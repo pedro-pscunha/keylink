@@ -32,12 +32,13 @@ use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, PoisonError, RwLock, Weak};
 use std::task::Poll;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use postcard_schema::Schema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -91,9 +92,37 @@ pub const MAILBOX: usize = 1;
 /// the fleet at once. Per-actor variation belongs in the payload, which is
 /// opaque and costs nothing here.
 ///
-/// Two fields were considered and rejected. **A method name**, because it
-/// duplicates the payload's own variant index and a peer can make the two
-/// disagree. **A protocol version**, because that is what the ALPN is.
+/// Three fields were considered and rejected.
+///
+/// **A method name**, because it duplicates the payload's own variant index and
+/// a peer can make the two disagree.
+///
+/// **A protocol version**, because that is what the ALPN is.
+///
+/// **A per-actor sequence number**, with the actor reordering behind a buffer,
+/// so that messages are handled in the order they were SENT rather than the
+/// order they arrived. Rejected, and this one is a judgement rather than an
+/// obvious call, so here is the reasoning.
+///
+/// A reorder buffer stalls while it waits for a number it has not seen. That is
+/// fine when the message is merely late. It is unbounded when the message is
+/// never coming — a cancelled call, a dropped stream, a caller that died
+/// between two sends — and the buffer cannot tell any of those apart from slow.
+/// The only way to bound the stall is a timeout, which means eventually giving
+/// up and processing a gap, which means dropping a message that may still
+/// arrive.
+///
+/// So the choice is not "ordered versus unordered". It is "out-of-order
+/// delivery, which the caller can see and correct" against "a stall of
+/// unpredictable length, ended by silently dropping someone's message". The
+/// second is worse, and it would be keylink's failure rather than the caller's
+/// decision.
+///
+/// Arrival order is therefore the order, the actor stamps sequence as it
+/// processes, and a caller who needs send order gets it by awaiting each reply
+/// or by carrying a sequence number in its own payload — where it owns the
+/// buffering policy and the stall that comes with it. Said where a user meets
+/// it, on the generated `Actor` trait and on `ActorRef`.
 #[derive(Serialize, Deserialize, Schema)]
 pub struct ActorRequest {
     /// Which actor, on the node this request is addressed to. An `ActorId` is
@@ -434,6 +463,10 @@ struct Registry {
     factory: Option<Factory>,
     capacity: usize,
     eviction: Eviction,
+    /// `tokio::time::Instant`, not `std::time::Instant`. The two are the same
+    /// clock in a running program, and only the first one a test can pause —
+    /// which is what makes the eviction policy provable rather than sampled by
+    /// a sleep long enough to usually work.
     epoch: Instant,
 }
 
@@ -1004,34 +1037,65 @@ mod tests {
         assert_eq!(guarded(async { 7u8 }).await.expect("no panic"), 7);
     }
 
+    /// An actor that does nothing at all, for testing the registry rather than
+    /// any message it carries.
+    fn idler() -> Mounted {
+        mount(1, |mut inbox| async move {
+            while inbox.recv().await.is_some() {}
+        })
+    }
+
     /// Eviction is by last message, not by mount time, or a busy actor would be
     /// evicted out from under its callers.
-    #[tokio::test]
-    async fn sweeping_keeps_the_actor_that_was_addressed() {
-        let system = System::builder(Eviction::Idle(Duration::from_millis(50)))
-            .spawn_with(|_| Some(mount(1, |mut inbox| async move { while inbox.recv().await.is_some() {} })))
-            .build();
-
+    ///
+    /// Time is paused, so this proves the policy instead of sampling it. The
+    /// same test against the wall clock WAS flaky, and failed: it needed the
+    /// background sweeper not to fire between two touches, which is a race no
+    /// test can win under load, and losing it evicted the actor the test was
+    /// about to address.
+    #[tokio::test(start_paused = true)]
+    async fn eviction_is_by_last_message_and_not_by_mount_time() {
+        let system = System::builder(Eviction::Idle(Duration::from_secs(60))).build();
         let busy = ActorId::new("busy").expect("valid");
         let idle = ActorId::new("idle").expect("valid");
-        system
-            .mount(busy.clone(), mount(1, |mut inbox| async move {
-                while inbox.recv().await.is_some() {}
-            }))
-            .expect("free");
-        system
-            .mount(idle.clone(), mount(1, |mut inbox| async move {
-                while inbox.recv().await.is_some() {}
-            }))
-            .expect("free");
+        system.mount(busy.clone(), idler()).expect("free");
+        system.mount(idle.clone(), idler()).expect("free");
 
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        // Both are now older than the budget.
+        tokio::time::advance(Duration::from_secs(90)).await;
         // Routing is what marks an actor as used.
         system.inner.route(&busy).expect("mounted");
         system.evict_idle();
 
         assert!(system.contains(&busy), "the addressed actor must survive");
         assert!(!system.contains(&idle), "the idle actor must be gone");
+    }
+
+    /// The other half: an actor inside its budget survives however often the
+    /// sweeper runs.
+    #[tokio::test(start_paused = true)]
+    async fn sweeping_does_not_evict_an_actor_inside_its_budget() {
+        let system = System::builder(Eviction::Idle(Duration::from_secs(60))).build();
+        let fresh = ActorId::new("fresh").expect("valid");
+        system.mount(fresh.clone(), idler()).expect("free");
+
+        tokio::time::advance(Duration::from_secs(59)).await;
+        system.evict_idle();
+
+        assert!(system.contains(&fresh));
+    }
+
+    /// `Eviction::Never` means never, however long nobody calls.
+    #[tokio::test(start_paused = true)]
+    async fn eviction_never_keeps_an_actor_nobody_addresses() {
+        let system = System::builder(Eviction::Never).build();
+        let forgotten = ActorId::new("forgotten").expect("valid");
+        system.mount(forgotten.clone(), idler()).expect("free");
+
+        tokio::time::advance(Duration::from_secs(60 * 60 * 24)).await;
+        system.evict_idle();
+
+        assert!(system.contains(&forgotten));
     }
 
     #[test]

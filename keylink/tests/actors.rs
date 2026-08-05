@@ -20,8 +20,19 @@ use keylink::{
 keylink::service! {
     service Journal;
 
+    /// Documenting an rpc is the first thing anyone tries, so the macro has to
+    /// accept it. `///` desugars to `#[doc = "..."]`, which used to be rejected
+    /// with an error pointing at the macro's own internals.
+    ///
+    /// The attribute reaches the `Request` variant, the `Handler` method, the
+    /// `Actor` method, and every client method, so one comment documents the
+    /// operation everywhere the operation appears.
     rpc Apply(entry: u64, hold_ms: u64) -> u64;
+
+    /// Every entry this actor has applied, in the order it applied them.
     rpc Entries() -> Vec<u64>;
+
+    #[allow(dead_code)]
     rpc Boom() -> u64;
 }
 
@@ -489,34 +500,29 @@ async fn lazy_spawn_stops_at_the_capacity() {
     assert_eq!(fixture.system.len(), 2);
 }
 
-/// An actor system that only grows is a leak.
+/// An actor system that only grows is a leak, and the sweeper runs on its own
+/// without anyone asking.
+///
+/// One-sided on purpose. Whether a BUSY actor survives is a claim about the
+/// clock, and it belongs in the unit tests, where time is paused and the answer
+/// is not a race — see `eviction_is_by_last_message_and_not_by_mount_time`.
+/// Asserting it here needed the background sweeper not to fire between two
+/// touches, which is a race this test cannot win under load and did not.
 #[tokio::test]
-async fn an_idle_actor_is_evicted() {
-    let system = System::builder(Eviction::Idle(Duration::from_millis(60))).build();
-    let fixture = start(system).await;
-    fixture
-        .system
-        .mount(id("busy"), journal::spawn(Journal::default()))
-        .expect("the id is free");
+async fn an_idle_actor_is_evicted_without_anyone_asking() {
+    let fixture = start(System::builder(Eviction::Idle(Duration::from_millis(60))).build()).await;
     fixture
         .system
         .mount(id("idle"), journal::spawn(Journal::default()))
         .expect("the id is free");
+    assert_eq!(fixture.system.len(), 1);
 
-    // Keep one of the two addressed across the budget.
-    for _ in 0..4 {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        journal::at(&fixture.client, id("busy")).apply(1, 0).await.unwrap();
-    }
-    fixture.system.evict_idle();
+    // No `evict_idle` call: the system's own sweeper has to do this.
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
     assert!(
-        fixture.system.contains(&id("busy")),
-        "an actor addressed inside the budget must survive"
-    );
-    assert!(
-        !fixture.system.contains(&id("idle")),
-        "an actor nobody addressed must be evicted"
+        fixture.system.is_empty(),
+        "an actor nobody addressed must be evicted by the sweeper alone"
     );
 }
 
