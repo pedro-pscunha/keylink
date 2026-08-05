@@ -37,7 +37,10 @@ use tokio::task::JoinSet;
 
 use crate::wire::FrameReader;
 use crate::error::ConfigError;
-use crate::{wire, Allowlist, Body, BodyReader, Error, Node, Outcome, Result};
+use crate::middleware::wrap;
+use crate::{
+    wire, Allowlist, Body, BodyReader, Context, Error, Middleware, Next, Node, Outcome, Result, Rpc,
+};
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -50,7 +53,7 @@ pub type Dispatch<Req, Resp> =
 /// Serves one protocol: authorizes the peer once per connection, then answers
 /// every stream that connection opens, concurrently.
 pub struct RpcService<Req, Resp> {
-    dispatch: Dispatch<Req, Resp>,
+    next: Next<Req, Resp>,
     allow: Arc<Allowlist>,
     _p: PhantomData<fn(Req) -> Resp>,
 }
@@ -58,7 +61,7 @@ pub struct RpcService<Req, Resp> {
 impl<Req, Resp> Clone for RpcService<Req, Resp> {
     fn clone(&self) -> Self {
         Self {
-            dispatch: self.dispatch.clone(),
+            next: self.next.clone(),
             allow: self.allow.clone(),
             _p: PhantomData,
         }
@@ -78,10 +81,15 @@ where
     Req: DeserializeOwned + Send + 'static,
     Resp: Serialize + Send + 'static,
 {
-    /// Build a service from an allowlist and an erased async handler.
-    pub fn new(allow: Allowlist, dispatch: Dispatch<Req, Resp>) -> Self {
+    /// Build a service from an allowlist and an erased async handler, with no
+    /// layers around it. Use [`ServiceBuilder`] to add layers.
+    pub fn new(allow: Allowlist, dispatch: Dispatch<Req, Resp>) -> Self
+    where
+        Req: 'static,
+        Resp: 'static,
+    {
         Self {
-            dispatch,
+            next: Arc::new(move |_cx, req, body| dispatch(req, body)),
             allow: Arc::new(allow),
             _p: PhantomData,
         }
@@ -90,12 +98,13 @@ where
 
 /// Answer one call on its own stream.
 async fn serve_one<Req, Resp>(
-    dispatch: Dispatch<Req, Resp>,
+    next: Next<Req, Resp>,
+    peer: EndpointId,
     mut send: SendStream,
     recv: RecvStream,
 ) -> Result<()>
 where
-    Req: DeserializeOwned,
+    Req: Rpc + DeserializeOwned,
     Resp: Serialize,
 {
     let mut frames = FrameReader::new(recv);
@@ -105,7 +114,13 @@ where
         return Ok(());
     };
 
-    let (outcome, body) = dispatch(request.message, BodyReader::new(frames, request.body_len)).await;
+    let cx = Context::new(peer, Req::SERVICE, request.message.method());
+    let (outcome, body) = next(
+        cx,
+        request.message,
+        BodyReader::new(frames, request.body_len),
+    )
+    .await;
 
     wire::write_header(&mut send, body.declared_len(), &outcome).await?;
     body.write_to(&mut send).await?;
@@ -151,7 +166,7 @@ fn is_clean_close(error: &ConnectionError) -> bool {
 
 impl<Req, Resp> ProtocolHandler for RpcService<Req, Resp>
 where
-    Req: DeserializeOwned + Send + Sync + 'static,
+    Req: Rpc + DeserializeOwned + Send + Sync + 'static,
     Resp: Serialize + Send + Sync + 'static,
 {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
@@ -169,7 +184,7 @@ where
 
             match connection.accept_bi().await {
                 Ok((send, recv)) => {
-                    calls.spawn(serve_one(self.dispatch.clone(), send, recv));
+                    calls.spawn(serve_one(self.next.clone(), peer, send, recv));
                 }
                 Err(error) if is_clean_close(&error) => break,
                 Err(error) => return Err(AcceptError::from_err(error)),
@@ -185,7 +200,7 @@ where
 
 impl<Req, Resp> RpcService<Req, Resp>
 where
-    Req: DeserializeOwned + Send + Sync + 'static,
+    Req: Rpc + DeserializeOwned + Send + Sync + 'static,
     Resp: Serialize + Send + Sync + 'static,
 {
     /// Erase the schema so services with unrelated types can share one node.
@@ -194,6 +209,68 @@ where
             alpn,
             handler: Box::new(self),
         }
+    }
+}
+
+/// Assembles one service: its allowlist, its handler, and the layers around it.
+///
+/// Returned by the generated `service()`, so a caller adds behaviour without
+/// the macro knowing anything about it.
+pub struct ServiceBuilder<Req, Resp> {
+    alpn: &'static [u8],
+    allow: Allowlist,
+    base: Next<Req, Resp>,
+    layers: Vec<Arc<dyn Middleware<Req, Resp>>>,
+}
+
+impl<Req, Resp> ServiceBuilder<Req, Resp>
+where
+    Req: Rpc + DeserializeOwned + Send + Sync + 'static,
+    Resp: Serialize + Send + Sync + 'static,
+{
+    /// Called by generated code. `dispatch` is the call into the user's handler.
+    #[doc(hidden)]
+    pub fn new(alpn: &'static [u8], allow: Allowlist, dispatch: Dispatch<Req, Resp>) -> Self {
+        Self {
+            alpn,
+            allow,
+            base: Arc::new(move |_cx, req, body| dispatch(req, body)),
+            layers: Vec::new(),
+        }
+    }
+
+    /// Add a layer. The first layer added is the outermost: it sees the request
+    /// first and the reply last.
+    #[must_use]
+    pub fn layer(mut self, layer: impl Middleware<Req, Resp>) -> Self {
+        self.layers.push(Arc::new(layer));
+        self
+    }
+
+    /// Freeze the chain and erase the schema.
+    pub fn build(self) -> Service {
+        let mut chain = self.base;
+        for layer in self.layers.into_iter().rev() {
+            chain = wrap(layer, chain);
+        }
+        Service {
+            alpn: self.alpn,
+            handler: Box::new(RpcService {
+                next: chain,
+                allow: Arc::new(self.allow),
+                _p: PhantomData,
+            }),
+        }
+    }
+}
+
+impl<Req, Resp> std::fmt::Debug for ServiceBuilder<Req, Resp> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceBuilder")
+            .field("alpn", &String::from_utf8_lossy(self.alpn))
+            .field("allow", &self.allow)
+            .field("layers", &self.layers.len())
+            .finish()
     }
 }
 
@@ -303,7 +380,7 @@ pub fn serve<Req, Resp>(
     service: RpcService<Req, Resp>,
 ) -> Result<Server>
 where
-    Req: DeserializeOwned + Send + Sync + 'static,
+    Req: Rpc + DeserializeOwned + Send + Sync + 'static,
     Resp: Serialize + Send + Sync + 'static,
 {
     Server::builder(node)

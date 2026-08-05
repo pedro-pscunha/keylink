@@ -418,8 +418,8 @@ async fn two_services_share_one_node_and_both_answer() {
     let client_node = local_node().await;
 
     let _running = keylink::Server::builder(&server)
-        .service(probe::service(Server, Allowlist::anyone()))
-        .service(telemetry::service(Tele, Allowlist::anyone()))
+        .service(probe::service(Server, Allowlist::anyone()).build())
+        .service(telemetry::service(Tele, Allowlist::anyone()).build())
         .spawn()
         .expect("distinct ALPNs register cleanly");
 
@@ -445,8 +445,8 @@ async fn two_services_share_one_node_and_both_answer() {
 async fn registering_one_alpn_twice_is_refused() {
     let node = local_node().await;
     let error = keylink::Server::builder(&node)
-        .service(probe::service(Server, Allowlist::anyone()))
-        .service(probe::service(Server, Allowlist::anyone()))
+        .service(probe::service(Server, Allowlist::anyone()).build())
+        .service(probe::service(Server, Allowlist::anyone()).build())
         .spawn()
         .expect_err("a duplicate ALPN must not be accepted");
 
@@ -479,4 +479,97 @@ async fn a_peer_on_a_different_schema_is_reported_as_a_schema_mismatch() {
         matches!(err, Error::SchemaMismatch { .. }),
         "expected a schema mismatch, got: {err:?}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────── layers
+
+/// Refuses one method by name, to prove a layer can see the typed request and
+/// say no without reaching the handler.
+struct WriteGuard;
+
+impl<Resp: Send + 'static> keylink::Middleware<probe::Request, Resp> for WriteGuard {
+    fn handle(
+        &self,
+        cx: keylink::Context,
+        req: probe::Request,
+        body: BodyReader,
+        next: keylink::Next<probe::Request, Resp>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (keylink::Outcome<Resp>, Body)> + Send>>
+    {
+        Box::pin(async move {
+            if cx.method() == "Slow" {
+                return (
+                    keylink::Outcome::Err(keylink::RemoteError::Unauthorized(
+                        "Slow needs write access".into(),
+                    )),
+                    Body::empty(),
+                );
+            }
+            next(cx, req, body).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_layer_can_refuse_one_method_and_pass_the_rest() {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let _running = keylink::Server::builder(&server)
+        .service(
+            probe::service(Server, Allowlist::anyone())
+                .layer(WriteGuard)
+                .build(),
+        )
+        .spawn()
+        .expect("serves");
+
+    let client = probe::Client::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("dials");
+
+    // Untouched method still works.
+    assert_eq!(client.ping().await.unwrap(), "pong");
+
+    // Guarded method is refused, and the refusal is typed.
+    let err = client.slow(1).await.expect_err("the layer refuses this one");
+    assert!(
+        matches!(
+            err,
+            Error::Remote(keylink::RemoteError::Unauthorized(_))
+        ),
+        "expected a typed refusal, got {err:?}"
+    );
+
+    // A refused call must not poison the connection.
+    assert_eq!(client.ping().await.unwrap(), "pong");
+}
+
+#[tokio::test]
+async fn a_timeout_layer_refuses_a_slow_handler() {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let _running = keylink::Server::builder(&server)
+        .service(
+            probe::service(Server, Allowlist::anyone())
+                .layer(keylink::Timeout::after(Duration::from_millis(50)))
+                .build(),
+        )
+        .spawn()
+        .expect("serves");
+
+    let client = probe::Client::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("dials");
+
+    let err = client
+        .slow(5_000)
+        .await
+        .expect_err("a handler over budget is refused");
+    assert!(
+        matches!(err, Error::Remote(keylink::RemoteError::TimedOut { .. })),
+        "expected a timeout refusal, got {err:?}"
+    );
+
+    // The connection survives the timeout.
+    assert_eq!(client.ping().await.unwrap(), "pong");
 }

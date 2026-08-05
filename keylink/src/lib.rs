@@ -42,6 +42,7 @@ mod authz;
 mod body;
 mod error;
 mod macros;
+mod middleware;
 mod node;
 mod reply;
 mod rpc;
@@ -53,8 +54,11 @@ pub use authz::Allowlist;
 pub use body::{Body, BodyReader};
 pub use error::{ConfigError, Error, Result, Transport};
 pub use node::{derive_alpn, Node};
+pub use middleware::{Context, Middleware, Next, Rpc, Timeout};
 pub use reply::{Outcome, RemoteError};
-pub use rpc::{serve, Dispatch, RpcClient, RpcService, Server, ServerBuilder, Service};
+pub use rpc::{
+    serve, Dispatch, RpcClient, RpcService, Server, ServerBuilder, Service, ServiceBuilder,
+};
 pub use wire::{Envelope, MAX_HEADER};
 
 /// Re-exported so generated code and callers agree on types without extra

@@ -126,13 +126,23 @@ macro_rules! service {
                 );
             )+
 
+            impl $crate::Rpc for Request {
+                const SERVICE: &'static str = stringify!($svc);
+
+                fn method(&self) -> &'static str {
+                    match self {
+                        $( Request::$rpc { .. } => stringify!($rpc), )+
+                    }
+                }
+            }
+
             /// Build this service so it can be registered on a
             /// [`Server`](keylink::Server), alongside other services or foreign
             /// iroh protocols, on one node.
             pub fn service<H: Handler>(
                 handler: H,
                 allow: $crate::Allowlist,
-            ) -> $crate::Service {
+            ) -> $crate::ServiceBuilder<Request, Response> {
                 let handler = ::std::sync::Arc::new(handler);
                 let dispatch: $crate::Dispatch<Request, Response> =
                     ::std::sync::Arc::new(move |req: Request, body: $crate::BodyReader| {
@@ -149,7 +159,7 @@ macro_rules! service {
                             ($crate::Outcome::Ok(__response), __body)
                         })
                     });
-                $crate::RpcService::new(allow, dispatch).into_service(alpn())
+                $crate::ServiceBuilder::new(alpn(), allow, dispatch)
             }
 
             /// Serve this service alone on `node`.
@@ -163,7 +173,7 @@ macro_rules! service {
                 allow: $crate::Allowlist,
             ) -> $crate::Result<$crate::Server> {
                 $crate::Server::builder(node)
-                    .service(service(handler, allow))
+                    .service(service(handler, allow).build())
                     .spawn()
             }
 
