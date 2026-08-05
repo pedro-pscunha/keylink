@@ -276,18 +276,57 @@ impl inventory::Handler for Warehouse {
 
 // ──────────────────────────────────────────────────────────────────── main
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Deliberately NOT `#[tokio::main]`.
+///
+/// `connect-sync` uses the blocking API, which refuses to run inside a runtime
+/// — correctly, since blocking there would deadlock. A synchronous `main` is
+/// what a program using that API actually looks like.
+fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some("serve") => serve().await,
-        Some("id") => print_id().await,
-        Some("connect") => {
-            let id = args.get(2).context("usage: connect <endpoint-id>")?;
-            connect(id, args.get(3).map(String::as_str)).await
+    let arg = |n: usize| args.get(n).map(String::as_str);
+
+    match arg(1) {
+        Some("connect-sync") => {
+            let id = arg(2).context("usage: connect-sync <endpoint-id>")?;
+            connect_sync(id)
         }
-        _ => bail!("usage: demo id | demo serve | demo connect <endpoint-id> [file-to-upload]"),
+        Some(other) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async move {
+                match other {
+                    "serve" => serve().await,
+                    "id" => print_id().await,
+                    "connect" => {
+                        let id = arg(2).context("usage: connect <endpoint-id>")?;
+                        connect(id, arg(3)).await
+                    }
+                    _ => bail!("unknown command: {other}"),
+                }
+            })
+        }
+        None => bail!(
+            "usage: demo id | demo serve | demo connect <id> [file] | demo connect-sync <id>"
+        ),
     }
+}
+
+/// The same conversation, from a program with no runtime of its own.
+fn connect_sync(id: &str) -> Result<()> {
+    let peer: EndpointId = id.parse().context("bad endpoint id")?;
+    let node = keylink::blocking::Node::bind_from_env("KEYLINK_SECRET")?;
+
+    println!("dialing as: {} (blocking)", node.id());
+    let client = inventory::blocking::Client::connect(&node, peer)?;
+
+    println!("ping        -> {}", client.ping()?);
+    println!("list        -> {} items", client.list()?.len());
+    println!("get_item    -> {:?}", client.get_item("ADU-014".into())?.map(|i| i.name));
+    match client.reserve("MUD-001".into(), 1) {
+        Ok(outcome) => println!("reserve 1   -> {outcome:?}"),
+        Err(err) => println!("reserve 1   -> REFUSED ({err})"),
+    }
+    client.close()?;
+    Ok(())
 }
 
 /// Print the endpoint id for `KEYLINK_SECRET`. This is the address peers dial
