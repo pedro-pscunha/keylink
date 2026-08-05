@@ -41,6 +41,7 @@
 pub mod blocking;
 
 mod authz;
+mod keys;
 mod body;
 mod error;
 mod macros;
@@ -53,6 +54,7 @@ mod testing;
 mod wire;
 
 pub use authz::Allowlist;
+pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use body::{Body, BodyReader};
 pub use error::{ConfigError, Error, Result, Transport};
 pub use node::{derive_alpn, Node};

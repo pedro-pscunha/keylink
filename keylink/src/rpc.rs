@@ -123,7 +123,7 @@ where
     )
     .await;
 
-    wire::write_header(&mut send, body.declared_len(), &outcome).await?;
+    wire::write_header(&mut send, body.declared_len(), None, &outcome).await?;
     body.write_to(&mut send).await?;
     send.finish()?;
     Ok(())
@@ -502,7 +502,10 @@ where
     pub async fn call(&self, request: Req, body: Body) -> Result<(Resp, BodyReader)> {
         let (mut send, recv) = self.conn.open_bi().await?;
 
-        wire::write_header(&mut send, body.declared_len(), &request).await?;
+        // Always None today. The envelope field is frozen ahead of the
+        // machinery so that adding retry safety later does not move every
+        // peer's ALPN a second time.
+        wire::write_header(&mut send, body.declared_len(), None, &request).await?;
         body.write_to(&mut send).await?;
         // The request is complete. Finishing tells the peer so without a
         // sentinel frame, and lets it start work before we read a byte.

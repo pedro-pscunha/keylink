@@ -206,6 +206,17 @@ pub enum ConfigError {
     /// in a doc comment nobody reads twice.
     #[error("{0} is reserved - keylink mounts this protocol itself, with a policy")]
     ReservedAlpn(String),
+    /// A bounded identifier was empty or too long.
+    ///
+    /// Raised by a constructor, and again on the receive path, because a peer's
+    /// value never passed through our constructor.
+    #[error("invalid {kind}: {reason}")]
+    MalformedKey {
+        /// Which identifier: "actor id", "idempotency key".
+        kind: &'static str,
+        /// Why it was refused.
+        reason: String,
+    },
 }
 
 /// `?` must reach [`Error`] from an iroh error in one step, or every call site

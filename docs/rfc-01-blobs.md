@@ -28,6 +28,17 @@ generates the mount, so `iroh_blobs::ALPN` is reserved against a hand-rolled
 replacement (section 4.1). A private `ProvenPeer` type keys the ledger, so an
 unidentified peer cannot reach an authorization decision (section 5.3).
 
+One property a user must know before choosing a store, and it is about
+deduplication rather than confidentiality:
+
+> **One node has one content store.** Two tenants on one node share a
+> deduplication domain: identical content is stored once, and a grant from
+> either tenant authorizes those bytes. Distinct content stays isolated. If two
+> tenants must not share a store, give them separate nodes.
+
+Section 5.8 tests that, including the case where it could have been a leak and
+is not.
+
 ### What I ran
 
 Every API claim below was compiled and run against the real crates on this
@@ -755,6 +766,121 @@ It is also unbounded memory: 32 bytes per grant plus map overhead, growing with
 distinct (peer, content) pairs. A server that grants at high rate needs a bound.
 I did not design one. See section 9.
 
+### 5.8 What a grant means, and what one node shares
+
+The team lead raised this as a live defect: two keylink services already share
+one node, so under this design they share one `Blobs` and one flat
+`(peer, hash)` ledger. A grant issued by service A then reaches content service
+B also serves. I tested it rather than agreeing, and the result changed the
+answer.
+
+**Distinct content is isolated. I checked the three ways it could fail.**
+
+```
+P asks for A's content it WAS granted
+   -> FETCHED "service A public datasheet"
+
+P asks for B's content, granted only to Q (P is on no allowlist of B)
+   -> REFUSED: stream reset by peer: error 1
+
+P asks for content in the store that nobody was granted
+   -> REFUSED: stream reset by peer: error 1
+```
+
+The first line is the control. The ledger keys on the hash, so a grant from A
+does not reach different content, whoever holds it and whoever else was granted
+it.
+
+**There is no existence oracle.** A hash the node holds but never granted is
+indistinguishable from a hash the node does not have:
+
+```
+   present-ungranted -> REFUSED: stream reset by peer: error 1
+   absent-entirely   -> REFUSED: stream reset by peer: error 1
+   distinguishable?  -> false
+```
+
+That closes the classic attack on deduplicated storage, where a peer probes for
+content by timing or by error code. Both refusals are `ERR_PERMISSION` and both
+arrive the same way.
+
+**The residual case is not a leak, because there is nothing to leak.** The only
+content a grant from A reaches in B is content that is byte-identical. Content
+addressing makes that one object:
+
+```
+IDENTICAL CONTENT added twice, as if by two services
+   A's hash: 53eb084351b742c475d8c595cf52e9b660e72d0469b16fe0e1b0fd61fa70e5b4
+   B's hash: 53eb084351b742c475d8c595cf52e9b660e72d0469b16fe0e1b0fd61fa70e5b4
+   one blob or two? -> ONE
+```
+
+There is no "B's copy" to reach. A peer that fetches it receives exactly the
+bytes A authorized. B holds the same bytes; it does not hold a second secret.
+
+**So a grant authorizes bytes, not a service's copy of them.** That is the whole
+property, and it is a consequence of content addressing rather than a gap in
+this design.
+
+#### The three mechanisms, and why none of them is worth building
+
+**Scope-salted `BlobId` — self-defeating, as the team lead suspected.** The
+blobs wire carries `GetRequest { hash, ranges }` and nothing else, so there is
+no field a scope token could ride in. Scoping the id therefore means scoping the
+*bytes*, which stores one copy per scope and destroys the deduplication that
+motivated adopting blobs. It buys no confidentiality either, because the
+underlying content is identical in every scope.
+
+**Single-use grants — breaks resume, and fixes nothing.** A resumed transfer is
+a second get request. I checked that a durable grant serves both:
+
+```
+   1st fetch -> FETCHED "service A public datasheet"
+   2nd fetch -> FETCHED "service A public datasheet"
+```
+
+Consuming the grant on first use refuses the second, which is exactly the resume
+that is one of the two reasons to adopt blobs. It also does not address the
+residual case, which is about identical content rather than repeated access.
+
+**One ALPN per scope — considered, rejected.** `BlobsProtocol` is an ordinary
+handler, so keylink could mount one per service on its own ALPN over one shared
+store, scoping admission at connect time. It preserves deduplication. It still
+does not change the identical-content case, because that is one blob either way.
+And it adds one ALPN per scope, which RFC-02 §10.2 measured as an O(N) cost on
+every handshake plus a TLS configuration clone per mount. It buys nothing the
+ledger does not already give.
+
+#### The limitation a user must read first
+
+Not confidentiality. Deduplication.
+
+> **One node has one content store.** Two tenants on one node share a
+> deduplication domain: identical content is stored once and a grant from either
+> tenant authorizes those bytes. Distinct content stays isolated. If two tenants
+> must not share a store, give them separate nodes.
+
+This design already pushes users that way. `ConfigError::ConflictingBlobStores`
+refuses two `Blobs` on one server, because one node has one blobs ALPN. Multiple
+tenants therefore means multiple nodes, which is the honest shape.
+
+The sentence above belongs in the `Blobs` type documentation, not in a risks
+section, so that a user reads it while choosing a store rather than afterwards.
+
+#### Tests that pin this
+
+```
+a_grant_to_one_peer_does_not_admit_another_peer
+content_that_nobody_was_granted_is_refused
+a_present_but_ungranted_hash_is_indistinguishable_from_an_absent_one
+identical_content_added_twice_is_one_blob
+a_grant_survives_a_second_fetch_so_resume_works
+```
+
+The third is the one to write carefully. It must compare the observable result
+of both attempts, not merely assert that each fails, or it passes without
+testing the oracle at all.
+
 ## 6. Store policy
 
 ### 6.1 What I checked about growth
@@ -915,6 +1041,11 @@ a_granted_peer_cannot_fetch_a_different_hash_in_the_same_store
 a_peer_with_no_grants_at_all_is_refused_at_the_connection
 a_connection_reporting_no_endpoint_id_is_refused
 a_request_on_a_connection_that_was_never_admitted_is_refused
+a_grant_to_one_peer_does_not_admit_another_peer
+content_that_nobody_was_granted_is_refused
+a_present_but_ungranted_hash_is_indistinguishable_from_an_absent_one
+identical_content_added_twice_is_one_blob
+a_grant_survives_a_second_fetch_so_resume_works
 a_push_from_any_peer_is_refused_and_the_store_is_unchanged
 an_observe_request_from_any_peer_is_refused
 a_get_many_request_from_any_peer_is_refused
@@ -1172,15 +1303,21 @@ holder will do and the hash verifies what arrives. But the handle must then carr
 **which** node to ask instead of assuming it is the one that answered. Flagging
 it now is cheap. Retrofitting it into a shipped `BlobHandle` is not.
 
-**(d) The ledger has no actor dimension.** Look at this one hardest. One node hosting many actors behind one ALPN shares one `Blobs`, so it
-shares one flat `(peer, hash)` grant namespace. If actors are meant to be
-isolation boundaries — different trust domains on one process — then actor A
-granting a hash to peer P lets P fetch it through any actor. That is the same
-defect I found with routing the `Allowlist` in section 5.1, one level down.
+**(d) The ledger has no actor dimension. Resolved in section 5.8 — no change
+needed.** I first flagged this as a future problem needing a
+`(peer, actor, hash)` key. The team lead corrected me twice: it is live today
+between services, and a wider key has nothing to match against, because a blobs
+fetch arrives on its own connection carrying only a peer and a hash.
 
-If actors are isolation boundaries, the ledger key must become
-`(peer, actor, hash)`, or each actor needs its own `Blobs`. Deciding that after
-the ledger ships is a migration. Deciding it now is a struct field.
+Both corrections are right, and testing them changed the conclusion. Section 5.8
+shows that distinct content is already isolated by hash, that there is no
+existence oracle, and that the only content a grant reaches across a scope
+boundary is byte-identical content, which is one blob rather than two secrets.
+
+So the actor case needs nothing new. An actor system inherits the same property:
+a grant authorizes bytes. What it inherits alongside it is the deduplication
+domain, which is why section 5.8 tells a multi-tenant user to use separate
+nodes. That guidance applies unchanged to multi-tenant actors.
 
 **I did not read RFC-04.** It was still being written. Items (c) and (d) are
 questions for whoever does, not conclusions about it.

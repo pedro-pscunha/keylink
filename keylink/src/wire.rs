@@ -42,11 +42,23 @@ const READ_CHUNK: usize = 64 * 1024;
 /// This is part of the hashed contract, so a change to keylink's wire format
 /// moves the ALPN exactly like a change to the caller's types does. There is no
 /// separate protocol version to remember to bump.
+/// # Freezing
+///
+/// Every field of this type is inside the hashed contract, so ANY change here
+/// moves the ALPN for every service in the fleet at once. That is the intended
+/// safety property and it is also the reason to change it rarely: prefer to put
+/// variation in the message, which is per service.
 #[derive(Debug, Serialize, Deserialize, Schema)]
 pub struct Envelope<T> {
     /// How many body bytes follow the header, when the sender knows. `None` is
     /// an open-ended stream that ends when the sender finishes it.
     pub body_len: Option<u64>,
+    /// Caller-supplied key so that a retried call runs at most once.
+    ///
+    /// Lives here rather than in an actor request because retry safety is not
+    /// an actor concern: an ordinary `rpc` that reserves stock needs it just as
+    /// much as an actor message does.
+    pub idempotency: Option<crate::IdempotencyKey>,
     /// The caller's request or response.
     pub message: T,
 }
@@ -59,11 +71,22 @@ pub struct Envelope<T> {
 pub(crate) async fn write_header<T: Serialize>(
     stream: &mut SendStream,
     body_len: Option<u64>,
+    idempotency: Option<&crate::IdempotencyKey>,
     message: &T,
 ) -> Result<()> {
     let mut buf = BytesMut::with_capacity(256);
     buf.extend_from_slice(&[0u8; PREFIX]);
-    let mut buf = postcard::to_extend(&Envelope { body_len, message }, buf)?;
+    // The clone is bounded at MAX_KEY_LEN and happens once per call. Borrowing
+    // into the envelope instead would make `Envelope` generic over a lifetime
+    // that only the write path has, and the read path would pay for it.
+    let mut buf = postcard::to_extend(
+        &Envelope {
+            body_len,
+            idempotency: idempotency.cloned(),
+            message,
+        },
+        buf,
+    )?;
 
     let encoded = buf.len() - PREFIX;
     let Ok(len) = u32::try_from(encoded) else {
@@ -180,7 +203,7 @@ mod tests {
         let link = testing::link().await;
         let (mut send, _recv) = link.client.open_bi().await.unwrap();
 
-        write_header(&mut send, Some(3), &"hello".to_string())
+        write_header(&mut send, Some(3), None, &"hello".to_string())
             .await
             .unwrap();
         send.write_all(b"abc").await.unwrap();
@@ -229,7 +252,7 @@ mod tests {
     async fn a_clean_close_at_a_frame_boundary_is_not_an_error() {
         let link = testing::link().await;
         let (mut send, _recv) = link.client.open_bi().await.unwrap();
-        write_header(&mut send, None, &"only one".to_string())
+        write_header(&mut send, None, None, &"only one".to_string())
             .await
             .unwrap();
         send.finish().unwrap();
@@ -276,6 +299,7 @@ mod tests {
         let mut framed = postcard::to_extend(
             &Envelope {
                 body_len: None,
+                idempotency: None,
                 message: &long,
             },
             framed,

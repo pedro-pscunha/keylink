@@ -1,6 +1,6 @@
 # RFC-04 — An actor model for keylink
 
-**Status:** proposal, revision 2. Nothing here is implemented.
+**Status:** proposal, revision 3. Nothing here is implemented.
 **Target:** `keylink` 0.1.0, iroh 1.0.3, edition 2021, rustc 1.97.
 **Author's recommendation in one line:** answer **(c)** — an actor is one more `Dispatch`, not one more transport; ship it in four steps, and reject supervision.
 
@@ -10,6 +10,21 @@ every point and contradicts it on none. It also reports one **defect in keylink 
 that revision 1 walked past: `Outcome` is not in the hashed contract, although `reply.rs`
 says it is ([section 14.6](#146-a-defect-found-while-answering-question-4)). That defect
 blocks question 4 and is demonstrated with running code.
+
+**Revision 3** records the review outcome. All three decisions are **approved**:
+`Dispatch` gains a `Context` (§2.6), the local `Handle` ships (§5.3-5.5), and `WireKinds`
+moves the contract hash (§3.5). Three arguments were corrected in review and are corrected
+here rather than left as they were first written:
+
+- §2.6 — the missing caller identity is a gap in the **concurrent** model too, not a cost
+  the actor model introduces.
+- §5.4 — `Handle` is justified because a local actor is the base case, **not** because it
+  is convenient to test. Revision 1's argument was weak and is replaced. §5.5 records the
+  rejection of location transparency as permanent, so a future proposal to unify the two
+  handles has an answer already written.
+- §3.5 and §12.3 — `WireKinds` ships with **test 17**, a pinned contract hash. Revision 1
+  defended the field with a comment and named its deletion as a risk; revision 1's test 17
+  could not have caught that deletion at all, and §12.3 explains why.
 
 ---
 
@@ -395,9 +410,9 @@ The change touches `Dispatch`, `RpcService::new`, `ServiceBuilder::new`, and the
 `Dispatch` the macro builds. `RpcService::new` and `Dispatch` are public. The crate is
 0.1.0 and unpublished, and `README.md:91` says "the API will move".
 
-**This is decision 1 for review.** The alternative is to leave `Dispatch` alone and pass
-the peer as an extra generated argument on every actor method, which is noisier at every
-call site and buys nothing.
+**Approved in review.** The alternative is to leave `Dispatch` alone and pass the peer as
+an extra generated argument on every actor method, which is noisier at every call site and
+buys nothing.
 
 ---
 
@@ -534,6 +549,60 @@ struct Contract {
 `WireKinds` is a unit struct with a `Schema` derive. `node.rs:177` already asserts the
 principle (`the_wire_envelope_is_part_of_the_hash`); this extends it from keylink's
 framing to keylink's stream usage.
+
+#### The field does not ship alone
+
+Revision 1 defended this field with a doc comment and then listed "the kind of line a
+future reader deletes as unused" as a risk. That is not a defence. **A field defended by a
+comment is deleted. A field defended by a red test is not.**
+
+So `WireKinds` ships in the same commit as this test:
+
+```rust
+keylink::service! {
+    service Pinned;
+    rpc Echo(text: String) -> String;
+}
+
+/// The ALPN of a frozen service, pinned as a literal.
+///
+/// Everything after the last slash is the schema hash of the whole contract, so
+/// this literal goes red when ANY of these moves: `Pinned`'s own types,
+/// `Envelope`, `Outcome`, `RemoteError`, or `WireKinds`. Every one of those
+/// changes forces every peer in every fleet to be rebuilt, and this assertion is
+/// the only thing in the crate that says so out loud.
+///
+/// When it goes red, in this order:
+///   1. Decide whether the change was meant to be wire-visible. If not, revert
+///      the change — do not touch this literal.
+///   2. If it was, update the literal and record the rebuild in the release notes.
+///
+/// Never do 2 without doing 1. Producing the new value is trivial, which is
+/// exactly why the ordering has to be written down.
+#[test]
+fn the_pinned_contract_hash_has_not_moved() {
+    assert_eq!(
+        std::str::from_utf8(pinned::alpn()).expect("alpn is ascii"),
+        "keylink/Pinned/0000000000000000", // <- from one run, never by hand
+    );
+}
+```
+
+One test defends three separate things: `WireKinds` here, the `Outcome` fix in §14.6, and
+any future accidental change to the wire. Deleting `WireKinds` moves the hash, and the
+literal goes red with no further machinery.
+
+**On precedent.** This is an extension of `alpn_shape_is_protocol_slash_16_hex`
+(`node.rs:144`), which already asserts the ALPN's structure; this asserts its value. It is
+**not** a golden wire-byte test — there is no such test in this repository, and a byte
+literal would be the weaker instrument here, because it pins one encoded message while the
+ALPN pins the entire transitive type graph on both sides at once.
+
+**One honest caveat.** A `postcard-schema` upgrade can move the hash without any keylink
+change. That is correct behaviour rather than a false positive — if the hash function
+changed, peers built against the two versions genuinely cannot agree — but it will
+surprise whoever bumps the dependency, so step 1 of the doc comment must be followed
+rather than skipped.
 
 ---
 
@@ -1270,7 +1339,7 @@ regression guard for §10.1.
 | 14 | `a_layer_refusing_a_tell_stops_the_handler` | Skipping the chain in `serve_tell` |
 | 15 | `a_panicking_tell_does_not_wedge_the_actor` | Removing `guarded` |
 | 16 | `two_tells_have_no_ordering_guarantee` | Nothing — this pins §3.4 |
-| 17 | `a_peer_without_wire_kinds_in_its_contract_is_refused` | Removing `WireKinds` from `Contract` |
+| 17 | `the_pinned_contract_hash_has_not_moved` | **Removing `WireKinds` from `Contract`** — and any other unintended wire change |
 
 Test 13 asserts the encoding directly: a bare `iroh` endpoint speaking the derived ALPN
 calls `accept_uni()` and reads the header. It fails if `tell` ever moves to a
@@ -1281,8 +1350,19 @@ so a future reader finds the non-guarantee in a test rather than during an incid
 asserts that **either** order is acceptable, and it is the place where the rustdoc
 sentence and the code are kept in agreement.
 
-Test 17 is the guard for §3.5, and it is the only evidence that a keylink capability
-change moves the ALPN.
+**Test 17 is the guard for §3.5, and revision 1 got it wrong.** Revision 1 named it
+`a_peer_without_wire_kinds_in_its_contract_is_refused` and claimed removing the field
+would make it red. It would not. Removing `WireKinds` changes *both* peers in one build,
+so the handshake still agrees and an integration test still passes — the test would have
+been decoration on the exact line it was supposed to defend.
+
+The pinned-hash form in §3.5 does make it red, because it compares against a literal that
+does not change when the code does. It is also the only test in the plan that fails
+**without a peer**, which is why it belongs here rather than among the QUIC tests: a wire
+change should be caught by `cargo test` in one crate, not by two endpoints agreeing to
+disagree.
+
+This test is shared with step 0 (§14.9). Whichever step lands first writes it.
 
 ### 12.4 Step 4
 
@@ -1754,11 +1834,21 @@ line, it makes an existing doc comment honest, and it is a prerequisite for addi
 variants in §14.5 without quietly weakening the guarantee that is keylink's headline
 property.
 
+**It ships with test 17**, the pinned contract hash from §3.5. Applying this fix moves the
+hash, so the literal is written for the first time in the same commit — which is the right
+moment, because from then on every wire change has to walk past it.
+
 It is also the third instance of one pattern, and the pattern is now worth naming:
 `WireKinds` (§3.5), this fix, and RFC-02's own reasoning all say the same thing. **The
 hashed contract must equal the wire type. Every time the two drift apart, the gate stops
-covering something it claims to cover.** A test belongs next to it that asserts the
-equality structurally rather than by inspection.
+covering something it claims to cover.**
+
+The ideal defence would be structural — a compile-time assertion that the type passed to
+`write_header` is the type named in `Contract`. That is not expressible today, because
+`Contract` is a struct built for its `Schema` derive and the wire type is chosen at two
+call sites (`rpc.rs:125`, `rpc.rs:485`). Until somebody finds a way to state it in the type
+system, **test 17 is the defence**, and it is a good one: it cannot be satisfied by
+inspection, and it does not need a peer.
 
 ### 14.7 The envelope, frozen
 
@@ -1839,17 +1929,23 @@ and it blocks §14.5.
 
 | Step | Content | Depends on |
 |---|---|---|
-| **0** | Capability G: `Envelope<Outcome<Response>>` in `Contract`, plus a test that the hashed type equals the wire type | nothing |
+| **0** | Capability G: `Envelope<Outcome<Response>>` in `Contract`, **plus test 17**, the pinned contract hash (§3.5) | nothing |
 | 1 | The mailbox, with no network (§11) | 0 |
 | 2 | Wire it to the transport; `Dispatch` gains `Context` (§11) | 1 |
 | 3 | `tell`, `accept_uni`, `WireKinds` (§11) | 2 |
 | 4 | `Peer`, the lazy reconnecting handle (§11) | 2 |
 | **5** | **The actor system** (§14): `ActorId`, `Sealed`, `ActorRequest`, registry, `stop`/`abort`, `Context::actor` | 0, 2 |
 
-Step 0 is worth doing even if every other step is rejected. Step 5 is **designed and
-unbuilt**. RFC-02 §10.8's tests 23 to 30 belong to it, and test 29 in particular is the
-one that pins §14.3 — RFC-02 is right that it must use two types with identical postcard
-shapes, or it passes against the broken ordering.
+Step 0 is worth doing even if every other step is rejected — it is one line plus the test
+that stops the next four steps from weakening the gate by accident.
+
+Step 5 is **designed and unbuilt**. RFC-02 §10.8's tests 23 to 30 belong to it, and test 29
+in particular is the one that pins §14.3 — RFC-02 is right that it must use two types with
+identical postcard shapes, or it passes against the broken ordering.
+
+Note that steps 3 and 5 both move the pinned hash, deliberately. That is the whole
+mechanism: a wire change cannot land without somebody updating a literal and reading the
+comment above it.
 
 ### 14.10 Added to "not verified"
 
