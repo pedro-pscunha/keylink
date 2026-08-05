@@ -1638,6 +1638,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "iroh",
+ "n0-future",
  "pastey",
  "postcard",
  "postcard-rpc",
@@ -1645,6 +1646,9 @@ dependencies = [
  "serde",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-util",
+ "wasm-streams",
+ "web-sys",
 ]
 
 [[package]]
@@ -3182,6 +3186,7 @@ checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
  "futures-util",
  "libc",

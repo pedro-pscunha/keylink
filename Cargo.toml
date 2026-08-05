@@ -3,11 +3,22 @@ members = ["keylink", "demo"]
 resolver = "2"
 
 [workspace.dependencies]
-iroh = "1.0.3"
+# The browser-safe feature set, which is the smaller one. `keylink` adds
+# `metrics`, `portmapper` and `fast-apple-datapath` back for native in its own
+# target block, and cargo unions the two sets per target.
+#
+# Putting `default-features = false` here and nowhere else would silently remove
+# NAT port mapping from every native build and degrade connectivity on real
+# networks. Check with `cargo tree -e features`.
+iroh = { version = "1.0.3", default-features = false, features = ["tls-ring"] }
+# The portable runtime shim. Spawn, time and streams that compile for a browser
+# as well as for a thread pool.
+n0-future = "0.3"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 postcard-schema = { version = "0.2", features = ["derive", "use-std"] }
 postcard-rpc = "0.12"
+# For `demo` only. `keylink` declares tokio itself, scoped per target.
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 thiserror = "2"
