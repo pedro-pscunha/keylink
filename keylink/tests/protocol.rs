@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use iroh::endpoint::presets;
 use iroh::Endpoint;
-use keylink::{Allowlist, Body, BodyReader, Error, Node, Router};
+use keylink::{Allowlist, Body, BodyReader, Error, Node, Server as KeylinkServer};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, ReadBuf};
@@ -107,7 +107,7 @@ impl probe::Handler for Server {
 /// endpoints outlive the test body.
 struct Fixture {
     client: probe::Client,
-    _router: Router,
+    _server: KeylinkServer,
     _nodes: [Node; 2],
 }
 
@@ -126,14 +126,14 @@ async fn start() -> Fixture {
 async fn start_with(allow: Allowlist) -> Fixture {
     let server = local_node().await;
     let client_node = local_node().await;
-    let router = probe::serve(&server, Server, allow);
+    let router = probe::serve(&server, Server, allow).expect("one service, no duplicate ALPN");
     let client = probe::Client::connect(&client_node, server.endpoint().addr())
         .await
         .expect("the client dials the server");
 
     Fixture {
         client,
-        _router: router,
+        _server: router,
         _nodes: [server, client_node],
     }
 }
@@ -388,4 +388,70 @@ impl AsyncRead for Pattern {
         self.offset += take as u64;
         Poll::Ready(Ok(()))
     }
+}
+
+// ──────────────────────────────────────────────── several services, one node
+
+keylink::service! {
+    service Telemetry;
+
+    rpc Echo(text: String) -> String;
+}
+
+struct Tele;
+
+impl telemetry::Handler for Tele {
+    async fn echo(&self, text: String) -> String {
+        text
+    }
+}
+
+/// The regression test for a real defect.
+///
+/// `Router::spawn` calls `Endpoint::set_alpns`, which *overrides* the ALPN list
+/// rather than adding to it. Building one router per service therefore left
+/// only the last-registered service reachable, silently. Every service has to
+/// go into a single router.
+#[tokio::test]
+async fn two_services_share_one_node_and_both_answer() {
+    let server = local_node().await;
+    let client_node = local_node().await;
+
+    let _running = keylink::Server::builder(&server)
+        .service(probe::service(Server, Allowlist::anyone()))
+        .service(telemetry::service(Tele, Allowlist::anyone()))
+        .spawn()
+        .expect("distinct ALPNs register cleanly");
+
+    let addr = server.endpoint().addr();
+    let probe_client = probe::Client::connect(&client_node, addr.clone())
+        .await
+        .expect("the first service is reachable");
+    let tele_client = telemetry::Client::connect(&client_node, addr)
+        .await
+        .expect("the second service is reachable too - this is what regressed");
+
+    assert_eq!(probe_client.ping().await.unwrap(), "pong");
+    assert_eq!(
+        tele_client.echo("olá".to_string()).await.unwrap(),
+        "olá",
+        "the service registered second must still answer"
+    );
+}
+
+/// Two services on one ALPN is a configuration error, not a last-one-wins race:
+/// the shadowed service would simply never answer.
+#[tokio::test]
+async fn registering_one_alpn_twice_is_refused() {
+    let node = local_node().await;
+    let error = keylink::Server::builder(&node)
+        .service(probe::service(Server, Allowlist::anyone()))
+        .service(probe::service(Server, Allowlist::anyone()))
+        .spawn()
+        .expect_err("a duplicate ALPN must not be accepted");
+
+    assert!(
+        matches!(error, Error::Config(_)),
+        "expected a config error, got {error:?}"
+    );
 }

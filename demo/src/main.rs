@@ -308,9 +308,9 @@ async fn serve() -> Result<()> {
     println!("alpn:         {}", String::from_utf8_lossy(inventory::alpn()));
     println!("listening as: {}", node.id());
 
-    let router = inventory::serve(&node, Warehouse::seeded(), allow);
+    let server = inventory::serve(&node, Warehouse::seeded(), allow)?;
     tokio::signal::ctrl_c().await?;
-    router.shutdown().await?;
+    server.shutdown().await?;
     Ok(())
 }
 

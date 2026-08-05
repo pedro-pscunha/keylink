@@ -21,6 +21,7 @@
 //! out-of-order reply matching, and no cancellation bookkeeping. Dropping the
 //! stream cancels the call.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -28,13 +29,14 @@ use std::sync::Arc;
 
 use iroh::{
     endpoint::{Connection, ConnectionError, RecvStream, SendStream},
-    protocol::{AcceptError, ProtocolHandler, Router},
+    protocol::{AcceptError, DynProtocolHandler, ProtocolHandler, Router},
     EndpointAddr, EndpointId,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::task::JoinSet;
 
 use crate::wire::FrameReader;
+use crate::error::ConfigError;
 use crate::{wire, Allowlist, Body, BodyReader, Error, Node, Result};
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -155,15 +157,131 @@ where
     }
 }
 
-/// Start serving. The returned `Router` owns the accept loop; drop or
-/// `shutdown()` it to stop.
-pub fn serve<Req, Resp>(node: &Node, alpn: &'static [u8], service: RpcService<Req, Resp>) -> Router
+impl<Req, Resp> RpcService<Req, Resp>
 where
     Req: DeserializeOwned + Send + Sync + 'static,
     Resp: Serialize + Send + Sync + 'static,
 {
-    Router::builder(node.endpoint().clone())
-        .accept(alpn, service)
+    /// Erase the schema so services with unrelated types can share one node.
+    pub fn into_service(self, alpn: &'static [u8]) -> Service {
+        Service {
+            alpn,
+            handler: Box::new(self),
+        }
+    }
+}
+
+/// One service, ready to register on a [`Server`].
+///
+/// The request and response types are erased here, which is what lets services
+/// with completely unrelated schemas sit in one collection — and therefore on
+/// one endpoint.
+pub struct Service {
+    alpn: &'static [u8],
+    handler: Box<dyn DynProtocolHandler>,
+}
+
+impl Service {
+    /// The ALPN this service answers on — `<crate>/<Service>/<schema hash>`.
+    pub fn alpn(&self) -> &'static [u8] {
+        self.alpn
+    }
+}
+
+impl std::fmt::Debug for Service {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Service")
+            .field("alpn", &String::from_utf8_lossy(self.alpn))
+            .finish()
+    }
+}
+
+/// The accept loop for every service on one node.
+///
+/// Drop it or call [`Server::shutdown`] to stop serving.
+#[derive(Debug)]
+#[must_use = "the server stops when dropped; hold it for as long as you serve"]
+pub struct Server {
+    router: Router,
+}
+
+impl Server {
+    /// Register services on `node`.
+    pub fn builder(node: &Node) -> ServerBuilder<'_> {
+        ServerBuilder {
+            node,
+            services: Vec::new(),
+        }
+    }
+
+    /// Stop accepting, and wait for in-flight connections to finish.
+    pub async fn shutdown(self) -> Result<()> {
+        self.router
+            .shutdown()
+            .await
+            .map_err(|e| Error::HandlerPanic(e.to_string()))
+    }
+
+    /// The underlying iroh router, so a keylink service can share a node with a
+    /// foreign iroh protocol such as `iroh-blobs` or `iroh-gossip`.
+    pub fn router(&self) -> &Router {
+        &self.router
+    }
+}
+
+/// Collects the services one node will answer.
+///
+/// This exists because [`iroh::protocol::Router::spawn`] calls
+/// `Endpoint::set_alpns`, which *overrides* the ALPN list rather than adding to
+/// it. Building one router per service therefore left only the last service
+/// reachable. Every service must go into a single router.
+#[derive(Debug)]
+pub struct ServerBuilder<'a> {
+    node: &'a Node,
+    services: Vec<Service>,
+}
+
+impl ServerBuilder<'_> {
+    /// Add a service. Each keeps its own allowlist and its own ALPN.
+    #[must_use]
+    pub fn service(mut self, service: Service) -> Self {
+        self.services.push(service);
+        self
+    }
+
+    /// Start the accept loop.
+    ///
+    /// Two services on the same ALPN is a configuration error, not a
+    /// last-one-wins race: the second would silently shadow the first.
+    pub fn spawn(self) -> Result<Server> {
+        let mut seen: BTreeSet<&'static [u8]> = BTreeSet::new();
+        let mut builder = Router::builder(self.node.endpoint().clone());
+        for service in self.services {
+            if !seen.insert(service.alpn) {
+                return Err(Error::Config(ConfigError::DuplicateAlpn(
+                    String::from_utf8_lossy(service.alpn).into_owned(),
+                )));
+            }
+            builder = builder.accept(service.alpn, service.handler);
+        }
+        Ok(Server {
+            router: builder.spawn(),
+        })
+    }
+}
+
+/// Serve a single service. Shorthand for [`Server::builder`] with one service.
+pub fn serve<Req, Resp>(
+    node: &Node,
+    alpn: &'static [u8],
+    service: RpcService<Req, Resp>,
+) -> Result<Server>
+where
+    Req: DeserializeOwned + Send + Sync + 'static,
+    Resp: Serialize + Send + Sync + 'static,
+{
+    Server::builder(node)
+        .service(service.into_service(alpn))
         .spawn()
 }
 

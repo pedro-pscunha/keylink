@@ -126,12 +126,13 @@ macro_rules! service {
                 );
             )+
 
-            /// Start serving. Returns a router owning the accept loop.
-            pub fn serve<H: Handler>(
-                node: &$crate::Node,
+            /// Build this service so it can be registered on a
+            /// [`Server`](keylink::Server), alongside other services or foreign
+            /// iroh protocols, on one node.
+            pub fn service<H: Handler>(
                 handler: H,
                 allow: $crate::Allowlist,
-            ) -> $crate::Router {
+            ) -> $crate::Service {
                 let handler = ::std::sync::Arc::new(handler);
                 let dispatch: $crate::Dispatch<Request, Response> =
                     ::std::sync::Arc::new(move |req: Request, body: $crate::BodyReader| {
@@ -147,7 +148,22 @@ macro_rules! service {
                             }
                         })
                     });
-                $crate::serve(node, alpn(), $crate::RpcService::new(allow, dispatch))
+                $crate::RpcService::new(allow, dispatch).into_service(alpn())
+            }
+
+            /// Serve this service alone on `node`.
+            ///
+            /// For several services on one endpoint, build each with
+            /// [`service`] and register them on a single
+            /// [`Server`](keylink::Server): one router must own every ALPN.
+            pub fn serve<H: Handler>(
+                node: &$crate::Node,
+                handler: H,
+                allow: $crate::Allowlist,
+            ) -> $crate::Result<$crate::Server> {
+                $crate::Server::builder(node)
+                    .service(service(handler, allow))
+                    .spawn()
             }
 
             /// A connected client. Every method is an ordinary async call, and

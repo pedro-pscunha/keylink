@@ -49,6 +49,15 @@ pub enum Error {
     #[error("peer closed the connection")]
     Closed,
 
+    /// A protocol handler panicked, and the router surfaced it during shutdown.
+    ///
+    /// Distinct from [`Error::Transport`] on purpose: nothing went wrong on the
+    /// network. Our own handler code is broken, and flattening that into a
+    /// transport error would send whoever reads the log looking at the wrong
+    /// layer.
+    #[error("a protocol handler panicked: {0}")]
+    HandlerPanic(String),
+
     /// A body ended before the length its sender declared. The streaming
     /// counterpart of [`Error::FrameTruncated`]: a short file is never mistaken
     /// for a complete one.
@@ -155,6 +164,13 @@ pub enum ConfigError {
     /// The allowlist parsed to nothing at all.
     #[error("allowlist is empty - refusing to serve a protocol nobody can reach")]
     EmptyAllowlist,
+    /// Two services were registered on the same ALPN.
+    ///
+    /// Caught rather than allowed to be last-one-wins: the second registration
+    /// would silently shadow the first, and the shadowed service would simply
+    /// never answer.
+    #[error("two services registered the same ALPN: {0}")]
+    DuplicateAlpn(String),
 }
 
 /// `?` must reach [`Error`] from an iroh error in one step, or every call site
