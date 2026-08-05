@@ -9,8 +9,9 @@ gains verified resume, deduplication and content addressing. The call site names
 no transport concept.
 
 The proposal adds one macro kind (`blob`), one value type (`BlobId`), one
-handle type (`BlobHandle`), and one node-level object (`Blobs`). It adds one
-escape hatch to `ServerBuilder`. It removes nothing.
+handle type (`BlobHandle`), and one node-level object (`Blobs`). It adds no
+escape hatch, because `Service::foreign` already landed in commit `2e02489`. It
+removes nothing.
 
 The security model is the load-bearing part. keylink does **not** route the
 `Allowlist` into blobs admission. keylink records a grant for every content
@@ -38,6 +39,24 @@ not part of the repository.
 | keylink `iroh` | 1.0.3 | `/Users/pedrocunha/repos/keylink/Cargo.toml` |
 | `iroh-gossip` | 0.101.0 | compiled in the probe, as a foreign protocol |
 | Vendored source | `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-blobs-0.103.0` | read directly |
+
+### An accepted risk, recorded on purpose
+
+iroh-blobs 0.103.0 carries this in its own `README.md`, first line after the
+title:
+
+> **NOTE: this version of iroh-blobs is not yet considered production quality.
+> For now, if you need production quality, use iroh-blobs 0.35**
+
+On 2026-08-05 the owner read that warning and chose 0.103.0 anyway. That advice
+was not available in any case: iroh-blobs 0.35.0 requires `iroh ^0.35`, and
+keylink is on iroh 1.0.3. This is a knowing decision, not an oversight.
+
+**The immaturity argues for this design rather than against adoption.** A
+dependency that ships a dead security field and teaches an unauthenticated mount
+in six of eight call sites is exactly the dependency a wrapper should own
+outright. On an immature crate the wrapper carrying the safety is worth more,
+not less. Sections 4.1 and 4.2 are the evidence.
 
 Three claims in the brief were wrong, and I correct them in place below:
 
@@ -213,50 +232,73 @@ position, so this needs no new mechanism.
 
 ## 4. Coexistence
 
-### 4.1 `ServerBuilder` needs an escape hatch, and blobs must not use it
+### 4.1 The escape hatch exists. It is currently the bypass.
 
-Today keylink cannot host iroh-blobs at all. I checked why:
-
-- `iroh::protocol::RouterBuilder::spawn` calls `Endpoint::set_alpns`, which
-  overrides the ALPN list. One router must own every ALPN. `rpc.rs:337` already
-  records this.
-- `Server::router()` hands back a `&Router` that is already spawned. iroh 1.0.3
-  offers no way to add a protocol after `spawn`. I read `src/protocol.rs` of
-  iroh 1.0.3 to confirm.
-- `keylink::Service` has private fields and no public constructor from a foreign
-  handler. `RpcService::into_service` requires `Req: Rpc`.
-
-So the escape hatch is genuinely needed. The signature mirrors
-`RouterBuilder::accept` exactly, which I read at `src/protocol.rs:484`:
+My first draft proposed `ServerBuilder::protocol(alpn, handler)`. **That work has
+already landed**, under a different name, in commit `2e02489` "fix(keylink): make
+foreign protocols actually mountable":
 
 ```rust
-impl ServerBuilder<'_> {
-    /// Register a foreign iroh protocol on this node's router.
-    ///
-    /// For protocols keylink does not wrap, such as `iroh-gossip`. keylink
-    /// applies no authorization to it: the handler owns its own admission.
-    ///
-    /// # Errors
-    ///
-    /// [`ConfigError::ReservedAlpn`] for an ALPN keylink mounts itself, and
-    /// [`ConfigError::DuplicateAlpn`] for one already taken by a service.
-    #[must_use]
-    pub fn protocol(
-        self,
-        alpn: impl AsRef<[u8]>,
-        handler: impl Into<Box<dyn DynProtocolHandler>>,
-    ) -> Self;
+// keylink/src/rpc.rs, on Service
+pub fn foreign(alpn: &'static [u8], handler: impl ProtocolHandler) -> Self;
+```
+
+The reasoning in that commit matches what I found independently:
+`Server::router()` returns a `&Router`, and iroh 1.0.3 accepts protocols only
+through `RouterBuilder`, which `spawn(self)` consumes. I read
+`src/protocol.rs:484` and `:501` of iroh 1.0.3 to confirm. So this RFC proposes
+**no new escape hatch**. `Service::foreign` is the right shape and the right
+name, and the surface table in section 11 drops my `protocol()` proposal.
+
+**But as it stands, `Service::foreign` is exactly the hole this RFC closes.**
+Its own doc comment says so:
+
+> A foreign protocol brings its own admission rules, or none. `Allowlist` does
+> NOT cover it. `iroh-blobs`, for one, will serve any hash to any peer that asks
+> unless you wire its own intercept. Read the protocol's documentation before
+> you mount it.
+
+That is an accurate warning and a correct decision for `iroh-gossip`. For
+iroh-blobs it is the failure mode the brief rules out: mounting blobs without a
+policy must be impossible, not documented as risky. Two things need to change.
+
+**One.** The doc example currently reads:
+
+```rust
+let blobs = BlobsProtocol::new(&store, None);
+Server::builder(&node)
+    .service(inventory::service(handler, allow).build())
+    .service(Service::foreign(iroh_blobs::ALPN, blobs))
+    .spawn()?;
+```
+
+`BlobsProtocol::new(&store, None)` is the mount I demonstrated serving every
+hash to every peer **and accepting writes** (section 4.2). Copying that example
+produces an unauthenticated store on the same public key as a strictly
+allowlisted service. The example must not show blobs.
+
+**Two.** `spawn` must reserve `iroh_blobs::ALPN`. It already walks every service
+and rejects a duplicate ALPN:
+
+```rust
+// keylink/src/rpc.rs, as it stands
+for service in self.services {
+    if !seen.insert(service.alpn) {
+        return Err(Error::Config(ConfigError::DuplicateAlpn(/* .. */)));
+    }
+    builder = builder.accept(service.alpn, service.handler);
 }
 ```
 
-Note `alpn: impl AsRef<[u8]>`. iroh accepts that, and `Service.alpn` being
-`&'static [u8]` is keylink's own choice, not a constraint from iroh.
+The reservation is one more check in that same loop, raised as
+`ConfigError::ReservedAlpn`. keylink mounts blobs itself from the `Blobs` its
+services carry (section 4.3), so a hand-rolled mount is never the only way to
+get blobs on a node. It is only the way to get blobs **without the ledger**.
 
-`iroh_blobs::ALPN` must be **reserved**. A user who mounts `BlobsProtocol` by
-hand through `.protocol()` bypasses the grant ledger and reopens every hole in
-section 4.2. `ConfigError::ReservedAlpn` closes that door at startup. This is
-the second half of "impossible to forget": the first half generates the policy,
-the second half refuses a hand-rolled replacement.
+This is the whole answer to "show me the types that enforce it". The enforcement
+is not a warning in a doc comment. It is a startup error on the one ALPN keylink
+owns, plus the `ProvenPeer` type in section 5.3 for the decision the generated
+policy makes.
 
 ### 4.2 Why keylink mounts blobs itself
 
@@ -291,8 +333,28 @@ $ grep -n "self\.mask\." src/provider/events.rs
 518:        let throttle = match self.mask.throttle {
 ```
 
-I treat this as a bug in iroh-blobs 0.103.0 and I report it in section 9. Two
-consequences for this design:
+**The wide-open mount is what the documentation teaches.** This is not one
+careless example. I listed every `BlobsProtocol::new` call site in the crate:
+
+| Site | Policy |
+|---|---|
+| `src/net_protocol.rs:24` (module documentation) | `None` |
+| `examples/transfer.rs:15` | `None` |
+| `examples/custom-protocol.rs:102` | `None` |
+| `examples/transfer-collection.rs:43` | `None` |
+| `examples/mdns-address-lookup.rs:71` | `None` |
+| `examples/compression.rs:196` | `EventSender::DEFAULT`, same thing |
+| `examples/limit.rs:361` | `Some(events)` |
+| `examples/random_store.rs:241` | `Some(events)` |
+
+Six of eight mount with no policy, including the crate's own module
+documentation, which is the first code a reader sees. The two that pass a policy
+are `limit.rs`, whose entire subject is limiting, and `random_store.rs`. A user
+who copies any introductory example gets an unauthenticated store on the same
+public key as a strictly allowlisted keylink service.
+
+I treat the dead mask as a bug in iroh-blobs 0.103.0 and I report it in section
+9. Two consequences for this design:
 
 1. A user must never be able to mount blobs with the default event sender.
    keylink mounts it, so a user never can.
@@ -339,66 +401,26 @@ today, and this keeps that property.
 `store.shutdown()`. So a persistent store flushes to disk with no new code. I
 read `src/net_protocol.rs` and `src/store/fs.rs:44-65` to confirm.
 
-### 4.4 Reaching the underlying store
+### 4.4 What is deliberately absent
 
-`Blobs::store()` returns the iroh-blobs store. It earns its place by
-consistency, not by any one consumer.
+Two things an earlier draft had, both cut. Recorded so nobody re-proposes them
+without new evidence.
 
-keylink already exposes the underlying object everywhere it wraps one.
-`Node::endpoint()` says "for anything keylink does not wrap". `Server::router()`
-and `blocking::Node::inner()` do the same. Without this accessor, `Blobs` is the
-only wrapper in the crate with no way out.
+**`Blobs::also_admit(Allowlist)`** widened admission to a whole-store read for
+named peers. It existed only so outbound `iroh-docs` sync could work over a
+shared store. iroh-docs is out of scope, so the weakening has no justification
+left. It was a documented way to defeat the ledger, and the ledger is the best
+part of this design.
 
-```rust
-impl Blobs {
-    /// The underlying iroh-blobs store, for anything keylink does not wrap.
-    ///
-    /// Reach for this to run a manual GC pass, to export content to a path, to
-    /// delete content, or to prefetch from a third peer with the downloader.
-    ///
-    /// This does not widen admission. The grant ledger still governs the blobs
-    /// ALPN, so handing this store to other code does not make its content
-    /// fetchable by anyone.
-    pub fn store(&self) -> &iroh_blobs::api::Store;
-}
-```
+**`Blobs::store()`** exposed the iroh-blobs store. I argued for keeping it on
+consistency: `Node::endpoint()`, `Server::router()` and `blocking::Node::inner()`
+all expose the object they wrap. That argument is real and it is not enough. The
+only concrete consumer was iroh-docs, and an accessor added on a cancelled
+premise is surface carried on speculation. Add it later, on evidence.
 
-The last paragraph is the reason this accessor is safe to offer. Admission lives
-on the protocol handler, which keylink owns, and not on the store. Code that
-holds the store can read and write it locally and still cannot serve it.
-
-> An earlier draft added `Blobs::also_admit(Allowlist)` so that `iroh-docs`
-> could sync content out of a shared store. iroh-docs is out of scope, and that
-> method existed only for it, so it is gone. Nothing else needed it, and it was
-> the one piece of the design that widened a whole store at once.
-
-### 4.5 A foreign protocol on the same node
-
-`iroh-gossip` is the realistic case: a protocol keylink does not wrap, mounted
-beside a keylink service. I compiled and ran this shape.
-
-```rust
-let node = Node::bind_from_env("KEYLINK_SECRET").await?;
-let blobs = keylink::Blobs::memory();
-let gossip = Gossip::builder().spawn(node.endpoint().clone());
-
-let server = keylink::Server::builder(&node)
-    .service(inventory::service(Warehouse::seeded(), allow, &blobs).build())
-    .protocol(iroh_gossip::ALPN, gossip)
-    .spawn()?;
-```
-
-Three protocols answer on this node: the keylink service, gossip, and blobs. The
-user writes two. The blobs mount is the one they do not write, which is what
-makes forgetting the policy impossible. `iroh_blobs::ALPN` stays reserved on
-`.protocol()`, so a hand-rolled mount that bypasses the ledger does not get past
-startup.
-
-Compare n0's own `examples/setup.rs`, which ends with
-`.accept(BLOBS_ALPN, BlobsProtocol::new(&blobs, None))`. That is the wide-open
-mount from section 4.2: it serves every hash to every peer and accepts writes.
-The hazard ships in the reference example, which is the strongest argument for
-keylink owning the mount.
+Handlers still publish content through `Blobs::add_file` and `Blobs::add_bytes`,
+and clients still read it through `BlobHandle`. Nothing in the design needs the
+raw store.
 
 ## 5. The security wiring
 
@@ -809,32 +831,41 @@ version. It is one more knob and its failure mode is silent corruption.
 
 ## 7. WASM
 
-**keylink does not compile for `wasm32-unknown-unknown` today.** The blobs
-question is downstream of that. I checked all three layers on this machine, with
-the `wasm32-unknown-unknown` target installed:
+**RFC-03 owns wasm for keylink. This section covers only what blobs adds to it.**
+
+The blobs-specific facts, measured with the `wasm32-unknown-unknown` target
+installed:
 
 | Crate | `cargo check --target wasm32-unknown-unknown` |
 |---|---|
 | `iroh` 1.0.3, `default-features = false` | passes |
 | `iroh-blobs` 0.103.0, `default-features = false` | passes |
 | `iroh-blobs` 0.103.0, default features | fails |
-| `keylink` (as it stands) | fails |
 
-Both failures are the same cause:
+The failure is the `rpc` feature, which pulls `noq`:
 
 ```
 error: This wasm target is unsupported by mio. If using Tokio, disable the net feature.
 ```
 
-For iroh-blobs it comes from the `rpc` feature, which pulls `noq`. For keylink
-it comes from `tokio = { version = "1", features = ["full"] }` in
-`/Users/pedrocunha/repos/keylink/Cargo.toml:11`. "full" includes `net`, which
-pulls mio.
+`default-features = false` is what this RFC proposes anyway, for the store
+reasons in section 6.2. So **iroh-blobs adds no new wasm blocker**. That is the
+whole finding.
 
-So the blocker is keylink's own feature selection, not iroh-blobs. Trimming
-tokio to the features keylink actually uses is the whole first step. I did not
-work out that list, and I did not check whether the QUIC transport works in a
-browser once it compiles.
+> **This part moved under me, and I rechecked it.** My first draft said keylink
+> fails on wasm for the same mio reason, through
+> `tokio = { features = ["full"] }`. Commit `1abfd35`, "target-scoped manifests
+> for the browser (RFC-03 step 1)", fixed that. keylink still fails, but the
+> cause is now its own source rather than a manifest:
+>
+> ```
+> error[E0433]: cannot find `signal` in `tokio`
+> error[E0433]: cannot find `fs` in `tokio`
+> error[E0599]: no associated function `new_multi_thread` found for `tokio::runtime::Builder`
+> ```
+>
+> RFC-03 says its source guards land in step 4. Read RFC-03, not this section,
+> for the base-crate status. I have not rechecked it since that commit.
 
 **On `browser-blobs`:** it is not a published crate, and it is not a repository.
 crates.io returns `crate 'browser-blobs' does not exist`, and a GitHub search of
@@ -902,6 +933,7 @@ mounting_iroh_blobs_by_hand_through_protocol_is_refused
 a_service_that_declares_blob_methods_without_a_store_is_refused
 two_services_with_different_blob_stores_are_refused
 a_foreign_protocol_on_a_service_alpn_is_refused
+service_foreign_on_the_blobs_alpn_is_refused
 a_service_and_a_foreign_protocol_coexist_on_one_node
 the_store_accessor_hands_out_the_same_store_the_mount_serves
 ```
@@ -956,7 +988,7 @@ it is not a regression guard for the upstream fix.
 
 ## 9. Risks, and what I could not check
 
-### Risk 1: the crate says it is not production quality
+### Risk 1: the crate says it is not production quality (accepted)
 
 `README.md` of iroh-blobs 0.103.0, first line after the title:
 
@@ -966,8 +998,18 @@ it is not a regression guard for the upstream fix.
 That advice is not available here. iroh-blobs 0.35.0 depends on `iroh ^0.35`,
 which I checked through the crates.io dependency API. keylink is on iroh 1.0.3.
 The only iroh-1.0-compatible line of iroh-blobs is the one its own authors call
-not production quality. **This is the decision I most want reviewed.** It is a
-project-level judgment, not a technical one.
+not production quality.
+
+**Decided on 2026-08-05: proceed on 0.103.0.** The risk stays open and named
+rather than closed. What it costs us in practice, and what to watch:
+
+- The API moves between minor versions. Pin the exact version, and read the
+  changelog on every bump rather than trusting semver.
+- Bugs of the class in Risk 2 are likely to exist elsewhere in the crate. The
+  design assumes the dependency is wrong until measured, which is why section 8
+  tests behavior rather than configuration.
+- If a keylink release ever needs an audited blobs implementation, that is a
+  fork or an upstream contribution, not a version bump.
 
 ### Risk 2: the dead event mask is an upstream bug
 
@@ -1070,7 +1112,9 @@ and its own grant direction.
 
 ## 11. Summary of new surface
 
-Ten items. Everything else is internal.
+Nine items. Everything else is internal. `Service::foreign` already exists, so
+this RFC adds no escape hatch — it only reserves one ALPN on the one that landed
+in commit `2e02489`.
 
 | Item | Kind |
 |---|---|
@@ -1080,8 +1124,7 @@ Ten items. Everything else is internal.
 | `Blobs` | node object, `memory()` plus `persistent()` behind a feature |
 | `Retention` | enum, 2 variants, no `Default` |
 | `Blobs::store` | escape hatch to the iroh-blobs store |
-| `ServerBuilder::protocol` | escape hatch for foreign iroh protocols |
-| `ConfigError::ReservedAlpn` | startup error |
+| `ConfigError::ReservedAlpn` | startup error on `Service::foreign(iroh_blobs::ALPN, ..)` |
 | `ConfigError::MissingBlobStore` | startup error |
 | `ConfigError::ConflictingBlobStores` | startup error |
 

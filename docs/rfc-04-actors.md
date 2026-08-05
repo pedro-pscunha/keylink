@@ -1,8 +1,15 @@
 # RFC-04 — An actor model for keylink
 
-**Status:** proposal. Nothing here is implemented.
+**Status:** proposal, revision 2. Nothing here is implemented.
 **Target:** `keylink` 0.1.0, iroh 1.0.3, edition 2021, rustc 1.97.
 **Author's recommendation in one line:** answer **(c)** — an actor is one more `Dispatch`, not one more transport; ship it in four steps, and reject supervision.
+
+**Revision 2** answers the four questions RFC-02 §10.7 puts to this RFC, in
+[section 14](#14-the-actor-system-answering-rfc-02-10). It agrees with RFC-02 §10.3 on
+every point and contradicts it on none. It also reports one **defect in keylink today**
+that revision 1 walked past: `Outcome` is not in the hashed contract, although `reply.rs`
+says it is ([section 14.6](#146-a-defect-found-while-answering-question-4)). That defect
+blocks question 4 and is demonstrated with running code.
 
 ---
 
@@ -33,7 +40,17 @@ A serial actor is a `Dispatch` that sends into a mailbox instead of calling a me
 | **C** | Reaching a peer unprompted | **0 lines** — dial it back | **Document. Build nothing.** |
 | **D** | Location-transparent handle (one type for local and remote) | ~40 lines | **Reject.** Section 5. |
 | **E** | Supervision, restart, actor trees | large | **Reject.** Section 8. |
-| **F** | Keyed instances (Restate Virtual Objects) | large | **Defer until named.** Section 7.5. |
+| **F** | The **actor system**: keyed instances, runtime mount and unmount | ~300 lines, new wire envelope | **Design now, build when named.** Section 14. |
+| **G** | Fixing `Outcome`'s absence from the hashed contract | **1 line** | **Ship first.** Blocks F. Section 14.6. |
+
+Capabilities A to E are the **singleton actor**: one actor per service, no id, no
+registry, and the wire unchanged. That is what removes the `Mutex` from `Warehouse`, and
+it is the only part with a justification today.
+
+Capability F is the **actor system** RFC-02 §10 designs: many instances behind one ALPN,
+addressed by an id inside the request. Section 14 answers RFC-02's four questions in full
+and freezes its wire envelope, then leaves it unbuilt — the same treatment RFC-02 §9.7
+gives its own capability A.
 
 The honest cost is in [section 10](#10-what-this-breaks). One thing genuinely breaks:
 **`send` (body up) serializes an entire upload inside one mailbox turn.** `recv` (body
@@ -639,7 +656,7 @@ The macro generates two types with the same method names and different error typ
 ```rust
 // local: same process, same runtime, no network
 let handle: inventory::Handle = /* from `actor(..)` */;
-let item: Option<Item> = handle.get_item(sku).await?;   // Err = ActorGone
+let item: Option<Item> = handle.get_item(sku).await?;   // Err = MailboxClosed
 
 // remote: another machine
 let client: inventory::Client = inventory::Client::connect(&node, peer).await?;
@@ -651,7 +668,12 @@ across the boundary is a mechanical edit that the compiler drives. What does **n
 compile is the code that ignored the difference: the `?` changes error type, and
 `keylink::Error::Transport` has no local counterpart to pattern-match on.
 
-`ActorGone` is a unit error struct, six lines with `thiserror`. It is nearly unreachable
+`MailboxClosed` is a unit error struct, six lines with `thiserror`. Revision 1 called it
+`ActorGone`; it is renamed because section 14 introduces
+`RemoteError::NoSuchActor`, and the two must not be read as the same thing.
+`MailboxClosed` is **local** and means the task that owned this mailbox is gone.
+`NoSuchActor` is a **remote refusal** and means the peer has no entry under that id.
+`MailboxClosed` is nearly unreachable
 once section 7.3's panic guard is in place, but it must be typed, because a runtime
 shutdown can still take the task.
 
@@ -728,12 +750,18 @@ owns the state and the receiver; the `Dispatch` closure owns a sender.
 
 ### 7.2 Stop
 
-There is no `stop` method, and that is deliberate.
+For a **singleton** actor there is no `stop` method, and that is deliberate.
 
 The actor stops when every sender drops. `Server::shutdown()` shuts down the router,
 which drops the handlers, which drops the `Dispatch` closures, which drops the senders,
 so `rx.recv()` returns `None` and the loop returns. Adding a control channel to stop it
 early would be a second way to do the same thing.
+
+RFC-02 §10.5 specifies `stop` and `abort`. Those belong to the **actor system**, where
+removing one instance must leave the service and the connection running. They are adopted
+unchanged in [section 14.5](#145-stop-and-abort-adopted-from-rfc-02-105), which also
+corrects one mechanism RFC-02 assumed. There is no contradiction: a singleton has nothing
+to remove itself from.
 
 One ordering detail, verified by reading: `Server::shutdown` waits for in-flight
 connections, and a connection serving an `ask` is parked on the `oneshot`, so shutdown
@@ -793,7 +821,12 @@ mount, and RFC-02's capability A is not on the path.
 RFC-02 §2.4 proposes `shutdown(&self)` instead of `shutdown(self)`. That is compatible
 with everything here. RFC-02's capability C (`Service::foreign`) is orthogonal.
 
-The keyed design is sketched in section 9.1 and **deferred until somebody names a use**.
+**Revision 2 note.** RFC-02 §10 reached the same conclusion independently, and proved it
+far more thoroughly than the paragraph above: per-actor ALPN is O(N) per mount and
+therefore O(N²) to start N actors, because `set_alpn_protocols` always takes the
+`Arc::make_mut` deep-copy branch. This RFC accepts that section in full. What §10 then
+asks in return — four questions, and one hard ordering requirement on the envelope — is
+answered in [section 14](#14-the-actor-system-answering-rfc-02-10).
 
 ---
 

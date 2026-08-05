@@ -274,6 +274,22 @@ impl<Req, Resp> std::fmt::Debug for ServiceBuilder<Req, Resp> {
     }
 }
 
+/// ALPNs keylink refuses to mount by hand.
+///
+/// These belong to protocols keylink means to mount ITSELF, with a policy
+/// attached. `iroh-blobs` is the reason this list exists: its own examples and
+/// module documentation all write `BlobsProtocol::new(&store, None)`, which
+/// serves every hash to every peer and accepts writes, because
+/// `EventMask::DEFAULT` disables the admission callback entirely. Mounting that
+/// beside an allowlisted keylink service puts an unauthenticated protocol on an
+/// otherwise closed node.
+///
+/// A prose warning does not stop that; a startup error does.
+const RESERVED_ALPNS: &[&[u8]] = &[
+    // iroh_blobs::ALPN
+    b"/iroh-bytes/4",
+];
+
 /// One service, ready to register on a [`Server`].
 ///
 /// The request and response types are erased here, which is what lets services
@@ -292,26 +308,31 @@ impl Service {
 
     /// Register a protocol keylink did not generate, on the same node.
     ///
-    /// `iroh-blobs`, `iroh-gossip` and `iroh-docs` are ordinary
-    /// [`ProtocolHandler`]s, so they belong in the same router as our services.
-    /// They must be registered here, before [`ServerBuilder::spawn`]: iroh's
-    /// `Router` accepts protocols only through its builder, and `spawn`
-    /// consumes it.
+    /// `iroh-gossip` and similar are ordinary [`ProtocolHandler`]s, so they
+    /// belong in the same router as our services. They must be registered here,
+    /// before [`ServerBuilder::spawn`]: iroh's `Router` accepts protocols only
+    /// through its builder, and `spawn` consumes it.
     ///
     /// ```ignore
-    /// let blobs = BlobsProtocol::new(&store, None);
     /// Server::builder(&node)
     ///     .service(inventory::service(handler, allow).build())
-    ///     .service(Service::foreign(iroh_blobs::ALPN, blobs))
+    ///     .service(Service::foreign(iroh_gossip::ALPN, gossip))
     ///     .spawn()?;
     /// ```
     ///
     /// # Authorization
     ///
     /// A foreign protocol brings its own admission rules, or none. [`Allowlist`]
-    /// does NOT cover it. `iroh-blobs`, for one, will serve any hash to any
-    /// peer that asks unless you wire its own intercept. Read the protocol's
-    /// documentation before you mount it.
+    /// does NOT cover it, and neither does [`Middleware`](crate::Middleware).
+    /// Read the protocol's documentation before you mount it, and assume it
+    /// admits everyone until you have found the sentence that says otherwise.
+    ///
+    /// # Reserved ALPNs
+    ///
+    /// A few ALPNs are refused here, and [`ServerBuilder::spawn`] returns
+    /// [`ConfigError::ReservedAlpn`]. Those are protocols keylink means to mount
+    /// itself, with a policy attached. Hand-mounting one would be a way to get
+    /// an unauthorized protocol onto an otherwise allowlisted node.
     pub fn foreign(alpn: &'static [u8], handler: impl ProtocolHandler) -> Self {
         Self {
             alpn,
@@ -397,6 +418,11 @@ impl ServerBuilder<'_> {
         let mut seen: BTreeSet<&'static [u8]> = BTreeSet::new();
         let mut builder = Router::builder(self.node.endpoint().clone());
         for service in self.services {
+            if RESERVED_ALPNS.contains(&service.alpn) {
+                return Err(Error::Config(ConfigError::ReservedAlpn(
+                    String::from_utf8_lossy(service.alpn).into_owned(),
+                )));
+            }
             if !seen.insert(service.alpn) {
                 return Err(Error::Config(ConfigError::DuplicateAlpn(
                     String::from_utf8_lossy(service.alpn).into_owned(),

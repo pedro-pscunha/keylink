@@ -198,6 +198,14 @@ pub enum ConfigError {
     /// never answer.
     #[error("two services registered the same ALPN: {0}")]
     DuplicateAlpn(String),
+    /// A reserved ALPN was mounted by hand.
+    ///
+    /// keylink means to mount this protocol itself, with a policy attached.
+    /// Mounting it by hand would put an unauthorized protocol on an otherwise
+    /// allowlisted node, so it is refused at startup rather than warned about
+    /// in a doc comment nobody reads twice.
+    #[error("{0} is reserved - keylink mounts this protocol itself, with a policy")]
+    ReservedAlpn(String),
 }
 
 /// `?` must reach [`Error`] from an iroh error in one step, or every call site

@@ -657,3 +657,39 @@ async fn a_foreign_protocol_shares_the_node_with_a_keylink_service() {
     let echoed = recv.read_to_end(64).await.expect("reads the echo");
     assert_eq!(echoed, "olá".as_bytes(), "the foreign protocol answered");
 }
+
+/// iroh-blobs' own examples and module docs all write
+/// `BlobsProtocol::new(&store, None)`, which disables the admission callback
+/// entirely: every hash to every peer, and writes accepted. Mounting that
+/// beside an allowlisted keylink service puts an unauthenticated protocol on a
+/// closed node.
+///
+/// keylink means to mount blobs itself, with a policy. So mounting it by hand
+/// must fail at startup, not merely be warned about in a doc comment.
+#[tokio::test]
+async fn a_reserved_alpn_cannot_be_mounted_by_hand() {
+    let node = local_node().await;
+    let error = keylink::Server::builder(&node)
+        .service(keylink::Service::foreign(b"/iroh-bytes/4", ForeignEcho))
+        .spawn()
+        .expect_err("the iroh-blobs ALPN must be refused");
+
+    assert!(
+        matches!(error, Error::Config(_)),
+        "expected a config error, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("reserved"),
+        "the message must say why: {error}"
+    );
+}
+
+/// The guard must not overreach: an unrelated foreign protocol still mounts.
+#[tokio::test]
+async fn a_non_reserved_foreign_alpn_still_mounts() {
+    let node = local_node().await;
+    let _running = keylink::Server::builder(&node)
+        .service(keylink::Service::foreign(FOREIGN_ALPN, ForeignEcho))
+        .spawn()
+        .expect("an ordinary foreign protocol is unaffected");
+}
