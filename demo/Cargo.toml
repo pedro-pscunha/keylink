@@ -1,0 +1,22 @@
+[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# Reorders two identically shaped enum variants. postcard encodes them by
+# declaration index, so a peer built with this feature misparses every price
+# without erroring. The schema-derived ALPN turns that into a refused handshake:
+# build this crate twice, once with the feature, and the two binaries cannot
+# talk to each other at all.
+swap-variants = []
+
+[dependencies]
+keylink = { path = "../keylink" }
+serde = { workspace = true }
+postcard-schema = { workspace = true }
+tokio = { workspace = true }
+anyhow = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+[workspace]
+members = ["keylink", "demo"]
+resolver = "2"
+
+[workspace.dependencies]
+iroh = "1.0.3"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+postcard-schema = { version = "0.2", features = ["derive", "use-std"] }
+postcard-rpc = "0.12"
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+thiserror = "2"
+pastey = "0.2"
+
+# `missing_docs` is not here: it belongs to the library, which declares it
+# itself, and a binary has no public API to document.
+#
+# `unwrap` and `expect` are denied by the compiler, not by promise. Test modules
+# opt out explicitly at the top of the file, which is the only place they are
+# allowed.
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+expect_used = "deny"
+unwrap_used = "deny"

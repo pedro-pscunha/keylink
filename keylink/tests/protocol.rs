@@ -1,0 +1,391 @@
+//! End-to-end behaviour of a generated service over a real QUIC connection.
+//!
+//! Everything here runs against two iroh endpoints on the loopback interface
+//! with no relay and no discovery, so the transport is genuine and the tests
+//! need no network.
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+
+use iroh::endpoint::presets;
+use iroh::Endpoint;
+use keylink::{Allowlist, Body, BodyReader, Error, Node, Router};
+use postcard_schema::Schema;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, ReadBuf};
+
+// ────────────────────────────────────────────────────────────── the service
+
+#[derive(Debug, Clone, Serialize, Deserialize, Schema)]
+pub struct Meta {
+    pub bytes: u64,
+    pub checksum: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Schema)]
+pub enum Received {
+    Stored { bytes: u64, checksum: u64 },
+    Failed { reason: String },
+}
+
+keylink::service! {
+    service Probe;
+
+    rpc  Ping() -> String;
+    rpc  Slow(ms: u64) -> u64;
+
+    recv Download(len: u64) -> Meta;
+    recv Mislabelled(declare: u64, actually: u64) -> Meta;
+
+    send Upload(name: String) -> Received;
+}
+
+struct Server;
+
+impl probe::Handler for Server {
+    async fn ping(&self) -> String {
+        "pong".to_string()
+    }
+
+    async fn slow(&self, ms: u64) -> u64 {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        ms
+    }
+
+    async fn download(&self, len: u64) -> (Meta, Body) {
+        let meta = Meta {
+            bytes: len,
+            checksum: Pattern::checksum(len),
+        };
+        (meta, Body::from_reader(Pattern::new(len), Some(len)))
+    }
+
+    /// Declares one length and sends another, which is how a real short read
+    /// looks from the receiving end.
+    async fn mislabelled(&self, declare: u64, actually: u64) -> (Meta, Body) {
+        let meta = Meta {
+            bytes: declare,
+            checksum: 0,
+        };
+        (
+            meta,
+            Body::from_reader(Pattern::new(actually), Some(declare)),
+        )
+    }
+
+    async fn upload(&self, _name: String, mut body: BodyReader) -> Received {
+        let mut checksum = Fnv1a::new();
+        let mut bytes = 0u64;
+        loop {
+            match body.next_chunk().await {
+                Ok(Some(chunk)) => {
+                    checksum.update(&chunk);
+                    bytes += chunk.len() as u64;
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    return Received::Failed {
+                        reason: error.to_string(),
+                    }
+                }
+            }
+        }
+        Received::Stored {
+            bytes,
+            checksum: checksum.finish(),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────── fixture
+
+/// A running server and a client connected to it. Both nodes are held so the
+/// endpoints outlive the test body.
+struct Fixture {
+    client: probe::Client,
+    _router: Router,
+    _nodes: [Node; 2],
+}
+
+async fn local_node() -> Node {
+    Node::from_endpoint(
+        Endpoint::bind(presets::Minimal)
+            .await
+            .expect("a local endpoint binds"),
+    )
+}
+
+async fn start() -> Fixture {
+    start_with(Allowlist::anyone()).await
+}
+
+async fn start_with(allow: Allowlist) -> Fixture {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let router = probe::serve(&server, Server, allow);
+    let client = probe::Client::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("the client dials the server");
+
+    Fixture {
+        client,
+        _router: router,
+        _nodes: [server, client_node],
+    }
+}
+
+// ───────────────────────────────────────────────────────────── unary calls
+
+#[tokio::test]
+async fn a_unary_call_round_trips() {
+    let fixture = start().await;
+    assert_eq!(fixture.client.ping().await.unwrap(), "pong");
+}
+
+/// iroh proves who the peer is. It does not decide whether they are welcome,
+/// and an allowlist that does not name us must close the door.
+#[tokio::test]
+async fn a_peer_outside_the_allowlist_is_refused() {
+    let stranger = local_node().await;
+    let fixture = start_with(Allowlist::only([stranger.id()])).await;
+
+    let error = fixture.client.ping().await.unwrap_err();
+    assert!(
+        matches!(error, Error::Transport(_)),
+        "expected a transport failure, got {error:?}"
+    );
+}
+
+/// The headline property of one stream per call. Eight handlers that each sleep
+/// 150 ms take 1200 ms in series. They must not — and they must not even when
+/// every call is driven from a single task, because the concurrency comes from
+/// the transport rather than from a thread pool.
+#[tokio::test]
+async fn concurrent_calls_do_not_queue_behind_each_other() {
+    const CALLS: u64 = 8;
+    const DELAY_MS: u64 = 150;
+
+    let fixture = start().await;
+    let client = &fixture.client;
+
+    let started = Instant::now();
+    let results = tokio::join!(
+        client.slow(DELAY_MS),
+        client.slow(DELAY_MS),
+        client.slow(DELAY_MS),
+        client.slow(DELAY_MS),
+        client.slow(DELAY_MS),
+        client.slow(DELAY_MS),
+        client.slow(DELAY_MS),
+        client.slow(DELAY_MS),
+    );
+    let elapsed = started.elapsed();
+
+    for result in [
+        results.0, results.1, results.2, results.3, results.4, results.5, results.6, results.7,
+    ] {
+        assert_eq!(result.unwrap(), DELAY_MS);
+    }
+
+    let serial = Duration::from_millis(DELAY_MS * CALLS);
+    assert!(
+        elapsed < serial / 2,
+        "{CALLS} concurrent calls took {elapsed:?}; in series they would take {serial:?}"
+    );
+    println!("{CALLS} concurrent {DELAY_MS}ms calls finished in {elapsed:?} (serial: {serial:?})");
+}
+
+// ──────────────────────────────────────────────────────────────── streaming
+
+/// A body is not a frame: the 1 MiB header cap does not apply to it, because it
+/// is never held in memory.
+#[tokio::test]
+async fn a_body_far_larger_than_the_header_cap_transfers_intact() {
+    const LEN: u64 = 4 * 1024 * 1024;
+    assert!(LEN > u64::from(keylink::MAX_HEADER));
+
+    let fixture = start().await;
+    let (meta, mut body) = fixture.client.download(LEN).await.unwrap();
+
+    assert_eq!(body.declared_len(), Some(LEN));
+
+    let mut checksum = Fnv1a::new();
+    let mut received = 0u64;
+    while let Some(chunk) = body.next_chunk().await.unwrap() {
+        checksum.update(&chunk);
+        received += chunk.len() as u64;
+    }
+
+    assert_eq!(received, LEN);
+    assert_eq!(checksum.finish(), meta.checksum);
+}
+
+/// The receiver knows the size before a byte moves, which is what makes
+/// refusing an oversized payload possible instead of theoretical.
+#[tokio::test]
+async fn the_declared_length_arrives_before_the_body() {
+    let fixture = start().await;
+    let (_meta, body) = fixture.client.download(9_999).await.unwrap();
+    assert_eq!(body.declared_len(), Some(9_999));
+    assert_eq!(body.received(), 0);
+}
+
+/// The streaming counterpart of a truncated frame. A file that stops early must
+/// never be mistaken for a complete one.
+#[tokio::test]
+async fn a_body_shorter_than_declared_is_an_error_not_a_short_file() {
+    let fixture = start().await;
+    let (_meta, body) = fixture.client.mislabelled(100_000, 4_096).await.unwrap();
+
+    let error = body.copy_to(&mut Vec::new()).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::BodyTruncated {
+                declared: 100_000,
+                received: 4_096
+            }
+        ),
+        "got {error:?}"
+    );
+}
+
+/// And the other direction: a sender that overruns its own declaration is
+/// stopped rather than trusted.
+#[tokio::test]
+async fn a_body_longer_than_declared_is_an_error() {
+    let fixture = start().await;
+    let (_meta, body) = fixture.client.mislabelled(1_024, 512_000).await.unwrap();
+
+    let error = body.copy_to(&mut Vec::new()).await.unwrap_err();
+    assert!(
+        matches!(error, Error::BodyOverrun { declared: 1_024 }),
+        "got {error:?}"
+    );
+}
+
+/// Collecting into memory is the one path that can exhaust it, so the cap is a
+/// required argument rather than a default nobody reads.
+#[tokio::test]
+async fn read_to_bytes_refuses_a_body_over_the_callers_cap() {
+    let fixture = start().await;
+    let (_meta, body) = fixture.client.download(1_000_000).await.unwrap();
+
+    let error = body.read_to_bytes(1_024).await.unwrap_err();
+    assert!(
+        matches!(error, Error::BodyTooLarge { cap: 1_024 }),
+        "got {error:?}"
+    );
+}
+
+/// A real file leaves the disk on one side and arrives byte-identical on the
+/// other, without either side holding it.
+#[tokio::test]
+async fn a_file_streams_up_from_disk_intact() {
+    const LEN: usize = 3 * 1024 * 1024;
+
+    let contents: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+    let path = std::env::temp_dir().join("keylink-test-upload.bin");
+    tokio::fs::write(&path, &contents).await.unwrap();
+
+    let mut expected = Fnv1a::new();
+    expected.update(&contents);
+
+    let fixture = start().await;
+    let outcome = fixture
+        .client
+        .upload("payload.bin".to_string(), Body::from_file(&path).await.unwrap())
+        .await
+        .unwrap();
+
+    match outcome {
+        Received::Stored { bytes, checksum } => {
+            assert_eq!(bytes, LEN as u64);
+            assert_eq!(checksum, expected.finish());
+        }
+        Received::Failed { reason } => panic!("upload failed: {reason}"),
+    }
+}
+
+/// Streaming and unary calls share a connection without interfering: the
+/// download holds one stream open while ordinary calls come and go on others.
+#[tokio::test]
+async fn a_download_in_flight_does_not_block_other_calls() {
+    let fixture = start().await;
+    let (_meta, mut body) = fixture.client.download(2 * 1024 * 1024).await.unwrap();
+
+    // One chunk in hand, the rest still on the wire.
+    assert!(body.next_chunk().await.unwrap().is_some());
+
+    assert_eq!(fixture.client.ping().await.unwrap(), "pong");
+
+    let rest = body.drain().await.unwrap();
+    assert!(rest > 0);
+}
+
+// ─────────────────────────────────────────────────────────── test utilities
+
+/// FNV-1a, computed incrementally so a test never has to hold a payload either.
+#[derive(Debug, Clone, Copy)]
+struct Fnv1a(u64);
+
+impl Fnv1a {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.0 = bytes.iter().fold(self.0, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+/// A deterministic byte stream of a known length, generated as it is read.
+/// Non-repeating over any 251-byte window, so dropped or duplicated bytes move
+/// the checksum instead of cancelling out.
+struct Pattern {
+    offset: u64,
+    len: u64,
+}
+
+impl Pattern {
+    fn new(len: u64) -> Self {
+        Self { offset: 0, len }
+    }
+
+    fn byte_at(offset: u64) -> u8 {
+        (offset % 251) as u8
+    }
+
+    fn checksum(len: u64) -> u64 {
+        let mut hash = Fnv1a::new();
+        for offset in 0..len {
+            hash.update(&[Self::byte_at(offset)]);
+        }
+        hash.finish()
+    }
+}
+
+impl AsyncRead for Pattern {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let take = (buf.remaining() as u64).min(self.len - self.offset) as usize;
+        for index in 0..take {
+            buf.put_slice(&[Self::byte_at(self.offset + index as u64)]);
+        }
+        self.offset += take as u64;
+        Poll::Ready(Ok(()))
+    }
+}

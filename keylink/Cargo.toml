@@ -1,0 +1,19 @@
+[package]
+name = "keylink"
+version = "0.1.0"
+edition = "2021"
+description = "Typed peer-to-peer RPC over iroh, with a schema-derived ALPN and fail-closed authorization."
+
+[dependencies]
+iroh = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+postcard-schema = { workspace = true }
+postcard-rpc = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+pastey = { workspace = true }
+
+[lints]
+workspace = true
