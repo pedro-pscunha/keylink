@@ -38,7 +38,7 @@
 macro_rules! service {
     (
         service $svc:ident;
-        $( $kind:tt $rpc:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty; )+
+        $( $( #[$meta:meta] )* $kind:ident $rpc:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty; )+
     ) => {
         $crate::pastey::paste! {
         pub mod [<$svc:snake>] {
@@ -51,7 +51,7 @@ macro_rules! service {
 
             #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, ::postcard_schema::Schema)]
             pub enum Request {
-                $( $rpc { $( $arg: $ty ),* } ),+
+                $( $( #[$meta] )* $rpc { $( $arg: $ty ),* } ),+
             }
 
             #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, ::postcard_schema::Schema)]
@@ -113,14 +113,15 @@ macro_rules! service {
             pub trait Handler: Send + Sync + 'static {
                 $(
                     $crate::__keylink_handler_method!(
-                        $kind, [<$rpc:snake>], ($( $arg : $ty ),*), $ret
+                        [$( #[$meta] )*],
+                        [<$kind>], [<$rpc:snake>], ($( $arg : $ty ),*), $ret
                     );
                 )+
             }
 
             $(
                 $crate::__keylink_invoke_fn!(
-                    $kind,
+                    [<$kind>],
                     [<__invoke_ $rpc:snake>],
                     Handler,
                     Response,
@@ -215,11 +216,36 @@ macro_rules! service {
             /// Serve this service as an actor: `&mut self`, one message at a
             /// time, state owned by a task rather than shared behind a lock.
             ///
-            /// `Send + 'static` and NOT `Sync`. A [`Handler`] is shared across
-            /// concurrent tasks behind an `Arc` and must be `Sync`; an actor is
-            /// owned by one task and never shared, so state holding an `Rc`, a
-            /// `RefCell` or a `!Sync` client can be an actor and cannot be a
-            /// `Handler`.
+            /// # Messages are handled in the order they ARRIVE
+            ///
+            /// Read this before you rely on the order of anything.
+            ///
+            /// Each call takes its own QUIC stream, and QUIC orders bytes
+            /// within a stream, not across streams. So two messages sent to
+            /// one actor in sequence can arrive in either order, and the actor
+            /// then handles them one at a time, serially, in the order they
+            /// turned up — which may not be the order they were sent.
+            ///
+            /// **A serial mailbox gives you serialization, not sequencing.**
+            /// The two are easy to conflate and the difference is expensive:
+            /// an order book with price-time priority, fed by a client that
+            /// sends two `Submit`s in a row, gets the right answer to the
+            /// wrong question and reports nothing.
+            ///
+            /// Arrival order is the truth, and the actor stamps sequence as it
+            /// processes. If your domain needs SEND order, you own that:
+            ///
+            /// - await each reply before sending the next, which is exact and
+            ///   costs one round trip per message, or
+            /// - carry your own sequence number in the message and buffer on
+            ///   it, where you choose what happens to a gap that never fills.
+            ///
+            /// # Send + 'static, and NOT Sync
+            ///
+            /// A [`Handler`] is shared across concurrent tasks behind an `Arc`
+            /// and must be `Sync`; an actor is owned by one task and never
+            /// shared, so state holding an `Rc`, a `RefCell` or a `!Sync`
+            /// client can be an actor and cannot be a `Handler`.
             pub trait Actor: Send + 'static {
                 /// The proven identity of the peer whose message comes next.
                 ///
@@ -233,14 +259,15 @@ macro_rules! service {
 
                 $(
                     $crate::__keylink_actor_method!(
-                        $kind, [<$rpc:snake>], ($( $arg : $ty ),*), $ret
+                        [$( #[$meta] )*],
+                        [<$kind>], [<$rpc:snake>], ($( $arg : $ty ),*), $ret
                     );
                 )+
             }
 
             $(
                 $crate::__keylink_actor_invoke_fn!(
-                    $kind,
+                    [<$kind>],
                     [<__actor_ $rpc:snake>],
                     Actor,
                     Response,
@@ -330,6 +357,17 @@ macro_rules! service {
             /// A typed handle to one actor. Its methods are the ones written in
             /// `service!`, and they name no transport concept and no actor
             /// concept beyond the id.
+            ///
+            /// # Two calls in a row can arrive in either order
+            ///
+            /// Every call takes its own QUIC stream, and QUIC orders bytes
+            /// within a stream, not across them. The actor handles messages one
+            /// at a time in the order they ARRIVE, which is not necessarily the
+            /// order you sent them.
+            ///
+            /// To send two messages in a defined order, await the first reply
+            /// before sending the second. Anything else is your own sequence
+            /// number inside your own message. See [`Actor`].
             #[derive(Debug)]
             pub struct ActorRef<'a> {
                 client: &'a $crate::ActorClient,
@@ -344,7 +382,8 @@ macro_rules! service {
 
                 $(
                     $crate::__keylink_actor_client_method!(
-                        $kind,
+                        [$( #[$meta] )*],
+                        [<$kind>],
                         [<$rpc:snake>],
                         Request,
                         Response,
@@ -387,9 +426,19 @@ macro_rules! service {
                     }
                 }
 
+                /// Await this peer's departure instead of meeting it on the
+                /// next call.
+                ///
+                /// See [`Watch`](keylink::Watch).
+                #[must_use]
+                pub fn watch(&self) -> $crate::Watch {
+                    self.inner.watch()
+                }
+
                 $(
                     $crate::__keylink_client_method!(
-                        $kind,
+                        [$( #[$meta] )*],
+                        [<$kind>],
                         [<$rpc:snake>],
                         Request,
                         $rpc,
@@ -435,9 +484,23 @@ macro_rules! service {
                         Ok(Self { inner, runtime })
                     }
 
+                    /// The same connection, with an idempotency key on every
+                    /// call made through the handle it returns.
+                    ///
+                    /// See the async twin,
+                    /// [`Client::with_idempotency`](super::Client::with_idempotency).
+                    #[must_use]
+                    pub fn with_idempotency(&self, key: $crate::IdempotencyKey) -> Self {
+                        Self {
+                            inner: self.inner.with_idempotency(key),
+                            runtime: ::std::sync::Arc::clone(&self.runtime),
+                        }
+                    }
+
                     $(
                         $crate::__keylink_blocking_method!(
-                            $kind,
+                            [$( #[$meta] )*],
+                            [<$kind>],
                             [<$rpc:snake>],
                             ($( $arg : $ty ),*),
                             $ret
@@ -459,31 +522,35 @@ macro_rules! service {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_blocking_method {
-    (rpc, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+    ([$( #[$meta:meta] )*], rpc, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
         #[doc = concat!("Call `", stringify!($name), "`, blocking until it answers.")]
         pub fn $name(&self $(, $arg: $ty )*) -> $crate::Result<$ret> {
             self.runtime.run(self.inner.$name($( $arg ),*))?
         }
     };
-    (send, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
-    (recv, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], send, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], recv, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
 }
 
 /// One handler-trait method, shaped by the rpc kind.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_handler_method {
-    (rpc, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+    ([$( #[$meta:meta] )*], rpc, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc.")]
         fn $name(&self $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = $ret> + Send;
     };
-    (send, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+    ([$( #[$meta:meta] )*], send, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc, reading the payload the caller streams up.")]
         fn $name(&self $(, $arg: $ty )*, body: $crate::BodyReader)
             -> impl ::core::future::Future<Output = $ret> + Send;
     };
-    (recv, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+    ([$( #[$meta:meta] )*], recv, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc, returning a payload to stream back.")]
         fn $name(&self $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = ($ret, $crate::Body)> + Send;
@@ -541,12 +608,14 @@ macro_rules! __keylink_invoke_fn {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_actor_method {
-    (rpc, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+    ([$( #[$meta:meta] )*], rpc, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc.")]
         fn $name(&mut self $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = $ret> + Send;
     };
-    (send, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+    ([$( #[$meta:meta] )*], send, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc, reading the payload the caller streams up.")]
         ///
         /// The body is read inside the turn, so
@@ -554,7 +623,8 @@ macro_rules! __keylink_actor_method {
         fn $name(&mut self $(, $arg: $ty )*, body: $crate::BodyReader)
             -> impl ::core::future::Future<Output = $ret> + Send;
     };
-    (recv, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+    ([$( #[$meta:meta] )*], recv, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc, returning a payload to stream back.")]
         ///
         /// The body is drained by the connection after the turn ends, so
@@ -614,8 +684,9 @@ macro_rules! __keylink_actor_invoke_fn {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_actor_client_method {
-    (rpc, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
+    ([$( #[$meta:meta] )*], rpc, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
         #[doc = concat!("Call the `", stringify!($variant), "` rpc on this actor.")]
         pub async fn $name(&self $(, $arg: $ty )*) -> $crate::Result<$ret> {
             let (response, _body) = self
@@ -630,8 +701,9 @@ macro_rules! __keylink_actor_client_method {
             response.$extract()
         }
     };
-    (send, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
+    ([$( #[$meta:meta] )*], send, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
         #[doc = concat!("Call the `", stringify!($variant), "` rpc on this actor, streaming `body` up alongside it.")]
         pub async fn $name(&self $(, $arg: $ty )*, body: $crate::Body) -> $crate::Result<$ret> {
             let (response, _body) = self
@@ -646,8 +718,9 @@ macro_rules! __keylink_actor_client_method {
             response.$extract()
         }
     };
-    (recv, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
+    ([$( #[$meta:meta] )*], recv, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
         #[doc = concat!("Call the `", stringify!($variant), "` rpc on this actor, returning its reply and a reader for the payload streaming back.")]
         pub async fn $name(&self $(, $arg: $ty )*)
             -> $crate::Result<($ret, $crate::BodyReader)> {
@@ -669,8 +742,9 @@ macro_rules! __keylink_actor_client_method {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_client_method {
-    (rpc, $name:ident, $req:ident, $variant:ident, $extract:ident,
+    ([$( #[$meta:meta] )*], rpc, $name:ident, $req:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
         #[doc = concat!("Call the `", stringify!($variant), "` rpc.")]
         pub async fn $name(&self $(, $arg: $ty )*) -> $crate::Result<$ret> {
             let (response, _body) = self
@@ -680,8 +754,9 @@ macro_rules! __keylink_client_method {
             response.$extract()
         }
     };
-    (send, $name:ident, $req:ident, $variant:ident, $extract:ident,
+    ([$( #[$meta:meta] )*], send, $name:ident, $req:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
         #[doc = concat!("Call the `", stringify!($variant), "` rpc, streaming `body` up alongside it.")]
         pub async fn $name(&self $(, $arg: $ty )*, body: $crate::Body) -> $crate::Result<$ret> {
             let (response, _body) = self
@@ -691,8 +766,9 @@ macro_rules! __keylink_client_method {
             response.$extract()
         }
     };
-    (recv, $name:ident, $req:ident, $variant:ident, $extract:ident,
+    ([$( #[$meta:meta] )*], recv, $name:ident, $req:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
         #[doc = concat!("Call the `", stringify!($variant), "` rpc, returning its reply and a reader for the payload streaming back.")]
         pub async fn $name(&self $(, $arg: $ty )*)
             -> $crate::Result<($ret, $crate::BodyReader)> {
