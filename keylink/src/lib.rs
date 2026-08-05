@@ -38,6 +38,8 @@
 
 #![warn(missing_docs)]
 
+pub mod blocking;
+
 mod authz;
 mod body;
 mod error;

@@ -68,6 +68,14 @@ pub enum Error {
         ours: String,
     },
 
+    /// A blocking call was made from inside an async runtime.
+    ///
+    /// Blocking there parks a worker thread on work that same runtime has to
+    /// perform, which deadlocks. Refused up front rather than hung: a returned
+    /// error is debuggable, a stalled process is not.
+    #[error("blocking keylink call from inside an async runtime - use the async API here")]
+    BlockingInAsync,
+
     /// A protocol handler panicked, and the router surfaced it during shutdown.
     ///
     /// Distinct from [`Error::Transport`] on purpose: nothing went wrong on the

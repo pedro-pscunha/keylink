@@ -211,9 +211,69 @@ macro_rules! service {
                     self.inner.close().await
                 }
             }
+
+            /// The same service, for programs that are not async.
+            ///
+            /// Streaming methods (`send`/`recv`) are deliberately absent: their
+            /// bodies are async by nature, and a synchronous wrapper would
+            /// either buffer a whole file or hand back a handle that only works
+            /// inside a runtime.
+            pub mod blocking {
+                use super::*;
+
+                /// A connected client whose methods are ordinary blocking calls.
+                pub struct Client {
+                    inner: super::Client,
+                    runtime: ::std::sync::Arc<$crate::blocking::Runtime>,
+                }
+
+                impl Client {
+                    /// Dial a peer by public key.
+                    pub fn connect(
+                        node: &$crate::blocking::Node,
+                        peer: impl Into<$crate::EndpointAddr>,
+                    ) -> $crate::Result<Self> {
+                        let runtime = ::std::sync::Arc::clone(node.runtime());
+                        let inner = $crate::blocking::connect_with(
+                            node,
+                            peer,
+                            |node, addr| async move { super::Client::connect(&node, addr).await },
+                        )?;
+                        Ok(Self { inner, runtime })
+                    }
+
+                    $(
+                        $crate::__keylink_blocking_method!(
+                            $kind,
+                            [<$rpc:snake>],
+                            ($( $arg : $ty ),*),
+                            $ret
+                        );
+                    )+
+
+                    /// Close the connection gracefully.
+                    pub fn close(self) -> $crate::Result<()> {
+                        self.runtime.run(self.inner.close())?
+                    }
+                }
+            }
         }
         }
     };
+}
+
+/// One blocking client method. Streaming kinds produce nothing.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_blocking_method {
+    (rpc, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        #[doc = concat!("Call `", stringify!($name), "`, blocking until it answers.")]
+        pub fn $name(&self $(, $arg: $ty )*) -> $crate::Result<$ret> {
+            self.runtime.run(self.inner.$name($( $arg ),*))?
+        }
+    };
+    (send, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    (recv, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
 }
 
 /// One handler-trait method, shaped by the rpc kind.

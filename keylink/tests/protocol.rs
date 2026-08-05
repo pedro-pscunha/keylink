@@ -573,3 +573,29 @@ async fn a_timeout_layer_refuses_a_slow_handler() {
     // The connection survives the timeout.
     assert_eq!(client.ping().await.unwrap(), "pong");
 }
+
+// ───────────────────────────────────────────────────── the synchronous twin
+
+/// The whole point of the blocking API: a synchronous program talks to a
+/// keylink service without writing one line of runtime plumbing.
+///
+/// Not a `#[tokio::test]` on purpose — this must run on a plain thread, which
+/// is exactly the situation the blocking API exists for.
+#[test]
+fn a_synchronous_program_can_call_a_service() {
+    // The server side still needs a runtime; it is a separate one, which is
+    // also the realistic shape (server and client are different processes).
+    let rt = tokio::runtime::Runtime::new().expect("a runtime for the server");
+    let (addr, _guard) = rt.block_on(async {
+        let server = local_node().await;
+        let running = probe::serve(&server, Server, Allowlist::anyone()).expect("serves");
+        (server.endpoint().addr(), (server, running))
+    });
+
+    let node = keylink::blocking::Node::bind().expect("binds a blocking node");
+    let client = probe::blocking::Client::connect(&node, addr).expect("dials");
+
+    assert_eq!(client.ping().expect("a blocking call answers"), "pong");
+    assert_eq!(client.slow(1).expect("and another"), 1);
+    client.close().expect("closes cleanly");
+}
