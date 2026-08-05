@@ -40,6 +40,7 @@ use crate::error::ConfigError;
 use crate::middleware::wrap;
 use crate::{
     wire, Allowlist, Body, BodyReader, Context, Error, Middleware, Next, Node, Outcome, Result, Rpc,
+    WireResponse,
 };
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -508,7 +509,7 @@ where
         send.finish()?;
 
         let mut frames = FrameReader::new(recv);
-        let Some(response) = frames.read_header::<Outcome<Resp>>().await? else {
+        let Some(response) = frames.read_header::<WireResponse<Resp>>().await? else {
             return Err(Error::Closed);
         };
         match response.message {

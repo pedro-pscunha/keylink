@@ -7,9 +7,10 @@
 //! is the handler's value, or a [`RemoteError`] the caller sees as
 //! [`crate::Error::Remote`].
 //!
-//! `Outcome<T>` sits inside the hashed contract, so adding a variant moves the
-//! ALPN and a drifted peer is refused at the handshake rather than misreading a
-//! reply.
+//! [`WireResponse`] names what the response direction actually carries, and the
+//! hashed contract names the same alias. That is what makes adding a
+//! [`RemoteError`] variant move the ALPN, so a drifted peer is refused at the
+//! handshake rather than misreading one refusal as another.
 
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +47,18 @@ pub enum Outcome<T> {
     /// The call was refused, by the handler or by a layer above it.
     Err(RemoteError),
 }
+
+/// The exact type the response direction carries on the wire.
+///
+/// Named once, and named by BOTH the wire and the hashed contract, because they
+/// drifted apart once already: the contract hashed the bare response while the
+/// wire carried `Outcome<Response>`, so adding a `RemoteError` variant did not
+/// move the ALPN. Inserting a variant then decoded one refusal as another —
+/// `Failed("disk full")` arriving as a different variant carrying that string.
+///
+/// Change what the wire carries by changing this alias, and the contract
+/// follows. Do not spell `Outcome<T>` at either site.
+pub type WireResponse<Resp> = Outcome<Resp>;
 
 impl<T> Outcome<T> {
     /// Whether this refuses the call. Lets logging and metrics layers report an

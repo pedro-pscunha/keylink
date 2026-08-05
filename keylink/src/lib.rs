@@ -57,7 +57,7 @@ pub use body::{Body, BodyReader};
 pub use error::{ConfigError, Error, Result, Transport};
 pub use node::{derive_alpn, Node};
 pub use middleware::{Context, Middleware, Next, Rpc, Timeout};
-pub use reply::{Outcome, RemoteError};
+pub use reply::{Outcome, RemoteError, WireResponse};
 pub use rpc::{
     serve, Dispatch, RpcClient, RpcService, Server, ServerBuilder, Service, ServiceBuilder,
 };

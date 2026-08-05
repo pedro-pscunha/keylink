@@ -89,10 +89,14 @@ macro_rules! service {
 
             /// Hashed to produce the ALPN, so the gate covers BOTH directions
             /// *and* keylink's own framing.
+            ///
+            /// The response field MUST name `WireResponse`, the same alias the
+            /// wire names. Spelling the bare `Response` here is what let the
+            /// contract and the wire drift apart once already.
             #[derive(::postcard_schema::Schema)]
             struct Contract {
                 request: $crate::Envelope<Request>,
-                response: $crate::Envelope<Response>,
+                response: $crate::Envelope<$crate::WireResponse<Response>>,
             }
 
             /// `<crate>/<Service>/<16-hex schema hash>`.

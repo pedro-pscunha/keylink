@@ -171,22 +171,23 @@ impl inventory::Actor for Warehouse {
 }
 ```
 
-**Nine lines disappear**: one import, one field wrapper, one constructor wrapper, and a
-six-line accessor with its poison comment. Three call sites lose a method call.
-
-The line count is the small half. The large half is a **class of failure that becomes
-unrepresentable**:
+**The win is that you can write the obvious code.** Today you cannot:
 
 > `clippy::await_holding_lock` lives in `clippy::suspicious`, which `clippy::all`
 > includes, which `Cargo.toml:23` sets to `deny`.
 
-So today, a maintainer who adds one `.await` inside `reserve` — a price lookup, a write
-to disk, an audit record — fails the build and must restructure the function around the
-guard. Under the actor model that maintainer writes the `.await` and moves on, because
-`&mut self` is held by the task rather than by a guard.
+So a maintainer who adds one `.await` inside `reserve` — a price lookup, a write to disk,
+an audit record — **fails the build** and must restructure the function around the guard.
+That is not a style warning. It is a deny-level stop, on the most ordinary edit anyone
+will ever make to a handler that holds state.
 
-That is the ergonomic win, stated exactly: **not nine lines, but the fact that awaiting
-while mutating stops being a lint failure and becomes the normal thing.**
+Under the actor model that maintainer writes the `.await` and moves on, because `&mut self`
+is held by the task rather than by a guard. Awaiting while mutating stops being a lint
+failure and becomes the normal thing.
+
+The line count is the smaller half, and it is listed second on purpose: **nine lines
+disappear** — one import, one field wrapper, one constructor wrapper, and a six-line
+accessor with its poison comment. Three call sites lose a method call.
 
 The cost is equally exact: `reserve` no longer runs concurrently with `list`. Section 6
 shows why that costs less than it appears to.
@@ -355,6 +356,17 @@ pub fn actor<A: Actor>(mut state: A, allow: Allowlist)
 **no new public surface at all**.
 
 ### 2.6 One breaking change: `Dispatch` gains a `Context`
+
+**This is not an actor tax. It corrects a gap that the concurrent model has today.**
+
+A `Handler` written against `service()` cannot find out who is calling it either. Any
+handler that needs its caller's identity — to write an audit record, to scope a lookup to
+a tenant, to answer the peer later — has exactly one option today, and it is the option
+`middleware.rs` tells you not to take: read a peer id out of the request body, where the
+caller wrote it and any caller could have written anything.
+
+The actor model is what made the gap impossible to ignore, because section 4 cannot work
+without it. It did not create it.
 
 ```rust
 - pub type Dispatch<Req, Resp> =
@@ -677,11 +689,46 @@ compile is the code that ignored the difference: the `?` changes error type, and
 once section 7.3's panic guard is in place, but it must be typed, because a runtime
 shutdown can still take the task.
 
-**This is decision 2 for review.** `Handle` is the item most likely to be cut. It is
-justified here on three grounds: it makes step 1 of the sequencing testable with no QUIC
-at all; it is the only honest way to *demonstrate* the local and remote difference rather
-than assert it; and without it, talking to your own actor in your own process requires
-binding an endpoint and opening a QUIC connection to yourself, which is absurd.
+### 5.4 Why `Handle` is not optional
+
+Revision 1 justified `Handle` by testability and called it the item most likely to be cut.
+That was the wrong argument, and it deserved to lose: testability is a weak reason to add
+public API, and "we need it for a test" is how test-shaped types end up in a published
+interface.
+
+The real argument is definitional:
+
+> **An actor framework whose actors must cross a network to be called is not an actor
+> framework.** A local actor is the base case. Remote is the interesting case, not the
+> only one.
+
+Every system in section 9 agrees. `ractor`, `kameo` and `actix` are local actor systems
+that grew distribution. `irpc` starts from `Client::local`. Erlang addresses a process on
+the same node with the same `!` it uses across a cluster. Not one of them requires a
+transport to deliver a message between two objects in one process, and a keylink that did
+would be alone in that.
+
+Testability follows from the definition rather than justifying it: because the base case
+needs no network, step 1 of section 11 is tested with no QUIC at all.
+
+### 5.5 This rejection of location transparency is permanent
+
+Recorded here so that a future proposal to unify `Handle` and `Client` has an answer
+already written, rather than relitigating section 5.2 from scratch.
+
+**`MailboxClosed` and `keylink::Error` stay distinct, and the two types stay distinct.**
+The reason is not taste. A unified handle must either claim failures the local case cannot
+have, or hide failures the remote case does have. `keylink::Error::Transport`,
+`Error::Closed`, `Error::SchemaMismatch` and `Error::Remote` have no local counterpart —
+none of them, not one. A local mailbox has exactly one failure: the task is gone.
+
+Merging them would make keylink the first place in this crate where a caller cannot tell
+from the type what can go wrong. That is the opposite of the property `error.rs` is built
+around, and it is the property section 5.2 says the crate should not trade away.
+
+If a future RFC proposes the unification, it must first answer what
+`Error::SchemaMismatch` means for two objects in one process. There is no honest answer,
+which is the point.
 
 ---
 
@@ -724,6 +771,39 @@ which is what 100 concurrent handler tasks already hold.
 no drop policy, no overflow error, no dead-letter queue, and nothing to configure.
 `.mailbox(n)` can go on the builder later if somebody produces a latency measurement that
 justifies a number.
+
+#### The comment this needs in the code
+
+Capacity 1 with no overflow policy reads as an oversight. Somebody will "fix" it by
+raising the number or adding a `try_send` fallback, and both changes look like
+improvements. The rustdoc on the constant must therefore carry the reason, not the value:
+
+```rust
+/// Messages that may wait ahead of the one being handled.
+///
+/// One, deliberately, and there is no overflow policy because there is no
+/// overflow to have a policy about.
+///
+/// A message occupies a QUIC stream from the moment it arrives until its reply
+/// is written, including the time it spends here. `max_concurrent_bidi_streams`
+/// is 100, so a peer cannot have more than 100 messages outstanding against this
+/// actor whatever this number is. The queue is bounded by the transport, and
+/// the 101st `open_bi` blocks ON THE CALLING MACHINE — which is where you want
+/// a slow actor to be felt.
+///
+/// Raising this does not raise the ceiling. It moves messages out of the
+/// transport, where the peer feels them, into a buffer where nobody does, and
+/// it adds that much latency to every message behind a slow one.
+///
+/// Before changing this, read RFC-04 section 6. If the transport ever stops
+/// bounding in-flight calls, this whole argument dies and a real policy is
+/// needed.
+const MAILBOX: usize = 1;
+```
+
+That is the chapter 1 §1.6 rule applied where it earns its place: the comment carries the
+*why*, which the code cannot, and it names the single condition under which the reasoning
+stops holding.
 
 ### 6.3 What this composes with
 
@@ -1099,7 +1179,7 @@ green. No step depends on a later one.
 
 ### Step 1 — the mailbox, with no network
 
-New `keylink/src/actor.rs`: `Mail`, `guarded`, `dispatch_to`, `ActorGone`. Macro gains
+New `keylink/src/actor.rs`: `Mail`, `guarded`, `dispatch_to`, `MailboxClosed`. Macro gains
 `trait Actor`, `fn actor()`, and `struct Handle`.
 
 Tests are plain `#[tokio::test]` against a `Handle`. **No QUIC, no endpoints, no
@@ -1156,7 +1236,7 @@ names the exact edit that must break it.
 | 2 | `two_calls_to_one_actor_never_overlap` | Replacing the mailbox with a direct call |
 | 3 | `a_panicking_message_costs_one_message_not_the_actor` | Removing `guarded` from the loop |
 | 4 | `a_panic_is_reported_as_a_remote_failure_not_a_closed_stream` | Returning `Body::empty()` with `Outcome::Ok` on panic |
-| 5 | `a_handle_to_a_stopped_actor_reports_actor_gone` | Returning `Ok` when `send` fails |
+| 5 | `a_handle_to_a_stopped_actor_reports_a_closed_mailbox` | Returning `Ok` when `send` fails |
 
 Test 2 is the load-bearing one. It sends two messages that each set a flag on entry, sleep,
 and assert the other flag is unset on exit. It fails deterministically against a
@@ -1318,3 +1398,476 @@ that. "Be able to be an actor-like framework" is a shape, not a need.
 
 **If either of those stops being true — if the actor model starts asking for changes in
 `rpc.rs`, `wire.rs` or `authz.rs` — stop and reread this section.** That is the tripwire.
+
+---
+
+## 14. The actor system: answering RFC-02 §10
+
+Revision 2. RFC-02 §10.7 puts four questions and one hard constraint to this RFC. This
+section answers all five, freezes the wire envelope RFC-02 asks to be frozen, and then
+**leaves the actor system unbuilt** — the same treatment RFC-02 §9.7 gives its own
+capability A.
+
+### 14.0 Agreement, and the one place this RFC pushes back
+
+**Agreement with RFC-02 §10.3 is total.** Actor lifecycle must never call
+`Endpoint::set_alpns`. Nothing in sections 1 to 13 does, and nothing in this section does.
+Revision 1 §7.5 reached the same conclusion from the invariant ("an ALPN is a contract
+identifier, not an instance identifier"); §10.2 reached it from cost, with source-verified
+complexity classes. Two independent arguments for one answer is the strongest position
+available, and neither RFC needs to yield.
+
+**One push-back, on scope rather than on design.** RFC-02 §10 designs the actor
+*system* — registry, ids, mount and unmount. Sections 1 to 13 of this RFC design the
+singleton actor, which has no id, no registry and no lifecycle. These are two features,
+and only the second has a justification today (§1.4). Revision 2 therefore answers every
+question §10 asks, freezes the envelope so that answering later is not a fleet rebuild,
+and puts the justified half first in the build order.
+
+**One correction to §10.5**, on mechanism rather than on conclusion: §14.5.
+
+### 14.1 Question 1 — the `ActorId` type and its encoding
+
+```rust
+/// The name of one actor within one node's actor system.
+///
+/// Scoped to the node you are connected to. It is not globally unique and it is
+/// not a route: the full address of an actor is `(EndpointId, ActorId)`, and the
+/// caller resolves both. See section 14.3.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash,
+         Serialize, Deserialize, postcard_schema::Schema)]
+pub struct ActorId(String);
+
+impl ActorId {
+    /// The longest id keylink accepts, in bytes.
+    ///
+    /// 128 holds a UUID, a hierarchical key such as `tenant/user/42`, and a
+    /// base64 32-byte key. The registry key stays small enough to be cheap to
+    /// hash on every message.
+    pub const MAX_LEN: usize = 128;
+
+    /// # Errors
+    /// [`ConfigError::MalformedActorId`] when empty or over [`Self::MAX_LEN`].
+    pub fn new(name: impl Into<String>) -> Result<Self>;
+}
+```
+
+**`String`, not `u64` or a fixed array.** Restate's Virtual Object key is a string, and
+Restate is the model the owner already runs in production (§9.1). A `u64` would push a
+name-to-number mapping into every user's code.
+
+**Encoding:** postcard writes a varint length then UTF-8 bytes. An empty id is rejected so
+that `ActorId::default()` cannot become an accidental catch-all.
+
+**The cap is enforced twice, and the second time is the one that matters.** `new` cannot
+protect the receiving side, because `#[derive(Deserialize)]` bypasses constructors. So the
+router re-checks after decode and before the registry lookup. A manual `Deserialize` impl
+would make an over-long id unrepresentable, and is **rejected**: it turns a protocol
+violation into `Error::Codec`, which reads as "the bytes were garbage" rather than "your
+id is too long". One explicit check, one honest error.
+
+The allocation is already bounded before this point: the whole header frame is checked
+against `MAX_HEADER` before a byte is buffered (`wire.rs:128`).
+
+**On the oracle question §10.2 left open.** Under Option 2 there is no TLS oracle at all,
+which is one of Option 2's wins. There is a weaker one at the message layer: a
+`NoSuchActor` refusal tells the sender that no actor holds that id. It is available only
+to a peer that already passed `Allowlist`, which fails closed and has no `Default`
+(`authz.rs:17-23`). That is a much smaller surface than an unauthenticated dial, and it is
+the same information any addressing scheme must return. **Guessable ids are still a bad
+idea**, and the rustdoc should say so where `ActorId::new` is defined rather than in a
+security section nobody reads.
+
+### 14.2 Question 2 — per actor TYPE, not per instance
+
+**Per type.** §10.4 assumed this and the assumption is correct, for a reason worth writing
+down: the hash exists to detect **schema drift**, and a schema is a property of a Rust
+type. Two instances of `Session` have identical message types by construction. A
+per-instance hash would repeat one value and carry no information.
+
+But §10.4 missed a second job the hash does, and it changes the check.
+
+**One node can host several actor types behind one ALPN.** If `Session` and `Ledger` both
+live in the system, the hash also **discriminates which type the payload is**. So the
+comparison is not against one global constant. It is against the hash recorded for the
+entry found under that id:
+
+```rust
+struct Entry {
+    /// `hash_ty_path::<T::Request>("myapp/Session")`, computed once at mount.
+    schema: u64,
+    mail: mpsc::Sender<SealedMail>,
+    task: JoinHandle<()>,
+}
+```
+
+The dispatch order is therefore fixed, and each step must fail before the next:
+
+1. Decode the envelope. Typed, shape-stable, no user types involved.
+2. Check `id.len() <= ActorId::MAX_LEN`. → `RemoteError::Failed` on violation.
+3. Look up the id. Miss → `RemoteError::NoSuchActor`.
+4. Compare `envelope.schema` against `entry.schema`. Mismatch →
+   `RemoteError::ActorSchemaMismatch`. **The payload is still bytes.**
+5. Decode the payload as the entry's type.
+
+### 14.3 The hard constraint — making decode-before-verify unrepresentable
+
+RFC-02 §10.4 requires that step 5 be reachable only from step 4's success arm, and says
+plainly that avoiding it in the example is not enough. **Agreed, and here is the
+mechanism.** It is the type-state pattern, and it costs about twenty lines.
+
+```rust
+/// Payload bytes that have not been schema-checked.
+///
+/// There is no way to read these bytes. `Sealed` has no accessor, no `Deref`,
+/// no `into_inner`, and no `Debug` that prints content. [`Sealed::open`] is the
+/// only route from bytes to a typed message, and it compares the declared hash
+/// against the hash of `T` before it decodes.
+///
+/// This is deliberate. postcard is not self-describing, so decoding before
+/// checking is exactly the silent misparse the ALPN scheme exists to prevent —
+/// see `same_shape_variant_swap_decodes_as_the_wrong_variant` (`node.rs:185`).
+pub struct Sealed {
+    declared: u64,
+    bytes: Bytes,
+}
+
+impl Sealed {
+    /// # Errors
+    /// [`RemoteError::ActorSchemaMismatch`] when the hashes differ. The bytes
+    /// are dropped without being interpreted.
+    pub fn open<T>(self, ours: u64) -> std::result::Result<T, RemoteError>
+    where
+        T: DeserializeOwned + postcard_schema::Schema,
+    {
+        if self.declared != ours {
+            return Err(RemoteError::ActorSchemaMismatch {
+                ours,
+                theirs: self.declared,
+            });
+        }
+        postcard::from_bytes(&self.bytes)
+            .map_err(|err| RemoteError::Failed(err.to_string()))
+    }
+}
+```
+
+Three properties make this unrepresentable rather than merely unwritten:
+
+- `bytes` is private and no method returns it. There is no path to the bytes that does not
+  go through `open`.
+- `open` takes `self` by value, so a `Sealed` cannot be opened twice against two different
+  hashes until one succeeds.
+- `open` compares before it decodes, in that order, in one function that is the only place
+  the ordering exists. There is no second copy of this logic to get wrong.
+
+`ours` comes from the registry entry, never from the caller's frame. The generated code
+passes `entry.schema`, which was computed at mount from the type the actor was registered
+with.
+
+**Do not** add `Sealed::bytes()`, `Sealed::peek()`, or a `Debug` impl that prints the
+payload. Any of the three reopens the hole. A comment saying so belongs on the struct.
+
+**One thing keylink must expose for this.** `node.rs:104` currently hides the `u64` inside
+a formatted string:
+
+```rust
+pub fn derive_alpn<C: Schema>(protocol: &str) -> Vec<u8> {
+    let hash = u64::from_le_bytes(hash_ty_path::<C>(protocol));
+    format!("{protocol}/{hash:016x}").into_bytes()
+}
+```
+
+Split it so both RFCs use one source of truth, and so nobody re-derives a hash by parsing
+hex out of an ALPN:
+
+```rust
+/// The schema hash of `C` under `protocol`. The trailing 16 hex digits of
+/// [`derive_alpn`] are this value.
+pub fn schema_hash<C: Schema>(protocol: &str) -> u64;
+```
+
+Two lines moved. `derive_alpn` calls it.
+
+### 14.4 Question 3 — addressing through a non-hosting node: **no, loudly**
+
+RFC-02 §10.7 asked this to be said loudly if wanted. **It is not wanted, and the answer
+should be recorded as a decision rather than an omission.**
+
+Four reasons, in descending order of force.
+
+1. **iroh already is the forwarding layer, and it is better at it.** A peer that cannot be
+   reached directly is reached through a relay, transparently, at the transport layer,
+   with end-to-end encryption preserved. An application-level forwarder would **terminate
+   the encryption at each hop**, which is strictly worse than what the crate gets for free
+   today.
+2. **It destroys the authorization model.** `Allowlist` authorizes the directly connected
+   peer, whose key iroh proved during the handshake. A forwarded message arrives carrying
+   the *forwarder's* proven key, so the origin's identity degrades to a claim in the
+   body — precisely what `middleware.rs:40-41` forbids. Restoring it needs per-message
+   signatures, which is a second crypto layer and a second key-management story.
+3. **It breaks the body invariant.** `body.rs:8-10` promises peak memory of one chunk. A
+   forwarded body makes every intermediate node a proxy with its own flow control, and
+   peak memory becomes one chunk per hop while the slowest hop sets the rate.
+4. **It puts a routing table in the request path**, which needs a topology source, loop
+   prevention, and an answer for a next hop that dies mid-transfer. §10.5's clean unmount
+   semantics do not survive any of that.
+
+So an `ActorId` is meaningful **only on the node you are connected to**. The full address
+is `(EndpointId, ActorId)`, and the caller resolves both. This is stated in the `ActorId`
+rustdoc in §14.1, not buried here.
+
+### 14.5 Question 4 — the error variants, and a correction to §10.5
+
+§10.7 asked for one variant name. **Two are needed**, and the second is what makes §10.4's
+ordering observable:
+
+```rust
+/// No actor is mounted under this id.
+///
+/// Deliberately does not distinguish "never existed" from "was stopped". The
+/// caller's next action is the same either way, and telling them apart would
+/// leak that an id was once real.
+#[error("no actor is mounted as {id}")]
+NoSuchActor {
+    /// The id that was addressed.
+    id: String,
+},
+
+/// The actor exists, and the caller built its message against different types.
+///
+/// The payload was dropped without being decoded. This is the in-envelope
+/// counterpart of [`Error::SchemaMismatch`], one layer down.
+#[error("actor message schema mismatch: ours is {ours:016x}, theirs is {theirs:016x}")]
+ActorSchemaMismatch {
+    /// The hash of the type the actor is registered with.
+    ours: u64,
+    /// The hash the caller declared.
+    theirs: u64,
+},
+```
+
+`NoSuchActor` over `ActorGone` or `NotFound`: `ActorGone` implies the id was once real,
+which both leaks and misdescribes a typo. `NotFound` is too bland beside `Unauthorized`
+and `TimedOut`. `NoSuchActor` also matches the register already used in this repository —
+`demo/src/main.rs:62` has `ReserveOutcome::NoSuchItem`.
+
+**Both variants are blocked by §14.6.** Adding them is not free today, and that is a
+defect rather than a design choice.
+
+#### `stop` and `abort`, adopted from RFC-02 §10.5
+
+The two-method shape is adopted verbatim. It is the right call, and it is the Flag
+Argument rule from chapter 1 §1.8 applied correctly: `stop(id, force: bool)` would hide
+"flush my document" and "kill this now" behind a boolean at the call site.
+
+**The correction is to the mechanism, not the conclusion.** §10.5 says:
+
+> Dispatch clones an `Arc` to the actor before it awaits, so removing the map entry drops
+> a reference and never cancels a running future.
+
+That is true for an `Arc<dyn Actor>` called directly. It is **not** the shape this RFC
+designs. Here an actor is a task that owns its state as `&mut`, and the registry holds an
+`mpsc::Sender`, not an `Arc` to the state. So:
+
+- **`stop` works as §10.5 describes, by a different route.** Removing the entry drops one
+  sender; the task lives while any sender lives and drains what is queued. Nothing is
+  cancelled. The conclusion stands.
+- **`abort` does not work as §10.5 describes.** Dropping a reference cannot cancel a
+  future the task owns. `abort` requires `JoinHandle::abort()`, so the registry must hold
+  the `JoinHandle` as well as the sender — which is why `Entry` in §14.2 has a `task`
+  field.
+
+That distinction has a consequence §10.5 could not have seen, and it is worth stating
+because it is the reason the two methods are genuinely different rather than stylistically
+different:
+
+> **`stop` preserves the state until the drain finishes. `abort` destroys it.**
+> `JoinHandle::abort` drops the task's future at an await point, and the state is owned by
+> that task, so it is dropped with it. An actor holding unflushed work loses it.
+
+One more consequence, from §10.4 of this RFC rather than of RFC-02: `abort` cannot
+truncate a `recv` download, because the body is drained by the connection task after the
+turn ends. It **can** truncate a `send` upload, because that body is read inside the turn.
+That is the same `send`/`recv` asymmetry as §10.4, surfacing in a third place.
+
+### 14.6 A defect found while answering question 4
+
+Adding a `RemoteError` variant is supposed to move the ALPN. **It does not.** This was
+found while costing question 4, and it is demonstrated with running code rather than
+argued.
+
+`reply.rs:10-12` states the guarantee:
+
+> `Outcome<T>` sits inside the hashed contract, so adding a variant moves the ALPN and a
+> drifted peer is refused at the handshake rather than misreading a reply.
+
+The hashed contract is `macros.rs:92-96`:
+
+```rust
+struct Contract {
+    request: $crate::Envelope<Request>,
+    response: $crate::Envelope<Response>,   // <- bare Response
+}
+```
+
+The wire carries something else. `rpc.rs:125` writes `&outcome`, which is
+`Outcome<Resp>`, and `rpc.rs:485` reads `read_header::<Outcome<Resp>>()`. So the wire type
+is `Envelope<Outcome<Resp>>` and the hashed type is `Envelope<Resp>`. **`Outcome` is not
+in the hash, and `RemoteError` is not in the hash.**
+
+Verified by building the two shapes with the real `serde` and `postcard`:
+
+```
+insert-in-middle  -> NoSuchActor { id: "disk full" }   <-- silent misparse
+append            -> Err(SerdeDeCustom)                <-- loud, rejected
+```
+
+The first line is `RemoteError::Failed("disk full")`, encoded by a peer built before
+`NoSuchActor` existed, decoded by a peer that inserted `NoSuchActor` ahead of `Failed`.
+`Failed(String)` and `NoSuchActor { id: String }` have identical postcard encodings, so
+the refusal changes meaning with no error — which is
+`same_shape_variant_swap_decodes_as_the_wrong_variant` (`node.rs:185`) reproduced in
+keylink's own error channel.
+
+Severity, stated precisely rather than dramatically:
+
+- **Appending** a variant is caught loudly: postcard rejects an out-of-range discriminant.
+- **Inserting or reordering** is silent, and changes what a refusal means.
+- `RemoteError` is `#[non_exhaustive]` (`reply.rs:23`), so nothing in the type system
+  discourages inserting.
+- No released version exists, so nothing is deployed against the wrong hash today.
+
+**The fix is one line**, in `macros.rs`:
+
+```rust
+- response: $crate::Envelope<Response>,
++ response: $crate::Envelope<$crate::Outcome<Response>>,
+```
+
+After it, the hashed type equals the wire type in both directions, the `reply.rs`
+paragraph becomes true, and every future `RemoteError` variant moves the ALPN — which is
+what the crate advertises with "Nothing to bump by hand" (`README.md:52`).
+
+**Ship this before anything else in this RFC.** It is capability G in section 0. It is one
+line, it makes an existing doc comment honest, and it is a prerequisite for adding the two
+variants in §14.5 without quietly weakening the guarantee that is keylink's headline
+property.
+
+It is also the third instance of one pattern, and the pattern is now worth naming:
+`WireKinds` (§3.5), this fix, and RFC-02's own reasoning all say the same thing. **The
+hashed contract must equal the wire type. Every time the two drift apart, the gate stops
+covering something it claims to cover.** A test belongs next to it that asserts the
+equality structurally rather than by inspection.
+
+### 14.7 The envelope, frozen
+
+RFC-02 §10.7 asks that the envelope be frozen early, because any change to it rebuilds
+every peer at once. Here it is, complete, with the reasoning for each field.
+
+```rust
+/// The request type of an actor system. One per system, not one per actor.
+///
+/// FROZEN. Every field change moves the system ALPN and rebuilds every peer in
+/// the fleet at once. Per-actor variation belongs in `payload`, which is opaque
+/// and costs nothing here. See RFC-02 §10.7 and RFC-04 §14.7.
+#[derive(Debug, Serialize, Deserialize, postcard_schema::Schema)]
+pub struct ActorRequest {
+    /// Which actor. Section 14.1.
+    pub actor: ActorId,
+    /// The schema hash of the actor's message type. Section 14.2.
+    pub schema: u64,
+    /// The actor's own `Request`, undecoded. Section 14.3.
+    pub payload: Vec<u8>,
+}
+```
+
+Three fields, and nothing else. Two fields that were considered and **rejected**:
+
+- **A method name.** It would let outer middleware match on the method before the payload
+  is decoded. Rejected because it duplicates the payload's own variant index, and a peer
+  can make the two disagree. Consequence in §14.8.
+- **A protocol version.** That is what the ALPN is. Adding one here would be the
+  hand-maintained version number `README.md:52` says does not exist.
+
+**`wire.rs` does not change.** `ActorRequest` is the `message` field inside the existing
+`Envelope<T>`, so framing, `MAX_HEADER` and `FrameReader` are all untouched, and a `Body`
+still rides beside the header exactly as today. The actor system is one ordinary
+`Service`, which is what RFC-02 §10.6 concludes.
+
+**The cost, named:** `payload: Vec<u8>` means postcard allocates and copies the payload on
+decode, where a typed field decodes from the frame in place. One extra allocation and one
+copy per actor message, bounded by `MAX_HEADER`. This is the price of the ordering
+guarantee in §14.3, and it is worth paying. It is also why the singleton actor
+(sections 1 to 13) does **not** use this envelope: it has one type, so there is nothing to
+discriminate and nothing to seal.
+
+### 14.8 What the actor system costs that the singleton does not
+
+Four things, so the build-order decision is made with them visible.
+
+1. **Per-method middleware stops working at the outer layer.** `Context::method()` is
+   built at `rpc.rs:117` from `Req::method()`, before any handler runs. With an opaque
+   payload, keylink cannot know the method until after §14.3's check. So a
+   `WriteGuard`-style layer — `a_layer_can_refuse_one_method_and_pass_the_rest` — can no
+   longer refuse one actor method from outside.
+   **Per-actor rules still work**, because `actor` is a typed field. This needs
+   `Context` to carry it:
+   ```rust
+   /// The actor this message addresses, when the service is an actor system.
+   pub fn actor(&self) -> Option<&ActorId>;
+   ```
+   The layering this forces is arguably the correct one: the outer layer answers "may this
+   peer reach this actor", the inner layer answers "may this peer call this method". It is
+   still a capability that exists today and would not exist there.
+2. **One extra allocation and copy per message.** §14.7.
+3. **A registry, and everything a registry needs**: eviction, a policy for a message to an
+   unmounted id (answered: `NoSuchActor`), and a decision about whether a first message
+   creates an actor. Restate creates on first use. This RFC does **not** propose that:
+   creating state from an unauthenticated-at-the-method-level message is how an actor
+   system becomes a memory-exhaustion target.
+4. **`stop`, `abort`, and the `JoinHandle` bookkeeping** of §14.5.
+
+None of these is an argument against the actor system. They are the reason it should be
+built when a use is named rather than alongside the singleton.
+
+### 14.9 Sequencing, revised
+
+The lead is right that the router change disappears, and section 11 never had one. The
+order changes in one place: **capability G moves to the front**, because it is one line
+and it blocks §14.5.
+
+| Step | Content | Depends on |
+|---|---|---|
+| **0** | Capability G: `Envelope<Outcome<Response>>` in `Contract`, plus a test that the hashed type equals the wire type | nothing |
+| 1 | The mailbox, with no network (§11) | 0 |
+| 2 | Wire it to the transport; `Dispatch` gains `Context` (§11) | 1 |
+| 3 | `tell`, `accept_uni`, `WireKinds` (§11) | 2 |
+| 4 | `Peer`, the lazy reconnecting handle (§11) | 2 |
+| **5** | **The actor system** (§14): `ActorId`, `Sealed`, `ActorRequest`, registry, `stop`/`abort`, `Context::actor` | 0, 2 |
+
+Step 0 is worth doing even if every other step is rejected. Step 5 is **designed and
+unbuilt**. RFC-02 §10.8's tests 23 to 30 belong to it, and test 29 in particular is the
+one that pins §14.3 — RFC-02 is right that it must use two types with identical postcard
+shapes, or it passes against the broken ordering.
+
+### 14.10 Added to "not verified"
+
+Beyond §13.2, and specific to this section:
+
+1. **The `Sealed` type-state was not compiled.** In particular, whether
+   `postcard_schema::Schema` and `DeserializeOwned` compose on the generated actor request
+   types without a lifetime obstruction.
+2. **The O(N²) claim in RFC-02 §10.2 was not independently re-derived here.** This RFC
+   accepts it. The `Arc::make_mut` reasoning was spot-checked and the shape is right, but
+   no allocation count was measured, and RFC-02 says the same about itself.
+3. **`ActorId::MAX_LEN = 128` is a judgement, not a measurement.** No workload was
+   profiled. It is chosen to fit the four key shapes named in §14.1.
+4. **Restate's own key-length limit was not confirmed**, so the 128 is not copied from a
+   precedent.
+5. **`JoinHandle::abort` dropping the state** (§14.5) follows from tokio's documented
+   cancellation behaviour. It was not exercised against an actor holding unflushed work.
+6. **The §14.6 defect was reproduced, but only in isolation.** The two enums were built
+   with real `serde` and `postcard` outside this workspace. It was **not** reproduced by
+   editing `RemoteError` in the crate and observing an unchanged ALPN, which is the test
+   that belongs in step 0.

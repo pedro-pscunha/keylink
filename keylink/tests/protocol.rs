@@ -693,3 +693,57 @@ async fn a_non_reserved_foreign_alpn_still_mounts() {
         .spawn()
         .expect("an ordinary foreign protocol is unaffected");
 }
+
+// ────────────────────────────── the hashed contract must equal the wire type
+
+/// The shape the contract had before the fix: the bare response, not the
+/// `Outcome` the wire actually carries.
+#[derive(postcard_schema::Schema)]
+#[allow(dead_code)]
+struct DriftedContract {
+    request: keylink::Envelope<probe::Request>,
+    response: keylink::Envelope<probe::Response>,
+}
+
+/// The shape it must have: the same alias the wire names.
+#[derive(postcard_schema::Schema)]
+#[allow(dead_code)]
+struct CorrectContract {
+    request: keylink::Envelope<probe::Request>,
+    response: keylink::Envelope<keylink::WireResponse<probe::Response>>,
+}
+
+/// keylink's whole safety story is that the ALPN hashes what the wire carries.
+/// It did not: the contract hashed `Envelope<Response>` while the wire carried
+/// `Envelope<Outcome<Response>>`, so adding a `RemoteError` variant did not move
+/// the ALPN — and inserting one decoded a refusal as a DIFFERENT refusal, which
+/// is the exact failure the scheme exists to prevent, inside the error channel.
+///
+/// This test fails if the contract is ever reverted to the bare response.
+#[test]
+fn the_alpn_hashes_the_response_type_the_wire_actually_carries() {
+    // Must match what the macro builds: concat!(CARGO_PKG_NAME, "/", service).
+    // The protocol name is part of the hash, by design.
+    const P: &str = concat!(env!("CARGO_PKG_NAME"), "/Probe");
+
+    let drifted = keylink::derive_alpn::<DriftedContract>(P);
+    let correct = keylink::derive_alpn::<CorrectContract>(P);
+
+    assert_ne!(
+        drifted, correct,
+        "wrapping the response in Outcome must change the hash, or the wrapper \
+         is invisible to the gate"
+    );
+
+    let real = String::from_utf8_lossy(probe::alpn()).into_owned();
+    let correct_hash = String::from_utf8_lossy(&correct)
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+
+    assert!(
+        real.ends_with(&correct_hash),
+        "the generated ALPN must hash the wire type.\n  generated: {real}\n  expected suffix: {correct_hash}"
+    );
+}

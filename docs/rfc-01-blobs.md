@@ -8,10 +8,14 @@ keylink RPC carries a content address. iroh-blobs moves the bytes. The caller
 gains verified resume, deduplication and content addressing. The call site names
 no transport concept.
 
-The proposal adds one macro kind (`blob`), one value type (`BlobId`), one
-handle type (`BlobHandle`), and one node-level object (`Blobs`). It adds no
-escape hatch, because `Service::foreign` already landed in commit `2e02489`. It
-removes nothing.
+The proposal adds eight items of public surface: one macro kind (`blob`), one
+value type (`BlobId`), one handle type (`BlobHandle`), one node-level object
+(`Blobs`), a `Retention` enum, and three startup errors. It adds no escape hatch,
+because `Service::foreign` already landed in commit `2e02489`. It removes
+nothing from keylink.
+
+Most of it is envelope-independent and can be built before RFC-04 settles.
+Section 11 lists the four items that cannot.
 
 The security model is the load-bearing part. keylink does **not** route the
 `Allowlist` into blobs admission. keylink records a grant for every content
@@ -54,7 +58,7 @@ keylink is on iroh 1.0.3. This is a knowing decision, not an oversight.
 
 **The immaturity argues for this design rather than against adoption.** A
 dependency that ships a dead security field and teaches an unauthenticated mount
-in six of eight call sites is exactly the dependency a wrapper should own
+in six of eight call sites is exactly the dependency a wrapper must own
 outright. On an immature crate the wrapper carrying the safety is worth more,
 not less. Sections 4.1 and 4.2 are the evidence.
 
@@ -690,9 +694,11 @@ fn policy(grants: Arc<Grants>) -> EventSender {
 Then, inside `ServerBuilder::spawn`:
 
 ```rust
+// `Blobs` keeps its store and ledger private. This is keylink's own
+// internal access, not the public accessor that section 4.4 cuts.
 builder = builder.accept(
     iroh_blobs::ALPN,
-    BlobsProtocol::new(blobs.store(), Some(policy(blobs.grants()))),
+    BlobsProtocol::new(blobs.inner_store(), Some(policy(blobs.grants()))),
 );
 ```
 
@@ -1110,11 +1116,85 @@ writes into the store, which is the hole section 4.2 documents. A client that
 must upload uses `send`. If a push path is ever wanted, it needs its own design
 and its own grant direction.
 
-## 11. Summary of new surface
+## 11. Dependency on the envelope layout
 
-Nine items. Everything else is internal. `Service::foreign` already exists, so
-this RFC adds no escape hatch — it only reserves one ALPN on the one that landed
-in commit `2e02489`.
+RFC-02 §10 settled that the actor system rides one ALPN, with the actor id in
+the envelope and a `u64` per-actor schema hash over an **opaque** payload that is
+decoded only after the hash matches. RFC-04 is still being written. This section
+says which parts of this RFC that changes, so the blob path is not built twice.
+
+### 11.1 Envelope-independent: build these whenever
+
+Nothing below touches keylink's wire envelope. They can be implemented and
+reviewed before RFC-04 lands.
+
+- **The grant ledger**, `Grants` and `ProvenPeer` (section 5). Keyed on the
+  connection identity iroh proved, not on any message shape.
+- **Mount ownership** and `ConfigError::ReservedAlpn` (section 4). This is about
+  iroh's router and the blobs ALPN, which is the constant `/iroh-bytes/4`.
+  keylink's own envelope has no bearing on it.
+- **The admission policy and its `EventMask`** (section 5.5). It is a function of
+  iroh-blobs types only.
+- **Store policy**: `Blobs`, `Retention`, the `blobs-fs` feature, and
+  `default-features = false` on iroh-blobs (section 6). No wire contact at all.
+- **`BlobHandle::copy_to` and `fetch_into`** (section 3.3). They speak the
+  iroh-blobs protocol on its own connection, which keylink does not frame.
+- **Every security test** in section 8.
+
+That is most of the value in this RFC, and the whole of the security argument.
+
+### 11.2 Envelope-dependent: reconcile before implementing
+
+**(a) Where `BlobId` sits in the hashed contract.** Today the `blob` kind puts
+`(R, BlobId)` in the generated `Response`, and `Contract` hashes
+`Envelope<Request>` and `Envelope<Response>`, so a `BlobId` moves the ALPN.
+Under RFC-02 §10 the payload is opaque and gated by a per-actor hash instead.
+`BlobId` therefore belongs in the **per-actor payload schema**, not the envelope.
+RFC-02 §10 already advises putting per-actor variation in the payload, so the two
+designs agree — but check it rather than assume it. A `BlobId` is a capability.
+If one could arrive under a mismatched schema, a peer could be handed a content
+address it was never meant to see. RFC-02's "refuse before the payload is
+interpreted" is exactly the property that makes a `BlobId` trustworthy.
+
+**(b) The `blob` codegen.** Section 3 extends `service!` with
+`__keylink_response_ty!` and `__keylink_is_blob!`. If RFC-04 forks or replaces
+that codegen for actors, the `blob` kind must be added to whichever generator
+survives. Mechanical work, but it is the literal "build the blob path twice" risk
+if both land independently.
+
+**(c) Which node holds the bytes.** `BlobHandle` opens its second connection to
+the peer that answered the call. That is sound while the responder is the holder.
+RFC-02 §10 keeps actors in a local registry behind one ALPN, so it holds today.
+**If the actor system ever forwards or routes** — an actor not resident on the
+dialled node — the responder and the holder differ, and the handle fetches from a
+node with no such blob. Content addressing makes this recoverable, because any
+holder will do and the hash verifies what arrives. But the handle must then carry
+**which** node to ask instead of assuming it is the one that answered. Flagging
+it now is cheap. Retrofitting it into a shipped `BlobHandle` is not.
+
+**(d) The ledger has no actor dimension.** Look at this one hardest. One node hosting many actors behind one ALPN shares one `Blobs`, so it
+shares one flat `(peer, hash)` grant namespace. If actors are meant to be
+isolation boundaries — different trust domains on one process — then actor A
+granting a hash to peer P lets P fetch it through any actor. That is the same
+defect I found with routing the `Allowlist` in section 5.1, one level down.
+
+If actors are isolation boundaries, the ledger key must become
+`(peer, actor, hash)`, or each actor needs its own `Blobs`. Deciding that after
+the ledger ships is a migration. Deciding it now is a struct field.
+
+**I did not read RFC-04.** It was still being written. Items (c) and (d) are
+questions for whoever does, not conclusions about it.
+
+## 12. Summary of new surface
+
+**Eight items.** Everything else is internal. `Service::foreign` already exists,
+so this RFC adds no escape hatch — it only reserves one ALPN on the one that
+landed in commit `2e02489`. `ProvenPeer` is `pub(crate)` and does not count.
+
+Cut from earlier drafts, and why: `ServerBuilder::protocol` (already landed as
+`Service::foreign`), `Blobs::also_admit` (weakened the ledger, existed only for
+iroh-docs), `Blobs::store` (only consumer was iroh-docs; add later on evidence).
+Section 4.4 records the last two.
 
 | Item | Kind |
 |---|---|
@@ -1123,7 +1203,6 @@ in commit `2e02489`.
 | `BlobHandle` | client handle, 3 methods |
 | `Blobs` | node object, `memory()` plus `persistent()` behind a feature |
 | `Retention` | enum, 2 variants, no `Default` |
-| `Blobs::store` | escape hatch to the iroh-blobs store |
 | `ConfigError::ReservedAlpn` | startup error on `Service::foreign(iroh_blobs::ALPN, ..)` |
 | `ConfigError::MissingBlobStore` | startup error |
 | `ConfigError::ConflictingBlobStores` | startup error |
