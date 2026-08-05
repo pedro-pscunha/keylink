@@ -7,7 +7,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::endpoint::presets;

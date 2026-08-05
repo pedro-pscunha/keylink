@@ -73,9 +73,12 @@ pub enum Departure {
     /// The peer closed the connection, or its QUIC stack closed it for them.
     /// Nothing failed.
     ///
-    /// The far side dropping its last `Connection` handle lands here too: QUIC
-    /// still emits a close frame, so it is indistinguishable from an explicit
-    /// goodbye — and it is one.
+    /// The far side **dropping** its last `Connection` handle lands here too,
+    /// which is the one reading people get wrong. Dropping is not a crash: QUIC
+    /// still emits `CONNECTION_CLOSE(0)` on the way out, so it arrives as
+    /// `ApplicationClosed` with an empty reason and is indistinguishable from
+    /// an explicit goodbye. It is one. A peer that truly died sends nothing at
+    /// all, and that is [`Self::Lost`].
     Closed,
 
     /// We ended it: [`RpcClient::close`], a [`Server`](crate::Server) shutting
@@ -90,6 +93,17 @@ pub enum Departure {
     ///
     /// This is the ending a watch exists to report. It is the one you would
     /// otherwise discover on your next call, and only then.
+    ///
+    /// Expect a timeout rather than a cause. Nothing arrives from a peer that
+    /// has stopped existing, so silence is the only evidence and the idle
+    /// timeout is what turns it into an event. That also means a timeout here
+    /// is **not** proof of a network fault: iroh's own [`Endpoint::close`]
+    /// documentation warns that connections "still open while closing the
+    /// endpoint time out on the remote end", so a peer that shut down in a
+    /// hurry, without waiting out its own close, reaches you looking exactly
+    /// like a peer that lost power. From here the two *are* the same silence.
+    ///
+    /// [`Endpoint::close`]: iroh::Endpoint::close
     Lost(Transport),
 }
 
@@ -105,10 +119,16 @@ impl Departure {
         let Some(closed) = closed else {
             return Self::Local;
         };
+        // `is_clean_close` answers "was this ending a failure". This answers
+        // "who ended it". Same enum, two different questions — so reuse its
+        // list, never its verdict.
+        //
+        // `LocallyClosed` is where the two disagree: clean by its question,
+        // ours by ours. Hence the ordering, which is load-bearing rather than
+        // stylistic. Move this arm below the guard and every local shutdown
+        // starts reporting itself as the peer walking away, silently and
+        // everywhere at once.
         match closed.reason {
-            // Before `is_clean_close`, which counts this as clean — correctly,
-            // for its own question. "Not a failure" and "not the peer" are
-            // different questions, and this is the arm that separates them.
             ConnectionError::LocallyClosed => Self::Local,
             reason if is_clean_close(&reason) => Self::Closed,
             reason => Self::Lost(reason.into()),
@@ -314,30 +334,62 @@ mod tests {
     /// the next call.
     #[tokio::test]
     async fn a_peer_that_vanishes_is_reported_as_lost_not_as_a_close() {
-        let (observer_endpoint, observer, peer_endpoint, peer) = vanishing_link().await;
+        let link = endpoint_link().await;
 
         // Order matters: the endpoint owns the socket, so it goes first. The
         // connection's own implicit close then has nothing to travel over,
         // which is exactly what a peer losing power looks like from here.
-        drop(peer_endpoint);
-        drop(peer);
+        drop(link.peer_endpoint);
+        drop(link.peer);
 
-        let departure = within(Watch::on(&observer)).await;
+        let departure = within(Watch::on(&link.observer)).await;
         assert!(
             matches!(departure, Departure::Lost(_)),
             "a vanished peer is a failure, not a goodbye: got {departure:?}"
         );
-        drop(observer_endpoint);
     }
 
-    /// Two endpoints whose connection fails fast when one side stops answering.
+    /// Shutting down our own *node* is the third ending, and the one most
+    /// likely to be got wrong, because it is the least interesting to write.
     ///
-    /// Local to this module rather than in `testing`, because the short idle
-    /// timeout is the whole point of the one test that uses it and is wrong
-    /// everywhere else.
-    async fn vanishing_link() -> (Endpoint, Connection, Endpoint, Connection) {
+    /// Distinct from closing one connection: an [`Endpoint`] closing takes down
+    /// every connection on it at once, which is what a process shutting down
+    /// actually does. It still has to arrive as [`Departure::Local`], or every
+    /// deploy reports a fleet of peers that never went anywhere.
+    #[tokio::test]
+    async fn our_own_node_shutting_down_is_reported_as_local() {
+        let link = endpoint_link().await;
+        let watch = Watch::on(&link.observer);
+
+        link.observer_endpoint.close().await;
+
+        let departure = within(watch).await;
+        assert!(
+            matches!(departure, Departure::Local),
+            "our own node shutting down is not a peer departure: got {departure:?}"
+        );
+    }
+
+    /// Both ends of one connection, *and the endpoints that own them*.
+    ///
+    /// `testing::link` deliberately keeps its endpoints private. Two tests here
+    /// need to close or drop an endpoint rather than a connection, because
+    /// those are different events with different endings, so this module builds
+    /// its own pair.
+    struct EndpointLink {
+        observer: Connection,
+        observer_endpoint: Endpoint,
+        peer: Connection,
+        peer_endpoint: Endpoint,
+    }
+
+    async fn endpoint_link() -> EndpointLink {
         const ALPN: &[u8] = b"keylink/watch-testing/1";
-        /// The observer's patience for silence. Bounds one test's runtime.
+        /// How long the observer tolerates silence before calling a peer lost.
+        ///
+        /// Only the vanish test depends on this, and it is what bounds that
+        /// test's runtime. Deliberate silence never reaches it: every other
+        /// ending here arrives as a close frame within milliseconds.
         const IDLE: Duration = Duration::from_secs(2);
 
         let peer_endpoint = Endpoint::builder(presets::Minimal)
@@ -373,6 +425,11 @@ mod tests {
             .expect("the dial succeeds");
         let peer = accepting.await.expect("the accept task finishes");
 
-        (observer_endpoint, observer, peer_endpoint, peer)
+        EndpointLink {
+            observer,
+            observer_endpoint,
+            peer,
+            peer_endpoint,
+        }
     }
 }
