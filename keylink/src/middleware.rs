@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use iroh::EndpointId;
 
-use crate::{Body, BodyReader, Outcome, RemoteError};
+use crate::{ActorId, Body, BodyReader, Outcome, RemoteError};
 
 pub(crate) type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -33,6 +33,17 @@ pub trait Rpc {
     /// The method this request selects, in the `CamelCase` spelling from
     /// `service!`.
     fn method(&self) -> &'static str;
+
+    /// Which actor this request addresses, for a request that names one.
+    ///
+    /// `None` for an ordinary service, where the whole handler is the address.
+    /// Overridden by [`ActorRequest`](crate::ActorRequest), so that a layer can
+    /// apply a per-actor rule before dispatch — which is the rule an actor
+    /// system can still enforce from outside, now that the method name is
+    /// inside the sealed payload.
+    fn actor(&self) -> Option<&ActorId> {
+        None
+    }
 }
 
 /// Who is calling, and what they are calling.
@@ -44,6 +55,7 @@ pub struct Context {
     peer: EndpointId,
     service: &'static str,
     method: &'static str,
+    actor: Option<ActorId>,
 }
 
 impl Context {
@@ -52,7 +64,15 @@ impl Context {
             peer,
             service,
             method,
+            actor: None,
         }
+    }
+
+    /// Record which actor the request addresses. Called by the accept loop for
+    /// every request whose type names one.
+    pub(crate) fn with_actor(mut self, actor: Option<ActorId>) -> Self {
+        self.actor = actor;
+        self
     }
 
     /// The proven public key of the calling peer.
@@ -66,8 +86,21 @@ impl Context {
     }
 
     /// The method being called.
+    ///
+    /// For an actor system this is not the actor's own method: that name lives
+    /// inside the sealed payload and is unreadable until the schema check has
+    /// passed. Use [`Self::actor`] for a rule at this layer.
     pub fn method(&self) -> &'static str {
         self.method
+    }
+
+    /// The actor this message addresses, when the service is an actor system.
+    ///
+    /// As it arrived. The length cap is enforced by the registry, not here, so
+    /// a value seen from a layer may be longer than [`crate::MAX_KEY_LEN`] —
+    /// in which case no actor can match it and the call is refused.
+    pub fn actor(&self) -> Option<&ActorId> {
+        self.actor.as_ref()
     }
 }
 

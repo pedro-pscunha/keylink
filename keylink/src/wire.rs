@@ -74,6 +74,26 @@ pub(crate) async fn write_header<T: Serialize>(
     idempotency: Option<&crate::IdempotencyKey>,
     message: &T,
 ) -> Result<()> {
+    write_frame(stream, encode_header(body_len, idempotency, message)?).await
+}
+
+/// Hand an already-encoded frame to the transport.
+///
+/// Split from [`write_header`] so a frame can be kept as well as sent. The
+/// idempotency ledger stores exactly these bytes, which is what makes a replayed
+/// reply byte-identical to the one the handler produced rather than a
+/// re-encoding of a value that has since been decoded and rebuilt.
+pub(crate) async fn write_frame(stream: &mut SendStream, frame: Bytes) -> Result<()> {
+    stream.write_chunk(frame).await?;
+    Ok(())
+}
+
+/// Build one header frame, length prefix included.
+pub(crate) fn encode_header<T: Serialize>(
+    body_len: Option<u64>,
+    idempotency: Option<&crate::IdempotencyKey>,
+    message: &T,
+) -> Result<Bytes> {
     let mut buf = BytesMut::with_capacity(256);
     buf.extend_from_slice(&[0u8; PREFIX]);
     // The clone is bounded at MAX_KEY_LEN and happens once per call. Borrowing
@@ -103,8 +123,7 @@ pub(crate) async fn write_header<T: Serialize>(
     }
     buf[..PREFIX].copy_from_slice(&len.to_le_bytes());
 
-    stream.write_chunk(buf.freeze()).await?;
-    Ok(())
+    Ok(buf.freeze())
 }
 
 /// The read half of one stream: a header frame, then the body.

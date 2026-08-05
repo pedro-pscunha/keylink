@@ -91,6 +91,16 @@ impl Node {
     }
 }
 
+/// The schema hash of `C` under `protocol`.
+///
+/// The trailing 16 hex digits of [`derive_alpn`] are this value. Exposed so
+/// that a caller who needs the number — an actor system comparing a declared
+/// hash against a mounted one — takes it from here instead of parsing hex back
+/// out of an ALPN.
+pub fn schema_hash<C: Schema>(protocol: &str) -> u64 {
+    u64::from_le_bytes(hash_ty_path::<C>(protocol))
+}
+
 /// Derive an ALPN from a protocol name *and a hash of the schema it carries*.
 ///
 /// postcard is not self-describing: enum variants are encoded by declaration
@@ -102,7 +112,7 @@ impl Node {
 /// The hash walks the whole transitive type graph, so a field added three
 /// structs deep still moves it. Nobody has to remember to bump a version.
 pub fn derive_alpn<C: Schema>(protocol: &str) -> Vec<u8> {
-    let hash = u64::from_le_bytes(hash_ty_path::<C>(protocol));
+    let hash = schema_hash::<C>(protocol);
     format!("{protocol}/{hash:016x}").into_bytes()
 }
 
@@ -138,6 +148,16 @@ mod tests {
     #[test]
     fn alpn_is_stable_for_an_unchanged_schema() {
         assert_eq!(derive_alpn::<V1>("svc"), derive_alpn::<V1>("svc"));
+    }
+
+    /// The two must not drift: an actor system compares the number while the
+    /// handshake compares the string, and they have to mean the same thing.
+    #[test]
+    fn the_alpn_suffix_is_the_schema_hash() {
+        let alpn = derive_alpn::<V1>("crate/Svc");
+        let text = std::str::from_utf8(&alpn).expect("alpn is ascii");
+        let (_, suffix) = text.rsplit_once('/').expect("has a hash suffix");
+        assert_eq!(suffix, format!("{:016x}", schema_hash::<V1>("crate/Svc")));
     }
 
     #[test]

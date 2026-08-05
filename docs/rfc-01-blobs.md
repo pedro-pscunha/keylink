@@ -292,6 +292,16 @@ hash to every peer **and accepting writes** (section 4.2). Copying that example
 produces an unauthenticated store on the same public key as a strictly
 allowlisted service. The example must not show blobs.
 
+**Both fixes have since landed**, in commit `483bc08` "fix(keylink): refuse
+reserved ALPNs instead of warning about them". `RESERVED_ALPNS` in
+`keylink/src/rpc.rs:289` holds `b"/iroh-bytes/4"`, and `spawn` raises
+`ConfigError::ReservedAlpn` at `rpc.rs:423`. So `ConfigError::ReservedAlpn` in
+the section 12 table is **already implemented**, not proposed. It is kept in the
+table because this RFC depends on it.
+
+The rest of this section records why, since the reasoning is what the next
+reserved ALPN will need.
+
 **Two.** `spawn` must reserve `iroh_blobs::ALPN`. It already walks every service
 and rejects a duplicate ALPN:
 
@@ -1324,7 +1334,7 @@ questions for whoever does, not conclusions about it.
 
 ## 12. Summary of new surface
 
-**Eight items.** Everything else is internal. `Service::foreign` already exists,
+**Eight items, one of which already shipped.** Everything else is internal. `Service::foreign` already exists,
 so this RFC adds no escape hatch — it only reserves one ALPN on the one that
 landed in commit `2e02489`. `ProvenPeer` is `pub(crate)` and does not count.
 
@@ -1340,7 +1350,7 @@ Section 4.4 records the last two.
 | `BlobHandle` | client handle, 3 methods |
 | `Blobs` | node object, `memory()` plus `persistent()` behind a feature |
 | `Retention` | enum, 2 variants, no `Default` |
-| `ConfigError::ReservedAlpn` | startup error on `Service::foreign(iroh_blobs::ALPN, ..)` |
+| `ConfigError::ReservedAlpn` | startup error — **already landed**, commit `483bc08` |
 | `ConfigError::MissingBlobStore` | startup error |
 | `ConfigError::ConflictingBlobStores` | startup error |
 

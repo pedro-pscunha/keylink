@@ -27,6 +27,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use iroh::{
     endpoint::{Connection, ConnectionError, RecvStream, SendStream},
     protocol::{AcceptError, DynProtocolHandler, ProtocolHandler, Router},
@@ -37,25 +38,38 @@ use tokio::task::JoinSet;
 
 use crate::wire::FrameReader;
 use crate::error::ConfigError;
+use crate::idempotency::{Claim, Ledger};
 use crate::middleware::wrap;
 use crate::{
-    wire, Allowlist, Body, BodyReader, Context, Error, Middleware, Next, Node, Outcome, Result, Rpc,
-    WireResponse,
+    wire, Allowlist, Body, BodyReader, Context, Error, IdempotencyKey, IdempotencyRefusal,
+    Middleware, Next, Node, Outcome, RemoteError, Result, Rpc, WireResponse,
 };
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-/// An erased async handler: request plus its incoming body, answered with a
-/// response plus its outgoing body. The macro boxes the user's `async fn` into
-/// this so `RpcService` needs no extra generic parameters.
+/// An erased async handler: who is calling, the request plus its incoming body,
+/// answered with a response plus its outgoing body. The macro boxes the user's
+/// `async fn` into this so `RpcService` needs no extra generic parameters.
+///
+/// This is the innermost [`Next`]: the same shape, named for the one position
+/// that has no layer beneath it.
+///
+/// The [`Context`] is here because the proven peer identity used to reach the
+/// edge of the handler and be thrown away. An actor that answers a peer later,
+/// or writes an audit record, needs `cx.peer()`, and the only alternative is a
+/// peer id carried in the request body — which is a claim, not a proof.
 pub type Dispatch<Req, Resp> =
-    Arc<dyn Fn(Req, BodyReader) -> BoxFut<(Outcome<Resp>, Body)> + Send + Sync>;
+    Arc<dyn Fn(Context, Req, BodyReader) -> BoxFut<(Outcome<Resp>, Body)> + Send + Sync>;
 
 /// Serves one protocol: authorizes the peer once per connection, then answers
 /// every stream that connection opens, concurrently.
 pub struct RpcService<Req, Resp> {
     next: Next<Req, Resp>,
     allow: Arc<Allowlist>,
+    /// Every recorded reply for THIS service. One per service rather than one
+    /// per node, because a record is an encoded reply of this service's
+    /// response type. See [`Ledger`].
+    ledger: Arc<Ledger>,
     _p: PhantomData<fn(Req) -> Resp>,
 }
 
@@ -64,6 +78,7 @@ impl<Req, Resp> Clone for RpcService<Req, Resp> {
         Self {
             next: self.next.clone(),
             allow: self.allow.clone(),
+            ledger: self.ledger.clone(),
             _p: PhantomData,
         }
     }
@@ -90,16 +105,49 @@ where
         Resp: 'static,
     {
         Self {
-            next: Arc::new(move |_cx, req, body| dispatch(req, body)),
+            next: dispatch,
             allow: Arc::new(allow),
+            ledger: Ledger::new(),
             _p: PhantomData,
         }
     }
 }
 
+/// What the caller's idempotency key is worth, or `None` when it sent no key.
+///
+/// The `validate` here is not a second opinion about
+/// [`IdempotencyKey::new`]. It is the only check this value has ever had:
+/// `derive(Deserialize)` builds the string field by field and never calls a
+/// constructor, so a peer's key arrives unchecked whatever our constructor
+/// allows. Skipping it would key a map on a string a peer chose the length of.
+fn claim_key(ledger: &Arc<Ledger>, peer: EndpointId, key: Option<IdempotencyKey>) -> Option<Claim> {
+    let key = key?;
+    if let Err(error) = key.validate() {
+        return Some(Claim::Refused(
+            IdempotencyRefusal::Malformed(error.to_string()).into(),
+        ));
+    }
+    Some(ledger.claim(peer, key))
+}
+
+/// Write a recorded reply again, byte for byte.
+async fn replay(send: &mut SendStream, frame: Bytes) -> Result<()> {
+    wire::write_frame(send, frame).await?;
+    send.finish()?;
+    Ok(())
+}
+
+/// Refuse a call that was never entered. Carries no body, like every refusal.
+async fn refuse<Resp: Serialize>(send: &mut SendStream, refusal: RemoteError) -> Result<()> {
+    wire::write_header(send, Some(0), None, &Outcome::<Resp>::Err(refusal)).await?;
+    send.finish()?;
+    Ok(())
+}
+
 /// Answer one call on its own stream.
 async fn serve_one<Req, Resp>(
     next: Next<Req, Resp>,
+    ledger: Arc<Ledger>,
     peer: EndpointId,
     mut send: SendStream,
     recv: RecvStream,
@@ -111,11 +159,23 @@ where
     let mut frames = FrameReader::new(recv);
     // A stream opened and finished without a request is not an error; the peer
     // simply changed its mind.
-    let Some(request) = frames.read_header::<Req>().await? else {
+    let Some(mut request) = frames.read_header::<Req>().await? else {
         return Ok(());
     };
 
-    let cx = Context::new(peer, Req::SERVICE, request.message.method());
+    let cx = Context::new(peer, Req::SERVICE, request.message.method())
+        .with_actor(request.message.actor().cloned());
+
+    // Claimed BEFORE the handler is entered, which is the whole at-most-once
+    // property: the only way back from a claimed key to a vacant one is
+    // eviction.
+    let guard = match claim_key(&ledger, peer, request.idempotency.take()) {
+        None => None,
+        Some(Claim::Fresh(guard)) => Some(guard),
+        Some(Claim::Replay(frame)) => return replay(&mut send, frame).await,
+        Some(Claim::Refused(refusal)) => return refuse::<Resp>(&mut send, refusal).await,
+    };
+
     let (outcome, body) = next(
         cx,
         request.message,
@@ -123,7 +183,18 @@ where
     )
     .await;
 
-    wire::write_header(&mut send, body.declared_len(), None, &outcome).await?;
+    let frame = wire::encode_header(body.declared_len(), None, &outcome)?;
+    // Recorded before the reply is written, so a reply lost on the way back
+    // still replays. That is the failure this exists for: the handler finished
+    // and the caller never heard.
+    //
+    // A reply with a payload behind it is recorded as unrecordable rather than
+    // as itself. Bodies are streamed and never held, and a header replayed
+    // without its payload decodes into a body that never arrives.
+    if let Some(guard) = guard {
+        guard.record(&frame, body.declared_len() != Some(0));
+    }
+    wire::write_frame(&mut send, frame).await?;
     body.write_to(&mut send).await?;
     send.finish()?;
     Ok(())
@@ -156,7 +227,7 @@ fn classify_connect(err: iroh::endpoint::ConnectError, alpn: &[u8]) -> Error {
 }
 
 /// A connection ending is not a failure. Anything else is.
-fn is_clean_close(error: &ConnectionError) -> bool {
+pub(crate) fn is_clean_close(error: &ConnectionError) -> bool {
     matches!(
         error,
         ConnectionError::ApplicationClosed(_)
@@ -185,7 +256,13 @@ where
 
             match connection.accept_bi().await {
                 Ok((send, recv)) => {
-                    calls.spawn(serve_one(self.next.clone(), peer, send, recv));
+                    calls.spawn(serve_one(
+                        self.next.clone(),
+                        self.ledger.clone(),
+                        peer,
+                        send,
+                        recv,
+                    ));
                 }
                 Err(error) if is_clean_close(&error) => break,
                 Err(error) => return Err(AcceptError::from_err(error)),
@@ -235,7 +312,7 @@ where
         Self {
             alpn,
             allow,
-            base: Arc::new(move |_cx, req, body| dispatch(req, body)),
+            base: dispatch,
             layers: Vec::new(),
         }
     }
@@ -259,6 +336,7 @@ where
             handler: Box::new(RpcService {
                 next: chain,
                 allow: Arc::new(self.allow),
+                ledger: Ledger::new(),
                 _p: PhantomData,
             }),
         }
@@ -459,7 +537,54 @@ where
 #[derive(Debug)]
 pub struct RpcClient<Req, Resp> {
     conn: Connection,
+    /// Attached to every call this client makes. See
+    /// [`with_idempotency`](Self::with_idempotency).
+    idempotency: Option<IdempotencyKey>,
     _p: PhantomData<fn(Req) -> Resp>,
+}
+
+impl<Req, Resp> RpcClient<Req, Resp> {
+    /// The live connection, for crate code that observes it rather than uses it.
+    ///
+    /// An accessor rather than a `pub(crate)` field on purpose: a field can be
+    /// assigned as well as read, and replacing a live connection underneath a
+    /// client is never correct.
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Scope this client to one idempotency key, so a call it makes runs at
+    /// most once however many times it is sent.
+    ///
+    /// The key rides beside the request rather than inside it, so the generated
+    /// method still takes domain arguments and nothing else:
+    ///
+    /// ```ignore
+    /// let ticket = client
+    ///     .with_idempotency(IdempotencyKey::new("reserve-4471")?)
+    ///     .reserve("ADU-014".into(), 2)
+    ///     .await?;
+    /// ```
+    ///
+    /// Cheap: a `Connection` is a handle, so this shares one rather than
+    /// opening another.
+    ///
+    /// # Make one call with it
+    ///
+    /// The key goes on EVERY call made through the returned client, so it is
+    /// meant for one. A second, DIFFERENT call through the same handle is
+    /// answered from the first call's record, and the generated client refuses
+    /// a reply to a question it did not ask
+    /// ([`Error::UnexpectedResponse`]). That is a loud failure rather than a
+    /// wrong answer, but it is still a mistake worth not making.
+    #[must_use]
+    pub fn with_idempotency(&self, key: IdempotencyKey) -> Self {
+        Self {
+            conn: self.conn.clone(),
+            idempotency: Some(key),
+            _p: PhantomData,
+        }
+    }
 }
 
 impl<Req, Resp> RpcClient<Req, Resp>
@@ -489,9 +614,11 @@ where
             .map_err(|err| classify_connect(err, alpn))?;
         Ok(Self {
             conn,
+            idempotency: None,
             _p: PhantomData,
         })
     }
+
 
     /// Send one request with its body and await the response and its body.
     ///
@@ -502,10 +629,13 @@ where
     pub async fn call(&self, request: Req, body: Body) -> Result<(Resp, BodyReader)> {
         let (mut send, recv) = self.conn.open_bi().await?;
 
-        // Always None today. The envelope field is frozen ahead of the
-        // machinery so that adding retry safety later does not move every
-        // peer's ALPN a second time.
-        wire::write_header(&mut send, body.declared_len(), None, &request).await?;
+        wire::write_header(
+            &mut send,
+            body.declared_len(),
+            self.idempotency.as_ref(),
+            &request,
+        )
+        .await?;
         body.write_to(&mut send).await?;
         // The request is complete. Finishing tells the peer so without a
         // sentinel frame, and lets it start work before we read a byte.

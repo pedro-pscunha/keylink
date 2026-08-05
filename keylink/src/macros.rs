@@ -149,7 +149,9 @@ macro_rules! service {
             ) -> $crate::ServiceBuilder<Request, Response> {
                 let handler = ::std::sync::Arc::new(handler);
                 let dispatch: $crate::Dispatch<Request, Response> =
-                    ::std::sync::Arc::new(move |req: Request, body: $crate::BodyReader| {
+                    ::std::sync::Arc::new(move |_cx: $crate::Context,
+                                                req: Request,
+                                                body: $crate::BodyReader| {
                         let handler = handler.clone();
                         ::std::boxed::Box::pin(async move {
                             let (__response, __body) = match req {
@@ -179,6 +181,179 @@ macro_rules! service {
                 $crate::Server::builder(node)
                     .service(service(handler, allow).build())
                     .spawn()
+            }
+
+            // ───────────────────────────────────────────── the actor twin
+
+            /// What the sealed payload carries in each direction: the bare
+            /// `Request` up, the bare `Response` down.
+            ///
+            /// A refusal is deliberately not in here. It travels in the actor
+            /// system's own `Outcome`, one layer out, where the system's ALPN
+            /// already covers it.
+            #[derive(::postcard_schema::Schema)]
+            #[allow(dead_code)]
+            struct ActorContract {
+                request: Request,
+                response: Response,
+            }
+
+            /// The schema hash a caller declares and a registry compares
+            /// against, for actors of this service.
+            ///
+            /// Derived from the same type graph as [`alpn`], under the same
+            /// protocol name. Change any type reachable from `Request` or
+            /// `Response` and this moves on its own, so a peer built against
+            /// the old shapes is refused with
+            /// [`RemoteError::ActorSchemaMismatch`](keylink::RemoteError)
+            /// before its payload is decoded.
+            pub fn schema() -> u64 {
+                static CELL: ::std::sync::OnceLock<u64> = ::std::sync::OnceLock::new();
+                *CELL.get_or_init(|| $crate::actor_schema::<ActorContract>(PROTOCOL))
+            }
+
+            /// Serve this service as an actor: `&mut self`, one message at a
+            /// time, state owned by a task rather than shared behind a lock.
+            ///
+            /// `Send + 'static` and NOT `Sync`. A [`Handler`] is shared across
+            /// concurrent tasks behind an `Arc` and must be `Sync`; an actor is
+            /// owned by one task and never shared, so state holding an `Rc`, a
+            /// `RefCell` or a `!Sync` client can be an actor and cannot be a
+            /// `Handler`.
+            pub trait Actor: Send + 'static {
+                /// The proven identity of the peer whose message comes next.
+                ///
+                /// Called immediately before each message and never
+                /// concurrently with one, because the mailbox is serial. Stash
+                /// what you need in your own state. The default does nothing.
+                ///
+                /// A concurrent [`Handler`] could not have this: two calls
+                /// would race on the stashed value.
+                fn caller(&mut self, _cx: &$crate::Context) {}
+
+                $(
+                    $crate::__keylink_actor_method!(
+                        $kind, [<$rpc:snake>], ($( $arg : $ty ),*), $ret
+                    );
+                )+
+            }
+
+            $(
+                $crate::__keylink_actor_invoke_fn!(
+                    $kind,
+                    [<__actor_ $rpc:snake>],
+                    Actor,
+                    Response,
+                    $rpc,
+                    [<$rpc:snake>],
+                    ($( $arg : $ty ),*)
+                );
+            )+
+
+            /// Spawn one actor of this service, ready to be mounted.
+            ///
+            /// Hand it to [`System::mount`](keylink::System::mount) under an
+            /// id, or return it from
+            /// [`spawn_with`](keylink::SystemBuilder::spawn_with) to have it
+            /// built on the first message to an unmounted id.
+            ///
+            /// A panicking message costs that message, not the actor: the turn
+            /// is caught and reported as a refusal, and the next message runs
+            /// against the state as it stands.
+            ///
+            /// # Panics
+            ///
+            /// Panics when called outside a tokio runtime.
+            pub fn spawn<A: Actor>(mut state: A) -> $crate::Mounted {
+                $crate::mount(schema(), move |mut inbox: $crate::Mailbox| async move {
+                    while let ::std::option::Option::Some(mail) = inbox.recv().await {
+                        let $crate::Mail { cx, payload, body, reply } = *mail;
+                        state.caller(&cx);
+                        // The ONLY route from the payload's bytes to a typed
+                        // message, and it compares the hashes first.
+                        let __answer = match payload.open::<Request>(schema()) {
+                            ::std::result::Result::Ok(__request) => {
+                                let __turn = $crate::guarded(async {
+                                    match __request {
+                                        $(
+                                            Request::$rpc { $( $arg ),* } =>
+                                                [<__actor_ $rpc:snake>](
+                                                    &mut state, body $(, $arg )*
+                                                ).await,
+                                        )+
+                                    }
+                                })
+                                .await;
+                                match __turn {
+                                    ::std::result::Result::Ok((__response, __body)) => {
+                                        match $crate::ActorReply::encode(&__response) {
+                                            ::std::result::Result::Ok(__encoded) =>
+                                                ($crate::Outcome::Ok(__encoded), __body),
+                                            ::std::result::Result::Err(__refusal) => (
+                                                $crate::Outcome::Err(__refusal),
+                                                $crate::Body::empty(),
+                                            ),
+                                        }
+                                    }
+                                    ::std::result::Result::Err(__panic) => (
+                                        $crate::Outcome::Err($crate::RemoteError::Failed(
+                                            __panic.to_string(),
+                                        )),
+                                        $crate::Body::empty(),
+                                    ),
+                                }
+                            }
+                            ::std::result::Result::Err(__refusal) => (
+                                $crate::Outcome::Err(__refusal),
+                                $crate::Body::empty(),
+                            ),
+                        };
+                        // The caller may have gone away mid-turn. Its stream is
+                        // dead either way, so there is nothing to report.
+                        let _ = reply.send(__answer);
+                    }
+                })
+            }
+
+            /// Address one actor of this service on a connected node.
+            ///
+            /// The handle borrows the connection, so every actor on that node
+            /// is reached over one connection with one congestion-control
+            /// state — which is what a per-actor ALPN would have thrown away.
+            pub fn at(
+                client: &$crate::ActorClient,
+                actor: $crate::ActorId,
+            ) -> ActorRef<'_> {
+                ActorRef { client, actor }
+            }
+
+            /// A typed handle to one actor. Its methods are the ones written in
+            /// `service!`, and they name no transport concept and no actor
+            /// concept beyond the id.
+            #[derive(Debug)]
+            pub struct ActorRef<'a> {
+                client: &'a $crate::ActorClient,
+                actor: $crate::ActorId,
+            }
+
+            impl ActorRef<'_> {
+                /// Which actor this handle addresses.
+                pub fn id(&self) -> &$crate::ActorId {
+                    &self.actor
+                }
+
+                $(
+                    $crate::__keylink_actor_client_method!(
+                        $kind,
+                        [<$rpc:snake>],
+                        Request,
+                        Response,
+                        $rpc,
+                        [<into_ $rpc:snake>],
+                        ($( $arg : $ty ),*),
+                        $ret
+                    );
+                )+
             }
 
             /// A connected client. Every method is an ordinary async call, and
@@ -343,6 +518,135 @@ macro_rules! __keylink_invoke_fn {
         ) -> ($resp, $crate::Body) {
             let (value, body) = handler.$method($( $arg ),*).await;
             ($resp::$variant(value), body)
+        }
+    };
+}
+
+/// One `Actor`-trait method, shaped by the rpc kind. `&mut self`, because the
+/// task owns the state instead of sharing it.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_actor_method {
+    (rpc, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        #[doc = concat!("Answer the `", stringify!($name), "` rpc.")]
+        fn $name(&mut self $(, $arg: $ty )*)
+            -> impl ::core::future::Future<Output = $ret> + Send;
+    };
+    (send, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        #[doc = concat!("Answer the `", stringify!($name), "` rpc, reading the payload the caller streams up.")]
+        ///
+        /// The body is read inside the turn, so
+        /// [`abort`](keylink::System::abort) can truncate it.
+        fn $name(&mut self $(, $arg: $ty )*, body: $crate::BodyReader)
+            -> impl ::core::future::Future<Output = $ret> + Send;
+    };
+    (recv, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        #[doc = concat!("Answer the `", stringify!($name), "` rpc, returning a payload to stream back.")]
+        ///
+        /// The body is drained by the connection after the turn ends, so
+        /// [`abort`](keylink::System::abort) cannot truncate it.
+        fn $name(&mut self $(, $arg: $ty )*)
+            -> impl ::core::future::Future<Output = ($ret, $crate::Body)> + Send;
+    };
+}
+
+/// The bridge from one `Request` variant to one `Actor` method.
+///
+/// A free function per rpc for the same reason as its `Handler` twin: a macro
+/// cannot expand to a match arm, but it can expand to an item.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_actor_invoke_fn {
+    (rpc, $fname:ident, $actor:ident, $resp:ident, $variant:ident, $method:ident,
+        ($( $arg:ident : $ty:ty ),*)) => {
+        async fn $fname<A: $actor>(
+            state: &mut A,
+            _body: $crate::BodyReader
+            $(, $arg: $ty )*
+        ) -> ($resp, $crate::Body) {
+            (
+                $resp::$variant(state.$method($( $arg ),*).await),
+                $crate::Body::empty(),
+            )
+        }
+    };
+    (send, $fname:ident, $actor:ident, $resp:ident, $variant:ident, $method:ident,
+        ($( $arg:ident : $ty:ty ),*)) => {
+        async fn $fname<A: $actor>(
+            state: &mut A,
+            body: $crate::BodyReader
+            $(, $arg: $ty )*
+        ) -> ($resp, $crate::Body) {
+            (
+                $resp::$variant(state.$method($( $arg, )* body).await),
+                $crate::Body::empty(),
+            )
+        }
+    };
+    (recv, $fname:ident, $actor:ident, $resp:ident, $variant:ident, $method:ident,
+        ($( $arg:ident : $ty:ty ),*)) => {
+        async fn $fname<A: $actor>(
+            state: &mut A,
+            _body: $crate::BodyReader
+            $(, $arg: $ty )*
+        ) -> ($resp, $crate::Body) {
+            let (value, body) = state.$method($( $arg ),*).await;
+            ($resp::$variant(value), body)
+        }
+    };
+}
+
+/// One method on the typed actor handle, shaped by the rpc kind.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_actor_client_method {
+    (rpc, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        #[doc = concat!("Call the `", stringify!($variant), "` rpc on this actor.")]
+        pub async fn $name(&self $(, $arg: $ty )*) -> $crate::Result<$ret> {
+            let (response, _body) = self
+                .client
+                .call::<$req, $resp>(
+                    &self.actor,
+                    schema(),
+                    &$req::$variant { $( $arg ),* },
+                    $crate::Body::empty(),
+                )
+                .await?;
+            response.$extract()
+        }
+    };
+    (send, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        #[doc = concat!("Call the `", stringify!($variant), "` rpc on this actor, streaming `body` up alongside it.")]
+        pub async fn $name(&self $(, $arg: $ty )*, body: $crate::Body) -> $crate::Result<$ret> {
+            let (response, _body) = self
+                .client
+                .call::<$req, $resp>(
+                    &self.actor,
+                    schema(),
+                    &$req::$variant { $( $arg ),* },
+                    body,
+                )
+                .await?;
+            response.$extract()
+        }
+    };
+    (recv, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        #[doc = concat!("Call the `", stringify!($variant), "` rpc on this actor, returning its reply and a reader for the payload streaming back.")]
+        pub async fn $name(&self $(, $arg: $ty )*)
+            -> $crate::Result<($ret, $crate::BodyReader)> {
+            let (response, body) = self
+                .client
+                .call::<$req, $resp>(
+                    &self.actor,
+                    schema(),
+                    &$req::$variant { $( $arg ),* },
+                    $crate::Body::empty(),
+                )
+                .await?;
+            Ok((response.$extract()?, body))
         }
     };
 }

@@ -35,15 +35,19 @@
 //!   silently misparsing. See [`derive_alpn`].
 //! - **Authorization.** iroh proves *who* a peer is; [`Allowlist`] decides
 //!   whether they are welcome, and fails closed.
+//! - **Departure.** A peer going away is something you can await, rather than
+//!   an error you meet on your next call. See [`Watch`].
 
 #![warn(missing_docs)]
 
 pub mod blocking;
 
+mod actor;
 mod authz;
 mod keys;
 mod body;
 mod error;
+mod idempotency;
 mod macros;
 mod middleware;
 mod node;
@@ -51,18 +55,25 @@ mod reply;
 mod rpc;
 #[cfg(test)]
 mod testing;
+mod watch;
 mod wire;
 
+pub use actor::{
+    actor_schema, guarded, mount, ActorClient, ActorReply, ActorRequest, Eviction, Factory, Mail,
+    Mailbox, MountError, Mounted, Panic, Sealed, System, SystemBuilder, MAILBOX,
+};
 pub use authz::Allowlist;
 pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use body::{Body, BodyReader};
 pub use error::{ConfigError, Error, Result, Transport};
-pub use node::{derive_alpn, Node};
+pub use idempotency::{IdempotencyRefusal, MAX_RECORDED_BYTES, MAX_RECORDS};
+pub use node::{derive_alpn, schema_hash, Node};
 pub use middleware::{Context, Middleware, Next, Rpc, Timeout};
 pub use reply::{Outcome, RemoteError, WireResponse};
 pub use rpc::{
     serve, Dispatch, RpcClient, RpcService, Server, ServerBuilder, Service, ServiceBuilder,
 };
+pub use watch::{Departure, Watch};
 pub use wire::{Envelope, MAX_HEADER};
 
 /// Re-exported so generated code and callers agree on types without extra

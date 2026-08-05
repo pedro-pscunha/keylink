@@ -34,6 +34,39 @@ pub enum RemoteError {
         millis: u64,
     },
 
+    /// The call carried an idempotency key, and the key is why it did not run.
+    ///
+    /// One variant rather than four, because this type belongs to every service
+    /// keylink will ever carry and that vocabulary belongs to one feature.
+    #[error("idempotency: {0}")]
+    Idempotency(crate::IdempotencyRefusal),
+
+    /// No actor is mounted under this id.
+    ///
+    /// Deliberately does NOT distinguish "never existed" from "was stopped".
+    /// The caller's next action is the same either way, and telling them apart
+    /// would leak that an id was once real.
+    #[error("no actor is mounted as {id}")]
+    NoSuchActor {
+        /// The id that was addressed.
+        id: String,
+    },
+
+    /// The actor exists, and the caller built its message against different
+    /// types.
+    ///
+    /// The payload was dropped without being decoded. This is the in-envelope
+    /// counterpart of [`crate::Error::SchemaMismatch`], one layer down: an
+    /// actor system carries every actor's messages behind one ALPN, so the
+    /// handshake cannot see per-actor drift and this variant is what does.
+    #[error("actor message schema mismatch: ours is {ours:016x}, theirs is {theirs:016x}")]
+    ActorSchemaMismatch {
+        /// The hash of the type the actor is mounted with.
+        ours: u64,
+        /// The hash the caller declared.
+        theirs: u64,
+    },
+
     /// Anything else the serving side wants to report.
     #[error("{0}")]
     Failed(String),
