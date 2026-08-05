@@ -63,6 +63,8 @@ impl<T> From<RemoteError> for Outcome<T> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     /// A layer refuses a call without knowing the method's return type. That is
