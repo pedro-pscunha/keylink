@@ -289,6 +289,35 @@ impl Service {
     pub fn alpn(&self) -> &'static [u8] {
         self.alpn
     }
+
+    /// Register a protocol keylink did not generate, on the same node.
+    ///
+    /// `iroh-blobs`, `iroh-gossip` and `iroh-docs` are ordinary
+    /// [`ProtocolHandler`]s, so they belong in the same router as our services.
+    /// They must be registered here, before [`ServerBuilder::spawn`]: iroh's
+    /// `Router` accepts protocols only through its builder, and `spawn`
+    /// consumes it.
+    ///
+    /// ```ignore
+    /// let blobs = BlobsProtocol::new(&store, None);
+    /// Server::builder(&node)
+    ///     .service(inventory::service(handler, allow).build())
+    ///     .service(Service::foreign(iroh_blobs::ALPN, blobs))
+    ///     .spawn()?;
+    /// ```
+    ///
+    /// # Authorization
+    ///
+    /// A foreign protocol brings its own admission rules, or none. [`Allowlist`]
+    /// does NOT cover it. `iroh-blobs`, for one, will serve any hash to any
+    /// peer that asks unless you wire its own intercept. Read the protocol's
+    /// documentation before you mount it.
+    pub fn foreign(alpn: &'static [u8], handler: impl ProtocolHandler) -> Self {
+        Self {
+            alpn,
+            handler: Box::new(handler),
+        }
+    }
 }
 
 impl std::fmt::Debug for Service {
@@ -318,15 +347,23 @@ impl Server {
     }
 
     /// Stop accepting, and wait for in-flight connections to finish.
-    pub async fn shutdown(self) -> Result<()> {
+    ///
+    /// Takes `&self` rather than consuming, so a `Server` can live in an `Arc`
+    /// and be shut down from whichever task notices first. iroh's
+    /// `Router::shutdown` is idempotent, so a second call returns `Ok`.
+    pub async fn shutdown(&self) -> Result<()> {
         self.router
             .shutdown()
             .await
             .map_err(|e| Error::HandlerPanic(e.to_string()))
     }
 
-    /// The underlying iroh router, so a keylink service can share a node with a
-    /// foreign iroh protocol such as `iroh-blobs` or `iroh-gossip`.
+    /// The underlying iroh router.
+    ///
+    /// Note that protocols CANNOT be added through this handle: iroh's `Router`
+    /// accepts protocols only through its builder, which `spawn` consumes. To
+    /// put a foreign protocol on this node, register it with
+    /// [`Service::foreign`] before spawning.
     pub fn router(&self) -> &Router {
         &self.router
     }

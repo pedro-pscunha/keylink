@@ -599,3 +599,61 @@ fn a_synchronous_program_can_call_a_service() {
     assert_eq!(client.slow(1).expect("and another"), 1);
     client.close().expect("closes cleanly");
 }
+
+// ─────────────────────────────────────────── foreign protocols on our node
+
+/// Stands in for `iroh-blobs` or `iroh-gossip`: a protocol keylink did not
+/// generate, with its own ALPN and its own rules.
+#[derive(Debug, Clone)]
+struct ForeignEcho;
+
+impl iroh::protocol::ProtocolHandler for ForeignEcho {
+    async fn accept(
+        &self,
+        connection: iroh::endpoint::Connection,
+    ) -> std::result::Result<(), iroh::protocol::AcceptError> {
+        let (mut send, mut recv) = connection.accept_bi().await?;
+        tokio::io::copy(&mut recv, &mut send).await?;
+        send.finish()?;
+        connection.closed().await;
+        Ok(())
+    }
+}
+
+const FOREIGN_ALPN: &[u8] = b"not-keylink/echo/1";
+
+/// `Server::router()` cannot register anything: iroh's `Router` accepts
+/// protocols only through its builder, and `spawn` consumes it. So a foreign
+/// protocol has to join before spawn, or the claim that keylink services can
+/// share a node with iroh-blobs is false.
+#[tokio::test]
+async fn a_foreign_protocol_shares_the_node_with_a_keylink_service() {
+    let server = local_node().await;
+    let client_node = local_node().await;
+
+    let _running = keylink::Server::builder(&server)
+        .service(probe::service(Server, Allowlist::anyone()).build())
+        .service(keylink::Service::foreign(FOREIGN_ALPN, ForeignEcho))
+        .spawn()
+        .expect("a keylink service and a foreign protocol register together");
+
+    let addr = server.endpoint().addr();
+
+    // The keylink service still answers.
+    let client = probe::Client::connect(&client_node, addr.clone())
+        .await
+        .expect("dials the keylink service");
+    assert_eq!(client.ping().await.unwrap(), "pong");
+
+    // And so does the foreign one, on its own ALPN.
+    let conn = client_node
+        .endpoint()
+        .connect(addr, FOREIGN_ALPN)
+        .await
+        .expect("dials the foreign protocol on the same endpoint");
+    let (mut send, mut recv) = conn.open_bi().await.expect("opens a stream");
+    send.write_all("olá".as_bytes()).await.expect("writes");
+    send.finish().expect("finishes");
+    let echoed = recv.read_to_end(64).await.expect("reads the echo");
+    assert_eq!(echoed, "olá".as_bytes(), "the foreign protocol answered");
+}

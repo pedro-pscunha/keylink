@@ -3,6 +3,8 @@ name = "keylink"
 version = "0.1.0"
 edition = "2021"
 description = "Typed peer-to-peer RPC over iroh, with a schema-derived ALPN and fail-closed authorization."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pedrocunha/keylink"
 
 [dependencies]
 iroh = { workspace = true }
