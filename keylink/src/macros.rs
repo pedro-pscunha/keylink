@@ -373,6 +373,20 @@ macro_rules! service {
                     })
                 }
 
+                /// The same connection, with an idempotency key on every call
+                /// made through the handle it returns.
+                ///
+                /// The key is a transport concern rather than a domain one, so
+                /// it goes here instead of into every method signature. See
+                /// [`RpcClient::with_idempotency`](keylink::RpcClient::with_idempotency)
+                /// for why the handle is meant for one call.
+                #[must_use]
+                pub fn with_idempotency(&self, key: $crate::IdempotencyKey) -> Self {
+                    Self {
+                        inner: self.inner.with_idempotency(key),
+                    }
+                }
+
                 $(
                     $crate::__keylink_client_method!(
                         $kind,

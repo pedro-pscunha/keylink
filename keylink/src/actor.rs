@@ -879,3 +879,163 @@ impl ActorClient {
 pub fn actor_schema<C: Schema>(protocol: &str) -> u64 {
     schema_hash::<C>(protocol)
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    /// Two types with IDENTICAL postcard encodings and different meanings. The
+    /// whole reason `Sealed` exists: postcard writes no type identity, so one
+    /// decodes cleanly as the other.
+    #[derive(Serialize, Deserialize, Schema, Debug, PartialEq, Eq)]
+    struct Brl {
+        cents: u64,
+    }
+
+    #[derive(Serialize, Deserialize, Schema, Debug, PartialEq, Eq)]
+    struct Usd {
+        cents: u64,
+    }
+
+    fn sealed_brl(declared: u64) -> Sealed {
+        let request = ActorRequest::new(
+            ActorId::new("money").expect("valid"),
+            declared,
+            &Brl { cents: 4_471 },
+        )
+        .expect("encodes");
+        request.seal().1
+    }
+
+    /// The fact the ordering exists to defeat, stated as a test rather than as
+    /// a comment: the bytes DO decode as the wrong type.
+    #[test]
+    fn the_wrong_type_decodes_cleanly_from_the_same_bytes() {
+        let bytes = postcard::to_stdvec(&Brl { cents: 4_471 }).expect("encodes");
+        let wrong: Usd = postcard::from_bytes(&bytes).expect("no error, wrong meaning");
+        assert_eq!(wrong, Usd { cents: 4_471 });
+    }
+
+    /// And with the hash in front of the decode, it is refused instead.
+    #[test]
+    fn open_refuses_a_payload_whose_declared_hash_is_not_ours() {
+        let error = sealed_brl(1)
+            .open::<Usd>(2)
+            .expect_err("the hashes differ, so the bytes are never interpreted");
+        assert_eq!(
+            error,
+            RemoteError::ActorSchemaMismatch { ours: 2, theirs: 1 }
+        );
+    }
+
+    #[test]
+    fn open_decodes_when_the_hashes_agree() {
+        let value: Brl = sealed_brl(7).open(7).expect("the hashes agree");
+        assert_eq!(value, Brl { cents: 4_471 });
+    }
+
+    /// A payload that survives the hash check and still does not decode is a
+    /// refusal, not a panic and not a truncated reply.
+    ///
+    /// The payload here is empty, because almost nothing else fails: postcard
+    /// reads a `String`'s length byte as a `u64` field quite happily, which is
+    /// the same permissiveness the hash exists to stand in front of.
+    #[test]
+    fn open_reports_undecodable_bytes_as_a_refusal() {
+        let request = ActorRequest::new(ActorId::new("x").expect("valid"), 7, &()).expect("encodes");
+        let error = request
+            .seal()
+            .1
+            .open::<Brl>(7)
+            .expect_err("no bytes is not a Brl");
+        assert!(matches!(error, RemoteError::Failed(_)), "got {error:?}");
+    }
+
+    /// `Debug` on a sealed payload must not be the accessor that the type has
+    /// no accessor for.
+    #[test]
+    fn debug_never_prints_the_payload() {
+        let secret = "muda-de-ipe-4471".to_string();
+        let request =
+            ActorRequest::new(ActorId::new("x").expect("valid"), 7, &secret).expect("encodes");
+
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains(&secret), "{rendered}");
+
+        let rendered = format!("{:?}", request.seal().1);
+        assert!(!rendered.contains(&secret), "{rendered}");
+    }
+
+    /// The envelope is frozen at three fields. postcard writes a struct as its
+    /// fields back to back, so this pins the bytes a peer must produce.
+    #[test]
+    fn the_envelope_is_three_fields_in_this_order() {
+        let request = ActorRequest::new(ActorId::new("ab").expect("valid"), 7, &9u8)
+            .expect("encodes");
+        let encoded = postcard::to_stdvec(&request).expect("encodes");
+
+        let mut expected = postcard::to_stdvec(&"ab".to_string()).expect("encodes");
+        expected.extend(postcard::to_stdvec(&7u64).expect("encodes"));
+        expected.extend(postcard::to_stdvec(&postcard::to_stdvec(&9u8).expect("encodes")).unwrap());
+
+        assert_eq!(encoded, expected);
+    }
+
+    #[tokio::test]
+    async fn guarded_turns_a_panic_into_a_value() {
+        let caught = guarded(async { panic!("bad message") }).await;
+        let error = caught.expect_err("the panic is caught");
+        assert!(error.to_string().contains("bad message"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn guarded_is_transparent_when_nothing_panics() {
+        assert_eq!(guarded(async { 7u8 }).await.expect("no panic"), 7);
+    }
+
+    /// Eviction is by last message, not by mount time, or a busy actor would be
+    /// evicted out from under its callers.
+    #[tokio::test]
+    async fn sweeping_keeps_the_actor_that_was_addressed() {
+        let system = System::builder(Eviction::Idle(Duration::from_millis(50)))
+            .spawn_with(|_| Some(mount(1, |mut inbox| async move { while inbox.recv().await.is_some() {} })))
+            .build();
+
+        let busy = ActorId::new("busy").expect("valid");
+        let idle = ActorId::new("idle").expect("valid");
+        system
+            .mount(busy.clone(), mount(1, |mut inbox| async move {
+                while inbox.recv().await.is_some() {}
+            }))
+            .expect("free");
+        system
+            .mount(idle.clone(), mount(1, |mut inbox| async move {
+                while inbox.recv().await.is_some() {}
+            }))
+            .expect("free");
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        // Routing is what marks an actor as used.
+        system.inner.route(&busy).expect("mounted");
+        system.evict_idle();
+
+        assert!(system.contains(&busy), "the addressed actor must survive");
+        assert!(!system.contains(&idle), "the idle actor must be gone");
+    }
+
+    #[test]
+    fn a_system_without_a_factory_never_grows_by_itself() {
+        let system = System::builder(Eviction::Never).build();
+        let error = system
+            .inner
+            .route(&ActorId::new("nobody").expect("valid"))
+            .expect_err("nothing is mounted and nothing builds it");
+        assert!(
+            matches!(error, RemoteError::NoSuchActor { .. }),
+            "got {error:?}"
+        );
+        assert!(system.is_empty());
+    }
+}
