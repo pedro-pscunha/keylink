@@ -471,7 +471,7 @@ impl Server {
 
 /// Collects the services one node will answer.
 ///
-/// This exists because [`iroh::protocol::Router::spawn`] calls
+/// This exists because [`RouterBuilder::spawn`](iroh::protocol::RouterBuilder::spawn) calls
 /// `Endpoint::set_alpns`, which *overrides* the ALPN list rather than adding to
 /// it. Building one router per service therefore left only the last service
 /// reachable. Every service must go into a single router.
