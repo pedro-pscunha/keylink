@@ -92,6 +92,15 @@ async fn ten_thousand_idle_actors_fit_in_the_budget() {
     let each = total / ACTORS as isize;
     println!("{ACTORS} idle actors cost {total} bytes, {each} bytes each");
 
+    // The boxing decision, in numbers rather than in prose. A mailbox holds one
+    // eagerly allocated block of 32 slots, so an unboxed `Mail` would cost this
+    // much per idle actor on its own.
+    let unboxed = std::mem::size_of::<keylink::Mail>() * 32;
+    println!(
+        "one Mail is {} bytes; unboxed, a mailbox alone would be {unboxed} bytes per actor",
+        std::mem::size_of::<keylink::Mail>()
+    );
+
     assert_eq!(system.len(), ACTORS);
     assert!(
         each <= BUDGET_PER_ACTOR,

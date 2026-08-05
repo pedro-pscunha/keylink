@@ -269,10 +269,19 @@ type Answer = (Outcome<ActorReply>, Body);
 
 /// One message on its way to an actor. Generated code destructures these.
 ///
-/// Boxed on the way into the mailbox. A `tokio::sync::mpsc` channel allocates
-/// its first block of 32 slots eagerly, so an unboxed `Mail` would cost
-/// `32 * size_of::<Mail>()` per idle actor — kilobytes each, tens of megabytes
-/// across ten thousand. Boxing makes an idle mailbox 32 pointers instead.
+/// Boxed on the way into the mailbox, which is not a micro-optimisation. A
+/// `tokio::sync::mpsc` channel allocates its first block of 32 slots eagerly, so
+/// the mailbox costs `32 * size_of::<T>()` whatever its capacity is. Measured at
+/// ten thousand idle actors, on this machine, by `tests/actor_memory.rs`:
+///
+/// | slot type   | per idle actor | ten thousand |
+/// |-------------|----------------|--------------|
+/// | `Box<Mail>` | 1,684 bytes    | 16.8 MB      |
+/// | `Mail`      | 8,724 bytes    | 87.2 MB      |
+///
+/// The 7,040 byte difference is the block: `Mail` is 224 bytes, and 32 of them
+/// is 7,168. The cost of boxing is one allocation per message, on a path that
+/// already allocates the payload.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct Mail {
