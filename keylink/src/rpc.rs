@@ -37,7 +37,7 @@ use tokio::task::JoinSet;
 
 use crate::wire::FrameReader;
 use crate::error::ConfigError;
-use crate::{wire, Allowlist, Body, BodyReader, Error, Node, Result};
+use crate::{wire, Allowlist, Body, BodyReader, Error, Node, Outcome, Result};
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -45,7 +45,7 @@ type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// response plus its outgoing body. The macro boxes the user's `async fn` into
 /// this so `RpcService` needs no extra generic parameters.
 pub type Dispatch<Req, Resp> =
-    Arc<dyn Fn(Req, BodyReader) -> BoxFut<(Resp, Body)> + Send + Sync>;
+    Arc<dyn Fn(Req, BodyReader) -> BoxFut<(Outcome<Resp>, Body)> + Send + Sync>;
 
 /// Serves one protocol: authorizes the peer once per connection, then answers
 /// every stream that connection opens, concurrently.
@@ -105,12 +105,38 @@ where
         return Ok(());
     };
 
-    let (response, body) = dispatch(request.message, BodyReader::new(frames, request.body_len)).await;
+    let (outcome, body) = dispatch(request.message, BodyReader::new(frames, request.body_len)).await;
 
-    wire::write_header(&mut send, body.declared_len(), &response).await?;
+    wire::write_header(&mut send, body.declared_len(), &outcome).await?;
     body.write_to(&mut send).await?;
     send.finish()?;
     Ok(())
+}
+
+/// Tell "your peer runs a different schema" apart from "the network is down".
+///
+/// TLS rejects an unknown ALPN with `no_application_protocol`, which is exactly
+/// what the derived-ALPN drift gate looks like from the dialling side. Leaving
+/// it as a generic transport error sends whoever reads the log to inspect the
+/// network, when the actual fix is to rebuild one of the two peers.
+fn classify_connect(err: iroh::endpoint::ConnectError, alpn: &[u8]) -> Error {
+    // Matched on the rendered cause rather than the error enum: the alert code
+    // is carried inside quinn's transport frame, several private layers down,
+    // and the string is the only stable surface iroh exposes for it today.
+    //
+    // The markers are what iroh 1.0.3 actually prints, verified against a live
+    // mismatch rather than taken from the TLS constant names:
+    //   "aborted by peer: the cryptographic handshake failed:
+    //    error 120: peer doesn't support any known protocol"
+    // 120 is the TLS `no_application_protocol` alert. Narrow on purpose —
+    // anything unrecognised stays a transport error.
+    let rendered = format!("{err:?} {err}").to_ascii_lowercase();
+    if rendered.contains("support any known protocol") || rendered.contains("error 120") {
+        return Error::SchemaMismatch {
+            ours: String::from_utf8_lossy(alpn).into_owned(),
+        };
+    }
+    Error::Transport(err.into())
 }
 
 /// A connection ending is not a failure. Anything else is.
@@ -308,15 +334,18 @@ where
     ///
     /// # Errors
     ///
-    /// [`Error::Transport`] when the peer is unreachable, refuses us, or was
-    /// built against a different schema — the ALPN gate reports that as
-    /// "peer doesn't support any known protocol".
+    /// [`Error::SchemaMismatch`] when the peer was built against a different
+    /// contract, and [`Error::Transport`] when it is unreachable or refuses us.
     pub async fn connect(
         node: &Node,
         peer: impl Into<EndpointAddr>,
         alpn: &'static [u8],
     ) -> Result<Self> {
-        let conn = node.endpoint().connect(peer, alpn).await?;
+        let conn = node
+            .endpoint()
+            .connect(peer, alpn)
+            .await
+            .map_err(|err| classify_connect(err, alpn))?;
         Ok(Self {
             conn,
             _p: PhantomData,
@@ -339,13 +368,15 @@ where
         send.finish()?;
 
         let mut frames = FrameReader::new(recv);
-        let Some(response) = frames.read_header::<Resp>().await? else {
+        let Some(response) = frames.read_header::<Outcome<Resp>>().await? else {
             return Err(Error::Closed);
         };
-        Ok((
-            response.message,
-            BodyReader::new(frames, response.body_len),
-        ))
+        match response.message {
+            Outcome::Ok(value) => Ok((value, BodyReader::new(frames, response.body_len))),
+            // A refusal carries no body: the handler never ran, or never
+            // finished, so there is nothing to stream.
+            Outcome::Err(refused) => Err(Error::Remote(refused)),
+        }
     }
 
     /// Close the connection gracefully.

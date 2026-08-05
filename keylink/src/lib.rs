@@ -43,6 +43,7 @@ mod body;
 mod error;
 mod macros;
 mod node;
+mod reply;
 mod rpc;
 #[cfg(test)]
 mod testing;
@@ -52,6 +53,7 @@ pub use authz::Allowlist;
 pub use body::{Body, BodyReader};
 pub use error::{ConfigError, Error, Result, Transport};
 pub use node::{derive_alpn, Node};
+pub use reply::{Outcome, RemoteError};
 pub use rpc::{serve, Dispatch, RpcClient, RpcService, Server, ServerBuilder, Service};
 pub use wire::{Envelope, MAX_HEADER};
 

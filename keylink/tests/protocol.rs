@@ -455,3 +455,28 @@ async fn registering_one_alpn_twice_is_refused() {
         "expected a config error, got {error:?}"
     );
 }
+
+/// The derived-ALPN drift gate is keylink's headline safety property. If it
+/// fires as a generic transport error, an operator reads "connection failed"
+/// and goes looking at the network, when the real cause is two peers built from
+/// different types.
+#[tokio::test]
+async fn a_peer_on_a_different_schema_is_reported_as_a_schema_mismatch() {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let _running = probe::serve(&server, Server, Allowlist::anyone()).expect("serves");
+
+    // Same node, same address, an ALPN that is not the one it answers.
+    let err = keylink::RpcClient::<probe::Request, probe::Response>::connect(
+        &client_node,
+        server.endpoint().addr(),
+        b"keylink/Probe/0000000000000000",
+    )
+    .await
+    .expect_err("a peer on another contract must not connect");
+
+    assert!(
+        matches!(err, Error::SchemaMismatch { .. }),
+        "expected a schema mismatch, got: {err:?}"
+    );
+}

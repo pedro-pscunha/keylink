@@ -1,0 +1,95 @@
+//! What comes back from a call.
+//!
+//! A handler returns a value. Anything *around* the handler — a timeout, a
+//! per-method authorization check, a rate limiter — has to be able to refuse
+//! the call instead, and it cannot do that by synthesising a return value it
+//! knows nothing about. So every reply carries a second channel: an [`Outcome`]
+//! is the handler's value, or a [`RemoteError`] the caller sees as
+//! [`crate::Error::Remote`].
+//!
+//! `Outcome<T>` sits inside the hashed contract, so adding a variant moves the
+//! ALPN and a drifted peer is refused at the handshake rather than misreading a
+//! reply.
+
+use serde::{Deserialize, Serialize};
+
+/// Why the serving side refused a call.
+///
+/// Constructed by handlers and by [`Middleware`](crate::Middleware). The caller
+/// receives it as [`crate::Error::Remote`].
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, postcard_schema::Schema, thiserror::Error,
+)]
+#[non_exhaustive]
+pub enum RemoteError {
+    /// The peer is known, but not for this method.
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+
+    /// The handler did not finish inside its budget.
+    #[error("timed out after {millis} ms")]
+    TimedOut {
+        /// The budget that expired.
+        millis: u64,
+    },
+
+    /// Anything else the serving side wants to report.
+    #[error("{0}")]
+    Failed(String),
+}
+
+/// The reply as it appears on the wire: a value, or a refusal.
+#[derive(Debug, Clone, Serialize, Deserialize, postcard_schema::Schema)]
+pub enum Outcome<T> {
+    /// The handler's return value.
+    Ok(T),
+    /// The call was refused, by the handler or by a layer above it.
+    Err(RemoteError),
+}
+
+impl<T> Outcome<T> {
+    /// Whether this refuses the call. Lets logging and metrics layers report an
+    /// outcome without knowing the success type.
+    pub fn is_err(&self) -> bool {
+        matches!(self, Self::Err(_))
+    }
+}
+
+impl<T> From<RemoteError> for Outcome<T> {
+    fn from(err: RemoteError) -> Self {
+        Self::Err(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A layer refuses a call without knowing the method's return type. That is
+    /// only sound because the `Err` arm carries no `T`, so its encoding is
+    /// identical for every instantiation. If postcard ever changed that, a
+    /// refusal written for one method would misdecode on another.
+    #[test]
+    fn the_error_arm_encodes_identically_for_every_return_type() {
+        let err = RemoteError::TimedOut { millis: 250 };
+        let as_u64 = postcard::to_stdvec(&Outcome::<u64>::Err(err.clone())).expect("encodes");
+        let as_string = postcard::to_stdvec(&Outcome::<String>::Err(err)).expect("encodes");
+        assert_eq!(as_u64, as_string);
+    }
+
+    #[test]
+    fn a_value_round_trips_through_the_envelope() {
+        let bytes = postcard::to_stdvec(&Outcome::Ok("muda de ipê".to_string())).expect("encodes");
+        let decoded: Outcome<String> = postcard::from_bytes(&bytes).expect("decodes");
+        let Outcome::Ok(text) = decoded else {
+            panic!("expected the ok arm");
+        };
+        assert_eq!(text, "muda de ipê");
+    }
+
+    #[test]
+    fn a_refusal_reports_itself_as_an_error() {
+        let refused: Outcome<u64> = RemoteError::Unauthorized("write".into()).into();
+        assert!(refused.is_err());
+    }
+}

@@ -138,14 +138,15 @@ macro_rules! service {
                     ::std::sync::Arc::new(move |req: Request, body: $crate::BodyReader| {
                         let handler = handler.clone();
                         ::std::boxed::Box::pin(async move {
-                            match req {
+                            let (__response, __body) = match req {
                                 $(
                                     Request::$rpc { $( $arg ),* } =>
                                         [<__invoke_ $rpc:snake>](
                                             handler.as_ref(), body $(, $arg )*
                                         ).await,
                                 )+
-                            }
+                            };
+                            ($crate::Outcome::Ok(__response), __body)
                         })
                     });
                 $crate::RpcService::new(allow, dispatch).into_service(alpn())

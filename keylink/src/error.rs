@@ -49,6 +49,25 @@ pub enum Error {
     #[error("peer closed the connection")]
     Closed,
 
+    /// The serving side refused the call.
+    ///
+    /// The handler, or a layer above it, said no. Distinct from a transport
+    /// failure: the call arrived, was understood, and was declined.
+    #[error("remote refused: {0}")]
+    Remote(#[from] crate::RemoteError),
+
+    /// The peer speaks a different schema.
+    ///
+    /// Our ALPN carries a hash of the contract, so a peer built against
+    /// different types cannot complete the handshake. Surfacing this as a plain
+    /// transport error would send whoever reads it looking at the network,
+    /// which is the wrong layer entirely: nothing is wrong with the network.
+    #[error("schema mismatch: the peer was built against a different contract (ours is {ours})")]
+    SchemaMismatch {
+        /// The ALPN we offered, whose trailing hash identifies our schema.
+        ours: String,
+    },
+
     /// A protocol handler panicked, and the router surfaced it during shutdown.
     ///
     /// Distinct from [`Error::Transport`] on purpose: nothing went wrong on the
