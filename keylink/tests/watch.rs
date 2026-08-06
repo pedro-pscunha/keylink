@@ -10,8 +10,6 @@
 use std::future::Future;
 use std::time::Duration;
 
-use iroh::endpoint::presets;
-use iroh::Endpoint;
 use keylink::{Allowlist, Departure, Node, RpcClient};
 
 keylink::service! {
@@ -38,13 +36,8 @@ async fn within<F: Future>(fut: F) -> F::Output {
         .expect("the watch resolves rather than hanging")
 }
 
-async fn local_node() -> Node {
-    Node::from_endpoint(
-        Endpoint::bind(presets::Minimal)
-            .await
-            .expect("a local endpoint binds"),
-    )
-}
+mod common;
+use common::local_node;
 
 type Client = RpcClient<sentinel::Request, sentinel::Response>;
 

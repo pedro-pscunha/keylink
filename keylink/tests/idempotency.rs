@@ -9,8 +9,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use iroh::endpoint::presets;
-use iroh::Endpoint;
 use keylink::{
     Allowlist, Body, BodyReader, Context, Error, IdempotencyKey, IdempotencyRefusal, Middleware,
     Next, Node, Outcome, RemoteError, Server as KeylinkServer,
@@ -76,18 +74,13 @@ impl till::Handler for Till {
 
 // ────────────────────────────────────────────────────────────────── fixture
 
+mod common;
+use common::local_node;
+
 struct Fixture {
     client: till::Client,
     _server: KeylinkServer,
     _nodes: Vec<Node>,
-}
-
-async fn local_node() -> Node {
-    Node::from_endpoint(
-        Endpoint::bind(presets::Minimal)
-            .await
-            .expect("a local endpoint binds"),
-    )
 }
 
 async fn start() -> Fixture {

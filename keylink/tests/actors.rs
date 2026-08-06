@@ -9,8 +9,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use iroh::endpoint::presets;
-use iroh::Endpoint;
 use keylink::{
     ActorClient, ActorId, Allowlist, Error, Eviction, MountError, Node, RemoteError, Server, System,
 };
@@ -80,13 +78,8 @@ impl journal::Actor for Journal {
 
 // ────────────────────────────────────────────────────────────────── fixture
 
-async fn local_node() -> Node {
-    Node::from_endpoint(
-        Endpoint::bind(presets::Minimal)
-            .await
-            .expect("a local endpoint binds"),
-    )
-}
+mod common;
+use common::local_node;
 
 /// A running actor system and a client connected to it.
 struct Fixture {

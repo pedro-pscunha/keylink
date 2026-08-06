@@ -11,8 +11,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use iroh::endpoint::presets;
-use iroh::Endpoint;
 use keylink::{Allowlist, Body, BodyReader, Error, Node, Server as KeylinkServer};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
@@ -103,20 +101,15 @@ impl probe::Handler for Server {
 
 // ────────────────────────────────────────────────────────────────── fixture
 
+mod common;
+use common::local_node;
+
 /// A running server and a client connected to it. Both nodes are held so the
 /// endpoints outlive the test body.
 struct Fixture {
     client: probe::Client,
     _server: KeylinkServer,
     _nodes: [Node; 2],
-}
-
-async fn local_node() -> Node {
-    Node::from_endpoint(
-        Endpoint::bind(presets::Minimal)
-            .await
-            .expect("a local endpoint binds"),
-    )
 }
 
 async fn start() -> Fixture {
