@@ -55,8 +55,8 @@
 use std::ops::{Deref, DerefMut};
 
 use crate::{
-    ActorId, AdmittedPeer, Allowlist, BlobId, Eviction, IdempotencyKey, ProvenPeer, Retention,
-    Sealed,
+    ActorId, Admission, Admittance, AdmittedPeer, Allowlist, BlobId, DynamicAdmission, Eviction,
+    IdempotencyKey, ProvenPeer, Retention, Sealed,
 };
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
@@ -149,6 +149,32 @@ impl<T: Default> HasNoDefault for T {}
 impl HasNoDefault for Allowlist {}
 impl HasNoDefault for Eviction {}
 impl HasNoDefault for Retention {}
+/// The adapter inherits the property from the value it holds. A `Default` here
+/// would mean "a policy you did not name", and the only policy nobody named is
+/// the one that admits everyone.
+impl HasNoDefault for DynamicAdmission {}
+
+// ─────────────────────────────────── `Admission` has no permissive blanket impl
+
+/// The claim: nothing implements [`Admission`](crate::Admission) for every
+/// type, so a policy is something a caller writes rather than something they
+/// get by accident.
+///
+/// The probe is coherence, not shadowing, because a trait impl is invisible to
+/// name resolution. A concrete `impl Admission for Doorstop` overlaps a
+/// hypothetical `impl<T> Admission for T` exactly, and an overlap is `E0119`.
+/// So this impl compiles only while no blanket impl exists.
+///
+/// A blanket impl is the shape this crate must never grow: it would make every
+/// type a policy, including `()`, and the answer would be whatever the blanket
+/// said — which is the fail-open `Allowlist` has no `Default` to prevent.
+struct Doorstop;
+
+impl Admission for Doorstop {
+    fn admits(&self, _peer: &ProvenPeer) -> Admittance {
+        Admittance::Refused
+    }
+}
 
 // ───────────────────────────────── a proven peer cannot be built from a claim
 

@@ -37,14 +37,15 @@ use iroh::{
 use n0_future::task::JoinSet;
 use serde::{de::DeserializeOwned, Serialize};
 
+use crate::admission::settle;
 use crate::error::ConfigError;
 use crate::idempotency::{Claim, Guard, Ledger};
 use crate::middleware::{wrap, Reached};
 use crate::wire::FrameReader;
 use crate::{
-    wire, AdmittedPeer, Allowlist, BlobHandle, BlobId, Blobs, Body, BodyReader, Context, Error,
-    Granting, Idempotency, IdempotencyKey, IdempotencyRefusal, KeyState, Middleware, Next, Node,
-    Outcome, ProvenPeer, RemoteError, Result, Rpc, WireRequest, WireResponse,
+    wire, Admission, AdmittedPeer, Allowlist, BlobHandle, BlobId, Blobs, Body, BodyReader, Context,
+    Error, Granting, Idempotency, IdempotencyKey, IdempotencyRefusal, KeyState, Middleware, Next,
+    Node, Outcome, RemoteError, Result, Rpc, WireRequest, WireResponse,
 };
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -75,7 +76,10 @@ pub type Dispatch<Req, Resp> =
 /// every stream that connection opens, concurrently.
 pub(crate) struct RpcService<Req, Resp> {
     next: Next<Req, Resp>,
-    allow: Arc<Allowlist>,
+    /// The policy this service admits against. An `Arc<dyn ..>` rather than a
+    /// generic parameter: the decision is made once per connection and does no
+    /// I/O, and a generic would reach every `service!` user's type errors.
+    admission: Arc<dyn Admission>,
     /// The content store this service grants against, when it declares `blob`
     /// methods. `None` for every service that does not, which is why an
     /// ordinary service pays nothing for this feature existing.
@@ -91,7 +95,7 @@ impl<Req, Resp> Clone for RpcService<Req, Resp> {
     fn clone(&self) -> Self {
         Self {
             next: self.next.clone(),
-            allow: self.allow.clone(),
+            admission: self.admission.clone(),
             blobs: self.blobs.clone(),
             ledger: self.ledger.clone(),
             _p: PhantomData,
@@ -101,9 +105,7 @@ impl<Req, Resp> Clone for RpcService<Req, Resp> {
 
 impl<Req, Resp> std::fmt::Debug for RpcService<Req, Resp> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RpcService")
-            .field("allow", &self.allow)
-            .finish_non_exhaustive()
+        f.debug_struct("RpcService").finish_non_exhaustive()
     }
 }
 
@@ -435,11 +437,12 @@ where
     Resp: Serialize + Granting + Send + Sync + 'static,
 {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
-        // The handshake proved this key. Whether it is welcome is our call, and
-        // the answer is a value rather than a `bool` somebody must remember to
-        // have consulted — see `Allowlist::admit`.
-        let Some(admitted) = self.allow.admit(ProvenPeer::on(&connection)) else {
-            connection.close(1u32.into(), b"unauthorized");
+        // The handshake proved this key. Whether it is welcome is the policy's
+        // call, and what comes back is a value rather than a `bool` somebody
+        // must remember to have consulted — see `Admittance`. The policy also
+        // takes the live connection here, which is the whole of what makes a
+        // revocation later able to reach it.
+        let Some((admitted, _live)) = settle(self.admission.as_ref(), &connection) else {
             return Ok(());
         };
 
@@ -498,7 +501,7 @@ where
 /// the macro knowing anything about it.
 pub struct ServiceBuilder<Req, Resp> {
     alpn: &'static [u8],
-    allow: Allowlist,
+    admission: Arc<dyn Admission>,
     base: Next<Req, Resp>,
     layers: Vec<Arc<dyn Middleware<Req, Resp>>>,
     blobs: Option<Blobs>,
@@ -518,7 +521,7 @@ where
     pub fn new(alpn: &'static [u8], allow: Allowlist, dispatch: Dispatch<Req, Resp>) -> Self {
         Self {
             alpn,
-            allow,
+            admission: Arc::new(allow),
             base: dispatch,
             layers: Vec::new(),
             blobs: None,
@@ -557,6 +560,28 @@ where
         self
     }
 
+    /// Admit against a policy rather than against the fixed list this was built
+    /// with.
+    ///
+    /// The list passed to the generated `service(handler, allow)` is itself an
+    /// [`Admission`] — it is the canonical one — so this replaces rather than
+    /// adds. Reach for it when the answer has to be able to change while the
+    /// service is running:
+    ///
+    /// ```ignore
+    /// let policy = Arc::new(DynamicAdmission::new(Allowlist::only([first])));
+    /// let service = inventory::service(handler, Allowlist::anyone())
+    ///     .admission(policy.clone())
+    ///     .build();
+    /// // ... later, without a restart, and closing whoever is no longer welcome
+    /// let closed = policy.replace(Allowlist::only([second]));
+    /// ```
+    #[must_use]
+    pub fn admission(mut self, admission: Arc<dyn Admission>) -> Self {
+        self.admission = admission;
+        self
+    }
+
     /// Add a layer. The first layer added is the outermost: it sees the request
     /// first and the reply last.
     #[must_use]
@@ -575,7 +600,7 @@ where
             alpn: self.alpn,
             handler: Box::new(RpcService {
                 next: chain,
-                allow: Arc::new(self.allow),
+                admission: self.admission,
                 blobs: self.blobs.clone(),
                 ledger: Ledger::new(),
                 _p: PhantomData,
@@ -590,7 +615,6 @@ impl<Req, Resp> std::fmt::Debug for ServiceBuilder<Req, Resp> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServiceBuilder")
             .field("alpn", &String::from_utf8_lossy(self.alpn))
-            .field("allow", &self.allow)
             .field("layers", &self.layers.len())
             .finish()
     }
