@@ -430,7 +430,10 @@ macro_rules! service {
                 /// next call.
                 ///
                 /// See [`Watch`](keylink::Watch).
-                #[must_use]
+                // No `#[must_use]`: `Watch` already carries one, and repeating it
+                // here is `clippy::double_must_use`. Only visible since the
+                // library expands this macro itself — clippy suppresses lints
+                // from an external macro, so no downstream expansion reports it.
                 pub fn watch(&self) -> $crate::Watch {
                     self.inner.watch()
                 }
@@ -454,6 +457,10 @@ macro_rules! service {
                 }
             }
 
+            // The doc comment lives INSIDE the wrap: attached to the macro
+            // invocation instead, it documents nothing and is
+            // `unused_doc_comments`.
+            $crate::__keylink_if_blocking! {
             /// The same service, for programs that are not async.
             ///
             /// Streaming methods (`send`/`recv`) are deliberately absent: their
@@ -513,9 +520,36 @@ macro_rules! service {
                     }
                 }
             }
+            }
         }
         }
     };
+}
+
+/// Emit the enclosed items only when keylink itself was built with `blocking`.
+///
+/// A `macro_rules!` body is inert tokens until it is invoked, so `service!`
+/// could name `$crate::blocking::Runtime` while that module did not exist and
+/// `cargo build -p keylink` stayed green. The failure appeared only in a
+/// DOWNSTREAM crate that expanded the macro without the feature — which for a
+/// browser build is every consumer, since `mise run wasm` builds
+/// `--no-default-features`.
+///
+/// Two definitions rather than a `#[cfg]` inside one, because the decision
+/// belongs to keylink's own feature set at the point keylink is compiled, not
+/// to the caller's.
+#[cfg(feature = "blocking")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __keylink_if_blocking {
+    ($($item:tt)*) => { $($item)* };
+}
+
+#[cfg(not(feature = "blocking"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __keylink_if_blocking {
+    ($($item:tt)*) => {};
 }
 
 /// One blocking client method. Streaming kinds produce nothing.
@@ -779,4 +813,31 @@ macro_rules! __keylink_client_method {
             Ok((response.$extract()?, body))
         }
     };
+}
+
+/// One expansion of [`service!`], inside the library's own test build.
+///
+/// keylink never expands its own macro anywhere else, and that is exactly why
+/// the `__keylink_if_blocking!` guard above was missing for so long. A
+/// `macro_rules!` body is inert tokens until it is invoked, so the crate
+/// compiled green while the code it *generates* named `$crate::blocking`, a
+/// module that does not exist without the `blocking` feature. The failure was
+/// reachable only from a downstream crate — which, for a browser build, is
+/// every consumer, because `mise run wasm` builds `--no-default-features`.
+///
+/// Expanding it here puts the generated code into the library's test build, so
+/// `cargo test -p keylink --lib --no-run` compiles it. `mise run features` runs
+/// that for all eight feature subsets, which is what turns the guard from a
+/// thing we believe into a thing the gate checks.
+///
+/// Nothing here is called. Compiling is the whole assertion.
+#[cfg(test)]
+mod expansion {
+    crate::service! {
+        service Expansion;
+
+        rpc Ping(n: u64) -> u64;
+        recv Fetch(name: String) -> u64;
+        send Store(name: String) -> u64;
+    }
 }

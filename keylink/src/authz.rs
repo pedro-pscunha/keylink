@@ -120,6 +120,11 @@ mod tests {
         );
     }
 
+    /// Carries the same gate as the function it calls. Without this,
+    /// `cargo test -p keylink --no-default-features` does not compile — and
+    /// nothing noticed, because the feature-subset task checked `--lib`, which
+    /// does not build test code.
+    #[cfg(feature = "env")]
     #[test]
     fn unset_env_fails_closed() {
         assert!(Allowlist::from_env("KEYLINK_DEFINITELY_UNSET_VAR").is_err());

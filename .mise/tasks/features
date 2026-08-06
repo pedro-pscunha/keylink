@@ -7,11 +7,21 @@
 # compiling, because `blocking::Node::bind_from_env` calls it, and neither end
 # noticed.
 #
-# `check` rather than `clippy`, because `lint` already lints both ends. What
-# this task looks for is a combination that does not build at all.
+# `test --no-run`, not `check`. `check` compiled the library and NOT its
+# `#[cfg(test)]` blocks, so a unit test calling a feature-gated function was
+# invisible here: `cargo test -p keylink --no-default-features` failed to
+# compile while this task stayed green. That is exactly the hole the task exists
+# to close, and it had one — `authz.rs`'s `unset_env_fails_closed` called
+# `Allowlist::from_env` with no gate of its own.
+#
+# `--lib` and not `--all-targets`, deliberately. The integration tests under
+# `keylink/tests/` use the blocking API and `Body::from_file`, so they cannot
+# compile without the features that provide them, and demanding it would only
+# teach us to add feature gates to tests that legitimately want the feature.
+# `lint` builds those at the all-features end, which is where they belong.
 set -euo pipefail
 
 for f in "" blocking fs env blocking,fs blocking,env fs,env blocking,fs,env; do
     echo "── features: ${f:-none}"
-    cargo check -p keylink --lib --no-default-features --features "$f"
+    cargo test -p keylink --lib --no-run --no-default-features --features "$f"
 done
