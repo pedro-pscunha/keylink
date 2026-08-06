@@ -11,7 +11,6 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::pin::Pin;
-use std::sync::Mutex;
 use std::task::{Context, Poll};
 
 use anyhow::{bail, Context as _, Result};
@@ -162,7 +161,7 @@ impl AsyncRead for Pattern {
 
 #[derive(Default)]
 struct Warehouse {
-    items: Mutex<BTreeMap<String, Item>>,
+    items: BTreeMap<String, Item>,
 }
 
 impl Warehouse {
@@ -193,18 +192,7 @@ impl Warehouse {
                 },
             );
         }
-        Self {
-            items: Mutex::new(items),
-        }
-    }
-
-    /// A panicking handler must not wedge every later request. Recover the guard
-    /// instead of propagating poisoning — one bad request should cost one
-    /// request, not the process.
-    fn items(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Item>> {
-        self.items
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        Self { items }
     }
 
     /// Land an upload on disk, hashing as it goes. Never holds the payload.
@@ -223,25 +211,24 @@ impl Warehouse {
     }
 }
 
-impl inventory::Handler for Warehouse {
-    async fn ping(&self) -> String {
+impl inventory::Actor for Warehouse {
+    async fn ping(&mut self) -> String {
         format!("ok from {}", hostname())
     }
 
-    async fn list(&self) -> Vec<Item> {
-        self.items().values().cloned().collect()
+    async fn list(&mut self) -> Vec<Item> {
+        self.items.values().cloned().collect()
     }
 
-    async fn get_item(&self, sku: String) -> Option<Item> {
-        self.items().get(&sku).cloned()
+    async fn get_item(&mut self, sku: String) -> Option<Item> {
+        self.items.get(&sku).cloned()
     }
 
     /// All-or-nothing. A partial fill would need a variant carrying how many we
     /// actually got, and a caller that always checks it — easy to get wrong at
     /// the call site, so the stricter contract is the safer default here.
-    async fn reserve(&self, sku: String, qty: u32) -> ReserveOutcome {
-        let mut items = self.items();
-        let Some(item) = items.get_mut(&sku) else {
+    async fn reserve(&mut self, sku: String, qty: u32) -> ReserveOutcome {
+        let Some(item) = self.items.get_mut(&sku) else {
             return ReserveOutcome::NoSuchItem;
         };
         if item.stock < qty {
@@ -258,7 +245,7 @@ impl inventory::Handler for Warehouse {
 
     /// Hand back a header and a payload. keylink streams the payload; this
     /// function returns immediately and never sees a byte of it.
-    async fn fetch(&self, sku: String, kib: u32) -> (Datasheet, Body) {
+    async fn fetch(&mut self, sku: String, kib: u32) -> (Datasheet, Body) {
         let len = u64::from(kib) * 1024;
         let sheet = Datasheet {
             sku,
@@ -270,7 +257,7 @@ impl inventory::Handler for Warehouse {
     }
 
     /// The declared length lets us refuse an oversized upload before it moves.
-    async fn upload(&self, name: String, body: BodyReader) -> UploadOutcome {
+    async fn upload(&mut self, name: String, body: BodyReader) -> UploadOutcome {
         const LIMIT: u64 = 64 * 1024 * 1024;
 
         if body.declared_len().is_some_and(|len| len > LIMIT) {
@@ -429,7 +416,13 @@ async fn serve() -> Result<()> {
     );
     println!("listening as: {}", node.id());
 
-    let server = inventory::serve(&node, Warehouse::seeded(), allow)?;
+    // An actor, not a concurrent handler: one task owns the map, messages run
+    // one at a time against `&mut self`, and nothing is locked across an await.
+    // None of that reaches the wire. `singleton.rs` holds both serving models to
+    // one ALPN, and `drift.rs` dials this binary with the ordinary
+    // `inventory::Client` to show it end to end.
+    let warehouse = inventory::actor(Warehouse::seeded());
+    let server = warehouse.serve(&node, allow)?;
 
     // AFTER `serve`, never before. `serve` is what registers the ALPN, so a peer
     // that read this line any earlier could dial an endpoint answering nothing
@@ -502,8 +495,19 @@ async fn connect(id: &str, upload: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Four calls on one connection, in flight at once. Each takes its own QUIC
-/// stream, so the slowest one does not decide when the others finish.
+/// Four calls on one connection, issued at once. Each still takes its own QUIC
+/// stream — that half is unchanged — but this peer serves the service as an
+/// actor, so the four land in one mailbox and run one after another. The number
+/// below is the sum of four turns rather than the slowest of four.
+///
+/// It does not prove that by itself: every method here answers in well under a
+/// millisecond, so both serving models print about the same figure. Telling
+/// them apart needs a handler held open long enough to see, which is why the
+/// claim is measured on both sides elsewhere —
+/// `protocol.rs::concurrent_calls_do_not_queue_behind_each_other` for the
+/// concurrent half, and
+/// `singleton.rs::a_served_actor_serializes_calls_that_arrive_on_separate_streams`
+/// for this one.
 async fn concurrent_calls(client: &inventory::Client) -> Result<()> {
     let started = std::time::Instant::now();
     let (a, b, c, d) = tokio::join!(
@@ -513,7 +517,7 @@ async fn concurrent_calls(client: &inventory::Client) -> Result<()> {
         client.get_item("GRA-esm".into()),
     );
     println!(
-        "\n4 concurrent -> ping={:?} list={} items, {:?} + {:?} in {:?}",
+        "\n4 in flight -> ping={:?} list={} items, {:?} + {:?} in {:?} (4 mailbox turns)",
         a?.is_empty(),
         b?.len(),
         c?.map(|i| i.sku),
@@ -611,7 +615,7 @@ fn hostname() -> String {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::inventory::Handler;
+    use super::inventory::Actor;
     use super::*;
 
     /// ADU-014 is seeded with 3 units.
@@ -619,7 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserve_deducts_and_reports_what_is_left() {
-        let w = Warehouse::seeded();
+        let mut w = Warehouse::seeded();
         match w.reserve(SKU.into(), 2).await {
             ReserveOutcome::Reserved { remaining } => assert_eq!(remaining, 1),
             other => panic!("expected Reserved, got {other:?}"),
@@ -629,7 +633,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserve_is_all_or_nothing_and_leaves_stock_untouched() {
-        let w = Warehouse::seeded();
+        let mut w = Warehouse::seeded();
         match w.reserve(SKU.into(), 99).await {
             ReserveOutcome::Insufficient {
                 requested,
@@ -645,7 +649,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserving_exactly_the_stock_succeeds_and_empties_it() {
-        let w = Warehouse::seeded();
+        let mut w = Warehouse::seeded();
         match w.reserve(SKU.into(), 3).await {
             ReserveOutcome::Reserved { remaining } => assert_eq!(remaining, 0),
             other => panic!("expected Reserved, got {other:?}"),
@@ -660,7 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_sku_is_distinct_from_insufficient() {
-        let w = Warehouse::seeded();
+        let mut w = Warehouse::seeded();
         assert!(matches!(
             w.reserve("NOPE".into(), 1).await,
             ReserveOutcome::NoSuchItem
@@ -669,7 +673,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_declares_the_length_and_checksum_of_what_it_will_stream() {
-        let w = Warehouse::seeded();
+        let mut w = Warehouse::seeded();
         let (sheet, body) = w.fetch(SKU.into(), 4).await;
 
         assert_eq!(sheet.bytes, 4096);
