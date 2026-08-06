@@ -166,14 +166,19 @@ impl std::fmt::Debug for BlobId {
 // - WRITING a grant demands an `AdmittedPeer`. `Blobs::grant` cannot be called
 //   for a peer no `Allowlist` said yes to, so a grant is always downstream of a
 //   policy decision that already happened on the keylink connection.
-// - READING one takes a `ProvenPeer`, because a blobs connection is not
-//   allowlisted by anybody. There is one blobs ALPN and several services with
-//   several allowlists (RFC-01 §5.1), so there is no allowlist for the mount to
-//   consult and picking one would be arbitrary. What authorizes the fetch is
-//   the grant itself, and the grant already carries the admission.
+// - READING one takes a `ProvenPeer`, because a blobs connection is
+//   allowlisted by nobody. `Blobs` is per NODE and `Allowlist` is per SERVICE,
+//   so a mount that called `admit` itself would have to pick one allowlist —
+//   or, worse, accept the union of them. Then a peer admitted by the chatty
+//   public service would be admitted at the blobs layer for content the
+//   private one granted. That union is exactly what RFC-01 §5.1 says must
+//   never exist, and it is the reason this ledger exists instead of the
+//   allowlist being routed into blobs admission.
 //
-// So the mount deliberately does NOT mint an `AdmittedPeer`. It proves who is
-// calling and asks the ledger whether that peer was handed this address.
+// So the mount deliberately does NOT mint an `AdmittedPeer` and admits nobody.
+// It proves who is calling and asks one question: does this peer hold a grant
+// for this exact hash. A grant can only exist because some service's allowlist
+// already said yes to that peer, at the moment its handler returned the id.
 
 // ────────────────────────────────────────────────────────────── the ledger
 

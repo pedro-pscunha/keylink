@@ -26,15 +26,25 @@ use crate::{ConfigError, Result};
 /// rather than anything proven. A constructor over `&Connecting` would compile
 /// and would prove nothing.
 ///
-/// # What it does NOT do today, stated plainly
+/// # What it deletes, and what it does not, stated plainly
 ///
-/// `HandshakeCompleted` is the default type parameter, so every bare
-/// `Connection` in this crate already is a `Connection<HandshakeCompleted>` and
-/// this constructor deletes no runtime check that exists now. Its value is that
-/// the state is named at the one boundary where an authorization decision
-/// starts, so a future zero-RTT accept path cannot reach that decision by
-/// accident. That is prospective, and worth having for a security type, but it
-/// is not a guard removed today and is not claimed as one.
+/// It deletes exactly one check, and that check lived in a design rather than
+/// in this crate. RFC-01 §5.5 keyed blobs admission on the
+/// `Option<EndpointId>` iroh-blobs reports, opening its policy loop with a
+/// `let Some(peer) = .. else { refuse }`. That arm is unreachable through
+/// `BlobsProtocol` today — both construction sites fill the field in — so a
+/// handler that wrote `_ => Ok(())` instead would have passed every test
+/// anybody could write, and would have begun admitting unidentified peers the
+/// day a transport reported none. keylink takes the identity from the
+/// connection it accepted itself, so there is no `Option` and no arm to get
+/// wrong.
+///
+/// It deletes **no check in keylink as it stands**. `HandshakeCompleted` is the
+/// default type parameter, so every bare `Connection` in this crate already is
+/// a `Connection<HandshakeCompleted>`. What naming the state buys is
+/// prospective: a future zero-RTT accept path cannot reach an authorization
+/// decision by accident. Worth having for a security type, and not a guard
+/// removed today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ProvenPeer(EndpointId);
 
