@@ -506,10 +506,40 @@ macro_rules! service {
                         // Taken before the turn because `cx` is only borrowed
                         // by `Caller::Peer(&cx)` below.
                         let __progress = cx.progress();
+                        // A `QueueTimeout` above the system's service stamped a
+                        // deadline on the context, and this loop was the one
+                        // dispatch path that never read it: the layer compiles
+                        // on `System::service` and guarded nothing there, at
+                        // any budget, with no error and no warning. RFC-04
+                        // §16.7.
+                        //
+                        // Read HERE, on the actor's own task and the instant
+                        // the message leaves the mailbox. Not in the layer,
+                        // which cannot tell a queued message from a running one
+                        // (RFC-04 §16.2), and not after the decode either:
+                        // queueing ENDS when the message is taken, so whatever
+                        // the decode below costs is not time spent waiting.
+                        //
+                        // `elapsed` rather than `Instant::now() >= deadline`
+                        // because the clock is `n0_future::time::Instant` —
+                        // tokio's natively, `web_time`'s in a browser, and
+                        // `std::time::Instant` on neither, since that one
+                        // panics on `wasm32-unknown-unknown`. Generated code
+                        // cannot name it: nothing in `$crate` re-exports a
+                        // clock. Calling `elapsed` on the deadline follows
+                        // whichever clock stamped it, which is one fewer place
+                        // that can drift from `middleware.rs`. It saturates to
+                        // zero on both, so this reads "now is strictly past the
+                        // deadline" and differs from the local path only for a
+                        // zero-length budget, in the direction of running the
+                        // message rather than refusing it.
+                        let __expired = cx
+                            .queueing()
+                            .filter(|__budget| !__budget.deadline().elapsed().is_zero());
                         // The ONLY route from the payload's bytes to a typed
                         // message, and it compares the hashes first.
                         let __answer = match payload.open::<Request>(schema()) {
-                            ::std::result::Result::Ok(__request) => {
+                            ::std::result::Result::Ok(__request) if __expired.is_none() => {
                                 // The hashes agreed and the bytes decoded, so
                                 // what follows is user code. Marking above the
                                 // match instead would report a schema mismatch
@@ -559,6 +589,42 @@ macro_rules! service {
                                     ),
                                 }
                             }
+                            // Still queued when the budget ran out, so nothing
+                            // ran. Refused with the value the local path
+                            // produces for the same message — `TimedOut`
+                            // carrying `Queueing::millis`, and an empty body —
+                            // because a peer must not be able to tell the two
+                            // dispatch paths apart by the refusal it reads.
+                            //
+                            // The progress marker is deliberately NOT touched.
+                            // `Drop for Guard` then sees `NotDispatched` and
+                            // RELEASES the key, which is what makes a retry of
+                            // a call that never happened a first attempt.
+                            // Marking `dispatched()` here would settle the key
+                            // `Interrupted` and permanently refuse every retry
+                            // of work nobody did — the failure §16.6 names one
+                            // arm along, and the one property that makes this
+                            // the only bound composing with an idempotency key.
+                            //
+                            // BELOW the decode, not above it: a payload whose
+                            // bytes are not a message of this contract is
+                            // broken permanently, and `TimedOut` invites a
+                            // retry that can never succeed. The local path
+                            // decides it the same way round, because there the
+                            // accept loop decodes before any layer runs and so
+                            // refuses a bad payload before a deadline exists at
+                            // all. Either refusal leaves the key claimable, so
+                            // the order costs the caller nothing but a truer
+                            // answer.
+                            //
+                            // The `0` is unreachable: this arm is only taken
+                            // when `__expired` is `Some`.
+                            ::std::result::Result::Ok(_) => (
+                                $crate::Outcome::Err($crate::RemoteError::TimedOut {
+                                    millis: __expired.map_or(0, $crate::Queueing::millis),
+                                }),
+                                $crate::Body::empty(),
+                            ),
                             ::std::result::Result::Err(__refusal) => (
                                 $crate::Outcome::Err(__refusal),
                                 $crate::Body::empty(),

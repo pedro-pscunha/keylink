@@ -2489,3 +2489,185 @@ and the `Vec` flavor `ActorReply::encode` uses has none. The test writes one by
 hand. Without it the arm that decides what a turn owes when it ran and produced
 nothing sendable is unreachable, and an unreachable arm is a decision nobody has
 checked.
+
+## 16.7 The keyed `System` path never read the deadline it was handed
+
+§16.2 argues why `QueueTimeout` is the only bound that can shed an actor's load:
+a layer runs outside the mailbox and cannot tell a queued message from a running
+one, so the budget travels on the `Context` and the **serving side** decides.
+The layer's whole contribution is one line — `cx.queueing = Some(Queueing { .. })`
+— and it is worth nothing unless somebody reads it.
+
+Exactly one place did. `Handle::service`'s generated dispatch takes the deadline
+off the context and hands it to `ask_catching_before`, an expired message comes
+back `Queued::Expired`, and it is refused with `RemoteError::TimedOut` without
+the turn running. `spawn`'s mailbox loop — the keyed `System` path — destructured
+`Mail { cx, payload, body, reply }` and ran the turn, having consulted
+`cx.queueing()` nowhere.
+
+So the deadline was stamped and read by nobody. Not refused late, not refused
+approximately: **not refused**. No error at build time, no warning at run time,
+and no budget small enough to produce one. A configured guard that does not
+guard, on a path where the identical layer works one module over — and, worse
+than a guard that is merely absent, one whose presence in the builder is the
+operator's evidence that the load is bounded.
+
+### How reachable this is, stated honestly
+
+More reachable than §16.6's defect, and by a wide margin.
+
+`System::service` gives back an ordinary `ServiceBuilder<ActorRequest, ActorReply>`,
+`ServiceBuilder::layer` accepts any `Middleware<Req, Resp>`, and `QueueTimeout`
+implements that generically. So
+
+```rust
+system.service(allow).layer(QueueTimeout::after(Duration::from_millis(50)))
+```
+
+compiles today, out of the shipped API, with no hand-rolled envelope and no
+`with_idempotency` — the two things §16.6 needed before it could be provoked.
+Anyone who reads `QueueTimeout`'s own documentation reaches it: that page says
+the layer refuses a message still queued when its budget expires, and says
+nothing about a keyed actor being the exception. This is not a latent defect. It
+is the documented behaviour of a public combination, absent.
+
+### Where the check goes, and where it does not
+
+In the loop, on the actor's own task, the instant the message comes off the
+mailbox — which is the same place the local path checks, for the same reason
+§16.2 gives. Not in the layer, which cannot see the queue. Not before the send,
+where "queued" has not happened yet. There is no third place, because once the
+turn starts, stopping it means dropping `&mut A` mid-mutation.
+
+`System::deliver` gets no check of its own, on the argument §16.6 already makes
+for its five failure paths: only the code that knows when the *work* begins may
+speak about the work, and `deliver` never does. One asymmetry with the local path
+survives and is recorded rather than papered over — see the last section.
+
+### The decode goes first, and the reason is the caller's next move
+
+A message can be both expired and undecodable. The loop answers with the decode
+refusal.
+
+Bytes that are not a message of this contract are broken **permanently**;
+`TimedOut` is transient and its entire meaning to a caller is "try again". Report
+the timeout and a peer with a bad payload retries forever and never learns why.
+Report the decode failure and it learns on the first attempt. The local path
+decides it the same way round without having to think about it, because there the
+accept loop decodes before any layer runs, so a bad payload is refused before a
+deadline exists at all; putting the expiry check below `Sealed::open` is what
+makes the keyed path agree with it.
+
+Nothing is lost by the ordering. Both refusals leave the marker untouched and the
+key claimable, and the decode is not the unit `QueueTimeout` sheds — the **turn**
+is, the thing that holds `&mut A` for an unbounded time. A postcard parse of a
+buffer already in memory is not what a load-shedding budget exists to prevent.
+
+The clock is read before the decode all the same, and that is deliberate: a
+message stops being queued when it is taken, so whatever the decode costs is not
+time spent waiting. The order of the two *checks* and the order of the two
+*refusals* are separate decisions, and they go opposite ways on purpose.
+
+### The progress marker is not touched, and that is the whole interaction
+
+A message refused while still queued **has not run**. `Drop for Guard` reads
+`NotDispatched` and releases the key, so the caller's retry is a first attempt.
+
+Marking `dispatched()` on the expiry arm would settle that key `Interrupted` and
+permanently refuse every retry of a call that never happened — which is §16.6's
+failure one arm along, and worse than it: §16.6 gave a key back that it owed, and
+this would keep a key it did not. It is also precisely the property that makes
+`QueueTimeout` the only bound that composes with an `IdempotencyKey` at all
+(RFC-05). A `Timeout` cannot promise it, because a `Timeout` cannot tell.
+
+Nothing already in the tree guarded that. Marking `dispatched()` on the new arm
+was run against the whole suite: **one** test failed, and it is one of the three
+this section adds. An unguarded interaction between two correct-looking pieces is
+how the last three of these arrived.
+
+### The clock generated code cannot name
+
+`Queueing::deadline` is an `n0_future::time::Instant` — tokio's natively,
+`web_time`'s in a browser, and `std::time::Instant` on neither, because that one
+panics on `wasm32-unknown-unknown`. The generated loop cannot write
+`Instant::now()`: nothing in `keylink`'s public surface re-exports a clock, and
+`service!` expands in the caller's crate, which has no reason to depend on
+`n0_future`.
+
+So the loop asks the deadline instead: `deadline.elapsed()` follows whichever
+clock stamped it, which is one fewer place that can drift from `middleware.rs`'s
+choice. Both implementations saturate to zero for an instant in the future, so
+`!elapsed().is_zero()` reads "now is strictly past the deadline". That differs
+from the local path's `now >= deadline` at one point only — a budget of exactly
+zero — and it differs in the direction of running the message rather than
+refusing it, which is the direction a disagreement should fail in. Recovering the
+last tick needs a `Queueing::expired()` beside the other two accessors in
+`middleware.rs`; that file was outside this change's scope, and the tidier home
+for the comparison is there rather than in a macro.
+
+### What is proved, and where
+
+Three tests in `keylink/tests/actors.rs`, over a real QUIC connection, none of
+them asserting on elapsed time:
+
+1. a keyed message still queued when its budget expires comes back
+   `RemoteError::TimedOut` carrying that budget, and the actor's counter says it
+   never ran;
+2. the same message leaves its key claimable — the retry runs and the counter
+   moves to one;
+3. a payload that does not decode says so even when its budget had expired.
+
+"Still queued when the deadline passed" is made a fact rather than a race, in
+three parts. The actor is held inside a turn that waits on a semaphore the test
+owns, so the mailbox is the only place anything else can be and it stays there
+until the test says otherwise. A second layer, mounted *inside* the
+`QueueTimeout`, reports that a call has passed it — so the wait for the deadline
+starts after the stamp has provably happened, and a wait of one whole budget from
+there ends after `stamped_at + budget` however slow the machine was. The permit
+is added last. Nothing asserts that time elapsed; the clock only decides when the
+actor is let go, and the assertion is on the variant the peer receives.
+
+The refusal was compared against the local path's on the wire rather than by
+reading: both encode to `[1, 200, 1]` for a 200 ms budget. A peer cannot tell the
+two paths apart by what it is told, which is the property that lets an operator
+move an actor between them.
+
+### The third thing, and there are more
+
+Three things the local dispatch threads through and this loop does not, now:
+
+1. **Observers.** Decided, not missed: RFC-06 §5.3 puts the keyed path out of
+   scope, and `spawn`'s own documentation says so in a paragraph written for the
+   user who would otherwise get no durability and no explanation.
+2. **The progress marker** (§16.6). Missed.
+3. **The queueing deadline** (this section). Missed.
+
+One divergence argued for, two dropped on the floor. Both of the dropped ones
+were invisible for the same structural reason: `spawn` is a **second
+implementation** of dispatch rather than a caller of the first, so every value the
+local path threads through is a value this one has to be told about separately,
+and nothing fails when it is not.
+
+Two more are already visible, and neither is fixed here:
+
+- **The wait for a mailbox permit is unbounded on this path.** The local path
+  bounds it with the same deadline, so a message that cannot even get a slot is
+  refused at its budget; `System::deliver` awaits `mail.send` with no bound at
+  all. The consequence is milder than it sounds — capacity is one and turns are
+  serial, so a waiting message is admitted as soon as the current turn ends and
+  is then refused by the loop — but the caller waits for the permit instead of
+  being answered at its deadline. The fix is in `actor/remote.rs`, not in the
+  macro.
+- **A panicking turn is reported differently.** The local path answers
+  `Failed("panicked: …")`, and its own comment argues that both halves of
+  `Failed` must carry a prefix or the guard cannot fail. The keyed loop answers
+  `Failed(<bare panic text>)`, and a decode refusal on the same path is also an
+  unprefixed `Failed` — so the two are distinguishable only by what the panic
+  happened to say. Nothing here has one refusal masquerading as another yet, but
+  the argument that produced the prefix applies to this loop as written.
+
+The pattern says the useful thing: the count will keep going up while the two
+loops are written twice. What ends it is not another audit but a shared turn body
+the two dispatchers call — the same conclusion RFC-06 §5.3 reaches from the
+observer side, where the keyed path's answer to "what about observers?" is still
+a paragraph in a doc comment.
