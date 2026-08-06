@@ -141,13 +141,16 @@ pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
 pub use blobs::{BlobHandle, BlobId, Blobs, BlobsAdmission, Granting, Retention, MAX_GRANTS};
 pub use body::{Body, BodyReader};
 pub use error::{ConfigError, Error, Result, Transport};
-pub use idempotency::{IdempotencyRefusal, MAX_RECORDED_BYTES, MAX_RECORDS};
+pub use idempotency::{
+    Idempotency, IdempotencyRefusal, KeyState, MAX_ATTACH, MAX_RECORDED_BYTES, MAX_RECORDS,
+    MAX_RUNNING, MAX_RUNNING_PER_PEER, MAX_TOMBSTONES, RECORD_TTL,
+};
 pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use local::{LocalActor, MailboxClosed};
 pub use middleware::{Context, Middleware, Next, Rpc, Timeout};
 pub use node::{derive_alpn, schema_hash, Node};
 pub use peer::{Dial, Peer};
-pub use reply::{Outcome, RemoteError, WireResponse};
+pub use reply::{Outcome, RemoteError, WireRequest, WireResponse};
 pub use rpc::{Dispatch, RpcClient, Server, ServerBuilder, Service, ServiceBuilder};
 pub use watch::{Departure, Watch};
 pub use wire::{Envelope, WireKinds, MAX_HEADER};

@@ -7,12 +7,24 @@
 //! is the handler's value, or a [`RemoteError`] the caller sees as
 //! [`crate::Error::Remote`].
 //!
-//! [`WireResponse`] names what the response direction actually carries, and the
-//! hashed contract names the same alias. That is what makes adding a
-//! [`RemoteError`] variant move the ALPN, so a drifted peer is refused at the
-//! handshake rather than misreading one refusal as another.
+//! [`WireRequest`] and [`WireResponse`] name what the two directions actually
+//! carry, and the hashed contract names the same two types. That is what makes
+//! adding a [`RemoteError`] variant move the ALPN, so a drifted peer is refused
+//! at the handshake rather than misreading one refusal as another.
+//!
+//! # Not everything on the wire is a call
+//!
+//! A caller can also ask what the serving side's ledger knows about one of its
+//! idempotency keys. That question has no handler, no body and no layer to run
+//! through — it is a read of keylink's own bookkeeping — so it is a second arm
+//! of the request type rather than a method on the user's service. Keeping it
+//! here means a service's `Request` enum stays exactly the methods its author
+//! wrote, and the query is peer-scoped by construction: it is answered from the
+//! ledger of the connection it arrived on.
 
 use serde::{Deserialize, Serialize};
+
+use crate::{IdempotencyKey, KeyState};
 
 /// Why the serving side refused a call.
 ///
@@ -81,6 +93,22 @@ pub enum Outcome<T> {
     Err(RemoteError),
 }
 
+/// The exact type the request direction carries on the wire.
+///
+/// One name, used by both the wire and the hashed contract, so the two cannot
+/// drift. See [`WireResponse`] for what that drift cost last time.
+#[derive(Debug, Clone, Serialize, Deserialize, postcard_schema::Schema)]
+pub enum WireRequest<Req> {
+    /// An ordinary call: the service's own request, headed for its handler
+    /// through whatever layers are installed.
+    Call(Req),
+    /// A question about this peer's idempotency ledger. Answered without
+    /// entering the handler and without running a layer, because there is
+    /// nothing to authorize past the connection's own admission: a peer can
+    /// only ever ask about its own keys.
+    KeyState(IdempotencyKey),
+}
+
 /// The exact type the response direction carries on the wire.
 ///
 /// Named once, and named by BOTH the wire and the hashed contract, because they
@@ -89,9 +117,25 @@ pub enum Outcome<T> {
 /// move the ALPN. Inserting a variant then decoded one refusal as another —
 /// `Failed("disk full")` arriving as a different variant carrying that string.
 ///
-/// Change what the wire carries by changing this alias, and the contract
+/// Change what the wire carries by changing this type, and the contract
 /// follows. Do not spell `Outcome<T>` at either site.
-pub type WireResponse<Resp> = Outcome<Resp>;
+#[derive(Debug, Clone, Serialize, Deserialize, postcard_schema::Schema)]
+pub enum WireResponse<Resp> {
+    /// The answer to a [`WireRequest::Call`].
+    Call(Outcome<Resp>),
+    /// The answer to a [`WireRequest::KeyState`].
+    KeyState(KeyState),
+}
+
+impl<Resp> WireResponse<Resp> {
+    /// Which arm this is, for an error that has to name what came back.
+    pub(crate) fn arm(&self) -> &'static str {
+        match self {
+            Self::Call(_) => "a call reply",
+            Self::KeyState(_) => "a key-state reply",
+        }
+    }
+}
 
 impl<T> Outcome<T> {
     /// Whether this refuses the call. Lets logging and metrics layers report an

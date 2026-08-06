@@ -137,20 +137,22 @@ async fn a_disconnected_peer_dials_again_on_the_next_call() {
     let _running = serve(&server, state.clone()).await;
 
     let peer: Peer<meter::Client> = Peer::new(&caller, server.endpoint().addr());
-    let first = peer
-        .call(|c| async move { Ok(Arc::as_ptr(&c) as usize) })
-        .await
-        .expect("connects");
+    // The client is HELD, not turned into an address. Comparing
+    // `Arc::as_ptr(..) as usize` across a drop compares allocator addresses,
+    // and the allocator reuses one it just freed — so that spelling failed
+    // roughly one run in three, correctly reporting a different client as the
+    // same one. Keeping the first alive makes reuse impossible by construction.
+    let first = peer.call(|c| async move { Ok(c) }).await.expect("connects");
 
     peer.disconnect();
 
     let second = peer
-        .call(|c| async move { Ok(Arc::as_ptr(&c) as usize) })
+        .call(|c| async move { Ok(c) })
         .await
         .expect("dials again");
 
-    assert_ne!(
-        first, second,
+    assert!(
+        !Arc::ptr_eq(&first, &second),
         "a forgotten connection is replaced, not reused"
     );
 }

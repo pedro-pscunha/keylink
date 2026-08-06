@@ -77,7 +77,23 @@ bouncing every peer at runtime.
 whether it ran. `client.with_idempotency(key)` removes the choice between a
 double booking and no booking: the serving side records the reply under
 `(peer, key)` and answers a repeat from that record, byte for byte, without
-entering the handler again. The record is in memory and dies with the process.
+entering the handler again.
+
+The word that does the work is *ran*. A layer that refuses a call before it
+reaches the handler leaves the key claimable, because nothing happened; one that
+refuses after leaves `Interrupted`, because what happened is genuinely unknown.
+A record that expires or is evicted leaves a tombstone, so a forgotten key is
+refused rather than silently run a second time.
+
+```rust
+// wait for the call already running under this key instead of being refused
+client.with_idempotency(Idempotency::attaching_for(key, Duration::from_secs(5)))
+      .reserve("ADU-014".into(), 2).await?;
+
+client.key_state(key).await?   // Fresh is the one answer a retry cannot give you
+```
+
+The record is in memory and dies with the process. See RFC-05.
 
 **Departure.** Every other failure here arrives as the answer to a question you
 asked. A dead peer does not — you find out on your next call, however long
@@ -201,6 +217,12 @@ decisions, including the reversed ones.
 
 Early. The API will move. Not published to crates.io.
 
+Greenfield: nothing here has ever run in production, so an ALPN move costs
+nothing and no compatibility shim is owed. Changes are taken in their correct
+form rather than their compatible one — every call site moves and the old path is
+deleted. That stops being true the day somebody deploys this, which is the
+argument for fixing the sharp things now.
+
 Known gaps, in rough priority order:
 
 - **Never run in a browser.** The crate compiles and links for
@@ -208,8 +230,10 @@ Known gaps, in rough priority order:
   tab. Threaded wasm is refused outright: the local mailbox holds a thread-affine
   task handle behind a `Send + Sync` type.
 - **An actor turn cannot be bounded from outside.** `Timeout` drops the wait for
-  the reply, not the turn, so it sheds no load — and it settles an idempotency
-  key for a message that then runs anyway. Bound the work inside the method.
+  the reply, not the turn, so it sheds no load. It no longer settles an
+  idempotency key as its own refusal — a turn that ran leaves `Interrupted`,
+  which is the truth — but the retry does not receive the turn's real reply
+  either. Bound the work inside the method. RFC-05 §7.
 - Protocols cannot be added or removed after `spawn`. iroh-examples'
   `custom-router` shows a runtime-mutable alternative worth adopting.
 - Idempotency records are in memory. They die with the process, so a retry

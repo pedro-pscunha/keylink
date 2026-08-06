@@ -87,12 +87,13 @@ pub struct Envelope<T> {
     /// How many body bytes follow the header, when the sender knows. `None` is
     /// an open-ended stream that ends when the sender finishes it.
     pub(crate) body_len: Option<u64>,
-    /// Caller-supplied key so that a retried call runs at most once.
+    /// Caller-supplied key so that a retried call runs at most once, and what
+    /// to do when it collides with a call already in flight.
     ///
     /// Lives here rather than in an actor request because retry safety is not
     /// an actor concern: an ordinary `rpc` that reserves stock needs it just as
     /// much as an actor message does.
-    pub(crate) idempotency: Option<crate::IdempotencyKey>,
+    pub(crate) idempotency: Option<crate::Idempotency>,
     /// The caller's request or response.
     pub(crate) message: T,
 }
@@ -105,7 +106,7 @@ pub struct Envelope<T> {
 pub(crate) async fn write_header<T: Serialize>(
     stream: &mut SendStream,
     body_len: Option<u64>,
-    idempotency: Option<&crate::IdempotencyKey>,
+    idempotency: Option<&crate::Idempotency>,
     message: &T,
 ) -> Result<()> {
     write_frame(stream, encode_header(body_len, idempotency, message)?).await
@@ -125,7 +126,7 @@ pub(crate) async fn write_frame(stream: &mut SendStream, frame: Bytes) -> Result
 /// Build one header frame, length prefix included.
 pub(crate) fn encode_header<T: Serialize>(
     body_len: Option<u64>,
-    idempotency: Option<&crate::IdempotencyKey>,
+    idempotency: Option<&crate::Idempotency>,
     message: &T,
 ) -> Result<Bytes> {
     let mut buf = BytesMut::with_capacity(256);

@@ -108,12 +108,12 @@ macro_rules! service {
             /// Hashed to produce the ALPN, so the gate covers BOTH directions
             /// *and* keylink's own framing.
             ///
-            /// The response field MUST name `WireResponse`, the same alias the
-            /// wire names. Spelling the bare `Response` here is what let the
-            /// contract and the wire drift apart once already.
+            /// Both fields MUST name the `Wire*` types, the same ones the wire
+            /// names. Spelling the bare `Request` or `Response` here is what let
+            /// the contract and the wire drift apart once already.
             #[derive(::postcard_schema::Schema)]
             struct Contract {
-                request: $crate::Envelope<Request>,
+                request: $crate::Envelope<$crate::WireRequest<Request>>,
                 response: $crate::Envelope<$crate::WireResponse<Response>>,
                 /// keylink's own wire surface, so a peer built against a
                 /// keylink that cannot accept a `tell` is refused instead of
@@ -196,11 +196,20 @@ macro_rules! service {
             ) -> $crate::ServiceBuilder<Request, Response> {
                 let handler = ::std::sync::Arc::new(handler);
                 let dispatch: $crate::Dispatch<Request, Response> =
-                    ::std::sync::Arc::new(move |_cx: $crate::Context,
+                    ::std::sync::Arc::new(move |cx: $crate::Context,
                                                 req: Request,
                                                 body: $crate::BodyReader| {
                         let handler = handler.clone();
+                        // Marked HERE rather than around `base` in
+                        // `ServiceBuilder::build`, because only this code knows
+                        // when the work itself begins. What the idempotency
+                        // ledger does with a claimed key depends entirely on
+                        // these two calls: neither means a layer refused
+                        // without dispatching, one means the handler was
+                        // entered and never answered, both mean it answered.
+                        let __progress = cx.progress();
                         ::std::boxed::Box::pin(async move {
+                            __progress.dispatched();
                             let (__response, __body) = match req {
                                 $(
                                     Request::$rpc { $( $arg ),* } =>
@@ -209,6 +218,7 @@ macro_rules! service {
                                         ).await,
                                 )+
                             };
+                            __progress.completed();
                             ($crate::Outcome::Ok(__response), __body)
                         })
                     });
@@ -667,17 +677,29 @@ macro_rules! service {
                                                     req: Request,
                                                     body: $crate::BodyReader| {
                             let actor = actor.clone();
+                            // Moved INTO the turn, which runs on the actor's own
+                            // task. That is what makes "dispatched" mean the
+                            // turn started rather than the message was queued:
+                            // a layer that refuses while the message is still
+                            // waiting leaves the key claimable, and a `Timeout`
+                            // that drops the wait for a turn already running
+                            // leaves it `Interrupted` — which is the truth,
+                            // because the turn runs on regardless.
+                            let __progress = cx.progress();
                             ::std::boxed::Box::pin(async move {
                                 let __answer = actor
                                     .ask_catching(move |__state: &mut A| {
                                         ::std::boxed::Box::pin(async move {
-                                            __actor_turn(
+                                            __progress.dispatched();
+                                            let __turned = __actor_turn(
                                                 __state,
                                                 ::core::option::Option::Some(&cx),
                                                 req,
                                                 body,
                                             )
-                                            .await
+                                            .await;
+                                            __progress.completed();
+                                            __turned
                                         })
                                     })
                                     .await;
@@ -921,14 +943,35 @@ macro_rules! service {
                 /// made through the handle it returns.
                 ///
                 /// The key is a transport concern rather than a domain one, so
-                /// it goes here instead of into every method signature. See
+                /// it goes here instead of into every method signature. Takes a
+                /// bare [`IdempotencyKey`](keylink::IdempotencyKey), which
+                /// refuses on collision, or an
+                /// [`Idempotency`](keylink::Idempotency), which can wait for the
+                /// call already running under the key. See
                 /// [`RpcClient::with_idempotency`](keylink::RpcClient::with_idempotency)
                 /// for why the handle is meant for one call.
                 #[must_use]
-                pub fn with_idempotency(&self, key: $crate::IdempotencyKey) -> Self {
+                pub fn with_idempotency(
+                    &self,
+                    idempotency: impl ::core::convert::Into<$crate::Idempotency>,
+                ) -> Self {
                     Self {
-                        inner: self.inner.with_idempotency(key),
+                        inner: self.inner.with_idempotency(idempotency),
                     }
+                }
+
+                /// Ask what this peer's ledger knows about one of your keys.
+                ///
+                /// See
+                /// [`RpcClient::key_state`](keylink::RpcClient::key_state). Runs
+                /// no handler, so it never appears in the [`Handler`] or
+                /// [`Actor`] traits — it is a question about keylink's own
+                /// bookkeeping rather than about your service.
+                pub async fn key_state(
+                    &self,
+                    key: $crate::IdempotencyKey,
+                ) -> $crate::Result<$crate::KeyState> {
+                    self.inner.key_state(key).await
                 }
 
                 /// Await this peer's departure instead of meeting it on the
@@ -1002,11 +1045,25 @@ macro_rules! service {
                     /// See the async twin,
                     /// [`Client::with_idempotency`](super::Client::with_idempotency).
                     #[must_use]
-                    pub fn with_idempotency(&self, key: $crate::IdempotencyKey) -> Self {
+                    pub fn with_idempotency(
+                        &self,
+                        idempotency: impl ::core::convert::Into<$crate::Idempotency>,
+                    ) -> Self {
                         Self {
-                            inner: self.inner.with_idempotency(key),
+                            inner: self.inner.with_idempotency(idempotency),
                             runtime: ::std::sync::Arc::clone(&self.runtime),
                         }
+                    }
+
+                    /// Ask what this peer's ledger knows about one of your keys.
+                    ///
+                    /// See the async twin,
+                    /// [`Client::key_state`](super::Client::key_state).
+                    pub fn key_state(
+                        &self,
+                        key: $crate::IdempotencyKey,
+                    ) -> $crate::Result<$crate::KeyState> {
+                        self.runtime.run(self.inner.key_state(key))?
                     }
 
                     $(
