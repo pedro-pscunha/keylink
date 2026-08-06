@@ -33,9 +33,17 @@ postcard-rpc = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 pastey = { workspace = true }
-# Only the io adapters, which are pure future combinators and compile
-# everywhere. Everything with a syscall behind it is in the target block below.
-tokio = { version = "1", default-features = false, features = ["io-util"] }
+# `sync` is DECLARED, not inherited. It was arriving by feature unification from
+# iroh, and `time` arrived from netwatch alone — one supplier for a feature
+# `actor.rs` cannot compile without. A build that is green because somebody
+# else's dependency happened to turn a feature on is green by accident, and it
+# breaks on an unrelated upgrade. `sync` compiles for the browser; `rt` and
+# `time` are no longer needed here at all, because the runtime and clock items
+# moved to n0_future.
+#
+# Only the io adapters and channels. Everything with a syscall behind it is in
+# the target block below.
+tokio = { version = "1", default-features = false, features = ["io-util", "sync"] }
 
 # Scoped by target rather than by cargo feature, on purpose. A feature that
 # enabled `tokio/fs` would fail inside mio, several crates away from the

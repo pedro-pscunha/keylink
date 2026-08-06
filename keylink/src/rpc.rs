@@ -26,6 +26,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll, Waker};
 
 use bytes::Bytes;
 use iroh::{
@@ -33,8 +34,8 @@ use iroh::{
     protocol::{AcceptError, DynProtocolHandler, ProtocolHandler, Router},
     EndpointAddr, EndpointId,
 };
+use n0_future::task::JoinSet;
 use serde::{de::DeserializeOwned, Serialize};
-use tokio::task::JoinSet;
 
 use crate::error::ConfigError;
 use crate::idempotency::{Claim, Ledger};
@@ -121,6 +122,27 @@ async fn refuse<Resp: Serialize>(send: &mut SendStream, refusal: RemoteError) ->
     wire::write_header(send, Some(0), None, &Outcome::<Resp>::Err(refusal)).await?;
     send.finish()?;
     Ok(())
+}
+
+/// Drop the handles of calls that have already finished.
+///
+/// Replaces `JoinSet::try_join_next`, which tokio has and `n0_future`'s browser
+/// shim does not. `poll_join_next` exists on both, so this is the portable
+/// spelling of the same non-blocking sweep.
+///
+/// It matters MORE in a browser, not less. The shim keeps a second `Vec` of
+/// handles purely so it can cancel them, and pruning that `Vec` happens only
+/// inside `poll_join_next`. Without this call the accept loop grows it for the
+/// lifetime of the connection.
+///
+/// Do NOT replace this with a `select!` between `accept_bi()` and
+/// `join_next()`. The shim documents that a `join_next` future held across a
+/// `spawn` stays pending even after the new task finishes, so such a loop would
+/// stop reaping on wasm. This helper builds a fresh `Context` each call and
+/// holds no future across a spawn, which is why it is safe.
+fn reap_finished<T: 'static>(calls: &mut JoinSet<T>) {
+    let mut cx = TaskContext::from_waker(Waker::noop());
+    while let Poll::Ready(Some(_)) = calls.poll_join_next(&mut cx) {}
 }
 
 /// Answer one call on its own stream.
@@ -231,7 +253,7 @@ where
         let mut calls = JoinSet::new();
         loop {
             // Reap finished calls so the set tracks in-flight work, not history.
-            while calls.try_join_next().is_some() {}
+            reap_finished(&mut calls);
 
             match connection.accept_bi().await {
                 Ok((send, recv)) => {

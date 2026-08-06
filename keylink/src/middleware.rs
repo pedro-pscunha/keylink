@@ -153,7 +153,7 @@ impl<Req: Send + 'static, Resp: Send + 'static> Middleware<Req, Resp> for Timeou
     ) -> BoxFut<(Outcome<Resp>, Body)> {
         let budget = self.budget;
         Box::pin(async move {
-            match tokio::time::timeout(budget, next(cx, req, body)).await {
+            match n0_future::time::timeout(budget, next(cx, req, body)).await {
                 Ok(reply) => reply,
                 Err(_) => (
                     Outcome::Err(RemoteError::TimedOut {

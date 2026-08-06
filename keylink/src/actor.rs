@@ -34,12 +34,12 @@ use std::sync::{Arc, OnceLock, PoisonError, RwLock, Weak};
 use std::task::Poll;
 use std::time::Duration;
 
+use n0_future::task::JoinHandle;
+use n0_future::time::Instant;
 use postcard_schema::Schema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
-use tokio::time::Instant;
 
 use crate::{
     derive_alpn, schema_hash, ActorId, Allowlist, Body, BodyReader, Context, Dispatch,
@@ -357,7 +357,7 @@ where
     Mounted {
         schema,
         mail,
-        task: tokio::task::spawn(run(inbox)),
+        task: n0_future::task::spawn(run(inbox)),
     }
 }
 
@@ -466,10 +466,20 @@ struct Registry {
     factory: Option<Factory>,
     capacity: usize,
     eviction: Eviction,
-    /// `tokio::time::Instant`, not `std::time::Instant`. The two are the same
-    /// clock in a running program, and only the first one a test can pause —
-    /// which is what makes the eviction policy provable rather than sampled by
-    /// a sleep long enough to usually work.
+    /// `n0_future::time::Instant`, which is neither of the obvious two.
+    ///
+    /// On native it IS `tokio::time::Instant`, so `tokio::time::pause` and
+    /// `advance` still drive it — which is what makes the eviction policy
+    /// provable rather than sampled by a sleep long enough to usually work. The
+    /// three paused-clock tests at the bottom of this file are the only proof
+    /// that this indirection did not quietly break that.
+    ///
+    /// In a browser it is `web_time::Instant`, reading `performance.now()`.
+    /// `std::time::Instant::now()` — which `tokio::time::Instant` resolves to
+    /// off a test runtime — **panics** on `wasm32-unknown-unknown`, where std
+    /// dispatches to an unsupported platform stub. This field is built in
+    /// `SystemBuilder::build`, so before this change every actor system panicked
+    /// in a tab. RFC-03 never caught it because this module postdates the RFC.
     epoch: Instant,
 }
 
@@ -845,9 +855,9 @@ fn spawn_sweeper(registry: &Arc<Registry>, budget: Duration) {
     // Half the budget, so an actor is evicted between one and one and a half
     // budgets after its last message rather than up to two.
     let tick = (budget / 2).max(Duration::from_millis(1));
-    tokio::task::spawn(async move {
+    n0_future::task::spawn(async move {
         loop {
-            tokio::time::sleep(tick).await;
+            n0_future::time::sleep(tick).await;
             let Some(registry) = Weak::upgrade(&registry) else {
                 return;
             };
