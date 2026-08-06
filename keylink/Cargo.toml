@@ -106,6 +106,17 @@ tokio-util = { version = "0.7", optional = true, default-features = false, featu
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+# `test-utils` ships iroh's relay and its pkarr/DNS server as libraries, so
+# `keylink/tests/relay.rs` can run both in-process. Without it every test in this
+# repo binds `presets::Minimal`, and the relay and discovery paths — the ones
+# `Node::bind` actually takes — have no coverage at all.
+#
+# It is a dev-dependency and nothing else, so it reaches tests and never a
+# published build. It is not free: it pulls iroh-relay's server stack, an ACME
+# client and a certificate generator among them. That is the price of testing
+# the relay without a container, and `mise run deny` is what keeps the new
+# crates honest.
+iroh = { workspace = true, features = ["test-utils"] }
 
 [lints]
 workspace = true

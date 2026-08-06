@@ -820,6 +820,19 @@ impl catalog::Handler for Warehouse {
     }
 }
 
+/// The actor twin. `blob` generates an `Actor` method just as it generates a
+/// `Handler` one — which is exactly why the test below exists: the method is
+/// reachable, and the address it returns is worth nothing.
+impl catalog::Actor for Warehouse {
+    async fn ping(&mut self) -> String {
+        "pong".to_owned()
+    }
+
+    async fn datasheet(&mut self, _sku: String) -> (Manual, BlobId) {
+        (Manual { pages: 42 }, self.published)
+    }
+}
+
 impl depot::Handler for Warehouse {
     async fn parcel(&self, _sku: String) -> (Manual, BlobId) {
         (Manual { pages: 1 }, self.published)
@@ -1137,4 +1150,146 @@ async fn a_blob_response_carries_the_reply_and_the_address_together() {
         ours, expected,
         "a blob reply is its value followed by 32 raw hash bytes"
     );
+}
+
+// ═════════════════════════════════════════════ the actor path, ruled out
+//
+// RFC-01 §11.2a from the other direction. Putting the `BlobId` in the
+// per-actor payload is right for the ALPN — it is what stops an address
+// arriving under a mismatched schema — and it also puts the address out of
+// reach of the granting seam, because `ActorReply` is opaque bytes the actor
+// system never decodes.
+//
+// So the `blob` kind works on plain services and NOT on actors. The outcome
+// that would be unacceptable is the third one: appearing to work while never
+// granting, which hands a peer an address nothing will serve. Both halves are
+// pinned below — the supported path does not exist, and the unsupported one
+// fails closed.
+
+/// Returned by the absence probe. Distinct from anything a real method would
+/// return, so an inherent method that shadows it is a type error rather than a
+/// silent pass.
+struct NoSuchMethod;
+
+/// `ActorRef` must have no `datasheet`, because a handle it returned could not
+/// have been granted.
+///
+/// An inherent method outranks a trait method, so while no inherent
+/// `datasheet` exists the call resolves here and the marker checks out. Add one
+/// and this stops compiling — which is the point: the day somebody wires the
+/// actor seam, they must delete this probe deliberately rather than discover
+/// later that it silently started handing out ungranted addresses.
+trait ActorRefHasNoBlobMethod {
+    fn datasheet(&self, _sku: String) -> NoSuchMethod {
+        NoSuchMethod
+    }
+}
+
+impl ActorRefHasNoBlobMethod for catalog::ActorRef<'_> {}
+
+#[allow(dead_code)]
+fn the_actor_handle_has_no_blob_method(actor: &catalog::ActorRef<'_>) {
+    let _: NoSuchMethod = actor.datasheet(String::new());
+}
+
+/// And the unsupported route fails closed rather than quietly.
+///
+/// A `blob` method still exists on the `Actor` trait, so a service CAN be
+/// mounted as an actor and reached through a raw `ActorClient::call`. That
+/// route returns the address with no grant behind it, because the actor
+/// system's reply is opaque and `serve_one` has nothing to read. The fetch is
+/// then refused, which is the safe direction and the one to pin.
+#[tokio::test]
+async fn an_actor_mounted_blob_method_hands_out_an_address_that_is_refused() {
+    use keylink::{ActorClient, Eviction, System};
+
+    let server = local_node().await;
+    let caller = local_node().await;
+    let blobs = Blobs::memory();
+    let granted = blobs
+        .add_bytes(b"reached the ordinary way, and granted".to_vec())
+        .await
+        .expect("stores");
+    let ungranted = blobs
+        .add_bytes(b"handed out by the actor path, granted by nobody".to_vec())
+        .await
+        .expect("stores");
+
+    let system = System::builder(Eviction::Never).build();
+    system
+        .mount(
+            keylink::ActorId::new("warehouse").expect("a valid id"),
+            // The ACTOR returns the address nobody grants.
+            catalog::spawn(Warehouse {
+                published: ungranted,
+                unpublished: ungranted,
+            }),
+        )
+        .expect("mounts");
+
+    // The node ALSO serves the same service the ordinary way, so
+    // `/iroh-bytes/4` really is mounted and a fetch reaches the grant check.
+    // Without this the address is unfetchable for the weaker reason that the
+    // node serves no blobs at all, and the test would pass while proving
+    // nothing about grants.
+    let _running = keylink::Server::builder(&server)
+        .service(system.service(Allowlist::anyone()).build())
+        .service(
+            // The PLAIN route returns a different address, and grants it. That
+            // is what gets the caller admitted at the blobs connection, so the
+            // fetch below reaches the per-hash check instead of stopping at
+            // "this peer holds no grants at all".
+            catalog::service(
+                Warehouse {
+                    published: granted,
+                    unpublished: granted,
+                },
+                Allowlist::anyone(),
+            )
+            .with_blobs(&blobs)
+            .build(),
+        )
+        .spawn()
+        .expect("an actor system beside the same service mounted plainly");
+
+    let client = ActorClient::connect(&caller, server.endpoint().addr())
+        .await
+        .expect("dials the actor system");
+
+    // The raw route: the reply decodes, so the address does arrive.
+    let (response, _body) = client
+        .call::<catalog::Request, catalog::Response>(
+            &keylink::ActorId::new("warehouse").expect("a valid id"),
+            catalog::schema(),
+            &catalog::Request::Datasheet {
+                sku: "ADU-014".to_owned(),
+            },
+            keylink::Body::empty(),
+        )
+        .await
+        .expect("the actor answers");
+    let catalog::Response::Datasheet((_manual, id)) = response else {
+        panic!("expected the datasheet reply");
+    };
+    assert_eq!(id, ungranted, "the address arrives");
+
+    // First earn a grant the ordinary way, so this peer IS admitted at the
+    // blobs connection. Without this the fetch below is refused for the weaker
+    // reason that the peer holds no grants at all, and the test stays green
+    // even with the per-hash check deleted. It did.
+    let plain = catalog::Client::connect(&caller, server.endpoint().addr())
+        .await
+        .expect("dials the plain service");
+    let (_manual, _handle) = plain
+        .datasheet("ADU-014".to_owned())
+        .await
+        .expect("the plain route answers");
+
+    // And the actor's address is worth nothing, because nothing granted it.
+    let mut sink = Vec::new();
+    let error = BlobHandle::new(&caller, server.endpoint().addr(), id)
+        .copy_to(&mut sink)
+        .await
+        .expect_err("an address from the actor path must not be fetchable");
+    assert_refused(&error, "an address the actor path never granted");
 }
