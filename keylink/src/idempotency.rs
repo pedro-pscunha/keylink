@@ -241,9 +241,21 @@ impl Ledger {
         let Some(bucket) = inner.peers.get_mut(&peer) else {
             return;
         };
+        // Exhaustive, with no catch-all, so that a fifth `Slot` variant is a
+        // compile error here rather than a silent zero.
+        //
+        // The failure a catch-all buys: a new variant that holds bytes counts as
+        // 0, `inner.bytes` drifts below the truth, and `evict` stops firing at
+        // the cap it exists to enforce. The ledger grows without bound and every
+        // test stays green, because no test asserts on a variant that does not
+        // exist yet. Verified by adding a fifth variant: E0004, here and in
+        // `replay`.
+        //
+        // `Slot::replay` above is already written this way. This was the one
+        // arm in the file that was not.
         let added = match &slot {
             Slot::Done(frame) => frame.len(),
-            _ => 0,
+            Slot::Running | Slot::Interrupted | Slot::Unrecordable => 0,
         };
         bucket.slots.insert(key.clone(), slot);
         bucket.settled.push_back(key.clone());
