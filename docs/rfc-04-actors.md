@@ -2671,3 +2671,93 @@ loops are written twice. What ends it is not another audit but a shared turn bod
 the two dispatchers call — the same conclusion RFC-06 §5.3 reaches from the
 observer side, where the keyed path's answer to "what about observers?" is still
 a paragraph in a doc comment.
+
+## 16.8 What it would take to make this two crates
+
+§16.7 closed the third defect found in the keyed loop. This section records
+something different: the price of finishing the split that `actor/registry.rs`
+and `actor/remote.rs` started, written down now, while the reasons are still in
+somebody's head.
+
+The structural work is done. No field type, no parameter and no return type in
+`registry.rs` names a transport type, and the registry's tests instantiate
+`System<()>`, `Mounted<()>` and `Mailbox<()>`, so that is checked by the
+compiler rather than argued in a comment. What remains is compatibility, and
+compatibility has a bill.
+
+An earlier draft of this list had three items. It was wrong in three ways: one
+entry was filed against the wrong crate, and two were missing entirely. The
+corrected list is six.
+
+### Blocks `registry.rs` from becoming its own crate
+
+1. **The four `M = Mail` defaults.** `System<M = Mail>`, `SystemBuilder<M = Mail>`,
+   `Mounted<M = Mail>`, `Mailbox<M = Mail>`. A registry crate cannot name `Mail`,
+   so they go, and `keylink::System` stops meaning `System<Mail>`. The transport
+   crate has to supply `pub type System = registry::System<Mail>` and friends to
+   restore the unparameterized names.
+
+   **This is the expensive one, and not for the reason it looks.** Four of the
+   thirteen re-exported paths break, which is survivable. But `macros.rs` writes
+   `$crate::Mounted`, `$crate::Mailbox` and `$crate::mount` unparameterized, so
+   the macro must change — and generated code is expanded in the *caller's*
+   crate, which means every downstream user's generated code changes shape at
+   the same time. Nothing else on this list has that reach.
+
+   The obvious escape does not work: republishing defaulted aliases from a
+   facade module (`pub type System<M = Mail> = registry::System<M>;`) is
+   syntactically fine and is what a crate split would normally do, but a `pub type`
+   alias onto a pub-in-private struct renders in rustdoc as an alias stub with no
+   methods. Four documented structs would quietly become four alias pages — a
+   public API change wearing a refactor's clothes.
+
+2. **`impl SystemBuilder<Mail>`,** which exists for `DEFAULT_CAPACITY` alone. It
+   survives in neither crate: the registry crate cannot name `Mail`, the
+   transport crate cannot write an inherent impl on a foreign type, and an
+   extension trait does not rescue it because `SystemBuilder::DEFAULT_CAPACITY`
+   puts `M` back in expression position, where a default does not apply. The
+   constant moves to `impl<M> SystemBuilder<M>` and callers write
+   `SystemBuilder::<Mail>::DEFAULT_CAPACITY`.
+
+3. **The seam becomes a public API.** It is two `pub(super)` items today —
+   `RouteError`, and one `route` function on `System<M>`. Across a crate
+   boundary a within-module courtesy has to become a genuine public routing
+   interface, with a name, a doc comment and a compatibility promise. It was
+   four items before it was narrowed to two, and narrowing it was worth doing
+   precisely because this decision arrives later: the smaller the surface when
+   somebody has to design it, the less of it gets designed under time pressure.
+
+4. **Three intra-doc links from the registry half to `crate::RemoteError`.** All
+   three are true statements about what a peer is told, and none is a code path.
+   But an intra-doc link across a crate boundary needs a real Cargo dependency,
+   so the registry crate would take a **doc-only dependency** on whatever crate
+   owns `RemoteError` — or the three links become plain prose. Small, and a
+   dependency edge that exists purely for documentation deserves a deliberate
+   decision rather than a default.
+
+### Blocks the transport crate, not the registry
+
+5. **`impl System<Mail>`,** holding `alpn`, `service`, `dispatch` and `deliver`.
+   This was the entry filed against the wrong crate in the earlier draft. It
+   lives in `remote.rs`, so it does not stop the registry lifting out at all; it
+   stops the *transport* crate adding inherent methods to a type it does not
+   define. The replacement is an extension trait, at which point
+   `System::service(allow)` stops being a method call — the one item on this list
+   a reader of the current docs would not predict.
+
+6. **`impl From<RouteError> for RemoteError`.** Fine wherever `RemoteError`
+   lives, because the trait target is local there. It becomes a problem only if
+   `RouteError` and `RemoteError` end up in two crates and neither hosts the
+   impl, which depends on where `reply.rs` lands — a decision nobody has made.
+
+`Factory<M>` is `pub(crate)` and used only inside `registry.rs`; it simply
+becomes private. Listed so the count is honest.
+
+### The one cost already paid
+
+`System<M = Mail>` has an inference edge a default cannot fix: a system built and
+then touched only through the methods that never mention `M` has no type
+position to infer from, and meets `error[E0283]`. It is documented on `System`
+with a `compile_fail` doctest, and the doctest was itself checked to fail for
+`E0283` specifically rather than for any compile error at all — a `compile_fail`
+doctest passes for the wrong reason as easily as the right one.
