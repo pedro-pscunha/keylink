@@ -11,7 +11,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use keylink::{Allowlist, Body, BodyReader, Error, Node, Server as KeylinkServer};
+use keylink::{
+    Allowlist, Body, BodyReader, Context as KeylinkContext, Error, Node, Server as KeylinkServer,
+};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, ReadBuf};
@@ -45,16 +47,16 @@ keylink::service! {
 struct Server;
 
 impl probe::Handler for Server {
-    async fn ping(&self) -> String {
+    async fn ping(&self, _cx: &KeylinkContext) -> String {
         "pong".to_string()
     }
 
-    async fn slow(&self, ms: u64) -> u64 {
+    async fn slow(&self, _cx: &KeylinkContext, ms: u64) -> u64 {
         tokio::time::sleep(Duration::from_millis(ms)).await;
         ms
     }
 
-    async fn download(&self, len: u64) -> (Meta, Body) {
+    async fn download(&self, _cx: &KeylinkContext, len: u64) -> (Meta, Body) {
         let meta = Meta {
             bytes: len,
             checksum: Pattern::checksum(len),
@@ -64,7 +66,7 @@ impl probe::Handler for Server {
 
     /// Declares one length and sends another, which is how a real short read
     /// looks from the receiving end.
-    async fn mislabelled(&self, declare: u64, actually: u64) -> (Meta, Body) {
+    async fn mislabelled(&self, _cx: &KeylinkContext, declare: u64, actually: u64) -> (Meta, Body) {
         let meta = Meta {
             bytes: declare,
             checksum: 0,
@@ -75,7 +77,7 @@ impl probe::Handler for Server {
         )
     }
 
-    async fn upload(&self, _name: String, mut body: BodyReader) -> Received {
+    async fn upload(&self, _cx: &KeylinkContext, _name: String, mut body: BodyReader) -> Received {
         let mut checksum = Fnv1a::new();
         let mut bytes = 0u64;
         loop {
@@ -397,7 +399,7 @@ keylink::service! {
 struct Tele;
 
 impl telemetry::Handler for Tele {
-    async fn echo(&self, text: String) -> String {
+    async fn echo(&self, _cx: &KeylinkContext, text: String) -> String {
         text
     }
 }

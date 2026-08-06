@@ -152,6 +152,12 @@ ending the turn. And an actor must not call itself — the mailbox holds one
 message, so a handler awaiting its own handle waits for a permit or a reply that
 only it can produce.
 
+A `send` method cannot be served this way at all, and `serve` stops compiling for
+a service declaring one. Its handler reads the upload inside the turn, so a peer
+that declares a large body and then stops writing holds the actor until the
+connection idle timeout, answering nothing else meanwhile. Bulk transfer goes on
+a second service, registered beside the actor on the same node.
+
 Many keyed instances behind one ALPN, addressed by an id inside the request, are
 `System` and `spawn`. That path costs more — an opaque payload, so no per-method
 layer, no idempotency ledger and no `blob` methods; see RFC-04 §14.8 — and is
@@ -194,7 +200,10 @@ whose `Currency` variants are swapped — identical shapes, so postcard would
 decode `Brl` as `Usd` silently. The handshake refuses it instead.
 
 The demo's `Warehouse` is served as an actor, so it also stands as the worked
-example of that model against an unmodified client.
+example of that model against an unmodified client. Its upload is a second
+service on a second ALPN, registered beside it on the same node, because a
+`send` method cannot be served as an actor — the split every actor with a bulk
+transfer now has to make.
 
 ## Working on it
 

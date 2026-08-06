@@ -12,7 +12,7 @@
 use std::alloc::{GlobalAlloc, Layout, System as Libc};
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use keylink::{ActorId, Eviction, System};
+use keylink::{ActorId, Caller, Eviction, System};
 
 /// Counts live heap bytes. Relaxed ordering: this is a measurement, and a
 /// missed reordering costs one allocation's worth of accuracy out of millions.
@@ -53,7 +53,7 @@ keylink::service! {
 struct Empty;
 
 impl ledger::Actor for Empty {
-    async fn note(&mut self, entry: u64) -> u64 {
+    async fn note(&mut self, _cx: Caller<'_>, entry: u64) -> u64 {
         entry
     }
 }

@@ -146,8 +146,8 @@ pub use idempotency::{
     MAX_RUNNING, MAX_RUNNING_PER_PEER, MAX_TOMBSTONES, RECORD_TTL,
 };
 pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
-pub use local::{LocalActor, MailboxClosed};
-pub use middleware::{Context, Middleware, Next, Rpc, Timeout};
+pub use local::{LocalActor, MailboxClosed, Queued};
+pub use middleware::{Caller, Context, Middleware, Next, QueueTimeout, Queueing, Rpc, Timeout};
 pub use node::{derive_alpn, schema_hash, Node};
 pub use peer::{Dial, Peer};
 pub use reply::{Outcome, RemoteError, WireRequest, WireResponse};

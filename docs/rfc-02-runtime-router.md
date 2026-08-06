@@ -1678,3 +1678,114 @@ shapes and different meanings**, the same construction as
 `same_shape_variant_swap_decodes_as_the_wrong_variant` in `node.rs:185`. A test
 with differently shaped types would pass even against the broken ordering,
 because the decode would fail on its own.
+
+---
+
+# Append: admission as a port, beside capability A
+
+**Appended, not edited.** Nothing above this line has been altered.
+
+This document's capability A is *stop serving an ALPN at runtime* — changing
+which protocols a node answers without restarting it. That is designed and not
+built. What **is** built is the adjacent question, and it turned out to be the
+one that mattered first: changing **who** a served protocol answers, without
+restarting it.
+
+`Allowlist` is read once at startup, so revoking a key meant a restart, and a
+restart drops every connection including the ones that were fine. That is a
+worse outcome than the problem, and it is the reason operators reach for
+`Allowlist::anyone()` during an incident.
+
+## The port
+
+```rust
+pub enum Admittance { Admitted, Refused, Unavailable(String) }
+
+pub trait Admission: Send + Sync + 'static {
+    fn admits(&self, peer: &ProvenPeer) -> Admittance;
+    fn admitted(&self, peer: &AdmittedPeer, live: Revocation) { /* default: drop it */ }
+}
+
+pub trait Revocable: Admission {
+    #[must_use = "a revocation that closed nothing is usually a mistake"]
+    fn replace(&self, next: Allowlist) -> Vec<EndpointId>;
+}
+```
+
+`Allowlist` is the canonical `Admission`. `DynamicAdmission` is the one adapter
+keylink ships — a snapshot behind a lock — and `Allowlist` is the *value* it
+holds rather than a second adapter: a static allowlist is a `DynamicAdmission`
+nobody replaces. The reason to write a second adapter is an external policy
+system, and that is the only reason.
+
+## Four decisions worth recording
+
+**`Admitted` carries no value.** `AdmittedPeer` is a newtype whose only public
+constructor is `Allowlist::admit`, and that privacy is the invariant. A trait
+returning one could not be implemented outside this crate; making it
+implementable would delete the property. So the arm carries nothing and keylink
+mints the proof at the one call site that has just been told yes. `AdmittedPeer`
+gained a `pub(crate)` mint for that, which keeps `Allowlist::admit` the only
+constructor *reachable from outside*, which is the half that was ever load
+bearing.
+
+**Three answers, not a `bool`.** A `bool` cannot say "the policy could not be
+consulted". A failing backend answers `false`, byte-identical to "not on the
+list", and an operator who cannot tell a dead authorizer from an unlisted peer
+reaches for the fail-open. Both refusing arms refuse; they differ in the close
+code and in the log, which is where the difference has to be visible. This is the
+same criticism `authz.rs:33-40` makes of RFC-01 §5.5's `Option`-keyed admission.
+
+This is **not** the `permits(&EndpointId) -> bool` that `authz.rs:183-188`
+rejects. That rejection is about a bool escaping downstream, where "every
+function downstream took that bare id". Here the answer is consumed one line
+later and everything downstream still demands an `AdmittedPeer` that only a
+policy could have produced.
+
+**Revocation is in the port, not in an adapter.** Every adapter *could* close the
+connections a new policy no longer admits, and one that quietly did not would be
+indistinguishable from one that did. So the capability is a trait a caller asks
+for by name. `keylink-persist` makes the same argument about `Claim`: *"there is
+no way to store bytes without holding one"*, because exclusivity is the port's
+promise rather than an adapter's habit.
+
+**`replace` swaps before it closes.** Closing first leaves a window in which a
+revoked peer reconnects and is admitted by the policy on its way out. That
+ordering is the correctness property, and it is tested from the outside — the
+instant `replace` returns, a fresh dial by the revoked peer is already refused.
+
+**Not an actor.** `admits` runs on the connection-accept path, and routing it
+through a mailbox would add a queue and a `MailboxClosed` failure mode to the
+security path. It is a read behind a lock, which is the shape that has neither.
+
+## Why `Arc<dyn Admission>` and not a generic
+
+Deliberately unlike `keylink-persist`'s `Snapshots`, which is RPITIT because its
+one operation does I/O at one monomorphized call site. `admits` runs once per
+*connection* and does no I/O; a backend that needs I/O keeps its own snapshot and
+feeds it in. A generic parameter would not reach `Server` — a service erases to a
+boxed handler — but it **would** reach the generated `service(handler, allow)`,
+putting a policy type into every `service!` user's type errors for a decision
+made once per connection.
+
+## The registry is wave C's
+
+`DynamicAdmission` holds a `Subscribers<Revocation>`, which is the same type the
+push work introduced for the peers that dialled in. One `HashMap<EndpointId, _>`
+that evicts on `Departure`, two uses: fan out, and close what is no longer
+admitted. Building it twice was the alternative and it was rejected.
+
+## What this does not promise
+
+- **Nothing about a peer already inside a stream.** Revocation closes the
+  connection; a call already dispatched runs to completion.
+- **Nothing across nodes.** `DynamicAdmission` is one process's view.
+- **No history.** There is no audit trail of past decisions; that is a different
+  port with different operations.
+- **One connection per peer.** The registry is keyed by `EndpointId`, so a peer
+  holding several has its most recent remembered and closed. Two live
+  connections from one identity are not two peers.
+
+Capability A remains designed and not built. It is a strictly larger change —
+iroh's `Router` accepts protocols only through its builder, which `spawn`
+consumes — and nothing in this append depends on it.

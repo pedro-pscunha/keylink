@@ -59,7 +59,7 @@ struct Journal {
 }
 
 impl journal::Actor for Journal {
-    async fn apply(&mut self, entry: u64, hold_ms: u64) -> u64 {
+    async fn apply(&mut self, _cx: keylink::Caller<'_>, entry: u64, hold_ms: u64) -> u64 {
         // The await point `abort` cancels at, and the reason `stop` and `abort`
         // leave the state in different shapes.
         tokio::time::sleep(Duration::from_millis(hold_ms)).await;
@@ -67,11 +67,11 @@ impl journal::Actor for Journal {
         entry
     }
 
-    async fn entries(&mut self) -> Vec<u64> {
+    async fn entries(&mut self, _cx: keylink::Caller<'_>) -> Vec<u64> {
         self.applied.lock().expect("not poisoned").clone()
     }
 
-    async fn boom(&mut self) -> u64 {
+    async fn boom(&mut self, _cx: keylink::Caller<'_>) -> u64 {
         panic!("this message is bad");
     }
 }
@@ -783,29 +783,24 @@ keylink::service! {
     rpc WhoCalled() -> Option<String>;
 }
 
-#[derive(Default)]
-struct Doorman {
-    last: Option<String>,
-}
+struct Doorman;
 
 impl doorman::Actor for Doorman {
-    fn caller(&mut self, cx: Option<&keylink::Context>) {
-        self.last = cx.map(|cx| cx.peer().to_string());
-    }
-
-    async fn who_called(&mut self) -> Option<String> {
-        self.last.clone()
+    async fn who_called(&mut self, cx: keylink::Caller<'_>) -> Option<String> {
+        cx.peer().map(|cx| cx.peer().to_string())
     }
 }
 
 /// RFC-04 §12.2 test 10, on the path the RFC put it: a keyed actor sees the
 /// proven key of its caller.
 ///
-/// It had never been written. `Actor::caller` shipped with a default empty body
-/// and nothing in the tree overrode it, so the hook had no implementor and no
-/// test — which is indistinguishable from a hook that does not work.
+/// It had never been written until this file. The identity used to arrive
+/// through an `Actor::caller` hook that shipped with a default empty body,
+/// which nothing in the tree overrode — a hook with no implementor and no test
+/// is indistinguishable from one that does not work. It is an argument now, so
+/// a method that wants the caller cannot fail to be given one.
 ///
-/// Made red by passing `None` to `caller` in the mailbox loop.
+/// Made red by passing `Caller::Local` in the mailbox loop.
 #[tokio::test]
 async fn a_keyed_actor_sees_the_proven_key_of_its_caller() {
     let server = local_node().await;
@@ -820,7 +815,7 @@ async fn a_keyed_actor_sees_the_proven_key_of_its_caller() {
         .expect("the client dials the actor system");
 
     system
-        .mount(id("gate/1"), doorman::spawn(Doorman::default()))
+        .mount(id("gate/1"), doorman::spawn(Doorman))
         .expect("the id is free");
 
     assert_eq!(

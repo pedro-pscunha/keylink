@@ -11,7 +11,7 @@
 use std::error::Error;
 use std::time::Duration;
 
-use keylink::{Allowlist, Node};
+use keylink::{Allowlist, Caller, Node};
 use keylink_persist::file::Files;
 use keylink_persist::{Claim, Durable, RestoreError, Snapshots, StateId};
 
@@ -30,12 +30,12 @@ struct Ledger {
 }
 
 impl ledger::Actor for Ledger {
-    async fn post(&mut self, entry: u64) -> u64 {
+    async fn post(&mut self, _cx: Caller<'_>, entry: u64) -> u64 {
         self.entries.push(entry);
         self.entries.len() as u64
     }
 
-    async fn total(&mut self) -> u64 {
+    async fn total(&mut self, _cx: Caller<'_>) -> u64 {
         self.entries.iter().sum()
     }
 }

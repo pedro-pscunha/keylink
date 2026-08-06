@@ -74,6 +74,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use n0_future::task::JoinHandle;
+use n0_future::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{guarded, Panic};
@@ -133,6 +134,21 @@ enum Message<A> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("the actor is no longer running")]
 pub struct MailboxClosed;
+
+/// What became of a turn that carried a queueing deadline.
+///
+/// Two states rather than a `Result<Option<..>>`, because the difference between
+/// "it ran and panicked" and "it never ran" is the difference between an
+/// idempotency key that is settled and one that is still claimable, and a
+/// caller that has to unwrap two layers to find that out will get it wrong.
+#[derive(Debug)]
+pub enum Queued<T> {
+    /// The turn ran. `Err` is a panic the actor survived.
+    Ran(Result<T, Panic>),
+    /// The budget expired while the message was still waiting. **Nothing ran**,
+    /// so nothing was mutated and nothing is owed.
+    Expired,
+}
 
 /// One value, owned by one task, addressed by `&mut self`.
 ///
@@ -238,6 +254,76 @@ impl<A: Send + 'static> LocalActor<A> {
         // three mean the same thing to a caller, which is why they share an
         // error rather than being told apart.
         answer.await.map_err(|_| MailboxClosed)
+    }
+
+    /// Run one turn, refusing it if it is still queued when `deadline` passes.
+    ///
+    /// What [`QueueTimeout`](crate::QueueTimeout) is built on, and the reason it
+    /// can promise something [`Timeout`](crate::Timeout) cannot: the deadline is
+    /// checked in two places, and the second is **on the actor's own task,
+    /// immediately before the turn begins**. So a refusal here is always a
+    /// refusal of work that never started.
+    ///
+    /// - Waiting for a mailbox permit is bounded. Giving up there means the
+    ///   message was never queued at all.
+    /// - Having been queued, the deadline is re-read by the closure the actor
+    ///   picks up. Past it, the turn is skipped.
+    ///
+    /// There is no third place to check, and there does not need to be: once
+    /// the turn starts, nothing outside can stop it without dropping `&mut A`
+    /// mid-mutation, which is the one thing an actor must never do.
+    ///
+    /// `None` for the deadline is [`ask_catching`](Self::ask_catching).
+    ///
+    /// # Errors
+    ///
+    /// [`MailboxClosed`] when the actor is gone. A panic is inside
+    /// [`Queued::Ran`], not here: the actor survived it.
+    pub async fn ask_catching_before<T, F>(
+        &self,
+        deadline: Option<Instant>,
+        turn: F,
+    ) -> Result<Queued<T>, MailboxClosed>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(&'a mut A) -> Pin<Box<dyn Future<Output = T> + Send + 'a>>
+            + Send
+            + 'static,
+    {
+        let Some(deadline) = deadline else {
+            return self.ask_catching(turn).await.map(Queued::Ran);
+        };
+
+        let (reply, answer) = oneshot::channel();
+        let queued = n0_future::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            self.deliver(Box::new(move |state| {
+                Box::pin(async move {
+                    // On the ACTOR's task. Nothing has touched the state yet,
+                    // so refusing here costs the message and not a half-applied
+                    // mutation.
+                    if Instant::now() >= deadline {
+                        let _ = reply.send(None);
+                        return;
+                    }
+                    let _ = reply.send(Some(guarded(async move { turn(state).await }).await));
+                })
+            })),
+        )
+        .await;
+
+        match queued {
+            // The permit never arrived. Dropping the `send` future is what
+            // makes this honest: tokio does not queue a message whose send was
+            // cancelled, so nothing is in the mailbox to run later.
+            Err(_elapsed) => Ok(Queued::Expired),
+            Ok(Err(closed)) => Err(closed),
+            Ok(Ok(())) => match answer.await {
+                Err(_) => Err(MailboxClosed),
+                Ok(None) => Ok(Queued::Expired),
+                Ok(Some(ran)) => Ok(Queued::Ran(ran)),
+            },
+        }
     }
 
     /// Queue one turn and do not wait for it.

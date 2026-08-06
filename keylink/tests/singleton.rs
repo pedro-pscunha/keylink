@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use keylink::{
-    Allowlist, Body, BodyReader, Context, Middleware, Next, Outcome, RemoteError, Server,
+    Allowlist, Body, BodyReader, Caller, Context, Middleware, Next, Outcome, RemoteError, Server,
 };
 
 mod common;
@@ -31,6 +31,21 @@ keylink::service! {
     rpc  Boom() -> u64;
     tell Note(line: String) -> ();
     recv Export() -> u64;
+}
+
+// Bulk transfer, on its own service, because a `send` method CANNOT be served
+// as an actor — `Handle::service` refuses to compile for a service that declares
+// one. RFC-04 §10.4 has the reason: a `send` handler reads its upload inside the
+// serial turn, so a peer that declares a large body and stops writing holds the
+// actor until the connection idle timeout.
+//
+// `Ledger` used to declare this method, and this file used to prove the cost by
+// measuring it. The cost is not measurable any more, because the shape is not
+// reachable. (A `///` here would be an unused doc comment: rustdoc does not
+// document a macro invocation.)
+keylink::service! {
+    service Depot;
+
     send Ingest(name: String) -> u64;
 }
 
@@ -39,21 +54,13 @@ keylink::service! {
 struct Ledger {
     entries: Vec<u64>,
     notes: BTreeMap<String, ()>,
-    /// Whatever the last `caller` hook was given, as the actor sees it.
-    last_caller: Option<String>,
     /// Set on entry to a turn and cleared on exit. If two turns ever overlap,
     /// the second one sees it set.
     inside: bool,
 }
 
 impl ledger::Actor for Ledger {
-    fn caller(&mut self, cx: Option<&Context>) {
-        // Assigned, never merged. A local message must not inherit the peer of
-        // the last remote one — which is the whole reason this is an `Option`.
-        self.last_caller = cx.map(|cx| cx.peer().to_string());
-    }
-
-    async fn post(&mut self, entry: u64, hold_ms: u64) -> u64 {
+    async fn post(&mut self, _cx: Caller<'_>, entry: u64, hold_ms: u64) -> u64 {
         assert!(!self.inside, "two turns overlapped");
         self.inside = true;
         // `&mut self` is held across an await. Under the concurrent model this
@@ -64,37 +71,44 @@ impl ledger::Actor for Ledger {
         self.entries.len() as u64
     }
 
-    async fn entries(&mut self) -> Vec<u64> {
+    async fn entries(&mut self, _cx: Caller<'_>) -> Vec<u64> {
         self.entries.clone()
     }
 
-    async fn who_called(&mut self) -> Option<String> {
-        self.last_caller.clone()
+    /// The caller is an argument, so there is nothing to stash and nothing to
+    /// go stale. The hook this replaced asked the state to remember the value
+    /// between two calls, and the idiomatic way to write that —
+    /// `if let Some(cx) = cx { self.last = Some(cx.peer()) }` — left the last
+    /// remote peer in place for the next LOCAL message.
+    async fn who_called(&mut self, cx: Caller<'_>) -> Option<String> {
+        cx.peer().map(|cx| cx.peer().to_string())
     }
 
-    async fn boom(&mut self) -> u64 {
+    async fn boom(&mut self, _cx: Caller<'_>) -> u64 {
         panic!("bad message");
     }
 
-    async fn note(&mut self, line: String) {
+    async fn note(&mut self, _cx: Caller<'_>, line: String) {
         self.notes.insert(line, ());
     }
 
-    /// Read **inside** the turn, which is RFC-04 §10.4's asymmetry: an upload
-    /// holds the actor for the whole transfer, and the body cannot be handed
-    /// off without giving up the `&mut self` the actor model exists for.
-    async fn ingest(&mut self, name: String, mut body: BodyReader) -> u64 {
+    async fn export(&mut self, _cx: Caller<'_>) -> (u64, Body) {
+        let payload = format!("{:?}", self.entries);
+        (payload.len() as u64, Body::from_bytes(payload.into_bytes()))
+    }
+}
+
+/// The concurrent half of the split: uploads, behind an `Arc`, where a slow
+/// writer costs its own caller and nobody else.
+struct Depot;
+
+impl depot::Handler for Depot {
+    async fn ingest(&self, _cx: &Context, _name: String, mut body: BodyReader) -> u64 {
         let mut bytes = 0u64;
         while let Ok(Some(chunk)) = body.next_chunk().await {
             bytes += chunk.len() as u64;
         }
-        self.notes.insert(name, ());
         bytes
-    }
-
-    async fn export(&mut self) -> (u64, Body) {
-        let payload = format!("{:?}", self.entries);
-        (payload.len() as u64, Body::from_bytes(payload.into_bytes()))
     }
 }
 
@@ -241,29 +255,29 @@ async fn a_service_cannot_be_served_concurrently_and_as_an_actor_at_once() {
     );
 }
 
-/// The `Handler` twin, needed only to prove the ALPN collision above. Every
-/// method is unreachable, which is the point: it never gets to run.
+/// The `Handler` twin. It exists to prove the ALPN collision above, where every
+/// method is unreachable because it never gets to run — and to prove the other
+/// half of caller identity, where `who_called` is served for real.
 struct ConcurrentLedger;
 
 impl ledger::Handler for ConcurrentLedger {
-    async fn post(&self, _entry: u64, _hold_ms: u64) -> u64 {
+    async fn post(&self, _cx: &Context, _entry: u64, _hold_ms: u64) -> u64 {
         0
     }
-    async fn entries(&self) -> Vec<u64> {
+    async fn entries(&self, _cx: &Context) -> Vec<u64> {
         Vec::new()
     }
-    async fn who_called(&self) -> Option<String> {
-        None
+    /// A `Handler` takes `&Context`, not `Caller`: it is reachable exactly one
+    /// way, so "no peer" is not a state it has.
+    async fn who_called(&self, cx: &Context) -> Option<String> {
+        Some(cx.peer().to_string())
     }
-    async fn boom(&self) -> u64 {
+    async fn boom(&self, _cx: &Context) -> u64 {
         0
     }
-    async fn note(&self, _line: String) {}
-    async fn export(&self) -> (u64, Body) {
+    async fn note(&self, _cx: &Context, _line: String) {}
+    async fn export(&self, _cx: &Context) -> (u64, Body) {
         (0, Body::empty())
-    }
-    async fn ingest(&self, _name: String, _body: BodyReader) -> u64 {
-        0
     }
 }
 
@@ -341,15 +355,18 @@ async fn a_served_actor_sees_the_proven_key_of_its_caller() {
     server.shutdown().await.expect("stops");
 }
 
-/// And the half that the `Option` exists for: a local message must not inherit
-/// the peer of the last remote one.
+/// And the half `Caller::Local` exists for: a local message cannot be
+/// attributed to a peer at all.
 ///
-/// Made red by having the local path skip the `caller` hook instead of passing
-/// `None` — at which point the local call reports the remote peer's key, and an
-/// actor authorizing on it would be authorizing an in-process caller as
-/// whoever last dialled.
+/// This used to be a property of *discipline* — the state was handed
+/// `Option<&Context>` before each message and had to remember to assign rather
+/// than merge, because `if let Some(cx) = cx { .. }` is the idiomatic spelling
+/// and leaves the last remote peer in place. It is a property of the *type*
+/// now: `Caller::Local` carries no peer, so there is nothing to inherit.
+///
+/// Made red by passing `Caller::Peer` on the local path.
 #[tokio::test]
-async fn a_local_message_does_not_inherit_the_last_remote_caller() {
+async fn a_local_call_has_no_caller() {
     let (server, actor, client) = served().await;
 
     assert!(
@@ -492,29 +509,48 @@ async fn a_served_actor_streams_a_body_back() {
     server.shutdown().await.expect("stops");
 }
 
-/// `send` reaches a served actor, and it is the one kind with no local
-/// counterpart: the handler is defined by the `BodyReader` it reads, and there
-/// is no such thing without a stream.
+/// An upload goes to a **second service**, because that is now the only shape
+/// available: `Handle::service` does not compile for a service declaring a
+/// `send` method.
 ///
-/// The upload is read inside the turn — RFC-04 §10.4 — so this also pins the
-/// cost. A caller that must not serialize uploads splits them onto a second
-/// service, which is what `README.md` recommends for bulk transfer anyway.
+/// This test used to serve `send Ingest` on the actor itself and measure the
+/// cost. Measuring a hazard is weaker than removing it — RFC-04 §10.4 explains
+/// why a `send` handler must read its upload inside the turn, and no layer can
+/// bound that, so a peer that declared a large body and stopped writing held
+/// the actor until iroh's idle timeout with nothing else answered, including
+/// the local handle.
+///
+/// The split is what `README.md` already recommended for bulk transfer. It is
+/// mandatory now, and this is what it looks like: two services, two ALPNs, one
+/// node. The compile-time refusal itself is proven by a `compile_fail` doctest
+/// on `Handle::service`.
 #[tokio::test]
-async fn a_served_actor_reads_an_upload_inside_its_turn() {
+async fn an_upload_goes_to_a_second_service_beside_the_actor() {
     const SIZE: usize = 64 * 1024;
 
-    let (server, actor, client) = served().await;
-    let stored = client
+    let node = local_node().await;
+    let caller = local_node().await;
+    let actor = ledger::actor(Ledger::default());
+    let server = Server::builder(&node)
+        .service(actor.service(Allowlist::anyone()).build())
+        .service(depot::service(Depot, Allowlist::anyone()).build())
+        .spawn()
+        .expect("two services, two ALPNs, one node");
+
+    let uploads = depot::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+    let stored = uploads
         .ingest("sheet.bin".to_owned(), Body::from_bytes(vec![7u8; SIZE]))
         .await
         .expect("answers");
     assert_eq!(stored as usize, SIZE);
 
-    // The actor is free again straight after, so the mailbox was released with
-    // the turn rather than held by the transfer.
+    // And the actor was never involved, which is the point of the split: an
+    // upload cannot hold a mailbox it does not touch.
     assert_eq!(actor.post(1, 0).await.expect("running"), 1);
 
-    client.close().await.expect("closes");
+    uploads.close().await.expect("closes");
     server.shutdown().await.expect("stops");
 }
 
@@ -543,5 +579,139 @@ async fn local_and_remote_messages_share_one_mailbox() {
     assert_eq!(local, 2, "and the local call waited for it");
 
     client.close().await.expect("closes");
+    server.shutdown().await.expect("stops");
+}
+
+// ────────────────────────────────────────── the handler half of the identity
+
+/// A `Handler` reads the calling peer, which it could not do at all before: the
+/// proven identity reached the edge of the generated dispatch and was thrown
+/// away there, so a concurrent service that wanted to audit or authorize per
+/// caller had to take a peer id in the request body — a claim rather than a
+/// proof.
+#[tokio::test]
+async fn a_handler_sees_the_calling_peer() {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let server = ledger::serve(&node, ConcurrentLedger, Allowlist::anyone()).expect("serves");
+    let client = ledger::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+
+    assert_eq!(
+        client.who_called().await.expect("answers"),
+        Some(caller.id().to_string()),
+        "the handler must see the dialing peer's proven key"
+    );
+
+    client.close().await.expect("closes");
+    server.shutdown().await.expect("stops");
+}
+
+// ───────────────────────────────────────────────────── shedding queued load
+
+/// `QueueTimeout` refuses a message that is still **queued** and never one that
+/// has started, which is the whole difference from `Timeout`.
+///
+/// `Timeout` on this path drops the wait for the reply and the turn runs to
+/// completion anyway, so ten callers get `TimedOut` and the actor still spends
+/// ten turns producing replies nobody wants. This one refuses before the work
+/// starts, so the load is genuinely shed.
+///
+/// The proof is the run counter: one turn was held for 400 ms, the second
+/// message waited behind it with a 100 ms budget and was refused, and the
+/// actor's own count says it ran once.
+#[tokio::test]
+async fn a_queue_timeout_refuses_before_the_mailbox() {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let actor = ledger::actor(Ledger::default());
+    let server = Server::builder(&node)
+        .service(
+            actor
+                .service(Allowlist::anyone())
+                .layer(keylink::QueueTimeout::after(Duration::from_millis(100)))
+                .build(),
+        )
+        .spawn()
+        .expect("serves");
+    let client = ledger::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+
+    let held = {
+        let client = client.clone();
+        tokio::spawn(async move { client.post(1, 400).await })
+    };
+    // Long enough that the first message is IN its turn, so the second one is
+    // queued behind it rather than racing it for the permit.
+    n0_future::time::sleep(Duration::from_millis(80)).await;
+
+    let refused = client
+        .post(2, 0)
+        .await
+        .expect_err("the second message is still queued when its budget expires");
+    assert!(
+        matches!(
+            refused,
+            keylink::Error::Remote(RemoteError::TimedOut { .. })
+        ),
+        "got {refused:?}"
+    );
+
+    assert_eq!(held.await.expect("no panic").expect("answers"), 1);
+    assert_eq!(
+        actor.entries().await.expect("running"),
+        vec![1],
+        "the refused message must not have reached the state"
+    );
+
+    server.shutdown().await.expect("stops");
+}
+
+/// The other half, and the one that makes `QueueTimeout` safe to combine with
+/// an idempotency key: a message it refuses never ran, so the key is still
+/// claimable. `Timeout` cannot promise that, because it cannot tell.
+#[tokio::test]
+async fn a_queue_timeout_leaves_an_idempotency_key_claimable() {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let actor = ledger::actor(Ledger::default());
+    let server = Server::builder(&node)
+        .service(
+            actor
+                .service(Allowlist::anyone())
+                .layer(keylink::QueueTimeout::after(Duration::from_millis(100)))
+                .build(),
+        )
+        .spawn()
+        .expect("serves");
+    let client = ledger::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+    let key = keylink::IdempotencyKey::new("post-1").expect("a valid key");
+
+    let held = {
+        let client = client.clone();
+        tokio::spawn(async move { client.post(1, 400).await })
+    };
+    n0_future::time::sleep(Duration::from_millis(80)).await;
+
+    let _refused = client
+        .with_idempotency(key.clone())
+        .post(2, 0)
+        .await
+        .expect_err("refused while queued");
+    assert_eq!(held.await.expect("no panic").expect("answers"), 1);
+
+    assert_eq!(
+        client
+            .with_idempotency(key)
+            .post(2, 0)
+            .await
+            .expect("the key must still be claimable, because nothing ran under it"),
+        2,
+    );
+
     server.shutdown().await.expect("stops");
 }

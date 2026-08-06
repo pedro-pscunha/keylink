@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use keylink::{
-    Allowlist, Body, BodyReader, Context, Error, IdempotencyKey, IdempotencyRefusal, Middleware,
-    Next, Node, Outcome, RemoteError, Server as KeylinkServer,
+    Allowlist, Body, BodyReader, Caller, Context, Error, IdempotencyKey, IdempotencyRefusal,
+    Middleware, Next, Node, Outcome, RemoteError, Server as KeylinkServer,
 };
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
@@ -53,17 +53,17 @@ struct Till {
 }
 
 impl till::Handler for Till {
-    async fn reserve(&self, _sku: String, _qty: u32) -> u64 {
+    async fn reserve(&self, _cx: &Context, _sku: String, _qty: u32) -> u64 {
         self.reserves.next()
     }
 
-    async fn slow(&self, ms: u64) -> u64 {
+    async fn slow(&self, _cx: &Context, ms: u64) -> u64 {
         let run = self.slows.next();
         tokio::time::sleep(Duration::from_millis(ms)).await;
         run
     }
 
-    async fn datasheet(&self, bytes: u64) -> (Sheet, Body) {
+    async fn datasheet(&self, _cx: &Context, bytes: u64) -> (Sheet, Body) {
         let sheet = Sheet {
             runs: self.sheets.next(),
             bytes,
@@ -636,7 +636,7 @@ keylink::service! {
 struct Depot(Counter);
 
 impl depot::Handler for Depot {
-    async fn reserve(&self, _sku: String, _qty: u32) -> u64 {
+    async fn reserve(&self, _cx: &Context, _sku: String, _qty: u32) -> u64 {
         self.0.next()
     }
 }
@@ -885,19 +885,19 @@ struct TillActor {
 }
 
 impl till::Actor for TillActor {
-    async fn reserve(&mut self, _sku: String, _qty: u32) -> u64 {
+    async fn reserve(&mut self, _cx: Caller<'_>, _sku: String, _qty: u32) -> u64 {
         self.reserves += 1;
         self.reserves
     }
 
-    async fn slow(&mut self, ms: u64) -> u64 {
+    async fn slow(&mut self, _cx: Caller<'_>, ms: u64) -> u64 {
         self.slows += 1;
         let run = self.slows;
         tokio::time::sleep(Duration::from_millis(ms)).await;
         run
     }
 
-    async fn datasheet(&mut self, bytes: u64) -> (Sheet, Body) {
+    async fn datasheet(&mut self, _cx: Caller<'_>, bytes: u64) -> (Sheet, Body) {
         (Sheet { runs: 0, bytes }, Body::from_bytes(vec![0u8; 0]))
     }
 }

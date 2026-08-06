@@ -5,8 +5,9 @@
 //!
 //! Note what is NOT in this file: no IP address, no port, no framing, no
 //! serialization call, no ALPN string, no version number. The domain types and
-//! the `service!` block are the entire protocol definition. A file transfer is
-//! `Body::from_file(path)` on one side and `copy_to(&mut file)` on the other.
+//! the two `service!` blocks are the entire protocol definition. A file
+//! transfer is `Body::from_file(path)` on one side and `copy_to(&mut file)` on
+//! the other.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -14,7 +15,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use anyhow::{bail, Context as _, Result};
-use keylink::{Allowlist, Body, BodyReader, EndpointAddr, EndpointId, Node, SecretKey};
+use keylink::{
+    Allowlist, Body, BodyReader, Caller, EndpointAddr, EndpointId, Node, SecretKey, Server,
+};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
@@ -86,6 +89,21 @@ keylink::service! {
     rpc  Reserve(sku: String, qty: u32) -> ReserveOutcome;
 
     recv Fetch(sku: String, kib: u32) -> Datasheet;
+}
+
+// `Upload` used to be a sixth method on `Inventory`. It cannot be one now that
+// the warehouse is an actor: `Handle::service` refuses to compile for a service
+// declaring a `send`, because that handler reads the upload INSIDE the serial
+// turn (RFC-04 §10.4). A peer that declared a large body and then stopped
+// writing would hold the mailbox until iroh's idle timeout, and no layer can
+// take it back — a `Timeout` refuses the caller without ending the turn.
+//
+// So bulk transfer goes beside the actor instead of through it: its own
+// service, its own ALPN, its own `&self` handler. Both are registered on one
+// node in `serve`, and a stalled upload now costs the peer that stalled it.
+keylink::service! {
+    service Dock;
+
     send Upload(name: String) -> UploadOutcome;
 }
 
@@ -194,40 +212,25 @@ impl Warehouse {
         }
         Self { items }
     }
-
-    /// Land an upload on disk, hashing as it goes. Never holds the payload.
-    async fn store(name: &str, mut body: BodyReader) -> Result<(u64, u64)> {
-        let path = std::env::temp_dir().join(format!("keylink-upload-{name}"));
-        let mut file = tokio::fs::File::create(&path).await?;
-        let mut hash = Fnv1a::new();
-        let mut bytes = 0u64;
-        while let Some(chunk) = body.next_chunk().await? {
-            hash.update(&chunk);
-            bytes += chunk.len() as u64;
-            file.write_all(&chunk).await?;
-        }
-        file.flush().await?;
-        Ok((bytes, hash.finish()))
-    }
 }
 
 impl inventory::Actor for Warehouse {
-    async fn ping(&mut self) -> String {
+    async fn ping(&mut self, _cx: Caller<'_>) -> String {
         format!("ok from {}", hostname())
     }
 
-    async fn list(&mut self) -> Vec<Item> {
+    async fn list(&mut self, _cx: Caller<'_>) -> Vec<Item> {
         self.items.values().cloned().collect()
     }
 
-    async fn get_item(&mut self, sku: String) -> Option<Item> {
+    async fn get_item(&mut self, _cx: Caller<'_>, sku: String) -> Option<Item> {
         self.items.get(&sku).cloned()
     }
 
     /// All-or-nothing. A partial fill would need a variant carrying how many we
     /// actually got, and a caller that always checks it — easy to get wrong at
     /// the call site, so the stricter contract is the safer default here.
-    async fn reserve(&mut self, sku: String, qty: u32) -> ReserveOutcome {
+    async fn reserve(&mut self, _cx: Caller<'_>, sku: String, qty: u32) -> ReserveOutcome {
         let Some(item) = self.items.get_mut(&sku) else {
             return ReserveOutcome::NoSuchItem;
         };
@@ -245,7 +248,7 @@ impl inventory::Actor for Warehouse {
 
     /// Hand back a header and a payload. keylink streams the payload; this
     /// function returns immediately and never sees a byte of it.
-    async fn fetch(&mut self, sku: String, kib: u32) -> (Datasheet, Body) {
+    async fn fetch(&mut self, _cx: Caller<'_>, sku: String, kib: u32) -> (Datasheet, Body) {
         let len = u64::from(kib) * 1024;
         let sheet = Datasheet {
             sku,
@@ -255,9 +258,44 @@ impl inventory::Actor for Warehouse {
         let body = Body::from_reader(Pattern { offset: 0, len }, Some(len));
         (sheet, body)
     }
+}
 
+/// The other half of the split, where the uploads land.
+///
+/// It holds nothing, and that is the argument for where `store` went with it:
+/// the function never read or wrote `items`, it opens a file and hashes what
+/// arrives. Leaving it on `Warehouse` would have kept the one piece of work
+/// that must NOT hold the mailbox on the type whose whole job is to hold it.
+struct Dock;
+
+impl Dock {
+    /// Land an upload on disk, hashing as it goes. Never holds the payload.
+    async fn store(name: &str, mut body: BodyReader) -> Result<(u64, u64)> {
+        let path = std::env::temp_dir().join(format!("keylink-upload-{name}"));
+        let mut file = tokio::fs::File::create(&path).await?;
+        let mut hash = Fnv1a::new();
+        let mut bytes = 0u64;
+        while let Some(chunk) = body.next_chunk().await? {
+            hash.update(&chunk);
+            bytes += chunk.len() as u64;
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        Ok((bytes, hash.finish()))
+    }
+}
+
+/// `&self`, not `&mut self`: two uploads run at once, and a peer that stops
+/// writing halfway waits alone. `keylink::Context` is spelled out because
+/// `std::task::Context` is already in scope for `Pattern`.
+impl dock::Handler for Dock {
     /// The declared length lets us refuse an oversized upload before it moves.
-    async fn upload(&mut self, name: String, body: BodyReader) -> UploadOutcome {
+    async fn upload(
+        &self,
+        _cx: &keylink::Context,
+        name: String,
+        body: BodyReader,
+    ) -> UploadOutcome {
         const LIMIT: u64 = 64 * 1024 * 1024;
 
         if body.declared_len().is_some_and(|len| len > LIMIT) {
@@ -265,7 +303,7 @@ impl inventory::Actor for Warehouse {
                 reason: format!("over the {LIMIT} byte limit"),
             };
         }
-        match Warehouse::store(&name, body).await {
+        match Dock::store(&name, body).await {
             Ok((bytes, checksum)) => UploadOutcome::Stored { bytes, checksum },
             Err(error) => UploadOutcome::Rejected {
                 reason: error.to_string(),
@@ -414,6 +452,7 @@ async fn serve() -> Result<()> {
         "alpn:         {}",
         String::from_utf8_lossy(inventory::alpn())
     );
+    println!("upload alpn:  {}", String::from_utf8_lossy(dock::alpn()));
     println!("listening as: {}", node.id());
 
     // An actor, not a concurrent handler: one task owns the map, messages run
@@ -422,13 +461,21 @@ async fn serve() -> Result<()> {
     // one ALPN, and `drift.rs` dials this binary with the ordinary
     // `inventory::Client` to show it end to end.
     let warehouse = inventory::actor(Warehouse::seeded());
-    let server = warehouse.serve(&node, allow)?;
 
-    // AFTER `serve`, never before. `serve` is what registers the ALPN, so a peer
-    // that read this line any earlier could dial an endpoint answering nothing
-    // and be refused for a reason that has nothing to do with the reason it was
-    // dialling. `keylink/tests/drift.rs` reads this line and dials the moment it
-    // arrives, so the ordering here is that test's starting gun.
+    // Two services, two ALPNs, one node — which is why the `warehouse.serve`
+    // shortcut cannot be used here: it builds a `Server` around one service and
+    // nothing else can join it. The allowlist is the same on both, so a peer
+    // that may reserve stock may also upload.
+    let server = Server::builder(&node)
+        .service(warehouse.service(allow.clone()).build())
+        .service(dock::service(Dock, allow).build())
+        .spawn()?;
+
+    // AFTER `spawn`, never before. `spawn` is what registers the ALPNs, so a
+    // peer that read this line any earlier could dial an endpoint answering
+    // nothing and be refused for a reason that has nothing to do with the reason
+    // it was dialling. `keylink/tests/drift.rs` reads this line and dials the
+    // moment it arrives, so the ordering here is that test's starting gun.
     if offline() {
         // The form the other side can actually dial with no discovery.
         let addr = node.endpoint().addr();
@@ -452,7 +499,7 @@ async fn connect(id: &str, upload: Option<&str>) -> Result<()> {
     println!("alpn:      {}", String::from_utf8_lossy(inventory::alpn()));
     println!("dialing as: {}", node.id());
 
-    let client = inventory::Client::connect(&node, peer).await?;
+    let client = inventory::Client::connect(&node, peer.clone()).await?;
 
     // ── everything below is ordinary async Rust. No transport in sight. ──
     println!("\nping        -> {}", client.ping().await?);
@@ -488,7 +535,12 @@ async fn connect(id: &str, upload: Option<&str>) -> Result<()> {
     concurrent_calls(&client).await?;
     download(&client).await?;
     if let Some(path) = upload {
-        upload_file(&client, path).await?;
+        // A second service is a second ALPN, so it is a second connection to the
+        // same endpoint — dialed here rather than beside `client`, because with
+        // no file to send there is nothing to open it for.
+        let dock = dock::Client::connect(&node, peer).await?;
+        upload_file(&dock, path).await?;
+        dock.close().await?;
     }
 
     client.close().await?;
@@ -570,7 +622,10 @@ async fn download(client: &inventory::Client) -> Result<()> {
 }
 
 /// Stream a real file up, and have the peer confirm what it stored.
-async fn upload_file(client: &inventory::Client, path: &str) -> Result<()> {
+///
+/// A `dock::Client`, not the `inventory::Client` everything above uses: the
+/// upload is a different service now, and the type says so at the call site.
+async fn upload_file(client: &dock::Client, path: &str) -> Result<()> {
     let name = std::path::Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -624,17 +679,20 @@ mod tests {
     #[tokio::test]
     async fn reserve_deducts_and_reports_what_is_left() {
         let mut w = Warehouse::seeded();
-        match w.reserve(SKU.into(), 2).await {
+        match w.reserve(Caller::Local, SKU.into(), 2).await {
             ReserveOutcome::Reserved { remaining } => assert_eq!(remaining, 1),
             other => panic!("expected Reserved, got {other:?}"),
         }
-        assert_eq!(w.get_item(SKU.into()).await.unwrap().stock, 1);
+        assert_eq!(
+            w.get_item(Caller::Local, SKU.into()).await.unwrap().stock,
+            1
+        );
     }
 
     #[tokio::test]
     async fn reserve_is_all_or_nothing_and_leaves_stock_untouched() {
         let mut w = Warehouse::seeded();
-        match w.reserve(SKU.into(), 99).await {
+        match w.reserve(Caller::Local, SKU.into(), 99).await {
             ReserveOutcome::Insufficient {
                 requested,
                 available,
@@ -644,20 +702,23 @@ mod tests {
             other => panic!("expected Insufficient, got {other:?}"),
         }
         // The critical half: a refused reservation must not consume anything.
-        assert_eq!(w.get_item(SKU.into()).await.unwrap().stock, 3);
+        assert_eq!(
+            w.get_item(Caller::Local, SKU.into()).await.unwrap().stock,
+            3
+        );
     }
 
     #[tokio::test]
     async fn reserving_exactly_the_stock_succeeds_and_empties_it() {
         let mut w = Warehouse::seeded();
-        match w.reserve(SKU.into(), 3).await {
+        match w.reserve(Caller::Local, SKU.into(), 3).await {
             ReserveOutcome::Reserved { remaining } => assert_eq!(remaining, 0),
             other => panic!("expected Reserved, got {other:?}"),
         }
         // And the now-empty item still refuses the next request rather than
         // underflowing `u32`, which would wrap to ~4 billion units of stock.
         assert!(matches!(
-            w.reserve(SKU.into(), 1).await,
+            w.reserve(Caller::Local, SKU.into(), 1).await,
             ReserveOutcome::Insufficient { available: 0, .. }
         ));
     }
@@ -666,7 +727,7 @@ mod tests {
     async fn unknown_sku_is_distinct_from_insufficient() {
         let mut w = Warehouse::seeded();
         assert!(matches!(
-            w.reserve("NOPE".into(), 1).await,
+            w.reserve(Caller::Local, "NOPE".into(), 1).await,
             ReserveOutcome::NoSuchItem
         ));
     }
@@ -674,7 +735,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_declares_the_length_and_checksum_of_what_it_will_stream() {
         let mut w = Warehouse::seeded();
-        let (sheet, body) = w.fetch(SKU.into(), 4).await;
+        let (sheet, body) = w.fetch(Caller::Local, SKU.into(), 4).await;
 
         assert_eq!(sheet.bytes, 4096);
         assert_eq!(body.declared_len(), Some(4096));

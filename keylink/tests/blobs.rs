@@ -26,7 +26,7 @@ use iroh_blobs::protocol::{
     ChunkRanges, ChunkRangesSeq, GetManyRequest, GetRequest, ObserveRequest, PushRequest,
 };
 use iroh_blobs::store::mem::MemStore;
-use keylink::{Allowlist, BlobHandle, BlobId, Blobs, Error, Node, ProvenPeer};
+use keylink::{Allowlist, BlobHandle, BlobId, Blobs, Caller, Context, Error, Node, ProvenPeer};
 use n0_future::StreamExt;
 
 mod common;
@@ -811,11 +811,11 @@ struct Warehouse {
 }
 
 impl catalog::Handler for Warehouse {
-    async fn ping(&self) -> String {
+    async fn ping(&self, _cx: &Context) -> String {
         "pong".to_owned()
     }
 
-    async fn datasheet(&self, _sku: String) -> (Manual, BlobId) {
+    async fn datasheet(&self, _cx: &Context, _sku: String) -> (Manual, BlobId) {
         (Manual { pages: 42 }, self.published)
     }
 }
@@ -824,17 +824,17 @@ impl catalog::Handler for Warehouse {
 /// `Handler` one — which is exactly why the test below exists: the method is
 /// reachable, and the address it returns is worth nothing.
 impl catalog::Actor for Warehouse {
-    async fn ping(&mut self) -> String {
+    async fn ping(&mut self, _cx: Caller<'_>) -> String {
         "pong".to_owned()
     }
 
-    async fn datasheet(&mut self, _sku: String) -> (Manual, BlobId) {
+    async fn datasheet(&mut self, _cx: Caller<'_>, _sku: String) -> (Manual, BlobId) {
         (Manual { pages: 42 }, self.published)
     }
 }
 
 impl depot::Handler for Warehouse {
-    async fn parcel(&self, _sku: String) -> (Manual, BlobId) {
+    async fn parcel(&self, _cx: &Context, _sku: String) -> (Manual, BlobId) {
         (Manual { pages: 1 }, self.published)
     }
 }
@@ -843,7 +843,7 @@ impl depot::Handler for Warehouse {
 struct Plain;
 
 impl plain::Handler for Plain {
-    async fn echo(&self, word: String) -> String {
+    async fn echo(&self, _cx: &Context, word: String) -> String {
         word
     }
 }

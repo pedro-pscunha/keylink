@@ -2211,3 +2211,177 @@ which no estimate would have included because §12 does not name it.
    buys in-process is narrower — a caller cannot get more than one message ahead of the
    actor, so a caller that measures its own latency sees the actor's. The number was
    reasoned about, not profiled.
+
+---
+
+# 16. Append: what the correctness programme changed here
+
+**Appended, not edited.** Nothing above this line has been altered. §15 is the
+earlier postscript recording where §1.4, §2.2, §5.3 and §10.3 were wrong; this
+section is the same discipline applied to four more sections, plus one item that
+was designed and deliberately not built. RFC-05 records the idempotency half of
+the same programme.
+
+## 16.1 Answering §2.6 — who is calling is an argument, not a hook
+
+`Actor::caller` is **deleted**. Every generated `Actor` method now takes
+`cx: Caller<'_>` first, and every generated `Handler` method takes
+`cx: &Context` first.
+
+```rust
+pub enum Caller<'a> { Local, Peer(&'a Context) }
+```
+
+The hook it replaces ran before each message and asked the state to stash the
+value. Three things were wrong with that, and all three are gone.
+
+- **It occupied a name.** A service with an `rpc Caller()` could not be an
+  actor, because the generated method and the hook were two trait items called
+  `caller`. That restriction did not exist for a `Handler`, so it appeared only
+  when a service gained an actor — as a duplicate-definition error pointing at
+  library code.
+- **It was reachable from one dispatcher of two.** `__actor_turn` called it;
+  the local handle's methods each repeated it by hand. A sixth method kind wired
+  into the local macro without that line would have silently inherited the last
+  remote peer. That is RFC-01 §11.2b's "build the path twice" hazard, and the
+  code carried a comment admitting it. An argument cannot be forgotten: a
+  missing `Caller` is a compile error.
+- **The idiomatic way to write the hook was wrong.**
+  `if let Some(cx) = cx { self.peer = Some(cx.peer()) }` reads perfectly and
+  leaves the previous remote peer in place for the next *local* message, so an
+  actor authorizing on the stashed value authorizes an in-process caller as
+  whoever last dialled in. `Caller::Local` carries no peer, so there is nothing
+  to inherit.
+
+The asymmetry between the two traits is the point. An actor is reachable two
+ways and a handler one, so only one of them has a "nobody" state, and that state
+is a named variant rather than an `Option` — `authz.rs` records what an `Option`
+on an identity costs.
+
+## 16.2 Answering §6 — `QueueTimeout`, and why `Timeout` stays
+
+§6 argues the mailbox capacity. What it does not say is that **no layer can
+bound a turn**: a layer runs outside the mailbox, so a budget expiring drops the
+*wait for the reply*, not the turn. `Timeout::after(100ms)` in front of a
+ten-second method sheds no load at all — ten callers are refused at 100 ms and
+the actor still spends a hundred seconds producing replies nobody wants.
+
+`QueueTimeout` refuses only a message that has **not started**, and it can,
+because the check happens where a layer cannot reach:
+
+1. the wait for a mailbox permit is bounded, and giving up there means the
+   message was never queued;
+2. having been queued, the deadline is re-read **on the actor's own task**,
+   immediately before the turn begins.
+
+There is no third place, and there does not need to be: once the turn starts,
+stopping it means dropping `&mut A` mid-mutation, which is the one thing an
+actor must never do.
+
+`Timeout` is **kept**, and this wave decided that explicitly rather than by
+default. Nothing prevents layering it on an actor-served builder, because after
+RFC-05 §2 it is no longer *unsafe* there — merely ineffective at shedding load,
+and honest about the key it settles. On a concurrent `Handler`, dropping the
+future genuinely cancels the work, and `QueueTimeout` cannot do that. Two
+behaviours, not two doors to one thing, so "one way to build a thing" does not
+apply. A marker bound on the actor path's `layer` was considered and rejected:
+it would split `ServiceBuilder` in two to prevent a combination that is now
+merely suboptimal.
+
+On a `Handler`, `QueueTimeout` refuses nothing. That is not a lie — a handler is
+dispatched immediately and never queues, so no message it serves is ever "still
+queued when the budget expired". Item 10 below is the case where the same shape
+*would* have been a lie, and is why it was not built.
+
+## 16.3 Answering §10.4 — a `send` method cannot be served as an actor
+
+§10.4 records the asymmetry: a `send` handler reads its upload **inside** the
+turn, so an upload holds the actor for the whole transfer. Combined with §16.2 —
+no layer can bound a turn — that is not a cost, it is a denial of service with a
+one-line trigger. A peer declares a large body, stops writing, and holds the
+actor until iroh's connection idle timeout with nothing else answered, including
+the local `Handle`.
+
+So it does not compile. `DECLARES_SEND` folds at compile time exactly as
+`DECLARES_BLOBS` does, and `Handle::service` opens with
+
+```rust
+let () = ServableAsActor::<A>::CHECK;
+```
+
+where `ServableAsActor<A>` is generic in `A` **on purpose**: an associated const
+of a generic type is evaluated when it is instantiated, so the assertion fires at
+the site that serves an actor and nowhere else. A plain `const` would be
+evaluated where it is written and would refuse every service that merely
+*declares* a `send` method, including every one served the concurrent way, where
+a `send` is perfectly safe.
+
+Chosen over a startup `ConfigError`, which the programme's own success criteria
+asked for. A compile error beats a runtime one, keeps `Result` off the generated
+serve site, costs no new error variant, does not ripple into `spawn_with`'s
+`Fn(&ActorId) -> Option<Mounted>`, and matches what the rest of this crate does
+with claims of the form "there is no way to do X" — `representability.rs` exists
+for exactly that.
+
+Scoped to `send` alone, deliberately. A `recv` body is drained by the connection
+*after* the turn ends and a `blob`'s bytes move later on a different connection,
+so neither can hold an actor. Widening it would refuse two shapes that are safe.
+
+`keylink/tests/singleton.rs` used to serve a `send` method on an actor and
+*measure* the cost. Measuring a hazard is weaker than removing it, so that test
+is now the split it recommended: two services, two ALPNs, one node.
+
+## 16.4 Answering §4.4 — Design B, and the case it does not solve
+
+Design B is built, and it added **nothing to the wire**. The reverse contract is
+an ordinary `service!` block with its own derived ALPN, served by the side that
+dialled; the side that accepted dials back and becomes an ordinary client of it.
+No new method kind, no `WireKinds` field, no second meaning for an existing one.
+
+What keylink adds is `Subscribers<C>`, and its only non-obvious content — the
+reason it is a type rather than a `HashMap` at a call site — is that it evicts on
+`Departure` rather than on `Connection::closed`. `closed()` borrows a strong
+handle, so a registry that waited on one would keep every connection it had ever
+seen alive: a diagnostic that pins its subject open, which `watch.rs:35-42`
+calls a leak wearing a diagnostic's clothes.
+
+The property that makes the second connection worth its cost: **the reverse
+direction has its own allowlist**. A reverse channel bolted onto the forward
+connection would inherit the forward direction's admission, so admitting a peer
+to *ask* would admit it to *tell*, and those are not the same decision.
+
+**The NAT case, named because §4.4 did not name it.** The accept side dials
+back, so it needs a route to the peer that dialled in. With a discovery service
+the proven `EndpointId` is the whole address and this is free. Without one — a
+LAN, an air-gapped network, the hermetic test suite — the peer has to say where
+it is, and that is a **claim** where the identity is a **proof**. The two are
+reconciled at the one place that holds both: the handler compares the declared
+address's id against `cx.peer()` and refuses a mismatch, so a peer cannot make
+the accept side dial a third party by asking nicely. Behind a symmetric NAT with
+no relay, no address the peer can name will work, and Design B does not solve
+that; a relay does.
+
+## 16.5 Item 10, designed and NOT built: an abandoned turn
+
+The programme asked for a long-running turn to be able to observe that its
+caller has gone and bail at a safe point. The signal exists and costs nothing:
+`Mail.reply` is a `oneshot::Sender`, closed exactly when the caller's future was
+dropped — no task, no timer, no cancellation.
+
+It was not built, and the goal permitted that outcome in terms: *"Either put it
+somewhere only an actor turn can reach, or do not build it."* Three placements
+exist and each costs more than the item is worth.
+
+- **On `Context`.** `Context` is shared with `Handler`, where nothing wires the
+  signal, so the method would answer "no" for every handler forever. A method
+  that lies to half its callers is worse than an absent one.
+- **Inside `Caller`.** It stops being `Local | Peer(&Context)` — the enum §16.1
+  exists to introduce — and becomes a struct wrapping an `Origin` enum plus a
+  type-erased closed-signal. Distorting the wave's centrepiece for its smallest
+  item is the wrong trade.
+- **A second parameter on every actor method.** Every user pays, in every
+  signature, for a signal few need.
+
+Recorded here rather than forgotten. The shape that would justify it is a turn
+long enough that abandoning it matters — a batch, a scan — and that is also the
+shape §16.2 says to bound from inside the method, where the state is.

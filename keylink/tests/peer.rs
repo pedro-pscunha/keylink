@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use keylink::{Allowlist, Node, Peer};
+use keylink::{Allowlist, Context, Node, Peer};
 
 mod common;
 use common::local_node;
@@ -25,7 +25,7 @@ keylink::service! {
 struct Ticks(AtomicUsize);
 
 impl meter::Handler for Arc<Ticks> {
-    async fn tick(&self) -> u64 {
+    async fn tick(&self, _cx: &Context) -> u64 {
         self.0.fetch_add(1, Ordering::SeqCst) as u64
     }
 }

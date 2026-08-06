@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::EndpointId;
+use n0_future::time::Instant;
 
 use crate::{ActorId, Body, BodyReader, Outcome, RemoteError};
 
@@ -131,6 +132,7 @@ pub struct Context {
     method: &'static str,
     actor: Option<ActorId>,
     progress: Progress,
+    queueing: Option<Queueing>,
 }
 
 impl Context {
@@ -141,7 +143,19 @@ impl Context {
             method,
             actor: None,
             progress: Progress::new(),
+            queueing: None,
         }
+    }
+
+    /// The budget a [`QueueTimeout`] put on this call, for generated actor
+    /// dispatch to honour.
+    ///
+    /// `None` on every call no `QueueTimeout` layer touched, which is every
+    /// call by default.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn queueing(&self) -> Option<Queueing> {
+        self.queueing
     }
 
     /// The progress marker for this call, for generated dispatch to mark.
@@ -187,6 +201,143 @@ impl Context {
     /// in which case no actor can match it and the call is refused.
     pub fn actor(&self) -> Option<&ActorId> {
         self.actor.as_ref()
+    }
+}
+
+/// Where a message reached an actor from.
+///
+/// An actor is reachable two ways — a local [`Handle`](crate::LocalActor) and a
+/// served ALPN — so "who is calling" has an answer that a concurrent
+/// [`Handler`] never needs: nobody, because the call came from this process.
+///
+/// **Not `Option<&Context>`.** `authz.rs` records what an `Option` on an
+/// identity costs, and this crate's rule is that a known value set is an enum.
+/// `None` also invites `cx.map(Context::peer)` at the one call site where being
+/// wrong means authorizing a local message against the last peer that happened
+/// to dial in.
+///
+/// ```ignore
+/// async fn submit(&mut self, cx: Caller<'_>, order: Order) -> Fill {
+///     let who = match cx {
+///         Caller::Local => Who::House,
+///         Caller::Peer(cx) => Who::Trader(cx.peer()),
+///     };
+///     // ...
+/// }
+/// ```
+///
+/// Exhaustive, like [`Departure`](crate::Departure). A wildcard arm here is the
+/// collapse the type exists to prevent.
+///
+/// [`Handler`]: crate::Middleware
+#[derive(Debug, Clone, Copy)]
+pub enum Caller<'a> {
+    /// From inside this process, through the generated `Handle`. There is no
+    /// peer, no handshake and no proven key, so there is nothing to attribute
+    /// it to — and pretending otherwise is the failure this variant exists to
+    /// make impossible.
+    Local,
+    /// From a peer iroh proved at the handshake.
+    Peer(&'a Context),
+}
+
+impl<'a> Caller<'a> {
+    /// The calling peer's context, when a peer is calling.
+    ///
+    /// A convenience for the common "log it, or ignore it" case. Reach for the
+    /// `match` when the local case needs its own answer, which is most of the
+    /// time an actor is served both ways.
+    #[must_use]
+    pub fn peer(self) -> Option<&'a Context> {
+        match self {
+            Self::Local => None,
+            Self::Peer(cx) => Some(cx),
+        }
+    }
+}
+
+/// A [`QueueTimeout`]'s budget, as the two things the serving side needs: when
+/// it runs out, and how long it was, for the refusal to report.
+///
+/// Carried on [`Context`] rather than kept inside the layer, because a layer
+/// cannot tell a queued message from a running one — only the actor's own task
+/// can, and that is where the deadline is checked.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct Queueing {
+    deadline: Instant,
+    millis: u64,
+}
+
+impl Queueing {
+    /// When the budget runs out.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn deadline(self) -> Instant {
+        self.deadline
+    }
+
+    /// The budget, for [`RemoteError::TimedOut`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn millis(self) -> u64 {
+        self.millis
+    }
+}
+
+/// Refuses a message that is still **queued** when its budget expires, and
+/// never one that has started.
+///
+/// # Why this is not `Timeout`
+///
+/// A layer runs outside the mailbox, so a [`Timeout`]'s budget expiring drops
+/// the *wait for the reply*, not the turn: the turn runs to completion whatever
+/// the caller does. Ten callers get `TimedOut` at 100 ms and the actor still
+/// spends a hundred seconds producing replies nobody is waiting for. That is
+/// not load shedding; it is load shedding's shadow.
+///
+/// This one sheds real load, because it refuses **before** the work starts. The
+/// deadline travels on the [`Context`] and is checked twice: once around the
+/// wait for a mailbox permit, and once on the actor's own task immediately
+/// before the turn begins. So a message it refuses is a message that never ran,
+/// which is also what makes it the only bound that composes with an
+/// [`IdempotencyKey`](crate::IdempotencyKey) — the key stays claimable.
+///
+/// # On a `Handler` it refuses nothing, and that is not a lie
+///
+/// A [`Handler`](crate::Middleware) is dispatched immediately and never queues,
+/// so no message it serves is ever "still queued when the budget expired". The
+/// answer is honestly zero rather than falsely reported. Use [`Timeout`] there,
+/// where dropping the future genuinely cancels the work.
+#[derive(Debug, Clone, Copy)]
+pub struct QueueTimeout {
+    budget: Duration,
+}
+
+impl QueueTimeout {
+    /// Refuse any message still waiting to start after `budget`.
+    #[must_use]
+    pub fn after(budget: Duration) -> Self {
+        Self { budget }
+    }
+}
+
+impl<Req: Send + 'static, Resp: Send + 'static> Middleware<Req, Resp> for QueueTimeout {
+    fn handle(
+        &self,
+        mut cx: Context,
+        req: Req,
+        body: BodyReader,
+        next: Next<Req, Resp>,
+    ) -> BoxFut<(Outcome<Resp>, Body)> {
+        // The deadline is stamped HERE, when the call reached this layer, so an
+        // outer layer that took its time is spent out of this budget rather
+        // than added to it.
+        cx.queueing = Some(Queueing {
+            deadline: Instant::now() + self.budget,
+            millis: u64::try_from(self.budget.as_millis()).unwrap_or(u64::MAX),
+        });
+        next(cx, req, body)
     }
 }
 

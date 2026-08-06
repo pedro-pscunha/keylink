@@ -10,7 +10,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use keylink::{Allowlist, Departure, Node, RpcClient};
+use keylink::{Allowlist, Context, Departure, Node, RpcClient};
 
 keylink::service! {
     service Sentinel;
@@ -21,7 +21,7 @@ keylink::service! {
 struct Handler;
 
 impl sentinel::Handler for Handler {
-    async fn ping(&self) -> String {
+    async fn ping(&self, _cx: &Context) -> String {
         "pong".to_string()
     }
 }
