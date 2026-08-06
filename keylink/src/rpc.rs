@@ -513,9 +513,11 @@ where
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+    use std::future::poll_fn;
     use std::str::FromStr;
     use std::time::Duration;
 
+    // `Future` and `Poll` arrive through the glob; `poll_fn` does not.
     use super::*;
     use crate::idempotency::MAX_WAITING_PER_PEER;
 
@@ -565,6 +567,48 @@ mod tests {
                 limit: u32::try_from(MAX_WAITING_PER_PEER).expect("a cap that fits"),
             },
             "an attacher past the cap must be turned away, not parked"
+        );
+        drop(places);
+    }
+
+    /// Taking a place before the park is only half the property: it has to be
+    /// **held** for the whole wait. `let _ = ledger.wait(peer)` takes one and
+    /// drops it on the same line, which leaves a cap that is enforced and a
+    /// bound that does not exist — every waiter frees its place before the next
+    /// one asks, so the ledger parks as many tasks as the network sends it.
+    ///
+    /// Polled once, so the attach reaches its park, and then the ledger is
+    /// asked for the place it should be holding. Deterministic on purpose:
+    /// there is no second task and no timer to race, which is what a test of a
+    /// concurrency bound usually gets wrong.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_attacher_keeps_its_place_for_the_whole_wait() {
+        let ledger = Ledger::new();
+        let peer = EndpointId::from_str(A).expect("a valid endpoint id");
+        let key = IdempotencyKey::new("k").expect("a valid key");
+
+        let Claim::Fresh(_running) = ledger.claim(peer, key.clone()) else {
+            panic!("the first claim must be fresh");
+        };
+        // Every place but one, so the attacher below takes the last.
+        let places: Vec<_> = (0..MAX_WAITING_PER_PEER - 1)
+            .map(|_| ledger.wait(peer).expect("a free place"))
+            .collect();
+
+        let mut attaching = Box::pin(claim_key(
+            &ledger,
+            peer,
+            Some(Idempotency::attaching_for(key, Duration::from_secs(30))),
+        ));
+        let answered = poll_fn(|cx| Poll::Ready(attaching.as_mut().poll(cx))).await;
+        assert!(
+            answered.is_pending(),
+            "the attacher must be parked, not answered"
+        );
+
+        assert!(
+            ledger.wait(peer).is_err(),
+            "a parked attacher must still be holding its place, or the cap bounds nothing"
         );
         drop(places);
     }
