@@ -517,3 +517,50 @@ async fn observers_run_in_order_and_the_first_refusal_stops_the_rest() {
         other => panic!("got {other:?}"),
     }
 }
+
+/// An observer that panics **before it returns a future** is caught too.
+///
+/// `after_turn` is a plain `fn` and not an `async fn`, and that is deliberate:
+/// the signature exists to invite synchronous work with the state before the
+/// future is built, which is what keeps `A: Sync` out of the whole design. So
+/// the prelude is not an edge case — it is the half the signature advertises.
+///
+/// It was also the half that was not caught. `guarded` takes a *built* future,
+/// so `guarded(observer.after_turn(..))` evaluates the call first and catches
+/// only what happens after it yields. A panic here unwound out of a detached
+/// task, the end channel was never filled, and `ended()` reported `Vanished` —
+/// "the loop never reached its exit" — for an actor whose observer had simply
+/// fallen over. The `Ended::Observer` arm was dead for every panic of this
+/// shape, and `a_panicking_observer_ends_the_actor_and_is_named` above could not
+/// see it, because that one panics inside the future.
+struct ExplodesBeforeItYields;
+
+impl Observer<Ledger> for ExplodesBeforeItYields {
+    fn name(&self) -> &'static str {
+        "early"
+    }
+
+    fn after_turn<'a>(&'a mut self, _state: &'a Ledger, _turn: TurnInfo<'a>) -> TurnFut<'a> {
+        panic!("the observer fell over before it yielded");
+    }
+}
+
+#[tokio::test]
+async fn an_observer_that_panics_before_it_yields_is_still_named() {
+    let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(ExplodesBeforeItYields)]);
+
+    assert_eq!(ledger.post(1).await, Err(MailboxClosed));
+
+    match ledger.ended().await {
+        Ended::Observer { name, error } => {
+            assert_eq!(name, "early");
+            assert!(
+                error.to_string().contains("fell over before it yielded"),
+                "got {error}"
+            );
+        }
+        // `Vanished` is the specific wrong answer this test exists for: it is
+        // what an uncaught unwind out of the detached task produces.
+        other => panic!("expected the observer to be named, got {other:?}"),
+    }
+}

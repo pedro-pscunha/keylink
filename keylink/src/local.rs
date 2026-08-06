@@ -191,7 +191,39 @@ where
     let mut refused: Option<(&'static str, Arc<dyn Error + Send + Sync>)> = None;
     for observer in hooks.iter_mut() {
         let name = observer.name();
-        match guarded(observer.after_turn(&*state, info)).await {
+        // TWO catches, because `after_turn` has two halves that can panic and
+        // `guarded` only covers one of them.
+        //
+        // `guarded` takes a BUILT future, so `guarded(observer.after_turn(..))`
+        // evaluates `after_turn` first and catches only what happens after it
+        // yields. And `after_turn` is a plain `fn` rather than an `async fn`
+        // *precisely* to invite synchronous work before the future exists — so
+        // the uncaught half is the half the signature advertises. A panic there
+        // would unwind out of a detached task, `ended` would never be filled,
+        // and `Ended` would report `Vanished` rather than naming the observer,
+        // making the `Err(panic)` arm below dead for half the surface.
+        //
+        // The obvious repair — wrapping the call in an async block — does not
+        // work here: the block would hold `&A` across an await, so it is `Send`
+        // only when `A: Sync`, and keeping `A: Sync` out of this design is the
+        // reason the signature is shaped this way at all. `catch_unwind` is
+        // synchronous, holds nothing across an await, and costs nothing.
+        // Shared reborrow first, because `move` would otherwise take the
+        // `&mut A` the loop still needs.
+        let shared: &A = &*state;
+        let watching: &mut dyn Observer<A> = &mut **observer;
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            // Consuming the capture is what makes this `FnOnce`. Inference
+            // settles on `FnMut` otherwise, and a future borrowing from an
+            // `FnMut`'s capture cannot escape the closure body.
+            let watching = watching;
+            watching.after_turn(shared, info)
+        }));
+        let ran = match built {
+            Ok(future) => guarded(future).await,
+            Err(payload) => Err(Panic::caught(payload)),
+        };
+        match ran {
             Ok(Ok(())) => {}
             Ok(Err(stop)) => {
                 refused = Some((name, Arc::from(stop.into_reason())));

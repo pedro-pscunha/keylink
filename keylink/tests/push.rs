@@ -311,3 +311,56 @@ async fn a_peer_can_unsubscribe_without_leaving() {
     assert_eq!(up.client.unsubscribe().await.expect("unsubscribes"), 0);
     assert!(up.subscribers.is_empty());
 }
+
+/// A peer that re-subscribes must not be evicted by its own previous
+/// connection.
+///
+/// The registry is keyed by [`EndpointId`], so a second subscribe from one peer
+/// **replaces** the first — which drops the first reverse client, closes its
+/// connection, and fires the `Watch` that the first subscribe registered. That
+/// task then wakes with the peer's id in hand and, if it removes by id alone,
+/// deletes the entry that replaced it.
+///
+/// The result is a peer that believes it is subscribed and a desk that has
+/// forgotten it: pushes stop, and nothing reports a fault. In the admission
+/// adapter, which instantiates this same registry at `Revocation`, the same race
+/// is worse than a lost push — the surviving connection leaves the registry, so
+/// a later `replace` can neither see nor close it, and a revoked peer keeps a
+/// live connection. That is an authorization bypass reached through a
+/// bookkeeping race.
+///
+/// So each entry is stamped and an eviction task removes only its own stamp.
+/// Made red by removing the stamp comparison in `Subscribers::insert`.
+#[tokio::test]
+async fn a_resubscribing_peer_is_not_evicted_by_its_own_old_connection() {
+    let up = pushing(Allowlist::anyone()).await;
+    let back = addr_of(&up._nodes[1]);
+
+    assert_eq!(
+        up.client.subscribe(back.clone()).await.expect("subscribes"),
+        1
+    );
+    // The second subscribe replaces the first, dropping the first reverse
+    // client and closing its connection — which is what arms the race.
+    assert_eq!(up.client.subscribe(back).await.expect("re-subscribes"), 1);
+
+    // Long enough for the first connection's `Watch` to fire and its eviction
+    // task to run. Not a timing assertion: the test fails if the entry goes,
+    // and waiting longer can only make a wrong implementation more wrong.
+    n0_future::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        up.subscribers.len(),
+        1,
+        "the live subscription must survive its predecessor's departure"
+    );
+    let listener = up
+        .subscribers
+        .get(up._nodes[1].id())
+        .expect("the peer is still registered");
+    assert_eq!(
+        listener.tick(4471).await.expect("the push still lands"),
+        1,
+        "and the handle in the registry must be the live one"
+    );
+}

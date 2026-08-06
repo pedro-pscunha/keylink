@@ -236,7 +236,24 @@ impl Admission for DynamicAdmission {
 
     fn admitted(&self, peer: &AdmittedPeer, live: Revocation) {
         let watch = live.watch();
-        self.live.insert(peer.id(), live, watch);
+        self.live.insert(peer.id(), live.clone(), watch);
+
+        // Re-read the policy AFTER the insert, and the order is the whole fix.
+        //
+        // `admits` released the policy lock before this ran, so a `replace` can
+        // land entirely inside that gap: it swaps the policy, takes its
+        // snapshot of `live`, and finds nothing — and then this connection is
+        // inserted, admitted under a policy that no longer exists, never closed
+        // and never reported in the returned list. Silent, and worst for the
+        // peer most likely to be reconnecting in a loop.
+        //
+        // Re-reading here cannot miss, because the two orders are exhaustive: a
+        // `replace` that takes its snapshot AFTER the insert sees this entry
+        // and closes it, and one that takes it BEFORE is visible to this read.
+        if self.policy().admit(live.peer()).is_none() {
+            live.close();
+            self.live.remove(peer.id());
+        }
     }
 }
 

@@ -61,6 +61,7 @@
 //! [`Weak`]: std::sync::Weak
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use iroh::EndpointId;
@@ -73,7 +74,11 @@ use crate::Watch;
 /// inserts and the task that pushes can each hold one.
 #[derive(Debug)]
 pub struct Subscribers<C> {
-    peers: Arc<Mutex<HashMap<EndpointId, C>>>,
+    /// Each entry carries the generation it was inserted under, so an eviction
+    /// task can tell its own entry from the one that replaced it. See
+    /// [`Subscribers::insert`].
+    peers: Arc<Mutex<HashMap<EndpointId, (u64, C)>>>,
+    next: Arc<AtomicU64>,
 }
 
 impl<C> Subscribers<C> {
@@ -82,6 +87,7 @@ impl<C> Subscribers<C> {
     pub fn new() -> Self {
         Self {
             peers: Arc::new(Mutex::new(HashMap::new())),
+            next: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -95,11 +101,27 @@ impl<C> Subscribers<C> {
     ///
     /// Replaces any handle already held for this peer, which is what makes
     /// resubscribing after a reconnect the obvious thing rather than a leak.
+    ///
+    /// # The generation, and the reconnect it exists for
+    ///
+    /// Each entry is stamped, and an eviction task removes the entry **only if
+    /// the stamp is still its own**. Without that, a make-before-break
+    /// reconnect deletes the live subscriber: a peer registers on connection
+    /// one, re-subscribes on connection two, then closes connection one — and
+    /// connection one's task wakes and removes connection two's entry, because
+    /// both are filed under the same [`EndpointId`].
+    ///
+    /// The result is a peer that believes it is subscribed, a registry that has
+    /// forgotten it, and — in the admission adapter that instantiates this at
+    /// `Revocation` — a live connection no `replace` can see or close. That is
+    /// an authorization bypass reached through a bookkeeping race, so the
+    /// generation is not an optimisation.
     pub fn insert(&self, peer: EndpointId, client: C, departure: Watch)
     where
         C: Send + 'static,
     {
-        self.lock().insert(peer, client);
+        let generation = self.next.fetch_add(1, Ordering::Relaxed);
+        self.lock().insert(peer, (generation, client));
 
         // Weak, so a registry nobody holds any more is dropped even with
         // subscribers still connected. The task then wakes once, finds nothing,
@@ -111,10 +133,13 @@ impl<C> Subscribers<C> {
             // things to report and one thing to do about.
             let _departure = departure.await;
             if let Some(peers) = Weak::upgrade(&peers) {
-                peers
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&peer);
+                let mut held = peers.lock().unwrap_or_else(PoisonError::into_inner);
+                // Compare-and-remove. A newer generation under this key is a
+                // reconnect that already replaced us, and it is not ours to
+                // evict.
+                if held.get(&peer).is_some_and(|(seen, _)| *seen == generation) {
+                    held.remove(&peer);
+                }
             }
         });
     }
@@ -124,7 +149,9 @@ impl<C> Subscribers<C> {
     /// For a peer that unsubscribed rather than left. The eviction task stays
     /// registered and finds nothing to do, which costs one wake-up.
     pub fn remove(&self, peer: EndpointId) -> Option<C> {
-        self.lock().remove(&peer)
+        self.lock()
+            .remove(&peer)
+            .map(|(_generation, client)| client)
     }
 
     /// How many peers are here.
@@ -143,7 +170,7 @@ impl<C> Subscribers<C> {
     /// ledger makes: one bad request should cost one request. Nothing here can
     /// panic while the lock is held, so this arm is unreachable in practice and
     /// must still be typed.
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<EndpointId, C>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<EndpointId, (u64, C)>> {
         self.peers.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -152,7 +179,9 @@ impl<C: Clone> Subscribers<C> {
     /// The handle for one peer, if it is still here.
     #[must_use]
     pub fn get(&self, peer: EndpointId) -> Option<C> {
-        self.lock().get(&peer).cloned()
+        self.lock()
+            .get(&peer)
+            .map(|(_generation, client)| client.clone())
     }
 
     /// Every peer here, as of now.
@@ -166,7 +195,7 @@ impl<C: Clone> Subscribers<C> {
     pub fn snapshot(&self) -> Vec<(EndpointId, C)> {
         self.lock()
             .iter()
-            .map(|(peer, client)| (*peer, client.clone()))
+            .map(|(peer, (_generation, client))| (*peer, client.clone()))
             .collect()
     }
 }
@@ -183,6 +212,7 @@ impl<C> Clone for Subscribers<C> {
     fn clone(&self) -> Self {
         Self {
             peers: Arc::clone(&self.peers),
+            next: Arc::clone(&self.next),
         }
     }
 }
