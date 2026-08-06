@@ -496,10 +496,26 @@ macro_rules! service {
                 $crate::mount(schema(), move |mut inbox: $crate::Mailbox| async move {
                     while let ::std::option::Option::Some(mail) = inbox.recv().await {
                         let $crate::Mail { cx, payload, body, reply } = *mail;
+                        // The third generated dispatch path, and the one that
+                        // marked nothing at all. A key claimed for a message
+                        // routed here was RELEASED once the turn had already
+                        // mutated the actor, so the caller's retry ran the work
+                        // a second time — at-least-once, out of the module
+                        // whose whole promise is at-most-once. RFC-04 §16.6.
+                        //
+                        // Taken before the turn because `cx` is only borrowed
+                        // by `Caller::Peer(&cx)` below.
+                        let __progress = cx.progress();
                         // The ONLY route from the payload's bytes to a typed
                         // message, and it compares the hashes first.
                         let __answer = match payload.open::<Request>(schema()) {
                             ::std::result::Result::Ok(__request) => {
+                                // The hashes agreed and the bytes decoded, so
+                                // what follows is user code. Marking above the
+                                // match instead would report a schema mismatch
+                                // as work that ran, and settle a key for a
+                                // message the actor never saw.
+                                __progress.dispatched();
                                 let __turn = $crate::guarded(__actor_turn(
                                     &mut state,
                                     $crate::Caller::Peer(&cx),
@@ -509,9 +525,26 @@ macro_rules! service {
                                 .await;
                                 match __turn {
                                     ::std::result::Result::Ok((__response, __body)) => {
+                                        // `completed` goes on the encoded arm
+                                        // and nowhere else. An encode that
+                                        // fails means the turn ran, mutated
+                                        // the state and produced nothing
+                                        // transmissible; marking it completed
+                                        // would record the encoding refusal as
+                                        // this call's settled reply and replay
+                                        // that refusal to every retry, for work
+                                        // that really happened. The refusing
+                                        // arm below, and the panic arm after
+                                        // it, leave the marker at
+                                        // `dispatched`, which settles
+                                        // `Interrupted` — "it ran, and whether
+                                        // it took effect is unknown". RFC-05
+                                        // §2.
                                         match $crate::ActorReply::encode(&__response) {
-                                            ::std::result::Result::Ok(__encoded) =>
-                                                ($crate::Outcome::Ok(__encoded), __body),
+                                            ::std::result::Result::Ok(__encoded) => {
+                                                __progress.completed();
+                                                ($crate::Outcome::Ok(__encoded), __body)
+                                            }
                                             ::std::result::Result::Err(__refusal) => (
                                                 $crate::Outcome::Err(__refusal),
                                                 $crate::Body::empty(),

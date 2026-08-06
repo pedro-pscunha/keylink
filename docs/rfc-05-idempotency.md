@@ -326,3 +326,152 @@ replays `NoSuchActor` forever. It is the same shape as §2 — a refusal recorde
 for a call that never ran — one layer down, where the payload is opaque to
 keylink by design and the progress marker therefore cannot reach. Fixing it means
 the keyed actor system growing an idea of dispatch it does not have yet.
+
+---
+
+## 11. Two structures §3 left unbounded, and it said they were bounded
+
+§3 is titled "Bounds: three of them, and why one was not enough". Two things it
+does not mention grew without one. Both are the same mistake as §2 in a third
+costume: the ledger was reasoning about the calls it *runs* and had stopped
+looking at everything else it was holding.
+
+### 11.1 The refusal that created what it refused
+
+`claim` took the peer's bucket with `entry(peer).or_default()` and then ran the
+cap checks. So a claim the **global** cap turned away — a peer this ledger had
+never seen, refused because 4096 other calls were in dispatch — left an empty
+`Bucket` behind in `inner.peers`, and nothing removes one: `release` and `evict`
+prune only a bucket they took the last slot out of, and this one never had a
+slot. With `Allowlist::Anyone` the number of distinct peers is a property of the
+network, so the refusal path was unbounded memory in the module whose entire
+purpose is bounds.
+
+The fix is where the map is touched, not what is counted: the read-only checks go
+through `inner.peers.get(&peer)`, and `entry(peer).or_default()` happens on the
+one path that inserts a slot. No refusing or replaying path creates an entry.
+
+`expire` and `evict` were checked for the same shape and do not have it. `expire`
+never removes a slot — a record past its TTL is **downgraded** to a tombstone,
+which is §3's own rule — so it cannot empty a bucket. `evict`'s record loop
+downgrades for the same reason; its tombstone loop is the one place a slot really
+is dropped, and it already prunes. Nothing there changed.
+
+### 11.2 A parked attacher holds no claim, and the claim caps are what bound it
+
+§3 says running claims used to be invisible to both volume bounds, and gave them
+`MAX_RUNNING_PER_PEER` and `MAX_RUNNING`. §4 then added attach on top, and
+reopened the hole one layer up.
+
+A caller parked in `claim_key` waiting on `notified` **holds no claim**. It is
+counted in neither `Bucket::running` nor `Inner::running`, so neither cap can see
+it or the QUIC stream pair it is keeping open for up to `MAX_ATTACH`. One claimed
+key, 40 connections of 100 concurrent bidirectional streams each, all attaching
+to it: 4000 parked tasks and 4000 stream pairs for thirty seconds, and
+`TooManyRunning` never fires. The argument in `MAX_RUNNING_PER_PEER`'s own doc
+comment is exactly this argument, about the other half.
+
+So there is a second pair, and it is a pair for the reason the first one is:
+`MAX_WAITING_PER_PEER` because a peer can open connection after connection, and
+`MAX_WAITING` because `Allowlist::Anyone` makes the peer count a property of the
+network rather than of the configuration.
+
+Three things about the shape are load bearing.
+
+**The count lives in the ledger.** A per-connection counter cannot see the other
+connections the same peer opened, which is the whole failure.
+
+**A place to wait in is RAII**, a `Waiting` whose `Drop` gives it back. The
+ordinary way a waiter stops waiting is that its task is *aborted* — the caller's
+connection ended — and a decrement written on the return paths of `claim_key`
+does not run then. It is the same argument `Drop for Guard` is built on, and the
+failure it prevents is worse than a leak: a place that is never given back means
+the cap is reached once and then refuses every attach, with nobody waiting, for
+as long as the process lives.
+
+**It reuses `TooManyRunning`.** `postcard_schema` hashes the variant list into the
+ALPN, so a second spelling of "too many at once" would move the protocol identity
+and break every handshake — §6's move was paid for by three genuinely wire-visible
+changes, and this is not one. `keylink/Probe/aa77e29e5e1ccdc7` is unchanged, and
+`the_contract_hash_has_not_moved` is what says so.
+
+**This adds a row to §4.2's table.** That table lists what an attaching call gets
+and its last row is "budget spent, still running → `InFlight`". There is now one
+more: *no place to wait in* → `TooManyRunning`, returned **before** the task
+parks, because a waiter refused after it has waited has already spent the task
+and the stream pair the refusal exists to save. §4.2's sentence that attach needs
+no new error variant is still true, and now carries twice the weight.
+
+**§3's numbers, and why these two are not the same numbers.**
+`MAX_WAITING_PER_PEER` is 128, the same as `MAX_RUNNING_PER_PEER`: above QUIC's
+100 concurrent streams so one well-behaved connection never meets it, and it is
+also the legitimate ceiling, since a `Peer` re-issue produces at most one
+attacher per running claim and running claims are capped there. `MAX_WAITING` is
+1024, a **quarter** of `MAX_RUNNING` rather than equal to it, because a waiter
+produces nothing: it costs a task and a stream pair, it may still be refused when
+its budget runs out, and a node should spend the smaller share of its budget on
+calls it has already decided not to run.
+
+`enable()`-before-re-read is untouched. §4's hazard and §4's answer are unchanged;
+the bound is around that sequence, not in it.
+
+### 11.3 What the probe checks now, and the one thing it cannot
+
+`assert_agrees` recomputes every counter from the maps, and it grew two
+assertions.
+
+The first is §11.1's guard: no bucket in `inner.peers` is empty. It is stated
+where the invariant lives rather than in one test, because the leak was reachable
+from one path and the invariant holds on all of them.
+
+The second is only half of what was wanted, and the half it is missing is worth
+saying plainly. The waiter counts are **not recomputable from the maps**: a place
+to wait in is a value on some other task's stack, and `Inner` records how many
+exist rather than which. So the probe checks what it can — the per-peer entries
+sum to the total, and no peer is left in the map at zero — and
+`the_waiting_count_follows_the_live_guards` checks the counts against the guards
+themselves by taking and dropping them one at a time. Two assertions, honestly
+scoped, rather than one that claims more than it verifies.
+
+### 11.4 A second live wart, recorded rather than fixed
+
+`evict`'s record loop increments `inner.spent` unconditionally but pushes to
+`bucket.spent` only when the key it popped from `held` is still in `slots`. If
+those two ever disagreed, the counter would drift **above** the truth and the
+tombstone loop would evict more than it should. The arm is unreachable today —
+a key in `held` is always in `slots`, which is the invariant `assert_agrees`
+checks — and it is the mirror image of the drift the exhaustive `match` in
+`held_bytes` exists to prevent. Left alone, because fixing an unreachable arm on
+the way past is how a correctness change grows a blast radius nobody reviewed.
+
+### 11.5 A middleware can forge the progress marker, and this is the wrong layer to stop it
+
+`Progress` and `Context::progress` are `#[doc(hidden)]` but they are `pub`,
+because the code that marks them is expanded into the *caller's* crate and
+`pub(crate)` does not reach across that boundary. So a `Middleware` holding a
+`Context` can mark `completed()` and then refuse without calling `next`, and the
+accept path records that refusal as the call's settled reply and replays it to
+every retry — §2's defect, re-opened one layer up by the extension point.
+
+**It cannot be sealed.** A token type only generated code could construct would
+itself have to be `pub` to be named in the expansion, so the forgery moves by one
+line and the surface grows by a type.
+
+**Cross-checking against the chain's `Outcome` would be a regression, not a
+fix.** The tempting shape is `Reached::Completed && matches!(outcome,
+Outcome::Ok(_))`. But a layer that runs `next` and *then* rewrites `Ok` into
+`Err` produced the frame the caller actually received, and replaying that frame
+byte for byte is exactly right — at-most-once, with the answer the caller was
+given. Demoting it to `Interrupted` would break an honest layer to inconvenience
+a dishonest one, and the dishonest one loses nothing.
+
+**What makes it tolerable is where the trust boundary is.** A `Middleware` is
+not a plugin: you write it, you compile it into your binary, and it already sits
+between every call and its handler. A layer willing to forge this marker can
+return a wrong answer outright and save itself the work. The boundary this crate
+defends is the **peer**, and no peer can reach any of this — every route to
+`Progress` is in-process.
+
+So it is documented rather than defended, at all three places a reader meets it:
+on `Progress`, on `Context::progress`, and on the `Middleware` trait, which is
+what someone about to write one actually reads.

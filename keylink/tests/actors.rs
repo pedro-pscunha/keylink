@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use keylink::{
-    ActorClient, ActorId, Allowlist, Error, Eviction, MountError, Node, RemoteError, Server, System,
+    ActorClient, ActorId, ActorReply, ActorRequest, Allowlist, Error, Eviction, IdempotencyKey,
+    IdempotencyRefusal, MountError, Node, RemoteError, RpcClient, Server, System,
 };
 
 // ────────────────────────────────────────────────────────────── two services
@@ -825,5 +826,295 @@ async fn a_keyed_actor_sees_the_proven_key_of_its_caller() {
             .unwrap(),
         Some(client_node.id().to_string()),
         "the actor must see the dialing peer's proven key, not None"
+    );
+}
+
+// ───────────────────────────────────────────── a key against a keyed actor
+
+/// A response the turn produces and the wire cannot carry.
+///
+/// The `Serialize` is written by hand because no derived one can fail: postcard
+/// reports a serialization error only from its flavor, and the `Vec` flavor
+/// `ActorReply::encode` uses has none. Without it the arm that decides what a
+/// turn owes when it ran and produced nothing sendable is unreachable from a
+/// test, and an unreachable arm is a decision nobody has checked.
+#[derive(Debug, Clone, serde::Deserialize, postcard_schema::Schema)]
+pub struct Untransmittable;
+
+impl serde::Serialize for Untransmittable {
+    fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom("this reply never encodes"))
+    }
+}
+
+// A fourth service, so the shape-for-shape pairing between `journal` and
+// `vault` survives a method being added here.
+keylink::service! {
+    service Ward;
+
+    /// Counts the turns that reached the state. A retry that ran a second time
+    /// is visible HERE and nowhere else: a replayed reply is byte identical to
+    /// a re-run one, which is the whole reason the ledger records the frame.
+    rpc Touch() -> u64;
+
+    /// The count, read without a key, so reading it never settles one.
+    rpc Touches() -> u64;
+
+    /// Mutates the state and then answers with something unencodable.
+    rpc Unsendable() -> Untransmittable;
+
+    /// Mutates the state and then panics, so the turn was entered and its
+    /// effect is whatever the panic left behind.
+    rpc Explode() -> u64;
+}
+
+#[derive(Default)]
+struct Ward {
+    touches: u64,
+}
+
+impl ward::Actor for Ward {
+    async fn touch(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+        self.touches += 1;
+        self.touches
+    }
+
+    async fn touches(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+        self.touches
+    }
+
+    async fn unsendable(&mut self, _cx: keylink::Caller<'_>) -> Untransmittable {
+        self.touches += 1;
+        Untransmittable
+    }
+
+    async fn explode(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+        self.touches += 1;
+        panic!("this turn dies after it mutated");
+    }
+}
+
+/// One `Ward`, reachable both the typed way and the way a hand-rolled peer
+/// reaches it.
+///
+/// The typed `ActorClient` exposes no `with_idempotency`, so nothing in
+/// keylink's own client sends a key to a keyed actor. The field is on the
+/// ENVELOPE of the system's ALPN, which is an ordinary
+/// `Envelope<WireRequest<ActorRequest>>`, so a peer that speaks the protocol by
+/// hand reaches it through the public `RpcClient`. Latent, not impossible —
+/// which is why these are integration tests and not unit ones.
+struct Keyed {
+    /// Carries the key. Speaks the envelope directly.
+    raw: RpcClient<ActorRequest, ActorReply>,
+    /// Reads the actor's own counter, without a key.
+    client: ActorClient,
+    _system: System,
+    _server: Server,
+    _nodes: [Node; 2],
+}
+
+async fn start_keyed() -> Keyed {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let system = mounted();
+    let running = Server::builder(&server)
+        .service(system.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("one service, no duplicate ALPN");
+    let raw = RpcClient::connect(&client_node, server.endpoint().addr(), System::alpn())
+        .await
+        .expect("the raw client dials the actor system");
+    let client = ActorClient::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("the typed client dials the actor system");
+    system
+        .mount(id("ward"), ward::spawn(Ward::default()))
+        .expect("the id is free");
+
+    Keyed {
+        raw,
+        client,
+        _system: system,
+        _server: running,
+        _nodes: [server, client_node],
+    }
+}
+
+/// One message to `ward`, under a key.
+async fn keyed(
+    fixture: &Keyed,
+    key: &str,
+    request: &ward::Request,
+) -> Result<ward::Response, Error> {
+    let envelope =
+        ActorRequest::new(id("ward"), ward::schema(), request).expect("the message encodes");
+    keyed_envelope(fixture, key, envelope).await
+}
+
+/// The same, for an envelope built by hand — the only way to reach a payload
+/// the actor's own loop cannot decode.
+async fn keyed_envelope(
+    fixture: &Keyed,
+    key: &str,
+    envelope: ActorRequest,
+) -> Result<ward::Response, Error> {
+    let (reply, _body) = fixture
+        .raw
+        .with_idempotency(IdempotencyKey::new(key).expect("a valid key"))
+        .call(envelope, keylink::Body::empty())
+        .await?;
+    reply.decode()
+}
+
+async fn touches(fixture: &Keyed) -> u64 {
+    ward::at(&fixture.client, id("ward"))
+        .touches()
+        .await
+        .expect("the actor answers")
+}
+
+/// The defect: of the three generated dispatch paths, the keyed `System` loop
+/// marked the progress marker nowhere. A key claimed for a message routed there
+/// was RELEASED once the turn had already mutated the actor, so the caller's
+/// retry ran the work again — at-least-once out of the module whose one promise
+/// is at-most-once.
+///
+/// Proved on the actor's counter and not on the reply, because a replayed reply
+/// and a re-run one are byte identical by construction. Made red by deleting
+/// the `completed()` call in `spawn`.
+#[tokio::test]
+async fn a_keyed_call_that_ran_a_turn_does_not_leave_the_key_claimable() {
+    let fixture = start_keyed().await;
+
+    let first = keyed(&fixture, "touch", &ward::Request::Touch {})
+        .await
+        .expect("the first call runs");
+    assert!(matches!(first, ward::Response::Touch(1)), "got {first:?}");
+
+    let again = keyed(&fixture, "touch", &ward::Request::Touch {})
+        .await
+        .expect("the retry is answered from the record");
+    assert!(matches!(again, ward::Response::Touch(1)), "got {again:?}");
+
+    assert_eq!(
+        touches(&fixture).await,
+        1,
+        "the retry must not have entered the turn a second time"
+    );
+}
+
+/// A payload the actor's loop cannot decode is refused before any user code
+/// runs, so nothing was entered and the key stays claimable. Settling it would
+/// refuse every retry of a message the actor never saw.
+///
+/// The declared hash is the RIGHT one, so `System::deliver`'s own comparison
+/// passes and the message reaches the mailbox loop. That is what makes this a
+/// test of `Sealed::open` inside the loop rather than of the check above it.
+/// Made red by marking `dispatched()` above the `match` instead of inside its
+/// `Ok` arm.
+#[tokio::test]
+async fn a_keyed_call_whose_payload_does_not_decode_leaves_the_key_claimable() {
+    let fixture = start_keyed().await;
+
+    // A variant index no variant has.
+    let garbage = ActorRequest::new(id("ward"), ward::schema(), &250u32).expect("the bytes encode");
+    let error = keyed_envelope(&fixture, "touch", garbage)
+        .await
+        .expect_err("the payload does not decode");
+    assert!(
+        matches!(error, Error::Remote(RemoteError::Failed(_))),
+        "got {error:?}"
+    );
+    assert_eq!(
+        touches(&fixture).await,
+        0,
+        "a payload that does not decode must not reach the turn"
+    );
+
+    let ran = keyed(&fixture, "touch", &ward::Request::Touch {})
+        .await
+        .expect("the key must still be claimable");
+    assert!(matches!(ran, ward::Response::Touch(1)), "got {ran:?}");
+}
+
+/// The `ActorReply::encode` decision, pinned. The turn ran and mutated the
+/// state, and produced nothing the wire can carry.
+///
+/// Not `completed`: that would record the encoding refusal as this call's
+/// settled reply and replay that refusal to every retry, for work that really
+/// happened. Not released either: that would run the work again. `Interrupted`
+/// is what is left, and it is the truth — "it ran, and whether it took effect
+/// is unknown". Made red by moving `completed()` above the encode.
+#[tokio::test]
+async fn a_keyed_call_whose_reply_does_not_encode_settles_the_key_interrupted() {
+    let fixture = start_keyed().await;
+
+    let error = keyed(&fixture, "touch", &ward::Request::Unsendable {})
+        .await
+        .expect_err("the reply does not encode");
+    assert!(
+        matches!(error, Error::Remote(RemoteError::Failed(_))),
+        "got {error:?}"
+    );
+    assert_eq!(
+        touches(&fixture).await,
+        1,
+        "the turn ran, which is what makes the key owe something"
+    );
+
+    let retried = keyed(&fixture, "touch", &ward::Request::Unsendable {})
+        .await
+        .expect_err("the key settled, so the retry is refused rather than run");
+    assert!(
+        matches!(
+            retried,
+            Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::Interrupted))
+        ),
+        "got {retried:?}"
+    );
+    assert_eq!(
+        touches(&fixture).await,
+        1,
+        "the retry must not run the turn a second time"
+    );
+}
+
+/// The panic arm, for the same reason. A turn that panicked was entered, and
+/// whatever it mutated before it panicked is in the state the actor carries on
+/// with. Giving the key back would run that half-done work again.
+///
+/// This is also what guards the `dispatched()` mark itself: delete it and this
+/// key is released rather than settled, which is the defect one arm along.
+#[tokio::test]
+async fn a_keyed_call_whose_turn_panicked_settles_the_key_interrupted() {
+    let fixture = start_keyed().await;
+
+    let error = keyed(&fixture, "touch", &ward::Request::Explode {})
+        .await
+        .expect_err("the turn panics");
+    assert!(
+        matches!(error, Error::Remote(RemoteError::Failed(ref why)) if why.contains("this turn dies")),
+        "got {error:?}"
+    );
+    assert_eq!(
+        touches(&fixture).await,
+        1,
+        "the turn ran, and mutated, before it panicked"
+    );
+
+    let retried = keyed(&fixture, "touch", &ward::Request::Explode {})
+        .await
+        .expect_err("the key settled, so the retry is refused rather than run");
+    assert!(
+        matches!(
+            retried,
+            Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::Interrupted))
+        ),
+        "got {retried:?}"
+    );
+    assert_eq!(
+        touches(&fixture).await,
+        1,
+        "the retry must not run the turn a second time"
     );
 }

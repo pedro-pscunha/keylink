@@ -78,6 +78,30 @@ pub(crate) enum Reached {
 /// the base is entered while the message is still queued, so a wrapper would
 /// report `Dispatched` for a turn that a [`QueueTimeout`](crate::QueueTimeout)
 /// then refused before it ever ran.
+///
+/// # A middleware can lie, and this is the wrong place to stop it
+///
+/// This type and [`Context::progress`] are `pub` — hidden, but `pub` — because
+/// the code that marks them is expanded into the *caller's* crate, where
+/// `pub(crate)` does not reach. So a [`Middleware`] holding a [`Context`] can
+/// mark [`completed`](Self::completed) and then refuse without calling `next`,
+/// and the accept path will record that refusal as the call's settled answer
+/// and replay it to every retry — the defect the whole marker exists to
+/// prevent, re-opened one layer up.
+///
+/// There is nothing to seal it with. A token only generated code could build
+/// would itself have to be `pub` to be named in the expansion, so the forgery
+/// moves by one line. Cross-checking against the chain's `Outcome` is worse
+/// than useless: a layer that runs `next` and *then* rewrites `Ok` into `Err`
+/// produced the frame the caller actually received, and replaying that frame
+/// byte for byte is correct — demoting it would break a legitimate layer to
+/// inconvenience a dishonest one.
+///
+/// What makes it tolerable is that a `Middleware` is not a plugin. You write
+/// it, you compile it into your binary, and it already sits between every call
+/// and the handler: a layer willing to forge this marker can return a wrong
+/// answer outright and save itself the trouble. The boundary this crate
+/// defends is the **peer**, and no peer can reach any of this.
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct Progress(Arc<AtomicU8>);
@@ -162,6 +186,9 @@ impl Context {
     ///
     /// A clone shares the marker, which is what lets an actor's turn — running
     /// on another task entirely — report that it started and finished.
+    ///
+    /// Reachable from a [`Middleware`], which is a hole [`Progress`] documents
+    /// rather than one it closes.
     #[doc(hidden)]
     #[must_use]
     pub fn progress(&self) -> Progress {
@@ -346,6 +373,13 @@ impl<Req: Send + 'static, Resp: Send + 'static> Middleware<Req, Resp> for QueueT
 /// Make the impl generic over `Req: Rpc` and it applies to every service you
 /// ever define, which is what keeps a logging or metrics layer from being
 /// rewritten per service.
+///
+/// # Leave the progress marker alone
+///
+/// The [`Context`] a layer is handed carries the marker the idempotency ledger
+/// reads to decide whether the work was entered. Marking it and then refusing
+/// records the refusal as the call's answer and replays it to every retry. It
+/// is `#[doc(hidden)]` and it cannot be sealed; the reasoning is on `Progress`.
 pub trait Middleware<Req, Resp>: Send + Sync + 'static {
     /// Handle one call. Call `next` to continue, or return an
     /// [`Outcome::Err`] to refuse without reaching the handler.

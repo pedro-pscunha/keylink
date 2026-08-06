@@ -2385,3 +2385,107 @@ exist and each costs more than the item is worth.
 Recorded here rather than forgotten. The shape that would justify it is a turn
 long enough that abandoning it matters — a batch, a scan — and that is also the
 shape §16.2 says to bound from inside the method, where the state is.
+
+## 16.6 The keyed `System` path marked nothing, and gave the key back
+
+Three generated paths dispatch a request, and each has to say how far its call
+got. They say it out of band, on the progress marker `Context` carries, because
+the `Outcome` cannot: `Outcome::Err` is what a refusing layer returns *and* what
+a panicking turn returns, so the value genuinely cannot name who produced it.
+RFC-05 §2 records why that channel exists at all.
+
+- **`service()`, the plain handler.** `dispatched()` on the way in,
+  `completed()` on the way out.
+- **`Handle::service()`, the local actor served over its own ALPN.**
+  `dispatched()` *inside* the turn closure, so a `QueueTimeout` refusing a
+  still-queued message leaves the key claimable; `completed()` outside it, on
+  the one arm holding an answer the turn produced, so an observer's veto does
+  not settle the key as the veto.
+- **`spawn()`, the keyed `System` mailbox loop — nothing.** It destructured
+  `Mail` and ran `__actor_turn` inside `guarded(..)` without touching
+  `cx.progress()` at any point.
+
+`Drop for Guard` reads that marker and reads nothing else, and `NotDispatched`
+means "no work was entered, give the key back so a retry is a first attempt". So
+a call carrying an idempotency key and addressed to a keyed actor claimed the
+key, ran the turn, mutated the actor, and then **released** the key on the way
+out. The key went vacant, the caller's retry was a first attempt, and the work
+ran again. That is at-least-once, produced by the module whose entire stated
+guarantee is at-most-once — the exact inversion it exists to prevent.
+
+### How reachable this is, stated honestly
+
+The typed `ActorClient` exposes no `with_idempotency`, so **nothing in keylink's
+own client can send one of these**. No user of the shipped API reaches it.
+
+It is not unreachable either. `idempotency` is a field on the `Envelope` that
+carries *every* ALPN, the actor system's included, and `RpcClient`,
+`ActorRequest`, `ActorReply` and `System::alpn` are all public. A peer that
+speaks the protocol by hand reaches it in four lines — which is exactly what
+`keylink/tests/actors.rs` now does. Latent, not impossible, and not a defect the
+client's shape can be relied on to keep buried: the moment `ActorClient` grows a
+`with_idempotency` it is a live one.
+
+### Where the two marks went
+
+`dispatched()` goes **inside the `Ok` arm of `payload.open::<Request>(schema())`**,
+immediately before the turn. A payload that fails that check fails it on the
+hashes or on the bytes, and both are decided before any user code runs. Marking
+above the `match` would report a message the actor never saw as work that ran,
+and settle its key `Interrupted` — refusing every retry of a call that never
+happened.
+
+`completed()` goes **on the arm where `ActorReply::encode` succeeded**, and
+nowhere else. The nested encode is the reason this is not simply "the turn
+returned": an encode that fails means the turn ran, mutated the state, and
+produced nothing the wire can carry. Marking completed there would record the
+*encoding refusal* as this call's settled reply and replay that refusal to every
+retry, for work that really did happen — the same failure §16's observer-veto
+argument names one path over. Leaving the marker at `dispatched` settles
+`Interrupted` instead: "it ran, and whether it took effect is unknown", which is
+the truth and is what the caller needs to hear.
+
+The **panic arm** leaves the marker where it is, for the same reason. A turn
+that panicked was entered, and whatever it mutated before it panicked is in the
+state the actor carries on with. `Interrupted` is right; giving the key back
+would run that half-done work a second time.
+
+### `System::deliver`'s five failure paths need nothing
+
+Every one of them was walked against the fix, and none of them wants a mark of
+its own — which is the same argument §16's first list makes: only the code that
+knows when the *work* begins may mark, and `deliver` never does.
+
+| Path | Marker on exit | Settles | Right? |
+| --- | --- | --- | --- |
+| `actor.validate()` refuses an over-long id | `NotDispatched` | released | yes — the registry was never consulted |
+| `route` finds nothing, or the system is at capacity | `NotDispatched` | released | yes — no actor, no turn |
+| the declared hash differs from the mounted one | `NotDispatched` | released | yes — the payload is dropped undecoded |
+| `mail.send` fails, the mailbox being closed | `NotDispatched` | released | yes — the message never entered the queue |
+| `answer.await` fails, the reply sender dropped | whatever the loop left | released *or* `Interrupted` | yes, and this is the one that needed the fix |
+
+The last row is the whole point. A `Mail` that was aborted **while still queued**
+leaves `NotDispatched`, and the key is released, because nothing ran. A `Mail`
+whose turn had **started** leaves `Dispatched`, and the key settles
+`Interrupted`, because it did. Before this section those two were the same
+answer, and the answer was the wrong one. **No change to `actor.rs` is
+required**, and none was made.
+
+### What is proved, and where
+
+Four tests in `keylink/tests/actors.rs`, all over a real QUIC connection, all
+reading the actor's own counter rather than a clock:
+
+1. a keyed call that ran a turn does not leave the key claimable — the retry is
+   answered from the record and the counter stays at one;
+2. a keyed call whose payload does not decode leaves the key claimable — the
+   retry runs;
+3. a keyed call whose reply does not encode settles `Interrupted`;
+4. a keyed call whose turn panicked settles `Interrupted`.
+
+Test 3 needs a response type that cannot be serialized, which no derived
+`Serialize` can be: postcard reports a serialization error only from its flavor,
+and the `Vec` flavor `ActorReply::encode` uses has none. The test writes one by
+hand. Without it the arm that decides what a turn owes when it ran and produced
+nothing sendable is unreachable, and an unreachable arm is a decision nobody has
+checked.

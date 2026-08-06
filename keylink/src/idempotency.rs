@@ -156,6 +156,27 @@ pub const MAX_RUNNING_PER_PEER: usize = 128;
 /// configuration.
 pub const MAX_RUNNING: usize = 4096;
 
+/// Attaching calls one peer may have parked at once, waiting on a call already
+/// in flight.
+///
+/// A parked attacher holds no claim, so neither running cap can see it or the
+/// QUIC stream pair it is holding open: one claimed key plus 40 connections of
+/// 100 streams each parks 4000 tasks for [`MAX_ATTACH`] and meets no bound.
+/// Same number as [`MAX_RUNNING_PER_PEER`], because that is also the legitimate
+/// ceiling — a [`Peer`](crate::Peer) re-issue produces at most one attacher per
+/// running claim, and running claims are capped there.
+pub const MAX_WAITING_PER_PEER: usize = 128;
+
+/// Attaching calls the whole ledger may have parked at once.
+///
+/// Two levels for the reason the running pair has two:
+/// [`Allowlist::Anyone`](crate::Allowlist) makes the peer count a property of
+/// the network. A quarter of [`MAX_RUNNING`] rather than the same number,
+/// because a waiter produces nothing — it costs a task and a stream pair, and
+/// it may still be refused when its budget runs out — so the node spends the
+/// smaller share of its budget on calls it has already decided not to run.
+pub const MAX_WAITING: usize = 1024;
+
 /// Why a call carrying an idempotency key was refused without being run.
 ///
 /// Grouped under one [`RemoteError`] variant rather than spread across six,
@@ -213,6 +234,12 @@ pub enum IdempotencyRefusal {
     ///
     /// A claimed slot is never evicted, so unbounded claims are unbounded
     /// memory. Bounded by [`MAX_RUNNING_PER_PEER`] and [`MAX_RUNNING`].
+    ///
+    /// Also what an attaching call is told when [`MAX_WAITING_PER_PEER`] or
+    /// [`MAX_WAITING`] is reached. One variant rather than two, because
+    /// `postcard_schema` hashes the variant list into the ALPN: a second
+    /// spelling of "too many at once" would move the protocol identity and
+    /// break every handshake, to say something the caller acts on identically.
     #[error("too many calls with idempotency keys are in flight - the limit is {limit}")]
     TooManyRunning {
         /// The cap that was reached.
@@ -424,10 +451,16 @@ struct Bucket {
 #[derive(Debug, Default)]
 struct Inner {
     peers: HashMap<EndpointId, Bucket>,
+    /// Attaching calls parked right now, per peer. Beside `peers` rather than
+    /// inside a [`Bucket`], because a waiter outlives the records it is waiting
+    /// on: the settle it is woken by can leave the bucket empty, and an empty
+    /// bucket is removed.
+    waiters: HashMap<EndpointId, usize>,
     held: usize,
     bytes: usize,
     spent: usize,
     running: usize,
+    waiting: usize,
 }
 
 /// Every bound the ledger enforces, in one value so a test can move them.
@@ -438,6 +471,8 @@ struct Limits {
     tombstones: usize,
     running: usize,
     running_per_peer: usize,
+    waiting: usize,
+    waiting_per_peer: usize,
     ttl: Duration,
 }
 
@@ -449,6 +484,8 @@ impl Default for Limits {
             tombstones: MAX_TOMBSTONES,
             running: MAX_RUNNING,
             running_per_peer: MAX_RUNNING_PER_PEER,
+            waiting: MAX_WAITING,
+            waiting_per_peer: MAX_WAITING_PER_PEER,
             ttl: RECORD_TTL,
         }
     }
@@ -520,17 +557,25 @@ impl Ledger {
         self.expire(inner, peer, now);
 
         let total = inner.running;
-        {
-            let bucket = inner.peers.entry(peer).or_default();
+        // `get`, never `entry`: an `or_default()` above these checks inserts a
+        // bucket for a peer the global cap is about to turn away, and nothing
+        // removes it, because `release` and `evict` prune only a bucket they
+        // took the last slot out of. With `Allowlist::Anyone` the number of
+        // distinct peers is a property of the network, so that is unbounded
+        // memory in the one module whose whole purpose is bounds.
+        if let Some(bucket) = inner.peers.get(&peer) {
             if let Some(entry) = bucket.slots.get(&key) {
                 return entry.slot.replay();
             }
             if bucket.running >= self.limits.running_per_peer {
                 return refused_over(self.limits.running_per_peer);
             }
-            if total >= self.limits.running {
-                return refused_over(self.limits.running);
-            }
+        }
+        if total >= self.limits.running {
+            return refused_over(self.limits.running);
+        }
+        {
+            let bucket = inner.peers.entry(peer).or_default();
             bucket.slots.insert(
                 key.clone(),
                 Entry {
@@ -548,6 +593,36 @@ impl Ledger {
             key,
             settled: false,
             progress: None,
+        })
+    }
+
+    /// Take a place to wait in, or refuse the attach before it parks.
+    ///
+    /// The other half of the running caps, and it has to be a separate count:
+    /// an attaching call holds **no** claim, so `Bucket::running` and
+    /// `Inner::running` see neither the task nor the QUIC stream pair it holds
+    /// open for [`MAX_ATTACH`]. Counted in the ledger rather than per
+    /// connection, because a peer's waiters are spread across however many
+    /// connections it opened and a per-connection value cannot see the others.
+    ///
+    /// # Errors
+    ///
+    /// [`IdempotencyRefusal::TooManyRunning`] once [`MAX_WAITING_PER_PEER`] or
+    /// [`MAX_WAITING`] is reached.
+    pub(crate) fn wait(self: &Arc<Self>, peer: EndpointId) -> Result<Waiting, RemoteError> {
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        if inner.waiters.get(&peer).copied().unwrap_or(0) >= self.limits.waiting_per_peer {
+            return Err(over(self.limits.waiting_per_peer));
+        }
+        if inner.waiting >= self.limits.waiting {
+            return Err(over(self.limits.waiting));
+        }
+        *inner.waiters.entry(peer).or_default() += 1;
+        inner.waiting += 1;
+        Ok(Waiting {
+            ledger: Arc::clone(self),
+            peer,
         })
     }
 
@@ -754,14 +829,17 @@ fn largest(inner: &Inner, size: impl Fn(&Bucket) -> usize) -> Option<EndpointId>
         .map(|(id, _)| *id)
 }
 
-/// One refusal, built in one place, so the two caps report the same way.
+/// One refusal, built in one place, so every cap reports the same way.
+fn over(limit: usize) -> RemoteError {
+    IdempotencyRefusal::TooManyRunning {
+        limit: u32::try_from(limit).unwrap_or(u32::MAX),
+    }
+    .into()
+}
+
+/// The same refusal, on the path that answers a claim rather than a wait.
 fn refused_over(limit: usize) -> Claim {
-    Claim::Refused(
-        IdempotencyRefusal::TooManyRunning {
-            limit: u32::try_from(limit).unwrap_or(u32::MAX),
-        }
-        .into(),
-    )
+    Claim::Refused(over(limit))
 }
 
 /// A claimed key, held for as long as the call is being handled.
@@ -828,6 +906,38 @@ impl Drop for Guard {
     }
 }
 
+/// One attaching call's place in the queue, held for as long as it waits.
+///
+/// RAII for the reason [`Guard`] is: the ordinary way a waiter stops waiting is
+/// that its task is **aborted** — the caller's connection ended — and a
+/// decrement written on the return paths of `claim_key` does not run then.
+/// `Drop` does. Getting this wrong leaks a place per abandoned attach until the
+/// cap is reached with nobody waiting, and every attach after that is refused
+/// for as long as the process lives.
+#[derive(Debug)]
+pub(crate) struct Waiting {
+    ledger: Arc<Ledger>,
+    peer: EndpointId,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        let mut guard = self.ledger.lock();
+        let inner = &mut *guard;
+        inner.waiting = inner.waiting.saturating_sub(1);
+        let Some(count) = inner.waiters.get_mut(&self.peer) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        // The entry goes at zero, for the reason `claim` creates no bucket on a
+        // refusing path: a map keyed by peer is a map an open network chooses
+        // the size of.
+        if *count == 0 {
+            inner.waiters.remove(&self.peer);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -878,6 +988,14 @@ mod tests {
         match claim {
             Claim::Fresh(guard) => guard,
             other => panic!("expected a fresh claim, got {other:?}"),
+        }
+    }
+
+    fn waited(place: Result<Waiting, RemoteError>) -> IdempotencyRefusal {
+        match place {
+            Err(RemoteError::Idempotency(refusal)) => refusal,
+            Err(other) => panic!("expected an idempotency refusal, got {other:?}"),
+            Ok(_) => panic!("expected a refusal, got a place to wait in"),
         }
     }
 
@@ -1167,6 +1285,68 @@ mod tests {
                 IdempotencyRefusal::TooManyRunning { limit: 2 }
             );
         }
+
+        /// The bound the running caps cannot supply: an attaching call holds no
+        /// claim, so one claimed key and enough connections parks unboundedly
+        /// many tasks and stream pairs and meets neither cap.
+        #[test]
+        fn waiting_attachers_are_bounded_per_peer() {
+            let ledger = Ledger::with_limits(Limits {
+                waiting_per_peer: 2,
+                ..Limits::default()
+            });
+            let _one = ledger.wait(peer(A)).expect("the first place is free");
+            let _two = ledger.wait(peer(A)).expect("and so is the second");
+
+            assert_eq!(
+                waited(ledger.wait(peer(A))),
+                IdempotencyRefusal::TooManyRunning { limit: 2 }
+            );
+            assert!(
+                ledger.wait(peer(B)).is_ok(),
+                "one peer's attachers must not close the door on another"
+            );
+        }
+
+        #[test]
+        fn waiting_attachers_are_bounded_in_total() {
+            let ledger = Ledger::with_limits(Limits {
+                waiting: 2,
+                ..Limits::default()
+            });
+            let _one = ledger.wait(peer(A)).expect("free");
+            let _two = ledger.wait(peer(B)).expect("free");
+
+            assert_eq!(
+                waited(ledger.wait(peer(B))),
+                IdempotencyRefusal::TooManyRunning { limit: 2 }
+            );
+        }
+
+        /// The RAII half, and the one that decides whether the cap is a bound or
+        /// a fuse. A waiter usually stops waiting because its task was aborted;
+        /// if the place did not come back, the cap would be reached once and
+        /// then refuse every attach for as long as the process lives, with
+        /// nobody waiting.
+        #[test]
+        fn a_dropped_waiter_gives_its_place_back() {
+            let ledger = Ledger::with_limits(Limits {
+                waiting_per_peer: 1,
+                ..Limits::default()
+            });
+            let first = ledger.wait(peer(A)).expect("free");
+            assert_eq!(
+                waited(ledger.wait(peer(A))),
+                IdempotencyRefusal::TooManyRunning { limit: 1 }
+            );
+
+            drop(first);
+
+            assert!(
+                ledger.wait(peer(A)).is_ok(),
+                "the place must come back when the waiter does not"
+            );
+        }
     }
 
     mod ttl {
@@ -1273,13 +1453,40 @@ mod tests {
 
         /// Recompute every counter from the maps and compare. The maps are the
         /// truth; the counters are a cache of them.
+        ///
+        /// The waiter count is the one thing here that is *not* recomputable
+        /// from the maps: a place to wait in is held by a `Waiting` living on
+        /// some other task's stack, and `Inner` records how many there are
+        /// rather than which. So this checks the two counts against each other
+        /// and against the pruning rule, and
+        /// `the_waiting_count_follows_the_live_guards` is what checks them
+        /// against the guards themselves.
         fn assert_agrees(ledger: &Ledger, whereabouts: &str) {
             let inner = ledger.lock();
             let mut held = 0;
             let mut bytes = 0;
             let mut spent = 0;
             let mut running = 0;
+            let mut waiting = 0;
+            for count in inner.waiters.values() {
+                assert_ne!(
+                    *count, 0,
+                    "{whereabouts}: a peer with no waiters must be removed from the map, \
+                     not left in it at zero"
+                );
+                waiting += *count;
+            }
+            assert_eq!(inner.waiting, waiting, "{whereabouts}: waiting");
             for bucket in inner.peers.values() {
+                // Fix 1's guard. A bucket is created by the claim that inserts
+                // the first slot and removed by whatever takes the last one
+                // out, so an empty one is a peer nothing removes — unbounded,
+                // because `Allowlist::Anyone` makes the peer count a property
+                // of the network.
+                assert!(
+                    !bucket.slots.is_empty(),
+                    "{whereabouts}: an empty bucket must be removed, not left behind"
+                );
                 assert_eq!(
                     bucket.held.len() + bucket.spent.len() + bucket.running,
                     bucket.slots.len(),
@@ -1310,6 +1517,13 @@ mod tests {
                 ..Limits::default()
             });
             assert_agrees(&ledger, "empty");
+
+            // Held across the whole loop, so every probe below runs with a live
+            // waiter for a peer whose bucket comes and goes underneath it. That
+            // is the reason the waiter counts live beside `peers` rather than
+            // inside a `Bucket`: the bucket is removed when its last slot goes,
+            // and the waiter is still waiting.
+            let _waiter = ledger.wait(peer(A)).expect("a free place");
 
             for n in 0..40u8 {
                 let k = key(&format!("k{n}"));
@@ -1359,6 +1573,66 @@ mod tests {
             let _ = ledger.claim(peer(A), key("wake"));
             assert_agrees(&ledger, "after the ttl");
             assert_eq!(ledger.lock().bytes, 0, "expired records free their bytes");
+        }
+
+        /// Fix 1's own case, and the only path that reached it: the GLOBAL cap
+        /// refuses a peer the ledger has never seen. Taking the bucket with
+        /// `entry(peer).or_default()` before the check meant the refusal itself
+        /// introduced the peer, and nothing ever removed it — `release` and
+        /// `evict` prune only a bucket they took the last slot out of, and this
+        /// one never had one.
+        #[test]
+        fn a_claim_the_global_cap_refuses_leaves_no_bucket_behind() {
+            let ledger = Ledger::with_limits(Limits {
+                running: 1,
+                ..Limits::default()
+            });
+            let _running = guard(ledger.claim(peer(A), key("a")));
+
+            assert_eq!(
+                refusal(ledger.claim(peer(B), key("b"))),
+                IdempotencyRefusal::TooManyRunning { limit: 1 }
+            );
+            // The probe is the assertion. A second, narrower one here would
+            // never be the one that fires, which makes it decoration.
+            assert_agrees(&ledger, "after a globally refused claim");
+        }
+
+        /// The waiter counts are what `assert_agrees` cannot recompute — a
+        /// place to wait in is a value on the waiting task's stack, and `Inner`
+        /// records how many exist rather than which — so they are checked
+        /// against the guards themselves here.
+        #[test]
+        fn the_waiting_count_follows_the_live_guards() {
+            let ledger = Ledger::new();
+            let mut places = Vec::new();
+            for _ in 0..4 {
+                places.push(ledger.wait(peer(A)).expect("free"));
+                places.push(ledger.wait(peer(B)).expect("free"));
+                assert_agrees(&ledger, "while places are being taken");
+            }
+            {
+                let inner = ledger.lock();
+                assert_eq!(inner.waiting, 8);
+                assert_eq!(inner.waiters.get(&peer(A)), Some(&4));
+                assert_eq!(inner.waiters.get(&peer(B)), Some(&4));
+            }
+
+            while let Some(place) = places.pop() {
+                let live = places.len();
+                drop(place);
+                assert_eq!(
+                    ledger.lock().waiting,
+                    live,
+                    "the count must be one per guard still alive"
+                );
+                assert_agrees(&ledger, "while places are being given back");
+            }
+
+            assert!(
+                ledger.lock().waiters.is_empty(),
+                "the last waiter to leave must take its map entry with it"
+            );
         }
     }
 

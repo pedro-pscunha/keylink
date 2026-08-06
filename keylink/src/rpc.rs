@@ -156,6 +156,13 @@ fn resolve(claim: Claim) -> Keyed {
 ///
 /// One wait and one re-claim, never a loop, so the work here is bounded by the
 /// caller's own budget and by nothing else.
+///
+/// # What the waiting itself is bounded by
+///
+/// A parked attacher holds no claim, so `MAX_RUNNING_PER_PEER` and `MAX_RUNNING`
+/// bound neither it nor the stream pair it keeps open. It takes a `Waiting` from
+/// the ledger instead, refused **before** it parks and given back by `Drop` —
+/// because the ordinary way a waiter stops waiting is that this task is aborted.
 async fn claim_key(ledger: &Arc<Ledger>, peer: EndpointId, idem: Option<Idempotency>) -> Keyed {
     let Some(idem) = idem else {
         return Keyed::None;
@@ -171,6 +178,13 @@ async fn claim_key(ledger: &Arc<Ledger>, peer: EndpointId, idem: Option<Idempote
     };
     let Some(budget) = idem.attach_budget() else {
         return Keyed::Refuse(IdempotencyRefusal::InFlight.into());
+    };
+    // Taken before anything parks, and held to the end of this function so it
+    // covers the wait AND the re-claim after it. A caller that is not going to
+    // wait never reaches here, so it never spends a place.
+    let _waiting = match ledger.wait(peer) {
+        Ok(waiting) => waiting,
+        Err(refusal) => return Keyed::Refuse(refusal),
     };
 
     let notified = notify.notified();
@@ -492,6 +506,67 @@ where
         // stream. Aborting them is the honest end, not a lost result.
         calls.shutdown().await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::idempotency::MAX_WAITING_PER_PEER;
+
+    /// A valid endpoint id, reused from `idempotency.rs` for the same reason.
+    const A: &str = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0";
+
+    /// The cap has to be met *before* the task parks, or it is not a cap: a
+    /// waiter that is refused after it waits has already spent the task and the
+    /// stream pair the refusal exists to save.
+    ///
+    /// `start_paused` is what makes that assertion honest rather than a race.
+    /// With the bound removed this call parks on its 30 second budget, tokio
+    /// auto-advances to the timer, and the answer comes back `InFlight` — so
+    /// the test fails on the variant rather than hanging.
+    #[tokio::test(start_paused = true)]
+    async fn an_attacher_over_the_cap_is_refused_before_it_parks() {
+        let ledger = Ledger::new();
+        let peer = EndpointId::from_str(A).expect("a valid endpoint id");
+        let key = IdempotencyKey::new("k").expect("a valid key");
+
+        let Claim::Fresh(_running) = ledger.claim(peer, key.clone()) else {
+            panic!("the first claim must be fresh");
+        };
+        let places: Vec<_> = (0..MAX_WAITING_PER_PEER)
+            .map(|_| ledger.wait(peer).expect("a free place"))
+            .collect();
+
+        let keyed = claim_key(
+            &ledger,
+            peer,
+            Some(Idempotency::attaching_for(key, Duration::from_secs(30))),
+        )
+        .await;
+
+        // Exhaustive, with no catch-all: the arm that would hide a regression
+        // here is the one nobody thought to name.
+        let refused = match keyed {
+            Keyed::Refuse(RemoteError::Idempotency(refusal)) => refusal,
+            Keyed::Refuse(other) => panic!("expected an idempotency refusal, got {other:?}"),
+            Keyed::None => panic!("expected a refusal, got no key at all"),
+            Keyed::Run(_) => panic!("expected a refusal, got the key"),
+            Keyed::Replay(_) => panic!("expected a refusal, got a replay"),
+        };
+        assert_eq!(
+            refused,
+            IdempotencyRefusal::TooManyRunning {
+                limit: u32::try_from(MAX_WAITING_PER_PEER).expect("a cap that fits"),
+            },
+            "an attacher past the cap must be turned away, not parked"
+        );
+        drop(places);
     }
 }
 
