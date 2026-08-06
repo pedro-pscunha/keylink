@@ -7,12 +7,12 @@
 //!
 //! # A primitive of the turn model, not of the actor system
 //!
-//! This lived in `actor.rs`, which owns the ALPN, [`Sealed`](crate::Sealed) and
-//! the wire envelope. That was an inversion: `local.rs` has no transport in it
-//! at all and still had to depend on the file that owns the wire format in
-//! order to run a turn safely. The keyed, networked system is one **consumer**
-//! of this, beside the local handle, the generated code and the observer chain.
-//! Nothing here knows what a peer is.
+//! This lived in `actor.rs`, now `actor/remote.rs`, which owns the ALPN,
+//! [`Sealed`](crate::Sealed) and the wire envelope. That was an inversion:
+//! `local.rs` has no transport in it at all and still had to depend on the file
+//! that owns the wire format in order to run a turn safely. The keyed, networked
+//! system is one **consumer** of this, beside the local handle, the generated
+//! code and the observer chain. Nothing here knows what a peer is.
 
 use std::fmt;
 use std::future::Future;

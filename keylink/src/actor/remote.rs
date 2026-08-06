@@ -268,11 +268,11 @@ type Answer = (Outcome<ActorReply>, Body);
 /// | slot type   | per idle actor | ten thousand |
 /// |-------------|----------------|--------------|
 /// | `Box<Mail>` | 1,684 bytes    | 16.8 MB      |
-/// | `Mail`      | 8,724 bytes    | 87.2 MB      |
+/// | `Mail`      | 9,620 bytes    | 96.2 MB      |
 ///
-/// The 7,040 byte difference is the block: `Mail` is 224 bytes, and 32 of them
-/// is 7,168. The cost of boxing is one allocation per message, on a path that
-/// already allocates the payload.
+/// The 7,936 byte difference is the block: `Mail` is 256 bytes, so 32 of them is
+/// 8,192, against 256 for 32 pointers. The cost of boxing is one allocation per
+/// message, on a path that already allocates the payload.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct Mail {
@@ -370,7 +370,7 @@ impl System<Mail> {
             .validate()
             .map_err(|err| RemoteError::Failed(err.to_string()))?;
 
-        let (ours, mail) = self.inner.route(&request.actor)?;
+        let (ours, mail) = self.route(&request.actor)?;
         if ours != request.schema {
             return Err(RemoteError::ActorSchemaMismatch {
                 ours,

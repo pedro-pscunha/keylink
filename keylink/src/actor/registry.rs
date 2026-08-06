@@ -184,7 +184,7 @@ struct Entry<M> {
     last_seen: AtomicU64,
 }
 
-pub(super) struct Registry<M> {
+struct Registry<M> {
     entries: RwLock<HashMap<ActorId, Entry<M>>>,
     factory: Option<Factory<M>>,
     capacity: usize,
@@ -222,10 +222,7 @@ impl<M> Registry<M> {
     }
 
     /// Find the actor, spawning it if the system was given a factory.
-    pub(super) fn route(
-        &self,
-        id: &ActorId,
-    ) -> std::result::Result<(u64, mpsc::Sender<Box<M>>), RouteError> {
+    fn route(&self, id: &ActorId) -> std::result::Result<(u64, mpsc::Sender<Box<M>>), RouteError> {
         if let Some(found) = self.touch(&self.read(), id) {
             return Ok(found);
         }
@@ -299,8 +296,38 @@ impl<M> Registry<M> {
 /// [`Mail`] in these fields would put a QUIC stream and a postcard payload
 /// inside the one half of this module that has no business knowing either, and
 /// no import list would show it.
+///
+/// # `error[E0283]: type annotations needed`
+///
+/// The default does not rescue every call site, and this is where somebody who
+/// has just met that error is looking. A default applies in **type position**,
+/// so there has to be a type position for it to apply in — and a system that is
+/// built and then touched only through the methods that never mention `M`
+/// ([`contains`](Self::contains), [`len`](Self::len),
+/// [`is_empty`](Self::is_empty), [`evict_idle`](Self::evict_idle),
+/// [`stop`](Self::stop), [`abort`](Self::abort)) never writes one:
+///
+/// ```compile_fail
+/// let system = keylink::System::builder(keylink::Eviction::Never).build();
+/// assert!(system.is_empty());
+/// ```
+///
+/// Name the type and it compiles. That is the whole fix:
+///
+/// ```
+/// use keylink::{Eviction, System};
+/// let system: System = System::builder(Eviction::Never).build();
+/// assert!(system.is_empty());
+/// ```
+///
+/// Most code never meets it, because it pins `M` without trying: `service` and
+/// `alpn` exist only on `System<Mail>`, and `mount(id, journal::spawn(..))`
+/// pins it through [`Mounted`]. Moving `builder` to `impl System<Mail>` would
+/// fix it outright, by inherent-method probing, and is declined: it puts a
+/// registry concern into the transport half at the one point this module is
+/// arranged to keep them apart.
 pub struct System<M = Mail> {
-    pub(super) inner: Arc<Registry<M>>,
+    inner: Arc<Registry<M>>,
 }
 
 /// Hand-written, because the derive would bound the impl on `M: Clone` — and
@@ -351,6 +378,26 @@ impl<M> System<M> {
         }
         entries.insert(id, self.inner.entry(actor));
         Ok(())
+    }
+
+    /// Find the actor `id` addresses, spawning it if this system has a factory.
+    ///
+    /// **The whole of the seam**, and an operation rather than a handle on
+    /// purpose. With `inner` reachable from `remote.rs`, the transport half held
+    /// the entire [`Registry`] and every method on it, so nothing but manners
+    /// stopped the next change from reaching the map, the cap or the eviction
+    /// clock from the side that has a network in it. One `pub(super)` function
+    /// is a boundary that can be read in full, and adding a second is a visible
+    /// act rather than a use of something already in hand.
+    ///
+    /// # Errors
+    ///
+    /// [`RouteError`], which `remote.rs` translates into what a peer is told.
+    pub(super) fn route(
+        &self,
+        id: &ActorId,
+    ) -> std::result::Result<(u64, mpsc::Sender<Box<M>>), RouteError> {
+        self.inner.route(id)
     }
 
     /// Stop routing to `id`, then wait for the actor to finish what it has.
@@ -558,14 +605,35 @@ fn spawn_sweeper<M: Send + 'static>(registry: &Arc<Registry<M>>, budget: Duratio
 
 #[cfg(test)]
 mod tests {
+    //! Every test here runs at `M = ()`, and that instantiation is the
+    //! assertion.
+    //!
+    //! The header above claims this half places no requirement on what a mailbox
+    //! carries. Run against [`Mail`] — which is what `Mounted` means when nobody
+    //! says otherwise — that claim is an argument, because `Mail` satisfies any
+    //! bound one of these types might quietly grow. `()` satisfies almost none:
+    //! it is `Send + 'static` and nothing else, with no `Context`, no stream, no
+    //! serde and nothing a peer could have put there.
+    //!
+    //! So `System<()>`, `Mounted<()>` and `Mailbox<()>` compiling at all is the
+    //! property the split exists for, checked rather than argued. A transport
+    //! bound added to `mount`, `route`, `stop` or `build` would leave a
+    //! `Mail`-typed test binary green and stops this one from compiling.
+    //!
+    //! Nothing here needs a message to *be* anything, which is the same point
+    //! from the other side: mounting, the cap, eviction, routing and the
+    //! lifecycle are all decisions about **which** actor. The tests that need a
+    //! real payload live in `remote.rs`, where a payload exists.
+
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
 
     /// An actor that does nothing at all, for testing the registry rather than
-    /// any message it carries.
-    fn idler() -> Mounted {
-        mount(1, |mut inbox| async move {
+    /// any message it carries — so its mailbox carries a message that is not
+    /// anything.
+    fn idler() -> Mounted<()> {
+        mount(1, |mut inbox: Mailbox<()>| async move {
             while inbox.recv().await.is_some() {}
         })
     }
@@ -589,7 +657,7 @@ mod tests {
         // Both are now older than the budget.
         tokio::time::advance(Duration::from_secs(90)).await;
         // Routing is what marks an actor as used.
-        system.inner.route(&busy).expect("mounted");
+        system.route(&busy).expect("mounted");
         system.evict_idle();
 
         assert!(system.contains(&busy), "the addressed actor must survive");
@@ -625,9 +693,8 @@ mod tests {
 
     #[test]
     fn a_system_without_a_factory_never_grows_by_itself() {
-        let system: System = System::builder(Eviction::Never).build();
+        let system: System<()> = System::builder(Eviction::Never).build();
         let error = system
-            .inner
             .route(&ActorId::new("nobody").expect("valid"))
             .expect_err("nothing is mounted and nothing builds it");
         assert!(
@@ -635,5 +702,59 @@ mod tests {
             "got {error:?}"
         );
         assert!(system.is_empty());
+    }
+
+    /// The cap is registry policy, so it refuses on both paths to an entry and
+    /// it refuses without knowing what a message is: by hand through
+    /// [`System::mount`], and from the factory through [`System::route`].
+    ///
+    /// The two refusals come from different enums, which is why both are here.
+    /// `remote.rs`'s `the_capacity_refusal_reads_the_same_by_hand_and_lazily` is
+    /// what keeps their sentences in step.
+    #[tokio::test]
+    async fn a_full_registry_refuses_by_hand_and_lazily() {
+        let system = System::builder(Eviction::Never)
+            .capacity(1)
+            .spawn_with(|_| Some(idler()))
+            .build();
+        system
+            .mount(ActorId::new("first").expect("valid"), idler())
+            .expect("the cap is one and nothing is mounted");
+
+        let by_hand = system
+            .mount(ActorId::new("second").expect("valid"), idler())
+            .expect_err("the cap is one and one is mounted");
+        assert_eq!(by_hand, MountError::AtCapacity { capacity: 1 });
+
+        let lazily = system
+            .route(&ActorId::new("third").expect("valid"))
+            .expect_err("the factory is never called past the cap");
+        assert_eq!(lazily, RouteError::AtCapacity { capacity: 1 });
+    }
+
+    /// The two lifecycle methods, at a message type with no wire behind it.
+    ///
+    /// They are the likeliest place for a transport bound to arrive by accident,
+    /// because both await a task and one of them drops a sender — and neither
+    /// needs to know what that sender carries. Here it carries `()`.
+    ///
+    /// What each one does to state in flight is `remote.rs`'s and
+    /// `tests/actors.rs`'s to prove, over a real actor with real state. This one
+    /// only asks that unmounting works at all when `M` is nothing.
+    #[tokio::test]
+    async fn stop_and_abort_unmount_whatever_the_mailbox_carries() {
+        let system = System::builder(Eviction::Never).build();
+        let drained = ActorId::new("drained").expect("valid");
+        let cancelled = ActorId::new("cancelled").expect("valid");
+        system.mount(drained.clone(), idler()).expect("free");
+        system.mount(cancelled.clone(), idler()).expect("free");
+        assert_eq!(system.len(), 2);
+
+        assert!(system.stop(&drained).await);
+        assert!(system.abort(&cancelled).await);
+        assert!(system.is_empty());
+
+        assert!(!system.stop(&drained).await, "gone stays gone");
+        assert!(!system.abort(&cancelled).await);
     }
 }
