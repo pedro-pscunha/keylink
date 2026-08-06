@@ -1259,6 +1259,109 @@ mod tests {
         }
     }
 
+    /// The counters and the maps must agree, on every path.
+    ///
+    /// `Inner` tracks `held`, `bytes`, `spent` and `running` beside per-bucket
+    /// queues, and every one of `claim`, `settle`, `release`, `expire` and
+    /// `evict` moves both halves. A counter that drifts below the truth makes
+    /// `evict` stop firing at the bound it exists to enforce, and the ledger
+    /// grows without limit while every other test stays green — which is
+    /// exactly the failure the exhaustive `match` in `held_bytes` was written to
+    /// prevent, one level up. Nothing checked the arithmetic itself until this.
+    mod consistency {
+        use super::*;
+
+        /// Recompute every counter from the maps and compare. The maps are the
+        /// truth; the counters are a cache of them.
+        fn assert_agrees(ledger: &Ledger, whereabouts: &str) {
+            let inner = ledger.lock();
+            let mut held = 0;
+            let mut bytes = 0;
+            let mut spent = 0;
+            let mut running = 0;
+            for bucket in inner.peers.values() {
+                assert_eq!(
+                    bucket.held.len() + bucket.spent.len() + bucket.running,
+                    bucket.slots.len(),
+                    "{whereabouts}: a bucket's queues plus its running claims must \
+                     account for every slot it holds"
+                );
+                held += bucket.held.len();
+                spent += bucket.spent.len();
+                running += bucket.running;
+                for entry in bucket.slots.values() {
+                    bytes += entry.slot.held_bytes();
+                }
+            }
+            assert_eq!(inner.held, held, "{whereabouts}: held");
+            assert_eq!(inner.bytes, bytes, "{whereabouts}: bytes");
+            assert_eq!(inner.spent, spent, "{whereabouts}: spent");
+            assert_eq!(inner.running, running, "{whereabouts}: running");
+        }
+
+        /// Every settled path, mixed, against tight bounds so eviction and the
+        /// tombstone pool both fire many times rather than never.
+        #[test]
+        fn the_counters_agree_with_the_maps_on_every_path() {
+            let ledger = Ledger::with_limits(Limits {
+                records: 3,
+                bytes: 64,
+                tombstones: 4,
+                ..Limits::default()
+            });
+            assert_agrees(&ledger, "empty");
+
+            for n in 0..40u8 {
+                let k = key(&format!("k{n}"));
+                let p = if n % 3 == 0 { peer(B) } else { peer(A) };
+                match n % 5 {
+                    // recorded, sometimes too large to hold
+                    0 => guard(ledger.claim(p, k)).record(&frame(usize::from(n) + 1), false),
+                    // unrecordable
+                    1 => guard(ledger.claim(p, k)).record(&frame(8), true),
+                    // interrupted, by dropping an unwatched guard
+                    2 => drop(guard(ledger.claim(p, k))),
+                    // released, because nothing was dispatched
+                    3 => drop(guard(ledger.claim(p, k)).watching(Progress::new())),
+                    // claimed and left running for a while
+                    _ => {
+                        let running = guard(ledger.claim(p, k.clone()));
+                        assert_agrees(&ledger, "while a claim is running");
+                        running.record(&frame(4), false);
+                    }
+                }
+                assert_agrees(&ledger, &format!("after n={n}"));
+            }
+
+            // And a re-claim of an evicted key, which is the path that both
+            // removes a tombstone and adds a record in one call.
+            for n in 0..20u8 {
+                guard(ledger.claim(peer(A), key(&format!("k{n}")))).record(&frame(2), false);
+                assert_agrees(&ledger, &format!("after re-claiming k{n}"));
+            }
+        }
+
+        /// The TTL path moves entries between the two pools without going
+        /// through `settle`, so it gets its own check.
+        #[tokio::test(start_paused = true)]
+        async fn the_counters_agree_after_records_expire() {
+            let ledger = Ledger::with_limits(Limits {
+                ttl: Duration::from_secs(60),
+                ..Limits::default()
+            });
+            for n in 0..10u8 {
+                guard(ledger.claim(peer(A), key(&format!("k{n}")))).record(&frame(8), false);
+            }
+            assert_agrees(&ledger, "before the ttl");
+
+            tokio::time::advance(Duration::from_secs(61)).await;
+            // `expire` is lazy, so a claim is what drives it.
+            let _ = ledger.claim(peer(A), key("wake"));
+            assert_agrees(&ledger, "after the ttl");
+            assert_eq!(ledger.lock().bytes, 0, "expired records free their bytes");
+        }
+    }
+
     mod attach {
         use super::*;
 
