@@ -1,2 +1,6 @@
 /target
 **/*.rs.bk
+
+# Scratch that is not part of the build. `.tmp/market-example` is a
+# standalone downstream consumer, kept out of the workspace on purpose.
+/.tmp

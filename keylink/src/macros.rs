@@ -294,7 +294,7 @@ macro_rules! service {
             /// shared, so state holding an `Rc`, a `RefCell` or a `!Sync`
             /// client can be an actor and cannot be a `Handler`.
             pub trait Actor: Send + 'static {
-                /// The proven identity of the peer whose message comes next.
+                /// Who sent the message that comes next, when anybody did.
                 ///
                 /// Called immediately before each message and never
                 /// concurrently with one, because the mailbox is serial. Stash
@@ -302,7 +302,32 @@ macro_rules! service {
                 ///
                 /// A concurrent [`Handler`] could not have this: two calls
                 /// would race on the stashed value.
-                fn caller(&mut self, _cx: &$crate::Context) {}
+                ///
+                /// # `None` is a message from this process
+                ///
+                /// A [`Handle`] call has no peer, no handshake and no proven
+                /// key, so there is nothing to pass. It is an `Option` rather
+                /// than a skipped call for exactly one reason: an actor that
+                /// stashes the caller and is reachable both ways would
+                /// otherwise authorize a local message against **the last peer
+                /// that happened to call it**. Assign what you are given,
+                /// including the `None`:
+                ///
+                /// ```ignore
+                /// fn caller(&mut self, cx: Option<&Context>) {
+                ///     self.peer = cx.map(Context::peer);
+                /// }
+                /// ```
+                ///
+                /// # It occupies the name
+                ///
+                /// A service with an `rpc Caller()` cannot be an actor: the
+                /// generated method and this hook would be two trait items
+                /// called `caller`. [`Handler`] has no hook and no such
+                /// restriction, so the collision shows up only when a service
+                /// gains an actor — as a duplicate-definition error naming this
+                /// line. Rename the rpc.
+                fn caller(&mut self, _cx: ::core::option::Option<&$crate::Context>) {}
 
                 $(
                     $crate::__keylink_actor_method!(
@@ -324,12 +349,37 @@ macro_rules! service {
                 );
             )+
 
+            /// One message against one actor: the caller hook, then the method.
+            ///
+            /// Generated **once** and used by all three consumers — the keyed
+            /// system's mailbox loop, the singleton service's dispatch, and
+            /// nothing else, because [`Handle`]'s own methods call the trait
+            /// directly. A method kind therefore cannot be dispatched two
+            /// different ways, which is the failure RFC-01 §11.2b names.
+            async fn __actor_turn<A: Actor>(
+                state: &mut A,
+                cx: ::core::option::Option<&$crate::Context>,
+                request: Request,
+                body: $crate::BodyReader,
+            ) -> (Response, $crate::Body) {
+                state.caller(cx);
+                match request {
+                    $(
+                        Request::$rpc { $( $arg ),* } =>
+                            [<__actor_ $rpc:snake>](state, body $(, $arg )*).await,
+                    )+
+                }
+            }
+
             /// Spawn one actor of this service, ready to be mounted.
             ///
             /// Hand it to [`System::mount`](keylink::System::mount) under an
             /// id, or return it from
             /// [`spawn_with`](keylink::SystemBuilder::spawn_with) to have it
             /// built on the first message to an unmounted id.
+            ///
+            /// For **one** actor rather than many, use [`actor`], which needs
+            /// no id, no registry and no second ALPN.
             ///
             /// A panicking message costs that message, not the actor: the turn
             /// is caught and reported as a refusal, and the next message runs
@@ -342,21 +392,16 @@ macro_rules! service {
                 $crate::mount(schema(), move |mut inbox: $crate::Mailbox| async move {
                     while let ::std::option::Option::Some(mail) = inbox.recv().await {
                         let $crate::Mail { cx, payload, body, reply } = *mail;
-                        state.caller(&cx);
                         // The ONLY route from the payload's bytes to a typed
                         // message, and it compares the hashes first.
                         let __answer = match payload.open::<Request>(schema()) {
                             ::std::result::Result::Ok(__request) => {
-                                let __turn = $crate::guarded(async {
-                                    match __request {
-                                        $(
-                                            Request::$rpc { $( $arg ),* } =>
-                                                [<__actor_ $rpc:snake>](
-                                                    &mut state, body $(, $arg )*
-                                                ).await,
-                                        )+
-                                    }
-                                })
+                                let __turn = $crate::guarded(__actor_turn(
+                                    &mut state,
+                                    ::core::option::Option::Some(&cx),
+                                    __request,
+                                    body,
+                                ))
                                 .await;
                                 match __turn {
                                     ::std::result::Result::Ok((__response, __body)) => {
@@ -387,6 +432,208 @@ macro_rules! service {
                         let _ = reply.send(__answer);
                     }
                 })
+            }
+
+            /// Start one actor of this service, here, in this process.
+            ///
+            /// No id, no registry, no schema hash, no serialization and no
+            /// network. The state moves onto its own task and is reached
+            /// through the returned [`Handle`], whose methods are the ones
+            /// written in `service!`.
+            ///
+            /// ```ignore
+            /// let warehouse = inventory::actor(Warehouse::seeded());
+            /// let item = warehouse.get_item("ADU-014".into()).await?;   // Err = MailboxClosed
+            /// ```
+            ///
+            /// To serve the **same** actor to other machines as well, call
+            /// [`Handle::service`]. To serve many keyed instances instead, use
+            /// [`spawn`] with a [`System`](keylink::System).
+            ///
+            /// # Panics
+            ///
+            /// Panics when called outside a tokio runtime, like every other
+            /// spawn. From synchronous code, enter one first with
+            /// [`blocking::Node::enter`](keylink::blocking::Node::enter).
+            #[must_use]
+            pub fn actor<A: Actor>(state: A) -> Handle<A> {
+                Handle { inner: $crate::LocalActor::spawn(state) }
+            }
+
+            /// A handle to an actor in this process.
+            ///
+            /// Its methods are the ones written in `service!`, with the same
+            /// names, the same argument order and the same success types as
+            /// [`Client`]'s. The error type is the difference, and it is the
+            /// whole difference: a local call fails one way, so it fails with
+            /// [`MailboxClosed`](keylink::MailboxClosed) and never with
+            /// [`Error`](keylink::Error).
+            ///
+            /// That is deliberate and permanent. RFC-04 §5.5: a handle that is
+            /// one type in both places must either claim failures the local
+            /// case cannot have, or hide failures the remote case does.
+            /// `Error::SchemaMismatch` means nothing between two objects in one
+            /// process.
+            ///
+            /// Cheap to clone: every clone names the same actor. The actor runs
+            /// until the last handle is dropped, or until
+            /// [`stop`](Self::stop).
+            ///
+            /// # A panic reaches the caller
+            ///
+            /// The actor survives a panicking message, and the caller of that
+            /// message gets the panic — resumed with its own payload, the way an
+            /// ordinary function call would deliver it. Both halves matter: the
+            /// first keeps one bad message from costing every later one, the
+            /// second keeps `MailboxClosed` meaning "the actor is gone" rather
+            /// than "something went wrong somewhere".
+            ///
+            /// # Which methods are here
+            ///
+            /// `rpc`, `tell` and `blob`. `send` and `recv` are **absent**, for
+            /// the reason given on their arms in
+            /// `__keylink_local_method!`: both are defined by a
+            /// [`BodyReader`](keylink::BodyReader) or a
+            /// [`Body`](keylink::Body), which are a QUIC stream's receiving and
+            /// sending halves. In this process there is no stream. An absent
+            /// method is better than one that buffers a 4 GiB upload in memory
+            /// to pretend otherwise.
+            pub struct Handle<A> {
+                inner: $crate::LocalActor<A>,
+            }
+
+            impl<A> ::core::clone::Clone for Handle<A> {
+                fn clone(&self) -> Self {
+                    Self { inner: self.inner.clone() }
+                }
+            }
+
+            impl<A> ::core::fmt::Debug for Handle<A> {
+                fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                    f.debug_struct("Handle")
+                        .field("service", &stringify!($svc))
+                        .field("running", &self.inner.is_running())
+                        .finish()
+                }
+            }
+
+            impl<A: Actor> Handle<A> {
+                /// Serve **this** actor to other machines, on this service's
+                /// own ALPN.
+                ///
+                /// The wire does not change: peers call it with the ordinary
+                /// [`Client`], with the same [`alpn`], the same `Request` and
+                /// the same `Response`. Nothing here is an actor concept from
+                /// the outside. What changes is the serving side — messages
+                /// queue in the mailbox and run one at a time against
+                /// `&mut self` instead of concurrently behind an `Arc`.
+                ///
+                /// This is what [`service`] is, with the mailbox in place of the
+                /// `Arc`, and the two are alternatives: one router owns one
+                /// ALPN, so registering both on a node is
+                /// [`ConfigError::DuplicateAlpn`](keylink::ConfigError).
+                ///
+                /// Because the reply is the service's own typed `Response`,
+                /// everything that reads one keeps working: per-method
+                /// [`Middleware`](keylink::Middleware), the idempotency ledger,
+                /// and `blob` methods, whose address the server must see to
+                /// record a grant. The keyed actor system can offer none of
+                /// those three — RFC-04 §14.8 — because there the payload is
+                /// opaque to keylink by design.
+                ///
+                /// The local [`Handle`] keeps working while this is served, and
+                /// messages from both sides share the one mailbox.
+                ///
+                /// # What it costs
+                ///
+                /// Calls no longer overlap. Four concurrent `list`s take four
+                /// turns, and a slow method delays every later message rather
+                /// than only its own caller. A `send` method reads its upload
+                /// **inside** the turn, so a large one holds the actor for the
+                /// whole transfer — RFC-04 §10.4.
+                pub fn service(
+                    &self,
+                    allow: $crate::Allowlist,
+                ) -> $crate::ServiceBuilder<Request, Response> {
+                    let actor = self.inner.clone();
+                    let dispatch: $crate::Dispatch<Request, Response> =
+                        ::std::sync::Arc::new(move |cx: $crate::Context,
+                                                    req: Request,
+                                                    body: $crate::BodyReader| {
+                            let actor = actor.clone();
+                            ::std::boxed::Box::pin(async move {
+                                let __answer = actor
+                                    .ask_catching(move |__state: &mut A| {
+                                        ::std::boxed::Box::pin(async move {
+                                            __actor_turn(
+                                                __state,
+                                                ::core::option::Option::Some(&cx),
+                                                req,
+                                                body,
+                                            )
+                                            .await
+                                        })
+                                    })
+                                    .await;
+                                match __answer {
+                                    ::std::result::Result::Ok(
+                                        ::std::result::Result::Ok((__response, __body)),
+                                    ) => ($crate::Outcome::Ok(__response), __body),
+                                    // A panic must not unwind out of a
+                                    // connection's task, so the remote caller is
+                                    // told what the keyed system tells it, in
+                                    // the same words. The actor is still alive.
+                                    ::std::result::Result::Ok(
+                                        ::std::result::Result::Err(__panic),
+                                    ) => (
+                                        $crate::Outcome::Err($crate::RemoteError::Failed(
+                                            __panic.to_string(),
+                                        )),
+                                        $crate::Body::empty(),
+                                    ),
+                                    ::std::result::Result::Err(__gone) => (
+                                        $crate::Outcome::Err($crate::RemoteError::Failed(
+                                            __gone.to_string(),
+                                        )),
+                                        $crate::Body::empty(),
+                                    ),
+                                }
+                            })
+                        });
+                    $crate::ServiceBuilder::new(alpn(), allow, dispatch)
+                        .__keylink_declares_blobs(DECLARES_BLOBS)
+                }
+
+                /// Stop after the messages already queued, then wait for the
+                /// actor to end. Every other handle reports
+                /// [`MailboxClosed`](keylink::MailboxClosed) from then on.
+                pub async fn stop(&self) {
+                    self.inner.stop().await;
+                }
+
+                /// Cancel the actor where it stands, destroying its state. What
+                /// to reach for when a turn will never return.
+                pub fn abort(&self) {
+                    self.inner.abort();
+                }
+
+                /// Whether the actor is still handling messages. Advisory: it
+                /// can stop between this answer and the next call.
+                #[must_use]
+                pub fn is_running(&self) -> bool {
+                    self.inner.is_running()
+                }
+
+                $(
+                    $crate::__keylink_local_method!(
+                        [$( #[$meta] )*],
+                        [<$kind>],
+                        [<$rpc:snake>],
+                        $rpc,
+                        ($( $arg : $ty ),*),
+                        $ret
+                    );
+                )+
             }
 
             /// Address one actor of this service on a connected node.
@@ -1062,6 +1309,116 @@ macro_rules! __keylink_actor_client_method {
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
 }
 
+/// One method on a local `Handle`, shaped by the rpc kind.
+///
+/// Every arm goes through the trait method **directly**: no `Request` variant is
+/// built, nothing is serialized, and no `Response` is taken apart. That is why
+/// none of these can fail in a second way — there is no encode step to fail, and
+/// no "wrong variant" to extract.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_local_method {
+    ([$( #[$meta:meta] )*], rpc, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Call the `", stringify!($variant), "` rpc on this actor.")]
+        ///
+        /// # Errors
+        ///
+        /// [`MailboxClosed`](keylink::MailboxClosed) when the actor is gone.
+        ///
+        /// # Panics
+        ///
+        /// With whatever the handler panicked with, after the actor has
+        /// survived it.
+        pub async fn $name(&self $(, $arg: $ty )*)
+            -> ::core::result::Result<$ret, $crate::MailboxClosed> {
+            self.inner
+                .ask(move |__state: &mut A| ::std::boxed::Box::pin(async move {
+                    __state.caller(::core::option::Option::None);
+                    __state.$name($( $arg ),*).await
+                }))
+                .await
+        }
+    };
+    ([$( #[$meta:meta] )*], tell, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Send the `", stringify!($variant), "` tell to this actor and return.")]
+        ///
+        /// Returns `()` rather than the method's declared type, exactly as the
+        /// remote client does, and for the same reason: a `tell` has no reply
+        /// channel. The `Ok` means the message is in the mailbox — it has not
+        /// run, it may panic, and there is nothing here on which to learn
+        /// either.
+        ///
+        /// It **is** ordered, which the remote one is not: two tells sent from
+        /// one handle are queued in that order and handled in that order,
+        /// because in this process there is no network to reorder them.
+        ///
+        /// # Errors
+        ///
+        /// [`MailboxClosed`](keylink::MailboxClosed) when the actor is gone.
+        pub async fn $name(&self $(, $arg: $ty )*)
+            -> ::core::result::Result<(), $crate::MailboxClosed> {
+            self.inner
+                .notify(move |__state: &mut A| ::std::boxed::Box::pin(async move {
+                    __state.caller(::core::option::Option::None);
+                    __state.$name($( $arg ),*).await
+                }))
+                .await
+        }
+    };
+    ([$( #[$meta:meta] )*], blob, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Call the `", stringify!($variant), "` rpc on this actor, returning the address of the content it named.")]
+        ///
+        /// A [`BlobId`](keylink::BlobId), not a
+        /// [`BlobHandle`](keylink::BlobHandle): a handle is an address plus the
+        /// node that holds it, and in this process the holder is you. No grant
+        /// is recorded either, because a grant is permission for a *peer* and
+        /// there is no peer here.
+        ///
+        /// # Errors
+        ///
+        /// [`MailboxClosed`](keylink::MailboxClosed) when the actor is gone.
+        pub async fn $name(&self $(, $arg: $ty )*)
+            -> ::core::result::Result<($ret, $crate::BlobId), $crate::MailboxClosed> {
+            self.inner
+                .ask(move |__state: &mut A| ::std::boxed::Box::pin(async move {
+                    __state.caller(::core::option::Option::None);
+                    __state.$name($( $arg ),*).await
+                }))
+                .await
+        }
+    };
+    // `send` and `recv` are deliberately absent, the same way
+    // `__keylink_blocking_method!` omits them — and the reason is the same one,
+    // one layer further in.
+    //
+    // A `send` handler is DEFINED by the `BodyReader` it reads, and a
+    // `BodyReader` reads a QUIC `RecvStream`: `body.rs` builds one from a
+    // `FrameReader`, which holds that stream by value. A `recv` handler returns
+    // a `Body`, which `body.rs` calls "a *value*, not a stream handle: a handler
+    // returns one and keylink drains it" — into a `SendStream`. Neither half
+    // exists in this process.
+    //
+    // The two ways to emit something anyway are both worse. Buffering the body
+    // in memory would make a 4 GiB upload resident, which is the one thing the
+    // streaming API exists to prevent. Generalizing `FrameReader` over
+    // `AsyncRead` would rewrite the transport to give a local caller a
+    // convenience.
+    //
+    // So: absent here, and present the moment the same actor is served with
+    // `Handle::service`, where there IS a stream. Streaming is a transport
+    // capability, and this handle names no transport.
+    ([$( #[$meta:meta] )*], send, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], recv, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+}
+
 /// One client method, shaped by the rpc kind.
 #[doc(hidden)]
 #[macro_export]
@@ -1161,10 +1518,76 @@ mod expansion {
         rpc Ping(n: u64) -> u64;
         recv Fetch(name: String) -> u64;
         send Store(name: String) -> u64;
+        // The fifth kind, here for the same reason as the fourth, plus one of
+        // its own: `tell` is the kind with the most arms that emit NOTHING —
+        // no actor-handle method, and no local method until this file gained
+        // one. An omission compiles; a wrong signature does not. Only an
+        // expansion can tell those apart.
+        tell Note(line: String) -> ();
         // The fourth kind belongs here for the same reason the other three do.
         // It also expands the ACTOR twin, which is where RFC-01 §11.2b's
         // "build the blob path twice" risk lives: a kind added to one generator
         // and not the other compiles until somebody declares it.
         blob Manual(sku: String) -> u64;
+    }
+
+    /// The one claim in `__keylink_local_method!` that a reader cannot check by
+    /// reading: `Handle` has **no** `send` and no `recv` method.
+    ///
+    /// Absence is invisible. This is the shadowing probe from
+    /// `representability.rs`, applied to generated code: an inherent method
+    /// outranks a trait method, so while `Handle` has no `store` and no `fetch`,
+    /// these calls resolve to the trait below and the marker type checks out.
+    /// Add either one — by buffering a body in memory, which is the tempting
+    /// way — and this stops compiling.
+    ///
+    /// It has to live here rather than in `representability.rs` because the
+    /// generated module is private to this one.
+    mod no_streaming_on_a_local_handle {
+        use super::expansion;
+
+        struct NoSuchMethod;
+
+        trait HandleHasNoStreamingMethod {
+            fn store(&self) -> NoSuchMethod {
+                NoSuchMethod
+            }
+            fn fetch(&self) -> NoSuchMethod {
+                NoSuchMethod
+            }
+        }
+
+        impl<A> HandleHasNoStreamingMethod for expansion::Handle<A> {}
+
+        /// One state, only so the handle has something to be generic over.
+        struct Probe;
+
+        impl expansion::Actor for Probe {
+            async fn ping(&mut self, n: u64) -> u64 {
+                n
+            }
+            async fn fetch(&mut self, _name: String) -> (u64, crate::Body) {
+                (0, crate::Body::empty())
+            }
+            async fn store(&mut self, _name: String, _body: crate::BodyReader) -> u64 {
+                0
+            }
+            async fn note(&mut self, _line: String) {}
+            async fn manual(&mut self, _sku: String) -> (u64, crate::BlobId) {
+                unreachable!("never called; this module only has to compile")
+            }
+        }
+
+        #[expect(dead_code, reason = "the proof is that this module compiles")]
+        fn a_local_handle_streams_nothing(handle: expansion::Handle<Probe>) {
+            let _: NoSuchMethod = handle.store();
+            let _: NoSuchMethod = handle.fetch();
+
+            // And the three that ARE there, so this probe cannot pass by the
+            // handle having no methods at all.
+            let _ = handle.ping(1);
+            let _ = handle.note(String::new());
+            let _ = handle.manual(String::new());
+        }
     }
 }

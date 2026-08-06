@@ -363,12 +363,43 @@ where
 }
 
 /// A panic that was caught instead of killing an actor.
-#[derive(Debug)]
-pub struct Panic(String);
+///
+/// Carries the original payload, not a rendering of it, so that a **local**
+/// caller can be given the panic it would have got from an ordinary function
+/// call — see [`Panic::resume`] and `local.rs`. A remote caller gets
+/// [`Display`](fmt::Display) inside [`RemoteError::Failed`], because an unwind
+/// does not cross a network.
+pub struct Panic {
+    message: String,
+    /// The `Box` `catch_unwind` handed back. Kept whole: `resume_unwind` on the
+    /// original payload is the difference between forwarding a panic and
+    /// starting a second one, which would run the panic hook twice and print
+    /// two backtraces for one fault.
+    payload: Box<dyn std::any::Any + Send>,
+}
+
+impl Panic {
+    /// Panic in the calling task, with the payload the handler panicked with.
+    ///
+    /// Does not run the panic hook a second time: the hook already ran where the
+    /// panic happened, which is where the useful backtrace is.
+    pub fn resume(self) -> ! {
+        std::panic::resume_unwind(self.payload)
+    }
+}
 
 impl fmt::Display for Panic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
+    }
+}
+
+/// Names the message. Never the payload, which is `dyn Any` and has no `Debug`.
+impl fmt::Debug for Panic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Panic")
+            .field("message", &self.message)
+            .finish()
     }
 }
 
@@ -379,7 +410,10 @@ impl From<Box<dyn std::any::Any + Send>> for Panic {
             .map(|s| (*s).to_string())
             .or_else(|| panic.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "panicked".to_string());
-        Self(format!("the actor panicked: {message}"))
+        Self {
+            message: format!("the actor panicked: {message}"),
+            payload: panic,
+        }
     }
 }
 
