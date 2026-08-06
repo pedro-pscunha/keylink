@@ -101,6 +101,7 @@ mod keys;
 mod macros;
 mod middleware;
 mod node;
+mod peer;
 mod reply;
 #[cfg(test)]
 mod representability;
@@ -122,6 +123,7 @@ pub use idempotency::{IdempotencyRefusal, MAX_RECORDED_BYTES, MAX_RECORDS};
 pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use middleware::{Context, Middleware, Next, Rpc, Timeout};
 pub use node::{derive_alpn, schema_hash, Node};
+pub use peer::{Dial, Peer};
 pub use reply::{Outcome, RemoteError, WireResponse};
 pub use rpc::{Dispatch, RpcClient, Server, ServerBuilder, Service, ServiceBuilder};
 pub use watch::{Departure, Watch};

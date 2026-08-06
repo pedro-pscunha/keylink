@@ -438,6 +438,15 @@ macro_rules! service {
                 )+
             }
 
+            impl $crate::Dial for Client {
+                async fn dial(
+                    node: &$crate::Node,
+                    addr: $crate::EndpointAddr,
+                ) -> $crate::Result<Self> {
+                    Self::connect(node, addr).await
+                }
+            }
+
             /// A connected client. Every method is an ordinary async call, and
             /// they run concurrently: each takes its own QUIC stream.
             pub struct Client {
