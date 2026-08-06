@@ -54,8 +54,10 @@
 
 use std::ops::{Deref, DerefMut};
 
-use crate::blobs::ProvenPeer;
-use crate::{ActorId, Allowlist, BlobId, Eviction, IdempotencyKey, Retention, Sealed};
+use crate::{
+    ActorId, AdmittedPeer, Allowlist, BlobId, Eviction, IdempotencyKey, ProvenPeer, Retention,
+    Sealed,
+};
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
 /// would return, so an inherent method that shadows one is a type error rather
@@ -150,7 +152,7 @@ impl HasNoDefault for Retention {}
 
 // ───────────────────────────────── a proven peer cannot be built from a claim
 
-/// [`ProvenPeer`](crate::blobs::ProvenPeer) keys the blobs grant ledger, and its
+/// [`ProvenPeer`](crate::ProvenPeer) keys the blobs grant ledger, and its
 /// whole value is that the identity inside it was proved by a TLS handshake
 /// keylink itself accepted. `ProvenPeer::on(&Connection<HandshakeCompleted>)` is
 /// meant to be the only route in.
@@ -216,6 +218,70 @@ fn a_proven_peer_has_one_constructor() {
 trait ProvenPeerIsNotConvertible {}
 impl<T: From<crate::EndpointId>> ProvenPeerIsNotConvertible for T {}
 impl ProvenPeerIsNotConvertible for ProvenPeer {}
+
+// ──────────────────────────────── admission has exactly one source of proof
+
+/// [`AdmittedPeer`](crate::AdmittedPeer) is the rung above
+/// [`ProvenPeer`](crate::ProvenPeer), and the two answer different questions:
+/// one says *who*, the other says *whether an `Allowlist` said yes*. The whole
+/// value of the second is that `Allowlist::admit` is the only way to reach it,
+/// so a function taking one has proof that a policy ran.
+///
+/// The blobs mount is why this matters rather than being tidy. It is a second
+/// accept path onto a node whose other protocols are allowlisted, and it writes
+/// authorization records. If it could build an `AdmittedPeer` from a connection
+/// — or from an id, or from a `ProvenPeer` it happened to be holding — it would
+/// be a way past every policy on the node with the compiler silent.
+///
+/// Each name below is a plausible second door: `admit` and `new` taking an id,
+/// `proven` or `trust` promoting a `ProvenPeer` without asking anybody.
+#[allow(
+    clippy::new_ret_no_self,
+    reason = "returning Self is exactly what this probe watches for. `new` is \
+              the first name an author reaches for, so dropping it to satisfy \
+              the lint would leave the likeliest hole uncovered"
+)]
+trait AdmittedPeerHasOneSource {
+    fn new() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn admit() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn trust() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn trusted() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn assume() -> NoSuchMethod {
+        NoSuchMethod
+    }
+}
+
+impl AdmittedPeerHasOneSource for AdmittedPeer {}
+
+fn admission_has_one_source() {
+    let _: NoSuchMethod = AdmittedPeer::new();
+    let _: NoSuchMethod = AdmittedPeer::admit();
+    let _: NoSuchMethod = AdmittedPeer::trust();
+    let _: NoSuchMethod = AdmittedPeer::trusted();
+    let _: NoSuchMethod = AdmittedPeer::assume();
+}
+
+/// The conversion half, which the shadowing probes cannot see.
+///
+/// A `From<ProvenPeer>` would be the quietest possible way to lose this: it
+/// reads as a widening, it needs no call site to look suspicious, and
+/// `.into()` at one site would promote identity to admission with nothing
+/// asked. `From<EndpointId>` is the same hole one rung lower.
+trait AdmissionIsNotAWidening {}
+impl<T: From<ProvenPeer>> AdmissionIsNotAWidening for T {}
+impl AdmissionIsNotAWidening for AdmittedPeer {}
+
+trait AdmissionIsNotBuiltFromAnId {}
+impl<T: From<crate::EndpointId>> AdmissionIsNotBuiltFromAnId for T {}
+impl AdmissionIsNotBuiltFromAnId for AdmittedPeer {}
 
 // ──────────────────────────────── a content address is not a set of raw bytes
 

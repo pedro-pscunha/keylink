@@ -43,7 +43,7 @@ use crate::middleware::wrap;
 use crate::wire::FrameReader;
 use crate::{
     wire, Allowlist, Body, BodyReader, Context, Error, IdempotencyKey, IdempotencyRefusal,
-    Middleware, Next, Node, Outcome, RemoteError, Result, Rpc, WireResponse,
+    Middleware, Next, Node, Outcome, ProvenPeer, RemoteError, Result, Rpc, WireResponse,
 };
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -243,12 +243,14 @@ where
     Resp: Serialize + Send + Sync + 'static,
 {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
-        // The handshake proved this key. Whether it is welcome is our call.
-        let peer: EndpointId = connection.remote_id();
-        if !self.allow.permits(&peer) {
+        // The handshake proved this key. Whether it is welcome is our call, and
+        // the answer is a value rather than a `bool` somebody must remember to
+        // have consulted — see `Allowlist::admit`.
+        let Some(admitted) = self.allow.admit(ProvenPeer::on(&connection)) else {
             connection.close(1u32.into(), b"unauthorized");
             return Ok(());
-        }
+        };
+        let peer: EndpointId = admitted.id();
 
         let mut calls = JoinSet::new();
         loop {

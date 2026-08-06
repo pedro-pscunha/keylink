@@ -20,15 +20,17 @@
 
 use std::time::Duration;
 
-use iroh::endpoint::{presets, Connection, ConnectionError};
+use iroh::endpoint::{Connection, ConnectionError};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::Endpoint;
 use iroh_blobs::protocol::{
     ChunkRanges, ChunkRangesSeq, GetManyRequest, GetRequest, ObserveRequest, PushRequest,
 };
 use iroh_blobs::store::mem::MemStore;
-use keylink::{BlobHandle, BlobId, Blobs, Error, Node};
+use keylink::{Allowlist, BlobHandle, BlobId, Blobs, Error, Node, ProvenPeer};
 use n0_future::StreamExt;
+
+mod common;
+use common::local_node;
 
 /// Where a test peer asks for the grants it wants. Stands in for an ordinary
 /// keylink `blob` rpc, which is what will carry this in production.
@@ -45,6 +47,9 @@ const GRANT_ALPN: &[u8] = b"/keylink-test/grant/1";
 #[derive(Debug, Clone)]
 struct Granting {
     blobs: Blobs,
+    /// The handler's own policy, exactly as a generated service carries one.
+    /// `Blobs::grant` will not take anything this has not admitted.
+    allow: Allowlist,
 }
 
 impl ProtocolHandler for Granting {
@@ -56,8 +61,15 @@ impl ProtocolHandler for Granting {
             .map_err(AcceptError::from_err)?;
         let wanted: Vec<BlobId> = postcard::from_bytes(&asked).map_err(AcceptError::from_err)?;
 
+        // The ladder, in the order a real service walks it: iroh proves the
+        // peer, the service's own `Allowlist` admits it, and only the value
+        // that came out of `admit` can write a grant.
+        let Some(admitted) = self.allow.admit(ProvenPeer::on(&connection)) else {
+            connection.close(1u32.into(), b"unauthorized");
+            return Ok(());
+        };
         for id in wanted {
-            self.blobs.grant(&connection, id);
+            self.blobs.grant(&admitted, id);
         }
 
         // Answered only after every grant is recorded, so a test that has read
@@ -80,14 +92,6 @@ struct Cluster {
     _router: Router,
 }
 
-async fn local_node() -> Node {
-    Node::from_endpoint(
-        Endpoint::bind(presets::Minimal)
-            .await
-            .expect("a local endpoint binds"),
-    )
-}
-
 async fn cluster() -> Cluster {
     let server = local_node().await;
     let blobs = Blobs::memory();
@@ -97,6 +101,7 @@ async fn cluster() -> Cluster {
             GRANT_ALPN,
             Granting {
                 blobs: blobs.clone(),
+                allow: Allowlist::anyone(),
             },
         )
         .spawn();
@@ -195,6 +200,82 @@ async fn a_peer_with_a_grant_can_fetch_that_content() {
         .await
         .expect("a granted fetch must succeed");
     assert_eq!(content, b"the granted datasheet");
+}
+
+/// **The ladder, end to end.** `Blobs::grant` takes an `AdmittedPeer`, and the
+/// only source of one is `Allowlist::admit`. So a handler serving a peer its
+/// own allowlist refuses has nothing to pass, and no grant can be written.
+///
+/// This is the runtime half of the claim. The compile-time half is in
+/// `representability.rs`: there is no second constructor and no `From` impl, so
+/// a handler cannot promote the `ProvenPeer` it already holds.
+///
+/// Without the ladder, this mount was a second accept path that could write an
+/// authorization record from a bare `connection.remote_id()` — reaching past
+/// every allowlist on the node with the compiler silent.
+#[tokio::test]
+async fn a_peer_no_allowlist_admits_cannot_be_granted_anything() {
+    let server = local_node().await;
+    let peer = local_node().await;
+    let stranger = local_node().await;
+    let blobs = Blobs::memory();
+    let id = blobs
+        .add_bytes(b"only for the admitted peer".to_vec())
+        .await
+        .expect("stores");
+
+    // The granting service admits `peer` and nobody else.
+    let _router = Router::builder(server.endpoint().clone())
+        .accept(iroh_blobs::ALPN, blobs.protocol())
+        .accept(
+            GRANT_ALPN,
+            Granting {
+                blobs: blobs.clone(),
+                allow: Allowlist::only([peer.endpoint().id()]),
+            },
+        )
+        .spawn();
+
+    let ask = |who: &Node| {
+        let addr = server.endpoint().addr();
+        let endpoint = who.endpoint().clone();
+        async move {
+            let conn = endpoint
+                .connect(addr, GRANT_ALPN)
+                .await
+                .expect("dials the granting protocol");
+            let (mut send, mut recv) = conn.open_bi().await.expect("opens a stream");
+            let asked = postcard::to_stdvec(&vec![id]).expect("encodes");
+            send.write_all(&asked).await.expect("writes");
+            send.finish().expect("finishes");
+            recv.read_to_end(64).await
+        }
+    };
+
+    // The control. Without it this passes just as well when granting is broken
+    // for everybody.
+    assert_eq!(
+        ask(&peer).await.expect("the admitted peer is answered"),
+        b"granted"
+    );
+    let mut sink = Vec::new();
+    BlobHandle::new(&peer, server.endpoint().addr(), id)
+        .copy_to(&mut sink)
+        .await
+        .expect("an admitted peer that was granted the id can fetch it");
+    assert_eq!(sink, b"only for the admitted peer");
+
+    // The stranger is refused by the allowlist, so nothing was ever granted.
+    assert!(
+        ask(&stranger).await.is_err(),
+        "the granting service must refuse a peer its allowlist does not admit"
+    );
+    let mut sink = Vec::new();
+    let error = BlobHandle::new(&stranger, server.endpoint().addr(), id)
+        .copy_to(&mut sink)
+        .await
+        .expect_err("and the blobs mount must not serve it either");
+    assert_refused(&error, "a peer no allowlist admitted");
 }
 
 /// The grant is durable, which is what makes resume possible at all: a resumed
@@ -675,6 +756,7 @@ async fn the_reserved_alpn_is_the_one_iroh_blobs_serves() {
             iroh_blobs::ALPN,
             Granting {
                 blobs: Blobs::memory(),
+                allow: Allowlist::anyone(),
             },
         ))
         .spawn()

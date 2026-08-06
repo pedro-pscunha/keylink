@@ -52,9 +52,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bao_tree::io::BaoContentItem;
 use bytes::Bytes;
-use iroh::endpoint::{ConnectError, Connection, ConnectionError, HandshakeCompleted};
+use iroh::endpoint::{ConnectError, Connection, ConnectionError};
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::api::Store;
 use iroh_blobs::get::request::{get_blob, GetBlobItem};
 use iroh_blobs::get::GetError;
@@ -69,7 +69,7 @@ use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::{Error, Node, Result};
+use crate::{AdmittedPeer, Error, Node, ProvenPeer, Result};
 
 /// Grants one node holds before it starts evicting the oldest.
 ///
@@ -152,42 +152,28 @@ impl std::fmt::Debug for BlobId {
     }
 }
 
-// ──────────────────────────────────────────────────────────── proven identity
+// ──────────────────────────────────────── what the ledger is keyed on, and why
 
-/// A peer iroh proved during a TLS handshake.
-///
-/// **Level 2 over a level 3 type, and the whole guard.** The one constructor
-/// takes `&Connection<HandshakeCompleted>`, a value iroh's sealed typestate
-/// will not produce before the handshake finishes. `remote_id()` is infallible
-/// only on that state; on both zero-RTT states it returns a `Result`, and on
-/// `Connecting` an infallible `remote_id()` exists that reports **the peer we
-/// are dialling** — our own intent, not a proven identity. Taking a
-/// `&Connecting` here would compile and would prove nothing.
-///
-/// **The runtime check this deletes.** iroh-blobs reports the peer as
-/// `ClientConnected.endpoint_id: Option<EndpointId>` (`provider/events.rs:590`).
-/// RFC-01 §5.5 answered that with a `let Some(peer) = .. else { refuse }` at the
-/// top of the policy loop. That arm is unreachable through `BlobsProtocol`
-/// today — both construction sites in the crate fill the field in — so a
-/// handler that wrote `_ => Ok(())` instead would pass every test anybody could
-/// write, and would start admitting unidentified peers the day a transport
-/// reported none.
-///
-/// keylink never reads that field. The identity comes from the connection
-/// keylink itself accepted, so there is no `Option` to unwrap and no arm to get
-/// wrong. `Grants` is keyed by this type, so a bare `EndpointId` — one parsed
-/// from a request body, say — cannot reach an authorization decision either.
-///
-/// `pub(crate)`: the enforcement costs nothing in public surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct ProvenPeer(EndpointId);
-
-impl ProvenPeer {
-    /// The only way to build one.
-    pub(crate) fn on(connection: &Connection<HandshakeCompleted>) -> Self {
-        Self(connection.remote_id())
-    }
-}
+// `ProvenPeer` and `AdmittedPeer` live in `authz.rs`, because admission is an
+// authorization concept rather than a blobs one. This module is their most
+// demanding consumer: the blobs mount is a SECOND accept path onto a node whose
+// other protocols are allowlisted, so if it could write an authorization record
+// from a bare `connection.remote_id()` it would be a way around every policy on
+// the node, with the compiler silent.
+//
+// The two rungs do different jobs here, and the asymmetry is the design:
+//
+// - WRITING a grant demands an `AdmittedPeer`. `Blobs::grant` cannot be called
+//   for a peer no `Allowlist` said yes to, so a grant is always downstream of a
+//   policy decision that already happened on the keylink connection.
+// - READING one takes a `ProvenPeer`, because a blobs connection is not
+//   allowlisted by anybody. There is one blobs ALPN and several services with
+//   several allowlists (RFC-01 §5.1), so there is no allowlist for the mount to
+//   consult and picking one would be arbitrary. What authorizes the fetch is
+//   the grant itself, and the grant already carries the admission.
+//
+// So the mount deliberately does NOT mint an `AdmittedPeer`. It proves who is
+// calling and asks the ledger whether that peer was handed this address.
 
 // ────────────────────────────────────────────────────────────── the ledger
 
@@ -232,7 +218,12 @@ impl Grants {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn grant(&self, peer: ProvenPeer, id: BlobId) {
+    /// Takes an [`AdmittedPeer`], not a [`ProvenPeer`]: a grant is an
+    /// authorization record, so writing one must be downstream of an
+    /// allowlist saying yes. The map keys on the identity underneath,
+    /// because that is all a later blobs connection can prove.
+    fn grant(&self, peer: AdmittedPeer, id: BlobId) {
+        let peer = peer.proven();
         let mut book = self.lock();
         // A repeat grant must not take a second slot in the eviction queue, or
         // a handler that answers one peer in a loop evicts every other peer.
@@ -472,15 +463,20 @@ impl Blobs {
         Ok(BlobId::from_hash(tag.hash))
     }
 
-    /// Record that `connection`'s peer may fetch `id`.
+    /// Record that an admitted peer may fetch `id`.
     ///
-    /// Takes the connection rather than an id, because that is the only thing
-    /// that proves who is on the other end — see [`ProvenPeer`]. Generated
-    /// `blob` dispatch calls this, so a handler that returns a [`BlobId`] has
-    /// already granted it and there is no call to forget.
+    /// Takes an [`AdmittedPeer`] rather than a connection or an id. A
+    /// connection would prove only identity, and an id proves nothing at all —
+    /// either would let this second accept path write an authorization record
+    /// for a peer no [`Allowlist`](crate::Allowlist) admitted. The only source
+    /// of an `AdmittedPeer` is `Allowlist::admit`, so the policy has already
+    /// run by the time this can be called.
+    ///
+    /// Generated `blob` dispatch calls it, so a handler that returns a
+    /// [`BlobId`] has already granted it and there is no call to forget.
     #[doc(hidden)]
-    pub fn grant(&self, connection: &Connection<HandshakeCompleted>, id: BlobId) {
-        self.inner.grants.grant(ProvenPeer::on(connection), id);
+    pub fn grant(&self, peer: &AdmittedPeer, id: BlobId) {
+        self.inner.grants.grant(*peer, id);
     }
 
     /// The mount, with the ledger attached.
@@ -876,14 +872,23 @@ fn is_permission(error: &ConnectionError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use iroh_blobs::protocol::{ChunkRanges, ChunkRangesSeq};
 
     use super::*;
 
+    /// `ProvenPeer` is `authz`'s, so its field is not reachable here. Going
+    /// through `Allowlist::anyone().admit(..)` is the only route, which is the
+    /// ladder working: even a test cannot conjure an admitted peer.
+    fn admitted(seed: u8) -> AdmittedPeer {
+        crate::Allowlist::anyone()
+            .admit(ProvenPeer::for_tests(seed))
+            .expect("anyone admits everyone")
+    }
+
     fn peer(seed: u8) -> ProvenPeer {
-        ProvenPeer(iroh::SecretKey::from_bytes(&[seed; 32]).public())
+        admitted(seed).proven()
     }
 
     fn blob(seed: u8) -> BlobId {
@@ -893,7 +898,7 @@ mod tests {
     #[test]
     fn a_grant_admits_exactly_the_content_it_names() {
         let grants = Grants::new();
-        grants.grant(peer(1), blob(7));
+        grants.grant(admitted(1), blob(7));
 
         assert!(grants.knows(&peer(1)));
         assert!(grants.permits(&peer(1), &blob(7)));
@@ -905,9 +910,9 @@ mod tests {
     #[test]
     fn the_ledger_evicts_the_oldest_grant_rather_than_growing() {
         let grants = Grants::with_limit(2);
-        grants.grant(peer(1), blob(1));
-        grants.grant(peer(1), blob(2));
-        grants.grant(peer(1), blob(3));
+        grants.grant(admitted(1), blob(1));
+        grants.grant(admitted(1), blob(2));
+        grants.grant(admitted(1), blob(3));
 
         assert!(!grants.permits(&peer(1), &blob(1)), "oldest is evicted");
         assert!(grants.permits(&peer(1), &blob(2)));
@@ -918,9 +923,9 @@ mod tests {
     #[test]
     fn a_repeated_grant_does_not_consume_a_second_slot() {
         let grants = Grants::with_limit(2);
-        grants.grant(peer(1), blob(1));
-        grants.grant(peer(1), blob(1));
-        grants.grant(peer(1), blob(2));
+        grants.grant(admitted(1), blob(1));
+        grants.grant(admitted(1), blob(1));
+        grants.grant(admitted(1), blob(2));
 
         // Without the duplicate check, three pushes against a cap of two would
         // have evicted blob(1) — the grant the peer still holds.
@@ -931,8 +936,8 @@ mod tests {
     #[test]
     fn a_peer_whose_last_grant_is_evicted_is_no_longer_known() {
         let grants = Grants::with_limit(1);
-        grants.grant(peer(1), blob(1));
-        grants.grant(peer(2), blob(2));
+        grants.grant(admitted(1), blob(1));
+        grants.grant(admitted(2), blob(2));
 
         // `knows` gates connection admission. A peer left behind with an empty
         // set would keep connecting while holding nothing.
@@ -999,7 +1004,7 @@ mod tests {
         };
         let unknown = ClientConnected {
             connection_id: 2,
-            endpoint_id: Some(peer(9).0),
+            endpoint_id: Some(peer(9).id()),
         };
 
         assert!(admits_connection(&live, &admitted).is_ok());
@@ -1025,7 +1030,7 @@ mod tests {
     fn a_request_on_a_connection_that_was_never_admitted_is_refused() {
         let grants = Grants::new();
         let live = Connections::default();
-        grants.grant(peer(1), blob(1));
+        grants.grant(admitted(1), blob(1));
         // Deliberately NOT admitted: `live` is empty. The grant exists, so the
         // refusal can only come from the connection lookup.
         assert!(admits_get(&grants, &live, &get(1, blob(1), whole_blob())).is_err());
@@ -1044,7 +1049,7 @@ mod tests {
     fn a_request_reaching_past_the_granted_blob_is_refused() {
         let grants = Grants::new();
         let live = Connections::default();
-        grants.grant(peer(1), blob(1));
+        grants.grant(admitted(1), blob(1));
         live.admit(1, peer(1));
 
         assert!(

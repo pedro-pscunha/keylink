@@ -98,7 +98,7 @@ pub use actor::{
     actor_schema, guarded, mount, ActorClient, ActorReply, ActorRequest, Eviction, Mail, Mailbox,
     MountError, Mounted, Panic, Sealed, System, SystemBuilder,
 };
-pub use authz::Allowlist;
+pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
 pub use blobs::{BlobHandle, BlobId, Blobs, BlobsAdmission, Retention, MAX_GRANTS};
 pub use body::{Body, BodyReader};
 pub use error::{ConfigError, Error, Result, Transport};
