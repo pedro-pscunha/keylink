@@ -42,8 +42,9 @@ use crate::idempotency::{Claim, Ledger};
 use crate::middleware::wrap;
 use crate::wire::FrameReader;
 use crate::{
-    wire, Allowlist, Body, BodyReader, Context, Error, IdempotencyKey, IdempotencyRefusal,
-    Middleware, Next, Node, Outcome, ProvenPeer, RemoteError, Result, Rpc, WireResponse,
+    wire, AdmittedPeer, Allowlist, BlobHandle, BlobId, Blobs, Body, BodyReader, Context, Error,
+    Granting, IdempotencyKey, IdempotencyRefusal, Middleware, Next, Node, Outcome, ProvenPeer,
+    RemoteError, Result, Rpc, WireResponse,
 };
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -67,6 +68,10 @@ pub type Dispatch<Req, Resp> =
 pub(crate) struct RpcService<Req, Resp> {
     next: Next<Req, Resp>,
     allow: Arc<Allowlist>,
+    /// The content store this service grants against, when it declares `blob`
+    /// methods. `None` for every service that does not, which is why an
+    /// ordinary service pays nothing for this feature existing.
+    blobs: Option<Blobs>,
     /// Every recorded reply for THIS service. One per service rather than one
     /// per node, because a record is an encoded reply of this service's
     /// response type. See [`Ledger`].
@@ -79,6 +84,7 @@ impl<Req, Resp> Clone for RpcService<Req, Resp> {
         Self {
             next: self.next.clone(),
             allow: self.allow.clone(),
+            blobs: self.blobs.clone(),
             ledger: self.ledger.clone(),
             _p: PhantomData,
         }
@@ -149,14 +155,16 @@ fn reap_finished<T: 'static>(calls: &mut JoinSet<T>) {
 async fn serve_one<Req, Resp>(
     next: Next<Req, Resp>,
     ledger: Arc<Ledger>,
-    peer: EndpointId,
+    blobs: Option<Blobs>,
+    admitted: AdmittedPeer,
     mut send: SendStream,
     recv: RecvStream,
 ) -> Result<()>
 where
     Req: Rpc + DeserializeOwned,
-    Resp: Serialize,
+    Resp: Serialize + Granting,
 {
+    let peer = admitted.id();
     let mut frames = FrameReader::new(recv);
     // A stream opened and finished without a request is not an error; the peer
     // simply changed its mind.
@@ -183,6 +191,21 @@ where
         BodyReader::new(frames, request.body_len),
     )
     .await;
+
+    // The grant is recorded BEFORE the reply is written, and that order is the
+    // whole property: the address reaches the caller only in this reply, so a
+    // peer cannot race ahead and fetch content it has not been told about.
+    //
+    // This is also the only place both halves exist. The handler returned the
+    // id and knows nothing about peers; `accept` proved the peer and knows
+    // nothing about ids. Neither could record this on its own, which is why the
+    // reply carries the address back here through `Granting` rather than the
+    // store being threaded down into dispatch.
+    if let (Some(blobs), Outcome::Ok(response)) = (&blobs, &outcome) {
+        if let Some(id) = response.granted() {
+            blobs.grant(&admitted, id);
+        }
+    }
 
     let frame = wire::encode_header(body.declared_len(), None, &outcome)?;
     // Recorded before the reply is written, so a reply lost on the way back
@@ -240,7 +263,7 @@ pub(crate) fn is_clean_close(error: &ConnectionError) -> bool {
 impl<Req, Resp> ProtocolHandler for RpcService<Req, Resp>
 where
     Req: Rpc + DeserializeOwned + Send + Sync + 'static,
-    Resp: Serialize + Send + Sync + 'static,
+    Resp: Serialize + Granting + Send + Sync + 'static,
 {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
         // The handshake proved this key. Whether it is welcome is our call, and
@@ -250,7 +273,6 @@ where
             connection.close(1u32.into(), b"unauthorized");
             return Ok(());
         };
-        let peer: EndpointId = admitted.id();
 
         let mut calls = JoinSet::new();
         loop {
@@ -262,7 +284,8 @@ where
                     calls.spawn(serve_one(
                         self.next.clone(),
                         self.ledger.clone(),
-                        peer,
+                        self.blobs.clone(),
+                        admitted,
                         send,
                         recv,
                     ));
@@ -288,12 +311,17 @@ pub struct ServiceBuilder<Req, Resp> {
     allow: Allowlist,
     base: Next<Req, Resp>,
     layers: Vec<Arc<dyn Middleware<Req, Resp>>>,
+    blobs: Option<Blobs>,
+    /// Set by generated code from `DECLARES_BLOBS`. Compared against `blobs` at
+    /// spawn, so "this service serves content but was given no store" is a
+    /// startup error rather than a refusal on the first call.
+    declares_blobs: bool,
 }
 
 impl<Req, Resp> ServiceBuilder<Req, Resp>
 where
     Req: Rpc + DeserializeOwned + Send + Sync + 'static,
-    Resp: Serialize + Send + Sync + 'static,
+    Resp: Serialize + Granting + Send + Sync + 'static,
 {
     /// Called by generated code. `dispatch` is the call into the user's handler.
     #[doc(hidden)]
@@ -303,7 +331,40 @@ where
             allow,
             base: dispatch,
             layers: Vec::new(),
+            blobs: None,
+            declares_blobs: false,
         }
+    }
+
+    /// Called by generated code. Reports whether this service declares any
+    /// `blob` method.
+    ///
+    /// A separate method rather than a fourth parameter on
+    /// [`new`](Self::new), because `new` is also called from the actor path and
+    /// an arity change there buys nothing.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __keylink_declares_blobs(mut self, declares: bool) -> Self {
+        self.declares_blobs = declares;
+        self
+    }
+
+    /// Give this service the content store its `blob` methods serve from.
+    ///
+    /// Required exactly when the service declares a `blob` method: without it
+    /// [`ServerBuilder::spawn`] raises
+    /// [`ConfigError::MissingBlobStore`](crate::ConfigError::MissingBlobStore).
+    /// A service with no `blob` methods never needs one, which is why this is a
+    /// builder method rather than a parameter every service would carry.
+    ///
+    /// One node has one content store. Two services on one node may share a
+    /// [`Blobs`], and two DIFFERENT stores are
+    /// [`ConfigError::ConflictingBlobStores`](crate::ConfigError::ConflictingBlobStores):
+    /// there is one blobs ALPN, so there can be one store behind it.
+    #[must_use]
+    pub fn with_blobs(mut self, blobs: &Blobs) -> Self {
+        self.blobs = Some(blobs.clone());
+        self
     }
 
     /// Add a layer. The first layer added is the outermost: it sees the request
@@ -325,9 +386,12 @@ where
             handler: Box::new(RpcService {
                 next: chain,
                 allow: Arc::new(self.allow),
+                blobs: self.blobs.clone(),
                 ledger: Ledger::new(),
                 _p: PhantomData,
             }),
+            blobs: self.blobs,
+            declares_blobs: self.declares_blobs,
         }
     }
 }
@@ -366,6 +430,10 @@ const RESERVED_ALPNS: &[&[u8]] = &[iroh_blobs::ALPN];
 pub struct Service {
     alpn: &'static [u8],
     handler: Box<dyn DynProtocolHandler>,
+    /// The store this service serves content from, if any. `spawn` collects
+    /// these to decide what to mount on `iroh_blobs::ALPN`.
+    blobs: Option<Blobs>,
+    declares_blobs: bool,
 }
 
 impl Service {
@@ -405,6 +473,8 @@ impl Service {
         Self {
             alpn,
             handler: Box::new(handler),
+            blobs: None,
+            declares_blobs: false,
         }
     }
 }
@@ -484,6 +554,7 @@ impl ServerBuilder<'_> {
     /// last-one-wins race: the second would silently shadow the first.
     pub fn spawn(self) -> Result<Server> {
         let mut seen: BTreeSet<&'static [u8]> = BTreeSet::new();
+        let mut store: Option<Blobs> = None;
         let mut builder = Router::builder(self.node.endpoint().clone());
         for service in self.services {
             if RESERVED_ALPNS.contains(&service.alpn) {
@@ -496,7 +567,33 @@ impl ServerBuilder<'_> {
                     String::from_utf8_lossy(service.alpn).into_owned(),
                 )));
             }
+            // A service that serves content and was handed no store would
+            // answer every `blob` call with an address nothing can fetch. That
+            // is a configuration mistake, and keylink raises those at startup.
+            if service.declares_blobs && service.blobs.is_none() {
+                return Err(Error::Config(ConfigError::MissingBlobStore {
+                    service: String::from_utf8_lossy(service.alpn).into_owned(),
+                }));
+            }
+            if let Some(theirs) = &service.blobs {
+                match &store {
+                    // One node has one blobs ALPN, so it can serve one store.
+                    // Sharing a `Blobs` between services is fine and normal;
+                    // two DIFFERENT stores is a question with no right answer.
+                    Some(ours) if !ours.is_same_store(theirs) => {
+                        return Err(Error::Config(ConfigError::ConflictingBlobStores));
+                    }
+                    Some(_) => {}
+                    None => store = Some(theirs.clone()),
+                }
+            }
             builder = builder.accept(service.alpn, service.handler);
+        }
+        // keylink mounts blobs itself, with the ledger attached. This is the
+        // reason `iroh_blobs::ALPN` is reserved: there is exactly one way for
+        // the protocol to reach a node, and it carries the policy.
+        if let Some(blobs) = store {
+            builder = builder.accept(iroh_blobs::ALPN, blobs.protocol());
         }
         Ok(Server {
             router: builder.spawn(),
@@ -511,6 +608,10 @@ impl ServerBuilder<'_> {
 #[derive(Debug)]
 pub struct RpcClient<Req, Resp> {
     conn: Connection,
+    /// Kept so a `blob` reply can open the second connection. A `Connection`
+    /// does not expose the endpoint it came from, and blobs speaks its own
+    /// ALPN, so the handle needs a dialler of its own.
+    endpoint: iroh::Endpoint,
     /// Attached to every call this client makes. See
     /// [`with_idempotency`](Self::with_idempotency).
     idempotency: Option<IdempotencyKey>,
@@ -525,6 +626,18 @@ impl<Req, Resp> RpcClient<Req, Resp> {
     /// client is never correct.
     pub(crate) fn connection(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Point a handle at content the peer we are talking to just named.
+    ///
+    /// Called by generated `blob` client code. The holder is this connection's
+    /// peer, which is sound while the node that ANSWERED is the node that
+    /// holds the bytes — true today, and RFC-01 §11.2c flags routing as the
+    /// case that would break it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn blob_handle(&self, id: BlobId) -> BlobHandle {
+        BlobHandle::on(self.endpoint.clone(), self.conn.remote_id(), id)
     }
 
     /// Scope this client to one idempotency key, so a call it makes runs at
@@ -555,6 +668,7 @@ impl<Req, Resp> RpcClient<Req, Resp> {
     pub fn with_idempotency(&self, key: IdempotencyKey) -> Self {
         Self {
             conn: self.conn.clone(),
+            endpoint: self.endpoint.clone(),
             idempotency: Some(key),
             _p: PhantomData,
         }
@@ -588,6 +702,7 @@ where
             .map_err(|err| classify_connect(err, alpn))?;
         Ok(Self {
             conn,
+            endpoint: node.endpoint().clone(),
             idempotency: None,
             _p: PhantomData,
         })

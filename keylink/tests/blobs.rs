@@ -767,3 +767,374 @@ async fn the_reserved_alpn_is_the_one_iroh_blobs_serves() {
         "the message must say why: {error}"
     );
 }
+
+// ═══════════════════════════════════════════════════ the `blob` method kind
+//
+// Everything above drives the mount by hand, because the macro kind did not
+// exist. These drive it the way a user will: declare `blob`, return an address,
+// and let the generated dispatch record the grant.
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, postcard_schema::Schema)]
+pub struct Manual {
+    pub pages: u32,
+}
+
+keylink::service! {
+    service Catalog;
+
+    rpc  Ping() -> String;
+    blob Datasheet(sku: String) -> Manual;
+}
+
+// A second service that also serves content, for the one-store-per-node checks.
+keylink::service! {
+    service Depot;
+
+    blob Parcel(sku: String) -> Manual;
+}
+
+// A service with no `blob` method at all. `DECLARES_BLOBS` is false here, and
+// that is what `a_service_with_no_blob_methods_needs_no_store` pins.
+keylink::service! {
+    service Plain;
+
+    rpc Echo(word: String) -> String;
+}
+
+/// The handler names no ledger, no ALPN and no connection. It returns a content
+/// address, and returning it IS the grant.
+#[derive(Debug, Clone)]
+struct Warehouse {
+    published: BlobId,
+    /// In the same store, never returned by any method. Nothing should reach it.
+    unpublished: BlobId,
+}
+
+impl catalog::Handler for Warehouse {
+    async fn ping(&self) -> String {
+        "pong".to_owned()
+    }
+
+    async fn datasheet(&self, _sku: String) -> (Manual, BlobId) {
+        (Manual { pages: 42 }, self.published)
+    }
+}
+
+impl depot::Handler for Warehouse {
+    async fn parcel(&self, _sku: String) -> (Manual, BlobId) {
+        (Manual { pages: 1 }, self.published)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Plain;
+
+impl plain::Handler for Plain {
+    async fn echo(&self, word: String) -> String {
+        word
+    }
+}
+
+struct Catalogue {
+    client: catalog::Client,
+    warehouse: Warehouse,
+    server_addr: iroh::EndpointAddr,
+    _server: keylink::Server,
+    _nodes: [Node; 2],
+}
+
+async fn catalogue() -> Catalogue {
+    let server = local_node().await;
+    let caller = local_node().await;
+    let blobs = Blobs::memory();
+    let warehouse = Warehouse {
+        published: blobs
+            .add_bytes(b"the published datasheet".to_vec())
+            .await
+            .expect("stores"),
+        unpublished: blobs
+            .add_bytes(b"never handed to anybody".to_vec())
+            .await
+            .expect("stores"),
+    };
+
+    // No hand-rolled mount: `spawn` sees the store this service carries and
+    // mounts `iroh_blobs::ALPN` itself, with the ledger attached.
+    let running = keylink::Server::builder(&server)
+        .service(
+            catalog::service(warehouse.clone(), Allowlist::anyone())
+                .with_blobs(&blobs)
+                .build(),
+        )
+        .spawn()
+        .expect("one service with a store");
+
+    let server_addr = server.endpoint().addr();
+    let client = catalog::Client::connect(&caller, server_addr.clone())
+        .await
+        .expect("dials the catalog");
+
+    Catalogue {
+        client,
+        warehouse,
+        server_addr,
+        _server: running,
+        _nodes: [server, caller],
+    }
+}
+
+/// The whole feature, at the call site. No ALPN, no hash, no second dial, no
+/// ledger call — and the mount was never written by hand.
+#[tokio::test]
+async fn a_blob_method_hands_back_content_the_caller_can_fetch() {
+    let cluster = catalogue().await;
+
+    let (manual, handle) = cluster
+        .client
+        .datasheet("ADU-014".to_owned())
+        .await
+        .expect("the blob rpc answers");
+    assert_eq!(manual.pages, 42);
+
+    let mut sink = Vec::new();
+    let copied = handle
+        .copy_to(&mut sink)
+        .await
+        .expect("the content follows");
+    assert_eq!(sink, b"the published datasheet");
+    assert_eq!(copied, sink.len() as u64);
+}
+
+/// The unary path still works beside it, on the same connection.
+#[tokio::test]
+async fn a_blob_method_and_a_unary_method_share_one_service() {
+    let cluster = catalogue().await;
+    assert_eq!(cluster.client.ping().await.unwrap(), "pong");
+    let (manual, _handle) = cluster.client.datasheet("x".to_owned()).await.unwrap();
+    assert_eq!(manual.pages, 42);
+}
+
+/// The grant covers the address the handler returned and nothing else, even
+/// though both blobs sit in one store and the peer is fully allowlisted.
+#[tokio::test]
+async fn the_grant_covers_the_returned_address_and_nothing_else() {
+    let cluster = catalogue().await;
+    let (_manual, handle) = cluster.client.datasheet("x".to_owned()).await.unwrap();
+
+    // The control: what the handler returned is fetchable.
+    let mut sink = Vec::new();
+    handle.copy_to(&mut sink).await.expect("granted");
+    assert_eq!(sink, b"the published datasheet");
+
+    // The sibling in the same store, whose address the caller somehow knows.
+    let mut sink = Vec::new();
+    let error = BlobHandle::new(
+        &cluster._nodes[1],
+        cluster.server_addr.clone(),
+        cluster.warehouse.unpublished,
+    )
+    .copy_to(&mut sink)
+    .await
+    .expect_err("content no handler returned to this peer");
+    assert_refused(&error, "an address the handler never returned");
+}
+
+/// A peer that never made the call holds no grant, even for the same address.
+/// This is what "returning it IS the grant" has to mean: per peer, not per
+/// blob.
+#[tokio::test]
+async fn a_peer_that_never_called_holds_no_grant_for_the_same_address() {
+    let cluster = catalogue().await;
+    let (_manual, handle) = cluster.client.datasheet("x".to_owned()).await.unwrap();
+    let id = handle.id();
+
+    let mut sink = Vec::new();
+    handle
+        .copy_to(&mut sink)
+        .await
+        .expect("the caller was granted it");
+
+    // A third node, allowlisted by the service, that simply never asked.
+    let bystander = local_node().await;
+    let mut sink = Vec::new();
+    let error = BlobHandle::new(&bystander, cluster.server_addr.clone(), id)
+        .copy_to(&mut sink)
+        .await
+        .expect_err("a peer that never called must hold no grant");
+    assert_refused(&error, "a peer that never made the call");
+}
+
+/// The store is reachable through the handle the ordinary way too.
+#[tokio::test]
+async fn a_blob_method_result_can_be_fetched_into_a_store() {
+    let cluster = catalogue().await;
+    let (_manual, handle) = cluster.client.datasheet("x".to_owned()).await.unwrap();
+
+    let local = Blobs::memory();
+    let moved = handle
+        .fetch_into(&local)
+        .await
+        .expect("fetches into a store");
+    assert!(moved > 0, "the first fetch moved bytes");
+}
+
+// ───────────────────────────────────────────────── configuration is checked
+
+/// `DECLARES_BLOBS` is what makes this able to fire. Without the macro half it
+/// would be a check whose flag is always false.
+#[tokio::test]
+async fn a_service_that_declares_blob_methods_without_a_store_is_refused() {
+    let node = local_node().await;
+    let warehouse = Warehouse {
+        published: Blobs::memory()
+            .add_bytes(b"x".to_vec())
+            .await
+            .expect("stores"),
+        unpublished: Blobs::memory()
+            .add_bytes(b"y".to_vec())
+            .await
+            .expect("stores"),
+    };
+
+    let error = keylink::Server::builder(&node)
+        .service(catalog::service(warehouse, Allowlist::anyone()).build())
+        .spawn()
+        .expect_err("a blob service with no store must be refused at startup");
+
+    assert!(
+        matches!(
+            error,
+            Error::Config(keylink::ConfigError::MissingBlobStore { .. })
+        ),
+        "expected MissingBlobStore, got {error:?}"
+    );
+}
+
+/// The control. The check must not fire for a service that serves no content —
+/// otherwise every existing service would need a store it never uses.
+#[tokio::test]
+async fn a_service_with_no_blob_methods_needs_no_store() {
+    let node = local_node().await;
+    let _running = keylink::Server::builder(&node)
+        .service(plain::service(Plain, Allowlist::anyone()).build())
+        .spawn()
+        .expect("a service with no blob methods needs no store");
+}
+
+/// One node has one blobs ALPN, so it can serve one store.
+#[tokio::test]
+async fn two_services_with_different_blob_stores_are_refused() {
+    let node = local_node().await;
+    let one = Blobs::memory();
+    let two = Blobs::memory();
+    let warehouse = Warehouse {
+        published: one.add_bytes(b"x".to_vec()).await.expect("stores"),
+        unpublished: one.add_bytes(b"y".to_vec()).await.expect("stores"),
+    };
+
+    let error = keylink::Server::builder(&node)
+        .service(
+            catalog::service(warehouse.clone(), Allowlist::anyone())
+                .with_blobs(&one)
+                .build(),
+        )
+        .service(
+            depot::service(warehouse, Allowlist::anyone())
+                .with_blobs(&two)
+                .build(),
+        )
+        .spawn()
+        .expect_err("two different stores on one node must be refused");
+
+    assert!(
+        matches!(
+            error,
+            Error::Config(keylink::ConfigError::ConflictingBlobStores)
+        ),
+        "expected ConflictingBlobStores, got {error:?}"
+    );
+}
+
+/// The control beside it. Sharing ONE store between two services is the normal
+/// case and must still work — without this, the test above passes just as well
+/// when any two blob services are refused.
+#[tokio::test]
+async fn two_services_sharing_one_blob_store_are_allowed() {
+    let node = local_node().await;
+    let shared = Blobs::memory();
+    let warehouse = Warehouse {
+        published: shared.add_bytes(b"x".to_vec()).await.expect("stores"),
+        unpublished: shared.add_bytes(b"y".to_vec()).await.expect("stores"),
+    };
+
+    let _running = keylink::Server::builder(&node)
+        .service(
+            catalog::service(warehouse.clone(), Allowlist::anyone())
+                .with_blobs(&shared)
+                .build(),
+        )
+        .service(
+            depot::service(warehouse, Allowlist::anyone())
+                .with_blobs(&shared)
+                .build(),
+        )
+        .spawn()
+        .expect("two services may share one store");
+}
+
+// ───────────────────────────────────────────────────────── the wire contract
+
+/// A `blob` method must be visible on the wire, because the response carries a
+/// `BlobId` that a peer built before the method existed cannot decode.
+///
+/// Written against a private shape rather than by moving
+/// `protocol.rs`'s `PINNED` literal. CONTRIBUTING.md governs that literal:
+/// decide whether a change SHOULD be wire-visible, and only then update it.
+/// Adding a kind to the macro does not change the `probe` service, so nothing
+/// there should move — and if it did, that would be the bug this style of test
+/// exists to keep visible.
+#[tokio::test]
+async fn adding_a_blob_method_moves_the_alpn() {
+    // `Catalog` as it would have been with `Datasheet` declared `rpc`: the same
+    // name, the same arguments, the same return type, and no address.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, postcard_schema::Schema)]
+    #[allow(dead_code)]
+    enum ResponseWithoutBlob {
+        Ping(String),
+        Datasheet(Manual),
+    }
+
+    #[derive(postcard_schema::Schema)]
+    #[allow(dead_code)]
+    struct ContractBefore {
+        request: keylink::Envelope<catalog::Request>,
+        response: keylink::Envelope<keylink::WireResponse<ResponseWithoutBlob>>,
+    }
+
+    const P: &str = concat!(env!("CARGO_PKG_NAME"), "/Catalog");
+    assert_ne!(
+        keylink::derive_alpn::<ContractBefore>(P),
+        catalog::alpn().to_vec(),
+        "a blob method must move the ALPN: the response carries a BlobId, and a \
+         peer built before it would decode the address as part of the reply"
+    );
+}
+
+/// The other half of the same claim: the address on the wire is the raw 32
+/// bytes beside the reply, not a wrapper. `Response` is what the contract
+/// hashes, so this pins what the hash is over.
+#[tokio::test]
+async fn a_blob_response_carries_the_reply_and_the_address_together() {
+    let store = MemStore::new();
+    let tag = store.add_bytes(b"addressed".to_vec()).await.expect("adds");
+    let id = address_of(tag.hash);
+
+    let ours = postcard::to_stdvec(&(Manual { pages: 42 }, id)).expect("encodes the pair");
+    let mut expected = postcard::to_stdvec(&Manual { pages: 42 }).expect("encodes the reply");
+    expected.extend_from_slice(tag.hash.as_bytes());
+
+    assert_eq!(
+        ours, expected,
+        "a blob reply is its value followed by 32 raw hash bytes"
+    );
+}

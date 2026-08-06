@@ -99,7 +99,7 @@ pub use actor::{
     MountError, Mounted, Panic, Sealed, System, SystemBuilder,
 };
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
-pub use blobs::{BlobHandle, BlobId, Blobs, BlobsAdmission, Retention, MAX_GRANTS};
+pub use blobs::{BlobHandle, BlobId, Blobs, BlobsAdmission, Granting, Retention, MAX_GRANTS};
 pub use body::{Body, BodyReader};
 pub use error::{ConfigError, Error, Result, Transport};
 pub use idempotency::{IdempotencyRefusal, MAX_RECORDED_BYTES, MAX_RECORDS};

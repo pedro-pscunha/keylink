@@ -228,6 +228,29 @@ pub enum ConfigError {
     /// in a doc comment nobody reads twice.
     #[error("{0} is reserved - keylink mounts this protocol itself, with a policy")]
     ReservedAlpn(String),
+    /// A service declares `blob` methods and was given no content store.
+    ///
+    /// Every `blob` method answers with an address, and an address is only
+    /// worth anything if some store holds the bytes. Raised at startup rather
+    /// than on the first call, where it would look like a transport failure to
+    /// whoever asked.
+    #[error(
+        "service {service} declares blob methods but was given no store - add .with_blobs(..)"
+    )]
+    MissingBlobStore {
+        /// The ALPN of the service that is missing one.
+        service: String,
+    },
+    /// Two services on one node were given two different content stores.
+    ///
+    /// One node has one blobs ALPN, so it can serve one store. Sharing a
+    /// [`Blobs`](crate::Blobs) between services is normal; two distinct stores
+    /// is a question with no right answer, so it is refused rather than
+    /// resolved by picking one.
+    ///
+    /// Two tenants that must not share a store need two nodes.
+    #[error("two services were given different blob stores - one node has one content store")]
+    ConflictingBlobStores,
     /// A bounded identifier was empty or too long.
     ///
     /// Raised by a constructor, and again on the receive path, because a peer's

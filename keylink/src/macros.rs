@@ -17,17 +17,34 @@
 /// //          let (info, body) = client.fetch(7).await?;
 /// ```
 ///
-/// # The three kinds
+/// # The four kinds
 ///
 /// `send` and `recv` are written from the *client's* point of view, and they
 /// change only the signatures — the wire types are identical, because a body
-/// travels beside the message rather than inside it.
+/// travels beside the message rather than inside it. `blob` is the one that
+/// changes the wire: a content address IS the message, so it rides in the
+/// response.
 ///
 /// | kind   | handler                                  | client                                |
 /// |--------|------------------------------------------|---------------------------------------|
 /// | `rpc`  | `async fn f(&self, a: A) -> R`           | `f(a) -> R`                           |
 /// | `send` | `async fn f(&self, a: A, b: BodyReader) -> R` | `f(a, body: Body) -> R`          |
 /// | `recv` | `async fn f(&self, a: A) -> (R, Body)`   | `f(a) -> (R, BodyReader)`             |
+/// | `blob` | `async fn f(&self, a: A) -> (R, BlobId)` | `f(a) -> (R, BlobHandle)`             |
+///
+/// ## Picking between `recv` and `blob`
+///
+/// **Does the payload exist as bytes before the call?** If no, use `recv` —
+/// blobs must hash content before serving it, so it cannot stream something
+/// being generated. **Will the same payload go to more than one peer, or more
+/// than once?** If yes, use `blob` and get deduplication, resume and content
+/// addressing. If no, use `recv` and pay for none of it.
+///
+/// A service with a `blob` method must be given a store —
+/// `service(..).with_blobs(&blobs)` — or [`ServerBuilder::spawn`](crate::ServerBuilder::spawn)
+/// refuses it at startup. Returning the [`BlobId`](crate::BlobId) is what
+/// grants it to the caller: no other peer can fetch it, and nothing else in the
+/// store becomes reachable.
 ///
 /// RPC names are written in `CamelCase` (they become enum variants); the
 /// generated methods are `snake_case`.
@@ -56,7 +73,7 @@ macro_rules! service {
 
             #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, ::postcard_schema::Schema)]
             pub enum Response {
-                $( $rpc($ret) ),+
+                $( $rpc($crate::__keylink_response_ty!([<$kind>], $ret)) ),+
             }
 
             impl Response {
@@ -75,7 +92,8 @@ macro_rules! service {
                     /// Unreachable against a peer running this same schema —
                     /// which the ALPN gate guarantees. Kept so a hand-rolled
                     /// peer gets an error, not a panic.
-                    fn [<into_ $rpc:snake>](self) -> $crate::Result<$ret> {
+                    fn [<into_ $rpc:snake>](self)
+                        -> $crate::Result<$crate::__keylink_response_ty!([<$kind>], $ret)> {
                         match self {
                             Self::$rpc(value) => Ok(value),
                             other => Err($crate::Error::UnexpectedResponse {
@@ -131,6 +149,30 @@ macro_rules! service {
                 );
             )+
 
+            /// Whether this reply hands out a content address, and which.
+            ///
+            /// Read by `serve_one`, which is the only place that holds BOTH the
+            /// store and the [`AdmittedPeer`](keylink::AdmittedPeer) the grant
+            /// must be recorded against. The handler has neither and needs
+            /// neither: returning the id is the whole of its part.
+            impl $crate::Granting for Response {
+                fn granted(&self) -> ::core::option::Option<$crate::BlobId> {
+                    match self {
+                        $( Self::$rpc(__value) =>
+                            $crate::__keylink_granted_id!([<$kind>], __value), )+
+                    }
+                }
+            }
+
+            /// Whether any method here serves content, folded at compile time.
+            ///
+            /// `ServerBuilder::spawn` reads it to refuse a service that
+            /// declares blob methods and carries no store, which is why
+            /// `ConfigError::MissingBlobStore` is a check that can fire rather
+            /// than a flag that is always false.
+            const DECLARES_BLOBS: bool =
+                false $( | $crate::__keylink_is_blob!([<$kind>]) )+;
+
             impl $crate::Rpc for Request {
                 const SERVICE: &'static str = stringify!($svc);
 
@@ -167,6 +209,7 @@ macro_rules! service {
                         })
                     });
                 $crate::ServiceBuilder::new(alpn(), allow, dispatch)
+                    .__keylink_declares_blobs(DECLARES_BLOBS)
             }
 
             /// Serve this service alone on `node`.
@@ -552,6 +595,87 @@ macro_rules! __keylink_if_blocking {
     ($($item:tt)*) => {};
 }
 
+/// What one `Response` variant carries, which is the only place the four kinds
+/// disagree about the wire.
+///
+/// `rpc`, `send` and `recv` put the declared return type in and nothing else: a
+/// body travels beside the message rather than inside it. `blob` puts the
+/// content address in beside the reply, because a content address IS the
+/// message — there is no second channel for it to ride on.
+///
+/// RFC-01 §3.4 rejected the alternative, which was a `BlobId` field on
+/// `Envelope`: every unary rpc would pay a byte for a field it never sets, and
+/// the generated `Response` would stop showing which methods hand out content.
+///
+/// A `macro_rules!` call is legal in type position. Checked rather than
+/// assumed, because a `derive` receives the item as TOKENS and therefore sees
+/// this invocation rather than a type: `Serialize`, `Deserialize` and
+/// `postcard_schema::Schema` all expand correctly over it.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_response_ty {
+    (rpc, $ret:ty) => {
+        $ret
+    };
+    (send, $ret:ty) => {
+        $ret
+    };
+    (recv, $ret:ty) => {
+        $ret
+    };
+    (blob, $ret:ty) => {
+        ($ret, $crate::BlobId)
+    };
+}
+
+/// The content address one `Response` variant hands out, if any.
+///
+/// The three non-blob arms discard the value they were given and answer
+/// `None` — they have no address to report, and this is where that fact is
+/// stated once instead of at every reading site.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_granted_id {
+    (rpc, $value:expr) => {{
+        let _ = $value;
+        ::core::option::Option::None
+    }};
+    (send, $value:expr) => {{
+        let _ = $value;
+        ::core::option::Option::None
+    }};
+    (recv, $value:expr) => {{
+        let _ = $value;
+        ::core::option::Option::None
+    }};
+    (blob, $value:expr) => {
+        ::core::option::Option::Some($value.1)
+    };
+}
+
+/// Whether one kind needs a content store, folded into `DECLARES_BLOBS`.
+///
+/// A `const`, so "this service serves content" is answered at compile time and
+/// `ServerBuilder::spawn` can refuse a service that declares blob methods and
+/// carries no store. Without it, `ConfigError::MissingBlobStore` would be a
+/// check whose flag is always false.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_is_blob {
+    (rpc) => {
+        false
+    };
+    (send) => {
+        false
+    };
+    (recv) => {
+        false
+    };
+    (blob) => {
+        true
+    };
+}
+
 /// One blocking client method. Streaming kinds produce nothing.
 #[doc(hidden)]
 #[macro_export]
@@ -565,6 +689,10 @@ macro_rules! __keylink_blocking_method {
     };
     ([$( #[$meta:meta] )*], send, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
     ([$( #[$meta:meta] )*], recv, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    // Absent for the same reason `send` and `recv` are: a `BlobHandle` fetches
+    // asynchronously, so a synchronous wrapper would either buffer the whole
+    // blob or hand back a handle that only works inside a runtime.
+    ([$( #[$meta:meta] )*], blob, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
 }
 
 /// One handler-trait method, shaped by the rpc kind.
@@ -588,6 +716,17 @@ macro_rules! __keylink_handler_method {
         #[doc = concat!("Answer the `", stringify!($name), "` rpc, returning a payload to stream back.")]
         fn $name(&self $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = ($ret, $crate::Body)> + Send;
+    };
+    ([$( #[$meta:meta] )*], blob, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Answer the `", stringify!($name), "` rpc, returning the address of content this node already holds.")]
+        ///
+        /// Returning the [`BlobId`](keylink::BlobId) IS the grant: the
+        /// generated dispatch records it against the peer that asked, so the
+        /// handler names no ledger and there is no call to forget. Nothing else
+        /// in the store becomes reachable.
+        fn $name(&self $(, $arg: $ty )*)
+            -> impl ::core::future::Future<Output = ($ret, $crate::BlobId)> + Send;
     };
 }
 
@@ -635,6 +774,21 @@ macro_rules! __keylink_invoke_fn {
             ($resp::$variant(value), body)
         }
     };
+    // The pair goes into the response WHOLE, and the grant is recorded from
+    // there rather than here. `serve_one` is the only place that holds both the
+    // `AdmittedPeer` and the store, and it reads the id back off this response
+    // through `Granting`.
+    (blob, $fname:ident, $handler:ident, $resp:ident, $variant:ident, $method:ident,
+        ($( $arg:ident : $ty:ty ),*)) => {
+        async fn $fname<H: $handler>(
+            handler: &H,
+            _body: $crate::BodyReader
+            $(, $arg: $ty )*
+        ) -> ($resp, $crate::Body) {
+            let (value, id) = handler.$method($( $arg ),*).await;
+            ($resp::$variant((value, id)), $crate::Body::empty())
+        }
+    };
 }
 
 /// One `Actor`-trait method, shaped by the rpc kind. `&mut self`, because the
@@ -665,6 +819,16 @@ macro_rules! __keylink_actor_method {
         /// [`abort`](keylink::System::abort) cannot truncate it.
         fn $name(&mut self $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = ($ret, $crate::Body)> + Send;
+    };
+    ([$( #[$meta:meta] )*], blob, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Answer the `", stringify!($name), "` rpc, returning the address of content this node already holds.")]
+        ///
+        /// Nothing is streamed during the turn: the address is the whole reply,
+        /// and the bytes move later on the blobs connection. So
+        /// [`abort`](keylink::System::abort) has nothing here to truncate.
+        fn $name(&mut self $(, $arg: $ty )*)
+            -> impl ::core::future::Future<Output = ($ret, $crate::BlobId)> + Send;
     };
 }
 
@@ -710,6 +874,21 @@ macro_rules! __keylink_actor_invoke_fn {
         ) -> ($resp, $crate::Body) {
             let (value, body) = state.$method($( $arg ),*).await;
             ($resp::$variant(value), body)
+        }
+    };
+    // RFC-01 §11.2b calls this the "build the blob path twice" risk: there are
+    // TWO generators, and a kind added to one and not the other compiles
+    // everywhere except the service that uses it. Identical to the `Handler`
+    // twin above on purpose — if these two ever diverge, that is the bug.
+    (blob, $fname:ident, $actor:ident, $resp:ident, $variant:ident, $method:ident,
+        ($( $arg:ident : $ty:ty ),*)) => {
+        async fn $fname<A: $actor>(
+            state: &mut A,
+            _body: $crate::BodyReader
+            $(, $arg: $ty )*
+        ) -> ($resp, $crate::Body) {
+            let (value, id) = state.$method($( $arg ),*).await;
+            ($resp::$variant((value, id)), $crate::Body::empty())
         }
     };
 }
@@ -770,6 +949,24 @@ macro_rules! __keylink_actor_client_method {
             Ok((response.$extract()?, body))
         }
     };
+    // Deliberately absent, the same way `__keylink_blocking_method!` omits
+    // `send` and `recv` — and for a reason of the same shape.
+    //
+    // `serve_one` records a grant by reading the address off the reply through
+    // `Granting`. On the actor path that reply is an `ActorReply`: an opaque
+    // payload the system never decodes, which is precisely the property RFC-01
+    // §11.2a wanted, since it means a `BlobId` cannot arrive under a mismatched
+    // schema. The cost is that the system cannot see the address either, so no
+    // grant is recorded and any handle built here would fetch content nobody
+    // was granted.
+    //
+    // Emitting a method that fails at runtime, or a `compile_error!` that would
+    // fire for every service declaring a `blob` method whether or not it is
+    // mounted as an actor, are both worse than emitting nothing. Wiring it
+    // needs the store inside the actor's own dispatch, which is RFC-04's to
+    // reconcile (§11.2b, §11.2c).
+    ([$( #[$meta:meta] )*], blob, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
 }
 
 /// One client method, shaped by the rpc kind.
@@ -813,6 +1010,24 @@ macro_rules! __keylink_client_method {
             Ok((response.$extract()?, body))
         }
     };
+    ([$( #[$meta:meta] )*], blob, $name:ident, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Call the `", stringify!($variant), "` rpc, returning its reply and a handle to the content it named.")]
+        ///
+        /// The call site names no ALPN, no second dial and no hash: a
+        /// [`BlobHandle`](keylink::BlobHandle) is a content address plus the
+        /// node that holds it, and it opens the blobs connection itself.
+        pub async fn $name(&self $(, $arg: $ty )*)
+            -> $crate::Result<($ret, $crate::BlobHandle)> {
+            let (response, _body) = self
+                .inner
+                .call($req::$variant { $( $arg ),* }, $crate::Body::empty())
+                .await?;
+            let (value, id) = response.$extract()?;
+            Ok((value, self.inner.blob_handle(id)))
+        }
+    };
 }
 
 /// One expansion of [`service!`], inside the library's own test build.
@@ -839,5 +1054,10 @@ mod expansion {
         rpc Ping(n: u64) -> u64;
         recv Fetch(name: String) -> u64;
         send Store(name: String) -> u64;
+        // The fourth kind belongs here for the same reason the other three do.
+        // It also expands the ACTOR twin, which is where RFC-01 §11.2b's
+        // "build the blob path twice" risk lives: a kind added to one generator
+        // and not the other compiles until somebody declares it.
+        blob Manual(sku: String) -> u64;
     }
 }

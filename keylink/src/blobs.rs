@@ -502,6 +502,54 @@ impl Blobs {
     fn store(&self) -> &Store {
         self.inner.backing.store()
     }
+
+    /// Whether two handles are the same store.
+    ///
+    /// Pointer identity on the shared `Inner`, not a comparison of contents:
+    /// the question `ServerBuilder::spawn` asks is "were these cloned from one
+    /// `Blobs`", and two `Blobs::memory()` calls are two stores even while both
+    /// are empty.
+    pub(crate) fn is_same_store(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+/// Whether a reply hands out a content address.
+///
+/// Implemented by every generated `Response`, so the RPC layer can record a
+/// grant without knowing anything about the service's types. `serve_one` is the
+/// only reader, and it is the only place that holds both the store and the
+/// [`AdmittedPeer`](crate::AdmittedPeer) — the handler has neither, and
+/// `accept` has no address.
+///
+/// This is what keeps the store out of `Dispatch`, `Next` and `Context`: the
+/// address travels back on the reply that already exists rather than the store
+/// travelling down through every middleware.
+pub trait Granting {
+    /// The content this reply names, if it names any.
+    fn granted(&self) -> Option<BlobId>;
+}
+
+/// The actor system's outer reply hands out no address of its own.
+///
+/// **This is RFC-01 §11.2a's question, answered by measurement rather than
+/// assumption.** `ActorReply` is a `Vec<u8>` the system never decodes: the
+/// per-actor `Response` — `BlobId` and all — rides inside it, sealed, and is
+/// refused before decoding unless the declared schema hash matches. So the
+/// address genuinely does sit in the per-actor payload schema rather than in
+/// the envelope, which is exactly the property that makes a `BlobId` arriving
+/// this way trustworthy.
+///
+/// It has a consequence, and it is why `blob` has no actor client method:
+/// `serve_one` reads the grant off this reply, and this reply cannot see one.
+/// Recording it would need the store inside the actor's own dispatch, which
+/// lives in `actor.rs` and is RFC-04's to reconcile. Until then the `blob` kind
+/// is reachable through the ordinary client and not through an actor handle —
+/// absent rather than broken.
+impl Granting for crate::ActorReply {
+    fn granted(&self) -> Option<BlobId> {
+        None
+    }
 }
 
 // ─────────────────────────────────────────────────────────────── the mount
@@ -712,8 +760,15 @@ impl BlobHandle {
     #[doc(hidden)]
     #[must_use]
     pub fn new(node: &Node, holder: impl Into<EndpointAddr>, id: BlobId) -> Self {
+        Self::on(node.endpoint().clone(), holder, id)
+    }
+
+    /// The same handle, built from the endpoint a live client is already
+    /// dialling on. Generated `blob` client code takes this route, because an
+    /// `RpcClient` holds an endpoint and a peer rather than a `Node`.
+    pub(crate) fn on(endpoint: Endpoint, holder: impl Into<EndpointAddr>, id: BlobId) -> Self {
         Self {
-            endpoint: node.endpoint().clone(),
+            endpoint,
             holder: holder.into(),
             id,
         }
