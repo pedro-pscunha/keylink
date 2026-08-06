@@ -262,8 +262,8 @@ type Answer = (Outcome<ActorReply>, Body);
 ///
 /// Boxed on the way into the mailbox, which is not a micro-optimisation. A
 /// `tokio::sync::mpsc` channel allocates its first block of 32 slots eagerly, so
-/// the mailbox costs `32 * size_of::<T>()` whatever its capacity is. Measured at
-/// ten thousand idle actors, on this machine, by `tests/actor_memory.rs`:
+/// the mailbox costs `32 * size_of::<T>()` whatever its capacity is. At ten
+/// thousand idle actors, on this machine:
 ///
 /// | slot type   | per idle actor | ten thousand |
 /// |-------------|----------------|--------------|
@@ -273,6 +273,13 @@ type Answer = (Outcome<ActorReply>, Body);
 /// The 7,936 byte difference is the block: `Mail` is 256 bytes, so 32 of them is
 /// 8,192, against 256 for 32 pointers. The cost of boxing is one allocation per
 /// message, on a path that already allocates the payload.
+///
+/// Only the boxed row is reported by `tests/actor_memory.rs`; the unboxed row is
+/// that number plus the difference above, because the test never builds ten
+/// thousand unboxed mailboxes — it would allocate 87 MB to measure a
+/// subtraction. Saying which row is checked matters here: every figure in this
+/// table except the boxed one was wrong for months, under a sentence claiming
+/// the whole thing was measured.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct Mail {
