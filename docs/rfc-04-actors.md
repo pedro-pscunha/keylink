@@ -1967,3 +1967,247 @@ Beyond §13.2, and specific to this section:
    with real `serde` and `postcard` outside this workspace. It was **not** reproduced by
    editing `RemoteError` in the crate and observing an unchanged ALPN, which is the test
    that belongs in step 0.
+
+---
+
+## 15. Postscript — what shipped, and in what order (2026-08-06)
+
+Appended, not edited. Everything above this line is the RFC as it was reviewed and
+approved; this section records what building it actually did, including where the RFC was
+wrong.
+
+### 15.1 The order was inverted, and nobody decided that
+
+§14.9 sequences six steps. Read against the git history, the work went:
+
+| Step | §14.9 says | What happened |
+|---|---|---|
+| 0 | capability G, the pinned hash | first, as specified (`4903601`, `7bc9d6d`) |
+| **5** | **the actor system — "designed and unbuilt"** | **second** (`b0e8ae5`, twelfth commit of fifty) |
+| 2 | wire it to the transport | with it |
+| 3 | `tell`, `accept_uni`, `WireKinds` | fourth (`d4cb94f`, `0936db9`) |
+| 4 | `Peer` | fifth (`a1d0e0d`) |
+| **1** | **the mailbox, with no network** | **last** (`354f5af`, 2026-08-06) |
+
+So the capability §0 marks **"Ship."** was the last thing built, and the capability §0
+marks **"Design now, build when named"** was among the first. No commit message argues for
+that order and no review approved it. It is what happens when a sequencing table sits in
+one document and the work is picked up from another: §14 is the longest and most specific
+section in this RFC, so it read as the instruction, and "designed and unbuilt" three lines
+into a 400-line design is easy to walk past.
+
+The lesson is about where a decision is written down, not about actors. A step marked
+**do not build this yet** has to be marked at the point where somebody would start
+building, which for §14 is §14.1, not §14.9.
+
+### 15.2 What the inversion cost
+
+Four things, none catastrophic, all avoidable.
+
+1. **Every user paid §14.8's four costs for a capability most of them did not want.** An
+   extra allocation and copy per message, a registry with eviction and a capacity cap,
+   `stop`/`abort` bookkeeping, and — the expensive one — per-method `Middleware` stops
+   working from outside, because the payload is opaque until after §14.3's check.
+2. **§12.1 tests 1, 2 and 5 were unwritable**, exactly as §11 step 1 predicted, so the
+   serialization property was tested only through a transport that was not under test.
+3. **§12.2 test 10 was never written.** `Actor::caller` shipped with a default empty body
+   and **nothing in the tree ever overrode it** — not one test, not the demo. A hook with
+   no implementor and no test is a hook nobody can say works. It did not, in one case
+   (§15.6).
+4. **`blob` methods could not be reached through an actor at all**, and
+   `__keylink_actor_client_method!` carries the paragraph explaining why: the system
+   cannot read the address off an opaque reply, so it cannot record a grant. That is a
+   true statement about capability F which was silently a statement about *all* actors,
+   because F was the only actor there was.
+
+### 15.3 Capability A is not what §14.8 assumed it would be
+
+§14.8 lists its four costs so "the build-order decision is made with them visible", and
+the natural reading is that the singleton would be the actor system with one entry — a
+system with one actor whose id you never write. Built that way it pays all four.
+
+It is not built that way. **A singleton actor is served on the service's own ALPN, with
+the service's own `Request` and `Response`, and the wire does not move.** Peers use the
+ordinary generated `Client`. `Handle::service(allow)` is `service(handler, allow)` with a
+mailbox where the `Arc` was, and that is the entire difference on the serving side.
+
+It therefore pays none of the four:
+
+| §14.8 cost | The keyed system | The singleton |
+|---|---|---|
+| per-method `Middleware` stops working | yes | **no** — the layer sees the typed enum |
+| an extra allocation and copy per message | yes | **no** — there is no second envelope |
+| a registry, eviction, capacity | yes | **no** — one actor, one task |
+| `stop`, `abort`, `JoinHandle` bookkeeping | yes | on the handle, where the owner is |
+
+And two capabilities the keyed system cannot have come back with it: the idempotency
+ledger applies unchanged, and `blob` methods work, because the server can still read the
+address off a typed reply to record a grant.
+
+This is not a criticism of §14. Every one of those four costs is the price of §14.3's
+property — that a payload is opaque to keylink until its schema hash is checked — and that
+property is what makes keyed actors safe. The point is narrower: **the costs belong to
+keyed addressing, not to actors**, and building A first would have shown that a year of
+commits earlier.
+
+`System` and the keyed envelope are unchanged and stay. A node serves either an actor
+system or one singleton per service, because one router owns one ALPN — refused at
+startup, with a test.
+
+### 15.4 §1.4's arithmetic is wrong. The win is bigger than claimed
+
+§1.4 is this RFC's justification, so it was checked rather than repeated. The demo's
+`Warehouse` is now an actor, and the count is:
+
+    35 removed = 13 that disappeared + 22 rewritten
+    39 added   = 17 that appeared   + 22 rewritten
+
+| item | §1.4 | actually gone |
+|---|---|---|
+| `use std::sync::Mutex;` | 1 | 1 |
+| the field wrapper | 1 | **0** — that line survives, edited |
+| the constructor wrapper | 1 | **2** — rustfmt writes it on three lines |
+| the accessor and its poison comment | 6 | **8** — 3 doc, 5 code |
+| the blank line the accessor owned | — | 1 |
+| `let mut items = self.items();` in `reserve` | — | **1** |
+| the three `self.items()` call sites | "lose a method call" | 0, all three rewritten |
+| | **9** | **13** |
+
+Two of the four errors are one mistake: **§1.4 counted its own snippet rather than the
+file.** It writes the accessor body on one line and the constructor on one line; at 100
+columns rustfmt writes three of each. A line count taken from prose is a line count of the
+prose.
+
+The other two are omissions. An edited line is not a saving, so the field wrapper should
+not have been counted. And `reserve` loses a whole line nobody counted, because
+`self.items.get_mut(&sku)` borrows directly where a guard had to be bound first.
+
+The call-site count — three — is right.
+
+§1.4 also counted **only deletions**. Seventeen lines appeared; sixteen are comments the
+change earns and one is code. So the honest figure is **13 out, 1 in, net −12 of code**,
+and the file grows by 4.
+
+### 15.5 §1.3's "one word at the serve site" did not survive contact
+
+§1.3 shows `actor(state, allow)` beside `service(handler, allow)` — symmetric, one word
+apart. What shipped is `actor(state) -> Handle`, with the allowlist on
+`Handle::service(allow)`, because **a local handle has no peer to allow**. The allowlist
+belongs where the network is, and that is a better shape than the sketch.
+
+The cost of it showed up the first time somebody outside the crate used the API: the
+concurrent model had a one-line front door (`inventory::serve`) and the actor model made
+you drop to `Server::builder(..).service(..).spawn()`, four lines, which made the actor the
+*more verbose* choice at exactly the site §1.3 advertises as one word. `Handle::serve`
+exists because of that report, and the serve site is two lines now.
+
+§2.2's `fn caller(&mut self, _cx: &Context)` is likewise stale — see §15.6.
+
+### 15.6 Corrections to sections above
+
+**§2.4 and §5.3 — `Actor::caller` takes `Option<&Context>`, not `&Context`.** A local
+message has no peer, no handshake and no proven key. Skipping the hook for local messages
+was the first design, and it is wrong in a way worth recording: an actor that stashes its
+caller and is reachable both ways would then authorize an in-process message against **the
+last peer that happened to dial it**. Verified by removing the `None` — the local call
+reports the remote peer's key. `Option` is the fix, and assigning rather than merging is
+the caller's part, said on the trait.
+
+**§5.3 — the success types do not all match.** §5.3 says the local and remote methods have
+matching "method names, argument order and success types". True for `rpc` and `tell`.
+`send` and `recv` have **no local method at all**: a `send` handler is defined by the
+`BodyReader` it reads and a `recv` handler by the `Body` it returns, and both of those are
+one half of a QUIC stream. In this process there is no stream. The two ways to pretend
+otherwise — buffer the body in memory, or generalize `FrameReader` over `AsyncRead` — are
+worse than the absence, and the absence is held by a compile-time probe rather than by a
+comment. `blob` has a local method returning the `BlobId` rather than a `BlobHandle`, for
+the same reason in the other direction: a handle names the node that holds the content,
+and here that is you.
+
+**§10.3 — `enter()` returns a `Result`.** The sketch is
+`pub fn enter(&self) -> tokio::runtime::EnterGuard<'_>`. It cannot be, for the reason the
+rest of the module exists: called from inside a runtime it must refuse, the way every
+other entry point here refuses, so it returns `Result<EnterGuard<'_>>` carrying
+`Error::BlockingInAsync`. Otherwise the one method that exists to fix a panic would itself
+be the only one in the module that can be misused silently.
+
+### 15.7 What two adversarial reviews found, and what §12 could not
+
+Two reviewers read the delivered code with different lenses. Recorded because §13's "not
+verified" list is the part of an RFC that ages worst, and because one finding is the shape
+this RFC keeps warning about.
+
+**The doc said a self `tell` was safe. It deadlocks.** Both reviewers found it
+independently. `notify` awaits a permit on a mailbox of capacity one; the actor released
+one permit when it took the message it is running, so a self `tell` succeeds *only until
+another sender takes it* — and a served actor always has other senders. Then the send
+blocks, and only the actor can free the permit. §6.2 argues the capacity from the transport
+side and never considers a sender that is the actor. Fixed in the docs, listed with the
+other two self-call cases, and worth noting as the failure mode this whole design invites:
+load-dependent, so it passes every test.
+
+**A test in §12's own shape was green and proved nothing.**
+`a_served_actor_serializes_calls_that_arrive_on_separate_streams` — §12.2's test 7 — built
+eight futures with `.map(..)` and awaited them in a loop. A Rust future does nothing until
+polled, so it ran eight sequential round trips and its assertion held under *any* serving
+model, including the concurrent one it was written to contradict. Its mirror,
+`concurrent_calls_do_not_queue_behind_each_other`, uses `tokio::join!`; that is the whole
+difference. Fixed, then verified by swapping in the concurrent handler: 62 ms against a
+480 ms floor. The old version passed that swap.
+
+§12's rule — "each row names the exact edit that must break it" — would not have caught
+either. Both were red-tested against the wrong edit.
+
+Also corrected, each because a reviewer showed the code rather than the claim: a layer can
+refuse a call and cannot cancel a turn, so `Timeout` on an actor sheds no load and settles
+an idempotency key for a message that then happens; a dropped call still runs, which is the
+one `Handler` → `Actor` change the compiler cannot show; `Panic` had a public constructor
+and so proved nothing about panics; the absence probe lacked the `Deref` companion
+`representability.rs` documents; and threaded wasm was unguarded, because the
+`compile_error!` for that assumption was gated on the `web` feature while the local
+mailbox is gated on nothing.
+
+### 15.8 The estimate
+
+§0 costs capability A at "~90 lines in the crate, ~60 in the macro".
+
+| | §0 estimate | shipped |
+|---|---|---|
+| crate | ~90 | 115 code lines (`local.rs`, excluding its tests and every comment) |
+| macro | ~60 | 199 added code lines in `macros.rs` |
+
+The crate estimate is good. The macro estimate is off by more than three times, and the
+reason is that §11 step 1 scopes the macro's share to `trait Actor`, `fn actor()` and
+`struct Handle` — the local half. The served half, `Handle::service`, is not in that
+estimate because §11 puts it in step 2, and step 2 was costed as a `Dispatch` change.
+Thirty-seven of those 199 lines are the compile-time probe and the `Actor` impl it needs,
+which no estimate would have included because §12 does not name it.
+
+### 15.9 What is still unbuilt, and why that is right
+
+- **Supervision and restart (§8).** Unbuilt, and this RFC's own recommendation is
+  "none. Not a smaller version. None." A panic costs one message; that is the whole policy.
+- **Design B, reusing the inbound connection (§4.4).** Unbuilt. §4.2's answer — dial it
+  back — still costs zero lines.
+- **The `tell` grammar without `-> ()` (§2.1)**, and `.mailbox(n)`. Both deferred, both
+  still deferred.
+- **Location transparency (§5.5).** Rejected permanently, and building both handles has
+  not weakened the argument: the local one has exactly one failure mode and the remote one
+  has five, and `MailboxClosed` deliberately does not convert into `Error`.
+
+### 15.10 Added to "not verified"
+
+1. **No `.wasm` has been loaded in a tab.** The local mailbox uses `n0_future::task::spawn`
+   and nothing else, so it should hold on the browser's single-threaded executor, but
+   "should" is the word.
+2. **`Panic::resume` was not exercised under `panic = "abort"`**, where `catch_unwind`
+   catches nothing and the actor dies with the process. `guarded` has always said so; the
+   local handle inherits it and no test can assert it without a second profile.
+3. **The mailbox capacity of 1 is not measured on the local path, and §6.1's argument does
+   not carry to it.** Over the network QUIC bounds in-flight calls, which is what §6.1
+   rests on. In-process nothing does, and the mailbox is not a substitute: a parked sender
+   still holds its message, so memory grows with waiting callers whatever the capacity is,
+   and the queue moves into a wait list with no length anybody can read. What capacity 1
+   buys in-process is narrower — a caller cannot get more than one message ahead of the
+   actor, so a caller that measures its own latency sees the actor's. The number was
+   reasoned about, not profiled.
