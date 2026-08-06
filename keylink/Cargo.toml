@@ -105,6 +105,10 @@ tokio-util = { version = "0.7", optional = true, default-features = false, featu
 ] }
 
 [dev-dependencies]
+# Test-only, and acyclic: `keylink-persist` does not depend on `keylink`.
+# The port must not know about the framework, so the wiring is proved from
+# this side rather than by making the hexagon point the wrong way.
+keylink-persist = { path = "../keylink-persist" }
 tokio = { version = "1", features = ["full"] }
 # `test-utils` ships iroh's relay and its pkarr/DNS server as libraries, so
 # `keylink/tests/relay.rs` can run both in-process. Without it every test in this

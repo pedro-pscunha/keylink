@@ -2085,6 +2085,7 @@ dependencies = [
  "bytes",
  "iroh",
  "iroh-blobs",
+ "keylink-persist",
  "n0-future",
  "pastey",
  "postcard",

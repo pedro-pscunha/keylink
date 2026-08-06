@@ -758,6 +758,45 @@ macro_rules! service {
                         .spawn()
                 }
 
+                /// Read the state between turns, for something the service's
+                /// own methods do not express.
+                ///
+                /// The seam for a cross-cutting concern: a snapshot for
+                /// persistence, a metric, a debug dump. It takes a turn like any
+                /// other message, so it **cannot observe a half-applied state**
+                /// — which is the entire reason it exists rather than the state
+                /// being shared behind a lock.
+                ///
+                /// ```ignore
+                /// // `snapshot` is the caller's own trait, not keylink's.
+                /// let bytes = warehouse.with_state(Warehouse::snapshot).await?;
+                /// ```
+                ///
+                /// The closure is **synchronous and takes `&A`**, on purpose.
+                /// It cannot await, so it cannot hold the actor open, and it
+                /// cannot mutate, so a concern bolted on from outside cannot
+                /// quietly become a second way to change the state. Use a
+                /// declared method for that.
+                ///
+                /// # Errors
+                ///
+                /// [`MailboxClosed`](keylink::MailboxClosed) when the actor is
+                /// gone.
+                pub async fn with_state<T, F>(
+                    &self,
+                    read: F,
+                ) -> ::core::result::Result<T, $crate::MailboxClosed>
+                where
+                    T: ::core::marker::Send + 'static,
+                    F: ::core::ops::FnOnce(&A) -> T + ::core::marker::Send + 'static,
+                {
+                    self.inner
+                        .ask(move |__state: &mut A| ::std::boxed::Box::pin(async move {
+                            read(__state)
+                        }))
+                        .await
+                }
+
                 /// Stop after the messages already queued, then wait for the
                 /// actor to end. Every other handle reports
                 /// [`MailboxClosed`](keylink::MailboxClosed) from then on.
