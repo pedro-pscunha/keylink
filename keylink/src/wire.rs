@@ -49,18 +49,22 @@ const READ_CHUNK: usize = 64 * 1024;
 /// safety property and it is also the reason to change it rarely: prefer to put
 /// variation in the message, which is per service.
 #[derive(Debug, Serialize, Deserialize, Schema)]
+/// Fields are `pub(crate)`: every reader and writer is in this crate, and a
+/// downstream crate that could build one could put an `IdempotencyKey` on the
+/// wire that never met a constructor. The TYPE stays public because each
+/// generated `Contract` names it.
 pub struct Envelope<T> {
     /// How many body bytes follow the header, when the sender knows. `None` is
     /// an open-ended stream that ends when the sender finishes it.
-    pub body_len: Option<u64>,
+    pub(crate) body_len: Option<u64>,
     /// Caller-supplied key so that a retried call runs at most once.
     ///
     /// Lives here rather than in an actor request because retry safety is not
     /// an actor concern: an ordinary `rpc` that reserves stock needs it just as
     /// much as an actor message does.
-    pub idempotency: Option<crate::IdempotencyKey>,
+    pub(crate) idempotency: Option<crate::IdempotencyKey>,
     /// The caller's request or response.
-    pub message: T,
+    pub(crate) message: T,
 }
 
 /// Serialise a header frame and hand it to the transport as one owned chunk.

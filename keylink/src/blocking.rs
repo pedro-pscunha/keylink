@@ -164,7 +164,7 @@ impl Node {
             builder = builder.service(service);
         }
         Ok(Server {
-            inner: Some(builder.spawn()?),
+            inner: builder.spawn()?,
             runtime: self.runtime.clone(),
         })
     }
@@ -174,17 +174,22 @@ impl Node {
 #[derive(Debug)]
 #[must_use = "the server stops when dropped; hold it for as long as you serve"]
 pub struct Server {
-    inner: Option<crate::Server>,
+    /// Not an `Option`. It was one, and the `None` arm was unreachable: this
+    /// type has no `Drop`, and `shutdown` consumes `self`, so nothing could ever
+    /// take the value out first.
+    ///
+    /// That is the trap `keys.rs` describes in its own words — an `Option` that
+    /// is never `None` in practice, whose dead arm every test passes through
+    /// without exercising. `crate::Server::shutdown` takes `&self`, so the
+    /// `Option` bought nothing even before that.
+    inner: crate::Server,
     runtime: Arc<Runtime>,
 }
 
 impl Server {
     /// Stop accepting and wait for in-flight connections to finish.
-    pub fn shutdown(mut self) -> Result<()> {
-        let Some(inner) = self.inner.take() else {
-            return Ok(());
-        };
-        self.runtime.run(inner.shutdown())?
+    pub fn shutdown(self) -> Result<()> {
+        self.runtime.run(self.inner.shutdown())?
     }
 
     /// Park the calling thread until the process is interrupted.

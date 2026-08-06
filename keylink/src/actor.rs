@@ -129,9 +129,9 @@ pub struct ActorRequest {
     /// Which actor, on the node this request is addressed to. An `ActorId` is
     /// not a route and not globally unique: the full address of an actor is
     /// `(EndpointId, ActorId)`, and the caller resolves both.
-    pub actor: ActorId,
+    actor: ActorId,
     /// The schema hash of the actor's own message type.
-    pub schema: u64,
+    schema: u64,
     /// The actor's `Request`, undecoded.
     ///
     /// Private, and reachable only as a [`Sealed`] through [`Self::seal`]. That
