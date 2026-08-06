@@ -268,6 +268,12 @@ struct OnOneThread<R>(R);
 #[cfg(all(feature = "web", target_family = "wasm", target_os = "unknown"))]
 // SAFETY: see the type's doc comment. Sound only while keylink refuses to
 // compile the `web` feature for threaded wasm, which lib.rs enforces.
+#[expect(
+    unsafe_code,
+    reason = "the one unsafe impl in the crate: `Send` for a browser stream \
+              reader that is `!Send` only for want of a second thread, on a \
+              target where lib.rs refuses to compile if a second thread exists"
+)]
 unsafe impl<R> Send for OnOneThread<R> {}
 
 #[cfg(all(feature = "web", target_family = "wasm", target_os = "unknown"))]

@@ -53,6 +53,16 @@
 //!   one, outside this crate.
 
 #![warn(missing_docs)]
+// `deny` and not `forbid`, and the difference is the one `unsafe impl` below.
+// `forbid` cannot be lifted at all, so it would make the browser body reader
+// unwritable; `deny` can be lifted exactly once, by name, at the site that needs
+// it. `#[expect]` rather than `#[allow]` for that site, so the day the impl goes
+// away the lift becomes an unfulfilled expectation and is removed with it — an
+// `allow` would sit there forever, silently re-opening the door.
+//
+// This is what turns "keylink contains exactly one `unsafe impl`" from a
+// sentence in two doc comments into something the compiler checks.
+#![deny(unsafe_code)]
 
 // Three features need an operating system facility a browser does not have, and
 // each says so here rather than letting the build fail somewhere unhelpful.
