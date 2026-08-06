@@ -8,6 +8,7 @@
 #
 # Run it with `just deny`.
 
+[graph]
 # The platforms keylink is built for. Without this, the graph includes every
 # target crates.io knows about, and the check reports crates that are never
 # compiled, let alone linked — `r-efi` (LGPL-2.1-or-later, reached only on
@@ -27,9 +28,24 @@ targets = [
 # about it leaves the warning in a log nobody reads.
 yanked = "deny"
 # Each entry needs a RUSTSEC id and a sentence saying why it does not reach us.
-# An empty list is the honest state today; keep it that way by fixing rather
-# than ignoring.
-ignore = []
+# Prefer fixing over adding one. An entry here is a promise that somebody read
+# the advisory, not a way to make the gate quiet.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = """
+`paste` is unmaintained: the author archived the repository. It is a proc macro
+that concatenates identifiers during expansion, so it emits no runtime code of
+its own and never sees a byte a peer sent — the exposure is at build time, on a
+crate that has not changed since 1.0.15.
+
+It is not ours to drop. keylink's own direct dependency is `pastey`, the
+maintained fork this advisory names as the replacement. The remaining copy
+arrives through iroh: netlink-packet-core, reached by netdev, netlink-proto and
+netlink-packet-route, all under netwatch. The advisory itself says "no safe
+upgrade is available".
+
+Revisit when iroh's netlink stack moves off it.
+""" },
+]
 
 [licenses]
 # Permissive only, and enumerated rather than inferred. keylink is
@@ -37,7 +53,6 @@ ignore = []
 # has to make on purpose — which is what this list forces.
 allow = [
     "Apache-2.0",
-    "BSD-1-Clause",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
@@ -67,7 +82,12 @@ allow = ["MPL-2.0"]
 # would be a full-time job for no safety gain. Left as a warning so a genuinely
 # surprising duplicate is still visible in the log.
 multiple-versions = "warn"
+# `foo = "*"` from a registry is a build that cannot be reproduced, so it is
+# refused. A path dependency inside this workspace resolves to the source next
+# to it and reaches no registry at all, which is why `demo`'s `keylink = { path
+# = ... }` is exempt rather than given a version it would have to be bumped in.
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 # Everything must come from crates.io. A git dependency that slipped in would

@@ -2,6 +2,11 @@
 name = "demo"
 version = "0.1.0"
 edition = "2021"
+# Matches keylink's. Without it `cargo deny check` reports the workspace's own
+# crate as unlicensed, which is a true finding about this file rather than noise
+# to configure away.
+license = "MIT OR Apache-2.0"
+publish = false
 
 [features]
 # Reorders two identically shaped enum variants. postcard encodes them by

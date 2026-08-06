@@ -23,7 +23,12 @@ commands to drift.
 |---|---|---|
 | `just pre-commit` | fmt, clippy on the library | Seconds. A commit hook people bypass is not a gate. |
 | `just pre-push` | the whole gate | A push is rarer than a commit, and a red gate here costs one local run instead of a CI round trip. |
-| CI | the same recipes, plus `cargo deny check` | `deny` needs the network, so it lives in CI rather than in a hook. |
+| CI | the same recipes, plus `cargo deny check` | `deny` fetches the advisory database, so it lives in CI rather than in a hook. |
+
+Run `just deny` by hand whenever you change a dependency. It is the one check no
+hook runs, which is exactly why it was broken for three commits without anybody
+seeing it: a licence, an advisory or a wildcard arrives with a dependency and
+with nothing else.
 
 ## When `--no-verify` is legitimate
 
