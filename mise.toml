@@ -96,6 +96,16 @@ run = "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features -p keylink"
 
 # ── supply chain ────────────────────────────────────────────────────────────
 
+[tasks.msrv]
+description = "Compile on the oldest Rust keylink claims to support"
+# Not in `gate` and not in a hook: it needs a second toolchain, which is a
+# ~200 MB download a contributor should not pay for on every push. CI runs it.
+#
+# An MSRV nobody compiles is a promise broken silently — `rust-version` changes
+# what cargo tells a user on an old compiler, so a wrong one sends them to the
+# wrong place.
+run = "cargo +1.91 check --workspace --all-targets --all-features"
+
 [tasks.deny]
 description = "Advisories and licences over the whole tree"
 # Not in `gate` and not in a hook: it fetches the advisory database, so it needs

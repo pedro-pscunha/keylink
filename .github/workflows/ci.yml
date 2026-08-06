@@ -63,6 +63,23 @@ jobs:
             echo "ok: '$feature' refuses the browser target"
           done
 
+  msrv:
+    name: oldest supported Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Both toolchains: the pinned one compiles, and stable is what
+      # rust-toolchain.toml would otherwise pull in for the `cargo` driver.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.91
+      - uses: Swatinem/rust-cache@v2
+      - uses: jdx/mise-action@v2
+
+      # `rust-version` in keylink/Cargo.toml says 1.91. An MSRV nobody compiles
+      # is a promise broken silently: the number changes what cargo tells a user
+      # on an old compiler, so a wrong one sends them somewhere unhelpful.
+      - run: mise run msrv
+
   supply-chain:
     name: advisories and licences
     runs-on: ubuntu-latest

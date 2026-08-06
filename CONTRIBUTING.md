@@ -21,7 +21,7 @@ copy of the commands to drift.
 |---|---|---|
 | `mise run pre-commit` | fmt, clippy on the library | Seconds. A commit hook people bypass is not a gate. |
 | `mise run pre-push` | the whole gate | A push is rarer than a commit, and a red gate here costs one local run instead of a CI round trip. |
-| CI | the same tasks, plus `mise run deny` | `deny` fetches the advisory database, so it lives in CI rather than in a hook. |
+| CI | the same tasks, plus `mise run deny` and `mise run msrv` | `deny` fetches the advisory database and `msrv` needs a second toolchain, so both live in CI rather than in a hook. |
 
 `mise run gate` runs its steps **one at a time**, cheapest first. That is why the
 task lists sub-tasks rather than using bare `depends`: mise parallelizes
@@ -32,6 +32,11 @@ Run `mise run deny` by hand whenever you change a dependency. It is the one chec
 hook runs, which is exactly why it was broken for three commits without anybody
 seeing it: a licence, an advisory or a wildcard arrives with a dependency and
 with nothing else.
+
+`mise run msrv` compiles the workspace on 1.91, the oldest Rust
+`keylink/Cargo.toml` claims. That number is not inherited from a dependency's
+manifest — it was compiled. Raise it only when something actually needs a newer
+compiler, and re-run the task rather than reasoning about it.
 
 `mise run features` builds every subset of `blocking`, `fs` and `env`. Clippy checks
 the two ends of that lattice — all on, all off — and the ends do not meet in the

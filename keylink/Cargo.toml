@@ -2,6 +2,11 @@
 name = "keylink"
 version = "0.1.0"
 edition = "2021"
+# Verified, not inherited: `cargo +1.91 check --workspace --all-targets
+# --all-features` passes. iroh 1.0.3 and iroh-blobs 0.103.0 both declare 1.91,
+# so this is the floor the dependency graph already imposes, and adding blobs
+# does not raise it. `mise run msrv` keeps the number honest.
+rust-version = "1.91"
 description = "Typed peer-to-peer RPC over iroh, with a schema-derived ALPN and fail-closed authorization."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pedrocunha/keylink"
