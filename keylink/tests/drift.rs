@@ -33,11 +33,17 @@
 //!
 //! It is in `gate` rather than behind `#[ignore]`, because a check no hook runs
 //! is a check that rots — CONTRIBUTING.md tells that story about `cargo deny`
-//! being broken for three commits. On an unloaded machine: 0.60s and 0.61s for
-//! the two builds, and around 1s for the child processes. Note that
-//! `cargo test --workspace` does *not* build the demo binary — it builds demo's
-//! test target, a different artifact — so both builds are this file's to pay. A
-//! repeat run is 0.11s, because neither feature set evicts the other.
+//! being broken for three commits.
+//!
+//! The delta is **about 1.1s**, measured as two back-to-back `cargo test
+//! --workspace` runs differing only in `--skip`: 59.19s without these two tests,
+//! 60.25s with them. That covers both builds and every child process, including
+//! the 8 MiB transfer the control ends up doing.
+//!
+//! Two things that number depends on. `cargo test --workspace` does *not* build
+//! the demo binary — it builds demo's test target, a different artifact — so
+//! both builds are this file's to pay. And cargo fingerprints each feature set
+//! separately, so neither build evicts the other and a settled repeat is 0.11s.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -46,15 +52,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::OnceLock;
 
-/// A syntactically valid endpoint id belonging to nobody here.
+/// The identity every client below dials with.
 ///
-/// It does two jobs. `alpn_of` needs something that parses, because
-/// `demo connect` parses its argument before it binds anything and this test
-/// kills the child before the dial matters. And it is what the server
-/// allowlists — deliberately a stranger, so that every client below is refused
-/// at *authorization*. Reaching that refusal is the evidence: authorization
-/// happens after the handshake, so a client that gets there agreed on the ALPN.
-const A_STRANGER: &str = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0";
+/// A fixed secret rather than a fresh one, because with no discovery the server
+/// must allowlist its peer by an id known *before* either process starts, and
+/// `bind_local()` alone takes a new identity every run. `PEER_ID` is the public
+/// key of `PEER_SECRET`; re-derive it any time with
+/// `KEYLINK_SECRET=<secret> demo id`.
+///
+/// It doubles as the dial target in `alpn_of`, which only needs something that
+/// parses: `demo connect` parses its argument before it binds anything, and
+/// that child is killed before the dial matters.
+const PEER_SECRET: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const PEER_ID: &str = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0";
 
 /// The directory cargo puts finished binaries in, derived from this test
 /// binary's own location (`<build>/deps/drift-<hash>`) rather than assumed, so
@@ -113,7 +123,7 @@ fn binaries() -> &'static (PathBuf, PathBuf) {
 /// kills the child rather than waiting for a dial that is meant to fail.
 fn alpn_of(demo: &Path) -> String {
     let mut child = Command::new(demo)
-        .args(["connect", A_STRANGER])
+        .args(["connect", PEER_ID])
         .env("KEYLINK_OFFLINE", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -162,7 +172,7 @@ fn serve(demo: &Path) -> Serving {
     let mut child = Command::new(demo)
         .arg("serve")
         .env("KEYLINK_OFFLINE", "1")
-        .env("KEYLINK_ALLOWED_IDS", A_STRANGER)
+        .env("KEYLINK_ALLOWED_IDS", PEER_ID)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -201,10 +211,12 @@ fn connect_to(demo: &Path, dial: &str) -> String {
     let out = Command::new(demo)
         .args(["connect", dial])
         .env("KEYLINK_OFFLINE", "1")
+        .env("KEYLINK_SECRET", PEER_SECRET)
         .output()
         .expect("demo connect runs");
 
-    let mut said = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut said = format!("[{}]\n", out.status);
+    said.push_str(&String::from_utf8_lossy(&out.stdout));
     said.push_str(&String::from_utf8_lossy(&out.stderr));
     said
 }
@@ -262,18 +274,23 @@ fn a_peer_built_from_other_types_is_refused_at_the_handshake() {
          rather than sent to look at the network. It said:\n{refused}"
     );
 
-    // The control. Same types on both ends, so the handshake must succeed —
-    // and then this client is refused by the allowlist, because `A_STRANGER`
-    // is not it. That refusal is the proof: authorization is downstream of the
-    // handshake, so reaching it means the ALPN matched.
+    // The control: same types on both ends, so the whole conversation runs.
     let agreed = connect_to(baseline, &server.dial);
     assert!(
         !agreed.contains("schema mismatch"),
         "two binaries from one type set must agree on the contract. It said:\n{agreed}"
     );
     assert!(
-        agreed.contains("unauthorized"),
-        "the agreeing client must get past the handshake and be stopped by the \
-         allowlist instead. It said:\n{agreed}"
+        agreed.contains("3 items"),
+        "the agreeing client must get a real reply, not merely a connection. \
+         It said:\n{agreed}"
+    );
+
+    // And the payoff. `Brl` is what the swapped build would have decoded as
+    // `Usd`, silently, had the handshake let it through. Reading it back
+    // correctly is the thing the whole ALPN scheme is protecting.
+    assert!(
+        agreed.contains("Brl"),
+        "prices must come back in the currency they were sent in. It said:\n{agreed}"
     );
 }

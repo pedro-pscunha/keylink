@@ -428,6 +428,14 @@ async fn serve() -> Result<()> {
         String::from_utf8_lossy(inventory::alpn())
     );
     println!("listening as: {}", node.id());
+
+    let server = inventory::serve(&node, Warehouse::seeded(), allow)?;
+
+    // AFTER `serve`, never before. `serve` is what registers the ALPN, so a peer
+    // that read this line any earlier could dial an endpoint answering nothing
+    // and be refused for a reason that has nothing to do with the reason it was
+    // dialling. `keylink/tests/drift.rs` reads this line and dials the moment it
+    // arrives, so the ordering here is that test's starting gun.
     if offline() {
         // The form the other side can actually dial with no discovery.
         let addr = node.endpoint().addr();
@@ -435,7 +443,6 @@ async fn serve() -> Result<()> {
         println!("dial:         {}@{}", node.id(), sockets.join(","));
     }
 
-    let server = inventory::serve(&node, Warehouse::seeded(), allow)?;
     tokio::signal::ctrl_c().await?;
     server.shutdown().await?;
     Ok(())
