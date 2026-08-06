@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# The heavy gate: everything CI runs, before it costs a CI minute.
+#
+# Slow on purpose. A push is rare compared to a commit, and finding a red gate
+# here costs one local run rather than a round trip through CI and a fixup
+# commit on a branch someone is already reading.
+#
+# Bypass with `git push --no-verify`. See CONTRIBUTING.md.
+set -euo pipefail
+
+chain="$(git config --get hooks.chain || true)"
+if [ -n "$chain" ] && [ -x "$chain/pre-push" ]; then
+    "$chain/pre-push" "$@"
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+if command -v just >/dev/null 2>&1; then
+    exec just pre-push
+fi
+
+echo "note: 'just' is not installed - running the same checks directly" >&2
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy -p keylink --lib --no-default-features -- -D warnings
+cargo test --workspace
+RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features -p keylink

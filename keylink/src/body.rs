@@ -10,6 +10,7 @@
 //! stops being polled. Peak memory is one chunk, whatever the payload size.
 
 use std::fmt;
+#[cfg(feature = "fs")]
 use std::path::Path;
 use std::pin::Pin;
 
@@ -68,6 +69,7 @@ impl Body {
     /// # Errors
     ///
     /// Returns [`Error::Io`] when the file cannot be opened or stat'd.
+    #[cfg(feature = "fs")]
     pub async fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let file = tokio::fs::File::open(path).await?;
         let declared_len = file.metadata().await?.len();

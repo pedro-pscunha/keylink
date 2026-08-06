@@ -1,0 +1,8 @@
+# Defaults, with one thing pinned.
+#
+# `cargo fmt` reads the edition from Cargo.toml, but a bare `rustfmt src/*.rs`
+# — which is what an editor-on-save integration and a hand-run invocation do —
+# defaults to edition 2015, where `async` is not a keyword. That reformats
+# every `async fn` in the crate into something that no longer parses. Naming
+# the edition here makes the file the single answer for every caller.
+edition = "2021"

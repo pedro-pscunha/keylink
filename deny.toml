@@ -1,0 +1,76 @@
+# cargo-deny: advisories and licences over the whole dependency graph.
+#
+# This earns its place in this crate specifically. keylink parses frames a
+# stranger sent, over TLS, on a tree that includes ring, rustls and the whole
+# of iroh — roughly 400 crates that a reader of this repository never chose.
+# An advisory against any of them is keylink's problem, and nobody notices one
+# by reading Cargo.lock.
+#
+# Run it with `just deny`.
+
+# The platforms keylink is built for. Without this, the graph includes every
+# target crates.io knows about, and the check reports crates that are never
+# compiled, let alone linked — `r-efi` (LGPL-2.1-or-later, reached only on
+# `x86_64-unknown-uefi`) is the one that shows up here. Narrowing the targets
+# is what makes the licence result mean "what we actually ship".
+targets = [
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "wasm32-unknown-unknown" },
+]
+
+[advisories]
+# A yanked dependency is a maintainer saying "do not use this version". Warning
+# about it leaves the warning in a log nobody reads.
+yanked = "deny"
+# Each entry needs a RUSTSEC id and a sentence saying why it does not reach us.
+# An empty list is the honest state today; keep it that way by fixing rather
+# than ignoring.
+ignore = []
+
+[licenses]
+# Permissive only, and enumerated rather than inferred. keylink is
+# "MIT OR Apache-2.0", so anything copyleft in the graph is a decision someone
+# has to make on purpose — which is what this list forces.
+allow = [
+    "Apache-2.0",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+# Named one crate at a time rather than added to `allow`, so that a SECOND
+# crate arriving under the same licence still fails the gate and gets read by
+# a human.
+[[licenses.exceptions]]
+# Weak, file-level copyleft. Reached through `igd-next`, iroh's UPnP port
+# mapper. We link it unmodified, which MPL-2.0 permits without touching the
+# licence of anything else here.
+name = "attohttpc"
+allow = ["MPL-2.0"]
+
+[bans]
+# Duplicate versions are the normal state of a tree this size and blocking them
+# would be a full-time job for no safety gain. Left as a warning so a genuinely
+# surprising duplicate is still visible in the log.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Everything must come from crates.io. A git dependency that slipped in would
+# be a supply-chain change nobody reviewed.
+unknown-registry = "deny"
+unknown-git = "deny"

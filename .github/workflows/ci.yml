@@ -1,0 +1,75 @@
+name: CI
+
+# The gate is defined once, in the justfile. CI calls those recipes rather than
+# restating the commands, so a green `just gate` locally means a green run here.
+# A second copy of the commands is a second thing to drift.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  gate:
+    name: fmt, clippy, test, docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - run: just fmt-check
+      - run: just lint
+      - run: just test
+      - run: just docs
+
+  wasm:
+    name: browser target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          # llvm-ar. Apple `ar` writes an archive index `rust-lld` cannot read,
+          # so `ring` links with every symbol undefined. Linux `ar` is fine, but
+          # the recipe derives one path for both so neither host is special.
+          components: llvm-tools
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+
+      # `build`, not `check`. The failure this job exists to catch is a LINK
+      # failure, and `cargo check` stops before the linker runs — it passes
+      # green on a tree whose wasm target does not link.
+      - run: just wasm
+
+      # The three guards must FIRE, not merely be present. A `compile_error!`
+      # nobody triggers is a comment. Each of these features needs an OS
+      # facility a browser does not have, so each must refuse to build for wasm
+      # in keylink's own words rather than 48 errors deep inside mio.
+      - name: the feature guards refuse the browser target
+        run: |
+          set -uo pipefail
+          for feature in blocking fs env; do
+            if cargo check -p keylink --target wasm32-unknown-unknown \
+                 --no-default-features --features "$feature" >/dev/null 2>&1; then
+              echo "::error::feature '$feature' built for wasm; its compile_error! guard is gone"
+              exit 1
+            fi
+            echo "ok: '$feature' refuses the browser target"
+          done
+
+  supply-chain:
+    name: advisories and licences
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check

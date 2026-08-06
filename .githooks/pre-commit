@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Fast gate. A commit hook that takes a minute is a commit hook people bypass,
+# so this runs formatting and a library-scoped clippy and nothing else. The
+# expensive checks — every target, every feature end, the tests, the docs, the
+# browser target — belong to pre-push, which runs far less often.
+#
+# Bypass with `git commit --no-verify`. See CONTRIBUTING.md for when that is
+# legitimate; the short version is "the hook itself is broken", never "the
+# check is inconvenient".
+set -euo pipefail
+
+# Chain to whatever hook was configured before this repo took over
+# `core.hooksPath` — a global secret scanner, most often. Setting a repo-local
+# hooks path silently REPLACES a global one, so without this the repo would
+# quietly disable a guard the developer set up for every repository they own.
+# `scripts/install-hooks.sh` records the previous path here.
+chain="$(git config --get hooks.chain || true)"
+if [ -n "$chain" ] && [ -x "$chain/pre-commit" ]; then
+    "$chain/pre-commit" "$@"
+fi
+
+# Nothing staged that we lint? Then there is nothing for this hook to say.
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$'; then
+    exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+if command -v just >/dev/null 2>&1; then
+    exec just pre-commit
+fi
+
+# `just` is how the gate is defined; these are the same two commands, inlined
+# so a contributor without it is still gated rather than silently ungated.
+echo "note: 'just' is not installed - running the same checks directly" >&2
+cargo fmt --all -- --check
+cargo clippy -p keylink --lib --all-features -- -D warnings

@@ -40,6 +40,11 @@
 
 #![warn(missing_docs)]
 
+/// Gated on the feature AND compiled only where OS threads exist. The Cargo
+/// feature alone is not enough: it controls which dependency features are on,
+/// not whether this module's `tokio::signal` and `new_multi_thread` calls are
+/// compiled. Without this, `--no-default-features` still built the module.
+#[cfg(feature = "blocking")]
 pub mod blocking;
 
 mod actor;
