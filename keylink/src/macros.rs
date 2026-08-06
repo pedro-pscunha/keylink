@@ -630,6 +630,9 @@ macro_rules! __keylink_response_ty {
     (rpc, $ret:ty) => {
         $ret
     };
+    (tell, $ret:ty) => {
+        $ret
+    };
     (send, $ret:ty) => {
         $ret
     };
@@ -650,6 +653,10 @@ macro_rules! __keylink_response_ty {
 #[macro_export]
 macro_rules! __keylink_granted_id {
     (rpc, $value:expr) => {{
+        let _ = $value;
+        ::core::option::Option::None
+    }};
+    (tell, $value:expr) => {{
         let _ = $value;
         ::core::option::Option::None
     }};
@@ -678,6 +685,9 @@ macro_rules! __keylink_is_blob {
     (rpc) => {
         false
     };
+    (tell) => {
+        false
+    };
     (send) => {
         false
     };
@@ -693,6 +703,17 @@ macro_rules! __keylink_is_blob {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_blocking_method {
+    ([$( #[$meta:meta] )*], tell, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Send the `", stringify!($name), "` tell and return.")]
+        ///
+        /// Unlike `send` and `recv`, a blocking `tell` is buildable: there is no
+        /// stream to hand back and no body to buffer, so the synchronous wrapper
+        /// is the whole operation rather than half of one.
+        pub fn $name(&self $(, $arg: $ty )*) -> $crate::Result<()> {
+            self.runtime.run(self.inner.$name($( $arg ),*))?
+        }
+    };
     ([$( #[$meta:meta] )*], rpc, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Call `", stringify!($name), "`, blocking until it answers.")]
@@ -715,6 +736,15 @@ macro_rules! __keylink_handler_method {
     ([$( #[$meta:meta] )*], rpc, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc.")]
+        fn $name(&self $(, $arg: $ty )*)
+            -> impl ::core::future::Future<Output = $ret> + Send;
+    };
+    ([$( #[$meta:meta] )*], tell, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Handle the `", stringify!($name), "` tell. Nothing is sent back.")]
+        ///
+        /// The caller has already returned. Whatever this produces is dropped,
+        /// including a panic, which is caught and costs one message.
         fn $name(&self $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = $ret> + Send;
     };
@@ -751,6 +781,22 @@ macro_rules! __keylink_handler_method {
 #[macro_export]
 macro_rules! __keylink_invoke_fn {
     (rpc, $fname:ident, $handler:ident, $resp:ident, $variant:ident, $method:ident,
+        ($( $arg:ident : $ty:ty ),*)) => {
+        async fn $fname<H: $handler>(
+            handler: &H,
+            _body: $crate::BodyReader
+            $(, $arg: $ty )*
+        ) -> ($resp, $crate::Body) {
+            (
+                $resp::$variant(handler.$method($( $arg ),*).await),
+                $crate::Body::empty(),
+            )
+        }
+    };
+    // Identical to `rpc`: the dispatch chain is typed `($resp, Body)` for every
+    // kind, so a tell still builds a response. `serve_one_tell` drops it —
+    // there is no stream to write it to.
+    (tell, $fname:ident, $handler:ident, $resp:ident, $variant:ident, $method:ident,
         ($( $arg:ident : $ty:ty ),*)) => {
         async fn $fname<H: $handler>(
             handler: &H,
@@ -815,6 +861,12 @@ macro_rules! __keylink_actor_method {
         fn $name(&mut self $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = $ret> + Send;
     };
+    ([$( #[$meta:meta] )*], tell, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Handle the `", stringify!($name), "` tell. Nothing is sent back.")]
+        fn $name(&mut self $(, $arg: $ty )*)
+            -> impl ::core::future::Future<Output = $ret> + Send;
+    };
     ([$( #[$meta:meta] )*], send, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc, reading the payload the caller streams up.")]
@@ -853,6 +905,21 @@ macro_rules! __keylink_actor_method {
 #[macro_export]
 macro_rules! __keylink_actor_invoke_fn {
     (rpc, $fname:ident, $actor:ident, $resp:ident, $variant:ident, $method:ident,
+        ($( $arg:ident : $ty:ty ),*)) => {
+        async fn $fname<A: $actor>(
+            state: &mut A,
+            _body: $crate::BodyReader
+            $(, $arg: $ty )*
+        ) -> ($resp, $crate::Body) {
+            (
+                $resp::$variant(state.$method($( $arg ),*).await),
+                $crate::Body::empty(),
+            )
+        }
+    };
+    // The twin of the `Handler` arm above, on purpose. If these two diverge,
+    // that is the bug RFC-01 §11.2b calls "build the path twice".
+    (tell, $fname:ident, $actor:ident, $resp:ident, $variant:ident, $method:ident,
         ($( $arg:ident : $ty:ty ),*)) => {
         async fn $fname<A: $actor>(
             state: &mut A,
@@ -910,6 +977,19 @@ macro_rules! __keylink_actor_invoke_fn {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_actor_client_method {
+    // No actor handle method for `tell`, the same way `blob` has none.
+    //
+    // A `tell` is delivered on a unidirectional stream, and the actor system
+    // reaches its registry over `ActorClient::call`, which is bidirectional by
+    // construction — the reply is what carries the schema-mismatch refusal.
+    // Emitting a method that silently used the bidirectional path would give a
+    // `tell` a reply channel it is documented not to have.
+    //
+    // Absent and documented, rather than present and lying. A caller who wants
+    // fire-and-forget to an actor writes an `rpc` returning `()` and drops the
+    // result, which is honest about the round trip it pays for.
+    ([$( #[$meta:meta] )*], tell, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
     ([$( #[$meta:meta] )*], rpc, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
@@ -996,6 +1076,20 @@ macro_rules! __keylink_client_method {
                 .call($req::$variant { $( $arg ),* }, $crate::Body::empty())
                 .await?;
             response.$extract()
+        }
+    };
+    ([$( #[$meta:meta] )*], tell, $name:ident, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Send the `", stringify!($variant), "` tell and return.")]
+        ///
+        /// Returns `Result<()>` rather than the method's declared type: there
+        /// is no reply stream, so there is nothing to decode. The `Ok` means
+        /// the bytes reached the transport and nothing more — see
+        /// [`RpcClient::tell`](keylink::RpcClient::tell) for what that does and
+        /// does not promise.
+        pub async fn $name(&self $(, $arg: $ty )*) -> $crate::Result<()> {
+            self.inner.tell($req::$variant { $( $arg ),* }).await
         }
     };
     ([$( #[$meta:meta] )*], send, $name:ident, $req:ident, $variant:ident, $extract:ident,

@@ -811,6 +811,45 @@ where
         }
     }
 
+    /// Send one message and return without waiting for anything.
+    ///
+    /// Opens a **unidirectional** stream, so there is no reply channel at all —
+    /// not an ignored reply, an absent one. That is what makes the guarantee
+    /// honest and also what makes it narrow.
+    ///
+    /// # What this guarantees
+    ///
+    /// The bytes were handed to the transport, in order relative to other
+    /// `tell`s on this client.
+    ///
+    /// # What it does NOT guarantee, and cannot
+    ///
+    /// - **Delivery.** The connection may die between the write and the peer's
+    ///   read, and nothing will report it.
+    /// - **Handling.** The peer may accept the stream and refuse the message —
+    ///   an allowlist, a middleware, a panic in the handler — and there is no
+    ///   channel to say so.
+    /// - **Ordering against `call`.** A `call` on a different stream may be
+    ///   handled first, because streams are independent by design.
+    ///
+    /// An idempotency key is deliberately not accepted: the ledger records a
+    /// reply so a retry can be answered with it, and a `tell` has no reply to
+    /// record. Anything needing at-most-once wants a `rpc`.
+    ///
+    /// # Errors
+    ///
+    /// Only local ones — opening the stream, encoding, or writing. A refusal on
+    /// the far side is not among them, by construction.
+    pub async fn tell(&self, request: Req) -> Result<()> {
+        let mut send = self.conn.open_uni().await?;
+        // `None` for the key: see above. `Some(0)` body length, because a
+        // `tell` carries no payload and an open-ended stream would make the
+        // receiver wait for an end that says nothing.
+        wire::write_header(&mut send, Some(0), None, &request).await?;
+        send.finish()?;
+        Ok(())
+    }
+
     /// Close the connection gracefully.
     pub async fn close(self) -> Result<()> {
         self.conn.close(0u32.into(), b"done");
