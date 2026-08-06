@@ -1,0 +1,26 @@
+[package]
+name = "keylink-persist"
+version = "0.1.0"
+edition = "2021"
+# The same floor the rest of the workspace compiles on. `File::try_lock`
+# stabilized in 1.89, so nothing here raises it.
+rust-version = "1.91"
+description = "A port for actor state that outlives its process, and the local-file adapter."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pedrocunha/keylink"
+publish = false
+
+[features]
+# The local-file adapter. On by default because it is the one that exists.
+default = ["file"]
+file = ["tokio/fs", "tokio/rt"]
+
+[dependencies]
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true
