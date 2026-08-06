@@ -39,7 +39,7 @@ impl Node {
     /// [`EndpointId`] no longer resolves — nothing is publishing it and nothing
     /// is looking it up.
     ///
-    /// So the caller must dial a full [`EndpointAddr`], which
+    /// So the caller must dial a full [`EndpointAddr`](crate::EndpointAddr), which
     /// [`RpcClient::connect`](crate::RpcClient::connect) already accepts and
     /// documents for exactly this case. Get one from
     /// `node.endpoint().addr()` on the serving side and carry it across by
