@@ -326,17 +326,20 @@ pub struct Mail {
 
 /// The receiving half of one actor's mailbox.
 #[doc(hidden)]
-pub type Mailbox = mpsc::Receiver<Box<Mail>>;
+pub type Mailbox<M = Mail> = mpsc::Receiver<Box<M>>;
 
 /// A live actor: the task, its mailbox, and the schema it accepts.
 ///
 /// Produced by the generated `spawn` and handed to [`System::mount`] or
 /// returned from a factory. Opaque on purpose: the registry owns the pairing of
 /// a hash with a mailbox, and nothing else may take them apart.
+///
+/// `M` is the message the mailbox carries, defaulted to [`Mail`]. See
+/// [`System`] for why it is a parameter at all.
 #[derive(Debug)]
-pub struct Mounted {
+pub struct Mounted<M = Mail> {
     schema: u64,
-    mail: mpsc::Sender<Box<Mail>>,
+    mail: mpsc::Sender<Box<M>>,
     task: JoinHandle<()>,
 }
 
@@ -348,7 +351,7 @@ pub struct Mounted {
 ///
 /// Panics when called outside a tokio runtime, like every other spawn.
 #[doc(hidden)]
-pub fn mount<F>(schema: u64, run: impl FnOnce(Mailbox) -> F) -> Mounted
+pub fn mount<M, F>(schema: u64, run: impl FnOnce(Mailbox<M>) -> F) -> Mounted<M>
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -385,7 +388,7 @@ pub enum Eviction {
 /// Builds an actor's state on first message. See [`SystemBuilder::spawn_with`],
 /// which takes the closure directly — this alias is how the system stores it,
 /// not something a caller ever names.
-pub(crate) type Factory = Arc<dyn Fn(&ActorId) -> Option<Mounted> + Send + Sync>;
+pub(crate) type Factory<M> = Arc<dyn Fn(&ActorId) -> Option<Mounted<M>> + Send + Sync>;
 
 /// Why an actor could not be mounted.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -406,18 +409,46 @@ pub enum MountError {
     },
 }
 
-struct Entry {
+/// Why a message could not reach an actor.
+///
+/// Two conditions, and neither of them is one of [`MountError`]'s: an id that
+/// is taken cannot stop a message, and an id that is empty cannot stop a mount.
+/// One enum over both would hand each path an arm the other can never produce,
+/// so the shared vocabulary is the *sentence* rather than the type — the
+/// capacity refusal reads the same whether a cap was met by hand or by a lazy
+/// spawn, and `the_capacity_refusal_reads_the_same_by_hand_and_lazily` is what
+/// keeps the two in step.
+///
+/// Transport-free on purpose. The registry decides what happened; the wire
+/// decides what a peer is told about it, in the [`From`] impl below.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum RouteError {
+    /// Nothing is mounted under that id, and no factory built one either.
+    #[error("no actor is mounted as {id}")]
+    NoSuchActor {
+        /// The id that was addressed.
+        id: ActorId,
+    },
+    /// The registry is full, so the factory was never called.
+    #[error("the actor system is at its capacity of {capacity} live actors")]
+    AtCapacity {
+        /// The cap that was reached.
+        capacity: usize,
+    },
+}
+
+struct Entry<M> {
     schema: u64,
-    mail: mpsc::Sender<Box<Mail>>,
+    mail: mpsc::Sender<Box<M>>,
     task: JoinHandle<()>,
     /// Milliseconds since the registry's epoch, as of the last message routed
     /// here. An atomic so that touching an actor stays on the read lock.
     last_seen: AtomicU64,
 }
 
-struct Registry {
-    entries: RwLock<HashMap<ActorId, Entry>>,
-    factory: Option<Factory>,
+struct Registry<M> {
+    entries: RwLock<HashMap<ActorId, Entry<M>>>,
+    factory: Option<Factory<M>>,
     capacity: usize,
     eviction: Eviction,
     /// `n0_future::time::Instant`, which is neither of the obvious two.
@@ -437,31 +468,28 @@ struct Registry {
     epoch: Instant,
 }
 
-impl Registry {
+impl<M> Registry<M> {
     fn now(&self) -> u64 {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<ActorId, Entry>> {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<ActorId, Entry<M>>> {
         // A panic under the lock must cost one message, not wedge the registry
         // for the life of the process. The same call the demo's handler makes.
         self.entries.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<ActorId, Entry>> {
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<ActorId, Entry<M>>> {
         self.entries.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Find the actor, spawning it if the system was given a factory.
-    fn route(
-        &self,
-        id: &ActorId,
-    ) -> std::result::Result<(u64, mpsc::Sender<Box<Mail>>), RemoteError> {
+    fn route(&self, id: &ActorId) -> std::result::Result<(u64, mpsc::Sender<Box<M>>), RouteError> {
         if let Some(found) = self.touch(&self.read(), id) {
             return Ok(found);
         }
         let Some(factory) = self.factory.as_ref() else {
-            return Err(no_such_actor(id));
+            return Err(RouteError::NoSuchActor { id: id.clone() });
         };
 
         let mut entries = self.write();
@@ -471,13 +499,12 @@ impl Registry {
             return Ok(found);
         }
         if entries.len() >= self.capacity {
-            return Err(RemoteError::Failed(format!(
-                "the actor system is at its capacity of {} live actors",
-                self.capacity
-            )));
+            return Err(RouteError::AtCapacity {
+                capacity: self.capacity,
+            });
         }
         let Some(mounted) = factory(id) else {
-            return Err(no_such_actor(id));
+            return Err(RouteError::NoSuchActor { id: id.clone() });
         };
         let found = (mounted.schema, mounted.mail.clone());
         entries.insert(id.clone(), self.entry(mounted));
@@ -486,15 +513,15 @@ impl Registry {
 
     fn touch(
         &self,
-        entries: &HashMap<ActorId, Entry>,
+        entries: &HashMap<ActorId, Entry<M>>,
         id: &ActorId,
-    ) -> Option<(u64, mpsc::Sender<Box<Mail>>)> {
+    ) -> Option<(u64, mpsc::Sender<Box<M>>)> {
         let entry = entries.get(id)?;
         entry.last_seen.store(self.now(), Ordering::Relaxed);
         Some((entry.schema, entry.mail.clone()))
     }
 
-    fn entry(&self, mounted: Mounted) -> Entry {
+    fn entry(&self, mounted: Mounted<M>) -> Entry<M> {
         Entry {
             schema: mounted.schema,
             mail: mounted.mail,
@@ -524,43 +551,61 @@ fn no_such_actor(id: &ActorId) -> RemoteError {
     RemoteError::NoSuchActor { id: id.to_string() }
 }
 
+/// What a peer is told, which is deliberately less than what happened.
+///
+/// The capacity refusal is [`RemoteError::Failed`] and not a variant of its own,
+/// because a cap is this node's configuration and not something the caller can
+/// act on differently from any other refusal. Changing that would move the
+/// system ALPN, so it is a wire decision rather than a tidying one.
+impl From<RouteError> for RemoteError {
+    fn from(err: RouteError) -> Self {
+        match &err {
+            RouteError::NoSuchActor { id } => no_such_actor(id),
+            RouteError::AtCapacity { .. } => Self::Failed(err.to_string()),
+        }
+    }
+}
+
 /// A registry of live actors, served behind one ALPN.
 ///
 /// Cheap to clone: every clone names the same registry.
-#[derive(Clone)]
-pub struct System {
-    inner: Arc<Registry>,
+///
+/// `M` is what a mailbox carries, defaulted to [`Mail`] so that `System` still
+/// means what it always did at every call site. It is a parameter because
+/// everything here — the map, the cap, the eviction clock, the lifecycle — is
+/// about *which* actor and never about what a message is made of. Naming
+/// [`Mail`] in these fields would put a QUIC stream and a postcard payload
+/// inside the one half of this module that has no business knowing either, and
+/// no import list would show it.
+pub struct System<M = Mail> {
+    inner: Arc<Registry<M>>,
 }
 
-impl System {
+/// Hand-written, because the derive would bound the impl on `M: Clone` — and
+/// [`Mail`], which owns a `oneshot::Sender` and a stream, is not. A clone here
+/// is a clone of the `Arc` and never of a message.
+///
+/// The derive does not fail where it is written, either: `self.clone()` in
+/// `dispatch` would quietly resolve to `Clone` on the *reference* and surface
+/// as a lifetime error inside the dispatch closure.
+impl<M> Clone for System<M> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<M> System<M> {
     /// Configure a system. The eviction policy is an argument because there is
     /// no safe default for it.
     #[must_use]
-    pub fn builder(eviction: Eviction) -> SystemBuilder {
+    pub fn builder(eviction: Eviction) -> SystemBuilder<M> {
         SystemBuilder {
-            capacity: SystemBuilder::DEFAULT_CAPACITY,
+            capacity: DEFAULT_CAPACITY,
             eviction,
             factory: None,
         }
-    }
-
-    /// The ALPN every actor system answers on.
-    ///
-    /// One node serves at most one actor system: a second would be a duplicate
-    /// ALPN, which [`ServerBuilder::spawn`](crate::ServerBuilder::spawn)
-    /// refuses. Actors of unrelated types share it, and the per-actor schema
-    /// hash is what tells them apart.
-    pub fn alpn() -> &'static [u8] {
-        static CELL: OnceLock<Vec<u8>> = OnceLock::new();
-        CELL.get_or_init(|| derive_alpn::<Contract>(PROTOCOL))
-            .as_slice()
-    }
-
-    /// Build the service that serves this system. Register it on a
-    /// [`Server`](crate::Server) like any other.
-    #[must_use]
-    pub fn service(&self, allow: Allowlist) -> ServiceBuilder<ActorRequest, ActorReply> {
-        ServiceBuilder::new(Self::alpn(), allow, self.dispatch())
     }
 
     /// Mount an actor under `id`.
@@ -572,7 +617,7 @@ impl System {
     ///
     /// [`MountError::Occupied`] when the id is taken, and
     /// [`MountError::AtCapacity`] when the registry is full.
-    pub fn mount(&self, id: ActorId, actor: Mounted) -> std::result::Result<(), MountError> {
+    pub fn mount(&self, id: ActorId, actor: Mounted<M>) -> std::result::Result<(), MountError> {
         let mut entries = self.inner.write();
         if entries.contains_key(&id) {
             return Err(MountError::Occupied { id });
@@ -651,6 +696,35 @@ impl System {
     pub fn evict_idle(&self) {
         self.inner.sweep();
     }
+}
+
+/// The half that knows there is a network: the ALPN, the service, and the walk
+/// from an arriving [`ActorRequest`] to a [`Mail`] in a mailbox.
+///
+/// Written against `System<Mail>` rather than against `M`, so the registry above
+/// stays free of every type named here. Inherent impls on a concrete
+/// instantiation are what make that possible in one crate; two crates would need
+/// an extension trait, because a transport crate cannot add inherent methods to
+/// a registry crate's type.
+impl System<Mail> {
+    /// The ALPN every actor system answers on.
+    ///
+    /// One node serves at most one actor system: a second would be a duplicate
+    /// ALPN, which [`ServerBuilder::spawn`](crate::ServerBuilder::spawn)
+    /// refuses. Actors of unrelated types share it, and the per-actor schema
+    /// hash is what tells them apart.
+    pub fn alpn() -> &'static [u8] {
+        static CELL: OnceLock<Vec<u8>> = OnceLock::new();
+        CELL.get_or_init(|| derive_alpn::<Contract>(PROTOCOL))
+            .as_slice()
+    }
+
+    /// Build the service that serves this system. Register it on a
+    /// [`Server`](crate::Server) like any other.
+    #[must_use]
+    pub fn service(&self, allow: Allowlist) -> ServiceBuilder<ActorRequest, ActorReply> {
+        ServiceBuilder::new(Self::alpn(), allow, self.dispatch())
+    }
 
     fn dispatch(&self) -> Dispatch<ActorRequest, ActorReply> {
         let system = self.clone();
@@ -710,7 +784,7 @@ impl System {
     }
 }
 
-impl fmt::Debug for System {
+impl<M> fmt::Debug for System<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("System")
             .field("live", &self.len())
@@ -722,19 +796,40 @@ impl fmt::Debug for System {
 }
 
 /// Assembles a [`System`]: its eviction policy, its cap, and how it spawns.
-pub struct SystemBuilder {
+///
+/// `M` is the system's message type, defaulted to [`Mail`] exactly as on
+/// [`System`].
+pub struct SystemBuilder<M = Mail> {
     capacity: usize,
     eviction: Eviction,
-    factory: Option<Factory>,
+    factory: Option<Factory<M>>,
 }
 
-impl SystemBuilder {
+/// The cap, as the generic half spells it. [`SystemBuilder::DEFAULT_CAPACITY`]
+/// is the public name and carries the reasoning for the number.
+const DEFAULT_CAPACITY: usize = 10_000;
+
+/// The one item a defaulted type parameter could not carry.
+///
+/// A default applies in type position and not in expression position, so a
+/// `DEFAULT_CAPACITY` on `impl<M> SystemBuilder<M>` leaves `M` uninferrable and
+/// `SystemBuilder::DEFAULT_CAPACITY` stops compiling at every call site that
+/// ever named it. Pinning one instantiation is what makes that path resolve
+/// again.
+///
+/// The cap is registry policy and has nothing to do with [`Mail`], so this
+/// block is a compatibility shim and not a statement about where the constant
+/// belongs. It moves back to the generic impl — a breaking change, taken
+/// deliberately — the day `SystemBuilder` and [`Mail`] stop sharing a crate.
+impl SystemBuilder<Mail> {
     /// The cap a system has when none is named.
     ///
     /// Ten thousand live actors was the number the design was costed against,
     /// so it is the number a system holds before it starts refusing.
-    pub const DEFAULT_CAPACITY: usize = 10_000;
+    pub const DEFAULT_CAPACITY: usize = self::DEFAULT_CAPACITY;
+}
 
+impl<M> SystemBuilder<M> {
     /// Build an actor on the first message addressed to an unmounted id.
     ///
     /// Without this, a message to an unmounted id is
@@ -748,7 +843,7 @@ impl SystemBuilder {
     #[must_use]
     pub fn spawn_with<F>(mut self, factory: F) -> Self
     where
-        F: Fn(&ActorId) -> Option<Mounted> + Send + Sync + 'static,
+        F: Fn(&ActorId) -> Option<Mounted<M>> + Send + Sync + 'static,
     {
         self.factory = Some(Arc::new(factory));
         self
@@ -773,7 +868,10 @@ impl SystemBuilder {
     /// Panics when [`Eviction::Idle`] is set outside a tokio runtime, because
     /// the sweeper is a task.
     #[must_use]
-    pub fn build(self) -> System {
+    pub fn build(self) -> System<M>
+    where
+        M: Send + 'static,
+    {
         let system = System {
             inner: Arc::new(Registry {
                 entries: RwLock::new(HashMap::new()),
@@ -790,7 +888,7 @@ impl SystemBuilder {
     }
 }
 
-impl fmt::Debug for SystemBuilder {
+impl<M> fmt::Debug for SystemBuilder<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SystemBuilder")
             .field("capacity", &self.capacity)
@@ -804,7 +902,7 @@ impl fmt::Debug for SystemBuilder {
 ///
 /// Holds a `Weak`, so the sweeper never keeps a registry alive. It outlives the
 /// last handle by at most one tick, which nobody can observe.
-fn spawn_sweeper(registry: &Arc<Registry>, budget: Duration) {
+fn spawn_sweeper<M: Send + 'static>(registry: &Arc<Registry<M>>, budget: Duration) {
     let registry = Arc::downgrade(registry);
     // Half the budget, so an actor is evicted between one and one and a half
     // budgets after its last message rather than up to two.
@@ -1055,15 +1153,56 @@ mod tests {
 
     #[test]
     fn a_system_without_a_factory_never_grows_by_itself() {
-        let system = System::builder(Eviction::Never).build();
+        let system: System = System::builder(Eviction::Never).build();
         let error = system
             .inner
             .route(&ActorId::new("nobody").expect("valid"))
             .expect_err("nothing is mounted and nothing builds it");
         assert!(
-            matches!(error, RemoteError::NoSuchActor { .. }),
+            matches!(error, RouteError::NoSuchActor { .. }),
             "got {error:?}"
         );
         assert!(system.is_empty());
+    }
+
+    /// The registry refuses in its own vocabulary and the wire translates, so
+    /// this pins what a peer actually receives from each arm.
+    ///
+    /// The capacity sentence is written twice — once on [`MountError`] for a
+    /// mount by hand, once on [`RouteError`] for a lazy spawn — because the two
+    /// enums describe different sets of conditions. This is what stops the two
+    /// copies from drifting: a peer met the same sentence before this
+    /// translation existed, and must go on meeting it.
+    #[test]
+    fn the_capacity_refusal_reads_the_same_by_hand_and_lazily() {
+        let by_hand = MountError::AtCapacity { capacity: 10_000 };
+        let lazily = RemoteError::from(RouteError::AtCapacity { capacity: 10_000 });
+
+        assert_eq!(
+            lazily,
+            RemoteError::Failed(
+                "the actor system is at its capacity of 10000 live actors".to_string()
+            )
+        );
+        assert_eq!(lazily.to_string(), by_hand.to_string());
+    }
+
+    /// An unmounted id is `NoSuchActor` carrying the id as text, unchanged by
+    /// the registry having its own error type now.
+    #[test]
+    fn an_unrouted_id_reaches_the_peer_as_no_such_actor() {
+        let id = ActorId::new("nobody").expect("valid");
+        assert_eq!(
+            RemoteError::from(RouteError::NoSuchActor { id: id.clone() }),
+            RemoteError::NoSuchActor {
+                id: "nobody".to_string()
+            }
+        );
+        assert_eq!(
+            no_such_actor(&id),
+            RemoteError::NoSuchActor {
+                id: "nobody".to_string()
+            }
+        );
     }
 }
