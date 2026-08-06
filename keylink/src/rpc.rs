@@ -49,6 +49,14 @@ use crate::{
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
+/// Which kind of stream the accept loop just took.
+enum Stream {
+    /// A call that expects a reply.
+    Bi((SendStream, RecvStream)),
+    /// A `tell`, which does not.
+    Uni(RecvStream),
+}
+
 /// An erased async handler: who is calling, the request plus its incoming body,
 /// answered with a response plus its outgoing body. The macro boxes the user's
 /// `async fn` into this so `RpcService` needs no extra generic parameters.
@@ -149,6 +157,47 @@ async fn refuse<Resp: Serialize>(send: &mut SendStream, refusal: RemoteError) ->
 fn reap_finished<T: 'static>(calls: &mut JoinSet<T>) {
     let mut cx = TaskContext::from_waker(Waker::noop());
     while let Poll::Ready(Some(_)) = calls.poll_join_next(&mut cx) {}
+}
+
+/// Handle one `tell` on its own unidirectional stream.
+///
+/// The shape of `serve_one` minus every reply. Nothing is written back, so
+/// there is no `SendStream`, no idempotency record — the ledger records a reply
+/// frame, and there is none — and no body to stream out.
+///
+/// A failure here is deliberately dropped rather than propagated. The caller
+/// has already gone: it wrote, finished the stream, and returned. There is
+/// nobody to tell, which is exactly what `tell` promises and why a call that
+/// needs an answer must be an `rpc`.
+async fn serve_one_tell<Req, Resp>(
+    next: Next<Req, Resp>,
+    blobs: Option<Blobs>,
+    peer: AdmittedPeer,
+    recv: RecvStream,
+) -> Result<()>
+where
+    Req: Rpc + DeserializeOwned,
+    Resp: Serialize,
+{
+    let mut frames = FrameReader::new(recv);
+    let Some(request) = frames.read_header::<Req>().await? else {
+        return Ok(());
+    };
+
+    let cx = Context::new(peer.id(), Req::SERVICE, request.message.method())
+        .with_actor(request.message.actor().cloned());
+
+    // The body reader is handed over for symmetry with `serve_one`: a `tell`
+    // carries no body today, and a future kind that does will find the seam
+    // already here rather than needing the signature changed.
+    let (_outcome, _body) = next(
+        cx,
+        request.message,
+        BodyReader::new(frames, request.body_len),
+    )
+    .await;
+    let _ = blobs;
+    Ok(())
 }
 
 /// Answer one call on its own stream.
@@ -279,14 +328,35 @@ where
             // Reap finished calls so the set tracks in-flight work, not history.
             reap_finished(&mut calls);
 
-            match connection.accept_bi().await {
-                Ok((send, recv)) => {
+            // Both stream kinds, on one connection. A `tell` arrives on a
+            // unidirectional stream precisely because there is no reply to
+            // send back, and accepting only `bi` would leave every one of them
+            // queued and unread rather than refused.
+            //
+            // `select!` is safe here: neither branch holds a future across a
+            // spawn, which is the pattern `reap_finished`'s comment warns is
+            // broken on the browser's `JoinSet` shim.
+            let accepted = tokio::select! {
+                bi = connection.accept_bi() => bi.map(Stream::Bi),
+                uni = connection.accept_uni() => uni.map(Stream::Uni),
+            };
+
+            match accepted {
+                Ok(Stream::Bi((send, recv))) => {
                     calls.spawn(serve_one(
                         self.next.clone(),
                         self.ledger.clone(),
                         self.blobs.clone(),
                         admitted,
                         send,
+                        recv,
+                    ));
+                }
+                Ok(Stream::Uni(recv)) => {
+                    calls.spawn(serve_one_tell(
+                        self.next.clone(),
+                        self.blobs.clone(),
+                        admitted,
                         recv,
                     ));
                 }

@@ -127,7 +127,7 @@ pub use peer::{Dial, Peer};
 pub use reply::{Outcome, RemoteError, WireResponse};
 pub use rpc::{Dispatch, RpcClient, Server, ServerBuilder, Service, ServiceBuilder};
 pub use watch::{Departure, Watch};
-pub use wire::{Envelope, MAX_HEADER};
+pub use wire::{Envelope, WireKinds, MAX_HEADER};
 
 /// Re-exported so generated code and callers agree on types without extra
 /// imports at the call site.

@@ -62,6 +62,7 @@ const PROTOCOL: &str = "keylink/actors";
 struct Contract {
     request: Envelope<ActorRequest>,
     response: Envelope<WireResponse<ActorReply>>,
+    kinds: crate::WireKinds,
 }
 
 /// Messages that may wait ahead of the one being handled.

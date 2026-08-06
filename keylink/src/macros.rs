@@ -115,6 +115,10 @@ macro_rules! service {
             struct Contract {
                 request: $crate::Envelope<Request>,
                 response: $crate::Envelope<$crate::WireResponse<Response>>,
+                /// keylink's own wire surface, so a peer built against a
+                /// keylink that cannot accept a `tell` is refused instead of
+                /// losing every one silently. See `WireKinds`.
+                kinds: $crate::WireKinds,
             }
 
             /// `<crate>/<Service>/<16-hex schema hash>`.

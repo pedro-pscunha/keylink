@@ -48,6 +48,36 @@ const READ_CHUNK: usize = 64 * 1024;
 /// moves the ALPN for every service in the fleet at once. That is the intended
 /// safety property and it is also the reason to change it rarely: prefer to put
 /// variation in the message, which is per service.
+/// The wire shapes this build of keylink can accept, hashed into every contract.
+///
+/// # The defect this closes
+///
+/// Before `tell`, the ALPN hashed the USER's types and nothing about keylink's
+/// own wire capabilities. So two peers with byte-identical service definitions,
+/// one built against a keylink that accepts unidirectional streams and one
+/// built against a keylink that does not, derived the SAME ALPN. The handshake
+/// agreed, the sender opened a `uni` stream, the older peer never accepted one,
+/// and **every `tell` was silently lost** — no error on either side.
+///
+/// Naming keylink's wire surface inside the hashed contract makes that a
+/// refused handshake instead. The `bool` values do not matter to the hash —
+/// `postcard_schema` hashes types, not values — so this is not a per-service
+/// discriminator. It is a version of keylink's wire protocol expressed as a
+/// type, and it moves whenever a FIELD is added.
+///
+/// # Changing this
+///
+/// Adding a field moves the ALPN of every service in the fleet at once. That is
+/// the point, and it is why a new field belongs here only when keylink learns a
+/// genuinely new way to carry a message. Per-service variation belongs in the
+/// message.
+#[derive(Debug, Serialize, Deserialize, Schema)]
+pub struct WireKinds {
+    /// This keylink accepts unidirectional streams, which is how `tell` is
+    /// delivered.
+    pub(crate) uni: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize, Schema)]
 /// Fields are `pub(crate)`: every reader and writer is in this crate, and a
 /// downstream crate that could build one could put an `IdempotencyKey` on the

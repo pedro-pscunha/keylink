@@ -707,6 +707,7 @@ struct DriftedContract {
 struct CorrectContract {
     request: keylink::Envelope<probe::Request>,
     response: keylink::Envelope<keylink::WireResponse<probe::Response>>,
+    kinds: keylink::WireKinds,
 }
 
 /// keylink's whole safety story is that the ALPN hashes what the wire carries.
@@ -768,7 +769,7 @@ fn the_alpn_hashes_the_response_type_the_wire_actually_carries() {
 /// A `postcard-schema` upgrade moves this legitimately.
 #[test]
 fn the_contract_hash_has_not_moved() {
-    const PINNED: &str = "keylink/Probe/d196f7b4d9d7daec";
+    const PINNED: &str = "keylink/Probe/a51c5347dacb0df5";
 
     assert_eq!(
         String::from_utf8_lossy(probe::alpn()),
