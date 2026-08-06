@@ -37,6 +37,14 @@
 //!   whether they are welcome, and fails closed.
 //! - **Departure.** A peer going away is something you can await, rather than
 //!   an error you meet on your next call. See [`Watch`].
+//! - **State, when sharing it is the awkward part.** The same `service!` block
+//!   generates an `Actor` trait taking `&mut self`, so state lives on a task
+//!   rather than behind a `Mutex` — locally through a generated `Handle`, and
+//!   over the network with no change to the wire. See [`LocalActor`], and
+//!   [`System`] for many keyed instances behind one ALPN.
+//! - **Content addressing.** A `blob` method hands back an address; iroh-blobs
+//!   moves the bytes, admitted only against a grant keylink recorded when it
+//!   returned that address to that peer. See [`Blobs`].
 
 #![warn(missing_docs)]
 
@@ -68,20 +76,33 @@ compile_error!(
      with --no-default-features and pass the secret and the allowlist in."
 );
 
-// `web` asserts a platform fact rather than checking one: `body.rs` carries an
-// `unsafe impl Send` for the browser's stream reader, which holds an
-// `Rc<RefCell<_>>` and is `!Send` for a real reason. The assertion is that
-// wasm32-unknown-unknown without `atomics` has no second thread to send it to.
+// Two places assert a platform fact rather than checking one, and both assert
+// the same fact: wasm32-unknown-unknown without `atomics` has no second thread.
 //
-// Under threaded wasm that stops being true and the `unsafe impl` becomes
-// unsound. This is what keeps the assertion enforceable instead of hopeful.
+// `body.rs` carries an `unsafe impl Send` for the browser's stream reader, which
+// holds an `Rc<RefCell<_>>` and is `!Send` for a real reason. That one is gated
+// on `web`.
 //
-// It cannot fire today — threaded wasm needs a nightly `build-std` — so unlike
-// the three guards above it is UNTESTED, and that is said here rather than
-// discovered later.
-#[cfg(all(feature = "web", target_feature = "atomics"))]
+// `local.rs` is NOT gated on anything: `LocalActor` holds an
+// `Arc<n0_future::task::JoinHandle<()>>`, which in a browser wraps an
+// `Rc<RefCell<_>>` in a `SendWrapper`. `SendWrapper` is `Send` and `Sync` for
+// every `T` and panics if it is dereferenced — or dropped — on another thread,
+// so `LocalActor: Send + Sync` is honest only while there is no other thread.
+// Under threaded wasm, sending a handle to a Web Worker turns `abort()` into a
+// panic and dropping the last clone into a panic inside a destructor.
+//
+// So the guard is crate-wide rather than feature-gated. It cannot fire today —
+// threaded wasm needs a nightly `build-std` — so unlike the three guards above
+// it is UNTESTED, and that is said here rather than discovered later.
+#[cfg(all(
+    target_family = "wasm",
+    target_os = "unknown",
+    target_feature = "atomics"
+))]
 compile_error!(
-    "keylink's `web` feature assumes a single-threaded browser: it contains an      `unsafe impl Send` that is sound only without shared-memory threading.      Threaded wasm is not supported."
+    "keylink assumes a single-threaded browser. `local.rs` holds a thread-affine \
+     task handle behind a `Send + Sync` type, and the `web` feature adds an \
+     `unsafe impl Send` beside it. Threaded wasm is not supported."
 );
 
 /// Gated on the feature AND compiled only where OS threads exist. The Cargo

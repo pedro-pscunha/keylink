@@ -31,6 +31,7 @@ keylink::service! {
     rpc  Boom() -> u64;
     tell Note(line: String) -> ();
     recv Export() -> u64;
+    send Ingest(name: String) -> u64;
 }
 
 /// The obvious code: a `BTreeMap` behind no lock at all.
@@ -79,12 +80,21 @@ impl ledger::Actor for Ledger {
         self.notes.insert(line, ());
     }
 
+    /// Read **inside** the turn, which is RFC-04 §10.4's asymmetry: an upload
+    /// holds the actor for the whole transfer, and the body cannot be handed
+    /// off without giving up the `&mut self` the actor model exists for.
+    async fn ingest(&mut self, name: String, mut body: BodyReader) -> u64 {
+        let mut bytes = 0u64;
+        while let Ok(Some(chunk)) = body.next_chunk().await {
+            bytes += chunk.len() as u64;
+        }
+        self.notes.insert(name, ());
+        bytes
+    }
+
     async fn export(&mut self) -> (u64, Body) {
         let payload = format!("{:?}", self.entries);
-        (
-            payload.len() as u64,
-            Body::from_bytes(payload.into_bytes()),
-        )
+        (payload.len() as u64, Body::from_bytes(payload.into_bytes()))
     }
 }
 
@@ -160,7 +170,9 @@ async fn a_panicking_local_call_costs_one_message_and_reaches_its_caller() {
         tokio::spawn(async move { ledger.boom().await })
     };
     assert!(
-        boom.await.expect_err("the panic reaches the caller").is_panic(),
+        boom.await
+            .expect_err("the panic reaches the caller")
+            .is_panic(),
         "a local call must not swallow a panic into an error"
     );
 
@@ -250,13 +262,29 @@ impl ledger::Handler for ConcurrentLedger {
     async fn export(&self) -> (u64, Body) {
         (0, Body::empty())
     }
+    async fn ingest(&self, _name: String, _body: BodyReader) -> u64 {
+        0
+    }
 }
 
 /// The cost, measured rather than asserted: eight calls that each hold the
 /// actor for 60 ms take at least eight times 60 ms.
 ///
-/// This is `concurrent_calls_do_not_queue_behind_each_other` with the opposite
-/// expectation, and having both on record is what makes the trade verifiable.
+/// This is `protocol.rs::concurrent_calls_do_not_queue_behind_each_other` with
+/// the opposite expectation, and having both on record is what makes the trade
+/// verifiable rather than asserted.
+///
+/// # `tokio::join!`, and why the obvious loop was wrong
+///
+/// The first version of this test built eight futures with `.map(..)` and then
+/// awaited them in a `for` loop. **A Rust future does nothing until it is
+/// polled**, so that ran eight sequential round trips and the assertion held
+/// under *any* serving model — including the concurrent one. It was green, and
+/// it proved nothing.
+///
+/// `join!` is what puts all eight in flight at once, which is exactly why the
+/// test it mirrors uses it. Load can only push the elapsed time up, so this
+/// assertion never fails for being run on a busy machine.
 #[tokio::test]
 async fn a_served_actor_serializes_calls_that_arrive_on_separate_streams() {
     const HOLD: u64 = 60;
@@ -264,15 +292,26 @@ async fn a_served_actor_serializes_calls_that_arrive_on_separate_streams() {
 
     let (server, _actor, client) = served().await;
     let started = Instant::now();
-    let calls = (0..CALLS).map(|n| client.post(n, HOLD));
-    for call in calls.collect::<Vec<_>>() {
-        call.await.expect("answers");
-    }
+    let answers = tokio::join!(
+        client.post(0, HOLD),
+        client.post(1, HOLD),
+        client.post(2, HOLD),
+        client.post(3, HOLD),
+        client.post(4, HOLD),
+        client.post(5, HOLD),
+        client.post(6, HOLD),
+        client.post(7, HOLD),
+    );
     let elapsed = started.elapsed();
 
+    for answer in [
+        answers.0, answers.1, answers.2, answers.3, answers.4, answers.5, answers.6, answers.7,
+    ] {
+        answer.expect("answers");
+    }
     assert!(
         elapsed >= Duration::from_millis(HOLD * CALLS),
-        "eight 60 ms turns took {elapsed:?}, which means they overlapped"
+        "{CALLS} concurrent {HOLD}ms turns took {elapsed:?}; serialized they cannot"
     );
     server.shutdown().await.expect("stops");
 }
@@ -365,8 +404,9 @@ impl Middleware<ledger::Request, ledger::Response> for NoPosting {
         req: ledger::Request,
         body: BodyReader,
         next: Next<ledger::Request, ledger::Response>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (Outcome<ledger::Response>, Body)> + Send>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = (Outcome<ledger::Response>, Body)> + Send>,
+    > {
         Box::pin(async move {
             if matches!(req, ledger::Request::Post { .. }) {
                 return (
@@ -392,7 +432,10 @@ async fn a_layer_can_still_refuse_one_method_of_a_served_actor() {
         .await
         .expect("dials");
 
-    assert!(client.post(1, 0).await.is_err(), "the layer refuses this one");
+    assert!(
+        client.post(1, 0).await.is_err(),
+        "the layer refuses this one"
+    );
     assert_eq!(
         client.entries().await.expect("and passes this one"),
         Vec::<u64>::new()
@@ -444,6 +487,32 @@ async fn a_served_actor_streams_a_body_back() {
 
     assert_eq!(received.len() as u64, len);
     assert_eq!(String::from_utf8_lossy(&received), "[7]");
+
+    client.close().await.expect("closes");
+    server.shutdown().await.expect("stops");
+}
+
+/// `send` reaches a served actor, and it is the one kind with no local
+/// counterpart: the handler is defined by the `BodyReader` it reads, and there
+/// is no such thing without a stream.
+///
+/// The upload is read inside the turn — RFC-04 §10.4 — so this also pins the
+/// cost. A caller that must not serialize uploads splits them onto a second
+/// service, which is what `README.md` recommends for bulk transfer anyway.
+#[tokio::test]
+async fn a_served_actor_reads_an_upload_inside_its_turn() {
+    const SIZE: usize = 64 * 1024;
+
+    let (server, actor, client) = served().await;
+    let stored = client
+        .ingest("sheet.bin".to_owned(), Body::from_bytes(vec![7u8; SIZE]))
+        .await
+        .expect("answers");
+    assert_eq!(stored as usize, SIZE);
+
+    // The actor is free again straight after, so the mailbox was released with
+    // the turn rather than held by the transfer.
+    assert_eq!(actor.post(1, 0).await.expect("running"), 1);
 
     client.close().await.expect("closes");
     server.shutdown().await.expect("stops");

@@ -369,6 +369,12 @@ where
 /// call — see [`Panic::resume`] and `local.rs`. A remote caller gets
 /// [`Display`](fmt::Display) inside [`RemoteError::Failed`], because an unwind
 /// does not cross a network.
+///
+/// Holding the payload costs one thing worth naming: `Box<dyn Any + Send>` is
+/// not `Sync`, so `Panic` is `Send` and no longer `Sync`. Nothing in keylink
+/// needs it to be — a `Result<T, Panic>` crosses a `oneshot`, which wants
+/// `Send` — but a downstream type that stored a `Panic` and asserted `Sync`
+/// would stop compiling.
 pub struct Panic {
     message: String,
     /// The `Box` `catch_unwind` handed back. Kept whole: `resume_unwind` on the
@@ -379,10 +385,34 @@ pub struct Panic {
 }
 
 impl Panic {
+    /// Build one from what `catch_unwind` handed back.
+    ///
+    /// **`pub(crate)`, and that is the whole point of it.** This was a public
+    /// `From<Box<dyn Any + Send>>`, which made the type prove nothing: any
+    /// caller could write `Panic::from(Box::new(0u8))` and then [`resume`] it,
+    /// unwinding with a payload no handler ever produced, under a message
+    /// reading "the actor panicked". A type named for a fact has to be
+    /// constructible only where the fact is known.
+    ///
+    /// [`resume`]: Self::resume
+    pub(crate) fn caught(payload: Box<dyn std::any::Any + Send>) -> Self {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panicked".to_string());
+        Self {
+            message: format!("the actor panicked: {message}"),
+            payload,
+        }
+    }
+
     /// Panic in the calling task, with the payload the handler panicked with.
     ///
     /// Does not run the panic hook a second time: the hook already ran where the
-    /// panic happened, which is where the useful backtrace is.
+    /// panic happened, which is where the useful backtrace is. The cost of that
+    /// is a caller-side panic with no location of its own, which is the right
+    /// trade — one backtrace at the fault beats two at the wrong place.
     pub fn resume(self) -> ! {
         std::panic::resume_unwind(self.payload)
     }
@@ -400,20 +430,6 @@ impl fmt::Debug for Panic {
         f.debug_struct("Panic")
             .field("message", &self.message)
             .finish()
-    }
-}
-
-impl From<Box<dyn std::any::Any + Send>> for Panic {
-    fn from(panic: Box<dyn std::any::Any + Send>) -> Self {
-        let message = panic
-            .downcast_ref::<&str>()
-            .map(|s| (*s).to_string())
-            .or_else(|| panic.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "panicked".to_string());
-        Self {
-            message: format!("the actor panicked: {message}"),
-            payload: panic,
-        }
     }
 }
 
@@ -435,7 +451,7 @@ pub async fn guarded<F: Future>(fut: F) -> std::result::Result<F::Output, Panic>
         match std::panic::catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
-            Err(panic) => Poll::Ready(Err(Panic::from(panic))),
+            Err(panic) => Poll::Ready(Err(Panic::caught(panic))),
         }
     })
     .await

@@ -81,6 +81,23 @@ impl Runtime {
         };
         Ok(inner.block_on(fut))
     }
+
+    /// Make this runtime the current one for as long as the guard lives.
+    ///
+    /// For constructors that *spawn* rather than await — see
+    /// [`Node::enter`], which is where a caller meets this.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BlockingInAsync`] when called from inside a tokio runtime,
+    /// which is where the async API belongs instead.
+    pub fn enter(&self) -> Result<tokio::runtime::EnterGuard<'_>> {
+        guard()?;
+        let Some(inner) = self.inner.as_ref() else {
+            return Err(Error::BlockingInAsync);
+        };
+        Ok(inner.enter())
+    }
 }
 
 impl Drop for Runtime {
@@ -155,6 +172,60 @@ impl Node {
     /// The shared runtime. Generated blocking clients need it.
     pub fn runtime(&self) -> &Arc<Runtime> {
         &self.runtime
+    }
+
+    /// Lend this node's runtime to the calling thread, so that a constructor
+    /// which **spawns** can be called from synchronous code.
+    ///
+    /// ```ignore
+    /// let node = keylink::blocking::Node::bind()?;
+    /// let warehouse = {
+    ///     let _guard = node.enter()?;
+    ///     inventory::actor(Warehouse::seeded())
+    /// };
+    /// let server = node.serve([warehouse.service(allow).build()])?;
+    /// ```
+    ///
+    /// # Why this is not optional
+    ///
+    /// The rest of this module hides the runtime because every operation it
+    /// mirrors is a *future*, and a future can be handed to
+    /// [`Runtime::run`]. An actor is different: `actor()` and `spawn()` start a
+    /// task, and `tokio::spawn` reads the current runtime from a thread-local
+    /// that a synchronous thread does not have. It panics rather than returning
+    /// an error, so there is nothing for this module to convert.
+    ///
+    /// So without this method a synchronous program cannot build an actor at
+    /// all — not awkwardly, not at all. RFC-04 §10.3.
+    ///
+    /// # Drop it before you use anything else here
+    ///
+    /// The guard sets the thread-local that [`Runtime::run`] checks, so while it
+    /// is held **every other method in this module returns
+    /// [`Error::BlockingInAsync`]** — including [`Node::serve`] and every
+    /// generated blocking client call. That is not a bug in the check: blocking
+    /// on a runtime from a thread that runtime considers its own is the
+    /// deadlock this module exists to refuse, and it cannot tell a borrowed
+    /// context from a real one.
+    ///
+    /// Hence the braces in the example. Hold the guard while constructing, drop
+    /// it, then carry on.
+    ///
+    /// # The node owns the actor's runtime
+    ///
+    /// An actor built under this guard runs on the node's runtime, and
+    /// [`Runtime`]'s `Drop` calls `shutdown_background`. Dropping the node
+    /// therefore ends the actor with no ordering and no notification: a handle
+    /// held past that point reports
+    /// [`MailboxClosed`](crate::MailboxClosed), which says the actor is gone and
+    /// not why. Keep the node alive for as long as the actor.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BlockingInAsync`] when called from inside a tokio runtime. Code
+    /// that already has one wants the async API, where nothing needs lending.
+    pub fn enter(&self) -> Result<tokio::runtime::EnterGuard<'_>> {
+        self.runtime.enter()
     }
 
     /// Serve services from a synchronous program.
@@ -238,5 +309,50 @@ mod tests {
     fn a_blocking_node_binds_and_reports_its_id() {
         let node = Node::bind().expect("binds off a runtime thread");
         assert_ne!(node.id().to_string(), "", "an id is available");
+    }
+
+    /// Both halves of RFC-04 §10.3, in one test because the second is only
+    /// interesting given the first.
+    ///
+    /// A spawn off a runtime **panics** — it does not return an error — so a
+    /// synchronous program could not construct an actor at all before this.
+    /// Made red by deleting either the `catch_unwind` assertion (which is then
+    /// a claim nobody checks) or `enter` itself.
+    ///
+    /// The panic below is caught on purpose. The panic hook still runs, and the
+    /// harness captures what it writes, so it is invisible while this test
+    /// passes and visible in the output if it ever fails — which is where that
+    /// message is worth reading anyway. Silencing it would need
+    /// `std::panic::set_hook`, which is process-global and would hide a real
+    /// panic in whatever test happened to be running beside this one.
+    #[test]
+    fn an_actor_needs_the_runtime_entered_and_enter_lends_it() {
+        let node = Node::bind().expect("binds off a runtime thread");
+
+        let without = std::panic::catch_unwind(|| {
+            let _ = crate::LocalActor::spawn(());
+        });
+        assert!(
+            without.is_err(),
+            "spawning off a runtime must panic, or this method has no reason to exist"
+        );
+
+        let actor = {
+            let _guard = node.enter().expect("a node off a runtime lends its own");
+            crate::LocalActor::spawn(())
+        };
+        assert!(actor.is_running(), "and with the runtime entered it starts");
+    }
+
+    /// The guard is not a way back into the blocking API from async code.
+    #[tokio::test]
+    async fn entering_from_inside_a_runtime_is_refused() {
+        // `Node::bind` already refuses here, so the runtime is built directly:
+        // the point is that `enter` refuses on its own rather than relying on
+        // there being no way to hold a node.
+        let Err(err) = Runtime::new() else {
+            panic!("must refuse, not deadlock");
+        };
+        assert!(matches!(err, Error::BlockingInAsync), "got {err:?}");
     }
 }

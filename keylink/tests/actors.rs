@@ -771,3 +771,64 @@ fn adding_a_remote_error_variant_moves_the_alpn() {
          decodes one refusal as another"
     );
 }
+
+// ──────────────────────────────────────────────────────────── who is calling
+
+// A third service, so that adding a method to `journal` does not break the
+// deliberate shape-for-shape pairing it has with `vault`. A `///` here would be
+// an unused doc comment: rustdoc does not document a macro invocation.
+keylink::service! {
+    service Doorman;
+
+    rpc WhoCalled() -> Option<String>;
+}
+
+#[derive(Default)]
+struct Doorman {
+    last: Option<String>,
+}
+
+impl doorman::Actor for Doorman {
+    fn caller(&mut self, cx: Option<&keylink::Context>) {
+        self.last = cx.map(|cx| cx.peer().to_string());
+    }
+
+    async fn who_called(&mut self) -> Option<String> {
+        self.last.clone()
+    }
+}
+
+/// RFC-04 §12.2 test 10, on the path the RFC put it: a keyed actor sees the
+/// proven key of its caller.
+///
+/// It had never been written. `Actor::caller` shipped with a default empty body
+/// and nothing in the tree overrode it, so the hook had no implementor and no
+/// test — which is indistinguishable from a hook that does not work.
+///
+/// Made red by passing `None` to `caller` in the mailbox loop.
+#[tokio::test]
+async fn a_keyed_actor_sees_the_proven_key_of_its_caller() {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let system = mounted();
+    let _running = Server::builder(&server)
+        .service(system.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("one service, no duplicate ALPN");
+    let client = ActorClient::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("the client dials the actor system");
+
+    system
+        .mount(id("gate/1"), doorman::spawn(Doorman::default()))
+        .expect("the id is free");
+
+    assert_eq!(
+        doorman::at(&client, id("gate/1"))
+            .who_called()
+            .await
+            .unwrap(),
+        Some(client_node.id().to_string()),
+        "the actor must see the dialing peer's proven key, not None"
+    );
+}

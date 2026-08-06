@@ -16,30 +16,57 @@
 //!
 //! # Two types, two error types, on purpose
 //!
-//! A local call fails one way: the actor is gone. That is why [`MailboxClosed`]
-//! is a unit struct and why it is not [`Error`](crate::Error). RFC-04 §5.2 and
-//! §5.5 reject a handle that is the same type locally and remotely, because such
-//! a handle must either claim failures the local case cannot have, or hide
-//! failures the remote case does. `Error::SchemaMismatch` has no meaning between
-//! two objects in one process.
+//! A local call **reports** one failure: the actor is gone. That is why
+//! [`MailboxClosed`] is a unit struct and why it is not [`Error`](crate::Error).
+//! RFC-04 §5.2 and §5.5 reject a handle that is the same type locally and
+//! remotely, because such a handle must either claim failures the local case
+//! cannot have, or hide failures the remote case does.
+//! `Error::SchemaMismatch` has no meaning between two objects in one process.
 //!
-//! The method names and the success types match the remote client exactly, so
-//! moving an actor across the boundary is a mechanical edit the compiler drives.
-//! What does not compile is the code that ignored the difference.
+//! "Reports one failure" is narrower than "fails one way", and the difference is
+//! worth having in front of you. A call can also panic ([`LocalActor::ask`]
+//! resumes it), never return ([`Handle`] documents the self-call deadlock), or —
+//! only for [`notify`](LocalActor::notify) — return `Ok` for a message that is
+//! then dropped unrun, because `Ok` there means "queued" and nothing else.
 //!
-//! # A panic reaches the caller
+//! The method names and success types match the remote client for `rpc` and
+//! `tell`. They do not for the other three: `blob` hands back a
+//! [`BlobId`](crate::BlobId) where the client hands back a
+//! [`BlobHandle`](crate::BlobHandle), and `send` and `recv` have no local method
+//! at all. Moving an actor across that boundary is a mechanical edit for two
+//! kinds out of five, and a compile error that needs a decision for the rest —
+//! which is the honest version of what §5.3 promised.
 //!
-//! A local call behaves like a local call: if the handler panics, the panic is
-//! caught so the **actor survives**, and then resumed in the caller — the same
-//! payload, unwinding the same way an ordinary function call would.
+//! # A panic reaches the caller of an `ask`
+//!
+//! If the handler panics, the panic is caught so the **actor survives**, and
+//! then resumed in the caller — the same payload, close to the way an ordinary
+//! function call would deliver it.
 //!
 //! Both halves matter. Catching keeps one bad message from costing every later
 //! one. Resuming keeps [`MailboxClosed`] honest: it means the actor is gone, and
 //! never "the actor is fine and your message exploded".
 //!
+//! Two structural exceptions. [`notify`](LocalActor::notify) has no channel to
+//! carry a panic, so it catches and drops one. And a caller that dropped its
+//! future before the turn finished is not there to receive one. In both the
+//! panic hook has already run at the fault, which is where the backtrace is.
+//!
 //! The remote path does the opposite with the same catch — see
 //! [`LocalActor::ask_catching`] — because a panic must not travel to another
 //! machine as an unwind.
+//!
+//! # What is not guarded
+//!
+//! The actor's task is detached, so nothing observes a panic that escapes the
+//! loop rather than a turn. Every path library code controls is inside
+//! [`guarded`], including the closure that produces the turn's future. What is
+//! left is a user `Drop` — on the state when the actor ends, or on a reply value
+//! dropped here because the caller went away. Either kills the loop, and every
+//! handle then reports [`MailboxClosed`]: the same lie the panic policy exists
+//! to remove, through a narrower door. And `panic = "abort"` defeats all of it.
+//!
+//! [`Handle`]: crate::LocalActor
 
 use std::fmt;
 use std::future::Future;
@@ -62,10 +89,21 @@ use crate::{guarded, Panic};
 /// by the transport whatever this number is. In-process there is no transport
 /// and no such bound — a caller can spawn ten thousand tasks that each send.
 ///
-/// So here the mailbox itself is the backpressure: `send` on a full channel
-/// waits, on the calling task, which is where a slow actor should be felt.
-/// Raising this moves messages out of the caller, where they are visible, into a
-/// buffer where they are not.
+/// So here the mailbox itself is what waits: `send` on a full channel parks the
+/// calling task, which is where a slow actor should be felt.
+///
+/// Be honest about what that buys. It is **not** a bound on memory: every
+/// parked sender still holds its boxed closure and its arguments alive, so cost
+/// grows with waiting callers whatever this number is — the queue moves into the
+/// channel's wait list, which has no length anybody can read. What capacity 1
+/// does buy is that a caller cannot get further ahead of the actor than one
+/// message, so a caller that measures its own latency sees the actor's.
+///
+/// Raising it would let callers run ahead without feeling it, and would make a
+/// self-`tell` succeed more often — which is worse, not better, because
+/// [`Handle`](crate::LocalActor) documents self-calls as a deadlock and the
+/// difference between "usually" and "always" is what makes a deadlock a
+/// production incident instead of a test failure.
 const MAILBOX: usize = 1;
 
 /// One turn against an actor's state.
@@ -142,9 +180,18 @@ impl<A: Send + 'static> LocalActor<A> {
     ///
     /// [`MailboxClosed`] when the actor is gone, before or during the turn.
     ///
+    /// # The turn runs even if you stop waiting
+    ///
+    /// Dropping this future does not cancel the turn: the message is already in
+    /// another task's mailbox. A caller that gives up on a `reserve` has still
+    /// reserved. Use [`ask_catching`](Self::ask_catching) on a served path, and
+    /// on any path put the bound inside the method rather than around the call.
+    ///
     /// # Panics
     ///
     /// With whatever the handler panicked with, after the actor has survived it.
+    /// Use [`ask_catching`](Self::ask_catching) where an unwind must not escape
+    /// — a connection's task, for one.
     pub async fn ask<T, F>(&self, turn: F) -> Result<T, MailboxClosed>
     where
         T: Send + 'static,
@@ -186,17 +233,23 @@ impl<A: Send + 'static> LocalActor<A> {
             })
         }))
         .await?;
-        // The turn ran and dropped the sender without sending only if the task
-        // died mid-turn, which is a runtime shutdown taking it.
+        // The sender is dropped without sending when the task died mid-turn:
+        // `abort`, a runtime shutdown, or a panicking `Drop` in the state. All
+        // three mean the same thing to a caller, which is why they share an
+        // error rather than being told apart.
         answer.await.map_err(|_| MailboxClosed)
     }
 
     /// Queue one turn and do not wait for it.
     ///
     /// What a local `tell` uses. The `Ok` means the message is in the mailbox
-    /// and nothing more: it has not run, it may panic, and there is no channel
-    /// on which to learn either. A panic is caught, so the actor survives, and
-    /// then dropped, because there is nobody left to tell.
+    /// and nothing more: it has not run, it may panic, it may be dropped unrun
+    /// by [`stop`](Self::stop) or [`abort`](Self::abort), and there is no
+    /// channel on which to learn any of that. A panic is caught, so the actor
+    /// survives, and then dropped, because there is nobody left to tell.
+    ///
+    /// **It still waits for a mailbox permit**, which is why an actor calling
+    /// this on itself can deadlock even though it never waits for a reply.
     ///
     /// # Errors
     ///
@@ -220,14 +273,23 @@ impl<A: Send + 'static> LocalActor<A> {
 impl<A> LocalActor<A> {
     /// Stop after the turns already queued, then wait for the actor to end.
     ///
-    /// Ordered: everything sent before this is handled and answered. Everything
-    /// sent after it — including anything already queued behind it — is refused
-    /// with [`MailboxClosed`], because the loop drops the receiver on its way
-    /// out.
+    /// Ordered: everything sent before this is handled and answered. Anything
+    /// queued behind it is dropped unrun when the loop drops the receiver — an
+    /// [`ask`](Self::ask) waiting on one is told [`MailboxClosed`], and a
+    /// [`notify`](Self::notify) is told nothing, because it was already told
+    /// `Ok`.
+    ///
+    /// **An actor must not call this on itself.** It takes a mailbox permit like
+    /// any message and then waits for a loop that cannot exit while it is inside
+    /// this turn.
+    ///
+    /// Waits for the receiver to be dropped, which is the loop ending — not for
+    /// the state's own `Drop` to have run. A state that flushes in `Drop` needs
+    /// its own signal.
     ///
     /// Idempotent, and takes no deadline: `n0_future::time::timeout` composes,
     /// and a parameter here would duplicate it. A turn that never returns is
-    /// what [`Self::abort`] is for.
+    /// what [`Self::abort`] is for — with the caveat on that method.
     pub async fn stop(&self) {
         let _ = self.mail.send(Message::Stop).await;
         // Resolves when the loop drops the receiver, which it does on the way
@@ -241,6 +303,13 @@ impl<A> LocalActor<A> {
     /// dropped at its next await point. That is the difference from
     /// [`Self::stop`], and it is why they are separate methods rather than one
     /// with a flag.
+    ///
+    /// Cooperative and asynchronous, like every tokio abort. A turn that never
+    /// reaches an await point is not interrupted and this returns having done
+    /// nothing; and until the runtime drops the task,
+    /// [`is_running`](Self::is_running) still says `true`. Callers waiting on a
+    /// dropped turn do get [`MailboxClosed`]: dropping the receiver drains the
+    /// buffer, and each queued turn owns its reply channel.
     pub fn abort(&self) {
         self.task.abort();
     }
@@ -297,7 +366,9 @@ mod tests {
         inside: bool,
     }
 
-    fn add(n: u64) -> impl for<'a> FnOnce(&'a mut Counter) -> Pin<Box<dyn Future<Output = usize> + Send + 'a>>
+    fn add(
+        n: u64,
+    ) -> impl for<'a> FnOnce(&'a mut Counter) -> Pin<Box<dyn Future<Output = usize> + Send + 'a>>
            + Send
            + 'static {
         move |state: &mut Counter| {

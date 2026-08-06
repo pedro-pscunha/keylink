@@ -1160,11 +1160,17 @@ async fn a_blob_response_carries_the_reply_and_the_address_together() {
 // reach of the granting seam, because `ActorReply` is opaque bytes the actor
 // system never decodes.
 //
-// So the `blob` kind works on plain services and NOT on actors. The outcome
-// that would be unacceptable is the third one: appearing to work while never
-// granting, which hands a peer an address nothing will serve. Both halves are
-// pinned below — the supported path does not exist, and the unsupported one
-// fails closed.
+// So the `blob` kind works on plain services and NOT through the KEYED actor
+// system. It does work on a singleton actor served with `Handle::service`,
+// which puts the mailbox behind the service's own typed `Response` and leaves
+// `Granting` exactly where it was — the address is readable, so the grant is
+// recorded. That is one of the three §14.8 costs capability A does not pay, and
+// it is a property of keyed addressing rather than of actors.
+//
+// The outcome that would be unacceptable is the third one: appearing to work
+// while never granting, which hands a peer an address nothing will serve. Both
+// halves are pinned below — the supported path does not exist here, and the
+// unsupported one fails closed.
 
 /// Returned by the absence probe. Distinct from anything a real method would
 /// return, so an inherent method that shadows it is a type error rather than a

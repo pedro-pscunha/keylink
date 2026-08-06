@@ -319,6 +319,18 @@ macro_rules! service {
                 /// }
                 /// ```
                 ///
+                /// The `Option` makes that call reachable. It does not make the
+                /// wrong one impossible, and the wrong one is idiomatic:
+                ///
+                /// ```ignore
+                /// if let Some(cx) = cx { self.peer = Some(cx.peer()); }   // stale peer survives
+                /// ```
+                ///
+                /// Nothing here can catch that, because keylink cannot see what
+                /// your state does with the value. What the type buys is that
+                /// the local case is now in the signature, where it has to be
+                /// answered — not that it is answered correctly.
+                ///
                 /// # It occupies the name
                 ///
                 /// A service with an `rpc Caller()` cannot be an actor: the
@@ -327,6 +339,11 @@ macro_rules! service {
                 /// restriction, so the collision shows up only when a service
                 /// gains an actor — as a duplicate-definition error naming this
                 /// line. Rename the rpc.
+                ///
+                /// [`Handle`] reserves five more, and those fire whether or not
+                /// anybody calls [`actor`], because its impl block is generated
+                /// unconditionally: `service`, `serve`, `stop`, `abort` and
+                /// `is_running`.
                 fn caller(&mut self, _cx: ::core::option::Option<&$crate::Context>) {}
 
                 $(
@@ -351,11 +368,18 @@ macro_rules! service {
 
             /// One message against one actor: the caller hook, then the method.
             ///
-            /// Generated **once** and used by all three consumers — the keyed
-            /// system's mailbox loop, the singleton service's dispatch, and
-            /// nothing else, because [`Handle`]'s own methods call the trait
-            /// directly. A method kind therefore cannot be dispatched two
-            /// different ways, which is the failure RFC-01 §11.2b names.
+            /// Generated **once** and used by both served paths: the keyed
+            /// system's mailbox loop and the singleton service's dispatch. One
+            /// match, so a kind cannot be routed two ways *over the wire*.
+            ///
+            /// [`Handle`]'s own methods do not come through here — they call the
+            /// trait method directly, since a local call has no `Request` to
+            /// build and no `BodyReader` to pass. So there **are** two
+            /// dispatchers, and the second one is `__keylink_local_method!`,
+            /// whose arms each repeat the `caller(None)` hook by hand. A sixth
+            /// method kind wired into that macro without it would silently
+            /// inherit the last remote peer. That is RFC-01 §11.2b's hazard,
+            /// reported here rather than claimed absent.
             async fn __actor_turn<A: Actor>(
                 state: &mut A,
                 cx: ::core::option::Option<&$crate::Context>,
@@ -388,6 +412,8 @@ macro_rules! service {
             /// # Panics
             ///
             /// Panics when called outside a tokio runtime.
+            #[must_use = "an unmounted actor is dropped, which stops the task \
+                          this just started"]
             pub fn spawn<A: Actor>(mut state: A) -> $crate::Mounted {
                 $crate::mount(schema(), move |mut inbox: $crate::Mailbox| async move {
                     while let ::std::option::Option::Some(mail) = inbox.recv().await {
@@ -476,17 +502,64 @@ macro_rules! service {
             /// process.
             ///
             /// Cheap to clone: every clone names the same actor. The actor runs
-            /// until the last handle is dropped, or until
-            /// [`stop`](Self::stop).
+            /// until the last handle is dropped, or until [`stop`](Self::stop)
+            /// — **unless it is served**, in which case
+            /// [`service`](Self::service) put a clone inside the server and that
+            /// one outlives every handle you hold.
             ///
-            /// # A panic reaches the caller
+            /// # A panic reaches the caller of an `rpc`
             ///
             /// The actor survives a panicking message, and the caller of that
-            /// message gets the panic — resumed with its own payload, the way an
-            /// ordinary function call would deliver it. Both halves matter: the
-            /// first keeps one bad message from costing every later one, the
-            /// second keeps `MailboxClosed` meaning "the actor is gone" rather
-            /// than "something went wrong somewhere".
+            /// message gets the panic — resumed with its own payload, close to
+            /// the way an ordinary function call would deliver it. Both halves
+            /// matter: the first keeps one bad message from costing every later
+            /// one, the second keeps `MailboxClosed` meaning "the actor is gone"
+            /// rather than "something went wrong somewhere".
+            ///
+            /// Two places it is **not** like an ordinary call, both structural:
+            /// a `tell` has no channel to carry the panic, so it is caught and
+            /// dropped; and a caller that dropped its future before the turn
+            /// finished is not there to receive one. In both cases the panic
+            /// hook has already run and printed at the fault, which is where the
+            /// backtrace is worth having.
+            ///
+            /// # A dropped call still runs
+            ///
+            /// This is the one behaviour change a `Handler` → `Actor` migration
+            /// makes that the compiler cannot show you. Dropping a `Handler`
+            /// call's future drops the handler's future with it. Dropping an
+            /// actor call's future does not: the message is in a mailbox on
+            /// another task, and the turn runs to completion. A `reserve` that
+            /// the caller timed out has still decremented the stock.
+            ///
+            /// # An actor must not call itself. Any method, including `tell`.
+            ///
+            /// A handler that awaits **any** method on a handle to its own actor
+            /// can deadlock, and the mechanism is worth knowing because two of
+            /// the three cases are load-dependent — they pass every test and
+            /// appear in production.
+            ///
+            /// - **`rpc`, always.** The reply cannot be produced until the actor
+            ///   takes the next message, and the actor is busy being this
+            ///   handler.
+            /// - **`tell`, under contention.** The mailbox holds one message.
+            ///   The actor released that permit when it took the message it is
+            ///   running now, so a self `tell` succeeds *only if nobody else
+            ///   took the permit first*. A served actor always has other
+            ///   senders. When the permit is gone the `send` itself blocks, and
+            ///   only the actor can free it.
+            /// - **[`stop`](Self::stop), always.** It takes a permit like any
+            ///   message, and then waits for a loop that cannot exit.
+            ///
+            /// An earlier version of this comment said a self `tell` was fine
+            /// because it waits for nothing. It waits for a permit.
+            ///
+            /// This is true of every actor system and it is not detected here:
+            /// no type can tell one actor's handle from another's. Call the
+            /// method on `&mut self` instead — it is the same code without the
+            /// round trip. If the work must happen *after* the current turn,
+            /// spawn a task that holds a handle; that task is not the actor and
+            /// can wait for a permit safely.
             ///
             /// # Which methods are here
             ///
@@ -548,9 +621,42 @@ macro_rules! service {
                 ///
                 /// Calls no longer overlap. Four concurrent `list`s take four
                 /// turns, and a slow method delays every later message rather
-                /// than only its own caller. A `send` method reads its upload
-                /// **inside** the turn, so a large one holds the actor for the
-                /// whole transfer — RFC-04 §10.4.
+                /// than only its own caller.
+                ///
+                /// # A layer can refuse a call. It cannot cancel a turn.
+                ///
+                /// Read this before adding [`Timeout`](keylink::Timeout).
+                ///
+                /// A layer runs **outside** the mailbox, which is what keeps a
+                /// refusal from costing a turn. The other half of that is that a
+                /// layer's budget expiring drops the *wait for the reply*, not
+                /// the turn: the turn is on the actor's task and runs to
+                /// completion whatever the caller does.
+                ///
+                /// So `Timeout::after(100ms)` in front of a method that takes
+                /// ten seconds does not shed load. Ten callers get `TimedOut` at
+                /// 100 ms and the actor still spends a hundred seconds producing
+                /// replies nobody is waiting for. Bound the work inside the
+                /// method instead, where `&mut self` is, or keep the slow method
+                /// off the actor.
+                ///
+                /// The same asymmetry breaks the guarantee an
+                /// [`IdempotencyKey`](keylink::IdempotencyKey) usually gives: a
+                /// refused call is recorded as the settled reply, and then the
+                /// turn runs and mutates the state anyway. The caller is told
+                /// `TimedOut`, keeps being told `TimedOut` on every retry, and
+                /// the actor has applied the message once. A key and a layer
+                /// that can refuse do not compose on this path.
+                ///
+                /// # A `send` method can hold the actor for the idle timeout
+                ///
+                /// A `send` handler reads its upload inside the turn — RFC-04
+                /// §10.4 — and no layer can bound that (see above). A peer that
+                /// declares a large body and then stops writing holds the actor
+                /// until iroh's connection idle timeout, during which nothing
+                /// else is answered, including the local [`Handle`]. Put bulk
+                /// transfer on a second service served with [`service`], which
+                /// is what the README already recommends for it.
                 pub fn service(
                     &self,
                     allow: $crate::Allowlist,
@@ -591,10 +697,21 @@ macro_rules! service {
                                         )),
                                         $crate::Body::empty(),
                                     ),
-                                    ::std::result::Result::Err(__gone) => (
-                                        $crate::Outcome::Err($crate::RemoteError::Failed(
-                                            __gone.to_string(),
-                                        )),
+                                    // NOT `Failed`, which is what a panic is.
+                                    // A peer must be able to tell "your message
+                                    // exploded, try another" from "there is
+                                    // nothing here any more, stop asking" —
+                                    // and after `stop()` the ALPN stays
+                                    // registered, so this is answered for as
+                                    // long as the server runs. The id is the
+                                    // service name because a singleton has no
+                                    // other one.
+                                    ::std::result::Result::Err(_gone) => (
+                                        $crate::Outcome::Err(
+                                            $crate::RemoteError::NoSuchActor {
+                                                id: stringify!($svc).to_owned(),
+                                            },
+                                        ),
                                         $crate::Body::empty(),
                                     ),
                                 }
@@ -604,6 +721,43 @@ macro_rules! service {
                         .__keylink_declares_blobs(DECLARES_BLOBS)
                 }
 
+                /// Serve this actor alone on `node`.
+                ///
+                /// The twin of [`serve`], and it exists because the first use
+                /// of this API outside the crate found the asymmetry: the
+                /// concurrent model had a one-line front door and the actor
+                /// model made you drop to the builder, which made the actor the
+                /// more verbose choice at exactly the site RFC-04 §1.3
+                /// advertises as "one word".
+                ///
+                /// For several services on one endpoint, build each with
+                /// [`Self::service`] and register them on a single
+                /// [`Server`](keylink::Server): one router must own every ALPN.
+                ///
+                /// # The server holds the actor, and holds it past `shutdown`
+                ///
+                /// The returned [`Server`](keylink::Server) owns a clone of this
+                /// handle, so the actor outlives every handle a caller holds.
+                /// [`Server::shutdown`](keylink::Server::shutdown) stops
+                /// accepting; it does not drop the router, so the actor and its
+                /// state live until the `Server` value itself is dropped. To end
+                /// the actor deterministically, call [`Self::stop`].
+                ///
+                /// # Errors
+                ///
+                /// [`ConfigError`](keylink::ConfigError) from
+                /// [`spawn`](keylink::ServerBuilder::spawn), the same as
+                /// [`serve`].
+                pub fn serve(
+                    &self,
+                    node: &$crate::Node,
+                    allow: $crate::Allowlist,
+                ) -> $crate::Result<$crate::Server> {
+                    $crate::Server::builder(node)
+                        .service(self.service(allow).build())
+                        .spawn()
+                }
+
                 /// Stop after the messages already queued, then wait for the
                 /// actor to end. Every other handle reports
                 /// [`MailboxClosed`](keylink::MailboxClosed) from then on.
@@ -611,8 +765,17 @@ macro_rules! service {
                     self.inner.stop().await;
                 }
 
-                /// Cancel the actor where it stands, destroying its state. What
-                /// to reach for when a turn will never return.
+                /// Cancel the actor where it stands, destroying its state.
+                ///
+                /// Cooperative, like every tokio abort: the turn is dropped at
+                /// its next await point. A turn that never reaches one — a
+                /// compute loop, a blocking syscall — is not interrupted, and
+                /// this returns having done nothing. That is the one case
+                /// [`stop`](Self::stop) also cannot fix.
+                ///
+                /// Asynchronous, too: [`is_running`](Self::is_running) can still
+                /// say `true` between this call and the runtime dropping the
+                /// task. `stop` does not have that gap, because it waits.
                 pub fn abort(&self) {
                     self.inner.abort();
                 }
@@ -1352,9 +1515,12 @@ macro_rules! __keylink_local_method {
         /// run, it may panic, and there is nothing here on which to learn
         /// either.
         ///
-        /// It **is** ordered, which the remote one is not: two tells sent from
-        /// one handle are queued in that order and handled in that order,
-        /// because in this process there is no network to reorder them.
+        /// It **is** ordered where the remote one is not, and the guarantee is
+        /// narrower than "one handle": two tells awaited **one after the other
+        /// on one task** are queued in that order and handled in that order,
+        /// because the mailbox is FIFO. Two tells started concurrently — a
+        /// `join!`, two spawned tasks, one handle shared across both — race for
+        /// the permit like any other pair of senders.
         ///
         /// # Errors
         ///
@@ -1544,6 +1710,8 @@ mod expansion {
     /// It has to live here rather than in `representability.rs` because the
     /// generated module is private to this one.
     mod no_streaming_on_a_local_handle {
+        #![allow(dead_code, reason = "the proof is that this module compiles")]
+
         use super::expansion;
 
         struct NoSuchMethod;
@@ -1558,6 +1726,21 @@ mod expansion {
         }
 
         impl<A> HandleHasNoStreamingMethod for expansion::Handle<A> {}
+
+        /// The hole the shadowing probe cannot see, closed the way
+        /// `representability.rs` closes it for `Sealed`.
+        ///
+        /// A trait method on `Self` outranks a deref step, so the probe above
+        /// would stay green while `handle.store(..)` quietly started working
+        /// through a `Deref` target. The blanket impl overlaps the concrete one
+        /// exactly when `Handle<A>: Deref`, and an overlap is `E0119`.
+        ///
+        /// This works only because `Handle` is a LOCAL type — in `tests/` rustc
+        /// answers "upstream crates may add a new impl in future versions",
+        /// which is the correct answer to the wrong question.
+        trait HandleDoesNotDeref {}
+        impl<T: ::core::ops::Deref> HandleDoesNotDeref for T {}
+        impl<A> HandleDoesNotDeref for expansion::Handle<A> {}
 
         /// One state, only so the handle has something to be generic over.
         struct Probe;
@@ -1578,16 +1761,17 @@ mod expansion {
             }
         }
 
-        #[expect(dead_code, reason = "the proof is that this module compiles")]
         fn a_local_handle_streams_nothing(handle: expansion::Handle<Probe>) {
             let _: NoSuchMethod = handle.store();
             let _: NoSuchMethod = handle.fetch();
 
             // And the three that ARE there, so this probe cannot pass by the
-            // handle having no methods at all.
-            let _ = handle.ping(1);
-            let _ = handle.note(String::new());
-            let _ = handle.manual(String::new());
+            // handle having no methods at all. `drop` rather than `let _`,
+            // which clippy reads as forgetting to await a future — here the
+            // future is the assertion and running it is not the point.
+            drop(handle.ping(1));
+            drop(handle.note(String::new()));
+            drop(handle.manual(String::new()));
         }
     }
 }

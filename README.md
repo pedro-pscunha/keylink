@@ -65,6 +65,40 @@ on one ALPN is a configuration error, not a last-one-wins race.
 `match` on the real enum. Make the impl generic over `Req: Rpc` and one layer
 covers every service you ever define. `Timeout` ships with the crate.
 
+**Actors, when shared state is the awkward part.** The same `service!` block also
+generates an `Actor` trait taking `&mut self`, so state lives on a task instead
+of behind a `Mutex`:
+
+```rust
+let warehouse = inventory::actor(Warehouse::seeded());  // in this process
+warehouse.reserve("ADU-014".into(), 2).await?;          // Err = MailboxClosed
+
+let service = warehouse.service(allow);                 // and to other machines
+```
+
+Serving it changes nothing on the wire — peers use the same `inventory::Client`,
+on the same ALPN. What changes is that calls no longer overlap, which is the
+whole trade: a maintainer can add an `.await` inside a handler that mutates
+state. Under the concurrent model that same edit fails the build, because
+`clippy::await_holding_lock` is deny-level here and a `std::sync` guard is what
+`&self` state needs. (A `tokio::sync::Mutex` is not linted — it is designed to
+be held across an await — at the cost of an async lock on every access.)
+
+A turn is not cancellable: dropping the call does not stop the handler, and a
+layer such as `Timeout` refuses the caller without ending the turn.
+
+Many keyed instances behind one ALPN, addressed by an id inside the request, are
+`System` and `spawn`. That path costs more — see RFC-04 §14.8 — and is worth it
+only when there are many.
+
+**Content addressing.** A `blob` method returns an address; iroh-blobs moves the
+bytes, with verified resume and deduplication. keylink owns the mount, because
+the mount iroh-blobs' own documentation teaches serves every hash to every peer
+and accepts writes. Returning an address to a peer records a grant for that
+exact `(peer, hash)` pair, and a blobs request is admitted only against a grant
+— so every entry was created by an RPC that already passed its service's
+allowlist and layers.
+
 **Sync and async.** `keylink::blocking` mirrors the async API for programs with
 no runtime. It owns a private multi-threaded runtime — mandatory, because a
 current-thread runtime only advances iroh's keepalives during `block_on`, so
@@ -107,12 +141,6 @@ Early. The API will move. Not published to crates.io.
 
 Known gaps, in rough priority order:
 
-- **`iroh-blobs` is not integrated.** The recommendation is a hybrid: keylink
-  RPC carries a `Hash`, iroh-blobs moves the bytes, gaining verified resume and
-  dedup. When it lands it MUST wire `Allowlist` into blobs' provider
-  `ConnectMode::Intercept` — blobs is a separate `ProtocolHandler` with its own
-  admission path, so mounting it naively lets any hash-knower bypass the
-  allowlist entirely.
 - Protocols cannot be added or removed after `spawn`. iroh-examples'
   `custom-router` shows a runtime-mutable alternative worth adopting.
 - **Never run in a browser.** The crate compiles and links for
