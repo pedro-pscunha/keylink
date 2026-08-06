@@ -86,6 +86,24 @@ cargo run -p demo -- connect-sync <endpoint-id>     # the same, without a runtim
 whose `Currency` variants are swapped — identical shapes, so postcard would
 decode `Brl` as `Usd` silently. The handshake refuses it instead.
 
+## Working on it
+
+```sh
+./scripts/install-hooks.sh   # once per clone
+just gate                    # everything CI runs
+```
+
+The browser target needs two rustup pieces, because `ring` links its C through
+`ar` and Apple's writes an index `rust-lld` cannot read:
+
+```sh
+rustup target add wasm32-unknown-unknown
+rustup component add llvm-tools          # llvm-ar
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the wire-contract pin, the public API
+rules, and when `--no-verify` is legitimate.
+
 ## Status
 
 Early. The API will move. Not published to crates.io.
@@ -100,9 +118,10 @@ Known gaps, in rough priority order:
   allowlist entirely.
 - Protocols cannot be added or removed after `spawn`. iroh-examples'
   `custom-router` shows a runtime-mutable alternative worth adopting.
-- Not verified on `wasm32-unknown-unknown`. iroh itself supports it; the work is
-  replacing tokio runtime items with `n0_future` and feature-gating the blocking
-  and filesystem paths.
+- **Never run in a browser.** The crate compiles and links for
+  `wasm32-unknown-unknown` and CI gates that, but no `.wasm` has been loaded in a
+  tab. `blocking`, `fs` and `env` refuse the target by `compile_error!` — each
+  needs an OS facility a browser does not have.
 - `Error::SchemaMismatch` is classified from the rendered error string, because
   the TLS alert code is several private layers down. Narrow and tested, but it
   would break if iroh reworded its message.

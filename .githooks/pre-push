@@ -19,7 +19,11 @@ if command -v just >/dev/null 2>&1; then
     exec just pre-push
 fi
 
-echo "note: 'just' is not installed - running the same checks directly" >&2
+# Not the same gate: the browser-target build needs `llvm-ar` derived from the
+# host triple, and duplicating that here would be a second copy to drift from
+# the justfile. So this path is honestly weaker, and says so — CI still runs it.
+echo "note: 'just' is not installed - running the checks directly," >&2
+echo "      WITHOUT the browser target. Install 'just' to gate it locally." >&2
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy -p keylink --lib --no-default-features -- -D warnings

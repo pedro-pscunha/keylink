@@ -35,6 +35,10 @@ echo "  pre-commit  cargo fmt --check, clippy on the library     (seconds)"
 echo "  pre-push    the full gate: every target, both feature ends,"
 echo "              the tests, the docs, and the browser target"
 echo
+echo "the browser target needs two rustup pieces:"
+echo "  rustup target add wasm32-unknown-unknown"
+echo "  rustup component add llvm-tools"
+echo
 echo "bypass with --no-verify; see CONTRIBUTING.md for when that is legitimate."
 
 if ! command -v just >/dev/null 2>&1; then
