@@ -122,6 +122,26 @@ pub enum Error {
         actual: &'static str,
     },
 
+    /// The holder refused to serve this content.
+    ///
+    /// Distinct from [`Error::Transport`] for the same reason
+    /// [`Error::SchemaMismatch`] is: nothing is wrong with the network, and a
+    /// refusal reported as `io: connection lost` sends whoever reads it looking
+    /// at one that is working. iroh-blobs answers a refusal with
+    /// `ERR_PERMISSION` on the wire — a stream reset when one request is
+    /// denied, an application close when the whole connection is — so the fact
+    /// is available and only needed carrying up.
+    ///
+    /// The cause is a missing grant: this peer was never handed this address,
+    /// or the address is a child of a hash sequence rather than the blob it was
+    /// granted, or the grant fell off the end of a ledger bounded by
+    /// [`MAX_GRANTS`](crate::MAX_GRANTS).
+    #[error("the holder refused to serve blob {id}")]
+    BlobRefused {
+        /// The content that was refused.
+        id: crate::BlobId,
+    },
+
     /// Bad or missing configuration, reported at startup rather than on first use.
     #[error("config: {0}")]
     Config(#[from] ConfigError),

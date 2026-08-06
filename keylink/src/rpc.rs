@@ -351,10 +351,10 @@ impl<Req, Resp> std::fmt::Debug for ServiceBuilder<Req, Resp> {
 /// otherwise closed node.
 ///
 /// A prose warning does not stop that; a startup error does.
-const RESERVED_ALPNS: &[&[u8]] = &[
-    // iroh_blobs::ALPN
-    b"/iroh-bytes/4",
-];
+/// The constant itself, not a copy of its value. A literal here would agree
+/// with iroh-blobs today and diverge silently on the version bump that renamed
+/// it, leaving the reservation pointed at an ALPN nobody serves.
+const RESERVED_ALPNS: &[&[u8]] = &[iroh_blobs::ALPN];
 
 /// One service, ready to register on a [`Server`].
 ///

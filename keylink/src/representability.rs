@@ -54,7 +54,8 @@
 
 use std::ops::{Deref, DerefMut};
 
-use crate::{ActorId, Allowlist, Eviction, IdempotencyKey, Sealed};
+use crate::blobs::ProvenPeer;
+use crate::{ActorId, Allowlist, BlobId, Eviction, IdempotencyKey, Retention, Sealed};
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
 /// would return, so an inherent method that shadows one is a type error rather
@@ -136,11 +137,124 @@ impl SealedIsNotUnwrappable for Sealed {}
 /// leak, and whether dropping state loses anything is a decision about the
 /// caller's data rather than ours.
 ///
+/// [`Retention`](crate::Retention) is the third of the same family: a store
+/// that grows until the disk fills is a decision about *your* disk, so it is
+/// typed out rather than inherited.
+///
 /// A hand-written impl trips this, and so does a `#[derive(Default)]`.
 trait HasNoDefault {}
 impl<T: Default> HasNoDefault for T {}
 impl HasNoDefault for Allowlist {}
 impl HasNoDefault for Eviction {}
+impl HasNoDefault for Retention {}
+
+// ───────────────────────────────── a proven peer cannot be built from a claim
+
+/// [`ProvenPeer`](crate::blobs::ProvenPeer) keys the blobs grant ledger, and its
+/// whole value is that the identity inside it was proved by a TLS handshake
+/// keylink itself accepted. `ProvenPeer::on(&Connection<HandshakeCompleted>)` is
+/// meant to be the only route in.
+///
+/// Every name below is one an author would reach for when adding a second one,
+/// and each would take an identity that was *asserted* rather than proved:
+///
+/// - `proved` is RFC-01 §5.3's own proposal, over the
+///   `Option<EndpointId>` iroh-blobs reports. That field is `None` for any
+///   transport with no proven identity, and the `None` arm is unreachable
+///   through `BlobsProtocol` today — so a mistake in it passes every test
+///   anybody can write.
+/// - `new`, `from_id` and `trusted` take a bare `EndpointId`, which is what an
+///   id parsed out of a request body looks like by the time it reaches here.
+/// - `dialling` is the trap in the other direction:
+///   `Connecting::remote_id()` is infallible and reports the peer we are
+///   dialling, so a constructor over it would compile and prove nothing.
+///
+/// The shadowing probe fires on an inherent associated function of the same
+/// name, whatever it takes as an argument.
+#[allow(
+    clippy::new_ret_no_self,
+    reason = "returning Self is exactly what this probe watches for. `new` is \
+              the first name an author reaches for, so dropping it to satisfy \
+              the lint would leave the likeliest hole uncovered"
+)]
+trait ProvenPeerHasOneConstructor {
+    fn proved() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn new() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn from_id() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn trusted() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn dialling() -> NoSuchMethod {
+        NoSuchMethod
+    }
+}
+
+impl ProvenPeerHasOneConstructor for ProvenPeer {}
+
+fn a_proven_peer_has_one_constructor() {
+    let _: NoSuchMethod = ProvenPeer::proved();
+    let _: NoSuchMethod = ProvenPeer::new();
+    let _: NoSuchMethod = ProvenPeer::from_id();
+    let _: NoSuchMethod = ProvenPeer::trusted();
+    let _: NoSuchMethod = ProvenPeer::dialling();
+}
+
+/// The other half: a `ProvenPeer` must not be constructible by conversion
+/// either. A `From<EndpointId>` would be invisible to the probes above, because
+/// a trait impl is invisible to name resolution — so it needs coherence.
+///
+/// `EndpointId` is a foreign type, so the blanket impl is written over
+/// `From<T>` in general rather than over that one source. Any `From` impl at
+/// all overlaps it, which is the right bar: `ProvenPeer` is built by one
+/// constructor, from one argument, and nothing else.
+trait ProvenPeerIsNotConvertible {}
+impl<T: From<crate::EndpointId>> ProvenPeerIsNotConvertible for T {}
+impl ProvenPeerIsNotConvertible for ProvenPeer {}
+
+// ──────────────────────────────── a content address is not a set of raw bytes
+
+/// [`BlobId`](crate::BlobId) is a capability: holding one is how a peer reaches
+/// content. `as_bytes` is the intended read, and it hands out a shared
+/// reference.
+///
+/// Anything handing out `&mut` would let a caller edit an address in place
+/// after it was recorded in the grant ledger, which turns one grant into a
+/// capability for whatever the caller writes next. The ledger stores a copy, so
+/// the mutation would not widen an existing grant — it would silently redirect
+/// the id a handler is about to return, which is the same bug one step earlier.
+trait BlobIdHasNoMutableAccessor {
+    fn as_mut_bytes(&mut self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn as_mut(&mut self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+}
+
+impl BlobIdHasNoMutableAccessor for BlobId {}
+
+fn a_content_address_cannot_be_edited(mut id: BlobId) {
+    let _: NoSuchMethod = id.as_mut_bytes();
+    let _: NoSuchMethod = id.as_mut();
+}
+
+/// A `From<[u8; 32]>` would be a public constructor for a capability, reachable
+/// from any caller with 32 bytes to hand. keylink builds a [`BlobId`] from an
+/// `iroh_blobs::Hash` — content the store actually holds — and from nothing
+/// else.
+///
+/// This does not stop `derive(Deserialize)` building one from the wire, and it
+/// is not meant to: an address a peer sent is a request, and the grant ledger
+/// is what answers it. See the type's own documentation.
+trait BlobIdIsNotBuiltFromRawBytes {}
+impl<T: From<[u8; 32]>> BlobIdIsNotBuiltFromRawBytes for T {}
+impl BlobIdIsNotBuiltFromRawBytes for BlobId {}
 
 // ──────────────────────────────── a validated key cannot be edited afterwards
 

@@ -77,6 +77,7 @@ pub mod blocking;
 
 mod actor;
 mod authz;
+mod blobs;
 mod body;
 mod error;
 mod idempotency;
@@ -98,6 +99,7 @@ pub use actor::{
     MountError, Mounted, Panic, Sealed, System, SystemBuilder,
 };
 pub use authz::Allowlist;
+pub use blobs::{BlobHandle, BlobId, Blobs, BlobsAdmission, Retention, MAX_GRANTS};
 pub use body::{Body, BodyReader};
 pub use error::{ConfigError, Error, Result, Transport};
 pub use idempotency::{IdempotencyRefusal, MAX_RECORDED_BYTES, MAX_RECORDS};

@@ -45,6 +45,29 @@ upgrade is available".
 
 Revisit when iroh's netlink stack moves off it.
 """ },
+    { id = "RUSTSEC-2024-0370", reason = """
+`proc-macro-error` is unmaintained: no releases for four years, no response from
+the author. It arrives with iroh-blobs, through
+genawaiter -> genawaiter-proc-macro -> proc-macro-error.
+
+It cannot reach a byte a peer sent. `genawaiter-proc-macro` declares
+`proc-macro = true`, so it and everything it depends on are compiled for the
+HOST and run during expansion. `proc-macro-error` supplies `abort!` and
+`abort_call_site!`, which report compile errors; none of it is linked into the
+binary that opens a socket. The advisory itself says "No safe upgrade is
+available!".
+
+It is not ours to turn off either, and that is worth writing down because it
+looks like it should be. genawaiter's `proc_macro` feature is on by DEFAULT, and
+both `bao-tree` and `iroh-blobs` declare `genawaiter` with
+`features = ["futures03"]` and no `default-features = false`. Cargo features are
+additive, so keylink's own `bao-tree = { default-features = false }` cannot
+subtract it. Neither crate uses the `yield_!` macro — both build generators with
+`Gen::new` — so the proc macro is compiled and never invoked.
+
+Revisit when iroh-blobs takes genawaiter's default features off, or moves off
+genawaiter.
+""" },
 ]
 
 [licenses]

@@ -22,6 +22,10 @@ env = []
 # The browser's answer to `fs`. Off by default, because it is meaningful on
 # exactly one target.
 web = ["dep:wasm-streams", "dep:web-sys", "dep:tokio-util"]
+# `Blobs::persistent`. Turns on iroh-blobs' `fs-store`, which pulls redb and
+# reflink-copy. Off by default so that `Blobs::memory` costs neither: a store
+# that needs no disk and no feature is the one a reader should reach first.
+blobs-fs = ["iroh-blobs/fs-store"]
 
 [dependencies]
 iroh = { workspace = true }
@@ -33,6 +37,26 @@ postcard-rpc = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 pastey = { workspace = true }
+# `default-features = false` drops `fs-store` (redb, reflink-copy) and `rpc`
+# (noq). Both are what makes the default build small, and `rpc` is the one that
+# refuses `wasm32-unknown-unknown` outright, through mio. The `blobs-fs` feature
+# adds `fs-store` back for whoever asks for a disk.
+#
+# iroh-blobs' own `iroh` dependency is `1.0.0, default-features = false`, so it
+# adds no iroh features to this graph and cannot quietly re-enable a browser
+# blocker.
+iroh-blobs = { version = "0.103.0", default-features = false }
+# Named for exactly one type: `BaoContentItem`, which sits in the public
+# signature of `iroh_blobs::get::request::GetBlobItem` and which iroh-blobs does
+# not re-export. `BlobHandle::copy_to` has to match on it to stream leaves
+# without buffering the blob, because the only alternative iroh-blobs offers —
+# awaiting `GetBlobResult` — collects the whole payload into memory and gives up
+# the one-chunk peak this crate promises everywhere else.
+#
+# Version-coupled to iroh-blobs on purpose. If the two ever disagree, cargo
+# resolves two copies and the type stops matching, which is a loud build failure
+# rather than a silent one.
+bao-tree = { version = "0.16", default-features = false }
 # `sync` is DECLARED, not inherited. It was arriving by feature unification from
 # iroh, and `time` arrived from netwatch alone — one supplier for a feature
 # `actor.rs` cannot compile without. A build that is green because somebody
