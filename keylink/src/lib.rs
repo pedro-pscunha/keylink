@@ -141,6 +141,7 @@ mod macros;
 mod middleware;
 mod node;
 mod observe;
+mod panic;
 mod peer;
 mod reply;
 #[cfg(test)]
@@ -153,8 +154,8 @@ mod watch;
 mod wire;
 
 pub use actor::{
-    actor_schema, guarded, mount, ActorClient, ActorReply, ActorRequest, Eviction, Mail, Mailbox,
-    MountError, Mounted, Panic, Sealed, System, SystemBuilder,
+    actor_schema, mount, ActorClient, ActorReply, ActorRequest, Eviction, Mail, Mailbox,
+    MountError, Mounted, Sealed, System, SystemBuilder,
 };
 pub use admission::{Admission, Admittance, DynamicAdmission, Revocable, Revocation};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
@@ -171,6 +172,7 @@ pub use local::{LocalActor, MailboxClosed, Queued};
 pub use middleware::{Caller, Context, Middleware, Next, QueueTimeout, Queueing, Rpc, Timeout};
 pub use node::{derive_alpn, schema_hash, Node};
 pub use observe::{Ended, Observer, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome};
+pub use panic::{guarded, Panic};
 pub use peer::{Dial, Peer};
 pub use reply::{Outcome, RemoteError, WireRequest, WireResponse};
 pub use rpc::{Dispatch, RpcClient, Server, ServerBuilder, Service, ServiceBuilder};

@@ -791,7 +791,7 @@ fn failed_reason(error: &keylink::Error) -> &str {
 /// the two happened.
 ///
 /// What keeps that from being reachable *today* is not the wire format at all:
-/// `Panic::caught` in `actor.rs` builds every message as
+/// `Panic::caught` in `panic.rs` builds every message as
 /// `the actor panicked: {payload}`, so the panic side arrives already marked.
 /// That is a `pub(crate)` detail of another module, invisible from here and
 /// free to change — and if it did change, a test that pinned only the refusal
