@@ -73,6 +73,33 @@
 /// let _ = actor.service(Allowlist::anyone());   // <- this line does not compile
 /// ```
 ///
+/// And at the other site that serves one, which for a long time it was not.
+/// `CHECK` is an associated const on a generic type, so it is evaluated where it
+/// is *instantiated*; while `Handle::service` held the only instantiation, the
+/// identical service was refused there and mounted into a keyed
+/// [`System`](crate::System) without a word — over an ALPN, reachable by any
+/// admitted peer, with the body read inside the turn exactly as above. §16.9.
+///
+/// (`crate::` and not `keylink::` there, unlike every link in the *expansion*
+/// below: this comment is rendered inside keylink, and those are rendered in the
+/// caller's crate.)
+///
+/// ```compile_fail
+/// use keylink::{BodyReader, Caller};
+///
+/// keylink::service! {
+///     service Depot;
+///     send Ingest(name: String) -> u64;
+/// }
+///
+/// struct Store;
+/// impl depot::Actor for Store {
+///     async fn ingest(&mut self, _cx: Caller<'_>, _n: String, _b: BodyReader) -> u64 { 0 }
+/// }
+///
+/// let _ = depot::spawn(Store);                   // <- nor does this one
+/// ```
+///
 /// Serving the same service the concurrent way is fine, which is what makes the
 /// refusal above a statement about the actor path rather than about `send`:
 ///
@@ -493,6 +520,21 @@ macro_rules! service {
             #[must_use = "an unmounted actor is dropped, which stops the task \
                           this just started"]
             pub fn spawn<A: Actor>(mut state: A) -> $crate::Mounted {
+                // The same refusal `Handle::service` makes, and for longer than
+                // it was made here: `CHECK` is an associated const on a generic
+                // type, so it is evaluated only where it is INSTANTIATED, and
+                // for a long time the one instantiation was in `Handle::service`.
+                // A service declaring `send` was therefore refused by the local
+                // handle at compile time and accepted here without a word —
+                // where the body is read inside the serial turn exactly as it
+                // would have been, so a peer declaring a large body and then
+                // not writing it holds the actor until iroh's idle timeout.
+                //
+                // Not bounded by a layer, and not by a `QueueTimeout` either:
+                // that refuses a message still QUEUED, and this one has already
+                // started. RFC-04 §10.4 argues the whole thing and named only
+                // the path that was guarded. §16.9.
+                let () = ServableAsActor::<A>::CHECK;
                 $crate::mount(schema(), move |mut inbox: $crate::Mailbox| async move {
                     while let ::std::option::Option::Some(mail) = inbox.recv().await {
                         let $crate::Mail { cx, payload, body, reply } = *mail;

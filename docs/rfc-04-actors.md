@@ -2761,3 +2761,69 @@ position to infer from, and meets `error[E0283]`. It is documented on `System`
 with a `compile_fail` doctest, and the doctest was itself checked to fail for
 `E0283` specifically rather than for any compile error at all — a `compile_fail`
 doctest passes for the wrong reason as easily as the right one.
+
+## 16.9 The `send` refusal guarded one of the two paths that serve an actor
+
+§10.4 argues that a service declaring a `send` method must not be served as an
+actor. A `send` handler reads its upload **inside** the serial turn, so a peer
+that declares a large body and then stops writing holds that actor until iroh's
+connection idle timeout, with nothing else on it answered. No layer bounds it: a
+layer refuses the caller without ending the turn.
+
+The argument is right and the refusal was built — `ServableAsActor::<A>::CHECK`,
+a `const` assert with a paragraph of explanation in its message, deliberately an
+*associated* const rather than a plain one so that merely declaring `send` is
+still fine for a service served the concurrent way.
+
+That last property is exactly what limited it. **An associated const on a
+generic type is evaluated only where it is instantiated**, and there was one
+instantiation, inside `Handle::service`. So:
+
+    let actor = depot::actor(Store);
+    actor.service(allow)      // refused at compile time, as designed
+    depot::spawn(Store)       // compiled, silently
+
+and the second is not a lesser path. It mounts into a keyed
+[`System`](../keylink/src/actor/registry.rs), is served over the system ALPN,
+and reaches every admitted peer. `System::deliver` puts the `BodyReader` into
+the `Mail`, and the loop hands it to the turn — the same body, in the same
+serial turn, for the same unbounded time. §10.4's denial of service, on the path
+§10.4 does not mention.
+
+The `QueueTimeout` of §16.7 does not help, and it is worth saying why rather
+than hoping: that refusal fires for a message still **queued**, and this message
+has already started. A budget bounds how long a call waits for a turn. Nothing
+here bounds how long a turn holds the actor once the body is inside it.
+
+`spawn` now instantiates `CHECK` too, and a second `compile_fail` doctest pins
+it — the existing one covers `Handle::service` alone, which is how this survived.
+That doctest was itself checked to fail for `E0080`, evaluation of a constant
+value, rather than merely failing: a `compile_fail` block passes for a typo as
+readily as for the assert it is meant to prove.
+
+**This is a breaking change.** A service declaring a `send` method can no longer
+be `spawn`ed. Nothing in this repository did so, and keylink is unpublished, so
+the cost is a compile error at a call site that was already unsafe.
+
+### The count, and what it says
+
+This is the sixth thing the keyed path was found not doing that the local path
+does, and the three found since §16.6 are not in the loop's behaviour at all:
+
+- the wait for a mailbox permit is unbounded here (`ask_catching_before` bounds
+  it there);
+- a panicking turn is reported as a bare `Failed` here and a prefixed one there,
+  which re-opens the ambiguity the prefix was added to close;
+- and this one, the missing compile guard.
+
+§16.7 called the pattern a property of how the loop was written. That was too
+narrow. The loop, `System::deliver`, and the call site each acquired their own
+version of a decision the local path made once, and no mechanism makes an
+omission visible in any of them — six were found by reading the two paths side
+by side, which is not a technique that scales or that anybody runs on a
+schedule. What would make it structural is routing `spawn` through `LocalActor`
+so there is one turn loop rather than two. That is a larger change than any of
+the six, and it is the one worth costing.
+
+Not yet audited: `System::deliver`'s failure paths beyond §16.6's table, and the
+blobs path.
