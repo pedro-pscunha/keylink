@@ -45,6 +45,12 @@
 //! - **Content addressing.** A `blob` method hands back an address; iroh-blobs
 //!   moves the bytes, admitted only against a grant keylink recorded when it
 //!   returned that address to that peer. See [`Blobs`].
+//! - **Extension, at two boundaries and not one.** [`Middleware`] intercepts a
+//!   **message on the wire**; [`Observer`] watches a **turn against the state**.
+//!   One sentence decides which to reach for, and neither grows toward the
+//!   other — an observer never sees a request or a reply payload, and a layer
+//!   never sees the state. Durability is the first thing built on the second
+//!   one, outside this crate.
 
 #![warn(missing_docs)]
 
@@ -124,6 +130,7 @@ mod local;
 mod macros;
 mod middleware;
 mod node;
+mod observe;
 mod peer;
 mod reply;
 #[cfg(test)]
@@ -152,6 +159,7 @@ pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use local::{LocalActor, MailboxClosed, Queued};
 pub use middleware::{Caller, Context, Middleware, Next, QueueTimeout, Queueing, Rpc, Timeout};
 pub use node::{derive_alpn, schema_hash, Node};
+pub use observe::{Ended, Observer, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome};
 pub use peer::{Dial, Peer};
 pub use reply::{Outcome, RemoteError, WireRequest, WireResponse};
 pub use rpc::{Dispatch, RpcClient, Server, ServerBuilder, Service, ServiceBuilder};

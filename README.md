@@ -158,6 +158,34 @@ that declares a large body and then stops writing holds the actor until the
 connection idle timeout, answering nothing else meanwhile. Bulk transfer goes on
 a second service, registered beside the actor on the same node.
 
+**Watching a turn, from outside.** `Middleware` intercepts a message on the wire.
+An `Observer` watches a turn against the state — after the method, before the
+reply. It sees the state and how the turn went, and never a request or a reply
+payload; a layer sees the opposite. Neither grows toward the other.
+
+```rust
+let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+ledger.post(1).await?;             // the observer ran before this returned
+
+match ledger.ended().await {
+    Ended::Stopped              => {}
+    Ended::Observer { name, .. } => error!("{name} gave up; the turn was not committed"),
+    _ => {}
+}
+```
+
+Returning `Err` ends the actor, and `Handle::ended()` says which observer and
+why — `MailboxClosed` means "gone" and must not be stretched to mean "gave up on
+durability". A refused turn reaches a peer as `Failed("observer refused: ..")`
+rather than `NoSuchActor`, which would say "there is nothing here, stop asking"
+about a turn that ran.
+
+The actor owns its observers, so nothing is shared and no `Sync` bound appears
+anywhere. `after_turn` returns a boxed future rather than being an `async fn`,
+which is what lets an implementation finish with the state before it awaits — an
+implementation that holds it across an await needs `A: Sync`, and one that does
+not, does not. Keyed actors mounted through `System` get no observers.
+
 Many keyed instances behind one ALPN, addressed by an id inside the request, are
 `System` and `spawn`. That path costs more — an opaque payload, so no per-method
 layer, no idempotency ledger and no `blob` methods; see RFC-04 §14.8 — and is

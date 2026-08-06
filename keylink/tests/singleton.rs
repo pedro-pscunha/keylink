@@ -15,7 +15,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use keylink::{
-    Allowlist, Body, BodyReader, Caller, Context, Middleware, Next, Outcome, RemoteError, Server,
+    Allowlist, Body, BodyReader, Caller, Context, Middleware, Next, Observer, Outcome, RemoteError,
+    Server, Stop, TurnFut, TurnInfo, TurnOutcome,
 };
 
 mod common;
@@ -714,4 +715,238 @@ async fn a_queue_timeout_leaves_an_idempotency_key_claimable() {
     );
 
     server.shutdown().await.expect("stops");
+}
+
+// ─────────────────────────────────────── what a lost turn tells a remote peer
+
+/// The name the observer below answers to, and therefore the exact text a peer
+/// reads after `observer refused: `.
+///
+/// A constant so the test asserts the value that reached the wire rather than a
+/// second copy of a literal that could drift from it.
+const REFUSER: &str = "refuses-completed-turns";
+
+/// Refuses every turn that **completed**, and passes every turn that panicked.
+///
+/// Both halves are load-bearing. Passing the panicked turn is what leaves the
+/// actor alive for the second call: an observer that refused it would end the
+/// actor after the first message, and the refusal call would then come back
+/// `NoSuchActor` *legitimately* — which is precisely the answer the test is
+/// trying to prove does not happen, so the test would prove nothing.
+///
+/// The `Stop` reason never reaches the wire; only [`Observer::name`] does. That
+/// is why the name is the thing worth choosing, and the thing worth asserting.
+struct RefusesWhatCompleted;
+
+impl Observer<Ledger> for RefusesWhatCompleted {
+    fn name(&self) -> &'static str {
+        REFUSER
+    }
+
+    fn after_turn<'a>(&'a mut self, _state: &'a Ledger, turn: TurnInfo<'a>) -> TurnFut<'a> {
+        Box::pin(async move {
+            match turn.outcome {
+                TurnOutcome::Completed => Err(Stop::new("nothing was committed")),
+                TurnOutcome::Panicked { .. } => Ok(()),
+            }
+        })
+    }
+}
+
+/// The `Failed` reason a peer actually read.
+///
+/// A helper rather than a `matches!` guard, because the useful thing to say on
+/// failure is **which** answer arrived instead — `NoSuchActor` above all, which
+/// a bare `matches!` would report as a silent `false`.
+fn failed_reason(error: &keylink::Error) -> &str {
+    match error {
+        keylink::Error::Remote(RemoteError::Failed(reason)) => reason,
+        other => panic!("expected a RemoteError::Failed, got {other:?}"),
+    }
+}
+
+/// A turn refused by an observer reaches a remote caller as
+/// [`RemoteError::Failed`] carrying `observer refused: {name}`, and a turn that
+/// panicked reaches it as `Failed` carrying `panicked: {message}`. One test,
+/// both prefixes, because either one on its own proves nothing.
+///
+/// # Why the refusal must not be `NoSuchActor`
+///
+/// `NoSuchActor` means "there is nothing here, stop asking", and a peer that
+/// reads it is right to give up on the address. A refused turn is the opposite
+/// fact: the actor was there, the turn **ran**, and it was not committed. The
+/// actor is ending, but it ended *because of this message*, and answering with
+/// "no such actor" sends a peer away from an actor that had just answered it —
+/// and hides the reason it stopped, which `Handle::ended` names in full.
+///
+/// # Why both prefixes belong in one test
+///
+/// `RemoteError::Failed` carries a `String` and not a variant — a variant is
+/// inside the hashed contract and would move the ALPN — so the **string is the
+/// whole discriminator** and a peer has nothing else to match on. Prefixing
+/// only the refusal is therefore a guard that cannot fail: `Display for Panic`
+/// writes its message verbatim, and panic text is usually caller-derived
+/// (`panic!("{}", input)`), so a handler that panicked with the refusal's exact
+/// text would hand a peer a byte-identical `Failed` and no way to tell which of
+/// the two happened.
+///
+/// What keeps that from being reachable *today* is not the wire format at all:
+/// `Panic::caught` in `actor.rs` builds every message as
+/// `the actor panicked: {payload}`, so the panic side arrives already marked.
+/// That is a `pub(crate)` detail of another module, invisible from here and
+/// free to change — and if it did change, a test that pinned only the refusal
+/// would stay green while the two answers quietly became indistinguishable.
+/// Both prefixes are one property about a pair, so they are pinned together,
+/// here, by one test that fails when either side loses its own.
+#[tokio::test]
+async fn both_halves_of_a_lost_turn_carry_their_own_prefix() {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let actor = ledger::actor_with(Ledger::default(), vec![Box::new(RefusesWhatCompleted)]);
+    let server = Server::builder(&node)
+        .service(actor.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("serves");
+    let client = ledger::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+
+    // The panicking call first, and the order is not cosmetic: the observer
+    // passes a panicked turn, so the actor is still there to be refused below.
+    let panicked = client.boom().await.expect_err("the handler panicked");
+    let panicked_reason = failed_reason(&panicked).to_owned();
+    assert!(
+        panicked_reason.starts_with("panicked: "),
+        "a panic must reach a peer under its own prefix, or it cannot be told from a refusal; \
+         got {panicked_reason:?}"
+    );
+    assert!(
+        panicked_reason.contains("bad message"),
+        "and it must still carry what the handler panicked with, or the prefix is all a peer \
+         gets; got {panicked_reason:?}"
+    );
+
+    let refused = client
+        .post(1, 0)
+        .await
+        .expect_err("the observer refused the completed turn");
+    assert!(
+        !matches!(
+            refused,
+            keylink::Error::Remote(RemoteError::NoSuchActor { .. })
+        ),
+        "a refused turn must not be reported as NoSuchActor: the actor was there, the turn ran, \
+         and telling a peer to stop asking is a different fact; got {refused:?}"
+    );
+    // Exact, because every byte of this one is chosen here: the format string
+    // in the dispatch and `REFUSER`, with nothing in between.
+    assert_eq!(
+        failed_reason(&refused),
+        format!("observer refused: {REFUSER}"),
+        "a refusal must reach a peer under its own prefix, naming the observer that made it"
+    );
+    assert_ne!(
+        panicked_reason,
+        failed_reason(&refused),
+        "the two answers a peer can only tell apart by their text must not be the same text"
+    );
+
+    client.close().await.expect("closes");
+    server.shutdown().await.expect("stops");
+}
+
+// ───────────────────────────────────────── what `stop()` has done by the time
+// ───────────────────────────────────────── it returns
+
+/// Counts turns, and nothing else.
+///
+/// It exists so that the rounds below cannot pass vacuously. An actor with an
+/// **empty** observer list reaches the same teardown, so a version of that test
+/// which forgot to attach an observer — or attached one that never ran — would
+/// still be green while saying nothing about the observed path the teardown
+/// order was written for. The count is asserted every round.
+///
+/// The increment happens **before** the future is built, which is the shape
+/// `Observer::after_turn` is a plain `fn` to allow.
+struct CountsTurns {
+    turns: Arc<AtomicUsize>,
+}
+
+impl Observer<Ledger> for CountsTurns {
+    fn name(&self) -> &'static str {
+        "counts turns"
+    }
+
+    fn after_turn<'a>(&'a mut self, _state: &'a Ledger, _turn: TurnInfo<'a>) -> TurnFut<'a> {
+        self.turns.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// `stop()` returns only once the mailbox is closed — on an actor that **has
+/// observers**, which is the case the loop's teardown order was written for.
+///
+/// # What is being pinned
+///
+/// `is_running()` is `!mail.is_closed()`, and that flips only when the loop's
+/// **receiver** is dropped. The loop drops the observers, then the receiver,
+/// and only then fills the `ended` channel that `stop()` is awaiting. The
+/// receiver drop has to come before that send, because the caller the send
+/// wakes reads the mailbox flag as its very next act. Without the explicit
+/// `drop(inbox)` the receiver instead lives until the spawned async block
+/// itself ends — which is *after* the send — and whether a woken caller sees a
+/// closed mailbox becomes a scheduling accident rather than a property.
+///
+/// # Why a loop, when one assertion looks like enough
+///
+/// `a_handle_to_a_stopped_actor_reports_a_closed_mailbox` above and
+/// `local.rs`'s `stop_drains_what_was_sent_before_it` each assert
+/// `!is_running()` exactly once, and those are the two tests that broke. Their
+/// ordering is stated by no type and enforced by no signature, so a single
+/// assertion samples exactly one interleaving and can come back green on luck:
+/// the same code passed 25 runs out of 25 in one capture order and failed 25
+/// out of 25 in the other, and nothing in the source said which order you get.
+/// A regression has to survive every round here, not one.
+///
+/// It runs on a multi-threaded runtime for the same reason the loop exists. On
+/// the current-thread runtime every other test in this file uses, the waker for
+/// `stop()` cannot be polled until the actor's task has already completed and
+/// dropped everything it captured, so the ordering under test is *unobservable*
+/// there and this test would be green either way. Several workers let the woken
+/// caller run while the actor's task is still tearing down, which is the
+/// interleaving worth asserting against.
+///
+/// There is no sleep here and nothing is timed: the loop buys interleavings,
+/// not a wall-clock window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_returns_only_once_the_mailbox_is_closed() {
+    const ROUNDS: usize = 100;
+
+    for round in 0..ROUNDS {
+        let turns = Arc::new(AtomicUsize::new(0));
+        let actor = ledger::actor_with(
+            Ledger::default(),
+            vec![Box::new(CountsTurns {
+                turns: turns.clone(),
+            })],
+        );
+
+        // One real turn, so the observer is on the path being torn down rather
+        // than merely attached to it.
+        actor.post(1, 0).await.expect("running");
+        assert_eq!(
+            turns.load(Ordering::SeqCst),
+            1,
+            "round {round}: the observer did not run, so this round says nothing about the \
+             observed path"
+        );
+
+        actor.stop().await;
+
+        assert!(
+            !actor.is_running(),
+            "round {round}: stop() returned while the mailbox was still open, so a caller woken \
+             by it can still be told the actor is running"
+        );
+    }
 }

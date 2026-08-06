@@ -407,6 +407,17 @@ impl Panic {
         }
     }
 
+    /// What the handler panicked with.
+    ///
+    /// An accessor rather than [`Display`](fmt::Display), because `Display`
+    /// cannot lend a borrow and an [`Observer`](crate::Observer) must be handed
+    /// the message without taking the payload — the payload belongs to the
+    /// caller that will resume it.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
     /// Panic in the calling task, with the payload the handler panicked with.
     ///
     /// Does not run the panic hook a second time: the hook already ran where the

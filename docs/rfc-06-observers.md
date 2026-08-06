@@ -828,3 +828,91 @@ Two commits. Each one is provable alone.
    being true — rewrite it with the move rather than carrying it across.
 
 Step 1 is useful without step 2, for the reason §2.1 gives.
+
+---
+
+## 13. Revision 5 — rebased onto the correctness programme
+
+**Appended, not edited.** Nothing above this line has been altered.
+
+RFC-06 revisions 1–4 were written against `main` at `caf94e9`. This branch lands
+four waves on top of that commit — the idempotency programme, caller identity and
+actor safety, server push, and the admission port — and three of them touch the
+exact files §12's step 1 touches. Every line reference above is therefore stale,
+and three of the design's factual premises changed. None of the *design* changes;
+this section records the deltas so an implementer does not discover them one
+compile error at a time.
+
+### 13.1 `ask_catching` no longer has two callers
+
+§10 says: *"`ask_catching` has exactly two callers in the repo — `local.rs:202`
+and `macros.rs:672` — and none in `tests/`, `demo/` or the README."*
+
+The served path no longer calls it. Wave B added
+`LocalActor::ask_catching_before(deadline, turn)` for `QueueTimeout`, which
+refuses a message still queued and never one that has started, and the generated
+actor dispatch calls **that**. So the callers are now:
+
+| caller | which |
+|---|---|
+| `LocalActor::ask` | `ask_catching` |
+| generated actor dispatch in `macros.rs` | `ask_catching_before` |
+
+Both error types move to `TurnLost`. §2.7's mapping applies to
+`ask_catching_before`, not to `ask_catching`, and `ask` still maps everything to
+`MailboxClosed` exactly as §2.7 says.
+
+### 13.2 How a refusal actually reaches the caller
+
+§2.6's table says row 3 answers `MailboxClosed`, and §2.7 says a refused turn
+reaches a *peer* as `Failed` naming the observer. Those two are only consistent
+if the name survives the trip, and dropping the reply sender loses it — a dropped
+sender is indistinguishable from an aborted actor, which is `TurnLost::Gone`.
+
+So the loop **sends** the refusal rather than withholding the channel. The reply
+payload becomes one enum:
+
+```rust
+/// What the loop puts on the reply channel.
+enum Answered<T> {
+    /// The turn ran. `Err` is a panic the actor survived.
+    Ran(Result<T, Panic>),
+    /// A queueing budget expired while the message waited. Nothing ran.
+    Expired,
+    /// An observer refused a completed turn. It ran and was not committed.
+    Refused { name: &'static str },
+}
+```
+
+`Queued<T>` keeps answering *did it run*; `TurnLost` answers *why there is no
+value*. A dropped sender stays `Gone`. Row 3 of §2.6 is unchanged from the
+caller's side: `ask` maps `TurnLost::Refused` to `MailboxClosed`.
+
+### 13.3 A refused turn settles an idempotency key as the refusal
+
+Wave A made the served path settle a key on **what ran**, using a progress marker
+that generated dispatch sets inside the turn. An observer refusal arrives after
+`completed()` has been marked, so the key settles as the `Failed` answer and a
+retry replays `observer refused: {name}` rather than running the work again.
+
+That is the right answer and it is worth stating, because §2.6 calls row 3's cost
+"the same ambiguity `client.with_idempotency` exists for". On this branch the
+ambiguity is *resolved* for a keyed call: the turn ran, at-most-once holds, and
+the caller is told the same thing every time. For an unkeyed call the cost is
+exactly as §2.6 describes.
+
+### 13.4 Names checked against four waves of new surface
+
+The waves added `Caller`, `QueueTimeout`, `Queueing`, `Queued`, `Idempotency`,
+`KeyState`, `WireRequest`, `Subscribers`, `Admission`, `Admittance`, `Revocable`
+and `Revocation`. None collides with §10's fourteen. `Queued` and `TurnLost` sit
+beside each other in one rustdoc index and mean different things, which §13.2
+names rather than leaves to a reader.
+
+### 13.5 What did not change
+
+`Handle::with_state` is untouched by the waves, so §5.2's routing at
+`LocalActor::read` is as written. `Caller<'_>` as the first argument of every
+generated actor method is invisible to an observer, which sees the state and the
+outcome and never the request. §5.3's exclusion of the keyed `System` path is
+unaffected: `macros.rs`'s `spawn()` still runs its own loop over `__actor_turn`.

@@ -29,6 +29,13 @@
 //! only for [`notify`](LocalActor::notify) — return `Ok` for a message that is
 //! then dropped unrun, because `Ok` there means "queued" and nothing else.
 //!
+//! It is also why [`ended`](LocalActor::ended) exists rather than a second error
+//! variant. An [`Observer`](crate::Observer) that refuses a turn ends the actor,
+//! and the caller of that turn is told [`MailboxClosed`] like any other — which
+//! is true, and which does not say *why*. `MailboxClosed` means "gone" and must
+//! not be stretched to mean "gave up on durability", so the second question is
+//! asked separately and answered by [`Ended`](crate::Ended).
+//!
 //! The method names and success types match the remote client for `rpc` and
 //! `tell`. They do not for the other three: `blob` hands back a
 //! [`BlobId`](crate::BlobId) where the client hands back a
@@ -68,6 +75,7 @@
 //!
 //! [`Handle`]: crate::LocalActor
 
+use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -75,9 +83,9 @@ use std::sync::Arc;
 
 use n0_future::task::JoinHandle;
 use n0_future::time::Instant;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::{guarded, Panic};
+use crate::{guarded, Ended, Observer, Panic, TurnInfo, TurnLost, TurnOutcome};
 
 /// Messages that may wait ahead of the one being handled.
 ///
@@ -114,8 +122,108 @@ const MAILBOX: usize = 1;
 /// failure that cannot happen), no unreachable arm for a method kind the local
 /// handle does not serve, and no `Box<dyn Any>` downcast. The generated method
 /// captures its own arguments and its own reply channel, both concretely typed.
-type Turn<A> =
-    Box<dyn for<'a> FnOnce(&'a mut A) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send>;
+/// The second parameter is the actor's observers, lent for the length of one
+/// turn. The alias is private, and `deliver` only wraps the closure, so nothing
+/// public moved with it.
+type Turn<A> = Box<
+    dyn for<'a> FnOnce(
+            &'a mut A,
+            &'a mut [Box<dyn Observer<A>>],
+        ) -> Pin<Box<dyn Future<Output = Option<Ended>> + Send + 'a>>
+        + Send,
+>;
+
+/// What the loop puts on the reply channel.
+///
+/// Three states rather than two, because "the budget expired while it queued"
+/// and "an observer refused the turn that ran" are opposite facts and a caller
+/// that has to unwrap two layers to tell them apart will get it wrong. A
+/// **dropped** sender is the fourth case and stays `TurnLost::Gone`.
+enum Answered<T> {
+    /// The turn ran. `Err` is a panic the actor survived.
+    Ran(Result<T, Panic>),
+    /// A queueing budget expired while the message waited. Nothing ran.
+    Expired,
+    /// An observer refused a completed turn. It ran and was not committed.
+    Refused {
+        /// [`Observer::name`].
+        name: &'static str,
+    },
+}
+
+/// One turn, its observers, and who is answered — RFC-06 §2.6 in one place, so
+/// the two catching paths cannot drift apart.
+///
+/// The observer chain runs **inside** the same [`guarded`] as the handler.
+/// Outside it, an observer that panicked would unwind out of a detached task and
+/// be swallowed, which is the property this module's header states about every
+/// path library code controls.
+async fn observed_turn<A, T, F>(
+    state: &mut A,
+    hooks: &mut [Box<dyn Observer<A>>],
+    turn: F,
+) -> (Answered<T>, Option<Ended>)
+where
+    A: 'static,
+    // `Send` on `T` and not on `A`. The handler's value is held across the
+    // observer awaits, so it has to cross them; the STATE is only ever borrowed
+    // by an observer's own future, and whether that future holds it across an
+    // await is the observer's choice. That is what keeps `A: Sync` out of this
+    // design — see `Observer::after_turn`.
+    T: Send + 'static,
+    F: for<'b> FnOnce(&'b mut A) -> Pin<Box<dyn Future<Output = T> + Send + 'b>> + Send + 'static,
+{
+    let answer = guarded(async { turn(state).await }).await;
+
+    // Copied out BEFORE `reply.send(answer)` moves the `Panic`. Building the
+    // reason afterwards is `E0382`, not a style preference.
+    let panicked: Option<String> = match &answer {
+        Err(panic) => Some(panic.message().to_owned()),
+        Ok(_) => None,
+    };
+    let info = TurnInfo {
+        outcome: match &panicked {
+            Some(message) => TurnOutcome::Panicked { message },
+            None => TurnOutcome::Completed,
+        },
+    };
+
+    let mut refused: Option<(&'static str, Arc<dyn Error + Send + Sync>)> = None;
+    for observer in hooks.iter_mut() {
+        let name = observer.name();
+        match guarded(observer.after_turn(&*state, info)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(stop)) => {
+                refused = Some((name, Arc::from(stop.into_reason())));
+                break;
+            }
+            // `Panic` implements `Display` and not `Error`, and is not `Sync`,
+            // so it cannot fill an `Arc<dyn Error + Send + Sync>` directly.
+            // `to_string()` is what `RemoteError::Failed` already does with one.
+            Err(panic) => {
+                let reason: Box<dyn Error + Send + Sync> = panic.to_string().into();
+                refused = Some((name, Arc::from(reason)));
+                break;
+            }
+        }
+    }
+
+    match (refused, panicked) {
+        // Completed and accepted: the value.
+        (None, _) => (Answered::Ran(answer), None),
+        // Panicked and refused: the panic is STILL answered, and then the actor
+        // ends. `Err(Panic)` is not `Ok`, so the argument for withholding a
+        // reply never applied to it — and withholding here would reverse what
+        // this module's header promises about a panicking call.
+        (Some(_), Some(message)) => (Answered::Ran(answer), Some(Ended::Panicked { message })),
+        // Completed and refused: the turn ran and was not committed, so the
+        // caller is told it has no answer rather than given an uncommitted one.
+        (Some((name, error)), None) => (
+            Answered::Refused { name },
+            Some(Ended::Observer { name, error }),
+        ),
+    }
+}
 
 /// A turn, or the request to stop after the turns already queued.
 enum Message<A> {
@@ -156,6 +264,12 @@ pub enum Queued<T> {
 /// last handle is dropped or [`Self::stop`] is called.
 pub struct LocalActor<A> {
     mail: mpsc::Sender<Message<A>>,
+    /// Why the actor ended, once it has. `Option`, starting at `None`, because
+    /// a channel initialised with a reason reports that reason for a live
+    /// actor. A receiver and never a sender, so awaiting it cannot keep the
+    /// actor alive — which is exactly what an earlier design built on
+    /// `mail.closed()` did, making "the last handle was dropped" unreachable.
+    ended: watch::Receiver<Option<Ended>>,
     /// Held so a wedged actor can still be [aborted](Self::abort). Dropping a
     /// `JoinHandle` detaches the task on both targets — it does not cancel it —
     /// so this is the only handle on a turn that never returns.
@@ -174,18 +288,68 @@ impl<A: Send + 'static> LocalActor<A> {
     /// synchronous code, enter one first with
     /// [`blocking::Node::enter`](crate::blocking::Node::enter).
     #[must_use]
-    pub fn spawn(mut state: A) -> Self {
+    pub fn spawn(state: A) -> Self {
+        Self::spawn_observed(state, Vec::new())
+    }
+
+    /// Start an actor whose turns are watched.
+    ///
+    /// Named `spawn_observed` and **not** `spawn_with`, because
+    /// [`SystemBuilder::spawn_with`](crate::SystemBuilder::spawn_with) already
+    /// exists and means something else — a factory for keyed actors. Two
+    /// meanings on one name in one crate is a reading hazard that costs nothing
+    /// to avoid now and cannot be fixed after 1.0.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a tokio runtime, like every other spawn.
+    #[must_use]
+    pub fn spawn_observed(mut state: A, mut hooks: Vec<Box<dyn Observer<A>>>) -> Self {
         let (mail, mut inbox) = mpsc::channel::<Message<A>>(MAILBOX);
+        let (ended, watching) = watch::channel::<Option<Ended>>(None);
         let task = n0_future::task::spawn(async move {
+            let mut reason = Ended::Stopped;
             while let Some(message) = inbox.recv().await {
                 match message {
-                    Message::Turn(turn) => turn(&mut state).await,
+                    Message::Turn(turn) => {
+                        if let Some(end) = turn(&mut state, &mut hooks).await {
+                            reason = end;
+                            break;
+                        }
+                    }
                     Message::Stop => break,
                 }
             }
+            // These three, in this order, and the order IS the fix.
+            //
+            // `drop(hooks)` releases whatever an observer holds — a file claim,
+            // for the first adapter — BEFORE anybody is told the actor ended,
+            // so `stop().await` returning means the claim is free.
+            //
+            // `drop(inbox)` closes the mailbox before the same moment.
+            // `is_running()` is `!mail.is_closed()`, which is false only once
+            // the RECEIVER drops; without this explicit drop the receiver lives
+            // until the async block ends, so `stop()` could return with
+            // `is_running()` still true — and `stop_drains_what_was_sent_before_it`
+            // asserts the opposite immediately after `stop().await`.
+            //
+            // **Not currently reproducible, and said so rather than claimed.**
+            // RFC-06 §2.4 reports one teardown order failing 25 of 25 and the
+            // other passing 25 of 25. Removing this line and running the guard
+            // 25 times on this tree failed 0 of 25: the block ends, dropping
+            // `inbox`, before the woken `stop()` waiter is polled. So the line
+            // is ordering insurance whose absence no test here catches. It
+            // stays because which order you get depends on the async block's
+            // capture order and nothing pins that — but it is listed among the
+            // guards that were NOT watched to fail, because a guard nobody has
+            // seen fail is not a guard.
+            drop(hooks);
+            drop(inbox);
+            let _ = ended.send(Some(reason));
         });
         Self {
             mail,
+            ended: watching,
             task: Arc::new(task),
         }
     }
@@ -215,9 +379,79 @@ impl<A: Send + 'static> LocalActor<A> {
             + Send
             + 'static,
     {
-        match self.ask_catching(turn).await? {
+        // Both losses collapse to `MailboxClosed` here, on purpose: a local
+        // caller learns WHY from [`ended`](Self::ended), and widening this
+        // error would make every existing call site match on a case it has
+        // nothing to do about.
+        match self.ask_catching(turn).await.map_err(|_| MailboxClosed)? {
             Ok(value) => Ok(value),
             Err(panic) => panic.resume(),
+        }
+    }
+
+    /// Read the state between turns, running **no** observers.
+    ///
+    /// [`Handle::with_state`] is this. A read takes `&A` and cannot mutate, so
+    /// storing after it is waste — and it also closes a loop a future background
+    /// writer would otherwise create, where a writer that read the state through
+    /// a turn would mark the actor dirty and schedule another read, forever.
+    ///
+    /// The message type does not change; only the closure does.
+    ///
+    /// # Errors
+    ///
+    /// [`MailboxClosed`] when the actor is gone.
+    ///
+    /// [`Handle::with_state`]: crate::LocalActor
+    pub async fn read<T, F>(&self, read: F) -> Result<T, MailboxClosed>
+    where
+        T: Send + 'static,
+        F: FnOnce(&A) -> T + Send + 'static,
+    {
+        let (reply, answer) = oneshot::channel();
+        self.deliver(Box::new(move |state, _hooks| {
+            Box::pin(async move {
+                // Caught synchronously rather than through `guarded`, and that
+                // is not a shortcut: `guarded` takes a future, an async block
+                // holding `&A` is `Send` only when `A: Sync`, and requiring
+                // `A: Sync` here would put it on every actor in the crate for a
+                // closure that cannot await in the first place.
+                let caught =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&*state)))
+                        .map_err(Panic::caught);
+                let _ = reply.send(caught);
+                None
+            })
+        }))
+        .await?;
+        match answer.await.map_err(|_| MailboxClosed)? {
+            Ok(value) => Ok(value),
+            Err(panic) => panic.resume(),
+        }
+    }
+
+    /// Resolve when this actor ends, and say why.
+    ///
+    /// Holds a watch receiver and no mailbox sender, so awaiting it does not
+    /// keep the actor alive — dropping every handle both ends the actor and
+    /// resolves this.
+    ///
+    /// Public because generated code reaches `LocalActor` only through public
+    /// methods, so `Handle::ended` cannot delegate to a private one.
+    ///
+    /// A turn that never reaches an await point is not interrupted by
+    /// [`abort`](Self::abort), so this waits. That is today's behaviour and not
+    /// a regression.
+    pub fn ended(&self) -> impl Future<Output = Ended> + Send + 'static {
+        let mut watching = self.ended.clone();
+        async move {
+            // `wait_for` and not `changed()`: a fresh receiver marks the current
+            // value as seen, so `changed()` would wait forever on a second call.
+            // A dropped sender is an aborted task, which never filled the value.
+            match watching.wait_for(Option::is_some).await {
+                Ok(seen) => seen.clone().unwrap_or(Ended::Vanished),
+                Err(_) => Ended::Vanished,
+            }
         }
     }
 
@@ -232,7 +466,7 @@ impl<A: Send + 'static> LocalActor<A> {
     ///
     /// [`MailboxClosed`] when the actor is gone. A panic is the inner `Err`, not
     /// this one: the actor survived it and is still running.
-    pub async fn ask_catching<T, F>(&self, turn: F) -> Result<Result<T, Panic>, MailboxClosed>
+    pub async fn ask_catching<T, F>(&self, turn: F) -> Result<Result<T, Panic>, TurnLost>
     where
         T: Send + 'static,
         F: for<'a> FnOnce(&'a mut A) -> Pin<Box<dyn Future<Output = T> + Send + 'a>>
@@ -240,20 +474,30 @@ impl<A: Send + 'static> LocalActor<A> {
             + 'static,
     {
         let (reply, answer) = oneshot::channel();
-        self.deliver(Box::new(move |state| {
+        self.deliver(Box::new(move |state, hooks| {
             Box::pin(async move {
                 // `turn(state)` is inside the guard as well as the future it
                 // returns, so a closure that panics before it yields one costs
-                // the message rather than the actor.
-                let _ = reply.send(guarded(async move { turn(state).await }).await);
+                // the message rather than the actor. The observers are inside
+                // the same guard; `observed_turn` owns both halves.
+                let (answered, end) = observed_turn(state, hooks, turn).await;
+                let _ = reply.send(answered);
+                end
             })
         }))
-        .await?;
+        .await
+        .map_err(|_| TurnLost::Gone)?;
         // The sender is dropped without sending when the task died mid-turn:
         // `abort`, a runtime shutdown, or a panicking `Drop` in the state. All
         // three mean the same thing to a caller, which is why they share an
-        // error rather than being told apart.
-        answer.await.map_err(|_| MailboxClosed)
+        // answer rather than being told apart.
+        match answer.await {
+            Err(_) => Err(TurnLost::Gone),
+            Ok(Answered::Ran(value)) => Ok(value),
+            Ok(Answered::Refused { name }) => Err(TurnLost::Refused { name }),
+            // Unreachable without a deadline, and typed rather than asserted.
+            Ok(Answered::Expired) => Err(TurnLost::Gone),
+        }
     }
 
     /// Run one turn, refusing it if it is still queued when `deadline` passes.
@@ -283,7 +527,7 @@ impl<A: Send + 'static> LocalActor<A> {
         &self,
         deadline: Option<Instant>,
         turn: F,
-    ) -> Result<Queued<T>, MailboxClosed>
+    ) -> Result<Queued<T>, TurnLost>
     where
         T: Send + 'static,
         F: for<'a> FnOnce(&'a mut A) -> Pin<Box<dyn Future<Output = T> + Send + 'a>>
@@ -297,16 +541,18 @@ impl<A: Send + 'static> LocalActor<A> {
         let (reply, answer) = oneshot::channel();
         let queued = n0_future::time::timeout(
             deadline.saturating_duration_since(Instant::now()),
-            self.deliver(Box::new(move |state| {
+            self.deliver(Box::new(move |state, hooks| {
                 Box::pin(async move {
                     // On the ACTOR's task. Nothing has touched the state yet,
                     // so refusing here costs the message and not a half-applied
-                    // mutation.
+                    // mutation — and it runs no observers, because nothing ran.
                     if Instant::now() >= deadline {
-                        let _ = reply.send(None);
-                        return;
+                        let _ = reply.send(Answered::Expired);
+                        return None;
                     }
-                    let _ = reply.send(Some(guarded(async move { turn(state).await }).await));
+                    let (answered, end) = observed_turn(state, hooks, turn).await;
+                    let _ = reply.send(answered);
+                    end
                 })
             })),
         )
@@ -317,11 +563,12 @@ impl<A: Send + 'static> LocalActor<A> {
             // makes this honest: tokio does not queue a message whose send was
             // cancelled, so nothing is in the mailbox to run later.
             Err(_elapsed) => Ok(Queued::Expired),
-            Ok(Err(closed)) => Err(closed),
+            Ok(Err(_closed)) => Err(TurnLost::Gone),
             Ok(Ok(())) => match answer.await {
-                Err(_) => Err(MailboxClosed),
-                Ok(None) => Ok(Queued::Expired),
-                Ok(Some(ran)) => Ok(Queued::Ran(ran)),
+                Err(_) => Err(TurnLost::Gone),
+                Ok(Answered::Expired) => Ok(Queued::Expired),
+                Ok(Answered::Ran(ran)) => Ok(Queued::Ran(ran)),
+                Ok(Answered::Refused { name }) => Err(TurnLost::Refused { name }),
             },
         }
     }
@@ -342,14 +589,23 @@ impl<A: Send + 'static> LocalActor<A> {
     /// [`MailboxClosed`] when the actor is gone.
     pub async fn notify<T, F>(&self, turn: F) -> Result<(), MailboxClosed>
     where
-        T: 'static,
+        // `Send` was not required before observers existed. A `tell` is a turn,
+        // so it is observed like one, and the handler's value is held across
+        // the observer awaits. Free in practice: a declared return type is a
+        // wire type, which is already `Send`.
+        T: Send + 'static,
         F: for<'a> FnOnce(&'a mut A) -> Pin<Box<dyn Future<Output = T> + Send + 'a>>
             + Send
             + 'static,
     {
-        self.deliver(Box::new(move |state| {
+        self.deliver(Box::new(move |state, hooks| {
             Box::pin(async move {
-                let _ = guarded(async move { turn(state).await }).await;
+                // A `tell` is a turn, so it is observed like one. Nobody is
+                // waiting, so the answer is dropped and only the ending — if an
+                // observer refused — travels back to the loop.
+                let (answered, end) = observed_turn::<A, T, F>(state, hooks, turn).await;
+                drop(answered);
+                end
             })
         }))
         .await
@@ -378,9 +634,17 @@ impl<A> LocalActor<A> {
     /// what [`Self::abort`] is for — with the caveat on that method.
     pub async fn stop(&self) {
         let _ = self.mail.send(Message::Stop).await;
-        // Resolves when the loop drops the receiver, which it does on the way
-        // out of the `Stop` arm. Immediate if the actor had already stopped.
-        self.mail.closed().await;
+        // The END channel, not `mail.closed()`. The loop fills it after it has
+        // dropped the observers and the mailbox, so returning from here means
+        // whatever an observer held — a file claim, for the first adapter — is
+        // already released. `mail.closed()` promised neither.
+        //
+        // `wait_for` and not `changed()`, because a fresh receiver marks the
+        // current value as seen and `changed()` would then wait forever on a
+        // second call — and this is documented as idempotent. A dropped sender
+        // is an aborted task, which is ended too, so the error is ignored.
+        let mut watching = self.ended.clone();
+        let _ = watching.wait_for(Option::is_some).await;
     }
 
     /// Cancel the actor where it stands.
@@ -424,6 +688,7 @@ impl<A> Clone for LocalActor<A> {
     fn clone(&self) -> Self {
         Self {
             mail: self.mail.clone(),
+            ended: self.ended.clone(),
             task: self.task.clone(),
         }
     }

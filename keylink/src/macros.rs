@@ -477,6 +477,16 @@ macro_rules! service {
             /// is caught and reported as a refusal, and the next message runs
             /// against the state as it stands.
             ///
+            /// # No observers on this path
+            ///
+            /// A keyed actor gets **no** [`Observer`](keylink::Observer)s. This
+            /// runs its own loop over `__actor_turn` and never touches
+            /// `LocalActor`, which is where the observer chain lives. So an
+            /// actor mounted here and expecting durability would get no
+            /// durability, no compile error and no explanation — hence this
+            /// paragraph. Use [`actor_with`] for one actor that must be
+            /// observed. RFC-06 §5.3.
+            ///
             /// # Panics
             ///
             /// Panics when called outside a tokio runtime.
@@ -551,7 +561,34 @@ macro_rules! service {
             /// [`blocking::Node::enter`](keylink::blocking::Node::enter).
             #[must_use]
             pub fn actor<A: Actor>(state: A) -> Handle<A> {
-                Handle { inner: $crate::LocalActor::spawn(state) }
+                actor_with(state, ::std::vec::Vec::new())
+            }
+
+            /// Start one actor of this service with observers watching its
+            /// turns.
+            ///
+            /// An [`Observer`](keylink::Observer) is called inside each turn,
+            /// after the method and **before the reply**, and it sees the state
+            /// and the outcome — never a request or a reply payload, which is
+            /// [`Middleware`](keylink::Middleware)'s half. Returning `Err` ends
+            /// the actor, and [`Handle::ended`] says which observer and why.
+            ///
+            /// ```ignore
+            /// let (state, saver) = keylink_durable::open(&store, id, Ledger::default).await?;
+            /// let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+            /// ledger.post(1).await?;   // stored before this returns
+            /// ```
+            ///
+            /// # Panics
+            ///
+            /// Panics when called outside a tokio runtime, like every other
+            /// spawn.
+            #[must_use]
+            pub fn actor_with<A: Actor>(
+                state: A,
+                observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
+            ) -> Handle<A> {
+                Handle { inner: $crate::LocalActor::spawn_observed(state, observers) }
             }
 
             /// A handle to an actor in this process.
@@ -791,13 +828,21 @@ macro_rules! service {
                                     )) => ($crate::Outcome::Ok(__response), __body),
                                     // A panic must not unwind out of a
                                     // connection's task, so the remote caller is
-                                    // told what the keyed system tells it, in
-                                    // the same words. The actor is still alive.
+                                    // told what the keyed system tells it. The
+                                    // actor is still alive.
+                                    //
+                                    // BOTH sides of `Failed` carry a prefix, and
+                                    // prefixing only the refusal below would be a
+                                    // guard that cannot fail: `Display for Panic`
+                                    // writes the bare message, panic text is
+                                    // often caller-derived, and a handler that
+                                    // panicked with a refusal's exact text would
+                                    // produce a byte-identical `Failed`.
                                     ::std::result::Result::Ok($crate::Queued::Ran(
                                         ::std::result::Result::Err(__panic),
                                     )) => (
                                         $crate::Outcome::Err($crate::RemoteError::Failed(
-                                            __panic.to_string(),
+                                            ::std::format!("panicked: {}", __panic),
                                         )),
                                         $crate::Body::empty(),
                                     ),
@@ -817,6 +862,29 @@ macro_rules! service {
                                         }),
                                         $crate::Body::empty(),
                                     ),
+                                    // An observer refused THIS TURN. Not
+                                    // `NoSuchActor`, which says "there is
+                                    // nothing here, stop asking" — the turn ran
+                                    // and was not committed, and the actor is
+                                    // ending for a reason the peer should be
+                                    // able to read.
+                                    //
+                                    // A `String` payload and NOT a new
+                                    // `RemoteError` variant: a variant is inside
+                                    // the hashed contract, so it would move the
+                                    // ALPN and the pinned literal in
+                                    // `tests/protocol.rs`. The cost is that a
+                                    // peer must match on the string to tell a
+                                    // refusal from a panic, which is why both
+                                    // carry a prefix.
+                                    ::std::result::Result::Err(
+                                        $crate::TurnLost::Refused { name: __name },
+                                    ) => (
+                                        $crate::Outcome::Err($crate::RemoteError::Failed(
+                                            ::std::format!("observer refused: {}", __name),
+                                        )),
+                                        $crate::Body::empty(),
+                                    ),
                                     // NOT `Failed`, which is what a panic is.
                                     // A peer must be able to tell "your message
                                     // exploded, try another" from "there is
@@ -826,7 +894,7 @@ macro_rules! service {
                                     // long as the server runs. The id is the
                                     // service name because a singleton has no
                                     // other one.
-                                    ::std::result::Result::Err(_gone) => (
+                                    ::std::result::Result::Err($crate::TurnLost::Gone) => (
                                         $crate::Outcome::Err(
                                             $crate::RemoteError::NoSuchActor {
                                                 id: stringify!($svc).to_owned(),
@@ -910,11 +978,13 @@ macro_rules! service {
                     T: ::core::marker::Send + 'static,
                     F: ::core::ops::FnOnce(&A) -> T + ::core::marker::Send + 'static,
                 {
-                    self.inner
-                        .ask(move |__state: &mut A| ::std::boxed::Box::pin(async move {
-                            read(__state)
-                        }))
-                        .await
+                    // A READ, not a turn: it takes `&A`, cannot mutate, and
+                    // therefore runs no observers. Storing after it would be
+                    // waste, and it also closes a loop a future background
+                    // writer would create — a writer that read through a turn
+                    // would mark the actor dirty and schedule another read,
+                    // forever.
+                    self.inner.read(read).await
                 }
 
                 /// Stop after the messages already queued, then wait for the
@@ -944,6 +1014,23 @@ macro_rules! service {
                 #[must_use]
                 pub fn is_running(&self) -> bool {
                     self.inner.is_running()
+                }
+
+                /// Resolve when this actor ends, and say why.
+                ///
+                /// [`MailboxClosed`](keylink::MailboxClosed) says "gone", and it
+                /// must not be stretched to say "gave up on durability". This is
+                /// the second question, asked separately — and it is the only
+                /// way to learn that an [`Observer`](keylink::Observer) refused
+                /// a turn, because a local call is told `MailboxClosed` either
+                /// way.
+                ///
+                /// Holds no mailbox sender, so awaiting it does not keep the
+                /// actor alive: dropping every handle both ends the actor and
+                /// resolves this.
+                pub fn ended(&self) -> impl ::core::future::Future<Output = $crate::Ended>
+                    + ::core::marker::Send + 'static {
+                    self.inner.ended()
                 }
 
                 $(
