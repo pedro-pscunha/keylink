@@ -38,12 +38,13 @@ use postcard_schema::Schema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::Instant;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::{
-    derive_alpn, schema_hash, ActorId, Allowlist, Body, BodyReader, Context, Dispatch, EndpointAddr,
-    Envelope, Node, Outcome, RemoteError, Result, Rpc, RpcClient, ServiceBuilder, WireResponse,
+    derive_alpn, schema_hash, ActorId, Allowlist, Body, BodyReader, Context, Dispatch,
+    EndpointAddr, Envelope, Node, Outcome, RemoteError, Result, Rpc, RpcClient, ServiceBuilder,
+    WireResponse,
 };
 
 /// The protocol name every actor system answers on.
@@ -82,7 +83,7 @@ struct Contract {
 /// Before changing this, read RFC-04 section 6. If the transport ever stops
 /// bounding in-flight calls, this whole argument dies and a real policy is
 /// needed.
-pub const MAILBOX: usize = 1;
+const MAILBOX: usize = 1;
 
 // ─────────────────────────────────────────────────────────────── the envelope
 
@@ -427,8 +428,10 @@ pub enum Eviction {
     Never,
 }
 
-/// Builds an actor's state on first message. See [`SystemBuilder::spawn_with`].
-pub type Factory = Arc<dyn Fn(&ActorId) -> Option<Mounted> + Send + Sync>;
+/// Builds an actor's state on first message. See [`SystemBuilder::spawn_with`],
+/// which takes the closure directly — this alias is how the system stores it,
+/// not something a caller ever names.
+pub(crate) type Factory = Arc<dyn Fn(&ActorId) -> Option<Mounted> + Send + Sync>;
 
 /// Why an actor could not be mounted.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -547,8 +550,9 @@ impl Registry {
         };
         let budget = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
         let now = self.now();
-        self.write()
-            .retain(|_, entry| now.saturating_sub(entry.last_seen.load(Ordering::Relaxed)) < budget);
+        self.write().retain(|_, entry| {
+            now.saturating_sub(entry.last_seen.load(Ordering::Relaxed)) < budget
+        });
     }
 }
 
@@ -738,9 +742,7 @@ impl System {
         .await
         .map_err(|_| no_such_actor(&actor))?;
 
-        answer
-            .await
-            .map_err(|_| no_such_actor(&actor))
+        answer.await.map_err(|_| no_such_actor(&actor))
     }
 }
 
@@ -986,7 +988,8 @@ mod tests {
     /// the same permissiveness the hash exists to stand in front of.
     #[test]
     fn open_reports_undecodable_bytes_as_a_refusal() {
-        let request = ActorRequest::new(ActorId::new("x").expect("valid"), 7, &()).expect("encodes");
+        let request =
+            ActorRequest::new(ActorId::new("x").expect("valid"), 7, &()).expect("encodes");
         let error = request
             .seal()
             .1
@@ -1014,8 +1017,8 @@ mod tests {
     /// fields back to back, so this pins the bytes a peer must produce.
     #[test]
     fn the_envelope_is_three_fields_in_this_order() {
-        let request = ActorRequest::new(ActorId::new("ab").expect("valid"), 7, &9u8)
-            .expect("encodes");
+        let request =
+            ActorRequest::new(ActorId::new("ab").expect("valid"), 7, &9u8).expect("encodes");
         let encoded = postcard::to_stdvec(&request).expect("encodes");
 
         let mut expected = postcard::to_stdvec(&"ab".to_string()).expect("encodes");

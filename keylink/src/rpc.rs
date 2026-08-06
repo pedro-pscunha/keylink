@@ -36,10 +36,10 @@ use iroh::{
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::task::JoinSet;
 
-use crate::wire::FrameReader;
 use crate::error::ConfigError;
 use crate::idempotency::{Claim, Ledger};
 use crate::middleware::wrap;
+use crate::wire::FrameReader;
 use crate::{
     wire, Allowlist, Body, BodyReader, Context, Error, IdempotencyKey, IdempotencyRefusal,
     Middleware, Next, Node, Outcome, RemoteError, Result, Rpc, WireResponse,
@@ -63,7 +63,7 @@ pub type Dispatch<Req, Resp> =
 
 /// Serves one protocol: authorizes the peer once per connection, then answers
 /// every stream that connection opens, concurrently.
-pub struct RpcService<Req, Resp> {
+pub(crate) struct RpcService<Req, Resp> {
     next: Next<Req, Resp>,
     allow: Arc<Allowlist>,
     /// Every recorded reply for THIS service. One per service rather than one
@@ -89,27 +89,6 @@ impl<Req, Resp> std::fmt::Debug for RpcService<Req, Resp> {
         f.debug_struct("RpcService")
             .field("allow", &self.allow)
             .finish_non_exhaustive()
-    }
-}
-
-impl<Req, Resp> RpcService<Req, Resp>
-where
-    Req: DeserializeOwned + Send + 'static,
-    Resp: Serialize + Send + 'static,
-{
-    /// Build a service from an allowlist and an erased async handler, with no
-    /// layers around it. Use [`ServiceBuilder`] to add layers.
-    pub fn new(allow: Allowlist, dispatch: Dispatch<Req, Resp>) -> Self
-    where
-        Req: 'static,
-        Resp: 'static,
-    {
-        Self {
-            next: dispatch,
-            allow: Arc::new(allow),
-            ledger: Ledger::new(),
-            _p: PhantomData,
-        }
     }
 }
 
@@ -273,20 +252,6 @@ where
         // stream. Aborting them is the honest end, not a lost result.
         calls.shutdown().await;
         Ok(())
-    }
-}
-
-impl<Req, Resp> RpcService<Req, Resp>
-where
-    Req: Rpc + DeserializeOwned + Send + Sync + 'static,
-    Resp: Serialize + Send + Sync + 'static,
-{
-    /// Erase the schema so services with unrelated types can share one node.
-    pub fn into_service(self, alpn: &'static [u8]) -> Service {
-        Service {
-            alpn,
-            handler: Box::new(self),
-        }
     }
 }
 
@@ -515,21 +480,6 @@ impl ServerBuilder<'_> {
     }
 }
 
-/// Serve a single service. Shorthand for [`Server::builder`] with one service.
-pub fn serve<Req, Resp>(
-    node: &Node,
-    alpn: &'static [u8],
-    service: RpcService<Req, Resp>,
-) -> Result<Server>
-where
-    Req: Rpc + DeserializeOwned + Send + Sync + 'static,
-    Resp: Serialize + Send + Sync + 'static,
-{
-    Server::builder(node)
-        .service(service.into_service(alpn))
-        .spawn()
-}
-
 /// A connected client.
 ///
 /// `call` takes `&self` and holds no lock, so a client behind an `Arc` serves
@@ -618,7 +568,6 @@ where
             _p: PhantomData,
         })
     }
-
 
     /// Send one request with its body and await the response and its body.
     ///

@@ -49,10 +49,10 @@ pub mod blocking;
 
 mod actor;
 mod authz;
-mod keys;
 mod body;
 mod error;
 mod idempotency;
+mod keys;
 mod macros;
 mod middleware;
 mod node;
@@ -64,20 +64,18 @@ mod watch;
 mod wire;
 
 pub use actor::{
-    actor_schema, guarded, mount, ActorClient, ActorReply, ActorRequest, Eviction, Factory, Mail,
-    Mailbox, MountError, Mounted, Panic, Sealed, System, SystemBuilder, MAILBOX,
+    actor_schema, guarded, mount, ActorClient, ActorReply, ActorRequest, Eviction, Mail, Mailbox,
+    MountError, Mounted, Panic, Sealed, System, SystemBuilder,
 };
 pub use authz::Allowlist;
-pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use body::{Body, BodyReader};
 pub use error::{ConfigError, Error, Result, Transport};
 pub use idempotency::{IdempotencyRefusal, MAX_RECORDED_BYTES, MAX_RECORDS};
-pub use node::{derive_alpn, schema_hash, Node};
+pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use middleware::{Context, Middleware, Next, Rpc, Timeout};
+pub use node::{derive_alpn, schema_hash, Node};
 pub use reply::{Outcome, RemoteError, WireResponse};
-pub use rpc::{
-    serve, Dispatch, RpcClient, RpcService, Server, ServerBuilder, Service, ServiceBuilder,
-};
+pub use rpc::{Dispatch, RpcClient, Server, ServerBuilder, Service, ServiceBuilder};
 pub use watch::{Departure, Watch};
 pub use wire::{Envelope, MAX_HEADER};
 
