@@ -85,6 +85,8 @@ mod macros;
 mod middleware;
 mod node;
 mod reply;
+#[cfg(test)]
+mod representability;
 mod rpc;
 #[cfg(test)]
 mod testing;
