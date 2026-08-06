@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+#MISE description="Build for the browser target. Builds, never checks"
+#
+# `build`, never `check`. `cargo check` stops before the link step, and the
+# failure this catches IS a link failure: `ring` compiles its C to an archive,
+# and an archive written by Apple `ar` carries an index `rust-lld` cannot read,
+# so every `ring_core_*` symbol comes back undefined. A `check` job passes green
+# while the target is broken. It did exactly that here.
+#
+# `llvm-ar` comes from the `llvm-tools` component, which rust-toolchain.toml
+# installs. The path is derived from the host triple so this works on a
+# developer's Mac and on CI's Linux without either naming the other.
+set -euo pipefail
+
+ar="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-ar"
+if [ ! -x "$ar" ]; then
+    echo "llvm-ar not found at $ar" >&2
+    echo "rust-toolchain.toml requests it; try: rustup component add llvm-tools" >&2
+    exit 1
+fi
+
+AR_wasm32_unknown_unknown="$ar" \
+    cargo build --target wasm32-unknown-unknown -p keylink --no-default-features

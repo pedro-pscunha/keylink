@@ -4,33 +4,36 @@
 
 ```sh
 ./scripts/install-hooks.sh   # once per clone
-just gate                    # everything CI runs
+mise run gate                # everything CI runs
 ```
 
-You need stable Rust, [`just`](https://github.com/casey/just), and two rustup
-pieces for the browser target:
+You need [`mise`](https://mise.jdx.dev) and rustup. Nothing else is a manual
+step: `rust-toolchain.toml` requests the `wasm32-unknown-unknown` target and the
+`llvm-tools` component, and rustup installs both on first use. `mise.toml` pins
+`cargo-deny`. A cold clone should reach a green gate without reading a list of
+setup commands, because a setup command in a README is a step somebody skips.
 
-```sh
-rustup target add wasm32-unknown-unknown
-rustup component add llvm-tools          # provides llvm-ar; see below
-```
-
-The gate is defined once, in the `justfile`. CI calls those same recipes, so a
-green `just gate` locally means a green run. There is no second copy of the
-commands to drift.
+The gate is defined once, in `mise.toml` and `.mise/tasks/`. CI calls those same
+tasks, so a green `mise run gate` locally means a green run. There is no second
+copy of the commands to drift.
 
 | | runs | why |
 |---|---|---|
-| `just pre-commit` | fmt, clippy on the library | Seconds. A commit hook people bypass is not a gate. |
-| `just pre-push` | the whole gate | A push is rarer than a commit, and a red gate here costs one local run instead of a CI round trip. |
-| CI | the same recipes, plus `cargo deny check` | `deny` fetches the advisory database, so it lives in CI rather than in a hook. |
+| `mise run pre-commit` | fmt, clippy on the library | Seconds. A commit hook people bypass is not a gate. |
+| `mise run pre-push` | the whole gate | A push is rarer than a commit, and a red gate here costs one local run instead of a CI round trip. |
+| CI | the same tasks, plus `mise run deny` | `deny` fetches the advisory database, so it lives in CI rather than in a hook. |
 
-Run `just deny` by hand whenever you change a dependency. It is the one check no
+`mise run gate` runs its steps **one at a time**, cheapest first. That is why the
+task lists sub-tasks rather than using bare `depends`: mise parallelizes
+dependencies, and two concurrent cargo invocations contend for one target
+directory and one machine's memory.
+
+Run `mise run deny` by hand whenever you change a dependency. It is the one check no
 hook runs, which is exactly why it was broken for three commits without anybody
 seeing it: a licence, an advisory or a wildcard arrives with a dependency and
 with nothing else.
 
-`just features` builds every subset of `blocking`, `fs` and `env`. Clippy checks
+`mise run features` builds every subset of `blocking`, `fs` and `env`. Clippy checks
 the two ends of that lattice — all on, all off — and the ends do not meet in the
 middle. When you put an item behind a feature gate, check what calls it:
 gating `Node::bind_from_env` behind `env` broke `--features blocking` on its
@@ -44,7 +47,7 @@ Both hooks point here. The short version is "the hook itself is broken", never
 
 Legitimate:
 
-- The hook cannot run — `just` is missing and the inline fallback is wrong, or a
+- The hook cannot run — `mise` is missing and the inline fallback is wrong, or a
   rustup component is not installed.
 - The push died in transport *after* the gate ran green on the same HEAD. That
   is a network failure, and running the gate again proves nothing.
@@ -91,19 +94,19 @@ Every `pub` item is a compatibility promise. Before you add one:
   removed because they were a second construction path that could not take
   middleware layers, so the shorter door quietly did less than the longer one.
 
-`just docs` runs rustdoc with `-D warnings`, which turns `#![warn(missing_docs)]`
+`mise run docs` runs rustdoc with `-D warnings`, which turns `#![warn(missing_docs)]`
 into a gate and fails on a broken intra-doc link in the same pass.
 
 ## The browser target
 
-`just wasm` **builds**, never checks. `cargo check` stops before the linker
+`mise run wasm` **builds**, never checks. `cargo check` stops before the linker
 runs, and the failure this recipe exists to catch is a link failure: `ring`
 compiles C into an archive, and an archive written by Apple `ar` carries an
 index `rust-lld` cannot read, so every `ring_core_*` symbol comes back
 undefined. A `check` job passes green on a tree whose wasm target does not link.
 That happened here.
 
-The recipe derives `llvm-ar` from the host triple, so a Mac and CI's Linux both
+The task derives `llvm-ar` from the host triple, so a Mac and CI's Linux both
 work without either naming the other.
 
 Three features need an operating system facility a browser does not have, and

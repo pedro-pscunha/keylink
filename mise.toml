@@ -1,0 +1,104 @@
+# keylink's gate, defined once.
+#
+# CI runs these same tasks, so a green `mise run gate` locally means a green run
+# there — there is no second copy of the commands to drift from this one.
+#
+#   mise tasks           # every task
+#   mise run gate        # everything CI runs
+#   mise run pre-commit  # the fast subset the commit hook runs
+#   mise run pre-push    # the heavy subset the push hook runs
+#
+# The compiler, its components and the wasm target come from rust-toolchain.toml,
+# because rustup is the only thing that can install a component. mise owns the
+# task layer and the tools cargo does not ship.
+#
+# `[task_config].includes` is deliberately NOT set: setting it replaces
+# auto-discovery entirely, so a new file task under .mise/tasks/ would silently
+# not load until somebody remembered to list it.
+
+[tools]
+# Pinned here so a fresh clone and CI get the same advisory checker, and so the
+# version that produced a green `mise run deny` is recorded.
+#
+# `aqua:` rather than `cargo:` — the cargo backend compiles cargo-deny from
+# source and takes minutes. It is also the backend this developer's global mise
+# config already uses for the same tool, so the two share one install path
+# instead of fetching the same binary twice under different schemes.
+"aqua:EmbarkStudios/cargo-deny" = "0.20.2"
+
+# ── the whole gate ──────────────────────────────────────────────────────────
+
+[tasks.gate]
+description = "Everything CI runs, in CI's order. Cheapest failures first"
+# A list of task references runs them ONE AT A TIME, in order. Bare `depends`
+# lets mise parallelize, and parallel cargo invocations contend for the same
+# target directory and the same memory.
+run = [
+    { task = "fmt-check" },
+    { task = "lint" },
+    { task = "features" },
+    { task = "test" },
+    { task = "docs" },
+    { task = "wasm" },
+]
+
+# ── what the hooks run ──────────────────────────────────────────────────────
+
+[tasks.pre-commit]
+description = "Fast enough that nobody is tempted to bypass it. Seconds, warm"
+run = [{ task = "fmt-check" }, { task = "lint-fast" }]
+
+[tasks.pre-push]
+description = "The heavy gate. A push is rarer than a commit"
+run = [{ task = "gate" }]
+
+# ── formatting ──────────────────────────────────────────────────────────────
+
+[tasks.fmt]
+description = "Format the workspace"
+run = "cargo fmt --all"
+
+[tasks.fmt-check]
+description = "Fail if anything is unformatted"
+run = "cargo fmt --all -- --check"
+
+# ── linting ─────────────────────────────────────────────────────────────────
+
+[tasks.lint-fast]
+description = "Clippy on the library only, so the commit hook stays seconds"
+# Catches what a --all-targets run would, minus the test and example targets
+# that dominate the build time.
+run = "cargo clippy -p keylink --lib --all-features -- -D warnings"
+
+[tasks.lint]
+description = "Clippy at both feature ends, every target"
+# --no-default-features is scoped to the library on purpose: the integration
+# tests use the blocking API, so they cannot compile without it.
+run = [
+    "cargo clippy --all-targets --all-features -- -D warnings",
+    "cargo clippy -p keylink --lib --no-default-features -- -D warnings",
+]
+
+# ── tests ───────────────────────────────────────────────────────────────────
+
+[tasks.test]
+description = "The whole workspace"
+run = "cargo test --workspace"
+
+# ── documentation ───────────────────────────────────────────────────────────
+
+[tasks.docs]
+description = "rustdoc as a gate, not as decoration"
+# `#![warn(missing_docs)]` is a warning, and a warning nothing denies is
+# decoration. This is what turns it into a gate, and it catches broken
+# intra-doc links in the same pass.
+run = "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features -p keylink"
+
+# ── supply chain ────────────────────────────────────────────────────────────
+
+[tasks.deny]
+description = "Advisories and licences over the whole tree"
+# Not in `gate` and not in a hook: it fetches the advisory database, so it needs
+# the network. CI runs it. Run it by hand when you change a dependency — see
+# CONTRIBUTING.md.
+run = "cargo deny check"

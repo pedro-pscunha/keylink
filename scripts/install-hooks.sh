@@ -33,16 +33,14 @@ echo "installed: .githooks/pre-commit, .githooks/pre-push"
 echo
 echo "  pre-commit  cargo fmt --check, clippy on the library     (seconds)"
 echo "  pre-push    the full gate: every target, both feature ends,"
-echo "              the tests, the docs, and the browser target"
-echo
-echo "the browser target needs two rustup pieces:"
-echo "  rustup target add wasm32-unknown-unknown"
-echo "  rustup component add llvm-tools"
+echo "              every feature subset, the tests, the docs,"
+echo "              and the browser target"
 echo
 echo "bypass with --no-verify; see CONTRIBUTING.md for when that is legitimate."
 
-if ! command -v just >/dev/null 2>&1; then
+if ! command -v mise >/dev/null 2>&1; then
     echo
-    echo "note: 'just' is not installed, so the hooks will run the checks"
-    echo "      directly. Install it for the one-command gate: 'just gate'."
+    echo "note: 'mise' is not installed, so the hooks will run the checks"
+    echo "      directly and will SKIP the browser target. Install it for the"
+    echo "      one-command gate: 'mise run gate'."
 fi

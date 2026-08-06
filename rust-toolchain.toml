@@ -1,0 +1,15 @@
+# rustup reads this and installs what is missing on first use.
+#
+# The two extras are not optional decoration. `llvm-tools` provides `llvm-ar`,
+# without which `ring` fails to LINK for the browser target on macOS: Apple `ar`
+# writes an archive index `rust-lld` cannot read. `wasm32-unknown-unknown` is
+# the target itself. Both used to be two commands a contributor had to find in
+# the README, and a missing one failed deep inside a linker error.
+#
+# `stable` rather than a pinned version: keylink is a library, so it must build
+# on whatever its users have. The floor is `rust-version` in keylink/Cargo.toml,
+# which is the number that actually promises something.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy", "llvm-tools"]
+targets = ["wasm32-unknown-unknown"]

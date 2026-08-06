@@ -6,7 +6,7 @@
 # An advisory against any of them is keylink's problem, and nobody notices one
 # by reading Cargo.lock.
 #
-# Run it with `just deny`.
+# Run it with `mise run deny`.
 
 [graph]
 # The platforms keylink is built for. Without this, the graph includes every

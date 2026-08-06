@@ -1,8 +1,13 @@
 name: CI
 
-# The gate is defined once, in the justfile. CI calls those recipes rather than
-# restating the commands, so a green `just gate` locally means a green run here.
-# A second copy of the commands is a second thing to drift.
+# The gate is defined once, in mise.toml and .mise/tasks/. CI calls those tasks
+# rather than restating the commands, so a green `mise run gate` locally means a
+# green run here. A second copy of the commands is a second thing to drift.
+#
+# The toolchain, its components and the wasm target come from
+# rust-toolchain.toml, which rustup honors on first use. That is why no job here
+# names a component or a target: adding one would be a second place to keep in
+# step with the file that already says it.
 
 on:
   push:
@@ -15,20 +20,18 @@ env:
 
 jobs:
   gate:
-    name: fmt, clippy, test, docs
+    name: fmt, clippy, features, test, docs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v2
-      - run: just fmt-check
-      - run: just lint
-      - run: just features
-      - run: just test
-      - run: just docs
+      - uses: jdx/mise-action@v2
+      - run: mise run fmt-check
+      - run: mise run lint
+      - run: mise run features
+      - run: mise run test
+      - run: mise run docs
 
   wasm:
     name: browser target
@@ -36,19 +39,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-          # llvm-ar. Apple `ar` writes an archive index `rust-lld` cannot read,
-          # so `ring` links with every symbol undefined. Linux `ar` is fine, but
-          # the recipe derives one path for both so neither host is special.
-          components: llvm-tools
       - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v2
+      - uses: jdx/mise-action@v2
 
       # `build`, not `check`. The failure this job exists to catch is a LINK
       # failure, and `cargo check` stops before the linker runs — it passes
       # green on a tree whose wasm target does not link.
-      - run: just wasm
+      - run: mise run wasm
 
       # The three guards must FIRE, not merely be present. A `compile_error!`
       # nobody triggers is a comment. Each of these features needs an OS
@@ -72,5 +69,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@cargo-deny
-      - run: cargo deny check
+      - uses: jdx/mise-action@v2
+      - run: mise run deny

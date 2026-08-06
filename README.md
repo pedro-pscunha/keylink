@@ -90,16 +90,13 @@ decode `Brl` as `Usd` silently. The handshake refuses it instead.
 
 ```sh
 ./scripts/install-hooks.sh   # once per clone
-just gate                    # everything CI runs
+mise run gate                # everything CI runs
 ```
 
-The browser target needs two rustup pieces, because `ring` links its C through
-`ar` and Apple's writes an index `rust-lld` cannot read:
-
-```sh
-rustup target add wasm32-unknown-unknown
-rustup component add llvm-tools          # llvm-ar
-```
+You need [`mise`](https://mise.jdx.dev) and rustup, and nothing else.
+`rust-toolchain.toml` asks for the `wasm32-unknown-unknown` target and the
+`llvm-tools` component — the second because `ring` links its C through `ar`, and
+Apple's writes an archive index `rust-lld` cannot read.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the wire-contract pin, the public API
 rules, and when `--no-verify` is legitimate.
