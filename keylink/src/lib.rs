@@ -128,6 +128,7 @@ mod reply;
 #[cfg(test)]
 mod representability;
 mod rpc;
+mod subscribers;
 #[cfg(test)]
 mod testing;
 mod watch;
@@ -152,6 +153,7 @@ pub use node::{derive_alpn, schema_hash, Node};
 pub use peer::{Dial, Peer};
 pub use reply::{Outcome, RemoteError, WireRequest, WireResponse};
 pub use rpc::{Dispatch, RpcClient, Server, ServerBuilder, Service, ServiceBuilder};
+pub use subscribers::Subscribers;
 pub use watch::{Departure, Watch};
 pub use wire::{Envelope, WireKinds, MAX_HEADER};
 
