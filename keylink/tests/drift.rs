@@ -1,4 +1,4 @@
-//! Two binaries, two type sets, one contract each.
+//! Two binaries, two type sets, one refused handshake.
 //!
 //! `demo/Cargo.toml` defines `swap-variants`, which reorders two identically
 //! shaped unit variants of `Currency`. postcard encodes a variant by its
@@ -13,40 +13,48 @@
 //! literal was typed by a person rather than derived from a second type set. As
 //! CONTRIBUTING.md puts it, a test cannot catch a change it participates in.
 //!
-//! So this file compiles `demo` twice and asks the binaries themselves.
+//! So this file compiles `demo` twice and puts the two binaries in a room.
+//!
+//! ## The trap this file is built to avoid
+//!
+//! Both builds report the same artifact path. Cargo keeps a separate object per
+//! feature set under `deps/`, but it *uplifts* whichever it built last to one
+//! `<build>/demo`, and `--message-format=json` names only that path. Build
+//! twice, run `<build>/demo` twice, and you have run one binary against itself:
+//! two identical peers agree, the test passes, and it has proved nothing —
+//! planted inside the test whose whole purpose is to catch exactly that.
+//!
+//! `build_demo` therefore copies the uplifted file to a distinct path the
+//! moment each build finishes, and every test below runs two different paths.
+//! `CARGO_BIN_EXE_demo` cannot help here whatever package this file lives in:
+//! it names one path, and this test needs two.
 //!
 //! ## What it costs, measured
 //!
 //! It is in `gate` rather than behind `#[ignore]`, because a check no hook runs
-//! is a check that rots — CONTRIBUTING.md tells the story of `cargo deny` being
-//! broken for three commits for exactly that reason. On an unloaded machine:
-//!
-//! | | |
-//! |---|---|
-//! | `cargo build -p demo` | 0.60s |
-//! | the same with `swap-variants` | 0.61s |
-//! | three child processes | 0.76s |
-//!
-//! About 2s, against a 7.7s gate. Note that `cargo test --workspace` does *not*
-//! build the demo binary — it builds demo's test target, a different artifact —
-//! so both builds are this file's to pay. Cargo fingerprints each feature set
-//! separately, so neither build evicts the other and a repeat run is 0.11s.
-//!
-//! ## What it does not do
-//!
-//! It proves the two binaries derive different contracts. It does not yet run
-//! them against each other, because `demo serve` waits on `Endpoint::online()`,
-//! which returns only once a home relay connects, and `demo connect` takes a
-//! bare `EndpointId` that only the public n0 DNS can resolve. Neither works on
-//! loopback. Proving the refused handshake needs an offline path through
-//! `demo/src/main.rs`, which is why one is proposed rather than assumed here.
+//! is a check that rots — CONTRIBUTING.md tells that story about `cargo deny`
+//! being broken for three commits. On an unloaded machine: 0.60s and 0.61s for
+//! the two builds, and around 1s for the child processes. Note that
+//! `cargo test --workspace` does *not* build the demo binary — it builds demo's
+//! test target, a different artifact — so both builds are this file's to pay. A
+//! repeat run is 0.11s, because neither feature set evicts the other.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::OnceLock;
+
+/// A syntactically valid endpoint id belonging to nobody here.
+///
+/// It does two jobs. `alpn_of` needs something that parses, because
+/// `demo connect` parses its argument before it binds anything and this test
+/// kills the child before the dial matters. And it is what the server
+/// allowlists — deliberately a stranger, so that every client below is refused
+/// at *authorization*. Reaching that refusal is the evidence: authorization
+/// happens after the handshake, so a client that gets there agreed on the ALPN.
+const A_STRANGER: &str = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0";
 
 /// The directory cargo puts finished binaries in, derived from this test
 /// binary's own location (`<build>/deps/drift-<hash>`) rather than assumed, so
@@ -59,13 +67,9 @@ fn build_dir() -> PathBuf {
         .to_path_buf()
 }
 
-/// Build `demo` with `features`, and keep the result somewhere the next build
-/// will not overwrite.
-///
-/// The copy is the whole point. Both feature sets land on the same
-/// `<build>/demo` path, so without it the second build destroys the first.
-/// Cargo fingerprints each feature set separately and keeps both artifacts
-/// under `deps/`, so a repeat run is a fingerprint check rather than a compile.
+/// Build `demo` with `features`, and copy the result somewhere the next build
+/// cannot overwrite. See the module doc: the copy is what stops this whole file
+/// from testing one binary against itself.
 fn build_demo(name: &str, features: &[&str]) -> PathBuf {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -90,9 +94,9 @@ fn build_demo(name: &str, features: &[&str]) -> PathBuf {
 
 /// The two binaries, built once however many tests ask for them.
 ///
-/// Swapped is built first so the tree is left in its default feature state,
-/// and `OnceLock` keeps two test threads from running two cargo processes at
-/// each other.
+/// Swapped is built first so the tree is left in its default feature state, and
+/// `OnceLock` keeps two test threads from running two cargo processes at each
+/// other.
 fn binaries() -> &'static (PathBuf, PathBuf) {
     static BINARIES: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
     BINARIES.get_or_init(|| {
@@ -102,31 +106,15 @@ fn binaries() -> &'static (PathBuf, PathBuf) {
     })
 }
 
-/// Any endpoint id that parses. `demo connect` parses its argument before it
-/// binds anything, and this test never lets the dial happen, so nothing about
-/// this id has to be reachable.
-fn an_endpoint_id(demo: &Path) -> String {
-    let out = Command::new(demo)
-        .arg("id")
-        .stderr(Stdio::null())
-        .output()
-        .expect("demo id runs");
-    assert!(out.status.success(), "demo id failed");
-    String::from_utf8(out.stdout)
-        .expect("an endpoint id is utf-8")
-        .trim()
-        .to_string()
-}
-
 /// The ALPN a binary presents, taken from the binary rather than from a
 /// literal.
 ///
 /// `demo connect` prints its ALPN before it dials, so this reads one line and
-/// kills the child. No network, and no waiting for a dial that is meant to
-/// fail.
-fn alpn_of(demo: &Path, peer: &str) -> String {
+/// kills the child rather than waiting for a dial that is meant to fail.
+fn alpn_of(demo: &Path) -> String {
     let mut child = Command::new(demo)
-        .args(["connect", peer])
+        .args(["connect", A_STRANGER])
+        .env("KEYLINK_OFFLINE", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -148,30 +136,100 @@ fn alpn_of(demo: &Path, peer: &str) -> String {
     alpn.expect("demo connect prints its alpn before it dials")
 }
 
+/// A `demo serve` running on loopback, and the address a peer needs to reach it.
+struct Serving {
+    child: Child,
+    dial: String,
+    /// Held only to keep the pipe open. Dropping the reader would close our end,
+    /// and the next thing the server printed would kill it with `EPIPE`.
+    _stdout: BufReader<ChildStdout>,
+}
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Start a server with no relay and no discovery, and wait for it to say where
+/// it can be reached.
+///
+/// `KEYLINK_OFFLINE` is what makes this hermetic. Without it `demo serve` waits
+/// on `Endpoint::online()`, which returns only once a home relay reports
+/// connected, and the peer would have to be found through n0's public DNS.
+fn serve(demo: &Path) -> Serving {
+    let mut child = Command::new(demo)
+        .arg("serve")
+        .env("KEYLINK_OFFLINE", "1")
+        .env("KEYLINK_ALLOWED_IDS", A_STRANGER)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("demo serve starts");
+
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout was piped"));
+    let mut dial = None;
+    let mut line = String::new();
+    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+        if let Some(rest) = line.strip_prefix("dial:") {
+            dial = Some(rest.trim().to_string());
+            break;
+        }
+        line.clear();
+    }
+
+    match dial {
+        Some(dial) => Serving {
+            child,
+            dial,
+            _stdout: reader,
+        },
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("demo serve never printed a dial line");
+        }
+    }
+}
+
+/// Everything `demo connect` said, stdout and stderr together.
+///
+/// The interesting line is on stderr: `main` returns the error and the runtime
+/// prints it there.
+fn connect_to(demo: &Path, dial: &str) -> String {
+    let out = Command::new(demo)
+        .args(["connect", dial])
+        .env("KEYLINK_OFFLINE", "1")
+        .output()
+        .expect("demo connect runs");
+
+    let mut said = String::from_utf8_lossy(&out.stdout).into_owned();
+    said.push_str(&String::from_utf8_lossy(&out.stderr));
+    said
+}
+
 /// The property the ALPN scheme exists for, asked of two real binaries.
 ///
-/// Reordering two unit variants changes nothing a compiler would complain
-/// about and nothing postcard would refuse to decode. It has to change the
-/// contract, or two peers silently disagree about what a price means.
+/// Reordering two unit variants changes nothing a compiler would complain about
+/// and nothing postcard would refuse to decode. It has to change the contract,
+/// or two peers silently disagree about what a price means.
 #[test]
 fn two_type_sets_derive_two_contracts() {
     let (baseline, swapped) = binaries();
 
     // Deliberately no `assert_ne!` on the two files' bytes. It says nothing the
-    // ALPN comparison below does not say better, and on failure `assert_ne!`
-    // prints both operands — 583 MB of Mach-O, which buries the one line that
-    // explains what went wrong.
-    let peer = an_endpoint_id(baseline);
-    let (from_baseline, from_swapped) = (alpn_of(baseline, &peer), alpn_of(swapped, &peer));
+    // ALPN comparison does not say better, and on failure `assert_ne!` prints
+    // both operands — 583 MB of Mach-O burying the one useful line.
+    let (from_baseline, from_swapped) = (alpn_of(baseline), alpn_of(swapped));
 
     assert_ne!(
         from_baseline, from_swapped,
         "swapping two same-shaped variants must move the contract, or the drift is invisible"
     );
 
-    // Same service, same protocol name: only the schema hash may differ. A
-    // difference in the prefix would mean this test passed for the wrong
-    // reason.
+    // Same service, same protocol name: only the schema hash may move. A
+    // difference in the prefix would mean this passed for the wrong reason.
     let prefix = |alpn: &str| {
         alpn.rsplit_once('/')
             .expect("<protocol>/<hash>")
@@ -182,5 +240,40 @@ fn two_type_sets_derive_two_contracts() {
         prefix(&from_baseline),
         prefix(&from_swapped),
         "only the hash may move: {from_baseline} vs {from_swapped}"
+    );
+}
+
+/// The claim the README leads with, run end to end for the first time.
+///
+/// Two processes, two type sets, a real QUIC handshake over loopback. The
+/// second half is the control, and it is the half that would catch a broken
+/// harness: if these two binaries were secretly the same file, or if the ALPN
+/// gate were not doing the work, the swapped client would fail the same way the
+/// baseline one does instead of differently.
+#[test]
+fn a_peer_built_from_other_types_is_refused_at_the_handshake() {
+    let (baseline, swapped) = binaries();
+    let server = serve(baseline);
+
+    let refused = connect_to(swapped, &server.dial);
+    assert!(
+        refused.contains("schema mismatch"),
+        "a peer built from other types must be refused for the schema, and told so \
+         rather than sent to look at the network. It said:\n{refused}"
+    );
+
+    // The control. Same types on both ends, so the handshake must succeed —
+    // and then this client is refused by the allowlist, because `A_STRANGER`
+    // is not it. That refusal is the proof: authorization is downstream of the
+    // handshake, so reaching it means the ALPN matched.
+    let agreed = connect_to(baseline, &server.dial);
+    assert!(
+        !agreed.contains("schema mismatch"),
+        "two binaries from one type set must agree on the contract. It said:\n{agreed}"
+    );
+    assert!(
+        agreed.contains("unauthorized"),
+        "the agreeing client must get past the handshake and be stopped by the \
+         allowlist instead. It said:\n{agreed}"
     );
 }
