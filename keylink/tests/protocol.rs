@@ -747,3 +747,37 @@ fn the_alpn_hashes_the_response_type_the_wire_actually_carries() {
         "the generated ALPN must hash the wire type.\n  generated: {real}\n  expected suffix: {correct_hash}"
     );
 }
+
+/// The contract hash, pinned to a literal.
+///
+/// Every other test in this repository compiles BOTH peers from one source
+/// tree, so a wire change moves both and the handshake still agrees. That makes
+/// wire drift invisible to the whole suite — a test cannot catch a change it
+/// participates in. Only a literal recorded outside the type system can.
+///
+/// # This test going red
+///
+/// It means the wire format of `probe` changed. Two steps, in order:
+///
+/// 1. Decide whether the change SHOULD be wire-visible. Adding a method or an
+///    error variant should be. A rename or a doc edit should not — if one of
+///    those moved this hash, something is in the hashed contract that has no
+///    business being there, and that is the bug.
+/// 2. Only then update the literal, and say so in the release notes: every
+///    peer in the fleet must be rebuilt.
+///
+/// Never do step 2 without doing step 1. Updating the literal to make a red
+/// test green is how a fleet silently splits in half.
+///
+/// A `postcard-schema` upgrade moves this legitimately.
+#[test]
+fn the_contract_hash_has_not_moved() {
+    const PINNED: &str = "keylink/Probe/d196f7b4d9d7daec";
+
+    assert_eq!(
+        String::from_utf8_lossy(probe::alpn()),
+        PINNED,
+        "\nthe wire format of `probe` changed.\n\
+         Read this test's documentation before updating the literal.\n"
+    );
+}
