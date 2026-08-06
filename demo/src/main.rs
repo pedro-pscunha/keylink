@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use std::task::{Context, Poll};
 
 use anyhow::{bail, Context as _, Result};
-use keylink::{Allowlist, Body, BodyReader, EndpointId, Node};
+use keylink::{Allowlist, Body, BodyReader, EndpointAddr, EndpointId, Node, SecretKey};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
@@ -353,9 +353,72 @@ async fn print_id() -> Result<()> {
     Ok(())
 }
 
+/// Is this process running without the public internet?
+///
+/// `presets::N0` publishes to pkarr and resolves ids through n0's DNS, and
+/// `Endpoint::online()` waits for a home relay to report connected. Both need
+/// the internet, which is right for the showcase and impossible for a test on
+/// loopback.
+///
+/// Set `KEYLINK_OFFLINE=1` and the demo binds `presets::Minimal`, skips
+/// `online()`, and accepts a peer written `<id>@<ip:port>`. Unset — the normal
+/// path, and the one the README documents — nothing below changes.
+fn offline() -> bool {
+    std::env::var_os("KEYLINK_OFFLINE").is_some()
+}
+
+/// Bind with no discovery, honouring `KEYLINK_SECRET` exactly as the online
+/// path does.
+///
+/// The secret matters MORE here than online: with no discovery a peer is
+/// allowlisted by an id somebody knew in advance, and a fresh random identity
+/// every run cannot be.
+async fn offline_node() -> Result<Node> {
+    match std::env::var("KEYLINK_SECRET") {
+        Ok(hex) => {
+            let secret: SecretKey = hex.trim().parse().context("bad KEYLINK_SECRET")?;
+            Ok(Node::bind_local_with_secret(secret).await?)
+        }
+        Err(_) => Ok(Node::bind_local().await?),
+    }
+}
+
+/// Parse `<id>` or `<id>@<ip:port>[,<ip:port>]` into something dialable.
+///
+/// The bare id is the point of this demo, and it stays the default. The second
+/// form is the door keylink already documents on `RpcClient::connect` — "an
+/// `EndpointAddr` is accepted too, for a LAN or air-gapped network where
+/// discovery is not available" — which this file had never used. Loopback is
+/// exactly that case: there is no discovery to resolve an id against.
+///
+/// So the "no IP address appears in your code" claim at the top of this file
+/// still holds for every path a reader follows. This is what the documented
+/// escape hatch looks like at a call site.
+fn dial_target(spec: &str) -> Result<EndpointAddr> {
+    let Some((id, addrs)) = spec.split_once('@') else {
+        return Ok(EndpointAddr::from(
+            spec.parse::<EndpointId>().context("bad endpoint id")?,
+        ));
+    };
+    let id: EndpointId = id.parse().context("bad endpoint id")?;
+    // `with_ip_addr` rather than `from_parts`, which wants iroh's `TransportAddr`
+    // — a type keylink does not re-export, because a caller has no reason to
+    // name it.
+    addrs
+        .split(',')
+        .try_fold(EndpointAddr::from(id), |addr, socket| {
+            Ok(addr.with_ip_addr(socket.parse().context("bad socket address")?))
+        })
+}
+
 async fn serve() -> Result<()> {
-    let node = Node::bind_from_env("KEYLINK_SECRET").await?;
-    node.online().await;
+    let node = if offline() {
+        offline_node().await?
+    } else {
+        let node = Node::bind_from_env("KEYLINK_SECRET").await?;
+        node.online().await;
+        node
+    };
 
     // Fails at startup when unset, rather than bouncing every peer at runtime.
     let allow = Allowlist::from_env("KEYLINK_ALLOWED_IDS")?;
@@ -365,6 +428,12 @@ async fn serve() -> Result<()> {
         String::from_utf8_lossy(inventory::alpn())
     );
     println!("listening as: {}", node.id());
+    if offline() {
+        // The form the other side can actually dial with no discovery.
+        let addr = node.endpoint().addr();
+        let sockets: Vec<String> = addr.ip_addrs().map(|a| a.to_string()).collect();
+        println!("dial:         {}@{}", node.id(), sockets.join(","));
+    }
 
     let server = inventory::serve(&node, Warehouse::seeded(), allow)?;
     tokio::signal::ctrl_c().await?;
@@ -373,8 +442,12 @@ async fn serve() -> Result<()> {
 }
 
 async fn connect(id: &str, upload: Option<&str>) -> Result<()> {
-    let peer: EndpointId = id.parse().context("bad endpoint id")?;
-    let node = Node::bind_from_env("KEYLINK_SECRET").await?;
+    let peer = dial_target(id)?;
+    let node = if offline() {
+        offline_node().await?
+    } else {
+        Node::bind_from_env("KEYLINK_SECRET").await?
+    };
 
     println!("alpn:      {}", String::from_utf8_lossy(inventory::alpn()));
     println!("dialing as: {}", node.id());

@@ -30,6 +30,44 @@ impl Node {
         Self::build(Endpoint::builder(presets::N0)).await
     }
 
+    /// Bind with no discovery and no relay, for a LAN, a test, or an air-gapped
+    /// network.
+    ///
+    /// [`Self::bind`] uses n0's preset: it publishes to pkarr, resolves ids
+    /// through n0's DNS, and relays when it cannot hole-punch. All three need
+    /// the public internet. This one needs nothing, and the cost is that a bare
+    /// [`EndpointId`] no longer resolves — nothing is publishing it and nothing
+    /// is looking it up.
+    ///
+    /// So the caller must dial a full [`EndpointAddr`], which
+    /// [`RpcClient::connect`](crate::RpcClient::connect) already accepts and
+    /// documents for exactly this case. Get one from
+    /// `node.endpoint().addr()` on the serving side and carry it across by
+    /// whatever means you have.
+    ///
+    /// [`Self::online`] is meaningless here and should not be awaited: it waits
+    /// for a home relay to report connected, and there is no relay.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Transport`] when the local endpoint cannot bind.
+    pub async fn bind_local() -> Result<Self> {
+        Self::build(Endpoint::builder(presets::Minimal)).await
+    }
+
+    /// [`Self::bind_local`] with a fixed identity.
+    ///
+    /// Needed more often than its online twin, not less: with no discovery the
+    /// peer must be allowlisted by an id somebody knew in advance, and a random
+    /// identity per run cannot be.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Transport`] when the local endpoint cannot bind.
+    pub async fn bind_local_with_secret(secret: SecretKey) -> Result<Self> {
+        Self::build(Endpoint::builder(presets::Minimal).secret_key(secret)).await
+    }
+
     /// Bind with a fixed identity, so the id peers dial survives restarts.
     ///
     /// # Errors
