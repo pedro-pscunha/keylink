@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+#MISE description="Build the browser target with the `web` feature"
+#
+# Separate from `wasm` because the two feature sets are different builds and a
+# green one says nothing about the other. Until the browser body constructors
+# landed, this task would have been green on a tree where `web` gated zero
+# lines — a gate that cannot fail, which is the fault it exists to prevent.
+#
+# NEVER `--all-features` on a wasm line: that turns on `blocking`, `fs` and
+# `env`, each of which refuses this target by `compile_error!` on purpose.
+set -euo pipefail
+
+ar="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-ar"
+if [ ! -x "$ar" ]; then
+    echo "llvm-ar not found at $ar" >&2
+    echo "rust-toolchain.toml requests it; try: rustup component add llvm-tools" >&2
+    exit 1
+fi
+
+AR_wasm32_unknown_unknown="$ar" \
+    cargo build --target wasm32-unknown-unknown -p keylink \
+        --no-default-features --features web

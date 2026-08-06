@@ -68,6 +68,22 @@ compile_error!(
      with --no-default-features and pass the secret and the allowlist in."
 );
 
+// `web` asserts a platform fact rather than checking one: `body.rs` carries an
+// `unsafe impl Send` for the browser's stream reader, which holds an
+// `Rc<RefCell<_>>` and is `!Send` for a real reason. The assertion is that
+// wasm32-unknown-unknown without `atomics` has no second thread to send it to.
+//
+// Under threaded wasm that stops being true and the `unsafe impl` becomes
+// unsound. This is what keeps the assertion enforceable instead of hopeful.
+//
+// It cannot fire today — threaded wasm needs a nightly `build-std` — so unlike
+// the three guards above it is UNTESTED, and that is said here rather than
+// discovered later.
+#[cfg(all(feature = "web", target_feature = "atomics"))]
+compile_error!(
+    "keylink's `web` feature assumes a single-threaded browser: it contains an      `unsafe impl Send` that is sound only without shared-memory threading.      Threaded wasm is not supported."
+);
+
 /// Gated on the feature AND compiled only where OS threads exist. The Cargo
 /// feature alone is not enough: it controls which dependency features are on,
 /// not whether this module's `tokio::signal` and `new_multi_thread` calls are

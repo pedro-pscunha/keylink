@@ -46,6 +46,7 @@ jobs:
       # failure, and `cargo check` stops before the linker runs — it passes
       # green on a tree whose wasm target does not link.
       - run: mise run wasm
+      - run: mise run wasm-web
 
       # The three guards must FIRE, not merely be present. A `compile_error!`
       # nobody triggers is a comment. Each of these features needs an OS

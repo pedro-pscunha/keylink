@@ -87,6 +87,21 @@ pub enum Error {
     #[error("a protocol handler panicked: {0}")]
     HandlerPanic(String),
 
+    /// A browser `ReadableStream` could not be read as bytes.
+    ///
+    /// `wasm_streams` can only adapt a stream created with `type: "bytes"`,
+    /// because it needs a BYOB reader. The ordinary JS shape,
+    /// `new ReadableStream({start(c) {..}})`, has none — and the underlying
+    /// `into_async_read` PANICS on it rather than returning an error, which is
+    /// why `Body::from_web_stream` is fallible. (Not a link: that constructor
+    /// exists only on wasm, and rustdoc runs on the host.)
+    ///
+    /// Not gated on the `web` feature on purpose: one enum shape on every
+    /// target costs one dead variant on native and removes a `cfg` from a
+    /// public type.
+    #[error("the ReadableStream is locked to a reader, or it is not a byte stream")]
+    NotAByteStream,
+
     /// A body ended before the length its sender declared. The streaming
     /// counterpart of [`Error::FrameTruncated`]: a short file is never mistaken
     /// for a complete one.

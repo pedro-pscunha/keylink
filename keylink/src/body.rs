@@ -242,3 +242,99 @@ impl BodyReader {
         Ok(self.received)
     }
 }
+
+// ───────────────────────────────────────────────────────── the browser's bodies
+
+/// A reader that is only ever touched from the thread that made it.
+///
+/// **This is not a level-2 newtype and must not be documented as one.** It
+/// deletes no check. It asserts a platform fact: `wasm32-unknown-unknown`
+/// without the `atomics` target feature is single threaded, so a value that is
+/// `!Send` for want of thread safety cannot in fact cross a thread, because
+/// there is no second thread to cross to.
+///
+/// The assertion is needed because [`Source::Reader`] requires `Send` — iroh's
+/// `ProtocolHandler::accept` returns `impl Future + Send` on **every** target,
+/// with no `cfg`, so the bound cannot be relaxed for the browser — while
+/// `wasm_streams`' reader holds a `JsFuture`, which holds an `Rc<RefCell<_>>`.
+///
+/// What makes the assertion enforceable rather than hopeful is the
+/// `compile_error!` in `lib.rs` that refuses `web` together with
+/// `target_feature = "atomics"`. Without that guard this `unsafe impl` would be
+/// unsound under threaded wasm, and nothing would say so.
+#[cfg(all(feature = "web", target_family = "wasm", target_os = "unknown"))]
+struct OnOneThread<R>(R);
+
+#[cfg(all(feature = "web", target_family = "wasm", target_os = "unknown"))]
+// SAFETY: see the type's doc comment. Sound only while keylink refuses to
+// compile the `web` feature for threaded wasm, which lib.rs enforces.
+unsafe impl<R> Send for OnOneThread<R> {}
+
+#[cfg(all(feature = "web", target_family = "wasm", target_os = "unknown"))]
+impl<R: AsyncRead + Unpin> AsyncRead for OnOneThread<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+#[cfg(all(feature = "web", target_family = "wasm", target_os = "unknown"))]
+impl Body {
+    /// Stream a browser `File` — from an `<input type="file">` or a drop — with
+    /// its length declared.
+    ///
+    /// The browser's answer to [`Body::from_file`], and the reason the `web`
+    /// feature exists. `File::size()` is known before a byte is read, so the
+    /// receiver can tell a truncated transfer from a clean close, which is the
+    /// property `from_reader(_, None)` gives up.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotAByteStream`] when the file's stream cannot produce a BYOB
+    /// reader. See [`Self::from_web_stream`].
+    pub fn from_web_file(file: &web_sys::File) -> Result<Self> {
+        // f64, and exact below 2^53 bytes — nine petabytes, so the cast is
+        // lossless for anything a browser can hold.
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let len = file.size() as u64;
+        Self::from_web_stream(file.stream(), Some(len))
+    }
+
+    /// Stream any browser `ReadableStream`.
+    ///
+    /// # Why this returns a `Result` when the obvious signature does not
+    ///
+    /// `wasm_streams`' `into_async_read` is documented to **panic** unless the
+    /// stream is a readable *byte* stream, because it needs a BYOB reader —
+    /// and it panics through `expect_throw`, which raises a JS exception rather
+    /// than unwinding. Under a `panic = "abort"` release profile that ends the
+    /// module.
+    ///
+    /// An infallible constructor over a fallible operation is worse than a
+    /// guard: the caller cannot see the failure, let alone handle it. So this
+    /// takes the fallible route and reports [`Error::NotAByteStream`].
+    ///
+    /// `File::stream()` is a byte stream per the File API, so
+    /// [`Self::from_web_file`] is expected to succeed. A stream built by hand
+    /// with `new ReadableStream({start(c) {..}})` is not, and will be refused.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotAByteStream`] when the stream is already locked to a reader,
+    /// or cannot produce a BYOB reader.
+    pub fn from_web_stream(stream: web_sys::ReadableStream, len: Option<u64>) -> Result<Self> {
+        use tokio_util::compat::FuturesAsyncReadCompatExt;
+
+        let reader = wasm_streams::ReadableStream::from_raw(stream)
+            .try_into_async_read()
+            .map_err(|_| Error::NotAByteStream)?;
+
+        Ok(Self {
+            declared_len: len,
+            source: Source::Reader(Box::pin(OnOneThread(reader.compat()))),
+        })
+    }
+}

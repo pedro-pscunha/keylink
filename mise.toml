@@ -40,6 +40,7 @@ run = [
     { task = "test" },
     { task = "docs" },
     { task = "wasm" },
+    { task = "wasm-web" },
 ]
 
 # ── what the hooks run ──────────────────────────────────────────────────────
