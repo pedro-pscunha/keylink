@@ -889,35 +889,38 @@ impl Observer<Ledger> for CountsTurns {
 /// # What is being pinned
 ///
 /// `is_running()` is `!mail.is_closed()`, and that flips only when the loop's
-/// **receiver** is dropped. The loop drops the observers, then the receiver,
-/// and only then fills the `ended` channel that `stop()` is awaiting. The
-/// receiver drop has to come before that send, because the caller the send
-/// wakes reads the mailbox flag as its very next act. Without the explicit
-/// `drop(inbox)` the receiver instead lives until the spawned async block
-/// itself ends — which is *after* the send — and whether a woken caller sees a
-/// closed mailbox becomes a scheduling accident rather than a property.
+/// **receiver** is dropped. So the property is a claim about an order: the loop
+/// closes the observers and then the mailbox *before* it publishes the reason
+/// it ended, and `stop()` waits for that reason rather than for its own `Stop`
+/// message to be accepted. A `stop()` that returned once the message was merely
+/// queued would return before the loop had even received it, and every caller
+/// that reads `is_running()` afterwards would be reading a live actor. The
+/// explicit `drop(inbox)` in the loop is what keeps the mailbox half of that
+/// from depending on the order the async block happens to drop its captures in,
+/// which no type states and no signature enforces.
 ///
 /// # Why a loop, when one assertion looks like enough
 ///
-/// `a_handle_to_a_stopped_actor_reports_a_closed_mailbox` above and
-/// `local.rs`'s `stop_drains_what_was_sent_before_it` each assert
-/// `!is_running()` exactly once, and those are the two tests that broke. Their
-/// ordering is stated by no type and enforced by no signature, so a single
-/// assertion samples exactly one interleaving and can come back green on luck:
-/// the same code passed 25 runs out of 25 in one capture order and failed 25
-/// out of 25 in the other, and nothing in the source said which order you get.
-/// A regression has to survive every round here, not one.
+/// A single assertion measures a single teardown, and this one is observable
+/// only when something sits between the loop's last send and the receiver's
+/// drop. On an actor holding nothing that gap is a few instructions with no
+/// await in it, so a woken caller cannot land inside it and a green round has
+/// proved nothing; give the actor a state or an observer that is slow to
+/// release and the same gap is wide enough to read, at which point the answer
+/// stops being lucky and becomes uniform — every round wrong. Which of those a
+/// round is depends on what the actor was holding rather than on anything this
+/// test decides, so it runs the whole start/turn/stop cycle many times instead
+/// of trusting one.
 ///
-/// It runs on a multi-threaded runtime for the same reason the loop exists. On
-/// the current-thread runtime every other test in this file uses, the waker for
-/// `stop()` cannot be polled until the actor's task has already completed and
-/// dropped everything it captured, so the ordering under test is *unobservable*
-/// there and this test would be green either way. Several workers let the woken
-/// caller run while the actor's task is still tearing down, which is the
-/// interleaving worth asserting against.
+/// The flavour is not decoration either. On the current-thread runtime every
+/// other test in this file uses, the task woken by `stop()` cannot be polled
+/// until the actor's task has already finished and dropped everything it
+/// captured: the window is unobservable there **by construction**, and this
+/// test would be green whatever the loop did. Several workers are what let a
+/// woken caller run while the actor's task is still tearing down.
 ///
-/// There is no sleep here and nothing is timed: the loop buys interleavings,
-/// not a wall-clock window.
+/// Nothing here is timed. The rounds buy interleavings, not a wall-clock
+/// window, and the assertion is on a flag rather than on elapsed time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stop_returns_only_once_the_mailbox_is_closed() {
     const ROUNDS: usize = 100;
@@ -949,4 +952,62 @@ async fn stop_returns_only_once_the_mailbox_is_closed() {
              by it can still be told the actor is running"
         );
     }
+}
+
+/// A turn an observer refused must NOT settle its idempotency key as the
+/// refusal, because the turn's effect was never committed.
+///
+/// This is wave A's rule meeting RFC-06's, one layer down. Wave A settles a key
+/// on **what ran**: a `Completed` marker records the answer and replays it
+/// forever. An observer runs after the method and can veto the turn it just
+/// watched — and a vetoed turn's mutation lived in memory and never reached a
+/// store, so it is exactly the "it ran, and whether it took effect is unknown"
+/// that `Interrupted` exists to say.
+///
+/// Marking `completed()` where the method returns — which is where it lived
+/// until this test — recorded the veto as the call's settled reply. Every retry
+/// under that key then read `observer refused: ..` as a final answer about work
+/// whose effect had been thrown away. That is RFC-05 §2's defect reached through
+/// a different door: an answer recorded for something that did not land.
+#[tokio::test]
+async fn a_refused_turn_does_not_settle_its_key_as_the_refusal() {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let actor = ledger::actor_with(Ledger::default(), vec![Box::new(RefusesWhatCompleted)]);
+    let _server = Server::builder(&node)
+        .service(actor.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("serves");
+    let client = ledger::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+    let key = keylink::IdempotencyKey::new("post-once").expect("a valid key");
+
+    let refused = client
+        .with_idempotency(key.clone())
+        .post(1, 0)
+        .await
+        .expect_err("the observer refuses the completed turn");
+    assert_eq!(
+        failed_reason(&refused),
+        format!("observer refused: {REFUSER}"),
+        "the caller of the refused turn is told who refused it"
+    );
+
+    // The ledger outlives the actor, so this reaches the record rather than the
+    // dead actor — which is what makes the recorded value observable at all.
+    let repeat = client
+        .with_idempotency(key)
+        .post(1, 0)
+        .await
+        .expect_err("the key was claimed");
+    assert!(
+        matches!(
+            repeat,
+            keylink::Error::Remote(RemoteError::Idempotency(
+                keylink::IdempotencyRefusal::Interrupted
+            ))
+        ),
+        "a refused turn is unknown, not a settled refusal: got {repeat:?}"
+    );
 }

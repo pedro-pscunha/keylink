@@ -798,6 +798,11 @@ macro_rules! service {
                             // leaves it `Interrupted` — which is the truth,
                             // because the turn runs on regardless.
                             let __progress = cx.progress();
+                            // A SECOND handle, marked outside the turn. The
+                            // turn closure can only say the work started; only
+                            // out here is it known whether the answer survived
+                            // an observer. See the `completed()` call below.
+                            let __settled = __progress.clone();
                             // A `QueueTimeout` above this put a deadline on the
                             // context. Honoured HERE rather than by the layer,
                             // because a layer cannot tell a queued message from
@@ -810,22 +815,40 @@ macro_rules! service {
                                         move |__state: &mut A| {
                                         ::std::boxed::Box::pin(async move {
                                             __progress.dispatched();
-                                            let __turned = __actor_turn(
+                                            __actor_turn(
                                                 __state,
                                                 $crate::Caller::Peer(&cx),
                                                 req,
                                                 body,
                                             )
-                                            .await;
-                                            __progress.completed();
-                                            __turned
+                                            .await
                                         })
                                     })
                                     .await;
                                 match __answer {
+                                    // Marked HERE, and not inside the turn.
+                                    // An observer runs after the method and can
+                                    // refuse the turn it just watched, and a
+                                    // refused turn was NOT committed — so
+                                    // marking `completed` where the method
+                                    // returns would settle an idempotency key
+                                    // as the observer's veto and replay that
+                                    // veto to every retry, for work whose
+                                    // effect was thrown away. This arm is the
+                                    // only one holding an answer the turn
+                                    // itself produced; every other one leaves
+                                    // the marker at `dispatched`, which settles
+                                    // `Interrupted` — "it ran, and whether it
+                                    // took effect is unknown". That is the
+                                    // truth for a refused turn, whose mutation
+                                    // lived in memory and never reached a
+                                    // store. RFC-06 §13.3.
                                     ::std::result::Result::Ok($crate::Queued::Ran(
                                         ::std::result::Result::Ok((__response, __body)),
-                                    )) => ($crate::Outcome::Ok(__response), __body),
+                                    )) => {
+                                        __settled.completed();
+                                        ($crate::Outcome::Ok(__response), __body)
+                                    }
                                     // A panic must not unwind out of a
                                     // connection's task, so the remote caller is
                                     // told what the keyed system tells it. The

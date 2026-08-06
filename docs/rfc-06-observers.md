@@ -916,3 +916,36 @@ names rather than leaves to a reader.
 generated actor method is invisible to an observer, which sees the state and the
 outcome and never the request. §5.3's exclusion of the keyed `System` path is
 unaffected: `macros.rs`'s `spawn()` still runs its own loop over `__actor_turn`.
+
+### 13.6 Correcting §13.3 — a refused turn settles `Interrupted`, not the refusal
+
+§13.3 above says a refused turn settles its idempotency key as the `Failed`
+answer, that a retry replays `observer refused: {name}`, and that this "is the
+right answer". **It is not, and this corrects it.**
+
+Wave A settles a key on **what ran**, through a progress marker generated
+dispatch sets. The marker had `completed()` inside the turn closure, where the
+service method returns — and an observer runs *after* that and can refuse the
+turn it just watched. So a row-3 refusal arrived with the marker already at
+`Completed`, and `serve_one` recorded the veto as the call's settled reply.
+
+That is RFC-05 §2's defect reached through a different door: an answer recorded
+for something that did not land. The turn's mutation lived in memory and never
+reached a store, and the actor is ending, so the effect is lost — which is
+exactly the "it ran, and whether it took effect is unknown" that `Interrupted`
+exists to say.
+
+`completed()` now sits in the one dispatch arm holding an answer the turn itself
+produced. Every other arm leaves the marker at `dispatched`. A panicking turn
+already behaved this way, because the panic unwinds past the mark; a refusal now
+matches it.
+
+This also answers something §2.6 leaves open. It says row 3's cost "is real and
+is not solved here — the turn **ran**, and the caller cannot tell whether it ran.
+That is the same ambiguity `client.with_idempotency` exists for." On this branch
+a keyed caller *is* told: `Interrupted` names the ambiguity rather than leaving
+the caller to infer it, which is strictly more than §2.6 expected to be able to
+offer. An unkeyed caller pays the cost §2.6 describes, unchanged.
+
+Found by a review of this branch rather than by the implementation, which had
+written §13.3 the wrong way round and would have shipped it.
