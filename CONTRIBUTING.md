@@ -30,6 +30,13 @@ hook runs, which is exactly why it was broken for three commits without anybody
 seeing it: a licence, an advisory or a wildcard arrives with a dependency and
 with nothing else.
 
+`just features` builds every subset of `blocking`, `fs` and `env`. Clippy checks
+the two ends of that lattice — all on, all off — and the ends do not meet in the
+middle. When you put an item behind a feature gate, check what calls it:
+gating `Node::bind_from_env` behind `env` broke `--features blocking` on its
+own, because `blocking::Node::bind_from_env` calls it, and neither end of the
+lattice noticed.
+
 ## When `--no-verify` is legitimate
 
 Both hooks point here. The short version is "the hook itself is broken", never

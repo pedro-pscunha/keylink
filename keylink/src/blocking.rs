@@ -125,6 +125,10 @@ impl Node {
     }
 
     /// Bind using a 64-hex secret from an environment variable.
+    ///
+    /// Gated on `env` as well as `blocking`: the synchronous API does not need
+    /// a process environment, only this one method does.
+    #[cfg(feature = "env")]
     pub fn bind_from_env(var: &str) -> Result<Self> {
         let runtime = Arc::new(Runtime::new()?);
         let inner = runtime.run(crate::Node::bind_from_env(var))??;

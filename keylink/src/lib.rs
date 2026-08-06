@@ -40,6 +40,34 @@
 
 #![warn(missing_docs)]
 
+// Three features need an operating system facility a browser does not have, and
+// each says so here rather than letting the build fail somewhere unhelpful.
+//
+// `blocking` and `fs` would fail anyway, dozens of errors deep inside mio or
+// tokio's filesystem module, naming crates the reader never chose. `env` is the
+// one that would NOT fail: `std::env::var` compiles for
+// wasm32-unknown-unknown and always returns `NotPresent`, so
+// `Allowlist::from_env` would build, ship, and then refuse every peer at
+// runtime. Failing closed is the right default, but a function that can never
+// succeed on a target should not compile for it.
+#[cfg(all(feature = "blocking", target_family = "wasm", target_os = "unknown"))]
+compile_error!(
+    "keylink's `blocking` feature needs OS threads, which a browser does not \
+     have. Build with --no-default-features."
+);
+#[cfg(all(feature = "fs", target_family = "wasm", target_os = "unknown"))]
+compile_error!(
+    "keylink's `fs` feature needs a filesystem, which a browser does not have. \
+     Build with --no-default-features, and enable `web` for Blob and File \
+     bodies instead."
+);
+#[cfg(all(feature = "env", target_family = "wasm", target_os = "unknown"))]
+compile_error!(
+    "keylink's `env` feature needs a process environment, which a browser does \
+     not have: `std::env::var` compiles here and always returns nothing. Build \
+     with --no-default-features and pass the secret and the allowlist in."
+);
+
 /// Gated on the feature AND compiled only where OS threads exist. The Cargo
 /// feature alone is not enough: it controls which dependency features are on,
 /// not whether this module's `tokio::signal` and `new_multi_thread` calls are

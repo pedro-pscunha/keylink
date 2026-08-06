@@ -68,6 +68,7 @@ impl Allowlist {
     ///
     /// [`ConfigError::MissingEnvVar`] when unset, plus the errors of
     /// [`Self::parse`].
+    #[cfg(feature = "env")]
     pub fn from_env(var: &str) -> Result<Self> {
         let raw = std::env::var(var).map_err(|_| ConfigError::MissingEnvVar {
             var: var.to_owned(),

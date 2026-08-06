@@ -1,12 +1,16 @@
 //! Endpoint lifecycle: identity, binding, and the derived ALPN.
 
+// Both reach exactly one item, `bind_from_env`, so they carry its gate.
+#[cfg(feature = "env")]
 use std::str::FromStr;
 
 use iroh::{endpoint::presets, Endpoint, EndpointId, SecretKey};
 use postcard_rpc::hash::fnv1a64::hash_ty_path;
 use postcard_schema::Schema;
 
-use crate::{ConfigError, Result};
+#[cfg(feature = "env")]
+use crate::ConfigError;
+use crate::Result;
 
 /// A bound iroh endpoint. One per process is normal; it multiplexes every
 /// protocol you serve or dial.
@@ -46,6 +50,7 @@ impl Node {
     ///
     /// [`ConfigError::MalformedSecretKey`] when the variable is set but does not
     /// parse, plus the errors of [`Self::bind`].
+    #[cfg(feature = "env")]
     pub async fn bind_from_env(var: &str) -> Result<Self> {
         let Ok(hex) = std::env::var(var) else {
             return Self::bind().await;

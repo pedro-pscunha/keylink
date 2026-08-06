@@ -14,7 +14,7 @@ _default:
 # ── the whole gate ──────────────────────────────────────────────────────────
 
 # Everything CI runs, in CI's order. Cheapest failures first.
-gate: fmt-check lint test docs wasm
+gate: fmt-check lint features test docs wasm
 
 # ── what the hooks run ──────────────────────────────────────────────────────
 
@@ -46,6 +46,25 @@ lint-fast:
 lint:
     cargo clippy --all-targets --all-features -- -D warnings
     cargo clippy -p keylink --lib --no-default-features -- -D warnings
+
+# ── feature combinations ────────────────────────────────────────────────────
+
+# Every subset of the three optional features.
+#
+# `lint` checks the two ENDS of the lattice — all features on, all features off
+# — and they do not meet in the middle. That gap is not theoretical: gating
+# `bind_from_env` behind `env` made `--features blocking` alone stop compiling,
+# because `blocking::Node::bind_from_env` calls it, and neither end noticed.
+#
+# `check` rather than `clippy`, because `lint` already lints both ends and what
+# this recipe is looking for is a combination that does not build at all.
+features:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for f in "" blocking fs env blocking,fs blocking,env fs,env blocking,fs,env; do
+        echo "── features: ${f:-none}"
+        cargo check -p keylink --lib --no-default-features --features "$f"
+    done
 
 # ── tests ───────────────────────────────────────────────────────────────────
 

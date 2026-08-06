@@ -26,6 +26,7 @@ jobs:
       - uses: extractions/setup-just@v2
       - run: just fmt-check
       - run: just lint
+      - run: just features
       - run: just test
       - run: just docs
 

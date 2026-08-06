@@ -27,5 +27,8 @@ echo "      WITHOUT the browser target. Install 'just' to gate it locally." >&2
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy -p keylink --lib --no-default-features -- -D warnings
+for f in "" blocking fs env blocking,fs blocking,env fs,env blocking,fs,env; do
+    cargo check -p keylink --lib --no-default-features --features "$f"
+done
 cargo test --workspace
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features -p keylink
