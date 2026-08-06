@@ -298,7 +298,10 @@ async fn a_file_streams_up_from_disk_intact() {
     let fixture = start().await;
     let outcome = fixture
         .client
-        .upload("payload.bin".to_string(), Body::from_file(&path).await.unwrap())
+        .upload(
+            "payload.bin".to_string(),
+            Body::from_file(&path).await.unwrap(),
+        )
         .await
         .unwrap();
 
@@ -531,12 +534,12 @@ async fn a_layer_can_refuse_one_method_and_pass_the_rest() {
     assert_eq!(client.ping().await.unwrap(), "pong");
 
     // Guarded method is refused, and the refusal is typed.
-    let err = client.slow(1).await.expect_err("the layer refuses this one");
+    let err = client
+        .slow(1)
+        .await
+        .expect_err("the layer refuses this one");
     assert!(
-        matches!(
-            err,
-            Error::Remote(keylink::RemoteError::Unauthorized(_))
-        ),
+        matches!(err, Error::Remote(keylink::RemoteError::Unauthorized(_))),
         "expected a typed refusal, got {err:?}"
     );
 

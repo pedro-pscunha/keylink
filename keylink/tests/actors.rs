@@ -252,7 +252,10 @@ async fn the_connection_survives_a_message_to_an_unmounted_actor() {
     );
 
     assert_eq!(
-        journal::at(&fixture.client, id("real")).apply(2, 0).await.unwrap(),
+        journal::at(&fixture.client, id("real"))
+            .apply(2, 0)
+            .await
+            .unwrap(),
         2,
         "a refusal must not poison the connection"
     );
@@ -303,10 +306,9 @@ async fn an_oversized_id_is_refused_before_it_reaches_the_registry() {
 
     // Encoded as a plain string and decoded as an `ActorId`, which is exactly
     // what a peer can do: `derive(Deserialize)` never calls `new`.
-    let oversized: ActorId = postcard::from_bytes(
-        &postcard::to_stdvec(&"x".repeat(keylink::MAX_KEY_LEN + 1)).unwrap(),
-    )
-    .expect("a peer can encode what our constructor refuses");
+    let oversized: ActorId =
+        postcard::from_bytes(&postcard::to_stdvec(&"x".repeat(keylink::MAX_KEY_LEN + 1)).unwrap())
+            .expect("a peer can encode what our constructor refuses");
 
     let error = journal::at(&fixture.client, oversized)
         .apply(1, 0)
@@ -406,7 +408,10 @@ async fn a_panicking_message_costs_one_message_and_not_the_actor() {
     );
 
     assert_eq!(
-        journal::at(&fixture.client, id("fragile")).apply(1, 0).await.unwrap(),
+        journal::at(&fixture.client, id("fragile"))
+            .apply(1, 0)
+            .await
+            .unwrap(),
         1,
         "the actor must still be serving"
     );
@@ -431,7 +436,10 @@ async fn a_first_message_spawns_an_actor_when_the_system_was_given_a_factory() {
     assert!(fixture.system.is_empty(), "nothing is mounted by hand");
 
     assert_eq!(
-        journal::at(&fixture.client, id("obra/9")).apply(3, 0).await.unwrap(),
+        journal::at(&fixture.client, id("obra/9"))
+            .apply(3, 0)
+            .await
+            .unwrap(),
         3
     );
 
@@ -440,7 +448,10 @@ async fn a_first_message_spawns_an_actor_when_the_system_was_given_a_factory() {
 
     // A second message reuses the actor rather than building another.
     assert_eq!(
-        journal::at(&fixture.client, id("obra/9")).entries().await.unwrap(),
+        journal::at(&fixture.client, id("obra/9"))
+            .entries()
+            .await
+            .unwrap(),
         vec![3],
         "the second message must reach the actor the first one spawned"
     );
@@ -539,7 +550,11 @@ async fn eviction_never_cuts_off_a_message_in_flight() {
     // In flight for far longer than the eviction budget.
     let answered = journal::at(&fixture.client, id("slow")).apply(5, 250).await;
 
-    assert_eq!(answered.unwrap(), 5, "the message in flight must be answered");
+    assert_eq!(
+        answered.unwrap(),
+        5,
+        "the message in flight must be answered"
+    );
 }
 
 /// Eviction never touches the ALPN, so a peer connected before it can still
@@ -554,14 +569,20 @@ async fn the_connection_outlives_the_actors_on_it() {
     .await;
 
     assert_eq!(
-        journal::at(&fixture.client, id("first")).apply(1, 0).await.unwrap(),
+        journal::at(&fixture.client, id("first"))
+            .apply(1, 0)
+            .await
+            .unwrap(),
         1
     );
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(fixture.system.is_empty(), "the first actor was evicted");
 
     assert_eq!(
-        journal::at(&fixture.client, id("second")).apply(2, 0).await.unwrap(),
+        journal::at(&fixture.client, id("second"))
+            .apply(2, 0)
+            .await
+            .unwrap(),
         2,
         "the same connection must still work after every actor on it went away"
     );

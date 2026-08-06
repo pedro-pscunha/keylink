@@ -169,7 +169,13 @@ impl Warehouse {
     fn seeded() -> Self {
         let mut items = BTreeMap::new();
         for (sku, name, cents, stock, tags) in [
-            ("MUD-001", "Muda de Ipê Amarelo", 4500u64, 12u32, vec!["arvore", "nativa"]),
+            (
+                "MUD-001",
+                "Muda de Ipê Amarelo",
+                4500u64,
+                12u32,
+                vec!["arvore", "nativa"],
+            ),
             ("ADU-014", "Adubo Orgânico 20kg", 8900, 3, vec!["insumo"]),
             ("GRA-esm", "Grama Esmeralda m²", 1250, 400, vec!["grama"]),
         ] {
@@ -178,20 +184,27 @@ impl Warehouse {
                 Item {
                     sku: sku.to_string(),
                     name: name.to_string(),
-                    price: Money { cents, currency: Currency::Brl },
+                    price: Money {
+                        cents,
+                        currency: Currency::Brl,
+                    },
                     stock,
                     tags: tags.into_iter().map(String::from).collect(),
                 },
             );
         }
-        Self { items: Mutex::new(items) }
+        Self {
+            items: Mutex::new(items),
+        }
     }
 
     /// A panicking handler must not wedge every later request. Recover the guard
     /// instead of propagating poisoning — one bad request should cost one
     /// request, not the process.
     fn items(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Item>> {
-        self.items.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.items
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Land an upload on disk, hashing as it goes. Never holds the payload.
@@ -304,9 +317,9 @@ fn main() -> Result<()> {
                 }
             })
         }
-        None => bail!(
-            "usage: demo id | demo serve | demo connect <id> [file] | demo connect-sync <id>"
-        ),
+        None => {
+            bail!("usage: demo id | demo serve | demo connect <id> [file] | demo connect-sync <id>")
+        }
     }
 }
 
@@ -320,7 +333,10 @@ fn connect_sync(id: &str) -> Result<()> {
 
     println!("ping        -> {}", client.ping()?);
     println!("list        -> {} items", client.list()?.len());
-    println!("get_item    -> {:?}", client.get_item("ADU-014".into())?.map(|i| i.name));
+    println!(
+        "get_item    -> {:?}",
+        client.get_item("ADU-014".into())?.map(|i| i.name)
+    );
     match client.reserve("MUD-001".into(), 1) {
         Ok(outcome) => println!("reserve 1   -> {outcome:?}"),
         Err(err) => println!("reserve 1   -> REFUSED ({err})"),
@@ -344,7 +360,10 @@ async fn serve() -> Result<()> {
     // Fails at startup when unset, rather than bouncing every peer at runtime.
     let allow = Allowlist::from_env("KEYLINK_ALLOWED_IDS")?;
 
-    println!("alpn:         {}", String::from_utf8_lossy(inventory::alpn()));
+    println!(
+        "alpn:         {}",
+        String::from_utf8_lossy(inventory::alpn())
+    );
     println!("listening as: {}", node.id());
 
     let server = inventory::serve(&node, Warehouse::seeded(), allow)?;
@@ -368,15 +387,30 @@ async fn connect(id: &str, upload: Option<&str>) -> Result<()> {
     let items = client.list().await?;
     println!("list        -> {} items", items.len());
     for item in &items {
-        println!("               {:<8} {:<28} {:>8} un  {:?}", item.sku, item.name, item.stock, item.price.currency);
+        println!(
+            "               {:<8} {:<28} {:>8} un  {:?}",
+            item.sku, item.name, item.stock, item.price.currency
+        );
     }
 
-    println!("\nget_item    -> {:?}", client.get_item("ADU-014".into()).await?.map(|i| i.name));
+    println!(
+        "\nget_item    -> {:?}",
+        client.get_item("ADU-014".into()).await?.map(|i| i.name)
+    );
     println!("get_item    -> {:?}", client.get_item("NOPE".into()).await?);
 
-    println!("\nreserve 2   -> {:?}", client.reserve("ADU-014".into(), 2).await?);
-    println!("reserve 99  -> {:?}", client.reserve("ADU-014".into(), 99).await?);
-    println!("reserve ??  -> {:?}", client.reserve("NOPE".into(), 1).await?);
+    println!(
+        "\nreserve 2   -> {:?}",
+        client.reserve("ADU-014".into(), 2).await?
+    );
+    println!(
+        "reserve 99  -> {:?}",
+        client.reserve("ADU-014".into(), 99).await?
+    );
+    println!(
+        "reserve ??  -> {:?}",
+        client.reserve("NOPE".into(), 1).await?
+    );
 
     concurrent_calls(&client).await?;
     download(&client).await?;
@@ -419,7 +453,10 @@ async fn download(client: &inventory::Client) -> Result<()> {
         "\nfetch       -> {} declares {} bytes (checksum {:016x})",
         sheet.sku, sheet.bytes, sheet.checksum
     );
-    println!("               body declares {:?} bytes", body.declared_len());
+    println!(
+        "               body declares {:?} bytes",
+        body.declared_len()
+    );
 
     let path = std::env::temp_dir().join("keylink-datasheet.bin");
     let mut file = tokio::fs::File::create(&path).await?;
@@ -437,7 +474,10 @@ async fn download(client: &inventory::Client) -> Result<()> {
         "               received {bytes} bytes in {:?} -> {}",
         started.elapsed(),
         if bytes == sheet.bytes && checksum == sheet.checksum {
-            format!("OK, checksum {checksum:016x} matches, saved to {}", path.display())
+            format!(
+                "OK, checksum {checksum:016x} matches, saved to {}",
+                path.display()
+            )
         } else {
             format!("MISMATCH: {checksum:016x} over {bytes} bytes")
         }
@@ -462,7 +502,11 @@ async fn upload_file(client: &inventory::Client, path: &str) -> Result<()> {
         .upload(name.clone(), Body::from_file(path).await?)
         .await?;
 
-    println!("\nupload      -> {name} ({} bytes) in {:?}", local.len(), started.elapsed());
+    println!(
+        "\nupload      -> {name} ({} bytes) in {:?}",
+        local.len(),
+        started.elapsed()
+    );
     match outcome {
         UploadOutcome::Stored { bytes, checksum } => println!(
             "               peer stored {bytes} bytes -> {}",

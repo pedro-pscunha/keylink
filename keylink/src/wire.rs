@@ -149,9 +149,7 @@ impl FrameReader {
     /// `Ok(None)` means the peer finished the stream cleanly *before* the frame
     /// started — a normal end of conversation. A frame that starts and does not
     /// finish is [`Error::FrameTruncated`]. The two are never confused.
-    pub(crate) async fn read_header<T: DeserializeOwned>(
-        &mut self,
-    ) -> Result<Option<Envelope<T>>> {
+    pub(crate) async fn read_header<T: DeserializeOwned>(&mut self) -> Result<Option<Envelope<T>>> {
         if !self.stage_at_least(PREFIX).await? {
             return if self.staged.is_empty() {
                 Ok(None)

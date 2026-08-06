@@ -6,7 +6,9 @@
 //! the single source of truth for "how does a transport failure become a
 //! keylink failure": one list, in one place.
 
-use iroh::endpoint::{BindError, ClosedStream, ConnectError, ConnectionError, ReadError, WriteError};
+use iroh::endpoint::{
+    BindError, ClosedStream, ConnectError, ConnectionError, ReadError, WriteError,
+};
 use iroh::KeyParsingError;
 
 /// Everything that can go wrong on a keylink call.

@@ -50,7 +50,15 @@ macro_rules! bounded_key {
         /// peer with [`validate`](Self::validate) before you use it: the derived
         /// `Deserialize` does not call [`new`](Self::new).
         #[derive(
-            Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+            Debug,
+            Clone,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            Serialize,
+            Deserialize,
             postcard_schema::Schema,
         )]
         pub struct $name(String);

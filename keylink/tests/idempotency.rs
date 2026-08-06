@@ -172,9 +172,17 @@ async fn a_different_key_runs_the_handler_again() {
 #[tokio::test]
 async fn a_call_without_a_key_runs_every_time() {
     let fixture = start().await;
-    let first = fixture.client.reserve("ADU-014".to_string(), 2).await.unwrap();
+    let first = fixture
+        .client
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .unwrap();
 
-    let second = fixture.client.reserve("ADU-014".to_string(), 2).await.unwrap();
+    let second = fixture
+        .client
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .unwrap();
 
     assert_eq!(second, first + 1);
 }

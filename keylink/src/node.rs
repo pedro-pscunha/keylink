@@ -50,10 +50,11 @@ impl Node {
         let Ok(hex) = std::env::var(var) else {
             return Self::bind().await;
         };
-        let secret = SecretKey::from_str(&hex).map_err(|source| ConfigError::MalformedSecretKey {
-            var: var.to_owned(),
-            source,
-        })?;
+        let secret =
+            SecretKey::from_str(&hex).map_err(|source| ConfigError::MalformedSecretKey {
+                var: var.to_owned(),
+                source,
+            })?;
         Self::bind_with_secret(secret).await
     }
 

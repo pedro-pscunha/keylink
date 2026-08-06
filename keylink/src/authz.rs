@@ -45,12 +45,11 @@ impl Allowlist {
     pub fn parse(raw: &str) -> Result<Self> {
         let mut ids = BTreeSet::new();
         for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-            let id = EndpointId::from_str(entry).map_err(|source| {
-                ConfigError::MalformedEndpointId {
+            let id =
+                EndpointId::from_str(entry).map_err(|source| ConfigError::MalformedEndpointId {
                     entry: entry.to_owned(),
                     source,
-                }
-            })?;
+                })?;
             ids.insert(id);
         }
         if ids.is_empty() {
@@ -106,10 +105,7 @@ mod tests {
     fn rejects_malformed_entry_instead_of_skipping() {
         let err = Allowlist::parse(&format!("{A},notahexid")).unwrap_err();
         assert!(
-            matches!(
-                err,
-                Error::Config(ConfigError::MalformedEndpointId { .. })
-            ),
+            matches!(err, Error::Config(ConfigError::MalformedEndpointId { .. })),
             "got {err:?}"
         );
     }
