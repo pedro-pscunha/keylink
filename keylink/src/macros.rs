@@ -500,6 +500,7 @@ macro_rules! service {
                                     __state,
                                     __hooks,
                                     origin,
+                                    ::core::stringify!($rpc),
                                     reply,
                                     body,
                                     [<$rpc:snake>],
@@ -510,6 +511,14 @@ macro_rules! service {
                             __state,
                             __hooks,
                             origin,
+                            // Read off the decoded request, because this arm is
+                            // one arm for every method: a served call arrives as
+                            // a `Request` and only its own variant knows which
+                            // method it is. `Rpc::method` is the same function
+                            // the wire layers read, so an observer and a
+                            // middleware watching one call agree on its name.
+                            // Read BEFORE `request` moves into the closure.
+                            $crate::Rpc::method(&request),
                             reply,
                             move |__from: $crate::Origin, __on: &mut A| {
                                 ::std::boxed::Box::pin(async move {
@@ -1994,15 +2003,22 @@ macro_rules! __keylink_mail_answer {
 /// `Caller` borrowed in the loop and captured here would have to outlive every
 /// lifetime `turn`'s higher ranked bound quantifies over, and RFC-07 §1.6 proves
 /// a peer's `Caller` never reaches `'static`.
+///
+/// `$declared` is the method's **wire** name and `$method` its snake-case trait
+/// method: one is what a `TurnInfo` reports and the other is what gets called.
+/// Two parameters rather than one derivation, because `pastey` can go from
+/// `Reserve` to `reserve` and nothing can reliably go back — `GetItem` is the
+/// counter-example.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_mail_arm {
-    (send, $actor:ty, $state:expr, $hooks:expr, $origin:expr, $reply:expr, $body:expr,
-        $method:ident, ($( $arg:ident ),*)) => {
+    (send, $actor:ty, $state:expr, $hooks:expr, $origin:expr, $declared:expr, $reply:expr,
+        $body:expr, $method:ident, ($( $arg:ident ),*)) => {
         $crate::turn(
             $state,
             $hooks,
             $origin,
+            $declared,
             $reply,
             move |__from: $crate::Origin, __on: &mut $actor| {
                 ::std::boxed::Box::pin(async move {
@@ -2012,8 +2028,8 @@ macro_rules! __keylink_mail_arm {
         )
         .await
     };
-    ($kind:ident, $actor:ty, $state:expr, $hooks:expr, $origin:expr, $reply:expr, $body:expr,
-        $method:ident, ($( $arg:ident ),*)) => {{
+    ($kind:ident, $actor:ty, $state:expr, $hooks:expr, $origin:expr, $declared:expr, $reply:expr,
+        $body:expr, $method:ident, ($( $arg:ident ),*)) => {{
         // The unit `__keylink_mail_body!` chose for this kind, destructured
         // rather than dropped: a `let _ = ..` would go on compiling if the field
         // ever became something else, and this says which kinds have no body.
@@ -2022,6 +2038,7 @@ macro_rules! __keylink_mail_arm {
             $state,
             $hooks,
             $origin,
+            $declared,
             $reply,
             move |__from: $crate::Origin, __on: &mut $actor| {
                 ::std::boxed::Box::pin(async move {

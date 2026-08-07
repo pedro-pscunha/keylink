@@ -171,7 +171,7 @@ pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use local::{deliver_to_local, turn, Hooks, LocalActor, MailboxClosed, Reply, Turn};
 pub use middleware::{Caller, Context, Middleware, Next, QueueTimeout, Queueing, Rpc, Timeout};
 pub use node::{derive_alpn, Node};
-pub use observe::{Ended, Observer, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome};
+pub use observe::{Ended, FinishFut, Observer, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome};
 pub use panic::{catching, guarded, Panic};
 pub use peer::{Dial, Peer};
 pub use reply::{Outcome, RemoteError, WireRequest, WireResponse};

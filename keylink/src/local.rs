@@ -202,7 +202,9 @@ pub trait Turn<A>: Send + 'static {
 /// own method's return type, and generated code does exactly two things with it:
 /// puts it in a variant, and hands it to [`turn`]. It never builds one — keylink
 /// makes the pair — and it never reads one, so [`Answered`] stays `pub(crate)`
-/// and Wave 2's fourth state is additive to a type nothing outside can match on.
+/// and its fourth state was additive to a type nothing outside can match on.
+/// That prediction was tested by [`Answered::Faulted`] landing: not one
+/// generated line moved.
 ///
 /// Contrast the alias this replaces: `Answer<Resp>` was a transparent
 /// `oneshot::Sender<..>`, so tokio's channel type was in keylink's public API
@@ -256,13 +258,30 @@ impl<T> Reply<T> {
 
 /// What the loop puts on the reply channel.
 ///
-/// Three states rather than two, because "the budget expired while it queued"
-/// and "an observer refused the turn that ran" are opposite facts and a caller
-/// that has to unwrap two layers to tell them apart will get it wrong. A
-/// **dropped** sender is the fourth case and stays `TurnLost::Gone`.
+/// Four states rather than two, because "the budget expired while it queued",
+/// "an observer refused the turn that ran" and "the turn ran and exploded" are
+/// three different facts and a caller that has to unwrap layers to tell them
+/// apart will get it wrong. A **dropped** sender is the fifth case and stays
+/// `TurnLost::Gone` — see [`LocalActor::answered`].
+///
+/// # `Faulted` is a variant and not a `Ran(Err(..))`
+///
+/// It was `Ran(Result<T, Panic>)`, which made a fault a *shape* of a successful
+/// turn: every consumer had to look one level in to find out whether the actor's
+/// state was mutated or torn, and the two consumers that matter — the panic
+/// policy on the local path and the wire rendering on the served one — both did
+/// it differently. Flattening the two puts the distinction in the discriminant,
+/// where a `match` has to answer it.
+///
+/// The `Panic` travels rather than being reduced to a message here. It is the
+/// original payload, and `resume_unwind` on the original payload is the
+/// difference between forwarding a panic and starting a second one — `panic.rs`
+/// says so where the payload is kept.
 pub(crate) enum Answered<T> {
-    /// The turn ran. `Err` is a panic the actor survived.
-    Ran(Result<T, Panic>),
+    /// The turn ran and produced its value.
+    Ran(T),
+    /// The turn ran and panicked. The actor survived it.
+    Faulted(Panic),
     /// A queueing budget expired while the message waited. Nothing ran.
     Expired,
     /// An observer refused a completed turn. It ran and was not committed.
@@ -282,6 +301,7 @@ pub(crate) enum Answered<T> {
 async fn observed_turn<A, T, F>(
     state: &mut A,
     hooks: &mut [Box<dyn Observer<A>>],
+    method: &'static str,
     turn: F,
 ) -> (Answered<T>, Option<Ended>)
 where
@@ -300,7 +320,7 @@ where
 {
     let answer = guarded(async { turn(state).await }).await;
 
-    // Copied out BEFORE `reply.send(answer)` moves the `Panic`. Building the
+    // Copied out BEFORE the `Panic` moves into an `Answered`. Building the
     // reason afterwards is `E0382`, not a style preference.
     let panicked: Option<String> = match &answer {
         Err(panic) => Some(panic.message().to_owned()),
@@ -311,6 +331,7 @@ where
             Some(message) => TurnOutcome::Panicked { message },
             None => TurnOutcome::Completed,
         },
+        method,
     };
 
     let mut refused: Option<(&'static str, Arc<dyn Error + Send + Sync>)> = None;
@@ -365,14 +386,23 @@ where
         }
     }
 
+    // The one place the handler's `Result` becomes a discriminant. Written once
+    // and read by two arms below, so a fault cannot be reported as a value on
+    // one path and as a fault on the other.
+    let answered = match answer {
+        Ok(value) => Answered::Ran(value),
+        Err(panic) => Answered::Faulted(panic),
+    };
+
     match (refused, panicked) {
-        // Completed and accepted: the value.
-        (None, _) => (Answered::Ran(answer), None),
-        // Panicked and refused: the panic is STILL answered, and then the actor
-        // ends. `Err(Panic)` is not `Ok`, so the argument for withholding a
-        // reply never applied to it — and withholding here would reverse what
-        // this module's header promises about a panicking call.
-        (Some(_), Some(message)) => (Answered::Ran(answer), Some(Ended::Panicked { message })),
+        // Completed and accepted: the value. Or faulted and accepted, which is
+        // an observer that read `TurnOutcome::Panicked` and chose to continue.
+        (None, _) => (answered, None),
+        // Panicked and refused: the fault is STILL answered, and then the actor
+        // ends. `Answered::Faulted` is not a value, so the argument for
+        // withholding a reply never applied to it — and withholding here would
+        // reverse what this module's header promises about a panicking call.
+        (Some(_), Some(message)) => (answered, Some(Ended::Panicked { message })),
         // Completed and refused: the turn ran and was not committed, so the
         // caller is told it has no answer rather than given an uncommitted one.
         (Some((name, error)), None) => (
@@ -416,11 +446,20 @@ where
 /// replay that veto to every retry, for work whose effect was thrown away —
 /// RFC-06 §13.3. That reasoning was written twice, in two dispatchers, and this
 /// is where it is written once.
+///
+/// # And so is the method's name
+///
+/// `method` is what [`TurnInfo::method`](crate::TurnInfo) reports, and it is a
+/// parameter rather than something derived here because only the caller knows
+/// it: a generated arm is expanded per method and passes its own literal, and
+/// the served arm reads it off the decoded request. Both spell it the way the
+/// wire does, which is the agreement `Rpc::method` holds the other half of.
 #[doc(hidden)]
 pub async fn turn<A, T, F>(
     state: &mut A,
     hooks: &mut Hooks<A>,
     origin: Origin,
+    method: &'static str,
     reply: Reply<T>,
     turn: F,
 ) -> Option<Ended>
@@ -465,8 +504,13 @@ where
     if let Some(progress) = &progress {
         progress.dispatched();
     }
-    let (answered, end) = observed_turn(state, hooks, move |state| turn(origin, state)).await;
-    if let (Some(progress), Answered::Ran(Ok(_))) = (&progress, &answered) {
+    let (answered, end) =
+        observed_turn(state, hooks, method, move |state| turn(origin, state)).await;
+    // `Ran` and nothing else. A `Faulted` turn is not a completed one, and an
+    // `Expired` or `Refused` one is handled above or marked by the observer
+    // chain's own refusal — spelling this as a positive match is what keeps a
+    // fifth `Answered` state from silently settling a key.
+    if let (Some(progress), Answered::Ran(_)) = (&progress, &answered) {
         progress.completed();
     }
     reply.answer(answered);
@@ -608,6 +652,64 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
                     Message::Stop => break,
                 }
             }
+            // The last thing that happens with the state, and it happens BEFORE
+            // the three drops below — so `stop().await` returning still means
+            // every claim is free, and a flush that needed the state still had
+            // it. RFC-06 §7's debounced store is unbuildable without this: a
+            // debounce is only safe with a guaranteed final flush.
+            //
+            // `reason` is already decided, and is lent rather than remade, so
+            // every observer is told what every waiter is about to be told.
+            //
+            // **Unreachable on `abort` by construction, not by policy.**
+            // `abort()` is `task.abort()` and nothing else: the future is
+            // dropped at its next await and the loop never gets here. The one
+            // hole is on `abort`'s own doc — a turn that never reaches an await
+            // is not interrupted, so such an actor can exit the loop normally
+            // afterwards and then this does run.
+            //
+            // TWO catches per observer and no `guarded` around the loop, which
+            // is the same decision `observed_turn` made one rung up and it is
+            // made here for both of its reasons.
+            //
+            // A single `guarded` around the whole loop would need a built
+            // future, so an `async` block, so a block capturing `&state` across
+            // an await — `Send` only when `A: Sync`, which is the bound this
+            // design exists to keep out. The leak is not a matter of care: this
+            // block is spawned under `A: Send + 'static` and nothing more, so an
+            // `A: Sync` requirement introduced here is a compile error in
+            // keylink itself rather than a downstream surprise.
+            //
+            // And it would stop the chain at the first panic. `finish` is a
+            // flush: an adapter that fell over must not cost the next adapter
+            // its write, and there is no refusal left to short-circuit for —
+            // `finish` is infallible and the reason is already fixed.
+            for observer in &mut hooks {
+                // Shared reborrow first, and the `FnOnce`-forcing rebind
+                // inside, for the reasons `observed_turn` spells out.
+                let shared: &A = &state;
+                // Borrowed OUT here and not inside: `&reason` taken in the
+                // closure body would make the closure own the `Ended` and the
+                // future borrow from its own capture, which is `E0515` — and
+                // cloning it per observer, which is what rustc suggests, would
+                // hand each one its own copy of a fact there is only one of.
+                let ending: &Ended = &reason;
+                let watching: &mut dyn Observer<A> = &mut **observer;
+                let built = crate::catching(move || {
+                    let watching = watching;
+                    watching.finish(shared, ending)
+                });
+                // A panic in either half is dropped rather than reported. There
+                // is no caller to resume it into and no reason left to change:
+                // `reason` has already been handed to whichever observers ran
+                // before this one, and rewriting it here would make two
+                // observers of one ending disagree about it. The panic hook has
+                // already run at the fault, which is where the backtrace is.
+                if let Ok(future) = built {
+                    let _ = guarded(future).await;
+                }
+            }
+
             // These three, in this order, and the order IS the fix.
             //
             // `drop(hooks)` releases whatever an observer holds — a file claim,
@@ -680,27 +782,75 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     where
         T: Send + 'static,
     {
-        // Both losses collapse to `MailboxClosed` here, on purpose: a local
+        // Every loss collapses to `MailboxClosed` here, on purpose: a local
         // caller learns WHY from [`ended`](Self::ended), and widening this
         // error would make every existing call site match on a case it has
-        // nothing to do about.
-        match self.ask_catching(mail).await.map_err(|_| MailboxClosed)? {
+        // nothing to do about. A **fault** is the exception, because it is not
+        // a loss: the value a panicking function produces is the panic, so the
+        // caller gets it.
+        match self.ask_catching(mail).await {
             Ok(value) => Ok(value),
-            Err(panic) => panic.resume(),
+            Err(TurnLost::Faulted(panic)) => panic.resume(),
+            Err(TurnLost::Gone | TurnLost::Refused { .. }) => Err(MailboxClosed),
         }
     }
 
-    /// Run one turn and hand back a panic instead of resuming it.
+    /// Run one turn and be *told* about a panic instead of having it resumed.
+    ///
+    /// The three ways a turn produces no value are the three
+    /// [`TurnLost`] variants, in one layer. It used to be
+    /// `Result<Result<T, Panic>, TurnLost>` — two error positions for one
+    /// question, which is the shape a caller unwraps wrongly.
     ///
     /// # Errors
     ///
-    /// [`TurnLost`] when the actor is gone or an observer refused the turn. A
-    /// panic is the inner `Err`, not this one: the actor survived it and is
-    /// still running.
+    /// [`TurnLost::Gone`] when the actor is gone, [`TurnLost::Refused`] when an
+    /// observer refused the turn, and [`TurnLost::Faulted`] when the turn ran
+    /// and panicked — the actor survived that one and is still running.
     pub async fn ask_catching<T>(
         &self,
         mail: impl FnOnce(Origin, Reply<T>) -> M,
-    ) -> Result<Result<T, Panic>, TurnLost>
+    ) -> Result<T, TurnLost>
+    where
+        T: Send + 'static,
+    {
+        match self.answered(mail).await? {
+            Answered::Ran(value) => Ok(value),
+            Answered::Faulted(panic) => Err(TurnLost::Faulted(panic)),
+            Answered::Refused { name } => Err(TurnLost::Refused { name }),
+            // A local origin carries no `Queueing`, so nothing can expire on
+            // this path. Typed rather than asserted.
+            Answered::Expired => Err(TurnLost::Gone),
+        }
+    }
+
+    /// Send one message and bring back the loop's own answer.
+    ///
+    /// The one place a lost reply channel is read, and the reason both public
+    /// asks can be exhaustive matches over [`Answered`] instead of a blanket
+    /// `Err(_) => Gone`.
+    ///
+    /// # What is still collapsed here, and why that is now the whole of it
+    ///
+    /// The sender is dropped *without sending* only when the loop is not there
+    /// to send: [`abort`](Self::abort), a runtime shutdown, or a panicking
+    /// `Drop` — in the state, or in a reply value dropped because its caller
+    /// went away. This used to read "all three mean the same thing to a caller,
+    /// which is why they share an answer", and that sentence was doing two jobs:
+    /// folding three ways of being gone together, which is right, and folding a
+    /// **fault** in with them, which was not, because a caller told `Gone` is
+    /// told to stop calling an actor that in fact still runs.
+    ///
+    /// The second job is finished: a turn that panics is answered
+    /// [`Answered::Faulted`] by a loop that survived it. What is left is only
+    /// the first, and it is not inference — a dead loop cannot send anything, so
+    /// there is no fourth answer it could have given. The one fact this arm
+    /// still cannot tell apart is *why* the loop died, and that question has its
+    /// own channel: [`ended`](Self::ended).
+    async fn answered<T>(
+        &self,
+        mail: impl FnOnce(Origin, Reply<T>) -> M,
+    ) -> Result<Answered<T>, TurnLost>
     where
         T: Send + 'static,
     {
@@ -708,18 +858,9 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
         self.send(Message::Mail(mail(Origin::local(), reply)))
             .await
             .map_err(|_| TurnLost::Gone)?;
-        // The sender is dropped without sending when the task died mid-turn:
-        // `abort`, a runtime shutdown, or a panicking `Drop` in the state. All
-        // three mean the same thing to a caller, which is why they share an
-        // answer rather than being told apart.
-        match answer.await {
-            Err(_) => Err(TurnLost::Gone),
-            Ok(Answered::Ran(value)) => Ok(value),
-            Ok(Answered::Refused { name }) => Err(TurnLost::Refused { name }),
-            // A local origin carries no `Queueing`, so nothing can expire on
-            // this path. Typed rather than asserted.
-            Ok(Answered::Expired) => Err(TurnLost::Gone),
-        }
+        // `RecvError` is a unit type: there is exactly one way to lose the
+        // channel, so this is total rather than blanket.
+        answer.await.map_err(|_gone| TurnLost::Gone)
     }
 
     /// Queue one turn and do not wait for it.
@@ -735,6 +876,14 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     /// is sent back": the loop answers exactly as it does for an `ask` and the
     /// answer lands nowhere. A variant without a reply would be a second shape
     /// for a turn, and a kind added later could pick the wrong one.
+    ///
+    /// **So [`TurnLost::Faulted`] means nothing here, and could not.** The loop
+    /// does answer a fault — `Answered::Faulted` is sent on this path exactly as
+    /// on an `ask`'s — into a channel whose other half this method already threw
+    /// away. A `tell` therefore cannot learn that its turn exploded, only that it
+    /// was queued. The actor still survives it. Nothing about a `tell` changed in
+    /// the wave that named the fault; what changed is that the silence is now a
+    /// consequence of one dropped receiver rather than of a fact nobody had.
     ///
     /// **It still waits for a mailbox permit**, which is why an actor calling
     /// this on itself can deadlock even though it never waits for a reply.
@@ -774,6 +923,17 @@ impl<A, M> LocalActor<A, M> {
     /// from. What it costs is a `Box<dyn FnOnce(&A)>` — **synchronous**, so no
     /// boxed future, no `&mut A` and no observer chain, which is a fraction of
     /// what the turn it used to share a type with cost.
+    ///
+    /// # And the one channel that is not the loop's own answer type
+    ///
+    /// It carries `Result<T, Panic>`, and stays that way deliberately. A read
+    /// runs no observers, so it can never be refused; it carries no
+    /// [`Queueing`], so its budget can never expire. Giving it the four-state
+    /// answer every turn uses would add two arms that cannot occur to the one
+    /// message whose entire argument is that it is not a turn. So
+    /// [`TurnLost::Faulted`] does not reach here — the
+    /// panic is caught synchronously above and resumed in the caller, which is
+    /// the same policy under a smaller type.
     ///
     /// # Errors
     ///
@@ -948,10 +1108,10 @@ pub(crate) fn rendered<Resp>(
     millis: u64,
 ) -> (Outcome<Resp>, Body) {
     match answered {
-        Answered::Ran(Ok((response, body))) => (Outcome::Ok(response), body),
+        Answered::Ran((response, body)) => (Outcome::Ok(response), body),
         // A panic must not unwind out of a connection's task, so the remote
         // caller is told a value. The actor is still alive.
-        Answered::Ran(Err(panic)) => (
+        Answered::Faulted(panic) => (
             Outcome::Err(RemoteError::Failed(format!("panicked: {panic}"))),
             Body::empty(),
         ),
@@ -1107,7 +1267,7 @@ mod tests {
         async fn run(self, state: &mut Counter, hooks: &mut Hooks<Counter>) -> Option<Ended> {
             match self {
                 Mail::Add { origin, n, reply } => {
-                    turn(state, hooks, origin, reply, move |_from, state| {
+                    turn(state, hooks, origin, "Add", reply, move |_from, state| {
                         Box::pin(async move {
                             state.seen.push(n);
                             state.seen.len()
@@ -1116,7 +1276,7 @@ mod tests {
                     .await
                 }
                 Mail::Alone { origin, reply } => {
-                    turn(state, hooks, origin, reply, move |_from, state| {
+                    turn(state, hooks, origin, "Alone", reply, move |_from, state| {
                         Box::pin(async move {
                             let alone = !state.inside;
                             state.inside = true;
@@ -1128,18 +1288,25 @@ mod tests {
                     .await
                 }
                 Mail::Boom { origin, reply } => {
-                    turn(state, hooks, origin, reply, move |_from, _state| {
+                    turn(state, hooks, origin, "Boom", reply, move |_from, _state| {
                         Box::pin(async move { panic!("bad message") })
                     })
                     .await
                 }
                 Mail::Wedge { origin, reply } => {
-                    turn(state, hooks, origin, reply, move |_from, _state| {
-                        Box::pin(async move {
-                            std::future::pending::<()>().await;
-                            0usize
-                        })
-                    })
+                    turn(
+                        state,
+                        hooks,
+                        origin,
+                        "Wedge",
+                        reply,
+                        move |_from, _state| {
+                            Box::pin(async move {
+                                std::future::pending::<()>().await;
+                                0usize
+                            })
+                        },
+                    )
                     .await
                 }
             }
@@ -1197,6 +1364,78 @@ mod tests {
 
         // And the very next message runs against the state as it stands.
         assert_eq!(actor.ask(add(7)).await.expect("still running"), 1);
+    }
+
+    /// A faulted turn is **answered**, and the answer says the actor is alive.
+    ///
+    /// The premise this replaces was that a panicking handler's reply sender died
+    /// and the caller inferred a fault from a closed channel. It did not: the
+    /// panic already crossed the channel, but it crossed it *inside*
+    /// `Answered::Ran(Err(..))` — a fault dressed as a value, one level in, where
+    /// the served path and the local path each unwrapped it their own way. What
+    /// this pins is the discriminant: a fault is its own answer and its own
+    /// `TurnLost`, and neither is `Gone`.
+    #[tokio::test]
+    async fn a_faulted_turn_is_answered_faulted_and_not_gone() {
+        let actor = LocalActor::spawn(Counter::default());
+
+        let lost = actor
+            .ask_catching(|origin, reply| Mail::Boom { origin, reply })
+            .await
+            .expect_err("a panicking turn has no value");
+        assert!(
+            matches!(lost, TurnLost::Faulted(_)),
+            "a panicking turn answered {lost:?}"
+        );
+        assert!(lost.to_string().contains("bad message"), "got {lost}");
+
+        // The half that makes `Faulted` a different fact rather than a second
+        // spelling of `Gone`: the actor is still there, and a caller told `Gone`
+        // would have stopped calling it.
+        assert_eq!(actor.ask(add(7)).await.expect("still running"), 1);
+    }
+
+    /// And the new arm does not swallow the real one. An actor that is genuinely
+    /// gone is still `Gone`, on both routes to that answer.
+    #[tokio::test]
+    async fn an_actor_that_stopped_is_still_gone_and_never_faulted() {
+        // Route one: the mailbox refuses the send.
+        let stopped = LocalActor::spawn(Counter::default());
+        let spare = stopped.clone();
+        stopped.stop().await;
+        let lost = spare
+            .ask_catching(add(1))
+            .await
+            .expect_err("a stopped actor has no value");
+        assert!(
+            matches!(lost, TurnLost::Gone),
+            "a stopped actor said {lost:?}"
+        );
+
+        // Route two — the one the rewritten arm is on: the message was taken and
+        // the loop then died without answering. This is the case whose three
+        // reasons stay collapsed, because a dead loop cannot send a fourth
+        // answer.
+        let aborted = LocalActor::spawn(Counter::default());
+        let wedged = {
+            let actor = aborted.clone();
+            tokio::spawn(async move {
+                actor
+                    .ask_catching(|origin, reply| Mail::Wedge { origin, reply })
+                    .await
+            })
+        };
+        n0_future::time::sleep(Duration::from_millis(20)).await;
+        aborted.abort();
+
+        let lost = wedged
+            .await
+            .expect("the caller is not itself aborted")
+            .expect_err("an aborted turn has no value");
+        assert!(
+            matches!(lost, TurnLost::Gone),
+            "an aborted turn said {lost:?}"
+        );
     }
 
     /// `stop` is ordered: what was sent before it is handled.

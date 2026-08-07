@@ -36,8 +36,10 @@
 //!
 //! # Read-only, stated narrowly
 //!
-//! `after_turn` takes `&A` and never `&mut A`, so no observer can call a
-//! `service!` method or assign to a field. That is the whole guarantee. `&A`
+//! `after_turn` takes `&A` and never `&mut A` — and so does
+//! [`Observer::finish`], which is why `representability.rs`'s probe implements
+//! both — so no observer can call a `service!` method or assign to a field. That
+//! is the whole guarantee. `&A`
 //! does **not** stop interior mutability: a state with an `AtomicU64`, a `Mutex`
 //! or a `RefCell` field is mutable through it, exactly as
 //! `Handle::with_state` already is. `representability.rs` holds the compile-time
@@ -66,12 +68,22 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::Panic;
+
 /// The future an observer returns.
 ///
 /// Concrete rather than an `impl Trait`, because `middleware.rs`'s `BoxFut` is
 /// `pub(crate)`, takes no lifetime and is `'static` — it cannot hold `&'a A`,
 /// and widening it would move the public [`Next`](crate::Next) type.
 pub type TurnFut<'a> = Pin<Box<dyn Future<Output = Result<(), Stop>> + Send + 'a>>;
+
+/// The future [`Observer::finish`] returns.
+///
+/// A second alias rather than a `Result` reused from [`TurnFut`], because
+/// `finish` is infallible and an `Output` that could be `Err` would invite a
+/// refusal the loop has nothing left to do about — the actor has already ended
+/// and its reason is already decided.
+pub type FinishFut<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 /// Something the actor owns that watches its turns.
 ///
@@ -94,19 +106,133 @@ pub trait Observer<A>: Send + 'static {
     /// not — and keeping that choice with the implementor is what keeps
     /// `A: Sync` out of this design entirely.
     fn after_turn<'a>(&'a mut self, state: &'a A, turn: TurnInfo<'a>) -> TurnFut<'a>;
+
+    /// Called once, after the last turn and **before the state is dropped**.
+    ///
+    /// Infallible: the actor is already ending, so there is nothing an `Err`
+    /// could change. `ended` is the same [`Ended`] every waiter is about to be
+    /// told, so an observer cannot be given one reason while a caller reads
+    /// another.
+    ///
+    /// Defaulted, so an observer that has nothing to flush says nothing. The
+    /// reason to implement it is a policy that batches: RFC-06 §7's debounced
+    /// store is only safe with a guaranteed final flush, and this is it.
+    ///
+    /// A plain `fn` and not an `async fn`, for the reason
+    /// [`after_turn`](Self::after_turn) is one — and here the reason is
+    /// stronger, because there is no reply to race and the whole point of the
+    /// call is the synchronous work with `state` that precedes the flush. An
+    /// `async fn` (and an RPITIT, which desugars to one) stores **every**
+    /// argument in the future it returns, so `Send` on that future would demand
+    /// `A: Sync` for every actor in the crate.
+    ///
+    /// # What it does not run for
+    ///
+    /// [`abort`](crate::LocalActor::abort) does not reach this: the task is
+    /// cancelled at its next await and the loop never reaches its exit, so there
+    /// is no place for the call to happen. Not a policy — a consequence.
+    ///
+    /// One hole, stated rather than papered over: a turn that never reaches an
+    /// await is not interrupted by an abort either, so an actor aborted during
+    /// such a turn can still exit the loop normally afterwards, and `finish`
+    /// then runs. `abort`'s own documentation already carries that caveat.
+    ///
+    /// # A panic here is caught and dropped
+    ///
+    /// There is no caller left to resume it into and no reason left to change:
+    /// `ended` has already been decided and handed to whichever observers ran
+    /// before this one. The panic hook has already run at the fault, which is
+    /// where the backtrace is — the same trade
+    /// [`notify`](crate::LocalActor::notify) documents for a `tell`. The rest of
+    /// the chain still runs.
+    fn finish<'a>(&'a mut self, _state: &'a A, _ended: &'a Ended) -> FinishFut<'a> {
+        Box::pin(async {})
+    }
 }
 
 /// What the turn did.
 ///
-/// `#[non_exhaustive]` so a later field is additive. It deliberately carries
-/// **no** sequence number and **no** method name: a `seq` "counting from zero
-/// per actor" is wrong wherever it could be built, because the turn closure is
+/// `#[non_exhaustive]` so a later field is additive — and
+/// [`method`](Self::method) is the proof, having been added to this struct
+/// without moving a single call site outside the crate.
+///
+/// It deliberately carries **no** sequence number: a `seq` "counting from zero
+/// per actor" is wrong wherever it could be built, because the message is
 /// created on the *caller's* task, on any of N cloned handles.
+///
+/// # The literal is shut from outside, which is what [`for_test`] is for
+///
+/// A doctest, because it compiles as its own crate and `representability.rs`
+/// cannot: in there the literal is reachable.
+///
+/// ```compile_fail
+/// // Fails with `E0639`: a struct marked `#[non_exhaustive]` cannot be built by
+/// // a literal outside the crate that declared it.
+/// //
+/// // The code is named HERE and deliberately NOT on the fence. rustdoc does not
+/// // check the code after `compile_fail`, so an annotated code asserts a
+/// // verification it does not perform — this project has shipped five guards
+/// // that were satisfiable without proving their claim, and a fence reading
+/// // `compile_fail,E0639` is how the sixth would look.
+/// //
+/// // What stops this passing for the WRONG reason — a renamed field, a moved
+/// // type, a typo — are the two lines above the literal. They read both fields
+/// // off a value keylink itself built, so every name written below is proved to
+/// // exist before it is written, and the only thing left to fail is the
+/// // attribute.
+/// use keylink::{TurnInfo, TurnOutcome};
+///
+/// let built = TurnInfo::for_test(TurnOutcome::Completed, "Post");
+/// let (outcome, method) = (built.outcome, built.method);
+///
+/// let _forged = TurnInfo { outcome, method };
+/// ```
+///
+/// [`for_test`]: TurnInfo::for_test
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct TurnInfo<'a> {
     /// How the turn finished.
     pub outcome: TurnOutcome<'a>,
+    /// Which declared method this turn ran.
+    ///
+    /// The **wire** spelling — `"Reserve"`, not `"reserve"` — so an observer and
+    /// a [`Middleware`](crate::Middleware) watching the same call name it
+    /// identically. `Rpc::method` is where the other half of that agreement is.
+    ///
+    /// It was absent because a boxed-closure mailbox had no name to report. A
+    /// generated mailbox is an enum whose variants *are* the service's methods,
+    /// so the name is free at the one dispatch site.
+    ///
+    /// **A feed reports the feed's name in this field.** Wave 3 adds a second
+    /// declared input whose items are turns in every respect that matters here —
+    /// they run the chain, they are committed, they can panic — and they are not
+    /// methods. This field names whichever declaration produced the turn, which
+    /// is why Wave 3 does not have to widen it and must not add a second one.
+    pub method: &'static str,
+}
+
+impl<'a> TurnInfo<'a> {
+    /// Build one, for a test of an [`Observer`] written outside this crate.
+    ///
+    /// keylink builds every `TurnInfo` a real turn produces, at the one dispatch
+    /// site, and never reads one back. This exists for the crate that cannot:
+    /// `#[non_exhaustive]` makes the struct literal an error outside keylink
+    /// (`E0639`), so a downstream author who implemented [`Observer`] could not
+    /// construct the argument to their own `after_turn` and therefore could not
+    /// unit-test it at all. RFC-07 §1.8 recorded that; this answers it.
+    ///
+    /// `#[non_exhaustive]` stays, because it is right — the `method` field
+    /// landed under it without breaking anybody, which is the whole argument for
+    /// it — and the escape hatch is `#[doc(hidden)]` rather than documented
+    /// surface: a later field is additive to `TurnInfo` and a **breaking change
+    /// to this signature**, on purpose. It fails loudly at compile time in a
+    /// test rather than quietly defaulting a field nobody chose.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_test(outcome: TurnOutcome<'a>, method: &'static str) -> Self {
+        Self { outcome, method }
+    }
 }
 
 /// How a turn finished.
@@ -228,7 +354,22 @@ pub enum Ended {
 /// Replaces [`MailboxClosed`](crate::MailboxClosed) on the catching paths,
 /// because "the actor is gone" and "this turn was refused" ask a caller for
 /// different things and the served path has to tell a peer which it was.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+///
+/// # Three answers and not two, and why the third carries a payload
+///
+/// [`Faulted`](Self::Faulted) used to be expressed as a nested
+/// `Result<Result<T, Panic>, TurnLost>`: the fault lived in the *inner* `Err`
+/// and this enum could not name it. Two error positions for one question is the
+/// two-layer unwrap a caller gets wrong, and it left this type able to say only
+/// half of why there is no value.
+///
+/// So the fault moved in here and brought its payload with it, which costs
+/// `Copy`, `Clone` and `Eq` — a [`Panic`] holds `Box<dyn Any + Send>` and is
+/// none of the three. That is the honest price: the payload is what
+/// [`ask`](crate::LocalActor::ask) resumes into the calling task, and an error
+/// type that dropped it would make the crate's whole panic policy
+/// unimplementable on top of the catching path.
+#[derive(Debug, thiserror::Error)]
 pub enum TurnLost {
     /// The actor was gone, or ended while this turn waited.
     #[error("the actor is no longer running")]
@@ -239,4 +380,13 @@ pub enum TurnLost {
         /// [`Observer::name`].
         name: &'static str,
     },
+    /// The turn ran and panicked. The actor **survived** it.
+    ///
+    /// Distinct from [`Gone`](Self::Gone) on purpose, and the distinction is not
+    /// cosmetic: a caller told `Gone` should stop calling, and a caller told
+    /// `Faulted` has an actor that is still serving the next message. Collapsing
+    /// the two is the inference this variant exists to delete — the loop knows
+    /// which happened and now says so.
+    #[error("{0}")]
+    Faulted(Panic),
 }

@@ -73,8 +73,8 @@ use std::ops::DerefMut;
 
 use crate::{
     ActorId, Admission, Admittance, AdmittedPeer, Allowlist, BlobId, Caller, DynamicAdmission,
-    Eviction, IdempotencyKey, LocalActor, MailboxClosed, MountError, Observer, Origin, ProvenPeer,
-    Retention, TurnFut, TurnInfo,
+    Ended, Eviction, FinishFut, IdempotencyKey, LocalActor, MailboxClosed, MountError, Observer,
+    Origin, ProvenPeer, Retention, TurnFut, TurnInfo,
 };
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
@@ -610,9 +610,21 @@ impl LedgerIsReadableThroughAShared for Ledger {}
 /// Whether any other route exists is decided by the state's own fields, and
 /// those are the caller's choice rather than keylink's.
 ///
-/// It is silent about a *second* method, too. An `Observer` that grew
-/// `after_turn_mut(&mut self, state: &mut A)` would be a new port beside this
-/// one, and this probe would stay green next to it.
+/// # The second method, and the hole that is closed versus the one that is not
+///
+/// `Observer` grew one: [`finish`](crate::Observer::finish), which sees the state
+/// once more before it is dropped. This impl covers it, so the claim now reads
+/// "**every** method of this port lends the state through a shared reference"
+/// rather than "the one method does" — a `&mut A` on `finish` alone would be
+/// `E0053` here, and a `finish` that resolved `post` to the inherent method would
+/// be `E0308` on the same annotation.
+///
+/// That is a **different and weaker** hole than the one this doc used to name. It
+/// is still silent about an `after_turn_mut(&mut self, state: &mut A)`: a *new*
+/// method added beside these two would be a new port, and this probe would stay
+/// green next to it. What changed is that the second method which actually
+/// landed is covered instead of unwatched; what did not change is that no probe
+/// here can forbid a third.
 struct Recorder;
 
 impl Observer<Ledger> for Recorder {
@@ -623,6 +635,11 @@ impl Observer<Ledger> for Recorder {
     fn after_turn<'a>(&'a mut self, state: &'a Ledger, _turn: TurnInfo<'a>) -> TurnFut<'a> {
         let _: ThroughShared = state.post();
         Box::pin(async { Ok(()) })
+    }
+
+    fn finish<'a>(&'a mut self, state: &'a Ledger, _ended: &'a Ended) -> FinishFut<'a> {
+        let _: ThroughShared = state.post();
+        Box::pin(async {})
     }
 }
 

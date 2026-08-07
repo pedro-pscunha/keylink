@@ -266,6 +266,14 @@ must stay additive. The fix is a `#[doc(hidden)] pub` constructor, or a small
 `keylink::testing` helper. Deferred to Wave 2b, which is where the field lands, and
 recorded here so it is not lost.
 
+**Resolved in Wave 2b — see §3.2.** The constructor won over the helper for one reason
+that is not taste: `keylink::testing` is already taken. `keylink/src/testing.rs` is a
+`pub(crate)` two-endpoint QUIC fixture, so a public module of that name would either
+collide with it or force it to be renamed for the sake of a two-line function. The door
+is `TurnInfo::for_test`, `#[doc(hidden)]`, and the prediction that `#[non_exhaustive]`
+was right is now tested rather than asserted: `method` landed under it and no call site
+outside `keylink` moved.
+
 ### 1.9 What Wave 0 did NOT verify
 
 - **`Reply<T>` and `Deferred<T>` (Wave 2c).** `reply.rs` today holds only the wire types
@@ -472,3 +480,191 @@ and a postcard decode.
 - **Move the ALPN.** `Mail` is local-only and derives no `Schema`, so nothing it
   contains is hashed. `keylink/tests/protocol.rs`'s `keylink/Probe/d3fe34471921164e`
   is unchanged and green.
+
+---
+
+## 3. Wave 2 — what the enum unlocked: `Faulted`, the method name, and `finish`
+
+Three of Wave 2's four items. `#[defer]` (2c) is a separate lane and is not recorded
+here.
+
+Wave 1b's claim was that holding the reply channel in the loop rather than sealed inside
+a closure would make three things cheap. This is the section that says which of the three
+were actually cheap, and which of the issue's premises about them were wrong.
+
+### 3.1 2a — the fault was already answered; what was missing was a *name* for it
+
+**The premise in issue #3 is false against this tree, and the correction matters more
+than the feature.** The issue says a panicking handler's reply sender dies and the caller
+gets a `RecvError` that a blanket arm maps to `TurnLost::Gone`. It does not. `guarded`
+caught the panic before Wave 1b and catches it now; the panic crossed the reply channel
+as `Answered::Ran(Err(Panic))` and `ask` resumed it. A panicking turn's caller never got
+`Gone`.
+
+What was true is subtler and was the real defect: **a fault was a shape of a successful
+answer rather than an answer of its own.** `Ran(Result<T, Panic>)` put the distinction
+between "the state was mutated and here is the value" and "the state may be torn" one
+level in, where every consumer had to look for it, and the two consumers that matter
+looked differently — the local path unwrapped and resumed, the served path unwrapped and
+formatted. And the public error type that exists to answer *why there is no value* could
+not say "it faulted" at all.
+
+So the flattening, not the addition, is the change:
+
+```rust
+pub(crate) enum Answered<T> { Ran(T), Faulted(Panic), Expired, Refused { name } }
+pub enum TurnLost { Gone, Refused { name }, Faulted(Panic) }
+```
+
+**`Faulted` carries the payload, against the issue's sketch, which shows a payload-free
+variant.** A payload-free `Faulted` destroys the `Box<dyn Any + Send>` that
+`Panic::resume` needs, so `ask` could no longer resume a handler's panic into its caller
+— a documented, tested, load-bearing behaviour and half of what keeps `MailboxClosed`
+honest — and `rendered`'s `panicked: {panic}` string, which `tests/` pins, would have
+nothing to format. The sketch was taken as intent, not as a signature.
+
+**The price is `Copy`, `Clone`, `PartialEq` and `Eq` on `TurnLost`.** A `Panic` is none
+of them. Nothing in the repo compared a `TurnLost` — it had no consumers at all — so
+this cost nothing today, and it buys the one-layer signature:
+
+```rust
+// was: Result<Result<T, Panic>, TurnLost>
+pub async fn ask_catching<T>(..) -> Result<T, TurnLost>
+```
+
+Two error positions for one question is the two-layer unwrap `Answered`'s own
+documentation says a caller will get wrong. `ask` still delegates to `ask_catching` and
+resumes `TurnLost::Faulted`, so there is one send-and-wait, in a private `answered`.
+
+#### The blanket arms: two were named, one of them had already been deleted
+
+The issue names arms at `local.rs:551` and `:638`. Verified against `83f92b5`, the second
+was inside `ask_before`, which Wave 1b deleted with its method. What exists now is one
+`Err(_) => Err(TurnLost::Gone)` in `ask_catching` and two structurally identical
+`RecvError` collapses on the served paths — `deliver_to_local` and `deliver_to_actor`,
+both producing `NoSuchActor`. All three are `Result<_, oneshot::error::RecvError>`, and
+`RecvError` is a unit type, so each is **total over a one-case error** rather than blanket
+over an enum. The blanket-ness was never in the `Err` arm; it was in the `Answered` enum
+being unable to distinguish a fault, and every one of the three now matches `Answered`
+exhaustively with a `Faulted` arm.
+
+**What stays collapsed, and why that is not inference.** A reply sender is dropped without
+sending only when the loop is not there to send: `abort`, a runtime shutdown, or a
+panicking `Drop` — in the state, or in a reply value dropped because its caller went away.
+The comment that justified folding those three was doing two jobs, and only one of them
+was right. Folding three ways of being gone is right — a dead loop cannot send a fourth
+answer, so there is nothing to infer. Folding a *fault* in with them was wrong, and that
+half is finished: the loop that survives a panic says so.
+
+#### `read` stays out of `Faulted`, and `notify` cannot observe it
+
+**`read` stays out, deliberately.** Its channel is `oneshot::Sender<Result<T, Panic>>`
+and not `Answered<T>`: a read runs no observers (`tests/observe.rs::a_read_runs_no_observers`
+pins it), so it can never be `Refused`, and it carries no `Queueing`, so it can never be
+`Expired`. Giving it an `Answered` would add two arms that cannot occur to a path whose
+whole argument is that it is not a turn. It catches its panic synchronously and resumes
+it in the caller, which is the same policy under a different type.
+
+**`notify` — a local `tell` — has no way to learn of a fault**, and `Faulted` does not
+change that. It builds a reply channel like every other message and drops the receiving
+half *before* the send, so the loop answers `Answered::Faulted` exactly as it would
+answer an `ask` and the answer lands nowhere. The actor still survives; nobody is told.
+That is unchanged by this wave and is the reason Wave 8's limit list says there is no
+reliable `tell`.
+
+#### The incarnation counter the issue says survives does not exist
+
+2a says `LocalActor::incarnations()` "survives only as observability" and asks Wave 6 to
+ship it, and gives `rg 'incarnation' keylink/src` finding nothing in Wave 2's diff as a
+criterion. `rg -n incarnation` over the whole repository returns **no hit in any source
+file** — the only hits are the two paragraphs of this section — so there is no counter,
+there never was one on this branch, and the criterion is trivially true and proves
+nothing. **No counter was added.** Whether Wave 6 wants one is
+Wave 6's decision, made against a tree where a fault is answered rather than reconstructed
+by comparison — which is exactly the argument that made the counter unnecessary.
+
+### 3.2 2b — `TurnInfo.method`, and the door that lets somebody test their observer
+
+The field is the wire spelling — `"Post"`, not `"post"` — because `Rpc::method` is the
+other half of an agreement an operator reads in one metrics label. The generated arms pass
+`stringify!($rpc)`; the `Served` arm reads `Rpc::method(&request)` before the request moves
+into the closure, because that one arm serves every method.
+
+**A feed will report the feed's name in this same field.** Documented where the field is
+declared, so Wave 3 neither widens `TurnInfo` nor adds a second field: what the field
+names is *whichever declaration produced the turn*, and a feed is a declaration.
+
+§1.8's defect is fixed here because this is the wave that proves the attribute was right.
+`TurnInfo::for_test(outcome, method)` is `#[doc(hidden)] pub`, and a `compile_fail`
+doctest on `TurnInfo` holds that the struct literal is still shut from outside. That
+doctest names `E0639` in prose and **never on the fence** — rustdoc does not check the
+code after `compile_fail`, twice demonstrated in this workspace — and it is protected
+against passing for the wrong reason by reading both field names off a `for_test` value
+before writing the literal, so a rename fails the *first* two lines rather than silently
+satisfying the fence. Red-tested: with `#[non_exhaustive]` removed the doctest fails with
+`Test compiled successfully, but it's marked compile_fail`.
+
+### 3.3 2d — `Observer::finish`, and the two ways to reintroduce `A: Sync`
+
+```rust
+fn finish<'a>(&'a mut self, _state: &'a A, _ended: &'a Ended) -> FinishFut<'a> {
+    Box::pin(async {})
+}
+```
+
+Defaulted, so no existing implementor moved. A plain `fn` returning a boxed future, never
+an `async fn` — an `async fn` (and an RPITIT, which desugars to one) stores every argument
+in the future it returns, so `Send` on that future would demand `A: Sync` for every actor
+in the crate. That is Wave 0's trap, arrived at from a second direction.
+
+**Ordering: after the last turn, before the three drops** (`drop(hooks)` → `drop(inbox)`
+→ `ended.send(reason)`), whose comment says the order *is* the fix. So `stop().await`
+returning still means every claim an observer held is free, and a flush that needed the
+state still had it. Red-tested by publishing the end before the loop instead: the log is
+empty when `stop()` returns.
+
+**The open decision, made explicitly: `guarded` does NOT wrap the finish loop.** Each
+observer gets the two catches `after_turn` has — a synchronous `catching` around the call,
+then `guarded` on the built future — and there is no third guard around the iteration.
+Both reasons matter and they are independent:
+
+1. A single `guarded` needs a *built* future, hence an `async` block, hence a block
+   holding `&state` across an await — `Send` only when `A: Sync`. This is not a matter of
+   care: the block is spawned under `A: Send + 'static` and nothing more, so an `A: Sync`
+   requirement introduced here is a compile error in `keylink` itself.
+2. It would stop the chain at the first panic. `finish` is a flush; an adapter that fell
+   over must not cost the next adapter its write, and there is no refusal to short-circuit
+   for, because `finish` is infallible.
+
+A panic in either half is caught and **dropped**, and the `Ended` is not rewritten. There
+is no caller to resume into, and `ended` has already been handed to whichever observers
+ran earlier — rewriting it would make two observers of one ending disagree about it. The
+panic hook already ran at the fault, which is the trade `notify` documents for a `tell`.
+
+**`finish` does not run on `abort`, by construction rather than by policy.** `abort()` is
+`task.abort()` and nothing else, so the loop's future is dropped at its next await and
+never reaches its exit; anything after the loop is unreachable. **One documented hole,
+and it is `abort`'s own:** a turn that never reaches an await is not interrupted either,
+so an actor aborted during such a turn can exit its loop normally afterwards and `finish`
+then runs. Nothing claims more than that.
+
+`representability.rs::Recorder` now implements both methods, so its claim reads "every
+method of this port lends the state through a shared reference" instead of "the one method
+does". **That is a different and weaker hole than the one its doc named.** It said the
+probe "is silent about a *second* method", naming `after_turn_mut(&mut self, state: &mut A)`
+as the hazard — a *new* port added beside these two, which no probe here can forbid and
+which this one would stay green next to. What closed is the second method that actually
+landed; what is still open is a third. Both are now written there.
+
+### 3.4 What Wave 2 (2a, 2b, 2d) did NOT do
+
+- **`#[defer]`.** A separate lane, and it needs its own `Send` probe: Wave 0 probed
+  `oneshot::Sender<Answered<T>>` held *inside* a turn, and a `Deferred<T>` parked past
+  the end of its turn changes what the loop holds across an await. §1.9 already says so.
+- **Observers on a keyed actor.** Still an empty hook slice, still Wave 3's line to
+  change. `finish` reaches keyed actors the moment that slice is not empty, with no
+  further work.
+- **Move the ALPN.** `Answered` and `TurnLost` are local types that derive no `Schema`;
+  `TurnInfo` is local; `rendered`'s two wire strings are byte-identical.
+  `keylink/tests/protocol.rs`'s `keylink/Probe/d3fe34471921164e` is unchanged and green.
+- **An incarnation counter.** See §3.1. It does not exist and was not added.
