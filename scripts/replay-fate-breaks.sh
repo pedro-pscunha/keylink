@@ -8,10 +8,30 @@
 # catch. Every line should report `exit=101`: the test caught its own break.
 #
 # It is not part of any gate — it edits the tree — and it takes a few minutes.
-set -uo pipefail
-cd /Users/pedrocunha/repos/keylink.keyed-fate
+# It does, however, **fail**: a break that stops reddening its guard, or an
+# anchor that stops being unique, exits non-zero here. It hard-coded one
+# developer's absolute path and swallowed every exit code before, which made it
+# unable to check the tree it ships in and unable to report anything at all.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
 
-run() { echo "════ $1"; shift; ./scripts/break-once.sh "$@" 2>&1 | rg "ABORT|expected exactly one|^a |^an |^the |^round |^left:|^right:|  left:| right:|exit=" ; }
+failed=0
+
+# `break-once.sh` reports the *test's* exit on its last line as `exit=N`, and
+# always exits 0 itself — so the status has to be read out of that line rather
+# than from the pipeline. A break that leaves its guard green is `exit=0`, which
+# is precisely the failure this script exists to report.
+run() {
+    local label="$1"; shift
+    echo "════ $label"
+    local out
+    out="$(./scripts/break-once.sh "$@" 2>&1)" || true
+    echo "$out" | rg "ABORT|expected exactly one|^a |^an |^the |^round |^left:|^right:|  left:| right:|exit=" || true
+    if ! echo "$out" | rg -q "exit=[1-9]"; then
+        echo "  ✗ NOT RED — this break no longer reddens its guard, or the anchor aborted"
+        failed=$((failed + 1))
+    fi
+}
 
 run "1 keyed live drop" keylink/src/actor/remote.rs \
 '        .map(|answered| rendered(answered, budget.map_or(0, Queueing::millis)))
@@ -147,11 +167,11 @@ run "17 the DROPPED prefix moves" keylink/src/reply.rs \
   the_four_prefixes_are_the_text_a_peer_matches_on -p keylink --lib
 
 run "18 supervise has no floor (factory panic)" keylink/src/local.rs \
-'        let mut floor = Floor::armed(fate);
-        let built = factory().await;' \
-'        let mut floor = Floor::armed(fate);
-        floor.disarm();
-        let built = factory().await;' \
+'    let mut floor = Floor::armed(fate);
+    let mut budget = Budget::new(limit);' \
+'    let mut floor = Floor::armed(fate);
+    floor.disarm();
+    let mut budget = Budget::new(limit);' \
   a_peer_whose_factory_panicked_is_told_the_actor_is_gone -p keylink --test supervision
 
 run "19 run_loop has no floor (feed panic)" keylink/src/local.rs \
@@ -166,3 +186,26 @@ run "20 gone becomes a Failed" keylink/src/local.rs \
 '        Standing::Gone => RemoteError::NoSuchActor { id: id.to_owned() },' \
 '        Standing::Gone => RemoteError::Failed(format!("{DROPPED}{id}")),' \
   the_gone_answer_is_not_a_failed_and_carries_no_prefix -p keylink --lib
+
+run "21 no floor between incarnations (N1)" keylink/src/local.rs \
+'    let mut floor = Floor::armed(fate);
+    let mut budget = Budget::new(limit);' \
+'    let mut floor = Floor::armed(fate);
+    floor.disarm();
+    let mut budget = Budget::new(limit);' \
+  a_supervisor_between_incarnations_is_gone_when_it_is_destroyed -p keylink --lib
+
+run "22 a per-iteration floor writes Gone on continue (N2)" keylink/src/local.rs \
+'    let mut floor = Floor::armed(fate);
+    let mut budget = Budget::new(limit);
+    loop {' \
+'    let mut budget = Budget::new(limit);
+    loop {
+        let mut floor = Floor::armed(fate);' \
+  a_transient_factory_failure_does_not_overwrite_a_pending_restart -p keylink --lib
+
+if [ "$failed" -ne 0 ]; then
+    echo "── $failed break(s) did not redden their guard"
+    exit 1
+fi
+echo "── every recorded break replays and reddens its guard"
