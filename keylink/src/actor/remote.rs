@@ -638,6 +638,10 @@ mod tests {
 
     /// `split` hands back exactly what `new` was given, in that order. The two
     /// are the only route in and the only route out.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/actor/remote.rs` on
+    /// `split`'s `(self.actor, self.message)` → `(ActorId::new("wrong")..,
+    /// self.message)`. Watched: `left: "wrong"` against `right: "a"`.
     #[test]
     fn split_undoes_new() {
         let (id, message) =

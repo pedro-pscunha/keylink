@@ -46,8 +46,9 @@
 //!
 //! # Designed against a mailbox of one, and where a deeper one would change this
 //!
-//! `local.rs`'s `MAILBOX` is 1, and every number in this module is chosen
-//! against that.
+//! `local.rs`'s `LOCAL_MAILBOX_DEPTH` is 1 — as is `registry.rs`'s
+//! `DEFAULT_MAILBOX_DEPTH`, the keyed side's — and every number in this module is
+//! chosen against that.
 //! One item in flight per subscriber matches it: a subscriber is "slow" exactly
 //! when it is still inside a turn while the next item arrives, which is the same
 //! definition of slow the mailbox already uses.
@@ -61,7 +62,10 @@
 //! subscriber at its bound must still hit one of the two policies above rather
 //! than a third that grows.
 //!
-//! Nothing in this module reads `MAILBOX` or depends on its value.
+//! Nothing in this module reads either constant or depends on its value. Both
+//! are private, which is why they are named here as text rather than linked: a
+//! reader who greps for them finds the declaration, and an intra-doc link would
+//! not resolve.
 //!
 //! # Handle ergonomics: already here, under keylink's names
 //!
@@ -86,7 +90,6 @@
 //! [`Handle::is_running`]: crate::LocalActor::is_running
 //! [`Handle::stop`]: crate::LocalActor::stop
 //! [`Handle::ended`]: crate::LocalActor::ended
-//! [`MAILBOX`]: crate::LocalActor::spawn
 //! [`n0_future`]: n0_future
 
 mod names;

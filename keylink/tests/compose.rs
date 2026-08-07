@@ -56,11 +56,13 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use keylink::compose::{after, every, Fanout, Names, Overflow, Pool, Subscription, Topic};
 use keylink::{ActorId, Caller, Ended};
 use n0_future::time::Duration;
+use n0_future::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 // The subscriber under test: it takes fills on a feed, and it can be parked
@@ -356,6 +358,101 @@ async fn a_slow_subscriber_is_unsubscribed_and_its_actor_ends_naming_the_feed() 
     );
     assert_eq!(fast_heard.recv().await, Some(3));
     drop(fast);
+}
+
+/// A panicking `T::clone` costs one publish, and not the topic.
+///
+/// `Topic::lock` recovers a poisoned mutex instead of propagating, and until now the
+/// justification for that arm was that it could not be reached: *"Nothing here can
+/// panic while the lock is held — `try_send` cannot, and the blocking path releases
+/// the lock before it awaits."* That argument is falsified by the file it is written
+/// in. `publish_dropping` calls `item.clone()` **inside** `self.lock().retain(..)`,
+/// and `T: Clone` is the caller's code, so one panicking `Clone` unwinds out with the
+/// guard held.
+///
+/// The behaviour was always right; only the reason was wrong. This is the reason,
+/// written as a test: the panic costs its own publish, and the next `subscribers`,
+/// `subscribe` and `publish` on the same topic all still answer.
+///
+/// Made red by `scripts/break-once.sh keylink/src/compose/topic.rs`, replacing
+/// `self.to.lock().unwrap_or_else(PoisonError::into_inner)` with
+/// `self.to.lock().expect("poisoned")` — propagation instead of recovery, which is
+/// what the old argument said was safe. Watched: the *next* call after the bad
+/// publish, `topic.subscribers()`, panicking in its turn with
+/// `topic.rs:260: poisoned: PoisonError { .. }`.
+#[tokio::test]
+async fn a_panicking_clone_costs_one_publish_and_not_the_topic() {
+    /// Clones `limit` times and then refuses, so the panic lands part-way through
+    /// a fan-out — inside `retain`, with the guard held.
+    #[derive(Debug)]
+    struct Brittle {
+        cloned: Arc<AtomicUsize>,
+        limit: usize,
+    }
+
+    impl Brittle {
+        fn breaking_after(limit: usize) -> Self {
+            Self {
+                cloned: Arc::new(AtomicUsize::new(0)),
+                limit,
+            }
+        }
+    }
+
+    impl Clone for Brittle {
+        fn clone(&self) -> Self {
+            assert!(
+                self.cloned.fetch_add(1, Ordering::SeqCst) < self.limit,
+                "this Clone has had enough"
+            );
+            Self {
+                cloned: Arc::clone(&self.cloned),
+                limit: self.limit,
+            }
+        }
+    }
+
+    let topic = Topic::new(Overflow::DropSubscriber);
+    let mut first = topic.subscribe();
+    let mut second = topic.subscribe();
+    let mut third = topic.subscribe();
+
+    // Three subscribers, two clones: the third one panics under the lock.
+    let poisoning = tokio::spawn({
+        let topic = topic.clone();
+        async move { topic.publish(Brittle::breaking_after(2)).await }
+    });
+    let died = poisoning
+        .await
+        .expect_err("the caller's `Clone` panics inside the fan-out");
+    assert!(died.is_panic(), "and it is that panic: {died:?}");
+
+    // The mutex is poisoned from here on. Every call below takes it, and the
+    // whole point is that none of them panics.
+    assert_eq!(
+        topic.subscribers(),
+        3,
+        "the topic outlives one caller's bad Clone"
+    );
+
+    // The publish cost exactly itself: the two it reached before the panic keep
+    // what they were handed, and the third was never delivered to.
+    assert!(first.next().await.is_some(), "delivered before the panic");
+    assert!(second.next().await.is_some(), "delivered before the panic");
+
+    let mut fourth = topic.subscribe();
+    assert_eq!(topic.subscribers(), 4, "and it still takes subscribers");
+    assert_eq!(
+        topic.publish(Brittle::breaking_after(usize::MAX)).await,
+        Fanout {
+            delivered: 4,
+            dropped: 0,
+            gone: 0
+        },
+        "and publishing after a poisoned publish still reaches everyone"
+    );
+    assert!(third.next().await.is_some(), "including the one skipped");
+    assert!(fourth.next().await.is_some());
 }
 
 /// The same break as its `DropSubscriber` sibling, watched against this half.

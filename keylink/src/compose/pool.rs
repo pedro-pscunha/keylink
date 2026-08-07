@@ -56,7 +56,15 @@
 //! - **Not a supervisor.** Nothing here restarts a member, notices one ending, or
 //!   removes one from the rotation. [`pick`](Pool::pick) will keep handing back a
 //!   handle to an actor that has stopped, and the call on it will answer
-//!   [`MailboxClosed`](crate::MailboxClosed). Restarting is Wave 9's.
+//!   [`MailboxClosed`](crate::MailboxClosed). **Restarting is the member's own
+//!   job, and it already has one:** build members with the generated
+//!   `supervised()` — or [`LocalActor::spawn_supervised`](crate::LocalActor::spawn_supervised)
+//!   — and each handle survives its own faults without the pool knowing. A
+//!   supervised member's mailbox outlives its incarnations, so `pick` keeps
+//!   working across a restart and nothing in this module has to learn about one.
+//!   That is why `rg -n 'supervised' keylink/src/compose/` finds only this
+//!   paragraph: composition and supervision compose, rather than one containing
+//!   the other.
 //! - **Not keyed.** If which member handles a message matters, the member is an
 //!   identity and the thing wanted is [`System`](crate::System) or
 //!   [`Names`](super::Names).

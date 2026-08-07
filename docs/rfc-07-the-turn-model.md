@@ -1518,7 +1518,7 @@ that never existed.
 | two `open`s on one `StateId`, the second `Error::Busy` | `a_second_open_on_one_state_is_busy` | `WouldBlock` hands out a `FileClaim` instead of `Error::Busy` → `a second open on a claimed state must be refused` |
 | a feed turn is stored on the same rule | `feeds.rs::a_feed_turn_is_stored_on_the_same_rule_as_a_mailbox_turn` | `after_turn` does not store → `something was stored` |
 | a keyed actor's state survives its own process | `a_keyed_actors_state_survives_its_own_process` | empty hook slice → `left: [20], right: [10, 20]` |
-| a non-probe `Observer` implementor exists | `rg 'impl.*Observer<' keylink/src` | `keylink/src/persist.rs` is the only hit outside `#[cfg(test)]` |
+| a non-probe `Observer` implementor exists | `rg 'impl.*Observer<' keylink/src` | `keylink/src/persist.rs` is the only hit outside `#[cfg(test)]` — ~~only~~ **true when Wave 5 wrote it; see the note under this table** |
 | `A: Sync` stays out of the design | `a_state_that_is_not_sync_is_still_persisted` | §6.5's two breaks |
 | the per-turn cost is measured, not estimated | `the_per_turn_store_cost` (`#[ignore]`) | §6.1 |
 | a refused turn is not stored on the way out | `a_turn_whose_store_failed_is_not_written_on_the_way_out` | put the `finish` retry back → `left: [1, 2], right: [1]` |
@@ -1526,6 +1526,20 @@ that never existed.
 | a `#[defer]` reply that IS answered is a stored one | `a_deferred_reply_that_is_answered_is_a_stored_reply` | `Verdict::Committed => drop(value)` → `the receipt reaches its caller when the turn commits: MailboxClosed` |
 | the restored state cannot be dropped on the way to the observer | `Opened::start_from` is the only route | write the old `let (_restored, saver) = ..` → `E0308`, `expected Opened<_, Files>, found (_, _)` |
 | both shipped crates still package | `mise run package` | drop `version` from keylink's `keylink-persist` dependency → `all dependencies must have a version requirement specified when packaging` |
+
+**The `Observer` row's uniqueness clause rotted inside this same PR, and the row is kept
+rather than rewritten so the rot is visible.** Wave 6 landed `impl<A> Observer<A> for Turns`
+at `keylink/src/console.rs:602`, which is production code — `rg '#\[cfg\(test\)\]'
+keylink/src/console.rs` returns nothing across 1,035 lines. The command now yields four
+hits: `console.rs:602` and `persist.rs:403` outside `#[cfg(test)]`, `local.rs` inside its
+test module, and `representability.rs`, whose whole file is `#![cfg(test)]`.
+
+**The criterion still passes and the evidence no longer does.** What Wave 5 had to show
+was that a non-probe implementor *exists*; that is now true twice over, which is a
+stronger result than the one recorded. Only the word "only" is false, and it was false
+because a later wave in the same merge did the right thing. Worth keeping as an example
+of the failure mode: an existence claim evidenced by a uniqueness command ages badly, and
+the fix is to write the command that matches the claim.
 
 `keylink/tests/durable.rs` is unchanged in behaviour and keeps committing once per run
 through `Handle::with_state`: **`with_state` survives and is not deprecated.** It is a
@@ -2225,7 +2239,12 @@ day it exists, `Names` takes it unchanged.
 - **Supervise anything.** `Pool` does not restart a member, notice one ending or
   take one out of the rotation; `pick` keeps handing back a stopped actor's handle
   and the call answers `MailboxClosed`. `Names` unregisters on ending and does not
-  re-spawn. Both are Wave 9's.
+  re-spawn. Both were Wave 9's. **Wave 9 has landed, and the answer turned out to
+  be composition rather than a change here:** a member built with the generated
+  `supervised()` restarts itself, and because a supervised actor's mailbox outlives
+  its incarnations, `pick` keeps working across a restart with nothing in `compose`
+  knowing. `rg -n 'supervised' keylink/src/compose/` still finds only the paragraph
+  in `pool.rs` that says so, and that is the design rather than an omission.
 - **Red-test the shared-rotation claim on its own.**
   `two_clones_of_a_pool_share_one_rotation` was watched to fail, but only under the
   break that stops the cursor advancing at all — which also fails its sibling. A
@@ -2239,6 +2258,82 @@ day it exists, `Names` takes it unchanged.
   is. A remote fan-out is `Subscribers` plus a reverse contract, which
   `subscribers.rs` already documents and which is a different thing wearing a
   similar name.
+
+### 8.8 C-14 and C-15 — two corrections to issue #3 that were found and never written down
+
+`.tmp/spec-corrections.md` runs C-1 to C-13 and stops. The invariant pass raised two more,
+both graded Critical, and neither reached any tracked file — so the tree's departures from
+the spec were recorded everywhere except where a reader looks. They are numbered here,
+continuing that list, and this file is their durable home because `.tmp/` is not tracked.
+
+C-15's subject belongs to §4 (Wave 2c) rather than to this section. It is written here
+anyway, so that the numbering stays in one place and a reader finds both at once.
+
+#### C-14 — the scheduler is two free functions and a handle, against a refused row that says "as an actor"
+
+**Issue #3's refused-designs table** carries a row for `Timer` whose resolution clause
+reads *"Scheduling arrives in Wave 7 as an actor, not as a core type."* What landed in
+`keylink/src/compose/schedule.rs` is `after` and `every` — two free functions returning
+`Scheduled`, a newtype over a `JoinHandle` with a `detached` flag. Not an actor.
+
+**The departure was recorded nowhere until now.** `rg -in 'as an actor|core type|refused'
+keylink/src/compose/schedule.rs` → exit 1. §8.3 above discusses the vacuous guards and
+"a dropped `Scheduled` cancels" without ever engaging the row.
+
+**And the departure is right, which is why this is a correction and not a defect.** The row
+has two clauses and they are not the same claim. "Not a core type" is satisfied: nothing in
+`schedule.rs` is reachable from `keylink`'s root, it reads nothing of the runtime, and
+`local.rs`, `registry.rs` and `macros.rs` are untouched by it. "As an actor" is the clause
+that does not survive contact:
+
+- **An actor scheduler is an admission point in front of the work.** This crate's mailbox
+  is one message deep, deliberately. A single scheduler actor holding N schedules would
+  serialise every fire through that one slot, so a slow job would delay an unrelated one —
+  the exact failure `Pool` is documented as refusing to build.
+- **Its message could not be typed.** A scheduler actor has to name the work it fires. The
+  module doc already argues this: `(handle, message)` needs one signature per method kind —
+  a `tell` has no reply, an `rpc` has one nobody awaits, a `blob` has a body — so it would
+  belong in the generated `Handle` rather than in a composition. A closure returning a
+  future is what a caller already has.
+- **Cancellation would get worse, not better.** Dropping a `Scheduled` cancels. Through an
+  actor, cancelling means addressing a schedule by an id the actor minted, which is a second
+  identity model beside `ActorId` for something that is not addressable in the first place.
+
+**What the shape costs, stated rather than hidden:** a schedule has no identity, so it
+cannot be listed by `System::status`, reached by a peer, or supervised. A process that wants
+those has an actor with a `feed`, not a schedule.
+
+**One thing from the same row WAS re-derived and is now deleted.** `Scheduled::cancel`
+shipped — *"The same thing `drop` does"*, by its own doc, with zero call sites repo-wide —
+which is the row's other clause, *"`Timer::cancel` beside 'dropping cancels it' is two ways
+to do one thing"*, rebuilt verbatim. It is gone, and `schedule.rs`'s module doc now carries
+the argument so it is not inherited by omission a third time.
+
+#### C-15 — Wave 2c's central guard is a positive doctest, not the `compile_fail` the criterion named
+
+**Issue #3's Wave 2c criterion** puts the safety claim in a `compile_fail` probe in
+`representability.rs`.
+
+**What landed** is a **positive** doctest at `keylink/src/local.rs:501-518`: a handler
+written the way `#[defer]` means it to be written, which fails if the *generated signature*
+stops demanding a token. Red-tested — with the arm's `Output` changed to `()` it goes red
+with `E0271`.
+
+**The `compile_fail` twin at `:529-546` is kept and demoted in place.** Under the same
+break it stayed **green**: the impl mismatched the trait's `Output` for an unrelated
+reason, so the fence went on passing while the obligation it claims to pin was gone. The
+doc says so, in those words, rather than keeping two fences and believing both.
+
+**This is C-4 applied a second time, not a new decision.** C-4 established that rustdoc
+ignores the error code on a `compile_fail` fence, so such a fence proves only "this does
+not compile" — which is why the repo-wide rule is no error code on any fence, and why the
+load-bearing probe is positive. A criterion that asks for a `compile_fail` is asking for
+the weaker of the two instruments.
+
+**Why it needed writing down:** the wave satisfied its criterion's *intent* more strongly
+than its *letter*, and a later reader grading the tree against issue #3 finds a
+`representability.rs` probe missing and no explanation. That reader would either re-add the
+weak fence or record a false FAIL.
 
 ---
 

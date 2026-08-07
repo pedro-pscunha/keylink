@@ -935,7 +935,7 @@ async fn the_connection_outlives_the_actors_on_it() {
 /// real. Made red by making `shutdown` an alias of `abort`.
 ///
 /// Two calls and not one, because "queued turns are answered" is the claim and
-/// one message in flight does not queue anything. `MAILBOX` is 1, so the second
+/// one message in flight does not queue anything. `LOCAL_MAILBOX_DEPTH` is 1, so the second
 /// `apply` is buffered behind the first and is the queued turn; the budget covers
 /// both holds together, which is the depth-versus-budget relationship 4a's doc
 /// names — at depth N a budget has to cover N + 1 turns, not one.
@@ -1644,6 +1644,11 @@ fn status_of(system: &journal::System, id: &ActorId) -> keylink::ActorStatus {
 /// This replaces `the_schema_hash_separates_two_services_with_identical_shapes`,
 /// which asserted the same separation one layer down, on the per-actor schema
 /// hash that no longer exists. Same claim, moved to where it is now enforced.
+///
+/// Made red by `scripts/break-once.sh keylink/src/macros.rs`, dropping
+/// `stringify!($svc)` from `KEYED_PROTOCOL` so two identically-shaped services
+/// hash the same contract under the same protocol string. Watched: `assertion
+/// `left != right` failed`, both sides `keylink/keyed/0f98f91088f727db`.
 #[test]
 fn the_keyed_alpn_separates_two_services_with_identical_shapes() {
     assert_ne!(journal::keyed_alpn(), vault::keyed_alpn());
@@ -1651,6 +1656,12 @@ fn the_keyed_alpn_separates_two_services_with_identical_shapes() {
 
 /// A service's two ALPNs are not each other, so one node can serve the same
 /// service as a singleton and as an actor system at once.
+///
+/// Made red by `scripts/break-once.sh keylink/src/macros.rs`, replacing
+/// `keyed_alpn`'s `derive_alpn::<KeyedContract>(KEYED_PROTOCOL)` with
+/// `alpn().to_vec()` — the collision `ConfigError::DuplicateAlpn` exists for.
+/// Watched: `assertion `left != right` failed`, both sides
+/// `keylink/Journal/c1794491a027bccd`.
 #[test]
 fn a_services_keyed_alpn_is_not_its_singleton_alpn() {
     assert_ne!(journal::keyed_alpn(), journal::alpn());
@@ -2784,7 +2795,8 @@ async fn busy_is_true_during_a_feed_turn() {
 /// **A saturated mailbox at depth > 1 still does not starve a feed.**
 ///
 /// `tests/feeds.rs` pins the fairness rule at the default depth and says what it
-/// cannot reach: *"with `MAILBOX = 1` on a single-threaded test runtime, the loop
+/// cannot reach: *"with `LOCAL_MAILBOX_DEPTH = 1` on a single-threaded test runtime,
+/// the loop
 /// takes the slot's message, runs the turn and polls again without yielding, so the
 /// parked sender has not been rescheduled and the mailbox is deterministically
 /// empty at the next poll."* A depth of three removes that limit — three messages

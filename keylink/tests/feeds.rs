@@ -441,7 +441,8 @@ async fn a_feed_that_ends_ends_the_actor_and_names_it() {
 /// # What is asserted, and what a test in this harness cannot assert
 ///
 /// The strongest claim would be about a *continuously* saturated mailbox, and that
-/// state cannot be built here: with `MAILBOX = 1` on a single-threaded test runtime,
+/// state cannot be built here: with `LOCAL_MAILBOX_DEPTH = 1` on a single-threaded
+/// test runtime,
 /// the loop takes the slot's message, runs the turn and polls again without yielding,
 /// so the parked sender has not been rescheduled and the mailbox is deterministically
 /// **empty** at the next poll. A test that tried would be asserting the scheduler.

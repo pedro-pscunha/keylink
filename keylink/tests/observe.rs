@@ -733,6 +733,12 @@ async fn an_observer_is_told_which_method_the_turn_ran() {
 ///
 /// The `compile_fail` doctest on `TurnInfo` is the other half: it holds that the
 /// literal is still shut, so this helper is the one door rather than a second one.
+///
+/// Made red by `scripts/break-once.sh keylink/src/observe.rs` on `for_test`'s
+/// `Self { outcome, method }` → `Self { outcome, method: "Post" }` — a
+/// constructor that drops the caller's argument, which would make the helper
+/// unable to test what it claims to. Watched: `left: ["Post", "Post"]` against
+/// `right: ["Post", "Boom"]`.
 #[tokio::test]
 async fn an_observer_can_be_unit_tested_without_an_actor() {
     let ran = ran();
