@@ -71,6 +71,7 @@
 
 use std::ops::DerefMut;
 
+use crate::compose::{Overflow, Topic};
 use crate::{
     ActorId, Admission, Admittance, AdmittedPeer, Allowlist, BlobId, Caller, DynamicAdmission,
     Ended, Eviction, FinishFut, IdempotencyKey, LocalActor, MailboxClosed, MountError, Observer,
@@ -300,6 +301,22 @@ impl<T: Default> HasNoDefault for T {}
 impl HasNoDefault for Allowlist {}
 impl HasNoDefault for Eviction {}
 impl HasNoDefault for Retention {}
+/// The fourth and fifth are the fan-out's, and they are the same family read one
+/// layer up: [`Overflow`] is the choice between *the publisher waits* and *the
+/// slow subscriber is ended*, and both are decisions about the caller's data
+/// rather than ours.
+///
+/// A `#[derive(Default)]` with `#[default]` on one arm is exactly what somebody
+/// would add — it is one attribute and it looks harmless — and it would give a
+/// fan-out a backpressure policy nobody chose. That is the failure the whole
+/// `compose` module is arranged against, so it is checked here rather than
+/// promised in its module doc.
+///
+/// [`Topic`] carries the policy, so it inherits the property: a
+/// `Topic::default()` would be a topic whose overflow behaviour is whatever the
+/// derive picked.
+impl HasNoDefault for Overflow {}
+impl<T> HasNoDefault for Topic<T> {}
 /// The adapter inherits the property from the value it holds. A `Default` here
 /// would mean "a policy you did not name", and the only policy nobody named is
 /// the one that admits everyone.
