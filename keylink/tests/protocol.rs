@@ -845,8 +845,18 @@ fn the_keyed_alpn_hashes_the_keyed_wire_type() {
     let correct_hash = String::from_utf8_lossy(&correct)
         .rsplit('/')
         .next()
-        .unwrap_or_default()
+        // NOT `unwrap_or_default`. An empty hash makes `ends_with` below
+        // unconditionally true, so the third of the three drifts this test
+        // refuses would pass green on a `None` — a guard that quietly does less,
+        // in the one test written to close a live defect. `derive_alpn` always
+        // emits `{protocol}/{hash:016x}`, so `None` is unreachable rather than
+        // tolerable, and it should say so loudly if that ever changes.
+        .expect("a derived contract hash always has a '/'-delimited suffix")
         .to_owned();
+    assert!(
+        !correct_hash.is_empty(),
+        "an empty expected suffix would satisfy `ends_with` for any input"
+    );
 
     assert!(
         real.ends_with(&correct_hash),
