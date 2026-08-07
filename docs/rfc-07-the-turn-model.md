@@ -3514,8 +3514,9 @@ two lines now, and `scripts/replay-fate-breaks.sh` runs the whole set.
 | `reply::the_four_prefixes_are_the_text_a_peer_matches_on` | `DROPPED` → `"lost: "` |
 | `local::a_supervisor_between_incarnations_is_gone_when_it_is_destroyed` | `supervise`'s floor disarmed at its declaration |
 | `local::a_transient_factory_failure_does_not_overwrite_a_pending_restart` | the floor moved back inside the loop body |
+| `local::a_state_that_panics_on_drop_mid_restart_is_gone_not_restarting` | the third disarm around `run_loop`, applied verbatim |
 
-`scripts/replay-fate-breaks.sh` runs all twenty-two and asserts, for each, that
+`scripts/replay-fate-breaks.sh` runs all twenty-three and asserts, for each, that
 **the exact sentence its guard's doc comment records as watched appears in the
 run**. It exits non-zero with a count if any is missing, and it refuses to start
 against a dirty tree, because `break-once.sh` restores a backup on EXIT and a run
@@ -3531,6 +3532,12 @@ time a break stayed red at a **different** assertion: the record for
 there to take it: SendError` *"because `supervise` reads the same cell"*, and three
 commits later the same wave deleted that read (§12.9's m1). `exit=101` is identical
 in all four. The recorded sentence is not.
+
+Three of the twenty-three carried a promissory note instead of an output at some
+point — two supervision guards and `the_gone_answer_..` — which made the premise
+above false for each until it was filled. Writing the record before running the
+break leaves a sentence that reads like evidence, and a reviewer grepping for the
+placeholder is what caught all three.
 
 Proved by execution rather than argued, twice: a deliberately no-op break reports
 its recorded output missing and the script exits 1; and break 6 run against the
@@ -3711,6 +3718,33 @@ way that scope returns, and nowhere else.**
 3. *One floor for the function, disarmed only before each `return`.* Both windows
    are covered because the floor is never dropped except on the way out, and
    attributability holds because a disarm immediately precedes each return.
+
+**A fourth shape was instructed and declined, and the decline turned out to be
+load-bearing rather than merely economical.** The instruction was to add a third
+disarm — around the `run_loop` call, since `run_loop` carries its own floor. It was
+declined on the grounds that it buys nothing: the floor is not dropped there, so
+leaving it armed costs nothing. That understated it. Disarming across `run_loop`
+**reintroduces a defect**, and the case is one nobody had enumerated:
+
+> a caller's state whose `Drop` **panics** on the restart path. `run_loop` settles
+> `Restarting`, disarms its own floor, and then `drop(state)` — caller's code,
+> outside any `catching` — panics. Drop glue continues during the unwind, so a
+> `Deferred` parked in that state still dies, with `Restarting` in the cell and
+> only `supervise`'s floor above it. Disarmed, nothing catches it and the peer
+> reads *retry, another incarnation is coming* about an actor that will never come
+> back.
+
+Measured both ways: shipped gives `NoSuchActor`, with the third disarm
+`Failed("restarting: a turn panicked: ..")`.
+
+So the rule on `Floor::disarm` is *immediately before each way the scope returns*,
+and **a nested call is not a way the scope returns**. That is the reading the rule
+invites and it is wrong. `a_state_that_panics_on_drop_mid_restart_is_gone_not_restarting`
+enforces it — break 23 is the third disarm, applied verbatim — because until it
+existed this was the only line in the design whose correctness rested on a comment,
+and the comment said *harmless to leave* where the truth is *required to leave*.
+Nothing in the replay set had covered it: break 21 disarms at the declaration,
+which is a different edit.
 
 **And `LocalActor::abort`'s settle was deleted, which was a defect of mine.** I
 judged it unreachable because no break could redden
