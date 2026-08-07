@@ -50,6 +50,7 @@
 //! both halves somewhere to see it from. That is a smaller cost than a second
 //! lifecycle vocabulary, which is what returning anything else would have been.
 
+use std::collections::hash_map;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
@@ -58,7 +59,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
-use n0_future::task::JoinHandle;
+use n0_future::task::{AbortOnDropHandle, JoinHandle};
 use n0_future::time::Instant;
 use tokio::sync::mpsc;
 
@@ -171,6 +172,16 @@ pub type Mailbox<M> = mpsc::Receiver<Box<M>>;
 /// The cost is one `Box` per mount, on a path that already allocates a channel,
 /// and it is transient: nothing the registry *keeps* is boxed by this, so the
 /// measured per-idle-actor cost above is untouched.
+///
+/// `#[must_use]` on the **type** as well as on the generated `spawn`, because an
+/// attribute on one function covers one function. Dropping one of these drops an
+/// actor's state, and it can be produced by [`mount`], by a factory, or by any
+/// helper a service author writes over either — measured: a local
+/// `fn helper() -> Mounted<_>` called as a statement warns with the attribute
+/// here and is silent without it. Bind-then-shadow is *not* what this buys;
+/// `unused_variables` already has that one.
+#[must_use = "an unmounted actor is dropped, and the state it was built around \
+              goes with it"]
 pub struct Mounted<M> {
     mail: mpsc::Sender<Box<M>>,
     /// Polled for the first time by [`Registry::entry`]. Boxed because the
@@ -275,6 +286,34 @@ pub enum Eviction {
         /// queue behind it needs, and is a property of the service's handlers.
         /// A budget shorter than a turn turns eviction into `abort` for every
         /// actor that happens to be busy when its clock runs out.
+        ///
+        /// # The one relationship it *does* have, and it is peer-visible
+        ///
+        /// This is also **the longest an evicted actor's exclusive resources stay
+        /// held after its id has left the map.** The sweeper takes the entry out
+        /// under the write guard and only then waits out this budget, so for up to
+        /// one budget the id is free and the state behind it is not.
+        ///
+        /// With a lazy factory — [`SystemBuilder::spawn_with`] — that window is
+        /// something a peer can hit. The next message to that id routes, finds
+        /// nothing, calls the factory, and the actor it builds goes for a resource
+        /// its predecessor has not let go of yet: a
+        /// `keylink_persist::Error::Busy` for a durable actor, or whatever else
+        /// "exclusive" means to that state. The refusal is **bounded** by this
+        /// number and it is not a bug in the eviction — it is the cost of draining
+        /// rather than detaching, and the old sweeper hid it by holding those
+        /// resources *forever* on a task nobody could reach.
+        ///
+        /// Two consequences worth stating. An id being free is not a promise that
+        /// its state is: a service whose actors own exclusive resources should
+        /// expect `Busy` from a re-spawn and answer it rather than treat it as
+        /// impossible. And the other end of the dial is worse, because it is
+        /// **silent**: a budget below the longest turn destroys that turn where it
+        /// stands, and nothing anywhere says so — the `Ended` the sweeper computes
+        /// is nobody's answer, an aborted task's observers never run, and the
+        /// caller was a peer whose stream is severed rather than answered. That
+        /// gap is known and Wave 6 owns it, where `System::snapshot` and the
+        /// console are. Until then this number is the only control over it.
         shutdown_budget: Duration,
     },
     /// Keep every actor until it is stopped by hand.
@@ -405,22 +444,34 @@ impl<M> Registry<M> {
         };
 
         let mut entries = self.write();
-        // Another message to the same new id may have won the race between the
-        // two locks. One id is one actor, so the loser adopts the winner's.
-        if let Some(found) = self.touch(&entries, id) {
-            return Ok(found);
+        // Read before the entry is taken, because a `VacantEntry` borrows the map
+        // and `len()` cannot be asked while one is held. The count is the one
+        // before this insert either way, which is what the cap is about.
+        let live = entries.len();
+        match entries.entry(id.clone()) {
+            hash_map::Entry::Occupied(taken) => {
+                // Another message to the same new id won the race between the two
+                // locks. One id is one actor, so the loser adopts the winner's.
+                // `touch` inlined, because it wants a `&HashMap` this arm has
+                // handed to the entry.
+                let entry = taken.into_mut();
+                entry.last_seen.store(self.now(), Ordering::Relaxed);
+                Ok(entry.mail.clone())
+            }
+            hash_map::Entry::Vacant(free) => {
+                if live >= self.capacity {
+                    return Err(RouteError::AtCapacity {
+                        capacity: self.capacity,
+                    });
+                }
+                let Some(mounted) = factory(id) else {
+                    return Err(RouteError::NoSuchActor { id: id.clone() });
+                };
+                let found = mounted.mail.clone();
+                free.insert(self.entry(mounted));
+                Ok(found)
+            }
         }
-        if entries.len() >= self.capacity {
-            return Err(RouteError::AtCapacity {
-                capacity: self.capacity,
-            });
-        }
-        let Some(mounted) = factory(id) else {
-            return Err(RouteError::NoSuchActor { id: id.clone() });
-        };
-        let found = mounted.mail.clone();
-        entries.insert(id.clone(), self.entry(mounted));
-        Ok(found)
     }
 
     fn touch(
@@ -437,6 +488,21 @@ impl<M> Registry<M> {
     ///
     /// **The only place an actor's task is spawned**, which is what lets
     /// [`Mounted`] be refused for free.
+    ///
+    /// # Every caller inserts through a `VacantEntry`, and that is structural
+    ///
+    /// What this returns owns a `JoinHandle`, so displacing a live entry with it
+    /// would detach the actor that was there — the defect this wave exists to
+    /// remove, in the one shape a type cannot catch: `HashMap::insert` hands the
+    /// displaced value back as an `Option` that a caller may discard, and
+    /// [`System::mount`] and [`Registry::route`] both did discard it. Both were
+    /// safe, each by a presence check a few lines up under the same write guard —
+    /// an argument that has to be re-made every time either function is edited.
+    ///
+    /// They go through `HashMap::entry` instead. A `VacantEntry::insert` returns
+    /// no predecessor because it has none, so the safe path is the only one that
+    /// type-checks and the argument does not have to be re-made. It also drops
+    /// the second lookup each of them was doing.
     ///
     /// # Panics
     ///
@@ -468,6 +534,14 @@ impl<M> Registry<M> {
     /// holds the guard across the user's `factory` call and is documented as such;
     /// nothing here may hold it across an await.
     ///
+    /// **On native that discipline is compiler-enforced and not merely argued.**
+    /// This future is spawned by [`spawn_sweeper`] through
+    /// `n0_future::task::spawn`, which is `tokio::spawn` and requires `Send`;
+    /// `std::sync::RwLockWriteGuard` is `!Send`; so a guard alive across the
+    /// `join_all` below makes this future `!Send` and the spawn stops compiling.
+    /// The paragraph above says why the shape is right, and the spawn is what
+    /// keeps it that way.
+    ///
     /// # Concurrently, and that is not an optimisation
     ///
     /// A hundred expired actors that all refuse to drain must cost one budget, not
@@ -475,6 +549,22 @@ impl<M> Registry<M> {
     /// next tick would not start until it finished, so a single wedged actor would
     /// push every other actor's eviction past its own deadline — a queue that
     /// grows under exactly the condition it exists to clear.
+    ///
+    /// # A known gap: an eviction that destroys a busy actor is silent
+    ///
+    /// The [`Ended`] each teardown computes is dropped here, deliberately — see
+    /// the comment on the `join_all` — and an aborted task's observers never run.
+    /// So a `shutdown_budget` set below the longest turn destroys turns with **no
+    /// signal anywhere**: no log, no counter, no observer, and no caller, because
+    /// the caller of an evicted actor is a peer whose stream is severed rather
+    /// than answered. The crate has no logging seam to report it through, and
+    /// adding one here would be a second, quieter path beside the observers.
+    ///
+    /// **Wave 6 owns this.** Its `System::snapshot` and the console are where a
+    /// destroyed-on-eviction count belongs, beside the other per-actor facts,
+    /// rather than in a sweeper that would have to invent a channel to carry it.
+    /// Until then, the mitigation is the budget itself: pick it from the longest
+    /// turn plus the queue behind it, as [`Eviction::Idle::shutdown_budget`] says.
     async fn sweep(&self) {
         let Eviction::Idle {
             after,
@@ -516,28 +606,50 @@ impl<M> Registry<M> {
 /// things. [`System::abort`] does not, because it never drains — that is a
 /// different operation rather than this one with a budget of zero.
 ///
-/// # The handle must outlive the timeout, and that is the whole defect
+/// # The handle must outlive the timeout, and must not outlive this future
 ///
-/// `n0_future::time::timeout(budget, task)` **consumes** the handle, so when the
-/// budget expires the timeout's future drops it — and a dropped `JoinHandle`
-/// detaches its task on both targets. Verified against `n0-future 0.3.2`: the
-/// native branch re-exports tokio's, whose documented behaviour is to detach,
-/// and the wasm branch has no `impl Drop for JoinHandle` at all — abort-on-drop
-/// lives in a separate `AbortOnDropHandle`. So the actor would go on running,
-/// still owning `&mut A` and whatever `A` holds, with the entry already out of
-/// the map and no handle anywhere able to reach it.
+/// There are two ways to let go of a `JoinHandle` here, and a dropped one
+/// **detaches** its task on both targets rather than cancelling it. Verified
+/// against `n0-future 0.3.2`: the native branch re-exports tokio's, whose
+/// documented behaviour is to detach, and the wasm branch has no `impl Drop for
+/// JoinHandle` at all — abort-on-drop lives in a separate `AbortOnDropHandle`.
+/// Either way of letting go leaves the actor running, still owning `&mut A` and
+/// whatever `A` holds, with the entry already out of the map and no handle
+/// anywhere able to reach it.
 ///
-/// `pin!` puts the handle on this future's own stack and hands the timeout a
-/// `&mut` to it, so expiry leaves the handle right here to be aborted. Stack
-/// pinning rather than `Box::pin` because a teardown should not allocate, and
-/// `&mut task` rather than either would rest on `JoinHandle: Unpin`, which is
-/// documented for tokio's and merely true of n0-future's wasm shim.
+/// The first way is **expiry**. `n0_future::time::timeout(budget, task)`
+/// **consumes** the handle, so when the budget runs out the timeout's own future
+/// drops it. `pin!` puts the handle on this future's stack and hands the timeout
+/// a `&mut` to it instead, so expiry leaves the handle right here to be aborted.
+/// Stack pinning rather than `Box::pin` because a teardown should not allocate,
+/// and rather than a bare `&mut task` because that rests on the wrapper being
+/// `Unpin`, which nothing promises: natively it is `tokio_util`'s plain struct
+/// around a `JoinHandle`, and on wasm it is n0-future's own
+/// `#[pin_project(PinnedDrop)]` shim, whose `Unpin` is derived from its pinned
+/// field. Both are `Unpin` today — measured on both targets, not assumed — so
+/// `pin!` is not what makes this compile. It is what stops a change to either of
+/// those two types from turning this line into a detach again, and it costs
+/// nothing.
+///
+/// The second way is **cancellation**, and it is the same defect one level up.
+/// This future is awaited by [`System::shutdown`] and by [`Registry::sweep`],
+/// and a caller may drop either: `tokio::select!`, a `race`, a `timeout` around
+/// the whole call, a spawned sweep whose handle goes away. Dropping the
+/// *outer* future drops this frame, and this frame is where the handle lives —
+/// so with a bare `JoinHandle` a cancelled `shutdown` reproduced the deleted
+/// `stop` exactly: entry gone from the map, task detached, and
+/// [`System::abort`] answering `false` for an actor that is still running.
+///
+/// So the handle is an [`AbortOnDropHandle`], and letting go of it — by expiry,
+/// by cancellation, or by a panic unwinding this frame — aborts instead of
+/// detaching. A dropped call loses the *wait*; it can no longer lose the
+/// *actor*.
 ///
 /// # What it returns, and the one thing it cannot know
 ///
 /// - the task returned → [`Ended::Stopped`];
-/// - the task's join failed → [`Ended::Vanished`], which is what a panicked or
-///   already-aborted task is;
+/// - the task's join failed → [`Ended::Vanished`], which is what an aborted or
+///   panicked task is;
 /// - the budget expired → the task is aborted, joined, and reported
 ///   [`Ended::Vanished`], because that is what `abort` produces everywhere else
 ///   in the crate.
@@ -550,7 +662,7 @@ async fn drain<M>(entry: Entry<M>, budget: Duration) -> Ended {
     // any other sender does, which is what lets a message already in flight
     // finish rather than be cancelled.
     drop(mail);
-    let mut task = std::pin::pin!(task);
+    let mut task = std::pin::pin!(AbortOnDropHandle::new(task));
     match n0_future::time::timeout(budget, &mut task).await {
         Ok(Ok(())) => Ended::Stopped,
         Ok(Err(_join)) => Ended::Vanished,
@@ -683,16 +795,26 @@ impl<M> System<M> {
     /// [`MountError::AtCapacity`] when the registry is full.
     pub fn mount(&self, id: ActorId, actor: Mounted<M>) -> std::result::Result<(), MountError> {
         let mut entries = self.inner.write();
-        if entries.contains_key(&id) {
-            return Err(MountError::Occupied { id });
+        // See `Registry::route`: a `VacantEntry` borrows the map, so the count is
+        // taken first. It is the count before this insert, which is the one the
+        // cap is about.
+        let live = entries.len();
+        match entries.entry(id) {
+            // The refusal clones the key it was given back out of the map, which
+            // is the one allocation this shape costs and it is on the cold path.
+            hash_map::Entry::Occupied(taken) => Err(MountError::Occupied {
+                id: taken.key().clone(),
+            }),
+            hash_map::Entry::Vacant(free) => {
+                if live >= self.inner.capacity {
+                    return Err(MountError::AtCapacity {
+                        capacity: self.inner.capacity,
+                    });
+                }
+                free.insert(self.inner.entry(actor));
+                Ok(())
+            }
         }
-        if entries.len() >= self.inner.capacity {
-            return Err(MountError::AtCapacity {
-                capacity: self.inner.capacity,
-            });
-        }
-        entries.insert(id, self.inner.entry(actor));
-        Ok(())
     }
 
     /// Find the actor `id` addresses, spawning it if this system has a factory.
@@ -728,6 +850,32 @@ impl<M> System<M> {
     /// [`Ended::Stopped`] if the actor drained inside its budget, and
     /// [`Ended::Vanished`] if it did not and was destroyed, or if its task had
     /// already failed.
+    ///
+    /// # Cancel-safe: dropping this loses the answer, never the actor
+    ///
+    /// The id leaves the map before the first await, so a caller who drops this
+    /// future — `tokio::select!`, a `race`, a `timeout` around the call — has
+    /// already unmounted the actor and cannot be handed it back. What the drop
+    /// must not do is *detach* it, and until this wave a dropped `JoinHandle`
+    /// did exactly that: the deleted `stop`'s whole defect, reachable through
+    /// cancellation instead of through a budget.
+    ///
+    /// So the teardown holds an abort-on-drop handle, and dropping this future
+    /// aborts the actor exactly as an expired budget would. A
+    /// dropped call therefore loses the [`Ended`] and the *wait*, and destroys
+    /// the actor rather than draining it, which is the same trade a budget of
+    /// zero would be. [`Self::abort`] is the deliberate spelling of that.
+    ///
+    /// # The exclusive resources outlive the id, by up to one budget
+    ///
+    /// The entry is gone and the actor is not, until it drains or the budget
+    /// expires. Anything exclusive the state owns — a
+    /// `keylink_persist::Claim`, a file lock, a device — is still held
+    /// throughout. So a lazily spawned system can serve the same id again
+    /// straight away and the actor it builds can be refused for as long as this
+    /// budget lasts. [`Eviction::Idle::shutdown_budget`] carries that in full,
+    /// because a sweeper applies it to every expired actor at once and a caller
+    /// applies it to one.
     ///
     /// # The budget is a parameter, and its absence was a live defect
     ///
@@ -770,8 +918,16 @@ impl<M> System<M> {
     /// call did not cause and cannot see, because the loop returns normally
     /// either way and the join says `Ok(())` for both. So:
     ///
-    /// - [`Ended::Vanished`] is exact. It means the task did not return, and only
-    ///   an abort — this call's, or an earlier one — produces that.
+    /// - [`Ended::Vanished`] means the task **did not return**, and it does not
+    ///   say why: this call's abort, an earlier one, a runtime shutdown, or a
+    ///   panic that escaped a turn all arrive here as a failed join. It used to
+    ///   claim "only an abort produces that", which is wrong on its face — the
+    ///   `Vanished` variant's own definition names a runtime shutdown — and
+    ///   `drain`'s doc twelve lines away already said "aborted or panicked". The
+    ///   crate does not split abort from panic here on purpose and not by
+    ///   omission: `JoinError::is_panic()` is hardcoded `false` on wasm, where a
+    ///   panicking task is not unwound at all, so a variant that promised the
+    ///   difference would be a promise one target cannot keep.
     /// - [`Ended::Stopped`] is exact about **this call**: routing has stopped and
     ///   the task is finished. It does not claim to be *why* the loop exited. An
     ///   actor that ended on an observer's refusal a second earlier is reported
@@ -844,8 +1000,23 @@ impl<M> System<M> {
     /// Awaiting this awaits the teardown of everything it evicted, so it returns
     /// only once each of those actors has either drained or been destroyed. It was
     /// synchronous, and could not be anything else while eviction meant dropping
-    /// an entry and detaching its task; a budget is a thing to wait out, and a
-    /// caller who cannot wait can spawn this.
+    /// an entry and detaching its task; a budget is a thing to wait out.
+    ///
+    /// # Cancel-safe, which is what makes "spawn it" a real escape hatch
+    ///
+    /// A caller who cannot wait can spawn this, or wrap it in a `timeout`, or put
+    /// it in a `select!`. Every one of those can drop the future mid-sweep, and
+    /// this method takes **no budget parameter**, so a caller who needs a bound
+    /// has no other spelling — one dropped sweep would have detached *every*
+    /// expired actor at once, because they are torn down concurrently.
+    ///
+    /// It does not: the entries are already out of the map when the first await
+    /// happens, and each teardown holds an abort-on-drop handle, so dropping this
+    /// future destroys those actors instead of setting them loose. The cost of
+    /// cancelling is that actors which would have drained are aborted mid-turn
+    /// — the same cost an under-sized
+    /// [`shutdown_budget`](Eviction::Idle::shutdown_budget) has, and just as
+    /// silent. Prefer letting a sweep finish.
     pub async fn evict_idle(&self) {
         self.inner.sweep().await;
     }
