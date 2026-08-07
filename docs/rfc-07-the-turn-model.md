@@ -110,20 +110,50 @@ This is not a new constraint — today's keyed mailbox message already carries a
 `pub cx: Context` (`actor/remote.rs:291`) and borrows from it in the loop
 (`macros.rs:615`). That is the only shape that works, and the sketch simply lost it.
 
-The generated enum therefore carries an owned discriminant, since `Context` is `Clone`:
+The generated enum therefore carries an **owned** discriminant:
 
 ```rust
 #[doc(hidden)]
-pub enum Origin { Local, Peer(Context) }
+pub enum Origin { Local, Peer(Context) }        // deliberately NOT Clone — see below
 
 impl Origin {
-    fn caller(&self) -> Caller<'_> {
+    /// `pub`, because the loop that calls it is generated into the USER's crate.
+    #[doc(hidden)]
+    pub fn caller(&self) -> Caller<'_> {
         match self { Self::Local => Caller::Local, Self::Peer(cx) => Caller::Peer(cx) }
     }
 }
 ```
 
 The loop borrows a `Caller<'_>` out of the owned `Origin` for the length of one turn.
+
+**Revision, 2026-08-07.** This section was first written with `fn caller` private and
+justified by "`Context` is `Clone`". Both were wrong, and an adversarial review of Wave 1
+caught them. Recorded rather than quietly corrected, because the second one is a live
+hazard and the first is this RFC reproducing, inside the amendment, the defect class the
+amendment exists to fix.
+
+1. **`caller` must be `#[doc(hidden)] pub`.** The mailbox loop is generated into the
+   *caller's* crate (`macros.rs:538-540`), so a private method is `E0624: method 'caller'
+   is private` at the one site that must call it. This is the same error Wave 0 hit on
+   `Context::new`, one layer up.
+
+2. **`Clone` was a non-sequitur, and inviting it is dangerous.** The fix works because
+   `deliver` *owns* the `Context` — `remote.rs:407` takes `cx: Context` by value and
+   `remote.rs:435` moves it into the message, with the comment *"Read before `cx` moves
+   into the `Mail`"*. Ownership, not cloning.
+
+   It matters because `Context` does derive `Clone`, and `Context.progress` is
+   `Progress(Arc<AtomicU8>)` (`middleware.rs:112`) whose `Clone` **shares the `Arc`,
+   deliberately** (`middleware.rs:235`). `Progress::reached()` is what `rpc.rs:398` reads
+   to decide **record versus release** on an idempotency key. Two messages carrying clones
+   of one `Context` would share one `AtomicU8` whose marks are `fetch_or` and never
+   cleared — so message A reaching `COMPLETED` makes message B read `Reached::Completed`
+   and **record a reply B never produced.** A silently wrong at-most-once answer, which is
+   the guarantee `idempotency.rs` exists to hold.
+
+   `Origin` is therefore **not `Clone`**, so the mistake is a compile error rather than a
+   wrong answer on the wire.
 
 ### 1.7 `Rc` is the wrong exemplar, and it would have failed the gate for the wrong reason
 
