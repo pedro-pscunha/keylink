@@ -14,8 +14,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink::{
-    ActorId, Allowlist, Caller, Deferred, Ended, Eviction, Observer, Persist, Replied, Reply,
-    Server, Stop, TurnFut, TurnInfo,
+    ActorId, Allowlist, Applied, CallId, Caller, Context, Deferred, Ended, Eviction,
+    IdempotencyKey, KeyState, Observer, Persist, Replied, Reply, Server, Stop, TurnFut, TurnInfo,
 };
 use std::time::Duration;
 
@@ -1083,4 +1083,686 @@ async fn the_per_turn_store_cost() {
 /// assertion.
 fn micros(elapsed: std::time::Duration, turns: u32) -> f64 {
     elapsed.as_secs_f64() * 1_000_000.0 / f64::from(turns)
+}
+
+// ───────────────────────────────── the restart the ledger cannot cross
+//
+// The other half of the pair `src/idempotency.rs` names: a durable state and a
+// volatile ledger disagree across a restart, and `Context::call` is what lets the
+// state settle it. Everything below drives the real file store, like the rest of
+// this file, and a "new process" is a second `Persist::open` on the same one.
+
+keylink::service! {
+    service Till;
+
+    /// Adds `amount` once per call, and answers the balance that produced.
+    ///
+    /// The whole subject: a retry of this that arrives after a restart meets an
+    /// empty ledger, is dispatched, and must not add the amount again.
+    rpc Debit(amount: u64) -> u64;
+    /// The balance now.
+    rpc Balance() -> u64;
+    /// How many times [`Debit`] actually did the work. This is the assertion —
+    /// "it did not run twice" and not "the ledger refused it".
+    rpc Runs() -> u64;
+}
+
+/// A balance, the calls that produced it, and a count of the work.
+///
+/// `applied` is the only new thing here, and it is in the caller's state rather
+/// than in keylink's — which is the design. The bound it carries is the caller's
+/// to argue, and this one is [`APPLIED_CAPACITY`](keylink::APPLIED_CAPACITY)
+/// because nothing about a test argues for another number.
+#[derive(Default)]
+struct Till {
+    balance: u64,
+    runs: u64,
+    applied: Applied<u64>,
+}
+
+impl till::Actor for Till {
+    /// The three lines the README's second limit now points at.
+    async fn debit(&mut self, cx: Caller<'_>, amount: u64) -> u64 {
+        let call = cx.peer().and_then(Context::call);
+        if let Some(&balance) = self.applied.get(call) {
+            return balance;
+        }
+        self.runs += 1;
+        self.balance += amount;
+        self.applied.insert(call, self.balance);
+        self.balance
+    }
+
+    async fn balance(&mut self, _cx: Caller<'_>) -> u64 {
+        self.balance
+    }
+
+    async fn runs(&mut self, _cx: Caller<'_>) -> u64 {
+        self.runs
+    }
+}
+
+/// Balance, run count, then one `(id, answer)` pair per applied call, oldest
+/// first — which is the order [`Applied::iter`](keylink::Applied::iter) reports
+/// for exactly this reason.
+impl Durable for Till {
+    const VERSION: u32 = 1;
+
+    fn snapshot(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&self.balance.to_le_bytes());
+        bytes.extend_from_slice(&self.runs.to_le_bytes());
+        for (call, answer) in self.applied.iter() {
+            bytes.extend_from_slice(call.as_bytes());
+            bytes.extend_from_slice(&answer.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn restore(bytes: &[u8]) -> Result<Self, RestoreError> {
+        const HEAD: usize = 16;
+        const ENTRY: usize = 24;
+        if bytes.len() < HEAD || !(bytes.len() - HEAD).is_multiple_of(ENTRY) {
+            return Err(RestoreError::Malformed(format!(
+                "a till is 16 bytes and then whole 24-byte entries, and this is {} bytes",
+                bytes.len()
+            )));
+        }
+        let mut till = Self {
+            balance: u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes")),
+            runs: u64::from_le_bytes(bytes[8..HEAD].try_into().expect("8 bytes")),
+            applied: Applied::new(),
+        };
+        for entry in bytes[HEAD..].chunks_exact(ENTRY) {
+            let id: [u8; 16] = entry[..16].try_into().expect("16 bytes");
+            let answer = u64::from_le_bytes(entry[16..].try_into().expect("8 bytes"));
+            till.applied.insert(Some(CallId::from_bytes(id)), answer);
+        }
+        Ok(till)
+    }
+
+    fn migrate(_from: u32, _bytes: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> {
+        Ok(None)
+    }
+}
+
+/// One incarnation of the till: a claim on the store, a mounted actor, and a
+/// served ALPN.
+///
+/// A struct rather than two runs of a loop — which is how
+/// `a_keyed_actors_state_survives_its_own_process` does it — because the two runs
+/// here are not the same script: one does the work and the other retries it.
+struct Serving {
+    system: till::System,
+    running: Server,
+}
+
+impl Serving {
+    async fn start(files: &Files, id: &StateId, actor: &ActorId, node: &keylink::Node) -> Self {
+        let (state, saver) = Persist::<Till, _>::open(files, id)
+            .await
+            .expect("claims and loads")
+            .start_from(Till::default);
+        let system = till::System::builder(Eviction::Never).capacity(4).build();
+        system
+            .mount(
+                actor.clone(),
+                till::spawn_wired(state, vec![Box::new(saver)], till::Feeds::new()),
+            )
+            .expect("mounts");
+        let running = Server::builder(node)
+            .service(till::keyed_service(&system, Allowlist::anyone()).build())
+            .spawn()
+            .expect("one service, no duplicate ALPN");
+        Self { system, running }
+    }
+
+    /// End the process, as far as a claim and a ledger can tell: drain the actor,
+    /// which drops the observers and releases the claim, then drop the router.
+    async fn stop(self, actor: &ActorId) {
+        match self.system.shutdown(actor, Duration::from_secs(5)).await {
+            Some(Ended::Stopped) => {}
+            other => panic!("the actor was mounted and must drain: got {other:?}"),
+        }
+        drop(self.running);
+    }
+}
+
+/// **The criterion: a retried call across a restart is applied once.**
+///
+/// This is `README.md`'s second limit, rewritten and then guarded. The ledger is
+/// memory, so the restarted process answers the retried key
+/// [`Fresh`](keylink::KeyState::Fresh) and dispatches it — that cost is asserted
+/// here rather than hidden, because option E accepts it. What must not happen is
+/// the *work* happening twice, and `runs` is where that is read.
+///
+/// # Why it rebuilds from the store
+///
+/// A test that reused the live service would prove the in-memory tombstone path
+/// and nothing about durability: `Ledger` already answers a repeated key from
+/// memory. So the actor is drained, the claim released and the router dropped —
+/// the same teardown `a_keyed_actors_state_survives_its_own_process` calls a new
+/// process — and the second incarnation loads from the file.
+///
+/// # Two negatives, because one of them was missing and the harness said so
+///
+/// A state that recognised *everything* has to fail this test, and so does a
+/// wiring that hashed the wrong thing. Two assertions do that:
+///
+/// - a **second key from the same peer** must be applied rather than recognised.
+/// - a **fresh keypair** using the first key must be applied too: a different peer
+///   hashes to a different [`CallId`](keylink::CallId) and is not recognised —
+///   silently, which is the precondition stated as a fact rather than a defect.
+///
+/// The first of those was not here originally, and the break below is how that was
+/// found: replacing the key with a constant left every assertion green, because the
+/// peer was still folded in and the test only ever used one key per peer. A guard
+/// that cannot go red is not a guard, so the assertion was added rather than the
+/// break record softened.
+///
+/// Made red at both ends, because two facts have to hold at once:
+///
+/// - `scripts/break-once.sh keylink/src/rpc.rs` on
+///   `.map(|idem| CallId::of(peer, idem.key())),` →
+///   `.map(|idem| { let _ = idem; CallId::of(peer, &IdempotencyKey::new("x").expect("valid")) }),`
+///   — every one of a peer's calls then shares one id. Watched:
+///   `left: 50 right: 57`, on the second-key assertion.
+/// - `scripts/break-once.sh keylink/src/middleware.rs` on `pub fn call`'s body
+///   `self.call` → `self.call.and(None)` — nothing is ever recognised. Watched:
+///   `the retry is answered with the FIRST run's balance, out of the state`,
+///   `left: 100 right: 50`.
+#[tokio::test]
+async fn a_retried_call_across_a_restart_is_applied_once() {
+    let (_scratch, files) = store("across-restart").await;
+    let id = StateId::new("tills/sp-01").expect("valid");
+    let actor = ActorId::new("tills/sp-01").expect("valid");
+    let server = local_node().await;
+    let caller = local_node().await;
+    let key = IdempotencyKey::new("debit-4471").expect("a valid key");
+
+    // ── the first process: the work happens and is stored, and the record that
+    //    would have suppressed a repeat is in memory only.
+    {
+        let serving = Serving::start(&files, &id, &actor, &server).await;
+        let client = till::KeyedClient::connect(&caller, server.endpoint().addr())
+            .await
+            .expect("dials");
+        assert_eq!(
+            till::at(&client.with_idempotency(key.clone()), actor.clone())
+                .debit(50)
+                .await
+                .expect("the keyed actor answers"),
+            50,
+        );
+        assert_eq!(
+            till::at(&client, actor.clone())
+                .runs()
+                .await
+                .expect("answers"),
+            1,
+        );
+        assert_eq!(
+            client.key_state(key.clone()).await.expect("answers"),
+            KeyState::Done,
+            "the ledger holds the reply — in memory, which is what the restart takes",
+        );
+        serving.stop(&actor).await;
+    }
+
+    // ── the second process: same store, same served node, same calling keypair.
+    let serving = Serving::start(&files, &id, &actor, &server).await;
+    let client = till::KeyedClient::connect(&caller, server.endpoint().addr())
+        .await
+        .expect("dials");
+
+    assert_eq!(
+        client.key_state(key.clone()).await.expect("answers"),
+        KeyState::Fresh,
+        "a restarted ledger knows nothing about the key, and E accepts that \
+         rather than closing it",
+    );
+    assert_eq!(
+        till::at(&client.with_idempotency(key.clone()), actor.clone())
+            .debit(50)
+            .await
+            .expect("the keyed actor answers"),
+        50,
+        "the retry is answered with the FIRST run's balance, out of the state",
+    );
+    assert_eq!(
+        till::at(&client, actor.clone())
+            .runs()
+            .await
+            .expect("answers"),
+        1,
+        "the work must not have run a second time",
+    );
+    assert_eq!(
+        till::at(&client, actor.clone())
+            .balance()
+            .await
+            .expect("answers"),
+        50,
+    );
+
+    // ── the first negative: a SECOND key from the SAME peer is a different call.
+    //    Without this the wiring could hash any fixed key it liked and every
+    //    assertion above would still hold — see this test's own break record.
+    let another = IdempotencyKey::new("debit-4472").expect("a valid key");
+    assert_eq!(
+        till::at(&client.with_idempotency(another), actor.clone())
+            .debit(7)
+            .await
+            .expect("the keyed actor answers"),
+        57,
+        "a different key from the same peer must be applied, not recognised",
+    );
+    assert_eq!(
+        till::at(&client, actor.clone())
+            .runs()
+            .await
+            .expect("answers"),
+        2,
+    );
+
+    // ── the second negative: a caller on a fresh keypair is a different peer, so
+    //    the same key is a different call. The precondition, stated as a fact.
+    let stranger = local_node().await;
+    let other = till::KeyedClient::connect(&stranger, server.endpoint().addr())
+        .await
+        .expect("dials");
+    assert_eq!(
+        till::at(&other.with_idempotency(key.clone()), actor.clone())
+            .debit(50)
+            .await
+            .expect("the keyed actor answers"),
+        107,
+        "a peer that reconnected on a new keypair is not recognised, and the \
+         work runs again — silently, which is the limit and not a defect",
+    );
+    assert_eq!(
+        till::at(&other, actor.clone())
+            .runs()
+            .await
+            .expect("answers"),
+        3,
+    );
+
+    serving.stop(&actor).await;
+}
+
+// ───────────────────────────── whose key a parked reply is answered under
+
+keylink::service! {
+    service Booth;
+
+    /// Parked, and answered from a later `approve`.
+    #[defer]
+    rpc Withdraw(amount: u64) -> u64;
+    /// Releases every parked withdrawal.
+    rpc Approve() -> u64;
+    /// How many are parked. The sync point, asked rather than slept for.
+    rpc Waiting() -> u64;
+    /// What each recorded turn saw on `cx.call()`, oldest first: the id in hex,
+    /// or `-` for a turn whose call carried no key.
+    ///
+    /// This method does **not** record itself — a probe that appeared in its own
+    /// answer would make the sequence a function of how often the test asked.
+    rpc Seen() -> Vec<String>;
+}
+
+/// A balance, the withdrawals waiting for approval, and what each turn was called.
+///
+/// Two fields are deliberately not in the snapshot, for two different reasons:
+///
+/// - `waiting` **cannot** be. A [`Deferred`] is a live channel to a caller in this
+///   process, and that is the whole of what a restart takes away.
+/// - `seen` is a probe. Restoring it would make the second incarnation's answer a
+///   function of the first's, which is the opposite of what the test reads it for.
+///
+/// `parked` is [`Applied<()>`](keylink::Applied) and not `Applied<u64>`, and that
+/// is the `#[defer]` decision made concrete: the turn that parks produces no
+/// answer, so there is nothing to record and nothing to replay. At-most-once is
+/// all this shape can have. `Till` above is the other shape.
+///
+/// `approve` deduplicates nothing on purpose. This state exists for one question
+/// and a second `Applied` in it would answer none of it better.
+#[derive(Default)]
+struct Booth {
+    balance: u64,
+    waiting: Vec<(u64, Deferred<u64>)>,
+    parked: Applied<()>,
+    seen: Vec<String>,
+}
+
+/// What a turn saw, in the form `Seen` reports.
+fn mark(cx: Caller<'_>) -> String {
+    cx.peer()
+        .and_then(Context::call)
+        .map_or_else(|| "-".to_string(), |call| call.to_string())
+}
+
+impl booth::Actor for Booth {
+    async fn withdraw(&mut self, cx: Caller<'_>, reply: Reply<u64>, amount: u64) -> Replied<u64> {
+        let call = cx.peer().and_then(Context::call);
+        self.seen.push(mark(cx));
+        if self.parked.seen(call) {
+            // Recognised, and there is no recorded answer to give — so the domain
+            // answers out of itself, which is all `Applied<()>` promises.
+            return reply.send(self.balance);
+        }
+        self.parked.insert(call, ());
+        let (deferred, replied) = reply.later();
+        self.waiting.push((amount, deferred));
+        replied
+    }
+
+    async fn approve(&mut self, cx: Caller<'_>) -> u64 {
+        self.seen.push(mark(cx));
+        let approved = self.waiting.len() as u64;
+        for (amount, deferred) in std::mem::take(&mut self.waiting) {
+            self.balance -= amount;
+            deferred.send(self.balance);
+        }
+        approved
+    }
+
+    async fn waiting(&mut self, _cx: Caller<'_>) -> u64 {
+        self.waiting.len() as u64
+    }
+
+    async fn seen(&mut self, _cx: Caller<'_>) -> Vec<String> {
+        self.seen.clone()
+    }
+}
+
+/// Balance, then one id per parked call. Neither `waiting` nor `seen` is here —
+/// see the type.
+impl Durable for Booth {
+    const VERSION: u32 = 1;
+
+    fn snapshot(&self) -> Vec<u8> {
+        let mut bytes = self.balance.to_le_bytes().to_vec();
+        for (call, ()) in self.parked.iter() {
+            bytes.extend_from_slice(call.as_bytes());
+        }
+        bytes
+    }
+
+    fn restore(bytes: &[u8]) -> Result<Self, RestoreError> {
+        if bytes.len() < 8 || !(bytes.len() - 8).is_multiple_of(16) {
+            return Err(RestoreError::Malformed(format!(
+                "a booth is 8 bytes and then whole 16-byte ids, and this is {} bytes",
+                bytes.len()
+            )));
+        }
+        let mut booth = Self {
+            balance: u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes")),
+            ..Self::default()
+        };
+        for id in bytes[8..].chunks_exact(16) {
+            let id: [u8; 16] = id.try_into().expect("16 bytes");
+            booth.parked.insert(Some(CallId::from_bytes(id)), ());
+        }
+        Ok(booth)
+    }
+
+    fn migrate(_from: u32, _bytes: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> {
+        Ok(None)
+    }
+}
+
+/// Wait for `want` withdrawals to be parked by asking over the wire, not by
+/// sleeping. `waiting_for` above, with a client instead of a `Handle`.
+async fn parked_over_the_wire(client: &booth::KeyedClient, actor: &ActorId, want: u64) {
+    for _ in 0..500 {
+        if booth::at(client, actor.clone())
+            .waiting()
+            .await
+            .expect("the actor is running")
+            == want
+        {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("{want} withdrawals never parked");
+}
+
+/// One incarnation of the booth. [`Serving`]'s twin; the two differ only in the
+/// service, and a generic over `service!`'s generated module is not a thing Rust
+/// can express.
+struct Booking {
+    system: booth::System,
+    running: Server,
+}
+
+impl Booking {
+    async fn start(files: &Files, id: &StateId, actor: &ActorId, node: &keylink::Node) -> Self {
+        let (state, saver) = Persist::<Booth, _>::open(files, id)
+            .await
+            .expect("claims and loads")
+            .start_from(|| Booth {
+                balance: 100,
+                ..Booth::default()
+            });
+        let system = booth::System::builder(Eviction::Never).capacity(4).build();
+        system
+            .mount(
+                actor.clone(),
+                booth::spawn_wired(state, vec![Box::new(saver)], booth::Feeds::new()),
+            )
+            .expect("mounts");
+        let running = Server::builder(node)
+            .service(booth::keyed_service(&system, Allowlist::anyone()).build())
+            .spawn()
+            .expect("one service, no duplicate ALPN");
+        Self { system, running }
+    }
+
+    async fn stop(self, actor: &ActorId) {
+        match self.system.shutdown(actor, Duration::from_secs(5)).await {
+            Some(Ended::Stopped) => {}
+            other => panic!("the actor was mounted and must drain: got {other:?}"),
+        }
+        drop(self.running);
+    }
+}
+
+/// **The criterion: a parked reply is named by the turn that RELEASES it, and
+/// that is a different call.**
+///
+/// `parking.rs` states the shape — *"a `Deferred` is parked in turn 1 and sent in
+/// turn 5"* — and leaves open whose key turn 5 is running under. This decides it:
+/// turn 5 is a call of its own, with its own caller and its own key, and
+/// `Context::call` answers **turn 5's**. Nothing leaks backwards from the parked
+/// reply into the turn that happens to release it.
+///
+/// The script, in order, and every assertion reads the one sequence:
+///
+/// 1. a **keyed** `withdraw` parks. Its turn reports its own id.
+/// 2. an **unkeyed** `approve` releases it. Its turn reports `-` — even though the
+///    reply it released belongs to a keyed call. That is the negative and it is
+///    the sharp half.
+/// 3. a **keyed** `withdraw`, then a **keyed** `approve`. The approving turn
+///    reports ITS key and not the parked withdrawal's. That is the positive.
+/// 4. a restart, and the retry of the second withdrawal's key. The ledger is
+///    empty so the handler is entered; the `Applied<()>` the parking turn wrote
+///    came back with the state, so nothing is parked twice.
+/// 5. the same key from a fresh keypair parks, because it is a different peer.
+///
+/// # What the restart does to the ANSWER, which is not asserted here
+///
+/// A parked reply channel is not `Durable` and cannot be — `Vault` above says so
+/// too — so a restart drops it and the original caller is answered by nobody. That
+/// is why the record a parking turn writes is `Applied<()>`: at-most-once on the
+/// work, never the replayed answer an ordinary `rpc` gets, because the parking turn
+/// produced no answer to record.
+///
+/// It is stated rather than asserted, and here is the observation behind that
+/// choice, because it is not a small one. **A keyed actor with a remote `#[defer]`
+/// reply still parked in its state does not drain.** Skipping only the approval in
+/// step 5 — `parked_over_the_wire(&other, &actor, 1).await;` followed immediately
+/// by `booking.stop(&actor).await; return;` — produced, watched:
+/// `the actor was mounted and must drain: got Some(Vanished)`, after the whole
+/// 5-second budget. So the shutdown path with a parked remote reply is its own
+/// subject with its own owner, and this test approves before it stops rather than
+/// smuggling that in.
+///
+/// Every break literal here is quoted without its leading indentation. Pass it to
+/// `scripts/break-once.sh` **with** the indentation — this doc comment is
+/// otherwise a second occurrence of the same text and the harness aborts on a
+/// match that is not unique, which is what it is for.
+///
+/// Made red twice, both on `keylink/src/middleware.rs`'s `pub fn call` body:
+///
+/// - `self.call` → `self.call.and(None)`, so no turn is named at all. Watched:
+///   `the first withdrawal's turn carried its own key`, `left: "-" right: "-"`.
+/// - `self.call` → `self.call.filter(|_| self.method() != "Approve")`, so the
+///   releasing turn loses its own name. Watched:
+///   `and the keyed approval carried its own`, `left: "-" right: "-"`.
+///
+/// # The leak itself has no break, and that is the argument
+///
+/// What this test refuses is the *other* direction — turn 5 reporting the parked
+/// `withdraw`'s id — and there is no one-literal edit that produces it, because
+/// there is no plumbing that could carry it. A [`Deferred`] holds a reply channel
+/// and nothing else; the `Context` a turn sees arrives with the mail for **that**
+/// message. So the decision is not merely tested, it is unrepresentable, and the
+/// two breaks above are what pin the assertions that would notice if that stopped
+/// being true.
+#[tokio::test]
+async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
+    let (_scratch, files) = store("deferred-call-id").await;
+    let id = StateId::new("booths/sp-01").expect("valid");
+    let actor = ActorId::new("booths/sp-01").expect("valid");
+    let server = local_node().await;
+    let caller = local_node().await;
+    let first_key = IdempotencyKey::new("withdraw-1").expect("a valid key");
+    let second_key = IdempotencyKey::new("withdraw-2").expect("a valid key");
+    let approve_key = IdempotencyKey::new("approve-2").expect("a valid key");
+
+    let booking = Booking::start(&files, &id, &actor, &server).await;
+    let client = booth::KeyedClient::connect(&caller, server.endpoint().addr())
+        .await
+        .expect("dials");
+
+    // ── 1 and 2: a keyed withdrawal, released by an UNKEYED approval.
+    let pending = {
+        let keyed = client.with_idempotency(first_key.clone());
+        let actor = actor.clone();
+        tokio::spawn(async move { booth::at(&keyed, actor).withdraw(40).await })
+    };
+    parked_over_the_wire(&client, &actor, 1).await;
+    assert_eq!(
+        booth::at(&client, actor.clone())
+            .approve()
+            .await
+            .expect("answers"),
+        1,
+    );
+    assert_eq!(
+        pending.await.expect("no panic").expect("answers"),
+        60,
+        "the parked caller is still answered from the later turn",
+    );
+
+    // ── 3: a keyed withdrawal, released by a KEYED approval.
+    let pending = {
+        let keyed = client.with_idempotency(second_key.clone());
+        let actor = actor.clone();
+        tokio::spawn(async move { booth::at(&keyed, actor).withdraw(40).await })
+    };
+    parked_over_the_wire(&client, &actor, 1).await;
+    assert_eq!(
+        booth::at(&client.with_idempotency(approve_key.clone()), actor.clone())
+            .approve()
+            .await
+            .expect("answers"),
+        1,
+    );
+    assert_eq!(pending.await.expect("no panic").expect("answers"), 20);
+
+    let seen = booth::at(&client, actor.clone())
+        .seen()
+        .await
+        .expect("answers");
+    assert_eq!(seen.len(), 4, "four recorded turns, in order: {seen:?}");
+    assert_ne!(
+        seen[0], "-",
+        "the first withdrawal's turn carried its own key"
+    );
+    assert_eq!(
+        seen[1], "-",
+        "the releasing turn carried NO key, and did not inherit the parked \
+         call's: {seen:?}",
+    );
+    assert_ne!(
+        seen[2], "-",
+        "the second withdrawal's turn carried its own key"
+    );
+    assert_ne!(seen[3], "-", "and the keyed approval carried its own");
+    assert_ne!(
+        seen[2], seen[3],
+        "the releasing turn is named by its OWN call, not by the one it released",
+    );
+    assert_ne!(seen[0], seen[2], "two keys, two calls");
+
+    booking.stop(&actor).await;
+
+    // ── 4: the restart. The channel is gone; the record the parking turn wrote
+    //      is not.
+    let booking = Booking::start(&files, &id, &actor, &server).await;
+    let client = booth::KeyedClient::connect(&caller, server.endpoint().addr())
+        .await
+        .expect("dials");
+    assert_eq!(
+        client.key_state(second_key.clone()).await.expect("answers"),
+        KeyState::Fresh,
+        "the ledger is memory here too",
+    );
+    assert_eq!(
+        booth::at(&client.with_idempotency(second_key.clone()), actor.clone())
+            .withdraw(40)
+            .await
+            .expect("answers"),
+        20,
+        "the retry is recognised out of the restored state and answered at once",
+    );
+    assert_eq!(
+        booth::at(&client, actor.clone())
+            .waiting()
+            .await
+            .expect("answers"),
+        0,
+        "and nothing was parked a second time",
+    );
+
+    // ── 5: a fresh keypair is a different peer, so the same key is a different
+    //    call and the withdrawal parks for real — a second piece of work, not a
+    //    recognised retry.
+    let stranger = local_node().await;
+    let other = booth::KeyedClient::connect(&stranger, server.endpoint().addr())
+        .await
+        .expect("dials");
+    let strangers = {
+        let keyed = other.with_idempotency(second_key.clone());
+        let actor = actor.clone();
+        tokio::spawn(async move { booth::at(&keyed, actor).withdraw(5).await })
+    };
+    parked_over_the_wire(&other, &actor, 1).await;
+    assert_eq!(
+        booth::at(&other, actor.clone())
+            .approve()
+            .await
+            .expect("answers"),
+        1,
+    );
+    assert_eq!(
+        strangers.await.expect("no panic").expect("answers"),
+        15,
+        "the stranger's withdrawal was applied, because it was never recognised",
+    );
+
+    booking.stop(&actor).await;
 }
