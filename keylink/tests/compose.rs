@@ -380,6 +380,11 @@ async fn a_slow_subscriber_is_unsubscribed_and_its_actor_ends_naming_the_feed() 
 /// what the old argument said was safe. Watched: the *next* call after the bad
 /// publish, `topic.subscribers()`, panicking in its turn with
 /// `topic.rs:260: poisoned: PoisonError { .. }`.
+///
+/// The "never delivered to" one-poll carries its own break, because an assertion
+/// that something is *absent* is the easiest kind to write vacuously. Pointed
+/// instead at `second` — delivered to before the panic, and left undrained — it
+/// goes red with "the third was never delivered to". It can tell the two apart.
 #[tokio::test]
 async fn a_panicking_clone_costs_one_publish_and_not_the_topic() {
     /// Clones `limit` times and then refuses, so the panic lands part-way through
@@ -429,6 +434,13 @@ async fn a_panicking_clone_costs_one_publish_and_not_the_topic() {
 
     // The mutex is poisoned from here on. Every call below takes it, and the
     // whole point is that none of them panics.
+    //
+    // What the recorded break falsifies is that `subscribers()` *answers at all*;
+    // the 3 is incidental to it. That value rides on `Vec::retain` keeping the
+    // elements it had not yet visited when the predicate unwound, which std does
+    // not document and has changed once already. Pinned anyway, because it is true
+    // today and a change would be worth hearing about — but if this line ever goes
+    // red on its own, read it as news about `retain` and not about `Topic`.
     assert_eq!(
         topic.subscribers(),
         3,
@@ -439,6 +451,16 @@ async fn a_panicking_clone_costs_one_publish_and_not_the_topic() {
     // what they were handed, and the third was never delivered to.
     assert!(first.next().await.is_some(), "delivered before the panic");
     assert!(second.next().await.is_some(), "delivered before the panic");
+
+    // "Never delivered to" is a claim about *now*, so it is asserted now — one
+    // poll, no clock. Drained after the next publish instead, it would pass on
+    // that publish's item and hold nothing: an empty third and a third that was
+    // reached before the panic look identical once a second item is in the
+    // channel.
+    assert!(
+        n0_future::future::poll_once(third.next()).await.is_none(),
+        "the third was never delivered to"
+    );
 
     let mut fourth = topic.subscribe();
     assert_eq!(topic.subscribers(), 4, "and it still takes subscribers");
