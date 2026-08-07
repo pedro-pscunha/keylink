@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use keylink::{Allowlist, Caller, Node};
 use keylink_persist::file::Files;
-use keylink_persist::{Claim, Durable, RestoreError, Snapshots, StateId};
+use keylink_persist::versioned::{Snapshot, Versioned};
+use keylink_persist::{Durable, RestoreError, Snapshots, StateId};
 
 keylink::service! {
     service Ledger;
@@ -41,13 +42,18 @@ impl ledger::Actor for Ledger {
 }
 
 impl Durable for Ledger {
+    /// Bump this whenever `snapshot` starts writing a different shape.
+    /// `Versioned` stamps it into the frame and reads it back; nothing can
+    /// check that you remembered.
+    const VERSION: u32 = 1;
+
     fn snapshot(&self) -> Vec<u8> {
         self.entries.iter().flat_map(|n| n.to_le_bytes()).collect()
     }
 
     fn restore(bytes: &[u8]) -> Result<Self, RestoreError> {
         if !bytes.len().is_multiple_of(8) {
-            return Err(RestoreError(format!(
+            return Err(RestoreError::Malformed(format!(
                 "a ledger is whole u64s, and this is {} bytes",
                 bytes.len()
             )));
@@ -59,6 +65,13 @@ impl Durable for Ledger {
                 .collect(),
         })
     }
+
+    /// Version 1 is the first, so there is no older version to come from. When
+    /// this becomes version 2, this grows a `1 => Some(..)` arm and nothing
+    /// else — the loader walks the chain, so a hop is always one step.
+    fn migrate(_from: u32, _bytes: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> {
+        Ok(None)
+    }
 }
 
 #[tokio::main]
@@ -69,7 +82,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // ── 1. Claim it. Exclusive for as long as this value lives, and released
     //       by the operating system if this process dies holding it.
-    let mut claim = match store.claim(&id).await {
+    let claim = match store.claim(&id).await {
         Ok(claim) => claim,
         Err(keylink_persist::Error::Busy { id }) => {
             // NOT a transient error to retry in a loop. Another process
@@ -81,11 +94,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Err(other) => return Err(other.into()),
     };
 
+    // The claim moves in and does not come back out. From here there is no way
+    // to write a snapshot without a version stamp in front of it, which is what
+    // lets a later `VERSION = 2` read what this run wrote.
+    let mut claim = Versioned::new(claim);
+
     // ── 2. Restore, or start. `None` is the first ever run, not a failure.
-    let state = match claim.load().await? {
-        Some(bytes) => {
-            println!("restored {} bytes from {}", bytes.len(), root.display());
-            Ledger::restore(&bytes)?
+    //
+    //  A snapshot from a *newer* build stops here with `FromTheFuture` rather
+    //  than being read as far as this build understands: half a state is worse
+    //  than none, and writing the truncation back would be worse still.
+    let state = match claim.load::<Ledger>().await? {
+        Some(state) => {
+            println!(
+                "restored {} entries from {}",
+                state.entries.len(),
+                root.display()
+            );
+            state
         }
         None => {
             println!("first run: no snapshot under {}", root.display());
@@ -112,8 +138,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ledger.post(entry).await?;
 
         // `with_state` takes a turn, so it cannot read a half-applied one.
-        let bytes = ledger.with_state(Ledger::snapshot).await?;
-        claim.store(&bytes).await?;
+        // `Snapshot::of` runs inside that turn, and the value it hands back is
+        // what tells `store` which version to stamp — there is no way from here
+        // to stamp a number this state did not declare.
+        let snapshot = ledger.with_state(Snapshot::of).await?;
+        claim.store(&snapshot).await?;
     }
     println!("after three posts: total {}", ledger.total().await?);
 

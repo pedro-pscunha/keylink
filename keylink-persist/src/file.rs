@@ -68,7 +68,28 @@ impl Files {
         })
     }
 
-    /// Refuse a snapshot larger than this.
+    /// Refuse a write larger than this.
+    ///
+    /// Counted on what reaches this adapter, which for anything written through
+    /// [`Versioned`](crate::versioned::Versioned) is the payload plus
+    /// [`FRAME_LEN`](crate::versioned::FRAME_LEN). Headroom for one snapshot is
+    /// therefore `bytes - FRAME_LEN`.
+    ///
+    /// # The floor
+    ///
+    /// **`FRAME_LEN` is the smallest limit that can ever store anything.**
+    /// Below it the subtraction above is negative: `limit(0)` — a plausible
+    /// default, and one typo away from a real number — leaves a store that
+    /// refuses every write forever, empty ones included, with
+    /// [`Error::TooLarge`] naming twelve bytes against a limit of zero.
+    ///
+    /// It is not rejected here, because this is a builder that returns `Self`
+    /// and the alternatives are worse: clamping upward is a silent fallback,
+    /// and panicking on a configuration value is a crash where a refused store
+    /// already says the same thing at the same volume. So the floor is a
+    /// documented number, and
+    /// `a_limit_under_the_frame_refuses_even_an_empty_snapshot` in
+    /// `keylink-persist/tests/versioned.rs` is what keeps this paragraph true.
     #[must_use]
     pub fn limit(mut self, bytes: u64) -> Self {
         self.limit = bytes;
@@ -153,10 +174,10 @@ impl Claim for FileClaim {
     }
 
     async fn store(&mut self, bytes: &[u8]) -> Result<()> {
-        let len = bytes.len() as u64;
-        if len > self.limit {
+        let offered = bytes.len() as u64;
+        if offered > self.limit {
             return Err(Error::TooLarge {
-                len,
+                offered,
                 limit: self.limit,
             });
         }
@@ -219,7 +240,6 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
-    use crate::Durable;
 
     /// A scratch directory that removes itself. Small enough to not be worth a
     /// dependency, and it keeps the test suite hermetic.
@@ -386,57 +406,10 @@ mod tests {
             vec!["warehouse", "sp-01"]
         );
     }
-
-    // ── the trait a state implements ──────────────────────────────────────
-
-    #[derive(Debug, PartialEq, Eq)]
-    struct Counter(u64);
-
-    impl Durable for Counter {
-        fn snapshot(&self) -> Vec<u8> {
-            self.0.to_le_bytes().to_vec()
-        }
-
-        fn restore(bytes: &[u8]) -> std::result::Result<Self, crate::RestoreError> {
-            let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
-                crate::RestoreError(format!("expected 8 bytes, got {}", bytes.len()))
-            })?;
-            Ok(Self(u64::from_le_bytes(bytes)))
-        }
-    }
-
-    /// The whole loop a caller writes: claim, restore or start fresh, run, store.
-    #[tokio::test]
-    async fn a_state_survives_being_dropped_and_rebuilt() {
-        let (_scratch, files) = files("survives").await;
-        let id = id("counters/hits");
-
-        {
-            let mut claim = files.claim(&id).await.expect("claims");
-            let mut counter = match claim.load().await.expect("loads") {
-                Some(bytes) => Counter::restore(&bytes).expect("restores"),
-                None => Counter(0),
-            };
-            counter.0 += 7;
-            claim.store(&counter.snapshot()).await.expect("stores");
-        }
-
-        // A new claim is a new process, as far as this adapter can tell.
-        let claim = files.claim(&id).await.expect("claims");
-        let bytes = claim.load().await.expect("loads").expect("stored earlier");
-        assert_eq!(Counter::restore(&bytes).expect("restores"), Counter(7));
-    }
-
-    #[tokio::test]
-    async fn bytes_written_by_another_version_are_reported_not_guessed() {
-        let (_scratch, files) = files("mismatch").await;
-        let mut claim = files.claim(&id("counters/hits")).await.expect("claims");
-        claim
-            .store(b"not eight bytes at all")
-            .await
-            .expect("stores");
-
-        let bytes = claim.load().await.expect("loads").expect("stored");
-        assert!(Counter::restore(&bytes).is_err());
-    }
 }
+
+// The round trip through `Durable`, the migration chain and the frame are in
+// `keylink-persist/tests/versioned.rs`, from outside the crate — which is where
+// `#[non_exhaustive]` on the loader's verdicts is actually in force. Nothing
+// about them belongs here: an adapter stores the bytes it is handed and never
+// learns that versions exist.

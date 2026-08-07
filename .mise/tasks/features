@@ -25,3 +25,13 @@ for f in "" blocking fs env blocking,fs blocking,env fs,env blocking,fs,env; do
     echo "── features: ${f:-none}"
     cargo test -p keylink --lib --no-run --no-default-features --features "$f"
 done
+
+# `keylink-persist` has one optional feature and both ends were built by
+# nothing until `versioned.rs` existed: `lint` covers the all-on end through
+# --all-features, and the off end had no builder at all. The frame and the
+# migration chain need no adapter, and this is what keeps that true — a
+# `use crate::file::..` slipped into `versioned.rs` compiles fine at the on end.
+for f in "" file; do
+    echo "── keylink-persist features: ${f:-none}"
+    cargo test -p keylink-persist --lib --no-run --no-default-features --features "$f"
+done

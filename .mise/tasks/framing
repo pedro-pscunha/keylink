@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+#MISE description="Nothing writes a snapshot without a version frame in front"
+#
+# `keylink_persist::versioned::Versioned` owns its claim and has no accessor,
+# no `Deref` and no `into_inner`, so a holder of one CANNOT reach
+# `Claim::store`. That is the real guarantee, it is in the type system, and
+# `keylink-persist/src/representability.rs` holds the compile-time probes for
+# it. This task is the belt to those braces: it watches the one way round the
+# type, which is taking a raw claim from `Snapshots::claim` and never wrapping
+# it.
+#
+# The first check reads a property of Rust rather than a naming convention.
+# `store` is a TRAIT method, so it is only callable where the trait is in
+# scope — a file that never brings `keylink_persist::Claim` into scope cannot
+# call it, whatever it calls its variables. There are three ways to bring it
+# in and all three are matched: naming it, naming it inside a brace list, and
+# a glob. **The glob is the one this check used to miss**, and it is the worst
+# one to miss: `use keylink_persist::*` puts `Claim` in scope without spelling
+# it, while NOT importing `Versioned`, which lives in the `versioned` module.
+# The one import that hands over the raw port and withholds the wrapper.
+#
+# The second is the ordinary grep. It used to look for `.store(&` and
+# `.store(b"`, which is what a raw write looked like at the time; thirteen
+# lines of `claim.store(payload.as_slice())` walked through it. So it now
+# matches any `.store(` with an argument — `.store()` with none is iroh's
+# blobs accessor and a `NoSuchMethod` probe, neither of which writes anything
+# — and the files that legitimately store are named below, one glob each.
+# Adding a file to that list is the deliberate act; forgetting to is a red
+# gate rather than a silent pass.
+#
+# Neither check is airtight — a `use keylink_persist::{\n  Claim,\n}` split
+# across lines would slip past the first, and `.store` reached through a local
+# alias in an allowlisted file slips past both. They do not have to be. The
+# type is the guarantee; this is the reminder.
+#
+# Sealing `Claim` would not help, and was considered: sealing stops a foreign
+# crate IMPLEMENTING a trait, not calling its methods, so it closes nothing
+# here — and the port exists to be implemented from outside, for a bucket or a
+# vault. It would cost the hexagon its whole point to buy nothing.
+set -euo pipefail
+
+root="${MISE_PROJECT_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+cd "$root"
+
+# `rg` exits 1 when it matches nothing, and NOTHING is this task's green case.
+# Under `set -euo pipefail` every unprotected `rg` in these pipelines inherits
+# that 1 to the command substitution, and `set -e` then aborts the whole task
+# with no message at all. It was green only because each pattern happened to
+# have exactly one match in the tree and each filter happened to have something
+# to let through; reword one comment in `keylink/src/observe.rs` — ordinary
+# prose that somebody will touch — and CI fails naming nothing.
+#
+# `|| true` is the usual patch and it is the wrong one, because rg also exits 2
+# on a broken pattern or an unreadable path, and a gate that swallows its own
+# tooling failure is worse than no gate. So both wrappers below say the same
+# thing: 1 is the green case, 2 or more stops the task and says what happened.
+scan() {
+    local status=0
+    rg "$@" || status=$?
+    if ((status > 1)); then
+        echo "── ripgrep failed with exit $status searching for: $*" >&2
+        return "$status"
+    fi
+}
+
+# The same, for the filters in the middle of a pipeline. An empty result is
+# what a clean tree looks like by the time it reaches here.
+drop() {
+    local status=0
+    rg -v "$@" || status=$?
+    if ((status > 1)); then
+        echo "── ripgrep failed with exit $status filtering: $*" >&2
+        return "$status"
+    fi
+}
+
+# Drop comment lines from rg's `path:line:text` output. The doc comment in
+# keylink/src/observe.rs explains this exact dependency and must stay.
+uncommented() { drop '^[^:]*:[0-9]+:\s*(//|/\*|\*)'; }
+
+fail=0
+
+named_outside="$(
+    scan --line-number --glob '*.rs' --glob '!keylink-persist/**' \
+        'keylink_persist::(\*|Claim\b|\{[^}]*(\bClaim\b|\*))|\buse\s+keylink_persist\s+as\b' . \
+        | uncommented
+)"
+
+if [[ -n "$named_outside" ]]; then
+    fail=1
+    echo "── keylink_persist::Claim is in scope outside keylink-persist:" >&2
+    echo "$named_outside" >&2
+    echo >&2
+    echo "Claim::store writes raw, unframed bytes, and an unframed snapshot is" >&2
+    echo "refused on the next load rather than read. Wrap the claim in" >&2
+    echo "keylink_persist::versioned::Versioned and store through that." >&2
+    echo >&2
+    echo "A glob import counts. 'use keylink_persist::*' brings Claim in and" >&2
+    echo "leaves Versioned behind, which is the wrong half of the crate." >&2
+fi
+
+# The allowlist, and why each file is on it:
+#
+#   versioned.rs         the one framed writer, and the only caller of the port
+#   file.rs              the one implementor; its tests store byte literals on
+#                        purpose, because an adapter must not know about frames
+#   representability.rs  the compile-time probe that `store` infers its version
+#                        from its argument
+#   tests/versioned.rs   the frame and the migration chain, from outside
+#   keylink/tests/durable.rs, keylink/examples/durable_ledger.rs
+#                        the two in-tree consumers, both storing a `Snapshot`
+stored_raw="$(
+    scan --line-number --glob '*.rs' \
+        --glob '!keylink-persist/src/versioned.rs' \
+        --glob '!keylink-persist/src/file.rs' \
+        --glob '!keylink-persist/src/representability.rs' \
+        --glob '!keylink-persist/tests/versioned.rs' \
+        --glob '!keylink/tests/durable.rs' \
+        --glob '!keylink/examples/durable_ledger.rs' \
+        '\.store\([^)]' . \
+        | drop 'Ordering::' \
+        | uncommented
+)"
+
+if [[ -n "$stored_raw" ]]; then
+    fail=1
+    echo "── something is stored outside the files that may store:" >&2
+    echo "$stored_raw" >&2
+    echo >&2
+    echo "A snapshot is written by Versioned::store, which takes a Snapshot<D>" >&2
+    echo "and stamps D::VERSION. If this line really does belong, add its file" >&2
+    echo "to the allowlist in this task and say why." >&2
+fi
+
+if [[ "$fail" -ne 0 ]]; then
+    exit 1
+fi
+
+echo "ok: every snapshot goes through the frame"
