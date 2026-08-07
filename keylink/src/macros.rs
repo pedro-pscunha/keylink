@@ -1464,6 +1464,24 @@ macro_rules! __keylink_service {
             /// has given up is an entry whose task has exited, which the
             /// registry sees as an actor to re-route on the next message.
             ///
+            /// # A peer whose reply is lost to a restart is told `NoSuchActor`
+            ///
+            /// **The one message a restart loses is a `#[defer]`red reply parked
+            /// in the state, and on the keyed served path that loss reaches the
+            /// peer as
+            /// [`RemoteError::NoSuchActor`](keylink::RemoteError::NoSuchActor)**
+            /// — *there is nothing here, stop asking* — about an actor that is
+            /// mid-restart and about to answer that same peer again. A client
+            /// that treats `NoSuchActor` as terminal, which is what the name
+            /// tells it to do, stops retrying an actor that is coming back.
+            ///
+            /// [`supervised`] does not have this: the local served path reads
+            /// the supervisor's decision and renders `Failed("restarting: ..")`.
+            /// The keyed one cannot, because the signal it would read is the
+            /// channel the section above says has no reader. Every *other*
+            /// message survives: a turn in flight is answered before the loop
+            /// breaks, and queued turns stay in the mailbox the supervisor owns.
+            ///
             /// # Panics
             ///
             /// Panics when called outside a tokio runtime.
@@ -1480,7 +1498,7 @@ macro_rules! __keylink_service {
                             $crate::Incarnation<A, F>,
                             $crate::Stop,
                         >,
-                    > + ::core::marker::Send + 'static,
+                    > + ::core::marker::Send,
                 F: $crate::Feeds<A>,
             {
                 let () = ServableAsActor::<A>::CHECK;
@@ -1605,7 +1623,7 @@ macro_rules! __keylink_service {
             ///             Ok((restored.unwrap_or_default(), vec![Box::new(saver) as _], ()))
             ///         }
             ///     },
-            ///     Intensity::new(NonZeroU32::new(3).unwrap(), Duration::from_secs(10)),
+            ///     Intensity::new(NonZeroU32::new(3).unwrap(), Duration::from_secs(10)).unwrap(),
             /// );
             /// ```
             ///

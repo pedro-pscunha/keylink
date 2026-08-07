@@ -174,9 +174,10 @@ const BUDGET_PER_ACTOR: isize = 2048;
 ///
 /// A separate literal because a local actor pays for a different set of things
 /// and there is no honest way to fold them into one number. It has **two**
-/// channels — its mailbox, and the `watch` that carries
-/// [`Ended`](keylink::Ended) — and an `Arc<JoinHandle>`, and it has no registry
-/// entry, no [`ActorId`] and no `HashMap` slot.
+/// channels — its mailbox, and the `watch` that carries what the actor is doing,
+/// which is an [`Ended`](keylink::Ended) once it has stopped — and an
+/// `Arc<JoinHandle>`, and it has no registry entry, no [`ActorId`] and no
+/// `HashMap` slot.
 ///
 /// The mailbox is where the two paths differ most, and it is why this number was
 /// recorded before anything moved rather than afterwards. A keyed mailbox slot is
@@ -190,10 +191,29 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// Measured on this machine, at ten thousand actors of the `ledger` service
 /// below, with an empty state:
 ///
-/// | path | before the generated mailbox (`c9056e0`) | Wave 1b (`c8712b0`) | Wave 2 (`836179c`) | Wave 3 |
-/// |---|---|---|---|---|
-/// | keyed, mounted in a `System` | 1,671 | 1,159 | 1,159 | 1,415 |
-/// | local, `ledger::actor(..)`   | 1,725 | 1,469 | **1,597** | **1,853** |
+/// | path | before the generated mailbox (`c9056e0`) | Wave 1b (`c8712b0`) | Wave 2 (`836179c`) | Wave 3 | Wave 9 |
+/// |---|---|---|---|---|---|
+/// | keyed, mounted in a `System` | 1,671 | 1,159 | 1,159 | 1,415 | **1,412** |
+/// | local, `ledger::actor(..)`   | 1,725 | 1,469 | **1,597** | **1,853** | **1,861** |
+///
+/// # Wave 9's eight bytes, on the local path only, and where they went
+///
+/// Supervision replaced `Option<Ended>` with a three-state `Life` in the `watch`
+/// channel a local actor already had, so it added **no allocation** — and that
+/// is not the same as adding nothing. Measured with `size_of`: `Ended` is 40
+/// bytes before and after, so `Ended::GaveUp` and the `fatal` field cost zero;
+/// `Option<Ended>` is also 40, because `Option` niche-packs into `Ended`'s spare
+/// discriminants; and `Life` is **48**, because its two payload-carrying
+/// variants need a tag of their own. Eight bytes, once, per **local** actor.
+///
+/// The keyed column is untouched by supervision — an unsupervised keyed actor
+/// gets no `Life`, and a supervised one builds its own inside `mount`'s closure
+/// — and its **−3 is not Wave 9's**: it is Waves 4 through 8 measured against a
+/// figure last written down at Wave 3. Neither move was caught by anything,
+/// because both budgets are 2,048 and both paths have hundreds of bytes of
+/// headroom. That is the argument for re-measuring rather than for a tighter
+/// budget: this file's job is to make a move *visible*, and a wave that reports
+/// "the suite ran green" has reported nothing about these two numbers.
 ///
 /// # Wave 3's 256 bytes, on both paths, and what they bought
 ///
@@ -245,9 +265,9 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// This literal was checked at exactly one `Mail` size for months — 248 bytes, the
 /// only one any phase built a *local* actor of — while the entire argument for the
 /// `Box::pin` at the local loop's await is an absolute ceiling (3,005 bytes without
-/// it against 1,597 with) that happens to sit between 1,853 and 2,048. The local
-/// path has **less** headroom than the keyed one, by 438 bytes now: a second
-/// channel, the `watch` that carries `Ended`, an `Arc<JoinHandle>` and the `finish`
+/// it against 1,597 with) that happens to sit between 1,861 and 2,048. The local
+/// path has **less** headroom than the keyed one, by 449 bytes now: a second
+/// channel, the `watch` that carries `Life`, an `Arc<JoinHandle>` and the `finish`
 /// loop, against the registry entry and `HashMap` slot the keyed one pays for
 /// instead. So phase 4 builds bulky *local* actors and asserts the slope here too,
 /// against [`SLOPE_SLACK_OVER_A_KILOBYTE`], rather than trusting that a flat keyed

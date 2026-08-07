@@ -1601,51 +1601,101 @@ pub async fn run_keyed<A, M, F>(
 /// and which of those a wrong value produces depends on the caller's actor.
 /// `representability.rs` holds the probe.
 ///
-/// # `within` is how long an incarnation must last to count as recovered
+/// `Intensity::new(3, 10s)` is *three restarts in a row, and an incarnation that
+/// stayed up ten seconds has recovered*. The second number is called
+/// `recovered_after` and not `within` because it is a **lifetime one incarnation
+/// must reach**, not a sliding window over wall clock: `max` consecutive
+/// restarts are allowed, and the count resets when one incarnation runs for
+/// `recovered_after` without ending.
 ///
-/// It is **not** a sliding window over the last `within` of wall clock, and the
-/// difference is the whole of why this type is documented rather than obvious.
-/// The backoff below is `within / max`, so spending the budget takes exactly
-/// `within` — and against a sliding window of the same length the oldest restart
-/// falls out just as the newest is granted. That pair never terminates: an actor
-/// faulting on every turn restarts forever at exactly the permitted rate, and
-/// `Ended::GaveUp` becomes unreachable. Measured on paper before it was written,
-/// and it is the reason the accounting is the one below.
+/// The OTP reading — `max` restarts *within* a sliding `recovered_after` —
+/// cannot terminate against the backoff below, which is `recovered_after / max`.
+/// Spending the budget takes exactly `recovered_after`, so against a window of
+/// the same length the oldest restart falls out just as the newest is granted:
+/// an actor faulting on every turn restarts for ever at exactly the permitted
+/// rate and [`Ended::GaveUp`] is unreachable. RFC-07 §9.1 works the table
+/// through.
 ///
-/// So: `max` consecutive restarts are allowed, and the count resets when one
-/// incarnation runs for `within` without ending. `Intensity::new(3, 10s)` means
-/// *three restarts in a row, and an actor that stayed up ten seconds has
-/// recovered*.
+/// # The precondition: `recovered_after` must outlast a FAILING incarnation
 ///
-/// # The backoff is `within / max`, and there is no knob for it
+/// An incarnation that reaches `recovered_after` and *then* fails has recovered
+/// by this type's own definition — the count resets, and its failure starts a
+/// fresh budget. So an actor whose failing incarnations reliably outlive
+/// `recovered_after` never exhausts one, and **[`Ended::GaveUp`] is unreachable
+/// for that actor**: it restarts for ever, one `recovered_after` apart.
 ///
-/// Spreading the budget across its own window makes exhausting it cost `within`
-/// instead of microseconds, which is what stops a supervised actor from turning
-/// a permanent fault into a hot loop. Exponential backoff with jitter is the
-/// wrong instrument at this size: the budget is single digits, so an exponential
-/// has no room to grow in, and one actor restarting alone has no herd to
-/// disperse.
+/// That is the policy rather than a hole in it, and OTP's window has the same
+/// property. What it costs the caller is that the number is chosen against an
+/// actor's **failure period** and not against its latency: pick a
+/// `recovered_after` shorter than the gap between failures you would still call
+/// broken. `tests/supervision.rs::a_failure_slower_than_its_recovery_span_never_gives_up`
+/// holds this exact behaviour, so a later reader finds it asserted rather than
+/// discovers it.
+///
+/// The one case that is a fact about the *value* rather than about the caller's
+/// actor — a `recovered_after` so small that the backoff truncates to zero, of
+/// which `Duration::ZERO` is the limit — is refused by [`new`](Self::new)
+/// instead of documented. There the unreachability holds for **every** actor and
+/// the restart loop has no sleep in it.
+///
+/// # The backoff is `recovered_after / max`, and there is no knob for it
+///
+/// Spreading the budget across its own span makes exhausting it cost
+/// `recovered_after` instead of microseconds, which is what stops a supervised
+/// actor from turning a permanent fault into a hot loop. Exponential backoff
+/// with jitter is the wrong instrument at this size: the budget is single
+/// digits, so an exponential has no room to grow in, and one actor restarting
+/// alone has no herd to disperse.
+///
+/// [`Ended::GaveUp`]: crate::Ended::GaveUp
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Intensity {
     max: NonZeroU32,
-    within: Duration,
+    recovered_after: Duration,
 }
 
 impl Intensity {
-    /// `max` restarts in a row, and an incarnation lasting `within` has
-    /// recovered.
+    /// `max` restarts in a row, and an incarnation lasting `recovered_after` has
+    /// recovered. `None` when the backoff those two imply would be zero.
     ///
     /// `NonZeroU32` because a budget of zero is `LocalActor::spawn_fed` — an
     /// actor with one incarnation — spelled through a supervisor that does
     /// nothing, and one way to build a thing is the rule.
+    ///
+    /// **The rejected case is a supervisor that never sleeps.** The guard is on
+    /// the *backoff* rather than on `recovered_after` alone because the backoff
+    /// is `recovered_after / max` truncated to nanoseconds, so
+    /// `Intensity::new(4, Duration::from_nanos(3))` is as much a busy loop as
+    /// `Duration::ZERO` is. Both are refused, and `ZERO` is the case worth
+    /// naming: `ran_for >= Duration::ZERO` is true of every incarnation that
+    /// ever ran, so the budget resets on every failure for every actor, and the
+    /// loop that then never terminates would spin with no `sleep` in it at all.
+    ///
+    /// `Option` and the same shape as [`NonZeroU32::new`], one argument along,
+    /// rather than a panic: a value a caller passed is checked where it is
+    /// built, not where it is used.
     #[must_use]
-    pub fn new(max: NonZeroU32, within: Duration) -> Self {
-        Self { max, within }
+    pub fn new(max: NonZeroU32, recovered_after: Duration) -> Option<Self> {
+        let limit = Self {
+            max,
+            recovered_after,
+        };
+        if limit.backoff().is_zero() {
+            return None;
+        }
+        Some(limit)
     }
 
     /// How long to wait between one incarnation and the next.
+    ///
+    /// **Never zero for an `Intensity` that exists**, which is what [`new`] is
+    /// checking: a supervisor always sleeps between incarnations, so no
+    /// configuration reachable from safe code turns a permanent fault into a
+    /// loop with no yield in it.
+    ///
+    /// [`new`]: Self::new
     fn backoff(&self) -> Duration {
-        self.within / self.max.get()
+        self.recovered_after / self.max.get()
     }
 }
 
@@ -1690,7 +1740,7 @@ enum Life {
 /// incarnation while the declaration is `Copy`.
 struct Budget {
     limit: Intensity,
-    /// Restarts since the last incarnation that lasted a whole `within`.
+    /// Restarts since the last incarnation that reached `recovered_after`.
     used: u32,
     /// Restarts granted in total, which is what [`Ended::GaveUp`] reports.
     spent: u32,
@@ -1712,8 +1762,14 @@ impl Budget {
     /// is why it counts against the budget exactly like a fault. That is what
     /// makes a state another machine has claimed end as [`Ended::GaveUp`] rather
     /// than loop on a re-acquire that will never succeed.
+    ///
+    /// **An incarnation that reached `recovered_after` and then failed resets
+    /// the count**, which is [`Intensity`]'s definition of *recovered* and is the
+    /// precondition stated there: an actor whose failures are always slower than
+    /// its `recovered_after` never exhausts a budget. `Intensity::new` refuses
+    /// the one span for which that is true of every actor.
     fn spend(&mut self, ran_for: Duration) -> bool {
-        if ran_for >= self.limit.within {
+        if ran_for >= self.limit.recovered_after {
             self.used = 0;
         }
         if self.used >= self.limit.max.get() {
@@ -1893,6 +1949,28 @@ where
 /// small channel per supervised keyed actor is the cost of that; the alternative
 /// is an `Option` and a second path through the one loop, which is the split
 /// Wave 3 exists to have deleted.
+///
+/// # What a peer is told when a keyed restart loses its reply
+///
+/// **A `Deferred` parked in the state dies with the incarnation, and on this
+/// path that loss is reported to the peer as [`RemoteError::NoSuchActor`] — an
+/// answer that reads *there is nothing here, stop asking* about an actor that is
+/// mid-restart and about to answer the same peer again.** A client that treats
+/// `NoSuchActor` as terminal, which is what the name tells it to do, will stop
+/// retrying an actor that is coming back.
+///
+/// [`LocalActor::spawn_supervised`] does not have this: `deliver_to_local` reads
+/// the [`Life`] channel and renders `Failed("restarting: ..")` instead. The
+/// keyed served path is `deliver_to_actor`, in `actor/remote.rs`, and it has no
+/// supervisor-visible signal to read because the [`Life`] above has no reader —
+/// giving it one reaches `Mounted`, `mount` and the registry entry, so this door
+/// leaves the asymmetry rather than making it. RFC-07 §9.10 names that cost.
+///
+/// Every *other* message survives a keyed restart: a turn in flight is answered
+/// before the loop breaks, and queued turns stay in the mailbox the supervisor
+/// owns.
+///
+/// [`RemoteError::NoSuchActor`]: crate::RemoteError::NoSuchActor
 #[doc(hidden)]
 pub async fn run_keyed_supervised<A, M, F, Fut, N>(
     factory: N,
@@ -2055,7 +2133,7 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
     /// that will never succeed; [`Stop::fatal`] skips even that.
     ///
     /// ```ignore
-    /// let limit = Intensity::new(NonZeroU32::new(3)?, Duration::from_secs(10));
+    /// let limit = Intensity::new(NonZeroU32::new(3)?, Duration::from_secs(10))?;
     /// let ledger = ledger::supervised(
     ///     move || {
     ///         let store = store.clone();
@@ -2663,8 +2741,12 @@ where
         // would otherwise introduce on the served path.
         //
         // `Life::Restarting` is published before the state is dropped, so this
-        // read cannot lose the race with the answer channel it is about. See
-        // `Inbox::ending`.
+        // read cannot be *early*: the sender cannot have died before the verdict
+        // it belongs to was published. It can be late — the next incarnation has
+        // already published `Running` by the time this borrows — and that
+        // renders `NoSuchActor` for a restart that has already finished, which
+        // is the one direction the ordering does not close and the harmless one.
+        // See `Inbox::ending`.
         Err(_) => match &*actor.life.borrow() {
             Life::Restarting(reason) => (
                 Outcome::Err(RemoteError::Failed(format!("restarting: {reason}"))),
