@@ -107,17 +107,25 @@ fi
 #   representability.rs  the compile-time probe that `store` infers its version
 #                        from its argument
 #   tests/versioned.rs   the frame and the migration chain, from outside
-#   keylink/tests/durable.rs, keylink/examples/durable_ledger.rs
-#                        the two in-tree consumers, both storing a `Snapshot`
-#   keylink/tests/feeds.rs
-#                        the third, and the first to store from inside a turn:
-#                        an `Observer` whose `after_turn` takes `Snapshot::of`
-#                        synchronously and writes it through `Versioned::store`
-#                        before the reply. It is on this list for the same
-#                        reason `durable.rs` is — it stores a `Snapshot`, never
-#                        raw bytes — and it does NOT bring the `Claim` trait into
-#                        scope, naming `file::FileClaim` concretely instead, so
-#                        the first check above still covers it.
+#   keylink/tests/durable.rs
+#                        the driving side of the port, committing once per run
+#                        through `Handle::with_state` and `Versioned::store`
+#   keylink/src/persist.rs
+#                        **the adapter**, and the only line of keylink's library
+#                        that writes a snapshot. It is on THIS list and not on
+#                        the one above, which is the whole point: it never brings
+#                        the `Claim` trait into scope — its type parameter is the
+#                        STORE, `S: Snapshots`, and `Versioned<S::Claim>` needs no
+#                        bound of its own — so the first check still proves it has
+#                        no route to a raw, unframed write. What it calls is
+#                        `Versioned::store`, an inherent method on the wrapper,
+#                        with a `Snapshot<D>` that `Snapshot::of` produced.
+#
+# `keylink/examples/durable_ledger.rs` and `keylink/tests/feeds.rs` came OFF this
+# list in Wave 5: the example's commit loop and the test's hand-rolled `Saver`
+# both went through `keylink::Persist`, so neither file stores anything any more.
+# A stale allowlist entry is a hole nobody can see, so removing one is part of
+# the change that made it unnecessary.
 stored_raw="$(
     scan --line-number --glob '*.rs' \
         --glob '!keylink-persist/src/versioned.rs' \
@@ -125,8 +133,7 @@ stored_raw="$(
         --glob '!keylink-persist/src/representability.rs' \
         --glob '!keylink-persist/tests/versioned.rs' \
         --glob '!keylink/tests/durable.rs' \
-        --glob '!keylink/examples/durable_ledger.rs' \
-        --glob '!keylink/tests/feeds.rs' \
+        --glob '!keylink/src/persist.rs' \
         '\.store\([^)]' . \
         | drop 'Ordering::' \
         | uncommented

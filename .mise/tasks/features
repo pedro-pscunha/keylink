@@ -19,11 +19,28 @@
 # compile without the features that provide them, and demanding it would only
 # teach us to add feature gates to tests that legitimately want the feature.
 # `lint` builds those at the all-features end, which is where they belong.
+#
+# The durability adapter multiplies this list by three rather than by four, and
+# saying which three is the point. `persist-file` implies `persist`, so
+# `persist-file` alone is not a subset anybody can build — the honest lattice is
+# each of the eight above with the adapter off, with `persist`, and with
+# `persist-file`. Twenty-four builds.
+#
+# It is not busywork on either axis. `persist` alone is the state this project
+# claims compiles for a browser, and it is the only one of the three that
+# `.mise/tasks/wasm` can check — so the middle column is what keeps the claim
+# honest on a native host too, where an accidental `use keylink_persist::file`
+# inside `src/persist.rs` would compile at the `persist-file` end and fail here.
 set -euo pipefail
 
 for f in "" blocking fs env blocking,fs blocking,env fs,env blocking,fs,env; do
-    echo "── features: ${f:-none}"
-    cargo test -p keylink --lib --no-run --no-default-features --features "$f"
+    for p in "" persist persist-file; do
+        # An empty subset and an empty adapter make an empty `--features`, which
+        # cargo accepts; a comma between two empties does not.
+        both="$(printf '%s\n' "$f,$p" | sed -e 's/^,//' -e 's/,$//')"
+        echo "── features: ${both:-none}"
+        cargo test -p keylink --lib --no-run --no-default-features --features "$both"
+    done
 done
 
 # `keylink-persist` has one optional feature and both ends were built by

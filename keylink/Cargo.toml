@@ -12,13 +12,26 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/pedrocunha/keylink"
 
 [features]
-default = ["blocking", "fs", "env"]
+default = ["blocking", "fs", "env", "persist-file"]
 # The synchronous API. Needs OS threads, so it cannot exist in a browser.
 blocking = []
 # `Body::from_file`. Needs a filesystem.
 fs = []
 # `Node::bind_from_env` and `Allowlist::from_env`. Needs a process environment.
 env = []
+# `Persist`: the `Observer` that stores the state after every turn.
+#
+# Over the PORT and nothing else — the frame, `Snapshots` and `Claim` — so it
+# compiles for the browser and `.mise/tasks/wasm` builds it there. It is useless
+# without an adapter, which is the next feature.
+persist = ["dep:keylink-persist"]
+# The above, plus `keylink-persist`'s local-file adapter.
+#
+# A second switch and not one, because this is the half that needs a filesystem:
+# it turns on `tokio/fs` inside `keylink-persist`, and `lib.rs` refuses it on
+# wasm beside the same refusal for `blocking`, `fs` and `env`. Default for the
+# same reason those three are — a native build gets the adapter that exists.
+persist-file = ["persist", "keylink-persist/file"]
 # The browser's answer to `fs`. Off by default, because it is meaningful on
 # exactly one target.
 web = ["dep:wasm-streams", "dep:web-sys", "dep:tokio-util"]
@@ -69,6 +82,28 @@ bao-tree = { version = "0.16", default-features = false }
 # the target block below.
 tokio = { version = "1", default-features = false, features = ["io-util", "sync"] }
 
+# The durability port, for `src/persist.rs`. It USED to be a dev-dependency, with
+# a comment saying it was test-only and that proving the wiring from the test side
+# was how the hexagon was kept pointing the right way. Half of that stopped being
+# true when the adapter moved into the library, and this is the rewrite rather
+# than a rule the change broke.
+#
+# What is unchanged, and is the part that mattered: **`keylink-persist` does not
+# depend on `keylink`.** The port must not know the framework, and it does not —
+# it compiles, tests and documents alone. This arrow is the application depending
+# on the port, which is the direction a hexagon's arrows are supposed to point,
+# and the reason a `keylink-durable` crate in between would be a seam with one
+# adapter inside it.
+#
+# What changed: the dependency is real, so tests name it as a normal dependency
+# rather than a dev one. `--no-default-features` therefore takes it out of the
+# integration tests too, exactly as it takes out the blocking API they use — see
+# `.mise/tasks/features` for why that task builds `--lib` only.
+#
+# `default-features = false` drops the file adapter, and with it `tokio/fs`.
+# `persist-file` adds it back for whoever has a disk.
+keylink-persist = { path = "../keylink-persist", optional = true, default-features = false }
+
 # Scoped by target rather than by cargo feature, on purpose. A feature that
 # enabled `tokio/fs` would fail inside mio, several crates away from the
 # mistake. Scoped this way, `--features blocking` on wasm fails in keylink's own
@@ -105,10 +140,6 @@ tokio-util = { version = "0.7", optional = true, default-features = false, featu
 ] }
 
 [dev-dependencies]
-# Test-only, and acyclic: `keylink-persist` does not depend on `keylink`.
-# The port must not know about the framework, so the wiring is proved from
-# this side rather than by making the hexagon point the wrong way.
-keylink-persist = { path = "../keylink-persist" }
 tokio = { version = "1", features = ["full"] }
 # `test-utils` ships iroh's relay and its pkarr/DNS server as libraries, so
 # `keylink/tests/relay.rs` can run both in-process. Without it every test in this

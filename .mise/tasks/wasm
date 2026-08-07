@@ -29,3 +29,17 @@ fi
 AR_wasm32_unknown_unknown="$ar" \
     cargo build --target wasm32-unknown-unknown -p keylink -p keylink-persist \
         --no-default-features
+
+# The second build is the durability adapter's, and it is the whole reason
+# `persist` and `persist-file` are two features instead of one. `src/persist.rs`
+# reaches the frame and the two port traits and nothing else, so it belongs in the
+# browser; `persist-file` pulls `tokio/fs` and `keylink/src/lib.rs` refuses it here
+# with a `compile_error!`.
+#
+# Without this line the claim "the wasm objection was a feature problem" would be
+# an argument rather than a build. `--features keylink/persist` and not a bare
+# `--features`, because two `-p` packages are in play.
+echo "── the durability adapter, over the port only"
+AR_wasm32_unknown_unknown="$ar" \
+    cargo build --target wasm32-unknown-unknown -p keylink -p keylink-persist \
+        --no-default-features --features keylink/persist

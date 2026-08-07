@@ -91,11 +91,16 @@ impl Drop for Scratch {
     }
 }
 
-/// The whole loop a caller writes today, in one place.
+/// One run of a process, committing **once** at the end rather than per turn.
 ///
-/// keylink has no hook in the generated turn loop yet, so the commit is
-/// explicit. That is deliberate: a durability policy woven into every turn is a
-/// bigger change than a port, and this proves the port first.
+/// This used to say that keylink had no hook in the turn loop, so the commit had
+/// to be explicit. There is a hook now — `keylink::Persist`, and
+/// `keylink/tests/persist.rs` is the file that drives it — and this one keeps the
+/// explicit shape on purpose, because it is testing something else: the *port*
+/// and the read seam, `Handle::with_state`, without an observer anywhere in
+/// sight. `with_state` is unchanged and not deprecated; what Wave 5 subsumed is
+/// using it as a commit mechanism, which is what `examples/durable_ledger.rs`
+/// used to do and no longer does.
 async fn run(files: &Files, id: &StateId, entries: &[u64]) -> Vec<u64> {
     // The claim moves into the wrapper and there is no way back out to it, so
     // nothing below this line can write a snapshot without a version stamp.

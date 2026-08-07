@@ -1376,17 +1376,29 @@ macro_rules! __keylink_service {
             /// actor needs has to be produced by that one closure:
             ///
             /// ```ignore
-            /// let system = orders::SystemBuilder::default()
-            ///     .spawn_with(|id| {
-            ///         let (state, saver) = store.open_blocking(id)?;
+            /// let system = orders::System::builder(Eviction::Never)
+            ///     .spawn_with(move |id| {
             ///         Some(orders::spawn_wired(
-            ///             state,
-            ///             vec![Box::new(saver)],
+            ///             Book::new(),
+            ///             vec![Box::new(metrics.watching(id))],
             ///             orders::Feeds::new(exchange.subscribe(id)),
             ///         ))
             ///     })
             ///     .build();
             /// ```
+            ///
+            /// # A factory is synchronous, and a durable actor is the case that hits it
+            ///
+            /// That closure is a plain `Fn`, so it cannot `await`. A
+            /// [`Persist`](keylink::Persist) has to claim its state before it can
+            /// observe anything, and claiming is I/O — so a durable keyed actor is
+            /// mounted **eagerly**, with
+            /// [`System::mount`](keylink::System::mount) after
+            /// `Persist::open(..).await`, rather than built on first message.
+            /// `keylink/tests/persist.rs::a_keyed_actors_state_survives_its_own_process`
+            /// is that shape. It is a real limit, discovered by the wave that wrote
+            /// the first adapter, and it is stated here rather than left for the next
+            /// author to find at the borrow checker.
             ///
             /// # What a keyed actor still does not get
             ///
@@ -1463,9 +1475,12 @@ macro_rules! __keylink_service {
             /// the actor, and [`Handle::ended`] says which observer and why.
             ///
             /// ```ignore
-            /// let (state, saver) = keylink_durable::open(&store, id, Ledger::default).await?;
-            /// let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
-            /// ledger.post(1).await?;   // stored before this returns
+            /// // `Persist` is keylink's own adapter, behind the `persist-file`
+            /// // feature. It named a `keylink_durable` crate here until Wave 5
+            /// // decided one adapter is a module and not a crate.
+            /// let (restored, saver) = keylink::Persist::<Ledger, _>::open(&store, &id).await?;
+            /// let ledger = ledger::actor_with(restored.unwrap_or_default(), vec![Box::new(saver)]);
+            /// ledger.post(1).await?;   // stored, and fsynced, before this returns
             /// ```
             ///
             /// # Panics

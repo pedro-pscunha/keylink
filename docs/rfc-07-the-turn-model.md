@@ -1258,3 +1258,230 @@ tested is the loop with no transport in the way to explain a pass. Red-tested by
   single-threaded test runtime the loop drains the slot and polls again before the
   parked sender is rescheduled, so that state is unconstructible and the reverse
   direction is asserted as "a queued message does not preempt a queued feed item".
+
+---
+
+## 6. Wave 5 — the durability adapter the port is owed, and what a turn costs
+
+`Observer` had **zero non-test implementors**. By the standard `keylink-persist`'s own
+module header sets — a port is justified by one adapter written on purpose — the port
+was unjustified, and the shape of `Observer::after_turn` was a prediction about an
+implementation nobody had written. This wave writes it.
+
+```rust
+// keylink/src/persist.rs, behind `persist` / `persist-file`
+pub struct Persist<D, S: Snapshots> { durable: Versioned<S::Claim>, dirty: bool, .. }
+
+let (restored, saver) = Persist::<Ledger, _>::open(&store, &id).await?;
+let ledger = ledger::actor_with(restored.unwrap_or_default(), vec![Box::new(saver)]);
+ledger.post(1).await?;   // stored, and fsynced, before this returns
+```
+
+### 6.1 THE NUMBER THIS WAVE OWNS — a stored turn costs 7.6 ms, which is ~130 turns/second
+
+RFC-06 §7 asked for a measurement and never got one. Every estimate in this repository's
+history was low by more than an order of magnitude.
+
+| profile | no observer | with `Persist` | runs |
+|---|---|---|---|
+| debug (`cargo test`) | 16.5 – 20.2 µs | 7,520 / 7,652 / 7,927 µs | 3 |
+| release | 12.8 µs | 7,083 µs | 1 |
+
+Apple M5 Max (`Mac17,6`), macOS 27.0 build 26A5378n, APFS on the internal SSD,
+2026-08-07. 1,000 turns of a fixed-size 8-byte state, so the payload is 20 framed bytes
+on every turn and the number is not a function of how far the run got.
+
+**Debug and release agree to within 8%, which is the evidence that this is a syscall
+cost and not a code-generation one.** It is two `fsync`s and a `rename`: the file
+adapter syncs the temporary file and then the directory, and the second sync is what
+makes "an answered call is a stored call" survive a power cut rather than merely a
+process restart. An adapter that skipped it would report a much better number and
+quietly mean something weaker.
+
+So the number is not a defect to fix in the adapter — it is the price of the promise.
+It is recorded in `keylink/src/persist.rs`'s module documentation, in
+`keylink/examples/durable_ledger.rs`, and reproducible with
+`cargo test -p keylink --test persist -- --ignored --nocapture`, which prints it and
+asserts nothing about it. **There is no wall-clock assertion anywhere in this wave.**
+
+What the number decides: RFC-06 §7's debounce stops being a nice-to-have and becomes the
+obvious next knob, and `Observer::finish` — which Wave 2d added for exactly that reason
+— is already the guaranteed final flush it needs.
+
+### 6.2 Placement: a module in `keylink`, not a third crate
+
+Three arguments, and the third is the one that had to be built rather than argued.
+
+- A `keylink-durable` crate whose entire content is one adapter is a hypothetical seam.
+- The dependency-direction objection does not survive. The hexagon's rule is that the
+  **port** must not know the framework, and `keylink → keylink-persist` is the
+  application depending on the port. `keylink-persist` still compiles, tests and
+  documents alone and names `keylink` nowhere.
+- The browser objection was a **feature** problem. `keylink-persist` arrives
+  `optional = true, default-features = false`, and the feature is split:
+
+  | feature | what it adds | browser |
+  |---|---|---|
+  | `persist` | the adapter, over the port | **builds** |
+  | `persist-file` | `persist` plus the file adapter | refused |
+
+  `.mise/tasks/wasm` now runs a second `cargo build` for
+  `wasm32-unknown-unknown --features keylink/persist`, so "the objection was a feature
+  problem" is a build rather than a paragraph.
+
+`persist-file` is a **default** feature, beside `blocking`, `fs` and `env`, and for the
+same reason all three are: a native build gets the adapter that exists, and a browser
+build already passes `--no-default-features`. It also keeps a bare `cargo test
+--workspace` running this wave's tests, which a default-off feature would have made
+invisible to the gate — `blobs-fs` is the in-tree example of a feature whose code no
+test ever runs.
+
+`keylink/Cargo.toml`'s dev-dependency comment — *"Test-only, and acyclic… rather than
+making the hexagon point the wrong way"* — was rewritten in the same commit rather than
+left as a rule the change broke. The dev-dependency is **gone**: the dependency is real
+now, so tests name it as a normal one.
+
+### 6.3 The type parameter is the STORE, and that is what keeps the framing gate honest
+
+`Versioned<C>` demands `C: Claim`, and `keylink_persist::Claim` is the trait whose one
+method writes **unframed** bytes. `.mise/tasks/framing` reads a property of Rust rather
+than a naming convention: `store` is a trait method, so a file that never brings the
+trait into scope cannot call it, whatever it calls its variables.
+
+So `Persist` is generic over `S: Snapshots` and holds a `Versioned<S::Claim>`, which
+needs no bound of its own because `Snapshots` already promises one. `keylink/src/persist.rs`
+therefore never names `Claim`, and the strongest available statement about the one file
+in keylink's library that writes a snapshot is that **it has no route to an unframed
+write at all**. It is on the framing task's second allowlist (it calls
+`Versioned::store`) and deliberately not on the first.
+
+Two files came **off** that allowlist in this wave, which is the part worth recording:
+`keylink/examples/durable_ledger.rs` lost its commit loop and `keylink/tests/feeds.rs`
+lost the hand-rolled `Saver` that prototyped this adapter. Neither stores anything now.
+A stale allowlist entry is a hole nobody can see.
+
+### 6.4 `dirty`, and why it is not RFC-06 §4.2's deleted `revision`
+
+`Persist` carries a `bool` meaning **there is a committed change that is not on the disk
+yet**. Set before the write, cleared after it, so a write that failed leaves it standing.
+
+RFC-06 §4.2's `Durable::revision` was an implementor-supplied counter with nothing
+connecting it to a mutation, and it was deleted for that reason. This flag is set by the
+one place that knows a turn happened, and it is read in one place.
+
+Today it costs nothing on every path but one. `after_turn` stores on every turn it
+accepts and clears the flag, so an actor that stopped normally reaches `finish` clean.
+The single path that arrives dirty is a `store` that returned `Err` — which ends the
+actor immediately, so the state is complete and consistent and only the write is
+missing, and one more attempt before the state is dropped is the difference between
+losing the last committed turn and not.
+
+**`finish`'s `Ended::Panicked` arm looks redundant and is not.** With a store on every
+turn it cannot fire: a panicked turn is refused without setting the flag, and a failed
+store ends the actor before another turn can panic. It is the rule a debounce needs. The
+moment `after_turn` stops writing on every turn, "turn n completed and is unwritten,
+turn n+1 panicked" is reachable, the flag stands over a half-applied state, and
+`Ended::Panicked` is the only thing there that says so. Losing one committed turn is the
+right trade against writing a state a restart would reproduce.
+
+### 6.5 The `A: Sync` trap, from the other side of the port
+
+`after_turn` is a plain `fn` returning a boxed future, and not an `async fn`, so an
+implementation can do synchronous work with `state` **before** the future exists. Wave 0
+probed the trap; Wave 2d hit it again on `finish`. This is the first time an
+implementation had to obey it.
+
+`Persist::after_turn` calls `Snapshot::of(state)` synchronously and moves the bytes into
+the future. Two breaks, failing in two different places, are what make that a checked
+claim rather than a remembered one:
+
+- Write the naive version — `store(&Snapshot::of(state))` *inside* the `async move` —
+  and **keylink itself** stops compiling before any test is reached:
+  `error: future cannot be sent between threads safely`, at `persist.rs`'s `Box::pin`,
+  with `help: consider further restricting type parameter D with trait Sync`. The bound
+  is demanded of the generic `D`, so the library refuses it for everybody.
+- Add `Sync` to the impl's bound and
+  `tests/persist.rs::a_state_that_is_not_sync_is_still_persisted` stops compiling,
+  naming the state: `error[E0277]: Cell<u64> cannot be shared between threads safely`,
+  `required because it appears within the type Counter`. Every `Ledger` test in the file
+  still passes, which is what makes the break discriminating rather than merely red.
+
+The state in that test holds a real `Cell<u64>` **and** a real `RefCell<u64>`, so
+neither member's removal can make the claim vacuous — the house rule a unit-struct
+`Panic` earned through two revisions of RFC-06.
+
+### 6.6 A keyed actor's state outlives its process, which Wave 3 is what made possible
+
+`tests/persist.rs::a_keyed_actors_state_survives_its_own_process` mounts a `Persist` on
+a keyed actor, drives it over **two real nodes** through the generated `KeyedClient`,
+stops it, and re-opens the state in a second "process".
+
+Say plainly why it could not be written before. A keyed actor used to run a second loop,
+generated into the user's crate, which handed the dispatch an **empty hook slice** — so
+a keyed actor had no observers, no `finish`, and no route to durability at all. Wave 3
+merged the two loops into `run_loop` and `spawn_wired` is the door that carries the
+triple. Red-tested by putting `Vec::new()` back where `spawn_wired` passes its observers
+on: `left: [20], right: [10, 20]`, the second run having restored nothing.
+
+**One limit this wave found and did not fix.** A `spawn_with` factory is a plain `Fn`, so
+it cannot `await`, and a `Persist` has to claim its state before it can observe anything.
+A durable keyed actor is therefore mounted **eagerly** — `Persist::open(..).await` and
+then `System::mount` — rather than built on first message. `spawn_wired`'s documentation
+says so now; the doc example that used to imply otherwise named a `store.open_blocking`
+that never existed.
+
+### 6.7 Every criterion, and the break that proves it
+
+| criterion | test | the break, and what it printed |
+|---|---|---|
+| a state survives its own process | `a_state_survives_the_process_that_built_it` | `after_turn` does not store → `run one stored something` |
+| an answered call is a stored call | `an_answered_call_is_a_stored_call_and_its_bytes_are_framed` | same break → `NotFound` reading the snapshot |
+| bytes are framed by 4c's envelope | (same test) | magic, layout and `Ledger::VERSION` read byte by byte off the file |
+| a panicked turn is not stored, and ends the actor | `a_panicked_turn_is_not_stored_and_ends_the_actor` | the panic arm never fires → `left: [1, 99], right: [1]` |
+| a refusal before `Persist` prevents the store | `a_refusal_before_persist_prevents_the_store` | swap the two observers → a refused turn is on the disk |
+| the claim is free the instant `stop().await` returns | `the_claim_is_free_the_instant_stop_returns` | `std::mem::forget(hooks)` in `run_loop` → `Busy { id: StateId("ledgers/sp-01") }` |
+| two `open`s on one `StateId`, the second `Error::Busy` | `a_second_open_on_one_state_is_busy` | — the store's own `try_lock`, already red-tested in `file.rs` |
+| a feed turn is stored on the same rule | `feeds.rs::a_feed_turn_is_stored_on_the_same_rule_as_a_mailbox_turn` | `after_turn` does not store → `something was stored` |
+| a keyed actor's state survives its own process | `a_keyed_actors_state_survives_its_own_process` | empty hook slice → `left: [20], right: [10, 20]` |
+| a non-probe `Observer` implementor exists | `rg 'impl.*Observer<' keylink/src` | `keylink/src/persist.rs` is the only hit outside `#[cfg(test)]` |
+| `A: Sync` stays out of the design | `a_state_that_is_not_sync_is_still_persisted` | §6.5's two breaks |
+| the per-turn cost is measured, not estimated | `the_per_turn_store_cost` (`#[ignore]`) | §6.1 |
+
+`keylink/tests/durable.rs` is unchanged in behaviour and keeps committing once per run
+through `Handle::with_state`: **`with_state` survives and is not deprecated.** It is a
+*read*, and `representability.rs::a_read_cannot_mutate_either` still holds the claim.
+What Wave 5 subsumed is using it as a **commit** mechanism, which is what the example
+did and no longer does.
+
+### 6.8 What Wave 5 did NOT do
+
+- **Debounce.** The number in §6.1 is the argument for it and `finish` is the flush it
+  needs, but nothing here batches. A caller who wants the other trade has it by choosing
+  a different adapter, not by configuring this one.
+- **Retry a failed store, except once at `finish`.** The `dirty` flag's one live path is
+  untested: making a real `Files` store fail *transiently* is not something this suite can
+  arrange — `limit()` fails permanently, and removing the directory breaks the lock the
+  claim holds. Listed among the guards that were **not** watched to fail.
+- **Move the ALPN.** `keylink/Probe/d3fe34471921164e` is unchanged, and all five hash
+  tests in `tests/protocol.rs` are green. An observer is local: it is a constructor
+  argument, not a declared type, so there is nothing for the wire graph to hash.
+- **Reach `registry.rs`.** Zero lines. A keyed actor's observers arrive through
+  `spawn_wired`, which Wave 3 already built.
+- **Answer what a dead keyed actor should do.** This wave makes an existing gap
+  consequential rather than theoretical, so it is recorded here rather than
+  discovered later. `Persist` refuses a panicked turn, which ends the actor — and a
+  keyed actor whose task has ended stays in the registry's map with a sender whose
+  receiver is gone, so `Registry::route` hands that sender out and the send fails.
+  The peer is told something, the actor is never rebuilt, and §5.7's missing
+  `ended()` channel means nothing can be told **why**. On a `LocalActor` the same
+  fault is fully observable through `ended()`, which is what
+  `a_panicked_turn_is_not_stored_and_ends_the_actor` asserts. This is Wave 9's
+  problem and it needs the field on `Mounted` that §5.7 already names.
+- **Make the `persist-file` wasm guard fire.** It was watched and it did not: cargo
+  compiles dependencies first, so the build stops at tokio's own `compile_error!` naming
+  `fs`. `lib.rs` says so at the guard rather than leaving a reader to assume otherwise.
+- **Fix `Persist::open`'s inference.** `D` appears only in the return type, so it usually
+  has to be named — `Persist::<Ledger, _>::open(..)`. Handing the restored value to a
+  generic `actor_with<A: Actor>` leaves `D` ambiguous even where exactly one type
+  implements that service's `Actor`, because rustc will not pick an impl to resolve a
+  type parameter. Documented on `open` rather than worked around.

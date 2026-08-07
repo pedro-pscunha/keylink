@@ -64,7 +64,7 @@
 // sentence in two doc comments into something the compiler checks.
 #![deny(unsafe_code)]
 
-// Three features need an operating system facility a browser does not have, and
+// Four features need an operating system facility a browser does not have, and
 // each says so here rather than letting the build fail somewhere unhelpful.
 //
 // `blocking` and `fs` would fail anyway, dozens of errors deep inside mio or
@@ -90,6 +90,38 @@ compile_error!(
     "keylink's `env` feature needs a process environment, which a browser does \
      not have: `std::env::var` compiles here and always returns nothing. Build \
      with --no-default-features and pass the secret and the allowlist in."
+);
+// The fourth is the durability adapter's, and it is the `persist-file` half
+// rather than `persist`. That split is the whole reason the adapter could be a
+// module here instead of a third crate: `persist` reaches only the frame and the
+// two port traits, so it compiles for the browser and `.mise/tasks/wasm` builds
+// it there. `persist-file` turns on `keylink-persist/file`, which turns on
+// `tokio/fs`, which a browser does not have.
+//
+// **This one was watched, and it did NOT fire — say so rather than let a reader
+// assume it did.** Unlike the three above, the failure is in a *dependency*, and
+// cargo compiles dependencies first: `--target wasm32-unknown-unknown --features
+// persist-file` stops at tokio's own `compile_error!`, `Only features
+// sync,macros,io-util,rt,time are supported on wasm`, and this line is never
+// reached. It stays for two reasons and neither is enforcement. It keeps
+// `persist-file` in the list a reader scans to learn which features a browser
+// refuses, so the next author does not add it back. And it is the message that
+// would be reached if tokio ever accepted the feature, which is the day the
+// silent-success hazard `env` documents would apply here too — `std::fs`
+// compiles for this target and fails at runtime.
+//
+// The 48-error mio explosion this used to produce instead is gone for an
+// unrelated and better reason: `keylink-persist` stopped inheriting `tokio`'s
+// `full`, which its own manifest now explains.
+#[cfg(all(
+    feature = "persist-file",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
+compile_error!(
+    "keylink's `persist-file` feature needs a filesystem, which a browser does \
+     not have. Build with --no-default-features --features persist, which is the \
+     adapter over the port with no file store behind it."
 );
 
 // Two places assert a platform fact rather than checking one, and both assert
@@ -143,6 +175,11 @@ mod node;
 mod observe;
 mod panic;
 mod peer;
+/// The durability adapter. Gated on the feature AND nothing else: unlike
+/// `blocking`, every line in it compiles for the browser, which is what makes
+/// `persist` and `persist-file` two switches rather than one.
+#[cfg(feature = "persist")]
+mod persist;
 mod reply;
 #[cfg(test)]
 mod representability;
@@ -177,6 +214,8 @@ pub use node::{derive_alpn, Node};
 pub use observe::{Ended, FinishFut, Observer, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome};
 pub use panic::Panic;
 pub use peer::{Dial, Peer};
+#[cfg(feature = "persist")]
+pub use persist::Persist;
 pub use reply::{Outcome, RemoteError, WireRequest, WireResponse};
 pub use rpc::{Dispatch, RpcClient, Server, ServerBuilder, Service, ServiceBuilder};
 pub use subscribers::Subscribers;

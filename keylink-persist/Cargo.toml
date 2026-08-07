@@ -17,9 +17,25 @@ file = ["tokio/fs", "tokio/rt"]
 
 [dependencies]
 thiserror = { workspace = true }
-tokio = { workspace = true, optional = true }
+# `default-features = false`, and NOT the workspace `tokio`, which is `full`.
+#
+# The `file` feature above says this adapter needs `fs` and `rt`, and while this
+# line inherited `full` that sentence was decoration: `fs` and `rt` were already
+# on, along with `net`, `process`, `signal` and `rt-multi-thread`, and the feature
+# selected nothing. keylink's own manifest states the rule this broke — a feature
+# that is on because somebody else's dependency turned it on is on by accident.
+#
+# It is also what made `keylink`'s `persist-file` wasm guard unreadable. Building
+# that feature for `wasm32-unknown-unknown` used to fail with **48 errors inside
+# mio**, which `full` pulls through `net`; it now fails with tokio's own one-liner,
+# `Only features sync,macros,io-util,rt,time are supported on wasm`, which names
+# `fs` — the actual offender — instead of naming crates the reader never chose.
+tokio = { version = "1", optional = true, default-features = false }
 
 [dev-dependencies]
+# `full` here on purpose: `#[tokio::test]` needs `macros` and a runtime, and a
+# dev-dependency reaches the tests without widening the graph a `cargo build`
+# produces.
 tokio = { workspace = true }
 
 [lints]

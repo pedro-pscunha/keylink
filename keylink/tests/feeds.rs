@@ -38,10 +38,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use keylink::{Caller, Ended, Observer, Stream, TurnFut, TurnInfo, TurnOutcome};
-use keylink_persist::file::{FileClaim, Files};
-use keylink_persist::versioned::{Snapshot, Versioned};
-use keylink_persist::{Durable, RestoreError, Snapshots, StateId};
+use keylink::{Caller, Ended, Observer, Persist, Stream, TurnFut, TurnInfo, TurnOutcome};
+use keylink_persist::file::Files;
+use keylink_persist::{Durable, RestoreError, StateId};
 use tokio::sync::{mpsc, oneshot};
 
 keylink::service! {
@@ -626,37 +625,6 @@ impl Durable for Tape {
     }
 }
 
-/// A durability adapter written the way RFC-06 §2.6 means one: the snapshot is
-/// taken **synchronously**, before the future exists, and the write happens inside
-/// the turn and before the reply.
-///
-/// That split is why `after_turn` is a plain `fn` returning a boxed future rather
-/// than an `async fn`: taking the snapshot first means the future holds bytes and
-/// not `&A`, so nothing here needs `A: Sync`.
-/// Concrete in [`FileClaim`] rather than generic over the port's claim type, and
-/// that is not laziness. `mise run framing` refuses any file outside
-/// `keylink-persist` that brings the `Claim` **trait** into scope, because `store`
-/// is a trait method and a file that cannot name the trait cannot call the raw,
-/// unframed write — the one way round `Versioned`. A generic adapter would have to
-/// name it for the bound; naming the adapter's own claim type needs no bound at all.
-struct Saver {
-    durable: Versioned<FileClaim>,
-}
-
-impl Observer<Tape> for Saver {
-    fn name(&self) -> &'static str {
-        "saver"
-    }
-
-    fn after_turn<'a>(&'a mut self, state: &'a Tape, _turn: TurnInfo<'a>) -> TurnFut<'a> {
-        let snapshot = Snapshot::of(state);
-        Box::pin(async move {
-            self.durable.store(&snapshot).await?;
-            Ok(())
-        })
-    }
-}
-
 /// A scratch directory that removes itself.
 struct Scratch(std::path::PathBuf);
 
@@ -675,20 +643,27 @@ impl Drop for Scratch {
     }
 }
 
-/// **A feed item is committed by a durable observer exactly as a turn is.**
+/// **A feed turn is stored on exactly the same rule as a mailbox turn.**
 ///
-/// Nothing in this test calls a method that changes the state: every mark on the
-/// tape arrived on the feed, and every one of them is in the file afterwards. So
-/// the file is a witness that the observer chain ran *for a feed item* and that
-/// its write was taken as this turn's commit — which is the whole of what a
-/// durability adapter needs from a feed, and the half Wave 5 will build on.
+/// Wave 5's criterion, and the reason it is here rather than in
+/// `tests/persist.rs`: this file owns the second input, and the claim is about
+/// what that input is. Nothing in this test calls a method that changes the
+/// state — every mark on the tape arrived on the feed — and every one of them is
+/// in the file afterwards. So the file is a witness that the observer chain ran
+/// *for a feed item* and that its write was taken as this turn's commit.
+///
+/// The adapter is `keylink::Persist` and not a hand-rolled one. It used to be a
+/// `Saver` written in this file, which was the right thing while Wave 5 had not
+/// happened: it was a *prototype* of the adapter, and keeping it beside the real
+/// one would be two implementations of one rule, differing wherever nobody
+/// looked. Wave 5 deleted it, and this test is the one that would notice.
 ///
 /// The real store and the real file, per the house rule: no mock of the ledger.
 ///
 /// Made red by having `feed_turn` skip the observer chain — the reload then comes
 /// back empty, because nothing ever wrote.
 #[tokio::test]
-async fn a_feed_item_is_committed_by_a_durable_observer() {
+async fn a_feed_turn_is_stored_on_the_same_rule_as_a_mailbox_turn() {
     let scratch = Scratch::new("committed");
     let files = Files::open(&scratch.0).await.expect("opens");
     let id = StateId::new("tapes/one").expect("valid");
@@ -707,10 +682,14 @@ async fn a_feed_item_is_committed_by_a_durable_observer() {
     marks.send(22).await.expect("the feed accepts");
     drop(marks);
     {
-        let durable = Versioned::new(files.claim(&id).await.expect("claims"));
+        let (restored, saver) = Persist::<Tape, _>::open(&files, &id)
+            .await
+            .expect("claims and loads");
+        assert!(restored.is_none(), "nothing has been stored yet");
+
         let tape = tape::actor_wired(
             Tape::default(),
-            vec![Box::new(Saver { durable })],
+            vec![Box::new(saver)],
             tape::Feeds::new(feed(mark_rx)),
         );
 
@@ -722,11 +701,10 @@ async fn a_feed_item_is_committed_by_a_durable_observer() {
     }
 
     // The claim is released with the actor, so a new "process" can open it.
-    let reloaded: Tape = Versioned::new(files.claim(&id).await.expect("claims"))
-        .load()
+    let (restored, _saver) = Persist::<Tape, _>::open(&files, &id)
         .await
-        .expect("loads")
-        .expect("something was stored");
+        .expect("the claim was released with the actor");
+    let reloaded = restored.expect("something was stored");
     assert_eq!(
         reloaded.marks,
         vec![11, 22],

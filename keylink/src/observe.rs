@@ -16,9 +16,14 @@
 //! keylink learning what storage is. `keylink-persist` is the port for the
 //! bytes; this is the port for the moment.
 //!
-//! It has **one** consumer today. The argument for making it generic is the
-//! boundary rule above, not a queue of waiting adapters — RFC-06 §0 says so
-//! plainly, having withdrawn a second consumer it had claimed.
+//! It has **one** consumer today, and since Wave 5 that consumer is real code
+//! rather than a plan: `keylink::Persist`, behind the `persist` feature — named
+//! without a link because it is gated and this paragraph is not — which owns a
+//! claim and writes a framed snapshot inside every turn it accepts.
+//! Every implementor of this trait used to be a test or a probe, which by this
+//! repo's own standard left the port unjustified. The argument for making it
+//! generic is still the boundary rule above and not a queue of waiting adapters —
+//! RFC-06 §0 says so plainly, having withdrawn a second consumer it had claimed.
 //!
 //! # The actor owns its observers
 //!
