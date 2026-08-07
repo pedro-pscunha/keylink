@@ -24,12 +24,12 @@ use std::time::Duration;
 
 use keylink::{
     Admission, Admittance, AdmittedPeer, Allowlist, Context, Departure, IdempotencyKey, KeyState,
-    Peer, ProvenPeer, Revocation, Server as KeylinkServer, MAX_ATTACH, MAX_RECORDS, MAX_TOMBSTONES,
-    RECORD_TTL,
+    Peer, ProvenPeer, Revocation, Server as KeylinkServer, MAX_ATTACH, MAX_RECORDED_BYTES,
+    MAX_RECORDS, MAX_TOMBSTONES, RECORD_TTL,
 };
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 // ────────────────────────────────────────────────────────────── the service
 
@@ -55,20 +55,13 @@ keylink::service! {
 /// the test throws the caller away, and only then is the handler let go.
 struct Desk {
     runs: AtomicU64,
-    entered: mpsc::UnboundedSender<u64>,
-    release: watch::Receiver<bool>,
+    rendezvous: Rendezvous,
 }
 
 impl orders::Handler for Desk {
     async fn submit(&self, _cx: &Context, sku: String, _qty: u32) -> Receipt {
         let run = self.runs.fetch_add(1, Ordering::SeqCst) + 1;
-        // A receiver the test has dropped means the test is already failing;
-        // there is nothing useful for a handler to do about that.
-        let _ = self.entered.send(run);
-        let mut release = self.release.clone();
-        // `wait_for` re-reads the current value before parking, so a release
-        // that lands between the send above and this line is not missed.
-        let _ = release.wait_for(|open| *open).await;
+        self.rendezvous.hold(run).await;
         Receipt { run, sku }
     }
 }
@@ -133,14 +126,7 @@ impl Admission for Gate {
 // ────────────────────────────────────────────────────────────────── fixture
 
 mod common;
-use common::local_node;
-
-/// How long the test waits for something that should already have happened.
-///
-/// A liveness bound, never a measurement. Nothing here is asserted to be *fast*;
-/// this is what turns a deadlock into a named failure instead of a hung test
-/// runner, and the passing path never comes near it.
-const NO_PROGRESS: Duration = Duration::from_secs(20);
+use common::{local_node, rendezvous, Rendezvous, NO_PROGRESS};
 
 // ───────────────────────────────────────────── the composed guarantee
 
@@ -149,8 +135,7 @@ const NO_PROGRESS: Duration = Duration::from_secs(20);
 /// record rather than by running the handler again.
 #[tokio::test]
 async fn a_retried_call_across_a_reconnect_runs_exactly_once() {
-    let (entered, mut entries) = mpsc::unbounded_channel();
-    let (release, held) = watch::channel(false);
+    let (rendezvous, mut arrivals) = rendezvous();
     let gate = Arc::new(Gate::new(Allowlist::anyone()));
 
     let server_node = local_node().await;
@@ -160,8 +145,7 @@ async fn a_retried_call_across_a_reconnect_runs_exactly_once() {
             orders::service(
                 Desk {
                     runs: AtomicU64::new(0),
-                    entered,
-                    release: held,
+                    rendezvous,
                 },
                 // Replaced by `admission` below, which is how that method is
                 // documented to work: the list is itself an `Admission`, and
@@ -201,11 +185,12 @@ async fn a_retried_call_across_a_reconnect_runs_exactly_once() {
         finished = &mut attempt => {
             panic!("the handler is held; the call cannot answer yet, but it returned {finished:?}")
         }
-        entered = entries.recv() => entered.expect("the handler announces itself on entry"),
+        entered = arrivals.entered.recv() => entered.expect("the handler announces itself on entry"),
     };
     assert_eq!(run, 1, "the first attempt entered the handler");
     drop(attempt);
-    release
+    arrivals
+        .release
         .send(true)
         .expect("the handler is still holding a receiver");
 
@@ -275,7 +260,10 @@ async fn a_retried_call_across_a_reconnect_runs_exactly_once() {
         "the retry crossed a second connection, not the first",
     );
     assert!(
-        matches!(entries.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        matches!(
+            arrivals.entered.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ),
         "the handler announced itself a second time, so the work ran twice",
     );
 }
@@ -287,10 +275,20 @@ async fn a_retried_call_across_a_reconnect_runs_exactly_once() {
 /// This is what stops the two drifting: change a bound and the test that names
 /// the README goes red, which is the moment to decide whether the prose or the
 /// constant is wrong. The same argument as the ALPN pin in `protocol.rs`.
+///
+/// **Every constant here must be one the README PRINTS A NUMBER for**, or the
+/// test's name is false about it and the drift it exists to catch cannot
+/// happen. Two of the four were wrong on that count when this test was
+/// written: `MAX_ATTACH` was pinned and the README did not mention it at all,
+/// and `MAX_RECORDED_BYTES` was named twice in the README and pinned by
+/// nothing. Both were fixed on the README's side — the numbers are printed
+/// there now — rather than by dropping the assertions, because a bound a reader
+/// cannot see is a bound they cannot plan around.
 #[test]
 fn the_limits_the_readme_names_are_the_ones_the_ledger_uses() {
     assert_eq!(RECORD_TTL, Duration::from_secs(600));
     assert_eq!(MAX_TOMBSTONES, 8192);
     assert_eq!(MAX_RECORDS, 1024);
+    assert_eq!(MAX_RECORDED_BYTES, 1 << 20);
     assert_eq!(MAX_ATTACH, Duration::from_secs(30));
 }

@@ -256,7 +256,9 @@ pub use peer::{Dial, Peer};
 #[cfg(feature = "persist")]
 pub use persist::{Opened, Persist};
 pub use reply::{Outcome, RemoteError, WireRequest, WireResponse};
-pub use rpc::{Dispatch, RpcClient, Server, ServerBuilder, Service, ServiceBuilder};
+pub use rpc::{
+    Dispatch, IdempotentClient, RpcClient, Server, ServerBuilder, Service, ServiceBuilder,
+};
 pub use subscribers::Subscribers;
 pub use watch::{Departure, Watch};
 pub use wire::{Envelope, WireKinds, MAX_HEADER};

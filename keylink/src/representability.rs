@@ -173,10 +173,14 @@ fn an_origin_cannot_be_duplicated(origin: Origin) {
 // expanding its own macro is not external to itself, and the lib test build
 // denies warnings. `tests/actor_memory.rs` declares exactly one rpc and stays
 // green for that reason.
+// The `tell` is here for the key-scoped probe below, and it has to be on a
+// service this module already expands: a probe can only speak about a client
+// type that exists.
 crate::service! {
     service Alpha;
     rpc Ping(n: u64) -> u64;
     rpc Pong(n: u64) -> u64;
+    tell Note(line: String) -> ();
 }
 
 crate::service! {
@@ -198,6 +202,7 @@ impl alpha::Actor for AlphaState {
     async fn pong(&mut self, _cx: Caller<'_>, n: u64) -> u64 {
         n
     }
+    async fn note(&mut self, _cx: Caller<'_>, _line: String) {}
 }
 
 struct BetaState;
@@ -229,6 +234,76 @@ fn a_services_two_alpns_differ_from_each_other_and_from_another_services() {
         String::from_utf8_lossy(alpha::keyed_alpn()).contains("/Alpha/keyed/"),
         "the keyed ALPN says which of the two it is without anyone hashing anything"
     );
+}
+
+// ────────────────────────────────── a key cannot be attached to a `tell`
+
+/// **The README said this twice and it was false both times.**
+///
+/// *"It does not accept an idempotency key either, and could not"* — but
+/// `with_idempotency` returned `Self`, the generated `tell` is an inherent
+/// method on that same type, and so `client.with_idempotency(key).note(line)`
+/// compiled. `RpcClient::tell` writes `None` for the key and dropped the
+/// attached one on the floor. A reader who took the limit at face value,
+/// concluded the compiler would stop them, and wrote it *to be safe* shipped
+/// believing they had at-most-once and had nothing.
+///
+/// **This probe is the whole argument for the invariant that requires it.** Had
+/// it been written when the limit was, it would have failed to compile-fail on
+/// the day the sentence was published, and the defect would have surfaced at
+/// authoring time instead of in review two waves later.
+///
+/// [`IdempotentClient`](crate::IdempotentClient) is what makes it true now: a
+/// distinct type with no `tell`, so the sentence is the type's claim rather than
+/// prose asking a future author to be careful.
+trait IdempotentClientHasNoTell {
+    fn tell(&self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+}
+
+impl<Req, Resp> IdempotentClientHasNoTell for crate::IdempotentClient<Req, Resp> {}
+
+/// The generated twin, and it is the one a caller actually meets: nobody writes
+/// `RpcClient::tell` by hand, they write `client.with_idempotency(k).note(..)`.
+///
+/// `note` is `Alpha`'s declared `tell`. The generated method takes one argument,
+/// so an inherent `note` appearing on this type shadows the trait's and fails on
+/// the argument count even before the return type is compared.
+trait AKeyScopedClientHasNoTellMethod {
+    fn note(&self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+}
+
+impl AKeyScopedClientHasNoTellMethod for alpha::IdempotentClient {}
+
+#[cfg(feature = "blocking")]
+impl AKeyScopedClientHasNoTellMethod for alpha::blocking::IdempotentClient {}
+
+fn a_key_scoped_client_has_no_tell(
+    raw: crate::IdempotentClient<alpha::Request, alpha::Response>,
+    generated: alpha::IdempotentClient,
+) {
+    let _: NoSuchMethod = raw.tell();
+    let _: NoSuchMethod = generated.note();
+}
+
+#[cfg(feature = "blocking")]
+fn a_blocking_key_scoped_client_has_no_tell(generated: alpha::blocking::IdempotentClient) {
+    let _: NoSuchMethod = generated.note();
+}
+
+/// The other bracket, and without it the two probes above are satisfied by a
+/// misspelling.
+///
+/// C-4's lesson, applied: a probe body with a typo in the method name passes for
+/// a reason unrelated to its claim. So the same `tell` is called here on the
+/// plain client, where it must exist with exactly that name, that argument and
+/// that return type. Absent there, present here — a pair, because either half
+/// alone can be green for the wrong reason.
+async fn the_plain_client_does_have_that_tell(plain: alpha::Client) {
+    let _: crate::Result<()> = plain.note("a line".to_owned()).await;
 }
 
 /// The claim the whole keyed rewrite rests on: **a per-service `System`

@@ -1356,6 +1356,11 @@ impl vault::Handler for Strongroom {
 /// having: `Book::order` is one queue across every peer, so `flood` evicts
 /// `caller`'s grant without `caller` making a single call. A peer therefore
 /// cannot keep its own capability alive by being quiet.
+///
+/// The caller then takes one live grant on a **different** blob, and that is
+/// load bearing rather than scenery — see step 3. It is what puts the refusal
+/// at `admits_get` rather than at `BlobsAdmission::accept`, and `admits_get` is
+/// the only guard the claim above is about.
 #[tokio::test]
 async fn a_replayed_blob_reply_hands_out_an_address_whose_grant_is_gone_and_the_fetch_is_refused() {
     let server = local_node().await;
@@ -1429,7 +1434,33 @@ async fn a_replayed_blob_reply_hands_out_an_address_whose_grant_is_gone_and_the_
             .expect("the filler call runs");
     }
 
-    // 3. The record is still there. This is the half of "two lifetimes" that
+    // 3. ONE live grant for the caller, on a DIFFERENT blob, taken AFTER the
+    //    flood so the flood cannot evict it.
+    //
+    //    **This is the step that makes the refusal at the end mean anything,
+    //    and without it this test passed for the wrong reason.** Eviction pops
+    //    `(caller, receipt)`, `held.remove` empties the caller's set, and
+    //    `Grants::grant` then deletes the caller from `by_peer` outright. A
+    //    caller holding zero grants is turned away by `BlobsAdmission::accept`
+    //    at `knows(&peer)` — the connection is closed before a single request
+    //    is parsed, so `admits_get` is never called. Both refusals arrive as
+    //    `Error::BlobRefused`, so `assert_refused` cannot tell them apart, and
+    //    deleting the `permits` check from `admits_get` — the exact check this
+    //    test exists to hold — left it green.
+    //
+    //    With this grant the connection is admitted, and the per-request check
+    //    is the only thing left standing between a replayed address and the
+    //    bytes. Same idea as `a_grant_to_one_peer_does_not_admit_another_peer`,
+    //    which keeps a decoy grant for the same reason.
+    let (_, decoy) = client.filler(0).await.expect("the filler call runs");
+    let mut sink = Vec::new();
+    decoy.copy_to(&mut sink).await.expect(
+        "the caller must get past connection admission, or the refusal below \
+         is the connection talking and not the grant book",
+    );
+    assert_eq!(sink, b"filler 0");
+
+    // 4. The record is still there. This is the half of "two lifetimes" that
     //    makes the sequence reachable at all, and it is asserted rather than
     //    assumed.
     assert!(
@@ -1440,7 +1471,7 @@ async fn a_replayed_blob_reply_hands_out_an_address_whose_grant_is_gone_and_the_
         "the reply frame must still be recorded, or there is nothing to replay"
     );
 
-    // 4. The retry is answered from the record, and the recorded frame carries
+    // 5. The retry is answered from the record, and the recorded frame carries
     //    the same address — the replay path never reaches the grant site.
     let (replayed_manual, replayed) = client
         .with_idempotency(key)
@@ -1456,9 +1487,10 @@ async fn a_replayed_blob_reply_hands_out_an_address_whose_grant_is_gone_and_the_
          the replay path is said to skip"
     );
 
-    // 5. And it is worth nothing. The grant book is read per request, so the
+    // 6. And it is worth nothing. The grant book is read per request, so the
     //    address the replay handed back is refused exactly like an address the
-    //    handler never returned.
+    //    handler never returned — on a connection that step 3 just proved is
+    //    admitted, which is what makes this `admits_get` talking.
     let mut sink = Vec::new();
     let error = replayed
         .copy_to(&mut sink)

@@ -17,7 +17,6 @@ use keylink::{
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::{mpsc, watch};
 
 // ────────────────────────────────────────────────────────────── the service
 
@@ -52,43 +51,6 @@ struct Server {
     rendezvous: Option<Rendezvous>,
 }
 
-impl Server {
-    /// What `slow` does when nothing is holding it.
-    ///
-    /// An associated function rather than a method, so the paused-clock test can
-    /// drive the real body: `Context::new` is `pub(crate)`, so no test can build
-    /// the argument `Handler::slow` takes.
-    async fn delay(ms: u64) {
-        tokio::time::sleep(Duration::from_millis(ms)).await;
-    }
-}
-
-/// Overlap, proven without consulting a clock.
-///
-/// A handler that enters announces itself on `entered` and then parks until the
-/// test opens `release`, which it does only once all [`CONCURRENT_CALLS`]
-/// announcements have arrived. The calls therefore cannot all return unless all
-/// of them were inside the server at the same moment. Load makes the parking
-/// longer and the conclusion no weaker, which is exactly what the wall-clock
-/// assertion this replaced could not say.
-struct Rendezvous {
-    entered: mpsc::UnboundedSender<u64>,
-    release: watch::Receiver<bool>,
-}
-
-impl Rendezvous {
-    /// Announce this handler, then wait for the test to say every one is in.
-    async fn hold(&self, ms: u64) {
-        // A receiver the test has dropped means the test is already failing, and
-        // a handler has nothing useful to do about that.
-        let _ = self.entered.send(ms);
-        let mut release = self.release.clone();
-        // `wait_for` re-reads the current value before parking, so a release
-        // landing between the announcement and this line is not lost.
-        let _ = release.wait_for(|open| *open).await;
-    }
-}
-
 impl probe::Handler for Server {
     async fn ping(&self, _cx: &KeylinkContext) -> String {
         "pong".to_string()
@@ -97,7 +59,7 @@ impl probe::Handler for Server {
     async fn slow(&self, _cx: &KeylinkContext, ms: u64) -> u64 {
         match &self.rendezvous {
             Some(rendezvous) => rendezvous.hold(ms).await,
-            None => Server::delay(ms).await,
+            None => tokio::time::sleep(Duration::from_millis(ms)).await,
         }
         ms
     }
@@ -150,7 +112,7 @@ impl probe::Handler for Server {
 // ────────────────────────────────────────────────────────────────── fixture
 
 mod common;
-use common::local_node;
+use common::{local_node, rendezvous, Rendezvous, NO_PROGRESS};
 
 /// A running server and a client connected to it. Both nodes are held so the
 /// endpoints outlive the test body.
@@ -204,16 +166,6 @@ async fn a_peer_outside_the_allowlist_is_refused() {
 /// Calls this test drives at once, and arrivals the rendezvous waits for.
 const CONCURRENT_CALLS: usize = 8;
 
-/// The delay the paused-clock test measures.
-const DELAY_MS: u64 = 150;
-
-/// How long either test waits for something that should already have happened.
-///
-/// A liveness bound, never a measurement. It turns a rendezvous that never fills
-/// into a named failure instead of a hung test runner, and the passing path never
-/// comes near it.
-const NO_PROGRESS: Duration = Duration::from_secs(20);
-
 /// The headline property of one stream per call, asserted as overlap rather than
 /// as elapsed time.
 ///
@@ -225,15 +177,27 @@ const NO_PROGRESS: Duration = Duration::from_secs(20);
 ///
 /// The wall-clock version asserted that eight 150 ms calls finished in under
 /// 600 ms, which is a claim about the machine as much as about the code, and it
-/// flaked under a concurrent build. The number it cared about is now in
-/// `eight_overlapping_delays_cost_one_delay`, where a clock is exact.
+/// flaked under a concurrent build. **The number went with it, and nothing
+/// replaced it.**
+///
+/// It briefly had a replacement — `eight_overlapping_delays_cost_one_delay`,
+/// eight `tokio::time::sleep`s in a `JoinSet` under a paused clock — and that
+/// test was deleted rather than kept, because no edit to this crate could
+/// redden it. It named no service, no dispatch and no transport: a `Mutex`
+/// around `serve_one` left it green, and only editing its own delay helper
+/// turned it red. What it actually asserted is that tokio's scheduler runs
+/// spawned tasks concurrently, which is tokio's guarantee to test, not ours.
+///
+/// The deleted assertion was a claim about the **server**, and this test is
+/// where that claim lives now — held as overlap rather than as elapsed time,
+/// and reddenable by serializing dispatch, which is the property in question.
+/// A number nothing can be wrong about buys nothing over that.
 #[tokio::test]
 async fn concurrent_calls_do_not_queue_behind_each_other() {
-    let (entered, mut entries) = mpsc::unbounded_channel();
-    let (open, release) = watch::channel(false);
+    let (rendezvous, mut arrivals) = rendezvous();
     let fixture = start_with(
         Server {
-            rendezvous: Some(Rendezvous { entered, release }),
+            rendezvous: Some(rendezvous),
         },
         Allowlist::anyone(),
     )
@@ -259,13 +223,17 @@ async fn concurrent_calls_do_not_queue_behind_each_other() {
     let overlap = async {
         while inside.len() < CONCURRENT_CALLS {
             inside.push(
-                entries
+                arrivals
+                    .entered
                     .recv()
                     .await
                     .expect("the serving side holds the sender"),
             );
         }
-        open.send(true).expect("the handlers are still parked");
+        arrivals
+            .release
+            .send(true)
+            .expect("the handlers are still parked");
     };
 
     // Its own statement, so the joined future is dropped here and `inside` is
@@ -297,37 +265,6 @@ async fn concurrent_calls_do_not_queue_behind_each_other() {
             "reply {nth} must answer its own call",
         );
     }
-}
-
-/// The arithmetic the assertion above used to make, kept where a clock is exact.
-///
-/// `Handler::slow` is a delay when nothing holds it, and the deleted wall-clock
-/// assertion was really a claim about that delay: eight of them overlapped cost
-/// one, not eight. On a paused clock that is an equality with no safety factor,
-/// because `tokio::time` advances virtual time only when every task is idle, so
-/// no load can move it.
-///
-/// Deliberately not over the transport. A paused clock stops iroh's keep-alives
-/// and idle timers too, so the real boundary belongs to the integration test
-/// above and the number belongs here — the split CONTRIBUTING.md asks for.
-#[tokio::test(start_paused = true)]
-async fn eight_overlapping_delays_cost_one_delay() {
-    let started = tokio::time::Instant::now();
-
-    // Annotated so that swapping the spawn below for a serial `.await` — which
-    // is how this guard is red-tested — still compiles and fails on the number
-    // rather than on inference.
-    let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    for _ in 0..CONCURRENT_CALLS {
-        inflight.spawn(Server::delay(DELAY_MS));
-    }
-    while inflight.join_next().await.is_some() {}
-
-    assert_eq!(
-        started.elapsed(),
-        Duration::from_millis(DELAY_MS),
-        "{CONCURRENT_CALLS} overlapping delays must cost one; in series they cost {CONCURRENT_CALLS}",
-    );
 }
 
 // ──────────────────────────────────────────────────────────────── streaming

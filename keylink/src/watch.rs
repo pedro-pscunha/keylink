@@ -51,7 +51,7 @@ use std::task::{Context, Poll};
 use iroh::endpoint::{Closed, Connection, ConnectionError};
 
 use crate::rpc::is_clean_close;
-use crate::{RpcClient, Transport};
+use crate::{IdempotentClient, RpcClient, Transport};
 
 /// How a connection ended.
 ///
@@ -193,6 +193,17 @@ impl<Req, Resp> RpcClient<Req, Resp> {
     /// The dialling side of [`Watch::on`]. Takes `&self` and holds nothing, so
     /// a client behind an `Arc` can hand a watch to every caller that wants one
     /// while the client itself stays usable for calls.
+    pub fn watch(&self) -> Watch {
+        Watch::on(self.connection())
+    }
+}
+
+impl<Req, Resp> IdempotentClient<Req, Resp> {
+    /// Resolve when this peer goes away.
+    ///
+    /// The same watch [`RpcClient::watch`] hands out: a key scopes the calls
+    /// made through a handle, and departure is a property of the connection
+    /// underneath, which both handles share.
     pub fn watch(&self) -> Watch {
         Watch::on(self.connection())
     }
