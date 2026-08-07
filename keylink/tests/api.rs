@@ -38,7 +38,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink::{
-    mount, ActorId, Allowlist, Body, BodyReader, Caller, Eviction, KeyedService, MountError,
+    mount, ActorId, Allowlist, Body, BodyReader, Caller, Ended, Eviction, KeyedService, MountError,
     Origin, Reply,
 };
 
@@ -86,7 +86,10 @@ async fn the_three_unparameterized_names_still_resolve_bare() {
     // so it is inferred — and the only thing here to infer it from is the
     // closure's annotation. That was true before the per-service rewrite and it
     // is unchanged by it: drop the `: depot::Mailbox` and this is `E0282`.
-    let _ = mount(|mut inbox: depot::Mailbox| async move { while inbox.recv().await.is_some() {} });
+    let _ = mount(|mut inbox: depot::Mailbox| async move {
+        while inbox.recv().await.is_some() {}
+        Ended::Stopped
+    });
 }
 
 #[tokio::test]

@@ -1028,7 +1028,14 @@ fn an_actor_status_claims_only_what_it_measures(status: ActorStatus) -> (bool, u
 /// measure": there is no second field list to keep in step, because there is no
 /// second struct. A field claiming the parked-sender count would have to be
 /// added to `ActorStatus`, where the destructure above refuses it.
-fn the_inspect_service_reports_the_status_type_itself() -> crate::inspect::Response {
-    let actors: fn(Vec<ActorStatus>) -> crate::inspect::Response = crate::inspect::Response::Actors;
+///
+/// `crate::console::inspect` and not `crate::inspect`: the root re-export is a
+/// curated five names now, and `Response` is deliberately not one of them. An
+/// in-crate probe reaches the generated module where it is defined, which is
+/// also the honest spelling — this claim is about keylink's own wire and not
+/// about anything a caller can name.
+fn the_inspect_service_reports_the_status_type_itself() -> crate::console::inspect::Response {
+    let actors: fn(Vec<ActorStatus>) -> crate::console::inspect::Response =
+        crate::console::inspect::Response::Actors;
     actors(Vec::new())
 }

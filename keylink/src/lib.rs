@@ -234,9 +234,58 @@ pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
 pub use blobs::{BlobHandle, BlobId, Blobs, BlobsAdmission, Granting, Retention, MAX_GRANTS};
 pub use body::{Body, BodyReader};
 pub use console::{
-    inspect, Console, EndReason, EventPage, EventStream, Events, Inspector, LifecycleEvent,
-    NodeStatus,
+    Console, EndReason, EventPage, EventStream, Events, FollowRefused, Inspector, LifecycleEvent,
+    NodeKey, NodeStatus, MAX_FOLLOWERS,
 };
+
+/// The client and the wiring for keylink's own `Inspect` service.
+///
+/// # Five documented names, and it was the whole generated module
+///
+/// `service!` generates around thirty public items into a module — a `Request`,
+/// a `Response`, a `Mail`, a `Feed`, a keyed `System` and its builder, a
+/// `KeyedClient`, six spawn doors and a `blocking` submodule. For a service **a
+/// caller writes**, all of that is theirs and belongs in their crate. `Inspect`
+/// is keylink's own, so every one of those was keylink's public API —
+/// `std::mem::size_of::<keylink::inspect::Mail>()` compiled — which is a
+/// compatibility promise about the shape of a mailbox enum nobody outside this
+/// crate can construct, consume or name a use for.
+///
+/// The wave that added this argued for two of them, the `Client` and the
+/// `alpn`. These five are that argument applied: what a program needs to **wire
+/// an inspector into a server** and what a console needs to **read one**. The
+/// `Inspect` service is never keyed, never hand-mounted and never implemented by
+/// anybody but [`Inspector`], so none of the rest has a caller.
+///
+/// A second, `#[doc(hidden)]` group follows it, and it is not a second surface:
+/// those are the names the *generated documentation above* cross-references,
+/// because `service!` writes its docs for a module whose siblings are all
+/// public. Hiding rather than dropping them is the house rule's middle tier —
+/// `#[doc(hidden)] pub` when only the macro must name it — and it is what keeps
+/// `mise run docs` a gate rather than twelve broken links.
+///
+/// `tests/api.rs` could not have caught the original: it pins that names
+/// *resolve*, which is the opposite question. So the guard is here, and it is an
+/// absence:
+///
+/// ```compile_fail
+/// let _ = std::mem::size_of::<keylink::inspect::Mail>();
+/// ```
+///
+/// ```compile_fail
+/// let _: Option<keylink::inspect::System> = None;
+/// ```
+pub mod inspect {
+    pub use crate::console::inspect::{actor_wired, alpn, Client, Feeds, Handle};
+
+    /// Named only so that the generated rustdoc above resolves its own
+    /// cross-references. Nothing outside this crate has a use for one.
+    #[doc(hidden)]
+    pub use crate::console::inspect::{
+        actor, actor_with, at, keyed_service, serve, service, spawn, spawn_wired, Actor, Handler,
+        KeyedClient,
+    };
+}
 pub use error::{ConfigError, Error, Result, Transport};
 pub use idempotency::{
     Idempotency, IdempotencyRefusal, KeyState, MAX_ATTACH, MAX_RECORDED_BYTES, MAX_RECORDS,

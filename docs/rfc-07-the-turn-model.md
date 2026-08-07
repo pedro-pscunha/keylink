@@ -2934,3 +2934,129 @@ wave finds a decision instead of an omission:
   the graph today: a turn blocked on another actor is blocked inside a caller's
   future, and nothing records who it is waiting for. `Handle` documents a self-call
   as a deadlock rather than detecting one. Recorded as wanted and unbuilt.
+
+---
+
+## 11. Wave 6, reviewed — three refusals in §10.8 that did not survive contact
+
+Appended rather than edited, per CONTRIBUTING.md: what §10.8 says is what was
+believed when Wave 6 landed, and this section is what a review found afterwards.
+Read together, the pair is the record. All three moved `keylink/Inspect`'s ALPN
+from `080c9e481c937d67` to `7bbd34fa83c9060c`; `keylink/Probe` did not move.
+
+### 11.1 "Bound the parked followers with a number" — the stated bound was false
+
+§10.8 refuses a cap because *"every parked `Deferred` is one open QUIC stream,
+and iroh caps those at `max_concurrent_bidi_streams` per connection times the
+peers the allowlist admits. A second cap would be a second bound on one thing."*
+
+Both halves of that are wrong, and in opposite directions.
+
+**The entry outlives the stream.** Nothing removed a `(after, Deferred)` from
+`Inspector::waiting` except `on_events` finding a page for it. A peer that opened
+a stream, called `Follow` and went away left its entry behind until the node
+recorded *something*, which on a quiet node is never. So the list was not bounded
+by open streams; it was bounded by event traffic, which is the thing a console
+watches precisely because it may be zero.
+
+**And a cursor at or above `seq` was never released at all.** `page(after)`
+answers `None` for it forever, so it was re-pushed on every event — and
+`on_events` walked the whole vector calling `page()` per waiter, so the cost was
+`O(waiting × history)` per event as well. `follow(u64::MAX - 1)` is the limit
+case: it needs 2^64 events. Compiled by the reviewer: ten peers holding one each,
+then fifty mounts, and all ten `Deferred`s retained across all fifty.
+
+That is the refused-designs table's own argument — *an unbounded mailbox converts
+backpressure into memory growth and a latency problem into an OOM* — turned
+inward, on the first service this crate puts on the wire, reachable by one call
+from an admitted-but-buggy console.
+
+**Both remedies landed, because they close different halves.** `Follow` answers
+`Result<EventPage, FollowRefused>`; a cursor **ahead** of the log is refused as a
+client error rather than waited on, and a call arriving past `MAX_FOLLOWERS`
+(128) is refused as `Crowded`. The refusal is what makes the cap's bound honest:
+every parked cursor is now `<= seq` as of its park, so the next recorded event is
+past all of them and the list is emptied by every event. Nothing accumulates.
+
+The general lesson is the one this project keeps relearning: **a bound stated in
+terms of something the code does not actually track is not a bound.** The stream
+was never consulted; only the event was.
+
+### 11.2 `EventPage::next`'s restart property was unreachable — and the same refusal implements it
+
+§10.9 took kameo's `Snapshot::seq` property, *"a `next` that went backwards is a
+process that restarted"*. Through the shipped client it could not happen: the
+sequence counter starts at zero in every process, so `follow(at = 50)` against a
+restarted node found nothing `> 50` and **parked** — until fifty fresh events
+existed, and then answered with a `lost` computed against the new ring, the new
+incarnation's first fifty events gone and unreported. The console never saw a
+`next` go backwards because it never got a `next` at all.
+
+`FollowRefused::Ahead { after, seq }` is the property, delivered immediately and
+with both numbers. A node whose log is *behind* a cursor that was correct a
+moment ago is, for a counter that only goes up, not the same log.
+
+`Console::events` deliberately does not catch and retry it. Resuming silently
+would hide the restart, which is the whole signal.
+
+### 11.3 "the erasure is narrow on purpose" — it was narrow in capability and not in lifetime
+
+§10.8 defends `Arc<dyn Fn() -> Vec<ActorStatus>>` as a narrow erasure: no mount,
+no shutdown, no abort, no downcast. That much held. What it did not say is that
+the closure captured a `System` **clone**, so an inspector *owned* the registry:
+a program that dropped its own system went on running every actor in it, for as
+long as the inspect actor lived. `spawn_sweeper` was already `Weak` for exactly
+this reason, which is what made the strong reference here the odd one out rather
+than a considered choice.
+
+`System::weak_status` is the version §10.8 describes. The signature becomes
+`Fn() -> Option<Vec<ActorStatus>>`, and the `None` is the system being gone —
+which a caller must be able to tell from a system with nothing in it.
+
+### 11.4 Three smaller ones, recorded because each was a claim rather than an omission
+
+- **`Ended::Feed { name: "Events" }` was unreachable.** The `Inspector` held an
+  `Events` clone for the drop counter, which is a `Sender` for the very channel
+  it reads, held inside the actor reading it. "Every clone dropped" could not
+  happen while the actor existed. It keeps only the `Arc<AtomicU64>` now.
+- **§10.8's "what is dropped is counted and published, at `NodeStatus::lost` for
+  the channel and `EventPage::lost` for the ring" is true and was not enough.**
+  The two counters live on two different RPCs, and the loop `Console`'s own
+  documentation tells a reader to write called only one of them — so a burst
+  deeper than `Events::new(depth)`, which is the *likelier* loss, was invisible
+  to the recipe. `EventPage::dropped` carries the sink's count now.
+- **§10.3's "the property that makes it checkable" claimed a test that cannot
+  exist.** It said an actor with N subscribers reads `busy == false`. `busy` is a
+  registry fact and the `Inspector` is a `LocalActor` with no registry entry, so
+  there is nothing to read it from. The property that *is* proven — twenty calls
+  answered while a subscriber is parked — is the sharper one anyway: a handler
+  parked inside a turn fails it, while a flag can be wrong without anybody being
+  kept waiting.
+
+### 11.5 And one that was not §10.8's at all: the fourth way out of a registry
+
+Recorded here because three reviewers found it from three directions and it is
+the same defect §10.5 says this wave closed *half* of.
+
+An actor that ends **on its own** — a feed that runs out, a handler that panics,
+an observer that refuses, a supervisor that gives up — was never removed from the
+registry and never reported. Entries left the map at exactly three sites, and
+every one of them is *somebody asking*. At the same moment on the same node:
+`System::status()` and `Actors()` listed the actor with `busy: false`, a real
+call answered `NoSuchActor`, and the event log held no `Ended`. Under
+`Eviction::Never` that was permanent, and the id was unmountable for the life of
+the process.
+
+`registry.rs`'s own rustdoc had already named the repair — *"the keyed loop
+already computes the true `Ended` and throws it away. Whoever wants it should
+give the loop somewhere to put it"* — and that is what landed: `Loop<M>` resolves
+to `Ended` rather than `()`, so a loop cannot return without naming its ending,
+and `Registry::entry` wraps the spawn in the one place an actor's task is
+started. One mechanism serves both keyed paths, supervised and not, because a
+**restart is not an ending**: `supervise` runs many incarnations behind one
+`Output` and returns only when there will be no more.
+
+`route` checking `Sender::is_closed` was the other remedy offered and is refused
+on its merits: it repairs *routing* and leaves `System::status` lying and the
+`Lifecycle` untold, and it cannot carry a reason — `is_closed` knows that an
+actor is gone and never why.
