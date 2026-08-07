@@ -92,6 +92,27 @@ keylink::service! {
     /// [`Desk`] has the same method, and the duplication is deliberate: the two
     /// panics that escape a turn's guard — a factory's and a feed's — need an
     /// actor that has **both** a feed and a parked reply, and `Desk` has no feed.
+    ///
+    /// # This moved `Ticker`'s ALPN, and the reason is the `rpc` rather than the
+    /// `#[defer]`
+    ///
+    /// Worth stating where it was done rather than only in a report. The attribute
+    /// is free — `protocol.rs` holds
+    /// `adding_defer_to_a_method_does_not_move_the_contract_hash`, and
+    /// `adding_a_feed_to_a_service_does_not_move_the_contract_hash` beside it — so
+    /// what moved the hash is the **request enum gaining a variant**. The M1 guards
+    /// could not have been built without moving it.
+    ///
+    /// It is inconsequential, and the reason is not "the pins passed". The two
+    /// pinned ALPNs cover the **shared hashed graph every service reaches** —
+    /// `Envelope`, `WireRequest`/`WireResponse`, `Outcome`, `RemoteError` and
+    /// everything beneath them — by value, twice, so *no shared contract moved* is
+    /// a supported claim. What they do not cover is one service's own declaration
+    /// changing, and that needs no cover: a service's client and server compile
+    /// together, so a mismatch between them is unreachable. Pins earn their keep
+    /// against a peer built from another revision, and `Ticker` has no such peer —
+    /// it exists only in this test binary. `tests/push.rs` declares a *separate*
+    /// service of the same name.
     #[defer]
     rpc Park(order: u64) -> u64;
     /// The input a supervisor cannot re-open by itself. A feed that ends stops
