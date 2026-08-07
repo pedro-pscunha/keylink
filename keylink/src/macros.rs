@@ -125,13 +125,366 @@
 /// RPC names are written in `CamelCase` (they become enum variants); the
 /// generated methods are `snake_case`.
 ///
+/// ## `#[defer]`: one attribute keylink reads, and the rest it forwards
+///
+/// An `rpc` marked `#[defer]` is handed its own reply channel and may answer from
+/// a later turn. Nothing about the wire changes — a deferred method is an ordinary
+/// `rpc` to the caller, which blocks on its stream exactly as today, and the ALPN
+/// does not move. See [`Reply`](crate::Reply) for the handler shape and
+/// [`Replied`](crate::Replied) for why forgetting to answer is a compile error.
+///
+/// It is the **only** attribute this macro interprets. Every other one is
+/// forwarded verbatim to the sites that take one, which is why reading this one at
+/// all needs a token-muncher: `service!`'s matcher captures attributes as
+/// `#[$meta:meta]`, and a `meta` fragment is opaque to further matching. So the
+/// declarations are munched a token at a time *before* the fragment forms, with
+/// interpreted attributes accumulated separately from pass-through ones. See
+/// [`__keylink_service_munch`](crate::__keylink_service_munch).
+///
+/// `#[defer]` on a `tell`, `send`, `recv` or `blob` is a compile error naming the
+/// reason — `__keylink_defer_check!` has the four messages, and this is one of
+/// them:
+///
+/// ```compile_fail
+/// keylink::service! {
+///     service Orders;
+///     rpc Fill(price: u64) -> u64;
+///     #[defer]
+///     tell Note(line: String) -> ();      // <- a `tell` has no reply to defer
+/// }
+/// ```
+///
+/// Nothing on the fence, because rustdoc does not check what follows
+/// `compile_fail` and the failure here is a `compile_error!` rather than an error
+/// code anyway. The refusal is watched to fail: `__keylink_defer_check!`'s arm for
+/// `tell` renamed away leaves this fence green, which was red-tested.
+///
+/// The `rpc` above is not padding. A `service!` of one method generates an
+/// `into_<rpc>` whose catch-all arm is `unreachable_patterns`, and a probe should
+/// not be able to fail for that instead.
+///
+/// ## `feed`: an actor's second input, and the one declaration with no wire form
+///
+/// ```ignore
+/// keylink::service! {
+///     service Orders;
+///     rpc  Cancel(id: OrderId) -> Result<(), Rejected>;
+///     feed Fills(fill: Fill);            // local only, never on the wire
+/// }
+///
+/// // generated on the Actor trait — no Caller (nobody called), no return (no
+/// // reply channel)
+/// async fn on_fills(&mut self, fill: Fill);
+/// ```
+///
+/// A feed is a locally wired [`Stream`](crate::Stream), selected against the
+/// mailbox inside the actor's own loop, so a feed item is a **turn**: the panic
+/// guard, the observer chain and a durability adapter's commit all apply to one.
+/// Wire it at spawn with `actor_wired(state, observers, Feeds::new(stream))`, or
+/// `spawn_wired(..)` for a keyed actor.
+///
+/// Four things follow, and each is a decision rather than an accident:
+///
+/// - **No `Caller` and no return.** Nobody called, so there is nobody to answer. A
+///   feed that needs a reply is an `rpc`.
+/// - **Not on the wire.** A `feed` produces no `Request` variant, no `Response`
+///   variant, no `WireKinds` entry and no client method, so **the ALPN does not
+///   move** when you add one. It is not a sixth `kind` at all: the muncher puts it
+///   in a second list, and the wire generators never see that list.
+/// - **Exactly one argument**, which is its item — a stream yields one value at a
+///   time. Several fields is a struct, which is a domain type rather than an
+///   argument list.
+/// - **A feed that ends, ends the actor**, as
+///   [`Ended::Feed`](crate::Ended::Feed). A silently dead subscription serving
+///   stale state is the failure that prevents.
+///
+/// `#[defer]` on a `feed` is a compile error, for the reason a `tell` is one: there
+/// is no reply to defer. `__keylink_defer_check!` has the message and this is it:
+///
+/// ```compile_fail
+/// keylink::service! {
+///     service Orders;
+///     rpc Fill(price: u64) -> u64;
+///     #[defer]
+///     feed Ticks(tick: u64);       // <- a `feed` has no reply, and no caller
+/// }
+/// ```
+///
+/// Nothing on the fence, for the reason the `tell` fence above gives. And the same
+/// hazard applies: renaming `__keylink_defer_check!`'s `feed` arm away leaves this
+/// fence red for the *wrong* reason — "no rule expected `feed`" — so it is
+/// red-tested the other way, by making that arm a no-op, which turns the fence
+/// green with *"Test compiled successfully, but it's marked `compile_fail`"*.
+///
+/// A service that declares a `feed` cannot be spawned through a door that wires
+/// none. An unwired feed would be a stream that never yields, which is silence a
+/// caller cannot tell apart from a quiet exchange, so the doors that take no
+/// `Feeds` refuse it at the call site instead:
+///
+/// ```compile_fail
+/// keylink::service! {
+///     service Orders;
+///     rpc Fill(price: u64) -> u64;
+///     feed Ticks(tick: u64);
+/// }
+///
+/// struct Book;
+/// impl orders::Actor for Book {
+///     async fn fill(&mut self, _cx: keylink::Caller<'_>, price: u64) -> u64 { price }
+///     async fn on_ticks(&mut self, _tick: u64) {}
+/// }
+///
+/// // Fails in `SpawnableUnfed::<Book>::CHECK`, a `const` assertion on a generic
+/// // type, so it is evaluated HERE — at the instantiation — and nowhere else.
+/// // `actor_wired(Book, vec![], orders::Feeds::new(stream))` is the door.
+/// let _ = orders::actor(Book);
+/// ```
+///
+/// The `rpc` in both fences is not padding: a `service!` of one method generates an
+/// `into_<rpc>` whose catch-all arm is `unreachable_patterns`, and a probe should not
+/// be able to fail for that instead. In the second, the `impl Actor` block is not
+/// padding either — without it the fence would pass on the missing impl rather than
+/// on the refusal, which is the shape of a guard that proves nothing.
+///
 /// The calling crate needs `serde`, `postcard-schema` and `tokio` as
 /// dependencies — the generated code derives against them by path.
 #[macro_export]
 macro_rules! service {
+    ( service $svc:ident; $( $rest:tt )+ ) => {
+        $crate::__keylink_service_munch! {
+            @svc [ $svc ]
+            @done [ ]
+            @feeds [ ]
+            @attrs [ ]
+            @defer [ ]
+            @rest [ $( $rest )+ ]
+        }
+    };
+}
+
+/// The token-muncher that reads `#[defer]` before a `meta` fragment can hide it.
+///
+/// **This exists because `macro_rules!` cannot pattern-match on `#[defer]` once it
+/// has been captured.** `service!` had one matcher capturing
+/// `$( #[$meta:meta] )*`, and a `meta` fragment is an opaque AST node: nothing
+/// downstream can ask whether it is `defer`. Those metas are forwarded verbatim to
+/// nine sites — the `Request` variant, the `Actor`, `Handler`, `Client`,
+/// `ActorRef` and blocking methods, and the local `Handle` method — so `#[defer]`
+/// parsed happily and was re-emitted where it is not an attribute at all,
+/// producing `cannot find attribute` from inside a `paste!` and pointing at
+/// `macros.rs` rather than at the declaration the author wrote.
+///
+/// So the raw tokens are walked one declaration at a time, and each declaration's
+/// attribute run is split in two: `@defer` for the one keylink reads and `@attrs`
+/// for everything it passes on. Both are closed by the declaration that follows
+/// them and handed to [`__keylink_service`](crate::__keylink_service) as one
+/// record per method.
+///
+/// Wave 1b established that a per-*kind* answer needs a helper macro
+/// (`__keylink_mail_body!` and its four siblings). A per-*attribute* answer needs a
+/// muncher, and this is the whole of it.
+///
+/// # It also partitions, and that is how `feed` cost two arms instead of twelve
+///
+/// A sixth declaration kind reached through `$kind:ident` would need an arm in each
+/// of the thirteen helper macros — `__keylink_response_ty!`, `__keylink_is_blob!`,
+/// `__keylink_client_method!` and the rest — every one of them saying "not on the
+/// wire" in a different shape, and one of them forgetting would put a `feed` in a
+/// `Request` enum.
+///
+/// So a `feed` is not a kind. It goes into a **second list** here, and
+/// [`__keylink_service`](crate::__keylink_service) receives
+/// `@wire [ .. ] @feeds [ .. ]`. The wire list expands into `Request`, `Response`,
+/// `Contract`, `Handler`, `Client`, `Mail` and the rest exactly as before, and the
+/// feed list reaches none of them. **"Feeds are not on the wire" is therefore a fact
+/// about which list a declaration is in**, checked by the compiler at every one of
+/// those sites, rather than a claim thirteen macros have to keep agreeing about.
+///
+/// The two arms it did cost are the well-formed `feed Name(item: Type);` and the
+/// refusal for any other shape of one.
+///
+/// `#[defer]` is idempotent rather than an error when doubled, because a matcher
+/// that refused the second one would report it as "no rule expected this token",
+/// which is a worse error than none.
+///
+/// Recursion is one step per attribute plus one per declaration, so the deepest
+/// service in this repository munches about a dozen frames against a default
+/// `recursion_limit` of 128.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_service_munch {
+    // The one attribute keylink reads. Never forwarded.
     (
-        service $svc:ident;
-        $( $( #[$meta:meta] )* $kind:ident $rpc:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty; )+
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @defer [ $( $_seen:tt )* ]
+        @rest [ #[defer] $( $rest:tt )* ]
+    ) => {
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ $( $attrs )* ] @defer [ defer ]
+            @rest [ $( $rest )* ]
+        }
+    };
+    // Everything else, kept in order and forwarded verbatim.
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ #[$meta:meta] $( $rest:tt )* ]
+    ) => {
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ $( $attrs )* #[$meta] ] @defer [ $( $seen )* ]
+            @rest [ $( $rest )* ]
+        }
+    };
+    // One `feed`, into the OTHER list. No return type, and exactly one argument.
+    //
+    // BEFORE the wire arm, and the order is load-bearing: `feed Fills(f: F) -> ();`
+    // matches the wire arm with `$kind = feed`, which would put a feed in the
+    // `Request` enum and then fail inside `__keylink_response_ty!` with "no rule
+    // expected `feed`", pointing at a macro the author did not write. The arm below
+    // catches that shape instead and says what is wrong with it.
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed $feed:ident ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $crate::__keylink_service_munch! {
+            @svc $svc
+            @done [ $( $done )* ]
+            @feeds [
+                $( $feeds )*
+                { [ $( $attrs )* ] [ $( $seen )* ] feed $feed ( $arg : $ty ) }
+            ]
+            @attrs [ ] @defer [ ]
+            @rest [ $( $rest )* ]
+        }
+    };
+    // A `feed` written with a return type.
+    (
+        @svc $svc:tt @done $done:tt @feeds $feeds:tt @attrs $attrs:tt @defer $defer:tt
+        @rest [ feed $feed:ident ( $( $anything:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        ::core::compile_error!(::core::concat!(
+            "`feed ",
+            ::core::stringify!($feed),
+            "` has no return type, because nothing is waiting for one. An item \
+             arrived off a stream; there is no caller and no reply channel, which \
+             is why the generated handler is `async fn on_",
+            ::core::stringify!($feed),
+            "(&mut self, item: Item)` and returns nothing. Write \
+             `feed ",
+            ::core::stringify!($feed),
+            "(item: Item);`. If something IS waiting for an answer, that something \
+             called: make it an `rpc`."
+        ));
+    };
+    // A `feed` that is not one argument. Said here rather than left to the
+    // catch-all, because the catch-all cannot name the declaration.
+    (
+        @svc $svc:tt @done $done:tt @feeds $feeds:tt @attrs $attrs:tt @defer $defer:tt
+        @rest [ feed $feed:ident ( $( $anything:tt )* ) ; $( $rest:tt )* ]
+    ) => {
+        ::core::compile_error!(::core::concat!(
+            "`feed ",
+            ::core::stringify!($feed),
+            "` must declare exactly one argument, which is its item. A feed is \
+             wired from a `Stream`, and a stream yields one value at a time - so \
+             `feed ",
+            ::core::stringify!($feed),
+            "(fill: Fill);` and then `Feeds::new(stream_of_fills)`. For several \
+             fields, name the struct: that is a domain type, not an argument list, \
+             and a feed with two arguments would only make the item an anonymous \
+             tuple."
+        ));
+    };
+    // One complete wire declaration, which closes the attribute run above it.
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident $rpc:ident ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $crate::__keylink_service_munch! {
+            @svc $svc
+            @done [
+                $( $done )*
+                { [ $( $attrs )* ] [ $( $seen )* ] $kind $rpc ( $( $args )* ) -> $ret }
+            ]
+            @feeds [ $( $feeds )* ]
+            @attrs [ ] @defer [ ]
+            @rest [ $( $rest )* ]
+        }
+    };
+    // Done, with at least one wire declaration and no attribute left dangling.
+    (
+        @svc [ $svc:ident ] @done [ $( $done:tt )+ ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ ] @defer [ ] @rest [ ]
+    ) => {
+        $crate::__keylink_service! {
+            $svc;
+            @wire [ $( $done )+ ]
+            @feeds [ $( $feeds )* ]
+        }
+    };
+    // Feeds and nothing else. Refused, and the message says what is missing rather
+    // than "at least one declaration is required" — there ARE declarations.
+    (
+        @svc [ $svc:ident ] @done [ ] @feeds [ $( $feeds:tt )+ ]
+        @attrs [ ] @defer [ ] @rest [ ]
+    ) => {
+        ::core::compile_error!(::core::concat!(
+            "`service ",
+            ::core::stringify!($svc),
+            "` declares only feeds. A `service!` generates a wire contract - a \
+             `Request`, a `Response`, an ALPN, a `Client` and a `Handler` - and a \
+             feed is local: it has no variant, no schema and no client method, \
+             which is what 'feeds are not on the wire' means. So a feeds-only \
+             service would be an empty protocol with a state attached. Declare at \
+             least one `rpc`, `tell`, `send`, `recv` or `blob` beside the feeds, \
+             or write a plain struct on a task."
+        ));
+    };
+    // Anything else is a malformed declaration, and saying so beats "no rule
+    // expected this token" pointing into a macro the author did not write.
+    ( $( $anything:tt )* ) => {
+        ::core::compile_error!(
+            "a `service!` body is `service Name;` followed by one or more \
+             declarations of the form `kind Method(arg: Type) -> Ret;` or \
+             `feed Name(item: Type);`, each optionally preceded by attributes. At \
+             least one non-feed declaration is required, and an attribute must be \
+             followed by a declaration."
+        );
+    };
+}
+
+/// Everything `service!` generates, from declarations the muncher has already
+/// split into pass-through attributes and the interpreted `#[defer]`.
+///
+/// Two lists, and the split is load-bearing.
+///
+/// `@wire` is one record per method — `{ [attrs] [defer?] kind Name(args) -> Ret }`.
+/// The `[defer?]` group is `[]` or `[defer]`, and it reaches exactly three of the
+/// thirteen helper macros — the `Actor` method, the mailbox arm and the served arm.
+/// The other ten do not know the attribute exists, because a deferred method's
+/// wire types, client methods, blocking method and local `Handle` method are
+/// byte-for-byte an ordinary `rpc`'s. That is the same statement as "the ALPN does
+/// not move", made in the shape of which macros take a parameter.
+///
+/// `@feeds` is one record per feed — `{ [attrs] [defer?] feed Name(item: Type) }` —
+/// and it expands at exactly four sites: the `Actor` trait's `on_*` method, the
+/// `Feed` item enum with its `Turn` impl, the `Feeds` bundle, and the `DECLARES_FEEDS`
+/// fold. It reaches **no** wire site at all, which is what makes "a feed is not on the
+/// wire" a compile-time property rather than thirteen agreeing macros. The `[defer?]`
+/// group is carried only so `__keylink_defer_check!` can refuse it.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_service {
+    (
+        $svc:ident;
+        @wire [ $( { [ $( #[$meta:meta] )* ] [ $( $defer:tt )? ]
+             $kind:ident $rpc:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty } )+ ]
+        @feeds [ $( { [ $( #[$fmeta:meta] )* ] [ $( $fdefer:tt )? ]
+             feed $feed:ident ( $farg:ident : $fty:ty ) } )* ]
     ) => {
         $crate::pastey::paste! {
         pub mod [<$svc:snake>] {
@@ -141,6 +494,16 @@ macro_rules! service {
             /// Namespaced by crate, so two crates can define `Inventory` without
             /// their endpoints colliding.
             const PROTOCOL: &str = concat!(env!("CARGO_PKG_NAME"), "/", stringify!($svc));
+
+            // One check per declaration, and the only place `#[defer]` is refused.
+            // The three sites that shape a deferred method fall back to the
+            // ordinary signatures for a kind that cannot defer, so a mistake here
+            // produces exactly one error — the one that says why — instead of that
+            // error plus a service whose trait no longer matches its mailbox.
+            $( $crate::__keylink_defer_check!([$( $defer )?], [<$kind>], $rpc); )+
+            // And once per feed, which is why the feed record carries a `[defer?]`
+            // group it otherwise has no use for.
+            $( $crate::__keylink_defer_check!([$( $fdefer )?], feed, $feed); )*
 
             #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, ::postcard_schema::Schema)]
             pub enum Request {
@@ -259,6 +622,14 @@ macro_rules! service {
             const DECLARES_SEND: bool =
                 false $( | $crate::__keylink_is_send!([<$kind>]) )+;
 
+            /// Whether this service declares a `feed`.
+            ///
+            /// Folded from the feed list itself rather than from a per-kind helper,
+            /// which is the shape of the whole decision: a feed is a second list,
+            /// so "are there any" is a repetition over that list and needs no arm
+            /// anywhere else.
+            const DECLARES_FEEDS: bool = false $( | { let _ = ::core::stringify!($feed); true } )*;
+
             /// The compile-time refusal for [`DECLARES_SEND`].
             ///
             /// Generic in `A` **on purpose**, and that is the whole trick: an
@@ -282,6 +653,34 @@ macro_rules! service {
                      that: a layer refuses the caller without ending the turn. \
                      Serve this with `service(handler, allow)` instead, or move \
                      the upload to a second service. RFC-04 s10.4."
+                );
+            }
+
+            /// The compile-time refusal for the doors that wire no feeds.
+            ///
+            /// Generic in `A` for the reason [`ServableAsActor`] is: an associated
+            /// const of a generic type is evaluated where it is *instantiated*, so
+            /// this fires at the call site that spawned an actor without its feeds
+            /// and nowhere else. A plain `const` would refuse the whole service at
+            /// the `service!` invocation.
+            ///
+            /// The alternative was letting an unwired feed be a stream that never
+            /// yields, which is the silent-fallback shape this crate refuses: an
+            /// actor that quietly never sees a fill is indistinguishable from an
+            /// exchange that is quiet.
+            struct SpawnableUnfed<A>(::core::marker::PhantomData<A>);
+
+            impl<A> SpawnableUnfed<A> {
+                const CHECK: () = ::core::assert!(
+                    !DECLARES_FEEDS,
+                    "this service declares a `feed`, so it cannot be spawned \
+                     through a door that wires none - an unwired feed would be a \
+                     stream that never yields, which is silence a caller cannot \
+                     tell from a quiet feed. Use `actor_wired(state, observers, \
+                     Feeds::new(..))` for one actor in this process, or \
+                     `spawn_wired(state, observers, Feeds::new(..))` for one \
+                     mounted in a System. `Feeds::new` takes one argument per \
+                     declared feed, so forgetting one is an argument count."
                 );
             }
 
@@ -351,31 +750,456 @@ macro_rules! service {
 
             // ───────────────────────────────────────────── the actor twin
 
-            /// What the sealed payload carries in each direction: the bare
-            /// `Request` up, the bare `Response` down.
+            /// Namespaced like [`PROTOCOL`] and then some: a node can serve this
+            /// service both ways at once, so the two need different ALPNs.
             ///
-            /// A refusal is deliberately not in here. It travels in the actor
-            /// system's own `Outcome`, one layer out, where the system's ALPN
-            /// already covers it.
+            /// The hashes would differ anyway — one contract names
+            /// `WireRequest<Request>` and the other
+            /// `WireRequest<Addressed<Request>>` — so this suffix is not what
+            /// makes them distinct. It is what makes them *readable*: an ALPN is
+            /// the one keylink string that turns up in a packet capture and in a
+            /// `DuplicateAlpn` error, and `<crate>/<Service>/keyed/<hash>` says
+            /// which of the two you are looking at without hashing anything.
+            const KEYED_PROTOCOL: &str =
+                concat!(env!("CARGO_PKG_NAME"), "/", stringify!($svc), "/keyed");
+
+            /// Hashed to produce the keyed ALPN, exactly as [`Contract`] is for
+            /// the singleton one.
+            ///
+            /// Both fields MUST name the `Wire*` types, the same ones the wire
+            /// names — and the request arm MUST name `Addressed`, which is what
+            /// the keyed wire actually carries. The hand-written actor contract
+            /// this replaces declared a bare `ActorRequest` while `serve_one`
+            /// read a `WireRequest` off the frame, so its ALPN was derived from a
+            /// type that was not what it put on the wire. That is the exact
+            /// drift `tests/protocol.rs` refuses for the generated path, and the
+            /// hand-written one evaded it by not being generated.
             #[derive(::postcard_schema::Schema)]
-            #[allow(dead_code)]
-            struct ActorContract {
-                request: Request,
-                response: Response,
+            struct KeyedContract {
+                request: $crate::Envelope<$crate::WireRequest<$crate::Addressed<Request>>>,
+                response: $crate::Envelope<$crate::WireResponse<Response>>,
+                /// keylink's own wire surface, for the reason [`Contract`] has
+                /// this field.
+                kinds: $crate::WireKinds,
             }
 
-            /// The schema hash a caller declares and a registry compares
-            /// against, for actors of this service.
+            /// `<crate>/<Service>/keyed/<16-hex schema hash>`.
             ///
-            /// Derived from the same type graph as [`alpn`], under the same
-            /// protocol name. Change any type reachable from `Request` or
-            /// `Response` and this moves on its own, so a peer built against
-            /// the old shapes is refused with
-            /// [`RemoteError::ActorSchemaMismatch`](keylink::RemoteError)
-            /// before its payload is decoded.
-            pub fn schema() -> u64 {
-                static CELL: ::std::sync::OnceLock<u64> = ::std::sync::OnceLock::new();
-                *CELL.get_or_init(|| $crate::actor_schema::<ActorContract>(PROTOCOL))
+            /// Derived, never hand-maintained, and distinct from [`alpn`]: a
+            /// node can serve this service as a singleton and as an actor system
+            /// at the same time, and one router owns one ALPN.
+            pub fn keyed_alpn() -> &'static [u8] {
+                static CELL: ::std::sync::OnceLock<::std::vec::Vec<u8>> =
+                    ::std::sync::OnceLock::new();
+                CELL.get_or_init(|| $crate::derive_alpn::<KeyedContract>(KEYED_PROTOCOL))
+                    .as_slice()
+            }
+
+            /// What one of this service's mailboxes carries: one variant per
+            /// declared method, plus the one a request from a peer lands in.
+            ///
+            /// **Local only, and never serialized.** That is what lets a variant
+            /// hold a [`BodyReader`](keylink::BodyReader) and a reply channel at
+            /// all — the wire types are [`Request`] and [`Response`], and this is
+            /// neither. It derives nothing: no `Debug`, no `Serialize`, no
+            /// `Schema`. Nothing hashes it, so nothing about it can move an ALPN.
+            ///
+            /// Each per-method variant carries that method's own declared
+            /// arguments and a [`Reply`](keylink::Reply) of that method's own
+            /// return type. There is no shared `Response` to pull a value out of,
+            /// so the "wrong variant" failure that cannot happen has no type to
+            /// happen in — and the reply is a value the loop **holds** rather
+            /// than a sender sealed inside a closure it can only call.
+            ///
+            /// The attributes written on a method in `service!` are deliberately
+            /// **not** forwarded here, exactly as they are not forwarded to
+            /// [`Response`]'s variants: they are written for the wire enum, and
+            /// a `#[serde(..)]` re-emitted onto an enum with no `Serialize`
+            /// derive is `cannot find attribute` pointing at this file.
+            ///
+            /// # `Served` is one variant and not one per method
+            ///
+            /// A request that arrived over the wire is already a [`Request`], and
+            /// `__actor_turn` is the match that takes one apart. One variant
+            /// keeps that decode in one place and keeps the reply typed as the
+            /// [`Response`] a peer is owed. A method **named** `Served` would
+            /// collide with it; rename the method.
+            ///
+            /// # `send` and `recv` get variants nothing builds
+            ///
+            /// [`Handle`] has no `send` and no `recv` method — a `BodyReader`
+            /// and a [`Body`](keylink::Body) are a QUIC stream's two halves and
+            /// there is no stream in this process — so for a service declaring
+            /// one, that variant is dead. It exists because `macro_rules!`
+            /// cannot emit a variant for some kinds and not others: a macro call
+            /// is not legal where a variant goes, so the alternative is a
+            /// token-muncher over the whole declaration list. Both are written to
+            /// be *correct* if something ever did build one, which is the honest
+            /// alternative to an arm that panics.
+            #[doc(hidden)]
+            pub enum Mail {
+                $(
+                    $rpc {
+                        /// Where this message came from. Built by keylink and
+                        /// handed in; generated code never constructs one.
+                        origin: $crate::Origin,
+                        $( $arg: $ty, )*
+                        /// A `BodyReader` for `send` and `()` for every other
+                        /// kind, because only a `send` handler reads an upload
+                        /// inside its turn.
+                        body: $crate::__keylink_mail_body!([<$kind>]),
+                        /// Where this method's own answer goes.
+                        reply: $crate::Reply<$crate::__keylink_mail_answer!([<$kind>], $ret)>,
+                    },
+                )+
+                /// One request that arrived from a peer, answered with this
+                /// service's own typed [`Response`].
+                Served {
+                    /// Which peer, for [`Caller`](keylink::Caller) and for the
+                    /// idempotency marks a turn makes.
+                    origin: $crate::Origin,
+                    /// The service's own request, already decoded.
+                    request: Request,
+                    /// The payload streaming up beside it.
+                    body: $crate::BodyReader,
+                    /// Where the answer goes, before it is rendered for the wire.
+                    reply: $crate::Reply<(Response, $crate::Body)>,
+                },
+            }
+
+            /// **The** dispatch path: every message an actor of this service can
+            /// receive, in one match, running one turn each.
+            ///
+            /// There used to be two dispatchers and the second one was
+            /// `__keylink_local_method!`, whose arms called the trait method
+            /// directly and bypassed everything a turn owes a caller. The comment
+            /// that admitted it — on `__actor_turn`, where it is now recorded as
+            /// history — argued the split was harmless "because the caller is an
+            /// argument now". It was not harmless: a `Handle` call ran no
+            /// observer chain through the loop's own reply channel, so a method
+            /// kind that later wanted to defer its answer, or a feed that later
+            /// wanted to share this loop, would have had to be built twice and
+            /// would have compiled fine when it was only built once.
+            ///
+            /// Every arm is [`turn`](keylink::turn) or its deferring twin, which is
+            /// where the queue deadline, the panic guard, the observer chain, the
+            /// idempotency marks and the reply all are. An arm can get its own
+            /// arguments wrong; it cannot get a turn's policy wrong.
+            ///
+            /// # `Served` decodes the request HERE, and Wave 2c is why
+            ///
+            /// It used to hand the whole undecoded `Request` to one `turn` and let
+            /// a generated `__actor_turn` match on it inside the turn's closure.
+            /// That cannot express a deferred method: which of the two turns to run
+            /// is decided by the method, the closure runs *inside* the turn already
+            /// chosen, and a `macro_rules!` invocation is not legal where a match
+            /// arm goes — so the arms are written out here and the per-method
+            /// expression is a macro call, exactly as the local arms above are.
+            ///
+            /// This is forced rather than chosen, and the criterion that forces it
+            /// is "the contract hash does not move for adding `#[defer]`": the
+            /// `Request` variant of a deferred method must therefore exist, so this
+            /// match must have an arm for it, so that arm must be expressible.
+            ///
+            /// What it also buys: `__actor_turn` is gone, and with it the last
+            /// dispatcher that was not this one.
+            impl<A: Actor> $crate::Turn<A> for Mail {
+                async fn run(
+                    self,
+                    __state: &mut A,
+                    __hooks: &mut $crate::Hooks<A>,
+                ) -> ::core::option::Option<$crate::Ended> {
+                    match self {
+                        $(
+                            Mail::$rpc { origin, $( $arg, )* body, reply } =>
+                                $crate::__keylink_mail_arm!(
+                                    [$( $defer )?],
+                                    [<$kind>],
+                                    A,
+                                    __state,
+                                    __hooks,
+                                    origin,
+                                    ::core::stringify!($rpc),
+                                    reply,
+                                    body,
+                                    [<$rpc:snake>],
+                                    ($( $arg ),*)
+                                ),
+                        )+
+                        Mail::Served { origin, request, body, reply } => match request {
+                            $(
+                                Request::$rpc { $( $arg, )* } =>
+                                    $crate::__keylink_served_arm!(
+                                        [$( $defer )?],
+                                        [<$kind>],
+                                        A,
+                                        __state,
+                                        __hooks,
+                                        origin,
+                                        ::core::stringify!($rpc),
+                                        reply,
+                                        body,
+                                        [<$rpc:snake>],
+                                        Response,
+                                        $rpc,
+                                        ($( $arg ),*)
+                                    ),
+                            )+
+                        },
+                    }
+                }
+            }
+
+            /// One item from one of this service's `feed`s.
+            ///
+            /// **Local only, and never serialized**, like [`Mail`] and for a
+            /// stronger reason: a feed has no wire form at all. It derives nothing
+            /// and no `Contract` field can reach it, which is what makes "adding a
+            /// feed does not move the ALPN" a property of the code rather than a
+            /// promise — `tests/protocol.rs` pins it by comparing two declarations
+            /// of the same service that differ only by a feed.
+            ///
+            /// One enum across every feed rather than one type per feed, so that
+            /// [`Feeds::poll_next`] can rotate among the feeds through a table of
+            /// pollers that all answer the same type.
+            ///
+            /// Uninhabited for a service that declares no feed, which is what lets
+            /// the loop's feed arm exist unconditionally: a branch on a value that
+            /// cannot be built costs nothing.
+            #[doc(hidden)]
+            pub enum Feed {
+                $(
+                    /// One item from this feed, carrying its declared argument.
+                    $feed($fty),
+                )*
+            }
+
+            /// A feed item is a turn, and this is where that stops being a slogan.
+            ///
+            /// The same trait [`Mail`] implements, so the loop dispatches both
+            /// through one call. What differs is what a turn owes anybody:
+            /// [`feed_turn`](keylink::feed_turn) runs the handler inside the panic
+            /// guard and then the observer chain, and there is no queue deadline to
+            /// read, no idempotency mark to make and nobody to answer — a feed has
+            /// no [`Origin`](keylink::Origin) and no reply channel, because nobody
+            /// called it.
+            impl<A: Actor> $crate::Turn<A> for Feed {
+                async fn run(
+                    self,
+                    __state: &mut A,
+                    __hooks: &mut $crate::Hooks<A>,
+                ) -> ::core::option::Option<$crate::Ended> {
+                    match self {
+                        $(
+                            Feed::$feed($farg) => $crate::feed_turn(
+                                __state,
+                                __hooks,
+                                // The DECLARED name, so `TurnInfo::method` spells a
+                                // feed the way it spells an rpc and an operator
+                                // reads one metrics label.
+                                ::core::stringify!($feed),
+                                move |__on: &mut A| ::std::boxed::Box::pin(async move {
+                                    __on.[<on_ $feed:snake>]($farg).await
+                                }),
+                            )
+                            .await,
+                        )*
+                    }
+                }
+            }
+
+            /// Every feed this service declares, wired to a stream each.
+            ///
+            /// Built once, at spawn, and handed to
+            /// [`actor_wired`] or [`spawn_wired`]. There is no way to add a feed to
+            /// a running actor and that is deliberate: the loop selects over a fixed
+            /// set, so a feed appearing later would need the loop to be
+            /// reconfigurable — a second input to the second input.
+            ///
+            /// # `new` takes one argument per feed, which is the guard
+            ///
+            /// Forgetting to wire a declared feed is `error[E0061]` at the call site
+            /// rather than a stream that never yields. That is why this is a
+            /// constructor and not a builder with one method per feed: a builder can
+            /// always be stopped early, and the sketch this replaces —
+            /// `actor(state).feed_fills(rx)` — cannot even be written, because
+            /// `actor` has already spawned the loop by then.
+            ///
+            /// Each stream is boxed. One allocation per feed per actor, paid once at
+            /// spawn, against making `Handle`, `Mounted` and `System` generic in one
+            /// type parameter per declared feed.
+            #[doc(hidden)]
+            pub struct Feeds {
+                $( [<$feed:snake>]: ::core::pin::Pin<
+                    ::std::boxed::Box<dyn $crate::Stream<Item = $fty> + ::core::marker::Send>
+                >, )*
+                /// Which feed gets first refusal on the next poll, so a saturated
+                /// feed cannot starve its siblings. See [`Feeds::poll_next`].
+                at: ::core::primitive::usize,
+            }
+
+            impl Feeds {
+                /// Wire every declared feed. One argument per `feed`, in
+                /// declaration order.
+                #[must_use]
+                pub fn new(
+                    $( [<$feed:snake>]: impl $crate::Stream<Item = $fty>
+                        + ::core::marker::Send + 'static, )*
+                ) -> Self {
+                    Self {
+                        $( [<$feed:snake>]: ::std::boxed::Box::pin([<$feed:snake>]), )*
+                        at: 0,
+                    }
+                }
+
+                /// One closure per feed, all answering the same type, so the
+                /// rotation below can be an index rather than a match written per
+                /// pair of feeds.
+                ///
+                /// Function pointers and not a `match` on the cursor, because
+                /// `macro_rules!` has no counter: numbering the arms of a match
+                /// would need the declarations munched into unary indices, and an
+                /// array literal needs none.
+                const POLLERS: &'static [fn(
+                    &mut Self,
+                    &mut ::core::task::Context<'_>,
+                ) -> ::core::task::Poll<$crate::Fed<Feed>>] = &[
+                    $(
+                        |__feeds: &mut Self, __cx: &mut ::core::task::Context<'_>| {
+                            match $crate::Stream::poll_next(
+                                ::core::pin::Pin::as_mut(&mut __feeds.[<$feed:snake>]),
+                                __cx,
+                            ) {
+                                // Boxed HERE, because an item spelled out in the
+                                // loop's future is a cost every idle actor of this
+                                // service pays — see `Fed::Item`.
+                                ::core::task::Poll::Ready(::core::option::Option::Some(
+                                    __item,
+                                )) => ::core::task::Poll::Ready($crate::Fed::Item(
+                                    ::std::boxed::Box::new(Feed::$feed(__item)),
+                                )),
+                                // The stream is done, which ends the actor. Never
+                                // polled again, so no `poll_next` after `None`.
+                                ::core::task::Poll::Ready(::core::option::Option::None) =>
+                                    ::core::task::Poll::Ready($crate::Fed::Ended {
+                                        name: ::core::stringify!($feed),
+                                    }),
+                                ::core::task::Poll::Pending =>
+                                    ::core::task::Poll::Pending,
+                            }
+                        },
+                    )*
+                ];
+            }
+
+            impl<A: Actor> $crate::Feeds<A> for Feeds {
+                type Item = Feed;
+
+                fn poll_next(
+                    &mut self,
+                    __cx: &mut ::core::task::Context<'_>,
+                ) -> ::core::task::Poll<$crate::Fed<Feed>> {
+                    let __n = Self::POLLERS.len();
+                    // Starts where the last item came from plus one, so `n` feeds
+                    // that are all ready are served round-robin instead of the
+                    // first one starving the rest. Zero feeds runs zero steps,
+                    // which is why the modulo below cannot divide by zero.
+                    for __step in 0..__n {
+                        let __i = (self.at + __step) % __n;
+                        if let ::core::task::Poll::Ready(__fed) = Self::POLLERS[__i](self, __cx) {
+                            self.at = (__i + 1) % __n;
+                            return ::core::task::Poll::Ready(__fed);
+                        }
+                    }
+                    ::core::task::Poll::Pending
+                }
+            }
+
+            /// The receiving half of one actor's mailbox.
+            #[doc(hidden)]
+            pub type Mailbox = $crate::Mailbox<Mail>;
+
+            /// A registry of **this service's** live actors: which ones exist,
+            /// and for how long.
+            ///
+            /// One system per service, not one per node. That is what makes an
+            /// actor of another service a type error at the mount rather than a
+            /// schema comparison on the serving node.
+            pub type System = $crate::System<Mail>;
+
+            /// Assembles a [`System`]: its eviction policy, its cap, and how it
+            /// spawns.
+            pub type SystemBuilder = $crate::SystemBuilder<Mail>;
+
+            /// One live actor of this service, ready to be mounted.
+            pub type Mounted = $crate::Mounted<Mail>;
+
+            /// What keylink dispatches this service's keyed system through.
+            ///
+            /// A marker with no values. The generated [`Actor`] trait has no
+            /// associated types and is expanded here, in your crate, so keylink
+            /// cannot reach this service's `Request`, `Response` or mailbox type
+            /// through it; [`KeyedService`](keylink::KeyedService) is the trait
+            /// that carries them across, and this is what implements it.
+            #[doc(hidden)]
+            pub struct Actors;
+
+            impl $crate::KeyedService for Actors {
+                type Request = Request;
+                type Response = Response;
+                type Mail = Mail;
+
+                fn mail(
+                    origin: $crate::Origin,
+                    request: Request,
+                    body: $crate::BodyReader,
+                    reply: $crate::Reply<(Response, $crate::Body)>,
+                ) -> Mail {
+                    Mail::Served { origin, request, body, reply }
+                }
+            }
+
+            /// Serve `system`'s actors to other machines, on this service's own
+            /// keyed ALPN. Register it on a [`Server`](keylink::Server) like any
+            /// other service.
+            ///
+            /// A free function taking `&System`, deliberately: it compiles
+            /// identically whether the registry lives in keylink or in a crate
+            /// of its own, which an inherent method on `System` cannot do.
+            ///
+            /// Because the reply is this service's own typed `Response`,
+            /// everything that reads one works here: per-method
+            /// [`Middleware`](keylink::Middleware), per-method authorization,
+            /// and `blob` methods, whose address the server must see to record a
+            /// grant. A service with a `blob` method must be given a store —
+            /// `keyed_service(..).with_blobs(&blobs)` — or
+            /// [`ServerBuilder::spawn`](keylink::ServerBuilder::spawn) refuses
+            /// it at startup, exactly as it does for [`service`].
+            #[must_use]
+            pub fn keyed_service(
+                system: &System,
+                allow: $crate::Allowlist,
+            ) -> $crate::ServiceBuilder<$crate::Addressed<Request>, Response> {
+                let system = system.clone();
+                let dispatch: $crate::Dispatch<$crate::Addressed<Request>, Response> =
+                    ::std::sync::Arc::new(move |cx: $crate::Context,
+                                                request: $crate::Addressed<Request>,
+                                                body: $crate::BodyReader| {
+                        let system = system.clone();
+                        ::std::boxed::Box::pin(async move {
+                            match $crate::deliver_to_actor::<Actors>(&system, cx, request, body)
+                                .await
+                            {
+                                ::std::result::Result::Ok(__answer) => __answer,
+                                ::std::result::Result::Err(__refusal) => (
+                                    $crate::Outcome::Err(__refusal),
+                                    $crate::Body::empty(),
+                                ),
+                            }
+                        })
+                    });
+                $crate::ServiceBuilder::new(keyed_alpn(), allow, dispatch)
+                    .__keylink_declares_blobs(DECLARES_BLOBS)
             }
 
             /// Serve this service as an actor: `&mut self`, one message at a
@@ -440,54 +1264,46 @@ macro_rules! service {
             /// local message could be authorized against whoever dialled in
             /// last. An argument cannot be forgotten, cannot go stale, and
             /// costs no name.
+            /// # A `feed` method takes no `Caller` and returns nothing
+            ///
+            /// Written out here rather than in a helper macro, because there is one
+            /// shape and no kind to dispatch on — which is the point of a feed being
+            /// a second list.
+            ///
+            /// **No `Caller`, because nobody called.** A feed item came off a
+            /// stream this process wired; there is no local caller to name and no
+            /// peer to authorize against. Handing one in would mean inventing a
+            /// caller, and `Caller::Local` on a market-data item is exactly the
+            /// stale-peer hazard the `caller(&mut self, ..)` hook was deleted for.
+            ///
+            /// **No return, because there is no reply channel.** Nothing is waiting.
+            /// A feed that needs to answer somebody is an `rpc` — the distinction is
+            /// type-level rather than conventional, which is why it is a different
+            /// declaration and not a convention about a `tell`.
+            ///
+            /// It is a turn in every other respect: the panic guard, the observer
+            /// chain and a durability adapter's commit all apply, because the loop is
+            /// still keylink's. A panic here ends the actor rather than costing one
+            /// message — see [`feed_turn`](keylink::feed_turn) for why the `rpc`
+            /// policy cannot hold where nobody is told.
             pub trait Actor: Send + 'static {
                 $(
                     $crate::__keylink_actor_method!(
+                        [$( $defer )?],
                         [$( #[$meta] )*],
                         [<$kind>], [<$rpc:snake>], ($( $arg : $ty ),*), $ret
                     );
                 )+
-            }
-
-            $(
-                $crate::__keylink_actor_invoke_fn!(
-                    [<$kind>],
-                    [<__actor_ $rpc:snake>],
-                    Actor,
-                    Response,
-                    $rpc,
-                    [<$rpc:snake>],
-                    ($( $arg : $ty ),*)
-                );
-            )+
-
-            /// One message against one actor.
-            ///
-            /// Generated **once** and used by both served paths: the keyed
-            /// system's mailbox loop and the singleton service's dispatch. One
-            /// match, so a kind cannot be routed two ways *over the wire*.
-            ///
-            /// [`Handle`]'s own methods do not come through here — they call the
-            /// trait method directly, since a local call has no `Request` to
-            /// build and no `BodyReader` to pass. So there **are** two
-            /// dispatchers, and the second one is `__keylink_local_method!`.
-            /// That used to matter: each arm repeated a `caller(None)` hook by
-            /// hand, and a sixth method kind wired in without it would silently
-            /// inherit the last remote peer. The caller is an argument now, so
-            /// the two dispatchers can disagree about many things and no longer
-            /// about this one — a missing `Caller` is a compile error.
-            async fn __actor_turn<A: Actor>(
-                state: &mut A,
-                cx: $crate::Caller<'_>,
-                request: Request,
-                body: $crate::BodyReader,
-            ) -> (Response, $crate::Body) {
-                match request {
-                    $(
-                        Request::$rpc { $( $arg ),* } =>
-                            [<__actor_ $rpc:snake>](state, cx, body $(, $arg )*).await,
-                    )+
-                }
+                $(
+                    $( #[$fmeta] )*
+                    #[doc = concat!("Handle one item from the `", stringify!($feed), "` feed.")]
+                    ///
+                    /// No [`Caller`](keylink::Caller): nobody called. No return:
+                    /// there is no reply channel. See this trait's own
+                    /// documentation.
+                    fn [<on_ $feed:snake>](&mut self, $farg: $fty)
+                        -> impl ::core::future::Future<Output = ()> + ::core::marker::Send;
+                )*
             }
 
             /// Spawn one actor of this service, ready to be mounted.
@@ -504,22 +1320,29 @@ macro_rules! service {
             /// is caught and reported as a refusal, and the next message runs
             /// against the state as it stands.
             ///
-            /// # No observers on this path
+            /// # No observers and no feeds on this door
             ///
-            /// A keyed actor gets **no** [`Observer`](keylink::Observer)s. This
-            /// runs its own loop over `__actor_turn` and never touches
-            /// `LocalActor`, which is where the observer chain lives. So an
-            /// actor mounted here and expecting durability would get no
-            /// durability, no compile error and no explanation — hence this
-            /// paragraph. Use [`actor_with`] for one actor that must be
-            /// observed. RFC-06 §5.3.
+            /// A shorthand rather than a limit, which it was until Wave 3. Use
+            /// [`spawn_wired`] for a keyed actor that must be observed, or that has
+            /// a feed — and a service that declares a feed cannot reach *this* door
+            /// at all, because `SpawnableUnfed` refuses it at the call site.
             ///
-            /// # Panics
+            /// What it no longer is, is a loop. The keyed loop used to read the
+            /// queue deadline, mark idempotency progress, guard the panic and render
+            /// the refusal itself, in ~150 lines that had to agree with `local.rs`'s
+            /// and twice did not: one spelled the deadline `>` where the other
+            /// spelled `>=`, and one rendered a panic bare where the other prefixed
+            /// it. Wave 1b made the *dispatch* one path and left two loops around
+            /// it; there is one loop now, and this is one call into it.
             ///
-            /// Panics when called outside a tokio runtime.
-            #[must_use = "an unmounted actor is dropped, which stops the task \
-                          this just started"]
-            pub fn spawn<A: Actor>(mut state: A) -> $crate::Mounted {
+            /// Nothing runs until this is mounted:
+            /// [`System::mount`](keylink::System::mount) is what starts the
+            /// task, so a `Mounted` that is refused or dropped costs no task at
+            /// all. That is where the tokio-runtime panic lives now, and it is
+            /// why this function has none.
+            #[must_use = "an unmounted actor is dropped, and the state it was \
+                          built around goes with it"]
+            pub fn spawn<A: Actor>(state: A) -> Mounted {
                 // The same refusal `Handle::service` makes, and for longer than
                 // it was made here: `CHECK` is an associated const on a generic
                 // type, so it is evaluated only where it is INSTANTIATED, and
@@ -535,247 +1358,159 @@ macro_rules! service {
                 // started. RFC-04 §10.4 argues the whole thing and named only
                 // the path that was guarded. §16.9.
                 let () = ServableAsActor::<A>::CHECK;
-                $crate::mount(schema(), move |mut inbox: $crate::Mailbox| async move {
-                    while let ::std::option::Option::Some(mail) = inbox.recv().await {
-                        let $crate::Mail { cx, payload, body, reply } = *mail;
-                        // The third generated dispatch path, and the one that
-                        // marked nothing at all. A key claimed for a message
-                        // routed here was RELEASED once the turn had already
-                        // mutated the actor, so the caller's retry ran the work
-                        // a second time — at-least-once, out of the module
-                        // whose whole promise is at-most-once. RFC-04 §16.6.
-                        //
-                        // Taken before the turn because `cx` is only borrowed
-                        // by `Caller::Peer(&cx)` below.
-                        let __progress = cx.progress();
-                        // A `QueueTimeout` above the system's service stamped a
-                        // deadline on the context, and this loop was the one
-                        // dispatch path that never read it: the layer compiles
-                        // on `System::service` and guarded nothing there, at
-                        // any budget, with no error and no warning. RFC-04
-                        // §16.7.
-                        //
-                        // Read HERE, on the actor's own task and the instant
-                        // the message leaves the mailbox. Not in the layer,
-                        // which cannot tell a queued message from a running one
-                        // (RFC-04 §16.2), and not after the decode either:
-                        // queueing ENDS when the message is taken, so whatever
-                        // the decode below costs is not time spent waiting.
-                        //
-                        // `Queueing::expired` and not a comparison written
-                        // here, because generated code cannot name the clock —
-                        // nothing in `$crate` re-exports one — and the spelling
-                        // that worked without naming it,
-                        // `!deadline().elapsed().is_zero()`, is `now >
-                        // deadline` where the local path is `now >= deadline`.
-                        // The comment this replaces called that "a zero-length
-                        // budget". It is every case where `now == deadline` — a
-                        // paused clock's ordinary case, and a browser's too,
-                        // where `Performance.now()` is clamped to a tick and the
-                        // deadline is stamped from that same clamped clock. So
-                        // the two paths disagreed on wasm at any whole-tick
-                        // budget, which is a shipped target rather than a test
-                        // artefact.
-                        //
-                        // There are still TWO comparisons, and this comment
-                        // claimed otherwise for an hour. `local.rs` writes its
-                        // own `Instant::now() >= deadline` inline, on the
-                        // actor's task, inside `ask_catching_before`. The two
-                        // now AGREE — `Queueing::expired` is that same `>=` —
-                        // but nothing makes them, and a pair of hand-written
-                        // comparisons drifting is precisely the defect above.
-                        // `ask_catching_before` takes a bare `Instant`; taking
-                        // the `Queueing` would leave one predicate rather than
-                        // two that agree by inspection.
-                        let __expired = cx.queueing().filter(|__budget| __budget.expired());
-                        // The ONLY route from the payload's bytes to a typed
-                        // message, and it compares the hashes first.
-                        //
-                        // Wrapped, because `open` runs the CALLER's
-                        // `Deserialize` on the actor's own task. Uncaught, a
-                        // panic there unwound out of the mounted task from one
-                        // line ABOVE `guarded` and produced, verbatim, the
-                        // failure `guarded` exists to prevent: the receiver
-                        // dropped, every later send failing, and the registry
-                        // still listing an id nobody can reach for the life of
-                        // the process. RFC-04 §16.11.
-                        let __decoded = $crate::catching(|| payload.open::<Request>(schema()));
-                        let __answer = match __decoded {
-                            ::std::result::Result::Ok(::std::result::Result::Ok(__request))
-                                if __expired.is_none() =>
-                            {
-                                // The hashes agreed and the bytes decoded, so
-                                // what follows is user code. Marking above the
-                                // match instead would report a schema mismatch
-                                // as work that ran, and settle a key for a
-                                // message the actor never saw.
-                                __progress.dispatched();
-                                let __turn = $crate::guarded(__actor_turn(
-                                    &mut state,
-                                    $crate::Caller::Peer(&cx),
-                                    __request,
-                                    body,
-                                ))
-                                .await;
-                                match __turn {
-                                    ::std::result::Result::Ok((__response, __body)) => {
-                                        // `completed` goes on the encoded arm
-                                        // and nowhere else. An encode that
-                                        // fails means the turn ran, mutated
-                                        // the state and produced nothing
-                                        // transmissible; marking it completed
-                                        // would record the encoding refusal as
-                                        // this call's settled reply and replay
-                                        // that refusal to every retry, for work
-                                        // that really happened. The refusing
-                                        // arm below, and the panic arm after
-                                        // it, leave the marker at
-                                        // `dispatched`, which settles
-                                        // `Interrupted` — "it ran, and whether
-                                        // it took effect is unknown". RFC-05
-                                        // §2.
-                                        //
-                                        // Wrapped for the same reason the
-                                        // decode above is: `encode` runs the
-                                        // caller's `Serialize` here, on the
-                                        // actor's task, one line after
-                                        // `guarded` has let go. The panic arm
-                                        // leaves the marker exactly where the
-                                        // refusing arm leaves it, because the
-                                        // two describe the same fact — the turn
-                                        // ran and produced nothing the wire can
-                                        // carry.
-                                        match $crate::catching(|| {
-                                            $crate::ActorReply::encode(&__response)
-                                        }) {
-                                            ::std::result::Result::Ok(
-                                                ::std::result::Result::Ok(__encoded),
-                                            ) => {
-                                                __progress.completed();
-                                                ($crate::Outcome::Ok(__encoded), __body)
-                                            }
-                                            ::std::result::Result::Ok(
-                                                ::std::result::Result::Err(__refusal),
-                                            ) => (
-                                                $crate::Outcome::Err(__refusal),
-                                                $crate::Body::empty(),
-                                            ),
-                                            // Says the REPLY panicked, not the
-                                            // actor. `Display for Panic` and
-                                            // `Panic::message` both render "the
-                                            // actor panicked: ..", which is
-                                            // false here and false above: the
-                                            // handler returned normally and the
-                                            // unwind came out of a `Serialize`.
-                                            // A peer told otherwise would look
-                                            // for a fault in the method that
-                                            // answered it.
-                                            ::std::result::Result::Err(_) => (
-                                                $crate::Outcome::Err($crate::RemoteError::Failed(
-                                                    "the reply's `Serialize` panicked after the \
-                                                     turn ran"
-                                                        .to_owned(),
-                                                )),
-                                                $crate::Body::empty(),
-                                            ),
-                                        }
-                                    }
-                                    ::std::result::Result::Err(__panic) => (
-                                        $crate::Outcome::Err($crate::RemoteError::Failed(
-                                            __panic.to_string(),
-                                        )),
-                                        $crate::Body::empty(),
-                                    ),
-                                }
-                            }
-                            // Still queued when the budget ran out, so nothing
-                            // ran. Refused with the value the local path
-                            // produces for the same message — `TimedOut`
-                            // carrying `Queueing::millis`, and an empty body —
-                            // because a peer must not be able to tell the two
-                            // dispatch paths apart by the refusal it reads.
-                            //
-                            // `unrun()` and not silence. Reaching the mailbox is
-                            // marked on the way in — §16.12 — so an arm that
-                            // says nothing says "queued, fate unknown", which
-                            // would settle the key `Interrupted` and
-                            // permanently refuse every retry of work nobody
-                            // did. That is §16.6's failure one arm along, and
-                            // it would cost the one property that makes this
-                            // the only bound composing with an idempotency key.
-                            // Saying it explicitly outranks the enqueue mark,
-                            // so `Drop for Guard` sees `NotDispatched` and
-                            // RELEASES the key: the retry of a call that never
-                            // happened is a first attempt.
-                            //
-                            // BELOW the decode, not above it: a payload whose
-                            // bytes are not a message of this contract is
-                            // broken permanently, and `TimedOut` invites a
-                            // retry that can never succeed. The local path
-                            // decides it the same way round, because there the
-                            // accept loop decodes before any layer runs and so
-                            // refuses a bad payload before a deadline exists at
-                            // all. Either refusal leaves the key claimable, so
-                            // the order costs the caller nothing but a truer
-                            // answer.
-                            //
-                            // The `0` is unreachable: this arm is only taken
-                            // when `__expired` is `Some`.
-                            ::std::result::Result::Ok(::std::result::Result::Ok(_)) => {
-                                __progress.unrun();
-                                (
-                                    $crate::Outcome::Err($crate::RemoteError::TimedOut {
-                                        millis: __expired.map_or(0, $crate::Queueing::millis),
-                                    }),
-                                    $crate::Body::empty(),
-                                )
-                            }
-                            // The hashes disagreed, or the bytes are not a
-                            // message of this contract. Either way the actor
-                            // never saw it, and `unrun()` is how that is said
-                            // now that arriving in the mailbox speaks for
-                            // itself.
-                            ::std::result::Result::Ok(::std::result::Result::Err(__refusal)) => {
-                                __progress.unrun();
-                                ($crate::Outcome::Err(__refusal), $crate::Body::empty())
-                            }
-                            // Never `TimedOut`, whatever the budget says, and
-                            // that falls out of the shape rather than out of
-                            // arm order: a payload that panics its own
-                            // `Deserialize` is broken permanently, and
-                            // `TimedOut` invites a retry that can never
-                            // succeed. The same argument the expiry arm above
-                            // makes for sitting below the decode.
-                            //
-                            // `unrun()`, so `Drop for Guard` sees
-                            // `NotDispatched` and RELEASES the key: the unwind
-                            // came out of the CALLER's `Deserialize`, before
-                            // any of the actor's own code, so nothing is owed
-                            // and a retry of a call that never happened is a
-                            // first attempt. Naming the MESSAGE and not the
-                            // actor for the reason the encode arm gives.
-                            //
-                            // The mirror image of the encode-panic arm above,
-                            // which stays silent on purpose: there the turn had
-                            // already run, and silence there means `dispatched`
-                            // rather than `enqueued` because `dispatched`
-                            // outranks it.
-                            ::std::result::Result::Err(_) => {
-                                __progress.unrun();
-                                (
-                                    $crate::Outcome::Err($crate::RemoteError::Failed(
-                                        "the message's `Deserialize` panicked, so the actor \
-                                         never saw it"
-                                            .to_owned(),
-                                    )),
-                                    $crate::Body::empty(),
-                                )
-                            }
-                        };
-                        // The caller may have gone away mid-turn. Its stream is
-                        // dead either way, so there is nothing to report.
-                        let _ = reply.send(__answer);
-                    }
+                let () = SpawnableUnfed::<A>::CHECK;
+                __mount(state, ::std::vec::Vec::new(), ())
+            }
+
+            /// Spawn one keyed actor with its observers and its feeds.
+            ///
+            /// **The general keyed door, and the one that closed the observer gap.**
+            /// A keyed actor mounted through a [`System`](keylink::System) is watched
+            /// by whatever this was given: the same [`Observer`](keylink::Observer)
+            /// chain, the same panic guard and the same
+            /// [`finish`](keylink::Observer::finish) a local actor gets, because it
+            /// is the same loop. RFC-06 §5.3's "no observers on the keyed path" is
+            /// no longer true and the paragraph that said so is in the past tense.
+            ///
+            /// State, observers and feeds together, which is the shape a factory
+            /// needs — [`spawn_with`](keylink::SystemBuilder::spawn_with) builds an
+            /// actor on the first message to an unmounted id, and everything that
+            /// actor needs has to be produced by that one closure:
+            ///
+            /// ```ignore
+            /// let system = orders::System::builder(Eviction::Never)
+            ///     .spawn_with(move |id| {
+            ///         Some(orders::spawn_wired(
+            ///             Book::new(),
+            ///             vec![Box::new(metrics.watching(id))],
+            ///             orders::Feeds::new(exchange.subscribe(id)),
+            ///         ))
+            ///     })
+            ///     .build();
+            /// ```
+            ///
+            /// # A factory is synchronous, and a durable actor is the case that hits it
+            ///
+            /// That closure is a plain `Fn`, so it cannot `await`. A
+            /// [`Persist`](keylink::Persist) has to claim its state before it can
+            /// observe anything, and claiming is I/O — so a durable keyed actor is
+            /// mounted **eagerly**, with
+            /// [`System::mount`](keylink::System::mount) after
+            /// `Persist::open(..).await`, rather than built on first message.
+            /// `keylink/tests/persist.rs::a_keyed_actors_state_survives_its_own_process`
+            /// is that shape. It is a real limit, discovered by the wave that wrote
+            /// the first adapter, and it is stated here rather than left for the next
+            /// author to find at the borrow checker.
+            ///
+            /// # What a keyed actor still does not get
+            ///
+            /// An `ended()` channel. The reason an actor stopped — an observer's
+            /// refusal, a fault, a feed that ended — reaches its own observers'
+            /// `finish` and nothing else, so a durability adapter still commits but
+            /// nobody outside can await *why*. `System::stop` and `System::abort`
+            /// await the task, not a reason.
+            ///
+            /// # Panics
+            ///
+            /// Panics when called outside a tokio runtime.
+            #[must_use = "an unmounted actor is dropped, which stops the task \
+                          this just started"]
+            pub fn spawn_wired<A: Actor>(
+                state: A,
+                observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
+                feeds: Feeds,
+            ) -> Mounted {
+                let () = ServableAsActor::<A>::CHECK;
+                __mount(state, observers, feeds)
+            }
+
+            /// What both keyed doors are, and the only place this service names
+            /// [`mount`](keylink::mount).
+            ///
+            /// Generic in the feeds so that [`spawn`]'s `()` and [`spawn_wired`]'s
+            /// [`Feeds`] go through one body: a second body is a second loop by
+            /// another name, and this wave exists to have one.
+            fn __mount<A: Actor, F: $crate::Feeds<A>>(
+                state: A,
+                observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
+                feeds: F,
+            ) -> Mounted {
+                $crate::mount(move |inbox: Mailbox| async move {
+                    // Returned, never discarded: `keylink::mount`'s `Loop` is
+                    // what turns this value into the registry removing its own
+                    // entry, and a `;` here is the defect that costs.
+                    $crate::run_keyed(state, observers, feeds, inbox).await
+                })
+            }
+
+            /// Spawn one **supervised** keyed actor, ready to be mounted.
+            ///
+            /// [`spawn_wired`] with the triple produced by an `async` factory
+            /// rather than written at the call site — which is also what makes
+            /// this the keyed door a *durable* actor can use lazily. The
+            /// factory [`spawn_with`](keylink::SystemBuilder::spawn_with) takes
+            /// is a plain `Fn` and cannot `await`, so a keyed durable actor had
+            /// to be mounted eagerly after `Persist::open(..).await`; this one
+            /// awaits, once per incarnation, which is the same call the first
+            /// mount makes.
+            ///
+            /// Nothing changes in the registry: [`mount`](keylink::mount) takes
+            /// a closure over a mailbox, and the supervisor is that closure's
+            /// whole body. `System::mount`, eviction, `shutdown` and
+            /// `System::status` see one task, exactly as for an unsupervised
+            /// keyed actor.
+            ///
+            /// # A keyed actor still has no `ended()`
+            ///
+            /// So [`Ended::GaveUp`](keylink::Ended::GaveUp) reaches its own
+            /// observers' `finish` and nothing a **caller** can await — a handle
+            /// is what would hold that channel, and a keyed actor is addressed
+            /// by id. It does reach the system's
+            /// [`Lifecycle`](keylink::Lifecycle): an actor that has given up
+            /// returns its ending from the loop, and the registry unmounts its
+            /// own entry with it, so the id is free again and a lazy factory may
+            /// serve the next message by building a fresh one.
+            ///
+            /// # A peer whose reply is lost to a restart is told `NoSuchActor`
+            ///
+            /// **The one message a restart loses is a `#[defer]`red reply parked
+            /// in the state, and on the keyed served path that loss reaches the
+            /// peer as
+            /// [`RemoteError::NoSuchActor`](keylink::RemoteError::NoSuchActor)**
+            /// — *there is nothing here, stop asking* — about an actor that is
+            /// mid-restart and about to answer that same peer again. A client
+            /// that treats `NoSuchActor` as terminal, which is what the name
+            /// tells it to do, stops retrying an actor that is coming back.
+            ///
+            /// [`supervised`] does not have this: the local served path reads
+            /// the supervisor's decision and renders `Failed("restarting: ..")`.
+            /// The keyed one cannot, because the signal it would read is the
+            /// channel the section above says has no reader. Every *other*
+            /// message survives: a turn in flight is answered before the loop
+            /// breaks, and queued turns stay in the mailbox the supervisor owns.
+            ///
+            /// # Panics
+            ///
+            /// Panics when called outside a tokio runtime.
+            #[must_use = "an unmounted actor is dropped, and the supervisor \
+                          that would have kept it alive goes with it"]
+            pub fn spawn_supervised<A: Actor, N, Fut, F>(
+                factory: N,
+                limit: $crate::Intensity,
+            ) -> Mounted
+            where
+                N: ::core::ops::FnMut() -> Fut + ::core::marker::Send + 'static,
+                Fut: ::core::future::Future<
+                        Output = ::core::result::Result<
+                            $crate::Incarnation<A, F>,
+                            $crate::Stop,
+                        >,
+                    > + ::core::marker::Send,
+                F: $crate::Feeds<A>,
+            {
+                let () = ServableAsActor::<A>::CHECK;
+                $crate::mount(move |inbox: Mailbox| async move {
+                    $crate::run_keyed_supervised(factory, limit, inbox).await
                 })
             }
 
@@ -802,7 +1537,8 @@ macro_rules! service {
             /// [`blocking::Node::enter`](keylink::blocking::Node::enter).
             #[must_use]
             pub fn actor<A: Actor>(state: A) -> Handle<A> {
-                actor_with(state, ::std::vec::Vec::new())
+                let () = SpawnableUnfed::<A>::CHECK;
+                Handle { inner: $crate::LocalActor::spawn_fed(state, ::std::vec::Vec::new(), ()) }
             }
 
             /// Start one actor of this service with observers watching its
@@ -815,9 +1551,12 @@ macro_rules! service {
             /// the actor, and [`Handle::ended`] says which observer and why.
             ///
             /// ```ignore
-            /// let (state, saver) = keylink_durable::open(&store, id, Ledger::default).await?;
-            /// let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
-            /// ledger.post(1).await?;   // stored before this returns
+            /// // `Persist` is keylink's own adapter, behind the `persist-file`
+            /// // feature. It named a `keylink_durable` crate here until Wave 5
+            /// // decided one adapter is a module and not a crate.
+            /// let (restored, saver) = keylink::Persist::<Ledger, _>::open(&store, &id).await?;
+            /// let ledger = ledger::actor_with(restored.unwrap_or_default(), vec![Box::new(saver)]);
+            /// ledger.post(1).await?;   // stored, and fsynced, before this returns
             /// ```
             ///
             /// # Panics
@@ -829,7 +1568,102 @@ macro_rules! service {
                 state: A,
                 observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
             ) -> Handle<A> {
-                Handle { inner: $crate::LocalActor::spawn_observed(state, observers) }
+                let () = SpawnableUnfed::<A>::CHECK;
+                Handle { inner: $crate::LocalActor::spawn_fed(state, observers, ()) }
+            }
+
+            /// Start one actor of this service with observers **and** feeds.
+            ///
+            /// The general local door: the triple a keyed factory returns, on the
+            /// path that has a [`Handle`]. [`actor`] and [`actor_with`] are
+            /// shorthands for it, and a service declaring a `feed` can use neither.
+            ///
+            /// ```ignore
+            /// let orders = orders::actor_wired(
+            ///     Book::new(),
+            ///     vec![Box::new(saver)],
+            ///     orders::Feeds::new(exchange.subscribe()),
+            /// );
+            /// orders.cancel(id).await?;      // the mailbox, as always
+            /// ```
+            ///
+            /// A feed item and a mailbox message are ordered at **one** `select`, so
+            /// the class of bug where an event is applied after the command that
+            /// should have preempted it does not arise: there is one arrival order,
+            /// not two.
+            ///
+            /// [`Feeds::new`] takes one argument per declared `feed`, in declaration
+            /// order, so a feed left unwired is an argument count rather than a
+            /// stream that never yields.
+            ///
+            /// # Panics
+            ///
+            /// Panics when called outside a tokio runtime, like every other
+            /// spawn.
+            #[must_use]
+            pub fn actor_wired<A: Actor>(
+                state: A,
+                observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
+                feeds: Feeds,
+            ) -> Handle<A> {
+                Handle { inner: $crate::LocalActor::spawn_fed(state, observers, feeds) }
+            }
+
+            /// Start one actor of this service that is **rebuilt** when an
+            /// incarnation fails.
+            ///
+            /// [`actor_wired`]'s three arguments, produced by one `async`
+            /// closure instead of written at the call site, so that every
+            /// incarnation gets its own state, its own observers and its own
+            /// feed subscriptions — and the previous ones are already dropped
+            /// when it is called.
+            ///
+            /// ```ignore
+            /// let ledger = ledger::supervised(
+            ///     move || {
+            ///         let store = store.clone();
+            ///         let id = id.clone();
+            ///         async move {
+            ///             // The claim the last incarnation held is already free.
+            ///             let (restored, saver) =
+            ///                 keylink::Persist::<Ledger, _>::open(&store, &id).await?;
+            ///             Ok((restored.unwrap_or_default(), vec![Box::new(saver) as _], ()))
+            ///         }
+            ///     },
+            ///     Intensity::new(NonZeroU32::new(3).unwrap(), Duration::from_secs(10)).unwrap(),
+            /// );
+            /// ```
+            ///
+            /// The feeds are whatever the factory returns: `()` for a service
+            /// with none, and [`Feeds::new`] for one that declares them. That is
+            /// [`actor`], [`actor_with`] and [`actor_wired`] collapsed into one
+            /// door rather than three, because a factory names its own triple
+            /// and there is nothing left for a shorthand to leave out.
+            ///
+            /// See [`LocalActor::spawn_supervised`](keylink::LocalActor::spawn_supervised)
+            /// for what a restart is worth, what it costs, and the four
+            /// properties that fall out of supervising in the actor's own task.
+            ///
+            /// # Panics
+            ///
+            /// Panics when called outside a tokio runtime, like every other
+            /// spawn.
+            #[must_use]
+            pub fn supervised<A: Actor, N, Fut, F>(
+                factory: N,
+                limit: $crate::Intensity,
+            ) -> Handle<A>
+            where
+                N: ::core::ops::FnMut() -> Fut + ::core::marker::Send + 'static,
+                Fut: ::core::future::Future<
+                        Output = ::core::result::Result<
+                            $crate::Incarnation<A, F>,
+                            $crate::Stop,
+                        >,
+                    > + ::core::marker::Send,
+                F: $crate::Feeds<A>,
+            {
+                Handle { inner: $crate::LocalActor::spawn_supervised(factory, limit) }
             }
 
             /// A handle to an actor in this process.
@@ -918,7 +1752,7 @@ macro_rules! service {
             /// method is better than one that buffers a 4 GiB upload in memory
             /// to pretend otherwise.
             pub struct Handle<A> {
-                inner: $crate::LocalActor<A>,
+                inner: $crate::LocalActor<A, Mail>,
             }
 
             impl<A> ::core::clone::Clone for Handle<A> {
@@ -955,20 +1789,28 @@ macro_rules! service {
                 /// Because the reply is the service's own typed `Response`,
                 /// everything that reads one keeps working: per-method
                 /// [`Middleware`](keylink::Middleware) and `blob` methods,
-                /// whose address the server must see to record a grant. The
-                /// keyed actor system can offer neither — RFC-04 §14.8 —
-                /// because there the payload is opaque to keylink by design.
+                /// whose address the server must see to record a grant.
                 ///
-                /// The idempotency ledger is **not** a third thing on that list,
-                /// which is what this paragraph used to say. A key is claimed
-                /// and settled off the *envelope*, and the envelope is typed on
-                /// both paths, so it works on a keyed actor exactly as it works
-                /// here. What the keyed path lacks is a way to *send* one: the
-                /// generated `ActorClient` has no `with_idempotency`, so a key
-                /// gets there only from a peer building the envelope through
-                /// [`RpcClient`](keylink::RpcClient) by hand. Reading it as a
-                /// missing capability invites reasoning about a keyed actor as
-                /// if no key could ever arrive at one.
+                /// **That list used to be a difference from the keyed system,
+                /// and it is not any more.** It said the keyed path could offer
+                /// neither, RFC-04 §14.8, because there the payload was opaque
+                /// to keylink by design. A keyed request is
+                /// [`Addressed<Request>`](keylink::Addressed) now and its reply
+                /// is this same typed `Response`, so per-method layers, per-method
+                /// authorization and `blob` methods all work through
+                /// [`keyed_service`] too. What is left of §14.8 is one QUIC
+                /// connection per actor *service* rather than one for a node's
+                /// whole fleet — and observers came off that list as well, since
+                /// [`spawn_wired`] runs the same loop this handle does. What a
+                /// keyed actor still lacks is an `ended()` channel, so nobody
+                /// outside can await *why* one stopped.
+                ///
+                /// The idempotency ledger was never on that list, which is what
+                /// this paragraph used to say and is worth keeping: a key is
+                /// claimed and settled off the *envelope*, and the envelope was
+                /// typed on both paths all along. What the keyed path lacked was
+                /// a way to *send* one, and
+                /// [`KeyedClient::with_idempotency`] is that way.
                 ///
                 /// The local [`Handle`] keeps working while this is served, and
                 /// messages from both sides share the one mailbox.
@@ -1040,185 +1882,34 @@ macro_rules! service {
                                                     req: Request,
                                                     body: $crate::BodyReader| {
                             let actor = actor.clone();
-                            // Moved INTO the turn, which runs on the actor's own
-                            // task. That is what makes "dispatched" mean the
-                            // turn started rather than the message was queued:
-                            // a layer that refuses while the message is still
-                            // waiting leaves the key claimable, and a `Timeout`
-                            // that drops the wait for a turn already running
-                            // leaves it `Interrupted` — which is the truth,
-                            // because the turn runs on regardless.
-                            let __progress = cx.progress();
-                            // A SECOND handle, marked outside the turn. The
-                            // turn closure can only say the work started; only
-                            // out here is it known whether the answer survived
-                            // an observer. See the `completed()` call below.
-                            let __settled = __progress.clone();
-                            // A THIRD, for the one fact neither of the others
-                            // can reach: the message got a mailbox permit. Only
-                            // `ask_catching_before` sees that moment, and a
-                            // caller that gives up after it gave up on a turn
-                            // that runs anyway. §16.12.
-                            let __queued = __progress.clone();
-                            // A `QueueTimeout` above this put a deadline on the
-                            // context. Honoured HERE rather than by the layer,
-                            // because a layer cannot tell a queued message from
-                            // a running one and the actor's own task can.
-                            let __queueing = cx.queueing();
                             ::std::boxed::Box::pin(async move {
-                                let __answer = actor
-                                    .ask_catching_before(
-                                        __queueing.map($crate::Queueing::deadline),
-                                        move || __queued.enqueued(),
-                                        move |__state: &mut A| {
-                                        ::std::boxed::Box::pin(async move {
-                                            __progress.dispatched();
-                                            __actor_turn(
-                                                __state,
-                                                $crate::Caller::Peer(&cx),
-                                                req,
-                                                body,
-                                            )
-                                            .await
-                                        })
-                                    })
-                                    .await;
-                                match __answer {
-                                    // Marked HERE, and not inside the turn.
-                                    // An observer runs after the method and can
-                                    // refuse the turn it just watched, and a
-                                    // refused turn was NOT committed — so
-                                    // marking `completed` where the method
-                                    // returns would settle an idempotency key
-                                    // as the observer's veto and replay that
-                                    // veto to every retry, for work whose
-                                    // effect was thrown away. This arm is the
-                                    // only one holding an answer the turn
-                                    // itself produced; every other one leaves
-                                    // the marker at `dispatched`, which settles
-                                    // `Interrupted` — "it ran, and whether it
-                                    // took effect is unknown". That is the
-                                    // truth for a refused turn, whose mutation
-                                    // lived in memory and never reached a
-                                    // store. RFC-06 §13.3.
-                                    ::std::result::Result::Ok($crate::Queued::Ran(
-                                        ::std::result::Result::Ok((__response, __body)),
-                                    )) => {
-                                        __settled.completed();
-                                        ($crate::Outcome::Ok(__response), __body)
-                                    }
-                                    // A panic must not unwind out of a
-                                    // connection's task, so the remote caller
-                                    // is told a value. The actor is still
-                                    // alive.
-                                    //
-                                    // BOTH sides of `Failed` need marking, or a
-                                    // handler that panicked with the refusal
-                                    // below's exact text would produce a
-                                    // byte-identical `Failed` and no peer could
-                                    // tell a panic from an observer's veto.
-                                    // Panic text is often caller-derived, so
-                                    // that is reachable rather than theoretical.
-                                    //
-                                    // This side arrives marked ALREADY, which
-                                    // is what the comment here used to deny:
-                                    // `Panic::caught` builds its message as
-                                    // "the actor panicked: {message}" and
-                                    // `Display` writes that, so the `format!`
-                                    // below adds a SECOND prefix and a peer
-                                    // reads "panicked: the actor panicked: bad
-                                    // message". Nor does it match the keyed
-                                    // loop, which renders the same panic as
-                                    // `__panic.to_string()` and sends "the
-                                    // actor panicked: bad message".
-                                    //
-                                    // Left alone rather than fixed here:
-                                    // `both_halves_of_a_lost_turn_carry_their_own_prefix`
-                                    // pins `starts_with("panicked: ")`, and it
-                                    // is the ONLY test pinning either prefix.
-                                    // There is no keyed twin, which is how a
-                                    // stutter on one path and a bare rendering
-                                    // on the other both stayed green.
-                                    ::std::result::Result::Ok($crate::Queued::Ran(
-                                        ::std::result::Result::Err(__panic),
-                                    )) => (
-                                        $crate::Outcome::Err($crate::RemoteError::Failed(
-                                            ::std::format!("panicked: {}", __panic),
-                                        )),
-                                        $crate::Body::empty(),
-                                    ),
-                                    // Refused while still queued, so nothing
-                                    // ran, and `unrun()` is what leaves an
-                                    // idempotency key claimable rather than
-                                    // settled — the only bound that composes
-                                    // with one. Silence would now mean
-                                    // `enqueued`, which settles.
-                                    //
-                                    // ONE call covers both halves of the
-                                    // budget, because `Queued::Expired`
-                                    // deliberately collapses them: the permit
-                                    // that never arrived (nothing was marked,
-                                    // and this adds a fact already true) and
-                                    // the turn-side refusal of a message that
-                                    // did queue (this outranks its enqueue
-                                    // mark). Neither ran, so neither owes
-                                    // anything, and this path never has to tell
-                                    // them apart.
-                                    //
-                                    // The `0` is unreachable: without a
-                                    // `QueueTimeout` there is no deadline, and
-                                    // without a deadline nothing expires.
-                                    ::std::result::Result::Ok($crate::Queued::Expired) => {
-                                        __settled.unrun();
-                                        (
-                                            $crate::Outcome::Err($crate::RemoteError::TimedOut {
-                                                millis: __queueing
-                                                    .map_or(0, $crate::Queueing::millis),
-                                            }),
-                                            $crate::Body::empty(),
-                                        )
-                                    }
-                                    // An observer refused THIS TURN. Not
-                                    // `NoSuchActor`, which says "there is
-                                    // nothing here, stop asking" — the turn ran
-                                    // and was not committed, and the actor is
-                                    // ending for a reason the peer should be
-                                    // able to read.
-                                    //
-                                    // A `String` payload and NOT a new
-                                    // `RemoteError` variant: a variant is inside
-                                    // the hashed contract, so it would move the
-                                    // ALPN and the pinned literal in
-                                    // `tests/protocol.rs`. The cost is that a
-                                    // peer must match on the string to tell a
-                                    // refusal from a panic, which is why both
-                                    // carry a prefix.
-                                    ::std::result::Result::Err(
-                                        $crate::TurnLost::Refused { name: __name },
-                                    ) => (
-                                        $crate::Outcome::Err($crate::RemoteError::Failed(
-                                            ::std::format!("observer refused: {}", __name),
-                                        )),
-                                        $crate::Body::empty(),
-                                    ),
-                                    // NOT `Failed`, which is what a panic is.
-                                    // A peer must be able to tell "your message
-                                    // exploded, try another" from "there is
-                                    // nothing here any more, stop asking" —
-                                    // and after `stop()` the ALPN stays
-                                    // registered, so this is answered for as
-                                    // long as the server runs. The id is the
-                                    // service name because a singleton has no
-                                    // other one.
-                                    ::std::result::Result::Err($crate::TurnLost::Gone) => (
-                                        $crate::Outcome::Err(
-                                            $crate::RemoteError::NoSuchActor {
-                                                id: stringify!($svc).to_owned(),
-                                            },
-                                        ),
-                                        $crate::Body::empty(),
-                                    ),
-                                }
+                                // Everything this used to do by hand — three
+                                // clones of `Progress` for three facts, the
+                                // queue deadline, the five-arm match that turned
+                                // a `Queued`/`TurnLost` back into an `Outcome` —
+                                // lives in `deliver_to_local` now, beside the
+                                // keyed twin it kept disagreeing with. What is
+                                // left here is the one thing only generated code
+                                // can do: name the variant.
+                                //
+                                // The `Origin` is keylink's to build. Both of
+                                // its constructors are `pub(crate)`, which is
+                                // what stops a downstream crate making a second
+                                // origin around a `Context` it already
+                                // delivered — so it is handed IN to this
+                                // closure rather than written here.
+                                $crate::deliver_to_local(
+                                    &actor,
+                                    cx,
+                                    stringify!($svc),
+                                    move |__from, __reply| Mail::Served {
+                                        origin: __from,
+                                        request: req,
+                                        body,
+                                        reply: __reply,
+                                    },
+                                )
+                                .await
                             })
                         });
                     $crate::ServiceBuilder::new(alpn(), allow, dispatch)
@@ -1361,13 +2052,162 @@ macro_rules! service {
                 )+
             }
 
+            /// A connection to one node's actors **of this service**.
+            ///
+            /// One connection carries every actor of this service on that node,
+            /// and no actor of any other. That is the bill the per-service ALPN
+            /// comes with, and it is worth stating plainly: two actor services on
+            /// one node are two QUIC connections, each with its own handshake,
+            /// admission decision, idempotency ledger, keep-alive and congestion
+            /// window. A key claimed against one service means nothing to
+            /// another.
+            ///
+            /// RFC-04 §10.2's O(N²) argument is about `Endpoint::set_alpns` and
+            /// the number of ALPNs a node announces — one per hand-written
+            /// service, a bounded number — and **not** about connection count.
+            /// Do not conflate them.
+            ///
+            /// Address one actor with [`at`], which gives back a typed handle
+            /// whose methods are the ones written in `service!`.
+            pub struct KeyedClient {
+                inner: $crate::RpcClient<$crate::Addressed<Request>, Response>,
+                /// Attached to every call [`ActorRef`] makes through this
+                /// handle. Held here rather than inside the client, because
+                /// `RpcClient::with_idempotency` gives back an
+                /// [`IdempotentClient`](keylink::IdempotentClient) — a type
+                /// with no `tell`, which is the point of it — and there is no
+                /// `tell` on this path to protect. So the key rides alongside
+                /// and `send_to` attaches it, instead of a second keyed twin of
+                /// this type and of [`ActorRef`] existing to hold it.
+                idempotency: ::core::option::Option<$crate::Idempotency>,
+            }
+
+            /// Every clone names the same connection. Written out rather than
+            /// derived for the reason [`Client`]'s is: a derive would demand
+            /// `Request: Clone, Response: Clone`, and neither appears in a field.
+            impl ::core::clone::Clone for KeyedClient {
+                fn clone(&self) -> Self {
+                    Self {
+                        inner: self.inner.clone(),
+                        idempotency: self.idempotency.clone(),
+                    }
+                }
+            }
+
+            impl ::core::fmt::Debug for KeyedClient {
+                fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                    f.debug_struct("KeyedClient")
+                        .field("service", &stringify!($svc))
+                        .finish_non_exhaustive()
+                }
+            }
+
+            impl KeyedClient {
+                /// Dial a peer's actor system for this service, by public key.
+                pub async fn connect(
+                    node: &$crate::Node,
+                    peer: impl Into<$crate::EndpointAddr>,
+                ) -> $crate::Result<Self> {
+                    Ok(Self {
+                        inner: $crate::RpcClient::connect(node, peer, keyed_alpn()).await?,
+                        idempotency: ::core::option::Option::None,
+                    })
+                }
+
+                /// The same connection, with an idempotency key on every call
+                /// made through the handle it returns.
+                ///
+                /// **This is the capability a keyed actor was missing**, and it
+                /// was never the ledger: a key is claimed and settled off the
+                /// envelope, and the envelope was typed on both paths, so the
+                /// ledger has always worked here. What did not exist was a
+                /// generated client that could attach one — a key reached a
+                /// keyed actor only from a peer building the envelope through
+                /// [`RpcClient`](keylink::RpcClient) by hand.
+                ///
+                /// See the singleton twin,
+                /// [`Client::with_idempotency`], for what a bare key does on
+                /// collision and how to wait for the call already in flight
+                /// instead.
+                #[must_use]
+                pub fn with_idempotency(
+                    &self,
+                    idempotency: impl ::core::convert::Into<$crate::Idempotency>,
+                ) -> Self {
+                    Self {
+                        inner: self.inner.clone(),
+                        idempotency: ::core::option::Option::Some(idempotency.into()),
+                    }
+                }
+
+                /// Ask what this peer's ledger knows about one of your keys.
+                ///
+                /// A ledger is per service, so this answers about **this
+                /// service's** keyed connection and nothing else. See
+                /// [`RpcClient::key_state`](keylink::RpcClient::key_state).
+                pub async fn key_state(
+                    &self,
+                    key: $crate::IdempotencyKey,
+                ) -> $crate::Result<$crate::KeyState> {
+                    self.inner.key_state(key).await
+                }
+
+                /// Await this peer's departure instead of meeting it on the
+                /// next call. See [`Watch`](keylink::Watch).
+                // No `#[must_use]`: `Watch` already carries one.
+                pub fn watch(&self) -> $crate::Watch {
+                    self.inner.watch()
+                }
+
+                /// Close the connection gracefully.
+                pub async fn close(self) -> $crate::Result<()> {
+                    self.inner.close().await
+                }
+
+                /// Send one message to one actor. Called by [`ActorRef`], which
+                /// is the only thing that should build an [`Addressed`].
+                async fn send_to(
+                    &self,
+                    actor: &$crate::ActorId,
+                    request: Request,
+                    body: $crate::Body,
+                ) -> $crate::Result<(Response, $crate::BodyReader)> {
+                    let envelope = $crate::Addressed::new(actor.clone(), request);
+                    match &self.idempotency {
+                        ::core::option::Option::Some(key) => {
+                            self.inner
+                                .with_idempotency(key.clone())
+                                .call(envelope, body)
+                                .await
+                        }
+                        ::core::option::Option::None => self.inner.call(envelope, body).await,
+                    }
+                }
+
+                /// Point a handle at content this peer just named. Called by a
+                /// generated `blob` method on [`ActorRef`].
+                fn blob_handle(&self, id: $crate::BlobId) -> $crate::BlobHandle {
+                    self.inner.blob_handle(id)
+                }
+            }
+
+            impl $crate::Dial for KeyedClient {
+                async fn dial(
+                    node: &$crate::Node,
+                    addr: $crate::EndpointAddr,
+                ) -> $crate::Result<Self> {
+                    Self::connect(node, addr).await
+                }
+            }
+
             /// Address one actor of this service on a connected node.
             ///
-            /// The handle borrows the connection, so every actor on that node
-            /// is reached over one connection with one congestion-control
-            /// state — which is what a per-actor ALPN would have thrown away.
+            /// The handle borrows the connection, so every actor of this service
+            /// on that node is reached over one connection with one
+            /// congestion-control state — which is what a per-actor ALPN would
+            /// have thrown away.
             pub fn at(
-                client: &$crate::ActorClient,
+                client: &KeyedClient,
                 actor: $crate::ActorId,
             ) -> ActorRef<'_> {
                 ActorRef { client, actor }
@@ -1389,7 +2229,7 @@ macro_rules! service {
             /// number inside your own message. See [`Actor`].
             #[derive(Debug)]
             pub struct ActorRef<'a> {
-                client: &'a $crate::ActorClient,
+                client: &'a KeyedClient,
                 actor: $crate::ActorId,
             }
 
@@ -1464,12 +2304,16 @@ macro_rules! service {
                 /// call already running under the key. See
                 /// [`RpcClient::with_idempotency`](keylink::RpcClient::with_idempotency)
                 /// for why the handle is meant for one call.
+                ///
+                /// Returns an [`IdempotentClient`], which has **no `tell`
+                /// method** — see that type for why the difference is a type
+                /// rather than a paragraph.
                 #[must_use]
                 pub fn with_idempotency(
                     &self,
                     idempotency: impl ::core::convert::Into<$crate::Idempotency>,
-                ) -> Self {
-                    Self {
+                ) -> IdempotentClient {
+                    IdempotentClient {
                         inner: self.inner.with_idempotency(idempotency),
                     }
                 }
@@ -1502,6 +2346,68 @@ macro_rules! service {
 
                 $(
                     $crate::__keylink_client_method!(
+                        [$( #[$meta] )*],
+                        [<$kind>],
+                        [<$rpc:snake>],
+                        Request,
+                        $rpc,
+                        [<into_ $rpc:snake>],
+                        ($( $arg : $ty ),*),
+                        $ret
+                    );
+                )+
+
+                /// Close the connection gracefully.
+                pub async fn close(self) -> $crate::Result<()> {
+                    self.inner.close().await
+                }
+            }
+
+            /// The same connection, scoped to one idempotency key.
+            ///
+            /// Built by [`Client::with_idempotency`]. Its methods are
+            /// [`Client`]'s, minus every `tell`: a key promises the work runs
+            /// at most once, and the ledger keeps that promise by recording the
+            /// reply and answering a repeat with it, so a method with no reply
+            /// has nothing to record and could only discard the key.
+            ///
+            /// It used to be `Client` itself, and
+            /// `client.with_idempotency(key).some_tell(..)` therefore compiled
+            /// and sent no key at all. See
+            /// [`IdempotentClient`](keylink::IdempotentClient).
+            pub struct IdempotentClient {
+                inner: $crate::IdempotentClient<Request, Response>,
+            }
+
+            /// Every clone names the same connection and carries the same key.
+            /// Written out rather than derived for the reason [`Client`]'s is.
+            impl ::core::clone::Clone for IdempotentClient {
+                fn clone(&self) -> Self {
+                    Self { inner: self.inner.clone() }
+                }
+            }
+
+            impl IdempotentClient {
+                /// Ask what this peer's ledger knows about one of your keys.
+                ///
+                /// See [`Client::key_state`].
+                pub async fn key_state(
+                    &self,
+                    key: $crate::IdempotencyKey,
+                ) -> $crate::Result<$crate::KeyState> {
+                    self.inner.key_state(key).await
+                }
+
+                /// Await this peer's departure instead of meeting it on the
+                /// next call. See [`Watch`](keylink::Watch).
+                // No `#[must_use]`: `Watch` already carries one, and repeating
+                // it here is `clippy::double_must_use`.
+                pub fn watch(&self) -> $crate::Watch {
+                    self.inner.watch()
+                }
+
+                $(
+                    $crate::__keylink_idempotent_client_method!(
                         [$( #[$meta] )*],
                         [<$kind>],
                         [<$rpc:snake>],
@@ -1558,12 +2464,14 @@ macro_rules! service {
                     ///
                     /// See the async twin,
                     /// [`Client::with_idempotency`](super::Client::with_idempotency).
+                    /// The returned type has no `tell`, for the reason given on
+                    /// [`IdempotentClient`](super::IdempotentClient).
                     #[must_use]
                     pub fn with_idempotency(
                         &self,
                         idempotency: impl ::core::convert::Into<$crate::Idempotency>,
-                    ) -> Self {
-                        Self {
+                    ) -> IdempotentClient {
+                        IdempotentClient {
                             inner: self.inner.with_idempotency(idempotency),
                             runtime: ::std::sync::Arc::clone(&self.runtime),
                         }
@@ -1595,10 +2503,85 @@ macro_rules! service {
                         self.runtime.run(self.inner.close())?
                     }
                 }
+
+                /// The same connection, scoped to one idempotency key.
+                ///
+                /// See the async twin,
+                /// [`IdempotentClient`](super::IdempotentClient). No `tell`
+                /// here either, for the same reason.
+                pub struct IdempotentClient {
+                    inner: super::IdempotentClient,
+                    runtime: ::std::sync::Arc<$crate::blocking::Runtime>,
+                }
+
+                impl IdempotentClient {
+                    /// Ask what this peer's ledger knows about one of your keys.
+                    ///
+                    /// See the async twin,
+                    /// [`IdempotentClient::key_state`](super::IdempotentClient::key_state).
+                    pub fn key_state(
+                        &self,
+                        key: $crate::IdempotencyKey,
+                    ) -> $crate::Result<$crate::KeyState> {
+                        self.runtime.run(self.inner.key_state(key))?
+                    }
+
+                    $(
+                        $crate::__keylink_idempotent_blocking_method!(
+                            [$( #[$meta] )*],
+                            [<$kind>],
+                            [<$rpc:snake>],
+                            ($( $arg : $ty ),*),
+                            $ret
+                        );
+                    )+
+
+                    /// Close the connection gracefully.
+                    pub fn close(self) -> $crate::Result<()> {
+                        self.runtime.run(self.inner.close())?
+                    }
+                }
             }
             }
         }
         }
+    };
+}
+
+/// One method on a key-scoped client, or nothing at all when it is a `tell`.
+///
+/// The filter, and the only place the absence is decided. `service!` walks the
+/// declared methods once per client type; this arm set is what makes the
+/// key-scoped walk skip the kind that cannot carry a key. Everything else
+/// delegates to [`__keylink_client_method`], so a key-scoped `rpc` and a plain
+/// one are the same code rather than two copies that can drift.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_idempotent_client_method {
+    // The whole finding, in one arm. `RpcClient::tell` writes `None` for the
+    // key and always did; what changed is that a client holding a key no longer
+    // has a `tell` to call, so the discard is unreachable rather than silent.
+    ([$( #[$meta:meta] )*], tell, $name:ident, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], $kind:ident, $name:ident, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_client_method!(
+            [$( #[$meta] )*], $kind, $name, $req, $variant, $extract,
+            ($( $arg : $ty ),*), $ret
+        );
+    };
+}
+
+/// The blocking twin of [`__keylink_idempotent_client_method`], and it drops the
+/// same kind for the same reason.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_idempotent_blocking_method {
+    ([$( #[$meta:meta] )*], tell, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], $kind:ident, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_blocking_method!(
+            [$( #[$meta] )*], $kind, $name, ($( $arg : $ty ),*), $ret
+        );
     };
 }
 
@@ -1902,24 +2885,438 @@ macro_rules! __keylink_invoke_fn {
     };
 }
 
-/// One `Actor`-trait method, shaped by the rpc kind. `&mut self`, because the
-/// task owns the state instead of sharing it.
+/// What one `Mail` variant carries beside its declared arguments.
+///
+/// `send` reads its upload **inside** the turn, so its variant has to carry the
+/// reader. The other four never touch one.
+///
+/// A unit rather than `Option<BodyReader>`, and the argument is **type honesty**,
+/// not size: there is no case where a non-`send` kind *might* have a body — the
+/// kind decides it at compile time, and a field that can only ever be one thing
+/// should be the type of that thing. An `Option` would invite an arm for a `None`
+/// that cannot occur, which is the shape `__keylink_mail_arm!` destructures the
+/// unit to refuse.
+///
+/// # The size argument this used to make is measurably false
+///
+/// It read: paying `size_of::<BodyReader>()` on every variant "would be a tax on
+/// the mailbox — which is sized to its largest variant and eagerly allocated 32
+/// deep". Every clause is true and the conclusion does not follow, because the
+/// mailbox is **already** sized to `Mail::Served`, which carries a `BodyReader`
+/// unconditionally. Measured on `tests/actor_memory.rs`'s `ledger`, which declares
+/// one `u64` method: `size_of::<ledger::Mail>()` is 248 bytes, and 248 is exactly
+/// `Served` — `Origin` 120 + `Request` 8 + `BodyReader` 96 + `Reply` 24 — against
+/// 152 for the per-method variant. `Option<BodyReader>` is also 96 bytes, the
+/// niche being free, so widening all four unit fields would leave the enum at 248.
+/// The tax is zero.
+///
+/// Recorded rather than deleted, because a wrong reason on a hot-path type is
+/// worse than no reason: the next wave cites it instead of measuring.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_mail_body {
+    (rpc) => {
+        ()
+    };
+    (tell) => {
+        ()
+    };
+    (send) => {
+        $crate::BodyReader
+    };
+    (recv) => {
+        ()
+    };
+    (blob) => {
+        ()
+    };
+}
+
+/// What one `Mail` variant's reply channel carries.
+///
+/// The **handler's** own return type, which is not the same as the wire
+/// `Response`'s payload: a `recv` handler returns `($ret, Body)` and the wire
+/// carries only `$ret`, because the body travels beside the message rather than
+/// inside it. `__keylink_response_ty!` answers the other question, and the two
+/// deliberately disagree for exactly that kind.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_mail_answer {
+    (rpc, $ret:ty) => {
+        $ret
+    };
+    (tell, $ret:ty) => {
+        $ret
+    };
+    (send, $ret:ty) => {
+        $ret
+    };
+    (recv, $ret:ty) => {
+        ($ret, $crate::Body)
+    };
+    (blob, $ret:ty) => {
+        ($ret, $crate::BlobId)
+    };
+}
+
+/// One arm of the `Mail` match, shaped by `#[defer]` and by the rpc kind.
+///
+/// Three of the four arms differ only in what reaches the handler, and that is the
+/// point: a kind differs in what its variant *carries*, which
+/// `__keylink_mail_body!` and `__keylink_mail_answer!` already decided, so only
+/// `send` — the one kind that hands its reader to the handler — and `#[defer]` —
+/// the one attribute that hands over the reply — need arms of their own.
+///
+/// Every arm is one call to [`turn`](crate::turn) or [`turn_deferred`](crate::turn_deferred)
+/// and nothing else. A kind added here without the queue deadline, the panic guard,
+/// the observer chain or the idempotency marks is not a thing that can be written:
+/// they are inside that call, not beside it.
+///
+/// An expression and not a statement, because a macro cannot expand to a match arm.
+/// That constraint is also what makes the `Served` arms per-method in the caller
+/// rather than a match inside one turn — see `Turn for Mail`.
+///
+/// The origin is passed to the closure **by value** and borrowed inside. A
+/// `Caller` borrowed in the loop and captured here would have to outlive every
+/// lifetime `turn`'s higher ranked bound quantifies over, and RFC-07 §1.6 proves
+/// a peer's `Caller` never reaches `'static`.
+///
+/// `$declared` is the method's **wire** name and `$method` its snake-case trait
+/// method: one is what a `TurnInfo` reports and the other is what gets called.
+/// Two parameters rather than one derivation, because `pastey` can go from
+/// `Reserve` to `reserve` and nothing can reliably go back — `GetItem` is the
+/// counter-example.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_mail_arm {
+    // A deferred `rpc`: the reply goes to the handler and comes back inside the
+    // `Replied` token, which is what lets `turn_deferred` still put the observer
+    // chain between an answer and its caller.
+    ([defer], rpc, $actor:ty, $state:expr, $hooks:expr, $origin:expr, $declared:expr,
+        $reply:expr, $body:expr, $method:ident, ($( $arg:ident ),*)) => {{
+        let () = $body;
+        $crate::turn_deferred(
+            $state,
+            $hooks,
+            $origin,
+            $declared,
+            $reply,
+            move |__from: $crate::Origin, __on: &mut $actor, __reply| {
+                ::std::boxed::Box::pin(async move {
+                    __on.$method(__from.caller(), __reply $(, $arg )*).await
+                })
+            },
+        )
+        .await
+    }};
+    // `#[defer]` on a kind that cannot defer: `__keylink_defer_check!` is emitting
+    // the error, and this arm keeps the mailbox agreeing with the trait so that
+    // error is the only one.
+    ([defer], $kind:ident, $actor:ty, $state:expr, $hooks:expr, $origin:expr, $declared:expr,
+        $reply:expr, $body:expr, $method:ident, ($( $arg:ident ),*)) => {
+        $crate::__keylink_mail_arm!(
+            [], $kind, $actor, $state, $hooks, $origin, $declared, $reply, $body, $method,
+            ($( $arg ),*)
+        )
+    };
+    ([], send, $actor:ty, $state:expr, $hooks:expr, $origin:expr, $declared:expr, $reply:expr,
+        $body:expr, $method:ident, ($( $arg:ident ),*)) => {
+        $crate::turn(
+            $state,
+            $hooks,
+            $origin,
+            $declared,
+            $reply,
+            move |__from: $crate::Origin, __on: &mut $actor| {
+                ::std::boxed::Box::pin(async move {
+                    __on.$method(__from.caller() $(, $arg )*, $body).await
+                })
+            },
+        )
+        .await
+    };
+    ([], $kind:ident, $actor:ty, $state:expr, $hooks:expr, $origin:expr, $declared:expr,
+        $reply:expr, $body:expr, $method:ident, ($( $arg:ident ),*)) => {{
+        // The unit `__keylink_mail_body!` chose for this kind, destructured
+        // rather than dropped: a `let _ = ..` would go on compiling if the field
+        // ever became something else, and this says which kinds have no body.
+        let () = $body;
+        $crate::turn(
+            $state,
+            $hooks,
+            $origin,
+            $declared,
+            $reply,
+            move |__from: $crate::Origin, __on: &mut $actor| {
+                ::std::boxed::Box::pin(async move {
+                    __on.$method(__from.caller() $(, $arg )*).await
+                })
+            },
+        )
+        .await
+    }};
+}
+
+/// One arm of the `Mail::Served` match: a request from a peer, against one actor.
+///
+/// The twin of `__keylink_mail_arm!` for the one variant that arrives over the
+/// wire, and the replacement for the `__actor_turn` free function plus the
+/// `__keylink_actor_invoke_fn!` item per method that Wave 2c deleted. Those two
+/// existed because a macro cannot expand to a match arm — but they put the match
+/// on `Request` *inside* the turn's closure, and by then which turn to run has
+/// already been decided. A deferred method needs that decision made first, so the
+/// arms are written out by `service!` and this is the expression each one is.
+///
+/// Where the reply comes from differs from `__keylink_mail_arm!` and it is the
+/// interesting part. A local arm has a `Reply` of the method's own return type; a
+/// served arm has one `Reply<(Response, Body)>` for every method, because a peer is
+/// owed the service's typed `Response`. For four kinds that is a value the closure
+/// builds and `turn` sends. For a `#[defer]` method the handler needs a
+/// `Reply<$ret>`, and the answer may arrive when no generated code is running — so
+/// the conversion is installed into the channel with
+/// [`Reply::wrapping`](crate::Reply::wrapping), which is the only reason that method
+/// exists.
+///
+/// `$body` is the `BodyReader` beside the request. It is dropped for every kind but
+/// `send`, which reads it inside the turn.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_served_arm {
+    ([defer], rpc, $actor:ty, $state:expr, $hooks:expr, $origin:expr, $declared:expr,
+        $reply:expr, $body:expr, $method:ident, $resp:ident, $variant:ident,
+        ($( $arg:ident ),*)) => {
+        $crate::turn_deferred(
+            $state,
+            $hooks,
+            $origin,
+            $declared,
+            // Only generated code can name `Response`, and the parked answer
+            // arrives when none is running. So the wrapping travels with the
+            // channel instead of being applied at a call site.
+            $crate::Reply::wrapping($reply, |__value| {
+                ($resp::$variant(__value), $crate::Body::empty())
+            }),
+            move |__from: $crate::Origin, __on: &mut $actor, __reply| {
+                ::std::boxed::Box::pin(async move {
+                    ::core::mem::drop($body);
+                    __on.$method(__from.caller(), __reply $(, $arg )*).await
+                })
+            },
+        )
+        .await
+    };
+    ([defer], $kind:ident, $actor:ty, $state:expr, $hooks:expr, $origin:expr, $declared:expr,
+        $reply:expr, $body:expr, $method:ident, $resp:ident, $variant:ident,
+        ($( $arg:ident ),*)) => {
+        $crate::__keylink_served_arm!(
+            [], $kind, $actor, $state, $hooks, $origin, $declared, $reply, $body, $method,
+            $resp, $variant, ($( $arg ),*)
+        )
+    };
+    ([], send, $actor:ty, $state:expr, $hooks:expr, $origin:expr, $declared:expr,
+        $reply:expr, $body:expr, $method:ident, $resp:ident, $variant:ident,
+        ($( $arg:ident ),*)) => {
+        $crate::turn(
+            $state, $hooks, $origin, $declared, $reply,
+            move |__from: $crate::Origin, __on: &mut $actor| {
+                ::std::boxed::Box::pin(async move {
+                    (
+                        $resp::$variant(
+                            __on.$method(__from.caller() $(, $arg )*, $body).await,
+                        ),
+                        $crate::Body::empty(),
+                    )
+                })
+            },
+        )
+        .await
+    };
+    ([], recv, $actor:ty, $state:expr, $hooks:expr, $origin:expr, $declared:expr,
+        $reply:expr, $body:expr, $method:ident, $resp:ident, $variant:ident,
+        ($( $arg:ident ),*)) => {
+        $crate::turn(
+            $state, $hooks, $origin, $declared, $reply,
+            move |__from: $crate::Origin, __on: &mut $actor| {
+                ::std::boxed::Box::pin(async move {
+                    ::core::mem::drop($body);
+                    let (__value, __out) = __on.$method(__from.caller() $(, $arg )*).await;
+                    ($resp::$variant(__value), __out)
+                })
+            },
+        )
+        .await
+    };
+    // The pair goes into the response WHOLE, and the grant is recorded from there
+    // rather than here. `serve_one` is the only place that holds both the
+    // `AdmittedPeer` and the store, and it reads the id back off this response
+    // through `Granting`.
+    ([], blob, $actor:ty, $state:expr, $hooks:expr, $origin:expr, $declared:expr,
+        $reply:expr, $body:expr, $method:ident, $resp:ident, $variant:ident,
+        ($( $arg:ident ),*)) => {
+        $crate::turn(
+            $state, $hooks, $origin, $declared, $reply,
+            move |__from: $crate::Origin, __on: &mut $actor| {
+                ::std::boxed::Box::pin(async move {
+                    ::core::mem::drop($body);
+                    let (__value, __id) = __on.$method(__from.caller() $(, $arg )*).await;
+                    ($resp::$variant((__value, __id)), $crate::Body::empty())
+                })
+            },
+        )
+        .await
+    };
+    // `rpc` and `tell` are identical, because the served chain is typed
+    // `(Response, Body)` for every kind: a `tell` still builds a response and
+    // `serve_one_tell` drops it, there being no stream to write it to.
+    ([], $kind:ident, $actor:ty, $state:expr, $hooks:expr, $origin:expr, $declared:expr,
+        $reply:expr, $body:expr, $method:ident, $resp:ident, $variant:ident,
+        ($( $arg:ident ),*)) => {
+        $crate::turn(
+            $state, $hooks, $origin, $declared, $reply,
+            move |__from: $crate::Origin, __on: &mut $actor| {
+                ::std::boxed::Box::pin(async move {
+                    ::core::mem::drop($body);
+                    (
+                        $resp::$variant(__on.$method(__from.caller() $(, $arg )*).await),
+                        $crate::Body::empty(),
+                    )
+                })
+            },
+        )
+        .await
+    };
+}
+
+/// Whether `#[defer]` means anything on this kind, and the one place it is refused.
+///
+/// Expanded once per declaration, inside the generated module. Emitting nothing is
+/// the common case; the four refusals name what a deferred reply would have to be
+/// for that kind, because "cannot defer" on its own sends an author looking for a
+/// workaround rather than for the right method kind.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_defer_check {
+    ([], $kind:ident, $rpc:ident) => {};
+    ([defer], rpc, $rpc:ident) => {};
+    ([defer], tell, $rpc:ident) => {
+        ::core::compile_error!(::core::concat!(
+            "`#[defer]` on `tell ",
+            ::core::stringify!($rpc),
+            "`, and a `tell` has \
+             no reply channel to defer. Nothing is sent back, so there is nothing \
+             to answer later and no caller waiting to be answered. Make it an \
+             `rpc` — a deferred `rpc` returning `()` is a `tell` whose caller \
+             waits, which is what a deferred answer needs."
+        ));
+    };
+    ([defer], send, $rpc:ident) => {
+        ::core::compile_error!(::core::concat!(
+            "`#[defer]` on `send ",
+            ::core::stringify!($rpc),
+            "`, and a `send` \
+             reads its upload INSIDE the turn. Deferring the reply does not \
+             release the `BodyReader`, so the turn would still hold the actor for \
+             as long as the peer keeps writing - RFC-04 s10.4 - and a `send` \
+             cannot be served as an actor at all. Put the upload on a second \
+             service and defer the `rpc` that follows it."
+        ));
+    };
+    ([defer], recv, $rpc:ident) => {
+        ::core::compile_error!(::core::concat!(
+            "`#[defer]` on `recv ",
+            ::core::stringify!($rpc),
+            "`, and a `recv` \
+             answers with a `Body` the connection drains AFTER the turn ends. The \
+             reply is already half-deferred by the transport, and a parked one \
+             would leave a stream open with nothing scheduled to write it. Return \
+             the payload from the turn, or hand out a `blob` address instead."
+        ));
+    };
+    ([defer], feed, $rpc:ident) => {
+        ::core::compile_error!(::core::concat!(
+            "`#[defer]` on `feed ",
+            ::core::stringify!($rpc),
+            "`, and a `feed` has \
+             no reply channel to defer - and no caller to defer one TO. An item \
+             arrived off a stream nobody is waiting on, which is why the handler \
+             takes no `Caller` and returns nothing. If something is waiting for an \
+             answer, that something called: make it an `rpc`, and `#[defer]` it if \
+             the answer comes from a later turn."
+        ));
+    };
+    ([defer], blob, $rpc:ident) => {
+        ::core::compile_error!(::core::concat!(
+            "`#[defer]` on `blob ",
+            ::core::stringify!($rpc),
+            "`, and a `blob` \
+             answers with a content address for bytes this node ALREADY holds. \
+             There is nothing to wait for: if the content does not exist yet, the \
+             address does not either. Defer an `rpc` that returns the address once \
+             the content has been written."
+        ));
+    };
+}
+
+/// One `Actor`-trait method, shaped by the rpc kind and by `#[defer]`. `&mut self`,
+/// because the task owns the state instead of sharing it.
+///
+/// The first parameter is the interpreted-attribute group the muncher built: `[]`
+/// or `[defer]`. Three arms handle it and the five kind arms below are untouched —
+/// a deferred `rpc` gets its own signature, and `#[defer]` on any other kind falls
+/// back to that kind's ordinary signature, because `__keylink_defer_check!` is
+/// already emitting the one error that says why. Generating a *deferring* signature
+/// for a kind whose mailbox arm cannot honour it would bury that error under a
+/// trait/mailbox mismatch.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_actor_method {
-    ([$( #[$meta:meta] )*], rpc, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+    // A deferred `rpc`: the reply channel is an argument and the return is the
+    // token proving it was consumed.
+    ([defer], [$( #[$meta:meta] )*], rpc, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Answer the `", stringify!($name), "` rpc — now, or from a later turn.")]
+        ///
+        /// `#[defer]`. The reply channel is an argument, and
+        /// [`Replied`](keylink::Replied) is the proof that it was used: there is no
+        /// way to build one except [`Reply::send`](keylink::Reply::send), which
+        /// answers this turn, or [`Reply::later`](keylink::Reply::later), which
+        /// hands back a [`Deferred`](keylink::Deferred) to answer from any turn
+        /// after it. So forgetting to answer is a compile error rather than a
+        /// caller that waits forever.
+        ///
+        /// `send` does not write to the channel: the value goes back to the turn,
+        /// which sends it **after** the observer chain — so an answer given here is
+        /// committed exactly like an ordinary method's return value, and an
+        /// observer that refuses withholds it. A parked answer is the turn's output
+        /// no longer, and is not gated.
+        ///
+        /// Nothing about the wire changes. A caller — local or remote — calls this
+        /// like any other `rpc` and blocks until the answer arrives.
+        fn $name(
+            &mut self,
+            cx: $crate::Caller<'_>,
+            reply: $crate::Reply<$ret>
+            $(, $arg: $ty )*
+        ) -> impl ::core::future::Future<Output = $crate::Replied<$ret>> + Send;
+    };
+    // `#[defer]` on a kind that cannot defer. Refused by `__keylink_defer_check!`;
+    // emit the ordinary signature so that is the only error.
+    ([defer], $attrs:tt, $kind:ident, $name:ident, $args:tt, $ret:ty) => {
+        $crate::__keylink_actor_method!([], $attrs, $kind, $name, $args, $ret);
+    };
+    ([], [$( #[$meta:meta] )*], rpc, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc.")]
         fn $name(&mut self, cx: $crate::Caller<'_> $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = $ret> + Send;
     };
-    ([$( #[$meta:meta] )*], tell, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+    ([], [$( #[$meta:meta] )*], tell, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Handle the `", stringify!($name), "` tell. Nothing is sent back.")]
         fn $name(&mut self, cx: $crate::Caller<'_> $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = $ret> + Send;
     };
-    ([$( #[$meta:meta] )*], send, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+    ([], [$( #[$meta:meta] )*], send, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc, reading the payload the caller streams up.")]
         ///
@@ -1928,7 +3325,7 @@ macro_rules! __keylink_actor_method {
         fn $name(&mut self, cx: $crate::Caller<'_> $(, $arg: $ty )*, body: $crate::BodyReader)
             -> impl ::core::future::Future<Output = $ret> + Send;
     };
-    ([$( #[$meta:meta] )*], recv, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+    ([], [$( #[$meta:meta] )*], recv, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc, returning a payload to stream back.")]
         ///
@@ -1937,7 +3334,7 @@ macro_rules! __keylink_actor_method {
         fn $name(&mut self, cx: $crate::Caller<'_> $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = ($ret, $crate::Body)> + Send;
     };
-    ([$( #[$meta:meta] )*], blob, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+    ([], [$( #[$meta:meta] )*], blob, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc, returning the address of content this node already holds.")]
         ///
@@ -1949,102 +3346,33 @@ macro_rules! __keylink_actor_method {
     };
 }
 
-/// The bridge from one `Request` variant to one `Actor` method.
-///
-/// A free function per rpc for the same reason as its `Handler` twin: a macro
-/// cannot expand to a match arm, but it can expand to an item.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __keylink_actor_invoke_fn {
-    (rpc, $fname:ident, $actor:ident, $resp:ident, $variant:ident, $method:ident,
-        ($( $arg:ident : $ty:ty ),*)) => {
-        async fn $fname<A: $actor>(
-            state: &mut A,
-            cx: $crate::Caller<'_>,
-            _body: $crate::BodyReader
-            $(, $arg: $ty )*
-        ) -> ($resp, $crate::Body) {
-            (
-                $resp::$variant(state.$method(cx $(, $arg )*).await),
-                $crate::Body::empty(),
-            )
-        }
-    };
-    // The twin of the `Handler` arm above, on purpose. If these two diverge,
-    // that is the bug RFC-01 §11.2b calls "build the path twice".
-    (tell, $fname:ident, $actor:ident, $resp:ident, $variant:ident, $method:ident,
-        ($( $arg:ident : $ty:ty ),*)) => {
-        async fn $fname<A: $actor>(
-            state: &mut A,
-            cx: $crate::Caller<'_>,
-            _body: $crate::BodyReader
-            $(, $arg: $ty )*
-        ) -> ($resp, $crate::Body) {
-            (
-                $resp::$variant(state.$method(cx $(, $arg )*).await),
-                $crate::Body::empty(),
-            )
-        }
-    };
-    (send, $fname:ident, $actor:ident, $resp:ident, $variant:ident, $method:ident,
-        ($( $arg:ident : $ty:ty ),*)) => {
-        async fn $fname<A: $actor>(
-            state: &mut A,
-            cx: $crate::Caller<'_>,
-            body: $crate::BodyReader
-            $(, $arg: $ty )*
-        ) -> ($resp, $crate::Body) {
-            (
-                $resp::$variant(state.$method(cx, $( $arg, )* body).await),
-                $crate::Body::empty(),
-            )
-        }
-    };
-    (recv, $fname:ident, $actor:ident, $resp:ident, $variant:ident, $method:ident,
-        ($( $arg:ident : $ty:ty ),*)) => {
-        async fn $fname<A: $actor>(
-            state: &mut A,
-            cx: $crate::Caller<'_>,
-            _body: $crate::BodyReader
-            $(, $arg: $ty )*
-        ) -> ($resp, $crate::Body) {
-            let (value, body) = state.$method(cx $(, $arg )*).await;
-            ($resp::$variant(value), body)
-        }
-    };
-    // RFC-01 §11.2b calls this the "build the blob path twice" risk: there are
-    // TWO generators, and a kind added to one and not the other compiles
-    // everywhere except the service that uses it. Identical to the `Handler`
-    // twin above on purpose — if these two ever diverge, that is the bug.
-    (blob, $fname:ident, $actor:ident, $resp:ident, $variant:ident, $method:ident,
-        ($( $arg:ident : $ty:ty ),*)) => {
-        async fn $fname<A: $actor>(
-            state: &mut A,
-            cx: $crate::Caller<'_>,
-            _body: $crate::BodyReader
-            $(, $arg: $ty )*
-        ) -> ($resp, $crate::Body) {
-            let (value, id) = state.$method(cx $(, $arg )*).await;
-            ($resp::$variant((value, id)), $crate::Body::empty())
-        }
-    };
-}
-
 /// One method on the typed actor handle, shaped by the rpc kind.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_actor_client_method {
-    // No actor handle method for `tell`, the same way `blob` has none.
+    // No actor handle method for `tell`, and the reason changed completely
+    // under it — so here is a new one rather than a stale one.
     //
-    // A `tell` is delivered on a unidirectional stream, and the actor system
-    // reaches its registry over `ActorClient::call`, which is bidirectional by
-    // construction — the reply is what carries the schema-mismatch refusal.
-    // Emitting a method that silently used the bidirectional path would give a
-    // `tell` a reply channel it is documented not to have.
+    // **The old reason is gone.** It was that the actor system reached its
+    // registry over a bidirectional `ActorClient::call`, because the reply was
+    // what carried the schema-mismatch refusal, and a `tell` has no reply. There
+    // is no schema-mismatch refusal any more: drift is refused at the handshake,
+    // and a keyed `tell` really would work — `RpcClient::tell` writes a
+    // `WireRequest::Call` on a unidirectional stream and `serve_one_tell` walks
+    // the same dispatch a call does.
     //
-    // Absent and documented, rather than present and lying. A caller who wants
-    // fire-and-forget to an actor writes an `rpc` returning `()` and drops the
-    // result, which is honest about the round trip it pays for.
+    // It stays absent for a reason of its own. A keyed message can be refused
+    // for four things a singleton `tell` cannot: a malformed id, an id nothing
+    // is mounted under, a registry at its capacity, and a queue budget that
+    // expired before a permit arrived. All four are decided AFTER the bytes
+    // reach the wire, and all four are reported on the reply — so a keyed `tell`
+    // would be fire-and-forget into a registry that can refuse four ways the
+    // caller can never learn about, including "you addressed an actor that does
+    // not exist", which is the mistake a caller most wants to hear about.
+    //
+    // A caller who wants fire-and-forget to a keyed actor writes an `rpc`
+    // returning `()` and drops the result, which is honest about the round trip
+    // it pays for. Absent and documented, rather than present and lying.
     ([$( #[$meta:meta] )*], tell, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
     ([$( #[$meta:meta] )*], rpc, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
@@ -2054,12 +3382,7 @@ macro_rules! __keylink_actor_client_method {
         pub async fn $name(&self $(, $arg: $ty )*) -> $crate::Result<$ret> {
             let (response, _body) = self
                 .client
-                .call::<$req, $resp>(
-                    &self.actor,
-                    schema(),
-                    &$req::$variant { $( $arg ),* },
-                    $crate::Body::empty(),
-                )
+                .send_to(&self.actor, $req::$variant { $( $arg ),* }, $crate::Body::empty())
                 .await?;
             response.$extract()
         }
@@ -2071,12 +3394,7 @@ macro_rules! __keylink_actor_client_method {
         pub async fn $name(&self $(, $arg: $ty )*, body: $crate::Body) -> $crate::Result<$ret> {
             let (response, _body) = self
                 .client
-                .call::<$req, $resp>(
-                    &self.actor,
-                    schema(),
-                    &$req::$variant { $( $arg ),* },
-                    body,
-                )
+                .send_to(&self.actor, $req::$variant { $( $arg ),* }, body)
                 .await?;
             response.$extract()
         }
@@ -2089,42 +3407,73 @@ macro_rules! __keylink_actor_client_method {
             -> $crate::Result<($ret, $crate::BodyReader)> {
             let (response, body) = self
                 .client
-                .call::<$req, $resp>(
-                    &self.actor,
-                    schema(),
-                    &$req::$variant { $( $arg ),* },
-                    $crate::Body::empty(),
-                )
+                .send_to(&self.actor, $req::$variant { $( $arg ),* }, $crate::Body::empty())
                 .await?;
             Ok((response.$extract()?, body))
         }
     };
-    // Deliberately absent, the same way `__keylink_blocking_method!` omits
-    // `send` and `recv` — and for a reason of the same shape.
+    // Present, and it was absent for years. The reason it was absent is worth
+    // keeping, because it is a good example of a limitation that looked
+    // structural and was not.
     //
     // `serve_one` records a grant by reading the address off the reply through
-    // `Granting`. On the actor path that reply is an `ActorReply`: an opaque
-    // payload the system never decodes, which is precisely the property RFC-01
-    // §11.2a wanted, since it means a `BlobId` cannot arrive under a mismatched
-    // schema. The cost is that the system cannot see the address either, so no
-    // grant is recorded and any handle built here would fetch content nobody
-    // was granted.
+    // `Granting`. On the keyed path that reply used to be an opaque `ActorReply`
+    // — a payload the system never decoded — so the address genuinely sat where
+    // nothing could see it, no grant was recorded, and any handle built here
+    // would have fetched content nobody was granted. Emitting a method that
+    // failed at run time was worse than emitting nothing, so nothing is what was
+    // emitted, and `tests/blobs.rs` pinned BOTH halves: the method did not exist,
+    // and the address reachable the hard way was refused on fetch.
     //
-    // Emitting a method that fails at runtime, or a `compile_error!` that would
-    // fire for every service declaring a `blob` method whether or not it is
-    // mounted as an actor, are both worse than emitting nothing. Wiring it
-    // needs the store inside the actor's own dispatch, which is RFC-04's to
-    // reconcile (§11.2b, §11.2c).
+    // A keyed actor answers with the service's own typed `Response` now. The
+    // generated `impl Granting for Response` is the one `serve_one` reads, it is
+    // the same impl the singleton path uses, and the grant is recorded before the
+    // reply is written exactly as it is there. The limitation was a consequence
+    // of payload opacity rather than of keyed addressing, which is what removing
+    // the opacity demonstrates.
     ([$( #[$meta:meta] )*], blob, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Call the `", stringify!($variant), "` rpc on this actor, returning its reply and a handle to the content it named.")]
+        ///
+        /// The call site names no ALPN, no second dial and no hash: a
+        /// [`BlobHandle`](keylink::BlobHandle) is a content address plus the
+        /// node that holds it, and it opens the blobs connection itself.
+        pub async fn $name(&self $(, $arg: $ty )*)
+            -> $crate::Result<($ret, $crate::BlobHandle)> {
+            let (response, _body) = self
+                .client
+                .send_to(&self.actor, $req::$variant { $( $arg ),* }, $crate::Body::empty())
+                .await?;
+            let (value, id) = response.$extract()?;
+            Ok((value, self.client.blob_handle(id)))
+        }
+    };
 }
 
 /// One method on a local `Handle`, shaped by the rpc kind.
 ///
-/// Every arm goes through the trait method **directly**: no `Request` variant is
-/// built, nothing is serialized, and no `Response` is taken apart. That is why
-/// none of these can fail in a second way — there is no encode step to fail, and
-/// no "wrong variant" to extract.
+/// Every arm builds one variant of the service's own `Mail` and hands it to the
+/// mailbox. Nothing here is serialized, no `Request` variant is built and no
+/// `Response` is taken apart — the variant carries this method's own arguments
+/// and a `Reply` of this method's own return type, so there is no encode step to
+/// fail and no "wrong variant" to extract.
+///
+/// **These arms used to call the trait method directly**, bypassing the mailbox
+/// loop's dispatch entirely, and `__actor_turn`'s comment admitted it in those
+/// words — *"there **are** two dispatchers, and the second one is
+/// `__keylink_local_method!`"* — which it now carries in the past tense instead,
+/// because the sentence outlived the arms it described by one wave. It argued the
+/// split had stopped mattering because the caller became an argument. It had not.
+/// A turn's *policy* — the observer chain reached through the loop's own reply
+/// channel, the panic guard, the marks a served call makes — was reachable only
+/// from the loop, so anything a later kind wanted to do to a turn had to be
+/// written twice and compiled fine when it was written once.
+///
+/// The `body: ()` on every arm is not padding. Only a `send` handler reads an
+/// upload inside its turn, so only `send`'s variant carries a `BodyReader`; the
+/// other four carry a unit, and `Handle` has no `send` method to build one from
+/// anyway.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_local_method {
@@ -2144,9 +3493,12 @@ macro_rules! __keylink_local_method {
         pub async fn $name(&self $(, $arg: $ty )*)
             -> ::core::result::Result<$ret, $crate::MailboxClosed> {
             self.inner
-                .ask(move |__state: &mut A| ::std::boxed::Box::pin(async move {
-                    __state.$name($crate::Caller::Local $(, $arg )*).await
-                }))
+                .ask(move |__from, __reply| Mail::$variant {
+                    origin: __from,
+                    $( $arg, )*
+                    body: (),
+                    reply: __reply,
+                })
                 .await
         }
     };
@@ -2174,9 +3526,12 @@ macro_rules! __keylink_local_method {
         pub async fn $name(&self $(, $arg: $ty )*)
             -> ::core::result::Result<(), $crate::MailboxClosed> {
             self.inner
-                .notify(move |__state: &mut A| ::std::boxed::Box::pin(async move {
-                    __state.$name($crate::Caller::Local $(, $arg )*).await
-                }))
+                .notify(move |__from, __reply| Mail::$variant {
+                    origin: __from,
+                    $( $arg, )*
+                    body: (),
+                    reply: __reply,
+                })
                 .await
         }
     };
@@ -2197,9 +3552,12 @@ macro_rules! __keylink_local_method {
         pub async fn $name(&self $(, $arg: $ty )*)
             -> ::core::result::Result<($ret, $crate::BlobId), $crate::MailboxClosed> {
             self.inner
-                .ask(move |__state: &mut A| ::std::boxed::Box::pin(async move {
-                    __state.$name($crate::Caller::Local $(, $arg )*).await
-                }))
+                .ask(move |__from, __reply| Mail::$variant {
+                    origin: __from,
+                    $( $arg, )*
+                    body: (),
+                    reply: __reply,
+                })
                 .await
         }
     };
@@ -2339,6 +3697,12 @@ mod expansion {
         // "build the blob path twice" risk lives: a kind added to one generator
         // and not the other compiles until somebody declares it.
         blob Manual(sku: String) -> u64;
+        // TWO feeds, and two is the number that matters: one feed's `POLLERS`
+        // table has nothing to rotate among, so the modulo arithmetic in
+        // `Feeds::poll_next` is only exercised from two up. It also means the
+        // service reaching `SpawnableUnfed::CHECK` below is a fed one.
+        feed Ticks(tick: u64);
+        feed Fills(fill: String);
     }
 
     /// The one claim in `__keylink_local_method!` that a reader cannot check by
@@ -2372,7 +3736,7 @@ mod expansion {
         impl<A> HandleHasNoStreamingMethod for expansion::Handle<A> {}
 
         /// The hole the shadowing probe cannot see, closed the way
-        /// `representability.rs` closes it for `Sealed`.
+        /// `representability.rs` closes it for `Origin`.
         ///
         /// A trait method on `Self` outranks a deref step, so the probe above
         /// would stay green while `handle.store(..)` quietly started working
@@ -2412,6 +3776,11 @@ mod expansion {
             ) -> (u64, crate::BlobId) {
                 unreachable!("never called; this module only has to compile")
             }
+            // No `Caller` and no return, which is the whole shape of a feed
+            // handler. That this compiles against the generated trait is the
+            // assertion: a signature with either would be `E0053`.
+            async fn on_ticks(&mut self, _tick: u64) {}
+            async fn on_fills(&mut self, _fill: String) {}
         }
 
         fn a_local_handle_streams_nothing(handle: expansion::Handle<Probe>) {

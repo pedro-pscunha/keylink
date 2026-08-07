@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+#MISE description="Nothing writes a snapshot without a version frame in front"
+#
+# `keylink_persist::versioned::Versioned` owns its claim and has no accessor,
+# no `Deref` and no `into_inner`, so a holder of one CANNOT reach
+# `Claim::store`. That is the real guarantee, it is in the type system, and
+# `keylink-persist/src/representability.rs` holds the compile-time probes for
+# it. This task is the belt to those braces: it watches the one way round the
+# type, which is taking a raw claim from `Snapshots::claim` and never wrapping
+# it.
+#
+# The first check reads a property of Rust rather than a naming convention.
+# `store` is a TRAIT method, so it is only callable where the trait is in
+# scope — a file that never brings `keylink_persist::Claim` into scope cannot
+# call it, whatever it calls its variables. There are three ways to bring it
+# in and all three are matched: naming it, naming it inside a brace list, and
+# a glob. **The glob is the one this check used to miss**, and it is the worst
+# one to miss: `use keylink_persist::*` puts `Claim` in scope without spelling
+# it, while NOT importing `Versioned`, which lives in the `versioned` module.
+# The one import that hands over the raw port and withholds the wrapper.
+#
+# **An IMPLEMENTOR of the port is exempt, and that exemption is the check's
+# correctness rather than a hole in it.** `impl Claim for MyStore` names the
+# trait because it has to; there is no spelling of "implement this trait" that
+# does not. So the check as first written refused, in-tree, exactly what
+# sealing the trait would have refused — while the paragraph at the bottom of
+# this comment rejects sealing for costing "the hexagon its whole point". Both
+# could not be true. A bucket adapter, a vault adapter, and the test-crate
+# adapter that makes a `store` fail on demand — the one that turns "a failed
+# store is not silently retried" from an argument into a red test — are all
+# the port working, not the port leaking. What is forbidden is *calling*
+# `Claim::store` on somebody else's claim, and that is the second check's job,
+# with a named allowlist. This one now catches the import route only where
+# nothing in the file defines the trait's other side.
+#
+# The second is the ordinary grep. It used to look for `.store(&` and
+# `.store(b"`, which is what a raw write looked like at the time; thirteen
+# lines of `claim.store(payload.as_slice())` walked through it. So it now
+# matches any `.store(` with an argument — `.store()` with none is iroh's
+# blobs accessor and a `NoSuchMethod` probe, neither of which writes anything
+# — and the files that legitimately store are named below, one glob each.
+# Adding a file to that list is the deliberate act; forgetting to is a red
+# gate rather than a silent pass.
+#
+# Neither check is airtight — a `use keylink_persist::{\n  Claim,\n}` split
+# across lines would slip past the first, and `.store` reached through a local
+# alias in an allowlisted file slips past both. They do not have to be. The
+# type is the guarantee; this is the reminder.
+#
+# Sealing `Claim` would not help, and was considered: sealing stops a foreign
+# crate IMPLEMENTING a trait, not calling its methods, so it closes nothing
+# here — and the port exists to be implemented from outside, for a bucket or a
+# vault. It would cost the hexagon its whole point to buy nothing. The
+# implementor exemption above is what makes this paragraph true of the task
+# and not only of the type.
+set -euo pipefail
+
+root="${MISE_PROJECT_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+cd "$root"
+
+# `rg` exits 1 when it matches nothing, and NOTHING is this task's green case.
+# Under `set -euo pipefail` every unprotected `rg` in these pipelines inherits
+# that 1 to the command substitution, and `set -e` then aborts the whole task
+# with no message at all. It was green only because each pattern happened to
+# have exactly one match in the tree and each filter happened to have something
+# to let through; reword one comment in `keylink/src/observe.rs` — ordinary
+# prose that somebody will touch — and CI fails naming nothing.
+#
+# `|| true` is the usual patch and it is the wrong one, because rg also exits 2
+# on a broken pattern or an unreadable path, and a gate that swallows its own
+# tooling failure is worse than no gate. So both wrappers below say the same
+# thing: 1 is the green case, 2 or more stops the task and says what happened.
+scan() {
+    local status=0
+    rg "$@" || status=$?
+    if ((status > 1)); then
+        echo "── ripgrep failed with exit $status searching for: $*" >&2
+        return "$status"
+    fi
+}
+
+# The same, for the filters in the middle of a pipeline. An empty result is
+# what a clean tree looks like by the time it reaches here.
+drop() {
+    local status=0
+    rg -v "$@" || status=$?
+    if ((status > 1)); then
+        echo "── ripgrep failed with exit $status filtering: $*" >&2
+        return "$status"
+    fi
+}
+
+# Drop comment lines from rg's `path:line:text` output. The doc comment in
+# keylink/src/observe.rs explains this exact dependency and must stay.
+uncommented() { drop '^[^:]*:[0-9]+:\s*(//|/\*|\*)'; }
+
+fail=0
+
+in_scope="$(
+    scan --line-number --glob '*.rs' --glob '!keylink-persist/**' \
+        'keylink_persist::(\*|Claim\b|\{[^}]*(\bClaim\b|\*))|\buse\s+keylink_persist\s+as\b' . \
+        | uncommented
+)"
+
+# `impl Claim for X`, in either spelling and with or without generics. A file
+# holding one is an adapter for the port and keeps the trait's name for the
+# only reason Rust offers.
+implements='^\s*impl(\s*<[^>]*>)?\s+(keylink_persist::)?Claim(\s*<[^>]*>)?\s+for\b'
+
+named_outside=""
+while IFS= read -r hit; do
+    [[ -z "$hit" ]] && continue
+    # `path:line:text`, so the path is everything before the first colon.
+    if rg --quiet "$implements" "${hit%%:*}"; then
+        continue
+    fi
+    named_outside+="$hit"$'\n'
+done <<<"$in_scope"
+
+if [[ -n "${named_outside//[$'\n']/}" ]]; then
+    fail=1
+    echo "── keylink_persist::Claim is in scope outside keylink-persist:" >&2
+    echo "$named_outside" >&2
+    echo >&2
+    echo "Claim::store writes raw, unframed bytes, and an unframed snapshot is" >&2
+    echo "refused on the next load rather than read. Wrap the claim in" >&2
+    echo "keylink_persist::versioned::Versioned and store through that." >&2
+    echo >&2
+    echo "A glob import counts. 'use keylink_persist::*' brings Claim in and" >&2
+    echo "leaves Versioned behind, which is the wrong half of the crate." >&2
+    echo >&2
+    echo "IMPLEMENTING the port is not this. A file containing 'impl Claim for'" >&2
+    echo "is an adapter and is exempt — that is what the port is for." >&2
+fi
+
+# The allowlist, and why each file is on it:
+#
+#   versioned.rs         the one framed writer, and the only caller of the port
+#   file.rs              the one implementor; its tests store byte literals on
+#                        purpose, because an adapter must not know about frames
+#   representability.rs  the compile-time probe that `store` infers its version
+#                        from its argument
+#   tests/versioned.rs   the frame and the migration chain, from outside
+#   keylink/tests/durable.rs
+#                        the driving side of the port, committing once per run
+#                        through `Handle::with_state` and `Versioned::store`
+#   keylink/src/persist.rs
+#                        **the adapter**, and the only line of keylink's library
+#                        that writes a snapshot. It is on THIS list and not on
+#                        the one above, which is the whole point: it never brings
+#                        the `Claim` trait into scope — its type parameter is the
+#                        STORE, `S: Snapshots`, and `Versioned<S::Claim>` needs no
+#                        bound of its own — so the first check still proves it has
+#                        no route to a raw, unframed write. What it calls is
+#                        `Versioned::store`, an inherent method on the wrapper,
+#                        with a `Snapshot<D>` that `Snapshot::of` produced.
+#
+# `keylink/examples/durable_ledger.rs` and `keylink/tests/feeds.rs` came OFF this
+# list in Wave 5: the example's commit loop and the test's hand-rolled `Saver`
+# both went through `keylink::Persist`, so neither file stores anything any more.
+# A stale allowlist entry is a hole nobody can see, so removing one is part of
+# the change that made it unnecessary.
+stored_raw="$(
+    scan --line-number --glob '*.rs' \
+        --glob '!keylink-persist/src/versioned.rs' \
+        --glob '!keylink-persist/src/file.rs' \
+        --glob '!keylink-persist/src/representability.rs' \
+        --glob '!keylink-persist/tests/versioned.rs' \
+        --glob '!keylink/tests/durable.rs' \
+        --glob '!keylink/src/persist.rs' \
+        '\.store\([^)]' . \
+        | drop 'Ordering::' \
+        | uncommented
+)"
+
+if [[ -n "$stored_raw" ]]; then
+    fail=1
+    echo "── something is stored outside the files that may store:" >&2
+    echo "$stored_raw" >&2
+    echo >&2
+    echo "A snapshot is written by Versioned::store, which takes a Snapshot<D>" >&2
+    echo "and stamps D::VERSION. If this line really does belong, add its file" >&2
+    echo "to the allowlist in this task and say why." >&2
+fi
+
+if [[ "$fail" -ne 0 ]]; then
+    exit 1
+fi
+
+echo "ok: every snapshot goes through the frame"

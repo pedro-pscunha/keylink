@@ -41,8 +41,12 @@ call.
 **Fire-and-forget.** A `tell` travels on a unidirectional stream and returns
 `Result<()>`, never the declared type: there is no reply stream to decode one
 from. The `Ok` means the bytes reached the transport and nothing more — not
-delivery, not handling, and no order against a `call`. Anything that needs an
-answer is an `rpc`.
+delivery, not handling, and no order against a `call`. It does not accept an
+idempotency key either, and the compiler is what says so: `with_idempotency`
+hands back an `IdempotentClient`, and a `tell` is not among its methods. The
+ledger answers a repeat with the recorded reply and a `tell` has no reply to
+record, so a key attached to one could only be discarded. **There is no reliable
+`tell`.** Anything that has to arrive is an `rpc`.
 
 **Large payloads.** A body is not framed: its extent is the rest of the stream
 and its flow control is QUIC's. A 4 GiB file costs zero framing bytes and one
@@ -93,7 +97,9 @@ client.with_idempotency(Idempotency::attaching_for(key, Duration::from_secs(5)))
 client.key_state(key).await?   // Fresh is the one answer a retry cannot give you
 ```
 
-The record is in memory and dies with the process. See RFC-05.
+The record is in memory and dies with the process. Composed with a reconnecting
+handle it is effectively-once for one `rpc`, which is the recipe below; RFC-05 has
+the reasoning.
 
 **Departure.** Every other failure here arrives as the answer to a question you
 asked. A dead peer does not — you find out on your next call, however long
@@ -184,12 +190,47 @@ The actor owns its observers, so nothing is shared and no `Sync` bound appears
 anywhere. `after_turn` returns a boxed future rather than being an `async fn`,
 which is what lets an implementation finish with the state before it awaits — an
 implementation that holds it across an await needs `A: Sync`, and one that does
-not, does not. Keyed actors mounted through `System` get no observers.
+not, does not.
 
-Many keyed instances behind one ALPN, addressed by an id inside the request, are
-`System` and `spawn`. That path costs more — an opaque payload, so no per-method
-layer, no idempotency ledger and no `blob` methods; see RFC-04 §14.8 — and is
-worth it only when there are many.
+**A second input.** A mailbox is one way into an actor. A `feed` is the other.
+Declare `feed Restocked(item: Restock);` and the generated `Actor` trait grows
+`async fn on_restocked(&mut self, item: Restock)` — no `Caller`, no return value,
+because nobody called and there is nothing to reply to — and a `Stream` is wired
+into the same loop at spawn, one argument per declared feed:
+
+```rust
+let warehouse = inventory::actor_wired(
+    Warehouse::seeded(),
+    vec![],                                 // observers
+    inventory::Feeds::new(deliveries),      // one argument per declared feed
+);
+```
+
+Feed items and mailbox messages are interleaved fairly: with everything ready at
+once the mailbox takes half the turns and each of `n` feeds takes `1/2n`. A feed
+is **local only and never on the wire**, so declaring one does not move the ALPN.
+A feed that ends, and a feed handler that panics, both end the actor — a fault
+with no caller to resume it into would otherwise be dropped onto a state the
+handler may have left half applied — and `Ended` names which happened.
+
+**Many instances behind one ALPN.** Keyed actors, addressed by an id inside the
+request, are `inventory::System`: build one, `mount(id, inventory::spawn(state))`,
+and serve it with `inventory::keyed_service(&system, allow)`, which peers reach
+through `inventory::KeyedClient`. That path once cost per-method layers,
+per-method authorization, `blob` methods and observers, because its payload was
+opaque to keylink. It no longer does: a keyed request is `Addressed<Request>` and
+its reply is the service's own typed `Response`, and a keyed mount runs the same
+turn loop a local `Handle` does — so layers, per-method authorization, `blob`
+grants, observers, the panic guard and `Observer::finish` all reach it. The
+idempotency ledger was never on that list; what was missing was a client that
+could send a key, and `KeyedClient::with_idempotency` is it.
+
+What the keyed path still costs: one QUIC connection per actor *service* — not one
+for a node's whole fleet, each with its own handshake, admission decision,
+idempotency ledger, keep-alive and congestion window — and no per-instance
+`ended()`, so `system.shutdown(&id, budget)` reports whether an instance drained
+rather than why its loop exited. The budget is not optional: every caller names
+how long it is prepared to wait before the actor is killed instead.
 
 **Sync and async.** `keylink::blocking` mirrors the async API for programs with
 no runtime. It owns a private multi-threaded runtime — mandatory, because a
@@ -205,6 +246,90 @@ to construct an actor at all.
 does on a server. `blocking`, `fs` and `env` refuse the target by
 `compile_error!` — each needs an OS facility a browser does not have. Nothing
 has ever run in a tab; see Status.
+
+## Reliable delivery, and its seven limits
+
+Every piece of effectively-once for an `rpc` is already here. Composed, they are a
+recipe rather than a feature:
+
+1. **Put the key on the work, not on the attempt.** `client.with_idempotency(key)`
+   records the reply under `(peer, key)`. Every retry of that one piece of work
+   carries that one key; different work gets a different key.
+2. **Call through `Peer<C>`.** It reconnects once when a call fails and re-issues
+   the call against the new connection. The ledger belongs to the served
+   `Service`, not to the connection, so the retry meets the same record.
+3. **Ask to attach.** `Idempotency::attaching_for(key, budget)` waits for a call
+   already in flight under the key instead of being refused with `InFlight` —
+   the difference between a retry that helps and a retry that races. **The
+   budget is capped at `MAX_ATTACH`, 30 s**, and the cap is the serving side's,
+   not yours: the budget arrives from the network and a peer asking to be held
+   for a year is asking for a QUIC stream to be held for a year. So a caller
+   with a 90-second handler cannot wait it out — it is refused at 30 s with the
+   work still running, which is `InFlight` and still the truth. Ask again, or
+   ask `key_state`.
+
+`examples/reliable_call.rs` is that recipe, compiled by the gate and run over two
+nodes. `tests/reliable.rs::a_retried_call_across_a_reconnect_runs_exactly_once` is
+the proof: the work runs, the serving side closes the connection that was carrying
+its answer, and the retry — over a second handshake, against the same ledger — is
+answered from the record without entering the handler again.
+
+That is effectively-once for one `rpc`. Here is what it does not cover.
+
+1. **There is no reliable `tell`.** A `tell` has no reply stream, so nothing can
+   ack it, nothing can refuse it, and it does not accept a key — there is no reply
+   to record and answer a repeat with. `with_idempotency` returns an
+   `IdempotentClient`, which has no `tell` method, so this limit is one the
+   compiler enforces rather than one you have to remember. Work that has to
+   arrive is an `rpc`.
+2. **The ledger is memory.** It dies with the process, and a restarted service
+   runs a retried call again. `keylink-persist` makes an actor's *state* durable
+   and does nothing for the ledger. keylink has no journal and this is not one.
+
+   **Durable state makes this sharper, not milder.** While nothing survived a
+   restart, re-running a retried call was *correct* — a fresh process had a fresh
+   state. It is not correct any more. A process that fsyncs turn *n*, records the
+   reply in the in-memory ledger, and dies before the frame reaches the peer will,
+   on restart, load a state that already contains *n*, find an empty ledger, and
+   run *n* again. The state is durable and the record that would have suppressed
+   the repeat is not.
+
+   So **effectively-once is a property of one process's lifetime, not of a key.**
+   Across a restart the guarantee is at-least-once, and a handler that is not
+   idempotent against its own committed state will double-apply. This is the real
+   distance to a journalled system, and it is one sentence rather than a caveat
+   you can tune away.
+3. **A record answers for 600 s.** That is `RECORD_TTL`, alongside volume bounds
+   of `MAX_RECORDS` — 1024 entries — and `MAX_RECORDED_BYTES` — 1 MiB of held
+   reply. Past any of them the reply is dropped and the retry is *refused* as
+   `Forgotten`:
+   at-most-once still holds, and the answer does not. Read the result out of your
+   own domain; do not re-run the work.
+4. **Past `MAX_TOMBSTONES` — 8192, eight times the record bound — a key is
+   `Fresh` again and the retry runs.** This is the one edge where the guarantee
+   degrades: effectively-once, to at-most-once, to at-least-once. It is also the
+   one state a caller cannot detect, because `Fresh` is what "never used" looks
+   like too. The wide margin over the record bound is what makes it unlikely
+   rather than impossible.
+5. **A reply that carries a payload is never recorded.** A `recv` method answers
+   with a body beside its reply, and a body is streamed rather than held, so the
+   repeat is refused as `Unrecordable` instead of being answered with a header
+   whose payload never arrives. So is any reply frame over `MAX_RECORDED_BYTES` —
+   a permanent property of the method, not an eviction. A `blob` reply is not
+   affected: its bytes move on iroh-blobs and the reply itself is just a header
+   carrying an address, so it records and replays like any other.
+6. **`Interrupted` is permanent, and it is the answer that needs a decision.** A
+   call whose handler was entered and produced no reply — a dead connection, a
+   shutdown, a layer that stopped waiting after dispatch — settles the key as
+   `Interrupted`. Whether the work took effect is genuinely unknown and no record
+   can make it known, so retrying that key is refused forever, by design. What a
+   caller *does*: reconcile against its own domain, then issue a **new** key.
+   `client.key_state(key).await` asks without running anything, which is the only
+   way to learn a state you are not willing to discover by executing.
+7. **A `feed` has no delivery guarantee at all.** It is a local stream into an
+   actor rather than a call: nobody sent it, nothing acks an item, nothing refuses
+   one, and no key applies. It never reaches the wire. A feed that dies takes the
+   actor with it, which is the only report a feed can make.
 
 ## Try it
 
@@ -266,17 +391,29 @@ Known gaps, in rough priority order:
   `wasm32-unknown-unknown` and CI gates that, but no `.wasm` has been loaded in a
   tab. Threaded wasm is refused outright: the local mailbox holds a thread-affine
   task handle behind a `Send + Sync` type.
-- **An actor turn cannot be bounded from outside.** `Timeout` drops the wait for
-  the reply, not the turn, so it sheds no load. It no longer settles an
-  idempotency key as its own refusal — a turn that ran leaves `Interrupted`,
-  which is the truth — but the retry does not receive the turn's real reply
-  either. Bound the work inside the method. RFC-05 §7.
+- **A running actor turn cannot be bounded from outside.** `Timeout` drops the
+  wait for the reply, not the turn, so it sheds no load once a turn has started.
+  It no longer settles an idempotency key as its own refusal — a turn that ran
+  leaves `Interrupted`, which is the truth — but the retry does not receive the
+  turn's real reply either. `QueueTimeout` is the half that does shed load: it
+  refuses a message that has not started, and leaves its key claimable, because
+  nothing ran. Past that point, bound the work inside the method. RFC-05 §7.
 - Protocols cannot be added or removed after `spawn`. iroh-examples'
   `custom-router` shows a runtime-mutable alternative worth adopting.
 - Idempotency records are in memory. They die with the process, so a retry
-  across a restart runs the handler again.
-- No supervision or restart, deliberately: a panicking message costs that
-  message and the actor survives it. RFC-04 §8 has the argument.
+  across a restart runs the handler again. `keylink-persist` is durability for an
+  actor's *state*, not for the ledger. The other six limits of the guarantee are
+  in **Reliable delivery** above.
+- A keyed instance has no `ended()`. `System::shutdown(&id, budget)` reports
+  whether it drained or had to be killed, which is a different question from why
+  its loop exited; the keyed loop computes that and throws it away.
+- No supervision or restart. What a fault costs depends on which input caused it:
+  a panicking `rpc` turn costs that message, the actor survives, and the caller is
+  told rather than left to infer it. A panic in a `feed` handler ends the actor,
+  and so does a feed that simply stops — nobody is waiting on a feed item, so
+  dropping its fault would carry on over a half-applied state. `Ended` says which
+  happened. RFC-04 §8 has the original argument against supervision; RFC-07 §5.1
+  has the argument for an ending that names itself.
 - `Error::SchemaMismatch` is classified from the rendered error string, because
   the TLS alert code is several private layers down. Narrow and tested, but it
   would break if iroh reworded its message.

@@ -22,6 +22,10 @@ serde = { workspace = true }
 postcard-schema = { workspace = true }
 tokio = { workspace = true }
 anyhow = "1"
+# For `Instant` only. This binary is native and would survive `std::time`, but
+# the no-`std::time::Instant` invariant is written without a target exemption,
+# and a rule with one documented exception is a rule the next reader argues with.
+n0-future = { workspace = true }
 
 [lints]
 workspace = true

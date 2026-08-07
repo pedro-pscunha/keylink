@@ -32,7 +32,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use keylink::{Caller, Ended, MailboxClosed, Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
+use keylink::{
+    Caller, Ended, FinishFut, MailboxClosed, Observer, Stop, TurnFut, TurnInfo, TurnOutcome,
+};
 use tokio::sync::{mpsc, oneshot};
 
 keylink::service! {
@@ -196,6 +198,127 @@ impl Observer<Ledger> for Strict {
     }
 }
 
+/// Records the **method name** of every turn it sees, rather than its own name.
+///
+/// A separate observer from [`Recording`] because the two log different things
+/// into the same `Vec`, and a test that read a mixture of names and methods out
+/// of one log would pass against a `TurnInfo` that reported either.
+struct Naming {
+    ran: Ran,
+}
+
+impl Observer<Ledger> for Naming {
+    fn name(&self) -> &'static str {
+        "naming"
+    }
+
+    fn after_turn<'a>(&'a mut self, _state: &'a Ledger, turn: TurnInfo<'a>) -> TurnFut<'a> {
+        let ran = self.ran.clone();
+        let method = turn.method;
+        Box::pin(async move {
+            ran.lock().unwrap().push(method);
+            Ok(())
+        })
+    }
+}
+
+/// How a [`Finishing`] observer falls over, and where.
+///
+/// Two halves rather than one, for the reason `after_turn` has two: a plain `fn`
+/// returning a boxed future can panic before the future exists, and `guarded`
+/// takes a built future and therefore cannot see that half.
+enum Falls {
+    /// Not at all.
+    No,
+    /// Before the future is built — the half a synchronous catch has to cover.
+    BeforeItYields,
+    /// Inside the future — the half `guarded` covers.
+    InsideTheFuture,
+}
+
+/// Implements both halves of the port, into two logs: `ran` gets its name once
+/// per turn, `ending` gets one line per `finish` naming what the state held and
+/// which [`Ended`] it was handed.
+///
+/// Two logs and not one, because every 2d claim is about the *relationship*
+/// between the two — that `finish` happens after the last turn, that it happens
+/// even when the turn half never ran, that it happens once.
+struct Finishing {
+    name: &'static str,
+    ran: Ran,
+    ending: Arc<Mutex<Vec<String>>>,
+    falls: Falls,
+}
+
+impl Finishing {
+    fn new(name: &'static str, ran: &Ran, ending: &Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            name,
+            ran: ran.clone(),
+            ending: ending.clone(),
+            falls: Falls::No,
+        }
+    }
+
+    fn falling(
+        name: &'static str,
+        ran: &Ran,
+        ending: &Arc<Mutex<Vec<String>>>,
+        falls: Falls,
+    ) -> Self {
+        Self {
+            falls,
+            ..Self::new(name, ran, ending)
+        }
+    }
+}
+
+impl Observer<Ledger> for Finishing {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn after_turn<'a>(&'a mut self, _state: &'a Ledger, _turn: TurnInfo<'a>) -> TurnFut<'a> {
+        let name = self.name;
+        let ran = self.ran.clone();
+        Box::pin(async move {
+            ran.lock().unwrap().push(name);
+            Ok(())
+        })
+    }
+
+    fn finish<'a>(&'a mut self, state: &'a Ledger, ended: &'a Ended) -> FinishFut<'a> {
+        if matches!(self.falls, Falls::BeforeItYields) {
+            panic!("{} fell over before it yielded", self.name);
+        }
+        // Read synchronously, before the future exists — which is what `finish`
+        // being a plain `fn` buys, and the reason the call site must build the
+        // future and only then await it. An `async` block holding `&Ledger`
+        // across an await would need `Ledger: Sync`.
+        let entries = state.entries.len();
+        let name = self.name;
+        let log = self.ending.clone();
+        let falls = matches!(self.falls, Falls::InsideTheFuture);
+        // Rendered here rather than held: what the test asserts is the reason,
+        // and `Ended::Observer` carries an `Arc<dyn Error>` that no equality
+        // check can reach.
+        let seen = format!("{ended:?}");
+        Box::pin(async move {
+            // Yielded first, and both halves of that are deliberate. A `finish`
+            // that the loop built and never awaited would write nothing, which
+            // is what makes the log a claim about the *await* rather than about
+            // the call. And it forces the write to the far side of a suspension
+            // point, so a `finish` moved after the end was published could not
+            // land before `stop()` returned — which is what
+            // `finish_runs_once_after_the_last_turn_and_before_stop_returns`
+            // asserts and could otherwise pass on a lucky poll order.
+            tokio::task::yield_now().await;
+            log.lock().unwrap().push(format!("{name}:{entries}:{seen}"));
+            assert!(!falls, "{name} fell over inside its future");
+        })
+    }
+}
+
 /// The two routes into a [`Stop`], which exist for different reasons.
 enum GivesUp {
     /// [`Stop::new`], for an observer that fails with a message.
@@ -311,7 +434,7 @@ async fn a_panicking_observer_ends_the_actor_and_is_named() {
     assert_eq!(ledger.post(1).await, Err(MailboxClosed));
 
     match ledger.ended().await {
-        Ended::Observer { name, error } => {
+        Ended::Observer { name, error, .. } => {
             assert_eq!(name, "exploding");
             assert!(
                 error.to_string().contains("the observer fell over"),
@@ -375,7 +498,7 @@ async fn a_refused_turn_answers_its_caller_with_nothing() {
     );
 
     match ledger.ended().await {
-        Ended::Observer { name, error } => {
+        Ended::Observer { name, error, .. } => {
             assert_eq!(name, "saver");
             assert!(error.to_string().contains("saver refused"), "got {error}");
         }
@@ -465,7 +588,7 @@ async fn an_observer_can_give_up_with_a_message_or_with_an_error() {
     let with_message = ledger::actor_with(Ledger::default(), vec![Box::new(GivesUp::WithMessage)]);
     assert_eq!(with_message.post(1).await, Err(MailboxClosed));
     match with_message.ended().await {
-        Ended::Observer { name, error } => {
+        Ended::Observer { name, error, .. } => {
             assert_eq!(name, "message");
             assert_eq!(error.to_string(), "the store said no");
         }
@@ -475,7 +598,7 @@ async fn an_observer_can_give_up_with_a_message_or_with_an_error() {
     let with_error = ledger::actor_with(Ledger::default(), vec![Box::new(GivesUp::WithError)]);
     assert_eq!(with_error.post(1).await, Err(MailboxClosed));
     match with_error.ended().await {
-        Ended::Observer { name, error } => {
+        Ended::Observer { name, error, .. } => {
             assert_eq!(name, "error");
             assert_eq!(error.to_string(), "the store is gone");
         }
@@ -552,7 +675,7 @@ async fn an_observer_that_panics_before_it_yields_is_still_named() {
     assert_eq!(ledger.post(1).await, Err(MailboxClosed));
 
     match ledger.ended().await {
-        Ended::Observer { name, error } => {
+        Ended::Observer { name, error, .. } => {
             assert_eq!(name, "early");
             assert!(
                 error.to_string().contains("fell over before it yielded"),
@@ -563,4 +686,273 @@ async fn an_observer_that_panics_before_it_yields_is_still_named() {
         // what an uncaught unwind out of the detached task produces.
         other => panic!("expected the observer to be named, got {other:?}"),
     }
+}
+
+// ────────────────────────────────────────────── what the turn was called (2b)
+
+/// An observer is told which declared method it just watched.
+///
+/// Absent until the mailbox stopped being a boxed closure, because a closure has
+/// no name. What makes this worth a test of its own rather than an assertion
+/// inside another one is that the field can be *plausibly wrong*: the trait
+/// method is `post` and the wire name is `Post`, and an observer that reported
+/// the snake-case spelling would disagree with every `Middleware` watching the
+/// same call, silently, in a metrics label.
+#[tokio::test]
+async fn an_observer_is_told_which_method_the_turn_ran() {
+    let ran = ran();
+    let ledger = ledger::actor_with(
+        Ledger::default(),
+        vec![Box::new(Naming { ran: ran.clone() })],
+    );
+
+    assert_eq!(ledger.post(1).await.expect("running"), 1);
+
+    // A panicking turn is observed too, and it is observed under its own name —
+    // `TurnOutcome` says how it went and `method` says what went.
+    let boom = {
+        let ledger = ledger.clone();
+        tokio::spawn(async move { ledger.boom().await })
+    };
+    assert!(boom
+        .await
+        .expect_err("the panic reaches the caller")
+        .is_panic());
+
+    assert_eq!(*ran.lock().unwrap(), ["Post", "Boom"]);
+}
+
+/// The defect RFC-07 §1.8 recorded, tested from the position that has it.
+///
+/// `tests/` is a separate crate, so `#[non_exhaustive]` bites here exactly as it
+/// bites a downstream author — and the thing being proved is that such an author
+/// can unit-test their own `Observer` with **no actor anywhere in sight**, which
+/// is the whole point of a port. Before `TurnInfo::for_test` the argument to
+/// `after_turn` was unconstructible from out here and this test could not be
+/// written at all.
+///
+/// The `compile_fail` doctest on `TurnInfo` is the other half: it holds that the
+/// literal is still shut, so this helper is the one door rather than a second one.
+#[tokio::test]
+async fn an_observer_can_be_unit_tested_without_an_actor() {
+    let ran = ran();
+    let mut naming = Naming { ran: ran.clone() };
+    let state = Ledger { entries: vec![7] };
+
+    naming
+        .after_turn(&state, TurnInfo::for_test(TurnOutcome::Completed, "Post"))
+        .await
+        .expect("the observer accepted the turn");
+    naming
+        .after_turn(
+            &state,
+            TurnInfo::for_test(TurnOutcome::Panicked { message: "torn" }, "Boom"),
+        )
+        .await
+        .expect("the observer accepted the fault");
+
+    assert_eq!(*ran.lock().unwrap(), ["Post", "Boom"]);
+
+    // The other half of the port, from the same position and with no actor.
+    let mut finishing = Finishing::new("solo", &ran, &Arc::new(Mutex::new(Vec::new())));
+    finishing.finish(&state, &Ended::Stopped).await;
+}
+
+// ────────────────────────────────────────────────────── the lifecycle end (2d)
+
+/// `finish` runs once, after the last turn, and **before `stop` returns**.
+///
+/// The ordering is the whole feature. `finish` exists so a policy that batches
+/// can flush, and a flush is only a flush if it happens while the state is still
+/// there and before anybody is told the actor ended — which is what makes
+/// `stop().await` returning continue to mean any claim an observer held is free.
+/// A `finish` placed after the three-drop teardown would satisfy "it ran" and
+/// none of that, and every assertion below would still pass but the last.
+#[tokio::test]
+async fn finish_runs_once_after_the_last_turn_and_before_stop_returns() {
+    let ran = ran();
+    let ending = Arc::new(Mutex::new(Vec::new()));
+    let ledger = ledger::actor_with(
+        Ledger::default(),
+        vec![Box::new(Finishing::new("saver", &ran, &ending))],
+    );
+
+    for entry in 1..=3 {
+        assert_eq!(ledger.post(entry).await.expect("running"), entry);
+    }
+    assert!(
+        ending.lock().unwrap().is_empty(),
+        "finish ran while the actor was still serving: {:?}",
+        ending.lock().unwrap()
+    );
+
+    ledger.stop().await;
+
+    // Read the instant `stop` returns, with nothing awaited in between: a
+    // `finish` that ran after the end was published would not be here yet.
+    assert_eq!(*ran.lock().unwrap(), ["saver", "saver", "saver"]);
+    assert_eq!(
+        *ending.lock().unwrap(),
+        ["saver:3:Stopped"],
+        "once, with the state as the last turn left it"
+    );
+}
+
+/// `finish` gets the same `Ended` every waiter is about to be told.
+///
+/// Two observers, and the first refuses. That makes the ending
+/// `Ended::Observer`, which is the interesting case for two reasons: the reason
+/// is not the default one, and the second observer's `after_turn` never ran at
+/// all — the chain short-circuited above it. It still gets a `finish`, because a
+/// `finish` is about the actor ending and not about that observer having
+/// participated. An adapter that had already written bytes for earlier turns
+/// needs its flush whether or not it was consulted about the last one.
+#[tokio::test]
+async fn finish_receives_the_same_ending_the_actor_reports() {
+    let ran = ran();
+    let ending = Arc::new(Mutex::new(Vec::new()));
+    let ledger = ledger::actor_with(
+        Ledger::default(),
+        vec![
+            Box::new(Recording::refusing("vetoing", &ran)),
+            Box::new(Finishing::new("saver", &ran, &ending)),
+        ],
+    );
+
+    assert_eq!(ledger.post(1).await, Err(MailboxClosed));
+
+    let reported = ledger.ended().await;
+    match &reported {
+        Ended::Observer { name, .. } => assert_eq!(*name, "vetoing"),
+        other => panic!("got {other:?}"),
+    }
+
+    let seen = ending.lock().unwrap().clone();
+    let [line] = seen.as_slice() else {
+        panic!("expected one finish, got {seen:?}")
+    };
+    assert!(
+        line.starts_with("saver:1:Observer"),
+        "finish saw a different ending from the one reported: {line}"
+    );
+    assert!(
+        line.contains("vetoing"),
+        "finish was not told which observer refused: {line}"
+    );
+    assert_eq!(
+        *ran.lock().unwrap(),
+        ["vetoing"],
+        "the chain short-circuited, and finish ran anyway"
+    );
+}
+
+/// Every observer gets its `finish`, in order, even when an earlier one falls
+/// over — in either of the two places it can.
+///
+/// This is why there is no single `guarded` around the finish loop and two
+/// catches inside it instead. One guard around the loop would stop at the first
+/// panic, so an adapter that fell over would cost the next adapter its flush;
+/// and being a *future* guard it would need an `async` block holding `&Ledger`
+/// across an await, which is `Send` only when `Ledger: Sync` — the bound the
+/// whole port is shaped to avoid.
+///
+/// `early` panics before it returns a future and `late` panics inside one. The
+/// first of those is the half a `guarded` alone cannot see, and it is the half
+/// `an_observer_that_panics_before_it_yields_is_still_named` exists for one rung
+/// up.
+#[tokio::test]
+async fn finish_runs_on_every_observer_even_when_an_earlier_one_panics() {
+    let ran = ran();
+    let ending = Arc::new(Mutex::new(Vec::new()));
+    let ledger = ledger::actor_with(
+        Ledger::default(),
+        vec![
+            Box::new(Finishing::falling(
+                "early",
+                &ran,
+                &ending,
+                Falls::BeforeItYields,
+            )),
+            Box::new(Finishing::falling(
+                "late",
+                &ran,
+                &ending,
+                Falls::InsideTheFuture,
+            )),
+            Box::new(Finishing::new("last", &ran, &ending)),
+        ],
+    );
+
+    assert_eq!(ledger.post(1).await.expect("running"), 1);
+    ledger.stop().await;
+
+    // `early` never reaches its log, because it panics before the future that
+    // writes it exists. `late` does, and then panics. `last` is the assertion:
+    // it is downstream of both and it ran.
+    assert_eq!(
+        *ending.lock().unwrap(),
+        ["late:1:Stopped", "last:1:Stopped"],
+        "a panicking finish cost a later observer its flush"
+    );
+
+    // And a panic in `finish` does not rewrite the ending. It cannot: the reason
+    // was decided before the loop, and two observers of one ending must not be
+    // told different things about it.
+    assert!(
+        matches!(ledger.ended().await, Ended::Stopped),
+        "a panicking finish changed why the actor ended"
+    );
+}
+
+/// `finish` runs on `stop` and does **not** run on `abort`.
+///
+/// Not a policy — a consequence. `abort` is `task.abort()` and nothing else, so
+/// the loop's future is dropped at its next await and never reaches its exit;
+/// anything placed after the loop is unreachable by construction. Both halves are
+/// in one test on purpose: the negative claim alone would pass against a `finish`
+/// that never ran at all, and the positive half is what proves this fixture can
+/// see one.
+///
+/// One documented hole, and it is `abort`'s own: a turn that never reaches an
+/// await is not interrupted either, so an actor aborted during such a turn can
+/// still exit its loop normally afterwards, and `finish` then runs. Nothing here
+/// claims otherwise.
+#[tokio::test]
+async fn finish_runs_on_stop_and_not_on_abort() {
+    let ran = ran();
+
+    let aborted_log = Arc::new(Mutex::new(Vec::new()));
+    let aborted = ledger::actor_with(
+        Ledger::default(),
+        vec![Box::new(Finishing::new("saver", &ran, &aborted_log))],
+    );
+    assert_eq!(aborted.post(1).await.expect("running"), 1);
+    aborted.abort();
+    // The abort is cooperative, so wait for it to have landed rather than
+    // asserting against a clock.
+    for _ in 0..100 {
+        if !aborted.is_running() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!aborted.is_running(), "the abort never landed");
+    assert!(
+        aborted_log.lock().unwrap().is_empty(),
+        "finish ran on an aborted actor: {:?}",
+        aborted_log.lock().unwrap()
+    );
+
+    let stopped_log = Arc::new(Mutex::new(Vec::new()));
+    let stopped = ledger::actor_with(
+        Ledger::default(),
+        vec![Box::new(Finishing::new("saver", &ran, &stopped_log))],
+    );
+    assert_eq!(stopped.post(1).await.expect("running"), 1);
+    stopped.stop().await;
+    assert_eq!(
+        *stopped_log.lock().unwrap(),
+        ["saver:1:Stopped"],
+        "the same fixture, stopped rather than aborted"
+    );
 }

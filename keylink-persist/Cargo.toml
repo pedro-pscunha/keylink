@@ -8,7 +8,17 @@ rust-version = "1.91"
 description = "A port for actor state that outlives its process, and the local-file adapter."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pedrocunha/keylink"
-publish = false
+# Publishable, and it has to be. `keylink` depends on this crate for real —
+# `persist-file` is a default feature — and cargo refuses to publish a crate
+# whose dependency cannot be published. `publish = false` here made `keylink`
+# unpublishable, quietly, from the commit that added the dependency.
+#
+# **The price, stated rather than discovered later:** this is a second crate
+# name on crates.io, released before `keylink` and version-bumped in lockstep
+# whenever the port moves. That is what a port in its own crate costs once
+# anything ships. The alternative — folding the port back into `keylink` — costs
+# the browser build and the "the port does not know the framework" claim, which
+# is a worse trade.
 
 [features]
 # The local-file adapter. On by default because it is the one that exists.
@@ -17,9 +27,25 @@ file = ["tokio/fs", "tokio/rt"]
 
 [dependencies]
 thiserror = { workspace = true }
-tokio = { workspace = true, optional = true }
+# `default-features = false`, and NOT the workspace `tokio`, which is `full`.
+#
+# The `file` feature above says this adapter needs `fs` and `rt`, and while this
+# line inherited `full` that sentence was decoration: `fs` and `rt` were already
+# on, along with `net`, `process`, `signal` and `rt-multi-thread`, and the feature
+# selected nothing. keylink's own manifest states the rule this broke — a feature
+# that is on because somebody else's dependency turned it on is on by accident.
+#
+# It is also what made `keylink`'s `persist-file` wasm guard unreadable. Building
+# that feature for `wasm32-unknown-unknown` used to fail with **48 errors inside
+# mio**, which `full` pulls through `net`; it now fails with tokio's own one-liner,
+# `Only features sync,macros,io-util,rt,time are supported on wasm`, which names
+# `fs` — the actual offender — instead of naming crates the reader never chose.
+tokio = { version = "1", optional = true, default-features = false }
 
 [dev-dependencies]
+# `full` here on purpose: `#[tokio::test]` needs `macros` and a runtime, and a
+# dev-dependency reaches the tests without widening the graph a `cargo build`
+# produces.
 tokio = { workspace = true }
 
 [lints]

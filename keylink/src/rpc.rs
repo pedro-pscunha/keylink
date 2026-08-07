@@ -114,7 +114,13 @@ impl<Req, Resp> std::fmt::Debug for RpcService<Req, Resp> {
 /// Deliberately has no `Running` arm. Whether a caller waits for a call already
 /// in flight is decided in [`claim_key`], so nothing downstream of it has to
 /// remember that the question exists.
-enum Keyed {
+///
+/// It was called `Keyed`, which is a name this crate needs for something else
+/// entirely — a keyed actor is one addressed by an [`ActorId`](crate::ActorId),
+/// and this is about an idempotency key. Two unrelated keys, one word, one
+/// crate. Renamed at the root rather than worked around at the call sites that
+/// meet the other meaning.
+enum Claimed {
     /// No key was sent. Nothing to record and nothing to release.
     None,
     /// The key is ours for this call. Settle it when the chain returns.
@@ -128,12 +134,12 @@ enum Keyed {
 /// Map a settled claim, treating "still running" as the refusal it has always
 /// been. Reached only by a caller that did not ask to attach, or one whose
 /// budget ran out — and `InFlight` is the truth in both cases.
-fn resolve(claim: Claim) -> Keyed {
+fn resolve(claim: Claim) -> Claimed {
     match claim {
-        Claim::Fresh(guard) => Keyed::Run(guard),
-        Claim::Replay(frame) => Keyed::Replay(frame),
-        Claim::Refused(refusal) => Keyed::Refuse(refusal),
-        Claim::Running(_) => Keyed::Refuse(IdempotencyRefusal::InFlight.into()),
+        Claim::Fresh(guard) => Claimed::Run(guard),
+        Claim::Replay(frame) => Claimed::Replay(frame),
+        Claim::Refused(refusal) => Claimed::Refuse(refusal),
+        Claim::Running(_) => Claimed::Refuse(IdempotencyRefusal::InFlight.into()),
     }
 }
 
@@ -163,12 +169,12 @@ fn resolve(claim: Claim) -> Keyed {
 /// bound neither it nor the stream pair it keeps open. It takes a `Waiting` from
 /// the ledger instead, refused **before** it parks and given back by `Drop` —
 /// because the ordinary way a waiter stops waiting is that this task is aborted.
-async fn claim_key(ledger: &Arc<Ledger>, peer: EndpointId, idem: Option<Idempotency>) -> Keyed {
+async fn claim_key(ledger: &Arc<Ledger>, peer: EndpointId, idem: Option<Idempotency>) -> Claimed {
     let Some(idem) = idem else {
-        return Keyed::None;
+        return Claimed::None;
     };
     if let Err(error) = idem.key().validate() {
-        return Keyed::Refuse(IdempotencyRefusal::Malformed(error.to_string()).into());
+        return Claimed::Refuse(IdempotencyRefusal::Malformed(error.to_string()).into());
     }
     let key = idem.key().clone();
 
@@ -177,14 +183,14 @@ async fn claim_key(ledger: &Arc<Ledger>, peer: EndpointId, idem: Option<Idempote
         settled => return resolve(settled),
     };
     let Some(budget) = idem.attach_budget() else {
-        return Keyed::Refuse(IdempotencyRefusal::InFlight.into());
+        return Claimed::Refuse(IdempotencyRefusal::InFlight.into());
     };
     // Taken before anything parks, and held to the end of this function so it
     // covers the wait AND the re-claim after it. A caller that is not going to
     // wait never reaches here, so it never spends a place.
     let _waiting = match ledger.wait(peer) {
         Ok(waiting) => waiting,
-        Err(refusal) => return Keyed::Refuse(refusal),
+        Err(refusal) => return Claimed::Refuse(refusal),
     };
 
     let notified = notify.notified();
@@ -199,7 +205,7 @@ async fn claim_key(ledger: &Arc<Ledger>, peer: EndpointId, idem: Option<Idempote
         settled => return resolve(settled),
     }
     if n0_future::time::timeout(budget, notified).await.is_err() {
-        return Keyed::Refuse(IdempotencyRefusal::InFlight.into());
+        return Claimed::Refuse(IdempotencyRefusal::InFlight.into());
     }
     resolve(ledger.claim(peer, key))
 }
@@ -352,13 +358,13 @@ where
     // property: the only way back from a claimed key to a vacant one is a
     // release, and a release happens exactly when nothing ran.
     let keyed = match claim_key(&ledger, peer, request.idempotency).await {
-        Keyed::None => None,
+        Claimed::None => None,
         // The guard watches the marker, so this task being ABORTED — the
         // connection ended, the server shut down — still settles honestly, even
         // though `Drop` is then the only code left running.
-        Keyed::Run(guard) => Some(guard.watching(progress.clone())),
-        Keyed::Replay(frame) => return replay(&mut send, frame).await,
-        Keyed::Refuse(refusal) => return refuse::<Resp>(&mut send, refusal).await,
+        Claimed::Run(guard) => Some(guard.watching(progress.clone())),
+        Claimed::Replay(frame) => return replay(&mut send, frame).await,
+        Claimed::Refuse(refusal) => return refuse::<Resp>(&mut send, refusal).await,
     };
 
     let (outcome, body) = next(cx, message, BodyReader::new(frames, request.body_len)).await;
@@ -556,11 +562,11 @@ mod tests {
         // Exhaustive, with no catch-all: the arm that would hide a regression
         // here is the one nobody thought to name.
         let refused = match keyed {
-            Keyed::Refuse(RemoteError::Idempotency(refusal)) => refusal,
-            Keyed::Refuse(other) => panic!("expected an idempotency refusal, got {other:?}"),
-            Keyed::None => panic!("expected a refusal, got no key at all"),
-            Keyed::Run(_) => panic!("expected a refusal, got the key"),
-            Keyed::Replay(_) => panic!("expected a refusal, got a replay"),
+            Claimed::Refuse(RemoteError::Idempotency(refusal)) => refusal,
+            Claimed::Refuse(other) => panic!("expected an idempotency refusal, got {other:?}"),
+            Claimed::None => panic!("expected a refusal, got no key at all"),
+            Claimed::Run(_) => panic!("expected a refusal, got the key"),
+            Claimed::Replay(_) => panic!("expected a refusal, got a replay"),
         };
         assert_eq!(
             refused,
@@ -1031,14 +1037,114 @@ impl<Req, Resp> RpcClient<Req, Resp> {
     /// a reply to a question it did not ask
     /// ([`Error::UnexpectedResponse`]). That is a loud failure rather than a
     /// wrong answer, but it is still a mistake worth not making.
+    ///
+    /// # Why this returns a different type
+    ///
+    /// [`IdempotentClient`] has no [`tell`](Self::tell). It used to return
+    /// `Self`, and `client.with_idempotency(key).upload(name)` therefore
+    /// compiled and sent no key — `tell` writes `None` on the wire and dropped
+    /// the attached one on the floor. Two places in the README told a reader
+    /// that shape was impossible, so somebody following the documentation to
+    /// the letter could write it *to be safe*, believe they had at-most-once,
+    /// and have nothing. The claim is now the type's, not the prose's.
     #[must_use]
-    pub fn with_idempotency(&self, idempotency: impl Into<Idempotency>) -> Self {
-        Self {
-            conn: self.conn.clone(),
-            endpoint: self.endpoint.clone(),
-            idempotency: Some(idempotency.into()),
-            _p: PhantomData,
+    pub fn with_idempotency(
+        &self,
+        idempotency: impl Into<Idempotency>,
+    ) -> IdempotentClient<Req, Resp> {
+        IdempotentClient {
+            inner: Self {
+                conn: self.conn.clone(),
+                endpoint: self.endpoint.clone(),
+                idempotency: Some(idempotency.into()),
+                _p: PhantomData,
+            },
         }
+    }
+}
+
+/// A connected client scoped to one idempotency key.
+///
+/// Built by [`RpcClient::with_idempotency`] and by the `with_idempotency` on
+/// every generated client. It is the same connection — a `Connection` is a
+/// handle — carrying a key on every call made through it.
+///
+/// # What it does not have, and why that is the whole point
+///
+/// There is no `tell`. A key is a promise that the work runs at most once, and
+/// the ledger keeps that promise by recording the reply and answering a repeat
+/// with it. A `tell` has no reply stream, so there is nothing to record and
+/// nothing to answer with, and a key attached to one could only be discarded.
+///
+/// Discarding it silently is what this type exists to stop. The absence is
+/// held by a probe in `representability.rs` rather than by this paragraph.
+/// Fire-and-forget that must not run twice is an `rpc`.
+#[derive(Debug)]
+pub struct IdempotentClient<Req, Resp> {
+    inner: RpcClient<Req, Resp>,
+}
+
+/// Every clone names the same connection and carries the same key. Written out
+/// rather than derived for the reason [`RpcClient`]'s is.
+impl<Req, Resp> Clone for IdempotentClient<Req, Resp> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<Req, Resp> IdempotentClient<Req, Resp> {
+    /// The live connection, for crate code that observes it. See
+    /// [`RpcClient::connection`].
+    pub(crate) fn connection(&self) -> &Connection {
+        self.inner.connection()
+    }
+
+    /// Point a handle at content the peer we are talking to just named.
+    ///
+    /// Called by generated `blob` client code. See
+    /// [`RpcClient::blob_handle`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn blob_handle(&self, id: BlobId) -> BlobHandle {
+        self.inner.blob_handle(id)
+    }
+}
+
+impl<Req, Resp> IdempotentClient<Req, Resp>
+where
+    Req: Serialize + Send + Sync,
+    Resp: DeserializeOwned + Send + Sync,
+{
+    /// Make one call, with this handle's key attached. See
+    /// [`RpcClient::call`].
+    ///
+    /// # Errors
+    ///
+    /// Everything [`RpcClient::call`] reports, plus the refusals a key can
+    /// meet — see [`IdempotencyRefusal`](crate::IdempotencyRefusal).
+    pub async fn call(&self, request: Req, body: Body) -> Result<(Resp, BodyReader)> {
+        self.inner.call(request, body).await
+    }
+
+    /// Ask what this peer's ledger knows about one of your keys. See
+    /// [`RpcClient::key_state`].
+    ///
+    /// # Errors
+    ///
+    /// Everything [`RpcClient::key_state`] reports.
+    pub async fn key_state(&self, key: IdempotencyKey) -> Result<KeyState> {
+        self.inner.key_state(key).await
+    }
+
+    /// Close the connection gracefully.
+    ///
+    /// # Errors
+    ///
+    /// Never, today. See [`RpcClient::close`].
+    pub async fn close(self) -> Result<()> {
+        self.inner.close().await
     }
 }
 
@@ -1176,15 +1282,21 @@ where
     /// reply so a retry can be answered with it, and a `tell` has no reply to
     /// record. Anything needing at-most-once wants a `rpc`.
     ///
+    /// That is a claim the compiler holds, not a request to be careful.
+    /// [`with_idempotency`](Self::with_idempotency) returns an
+    /// [`IdempotentClient`], and this method is not on it.
+    ///
     /// # Errors
     ///
     /// Only local ones — opening the stream, encoding, or writing. A refusal on
     /// the far side is not among them, by construction.
     pub async fn tell(&self, request: Req) -> Result<()> {
         let mut send = self.conn.open_uni().await?;
-        // `None` for the key: see above. `Some(0)` body length, because a
-        // `tell` carries no payload and an open-ended stream would make the
-        // receiver wait for an end that says nothing.
+        // `None` for the key, and it is now the only value this line could
+        // write: `self.idempotency` is `Some` on no client that has a `tell`.
+        // `Some(0)` body length, because a `tell` carries no payload and an
+        // open-ended stream would make the receiver wait for an end that says
+        // nothing.
         wire::write_header(&mut send, Some(0), None, &WireRequest::Call(request)).await?;
         send.finish()?;
         Ok(())

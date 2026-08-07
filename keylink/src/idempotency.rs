@@ -44,6 +44,28 @@
 //! - **Durability.** The record is memory. It dies with the process, and a
 //!   restarted service will run a retried call again. keylink has no journal and
 //!   this is not one. Durable execution is what [Restate] is for.
+//!
+//!   **A durable state makes that sentence sharper, and the sharper version is
+//!   a double-apply.** While nothing survived a restart, re-running a retried
+//!   call was a re-run against a state that had also been lost, so the work
+//!   happened once in total. [`Persist`](crate::Persist) changed that half and
+//!   not this one. The interleaving, all of it on the served path:
+//!
+//!   1. Turn *n* completes. The observer chain stores the state and `fsync`s it.
+//!   2. [`Reply::answer`](crate::Reply) marks the key `completed`, and
+//!      `Guard::record` writes the replayable reply into the **in-memory**
+//!      ledger.
+//!   3. The process dies before the reply frame reaches the peer.
+//!   4. The peer retries the same key. The restarted process restores a state
+//!      that **already contains turn *n***, its ledger is empty, `claim_key`
+//!      answers `Claimed::Run`, and the handler runs turn *n* a second time.
+//!
+//!   Neither half is wrong on its own: the state is exactly as durable as it
+//!   promises, and the ledger is exactly as volatile as it says. It is the pair
+//!   that is new, and it is the reason effectively-once is a property of one
+//!   process's lifetime rather than of a key. A durable ledger is what would
+//!   close it, and there is no cheap version — it has to be written on the same
+//!   commit as the state, or the two disagree in the other direction.
 //! - **A reply forever.** Records are bounded three ways — [`MAX_RECORDS`]
 //!   entries, [`MAX_RECORDED_BYTES`] of reply, and [`RECORD_TTL`] of age. Past
 //!   any of them the reply is dropped and the key becomes
@@ -340,9 +362,21 @@ impl Idempotency {
     /// Wait up to `budget` for a call already in flight under this key, then
     /// answer with whatever it settled as.
     ///
-    /// Capped server-side by [`MAX_ATTACH`]. A budget that runs out is
-    /// [`IdempotencyRefusal::InFlight`] — the same answer a non-attaching call
-    /// gets, and still the truth.
+    /// Capped server-side by [`MAX_ATTACH`], which is 30 seconds. A budget that
+    /// runs out is [`IdempotencyRefusal::InFlight`] — the same answer a
+    /// non-attaching call gets, and still the truth.
+    ///
+    /// **The cap is not yours to raise, and asking for more is not an error
+    /// here.** The budget is written on the envelope and read by the peer, so a
+    /// number refused on this side would stop nobody: a hand-rolled peer sends
+    /// whatever it likes, and the serving side caps it because holding a QUIC
+    /// stream open is its cost to pay, not the caller's. So `attaching_for(key,
+    /// Duration::from_secs(120))` is accepted and waits 30 seconds.
+    ///
+    /// A handler that routinely runs longer than [`MAX_ATTACH`] cannot be waited
+    /// out. Ask again — a second attach re-parks for another budget — or stop
+    /// waiting and ask [`key_state`](crate::RpcClient::key_state), which reports
+    /// without running anything.
     ///
     /// Only a *running* call is waited for. A key that already settled is
     /// answered at once, whether that answer is the reply, `Interrupted`,

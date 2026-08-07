@@ -9,7 +9,7 @@
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use keylink::{
     Allowlist, Body, BodyReader, Context as KeylinkContext, Error, Node, Server as KeylinkServer,
@@ -44,7 +44,12 @@ keylink::service! {
     send Upload(name: String) -> Received;
 }
 
-struct Server;
+/// The serving side. `rendezvous` is `Some` for exactly one test — the one that
+/// proves calls overlap — and `None` everywhere else, where `slow` is a delay.
+#[derive(Default)]
+struct Server {
+    rendezvous: Option<Rendezvous>,
+}
 
 impl probe::Handler for Server {
     async fn ping(&self, _cx: &KeylinkContext) -> String {
@@ -52,7 +57,10 @@ impl probe::Handler for Server {
     }
 
     async fn slow(&self, _cx: &KeylinkContext, ms: u64) -> u64 {
-        tokio::time::sleep(Duration::from_millis(ms)).await;
+        match &self.rendezvous {
+            Some(rendezvous) => rendezvous.hold(ms).await,
+            None => tokio::time::sleep(Duration::from_millis(ms)).await,
+        }
         ms
     }
 
@@ -104,7 +112,7 @@ impl probe::Handler for Server {
 // ────────────────────────────────────────────────────────────────── fixture
 
 mod common;
-use common::local_node;
+use common::{local_node, rendezvous, Rendezvous, NO_PROGRESS};
 
 /// A running server and a client connected to it. Both nodes are held so the
 /// endpoints outlive the test body.
@@ -115,13 +123,13 @@ struct Fixture {
 }
 
 async fn start() -> Fixture {
-    start_with(Allowlist::anyone()).await
+    start_with(Server::default(), Allowlist::anyone()).await
 }
 
-async fn start_with(allow: Allowlist) -> Fixture {
+async fn start_with(handler: Server, allow: Allowlist) -> Fixture {
     let server = local_node().await;
     let client_node = local_node().await;
-    let router = probe::serve(&server, Server, allow).expect("one service, no duplicate ALPN");
+    let router = probe::serve(&server, handler, allow).expect("one service, no duplicate ALPN");
     let client = probe::Client::connect(&client_node, server.endpoint().addr())
         .await
         .expect("the client dials the server");
@@ -146,7 +154,7 @@ async fn a_unary_call_round_trips() {
 #[tokio::test]
 async fn a_peer_outside_the_allowlist_is_refused() {
     let stranger = local_node().await;
-    let fixture = start_with(Allowlist::only([stranger.id()])).await;
+    let fixture = start_with(Server::default(), Allowlist::only([stranger.id()])).await;
 
     let error = fixture.client.ping().await.unwrap_err();
     assert!(
@@ -155,43 +163,108 @@ async fn a_peer_outside_the_allowlist_is_refused() {
     );
 }
 
-/// The headline property of one stream per call. Eight handlers that each sleep
-/// 150 ms take 1200 ms in series. They must not — and they must not even when
-/// every call is driven from a single task, because the concurrency comes from
-/// the transport rather than from a thread pool.
+/// Calls this test drives at once, and arrivals the rendezvous waits for.
+const CONCURRENT_CALLS: usize = 8;
+
+/// The headline property of one stream per call, asserted as overlap rather than
+/// as elapsed time.
+///
+/// Every handler announces itself on entry and none is let go until all eight
+/// have, so a server that queued the calls behind each other could never fill
+/// the rendezvous. What is asserted is therefore *not serialized* rather than
+/// *fast*, and a loaded machine can only make it take longer — never make it
+/// pass by accident.
+///
+/// The wall-clock version asserted that eight 150 ms calls finished in under
+/// 600 ms, which is a claim about the machine as much as about the code, and it
+/// flaked under a concurrent build. **The number went with it, and nothing
+/// replaced it.**
+///
+/// It briefly had a replacement — `eight_overlapping_delays_cost_one_delay`,
+/// eight `tokio::time::sleep`s in a `JoinSet` under a paused clock — and that
+/// test was deleted rather than kept, because no edit to this crate could
+/// redden it. It named no service, no dispatch and no transport: a `Mutex`
+/// around `serve_one` left it green, and only editing its own delay helper
+/// turned it red. What it actually asserted is that tokio's scheduler runs
+/// spawned tasks concurrently, which is tokio's guarantee to test, not ours.
+///
+/// The deleted assertion was a claim about the **server**, and this test is
+/// where that claim lives now — held as overlap rather than as elapsed time,
+/// and reddenable by serializing dispatch, which is the property in question.
+/// A number nothing can be wrong about buys nothing over that.
 #[tokio::test]
 async fn concurrent_calls_do_not_queue_behind_each_other() {
-    const CALLS: u64 = 8;
-    const DELAY_MS: u64 = 150;
-
-    let fixture = start().await;
+    let (rendezvous, mut arrivals) = rendezvous();
+    let fixture = start_with(
+        Server {
+            rendezvous: Some(rendezvous),
+        },
+        Allowlist::anyone(),
+    )
+    .await;
     let client = &fixture.client;
 
-    let started = Instant::now();
-    let results = tokio::join!(
-        client.slow(DELAY_MS),
-        client.slow(DELAY_MS),
-        client.slow(DELAY_MS),
-        client.slow(DELAY_MS),
-        client.slow(DELAY_MS),
-        client.slow(DELAY_MS),
-        client.slow(DELAY_MS),
-        client.slow(DELAY_MS),
-    );
-    let elapsed = started.elapsed();
+    // Distinct arguments, so a reply is evidence of which call it answers. A
+    // held handler ignores the number otherwise.
+    let calls = async {
+        tokio::join!(
+            client.slow(0),
+            client.slow(1),
+            client.slow(2),
+            client.slow(3),
+            client.slow(4),
+            client.slow(5),
+            client.slow(6),
+            client.slow(7),
+        )
+    };
 
-    for result in [
-        results.0, results.1, results.2, results.3, results.4, results.5, results.6, results.7,
-    ] {
-        assert_eq!(result.unwrap(), DELAY_MS);
+    let mut inside: Vec<u64> = Vec::with_capacity(CONCURRENT_CALLS);
+    let overlap = async {
+        while inside.len() < CONCURRENT_CALLS {
+            inside.push(
+                arrivals
+                    .entered
+                    .recv()
+                    .await
+                    .expect("the serving side holds the sender"),
+            );
+        }
+        arrivals
+            .release
+            .send(true)
+            .expect("the handlers are still parked");
+    };
+
+    // Its own statement, so the joined future is dropped here and `inside` is
+    // readable in the failure arm below.
+    let outcome = tokio::time::timeout(NO_PROGRESS, async { tokio::join!(calls, overlap) }).await;
+    let Ok((replies, ())) = outcome else {
+        panic!(
+            "only {} of {CONCURRENT_CALLS} handlers were inside the server together",
+            inside.len()
+        );
+    };
+
+    inside.sort_unstable();
+    assert_eq!(
+        inside,
+        (0..CONCURRENT_CALLS as u64).collect::<Vec<_>>(),
+        "each of the {CONCURRENT_CALLS} calls reached a handler exactly once",
+    );
+
+    for (nth, reply) in [
+        replies.0, replies.1, replies.2, replies.3, replies.4, replies.5, replies.6, replies.7,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            reply.unwrap(),
+            nth as u64,
+            "reply {nth} must answer its own call",
+        );
     }
-
-    let serial = Duration::from_millis(DELAY_MS * CALLS);
-    assert!(
-        elapsed < serial / 2,
-        "{CALLS} concurrent calls took {elapsed:?}; in series they would take {serial:?}"
-    );
-    println!("{CALLS} concurrent {DELAY_MS}ms calls finished in {elapsed:?} (serial: {serial:?})");
 }
 
 // ──────────────────────────────────────────────────────────────── streaming
@@ -416,7 +489,7 @@ async fn two_services_share_one_node_and_both_answer() {
     let client_node = local_node().await;
 
     let _running = keylink::Server::builder(&server)
-        .service(probe::service(Server, Allowlist::anyone()).build())
+        .service(probe::service(Server::default(), Allowlist::anyone()).build())
         .service(telemetry::service(Tele, Allowlist::anyone()).build())
         .spawn()
         .expect("distinct ALPNs register cleanly");
@@ -443,8 +516,8 @@ async fn two_services_share_one_node_and_both_answer() {
 async fn registering_one_alpn_twice_is_refused() {
     let node = local_node().await;
     let error = keylink::Server::builder(&node)
-        .service(probe::service(Server, Allowlist::anyone()).build())
-        .service(probe::service(Server, Allowlist::anyone()).build())
+        .service(probe::service(Server::default(), Allowlist::anyone()).build())
+        .service(probe::service(Server::default(), Allowlist::anyone()).build())
         .spawn()
         .expect_err("a duplicate ALPN must not be accepted");
 
@@ -462,7 +535,7 @@ async fn registering_one_alpn_twice_is_refused() {
 async fn a_peer_on_a_different_schema_is_reported_as_a_schema_mismatch() {
     let server = local_node().await;
     let client_node = local_node().await;
-    let _running = probe::serve(&server, Server, Allowlist::anyone()).expect("serves");
+    let _running = probe::serve(&server, Server::default(), Allowlist::anyone()).expect("serves");
 
     // Same node, same address, an ALPN that is not the one it answers.
     let err = keylink::RpcClient::<probe::Request, probe::Response>::connect(
@@ -514,7 +587,7 @@ async fn a_layer_can_refuse_one_method_and_pass_the_rest() {
     let client_node = local_node().await;
     let _running = keylink::Server::builder(&server)
         .service(
-            probe::service(Server, Allowlist::anyone())
+            probe::service(Server::default(), Allowlist::anyone())
                 .layer(WriteGuard)
                 .build(),
         )
@@ -548,7 +621,7 @@ async fn a_timeout_layer_refuses_a_slow_handler() {
     let client_node = local_node().await;
     let _running = keylink::Server::builder(&server)
         .service(
-            probe::service(Server, Allowlist::anyone())
+            probe::service(Server::default(), Allowlist::anyone())
                 .layer(keylink::Timeout::after(Duration::from_millis(50)))
                 .build(),
         )
@@ -586,7 +659,8 @@ fn a_synchronous_program_can_call_a_service() {
     let rt = tokio::runtime::Runtime::new().expect("a runtime for the server");
     let (addr, _guard) = rt.block_on(async {
         let server = local_node().await;
-        let running = probe::serve(&server, Server, Allowlist::anyone()).expect("serves");
+        let running =
+            probe::serve(&server, Server::default(), Allowlist::anyone()).expect("serves");
         (server.endpoint().addr(), (server, running))
     });
 
@@ -630,7 +704,7 @@ async fn a_foreign_protocol_shares_the_node_with_a_keylink_service() {
     let client_node = local_node().await;
 
     let _running = keylink::Server::builder(&server)
-        .service(probe::service(Server, Allowlist::anyone()).build())
+        .service(probe::service(Server::default(), Allowlist::anyone()).build())
         .service(keylink::Service::foreign(FOREIGN_ALPN, ForeignEcho))
         .spawn()
         .expect("a keylink service and a foreign protocol register together");
@@ -713,6 +787,45 @@ struct RequestDriftedContract {
     kinds: keylink::WireKinds,
 }
 
+/// The keyed twin of [`RequestDriftedContract`], and the shape the hand-written
+/// actor contract actually had until Wave 1a.
+///
+/// `actor/remote.rs` declared `request: Envelope<ActorRequest>` while `serve_one`
+/// read `WireRequest<Req>` off the frame. The generated path spelled it
+/// correctly and this test refused the drift for it; the hand-written contract
+/// evaded the test by not being generated, so the keyed ALPN was derived from a
+/// type that was not what the keyed wire carried.
+///
+/// Pinned here so the hole cannot reopen through the generated keyed contract
+/// the way it opened through the hand-written one.
+#[derive(postcard_schema::Schema)]
+#[allow(dead_code)]
+struct KeyedRequestDriftedContract {
+    request: keylink::Envelope<keylink::Addressed<probe::Request>>,
+    response: keylink::Envelope<keylink::WireResponse<probe::Response>>,
+    kinds: keylink::WireKinds,
+}
+
+/// The other keyed drift, and the one that would be invisible without a test:
+/// the request arm forgetting the `Addressed` wrapper altogether, so a keyed
+/// contract and a singleton contract hash the same request type.
+#[derive(postcard_schema::Schema)]
+#[allow(dead_code)]
+struct KeyedUnaddressedContract {
+    request: keylink::Envelope<keylink::WireRequest<probe::Request>>,
+    response: keylink::Envelope<keylink::WireResponse<probe::Response>>,
+    kinds: keylink::WireKinds,
+}
+
+/// The shape the keyed contract must have.
+#[derive(postcard_schema::Schema)]
+#[allow(dead_code)]
+struct CorrectKeyedContract {
+    request: keylink::Envelope<keylink::WireRequest<keylink::Addressed<probe::Request>>>,
+    response: keylink::Envelope<keylink::WireResponse<probe::Response>>,
+    kinds: keylink::WireKinds,
+}
+
 /// The shape it must have: the same two types the wire names.
 #[derive(postcard_schema::Schema)]
 #[allow(dead_code)]
@@ -764,6 +877,92 @@ fn the_alpn_hashes_the_response_type_the_wire_actually_carries() {
     );
 }
 
+/// The same assertion for the KEYED contract, which is the one that was wrong.
+///
+/// Before Wave 1a there was one hand-written actor contract for every service on
+/// a node, it declared `Envelope<ActorRequest>`, and `serve_one` read
+/// `WireRequest<ActorRequest>`. Two builds whose `WireRequest` shape differed
+/// could therefore agree on the actor ALPN and then disagree on the wire — the
+/// precise failure the derived ALPN exists to prevent, evading the test above by
+/// living outside the macro.
+///
+/// Three drifts are refused here rather than one. Dropping `WireRequest` is the
+/// original defect. Dropping `Addressed` is the new one this shape makes
+/// possible, and it is the more dangerous of the two: it would make the keyed
+/// contract hash the *singleton's* request type, so a peer holding a singleton
+/// client could complete a handshake against an actor system and then send a
+/// message with no actor id in it.
+#[test]
+fn the_keyed_alpn_hashes_the_keyed_wire_type() {
+    // Must match what the macro builds: concat!(CARGO_PKG_NAME, "/", service,
+    // "/keyed").
+    const P: &str = concat!(env!("CARGO_PKG_NAME"), "/Probe/keyed");
+
+    let request_drifted = keylink::derive_alpn::<KeyedRequestDriftedContract>(P);
+    let unaddressed = keylink::derive_alpn::<KeyedUnaddressedContract>(P);
+    let correct = keylink::derive_alpn::<CorrectKeyedContract>(P);
+
+    assert_ne!(
+        request_drifted, correct,
+        "wrapping the keyed request in WireRequest must change the hash. A peer \
+         that cannot receive a ledger query decodes one as a call, which is the \
+         variant confusion this whole scheme exists to refuse"
+    );
+    assert_ne!(
+        unaddressed, correct,
+        "wrapping the request in Addressed must change the hash, or a keyed \
+         contract and a singleton contract agree about a wire that carries an \
+         actor id in one direction and not the other"
+    );
+
+    let real = String::from_utf8_lossy(probe::keyed_alpn()).into_owned();
+    let correct_hash = String::from_utf8_lossy(&correct)
+        .rsplit('/')
+        .next()
+        // NOT `unwrap_or_default`. An empty hash makes `ends_with` below
+        // unconditionally true, so the third of the three drifts this test
+        // refuses would pass green on a `None` — a guard that quietly does less,
+        // in the one test written to close a live defect. `derive_alpn` always
+        // emits `{protocol}/{hash:016x}`, so `None` is unreachable rather than
+        // tolerable, and it should say so loudly if that ever changes.
+        .expect("a derived contract hash always has a '/'-delimited suffix")
+        .to_owned();
+    assert!(
+        !correct_hash.is_empty(),
+        "an empty expected suffix would satisfy `ends_with` for any input"
+    );
+
+    assert!(
+        real.ends_with(&correct_hash),
+        "the generated keyed ALPN must hash the keyed wire type.\n  generated: {real}\n  expected suffix: {correct_hash}"
+    );
+}
+
+/// A service served both ways at once answers on two different ALPNs, and both
+/// register on one node.
+///
+/// One router owns one ALPN, so a collision here would be
+/// `ConfigError::DuplicateAlpn` at startup — on a tree where nothing looked
+/// wrong, because the two contracts are built from the same `Request` and
+/// `Response` and only their wrappers differ.
+#[tokio::test]
+async fn a_service_serves_as_a_singleton_and_as_an_actor_system_on_one_node() {
+    let node = local_node().await;
+    let system: probe::System = probe::System::builder(keylink::Eviction::Never).build();
+
+    assert_ne!(
+        probe::alpn(),
+        probe::keyed_alpn(),
+        "the two contracts must not hash the same, or one node cannot serve both"
+    );
+
+    let _running = keylink::Server::builder(&node)
+        .service(probe::service(Server::default(), Allowlist::anyone()).build())
+        .service(probe::keyed_service(&system, Allowlist::anyone()).build())
+        .spawn()
+        .expect("one service, served both ways, on one node");
+}
+
 /// The contract hash, pinned to a literal.
 ///
 /// Every other test in this repository compiles BOTH peers from one source
@@ -806,14 +1005,257 @@ fn the_alpn_hashes_the_response_type_the_wire_actually_carries() {
 /// reply, which is exactly the postcard variant-confusion the derived ALPN
 /// exists to refuse. Refusing it at the handshake is the correct outcome, and
 /// costs nothing: keylink is unpublished, so there is no fleet to split.
+///
+/// # Moved a second time, by the per-service keyed rewrite
+///
+/// `aa77e29e5e1ccdc7` → `d3fe34471921164e`. **Step 1 was answered before the
+/// literal was touched, and the answer is yes.**
+///
+/// `RemoteError::ActorSchemaMismatch` was deleted. It was the fifth variant of
+/// six, and removing it renumbers `Failed` from index 5 to index 4. `RemoteError`
+/// is inside every service's hashed contract —
+/// `Envelope<WireResponse<Response>>` reaches `WireResponse::Call(Outcome<Resp>)`
+/// reaches `Outcome::Err(RemoteError)` — and postcard encodes an enum variant by
+/// its declaration index. So a peer built before this change writes a refusal
+/// under a number the new one does not have, and a peer built after would read
+/// an old `Failed` as whatever now sits at 5. Under a variant *insertion* rather
+/// than a removal that is silent and wrong; here it is a decode failure. Either
+/// way it is the drift this hash exists to refuse, so the hash MUST move.
+///
+/// It is not a rename and not a doc edit. Nothing else in `probe`'s transitive
+/// contract graph changed: `Envelope`, `WireRequest`, `WireResponse`,
+/// `WireKinds` and `Outcome` are untouched, and `probe`'s own `Request` and
+/// `Response` are untouched. One cause, one move.
+///
+/// **This is wire-visible for every service, singletons included** — the keyed
+/// rewrite is where the variant became unnecessary, but the cost lands on the
+/// whole fleet because `RemoteError` belongs to every service keylink carries.
+/// The variant was there to report per-actor schema drift inside one system-wide
+/// actor envelope. A keyed system is per-service now, its ALPN hashes
+/// `Envelope<WireRequest<Addressed<Request>>>`, drift is refused at the
+/// handshake, and a `System` of one service physically cannot hold an actor of
+/// another. There is nothing left for the variant to say.
 #[test]
 fn the_contract_hash_has_not_moved() {
-    const PINNED: &str = "keylink/Probe/aa77e29e5e1ccdc7";
+    const PINNED: &str = "keylink/Probe/d3fe34471921164e";
 
     assert_eq!(
         String::from_utf8_lossy(probe::alpn()),
         PINNED,
         "\nthe wire format of `probe` changed.\n\
          Read this test's documentation before updating the literal.\n"
+    );
+}
+
+/// **keylink's own service has a contract too, and this is its first pin.**
+///
+/// Wave 6 gave keylink a `service!` block of its own — `keylink::inspect` — so
+/// the crate now carries two wire contracts rather than a macro and no users of
+/// it. This is that contract's literal, pinned on the day it was derived.
+///
+/// The two ALPNs are **independent**, and that independence is what the wave
+/// needed: `ActorStatus` gained `Serialize`, `Deserialize` and `Schema` so that
+/// a console could read it, and the pin above proves that decision reached no
+/// existing contract. `Probe` does not carry an `ActorStatus` and neither does
+/// any keyed or singleton service, because a service's hash walks *its own*
+/// request and response types.
+///
+/// The rule for this literal is the rule for the one above: when it goes red,
+/// decide whether the change *should* be visible to a console built against the
+/// old shape, and only then update it. A fifth field on `ActorStatus` moves this
+/// hash, which is the whole point — an old console is refused at the handshake
+/// rather than handed four fields where it expected five.
+///
+/// # It has moved twice, and these are the decisions
+///
+/// ## `080c9e481c937d67` → `7bbd34fa83c9060c`, applying Wave 6's review
+///
+/// Three changes at once, and all three **should** be visible to a console:
+///
+/// - **`Follow` answers `Result<EventPage, FollowRefused>`.** It used to answer
+///   an `EventPage` and had no way to say no, so a cursor ahead of the node's
+///   log was *parked* — an entry in the inspector's waiting list that no event
+///   could release, and the reason that list stopped being bounded by anything.
+///   A console built against the old shape cannot decode a refusal, and a
+///   refusal is now the ordinary answer to two ordinary mistakes.
+/// - **`EventPage` gained `dropped`.** Events lost by the sink's `try_send`
+///   never get a sequence number, so `EventPage::lost` — arithmetic over
+///   sequence numbers — could not see them, and the loop this crate documents
+///   was blind to the likelier of the two losses. An old console reading a page
+///   without the field would report a complete stream that was not one.
+/// - **`NodeStatus::id` became `NodeKey`.** Identical bytes on the wire and a
+///   different *schema*: a struct where there was an array. That is the point —
+///   a raw `[u8; 32]` is assignable between a node key, a blob id, a hash and a
+///   secret key, and the newtype is what stops a console pointing one at the
+///   wrong one. A peer built against the array is refused at the handshake
+///   rather than reading one kind of thirty-two bytes as another.
+///
+/// **`Probe`'s hash did not move**, again, which is the same evidence it was the
+/// first time: three changes to one contract, none to the other, and exactly one
+/// of these two tests went red.
+///
+/// ## `879d78ee456a20b7` → `080c9e481c937d67`, when Wave 9 merged into Wave 6
+///
+/// Wave 9 gave `Ended` a sixth variant (`GaveUp`) and gave `Ended::Observer` a
+/// `fatal` flag. `EndReason` is this service's wire rendering of `Ended` and
+/// carries no wildcard arm, deliberately, so the merge did not compile until both
+/// were answered here — `E0027` for the field, and `E0004` waiting behind it for
+/// the variant. That is the guard working: a textual merge of two branches that
+/// never saw each other produced a wire type quietly missing an ending, and the
+/// compiler refused it.
+///
+/// The change **should** be visible to a console. `GaveUp` is the one ending that
+/// means *this actor could not be kept alive*, as against every other variant,
+/// which means something asked it to stop; and `fatal` is the difference between
+/// "this turn was refused" and "there will be no next incarnation". A console
+/// built against the old shape would render a supervised actor's death as an
+/// unknown ending, so being refused at the handshake is the correct outcome.
+///
+/// **`Probe`'s hash did not move in the same run**, which is the evidence that
+/// these two pins discriminate rather than both being satisfiable: one contract
+/// changed, one did not, and exactly one test went red.
+///
+/// [`FollowRefused`]: keylink::FollowRefused
+/// [`EventPage`]: keylink::EventPage
+/// [`NodeKey`]: keylink::NodeKey
+#[test]
+fn the_inspect_contract_hash_has_not_moved() {
+    const PINNED: &str = "keylink/Inspect/7bbd34fa83c9060c";
+
+    assert_eq!(
+        String::from_utf8_lossy(keylink::inspect::alpn()),
+        PINNED,
+        "\nthe wire format of keylink's own `inspect` service changed.\n\
+         Read this test's documentation before updating the literal.\n"
+    );
+}
+
+// ─────────────────────────────────────────────── and what must NOT move it
+
+// Two declarations of the SAME service, identical in every way except that one
+// method of the second is `#[defer]`. The service *name* is folded into the hash —
+// `schema_hash(protocol)` takes the protocol string — so two differently named
+// services would differ for a reason that has nothing to do with the attribute, and
+// the comparison would prove nothing. Same name, two modules, one difference.
+//
+// Deliberately not the `Probe` above: that one is pinned to a literal, and a second
+// declaration of it would be a second thing to keep in step.
+mod plain {
+    keylink::service! {
+        service Deferring;
+
+        rpc Fill(price: u64) -> u64;
+        rpc Place(size: u64) -> u64;
+    }
+}
+
+mod deferring {
+    keylink::service! {
+        service Deferring;
+
+        rpc Fill(price: u64) -> u64;
+        #[defer]
+        rpc Place(size: u64) -> u64;
+    }
+}
+
+/// **Adding `#[defer]` to a method does not move the contract hash**, and this pins
+/// it rather than asserting it in a comment.
+///
+/// `#[defer]` changes who holds a reply channel on the serving side. It does not
+/// change `Request`, `Response`, `WireRequest`, `WireResponse`, `Envelope` or
+/// `WireKinds` — the six types `Contract` is built from — so there is nothing in the
+/// hashed graph for it to touch. A deferred method is an ordinary `rpc` to the
+/// caller, blocking on its stream exactly as before.
+///
+/// The two declarations differ only in the attribute and are the same service by
+/// name, so the whole ALPN byte string is compared rather than the hash alone — a
+/// stronger assertion than splitting the hash out and one that cannot pass by the
+/// protocol prefix having drifted too.
+///
+/// Both ALPNs are compared, keyed and singleton, because the keyed contract hashes
+/// `Addressed<Request>` and a `#[defer]` method must not move that either.
+///
+/// The one thing this cannot prove is that the hash is *sensitive* to what it
+/// should be. Made red by changing the deferring `Place` to take an `i64`: observed
+/// `left: "keylink/Deferring/fc7ebbc70dab10a0"`, `right:
+/// "keylink/Deferring/aa439906ad24a918"` on the singleton arm.
+#[test]
+fn adding_defer_to_a_method_does_not_move_the_contract_hash() {
+    assert_eq!(
+        String::from_utf8_lossy(plain::deferring::alpn()),
+        String::from_utf8_lossy(deferring::deferring::alpn()),
+        "the ALPN moved for a change that is not on the wire: `#[defer]` decides who \
+         holds a reply channel on the serving side, and touches none of the six types \
+         `Contract` is built from"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(plain::deferring::keyed_alpn()),
+        String::from_utf8_lossy(deferring::deferring::keyed_alpn()),
+        "the keyed ALPN moved for a change that is not on the wire"
+    );
+}
+
+// The same pattern for a `feed`, and for the same reason it has to be the same
+// pattern: two declarations of one service, identical but for the feed.
+mod unfed {
+    keylink::service! {
+        service Fed;
+
+        rpc Fill(price: u64) -> u64;
+    }
+}
+
+mod fed {
+    keylink::service! {
+        service Fed;
+
+        rpc Fill(price: u64) -> u64;
+        feed Ticks(tick: u64);
+        // Two, so the comparison also covers whatever a second one might add. A
+        // service with one feed and a service with two must both hash like a
+        // service with none.
+        feed Fills(fill: [u8; 32]);
+    }
+}
+
+/// **Adding a `feed` does not move the contract hash.**
+///
+/// The strongest form of "feeds are not on the wire", and it is stronger than the
+/// `#[defer]` twin above rather than merely parallel to it. `#[defer]` is an
+/// attribute on a method that *is* on the wire, so the claim there is that the
+/// attribute changes nothing. A `feed` adds a whole declaration, with an item type
+/// of its own — `[u8; 32]` here, a type the wire graph has never seen — and the
+/// claim is that a declaration can exist without touching the contract at all.
+///
+/// Structurally, that is because a feed is not a sixth `kind`: the muncher puts it
+/// in a second list, and `Request`, `Response`, `Contract`, `WireKinds`, `Handler`
+/// and both clients expand over the first list only. There is no arm anywhere that
+/// has to remember to leave a feed out.
+///
+/// `[u8; 32]` is not decoration. A `postcard_schema::Schema` reaches every type
+/// nested in a hashed one, so an item type that leaked into `Request` or `Response`
+/// through some forgotten repetition would move the hash — a plain `u64` would not,
+/// `Fill` already carrying one.
+///
+/// Both ALPNs, keyed and singleton, for the reason the twin gives.
+///
+/// The sensitivity this cannot prove itself is proved by the twin above, which was
+/// made red by changing an argument type. The pinned literal
+/// `keylink/Probe/d3fe34471921164e` in `the_contract_hash_has_not_moved` is the
+/// other half: it is unchanged by this wave.
+#[test]
+fn adding_a_feed_to_a_service_does_not_move_the_contract_hash() {
+    assert_eq!(
+        String::from_utf8_lossy(unfed::fed::alpn()),
+        String::from_utf8_lossy(fed::fed::alpn()),
+        "the ALPN moved for a declaration that is not on the wire: a `feed` has no \
+         `Request` variant, no `Response` variant and no `WireKinds` entry, and \
+         touches none of the six types `Contract` is built from"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(unfed::fed::keyed_alpn()),
+        String::from_utf8_lossy(fed::fed::keyed_alpn()),
+        "the keyed ALPN moved for a declaration that is not on the wire"
     );
 }

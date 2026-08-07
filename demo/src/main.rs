@@ -561,7 +561,7 @@ async fn connect(id: &str, upload: Option<&str>) -> Result<()> {
 /// `singleton.rs::a_served_actor_serializes_calls_that_arrive_on_separate_streams`
 /// for this one.
 async fn concurrent_calls(client: &inventory::Client) -> Result<()> {
-    let started = std::time::Instant::now();
+    let started = n0_future::time::Instant::now();
     let (a, b, c, d) = tokio::join!(
         client.ping(),
         client.list(),
@@ -583,7 +583,7 @@ async fn concurrent_calls(client: &inventory::Client) -> Result<()> {
 async fn download(client: &inventory::Client) -> Result<()> {
     const KIB: u32 = 8 * 1024;
 
-    let started = std::time::Instant::now();
+    let started = n0_future::time::Instant::now();
     let (sheet, mut body) = client.fetch("ADU-014".into(), KIB).await?;
     println!(
         "\nfetch       -> {} declares {} bytes (checksum {:016x})",
@@ -636,7 +636,7 @@ async fn upload_file(client: &dock::Client, path: &str) -> Result<()> {
     let mut hash = Fnv1a::new();
     hash.update(&local);
 
-    let started = std::time::Instant::now();
+    let started = n0_future::time::Instant::now();
     let outcome = client
         .upload(name.clone(), Body::from_file(path).await?)
         .await?;

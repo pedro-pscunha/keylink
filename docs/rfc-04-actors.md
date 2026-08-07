@@ -948,9 +948,20 @@ Two consequences, both documented rather than solved:
 
 ### 7.4 Restart
 
-Not in v1. Restarting requires reconstructing the state, which requires a
-`fn init() -> Self` on the trait — `Actor::Args` in kameo, `pre_start` in ractor. That
-is the door to supervision, and section 8 argues for keeping it shut.
+**SUPERSEDED AND REMOVED, 2026-08-07. The current model is `docs/rfc-07-the-turn-model.md` §9.**
+
+This section said restart was "not in v1" because it "requires a `fn init() -> Self` on the
+trait", and pointed at §8 for the argument to keep that door shut. Both halves are now wrong,
+and the second is wrong in a way worth keeping:
+
+- **A factory need not be a trait method.** `spawn_supervised` takes a closure, so nothing was
+  added to `Actor` and the `Actor::Args`/`pre_start` shape this section feared never arose. The
+  premise that restart forces a trait change was the load-bearing one, and it was false.
+- **§8's conclusion is overturned by the owner**, not by an argument this RFC lost. See §8.
+
+The original text is deleted rather than annotated, deliberately. An append-only record whose
+head is wrong makes the next reader work backwards through three corrections to find what is
+true, and this section's head was wrong about the one fact everything after it rested on.
 
 ### 7.5 What this needs from RFC-02
 
@@ -981,28 +992,38 @@ answered in [section 14](#14-the-actor-system-answering-rfc-02-10).
 
 ## 8. Supervision
 
-**Recommendation: none. Not a smaller version. None.**
+**SUPERSEDED AND REMOVED, 2026-08-07. The current model is `docs/rfc-07-the-turn-model.md` §9.**
 
-Erlang/OTP supervision is a coherent whole: links, monitors, exit signals, child specs,
-restart strategies (`one_for_one`, `one_for_all`, `rest_for_one`), and a restart intensity
-limiter that defaults to one restart in five seconds. Every piece assumes a process tree
-and restartable state.
+This section recommended **"none. Not a smaller version. None."** It is overturned by the
+owner's decision that keylink should have supervision, and the deleted text is not restored
+here because it argued against a feature that now exists — leaving it in place would make a
+reader work backwards through it to find what is true.
 
-keylink has neither. There is one process, one node, and a flat set of services. There
-are no links and no exit signals to supervise with.
+Two of its arguments deserve to be recorded as *wrong*, because they are the kind that get
+re-derived:
 
-The useful 80% of supervision, in this crate, is one sentence: **a panicking message must
-not kill the service.** Section 7.3 delivers that in about ten lines with zero new public
-types. Everything past it — a restart policy, an intensity window, a supervision tree —
-requires `Actor::Args`, a restart strategy enum, and a limiter, and none of it helps with
-the failures keylink actually has. A peer that vanished is not fixed by restarting a local
-actor.
+- **"Everything past it requires `Actor::Args`, a restart strategy enum, and a limiter."** It
+  requires none of those. Wave 9's factory is a closure, so `Actor` is unchanged; no strategy
+  enum was built (`Supervisor`, `Strategy`, `OneForAll`/`RestForOne` and trees are all still
+  refused, and named as refused in RFC-07 §9.10); and the limiter is one `Intensity` value.
+- **"A peer that vanished is not fixed by restarting a local actor."** True, and irrelevant —
+  the failure supervision addresses here is an actor that ended by its own fault, not a peer
+  that left.
 
-The honest alternative, and the one to recommend out loud: **if you need "restart from a
-known state after a crash", you need durable state, and that is Restate.** Restate's
-Virtual Object gives keyed serialized access *and* a K/V store that survives the process,
-which is strictly more than an in-memory supervisor can offer. keylink should not grow a
-worse copy of a system the owner already runs in production.
+What survives, and is still right: supervision is **not** an Erlang transplant. There is no
+process tree, no links, no exit signals, and Wave 9 built none of them. §7.3's "a panicking
+message must not kill the service" remains the useful core; supervision sits *outside* the
+turn loop rather than inside it.
+
+**The Restate paragraph is overturned separately and by evidence, not by preference.** It said
+that if you need "restart from a known state after a crash" you need durable state, "and that
+is Restate", and that keylink "should not grow a worse copy of a system the owner already runs
+in production". keylink now has durable state (RFC-07 §6, measured at 7.6 ms per turn) and
+restart-from-last-committed-state over two real nodes. The remaining honest caveat is narrower
+than this section's and is recorded where it belongs, in `keylink/src/idempotency.rs`: the
+idempotency ledger is **volatile**, so effectively-once is a property of one process's
+lifetime, not of a key. That is the real gap against a journalled system, and it is one
+sentence rather than a section. See also §9.1.
 
 ---
 
@@ -1027,23 +1048,35 @@ scoped per key and retained indefinitely.
    key insight is that "one at a time per key" is worth having on its own, separate from
    durability.
 
-**Rejected:** durable state, and everything downstream of it — journaling, replay,
-suspension, and restart-from-a-known-point. That is the whole of Restate. A keylink actor
-holds memory. When the process dies, the state is gone. Saying so in one sentence in the
-rustdoc is better than shipping a fraction of Restate and letting somebody assume the
-rest.
+**The "Rejected" paragraph below this line is SUPERSEDED AND REMOVED, 2026-08-07.** The three
+things *taken*, above, are unchanged and still right. What was rejected is not.
 
-The keyed shape, if it is ever wanted, and **not proposed here**:
+It read: *"Rejected: durable state, and everything downstream of it — journaling, replay,
+suspension, and restart-from-a-known-point. That is the whole of Restate. A keylink actor holds
+memory. When the process dies, the state is gone."* And it closed with a hypothetical keyed
+service sketch marked **not proposed here**, needing "an instance registry, an eviction policy,
+a per-key mailbox, and an answer for what happens on the first message to an unknown key. That
+is a second RFC."
 
-```rust
-keylink::service! {
-    service Ledger;
-    key account: String;                       // hypothetical
-    rpc Deposit(cents: u64) -> Balance;
-}
-```
-It needs an instance registry, an eviction policy, a per-key mailbox, and an answer for
-what happens on the first message to an unknown key. That is a second RFC.
+All of that shipped:
+
+- **Durable state** — `docs/rfc-07-the-turn-model.md` §6. A `Persist` observer stores after each
+  turn, measured at **7.6 ms** (Apple M5 Max, 2026-08-07), so an actor survives its own process.
+- **Restart-from-a-known-point** — RFC-07 §9. `spawn_supervised` rebuilds from the last
+  committed state, proven over two real nodes.
+- **The keyed shape** — the instance registry, the eviction policy, the per-key mailbox and the
+  first-message answer all exist. It was indeed a second RFC; this is it.
+
+**Still rejected, and this is the line that matters:** journaling, replay and suspension.
+keylink does not journal side effects, and the one place that shows is the idempotency ledger,
+which is **volatile** — so effectively-once is a property of one process's lifetime, not of a
+key (`keylink/src/idempotency.rs`). That is the real remaining distance to Restate, it is
+narrower than this section claimed, and it is the recorded trigger for RFC-07 §9's deferred
+phase 3 rather than a permanent refusal.
+
+The advice that survives intact is the one about honesty: **say what does not survive a
+restart, in the rustdoc, in one sentence.** That is now a larger sentence than it was, and it
+is written where the ledger lives rather than here.
 
 ### 9.2 `irpc` — the same transport, and the closest thing that exists
 
@@ -1770,6 +1803,100 @@ One more consequence, from §10.4 of this RFC rather than of RFC-02: `abort` can
 truncate a `recv` download, because the body is drained by the connection task after the
 turn ends. It **can** truncate a `send` upload, because that body is read inside the turn.
 That is the same `send`/`recv` asymmetry as §10.4, surfacing in a third place.
+
+#### Revision note — issue #3 Wave 4b: `System::stop` is deleted, and the bullet above is why nobody looked
+
+The bullet reading *"`stop` works as §10.5 describes, by a different route. Removing the
+entry drops one sender; the task lives while any sender lives and drains what is queued.
+Nothing is cancelled. The conclusion stands."* is left standing as written, because it
+records what was believed and because it is **true of every drain that finishes**. The
+question it never asks is what happens to a drain that does not, and that omission is where
+a live defect sat:
+
+- `stop` removed the entry from the map **first**, then awaited a bare `JoinHandle<()>`.
+  Wrap the call in a timeout and let the timeout fire: the dropped future drops the `Entry`,
+  drops the handle, and **detaches** the task — on both targets, verified against
+  `n0-future 0.3.2`, whose wasm branch has no `impl Drop for JoinHandle` at all. The actor
+  kept running, still owning `&mut A` and whatever `A` held, and was unreachable, because
+  the entry had already left the map.
+- `stop`'s own rustdoc read *"Deliberately takes no deadline: `tokio::time::timeout`
+  composes."* `LocalActor::stop` carries the identical sentence and there it is true — a
+  `LocalActor` keeps `task: Arc<JoinHandle<()>>` and waits on a separate `ended` channel, so
+  a dropped `stop()` future costs the wait and leaves `abort()` reachable. One sentence, true
+  of a handle that outlives its own await and false of an entry that does not.
+- `Eviction::Idle`'s rustdoc claimed *"Eviction is `System::stop`, not `System::abort`"*, and
+  the sweeper it described awaited nothing at all: it dropped entries inside a `retain` under
+  the write lock, detaching every task it evicted, with nobody watching.
+
+So `System::stop` is **gone**, not kept beside a budgeted twin — the deadline-free spelling
+*is* the hazard, and two ways to do one thing is what let the false sentence sit next to the
+true one. What replaced it:
+
+```rust
+pub async fn shutdown(&self, id: &ActorId, budget: Duration) -> Option<Ended>;
+pub enum Eviction { Idle { after: Duration, shutdown_budget: Duration }, Never }
+```
+
+`System::abort` survives untouched, and §14.5's `stop`-versus-`abort` distinction survives
+with it: `abort` never drains, so it is a different operation rather than a `shutdown` with a
+budget of zero, and it calls `JoinHandle::abort()` **before** its await, which is the
+asymmetry that made it correct all along. `LocalActor::stop` is untouched and keeps its
+sentence. `evict_idle` became `async`, which is a public breaking change and is said here
+rather than left to be discovered.
+
+A second detach of the same family, not in issue #3 and fixed in the same wave:
+`System::mount` dropped the `Mounted` on both refusals, and its task had already been spawned
+by the free `mount()` — so every refused mount left a live, unreachable actor, because
+`MountError` hands nothing back and the registry never had it either. `Mounted` now carries an
+**unstarted** future and `System::mount` is the one place it starts, after the refusals. That
+also puts §14.2's `task: JoinHandle<()>` where it always belonged, on `Entry` alone: a handle
+exists once an actor has been accepted, and not one moment before.
+
+##### Addendum, same wave, after review: a budget does not reach the third instance
+
+Everything above prices the hazard as *expiry* — a `timeout` around the old `stop`, a
+`shutdown_budget` that runs out — and a budget parameter answers that. It does not answer
+**cancellation**, which is the same defect one level up and was still live after the two
+above were fixed:
+
+- `shutdown` removes the entry before its first await, and the `JoinHandle` lived in the
+  `drain` frame the returned future owns. Drop that future — `tokio::select!`, `race`,
+  `timeout(1ms, system.shutdown(&id, 10s))`, spawn-and-drop — and the handle is dropped
+  without `abort()`. Byte for byte the deleted `stop`'s outcome: entry gone from the map,
+  task detached, state and its exclusive resources still held, and `System::abort(&id)`
+  answering `false` for an actor that is still running. `abort` survives cancellation
+  because it aborts *before* its await; `drain` cannot borrow that trick, because aborting
+  first is the opposite of draining.
+- `evict_idle` is the worse half, because it takes **no** budget parameter: a caller who
+  needs a bound has no spelling except a `timeout` around the whole sweep, and one dropped
+  sweep would detach every expired actor at once, since they are torn down concurrently.
+
+The fix is one type, and the wave's own rustdoc had already named it while using it nowhere:
+the handle is an `n0_future::task::AbortOnDropHandle`, so letting go of it — by expiry, by
+cancellation, or by a panic unwinding the frame — aborts instead of detaching. `shutdown`
+and `evict_idle` are therefore **cancel-safe in the only sense available here**: a dropped
+call loses the wait and the `Ended`, and destroys the actor rather than draining it, which is
+the trade `abort` spells out loud.
+
+Measured while doing it, because the argument nearly rested on the wrong fact:
+`AbortOnDropHandle` is `Unpin` on **both** targets — natively it is `tokio_util`'s plain
+struct, and on wasm it is n0-future's `#[pin_project(PinnedDrop)]` shim whose `Unpin` is
+derived from its pinned field — so `pin!` is not what makes the line compile. It is what
+stops a change to either of those two types from turning the line back into a detach.
+
+**Two consequences of draining rather than detaching, both new and both worth stating in the
+RFC rather than only in rustdoc.** First, the budget is also the longest an evicted actor's
+exclusive resources stay held *after its id has left the map*: `sweep` removes the entry
+under the write guard and only then waits, so a lazily re-spawned actor for the same id can
+be refused — `keylink_persist::Error::Busy` for a durable one — for up to one budget. That is
+a bounded, peer-visible failure where the old sweeper held those resources *forever* on a
+task nobody could reach, and it is pinned by
+`an_evicted_actor_still_holds_its_state_after_its_id_is_free_again`. Second, the other end of
+the dial is **silent**: a budget below the longest turn destroys that turn where it stands,
+the `Ended` the sweeper computes is nobody's answer, an aborted task's observers never run,
+and the caller is a peer whose stream is severed rather than answered. No logging seam is
+added here — that would be a second, quieter path beside the observers. **Wave 6 owns it**,
+where `System::snapshot` and the console are; until then the budget is the only control.
 
 ### 14.6 A defect found while answering question 4
 
@@ -3225,6 +3352,9 @@ promise did not run.
 | keyed loop, decode-**panic** arm | `unrun()` |
 | `Handle::service`, `Queued::Expired` arm | `unrun()` |
 
+> **Superseded — every one of these six rows names a site that no longer exists. The rule
+> that closed the list still holds and now closes over three sites. See §16.14 below.**
+
 The list is closed by a rule rather than by a search, which is the only way to
 know it is closed: once reaching a mailbox is a fact, **silence means "queued,
 fate unknown"**, so every arm that ends a message without entering user code has
@@ -3443,3 +3573,111 @@ chosen for it.
 
 Nothing on the wire moved: no `RemoteError` variant, no `postcard_schema` type,
 no ALPN. `keylink/Probe/aa77e29e5e1ccdc7` before and after.
+
+## 16.13 Revision, 2026-08-07: the ALPN moved, and two facts above are now stale
+
+Appended rather than edited in place, per CONTRIBUTING.md. Everything above stands as
+what was believed when it was written; these two things are no longer true of the code.
+
+**The pinned literal is `keylink/Probe/d3fe34471921164e`.** Every sentence above that
+says `keylink/Probe/aa77e29e5e1ccdc7` — §16.10's "before this change and after it",
+§16.11's "still pins", §16.12's "before and after" — was true of the change *it* was
+describing and is stale as a statement about the tree. The move has one cause, and it is
+not any of those changes: the per-service keyed rewrite **deleted
+`RemoteError::ActorSchemaMismatch`**, which was the fifth variant of six, so `Failed`
+renumbers from index 5 to index 4. `RemoteError` is inside every service's hashed
+contract — `Envelope<WireResponse<Response>>` → `WireResponse::Call(Outcome<Resp>)` →
+`Outcome::Err(RemoteError)` — and postcard encodes a variant by its declaration index, so
+this is wire-visible **for every service, singletons included**. Step 1 of
+CONTRIBUTING.md's rule was answered before the literal was touched, and the answer is
+yes: the variant reported per-actor schema drift inside one node-wide actor envelope, and
+there is no such envelope and no such drift left to report. Proved by construction —
+restoring the variant at index 4 reproduces `aa77e29e5e1ccdc7` exactly.
+`tests/protocol.rs::the_contract_hash_has_not_moved` carries the full argument.
+
+**§14.3's `schema_hash` is `pub(crate)`, not `pub`.** That section proposed
+`pub fn schema_hash<C: Schema>(protocol: &str) -> u64` so that two RFCs could share one
+source of truth for the hash. It exists at `node.rs:149` and is `pub(crate)`: nothing
+outside the crate names it, `derive_alpn` is the only caller, and a `pub` fn is a
+compatibility promise this crate does not need to make to keep the two RFCs honest. The
+"split it so both RFCs use one source of truth" reasoning is unaffected — the split
+happened; the visibility did not.
+
+The model that replaced this document's actor envelope is recorded in
+`docs/rfc-07-the-turn-model.md`. §1.6 there holds the mailbox's owned `Origin`, including
+two revisions correcting what withholding `Clone` on it actually buys.
+
+## 16.14 Revision, 2026-08-07: §16.12's closed list is closed over six sites that no longer exist
+
+Appended rather than edited in place, per CONTRIBUTING.md. §16.12's table and the four
+paragraphs under it stand as what was believed when they were written; the marks are in
+three places now, and this says where.
+
+**A closed list with dead rows is worse than an open one**, and the reason is stated by
+§16.12 itself: *"The list is closed by a rule rather than by a search, which is the only
+way to know it is closed."* That is exactly why this note exists. The next wave audits its
+own arms against that table, and four of the six rows name a construct it will not find —
+so the audit either comes back silently clean or sends the auditor looking for a loop that
+was deleted. The rule survives untouched. Only the sites moved.
+
+### What deleted them
+
+`c8712b0` — RFC-07 §2 — replaced `Message::Turn(Box<dyn FnOnce(..)>)` with a mailbox enum
+the `service!` expansion generates, and collapsed the two dispatchers into one
+`keylink::turn`. RFC-07 §2.4 records the deletions in one sentence: *"`Queued<T>` and
+`ask_catching_before` are deleted. Their one caller was `Handle::service`'s dispatch, which
+is now `deliver_to_local` — the twin of `deliver_to_actor`, in keylink, sharing one
+`rendered`."* Both symbols in rows 2 and 6 are gone from the crate;
+`grep -rn 'Queued\|ask_catching_before' keylink/src/` finds only two comments mentioning
+them in passing.
+
+### Where each row went
+
+Read as `file:symbol` and not as `file:line`, deliberately: this note was written while
+another wave was editing `local.rs`, and a line number in a document is a claim that goes
+stale the way §16.12's did.
+
+| §16.12's row | where the mark is now |
+| --- | --- |
+| `System::deliver`, after `mail.send` resolves `Ok` → `enqueued()` | `keylink/src/actor/remote.rs::deliver_to_actor` — same placement, below every refusal above it and above the wait, for the reason §16.12 gives |
+| `LocalActor::ask_catching_before`, once the permit is in hand → `enqueued()` | `keylink/src/local.rs::deliver_to_local`, after `sent.is_err()` is ruled out |
+| keyed loop, queue-deadline expiry arm → `unrun()` | `keylink/src/local.rs::turn`, the `if expired` arm |
+| keyed loop, decode-refusal arm → `unrun()` | **no such arm.** See below |
+| keyed loop, decode-**panic** arm → `unrun()` | **no such arm.** See below |
+| `Handle::service`, `Queued::Expired` arm → `unrun()` | `keylink/src/local.rs::turn`, the same `if expired` arm as row 3 |
+
+Rows 3 and 6 landing on one arm is the whole of `c8712b0`: the queue deadline was three
+hand-written comparisons across two dispatchers, two spelled `>` and one `>=`, and it is
+one `Queueing::expired` call in one place now. The divergence `middleware.rs` documents as
+wasm-visible is gone because neither path spells a comparison any more.
+
+`dispatched()` and `completed()` moved with it — both are in `keylink::turn`, and
+`completed()` is still a positive match on `Answered::Ran`, which is what keeps a fifth
+`Answered` state from silently settling a key. The plain non-actor service dispatch keeps
+its own pair in `macros.rs`, unchanged and outside this table's scope.
+
+### The two decode arms are gone, and nothing is owed in their place
+
+This is the one row where "moved" would be the wrong word, so it is worth being explicit:
+those arms existed because a keyed actor's mailbox carried **encoded bytes** and the loop
+decoded them *after* `serve_one` had claimed the key. A refusal or a panic there had
+therefore claimed a key for work that never ran, and had to say `unrun()`.
+
+The generated mailbox carries the method's **declared argument types**. There is no second
+decode, so there is no arm to refuse in, and `grep -rn 'unrun()' keylink/src/` returns one
+call and one comment about it. The one decode that can still fail is
+`frames.read_header::<WireRequest<Req>>()` at the top of `serve_one`, which runs **before**
+`claim_key` — so a malformed request claims nothing and there is no key to hand back.
+§16.7's *"The decode goes first, and the reason is the caller's next move"* is now true of
+the only decode there is.
+
+### What is unchanged
+
+The precedence — `COMPLETED`, `DISPATCHED`, `UNRUN`, `ENQUEUED`, nothing — the three-arm
+`Reached`, `Drop for Guard`, and the argument in §16.12 that `ENQUEUED` is a fact a later
+fact overrides rather than a settlement. §16.7's three named tests are still the guards, and
+the second of them is still the guard for the expiry arm's `unrun()`; it now covers both
+dispatch paths at once, because there is only one arm left for it to cover.
+
+Found by an adversarial review of Wave 1b, which read the table as the audit surface it
+claims to be and could not find four of its six rows.

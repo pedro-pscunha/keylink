@@ -137,11 +137,16 @@ impl Node {
 
 /// The schema hash of `C` under `protocol`.
 ///
-/// The trailing 16 hex digits of [`derive_alpn`] are this value. Exposed so
-/// that a caller who needs the number — an actor system comparing a declared
-/// hash against a mounted one — takes it from here instead of parsing hex back
-/// out of an ALPN.
-pub fn schema_hash<C: Schema>(protocol: &str) -> u64 {
+/// The trailing 16 hex digits of [`derive_alpn`] are this value.
+///
+/// `pub(crate)`, and it was `pub` for exactly one reason: an actor system
+/// comparing a hash a caller declared against the one an actor was mounted with
+/// needed the number rather than the ALPN, and parsing hex back out of an ALPN
+/// would have been worse. That caller is gone — a keyed system is per-service
+/// and a mismatched actor type is unrepresentable rather than compared — so
+/// nothing outside this crate needs a bare hash any more. [`derive_alpn`] is
+/// what a caller wants, and it is still `pub`.
+pub(crate) fn schema_hash<C: Schema>(protocol: &str) -> u64 {
     u64::from_le_bytes(hash_ty_path::<C>(protocol))
 }
 

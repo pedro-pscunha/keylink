@@ -19,9 +19,56 @@
 # compile without the features that provide them, and demanding it would only
 # teach us to add feature gates to tests that legitimately want the feature.
 # `lint` builds those at the all-features end, which is where they belong.
+#
+# The durability adapter multiplies this list by three rather than by four, and
+# saying which three is the point. `persist-file` implies `persist`, so
+# `persist-file` alone is not a subset anybody can build — the honest lattice is
+# each of the eight above with the adapter off, with `persist`, and with
+# `persist-file`. Twenty-four builds.
+#
+# It is not busywork on either axis. `persist` alone is the state this project
+# claims compiles for a browser, and it is the only one of the three that
+# `.mise/tasks/wasm` can check — so the middle column is what keeps the claim
+# honest on a native host too, where an accidental `use keylink_persist::file`
+# inside `src/persist.rs` would compile at the `persist-file` end and fail here.
 set -euo pipefail
 
 for f in "" blocking fs env blocking,fs blocking,env fs,env blocking,fs,env; do
-    echo "── features: ${f:-none}"
-    cargo test -p keylink --lib --no-run --no-default-features --features "$f"
+    for p in "" persist persist-file; do
+        # An empty subset and an empty adapter make an empty `--features`, which
+        # cargo accepts; a comma between two empties does not.
+        both="$(printf '%s\n' "$f,$p" | sed -e 's/^,//' -e 's/,$//')"
+        echo "── features: ${both:-none}"
+        cargo test -p keylink --lib --no-run --no-default-features --features "$both"
+    done
 done
+
+# `keylink-persist` has one optional feature and both ends were built by
+# nothing until `versioned.rs` existed: `lint` covers the all-on end through
+# --all-features, and the off end had no builder at all. The frame and the
+# migration chain need no adapter, and this is what keeps that true — a
+# `use crate::file::..` slipped into `versioned.rs` compiles fine at the on end.
+#
+# **`--lib` excludes doctests, and that was a hole this task could not see.**
+# The only example on `Versioned` — the crate's feature-independent core — began
+# `use keylink_persist::file::Files`, so it had not compiled without the `file`
+# feature since the day it was written. Nothing was red: this task ran `--lib`,
+# `test` runs default features and `docs` runs `--all-features`. A doctest is
+# compiled as its own crate against the built lib, so it is a second target and
+# needs a second invocation. `--doc` cannot be combined with `--no-run`, so
+# these actually run; there are five of them and they take a tenth of a second.
+for f in "" file; do
+    echo "── keylink-persist features: ${f:-none}"
+    cargo test -p keylink-persist --lib --no-run --no-default-features --features "$f"
+    cargo test -p keylink-persist --doc --no-default-features --features "$f"
+done
+
+# The same hole exists for `keylink`, whose doctests the loop above also cannot
+# see. One run and not twenty-four: the failure being guarded is a doctest that
+# names a feature-gated item, and the all-off end is where every one of those
+# fails at once. `lint` covers the all-on end. The middle of the lattice is
+# where `--lib` earns its twenty-four builds, and doctests do not multiply the
+# same way — a doctest that needs `blocking` fails identically with `fs` on or
+# off.
+echo "── keylink doctests: no default features"
+cargo test -p keylink --doc --no-default-features

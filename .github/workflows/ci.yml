@@ -27,10 +27,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: jdx/mise-action@v2
+      - run: mise run framing
       - run: mise run fmt-check
       - run: mise run lint
       - run: mise run features
       - run: mise run test
+      - run: mise run examples
       - run: mise run docs
 
   wasm:

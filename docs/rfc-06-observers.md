@@ -546,9 +546,15 @@ advance — and not an assertion.
 
 ### 5.1 A panicking turn ends a durable actor
 
-RFC-04 §8 refuses supervision: a panicking message costs that message, and the actor
-survives. That rule stays, and it stays **in keylink**. The stricter rule belongs to
+RFC-04 **§7.3** is the rule this rests on: a panicking message costs that message, and the
+actor survives. That rule stays, and it stays **in keylink**. The stricter rule belongs to
 the adapter.
+
+*(Citation corrected 2026-08-07. This said "RFC-04 §8 refuses supervision", which was true when
+written and is now doubly wrong: §8 has been superseded and removed, and the rule being invoked
+here was always §7.3's, not §8's. Supervision arriving in RFC-07 §9 does not disturb it —
+supervision decides what happens **after** an incarnation ends, and this section is about which
+turn ends it.)*
 
 Revision 1 argued this from the torn state alone, which proves the smaller claim. Not
 storing a torn state already keeps the disk clean. The reason to end the actor is the
@@ -574,26 +580,59 @@ schedule another read, forever.
 
 ### 5.3 The keyed `System` path is out of scope
 
-`macros.rs:417`'s `spawn()` runs its own loop over `__actor_turn` and never touches
-`LocalActor`. It gets no observers.
+**SUPERSEDED AND REMOVED, 2026-08-07. It is in scope, and it works.** The current model is
+`docs/rfc-07-the-turn-model.md` §5.
 
-That is a scope limit and not an oversight, and it must be **written down** in the
-trait doc and beside `spawn`. A user who mounts with `spawn()` and expects durability
-would otherwise get no durability, no compile error, and no explanation. RFC-04 §14.8
-already says the keyed path costs more and is worth it only when there are many.
+This section said the keyed path "runs its own loop over `__actor_turn` and never touches
+`LocalActor`. It gets no observers", and asked for that limit to be written into the trait doc
+and beside `spawn`.
+
+**Wave 3 deleted the second loop rather than documenting it.** There is now one `run_loop` with
+two call sites and one turn-dispatch site; the generated keyed loop — which passed a hardcoded
+**empty hook slice**, which is exactly why keyed actors got no observers — is gone. Keyed actors
+get observers, the panic guard and `finish` on the same code path as local ones.
+
+Proven, not asserted: `an_observer_attached_to_a_keyed_actor_runs`, and
+`a_keyed_actors_state_survives_its_own_process` — a real `Persist` over a real `Files` store
+across two real nodes.
+
+This section is deleted rather than annotated because its instruction was to *write the
+limitation down in two places*. Following it now would add two false statements to the public
+docs, which is worse than the original error.
 
 ---
 
 ## 6. Refused
 
-- No retry of a failed store.
-- No best-effort mode that keeps serving without durability.
-- No store on `Drop`. `Drop` cannot await.
-- No observer that can mutate the state through its reference.
-- No observer that sees a request or a reply payload. That is `Middleware`.
-- No supervision. An actor that cannot honor its contract ends.
-- No journal, and no replay. §8.
-- No new `RemoteError` variant, because that moves the wire contract.
+**PARTIALLY SUPERSEDED, 2026-08-07.** Two of these eight are overturned. The rest hold, and
+one holds harder than when it was written.
+
+Still refused, and still right:
+
+- **No retry of a failed store.** Stronger now than when written: Wave 5's review found the
+  adapter *did* retry, on the way out, for a turn whose caller had already been told
+  "it ran and was not committed" — a double-apply. The fix deleted `Persist::finish` and the
+  `dirty` flag outright, so there is no longer any code path that could retry. See RFC-07 §6.
+- **No best-effort mode that keeps serving without durability.**
+- **No store on `Drop`.** `Drop` cannot await.
+- **No observer that can mutate the state through its reference.**
+- **No observer that sees a request or a reply payload.** That is `Middleware`.
+- **No journal, and no replay.** Still refused — and it is the one line that keeps the
+  distance to Restate honest. See §8.
+
+Overturned:
+
+- ~~No supervision. An actor that cannot honor its contract ends.~~ **Superseded by RFC-07 §9.**
+  An actor that cannot honour its contract may now be re-incarnated from its last committed
+  state, bounded by an `Intensity` and ending as `Ended::GaveUp` when the budget runs out.
+  Supervision sits *outside* the turn loop; the sentence that ends a failing incarnation is
+  unchanged, and what changed is what happens next.
+- ~~No new `RemoteError` variant, because that moves the wire contract.~~ **The rule survives;
+  the reason it was listed does not.** Wave 9 needed to tell a peer that an actor is restarting
+  rather than gone, and did it *without* a new variant — a `"restarting: "` prefix inside
+  `Failed`, matching Wave 1b's `"panicked: "` discipline. Three prefixes now, none a prefix of
+  another. So no variant was added, the ALPN did not move, and the constraint was met by
+  design rather than by refusing the feature.
 
 ---
 
@@ -659,9 +698,37 @@ So the recommendation is explicit: **a caller who already runs Restate should us
 K/V store and not this.** RFC-06 is for a program that does not, and does not want to
 run one to keep a counter across a restart.
 
-The tripwire stands. §6 refuses retry and supervision, and now refuses a journal and
-replay as well. If a later revision adds any of the four, it has crossed into
-Restate's territory and RFC-04 §8 applies again.
+---
+
+### 8.1 The tripwire fired. SUPERSEDED, 2026-08-07.
+
+The paragraph that stood here read: *"The tripwire stands. §6 refuses retry and supervision,
+and now refuses a journal and replay as well. If a later revision adds any of the four, it has
+crossed into Restate's territory and RFC-04 §8 applies again."*
+
+**One of the four was added — supervision, in RFC-07 §9 — and it was added on purpose, by the
+owner, not by a revision that forgot the tripwire.** So the tripwire did its job: it made the
+crossing a decision rather than a drift. Recording the outcome rather than deleting the
+mechanism, because the mechanism was right.
+
+Two things follow, and both matter more than the sentence they replace:
+
+- **RFC-04 §8 no longer applies, because it no longer exists.** It has been superseded and
+  removed in the same pass as this section. A tripwire that points at a deleted argument is a
+  worse failure than no tripwire, which is why this is being fixed here and not left to the
+  next reader to discover.
+- **The other three still hold, and they are now the whole of the distance to Restate.** No
+  retry (and the mechanism that could have retried is deleted, not merely unused), no journal,
+  no replay. The place that shows is `keylink/src/idempotency.rs`: the ledger is **volatile**,
+  so effectively-once is a property of one process's lifetime and not of a key. A process that
+  dies after fsyncing turn *n* but before the reply reaches the peer will, on restart, restore
+  a state that already contains *n*, find an empty ledger, and run *n* again.
+
+**The replacement tripwire, stated so it can fire again:** if a later revision adds a journal
+or a replay — or makes the idempotency ledger durable, which is the same thing wearing a
+smaller hat — then keylink is doing durable execution, and that is RFC-07 §9's deferred phase 3.
+Its trigger is written there as *"journaled side effects land"*, which converts the old
+permanent refusal into a sequenced one. That is the line to defend now.
 
 ---
 
@@ -858,6 +925,9 @@ actor dispatch calls **that**. So the callers are now:
 | `LocalActor::ask` | `ask_catching` |
 | generated actor dispatch in `macros.rs` | `ask_catching_before` |
 
+> **Superseded — `ask_catching_before` is deleted, and generated dispatch calls neither
+> of these. `ask_catching` is down to one caller again. See §16 below.**
+
 Both error types move to `TurnLost`. §2.7's mapping applies to
 `ask_catching_before`, not to `ask_catching`, and `ask` still maps everything to
 `MailboxClosed` exactly as §2.7 says.
@@ -888,6 +958,10 @@ enum Answered<T> {
 value*. A dropped sender stays `Gone`. Row 3 of §2.6 is unchanged from the
 caller's side: `ask` maps `TurnLost::Refused` to `MailboxClosed`.
 
+> **Superseded — there is no `Queued<T>` to keep answering anything. `Answered<T>` landed
+> and is what the loop puts on the reply channel; the sentence about the division of labour
+> now describes `Answered` alone. See §16 below.**
+
 ### 13.3 A refused turn settles an idempotency key as the refusal
 
 Wave A made the served path settle a key on **what ran**, using a progress marker
@@ -908,6 +982,9 @@ The waves added `Caller`, `QueueTimeout`, `Queueing`, `Queued`, `Idempotency`,
 and `Revocation`. None collides with §10's fourteen. `Queued` and `TurnLost` sit
 beside each other in one rustdoc index and mean different things, which §13.2
 names rather than leaves to a reader.
+
+> **Superseded — `Queued<T>` is deleted, so the collision it was worth naming cannot
+> happen and `TurnLost` sits alone. The other eleven names stand. See §16 below.**
 
 ### 13.5 What did not change
 
@@ -949,3 +1026,154 @@ offer. An unkeyed caller pays the cost §2.6 describes, unchanged.
 
 Found by a review of this branch rather than by the implementation, which had
 written §13.3 the wrong way round and would have shipped it.
+
+---
+
+## 14. Revision 6 — `keylink-persist` does add something, and it is not `revision`
+
+§10 says *"`keylink-persist` adds nothing, because `Durable::revision` is cut."*
+Issue #3's wave 4c makes the first half stale. The second half stands.
+
+`keylink-persist` now has `Durable::VERSION`, `Durable::migrate`, a
+`RestoreError` enum in place of the newtype, and
+`versioned::Versioned` — a wrapper that owns a claim and is the only thing that
+writes a twelve-byte header in front of a snapshot.
+
+**This is not `revision` re-derived**, and the distinction is the reason §4.2
+cut it. `revision` was a per-instance counter whose job was to *skip a store*,
+and it was cut because nothing connects a mutation to a bump: an impl that
+forgets one disables durability completely with every test still green. `VERSION`
+is an associated `const` on the type, it skips nothing, and every store writes.
+Forgetting to bump it cannot silence a store; it fails closed at the *next* load
+as an unparseable `restore`, which the constant's own documentation states in as
+many words. The failure mode §4.2 refused — a guard that moves rather than one
+that is deleted — is absent, because there is no guard to move.
+
+**§4.2 step 3 still reads `self.claim.store(&bytes).await`.** A `Saver` built
+today holds a `Versioned<C>` and calls `store::<A>(&bytes)`, which frames the
+same bytes and takes the same `&mut self`. Nothing else in §4.2 changes: the
+snapshot is still taken synchronously outside the future, `A: Sync` is still
+absent, and §5.3's argument from `Claim::store(&mut self)` on a non-`Sync` claim
+is untouched — `Versioned` owns the claim and inherits both properties. A
+compile-time probe in `keylink-persist/src/representability.rs` now pins the
+`Send + 'static` half of that, which §5.3 previously only asserted in prose.
+
+---
+
+## 15. Revision 7 — the version stamp is proved by the payload, not named beside it
+
+§14's last paragraph says a `Saver` "holds a `Versioned<C>` and calls
+`store::<A>(&bytes)`". **That signature is gone**, and it was removed because it
+was unsound in exactly the way §14 was arguing it was not.
+
+`store::<D>(&[u8])` let a caller *assert* a version rather than prove one:
+
+```rust
+let v1 = LedgerV1 { entries: vec![10, 20, 30] };   // VERSION = 1
+state.store::<LedgerV3>(&v1.snapshot()).await?;    // VERSION = 3. Compiled clean.
+```
+
+The frame then said 3, so the next load took the equal-versions fast path,
+skipped the migration chain and handed v1 bytes to `LedgerV3::restore`, which
+read the first entry as a total and the last as a count. Silent at both ends.
+§14 argues that `VERSION` is safer than the cut `revision` because "forgetting
+to bump it cannot silence a store" — true, and beside the point of this one:
+this defect was not a forgotten bump, it was a *typeable* lie, and `&[u8]` had
+erased the one thing the type parameter needed to know.
+
+`store` now takes a `versioned::Snapshot<D>`, whose only constructor calls
+`D::snapshot` itself, so `D` is inferred from the payload:
+
+```rust
+let snapshot = ledger.with_state(Snapshot::of).await?;   // inside the turn
+claim.store(&snapshot).await?;                           // D = Ledger, not a name
+```
+
+**Nothing else in §4.2 moves.** Step 2 still takes the snapshot *synchronously*,
+before the future is built — `Snapshot::of` is a synchronous call on `&A`, which
+is what keeps `A: Sync` off the design. `Snapshot<A>` is `Send` and `'static`
+whatever `A` is, because its type parameter is carried as
+`PhantomData<fn() -> A>` rather than as an `A`, so a `Saver` may hold one across
+its own `await` without acquiring a bound. Step 3 is
+`self.claim.store(&snapshot).await` and still takes `&mut self`, so §5.3's
+argument from `Claim::store(&mut self)` on a non-`Sync` claim is untouched, as
+is §14's reading of it.
+
+**`Claim` is unchanged.** The port still takes raw bytes, because an adapter for
+a bucket or a vault must not learn what a frame is. Only the wrapper moved.
+
+---
+
+## 16. Revision 8 — §13's vocabulary: `Queued<T>` and `ask_catching_before` are deleted
+
+**Appended, not edited.** Nothing above this line has been altered except three pointer
+lines under §13.1, §13.2 and §13.4 saying that this section supersedes them. §13 was
+written as *"line references above are stale, and three factual premises changed"*; this is
+the same service performed on §13 itself.
+
+`c8712b0` replaced `Message::Turn(Box<dyn FnOnce(..)>)` with a mailbox enum that the
+`service!` expansion generates — one variant per declared method, carrying that method's own
+arguments and a `Reply<T>` of its own return type — and collapsed the two dispatchers into
+one `keylink::turn`. **The deletion is recorded in `docs/rfc-07-the-turn-model.md` §2.4**,
+which is the head of the record for the turn model and the section to read before this one.
+
+### What §13 says that is no longer true
+
+**§13.1's table.** `LocalActor::ask_catching_before` does not exist.
+`grep -rn 'ask_catching_before' keylink/src/` finds nothing, and generated dispatch calls
+neither method in that table: it calls `$crate::deliver_to_local`, keylink's own twin of
+`deliver_to_actor`, which sends `Message::Mail` into the mailbox itself. So §10's original
+claim is nearly true again — `ask_catching` has **one** non-test caller, `LocalActor::ask`,
+plus three call sites in `local.rs`'s own test module, and none in `keylink/tests/`, `demo/`
+or the README. §13.1's correction of §10 was right about its wave and is now a round trip.
+
+**§13.2's `Queued<T>` sentence.** There is no `Queued<T>`. `Answered<T>` did land, which is
+what §13.2 proposed and it is the section's substance — but as a `pub(crate)` type, and with
+one more variant than the sketch:
+
+```rust
+pub(crate) enum Answered<T> {
+    Ran(T),
+    Faulted(Panic),
+    Expired,
+    Refused { name: &'static str },
+}
+```
+
+`Ran(Result<T, Panic>)` was flattened into `Ran` and `Faulted`, so the distinction between a
+turn that produced a value and one that panicked lives in the discriminant where a `match`
+has to answer it. That is what §13.2's own argument asked for — the reply is *sent* rather
+than withheld, so a refusal keeps its name and does not arrive as `TurnLost::Gone` — one
+step further in. `TurnLost` is untouched and `ask` still maps `Refused` to `MailboxClosed`,
+so **§2.6 row 3 and §2.7 read exactly as written**.
+
+`Answered` being `pub(crate)` is the part worth carrying forward: a fourth state added to it
+is additive to a type nothing outside keylink can match on.
+
+**§13.4's name count.** `Queued` was one of the twelve names checked against §10's
+fourteen. It is gone, so the collision §13.4 thought worth naming — `Queued` and `TurnLost`
+side by side in one rustdoc index, meaning different things — cannot happen. The other
+eleven stand.
+
+### What did not change, and this is the point of the note
+
+**No part of this RFC's *design* moves.** §2.6's table, §2.7's mapping, the boundary rule in
+§2.1, `stop()` releasing the claim in §2.4, and every argument in §13.6 about a refused turn
+settling `Interrupted` rather than the refusal are all about *where the observer chain runs
+and who is answered*, and the chain still runs inside one `guarded`. It is now literally one
+place rather than two that agree: `keylink::turn` is the single site holding the deadline,
+the guard, the observers, the marks and the reply, which is the property §13.6 had to
+establish by argument across two dispatchers.
+
+§13.5's last sentence needs one correction of the same kind. It says *"§5.3's exclusion of
+the keyed `System` path is unaffected: `macros.rs`'s `spawn()` still runs its own loop over
+`__actor_turn`."* Half of that holds. `spawn()` does still run its own
+`while let Some(mail) = inbox.recv().await`, but the **turn** inside it is `$crate::turn`
+handed `&mut []` — an empty hook slice, in the one place that would otherwise have to be a
+second loop. So §5.3's exclusion is now a one-line decision rather than a structural fact,
+which is exactly how RFC-07 §2.6 records it: deferred to Wave 3 because feeds ask the same
+question about the same loop, not blocked. §5.3 is on issue #3's list to be superseded and
+removed outright, so it is not repaired here.
+
+Found by an adversarial review of Wave 1b, which read §13.1's table and §13.4's name list as
+current vocabulary — which is what they present themselves as.

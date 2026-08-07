@@ -51,6 +51,14 @@
 //!   other — an observer never sees a request or a reply payload, and a layer
 //!   never sees the state. Durability is the first thing built on the second
 //!   one, outside this crate.
+//! - **The compositions every actor system grows**, each with its backpressure
+//!   written down rather than inherited from an unbounded queue: fan-out, a
+//!   pool, a schedule and a name registry. See [`compose`].
+//! - **Its own introspection, served over itself.** [`System::status`] lists
+//!   what is running; [`inspect`] serves that list and a live lifecycle log on
+//!   an ALPN and an [`Allowlist`] of their own, and [`Console`] is the peer that
+//!   reads them. A subscriber is a parked reply rather than a held handler, so
+//!   watching an actor does not stop it.
 
 #![warn(missing_docs)]
 // `deny` and not `forbid`, and the difference is the one `unsafe impl` below.
@@ -64,7 +72,7 @@
 // sentence in two doc comments into something the compiler checks.
 #![deny(unsafe_code)]
 
-// Three features need an operating system facility a browser does not have, and
+// Four features need an operating system facility a browser does not have, and
 // each says so here rather than letting the build fail somewhere unhelpful.
 //
 // `blocking` and `fs` would fail anyway, dozens of errors deep inside mio or
@@ -90,6 +98,38 @@ compile_error!(
     "keylink's `env` feature needs a process environment, which a browser does \
      not have: `std::env::var` compiles here and always returns nothing. Build \
      with --no-default-features and pass the secret and the allowlist in."
+);
+// The fourth is the durability adapter's, and it is the `persist-file` half
+// rather than `persist`. That split is the whole reason the adapter could be a
+// module here instead of a third crate: `persist` reaches only the frame and the
+// two port traits, so it compiles for the browser and `.mise/tasks/wasm` builds
+// it there. `persist-file` turns on `keylink-persist/file`, which turns on
+// `tokio/fs`, which a browser does not have.
+//
+// **This one was watched, and it did NOT fire — say so rather than let a reader
+// assume it did.** Unlike the three above, the failure is in a *dependency*, and
+// cargo compiles dependencies first: `--target wasm32-unknown-unknown --features
+// persist-file` stops at tokio's own `compile_error!`, `Only features
+// sync,macros,io-util,rt,time are supported on wasm`, and this line is never
+// reached. It stays for two reasons and neither is enforcement. It keeps
+// `persist-file` in the list a reader scans to learn which features a browser
+// refuses, so the next author does not add it back. And it is the message that
+// would be reached if tokio ever accepted the feature, which is the day the
+// silent-success hazard `env` documents would apply here too — `std::fs`
+// compiles for this target and fails at runtime.
+//
+// The 48-error mio explosion this used to produce instead is gone for an
+// unrelated and better reason: `keylink-persist` stopped inheriting `tokio`'s
+// `full`, which its own manifest now explains.
+#[cfg(all(
+    feature = "persist-file",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
+compile_error!(
+    "keylink's `persist-file` feature needs a filesystem, which a browser does \
+     not have. Build with --no-default-features --features persist, which is the \
+     adapter over the port with no file store behind it."
 );
 
 // Two places assert a platform fact rather than checking one, and both assert
@@ -121,6 +161,22 @@ compile_error!(
      `unsafe impl Send` beside it. Threaded wasm is not supported."
 );
 
+// So that keylink can expand its own `service!`.
+//
+// The macro's generated rustdoc links its way back to this crate by name —
+// `[`Handle::service`]`, `[`mount`](keylink::mount)` and a dozen more — because
+// every other expansion of it is rendered in somebody else's crate, where
+// `keylink::` is the only spelling that resolves. Inside keylink there is no such
+// path by default, so `mise run docs` (`-D warnings`, broken intra-doc links
+// included) fails on every one of those links the moment the crate expands the
+// macro on a non-`#[cfg(test)]` item. `representability.rs` has expanded it for
+// waves without hitting this, because rustdoc does not render test-only code.
+//
+// The alternative was `#[allow(rustdoc::broken_intra_doc_links)]` inside the
+// macro, which would have turned the links off in **every** downstream crate to
+// fix one crate's problem. This turns them on here instead.
+extern crate self as keylink;
+
 /// Gated on the feature AND compiled only where OS threads exist. The Cargo
 /// feature alone is not enough: it controls which dependency features are on,
 /// not whether this module's `tokio::signal` and `new_multi_thread` calls are
@@ -133,6 +189,17 @@ mod admission;
 mod authz;
 mod blobs;
 mod body;
+// A `pub mod` and not five root re-exports. The one thing these four share is an
+// argument about backpressure, and a module is where it can be written once
+// instead of five times. Its docs live in `compose/mod.rs`: an outer `///` here
+// beside the inner `//!` there merges the two and resolves the merged doc's
+// intra-doc links in *this* file's scope, which turns every `[`Topic`]` in that
+// module doc into a broken link under `mise run docs`.
+pub mod compose;
+// A private module holding one `service!` invocation and the types around it.
+// The generated module — `inspect` — is re-exported at the root below, so a
+// caller writes `keylink::inspect::Client` and never `keylink::console::inspect`.
+mod console;
 mod error;
 mod idempotency;
 mod keys;
@@ -142,7 +209,17 @@ mod middleware;
 mod node;
 mod observe;
 mod panic;
+// Where an answer waits for the verdict of the turn that produced it. Its own
+// module and not four items in `local.rs`, because the invariant it holds — a
+// lot is a local of one turn, so nothing can be parked outside one — is a
+// property of these types together and of nothing else in that file.
+mod parking;
 mod peer;
+/// The durability adapter. Gated on the feature AND nothing else: unlike
+/// `blocking`, every line in it compiles for the browser, which is what makes
+/// `persist` and `persist-file` two switches rather than one.
+#[cfg(feature = "persist")]
+mod persist;
 mod reply;
 #[cfg(test)]
 mod representability;
@@ -154,13 +231,74 @@ mod watch;
 mod wire;
 
 pub use actor::{
-    actor_schema, mount, ActorClient, ActorReply, ActorRequest, Eviction, Mail, Mailbox,
-    MountError, Mounted, Sealed, System, SystemBuilder,
+    deliver_to_actor, mount, ActorStatus, Addressed, Eviction, KeyedService, Lifecycle, Mailbox,
+    MountError, Mounted, Origin, System, SystemBuilder,
 };
 pub use admission::{Admission, Admittance, DynamicAdmission, Revocable, Revocation};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
 pub use blobs::{BlobHandle, BlobId, Blobs, BlobsAdmission, Granting, Retention, MAX_GRANTS};
 pub use body::{Body, BodyReader};
+pub use console::{
+    Console, EndReason, EventPage, EventStream, Events, FollowRefused, Inspector, LifecycleEvent,
+    NodeKey, NodeStatus, MAX_FOLLOWERS,
+};
+
+/// The client and the wiring for keylink's own `Inspect` service.
+///
+/// # Five documented names, and it was the whole generated module
+///
+/// `service!` generates around thirty public items into a module — a `Request`,
+/// a `Response`, a `Mail`, a `Feed`, a keyed `System` and its builder, a
+/// `KeyedClient`, six spawn doors and a `blocking` submodule. For a service **a
+/// caller writes**, all of that is theirs and belongs in their crate. `Inspect`
+/// is keylink's own, so every one of those was keylink's public API —
+/// `std::mem::size_of::<keylink::inspect::Mail>()` compiled — which is a
+/// compatibility promise about the shape of a mailbox enum nobody outside this
+/// crate can construct, consume or name a use for.
+///
+/// The wave that added this argued for two of them, the `Client` and the
+/// `alpn`. These five are that argument applied: what a program needs to **wire
+/// an inspector into a server** and what a console needs to **read one**. The
+/// `Inspect` service is never keyed, never hand-mounted and never implemented by
+/// anybody but [`Inspector`], so none of the rest has a caller.
+///
+/// A second, `#[doc(hidden)]` group follows it, and it is not a second surface:
+/// those are the names the *generated documentation above* cross-references,
+/// because `service!` writes its docs for a module whose siblings are all
+/// public. Hiding rather than dropping them is the house rule's middle tier —
+/// `#[doc(hidden)] pub` when only the macro must name it — and it is what keeps
+/// `mise run docs` a gate rather than twelve broken links.
+///
+/// `tests/api.rs` could not have caught the original: it pins that names
+/// *resolve*, which is the opposite question. So the guard is here, and it is an
+/// absence:
+///
+/// ```compile_fail
+/// let _ = std::mem::size_of::<keylink::inspect::Mail>();
+/// ```
+///
+/// ```compile_fail
+/// let _: Option<keylink::inspect::System> = None;
+/// ```
+pub mod inspect {
+    pub use crate::console::inspect::{actor_wired, alpn, Client, Feeds, Handle};
+
+    /// Named only so that the generated rustdoc above resolves its own
+    /// cross-references. Nothing outside this crate has a use for one.
+    ///
+    /// `IdempotentClient` joined this list after the fact, and how it got here is
+    /// the argument for the list existing. It was added to `service!` on one
+    /// branch while this narrowing was written on another; each was green alone,
+    /// and `mise run docs` went red the first time the two were built together.
+    /// A generated doc comment cross-references its own module's siblings, so
+    /// **every** name `service!` learns to mention is a name this list must learn
+    /// too — which is a maintenance cost worth naming rather than a one-off.
+    #[doc(hidden)]
+    pub use crate::console::inspect::{
+        actor, actor_with, at, keyed_service, serve, service, spawn, spawn_wired, Actor, Handler,
+        IdempotentClient, KeyedClient,
+    };
+}
 pub use error::{ConfigError, Error, Result, Transport};
 pub use idempotency::{
     Idempotency, IdempotencyRefusal, KeyState, MAX_ATTACH, MAX_RECORDED_BYTES, MAX_RECORDS,
@@ -168,14 +306,21 @@ pub use idempotency::{
     RECORD_TTL,
 };
 pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
-pub use local::{LocalActor, MailboxClosed, Queued};
+pub use local::{
+    deliver_to_local, feed_turn, run_keyed, run_keyed_supervised, turn, turn_deferred, Deferred,
+    Fed, Feeds, Hooks, Incarnation, Intensity, LocalActor, MailboxClosed, Replied, Reply, Turn,
+};
 pub use middleware::{Caller, Context, Middleware, Next, QueueTimeout, Queueing, Rpc, Timeout};
-pub use node::{derive_alpn, schema_hash, Node};
-pub use observe::{Ended, Observer, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome};
-pub use panic::{catching, guarded, Panic};
+pub use node::{derive_alpn, Node};
+pub use observe::{Ended, FinishFut, Observer, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome};
+pub use panic::Panic;
 pub use peer::{Dial, Peer};
+#[cfg(feature = "persist")]
+pub use persist::{Opened, Persist};
 pub use reply::{Outcome, RemoteError, WireRequest, WireResponse};
-pub use rpc::{Dispatch, RpcClient, Server, ServerBuilder, Service, ServiceBuilder};
+pub use rpc::{
+    Dispatch, IdempotentClient, RpcClient, Server, ServerBuilder, Service, ServiceBuilder,
+};
 pub use subscribers::Subscribers;
 pub use watch::{Departure, Watch};
 pub use wire::{Envelope, WireKinds, MAX_HEADER};
@@ -183,5 +328,14 @@ pub use wire::{Envelope, WireKinds, MAX_HEADER};
 /// Re-exported so generated code and callers agree on types without extra
 /// imports at the call site.
 pub use iroh::{protocol::Router, EndpointAddr, EndpointId, SecretKey};
+
+/// The trait a `feed` is wired from, re-exported for the same reason.
+///
+/// A generated `Feeds::new` takes `impl Stream<Item = ..>`, so this trait is in
+/// keylink's public API whether or not it is named here — and it is
+/// `futures_core::Stream`, the one `tokio_stream`, `futures` and `async_stream` all
+/// implement, reached through the runtime shim the rest of the crate uses. Naming it
+/// here means a caller wiring a feed needs no direct dependency on any of them.
+pub use n0_future::Stream;
 #[doc(hidden)]
 pub use pastey;
