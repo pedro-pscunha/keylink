@@ -546,9 +546,15 @@ advance — and not an assertion.
 
 ### 5.1 A panicking turn ends a durable actor
 
-RFC-04 §8 refuses supervision: a panicking message costs that message, and the actor
-survives. That rule stays, and it stays **in keylink**. The stricter rule belongs to
+RFC-04 **§7.3** is the rule this rests on: a panicking message costs that message, and the
+actor survives. That rule stays, and it stays **in keylink**. The stricter rule belongs to
 the adapter.
+
+*(Citation corrected 2026-08-07. This said "RFC-04 §8 refuses supervision", which was true when
+written and is now doubly wrong: §8 has been superseded and removed, and the rule being invoked
+here was always §7.3's, not §8's. Supervision arriving in RFC-07 §9 does not disturb it —
+supervision decides what happens **after** an incarnation ends, and this section is about which
+turn ends it.)*
 
 Revision 1 argued this from the torn state alone, which proves the smaller claim. Not
 storing a torn state already keeps the disk clean. The reason to end the actor is the
@@ -574,26 +580,59 @@ schedule another read, forever.
 
 ### 5.3 The keyed `System` path is out of scope
 
-`macros.rs:417`'s `spawn()` runs its own loop over `__actor_turn` and never touches
-`LocalActor`. It gets no observers.
+**SUPERSEDED AND REMOVED, 2026-08-07. It is in scope, and it works.** The current model is
+`docs/rfc-07-the-turn-model.md` §5.
 
-That is a scope limit and not an oversight, and it must be **written down** in the
-trait doc and beside `spawn`. A user who mounts with `spawn()` and expects durability
-would otherwise get no durability, no compile error, and no explanation. RFC-04 §14.8
-already says the keyed path costs more and is worth it only when there are many.
+This section said the keyed path "runs its own loop over `__actor_turn` and never touches
+`LocalActor`. It gets no observers", and asked for that limit to be written into the trait doc
+and beside `spawn`.
+
+**Wave 3 deleted the second loop rather than documenting it.** There is now one `run_loop` with
+two call sites and one turn-dispatch site; the generated keyed loop — which passed a hardcoded
+**empty hook slice**, which is exactly why keyed actors got no observers — is gone. Keyed actors
+get observers, the panic guard and `finish` on the same code path as local ones.
+
+Proven, not asserted: `an_observer_attached_to_a_keyed_actor_runs`, and
+`a_keyed_actors_state_survives_its_own_process` — a real `Persist` over a real `Files` store
+across two real nodes.
+
+This section is deleted rather than annotated because its instruction was to *write the
+limitation down in two places*. Following it now would add two false statements to the public
+docs, which is worse than the original error.
 
 ---
 
 ## 6. Refused
 
-- No retry of a failed store.
-- No best-effort mode that keeps serving without durability.
-- No store on `Drop`. `Drop` cannot await.
-- No observer that can mutate the state through its reference.
-- No observer that sees a request or a reply payload. That is `Middleware`.
-- No supervision. An actor that cannot honor its contract ends.
-- No journal, and no replay. §8.
-- No new `RemoteError` variant, because that moves the wire contract.
+**PARTIALLY SUPERSEDED, 2026-08-07.** Two of these eight are overturned. The rest hold, and
+one holds harder than when it was written.
+
+Still refused, and still right:
+
+- **No retry of a failed store.** Stronger now than when written: Wave 5's review found the
+  adapter *did* retry, on the way out, for a turn whose caller had already been told
+  "it ran and was not committed" — a double-apply. The fix deleted `Persist::finish` and the
+  `dirty` flag outright, so there is no longer any code path that could retry. See RFC-07 §6.
+- **No best-effort mode that keeps serving without durability.**
+- **No store on `Drop`.** `Drop` cannot await.
+- **No observer that can mutate the state through its reference.**
+- **No observer that sees a request or a reply payload.** That is `Middleware`.
+- **No journal, and no replay.** Still refused — and it is the one line that keeps the
+  distance to Restate honest. See §8.
+
+Overturned:
+
+- ~~No supervision. An actor that cannot honor its contract ends.~~ **Superseded by RFC-07 §9.**
+  An actor that cannot honour its contract may now be re-incarnated from its last committed
+  state, bounded by an `Intensity` and ending as `Ended::GaveUp` when the budget runs out.
+  Supervision sits *outside* the turn loop; the sentence that ends a failing incarnation is
+  unchanged, and what changed is what happens next.
+- ~~No new `RemoteError` variant, because that moves the wire contract.~~ **The rule survives;
+  the reason it was listed does not.** Wave 9 needed to tell a peer that an actor is restarting
+  rather than gone, and did it *without* a new variant — a `"restarting: "` prefix inside
+  `Failed`, matching Wave 1b's `"panicked: "` discipline. Three prefixes now, none a prefix of
+  another. So no variant was added, the ALPN did not move, and the constraint was met by
+  design rather than by refusing the feature.
 
 ---
 
@@ -659,9 +698,37 @@ So the recommendation is explicit: **a caller who already runs Restate should us
 K/V store and not this.** RFC-06 is for a program that does not, and does not want to
 run one to keep a counter across a restart.
 
-The tripwire stands. §6 refuses retry and supervision, and now refuses a journal and
-replay as well. If a later revision adds any of the four, it has crossed into
-Restate's territory and RFC-04 §8 applies again.
+---
+
+### 8.1 The tripwire fired. SUPERSEDED, 2026-08-07.
+
+The paragraph that stood here read: *"The tripwire stands. §6 refuses retry and supervision,
+and now refuses a journal and replay as well. If a later revision adds any of the four, it has
+crossed into Restate's territory and RFC-04 §8 applies again."*
+
+**One of the four was added — supervision, in RFC-07 §9 — and it was added on purpose, by the
+owner, not by a revision that forgot the tripwire.** So the tripwire did its job: it made the
+crossing a decision rather than a drift. Recording the outcome rather than deleting the
+mechanism, because the mechanism was right.
+
+Two things follow, and both matter more than the sentence they replace:
+
+- **RFC-04 §8 no longer applies, because it no longer exists.** It has been superseded and
+  removed in the same pass as this section. A tripwire that points at a deleted argument is a
+  worse failure than no tripwire, which is why this is being fixed here and not left to the
+  next reader to discover.
+- **The other three still hold, and they are now the whole of the distance to Restate.** No
+  retry (and the mechanism that could have retried is deleted, not merely unused), no journal,
+  no replay. The place that shows is `keylink/src/idempotency.rs`: the ledger is **volatile**,
+  so effectively-once is a property of one process's lifetime and not of a key. A process that
+  dies after fsyncing turn *n* but before the reply reaches the peer will, on restart, restore
+  a state that already contains *n*, find an empty ledger, and run *n* again.
+
+**The replacement tripwire, stated so it can fire again:** if a later revision adds a journal
+or a replay — or makes the idempotency ledger durable, which is the same thing wearing a
+smaller hat — then keylink is doing durable execution, and that is RFC-07 §9's deferred phase 3.
+Its trigger is written there as *"journaled side effects land"*, which converts the old
+permanent refusal into a sequenced one. That is the line to defend now.
 
 ---
 

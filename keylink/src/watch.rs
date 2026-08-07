@@ -19,9 +19,14 @@
 //!
 //! # This is notification, not supervision
 //!
-//! RFC-04 §8 rejects supervision, and it is right to: restarting a remote actor
-//! means nothing without durable state, and a peer that vanished is not fixed
-//! by restarting something local. Being *told* is a different thing, and it is
+//! keylink now has supervision — [`LocalActor::spawn_supervised`], RFC-07 §9 —
+//! and this is still not it. RFC-04 §8 rejected supervision outright and has
+//! since been superseded, but the half of its argument that applies here never
+//! depended on that refusal: restarting a *remote* actor means nothing without
+//! durable state, and a peer that vanished is not fixed by restarting something
+//! local. Supervision answers an actor that ended by its own fault, which is a
+//! different question from a peer that left. Being *told* is a third thing, and
+//! it is
 //! the part that was worth keeping — it reports a fact instead of acting on
 //! one. Nothing here restarts, retries or reconnects. What to do about a
 //! departure stays where it belongs, with the caller.

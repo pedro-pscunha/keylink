@@ -948,9 +948,20 @@ Two consequences, both documented rather than solved:
 
 ### 7.4 Restart
 
-Not in v1. Restarting requires reconstructing the state, which requires a
-`fn init() -> Self` on the trait — `Actor::Args` in kameo, `pre_start` in ractor. That
-is the door to supervision, and section 8 argues for keeping it shut.
+**SUPERSEDED AND REMOVED, 2026-08-07. The current model is `docs/rfc-07-the-turn-model.md` §9.**
+
+This section said restart was "not in v1" because it "requires a `fn init() -> Self` on the
+trait", and pointed at §8 for the argument to keep that door shut. Both halves are now wrong,
+and the second is wrong in a way worth keeping:
+
+- **A factory need not be a trait method.** `spawn_supervised` takes a closure, so nothing was
+  added to `Actor` and the `Actor::Args`/`pre_start` shape this section feared never arose. The
+  premise that restart forces a trait change was the load-bearing one, and it was false.
+- **§8's conclusion is overturned by the owner**, not by an argument this RFC lost. See §8.
+
+The original text is deleted rather than annotated, deliberately. An append-only record whose
+head is wrong makes the next reader work backwards through three corrections to find what is
+true, and this section's head was wrong about the one fact everything after it rested on.
 
 ### 7.5 What this needs from RFC-02
 
@@ -981,28 +992,38 @@ answered in [section 14](#14-the-actor-system-answering-rfc-02-10).
 
 ## 8. Supervision
 
-**Recommendation: none. Not a smaller version. None.**
+**SUPERSEDED AND REMOVED, 2026-08-07. The current model is `docs/rfc-07-the-turn-model.md` §9.**
 
-Erlang/OTP supervision is a coherent whole: links, monitors, exit signals, child specs,
-restart strategies (`one_for_one`, `one_for_all`, `rest_for_one`), and a restart intensity
-limiter that defaults to one restart in five seconds. Every piece assumes a process tree
-and restartable state.
+This section recommended **"none. Not a smaller version. None."** It is overturned by the
+owner's decision that keylink should have supervision, and the deleted text is not restored
+here because it argued against a feature that now exists — leaving it in place would make a
+reader work backwards through it to find what is true.
 
-keylink has neither. There is one process, one node, and a flat set of services. There
-are no links and no exit signals to supervise with.
+Two of its arguments deserve to be recorded as *wrong*, because they are the kind that get
+re-derived:
 
-The useful 80% of supervision, in this crate, is one sentence: **a panicking message must
-not kill the service.** Section 7.3 delivers that in about ten lines with zero new public
-types. Everything past it — a restart policy, an intensity window, a supervision tree —
-requires `Actor::Args`, a restart strategy enum, and a limiter, and none of it helps with
-the failures keylink actually has. A peer that vanished is not fixed by restarting a local
-actor.
+- **"Everything past it requires `Actor::Args`, a restart strategy enum, and a limiter."** It
+  requires none of those. Wave 9's factory is a closure, so `Actor` is unchanged; no strategy
+  enum was built (`Supervisor`, `Strategy`, `OneForAll`/`RestForOne` and trees are all still
+  refused, and named as refused in RFC-07 §9.10); and the limiter is one `Intensity` value.
+- **"A peer that vanished is not fixed by restarting a local actor."** True, and irrelevant —
+  the failure supervision addresses here is an actor that ended by its own fault, not a peer
+  that left.
 
-The honest alternative, and the one to recommend out loud: **if you need "restart from a
-known state after a crash", you need durable state, and that is Restate.** Restate's
-Virtual Object gives keyed serialized access *and* a K/V store that survives the process,
-which is strictly more than an in-memory supervisor can offer. keylink should not grow a
-worse copy of a system the owner already runs in production.
+What survives, and is still right: supervision is **not** an Erlang transplant. There is no
+process tree, no links, no exit signals, and Wave 9 built none of them. §7.3's "a panicking
+message must not kill the service" remains the useful core; supervision sits *outside* the
+turn loop rather than inside it.
+
+**The Restate paragraph is overturned separately and by evidence, not by preference.** It said
+that if you need "restart from a known state after a crash" you need durable state, "and that
+is Restate", and that keylink "should not grow a worse copy of a system the owner already runs
+in production". keylink now has durable state (RFC-07 §6, measured at 7.6 ms per turn) and
+restart-from-last-committed-state over two real nodes. The remaining honest caveat is narrower
+than this section's and is recorded where it belongs, in `keylink/src/idempotency.rs`: the
+idempotency ledger is **volatile**, so effectively-once is a property of one process's
+lifetime, not of a key. That is the real gap against a journalled system, and it is one
+sentence rather than a section. See also §9.1.
 
 ---
 
@@ -1027,23 +1048,35 @@ scoped per key and retained indefinitely.
    key insight is that "one at a time per key" is worth having on its own, separate from
    durability.
 
-**Rejected:** durable state, and everything downstream of it — journaling, replay,
-suspension, and restart-from-a-known-point. That is the whole of Restate. A keylink actor
-holds memory. When the process dies, the state is gone. Saying so in one sentence in the
-rustdoc is better than shipping a fraction of Restate and letting somebody assume the
-rest.
+**The "Rejected" paragraph below this line is SUPERSEDED AND REMOVED, 2026-08-07.** The three
+things *taken*, above, are unchanged and still right. What was rejected is not.
 
-The keyed shape, if it is ever wanted, and **not proposed here**:
+It read: *"Rejected: durable state, and everything downstream of it — journaling, replay,
+suspension, and restart-from-a-known-point. That is the whole of Restate. A keylink actor holds
+memory. When the process dies, the state is gone."* And it closed with a hypothetical keyed
+service sketch marked **not proposed here**, needing "an instance registry, an eviction policy,
+a per-key mailbox, and an answer for what happens on the first message to an unknown key. That
+is a second RFC."
 
-```rust
-keylink::service! {
-    service Ledger;
-    key account: String;                       // hypothetical
-    rpc Deposit(cents: u64) -> Balance;
-}
-```
-It needs an instance registry, an eviction policy, a per-key mailbox, and an answer for
-what happens on the first message to an unknown key. That is a second RFC.
+All of that shipped:
+
+- **Durable state** — `docs/rfc-07-the-turn-model.md` §6. A `Persist` observer stores after each
+  turn, measured at **7.6 ms** (Apple M5 Max, 2026-08-07), so an actor survives its own process.
+- **Restart-from-a-known-point** — RFC-07 §9. `spawn_supervised` rebuilds from the last
+  committed state, proven over two real nodes.
+- **The keyed shape** — the instance registry, the eviction policy, the per-key mailbox and the
+  first-message answer all exist. It was indeed a second RFC; this is it.
+
+**Still rejected, and this is the line that matters:** journaling, replay and suspension.
+keylink does not journal side effects, and the one place that shows is the idempotency ledger,
+which is **volatile** — so effectively-once is a property of one process's lifetime, not of a
+key (`keylink/src/idempotency.rs`). That is the real remaining distance to Restate, it is
+narrower than this section claimed, and it is the recorded trigger for RFC-07 §9's deferred
+phase 3 rather than a permanent refusal.
+
+The advice that survives intact is the one about honesty: **say what does not survive a
+restart, in the rustdoc, in one sentence.** That is now a larger sentence than it was, and it
+is written where the ledger lives rather than here.
 
 ### 9.2 `irpc` — the same transport, and the closest thing that exists
 
