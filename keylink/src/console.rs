@@ -381,11 +381,27 @@ pub struct EventPage {
 /// on it, and both exist because parking on them is what an unbounded
 /// `Inspector::waiting` looks like from the outside.
 ///
-/// A caller constructs neither and matches both, so it is deliberately
-/// [`non_exhaustive`](https://doc.rust-lang.org/reference/attributes/type_system.html)
-/// — this crate's rule is that an enum a caller only *reads* may grow, and this
-/// one is on a wire besides, where growing it moves the ALPN and an old console
-/// is refused at the handshake rather than shown an arm it cannot name.
+/// # `#[non_exhaustive]`, where [`EndReason`] beside it is not
+///
+/// Two rules meet here and they point opposite ways, so this is the reasoning
+/// rather than the attribute alone. **Error enums are `#[non_exhaustive]`** in
+/// this crate — [`RemoteError`](crate::RemoteError),
+/// [`MountError`](crate::MountError), [`Error`](crate::Error) — and this is one.
+/// **Enums a caller matches exhaustively are not**, which is why [`EndReason`]
+/// and [`LifecycleEvent`] are open: a `_ =>` arm forced on a console would
+/// swallow a lifecycle signal, and swallowing one is the failure this module
+/// exists against.
+///
+/// A refusal is not a signal to swallow; it is one to **handle**, and every
+/// caller handles all of them the same two ways — report it, or resume from the
+/// number in it. A console written against `Ahead` and `Crowded` should keep
+/// working on the day a third reason exists, whereas a console written against
+/// five endings must be *made* to look at a sixth. That is the difference, and
+/// it is why the rules disagree without either being wrong.
+///
+/// Either way the wire is not the lax half: a new arm moves
+/// [`Inspect`](crate::inspect)'s ALPN, so an old console is refused at the
+/// handshake rather than handed a variant it cannot decode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Schema, thiserror::Error)]
 #[non_exhaustive]
 pub enum FollowRefused {
