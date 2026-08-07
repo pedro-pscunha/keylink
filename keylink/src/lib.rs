@@ -51,6 +51,9 @@
 //!   other — an observer never sees a request or a reply payload, and a layer
 //!   never sees the state. Durability is the first thing built on the second
 //!   one, outside this crate.
+//! - **The compositions every actor system grows**, each with its backpressure
+//!   written down rather than inherited from an unbounded queue: fan-out, a
+//!   pool, a schedule and a name registry. See [`compose`].
 
 #![warn(missing_docs)]
 // `deny` and not `forbid`, and the difference is the one `unsafe impl` below.
@@ -165,6 +168,13 @@ mod admission;
 mod authz;
 mod blobs;
 mod body;
+// A `pub mod` and not five root re-exports. The one thing these four share is an
+// argument about backpressure, and a module is where it can be written once
+// instead of five times. Its docs live in `compose/mod.rs`: an outer `///` here
+// beside the inner `//!` there merges the two and resolves the merged doc's
+// intra-doc links in *this* file's scope, which turns every `[`Topic`]` in that
+// module doc into a broken link under `mise run docs`.
+pub mod compose;
 mod error;
 mod idempotency;
 mod keys;

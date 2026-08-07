@@ -1789,3 +1789,232 @@ Red-tested with the loop's alternation deleted, which puts the tick fourth.
 - **Give a keyed actor an `ended()` channel.** Still §5.7's gap, and still Wave 9's.
 - **Watch the `docs`, `features` or `wasm` gates fail on this diff.** They were run green;
   no red was manufactured for them.
+## 8. Wave 7 — composition, and the argument every one of them had to answer
+
+Five patterns, none of which touches the transport. `keylink::compose` is one
+`pub mod` with four types and two functions in it, and the reason it is a module
+rather than five root re-exports is that they share exactly one thing worth
+grouping: **a statement about what a slow consumer costs.**
+
+### 8.1 THE DECISION THIS WAVE OWNS — one item in flight, and two ways to be full
+
+kameo implements all five in ~2,400 lines, and the difference between its
+versions and these is not size. Its versions predate a `MAILBOX = 1` argument, so
+they answer a slow consumer by buffering, and the buffer has no bound. Issue #3's
+refused table lists an unbounded mailbox as the one kameo feature *actively
+rejected* rather than deferred, on the ground that it converts backpressure into
+memory growth and a latency problem into an OOM. A fan-out is where that
+conversion hides best: "publish to everybody" with a queue per subscriber is an
+unbounded queue **per subscriber**, invisible until the day one subscriber is
+slow.
+
+So every pattern here names its bound, and the table is in `compose/mod.rs` where
+a reader meets it rather than only here:
+
+| pattern | a slow consumer costs | bounded by |
+|---|---|---|
+| `Topic` + `Overflow::BlockPublisher` | the publisher waits | one item in flight per subscriber; `publish` returns when the slowest has taken it |
+| `Topic` + `Overflow::DropSubscriber` | the subscriber is unsubscribed, loudly | one item in flight per subscriber; a second ends that subscriber's stream, so its actor ends as `Ended::Feed` |
+| `Pool` | the caller waits on that member's own mailbox | the pool holds **no** queue at all |
+| `every` | the next run is late | a run is never re-entered and a missed tick is never queued |
+| `Names` | nothing waits | a map and a lock; no channel exists |
+
+**There is no third policy on a `Topic`, and the missing one is the one every
+fan-out reaches for**: keep the item for later. It is refused by name, in the
+module doc, so that the next author meets the argument rather than the gap.
+
+`IN_FLIGHT` is a `const` and not an argument. That is the load-bearing half: a
+per-subscriber depth that a caller supplies is an unbounded queue with an extra
+parameter, and it arrives disguised as symmetry with Wave 4a's mailbox depth. If
+a depth is ever wanted here it must be bounded by the same constant the mailbox
+is, and a subscriber at its bound must still hit one of the two policies rather
+than a third that grows. Nothing in `compose` reads `MAILBOX` or depends on its
+value, so Wave 4a lands underneath this without touching it.
+
+Both policies are proven, and by the same break: folding `IN_FLIGHT` from 1 to 8
+turns **both** the `DropSubscriber` and the `BlockPublisher` guard red, which is
+the evidence that the bound is what they rest on rather than an accident of
+scheduling.
+
+### 8.2 A subscriber is a `feed`, and that is why this waited for Wave 3
+
+`Topic::subscribe` hands back a `Subscription<T>`, which implements
+`n0_future::Stream` and is therefore exactly what a generated `Feeds::new` takes.
+Nothing about fan-out reaches a `service!` declaration: the actor declares
+`feed Fills(fill: Fill)` as it would for any stream, and the topic is wired in at
+`actor_wired` like any other.
+
+The alternative was a fan-out task holding `Handle`s and calling `tell`. It is
+worse for the reason §5.2 gives about feeds in general: a `tell` is somebody in
+this process **choosing** fire-and-forget, and `notify` documents that nobody is
+told. A pushed event is not a choice anybody made, and a `tell` would also
+consume a mailbox permit, so a fan-out would compete with the actor's own callers
+for the one slot.
+
+`Subscription` is deliberately not `Clone`: two holders of one subscription would
+each get *some* of the items, depending on who polled first. Two subscribers are
+two `subscribe` calls.
+
+### 8.3 The scheduler, and the two guards that were vacuous first
+
+`after` and `every` are `n0_future::time::sleep` in a spawned task. There is no
+`Instant`, no `Interval` and no clock read at all — a sleep needs a duration, not
+a `now` — which is what keeps `std::time::Instant::now()`'s wasm panic
+structurally unreachable rather than merely avoided. `rg 'std::time'` over the new
+modules matches only prose.
+
+`every` sleeps, runs, and sleeps again, so the period is a floor on the **gap**
+between runs rather than a rate. `n0_future::time::interval`'s default
+`MissedTickBehavior::Burst` is precisely the queue this refuses: it fires
+repeatedly to catch up, and pointed at a mailbox of one that is a pile of tasks
+all waiting for the same permit. The cost is stated where a reader meets it: a
+slow work function **loses ticks silently**, because there is nobody to tell. It
+is the one place in `compose` where something is dropped without a loud signal,
+and the answer is that a tick which matters individually is a message and wants a
+`Topic`.
+
+**Two of this wave's guards were written with `tokio::time::advance` and both were
+vacuous.** `advance` jumps the clock and yields once; a `yield_now` leaves the
+test task immediately runnable, so the runtime never *parks*, the timer wheel is
+never turned, and a spawned schedule's `sleep` does not fire at all. An `after`
+with its delay replaced by `Duration::ZERO` passed, and an `every` that spawned a
+run per period instead of awaiting it passed — the exact defect the second test
+exists to catch. Both are now `tokio::time::sleep` in the test, which parks it, so
+the paused clock auto-advances to the *earliest* pending deadline and a schedule
+that should not have fired demonstrably has not. Both breaks are now red.
+
+This is the twelfth guard in this project caught satisfiable without proving its
+claim, and it is written down because the instrument was the fault rather than the
+assertion: `advance` is the tool the brief named, and it is the wrong one for a
+timer that belongs to another task.
+
+**A dropped `Scheduled` cancels**, which is the opposite of `LocalActor` and of a
+bare `JoinHandle`, both of which detach. A repeating task whose handle was lost
+would run forever, hold whatever it captured — a `Handle` clone keeps an actor
+alive — and be unreachable. `detach` is the one way to say "run without me" out
+loud, and both constructors are `#[must_use]`.
+
+### 8.4 `Pool` adds no queue, and says what round-robin does not do
+
+`pick` returns `(Member, &H)`. Every wait after that is the ordinary mailbox
+permit on one member, so a pool of N actors is N mailboxes and nothing else. A
+pool that queued would be an admission point in front of an admission point: work
+accepted by something that cannot run it.
+
+`from_fn(NonZeroUsize, impl FnMut(Member) -> H)` is the only constructor, and both
+halves are decisions. `NonZeroUsize` makes an empty pool unrepresentable rather
+than a `Result` nobody can act on. The factory rather than a `Vec` is the sharper
+one: a pool's members are interchangeable *by definition*, so a constructor taking
+a heterogeneous `Vec` would accept members that are not — which is a name registry
+wearing a pool's clothes, and `Names` is that.
+
+The limitation is named rather than hidden behind a claim of fairness: **this is
+fair in dispatch and not in service time.** `pick` can hand back a member that is
+mid-turn while a sibling is idle. Least-loaded needs to read how many permits each
+mailbox has free and a `Handle` exposes none, so a `try_pick` would need a
+`try_reserve` that does not exist. With a mailbox of one the two coincide more
+often than they look like they would — a member is either running a turn or has a
+free permit — and a deeper mailbox is exactly what would separate them.
+
+"Reports which handled each" is checked rather than asserted: the factory is
+handed the `Member`, so the actor knows its own number, and the guard compares the
+pool's claim against the number the actor that answered reported. A rotation that
+reported one member and dispatched to another fails there and would pass a cursor
+assertion.
+
+### 8.5 `Names`, and the lifecycle rule it changes
+
+The key is `ActorId` and not a new newtype: a local actor's name and a keyed
+actor's id are the same kind of thing, bounded the same way, and a name that works
+here works when the same actor is later mounted.
+
+`register(name, handle, ended)` takes the ending future as an **argument** rather
+than asking the handle for one. That is `Subscribers::insert`'s shape and it is
+kept for a second reason here: §5.7's missing keyed `ended()` channel means `H`
+cannot be required to have one, and the day `Mounted` grows that field this takes
+it with no change.
+
+**The rule this type changes, and it is the thing to know:** the registry holds a
+handle, so a registered actor no longer ends when the caller's last handle drops.
+`stop`, `abort`, a panicking turn, an observer refusing and a feed ending all
+still end it and all still unregister it; "went out of scope" does not. That is
+not a defect to be fixed by holding something weaker — a registry of dead names is
+not one — and it is pinned by a guard rather than left in prose.
+
+Re-registering a live name **replaces** and hands back what it displaced. Refusing
+was the alternative and it is worse: a name is freed by the eviction task
+asynchronously, so a registry that refused a taken name would refuse a restart
+nondeterministically, the same restart succeeding or failing depending on whether
+a task had been scheduled. The generation stamp is what makes replacement safe,
+and it is `Subscribers`' argument exactly: without it, the first incarnation's
+eviction removes the second one's entry, because both are filed under one
+`ActorId`.
+
+**Debt, recorded rather than left to be noticed.** `Names` and `Subscribers` are
+one generic registry — a keyed map with a generation stamp and a future-driven
+eviction — differing only in the key (`ActorId` against `EndpointId`) and the
+trigger (`Ended` against `Departure`). The merge was not taken in this wave
+because `subscribers.rs` is a file a parallel wave owns, and a duplicated
+*correctness* argument is the worst kind of duplication. It is the first thing to
+do to this module.
+
+### 8.6 Handle ergonomics: already here, and no alias was added
+
+The brief asked for `is_alive`, `stop_gracefully` and `wait_for_shutdown`. All
+three exist under keylink's names, and adding a second spelling for each would be
+"one way to build a thing" broken for nothing:
+
+| asked for | what it is here |
+|---|---|
+| `is_alive` | `Handle::is_running`, documented as advisory |
+| `stop_gracefully` | `Handle::stop` — ordered, drains what was queued, waits on the `ended` channel |
+| `wait_for_shutdown` | `Handle::ended` — and it answers *why*, which a `wait_for_shutdown` returning `()` cannot |
+
+What is genuinely absent is on the keyed path and is still §5.7's: a keyed actor
+has no per-actor `ended()`. This wave does not add one; it is arranged so that the
+day it exists, `Names` takes it unchanged.
+
+### 8.7 What Wave 7 did NOT do
+
+- **Move the ALPN, or touch the wire at all.** `keylink/Probe/d3fe34471921164e` is
+  unchanged and all 25 tests in `tests/protocol.rs` are green. Stronger than the
+  test: `rg 'iroh|ALPN|Envelope|WireKinds|postcard'` over `keylink/src/compose/`
+  matches **no code line**, only two sentences of prose, and `macros.rs` is not in
+  this wave's diff — so there is no wire generator that could have seen any of
+  this.
+- **Touch `macros.rs`, `local.rs`, `registry.rs` or `remote.rs`.** Zero lines. The
+  only existing files changed are `lib.rs` (one `pub mod`, one crate-doc bullet)
+  and `representability.rs` (two probes). A pool of generated handles is generic
+  over the handle for exactly this reason: generating pool methods would have
+  meant a thirteenth per-kind arm.
+- **Give `Topic` a history, a replay or a durable queue.** An item published before
+  a subscriber joined is gone, and a subscriber that joins during a `publish` is
+  not delivered to. Pinned, because "a topic is not a queue" is the sentence a
+  reader most wants to disbelieve.
+- **Make `publish` atomic.** Under `BlockPublisher` it delivers sequentially and
+  dropping its future leaves the item delivered to the subscribers already reached
+  and to no others. Sequential rather than a `join_all` is what makes that subset a
+  *prefix* rather than arbitrary. There is no rollback, because a delivered item
+  cannot be recalled.
+- **Detect an actor publishing to a topic it subscribes to.** Under
+  `BlockPublisher` that deadlocks, and it is `Handle`'s self-call deadlock in a
+  second costume: the actor is inside a turn, so it is not polling its own feed, so
+  the permit it waits for can only be freed by the loop it is blocking. No type can
+  tell one subscriber's channel from another's. Documented on `publish`.
+- **Supervise anything.** `Pool` does not restart a member, notice one ending or
+  take one out of the rotation; `pick` keeps handing back a stopped actor's handle
+  and the call answers `MailboxClosed`. `Names` unregisters on ending and does not
+  re-spawn. Both are Wave 9's.
+- **Red-test the shared-rotation claim on its own.**
+  `two_clones_of_a_pool_share_one_rotation` was watched to fail, but only under the
+  break that stops the cursor advancing at all — which also fails its sibling. A
+  break isolating *sharing* would have to move `at` out of `Inner`, which is a
+  restructure rather than a literal, so `break-once.sh` cannot express it. Said
+  here rather than counted as a proven guard.
+- **Red-test "a topic keeps no history".** It is an assertion about behaviour with
+  no mechanism to break — the buffer it denies does not exist — so there is no
+  one-literal edit that turns it red. It is a regression pin, not a guard.
+- **Reach a topic from a peer.** A `Subscription` is local in the way a `Handle`
+  is. A remote fan-out is `Subscribers` plus a reverse contract, which
+  `subscribers.rs` already documents and which is a different thing wearing a
+  similar name.
