@@ -3413,8 +3413,9 @@ that reach it. The local path also gave eight bytes back (below).
 It measured **+165 and +192** first, with `Standing::Restarting(Ended)` inline:
 `Ended` is 40 bytes, so `Standing` was 40 and `Mutex<Standing>` 56, and every idle
 actor paid for a value only a restart ever writes. Behind an `Arc` they are 16 and
-24 — a measured 24 bytes per idle actor on both paths, with the allocation moved
-to the restart that needs it.
+32 — all four figures from a `size_of` probe rather than from arithmetic — worth a
+measured 24 bytes per idle actor on both paths, with the allocation moved to the
+restart that needs it.
 
 `BUDGET_PER_LOCAL_ACTOR` goes **2,048 → 2,304**, and a budget raised by the change
 that would have broken it is the weakest thing here, so: it went red at 2,053, the

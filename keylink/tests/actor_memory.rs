@@ -216,9 +216,10 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// It was measured at +165 and +192 first, with the restart reason stored
 /// **inline**: `Standing::Restarting(Ended)` makes `Standing` 40 bytes and
 /// `Mutex<Standing>` 56, so every idle actor paid for a value only a restart ever
-/// writes. Behind an `Arc` it is 16 and 24, worth a measured 24 bytes per idle
-/// actor on both paths, and the allocation moved to the restart that needs it.
-/// That reduction is why this file is cited in `Standing`'s own documentation.
+/// writes. Behind an `Arc` they are 16 and 32 — all four `size_of` probes were
+/// run, not reasoned — worth a measured 24 bytes per idle actor on both paths,
+/// with the allocation moved to the restart that needs it. That reduction is why
+/// this file is cited in `Standing`'s own documentation.
 ///
 /// # Wave 9's eight bytes, on the local path only, and where they went
 ///
