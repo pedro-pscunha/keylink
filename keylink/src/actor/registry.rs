@@ -75,6 +75,40 @@ const MAILBOX: usize = 1;
 // ──────────────────────────────────────────────────────────────── the mailbox
 
 /// The receiving half of one actor's mailbox.
+///
+/// # Why the slot is a `Box<M>` and not an `M`
+///
+/// Boxing here is not a micro-optimisation, and it is a decision about the
+/// registry rather than about any particular message type — which is why the
+/// argument lives on this alias, where the `Box` is written, rather than on
+/// whatever `M` happens to be this month.
+///
+/// A `tokio::sync::mpsc` channel allocates its first block of 32 slots eagerly,
+/// so a mailbox costs `32 * size_of::<M>()` whatever its capacity is, and the
+/// capacity is 1. At ten thousand idle actors, measured on this machine
+/// against the message type of the day:
+///
+/// | slot type  | per idle actor | ten thousand |
+/// |------------|----------------|--------------|
+/// | `Box<M>`   | 1,684 bytes    | 16.8 MB      |
+/// | `M`        | 9,620 bytes    | 96.2 MB      |
+///
+/// The 7,936 byte difference is the block: that `M` was 256 bytes, so 32 of
+/// them is 8,192, against 256 for 32 pointers. The cost of boxing is one
+/// allocation per message, on a path that already allocates.
+///
+/// The pressure gets *worse* as `M` grows, and `M` is the caller's to grow: a
+/// per-service message is sized to its largest request plus a reply channel, so
+/// the slot stops being service-independent. The box is what keeps the
+/// ten-thousand-actor budget a statement about keylink rather than about
+/// whoever wrote the service.
+///
+/// Only the boxed row is reported by `tests/actor_memory.rs`; the unboxed row is
+/// that number plus the difference above, because the test never builds ten
+/// thousand unboxed mailboxes — it would allocate 87 MB to measure a
+/// subtraction. Saying which row is checked matters here: every figure in this
+/// table except the boxed one was wrong for months, under a sentence claiming
+/// the whole thing was measured.
 #[doc(hidden)]
 pub type Mailbox<M = Mail> = mpsc::Receiver<Box<M>>;
 

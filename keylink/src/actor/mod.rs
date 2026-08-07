@@ -17,6 +17,61 @@
 //! node, and the existing one-stream-per-call design already gives per-message
 //! concurrency between different actors. See RFC-02 §10.2 and RFC-04 §14.
 //!
+//! # Messages are handled in the order they ARRIVE
+//!
+//! Each call takes its own QUIC stream, and QUIC orders bytes within a stream,
+//! not across streams. So two messages sent to one actor in sequence can arrive
+//! in either order, and the actor then handles them one at a time, serially, in
+//! the order they turned up — which may not be the order they were sent.
+//!
+//! **A serial mailbox gives you serialization, not sequencing.** Arrival order
+//! is the order, the actor stamps sequence as it processes, and a caller who
+//! needs send order gets it by awaiting each reply or by carrying a sequence
+//! number in its own payload — where it owns the buffering policy and the stall
+//! that comes with it.
+//!
+//! ## A per-actor sequence number was designed and refused
+//!
+//! The shape considered was a sequence number beside the actor id, with the
+//! actor reordering behind a buffer, so that messages are handled in the order
+//! they were SENT. Refused, and this one is a judgement rather than an obvious
+//! call, so here is the reasoning.
+//!
+//! A reorder buffer stalls while it waits for a number it has not seen. That is
+//! fine when the message is merely late. It is unbounded when the message is
+//! never coming — a cancelled call, a dropped stream, a caller that died
+//! between two sends — and the buffer cannot tell any of those apart from slow.
+//! The only way to bound the stall is a timeout, which means eventually giving
+//! up and processing a gap, which means dropping a message that may still
+//! arrive.
+//!
+//! So the choice is not "ordered versus unordered". It is "out-of-order
+//! delivery, which the caller can see and correct" against "a stall of
+//! unpredictable length, ended by silently dropping someone's message". The
+//! second is worse, and it would be keylink's failure rather than the caller's
+//! decision.
+//!
+//! **This argument is independent of what the envelope looks like.** It was
+//! first written on the field list of an envelope that no longer exists, which
+//! is why it is stated here instead: the reasoning outlives any particular
+//! wrapper, and a future author reaching for a reorder buffer must meet it
+//! wherever the wrapper happens to live. Said where a user meets it too, on the
+//! generated `Actor` trait and on `ActorRef`.
+//!
+//! ## Two more fields were refused, and both refusals still hold
+//!
+//! **A protocol version**, because that is what the ALPN is. A version field
+//! inside a message hashed into the ALPN would be a second version number that
+//! can disagree with the first.
+//!
+//! **A method name**, because it would duplicate the payload's own variant
+//! index and a peer could make the two disagree. The method name IS readable
+//! from outside the payload now — [`Rpc::method`](crate::Rpc::method) reports
+//! it, which is what per-method authorization on a keyed actor rests on — but
+//! it is *derived from* the request rather than carried beside it, so there is
+//! still only one place a method name can come from and nothing for a peer to
+//! make inconsistent.
+//!
 //! # Why there are two halves
 //!
 //! That decision produced two answers to two unrelated questions, and they were

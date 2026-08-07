@@ -55,37 +55,12 @@ struct Contract {
 /// the fleet at once. Per-actor variation belongs in the payload, which is
 /// opaque and costs nothing here.
 ///
-/// Three fields were considered and rejected.
-///
-/// **A method name**, because it duplicates the payload's own variant index and
-/// a peer can make the two disagree.
-///
-/// **A protocol version**, because that is what the ALPN is.
-///
-/// **A per-actor sequence number**, with the actor reordering behind a buffer,
-/// so that messages are handled in the order they were SENT rather than the
-/// order they arrived. Rejected, and this one is a judgement rather than an
-/// obvious call, so here is the reasoning.
-///
-/// A reorder buffer stalls while it waits for a number it has not seen. That is
-/// fine when the message is merely late. It is unbounded when the message is
-/// never coming — a cancelled call, a dropped stream, a caller that died
-/// between two sends — and the buffer cannot tell any of those apart from slow.
-/// The only way to bound the stall is a timeout, which means eventually giving
-/// up and processing a gap, which means dropping a message that may still
-/// arrive.
-///
-/// So the choice is not "ordered versus unordered". It is "out-of-order
-/// delivery, which the caller can see and correct" against "a stall of
-/// unpredictable length, ended by silently dropping someone's message". The
-/// second is worse, and it would be keylink's failure rather than the caller's
-/// decision.
-///
-/// Arrival order is therefore the order, the actor stamps sequence as it
-/// processes, and a caller who needs send order gets it by awaiting each reply
-/// or by carrying a sequence number in its own payload — where it owns the
-/// buffering policy and the stall that comes with it. Said where a user meets
-/// it, on the generated `Actor` trait and on `ActorRef`.
+/// **The three fields that were considered and refused are argued in this
+/// module's own header**, not here. A method name, a protocol version and a
+/// per-actor sequence number were each designed and killed, and the reasoning
+/// is about the actor model rather than about this struct's field list — the
+/// reorder-buffer argument especially, which governs whatever the envelope
+/// happens to be. See the `actor` module header.
 #[derive(Serialize, Deserialize, Schema)]
 pub struct ActorRequest {
     /// Which actor, on the node this request is addressed to. An `ActorId` is
@@ -264,26 +239,10 @@ type Answer = (Outcome<ActorReply>, Body);
 
 /// One message on its way to an actor. Generated code destructures these.
 ///
-/// Boxed on the way into the mailbox, which is not a micro-optimisation. A
-/// `tokio::sync::mpsc` channel allocates its first block of 32 slots eagerly, so
-/// the mailbox costs `32 * size_of::<T>()` whatever its capacity is. At ten
-/// thousand idle actors, on this machine:
-///
-/// | slot type   | per idle actor | ten thousand |
-/// |-------------|----------------|--------------|
-/// | `Box<Mail>` | 1,684 bytes    | 16.8 MB      |
-/// | `Mail`      | 9,620 bytes    | 96.2 MB      |
-///
-/// The 7,936 byte difference is the block: `Mail` is 256 bytes, so 32 of them is
-/// 8,192, against 256 for 32 pointers. The cost of boxing is one allocation per
-/// message, on a path that already allocates the payload.
-///
-/// Only the boxed row is reported by `tests/actor_memory.rs`; the unboxed row is
-/// that number plus the difference above, because the test never builds ten
-/// thousand unboxed mailboxes — it would allocate 87 MB to measure a
-/// subtraction. Saying which row is checked matters here: every figure in this
-/// table except the boxed one was wrong for months, under a sentence claiming
-/// the whole thing was measured.
+/// **Boxed on the way into the mailbox**, and the reasoning for that — the
+/// eagerly allocated block of 32 slots, the measured table, and why the
+/// pressure grows with whatever a service puts in here — lives on
+/// [`Mailbox`](crate::Mailbox), where the `Box` is actually written.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct Mail {
