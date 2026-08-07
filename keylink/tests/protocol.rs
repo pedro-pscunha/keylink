@@ -9,7 +9,7 @@
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use keylink::{
     Allowlist, Body, BodyReader, Context as KeylinkContext, Error, Node, Server as KeylinkServer,
@@ -17,6 +17,7 @@ use keylink::{
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, ReadBuf};
+use tokio::sync::{mpsc, watch};
 
 // ────────────────────────────────────────────────────────────── the service
 
@@ -44,7 +45,49 @@ keylink::service! {
     send Upload(name: String) -> Received;
 }
 
-struct Server;
+/// The serving side. `rendezvous` is `Some` for exactly one test — the one that
+/// proves calls overlap — and `None` everywhere else, where `slow` is a delay.
+#[derive(Default)]
+struct Server {
+    rendezvous: Option<Rendezvous>,
+}
+
+impl Server {
+    /// What `slow` does when nothing is holding it.
+    ///
+    /// An associated function rather than a method, so the paused-clock test can
+    /// drive the real body: `Context::new` is `pub(crate)`, so no test can build
+    /// the argument `Handler::slow` takes.
+    async fn delay(ms: u64) {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+}
+
+/// Overlap, proven without consulting a clock.
+///
+/// A handler that enters announces itself on `entered` and then parks until the
+/// test opens `release`, which it does only once all [`CONCURRENT_CALLS`]
+/// announcements have arrived. The calls therefore cannot all return unless all
+/// of them were inside the server at the same moment. Load makes the parking
+/// longer and the conclusion no weaker, which is exactly what the wall-clock
+/// assertion this replaced could not say.
+struct Rendezvous {
+    entered: mpsc::UnboundedSender<u64>,
+    release: watch::Receiver<bool>,
+}
+
+impl Rendezvous {
+    /// Announce this handler, then wait for the test to say every one is in.
+    async fn hold(&self, ms: u64) {
+        // A receiver the test has dropped means the test is already failing, and
+        // a handler has nothing useful to do about that.
+        let _ = self.entered.send(ms);
+        let mut release = self.release.clone();
+        // `wait_for` re-reads the current value before parking, so a release
+        // landing between the announcement and this line is not lost.
+        let _ = release.wait_for(|open| *open).await;
+    }
+}
 
 impl probe::Handler for Server {
     async fn ping(&self, _cx: &KeylinkContext) -> String {
@@ -52,7 +95,10 @@ impl probe::Handler for Server {
     }
 
     async fn slow(&self, _cx: &KeylinkContext, ms: u64) -> u64 {
-        tokio::time::sleep(Duration::from_millis(ms)).await;
+        match &self.rendezvous {
+            Some(rendezvous) => rendezvous.hold(ms).await,
+            None => Server::delay(ms).await,
+        }
         ms
     }
 
@@ -115,13 +161,13 @@ struct Fixture {
 }
 
 async fn start() -> Fixture {
-    start_with(Allowlist::anyone()).await
+    start_with(Server::default(), Allowlist::anyone()).await
 }
 
-async fn start_with(allow: Allowlist) -> Fixture {
+async fn start_with(handler: Server, allow: Allowlist) -> Fixture {
     let server = local_node().await;
     let client_node = local_node().await;
-    let router = probe::serve(&server, Server, allow).expect("one service, no duplicate ALPN");
+    let router = probe::serve(&server, handler, allow).expect("one service, no duplicate ALPN");
     let client = probe::Client::connect(&client_node, server.endpoint().addr())
         .await
         .expect("the client dials the server");
@@ -146,7 +192,7 @@ async fn a_unary_call_round_trips() {
 #[tokio::test]
 async fn a_peer_outside_the_allowlist_is_refused() {
     let stranger = local_node().await;
-    let fixture = start_with(Allowlist::only([stranger.id()])).await;
+    let fixture = start_with(Server::default(), Allowlist::only([stranger.id()])).await;
 
     let error = fixture.client.ping().await.unwrap_err();
     assert!(
@@ -155,43 +201,133 @@ async fn a_peer_outside_the_allowlist_is_refused() {
     );
 }
 
-/// The headline property of one stream per call. Eight handlers that each sleep
-/// 150 ms take 1200 ms in series. They must not — and they must not even when
-/// every call is driven from a single task, because the concurrency comes from
-/// the transport rather than from a thread pool.
+/// Calls this test drives at once, and arrivals the rendezvous waits for.
+const CONCURRENT_CALLS: usize = 8;
+
+/// The delay the paused-clock test measures.
+const DELAY_MS: u64 = 150;
+
+/// How long either test waits for something that should already have happened.
+///
+/// A liveness bound, never a measurement. It turns a rendezvous that never fills
+/// into a named failure instead of a hung test runner, and the passing path never
+/// comes near it.
+const NO_PROGRESS: Duration = Duration::from_secs(20);
+
+/// The headline property of one stream per call, asserted as overlap rather than
+/// as elapsed time.
+///
+/// Every handler announces itself on entry and none is let go until all eight
+/// have, so a server that queued the calls behind each other could never fill
+/// the rendezvous. What is asserted is therefore *not serialized* rather than
+/// *fast*, and a loaded machine can only make it take longer — never make it
+/// pass by accident.
+///
+/// The wall-clock version asserted that eight 150 ms calls finished in under
+/// 600 ms, which is a claim about the machine as much as about the code, and it
+/// flaked under a concurrent build. The number it cared about is now in
+/// `eight_overlapping_delays_cost_one_delay`, where a clock is exact.
 #[tokio::test]
 async fn concurrent_calls_do_not_queue_behind_each_other() {
-    const CALLS: u64 = 8;
-    const DELAY_MS: u64 = 150;
-
-    let fixture = start().await;
+    let (entered, mut entries) = mpsc::unbounded_channel();
+    let (open, release) = watch::channel(false);
+    let fixture = start_with(
+        Server {
+            rendezvous: Some(Rendezvous { entered, release }),
+        },
+        Allowlist::anyone(),
+    )
+    .await;
     let client = &fixture.client;
 
-    let started = Instant::now();
-    let results = tokio::join!(
-        client.slow(DELAY_MS),
-        client.slow(DELAY_MS),
-        client.slow(DELAY_MS),
-        client.slow(DELAY_MS),
-        client.slow(DELAY_MS),
-        client.slow(DELAY_MS),
-        client.slow(DELAY_MS),
-        client.slow(DELAY_MS),
-    );
-    let elapsed = started.elapsed();
+    // Distinct arguments, so a reply is evidence of which call it answers. A
+    // held handler ignores the number otherwise.
+    let calls = async {
+        tokio::join!(
+            client.slow(0),
+            client.slow(1),
+            client.slow(2),
+            client.slow(3),
+            client.slow(4),
+            client.slow(5),
+            client.slow(6),
+            client.slow(7),
+        )
+    };
 
-    for result in [
-        results.0, results.1, results.2, results.3, results.4, results.5, results.6, results.7,
-    ] {
-        assert_eq!(result.unwrap(), DELAY_MS);
+    let mut inside: Vec<u64> = Vec::with_capacity(CONCURRENT_CALLS);
+    let overlap = async {
+        while inside.len() < CONCURRENT_CALLS {
+            inside.push(
+                entries
+                    .recv()
+                    .await
+                    .expect("the serving side holds the sender"),
+            );
+        }
+        open.send(true).expect("the handlers are still parked");
+    };
+
+    // Its own statement, so the joined future is dropped here and `inside` is
+    // readable in the failure arm below.
+    let outcome = tokio::time::timeout(NO_PROGRESS, async { tokio::join!(calls, overlap) }).await;
+    let Ok((replies, ())) = outcome else {
+        panic!(
+            "only {} of {CONCURRENT_CALLS} handlers were inside the server together",
+            inside.len()
+        );
+    };
+
+    inside.sort_unstable();
+    assert_eq!(
+        inside,
+        (0..CONCURRENT_CALLS as u64).collect::<Vec<_>>(),
+        "each of the {CONCURRENT_CALLS} calls reached a handler exactly once",
+    );
+
+    for (nth, reply) in [
+        replies.0, replies.1, replies.2, replies.3, replies.4, replies.5, replies.6, replies.7,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            reply.unwrap(),
+            nth as u64,
+            "reply {nth} must answer its own call",
+        );
     }
+}
 
-    let serial = Duration::from_millis(DELAY_MS * CALLS);
-    assert!(
-        elapsed < serial / 2,
-        "{CALLS} concurrent calls took {elapsed:?}; in series they would take {serial:?}"
+/// The arithmetic the assertion above used to make, kept where a clock is exact.
+///
+/// `Handler::slow` is a delay when nothing holds it, and the deleted wall-clock
+/// assertion was really a claim about that delay: eight of them overlapped cost
+/// one, not eight. On a paused clock that is an equality with no safety factor,
+/// because `tokio::time` advances virtual time only when every task is idle, so
+/// no load can move it.
+///
+/// Deliberately not over the transport. A paused clock stops iroh's keep-alives
+/// and idle timers too, so the real boundary belongs to the integration test
+/// above and the number belongs here — the split CONTRIBUTING.md asks for.
+#[tokio::test(start_paused = true)]
+async fn eight_overlapping_delays_cost_one_delay() {
+    let started = tokio::time::Instant::now();
+
+    // Annotated so that swapping the spawn below for a serial `.await` — which
+    // is how this guard is red-tested — still compiles and fails on the number
+    // rather than on inference.
+    let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    for _ in 0..CONCURRENT_CALLS {
+        inflight.spawn(Server::delay(DELAY_MS));
+    }
+    while inflight.join_next().await.is_some() {}
+
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_millis(DELAY_MS),
+        "{CONCURRENT_CALLS} overlapping delays must cost one; in series they cost {CONCURRENT_CALLS}",
     );
-    println!("{CALLS} concurrent {DELAY_MS}ms calls finished in {elapsed:?} (serial: {serial:?})");
 }
 
 // ──────────────────────────────────────────────────────────────── streaming
@@ -416,7 +552,7 @@ async fn two_services_share_one_node_and_both_answer() {
     let client_node = local_node().await;
 
     let _running = keylink::Server::builder(&server)
-        .service(probe::service(Server, Allowlist::anyone()).build())
+        .service(probe::service(Server::default(), Allowlist::anyone()).build())
         .service(telemetry::service(Tele, Allowlist::anyone()).build())
         .spawn()
         .expect("distinct ALPNs register cleanly");
@@ -443,8 +579,8 @@ async fn two_services_share_one_node_and_both_answer() {
 async fn registering_one_alpn_twice_is_refused() {
     let node = local_node().await;
     let error = keylink::Server::builder(&node)
-        .service(probe::service(Server, Allowlist::anyone()).build())
-        .service(probe::service(Server, Allowlist::anyone()).build())
+        .service(probe::service(Server::default(), Allowlist::anyone()).build())
+        .service(probe::service(Server::default(), Allowlist::anyone()).build())
         .spawn()
         .expect_err("a duplicate ALPN must not be accepted");
 
@@ -462,7 +598,7 @@ async fn registering_one_alpn_twice_is_refused() {
 async fn a_peer_on_a_different_schema_is_reported_as_a_schema_mismatch() {
     let server = local_node().await;
     let client_node = local_node().await;
-    let _running = probe::serve(&server, Server, Allowlist::anyone()).expect("serves");
+    let _running = probe::serve(&server, Server::default(), Allowlist::anyone()).expect("serves");
 
     // Same node, same address, an ALPN that is not the one it answers.
     let err = keylink::RpcClient::<probe::Request, probe::Response>::connect(
@@ -514,7 +650,7 @@ async fn a_layer_can_refuse_one_method_and_pass_the_rest() {
     let client_node = local_node().await;
     let _running = keylink::Server::builder(&server)
         .service(
-            probe::service(Server, Allowlist::anyone())
+            probe::service(Server::default(), Allowlist::anyone())
                 .layer(WriteGuard)
                 .build(),
         )
@@ -548,7 +684,7 @@ async fn a_timeout_layer_refuses_a_slow_handler() {
     let client_node = local_node().await;
     let _running = keylink::Server::builder(&server)
         .service(
-            probe::service(Server, Allowlist::anyone())
+            probe::service(Server::default(), Allowlist::anyone())
                 .layer(keylink::Timeout::after(Duration::from_millis(50)))
                 .build(),
         )
@@ -586,7 +722,8 @@ fn a_synchronous_program_can_call_a_service() {
     let rt = tokio::runtime::Runtime::new().expect("a runtime for the server");
     let (addr, _guard) = rt.block_on(async {
         let server = local_node().await;
-        let running = probe::serve(&server, Server, Allowlist::anyone()).expect("serves");
+        let running =
+            probe::serve(&server, Server::default(), Allowlist::anyone()).expect("serves");
         (server.endpoint().addr(), (server, running))
     });
 
@@ -630,7 +767,7 @@ async fn a_foreign_protocol_shares_the_node_with_a_keylink_service() {
     let client_node = local_node().await;
 
     let _running = keylink::Server::builder(&server)
-        .service(probe::service(Server, Allowlist::anyone()).build())
+        .service(probe::service(Server::default(), Allowlist::anyone()).build())
         .service(keylink::Service::foreign(FOREIGN_ALPN, ForeignEcho))
         .spawn()
         .expect("a keylink service and a foreign protocol register together");
@@ -883,7 +1020,7 @@ async fn a_service_serves_as_a_singleton_and_as_an_actor_system_on_one_node() {
     );
 
     let _running = keylink::Server::builder(&node)
-        .service(probe::service(Server, Allowlist::anyone()).build())
+        .service(probe::service(Server::default(), Allowlist::anyone()).build())
         .service(probe::keyed_service(&system, Allowlist::anyone()).build())
         .spawn()
         .expect("one service, served both ways, on one node");
