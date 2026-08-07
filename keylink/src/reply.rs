@@ -277,4 +277,33 @@ mod tests {
         let refused: Outcome<u64> = RemoteError::Unauthorized("write".into()).into();
         assert!(refused.is_err());
     }
+
+    /// **The four prefixes are bytes on a wire, so their values are pinned like
+    /// bytes on a wire.**
+    ///
+    /// They are public now, which is what makes this necessary rather than
+    /// pedantic: every other assertion in this repository can name the constant
+    /// and would go on passing if the constant's *value* changed, and so would
+    /// every downstream `starts_with`. Nothing else anywhere pins the text a peer
+    /// actually matches on. This does, in the register `tests/protocol.rs` uses
+    /// for an ALPN: a literal that must not move quietly.
+    ///
+    /// It does **not** claim the four may never change. It claims a change is a
+    /// deliberate act with a compatibility argument attached, exactly like a
+    /// hash pin — and unlike an ALPN, moving one of these refuses nothing at the
+    /// handshake, so an old peer meets it as a `Failed` it silently stops
+    /// recognising. That is the more dangerous kind of break and the reason this
+    /// is here.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/reply.rs` on
+    /// `pub const DROPPED: &'static str = "dropped: ";` →
+    /// `pub const DROPPED: &'static str = "lost: ";`. Watched: `left: "lost: "`,
+    /// `right: "dropped: "`.
+    #[test]
+    fn the_four_prefixes_are_the_text_a_peer_matches_on() {
+        assert_eq!(RemoteError::PANICKED, "panicked: ");
+        assert_eq!(RemoteError::REFUSED, "observer refused: ");
+        assert_eq!(RemoteError::RESTARTING, "restarting: ");
+        assert_eq!(RemoteError::DROPPED, "dropped: ");
+    }
 }
