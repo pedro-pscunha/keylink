@@ -16,6 +16,8 @@
 use keylink::{
     ActorId, Allowlist, Caller, Ended, Eviction, Observer, Persist, Server, Stop, TurnFut, TurnInfo,
 };
+use std::time::Duration;
+
 use keylink_persist::file::Files;
 use keylink_persist::versioned::FRAME_LEN;
 use keylink_persist::{Durable, RestoreError, Snapshots, StateId};
@@ -448,7 +450,27 @@ async fn a_keyed_actors_state_survives_its_own_process() {
 
         // Ends the actor, which drops its observers, which releases the claim —
         // the same teardown the local path runs, because it is the same loop.
-        assert!(system.stop(&actor).await, "the actor was mounted");
+        //
+        // `shutdown` rather than `stop`: Wave 4b deleted `System::stop`, whose
+        // rustdoc claimed `tokio::time::timeout` composes when a fired timeout
+        // dropped the `JoinHandle` and detached a live actor still holding this
+        // very `Claim`. Every caller names a budget now.
+        //
+        // The budget is generous on purpose, and the number is not arbitrary:
+        // this actor's `Persist` observer stores on the way out, and a store is
+        // two `fsync`s plus a `rename` — measured at ~7.6 ms per turn on this
+        // machine (RFC-07 §6.1). A budget near that figure would be asserting
+        // the disk's latency rather than the teardown's correctness, and the
+        // failure would look like a flake. `Some(..)` is the claim: the id was
+        // mounted and the drain finished inside the budget, so the observers are
+        // dropped and the claim is free by the time `Persist::open` below runs.
+        assert!(
+            system
+                .shutdown(&actor, Duration::from_secs(5))
+                .await
+                .is_some(),
+            "the actor was mounted"
+        );
         drop(running);
     }
 

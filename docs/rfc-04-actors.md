@@ -1771,6 +1771,100 @@ truncate a `recv` download, because the body is drained by the connection task a
 turn ends. It **can** truncate a `send` upload, because that body is read inside the turn.
 That is the same `send`/`recv` asymmetry as §10.4, surfacing in a third place.
 
+#### Revision note — issue #3 Wave 4b: `System::stop` is deleted, and the bullet above is why nobody looked
+
+The bullet reading *"`stop` works as §10.5 describes, by a different route. Removing the
+entry drops one sender; the task lives while any sender lives and drains what is queued.
+Nothing is cancelled. The conclusion stands."* is left standing as written, because it
+records what was believed and because it is **true of every drain that finishes**. The
+question it never asks is what happens to a drain that does not, and that omission is where
+a live defect sat:
+
+- `stop` removed the entry from the map **first**, then awaited a bare `JoinHandle<()>`.
+  Wrap the call in a timeout and let the timeout fire: the dropped future drops the `Entry`,
+  drops the handle, and **detaches** the task — on both targets, verified against
+  `n0-future 0.3.2`, whose wasm branch has no `impl Drop for JoinHandle` at all. The actor
+  kept running, still owning `&mut A` and whatever `A` held, and was unreachable, because
+  the entry had already left the map.
+- `stop`'s own rustdoc read *"Deliberately takes no deadline: `tokio::time::timeout`
+  composes."* `LocalActor::stop` carries the identical sentence and there it is true — a
+  `LocalActor` keeps `task: Arc<JoinHandle<()>>` and waits on a separate `ended` channel, so
+  a dropped `stop()` future costs the wait and leaves `abort()` reachable. One sentence, true
+  of a handle that outlives its own await and false of an entry that does not.
+- `Eviction::Idle`'s rustdoc claimed *"Eviction is `System::stop`, not `System::abort`"*, and
+  the sweeper it described awaited nothing at all: it dropped entries inside a `retain` under
+  the write lock, detaching every task it evicted, with nobody watching.
+
+So `System::stop` is **gone**, not kept beside a budgeted twin — the deadline-free spelling
+*is* the hazard, and two ways to do one thing is what let the false sentence sit next to the
+true one. What replaced it:
+
+```rust
+pub async fn shutdown(&self, id: &ActorId, budget: Duration) -> Option<Ended>;
+pub enum Eviction { Idle { after: Duration, shutdown_budget: Duration }, Never }
+```
+
+`System::abort` survives untouched, and §14.5's `stop`-versus-`abort` distinction survives
+with it: `abort` never drains, so it is a different operation rather than a `shutdown` with a
+budget of zero, and it calls `JoinHandle::abort()` **before** its await, which is the
+asymmetry that made it correct all along. `LocalActor::stop` is untouched and keeps its
+sentence. `evict_idle` became `async`, which is a public breaking change and is said here
+rather than left to be discovered.
+
+A second detach of the same family, not in issue #3 and fixed in the same wave:
+`System::mount` dropped the `Mounted` on both refusals, and its task had already been spawned
+by the free `mount()` — so every refused mount left a live, unreachable actor, because
+`MountError` hands nothing back and the registry never had it either. `Mounted` now carries an
+**unstarted** future and `System::mount` is the one place it starts, after the refusals. That
+also puts §14.2's `task: JoinHandle<()>` where it always belonged, on `Entry` alone: a handle
+exists once an actor has been accepted, and not one moment before.
+
+##### Addendum, same wave, after review: a budget does not reach the third instance
+
+Everything above prices the hazard as *expiry* — a `timeout` around the old `stop`, a
+`shutdown_budget` that runs out — and a budget parameter answers that. It does not answer
+**cancellation**, which is the same defect one level up and was still live after the two
+above were fixed:
+
+- `shutdown` removes the entry before its first await, and the `JoinHandle` lived in the
+  `drain` frame the returned future owns. Drop that future — `tokio::select!`, `race`,
+  `timeout(1ms, system.shutdown(&id, 10s))`, spawn-and-drop — and the handle is dropped
+  without `abort()`. Byte for byte the deleted `stop`'s outcome: entry gone from the map,
+  task detached, state and its exclusive resources still held, and `System::abort(&id)`
+  answering `false` for an actor that is still running. `abort` survives cancellation
+  because it aborts *before* its await; `drain` cannot borrow that trick, because aborting
+  first is the opposite of draining.
+- `evict_idle` is the worse half, because it takes **no** budget parameter: a caller who
+  needs a bound has no spelling except a `timeout` around the whole sweep, and one dropped
+  sweep would detach every expired actor at once, since they are torn down concurrently.
+
+The fix is one type, and the wave's own rustdoc had already named it while using it nowhere:
+the handle is an `n0_future::task::AbortOnDropHandle`, so letting go of it — by expiry, by
+cancellation, or by a panic unwinding the frame — aborts instead of detaching. `shutdown`
+and `evict_idle` are therefore **cancel-safe in the only sense available here**: a dropped
+call loses the wait and the `Ended`, and destroys the actor rather than draining it, which is
+the trade `abort` spells out loud.
+
+Measured while doing it, because the argument nearly rested on the wrong fact:
+`AbortOnDropHandle` is `Unpin` on **both** targets — natively it is `tokio_util`'s plain
+struct, and on wasm it is n0-future's `#[pin_project(PinnedDrop)]` shim whose `Unpin` is
+derived from its pinned field — so `pin!` is not what makes the line compile. It is what
+stops a change to either of those two types from turning the line back into a detach.
+
+**Two consequences of draining rather than detaching, both new and both worth stating in the
+RFC rather than only in rustdoc.** First, the budget is also the longest an evicted actor's
+exclusive resources stay held *after its id has left the map*: `sweep` removes the entry
+under the write guard and only then waits, so a lazily re-spawned actor for the same id can
+be refused — `keylink_persist::Error::Busy` for a durable one — for up to one budget. That is
+a bounded, peer-visible failure where the old sweeper held those resources *forever* on a
+task nobody could reach, and it is pinned by
+`an_evicted_actor_still_holds_its_state_after_its_id_is_free_again`. Second, the other end of
+the dial is **silent**: a budget below the longest turn destroys that turn where it stands,
+the `Ended` the sweeper computes is nobody's answer, an aborted task's observers never run,
+and the caller is a peer whose stream is severed rather than answered. No logging seam is
+added here — that would be a second, quieter path beside the observers. **Wave 6 owns it**,
+where `System::snapshot` and the console are; until then the budget is the only control.
+
 ### 14.6 A defect found while answering question 4
 
 Adding a `RemoteError` variant is supposed to move the ALPN. **It does not.** This was

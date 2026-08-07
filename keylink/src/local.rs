@@ -1907,6 +1907,22 @@ impl<A, M> LocalActor<A, M> {
     /// Idempotent, and takes no deadline: `n0_future::time::timeout` composes,
     /// and a parameter here would duplicate it. A turn that never returns is
     /// what [`Self::abort`] is for — with the caveat on that method.
+    ///
+    /// # Why "timeout composes" is true here, and was not on the keyed path
+    ///
+    /// [`System::shutdown`](crate::System::shutdown) takes a budget because the
+    /// identical sentence was **false** where the registry wrote it: its `stop`
+    /// removed the entry from the map and then awaited a bare `JoinHandle<()>`,
+    /// so a timeout that fired dropped the entry, dropped the handle, and
+    /// *detached* the task — leaving an actor nobody could reach.
+    ///
+    /// It composes here because this handle survives its own await. `stop` waits
+    /// on the [`ended`](Self::ended) channel and owns none of the actor's
+    /// lifetime; the `JoinHandle` lives behind an `Arc` in `self`, so a timeout
+    /// costs the *wait* and nothing else. The caller still holds a handle, and
+    /// [`Self::abort`] is still reachable through it — which is exactly what a
+    /// caller who ran out of patience wants next, and exactly what a timed-out
+    /// registry `stop` had taken away.
     pub async fn stop(&self) {
         let _ = self.send(Message::Stop).await;
         // The END channel, not `mail.closed()`. The loop fills it after it has
