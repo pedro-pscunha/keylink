@@ -48,6 +48,16 @@
 //! struct and adding a field to this header were the same event, and they are
 //! not.
 //!
+//! **A layout that is not this one gets two different verdicts**, and which one
+//! it gets starts mattering on the day `LAYOUT` becomes 2 — which is the entire
+//! reason `layout` is a separate field in the first place. A *newer* layout is
+//! [`FrameFault::LayoutFromTheFuture`]; an *older* one is
+//! [`FrameFault::LayoutTooOld`], and that is the arm a layout migration would
+//! be written into. A single `!=` reported both as being from the future. It
+//! was unreachable while there was only one layout, and it would have refused
+//! every file already on disk with a reason that was false about all of them
+//! the moment there were two.
+//!
 //! `version` is a `u32` because that is what [`Durable::VERSION`] is: four
 //! billion revisions of one state is not a second break. `layout` is a `u16`
 //! because this table is expected to change approximately never, and the two
@@ -79,6 +89,7 @@
 //! writes the truncation back over the original. There is no partial read here:
 //! a snapshot from the future is an error and the stored bytes are not touched.
 
+use std::cmp::Ordering;
 use std::marker::PhantomData;
 
 use crate::{Claim, Durable, RestoreError, Result};
@@ -135,8 +146,46 @@ pub enum FrameFault {
     WrongMagic,
 
     /// The header's own layout is newer than this build writes.
-    #[error("the frame layout is version {stored} and this build writes {ours}")]
+    ///
+    /// Reported on `layout > LAYOUT`, which is the comparison this sentence
+    /// describes. It was `layout != LAYOUT` until this variant got a sibling,
+    /// so an *older* layout was reported as being from the future — false about
+    /// every such file, and unfalsifiable only because `LAYOUT` has never left
+    /// 1.
+    #[error("the frame layout is version {stored}, newer than the {ours} this build writes")]
     LayoutFromTheFuture {
+        /// What the header claims.
+        stored: u16,
+        /// What this build understands.
+        ours: u16,
+    },
+
+    /// The header's own layout is older than this build writes.
+    ///
+    /// **There is no layout-migration chain, and this is the arm that would
+    /// grow one.** A payload's hops belong to the caller and
+    /// [`Durable::migrate`] is where they go; a *layout* hop would belong to
+    /// this crate, because this crate is what wrote the header. Until one
+    /// exists an older layout is refused rather than guessed at, which is the
+    /// same answer this module gives to every other header it cannot account
+    /// for.
+    ///
+    /// Layout `0` is what an unframed file reads here, so this arm is a second
+    /// line under the magic rather than a hypothetical. Verified by deleting
+    /// the magic comparison: a raw 24-byte legacy ledger then fails here, as
+    /// `LayoutTooOld { stored: 0, ours: 1 }`. That redundancy is worth having
+    /// and it survived splitting the comparison in two — but it is *this*
+    /// variant it lands on. Under the `!=` this replaced it landed on
+    /// [`LayoutFromTheFuture`](Self::LayoutFromTheFuture), which called a file
+    /// older than anything this build writes a file from the future.
+    ///
+    /// A legacy file does not reach here in practice.
+    /// [`WrongMagic`](Self::WrongMagic) is checked first and is the verdict one
+    /// actually gets.
+    #[error(
+        "the frame layout is version {stored}, older than the {ours} this build writes, and there is no layout migration"
+    )]
+    LayoutTooOld {
         /// What the header claims.
         stored: u16,
         /// What this build understands.
@@ -169,11 +218,20 @@ fn unframe(bytes: &[u8]) -> std::result::Result<(u32, &[u8]), RestoreError> {
     }
 
     let layout = u16::from_le_bytes([header[6], header[7]]);
-    if layout != LAYOUT {
-        return Err(fault(FrameFault::LayoutFromTheFuture {
-            stored: layout,
-            ours: LAYOUT,
-        }));
+    match layout.cmp(&LAYOUT) {
+        Ordering::Greater => {
+            return Err(fault(FrameFault::LayoutFromTheFuture {
+                stored: layout,
+                ours: LAYOUT,
+            }))
+        }
+        Ordering::Less => {
+            return Err(fault(FrameFault::LayoutTooOld {
+                stored: layout,
+                ours: LAYOUT,
+            }))
+        }
+        Ordering::Equal => {}
     }
 
     let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
@@ -292,13 +350,22 @@ impl<D: Durable> std::fmt::Debug for Snapshot<D> {
 /// A claim that only ever sees framed bytes.
 ///
 /// Owns the claim it was built from. That ownership is the guarantee: there is
-/// no accessor, no `Deref`, no `From` and no `into_inner`, so nothing holding a
-/// `Versioned` can write an unframed byte. `keylink-persist/src/representability.rs`
-/// holds the compile-time probes for that sentence.
+/// no accessor, no `Deref` and no `into_inner`, so nothing holding a
+/// `Versioned` can write an unframed byte.
+/// `keylink-persist/src/representability.rs` holds the compile-time probes for
+/// that sentence, and records there why the *conversion* direction rests on the
+/// orphan rule instead of on a probe.
 ///
-/// ```no_run
-/// # use keylink_persist::{Durable, RestoreError, Snapshots, StateId};
-/// # use keylink_persist::file::Files;
+/// **The claim is a type parameter here and stays one in this example**, which
+/// is the whole shape of the thing: the wrapper is this crate's
+/// feature-independent core and knows nothing about where the bytes land. The
+/// example named `Files` until it was noticed that the only doctest on the
+/// crate's core module could not compile without its one optional adapter. The
+/// `file` module's own documentation carries the end-to-end version, where the
+/// feature gate already is.
+///
+/// ```
+/// # use keylink_persist::{Claim, Durable, RestoreError};
 /// # use keylink_persist::versioned::{Snapshot, Versioned};
 /// # struct Counter(u64);
 /// # impl Durable for Counter {
@@ -307,11 +374,8 @@ impl<D: Durable> std::fmt::Debug for Snapshot<D> {
 /// #     fn restore(_: &[u8]) -> Result<Self, RestoreError> { Ok(Self(0)) }
 /// #     fn migrate(_: u32, _: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> { Ok(None) }
 /// # }
-/// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// let files = Files::open("/var/lib/keylink").await?;
-/// let id = StateId::new("counters/hits")?;
-///
-/// let mut state = Versioned::new(files.claim(&id).await?);
+/// # async fn bump<C: Claim>(claim: C) -> Result<(), Box<dyn std::error::Error>> {
+/// let mut state = Versioned::new(claim);
 /// let mut counter = state.load::<Counter>().await?.unwrap_or(Counter(0));
 ///
 /// counter.0 += 1;
@@ -479,6 +543,21 @@ mod tests {
             unframe(&framed),
             Err(RestoreError::NotAFrame {
                 fault: FrameFault::LayoutFromTheFuture { stored: 2, ours: 1 }
+            })
+        ));
+    }
+
+    /// The other side of that comparison, and the one a `!=` got wrong. Layout
+    /// 0 is also what an unframed file reads, so this is the check that still
+    /// refuses one if the magic ever stops being the first thing tested.
+    #[test]
+    fn a_header_layout_older_than_this_build_is_refused_as_old() {
+        let mut framed = frame(1, b"12345678");
+        framed[6] = 0;
+        assert!(matches!(
+            unframe(&framed),
+            Err(RestoreError::NotAFrame {
+                fault: FrameFault::LayoutTooOld { stored: 0, ours: 1 }
             })
         ));
     }

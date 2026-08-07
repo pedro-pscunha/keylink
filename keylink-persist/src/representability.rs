@@ -77,6 +77,37 @@
 //! than the attribute holding, is `keylink-persist/tests/versioned.rs` naming
 //! all three variants from outside the crate.
 //!
+//! **That a wrapper cannot be converted back into its claim is not probed
+//! here, and what replaced the probe is stronger than one.** The break such a
+//! probe would guard is `impl<C: Claim> From<Versioned<C>> for C`, and rustc
+//! will not accept that impl at all:
+//!
+//! ```text
+//! error[E0210]: type parameter `C` must be covered by another type when it
+//!               appears before the first local type (`Versioned<_>`)
+//! ```
+//!
+//! The orphan rule, enforced by the language rather than watched by a test.
+//! `From`'s `Self` type is the *claim*, so the impl puts an uncovered parameter
+//! before the first local type — which is exactly the position `Deref` and
+//! `AsRef` do not put it in, and why those two are probed below and this is
+//! not.
+//!
+//! A coherence probe stood here through Wave 4c and proved nothing. Its blanket
+//! was `impl<T: Into<ProbeClaim>> ..`, so the only impl it could ever collide
+//! with was `From<Versioned<ProbeClaim>> for ProbeClaim` — on this module's own
+//! test type, which nobody outside this file can name. The conversion an
+//! adapter author genuinely *can* write is the concrete one,
+//! `impl From<Versioned<FileClaim>> for FileClaim`; it does not overlap that
+//! blanket and compiles clean beside it. All three were compiled before the
+//! probe came out.
+//!
+//! What keeps a per-adapter conversion from mattering is not a probe either.
+//! `Claim::store` is a **trait** method, so it is callable only where the trait
+//! is in scope, and `.mise/tasks/framing` fails if `keylink_persist::Claim` is
+//! named outside this crate at all. A loose claim with no callable `store` is
+//! not a hole.
+//!
 //! **A trait method having no default body is not probeable.** That
 //! [`Durable::migrate`](crate::Durable::migrate) is required rather than
 //! defaulted is exactly what makes a forgotten hop a compile error, and
@@ -301,14 +332,10 @@ trait AWrapperDoesNotDerefMut {}
 impl<T: DerefMut> AWrapperDoesNotDerefMut for T {}
 impl AWrapperDoesNotDerefMut for Versioned<ProbeClaim> {}
 
-/// The conversion half. `impl<C: Claim> From<Versioned<C>> for C` would be an
-/// `.into()` at one call site and the claim would be loose again, with no name
-/// on it for the probes above to catch.
-trait AWrapperIsNotConvertibleBackToItsClaim {}
-impl<T: Into<ProbeClaim>> AWrapperIsNotConvertibleBackToItsClaim for T {}
-impl AWrapperIsNotConvertibleBackToItsClaim for Versioned<ProbeClaim> {}
-
-/// And borrowing back out, which is neither a `Deref` nor a conversion.
+/// Borrowing back out, which is neither a `Deref` nor a conversion.
+///
+/// The conversion half is not here, and the module header says why: the impl a
+/// probe would guard is one rustc refuses to accept in the first place.
 trait AWrapperDoesNotLendItsClaim {}
 impl<T: AsRef<ProbeClaim>> AWrapperDoesNotLendItsClaim for T {}
 impl AWrapperDoesNotLendItsClaim for Versioned<ProbeClaim> {}

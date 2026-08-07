@@ -35,6 +35,38 @@
 //! It is an advisory lock **within one machine**. Two processes on two machines
 //! sharing a network filesystem are not excluded by this and must not be
 //! arranged.
+//!
+//! # End to end
+//!
+//! Store, claim, wrap, load, store. This example lives here rather than on
+//! [`Versioned`](crate::versioned::Versioned) because it names `Files`, and a
+//! doctest on the crate's feature-independent core that cannot compile without
+//! the `file` feature is a coupling `.mise/tasks/features` exists to prevent —
+//! one that end reported green for, because `--lib` excludes doctests.
+//!
+//! ```no_run
+//! # use keylink_persist::file::Files;
+//! # use keylink_persist::versioned::{Snapshot, Versioned};
+//! # use keylink_persist::{Durable, RestoreError, Snapshots, StateId};
+//! # struct Counter(u64);
+//! # impl Durable for Counter {
+//! #     const VERSION: u32 = 1;
+//! #     fn snapshot(&self) -> Vec<u8> { self.0.to_le_bytes().to_vec() }
+//! #     fn restore(_: &[u8]) -> Result<Self, RestoreError> { Ok(Self(0)) }
+//! #     fn migrate(_: u32, _: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> { Ok(None) }
+//! # }
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let files = Files::open("/var/lib/keylink").await?;
+//! let id = StateId::new("counters/hits")?;
+//!
+//! let mut state = Versioned::new(files.claim(&id).await?);
+//! let mut counter = state.load::<Counter>().await?.unwrap_or(Counter(0));
+//!
+//! counter.0 += 1;
+//! state.store(&Snapshot::of(&counter)).await?;
+//! # Ok(())
+//! # }
+//! ```
 
 use std::path::{Path, PathBuf};
 

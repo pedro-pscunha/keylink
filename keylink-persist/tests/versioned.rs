@@ -554,6 +554,43 @@ async fn a_frame_layout_from_the_future_is_refused() {
     );
 }
 
+/// The other side of that comparison, and the side a single `!=` got wrong: a
+/// layout *older* than this build's is not a layout from the future. Which
+/// verdict fires is unobservable while `LAYOUT` is 1 and nothing ever wrote 0 —
+/// and it stops being unobservable on the day `LAYOUT` becomes 2, when every
+/// file already on disk takes this arm and the wrong name would have refused
+/// all of them with a reason that was false about all of them.
+///
+/// Layout 0 is also what an unframed file reads here. It does not reach this
+/// check in practice — the magic is tested first and
+/// `a_raw_unframed_snapshot_is_refused_rather_than_mis_parsed` is what proves
+/// that — so this is the header's second refusal rather than its first.
+///
+/// Made red by putting `layout != LAYOUT` back: this then reports
+/// `LayoutFromTheFuture` and the match below fails.
+#[tokio::test]
+async fn a_frame_layout_older_than_this_build_is_refused_as_old() {
+    let scratch = Scratch::new("layout-old");
+    let files = open(&scratch).await;
+
+    let mut older = framed(1, &[0; 8]);
+    older[6] = 0;
+    plant(&scratch, &files, &older).await;
+
+    let state = Versioned::new(files.claim(&id()).await.expect("claims"));
+    let error = state.load::<LedgerV1>().await.expect_err("layout 0");
+    assert!(
+        matches!(
+            error,
+            Error::Restore(RestoreError::NotAFrame {
+                fault: FrameFault::LayoutTooOld { stored: 0, ours: 1 },
+                ..
+            })
+        ),
+        "got {error:?}"
+    );
+}
+
 /// What a `Durable` reports about its own bytes reaches the caller unchanged,
 /// and is the only variant it can report.
 #[tokio::test]
