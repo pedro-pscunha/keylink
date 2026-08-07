@@ -27,7 +27,11 @@
 //! - a read from inside a turn is the same deadlock through
 //!   [`Handle::with_state`];
 //! - parking the reply and leaving the turn breaks the cycle — and parking it
-//!   without leaving the turn does not, which is the distinction a reader needs.
+//!   without leaving the turn does not, which is the distinction a reader needs;
+//! - and the cycle `compose` already breaks: the same publish from inside a turn
+//!   hangs under [`Overflow::BlockPublisher`] and completes under
+//!   [`Overflow::DropSubscriber`], so that policy is a safety property and not a
+//!   preference about throughput.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -35,6 +39,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use keylink::compose::{Overflow, Subscription, Topic};
 use keylink::{Caller, Replied, Reply};
 use tokio::sync::Notify;
 
@@ -479,4 +484,103 @@ async fn a_parked_reply_that_stays_in_the_turn_does_not_break_the_cycle() {
     );
 
     a.abort();
+}
+
+// ─────────────────────────────────────────── the cycle a policy already breaks
+
+keylink::service! {
+    service Room;
+
+    /// Publish `times` items from inside a turn, to a topic this actor
+    /// subscribes to and is therefore not reading. Answers with how many
+    /// publishes dropped a subscriber.
+    rpc Shout(times: u64) -> u64;
+}
+
+/// An actor subscribed to its own topic, holding the [`Subscription`] in its
+/// state and **never polling it** — which is precisely what an actor inside a
+/// turn is.
+struct Chatter {
+    topic: Topic<u64>,
+    _feed: Subscription<u64>,
+}
+
+impl room::Actor for Chatter {
+    async fn shout(&mut self, _cx: Caller<'_>, times: u64) -> u64 {
+        let mut dropped = 0;
+        for item in 0..times {
+            dropped += self.topic.publish(item).await.dropped as u64;
+        }
+        dropped
+    }
+}
+
+fn chatter(overflow: Overflow) -> room::Handle<Chatter> {
+    let topic = Topic::new(overflow);
+    let feed = topic.subscribe();
+    room::actor(Chatter { topic, _feed: feed })
+}
+
+/// `Overflow::DropSubscriber` is not a style preference. It is what makes a
+/// publish safe from inside a turn, and this is the pair that says so.
+///
+/// `topic.rs` already states it — "`Overflow::DropSubscriber` never awaits — it
+/// completes without yielding, which is worth knowing for a caller that
+/// publishes from inside a turn" — and states it as prose. This is the guard.
+///
+/// `IN_FLIGHT` is 1, so the first item fits and the second finds the subscriber
+/// full. Under this policy that unsubscribes the reader and the publish returns;
+/// nothing awaits, so no edge of the cycle can block.
+///
+/// Made red by `scripts/break-once.sh`, replacing `Topic::publish`'s
+/// `Overflow::DropSubscriber => self.publish_dropping(item),` with
+/// `Overflow::DropSubscriber => self.publish_blocking(item).await,` — the policy
+/// swapped for the one that awaits. Watched: "a dropping publish must not hang:
+/// nothing in it awaits: Elapsed(())".
+#[tokio::test]
+async fn publishing_into_your_own_topic_completes_under_drop_subscriber() {
+    let room = chatter(Overflow::DropSubscriber);
+
+    let dropped = n0_future::time::timeout(SETTLE, room.shout(2))
+        .await
+        .expect("a dropping publish must not hang: nothing in it awaits")
+        .expect("the actor is running");
+    assert_eq!(
+        dropped, 1,
+        "IN_FLIGHT is 1: the first item fits, the second unsubscribes the reader"
+    );
+
+    // And the actor is still taking messages, which is the half that makes this
+    // a remedy rather than merely a different failure.
+    n0_future::time::timeout(SETTLE, room.shout(1))
+        .await
+        .expect("still polling")
+        .expect("still running");
+}
+
+/// The other half of the pair, and the one the crate already documents: under
+/// `Overflow::BlockPublisher` the same handler hangs.
+///
+/// Same actor, same topic, same two publishes. The only difference is the
+/// policy, which is what makes the policy the safety property rather than a
+/// preference about throughput.
+///
+/// Made red by `scripts/break-once.sh`, replacing `Topic::publish`'s
+/// `Overflow::BlockPublisher => self.publish_blocking(item).await,` with
+/// `Overflow::BlockPublisher => self.publish_dropping(item),`. Watched: "a
+/// blocking publish into your own topic must hang".
+#[tokio::test]
+async fn publishing_into_your_own_topic_hangs_under_block_publisher() {
+    let room = chatter(Overflow::BlockPublisher);
+
+    let mut shouting = {
+        let room = room.clone();
+        tokio::spawn(async move { room.shout(2).await })
+    };
+    assert!(
+        n0_future::time::timeout(HANG, &mut shouting).await.is_err(),
+        "a blocking publish into your own topic must hang"
+    );
+
+    room.abort();
 }
