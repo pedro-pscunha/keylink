@@ -138,10 +138,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //  `rpc` is a stored `rpc`, and a panicked turn is refused rather than
     //  written.
     //
-    //  Neither method here is `#[defer]`, and that is why the sentence above
-    //  needs no asterisk. A `#[defer]` method answering through
-    //  `Deferred::send` hands its caller the value from inside the handler,
-    //  before the observer chain — see `keylink::Persist`'s module header.
+    //  Neither method here is `#[defer]`, and that no longer needs saying: a
+    //  `#[defer]` method's parked answer waits for the same observer chain, so
+    //  `Deferred::send` is behind the store too. The one send that is not is one
+    //  made from a task you spawned yourself, which is answering with something
+    //  no turn produced — see `keylink::Persist`'s module header.
     let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
     println!("carried over: total {}", ledger.total().await?);
 
@@ -170,10 +171,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //
     //  Nothing in THIS example is uncommitted any more. The window the previous
     //  version demonstrated — a turn the caller's loop had not got around to
-    //  storing — does not exist when the store is inside the turn. Two windows
-    //  the store's placement does not close, both named rather than implied:
-    //  a `#[defer]` method answering through `Deferred::send`, and the volatile
-    //  idempotency ledger a retrying peer is matched against (RFC-07 §6.8).
+    //  storing — does not exist when the store is inside the turn. Two things
+    //  the store's placement does not cover, both named rather than implied: a
+    //  `Deferred` answered from a task you spawned yourself, which is answering
+    //  with something no turn produced, and the volatile idempotency ledger a
+    //  retrying peer is matched against (RFC-07 §6.8).
     ledger.stop().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     Ok(())

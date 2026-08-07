@@ -4,13 +4,19 @@
 //! the caller, which blocks on its stream exactly as before — so everything here is
 //! about who holds the reply channel and when.
 //!
-//! Four claims, and each of the last three is a case a reader would otherwise have
+//! Six claims, and each of the last five is a case a reader would otherwise have
 //! to guess at:
 //!
 //! - a parked reply is answered from a **later turn**, and the value reaches the
 //!   original caller;
 //! - an answer given **inside** the turn is still gated by the observer chain, so a
 //!   `#[defer]` method does not quietly cost a durable actor its commit;
+//! - **and so is a parked one**, which is what `parking.rs` closed: a value handed
+//!   to `Deferred::send` during a turn waits for that turn's verdict, so a turn
+//!   that panics after sending gives its parked callers nothing;
+//! - **a send from off the turn's task is not gated**, and that is the one thing
+//!   left of the `#[defer]` exception — nothing ran, so there is no commit for the
+//!   answer to wait for;
 //! - a parked reply whose actor **ends** answers rather than hanging;
 //! - a handler that **panics** before consuming its reply costs its caller the
 //!   answer and does not cost the actor.
@@ -55,6 +61,15 @@ keylink::service! {
     /// Panics before it consumes its reply.
     #[defer]
     rpc Boom(size: u64) -> u64;
+
+    /// Answers every parked order **and then panics**. The sends happen inside
+    /// the turn, so nothing that turn produced crosses.
+    rpc FillThenBoom() -> u64;
+
+    /// Hands every parked reply to a spawned task and **then panics**. Those
+    /// sends happen off the turn's task, so the turn's verdict does not reach
+    /// them — the one thing left of the `#[defer]` exception.
+    rpc DetachThenBoom() -> u64;
 }
 
 /// An order book that answers when a price arrives, not when an order does.
@@ -88,6 +103,22 @@ impl orders::Actor for Book {
 
     async fn boom(&mut self, _cx: Caller<'_>, _reply: Reply<u64>, _size: u64) -> Replied<u64> {
         panic!("no price for that");
+    }
+
+    async fn fill_then_boom(&mut self, _cx: Caller<'_>) -> u64 {
+        for (size, deferred) in self.waiting.drain(..) {
+            deferred.send(size * 5);
+        }
+        panic!("the book was half filled");
+    }
+
+    async fn detach_then_boom(&mut self, _cx: Caller<'_>) -> u64 {
+        for (size, deferred) in self.waiting.drain(..) {
+            // Off this task, so the send is not this turn's output and there is
+            // no verdict for it to wait for.
+            tokio::spawn(async move { deferred.send(size * 5) });
+        }
+        panic!("the book was half filled");
     }
 }
 
@@ -336,6 +367,110 @@ async fn a_reply_parked_before_a_fault_is_still_answered_after_it() {
         .expect("still answerable after the fault")
         .expect("the caller is not itself panicking");
     assert_eq!(answer.expect("the actor is running"), 21);
+}
+
+// ───────────────────────────────── inside the turn waits; off the turn does not
+
+/// **The commit point, at the macro's own surface.** A turn that answers parked
+/// callers and then panics gives them nothing: the sends waited for that turn's
+/// verdict, and a turn that panicked produced nothing committable — a durability
+/// adapter refuses one, so releasing its values would hand out answers about
+/// state that was never stored.
+///
+/// `Gone` and not `Faulted`, and that is not a near miss: there is one `Panic`,
+/// it is the original payload rather than a message, and it belongs to the turn's
+/// own caller. `local.rs`'s
+/// `a_released_reply_is_gone_when_the_turn_that_released_it_panicked` asserts the
+/// variant, which a `Handle` folds away.
+///
+/// Made red by `scripts/break-once.sh keylink/src/local.rs` on `Deferred::send`'s
+/// `Verdict::Faulted => drop(reply),` → `Verdict::Faulted =>
+/// reply.answer(Answered::Ran(value)),`. Watched: `a panicking turn's answer
+/// crossed anyway: Ok(15)`.
+#[tokio::test]
+async fn an_answer_sent_inside_a_turn_that_then_panics_does_not_cross() {
+    let book = orders::actor(Book::default());
+
+    let placing = {
+        let book = book.clone();
+        tokio::spawn(async move { book.place(3).await })
+    };
+    parked(&book, 1).await;
+
+    let filling = {
+        let book = book.clone();
+        tokio::spawn(async move { book.fill_then_boom().await })
+    };
+    assert!(
+        filling
+            .await
+            .expect_err("an rpc resumes the panic")
+            .is_panic(),
+        "the filling turn's own caller gets the panic"
+    );
+
+    let answer = n0_future::time::timeout(Duration::from_secs(5), placing)
+        .await
+        .expect("a withheld answer must not hang its caller")
+        .expect("the caller is not itself panicking");
+    assert!(
+        answer.is_err(),
+        "a panicking turn's answer crossed anyway: {answer:?}"
+    );
+
+    // The half that keeps the trade worth making: the actor survived.
+    assert_eq!(book.parked().await.expect("still running"), 0);
+}
+
+/// **And the one thing left of the exception, pinned rather than only written
+/// down.** A `Deferred` is `Send` and `'static`, so it can be handed to a spawned
+/// task — and a send from there is answering with something no turn produced.
+/// There is no lot in scope, so it crosses immediately.
+///
+/// The same turn as the test above, panicking the same way, differing in one
+/// line: the send goes through `tokio::spawn`. The parked caller gets its value.
+/// That is the honest scope of *"an answered call is a stored call"* — it holds
+/// for every answer a **turn** produced, and a `Deferred` answered from outside
+/// every turn is not one.
+///
+/// Withholding those would be the wrong fix rather than a stricter one: nothing
+/// ran, no observer saw anything, and there is no commit for the answer to wait
+/// for — so the value would wait for a turn that may never come.
+///
+/// Made red by `scripts/break-once.sh keylink/src/parking.rs` on `park`'s
+/// `if let Some(answer) = carried {` → `if let Some(answer) = Option::<Parked>::None {`,
+/// which drops an off-turn answer instead of giving it. Watched: `a send from
+/// another task must not be gated by the turn that spawned it: MailboxClosed`.
+#[tokio::test]
+async fn a_deferred_sent_from_another_task_is_not_gated_by_the_turn_that_spawned_it() {
+    let book = orders::actor(Book::default());
+
+    let placing = {
+        let book = book.clone();
+        tokio::spawn(async move { book.place(3).await })
+    };
+    parked(&book, 1).await;
+
+    let detaching = {
+        let book = book.clone();
+        tokio::spawn(async move { book.detach_then_boom().await })
+    };
+    assert!(
+        detaching
+            .await
+            .expect_err("an rpc resumes the panic")
+            .is_panic(),
+        "the detaching turn's own caller gets the panic"
+    );
+
+    let answer = n0_future::time::timeout(Duration::from_secs(5), placing)
+        .await
+        .expect("a detached answer must not hang its caller")
+        .expect("the caller is not itself panicking");
+    assert_eq!(
+        answer.expect("a send from another task must not be gated by the turn that spawned it"),
+        15,
+    );
 }
 
 // ─────────────────────────────────────────────────────── and over the wire

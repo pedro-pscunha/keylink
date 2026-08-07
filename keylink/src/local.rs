@@ -158,6 +158,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 // `catching` re-exported `pub` with no consumer outside this crate, so they are
 // `pub(crate)` now and the root no longer names them.
 use crate::panic::{catching, guarded};
+use crate::parking::{Parking, Verdict};
 use crate::{
     Body, Context, Ended, Observer, Origin, Outcome, Panic, Queueing, RemoteError, Stop, TurnInfo,
     TurnLost, TurnOutcome,
@@ -305,8 +306,12 @@ pub trait Turn<A>: Send + 'static {
 /// would hand its caller a value the store never accepted, which is the one
 /// property RFC-06 exists for.
 ///
-/// [`later`](Self::later) is the other case, and it genuinely escapes: the answer
-/// is not this turn's output, so this turn's commit says nothing about it.
+/// [`later`](Self::later) is the other case, and it escapes *this* turn — not
+/// every turn. This turn's commit says nothing about the parked answer, because
+/// this turn did not produce it; the turn that eventually calls
+/// [`Deferred::send`] does, and that turn's commit gates it. See `parking.rs`,
+/// which is where the two halves of `#[defer]` meet: the channel outlives the
+/// turn that received it, and the value waits for the turn that answered it.
 ///
 /// # Two shapes of destination, because only generated code can name a `Response`
 ///
@@ -588,9 +593,13 @@ enum Settled<T> {
 ///
 /// Three ways a parked reply *does* end, all of them the state's own doing:
 ///
-/// - somebody calls [`send`](Self::send);
+/// - somebody calls [`send`](Self::send) in a turn that is then **committed** —
+///   the value waits for that turn's observer chain, which is the whole of
+///   `parking.rs`;
 /// - somebody drops it — including a turn that takes it out of the state and then
-///   panics, which is the one case where a fault does resolve one, as `Gone`;
+///   panics, which is the one case where a fault does resolve one, as `Gone`.
+///   A turn that *sent* it and then panicked is the same case now, for the same
+///   reason: nothing that turn produced crosses;
 /// - the actor ends, which drops the state and every reply in it, as `Gone`. An
 ///   observer refusing the faulted turn is how a fault reaches parked replies
 ///   *indirectly*, and it reaches them the same way `stop()` does.
@@ -603,12 +612,51 @@ pub struct Deferred<T>(Reply<T>);
 impl<T> Deferred<T> {
     /// Answer the caller that has been waiting since the turn this was parked in.
     ///
-    /// Nothing is owed to the turn running now: the value crosses the channel
-    /// directly, and this turn's observers neither see it nor gate it. That is
-    /// what deferral means — the answer is not this turn's output — and it is the
-    /// difference from [`Reply::send`].
-    pub fn send(self, value: T) {
-        self.0.answer(Answered::Ran(value));
+    /// **The value is owed to the turn running now, and waits for it.** It is
+    /// held until that turn's observer chain has accepted it, and then released
+    /// with the same verdict the turn's own caller is answered by: an observer
+    /// that refuses tells this caller [`TurnLost::Refused`] naming the same
+    /// observer, and a handler that panics after sending drops the channel, which
+    /// is [`TurnLost::Gone`].
+    ///
+    /// That is not what deferral costs — it is what makes it free. `#[defer]`'s
+    /// point is that the reply outlives the turn that **received** it, and it
+    /// still does. What it no longer does is outrun the turn that **answered**
+    /// it, which is what made *"an answered call is a stored call"* false for
+    /// every deferred method against a durable actor: the caller held a receipt
+    /// for a debit that was still ~7.6 ms of `fsync` away from the disk.
+    ///
+    /// # The one case that is still immediate, and it is not a hole
+    ///
+    /// A `Deferred` is `Send` and `'static`, so it can be sent from a spawned
+    /// task, or reached from a [`read`](LocalActor::read) closure through
+    /// interior mutability. Neither is inside a turn: no handler ran, no observer
+    /// saw anything, and there is no commit for the answer to wait for. Those
+    /// sends cross immediately, because withholding a value no turn produced
+    /// would hang its caller for ever. `Persist`'s module header states it as the
+    /// one thing left of the exception, and `tests/defer.rs::
+    /// a_deferred_sent_from_another_task_is_not_gated_by_the_turn_that_spawned_it`
+    /// pins it.
+    ///
+    /// # `T: Send + 'static`, which every method's return type already is
+    ///
+    /// The parked answer is type-erased into the turn's lot — one turn can hold
+    /// answers of several types — so the value crosses into a
+    /// `Box<dyn FnOnce(..) + Send>`. Every `$ret` a `service!` can declare is
+    /// already `Send + 'static`, because [`turn`] demands exactly that of it.
+    pub fn send(self, value: T)
+    where
+        T: Send + 'static,
+    {
+        let reply = self.0;
+        crate::parking::park(Box::new(move |verdict| match verdict {
+            Verdict::Committed => reply.answer(Answered::Ran(value)),
+            Verdict::Refused { name } => reply.answer(Answered::Refused { name }),
+            // Dropped, not answered. `Answered::Faulted` needs the `Panic`
+            // itself, there is one, and it is the turn's own caller's — see
+            // `Verdict::Faulted`.
+            Verdict::Faulted => drop(reply),
+        }));
     }
 }
 
@@ -688,6 +736,20 @@ impl<T> Answered<T> {
 /// question "who is answered" belongs, and this function answers only "what
 /// happened": the handler's outcome, the name of the observer that refused if one
 /// did, and the [`Ended`] either of those implies.
+///
+/// # Except for the answers the turn parked, which are released HERE
+///
+/// The one thing this does decide, and it is here rather than in the three
+/// callers for the reason the rest of it is not: a [`Deferred::send`] made during
+/// the handler is an answer to somebody who is not this turn's caller, so no
+/// caller-side fold can see it. It waits in the turn's lot — see `parking.rs` —
+/// and is released after the observer chain with the [`Verdict`] read from the
+/// same two facts the callers fold, six lines apart, so the two cannot disagree
+/// about one turn.
+///
+/// Putting it here is also what gives [`feed_turn`] the same rule for free: a
+/// feed item has no caller and no fold, and its `Deferred::send` is gated
+/// anyway.
 async fn observed_turn<A, T, F>(
     state: &mut A,
     hooks: &mut [Box<dyn Observer<A>>],
@@ -708,7 +770,16 @@ where
     // came out of is fine. `Send` stays: this future holds it across an await.
     F: for<'b> FnOnce(&'b mut A) -> Pin<Box<dyn Future<Output = T> + Send + 'b>> + Send,
 {
-    let answer = guarded(async { turn(state).await }).await;
+    // The handler runs inside a lot, so a `Deferred::send` in its body holds the
+    // value here instead of writing it. The lot is a local of *this* function
+    // rather than anything the loop owns, which is what makes "nothing is parked
+    // at `finish`" structural — see `parking.rs`.
+    let mut parking = Parking::new(turn(state));
+    let answer = guarded(&mut parking).await;
+    // Out before the observer chain reborrows the state: a `Vec<Parked>` names no
+    // lifetime, while the future in `parking` holds the handler's `&mut A`.
+    let parked = parking.take();
+    drop(parking);
 
     // Copied out BEFORE the `Panic` moves into an `Answered`. Building the
     // reason afterwards is `E0382`, not a style preference.
@@ -781,6 +852,24 @@ where
                 break;
             }
         }
+    }
+
+    // **Every answer this turn parked, released here, in send order.** Before the
+    // fold below rather than after, so a turn that answers other callers and then
+    // returns a value of its own is read in that order by everybody: what the
+    // handler said during its body, then what it returned.
+    //
+    // Read from the same two facts the fold reads, six lines down, so a parked
+    // caller and the turn's own caller cannot be told two different things about
+    // one turn. A fault outranks a refusal here for the reason it does there: the
+    // ending names the fault, and there is nothing committed either way.
+    let verdict = match (&panicked, &refused) {
+        (Some(_), _) => Verdict::Faulted,
+        (None, Some((name, _, _))) => Verdict::Refused { name },
+        (None, None) => Verdict::Committed,
+    };
+    for release in parked {
+        release(verdict);
     }
 
     match (refused, panicked) {
@@ -2856,6 +2945,11 @@ mod tests {
         Park { origin: Origin, reply: Reply<usize> },
         /// Answer whatever is parked, from a turn that is not the one that took it.
         Release { origin: Origin, reply: Reply<usize> },
+        /// Answer whatever is parked and **then** panic, which is the ordering
+        /// `Verdict::Faulted` exists to decide: the value was sent, the turn that
+        /// sent it produced nothing committable, and a durability adapter refuses
+        /// a panicked turn.
+        ReleaseThenBoom { origin: Origin, reply: Reply<usize> },
     }
 
     impl Turn<Counter> for Mail {
@@ -2932,6 +3026,26 @@ mod tests {
                             answered
                         })
                     })
+                    .await
+                }
+                Mail::ReleaseThenBoom { origin, reply } => {
+                    turn(
+                        state,
+                        hooks,
+                        origin,
+                        "ReleaseThenBoom",
+                        reply,
+                        |_from, state| {
+                            Box::pin(async move {
+                                if let Some(deferred) = state.parked.take() {
+                                    deferred.send(99);
+                                }
+                                panic!("after the send");
+                                #[allow(unreachable_code)]
+                                0usize
+                            })
+                        },
+                    )
                     .await
                 }
             }
@@ -3173,6 +3287,163 @@ mod tests {
         assert!(
             matches!(lost, TurnLost::Gone),
             "a reply parked in a state that was dropped said {lost:?}"
+        );
+    }
+
+    /// An observer that refuses one named method and accepts everything else.
+    ///
+    /// One method rather than all of them because a refusal **ends the actor**: an
+    /// observer that vetoed the `Park` turn too would leave no actor for a later
+    /// turn to release anything from, and the test would pass on `Gone` for the
+    /// wrong reason. That is not hypothetical — it is what the first version of
+    /// this test did, and `Err(Gone)` is what it printed.
+    struct Vetoing {
+        method: &'static str,
+    }
+
+    impl Observer<Counter> for Vetoing {
+        fn name(&self) -> &'static str {
+            "vetoing"
+        }
+
+        fn after_turn<'a>(
+            &'a mut self,
+            _state: &'a Counter,
+            turn: TurnInfo<'a>,
+        ) -> crate::TurnFut<'a> {
+            let refuse = turn.method == self.method;
+            Box::pin(async move {
+                match refuse {
+                    true => Err(Stop::new("vetoing refused")),
+                    false => Ok(()),
+                }
+            })
+        }
+    }
+
+    /// Wait for the `Park` turn to have parked, by reading the state rather than
+    /// by sleeping. A `read` takes a mailbox permit like anything else, so it can
+    /// only answer once the park's turn has finished.
+    async fn until_parked(actor: &LocalActor<Counter, Mail>) {
+        for _ in 0..500 {
+            if actor
+                .read(|state| state.parked.is_some())
+                .await
+                .expect("running")
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("nothing ever parked");
+    }
+
+    /// **The commit point for a released reply, at the variant a `Handle` folds
+    /// away.** A turn that answers a parked caller and is then refused by an
+    /// observer must not let that answer cross — and the parked caller is told the
+    /// same thing the turn's own caller is, naming the same observer.
+    ///
+    /// This is where the `#[defer]` durability window closed. Before it,
+    /// `Deferred::send` wrote to the channel from inside the handler, so the parked
+    /// caller had `99` before any observer had seen anything, and a `Persist` that
+    /// then refused left it holding an answer for state that was never stored.
+    ///
+    /// Here rather than only in `tests/persist.rs` because
+    /// [`ask`](LocalActor::ask) collapses every loss to `MailboxClosed`: **the
+    /// difference between "refused" and "gone" is only visible from inside the
+    /// crate**, and the difference is the whole finding — a caller told `Gone`
+    /// stops calling, and a caller told `Refused` knows the turn ran and was not
+    /// committed.
+    ///
+    /// Made red by `scripts/break-once.sh` on `parking.rs`'s `park`, replacing the
+    /// `if let Some(mut lot) = slot.take() {` guard with `if let Some(mut lot) =
+    /// Option::<Vec<Parked>>::None {` — the send then escapes to the immediate
+    /// branch, which is exactly the old behaviour. Watched: `a released reply
+    /// crossed a refused turn: Ok(99)`.
+    #[tokio::test]
+    async fn a_released_reply_is_refused_with_the_turn_that_released_it() {
+        let actor: LocalActor<Counter, Mail> = LocalActor::spawn_observed(
+            Counter::default(),
+            vec![Box::new(Vetoing { method: "Release" })],
+        );
+
+        // The `Park` turn is accepted, so the channel is in the state and the
+        // actor is still there — which is what leaves anything to release.
+        let parked = {
+            let actor = actor.clone();
+            tokio::spawn(async move {
+                actor
+                    .ask_catching(|origin, reply| Mail::Park { origin, reply })
+                    .await
+            })
+        };
+        until_parked(&actor).await;
+
+        let releasing = actor
+            .ask_catching(|origin, reply| Mail::Release { origin, reply })
+            .await;
+        assert!(
+            matches!(releasing, Err(TurnLost::Refused { name: "vetoing" })),
+            "the releasing turn's own caller is refused: got {releasing:?}"
+        );
+
+        let lost = n0_future::time::timeout(Duration::from_secs(5), parked)
+            .await
+            .expect("a released reply must not hang its caller")
+            .expect("the caller is not itself panicking");
+        assert!(
+            matches!(lost, Err(TurnLost::Refused { name: "vetoing" })),
+            "a released reply crossed a refused turn: {lost:?}"
+        );
+    }
+
+    /// And the panicking half, which cannot be told the same thing.
+    ///
+    /// A turn sends a parked value and then panics. The value must not cross — a
+    /// durability adapter refuses a panicked turn, so nothing behind that answer
+    /// was committed — and it cannot be answered `Faulted` either: there is one
+    /// `Panic`, it is the original payload rather than a message, and it belongs
+    /// to the turn's own caller. So the channel is dropped, which is `Gone`, and
+    /// that is already what `Deferred` documents for a fault that reaches a parked
+    /// reply.
+    ///
+    /// The two assertions are the two halves: the turn's own caller gets the panic
+    /// (so the payload really did go somewhere), and the parked caller gets `Gone`
+    /// (so it did not go to two places, and no uncommitted value crossed).
+    ///
+    /// Made red by replacing `parking.rs`'s `Verdict::Faulted => drop(reply)` arm
+    /// in `Deferred::send` with `Verdict::Faulted => reply.answer(Answered::Ran(value))`.
+    /// Watched: `a value sent by a turn that then panicked crossed anyway:
+    /// Ok(99)`.
+    #[tokio::test]
+    async fn a_released_reply_is_gone_when_the_turn_that_released_it_panicked() {
+        let actor: LocalActor<Counter, Mail> = LocalActor::spawn(Counter::default());
+
+        let parked = {
+            let actor = actor.clone();
+            tokio::spawn(async move {
+                actor
+                    .ask_catching(|origin, reply| Mail::Park { origin, reply })
+                    .await
+            })
+        };
+        until_parked(&actor).await;
+
+        let faulted = actor
+            .ask_catching(|origin, reply| Mail::ReleaseThenBoom { origin, reply })
+            .await;
+        assert!(
+            matches!(faulted, Err(TurnLost::Faulted(_))),
+            "the turn's own caller gets the panic: got {faulted:?}"
+        );
+
+        let lost = n0_future::time::timeout(Duration::from_secs(5), parked)
+            .await
+            .expect("a released reply must not hang its caller")
+            .expect("the caller is not itself panicking");
+        assert!(
+            matches!(lost, Err(TurnLost::Gone)),
+            "a value sent by a turn that then panicked crossed anyway: {lost:?}"
         );
     }
 
