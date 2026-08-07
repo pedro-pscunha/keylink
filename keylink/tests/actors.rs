@@ -1646,9 +1646,13 @@ fn status_of(system: &journal::System, id: &ActorId) -> keylink::ActorStatus {
 /// hash that no longer exists. Same claim, moved to where it is now enforced.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/macros.rs`, dropping
-/// `stringify!($svc)` from `KEYED_PROTOCOL` so two identically-shaped services
-/// hash the same contract under the same protocol string. Watched: `assertion
-/// `left != right` failed`, both sides `keylink/keyed/0f98f91088f727db`.
+/// `"/", stringify!($svc)` from `KEYED_PROTOCOL` — both fragments, because
+/// dropping the name on its own leaves a `keylink//keyed` with the separator
+/// stranded, and the protocol string is hashed, so that spelling moves the digest
+/// as well — and two identically-shaped services then hash the same contract under
+/// the same protocol string. Watched: `assertion `left != right` failed`, both
+/// sides the bytes of `keylink/keyed/0f98f91088f727db` (an ALPN is a `Vec<u8>`, so
+/// the panic prints it as decimal bytes rather than as that string).
 #[test]
 fn the_keyed_alpn_separates_two_services_with_identical_shapes() {
     assert_ne!(journal::keyed_alpn(), vault::keyed_alpn());
