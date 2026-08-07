@@ -258,3 +258,179 @@ for f in r0 r1 r2 r3a rc_loop rc_actor; do  # each exit 101
 done
 cargo check --locked --features r3b         # exit 0
 ```
+
+---
+
+## 2. Wave 1b — the mailbox is a generated enum
+
+Wave 0 proved the shape compiles. Wave 1a made the wire typed. This is the other
+half of Wave 1: `type Turn<A> = Box<dyn FnOnce(&mut A, &mut [Box<dyn Observer<A>>])
+-> Pin<Box<dyn Future<Output = Option<Ended>> + Send + 'a>> + Send>` and
+`Message::Turn` are gone, and a `service!` expansion now generates the mailbox.
+
+### 2.1 The shape that landed, and the three places it differs from the sketch
+
+```rust
+// generated, local only, never serialized, derives NOTHING
+#[doc(hidden)]
+pub enum Mail {
+    Reserve { origin: Origin, sku: String, qty: u32, body: (), reply: Reply<Outcome> },
+    // ... one per declared method ...
+    Served { origin: Origin, request: Request, body: BodyReader,
+             reply: Reply<(Response, Body)> },
+}
+
+impl<A: Actor> keylink::Turn<A> for Mail {
+    async fn run(self, state: &mut A, hooks: &mut keylink::Hooks<A>) -> Option<Ended> { .. }
+}
+```
+
+1. **`cx: Caller<'static>` is an owned `Origin`** — §1.6, already settled in 1a.
+   The origin is now handed to the closure **by value** and borrowed inside it,
+   because a `Caller<'o>` borrowed in the loop and captured by the closure would
+   need `'o: 'b` for every `'b` the higher-ranked bound quantifies over.
+2. **There is no `Stop` variant.** `Stop` stays in keylink's own
+   `Message<A, M>`, beside a `Read` variant, so a generated enum cannot forget
+   it and a wave that adds a third keylink-level message does not regenerate
+   anybody's crate.
+3. **`send` and `recv` get variants nothing builds.** The sketch says "a kind the
+   local handle does not serve simply gets no variant". `macro_rules!` cannot do
+   that: a macro invocation is not legal where a variant goes, so emitting a
+   variant for four kinds out of five needs a token-muncher over the whole
+   declaration list. Both are written to be *correct* if something built one,
+   which is the honest alternative to an arm that panics. Same mechanism as S-07.
+
+### 2.2 `read` is still a boxed closure, and that is the right answer
+
+`with_state` takes an arbitrary caller closure rather than a declared method, so
+there is no enum a macro could generate for it. It lives in keylink's
+`Message::Read(Box<dyn FnOnce(&A) + Send>)` — **synchronous**: no future to
+build, no `&mut A`, no observer chain. Making it a declared method instead would
+put a cross-cutting concern into the service's own wire contract, which is the
+opposite of why it exists.
+
+### 2.3 The reply channel is a value the loop holds, and the loop is one loop
+
+The property Wave 2 needs. `Reply<T>` is an opaque newtype over
+`oneshot::Sender<Answered<T>>`, so `Answered` went from private to `pub(crate)`
+rather than to `pub`, and Wave 2's fourth state is additive to a type nothing
+outside keylink can match on. It also retires `Answer<Resp>`, which was a
+*transparent* alias and therefore had `tokio::sync::oneshot::Sender` in keylink's
+public API behind a `#[doc(hidden)]` name.
+
+`keylink::turn(state, hooks, origin, reply, f)` is what every generated arm calls,
+and it is where the queue deadline, the panic guard, the observer chain, the
+idempotency marks and the reply all are. What that replaced:
+
+| decision | before | after |
+|---|---|---|
+| queue deadline, turn side | 3 hand-written comparisons, two spelling `>` and one `>=` | 1, `Queueing::expired` |
+| `dispatched` / `completed` / `unrun` | 2 dispatchers, each with its own arms | 1 |
+| a panic, as a peer reads it | keyed `{panic}`, singleton `panicked: {panic}` | 1 rendering |
+| `Answered` → `Outcome` | 2 copies, 5 arms each | 1 `rendered` |
+
+The panic rendering is a **behaviour change on the keyed wire**: a keyed actor's
+panic now reaches a peer as `Failed("panicked: the actor panicked: ..")` where it
+used to be `Failed("the actor panicked: ..")`. The singleton's rendering is
+unchanged, which is why `both_halves_of_a_lost_turn_carry_their_own_prefix` stayed
+green — and that test's own documentation had already named the gap: *"There is no
+keyed twin, which is how a stutter on one path and a bare rendering on the other
+both stayed green."* There is one now,
+`one_panic_reads_the_same_whichever_way_the_service_is_served`, and it asserts
+byte equality between the two paths rather than that both contain "panicked".
+
+The stutter survives and is recorded rather than fixed: `Panic::caught` builds its
+message as `the actor panicked: {payload}`, and that same string is what
+`Ended::Panicked` and `TurnOutcome::Panicked` carry, so removing one of the two
+prefixes is a decision about `panic.rs`'s vocabulary and not about a dispatch.
+
+### 2.4 `LocalActor<A, M>`, and what the second parameter cost
+
+The alternative was one parameter and a bound tying the mailbox to the state, and
+it does not work: the enum is generated into the caller's crate, so keylink cannot
+name it, and an associated type on a trait keylink *could* name would put the
+mailbox inside the state's definition — where a state used by two services could
+only have one.
+
+The cost is paid by generated code. A caller writes `inventory::Handle<Warehouse>`
+and the generated `Handle` applies `M` itself. Three hand-written sites moved:
+
+- `representability.rs`'s read probe is now generic in `M`, which is itself the
+  claim: `read` needs to know nothing about a turn, so it works on a hand-written
+  non-`service!` state with no mailbox enum to name. Bound it to `M: Turn<A>` and
+  the probe stops compiling.
+- `blocking.rs`'s runtime test names an uninhabited `enum Nothing {}`.
+- `local.rs`'s own tests carry a hand-written `Mail`, deliberately: this is where
+  the loop lives, so a probe only the macro could build would prove the macro and
+  the loop agree rather than that the loop holds.
+
+The methods are split across three impl blocks by what each genuinely needs.
+`spawn`/`spawn_observed` need `M: Turn<A>`; `ask`/`ask_catching`/`notify` need
+`M: Send + 'static`; `read`/`stop`/`abort`/`ended` need neither parameter bounded.
+
+`ask` and `notify` take a **builder** — `impl FnOnce(Origin, Reply<T>) -> M` —
+rather than a message. keylink makes both the origin and the reply channel and
+hands them in, so generated code never constructs an `Origin` on the local path
+either, and both of its constructors stay `pub(crate)`. That is what made
+`Origin::local()`'s `#[allow(dead_code)]` removable: Wave 1b is its consumer, as
+predicted.
+
+`Queued<T>` and `ask_catching_before` are deleted. Their one caller was
+`Handle::service`'s dispatch, which is now `deliver_to_local` — the twin of
+`deliver_to_actor`, in keylink, sharing one `rendered`.
+
+### 2.5 The measured result: an idle actor stopped paying for the service's types
+
+The wave that replaces a fat pointer with an enum sounds like it should cost
+memory. It saved some, and the reason is a second box nobody had asked for.
+
+`Mailbox<M> = mpsc::Receiver<Box<M>>` boxed the slot at the channel and carried
+the argument for it. Nothing boxed the **task's future**, which the keyed loop had
+always sized to the service's own handler by inlining `guarded(__actor_turn(..))`
+into it. Measured, at ten thousand idle actors of a one-`u64`-argument service:
+
+| | keyed | local |
+|---|---|---|
+| before (`c9056e0`) | 1,671 B | 1,725 B |
+| enum, turn future unboxed | 2,567 B | 3,005 B |
+| enum, turn future boxed | **1,159 B** | **1,469 B** |
+
+And the number that matters, because it is what makes `BUDGET_PER_ACTOR` a
+statement about keylink rather than about whoever wrote the service — the same
+measurement against a service whose declared arguments are a kilobyte larger:
+
+| `size_of::<Mail>()` | before | after |
+|---|---|---|
+| 232 | 1,686 B | 1,159 B |
+| 1,248 | 4,662 B | 1,146 B |
+
+About 2.9 bytes of permanent per-actor cost per byte of message before, and a flat
+line after. `tests/actor_memory.rs` asserts the flatness — `BUDGET_PER_DECLARED_BYTE`,
+128 bytes of slack over a kilobyte of arguments — rather than describing it, and
+that assertion was watched to fail at 5,067 bytes with the box removed.
+
+The bill is one heap allocation per message for the turn's state machine, on a
+path that already allocates the mailbox slot and, for a served call, a QUIC stream
+and a postcard decode.
+
+### 2.6 What Wave 1b did NOT do
+
+- **Observers on a keyed actor.** The keyed loop runs the same `Mail` dispatch
+  now and hands it an **empty** hook slice, so this is one line rather than a
+  second loop — but it is still Wave 3's decision, because feeds ask the same
+  question about the same loop.
+- **Remove the per-turn `Box::pin` inside `turn`'s closure.** `turn` takes
+  `for<'b> FnOnce(Origin, &'b mut A) -> Pin<Box<dyn Future + Send + 'b>>`, and
+  expressing it over a generic future needs a helper trait with a lifetime-generic
+  associated type plus a `Send` bound on it — implemented per method by generated
+  code. Possible, not free, and not measured to matter: the allocation is on the
+  message path, not the idle one.
+- **Forward `#[$meta]` to the `Mail` variants.** Deliberately not, following
+  `Response`'s precedent: a `#[serde(..)]` written for the wire enum and
+  re-emitted onto an enum with no `Serialize` derive is `cannot find attribute`
+  pointing at `macros.rs`. The cost is that a `#[cfg]`-gated method would gate its
+  `Request` variant and not its `Mail` one — which was already true of `Response`,
+  so this wave neither fixes nor worsens it.
+- **Move the ALPN.** `Mail` is local-only and derives no `Schema`, so nothing it
+  contains is hashed. `keylink/tests/protocol.rs`'s `keylink/Probe/d3fe34471921164e`
+  is unchanged and green.
