@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+#MISE description="Nothing writes a snapshot without a version frame in front"
+#
+# `keylink_persist::versioned::Versioned` owns its claim and has no accessor,
+# no `Deref` and no `into_inner`, so a holder of one CANNOT reach
+# `Claim::store`. That is the real guarantee, it is in the type system, and
+# `keylink-persist/src/representability.rs` holds the compile-time probes for
+# it. This task is the belt to those braces: it watches the one way round the
+# type, which is taking a raw claim from `Snapshots::claim` and never wrapping
+# it.
+#
+# The first check reads a property of Rust rather than a naming convention.
+# `store` is a TRAIT method, so it is only callable where the trait is in
+# scope — a file that never names `keylink_persist::Claim` cannot call it,
+# whatever it calls its variables.
+#
+# The second is the ordinary grep, kept narrow on purpose. `.store(&` and
+# `.store(b"` are what a raw snapshot write looks like; `Ordering::` drops the
+# atomics; and `versioned.store::<Ledger>(&bytes)` does not match either
+# pattern, because the turbofish sits between the name and the paren.
+#
+# Neither check is airtight — a `use keylink_persist::{\n  Claim,\n}` split
+# across lines would slip past the first, and an alias would slip past both.
+# They do not have to be. The type is the guarantee; this is the reminder.
+set -euo pipefail
+
+root="${MISE_PROJECT_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+cd "$root"
+
+# Drop comment lines from rg's `path:line:text` output. The doc comment in
+# keylink/src/observe.rs explains this exact dependency and must stay.
+uncommented() { rg -v '^[^:]*:[0-9]+:\s*(//|/\*|\*)' || true; }
+
+fail=0
+
+named_outside="$(
+    rg --line-number --glob '*.rs' --glob '!keylink-persist/**' \
+        'keylink_persist::(\{[^}]*\bClaim\b|Claim\b)' . \
+        | uncommented
+)"
+
+if [[ -n "$named_outside" ]]; then
+    fail=1
+    echo "── keylink_persist::Claim is in scope outside keylink-persist:" >&2
+    echo "$named_outside" >&2
+    echo >&2
+    echo "Claim::store writes raw, unframed bytes, and an unframed snapshot is" >&2
+    echo "refused on the next load rather than read. Wrap the claim in" >&2
+    echo "keylink_persist::versioned::Versioned and store through that." >&2
+fi
+
+# `versioned.rs` is the one caller. `file.rs` is the one implementor, and its
+# tests store byte literals on purpose: they test the adapter, which must not
+# know what a frame is.
+stored_raw="$(
+    rg --line-number --glob '*.rs' \
+        --glob '!keylink-persist/src/versioned.rs' \
+        --glob '!keylink-persist/src/file.rs' \
+        '\.store\((&|b")' . \
+        | rg -v 'Ordering::' \
+        | uncommented
+)"
+
+if [[ -n "$stored_raw" ]]; then
+    fail=1
+    echo "── raw bytes are being stored outside the framing wrapper:" >&2
+    echo "$stored_raw" >&2
+fi
+
+if [[ "$fail" -ne 0 ]]; then
+    exit 1
+fi
+
+echo "ok: every snapshot goes through the frame"

@@ -12,7 +12,10 @@
 //!            ┌──────────────────────────────┐
 //!            │  the actor, holding &mut self │
 //!            └───────────────┬──────────────┘
-//!                            │  Durable::snapshot / restore
+//!                            │  Durable::snapshot / restore / migrate
+//!            ┌───────────────▼──────────────┐
+//!            │  Versioned    the frame      │   ← the only writer of a header
+//!            └───────────────┬──────────────┘
 //!            ┌───────────────▼──────────────┐
 //!            │  PORT   Snapshots · Claim    │   ← this crate's whole surface
 //!            └───┬─────────────┬────────────┘
@@ -36,6 +39,19 @@
 //! That is the whole type-level content of this crate. It deletes the guard that
 //! would otherwise read "remember to take the lock first".
 //!
+//! # The second one: bytes on disk say which version wrote them
+//!
+//! [`Claim::store`] takes raw bytes, because an adapter for a bucket or a vault
+//! must not have to understand framing. [`Versioned`](versioned::Versioned)
+//! **owns** a claim and is the only thing here that writes a header, and there
+//! is no route from one back to the claim it holds. So a caller who has a
+//! `Versioned` cannot write an unframed byte, and an adapter author never
+//! learns that versions exist.
+//!
+//! The header carries a magic, which is what makes an unframed file — anything
+//! this crate wrote before framing existed — a loud error rather than a payload
+//! misread as garbage. [`versioned`] documents the layout byte by byte.
+//!
 //! # What this does not promise
 //!
 //! - **Nothing about other machines.** The file adapter survives a restart of
@@ -43,8 +59,11 @@
 //!   would; that is the reason to write one, and the only reason.
 //! - **No history.** One state, one current value. A journal is a different
 //!   port with different operations.
-//! - **No migration.** [`Durable::restore`] reports bytes it does not
-//!   understand. It does not upgrade them.
+//! - **No guess about the payload.** Migration walks
+//!   [`Durable::migrate`] one hop at a time and this crate never parses what
+//!   comes back. A state whose encoding changed without
+//!   [`Durable::VERSION`] changing is undetectable from here, and
+//!   [`Durable::VERSION`] says so in as many words.
 
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
@@ -54,6 +73,9 @@ use std::future::Future;
 
 #[cfg(feature = "file")]
 pub mod file;
+pub mod versioned;
+
+mod representability;
 
 // ───────────────────────────────────────────────────────────────── the port
 
@@ -108,32 +130,158 @@ pub trait Claim: Send + 'static {
     fn store(&mut self, bytes: &[u8]) -> impl Future<Output = Result<()>> + Send;
 }
 
-/// State that knows how to become bytes and come back.
+/// State that knows how to become bytes, come back, and grow a field without
+/// orphaning what is already on disk.
 ///
 /// Deliberately not `Serialize`: the encoding is the state's own decision, and
 /// a state that wants postcard, JSON or a hand-rolled format is equally welcome.
 /// This crate never looks inside.
 pub trait Durable: Sized {
+    /// Which revision of this type's encoding [`snapshot`](Self::snapshot)
+    /// writes.
+    ///
+    /// Stamped into the frame by
+    /// [`Versioned::store`](versioned::Versioned::store) and read back by
+    /// [`Versioned::load`](versioned::Versioned::load), which is what decides
+    /// whether [`migrate`](Self::migrate) runs.
+    ///
+    /// # The failure nobody can type against
+    ///
+    /// **Change the encoding, bump this.** Nothing here can check that you did.
+    /// The frame stamps whatever number this constant holds, and the payload is
+    /// opaque to this crate by design — so a `snapshot` that started writing a
+    /// new shape under an unchanged `VERSION` writes new bytes wearing an old
+    /// label, and the old bytes already on disk wear the same one.
+    ///
+    /// What happens then depends on the new `restore`, and neither outcome is
+    /// good:
+    ///
+    /// - It rejects the old bytes, and the state fails closed as
+    ///   [`RestoreError::Malformed`] — loud, at startup, recoverable. This is
+    ///   the likely case and it is the one worth having.
+    /// - It *accepts* them, because the two encodings overlap. A ledger of
+    ///   little-endian `u64`s that grew a header is exactly this: every old
+    ///   file is still a valid new file, and it restores as nonsense. No
+    ///   frame can see that, because seeing it would mean parsing the payload.
+    ///
+    /// The frame closes the version question. It cannot close this one, and
+    /// pretending otherwise would be worse than saying so.
+    const VERSION: u32;
+
     /// The bytes to store.
     ///
     /// Call this **inside a turn**, where `&mut self` is exclusive. That is what
     /// makes the result a consistent point rather than a torn read.
     fn snapshot(&self) -> Vec<u8>;
 
-    /// Rebuild from bytes this type wrote earlier.
+    /// Rebuild from bytes this type wrote at [`VERSION`](Self::VERSION).
+    ///
+    /// Never called with bytes from another version: the loader has already
+    /// refused a newer snapshot and walked an older one forward, so what
+    /// arrives here is always this revision's own shape.
     ///
     /// # Errors
     ///
-    /// [`RestoreError`] when the bytes were written by a different version of
-    /// this type. There is no migration here, and pretending otherwise would be
-    /// worse than saying so.
+    /// [`RestoreError::Malformed`], which is this trait's only channel. The
+    /// other variants are the loader's verdicts about provenance, and an
+    /// implementation that could construct them could lie about it.
     fn restore(bytes: &[u8]) -> std::result::Result<Self, RestoreError>;
+
+    /// ONE step: `from` to `from + 1`.
+    ///
+    /// The loader walks the chain, so a v1 author never learns that v4 exists
+    /// and a v4 author writes one arm rather than three. "Migrate from any
+    /// older version" is the alternative, and it makes every implementor
+    /// re-implement every earlier hop forever.
+    ///
+    /// Return `Ok(None)` for a hop this type does not have. That is a fact
+    /// about the type and not an error: whether a gap is fatal depends on which
+    /// version is on disk, which only the loader knows, and it reports
+    /// [`RestoreError::NoMigration`].
+    ///
+    /// **Required, not defaulted.** A defaulted body saves one line for a v1
+    /// author and lets a v3 author forget the hop and still compile, which is
+    /// the trade this trait refuses.
+    ///
+    /// ```
+    /// # use keylink_persist::{Durable, RestoreError};
+    /// # struct Ledger;
+    /// # impl Ledger {
+    /// #     fn total_of(_: &[u8]) -> Vec<u8> { Vec::new() }
+    /// #     fn count_of(_: &[u8]) -> Vec<u8> { Vec::new() }
+    /// # }
+    /// # impl Durable for Ledger {
+    /// # const VERSION: u32 = 3;
+    /// # fn snapshot(&self) -> Vec<u8> { Vec::new() }
+    /// # fn restore(_: &[u8]) -> Result<Self, RestoreError> { Ok(Self) }
+    /// fn migrate(from: u32, bytes: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> {
+    ///     Ok(match from {
+    ///         1 => Some(Ledger::total_of(bytes)),
+    ///         2 => Some(Ledger::count_of(bytes)),
+    ///         _ => None,
+    ///     })
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`RestoreError::Malformed`] when the bytes are not readable as version
+    /// `from`. A hop that simply does not exist is `Ok(None)`, not an error.
+    fn migrate(from: u32, bytes: &[u8]) -> std::result::Result<Option<Vec<u8>>, RestoreError>;
 }
 
-/// What a state reports when it cannot read its own stored bytes.
+/// Why a stored snapshot did not become a state.
+///
+/// Three of these are the **loader's** verdicts about provenance, and their
+/// variants are `#[non_exhaustive]` so that only this crate can construct them.
+/// A [`Durable::restore`] that could return `FromTheFuture` could claim a
+/// version comparison it never made. [`Malformed`](Self::Malformed) stays
+/// constructible; it is the implementor's channel and the only one it needs.
 #[derive(Debug, thiserror::Error)]
-#[error("the stored snapshot could not be restored: {0}")]
-pub struct RestoreError(pub String);
+#[non_exhaustive]
+pub enum RestoreError {
+    /// The stored bytes are not a frame this build can read.
+    ///
+    /// **A snapshot written before this crate framed anything lands here**, and
+    /// that is the whole reason the frame carries a magic. Without one, an
+    /// unframed file would be read as header-plus-payload and restore
+    /// successfully with garbage.
+    #[error("the stored bytes are not a snapshot frame this build can read: {fault}")]
+    #[non_exhaustive]
+    NotAFrame {
+        /// Which header check refused it.
+        fault: versioned::FrameFault,
+    },
+
+    /// The snapshot was written by a newer build than this one.
+    ///
+    /// Refused, and the stored bytes are left exactly as they were. The
+    /// tempting alternative is to read the fields this build knows and drop the
+    /// rest, which discards whatever the newer build added and then writes the
+    /// truncation back over it.
+    #[error("the snapshot is version {stored} and this build understands {ours}")]
+    #[non_exhaustive]
+    FromTheFuture {
+        /// The version stamped in the frame.
+        stored: u32,
+        /// [`Durable::VERSION`] of the type being loaded.
+        ours: u32,
+    },
+
+    /// The migration chain has a gap: [`Durable::migrate`] has no hop from
+    /// `from` to `from + 1`, and the loader will not jump over it.
+    #[error("no migration from version {from}")]
+    #[non_exhaustive]
+    NoMigration {
+        /// The missing hop's starting version.
+        from: u32,
+    },
+
+    /// What a [`Durable`] reports about bytes it cannot read.
+    #[error("the stored snapshot could not be restored: {0}")]
+    Malformed(String),
+}
 
 // ──────────────────────────────────────────────────────────────── the name
 
@@ -268,14 +416,32 @@ pub enum Error {
         id: StateId,
     },
 
-    /// A snapshot larger than the adapter will store.
-    #[error("the snapshot is {len} bytes and the limit is {limit}")]
+    /// More bytes than the adapter will store.
+    ///
+    /// The field is named `offered` rather than `len` because of what it counts
+    /// after framing. A limit applies to what reaches the adapter, and what
+    /// reaches the adapter through
+    /// [`Versioned::store`](versioned::Versioned::store) is the payload **plus**
+    /// [`versioned::FRAME_LEN`] bytes of header. So a caller who handed over
+    /// exactly `limit` bytes of snapshot is refused with a number twelve larger
+    /// than the one they passed, and the alternative — reporting the payload
+    /// length against a limit that includes the header — would print
+    /// `120 bytes, limit 128` beside a refusal.
+    ///
+    /// The honest fix is for the number to say which number it is. Headroom for
+    /// a payload is `limit - versioned::FRAME_LEN`.
+    #[error("the store was offered {offered} bytes and the limit is {limit}")]
     TooLarge {
-        /// What was offered.
-        len: u64,
+        /// What reached the adapter: the payload, plus the frame when there was
+        /// one.
+        offered: u64,
         /// The cap.
         limit: u64,
     },
+
+    /// Stored bytes that did not become a state.
+    #[error(transparent)]
+    Restore(#[from] RestoreError),
 
     /// The underlying store failed.
     #[error("the snapshot store failed: {0}")]

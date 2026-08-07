@@ -949,3 +949,34 @@ offer. An unkeyed caller pays the cost §2.6 describes, unchanged.
 
 Found by a review of this branch rather than by the implementation, which had
 written §13.3 the wrong way round and would have shipped it.
+
+---
+
+## 14. Revision 6 — `keylink-persist` does add something, and it is not `revision`
+
+§10 says *"`keylink-persist` adds nothing, because `Durable::revision` is cut."*
+Issue #3's wave 4c makes the first half stale. The second half stands.
+
+`keylink-persist` now has `Durable::VERSION`, `Durable::migrate`, a
+`RestoreError` enum in place of the newtype, and
+`versioned::Versioned` — a wrapper that owns a claim and is the only thing that
+writes a twelve-byte header in front of a snapshot.
+
+**This is not `revision` re-derived**, and the distinction is the reason §4.2
+cut it. `revision` was a per-instance counter whose job was to *skip a store*,
+and it was cut because nothing connects a mutation to a bump: an impl that
+forgets one disables durability completely with every test still green. `VERSION`
+is an associated `const` on the type, it skips nothing, and every store writes.
+Forgetting to bump it cannot silence a store; it fails closed at the *next* load
+as an unparseable `restore`, which the constant's own documentation states in as
+many words. The failure mode §4.2 refused — a guard that moves rather than one
+that is deleted — is absent, because there is no guard to move.
+
+**§4.2 step 3 still reads `self.claim.store(&bytes).await`.** A `Saver` built
+today holds a `Versioned<C>` and calls `store::<A>(&bytes)`, which frames the
+same bytes and takes the same `&mut self`. Nothing else in §4.2 changes: the
+snapshot is still taken synchronously outside the future, `A: Sync` is still
+absent, and §5.3's argument from `Claim::store(&mut self)` on a non-`Sync` claim
+is untouched — `Versioned` owns the claim and inherits both properties. A
+compile-time probe in `keylink-persist/src/representability.rs` now pins the
+`Send + 'static` half of that, which §5.3 previously only asserted in prose.

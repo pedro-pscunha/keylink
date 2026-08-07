@@ -12,7 +12,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink::Caller;
-use keylink_persist::{file::Files, Claim, Durable, RestoreError, Snapshots, StateId};
+use keylink_persist::versioned::Versioned;
+use keylink_persist::{file::Files, Durable, RestoreError, Snapshots, StateId};
 
 keylink::service! {
     service Ledger;
@@ -45,13 +46,15 @@ impl ledger::Actor for Ledger {
 /// the point here is that the encoding is the state's own decision and the port
 /// never looks inside.
 impl Durable for Ledger {
+    const VERSION: u32 = 1;
+
     fn snapshot(&self) -> Vec<u8> {
         self.entries.iter().flat_map(|n| n.to_le_bytes()).collect()
     }
 
     fn restore(bytes: &[u8]) -> Result<Self, RestoreError> {
         if !bytes.len().is_multiple_of(8) {
-            return Err(RestoreError(format!(
+            return Err(RestoreError::Malformed(format!(
                 "a ledger is whole u64s, and this is {} bytes",
                 bytes.len()
             )));
@@ -62,6 +65,11 @@ impl Durable for Ledger {
                 .map(|c| u64::from_le_bytes(c.try_into().expect("chunks_exact(8)")))
                 .collect(),
         })
+    }
+
+    /// Version 1 is the first, so there is no older version to come from.
+    fn migrate(_from: u32, _bytes: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> {
+        Ok(None)
     }
 }
 
@@ -89,13 +97,16 @@ impl Drop for Scratch {
 /// explicit. That is deliberate: a durability policy woven into every turn is a
 /// bigger change than a port, and this proves the port first.
 async fn run(files: &Files, id: &StateId, entries: &[u64]) -> Vec<u64> {
-    let mut claim = files.claim(id).await.expect("claims");
+    // The claim moves into the wrapper and there is no way back out to it, so
+    // nothing below this line can write a snapshot without a version stamp.
+    let mut durable = Versioned::new(files.claim(id).await.expect("claims"));
 
-    let state = match claim.load().await.expect("loads") {
-        Some(bytes) => Ledger::restore(&bytes).expect("restores"),
-        // The first ever run. No file, no state, no ceremony.
-        None => Ledger::default(),
-    };
+    // The first ever run is `None`. No file, no state, no ceremony.
+    let state = durable
+        .load::<Ledger>()
+        .await
+        .expect("loads")
+        .unwrap_or_default();
 
     let ledger = ledger::actor(state);
     for entry in entries {
@@ -104,7 +115,7 @@ async fn run(files: &Files, id: &StateId, entries: &[u64]) -> Vec<u64> {
 
     // Between turns, so it cannot see a half-applied one.
     let bytes = ledger.with_state(Ledger::snapshot).await.expect("running");
-    claim.store(&bytes).await.expect("stores");
+    durable.store::<Ledger>(&bytes).await.expect("stores");
 
     let seen = ledger.entries().await.expect("running");
     ledger.stop().await;
