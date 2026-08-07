@@ -1495,6 +1495,13 @@ async fn a_peer_whose_factory_panicked_is_told_the_actor_is_gone() {
 /// `run_loop`'s floor immediately after it is armed. Watched: `a peer whose actor
 /// died in its own feed must not be told it is serving: Remote(Failed("dropped:
 /// the actor is serving and this reply was never answered"))`.
+///
+/// **Disarming and not deleting**, as for the factory twin above: `run_loop` has a
+/// `floor.disarm()` of its own at the settle, so deleting the declaration leaves
+/// it with nothing to name and the break becomes `error[E0425]: cannot find value
+/// floor`. That is the compiler catching it rather than the test. This note was in
+/// the factory guard's record and not in this one, and the two are the same
+/// hazard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_whose_feed_panicked_is_told_the_actor_is_gone() {
     let server_node = local_node().await;
