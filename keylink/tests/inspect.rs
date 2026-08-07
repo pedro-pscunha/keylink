@@ -643,6 +643,81 @@ async fn a_page_reports_the_events_the_sink_dropped_before_they_were_sequenced()
     );
 }
 
+/// **Dropping the system takes its actors with it, even while a console is
+/// watching.**
+///
+/// `Inspector` erases a `System<M>` to a closure, which is what lets one console
+/// answer for a system of any service, and the erasure is documented as narrow:
+/// no mount, no shutdown, no abort, no downcast. It was narrow in **capability**
+/// and not in **lifetime** — the closure captured a `System` *clone*, so the
+/// inspect actor owned the registry and a program that dropped its own system
+/// went on running every actor in it. `spawn_sweeper` was already `Weak` for
+/// exactly this reason, which is what made the strong reference here the odd one
+/// out rather than a considered choice.
+///
+/// The feed's sender is held throughout, so the only thing that ends these
+/// actors is the system going away.
+///
+/// Red-tested with `scripts/break-once.sh`, replacing
+/// `let actors = system.weak_status();` with the strong closure it replaced:
+/// `let actors = { let system = system.clone(); move || Some(system.status()) };`.
+/// Watched to fail in five seconds on `a dropped system must take its actors
+/// with it`, printing the row still listed.
+#[tokio::test]
+async fn dropping_the_system_takes_its_actors_with_it_even_while_a_console_watches() {
+    let serving = local_node().await;
+    let (events, stream) = Events::new(depth(8));
+    let system: journal::System = journal::System::builder(Eviction::Never)
+        .lifecycle(events.clone())
+        .build();
+    let inspector = inspect::actor_wired(
+        Inspector::new(&system, &serving, &events, depth(8)),
+        vec![],
+        inspect::Feeds::new(stream),
+    );
+
+    let (_ticks, from) = mpsc::channel(1);
+    system
+        .mount(
+            id("obra/0"),
+            journal::spawn_wired(Journal::default(), vec![], journal::Feeds::new(feed(from))),
+        )
+        .expect("the id is free");
+    assert_eq!(
+        inspector
+            .actors()
+            .await
+            .expect("the inspect actor is running")
+            .len(),
+        1,
+        "mounted, and the console can see it"
+    );
+
+    drop(system);
+
+    let gone = tokio::time::timeout(REFUSAL, async {
+        loop {
+            let rows = inspector
+                .actors()
+                .await
+                .expect("the inspect actor is running");
+            if rows.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        gone.is_ok(),
+        "a dropped system must take its actors with it: {:?}",
+        inspector
+            .actors()
+            .await
+            .expect("the inspect actor is running")
+    );
+}
+
 /// **The `Inspector` does not hold its own feed open.**
 ///
 /// `EventStream`'s documentation says its `None` — every [`Events`] clone gone —
