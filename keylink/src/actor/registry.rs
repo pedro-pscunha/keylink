@@ -2053,6 +2053,26 @@ mod tests {
     /// arm left this green. That arm is only reached when two messages to one new
     /// id race between the read lock and the write lock — the second `route` here
     /// finds the actor on `touch`'s fast path and never reaches the match at all.
+    ///
+    /// **That arm cannot be reached by a test from outside this module, and the
+    /// lock order is why.** Reaching it needs the loser to miss `touch` *before*
+    /// the winner takes the write lock. The obvious way to arrange that is a
+    /// factory that blocks, since the factory runs under the write lock — but a
+    /// winner holding the write lock also blocks the loser's `self.read()`, so by
+    /// the time the loser can call `touch` the entry is in and it takes the fast
+    /// path. Every ordering a caller can impose from outside collapses to the
+    /// fast path; the arm needs a seam *between* `touch` and `self.write()`,
+    /// which production code does not have and should not grow for a test. A
+    /// probabilistic version — thirty routes and hope — would exercise the arm
+    /// sometimes and pass either way, which is the vacuous shape this file spends
+    /// its length objecting to.
+    ///
+    /// What holds it instead: the arm is four lines, it clones a sender and
+    /// stamps `last_seen`, and it is the only arm that does not announce. If it
+    /// ever needs a real guard, the seam to add is a `#[cfg(test)]` hook after
+    /// `touch` — recorded here so the next reader does not re-derive why the
+    /// straightforward test does not work.
+    ///
     /// So the "a second route is not a second mount" claim below is carried by
     /// the fast path, and the race arm is covered by argument rather than by this
     /// test.

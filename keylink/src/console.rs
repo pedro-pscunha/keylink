@@ -805,10 +805,27 @@ impl Inspector {
             .collect();
         // The oldest sequence still held, against the first one this caller had
         // not seen. `saturating_sub` is the caller who is not behind at all.
-        let oldest = self.log.front().map_or(0, |(seq, _)| *seq);
+        //
+        // `front()` is `Some` under this function's precondition: `after <
+        // self.seq` means `record` has run, and `record` never leaves the log
+        // empty. The `None` arm is therefore dead — and it is written as the
+        // *conservative* answer rather than a default, because the obvious
+        // default is a lie. An empty log with a live sequence means everything
+        // this caller had not seen is gone, so reporting `lost: 0` — "nothing
+        // was missed" — would be wrong in exactly the state that made it
+        // reachable. A dead branch still has to say something true if it is ever
+        // woken.
+        let lost = match self.log.front() {
+            Some((oldest, _)) => oldest.saturating_sub(after + 1),
+            None => self.seq.saturating_sub(after),
+        };
+        debug_assert!(
+            !self.log.is_empty(),
+            "page_after's precondition is after < seq, which implies a non-empty log"
+        );
         EventPage {
             next: self.seq,
-            lost: oldest.saturating_sub(after + 1),
+            lost,
             dropped: self.dropped.load(Ordering::Relaxed),
             events,
         }

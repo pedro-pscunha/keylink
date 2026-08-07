@@ -285,6 +285,20 @@ That is effectively-once for one `rpc`. Here is what it does not cover.
 2. **The ledger is memory.** It dies with the process, and a restarted service
    runs a retried call again. `keylink-persist` makes an actor's *state* durable
    and does nothing for the ledger. keylink has no journal and this is not one.
+
+   **Durable state makes this sharper, not milder.** While nothing survived a
+   restart, re-running a retried call was *correct* — a fresh process had a fresh
+   state. It is not correct any more. A process that fsyncs turn *n*, records the
+   reply in the in-memory ledger, and dies before the frame reaches the peer will,
+   on restart, load a state that already contains *n*, find an empty ledger, and
+   run *n* again. The state is durable and the record that would have suppressed
+   the repeat is not.
+
+   So **effectively-once is a property of one process's lifetime, not of a key.**
+   Across a restart the guarantee is at-least-once, and a handler that is not
+   idempotent against its own committed state will double-apply. This is the real
+   distance to a journalled system, and it is one sentence rather than a caveat
+   you can tune away.
 3. **A record answers for 600 s.** That is `RECORD_TTL`, alongside volume bounds
    of `MAX_RECORDS` — 1024 entries — and `MAX_RECORDED_BYTES` — 1 MiB of held
    reply. Past any of them the reply is dropped and the retry is *refused* as
