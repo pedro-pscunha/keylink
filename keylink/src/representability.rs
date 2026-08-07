@@ -1,26 +1,34 @@
 //! Compile-time proof for the claims that say a state cannot be represented.
 //!
 //! keylink asserts, in prose, several things of the form "there is no way to do
-//! X". The loudest is on [`Sealed`](crate::Sealed): *"There is no way to read
-//! these bytes... **Do not** add `bytes()`, `peek()`, `len()`... Any of them
-//! reopens the hole."*
+//! X". The loudest today is on [`Origin`](crate::Origin): *"**Do not derive
+//! `Clone`.** Two messages sharing one progress marker means one of them records
+//! a reply it never produced."*
 //!
 //! That is a comment asking a future author to be careful. This module asks the
 //! compiler instead. Nothing here runs; the proof is that it compiles.
 //!
-//! # Two probes, because one cannot see everything
+//! # Three probes, because one cannot see everything
 //!
 //! **An inherent method outranks a trait method.** So a trait whose default
 //! method returns a marker type is a probe: while the type has no inherent
 //! method of that name, the call resolves to the trait and the marker checks
-//! out. Add `pub fn bytes(&self) -> &[u8]` and the call resolves to the inherent
-//! method, whose return type is not the marker, and this module stops compiling.
+//! out. Add `pub fn as_mut(&mut self) -> &mut [u8]` and the call resolves to the
+//! inherent method, whose return type is not the marker, and this module stops
+//! compiling.
 //!
 //! **A trait impl is invisible to name resolution**, so it needs coherence
-//! instead. A blanket `impl<T: Deref> Marker for T` beside a concrete
-//! `impl Marker for Sealed` overlaps exactly when `Sealed: Deref`, and an
+//! instead. A blanket `impl<T: Clone> Marker for T` beside a concrete
+//! `impl Marker for Origin` overlaps exactly when `Origin: Clone`, and an
 //! overlap is `E0119`. The concrete impl therefore compiles only while the trait
 //! is absent.
+//!
+//! **Some claims are positive**, and those are written as ordinary code that
+//! has to type-check. "A per-service actor system cannot hold another service's
+//! actor" is one: the annotated mount below compiles only while the two are the
+//! same service. It is deliberately NOT a `compile_fail` doctest — see
+//! [`a_system_mounts_only_its_own_services_actors`] for why that tool cannot
+//! state this claim at all.
 //!
 //! Shadowing also reads a **receiver** rather than a name, and the last probe in
 //! this file is that shape. Give one type an inherent `&mut self` method beside
@@ -43,8 +51,8 @@
 //! negatively about a foreign type:
 //!
 //! ```text
-//! note: upstream crates may add a new impl of trait `std::ops::Deref`
-//!       for type `keylink::Sealed` in future versions
+//! note: upstream crates may add a new impl of trait `std::clone::Clone`
+//!       for type `keylink::Origin` in future versions
 //! ```
 //!
 //! Which is the correct answer to the question an integration test asks. The
@@ -61,12 +69,12 @@
 #![cfg(test)]
 #![allow(dead_code, reason = "the proof is that this module compiles")]
 
-use std::ops::{Deref, DerefMut};
+use std::ops::DerefMut;
 
 use crate::{
-    ActorId, Admission, Admittance, AdmittedPeer, Allowlist, BlobId, DynamicAdmission, Eviction,
-    IdempotencyKey, LocalActor, MailboxClosed, Observer, ProvenPeer, Retention, Sealed, TurnFut,
-    TurnInfo,
+    ActorId, Admission, Admittance, AdmittedPeer, Allowlist, BlobId, Caller, DynamicAdmission,
+    Eviction, IdempotencyKey, LocalActor, MailboxClosed, MountError, Observer, Origin, ProvenPeer,
+    Retention, TurnFut, TurnInfo,
 };
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
@@ -74,72 +82,181 @@ use crate::{
 /// than a silent pass.
 struct NoSuchMethod;
 
-// ─────────────────────────────────────────── Sealed: no inherent way to read it
+// ─────────────────────────────────── Origin is not Clone, and must never be
 
-/// Every name here is one an author would reach for when adding "just a quick
-/// accessor" to [`Sealed`](crate::Sealed).
+/// The claim, and it is the sharpest one in the crate: **[`Origin`] is not
+/// `Clone`.**
 ///
-/// The type exists so that payload bytes cannot be read before their schema hash
-/// is checked, and `Sealed::open` is meant to be the only route from bytes to a
-/// typed message. Each of these would be a second route.
-trait SealedHasNoAccessor {
-    fn bytes(&self) -> NoSuchMethod {
+/// `Origin::Peer` owns a [`Context`](crate::Context), whose `progress` field is
+/// an `Arc<AtomicU8>` that its own `Clone` shares deliberately — that sharing is
+/// what lets a turn running on the actor's task report back to the accept task
+/// that dispatched it. `Progress::reached()` is what decides whether an
+/// idempotency key is **recorded** or **released**.
+///
+/// So two mailbox messages carrying clones of one context would share one
+/// marker whose bits are `fetch_or` and never cleared: the one that reached
+/// `COMPLETED` would make the other read `Reached::Completed` and record a reply
+/// it never produced. At-most-once, answered wrongly, silently, on the wire.
+///
+/// The delivery path works by **ownership** — the context is taken by value and
+/// moved into the message — so nothing needs `Clone` and nothing ever should.
+/// An earlier draft of RFC-07 §1.6 justified the design with "since `Context` is
+/// `Clone`", which is why this probe exists rather than a sentence: the wrong
+/// justification was already written down once.
+///
+/// The break: add `#[derive(Clone)]` to `Origin` in `actor/remote.rs`. This
+/// impl then overlaps the blanket one and it is `E0119: conflicting
+/// implementations`.
+trait OriginIsNotClone {}
+impl<T: Clone> OriginIsNotClone for T {}
+impl OriginIsNotClone for Origin {}
+
+/// The other half, which coherence cannot see: no inherent method hands out a
+/// second `Origin` either. `Clone` is the obvious spelling; these are what an
+/// author reaches for when the derive is refused and the need feels real.
+trait OriginHasNoDuplicator {
+    fn duplicate(&self) -> NoSuchMethod {
         NoSuchMethod
     }
-    fn peek(&self) -> NoSuchMethod {
+    fn copy(&self) -> NoSuchMethod {
         NoSuchMethod
     }
-    fn len(&self) -> NoSuchMethod {
-        NoSuchMethod
-    }
-    fn as_slice(&self) -> NoSuchMethod {
-        NoSuchMethod
-    }
-    fn as_bytes(&self) -> NoSuchMethod {
-        NoSuchMethod
-    }
-    fn payload(&self) -> NoSuchMethod {
-        NoSuchMethod
-    }
-    fn into_inner(self) -> NoSuchMethod
-    where
-        Self: Sized,
-    {
+    fn to_owned(&self) -> NoSuchMethod {
         NoSuchMethod
     }
 }
 
-impl SealedHasNoAccessor for Sealed {}
+impl OriginHasNoDuplicator for Origin {}
 
-fn sealed_cannot_be_read(sealed: Sealed) {
-    let _: NoSuchMethod = sealed.bytes();
-    let _: NoSuchMethod = sealed.peek();
-    let _: NoSuchMethod = sealed.len();
-    let _: NoSuchMethod = sealed.as_slice();
-    let _: NoSuchMethod = sealed.as_bytes();
-    let _: NoSuchMethod = sealed.payload();
-    let _: NoSuchMethod = sealed.into_inner();
+fn an_origin_cannot_be_duplicated(origin: Origin) {
+    let _: NoSuchMethod = origin.duplicate();
+    let _: NoSuchMethod = origin.copy();
+    let _: NoSuchMethod = origin.to_owned();
+    // And the one thing it IS for: a borrowed caller, for one turn.
+    let _: Caller<'_> = origin.caller();
 }
 
-// ──────────────────────────────────────────── Sealed: no trait way out either
+// ─────────────────────── a per-service system holds only its own service
 
-/// The accessor probes above genuinely cannot see a `Deref`. A trait method on
-/// `Self` outranks a deref step, so they would keep resolving to the trait and
-/// stay green while `sealed.len()` quietly started working through `Vec<u8>`.
+// Two methods each and not one, which is about the macro rather than about the
+// probe: a `service!` with a single rpc generates an `into_<rpc>` whose
+// catch-all arm is `unreachable_patterns`. No downstream service reports it —
+// rustc suppresses the lint inside an external macro's expansion, which is the
+// same asymmetry `macros.rs` records about `double_must_use` — but keylink
+// expanding its own macro is not external to itself, and the lib test build
+// denies warnings. `tests/actor_memory.rs` declares exactly one rpc and stays
+// green for that reason.
+crate::service! {
+    service Alpha;
+    rpc Ping(n: u64) -> u64;
+    rpc Pong(n: u64) -> u64;
+}
+
+crate::service! {
+    service Beta;
+    rpc Ping(n: u64) -> u64;
+    rpc Pong(n: u64) -> u64;
+}
+
+/// Deliberately identical to [`BetaState`] in every way but the trait it
+/// implements. Two services with the same shape are the case that matters: if
+/// the separation came from the message *shape* rather than from the service,
+/// two services that happen to agree would be interchangeable.
+struct AlphaState;
+
+impl alpha::Actor for AlphaState {
+    async fn ping(&mut self, _cx: Caller<'_>, n: u64) -> u64 {
+        n
+    }
+    async fn pong(&mut self, _cx: Caller<'_>, n: u64) -> u64 {
+        n
+    }
+}
+
+struct BetaState;
+
+impl beta::Actor for BetaState {
+    async fn ping(&mut self, _cx: Caller<'_>, n: u64) -> u64 {
+        n
+    }
+    async fn pong(&mut self, _cx: Caller<'_>, n: u64) -> u64 {
+        n
+    }
+}
+
+/// The keyed and singleton contracts of one service must not collide, or a node
+/// could not serve both — [`ConfigError::DuplicateAlpn`](crate::ConfigError) is
+/// what a collision would become, at startup, on a tree where nothing looked
+/// wrong.
 ///
-/// Each of these is a route from a `Sealed` to its bytes that skips
-/// `Sealed::open`, which is the one thing the type exists to prevent.
-trait SealedDoesNotDeref {}
-impl<T: Deref> SealedDoesNotDeref for T {}
-impl SealedDoesNotDeref for Sealed {}
+/// And `alpha` must not agree with `beta`, which is the property that makes an
+/// ALPN a contract identifier at all. Both are runtime assertions rather than
+/// probes, because the values exist and there is nothing to be unable to
+/// represent.
+#[test]
+fn a_services_two_alpns_differ_from_each_other_and_from_another_services() {
+    assert_ne!(alpha::alpn(), alpha::keyed_alpn());
+    assert_ne!(alpha::keyed_alpn(), beta::keyed_alpn());
+    assert_ne!(alpha::alpn(), beta::alpn());
+    assert!(
+        String::from_utf8_lossy(alpha::keyed_alpn()).contains("/Alpha/keyed/"),
+        "the keyed ALPN says which of the two it is without anyone hashing anything"
+    );
+}
 
-trait SealedIsNotBorrowable {}
-impl<T: AsRef<[u8]>> SealedIsNotBorrowable for T {}
-impl SealedIsNotBorrowable for Sealed {}
+/// The claim the whole keyed rewrite rests on: **a per-service `System`
+/// physically cannot hold another service's actor**, so the mismatch is
+/// unrepresentable rather than refused at run time on the serving node.
+///
+/// # Why this is positive code and not a `compile_fail` doctest
+///
+/// Because `compile_fail` cannot state it. **rustdoc ignores the error code**: a
+/// doctest annotated `compile_fail,E0308` that in fact fails with `E0425`
+/// (a typo in an identifier) or `E0282` (an inference failure) passes green and
+/// silently, so the annotation asserts only "something went wrong somewhere".
+/// `trybuild` is the one tool that matches stderr, and this module's header
+/// explains why it is refused. So the claim is written the only way a compiler
+/// can be made to check it: as code that must type-check, whose types are
+/// annotated rather than inferred.
+///
+/// The annotations are the assertion. `let mounted: alpha::Mounted` pins the
+/// generated alias, so this stays a statement about `alpha`'s system rather than
+/// about whatever inference happened to pick.
+///
+/// The break, executed by hand rather than described: swap `alpha::spawn` for
+/// `beta::spawn` below. Observed —
+///
+/// ```text
+/// error[E0308]: mismatched types
+///    |     let mounted: alpha::Mounted = beta::spawn(BetaState);
+///    |                  --------------   ^^^^^^^^^^^^^^^^^^^^^^ expected `Mounted<Mail<alpha::Request, alpha::Response>>`,
+///    |                                                           found `Mounted<Mail<beta::Request, beta::Response>>`
+/// ```
+///
+/// # What this does NOT prove
+///
+/// It proves **mount** safety, not ALPN-**pairing** safety.
+/// `ServiceBuilder::new(alpn: &'static [u8], ..)` takes the ALPN as an untyped
+/// slice, so nothing at the type level stops `alpha`'s dispatch from being
+/// registered under `beta`'s ALPN. What prevents that is the generated pairing —
+/// `alpha::keyed_service` is the only thing that calls `alpha::keyed_alpn()` —
+/// and a hand-written registration could still get it wrong. Saying so is the
+/// difference between a probe and a claim about a probe.
+fn a_system_mounts_only_its_own_services_actors(
+    system: &alpha::System,
+    id: ActorId,
+) -> Result<(), MountError> {
+    let mounted: alpha::Mounted = alpha::spawn(AlphaState);
+    system.mount(id, mounted)
+}
 
-trait SealedIsNotUnwrappable {}
-impl<T: Into<Vec<u8>>> SealedIsNotUnwrappable for T {}
-impl SealedIsNotUnwrappable for Sealed {}
+/// The same property from the builder's side, so a future `System` that lost
+/// its parameter would break here too rather than only above.
+fn a_system_is_built_at_one_services_mail() -> beta::System {
+    beta::System::builder(Eviction::Never)
+        .capacity(beta::SystemBuilder::DEFAULT_CAPACITY)
+        .build()
+}
 
 // ───────────────────────────────────────────────── fail-closed has no `Default`
 

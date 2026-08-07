@@ -525,31 +525,20 @@ impl Blobs {
 /// This is what keeps the store out of `Dispatch`, `Next` and `Context`: the
 /// address travels back on the reply that already exists rather than the store
 /// travelling down through every middleware.
+///
+/// # It used to have a second, dishonest implementor
+///
+/// A keyed actor system answered with an opaque `ActorReply` — a `Vec<u8>` the
+/// system never decoded — so its `Granting` impl returned `None` under an
+/// eighteen-line comment explaining that the address was genuinely out of reach.
+/// The consequence was `blob` having no actor-handle method at all: an address
+/// handed out that way was granted by nobody and refused on fetch.
+///
+/// A keyed actor answers with the service's own `Response` now, so the generated
+/// impl below is the only one, it is honest, and `blob` works on a keyed actor.
 pub trait Granting {
     /// The content this reply names, if it names any.
     fn granted(&self) -> Option<BlobId>;
-}
-
-/// The actor system's outer reply hands out no address of its own.
-///
-/// **This is RFC-01 §11.2a's question, answered by measurement rather than
-/// assumption.** `ActorReply` is a `Vec<u8>` the system never decodes: the
-/// per-actor `Response` — `BlobId` and all — rides inside it, sealed, and is
-/// refused before decoding unless the declared schema hash matches. So the
-/// address genuinely does sit in the per-actor payload schema rather than in
-/// the envelope, which is exactly the property that makes a `BlobId` arriving
-/// this way trustworthy.
-///
-/// It has a consequence, and it is why `blob` has no actor client method:
-/// `serve_one` reads the grant off this reply, and this reply cannot see one.
-/// Recording it would need the store inside the actor's own dispatch, which
-/// lives in `actor.rs` and is RFC-04's to reconcile. Until then the `blob` kind
-/// is reachable through the ordinary client and not through an actor handle —
-/// absent rather than broken.
-impl Granting for crate::ActorReply {
-    fn granted(&self) -> Option<BlobId> {
-        None
-    }
 }
 
 // ─────────────────────────────────────────────────────────────── the mount

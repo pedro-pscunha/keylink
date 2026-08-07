@@ -39,10 +39,20 @@ pub trait Rpc {
     /// Which actor this request addresses, for a request that names one.
     ///
     /// `None` for an ordinary service, where the whole handler is the address.
-    /// Overridden by [`ActorRequest`](crate::ActorRequest), so that a layer can
-    /// apply a per-actor rule before dispatch — which is the rule an actor
-    /// system can still enforce from outside, now that the method name is
-    /// inside the sealed payload.
+    /// Overridden by [`Addressed`](crate::Addressed), which is what a keyed
+    /// request arrives inside, so that a layer can apply a **per-actor** rule
+    /// before dispatch.
+    ///
+    /// This method survived a proposal to delete it, and the reversal is worth
+    /// recording because the reason it was written down is no longer the reason
+    /// it is here. It used to be the *only* thing a layer could discriminate on
+    /// over a keyed system: the method name lived inside a sealed payload no
+    /// layer could read before a hash check, so [`Self::method`] answered the
+    /// constant `"Message"` and a per-method rule was impossible. A keyed
+    /// request is typed now and `method` reports the real name, so this is no
+    /// longer a consolation prize — it is the *other* axis, and a per-actor rule
+    /// is a thing a caller genuinely wants beside a per-method one. Three lines
+    /// with a default beat a permanent fleet-wide wire tax.
     fn actor(&self) -> Option<&ActorId> {
         None
     }
@@ -262,9 +272,12 @@ impl Context {
 
     /// The method being called.
     ///
-    /// For an actor system this is not the actor's own method: that name lives
-    /// inside the sealed payload and is unreadable until the schema check has
-    /// passed. Use [`Self::actor`] for a rule at this layer.
+    /// For a keyed actor this **is** the actor's own method, the same name a
+    /// singleton reports, because a keyed request is
+    /// [`Addressed<Request>`](crate::Addressed) and its
+    /// [`Rpc::method`] delegates inward. It answered the constant `"Message"`
+    /// for every keyed call while the payload was opaque bytes, which is what
+    /// made per-method middleware and per-method authorization impossible there.
     pub fn method(&self) -> &'static str {
         self.method
     }

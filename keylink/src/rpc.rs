@@ -114,7 +114,13 @@ impl<Req, Resp> std::fmt::Debug for RpcService<Req, Resp> {
 /// Deliberately has no `Running` arm. Whether a caller waits for a call already
 /// in flight is decided in [`claim_key`], so nothing downstream of it has to
 /// remember that the question exists.
-enum Keyed {
+///
+/// It was called `Keyed`, which is a name this crate needs for something else
+/// entirely — a keyed actor is one addressed by an [`ActorId`](crate::ActorId),
+/// and this is about an idempotency key. Two unrelated keys, one word, one
+/// crate. Renamed at the root rather than worked around at the call sites that
+/// meet the other meaning.
+enum Claimed {
     /// No key was sent. Nothing to record and nothing to release.
     None,
     /// The key is ours for this call. Settle it when the chain returns.
@@ -128,12 +134,12 @@ enum Keyed {
 /// Map a settled claim, treating "still running" as the refusal it has always
 /// been. Reached only by a caller that did not ask to attach, or one whose
 /// budget ran out — and `InFlight` is the truth in both cases.
-fn resolve(claim: Claim) -> Keyed {
+fn resolve(claim: Claim) -> Claimed {
     match claim {
-        Claim::Fresh(guard) => Keyed::Run(guard),
-        Claim::Replay(frame) => Keyed::Replay(frame),
-        Claim::Refused(refusal) => Keyed::Refuse(refusal),
-        Claim::Running(_) => Keyed::Refuse(IdempotencyRefusal::InFlight.into()),
+        Claim::Fresh(guard) => Claimed::Run(guard),
+        Claim::Replay(frame) => Claimed::Replay(frame),
+        Claim::Refused(refusal) => Claimed::Refuse(refusal),
+        Claim::Running(_) => Claimed::Refuse(IdempotencyRefusal::InFlight.into()),
     }
 }
 
@@ -163,12 +169,12 @@ fn resolve(claim: Claim) -> Keyed {
 /// bound neither it nor the stream pair it keeps open. It takes a `Waiting` from
 /// the ledger instead, refused **before** it parks and given back by `Drop` —
 /// because the ordinary way a waiter stops waiting is that this task is aborted.
-async fn claim_key(ledger: &Arc<Ledger>, peer: EndpointId, idem: Option<Idempotency>) -> Keyed {
+async fn claim_key(ledger: &Arc<Ledger>, peer: EndpointId, idem: Option<Idempotency>) -> Claimed {
     let Some(idem) = idem else {
-        return Keyed::None;
+        return Claimed::None;
     };
     if let Err(error) = idem.key().validate() {
-        return Keyed::Refuse(IdempotencyRefusal::Malformed(error.to_string()).into());
+        return Claimed::Refuse(IdempotencyRefusal::Malformed(error.to_string()).into());
     }
     let key = idem.key().clone();
 
@@ -177,14 +183,14 @@ async fn claim_key(ledger: &Arc<Ledger>, peer: EndpointId, idem: Option<Idempote
         settled => return resolve(settled),
     };
     let Some(budget) = idem.attach_budget() else {
-        return Keyed::Refuse(IdempotencyRefusal::InFlight.into());
+        return Claimed::Refuse(IdempotencyRefusal::InFlight.into());
     };
     // Taken before anything parks, and held to the end of this function so it
     // covers the wait AND the re-claim after it. A caller that is not going to
     // wait never reaches here, so it never spends a place.
     let _waiting = match ledger.wait(peer) {
         Ok(waiting) => waiting,
-        Err(refusal) => return Keyed::Refuse(refusal),
+        Err(refusal) => return Claimed::Refuse(refusal),
     };
 
     let notified = notify.notified();
@@ -199,7 +205,7 @@ async fn claim_key(ledger: &Arc<Ledger>, peer: EndpointId, idem: Option<Idempote
         settled => return resolve(settled),
     }
     if n0_future::time::timeout(budget, notified).await.is_err() {
-        return Keyed::Refuse(IdempotencyRefusal::InFlight.into());
+        return Claimed::Refuse(IdempotencyRefusal::InFlight.into());
     }
     resolve(ledger.claim(peer, key))
 }
@@ -352,13 +358,13 @@ where
     // property: the only way back from a claimed key to a vacant one is a
     // release, and a release happens exactly when nothing ran.
     let keyed = match claim_key(&ledger, peer, request.idempotency).await {
-        Keyed::None => None,
+        Claimed::None => None,
         // The guard watches the marker, so this task being ABORTED — the
         // connection ended, the server shut down — still settles honestly, even
         // though `Drop` is then the only code left running.
-        Keyed::Run(guard) => Some(guard.watching(progress.clone())),
-        Keyed::Replay(frame) => return replay(&mut send, frame).await,
-        Keyed::Refuse(refusal) => return refuse::<Resp>(&mut send, refusal).await,
+        Claimed::Run(guard) => Some(guard.watching(progress.clone())),
+        Claimed::Replay(frame) => return replay(&mut send, frame).await,
+        Claimed::Refuse(refusal) => return refuse::<Resp>(&mut send, refusal).await,
     };
 
     let (outcome, body) = next(cx, message, BodyReader::new(frames, request.body_len)).await;
@@ -556,11 +562,11 @@ mod tests {
         // Exhaustive, with no catch-all: the arm that would hide a regression
         // here is the one nobody thought to name.
         let refused = match keyed {
-            Keyed::Refuse(RemoteError::Idempotency(refusal)) => refusal,
-            Keyed::Refuse(other) => panic!("expected an idempotency refusal, got {other:?}"),
-            Keyed::None => panic!("expected a refusal, got no key at all"),
-            Keyed::Run(_) => panic!("expected a refusal, got the key"),
-            Keyed::Replay(_) => panic!("expected a refusal, got a replay"),
+            Claimed::Refuse(RemoteError::Idempotency(refusal)) => refusal,
+            Claimed::Refuse(other) => panic!("expected an idempotency refusal, got {other:?}"),
+            Claimed::None => panic!("expected a refusal, got no key at all"),
+            Claimed::Run(_) => panic!("expected a refusal, got the key"),
+            Claimed::Replay(_) => panic!("expected a refusal, got a replay"),
         };
         assert_eq!(
             refused,

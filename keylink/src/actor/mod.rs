@@ -77,7 +77,8 @@
 //! That decision produced two answers to two unrelated questions, and they were
 //! written as one file. [`registry`] answers **which actor**: a keyed map of
 //! tasks, a cap, and an eviction clock. [`remote`] answers **what a message is
-//! made of**: an ALPN, an envelope, and a payload nobody may read early.
+//! made of**: the wrapper that names an actor, where a message came from, and
+//! the walk to a mailbox slot.
 //!
 //! Neither needs the other to be understood, and only one of them needs a
 //! network. That is the argument for the seam, and the type parameter `M` is
@@ -97,4 +98,4 @@ mod registry;
 mod remote;
 
 pub use registry::{mount, Eviction, Mailbox, MountError, Mounted, System, SystemBuilder};
-pub use remote::{actor_schema, ActorClient, ActorReply, ActorRequest, Mail, Sealed};
+pub use remote::{deliver_to_actor, Addressed, Answer, KeyedService, Mail, Origin};

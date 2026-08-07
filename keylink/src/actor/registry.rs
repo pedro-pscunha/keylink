@@ -10,32 +10,37 @@
 //!
 //! RFC-04 §16.8 prices the crate split at six items and is the list of record.
 //! An earlier list of three was wrong in three ways, which is what a bill kept
-//! in two places costs; the four items that live in this file are:
+//! in two places costs. **Two of the four items that lived here are now gone,**
+//! not because the split happened but because the wave that made every actor
+//! system per-service removed the reason for them:
 //!
-//! - four type-parameter defaults — `System<M = Mail>`, `SystemBuilder<M = Mail>`,
-//!   `Mounted<M = Mail>`, `Mailbox<M = Mail>` — because `keylink::System`
-//!   written with no parameter has to go on meaning what it always meant, and a
-//!   default is the only way to say that;
-//! - `impl SystemBuilder<Mail>`, which exists for one associated constant,
-//!   because a default applies in type position and not in expression position;
+//! - ~~four type-parameter defaults — `System<M = Mail>` and its three
+//!   relatives~~ — gone. A default existed so that `keylink::System` written
+//!   with no parameter went on meaning what it always meant. There is no such
+//!   spelling any more: a system is `inventory::System`, a generated alias that
+//!   applies `M` itself, so there is nothing left for a default to rescue.
+//! - ~~`impl SystemBuilder<Mail>`, for one associated constant~~ — gone with
+//!   them. Its own doc called it a compatibility shim; `DEFAULT_CAPACITY` now
+//!   sits on the generic impl where the cap always belonged, and every call site
+//!   reaches it through a fully applied alias.
 //! - three intra-doc links to `RemoteError`, a `reply.rs` type. Prose rather
 //!   than a code path, but an intra-doc link across a crate boundary still
-//!   needs a Cargo dependency to resolve;
+//!   needs a Cargo dependency to resolve.
 //! - the seam itself: `RouteError` and `route` are `pub(super)` here, and
 //!   across a crate boundary a within-module courtesy has to become a designed
 //!   public interface.
 //!
 //! `rg 'super::|crate::' registry.rs` is the check that keeps that list honest.
-//! It returns seven lines: this one, the two imports, the three doc links, and
-//! the tests module's glob. Nothing in this file can name a type from the
-//! transport half except through an import or a qualified path, so a new one
-//! cannot arrive without adding a line to that output. `rg 'Mail'` is NOT that
-//! check and never was — it cannot see `RemoteError` at all, which is how three
-//! links to a wire type got in under a header claiming nothing else was there.
+//! Nothing in this file can name a type from the transport half except through
+//! an import or a qualified path, so a new one cannot arrive without adding a
+//! line to that output. `rg 'Mail'` is NOT that check and never was — it cannot
+//! see `RemoteError` at all, which is how three links to a wire type got in
+//! under a header claiming nothing else was there.
 //!
-//! The glob is the one hole, because it puts [`Mail`] in scope inside the tests
-//! without a line of its own. Running every test at a type that is not `Mail` is
-//! what covers it.
+//! **This file no longer names the transport half at all.** There is no `use
+//! super::remote::..` line in it, which is a stronger statement than any list:
+//! the tests below run at a witness type with no derives, and they are the only
+//! instantiation this file knows about.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -48,7 +53,6 @@ use n0_future::task::JoinHandle;
 use n0_future::time::Instant;
 use tokio::sync::mpsc;
 
-use super::remote::Mail;
 use crate::ActorId;
 
 /// Messages that may wait ahead of the one being handled.
@@ -85,22 +89,24 @@ const MAILBOX: usize = 1;
 ///
 /// A `tokio::sync::mpsc` channel allocates its first block of 32 slots eagerly,
 /// so a mailbox costs `32 * size_of::<M>()` whatever its capacity is, and the
-/// capacity is 1. At ten thousand idle actors, measured on this machine
-/// against the message type of the day:
+/// capacity is 1. At ten thousand idle actors, re-measured on this machine after
+/// the message type became per-service, against a service with one `u64`
+/// argument — the smallest case there is:
 ///
 /// | slot type  | per idle actor | ten thousand |
 /// |------------|----------------|--------------|
-/// | `Box<M>`   | 1,684 bytes    | 16.8 MB      |
-/// | `M`        | 9,620 bytes    | 96.2 MB      |
+/// | `Box<M>`   | 1,671 bytes    | 16.7 MB      |
+/// | `M`        | 8,839 bytes    | 88.4 MB      |
 ///
-/// The 7,936 byte difference is the block: that `M` was 256 bytes, so 32 of
-/// them is 8,192, against 256 for 32 pointers. The cost of boxing is one
-/// allocation per message, on a path that already allocates.
+/// The 7,168 byte difference is the block: that `M` is 232 bytes, so 32 of them
+/// is 7,424, against 256 for 32 pointers. The cost of boxing is one allocation
+/// per message, on a path that already allocates.
 ///
-/// The pressure gets *worse* as `M` grows, and `M` is the caller's to grow: a
-/// per-service message is sized to its largest request plus a reply channel, so
-/// the slot stops being service-independent. The box is what keeps the
-/// ten-thousand-actor budget a statement about keylink rather than about
+/// **The pressure gets worse as `M` grows, and `M` is the caller's to grow.** A
+/// per-service message is sized to its largest request plus a reply channel of
+/// its largest response, so the slot stops being service-independent and the
+/// figures above are a floor rather than a typical case. The box is what keeps
+/// the ten-thousand-actor budget a statement about keylink rather than about
 /// whoever wrote the service.
 ///
 /// Only the boxed row is reported by `tests/actor_memory.rs`; the unboxed row is
@@ -110,32 +116,34 @@ const MAILBOX: usize = 1;
 /// table except the boxed one was wrong for months, under a sentence claiming
 /// the whole thing was measured.
 #[doc(hidden)]
-pub type Mailbox<M = Mail> = mpsc::Receiver<Box<M>>;
+pub type Mailbox<M> = mpsc::Receiver<Box<M>>;
 
-/// A live actor: the task, its mailbox, and the schema it accepts.
+/// A live actor: its task and its mailbox.
 ///
 /// Produced by the generated `spawn` and handed to [`System::mount`] or
 /// returned from a factory. Opaque on purpose: the registry owns the pairing of
-/// a hash with a mailbox, and nothing else may take them apart.
+/// a task with the sender that reaches it, and nothing else may take them apart.
 ///
-/// `M` is the message the mailbox carries, defaulted to [`Mail`], which is the
-/// only supported instantiation. See [`System`] for why it is a parameter at all
-/// and why choosing your own gets you nothing.
-pub struct Mounted<M = Mail> {
-    schema: u64,
+/// It used to carry a third thing, a schema hash, because one node-wide system
+/// held actors of unrelated services and something had to tell them apart. A
+/// system is per-service now, so the hash has nothing left to discriminate and
+/// the comparison it fed is unrepresentable rather than refused.
+///
+/// `M` is the message the mailbox carries. See [`System`] for what a registry is
+/// allowed to know about it, which is nothing.
+pub struct Mounted<M> {
     mail: mpsc::Sender<Box<M>>,
     task: JoinHandle<()>,
 }
 
 /// Hand-written for the same reason as [`System`]'s, and it was derived by
 /// mistake: `derive(Debug)` writes `impl<M: Debug> Debug`, which would make
-/// printing a handle depend on a message type nobody prints. None of the three
-/// fields needs it — a `u64`, an `mpsc::Sender` whose own `Debug` is
-/// unconditional, and a `JoinHandle<()>`.
+/// printing a handle depend on a message type nobody prints. Neither field needs
+/// it — an `mpsc::Sender` whose own `Debug` is unconditional, and a
+/// `JoinHandle<()>`.
 impl<M> fmt::Debug for Mounted<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Mounted")
-            .field("schema", &self.schema)
             .field("mail", &self.mail)
             .field("task", &self.task)
             .finish()
@@ -146,42 +154,37 @@ impl<M> fmt::Debug for Mounted<M> {
 ///
 /// Called by the generated `spawn`, which supplies the loop.
 ///
-/// # The mailbox must be named, and it did not used to be
+/// # The mailbox must be named
 ///
-/// A function's type parameter cannot carry a default — only a type's can — so
-/// the `M = Mail` that keeps `System` and [`Mounted`] spelled the way they
-/// always were does not reach this signature. `Mailbox` was a concrete alias
-/// before the registry became generic, which left the closure's argument fully
-/// determined; now `M` is free, and an unannotated closure is
-/// `error[E0282]: type annotations needed`, pointed at the closure's parameter
+/// A function's type parameter cannot carry a default — only a type's can — and
+/// there are no defaults left to inherit anyway, so `M` is inferred and the only
+/// thing here to infer it from is the closure's own argument. An unannotated
+/// closure is `error[E0282]: type annotations needed`, pointed at the parameter
 /// — or at the binding, as `Mounted<_>`, if the handle is bound before it is
 /// used:
 ///
 /// ```compile_fail
-/// keylink::mount(1, |mut inbox| async move { while inbox.recv().await.is_some() {} });
+/// keylink::mount(|mut inbox| async move { while inbox.recv().await.is_some() {} });
 /// ```
 ///
-/// Naming the mailbox is the whole fix, and the generated `spawn` annotates the
-/// closure with the defaulted `Mailbox` alias every time — which is why the
-/// break reached no caller, and why nothing in the tree noticed it happening:
-///
-/// ```no_run
-/// keylink::mount(1, |mut inbox: keylink::Mailbox| async move {
-///     while inbox.recv().await.is_some() {}
-/// });
-/// ```
+/// That hazard is unchanged by the per-service rewrite and it is worth being
+/// exact about why, because the wave that removed the type defaults was expected
+/// to remove this too. It did not: `mount` is generic in a *function* parameter,
+/// a function generic cannot carry a default, and a generated alias applies `M`
+/// in type position where this signature has none. The generated `spawn`
+/// annotates the closure with its own `Mailbox` alias every time, which is why
+/// the break reaches no caller.
 ///
 /// # Panics
 ///
 /// Panics when called outside a tokio runtime, like every other spawn.
 #[doc(hidden)]
-pub fn mount<M, F>(schema: u64, run: impl FnOnce(Mailbox<M>) -> F) -> Mounted<M>
+pub fn mount<M, F>(run: impl FnOnce(Mailbox<M>) -> F) -> Mounted<M>
 where
     F: Future<Output = ()> + Send + 'static,
 {
     let (mail, inbox) = mpsc::channel(MAILBOX);
     Mounted {
-        schema,
         mail,
         task: n0_future::task::spawn(run(inbox)),
     }
@@ -275,7 +278,6 @@ pub(super) enum RouteError {
 }
 
 struct Entry<M> {
-    schema: u64,
     mail: mpsc::Sender<Box<M>>,
     task: JoinHandle<()>,
     /// Milliseconds since the registry's epoch, as of the last message routed
@@ -321,7 +323,7 @@ impl<M> Registry<M> {
     }
 
     /// Find the actor, spawning it if the system was given a factory.
-    fn route(&self, id: &ActorId) -> std::result::Result<(u64, mpsc::Sender<Box<M>>), RouteError> {
+    fn route(&self, id: &ActorId) -> std::result::Result<mpsc::Sender<Box<M>>, RouteError> {
         if let Some(found) = self.touch(&self.read(), id) {
             return Ok(found);
         }
@@ -343,7 +345,7 @@ impl<M> Registry<M> {
         let Some(mounted) = factory(id) else {
             return Err(RouteError::NoSuchActor { id: id.clone() });
         };
-        let found = (mounted.schema, mounted.mail.clone());
+        let found = mounted.mail.clone();
         entries.insert(id.clone(), self.entry(mounted));
         Ok(found)
     }
@@ -352,15 +354,14 @@ impl<M> Registry<M> {
         &self,
         entries: &HashMap<ActorId, Entry<M>>,
         id: &ActorId,
-    ) -> Option<(u64, mpsc::Sender<Box<M>>)> {
+    ) -> Option<mpsc::Sender<Box<M>>> {
         let entry = entries.get(id)?;
         entry.last_seen.store(self.now(), Ordering::Relaxed);
-        Some((entry.schema, entry.mail.clone()))
+        Some(entry.mail.clone())
     }
 
     fn entry(&self, mounted: Mounted<M>) -> Entry<M> {
         Entry {
-            schema: mounted.schema,
             mail: mounted.mail,
             task: mounted.task,
             last_seen: AtomicU64::new(self.now()),
@@ -388,33 +389,34 @@ impl<M> Registry<M> {
 ///
 /// Cheap to clone: every clone names the same registry.
 ///
-/// `M` is what a mailbox carries, defaulted to [`Mail`] so that `System` still
-/// means what it always did at every call site. It is a parameter because
-/// everything here — the map, the cap, the eviction clock, the lifecycle — is
-/// about *which* actor and never about what a message is made of. Naming
-/// [`Mail`] in these fields would put a QUIC stream and a postcard payload
-/// inside the one half of this module that has no business knowing either, and
-/// no import list would show it.
+/// `M` is what a mailbox carries, and it is a parameter because everything here
+/// — the map, the cap, the eviction clock, the lifecycle — is about *which*
+/// actor and never about what a message is made of. Naming a message type in
+/// these fields would put a QUIC stream and a postcard payload inside the one
+/// half of this module that has no business knowing either, and no import list
+/// would show it.
 ///
-/// **[`Mail`] is the only supported `M`.** The parameter is an implementation
-/// detail carrying a compatibility default, and it would be `#[doc(hidden)]` if
-/// Rust could hide a type parameter; it cannot, so this sentence is the only
-/// place the constraint can live. `System<YourType>` does compile, and there is
-/// no way to deliver a message to anything in it: every path that reaches an
-/// actor is either an inherent method on `System<Mail>` (`service`, `alpn`) or
-/// crate-private (`route`), and [`Mounted`] keeps its sender to itself. What you
-/// get is a map you can mount into, count, stop and evict, and never send to.
-/// The tests in this file are the exception that proves it — they are inside the
-/// crate, so they can call `route`, and RFC-04 §16.8 expects these defaults to
-/// go when the crate splits.
+/// **There is no default, and there used to be.** One system per node held
+/// actors of unrelated services, so `keylink::System` written bare had to mean
+/// something and a type-parameter default was the only way to say it. A system
+/// is per-service now: `M` is that service's own mailbox type, `inventory::Mail`,
+/// and a caller writes the generated `inventory::System` alias rather than this
+/// type. That is not tidying — a per-service registry **physically cannot hold**
+/// an actor of another service, so mounting the wrong one is `E0308` at the call
+/// site instead of a schema comparison at run time on the serving node.
 ///
-/// # `error[E0283]: type annotations needed`
+/// `System<YourOwnType>` still compiles, and there is still no way to deliver a
+/// message to anything in it: `route` is `pub(super)` and [`Mounted`] keeps its
+/// sender to itself. What you get is a map you can mount into, count, stop and
+/// evict, and never send to. The tests in this file are the exception that
+/// proves it — they are inside the crate, so they can call `route`.
 ///
-/// The default does not rescue every call site, and this is where somebody who
-/// has just met that error is looking. A default applies in **type position**,
-/// so there has to be a type position for it to apply in — and a `let` that
-/// binds what [`build`](SystemBuilder::build) returns without naming its type
-/// is not one:
+/// # `error[E0282]: type annotations needed`
+///
+/// This is where somebody who has just met that error is looking. `M` has to
+/// come from somewhere, and a `let` that binds what
+/// [`build`](SystemBuilder::build) returns without naming its type gives it
+/// nowhere to come from:
 ///
 /// ```compile_fail
 /// let system = keylink::System::builder(keylink::Eviction::Never).build();
@@ -430,33 +432,29 @@ impl<M> Registry<M> {
 /// [`evict_idle`](Self::evict_idle), [`stop`](Self::stop) and
 /// [`abort`](Self::abort) never mention `M`, so none of them pins it.
 ///
-/// `compile_fail` says only that it failed, and writing `compile_fail,E0283`
-/// would not pin the code — rustdoc accepts a bogus `E0999` there and reports
-/// the doctest as passing. That the failure is `E0283` and not something else
-/// is checked by lifting the tag and reading the error, which is a thing a
-/// person does, not the harness.
+/// `compile_fail` says only that it failed, and writing `compile_fail,E0282`
+/// would not pin the code — **rustdoc ignores the error code entirely**, so a
+/// doctest tagged with one error and failing with another reports as passing.
+/// That the failure is the one described is checked by lifting the tag and
+/// reading the error, which is a thing a person does, not the harness.
 ///
-/// Name the type and it compiles. That is the whole fix:
+/// Name the service's own system and it compiles, which is what every real call
+/// site does anyway:
 ///
-/// ```
-/// use keylink::{Eviction, System};
-/// let system: System = System::builder(Eviction::Never).build();
+/// ```ignore
+/// let system: inventory::System = inventory::System::builder(Eviction::Never).build();
 /// assert!(system.is_empty());
 /// ```
 ///
-/// Most code never meets it, because it pins `M` without trying: `service` and
-/// `alpn` exist only on `System<Mail>`, and `mount(id, journal::spawn(..))`
-/// pins it through [`Mounted`]. Moving `builder` to `impl System<Mail>` would
-/// fix it outright, by inherent-method probing, and is declined: it puts a
-/// registry concern into the transport half at the one point this module is
-/// arranged to keep them apart.
-pub struct System<M = Mail> {
+/// Most code never meets it, because `mount(id, inventory::spawn(..))` pins `M`
+/// through [`Mounted`] without anybody trying.
+pub struct System<M> {
     inner: Arc<Registry<M>>,
 }
 
-/// Hand-written, because the derive would bound the impl on `M: Clone` — and
-/// [`Mail`], which owns a `oneshot::Sender` and a stream, is not. A clone here
-/// is a clone of the `Arc` and never of a message.
+/// Hand-written, because the derive would bound the impl on `M: Clone` — and a
+/// mailbox message, which owns a reply channel and a stream, is not. A clone
+/// here is a clone of the `Arc` and never of a message.
 ///
 /// The derive does not fail where it is written, either: `self.clone()` in
 /// `dispatch` would quietly resolve to `Clone` on the *reference* and surface
@@ -520,7 +518,7 @@ impl<M> System<M> {
     pub(super) fn route(
         &self,
         id: &ActorId,
-    ) -> std::result::Result<(u64, mpsc::Sender<Box<M>>), RouteError> {
+    ) -> std::result::Result<mpsc::Sender<Box<M>>, RouteError> {
         self.inner.route(id)
     }
 
@@ -605,9 +603,9 @@ impl<M> fmt::Debug for System<M> {
 
 /// Assembles a [`System`]: its eviction policy, its cap, and how it spawns.
 ///
-/// `M` is the system's message type, defaulted to [`Mail`] exactly as on
-/// [`System`], and supported at [`Mail`] alone for the reason given there.
-pub struct SystemBuilder<M = Mail> {
+/// `M` is the system's message type, exactly as on [`System`], and it has no
+/// default for the same reason.
+pub struct SystemBuilder<M> {
     capacity: usize,
     eviction: Eviction,
     factory: Option<Factory<M>>,
@@ -617,27 +615,22 @@ pub struct SystemBuilder<M = Mail> {
 /// is the public name and carries the reasoning for the number.
 const DEFAULT_CAPACITY: usize = 10_000;
 
-/// The one item a defaulted type parameter could not carry.
-///
-/// A default applies in type position and not in expression position, so a
-/// `DEFAULT_CAPACITY` on `impl<M> SystemBuilder<M>` leaves `M` uninferrable and
-/// `SystemBuilder::DEFAULT_CAPACITY` stops compiling at every call site that
-/// ever named it. Pinning one instantiation is what makes that path resolve
-/// again.
-///
-/// The cap is registry policy and has nothing to do with [`Mail`], so this
-/// block is a compatibility shim and not a statement about where the constant
-/// belongs. It moves back to the generic impl — a breaking change, taken
-/// deliberately — the day `SystemBuilder` and [`Mail`] stop sharing a crate.
-impl SystemBuilder<Mail> {
+impl<M> SystemBuilder<M> {
     /// The cap a system has when none is named.
     ///
     /// Ten thousand live actors was the number the design was costed against,
     /// so it is the number a system holds before it starts refusing.
+    ///
+    /// This lived on `impl SystemBuilder<Mail>` for one release, under a doc
+    /// comment calling itself a compatibility shim: a type-parameter default
+    /// applies in type position and not in expression position, so a constant on
+    /// the generic impl left `M` uninferrable at every call site that named it.
+    /// The defaults are gone and a caller reaches this through a generated,
+    /// fully applied alias — `inventory::SystemBuilder::DEFAULT_CAPACITY` — so
+    /// the constant is back where the cap belongs, on every instantiation at
+    /// once.
     pub const DEFAULT_CAPACITY: usize = self::DEFAULT_CAPACITY;
-}
 
-impl<M> SystemBuilder<M> {
     /// Build an actor on the first message addressed to an unmounted id.
     ///
     /// Without this, a message to an unmounted id is
@@ -733,11 +726,11 @@ mod tests {
     //! assertion.
     //!
     //! The header above claims this half places no requirement on what a mailbox
-    //! carries. Run against [`Mail`] — which is what `Mounted` means when nobody
-    //! says otherwise — that claim is an argument, because `Mail` satisfies any
-    //! bound one of these types might quietly grow. So the witness is a type
-    //! that satisfies as little as a witness can, and `mount`, `route`, `stop`
-    //! and `build` all appear here at it: a bound on any of the four stops this
+    //! carries. Run against a real per-service message type, that claim is an
+    //! argument rather than a proof, because a real one satisfies any bound one
+    //! of these types might quietly grow. So the witness is a type that
+    //! satisfies as little as a witness can, and `mount`, `route`, `stop` and
+    //! `build` all appear here at it: a bound on any of the four stops this
     //! binary from compiling.
     //!
     //! **`()` was the witness first, and it was the wrong one.** It is not
@@ -747,13 +740,14 @@ mod tests {
     //! encoding needs. Measured, not argued: with `M: Debug` on `build`, the
     //! whole crate passed — 18 `test result: ok` lines, 0 failures.
     //!
-    //! What the `Mail`-typed binaries cover is worth being exact about, because
-    //! it is most of the real cover: `Mail` is not `Serialize`, so a serde bound
-    //! on `build` fails `tests/api.rs`, `tests/actors.rs`, `tests/blobs.rs` and
-    //! `tests/actor_memory.rs` with no help from here — also measured. What they
-    //! cannot catch is a bound `Mail` happens to satisfy, and `Debug` is one,
-    //! because `Mail` derives it. That gap is what a witness with no derives at
-    //! all closes.
+    //! What the integration-test binaries cover is worth being exact about,
+    //! because it is most of the real cover: a per-service mailbox message is
+    //! not `Serialize`, so a serde bound on `build` fails `tests/api.rs`,
+    //! `tests/actors.rs`, `tests/blobs.rs` and `tests/actor_memory.rs` with no
+    //! help from here — also measured. What they cannot catch is a bound a real
+    //! message happens to satisfy, and `Debug` is one, because
+    //! `remote.rs` writes one by hand. That gap is what a witness with no
+    //! derives at all closes.
     //!
     //! Nothing here needs a message to *be* anything, which is the same point
     //! from the other side: mounting, the cap, eviction, routing and the
@@ -775,9 +769,7 @@ mod tests {
     /// An actor that does nothing at all, for testing the registry rather than
     /// any message it carries.
     fn idler() -> Mounted<Bare> {
-        mount(1, |mut inbox: Mailbox<Bare>| async move {
-            while inbox.recv().await.is_some() {}
-        })
+        mount(|mut inbox: Mailbox<Bare>| async move { while inbox.recv().await.is_some() {} })
     }
 
     /// Printing a handle must not depend on what its mailbox carries, which a

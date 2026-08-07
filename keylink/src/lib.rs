@@ -154,8 +154,8 @@ mod watch;
 mod wire;
 
 pub use actor::{
-    actor_schema, mount, ActorClient, ActorReply, ActorRequest, Eviction, Mail, Mailbox,
-    MountError, Mounted, Sealed, System, SystemBuilder,
+    deliver_to_actor, mount, Addressed, Answer, Eviction, KeyedService, Mail, Mailbox, MountError,
+    Mounted, Origin, System, SystemBuilder,
 };
 pub use admission::{Admission, Admittance, DynamicAdmission, Revocable, Revocation};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
@@ -170,7 +170,7 @@ pub use idempotency::{
 pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use local::{LocalActor, MailboxClosed, Queued};
 pub use middleware::{Caller, Context, Middleware, Next, QueueTimeout, Queueing, Rpc, Timeout};
-pub use node::{derive_alpn, schema_hash, Node};
+pub use node::{derive_alpn, Node};
 pub use observe::{Ended, Observer, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome};
 pub use panic::{catching, guarded, Panic};
 pub use peer::{Dial, Peer};

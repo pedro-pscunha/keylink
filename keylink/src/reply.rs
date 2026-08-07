@@ -30,6 +30,27 @@ use crate::{IdempotencyKey, KeyState};
 ///
 /// Constructed by handlers and by [`Middleware`](crate::Middleware). The caller
 /// receives it as [`crate::Error::Remote`].
+///
+/// # One variant was removed, and it moved every ALPN in the fleet
+///
+/// `ActorSchemaMismatch { ours, theirs }` sat fifth of six, and it said "the
+/// actor exists, and you built its message against different types". It had to
+/// exist while one system-wide ALPN carried every actor on a node: the handshake
+/// could only prove agreement about an envelope, so per-actor drift was caught
+/// inside it.
+///
+/// A keyed system is per-service now. Its ALPN hashes
+/// `Envelope<WireRequest<Addressed<Request>>>`, so drift is refused at the
+/// handshake exactly as it is for a singleton, and a `System` of one service
+/// physically cannot hold an actor of another. There is nothing left for the
+/// variant to report.
+///
+/// Removing it renumbered [`Failed`](Self::Failed) from index 5 to 4. This enum
+/// is inside every service's hashed contract — `Envelope<WireResponse<Response>>`
+/// reaches `Outcome::Err(RemoteError)` — so that renumbering is **wire-visible
+/// for every service, singletons included**, and it is meant to be: a peer built
+/// against the old numbering would decode `Failed("disk full")` as a variant
+/// that no longer exists. Refusing it at the handshake is the correct outcome.
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, postcard_schema::Schema, thiserror::Error,
 )]
@@ -62,21 +83,6 @@ pub enum RemoteError {
     NoSuchActor {
         /// The id that was addressed.
         id: String,
-    },
-
-    /// The actor exists, and the caller built its message against different
-    /// types.
-    ///
-    /// The payload was dropped without being decoded. This is the in-envelope
-    /// counterpart of [`crate::Error::SchemaMismatch`], one layer down: an
-    /// actor system carries every actor's messages behind one ALPN, so the
-    /// handshake cannot see per-actor drift and this variant is what does.
-    #[error("actor message schema mismatch: ours is {ours:016x}, theirs is {theirs:016x}")]
-    ActorSchemaMismatch {
-        /// The hash of the type the actor is mounted with.
-        ours: u64,
-        /// The hash the caller declared.
-        theirs: u64,
     },
 
     /// Anything else the serving side wants to report.
