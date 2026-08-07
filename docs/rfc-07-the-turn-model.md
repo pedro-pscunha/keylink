@@ -3479,8 +3479,7 @@ comment. **Every one of them replays**, which is not a claim this section could
 make at first: six recorded a literal the harness cannot find exactly once —
 usually because the record itself quotes it, so the count is two — and an
 unreplayable record is the one thing a record must not be. They are anchored on
-two lines now, and `scripts/replay-fate-breaks.sh` runs the whole set: twenty
-breaks, twenty non-zero exits, no aborts.
+two lines now, and `scripts/replay-fate-breaks.sh` runs the whole set.
 
 | guard | break |
 |---|---|
@@ -3502,6 +3501,15 @@ breaks, twenty non-zero exits, no aborts.
 | `supervision::a_peer_whose_feed_panicked_is_told_the_actor_is_gone` | `run_loop`'s floor disarmed before the loop |
 | `local::the_gone_answer_is_not_a_failed_and_carries_no_prefix` | `lost`'s `Gone` arm becomes a `Failed` |
 | `reply::the_four_prefixes_are_the_text_a_peer_matches_on` | `DROPPED` → `"lost: "` |
+| `local::a_supervisor_between_incarnations_is_gone_when_it_is_destroyed` | `supervise`'s floor disarmed at its declaration |
+| `local::a_transient_factory_failure_does_not_overwrite_a_pending_restart` | the floor moved back inside the loop body |
+
+`scripts/replay-fate-breaks.sh` runs all twenty-two and **exits non-zero if any of
+them stops reddening its guard** — which it did not do when this section first
+cited it: it hard-coded one developer's absolute path, and its helper swallowed
+every exit code, so it could neither check the tree it shipped in nor report
+anything. Both fixed, and the failure path is proved by execution rather than
+asserted: a deliberately no-op break reports `✗ NOT RED` and the script exits 1.
 
 **The ordering guard needs an in-drop observer, and that is a finding.** From
 outside the actor there is nothing to see: the whole teardown runs before any
@@ -3650,15 +3658,50 @@ vanish the task), which is a supervision-semantics decision with its own guards 
 write. The floor is correct under either and stays correct if they are caught
 later.
 
-**Two things fell out of building it, and both are recorded because they cost a
-guard.** A floor held for the whole of `supervise` fires on the normal give-up
-return too, writing the right answer a moment after the wrong one — which left two
-end-to-end guards green under the break they exist for. Hence per-iteration. And
-`LocalActor::abort`'s own settle became unreachable: no break of it can be made
-red, because the floor is strictly earlier in the same drop. **It is deleted.**
+**Where the floor goes took three attempts, and the two failures are the whole
+lesson.** The shape is: **one floor per scope, disarmed immediately before each
+way that scope returns, and nowhere else.**
+
+1. *Armed for the whole of `supervise`, never disarmed.* It fires on the normal
+   give-up return too, writing the right answer a moment after the wrong one — so
+   breaking `Lent::ending`'s give-up arm left two end-to-end guards **green**. A
+   floor that outlives what it guards launders a broken verdict.
+2. *Armed per loop iteration.* This fixed attributability and opened a hole at
+   each end of the iteration, both of them the **false** answer rather than the
+   merely less useful one §12.4 accepts:
+   - `continue` drops a loop-body local, so the **transient factory failure** — a
+     documented path, non-fatal `Stop` with budget left — dropped it armed and
+     wrote `Gone` over a live `Restarting`: *stop asking*, about an actor being
+     rebuilt.
+   - it was disarmed before `run_loop` and re-armed nowhere, so the **backoff
+     between incarnations** had no floor at all: an `abort` there left
+     `Restarting` standing for an actor that had been destroyed — *retry, another
+     is coming*, about nothing.
+3. *One floor for the function, disarmed only before each `return`.* Both windows
+   are covered because the floor is never dropped except on the way out, and
+   attributability holds because a disarm immediately precedes each return.
+
+**And `LocalActor::abort`'s settle was deleted, which was a defect of mine.** I
+judged it unreachable because no break could redden
+`an_aborted_actor_tells_a_peer_no_such_actor` — a test that aborts an actor
+sitting *inside* `run_loop`, where the floor genuinely is earlier. The line also
+covered the window where `run_loop` does not exist, and **that window had no
+guard**: twenty recorded breaks and not one touched it. The line was not
+unguardable, it was unguarded. `a_supervisor_between_incarnations_is_gone_when_it_is_destroyed`
+is the guard it never had, and the remedy is attempt 3 above rather than the line
+coming back — because with the floor armed across that window the line is
+genuinely unreddenable again, and a second writer nobody can hold to account is
+what got deleted in the first place.
+
+The general rule this pair yields, which is worth more than either fix: **a line
+is only "unreachable" for the windows the guard you checked actually enters.**
+"No break of this reddens any test" and "no break of this can redden any test" are
+different claims, and the first was mistaken for the second.
+
 `System::abort`'s and `drain`'s settles survive on a narrower claim than they were
 first documented with — they answer for a **hand-written** `mount` loop, which has
-no `run_loop` and therefore no floor, and their guards say so.
+no `run_loop` and therefore no floor. Their guards drive one for that reason, and
+both inline comments say so now.
 
 ### 12.12 Why this suite could not have caught it: one `multi_thread` in the whole tree
 
