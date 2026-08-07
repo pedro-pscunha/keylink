@@ -2083,6 +2083,7 @@ name = "keylink"
 version = "0.1.0"
 dependencies = [
  "bao-tree",
+ "blake3",
  "bytes",
  "iroh",
  "iroh-blobs",

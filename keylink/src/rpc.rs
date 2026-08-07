@@ -48,9 +48,9 @@ use crate::idempotency::{Claim, Guard, Keyable, Ledger, Records};
 use crate::middleware::{wrap, Reached};
 use crate::wire::FrameReader;
 use crate::{
-    wire, Admission, AdmittedPeer, Allowlist, BlobHandle, BlobId, Blobs, Body, BodyReader, Context,
-    Error, Granting, Idempotency, IdempotencyKey, IdempotencyRefusal, KeyState, Middleware, Next,
-    Node, Outcome, RemoteError, Result, Rpc, WireRequest, WireResponse,
+    wire, Admission, AdmittedPeer, Allowlist, BlobHandle, BlobId, Blobs, Body, BodyReader, CallId,
+    Context, Error, Granting, Idempotency, IdempotencyKey, IdempotencyRefusal, KeyState,
+    Middleware, Next, Node, Outcome, RemoteError, Result, Rpc, WireRequest, WireResponse,
 };
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -479,8 +479,21 @@ where
         WireRequest::Call(message) => message,
     };
 
-    let cx =
-        Context::new(peer, Req::SERVICE, message.method()).with_actor(message.actor().cloned());
+    // Named BEFORE the key is consumed below, and by reference rather than by
+    // clone: this is the one place both halves of the digest exist, exactly as it
+    // is the one place both halves of a blob grant do.
+    //
+    // Computed for a key that has not been validated yet, which is harmless and
+    // worth saying: `claim_key` refuses a malformed key before the chain is
+    // entered, so no handler ever sees a `CallId` derived from one.
+    let cx = Context::new(peer, Req::SERVICE, message.method())
+        .with_actor(message.actor().cloned())
+        .with_call(
+            request
+                .idempotency
+                .as_ref()
+                .map(|idem| CallId::of(peer, idem.key())),
+        );
     // Kept while the chain runs, because the chain's own `Outcome` cannot say
     // whether the work was entered — see `Reached`.
     let progress = cx.progress();

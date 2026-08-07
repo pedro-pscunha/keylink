@@ -189,6 +189,12 @@ mod admission;
 mod authz;
 mod blobs;
 mod body;
+// The name a keyed call has inside its own handler, and a set to hold what has
+// been applied under one. Its own module and not four items in `idempotency.rs`,
+// because nothing here is the ledger's: the ledger is what stops running a
+// duplicate for as long as the process lives, and this is what a caller's own
+// state does about the restart the ledger cannot cross.
+mod call;
 // A `pub mod` and not five root re-exports. The one thing these four share is an
 // argument about backpressure, and a module is where it can be written once
 // instead of five times. Its docs live in `compose/mod.rs`: an outer `///` here
@@ -238,6 +244,7 @@ pub use admission::{Admission, Admittance, DynamicAdmission, Revocable, Revocati
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
 pub use blobs::{BlobHandle, BlobId, Blobs, BlobsAdmission, Granting, Retention, MAX_GRANTS};
 pub use body::{Body, BodyReader};
+pub use call::{Applied, CallId, APPLIED_CAPACITY};
 pub use console::{
     Console, EndReason, EventPage, EventStream, Events, FollowRefused, Inspector, LifecycleEvent,
     NodeKey, NodeStatus, MAX_FOLLOWERS,

@@ -50,6 +50,20 @@ postcard-rpc = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 pastey = { workspace = true }
+# For one 16-byte digest: `CallId`, which folds the calling peer into the hash of
+# its idempotency key so a handler can dedupe a retry without being handed the
+# ledger's peer-scoping rule to re-implement.
+#
+# It adds an edge and not a crate. blake3 1.8.5 is already resolved here three
+# times over — `bao-tree`, `iroh` and `iroh-relay` all name it — so this changes
+# what keylink is allowed to call, not what it compiles. Check with
+# `cargo tree -i blake3`.
+#
+# `default-features = false` drops `std`, which this use does not need: a
+# `Hasher`, two `update`s and a fixed-size `finalize`. Whoever else in the graph
+# wants `std` asks for it themselves, and cargo unions the two. Declared rather
+# than inherited, for the reason the `tokio` line below says at length.
+blake3 = { version = "1", default-features = false }
 # `default-features = false` drops `fs-store` (redb, reflink-copy) and `rpc`
 # (noq). Both are what makes the default build small, and `rpc` is the one that
 # refuses `wasm32-unknown-unknown` outright, through mio. The `blobs-fs` feature
