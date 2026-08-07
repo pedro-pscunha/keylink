@@ -1,11 +1,23 @@
 //! What an idle actor costs, measured rather than asserted.
 //!
 //! One test in its own binary, because the measurement is a process-wide
-//! allocation counter and a second test running beside it would be noise.
+//! allocation counter and a second test running beside it would be noise. That
+//! is also why the two paths below are two **phases of one test** rather than two
+//! tests: cargo runs the tests in a binary on parallel threads, and `LIVE` is
+//! process-wide, so a second `#[test]` would measure this one's allocations as
+//! well as its own.
 //!
-//! The number this prints is the answer to "can one service hold ten thousand
-//! live actors": it is the framework's own cost per mounted actor, with an
-//! empty state, so a real deployment adds `size_of` its own state on top.
+//! The numbers this prints are the answer to "can one service hold ten thousand
+//! live actors": the framework's own cost per actor, with an empty state, so a
+//! real deployment adds `size_of` its own state on top.
+//!
+//! **There are two mailboxes and they are measured separately.** A keyed actor's
+//! mailbox is the registry's — `Mailbox<M> = mpsc::Receiver<Box<M>>`, boxed at the
+//! channel. A local actor's is [`LocalActor`](keylink::LocalActor)'s own, and it
+//! carries a second channel besides: the `watch` that answers `ended()`. Only the
+//! keyed one was measured here for months, which is exactly how a change to the
+//! local mailbox could have landed against a remembered number instead of a
+//! measured one.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -101,9 +113,40 @@ impl ledger::Actor for Empty {
 /// not to raise the literal until it passes.
 const BUDGET_PER_ACTOR: isize = 2048;
 
+/// The same ceiling, for an actor started with `ledger::actor(..)` instead of
+/// mounted in a [`System`](keylink::System).
+///
+/// A separate literal because a local actor pays for a different set of things
+/// and there is no honest way to fold them into one number. It has **two**
+/// channels — its mailbox, and the `watch` that carries
+/// [`Ended`](keylink::Ended) — and an `Arc<JoinHandle>`, and it has no registry
+/// entry, no [`ActorId`] and no `HashMap` slot.
+///
+/// The mailbox is where the two paths differ most, and it is why this number is
+/// recorded before anything moves rather than afterwards. A keyed mailbox slot is
+/// a `Box<M>`, so the eagerly allocated block of 32 is 256 bytes whatever the
+/// service is. A local mailbox slot is **not boxed**: today its message is a
+/// pointer-sized boxed closure and the block is small by accident of that shape,
+/// not by decision. Whatever the local slot becomes, it lands in this number, and
+/// this number was taken by measurement.
+///
+/// Measured on this machine, at ten thousand actors of the `ledger` service
+/// below, with an empty state:
+///
+/// | path | bytes per idle actor |
+/// |---|---|
+/// | keyed, mounted in a `System` | 1,671 |
+/// | local, `ledger::actor(..)`   | 1,725 |
+///
+/// The 54 byte difference is the second channel and the `Arc<JoinHandle>`,
+/// against the registry entry the keyed one pays for instead.
+const BUDGET_PER_LOCAL_ACTOR: isize = 2048;
+
 #[tokio::test]
 async fn ten_thousand_idle_actors_fit_in_the_budget() {
     const ACTORS: usize = 10_000;
+
+    // ── phase 1: keyed, mounted in a registry ────────────────────────────────
 
     let system: ledger::System = ledger::System::builder(Eviction::Never)
         .capacity(ACTORS)
@@ -142,12 +185,49 @@ async fn ten_thousand_idle_actors_fit_in_the_budget() {
     );
 
     assert_eq!(system.len(), ACTORS);
+
+    // ── phase 2: local, started with `actor()` ───────────────────────────────
+    //
+    // Sequential rather than a second `#[test]`, for the reason in the module
+    // header. The actors from phase 1 stay alive, which costs nothing here: the
+    // measurement is a delta.
+    //
+    // The `Vec` is reserved BEFORE the baseline is read, so its own block is not
+    // counted against the actors it holds. Phase 1 has no equivalent line because
+    // the registry's `HashMap` growth genuinely is part of what a mounted actor
+    // costs.
+    let mut handles: Vec<ledger::Handle<Empty>> = Vec::with_capacity(ACTORS);
+    settle().await;
+
+    let before_local = LIVE.load(Ordering::Relaxed);
+    for _ in 0..ACTORS {
+        handles.push(ledger::actor(Empty));
+    }
+    settle().await;
+    let after_local = LIVE.load(Ordering::Relaxed);
+
+    let total_local = after_local - before_local;
+    let each_local = total_local / ACTORS as isize;
+    println!("{ACTORS} idle LOCAL actors cost {total_local} bytes, {each_local} bytes each");
+
+    assert_eq!(handles.len(), ACTORS);
+    assert!(
+        handles.iter().all(ledger::Handle::is_running),
+        "a handle that already stopped is not an idle actor"
+    );
+
     assert!(
         each <= BUDGET_PER_ACTOR,
-        "an idle actor costs {each} bytes, over the {BUDGET_PER_ACTOR} byte budget \
+        "a keyed idle actor costs {each} bytes, over the {BUDGET_PER_ACTOR} byte budget \
          scoped to a ledger::Mail of {} bytes — read BUDGET_PER_ACTOR's \
          documentation before moving the literal",
         std::mem::size_of::<ledger::Mail>()
+    );
+    assert!(
+        each_local <= BUDGET_PER_LOCAL_ACTOR,
+        "a local idle actor costs {each_local} bytes, over the \
+         {BUDGET_PER_LOCAL_ACTOR} byte budget — read BUDGET_PER_LOCAL_ACTOR's \
+         documentation before moving the literal"
     );
 }
 
