@@ -4132,11 +4132,25 @@ mod tests {
     ///   `a give-up must close the mailbox and a restart must not: [(Restarting(
     ///   Panicked { message: "this incarnation is over" }), false), (Gone, false)]`,
     ///   with `left: [false, false]`.
-    /// - the blunter one — deleting the publish outright — is red too, and at a
-    ///   *different* assertion: `an incarnation is there to take it: SendError`,
-    ///   because [`supervise`] reads the same cell and stops restarting. Recorded
-    ///   because it is the more informative half: there is one place this fact is
-    ///   written, so losing it cannot cost only the peer's answer.
+    /// - the blunter one — deleting the publish outright — is red too, at this
+    ///   same assertion: `an incarnation's verdict must be settled before its
+    ///   state dies: [(Running, false), (Running, true)]`.
+    ///
+    /// **That third record used to claim something else and it went stale inside
+    /// its own wave.** It read: *red at a `different` assertion, `an incarnation
+    /// is there to take it: SendError`, because `supervise` reads the same cell
+    /// and stops restarting.* True when it was written, and untrue three commits
+    /// later — the same wave stopped `supervise` reading the cell, returning the
+    /// verdict from [`run_loop`] instead so that a supervisor could not be wrong
+    /// about a decision five doors now write. Deleting the publish no longer
+    /// reaches the supervisor at all.
+    ///
+    /// Worth leaving the correction visible rather than just the fix: a record
+    /// whose *reason* is a fact about another function will rot when that function
+    /// changes, and nothing in a green test run says so. The replay script greps
+    /// each recorded output out of the run for exactly this — a break that is
+    /// still red for a different reason is the failure counting exit codes cannot
+    /// see, and it is the one that happened.
     #[tokio::test(start_paused = true)]
     async fn an_ending_incarnation_settles_its_verdict_and_its_mailbox_before_its_state() {
         let fate = Fate::default();
