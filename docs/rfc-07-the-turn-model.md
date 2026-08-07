@@ -3261,3 +3261,243 @@ started. One mechanism serves both keyed paths, supervised and not, because a
 on its merits: it repairs *routing* and leaves `System::status` lying and the
 `Lifecycle` untold, and it cannot carry a reason — `is_closed` knows that an
 actor is gone and never why.
+
+## 12. The `Fate` wave — one verdict, both served paths, and where certainty runs out
+
+§9.10 recorded a wrong answer and declined to fix it. This is the fix, and the
+part worth reading is not the mechanism — it is which claims about it are proved
+and which are only true *at the moment they are made*.
+
+### 12.1 THE DECISION THIS WAVE OWNS — the answer is about the actor NOW, not about what killed the reply
+
+A served reply channel that dies without sending has three causes, and the peer's
+next move differs for each: an incarnation that ended with another coming (retry),
+a live actor that dropped one reply (do not retry this call, the actor is fine),
+and an actor that is finished (stop asking). `deliver_to_local` split them in
+a3171df. `deliver_to_actor` rendered all three as `NoSuchActor`.
+
+The obvious design is a cause tag travelling with the death. It is not
+buildable, and saying why fixes the shape of everything below. The three causes
+are distinguished by **who drops the `Reply`**: a handler, or the state's own
+`Drop`. Both are `Deferred::drop`, and the parked one lives in *user state* — the
+loop does not know which `Deferred`s the state holds, which is the whole point of
+`#[defer]`. So nothing at the point of death can label it, and the answer has to
+come from a cell read afterwards.
+
+That reframes the question, and the reframing is the decision:
+
+> The cell says **what is true of this actor now**, not **what killed your reply**.
+
+Every answer is then a statement that is true when it is written, and the three
+map onto the three next moves without ever claiming to know a cause. A live actor
+that dropped a reply and then ended reads `Gone`, and *stop asking* is right for
+it. A restart whose next incarnation is already up reads `Running`, and *the actor
+is there* is right for it. §12.4 is where that stops being free.
+
+### 12.2 The mechanism, and why it is not the six touch points §9.10 priced
+
+`Standing` — `Running | Restarting(Arc<Ended>) | Gone` — behind a
+`Fate(Arc<Mutex<Standing>>)`. One cell per actor, made where the actor is made,
+written by the actor's own loop, read by whoever serves it.
+
+`Inbox::ending` **returns** it rather than publishing it. `run_loop` publishes at
+one line:
+
+```rust
+fate.settle(inbox.ending(&reason));
+```
+
+§9.10 priced the keyed half at *"`Life` stops being private to `local.rs`;
+`Mounted<M>` carries a receiver beside its `Loop<M>`; `mount` grows a second door
+…; `Registry`'s `Entry` stores it; `System::route` hands back a pair"* — six touch
+points, one of them a public type, and an `Option`-shaped `mount` the house rules
+ban by name. Only the last two happened. The cell rides on `Mailbox<M>`, which
+`registry.rs`'s own documentation had already argued is the right vehicle for
+exactly this, for `Busy`: *"widening `mount`'s closure would have carried it just
+as well and put the pairing in **generated** code, one expansion per `service!` in
+the world."* `mount(|inbox: Mailbox| ..)` is the same line it was; `run_keyed` and
+`run_keyed_supervised` take the cell off the mailbox they were already handed;
+`macros.rs` is untouched but for prose. Neither ALPN moves, no `RemoteError`
+variant is added, and there is no fifth prefix.
+
+**A `watch` channel was refused.** Nobody awaits this: it is read once, on a dead
+reply, by a task that is already awake. A `watch` per keyed actor buys a wait
+list, a version counter and a `Notify` for a value nothing waits on, and §12.5 is
+what a per-idle-actor byte costs here.
+
+**Folding it into `Busy` was refused**, though both are one word about one actor
+and it would save an allocation on the keyed path. A `LocalActor` needs the fate
+and deliberately has no `Busy` — its documentation refuses one — so folding would
+force a registry fact onto the path whose reason for existing is that it has no
+registry.
+
+### 12.3 The happens-before for each answer
+
+The reader is `deliver_to_local` or `deliver_to_actor`, at the instant
+`answer.await` resolves `Err` — the reply channel's sender was dropped. tokio's
+`oneshot` closes with an AcqRel RMW and the receiver observes it with Acquire, so
+**everything the dropping task did before that drop happens-before the read.**
+Every claim below is that edge plus a program order on one task.
+
+| answer | what makes it true |
+|---|---|
+| `Restarting` | `Lent::ending` grants the restart and hands the verdict back; `run_loop` settles it at the line above — before `finish`, before `drop(inbox)`, before `drop(state)`. Every reply this teardown kills dies after the store. |
+| `Gone`, ordinary ending | The default `Inbox::ending` for an inbox with no supervisor above it, settled at the same line. A loop that reached it and is nobody's incarnation will not run again. |
+| `Gone`, supervised give-up | The same line, the arm `Lent::ending` refuses. This is the Major regression: the old hook wrote a channel itself on the restart arm and returned nothing, so the give-up published *nothing*, and `is_running()` — `!mail.is_closed()` — was `true` because `supervise` owns the receiver for the actor's whole life. A peer was told `dropped: `, *the actor is still there*, about an actor that would never answer again. A hook that must hand a value back has no arm that quietly says nothing. |
+| `Gone`, factory give-up | `supervise` settles before it returns. No incarnation ever reached a loop, and the receiver — this function's own parameter — drops on the way out, killing everything queued behind an actor that will never exist. |
+| `Gone`, destroyed | `LocalActor::abort`, `System::abort` and `drain`'s expired budget settle **before** they ask the runtime. `JoinHandle::abort` is an RMW on the task state; the runtime drops the future after observing it and drops the state after that, so the settle happens-before every reply the destruction kills. An aborted loop never reaches the hook, so nothing inside it could have said this. |
+| `Gone`, hand-written loop | `Mailbox`'s `Drop`, which is a **floor and says so**: a `Drop` body runs before its fields, so it lands before the receiver closes and before what is queued behind it is dropped — exact. Where it sits relative to a hand-written loop's own state is not knowable from here, because that state is whatever the closure captured. The loops keylink generates never rely on it. |
+
+The two registry settles look redundant against that floor and are not. On an
+**unsupervised** keyed actor the mailbox is `run_loop`'s own parameter and drops
+before the state, so the floor answers and breaking either settle leaves the
+end-to-end tests green — recorded in those tests, because that is exactly the sort
+of belt that reads like a guard. They earn their place on the **supervised** keyed
+path, where the mailbox belongs to the supervisor's frame and its `Drop` is too
+late, and on the local path, which has no `Mailbox` at all.
+
+### 12.4 Where certainty runs out: the read can be LATE, and no cheap fix is honest
+
+One direction is open and it is stated rather than closed. The reader is woken by
+the death and reads afterwards, so **the actor may have moved on in between.** A
+restart whose next incarnation has already published `Running` reads as *dropped*.
+The window is a supervisor's backoff wide — `run_loop` returns, `supervise` sleeps
+the backoff, calls the factory, then publishes — so it takes a starved worker to
+hit, but it is reachable.
+
+What it costs is exactly one thing: such a caller is not told to retry. The
+sentence it does get is true when it is written — the actor *is* there — which is
+the §12.1 frame doing its job.
+
+**A generation counter was considered and refused, and this is the reasoning to
+keep.** Stamp an incarnation number in the cell, capture it at `route`, compare it
+at the read: a bump proves the incarnation we sent to is gone. It is wrong in the
+other direction, and worse. Queued turns survive a restart — the supervisor owns
+the mailbox — so a message sent to incarnation *N* may **run** in *N+1* and have
+its reply dropped live there. The generation bumped, so this would answer
+`restarting: `, which claims the actor is *between* incarnations while it is
+running. Today's imprecision produces a sentence that is true and less useful;
+the counter produces one that is false. Trading the first for the second is what
+"differently wrong" means.
+
+Making it exact needs the *turn* to stamp which incarnation ran it, which puts an
+incarnation number inside `Reply<T>` and therefore inside every generated mailbox
+variant — a cost to every service for a window bounded by a backoff. Not built,
+and named here as the only design that would close it.
+
+**No "cannot be certain" class is added, and that is a finding rather than an
+omission.** The brief asked for a distinct class where certainty is unattainable,
+and it would have to be a fifth `Failed` prefix. There is no reachable case that
+needs one: every answer above is provable at the moment it is written, and the
+late read does not produce *uncertainty* — it produces a different true statement
+about the same actor. A fifth prefix would have to be reached by some arm of
+`lost`, and there is no condition to put in that arm. The two residuals are named
+instead: this section, and the hand-written-loop floor in §12.3.
+
+The one case genuinely outside the argument is a **runtime shutdown**, which
+destroys tasks without going through any of the three doors. It gets no class
+either: the task that would read the cell is being destroyed too.
+
+### 12.5 What it costs, measured
+
+`tests/actor_memory.rs`, ten thousand idle actors, same machine:
+
+| path | before (`810650a`) | with `Fate` |
+|---|---|---|
+| keyed, mounted in a `System` | 1,549 | **1,690** |
+| local, `ledger::actor(..)` | 1,861 | **2,029** |
+
+**+141 keyed, +168 local**, one `Arc<Mutex<Standing>>` per actor plus the handles
+that reach it. The local path also gave eight bytes back (below).
+
+It measured **+165 and +192** first, with `Standing::Restarting(Ended)` inline:
+`Ended` is 40 bytes, so `Standing` was 40 and `Mutex<Standing>` 56, and every idle
+actor paid for a value only a restart ever writes. Behind an `Arc` they are 16 and
+24 — a measured 24 bytes per idle actor on both paths, with the allocation moved
+to the restart that needs it.
+
+`BUDGET_PER_LOCAL_ACTOR` goes **2,048 → 2,304**, and a budget raised by the change
+that would have broken it is the weakest thing here, so: it went red at 2,053, the
+guard working; the first response was to make the change cheaper, which landed
+2,029, which *passes*; it is raised anyway because nineteen bytes under a ceiling
+is inside the difference between one allocator and another, so a green run on this
+machine would say nothing about a Linux CI. The keyed budget stays at 2,048 with
+358 bytes under it. `SLOPE_SLACK_OVER_A_KILOBYTE` — the guard that catches
+*unbounded* growth rather than a constant — is untouched, and the slope is 13
+bytes over a kilobyte of declared message, flat as before.
+
+Per call: nothing on the answered path. One uncontended `Mutex` lock on the arm
+where a reply already died.
+
+Code paths touched: `local.rs` (the type, `run_loop`, `Inbox`, `Lent`,
+`supervise`, `LocalActor`, `lost`, `deliver_to_local`), `actor/registry.rs`
+(`Mailbox`, `Entry`, `Route`, `route`, `touch`, `entry`, `drain`, `System::abort`,
+`System::route`), `actor/remote.rs` (`deliver_to_actor`). `macros.rs` and the
+whole public surface: prose only.
+
+### 12.6 `Life` is deleted, and the reader-less channel with it
+
+Wave 9 gave the local `ended` channel a third state, `Life::Restarting(Ended)`, so
+that `deliver_to_local` and `supervise` could both read a restart off it. Neither
+does now — both read the verdict — so the arm has no writer and the channel is
+back to `Option<Ended>`. Three consequences, all in the same direction:
+
+- the eight bytes §9.10 measured onto every local actor come back;
+- `run_keyed_supervised`'s `watch::channel(Life::Running)` with **no reader at
+  all** — §9.10's *"one small channel per supervised keyed actor is the cost of
+  that"* — is deleted rather than explained;
+- one fact has one home. `Lent::ending` decides, `run_loop` publishes, `supervise`
+  and both served paths read the same cell. The blunt break — deleting the publish
+  — now reddens the *supervisor* too, which is recorded in that guard as the more
+  informative half.
+
+### 12.7 Corrections to §9.10
+
+Three of its bullets described a permanent state of affairs and are now false.
+They are corrected here rather than edited there, per this file's habit:
+
+- *"a keyed actor has no `Life` channel anyone reads"* and *"`run_keyed_supervised`
+  allocates a `Life` channel with no reader"* — there is no `Life` at all.
+- *"The proper fix is declined out loud, and it is not one paragraph … Six touch
+  points across three files, one of them `Mounted` — a public type"* — the trace
+  was accurate for the design it traced, and that design was not the only one. Two
+  touch points, neither public, because the vehicle was already in the tree
+  carrying `Busy`. The lesson is narrow and worth keeping: a cost estimate is
+  about a *route*, and naming the route it prices is what lets a later reader find
+  a cheaper one.
+- *"the other two want a mounted-vs-gone answer from the registry and are a design
+  rather than a line"* — true, and the design is §12.3. The risk named with it —
+  that ordering a mounted-vs-gone answer against a restart "has a real risk of
+  being differently wrong" — is real and is §12.4, where it is refused rather than
+  guessed at.
+
+### 12.8 Every guard, and the break that proves it
+
+Each was watched red; each records the break and the exact output in its own doc
+comment.
+
+| guard | break |
+|---|---|
+| `defer::a_live_keyed_actor_does_not_tell_a_peer_no_such_actor` | `deliver_to_actor`'s `lost(..)` → `no_such_actor(&actor)`, the pre-fix line verbatim |
+| `supervision::a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor` | `Lent::ending`'s `Standing::Restarting(..)` → `Standing::Gone` |
+| `local::an_incarnations_verdict_is_settled_before_its_state_is_dropped` | the settle moved to the end of `run_loop`, after `drop(state)`, via a `Drop` guard holding the same verdict — decided in the same place, still reaching `supervise` |
+| `local::a_supervisor_that_refuses_a_restart_answers_gone_rather_than_running` | the refusal arm answers `Standing::Running` |
+| `registry::abort_settles_the_served_answer_before_it_destroys_the_actor` | `System::abort`'s settle → `Standing::Running` |
+| `registry::an_expired_shutdown_budget_settles_the_served_answer_before_the_abort` | `drain`'s settle → `Standing::Running` |
+| `defer::a_live_actor_does_not_tell_a_peer_no_such_actor` | `lost`'s `Standing::Running` arm → `NoSuchActor` |
+| `defer::a_stopped_actor_still_tells_a_peer_no_such_actor` | the default `Inbox::ending` → `Standing::Running` |
+| `defer::an_aborted_actor_tells_a_peer_no_such_actor` | `LocalActor::abort`'s settle → `Standing::Running` |
+| `defer::an_aborted_keyed_actor_tells_a_peer_no_such_actor` | `Mailbox`'s `Drop` → `Standing::Running` |
+| `defer::a_keyed_actor_destroyed_by_an_expired_budget_tells_a_peer_no_such_actor` | the same |
+
+**The ordering guard needs an in-drop observer, and that is a finding.** From
+outside the actor there is nothing to see: the whole teardown runs before any
+other task is polled on a current-thread runtime, so a served call always reads
+the final value and every ordering — including the broken ones — looks correct.
+That is why the empirical probe of the supervised give-up window hung and proved
+nothing, and why the guard is a state whose own `Drop` reads the cell.
+
+**Two guards are recorded as leaving a line uncovered**, rather than being
+credited with it: breaking `System::abort`'s or `drain`'s settle leaves the keyed
+end-to-end tests green, because the `Mailbox` floor answers first on an
+unsupervised keyed actor. Those lines are held by the registry unit tests above.
