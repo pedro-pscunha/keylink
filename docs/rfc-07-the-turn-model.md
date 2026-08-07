@@ -2243,8 +2243,8 @@ day it exists, `Names` takes it unchanged.
   be composition rather than a change here:** a member built with the generated
   `supervised()` restarts itself, and because a supervised actor's mailbox outlives
   its incarnations, `pick` keeps working across a restart with nothing in `compose`
-  knowing. `rg -n 'supervised' keylink/src/compose/` still finds only the paragraph
-  in `pool.rs` that says so, and that is the design rather than an omission.
+  knowing. `compose` still holds no supervision mechanism of its own, and that is
+  the design rather than an omission.
 - **Red-test the shared-rotation claim on its own.**
   `two_clones_of_a_pool_share_one_rotation` was watched to fail, but only under the
   break that stops the cursor advancing at all — which also fails its sibling. A
