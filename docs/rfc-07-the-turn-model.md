@@ -3481,11 +3481,14 @@ comment.
 |---|---|
 | `defer::a_live_keyed_actor_does_not_tell_a_peer_no_such_actor` | `deliver_to_actor`'s `lost(..)` → `no_such_actor(&actor)`, the pre-fix line verbatim |
 | `supervision::a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor` | `Lent::ending`'s `Standing::Restarting(..)` → `Standing::Gone` |
-| `local::an_incarnations_verdict_is_settled_before_its_state_is_dropped` | the settle moved to the end of `run_loop`, after `drop(state)`, via a `Drop` guard holding the same verdict — decided in the same place, still reaching `supervise` |
+| `supervision::a_remote_caller_can_tell_restarting_from_gone` | `Lent::ending`'s `Standing::Gone` → `Standing::Running` — the regression verbatim, under four workers |
+| `local::an_ending_incarnation_settles_its_verdict_and_its_mailbox_before_its_state` | three: the settle moved after `drop(state)` via a `Drop` guard holding the same verdict; `Lent::ending`'s `self.close()` deleted; the settle deleted outright |
 | `local::a_supervisor_that_refuses_a_restart_answers_gone_rather_than_running` | the refusal arm answers `Standing::Running` |
 | `registry::abort_settles_the_served_answer_before_it_destroys_the_actor` | `System::abort`'s settle → `Standing::Running` |
 | `registry::an_expired_shutdown_budget_settles_the_served_answer_before_the_abort` | `drain`'s settle → `Standing::Running` |
+| `remote::no_other_served_failure_begins_with_one_of_the_four` | `RouteError::AtCapacity`'s `Display` gains a `"dropped: "` prefix |
 | `defer::a_live_actor_does_not_tell_a_peer_no_such_actor` | `lost`'s `Standing::Running` arm → `NoSuchActor` |
+| `defer::a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer` | the same arm → `Failed("panicked: bad")` |
 | `defer::a_stopped_actor_still_tells_a_peer_no_such_actor` | the default `Inbox::ending` → `Standing::Running` |
 | `defer::an_aborted_actor_tells_a_peer_no_such_actor` | `LocalActor::abort`'s settle → `Standing::Running` |
 | `defer::an_aborted_keyed_actor_tells_a_peer_no_such_actor` | `Mailbox`'s `Drop` → `Standing::Running` |
@@ -3498,7 +3501,116 @@ the final value and every ordering — including the broken ones — looks corre
 That is why the empirical probe of the supervised give-up window hung and proved
 nothing, and why the guard is a state whose own `Drop` reads the cell.
 
-**Two guards are recorded as leaving a line uncovered**, rather than being
-credited with it: breaking `System::abort`'s or `drain`'s settle leaves the keyed
-end-to-end tests green, because the `Mailbox` floor answers first on an
-unsupervised keyed actor. Those lines are held by the registry unit tests above.
+**Three guards are recorded as leaving a line uncovered**, rather than being
+credited with it:
+
+- breaking `System::abort`'s or `drain`'s settle leaves the two keyed end-to-end
+  teardown tests green, because the `Mailbox` floor answers first on an
+  *unsupervised* keyed actor. Those lines are held by the registry unit tests
+  above, which observe inside the drop.
+- breaking `Lent::ending`'s give-up arm leaves
+  `a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor` green, for the
+  same shape of reason: `Mailbox`'s `Drop` settles `Gone` a few instructions
+  later, when `supervise` lets go of the receiver, and on the run that was watched
+  the peer read after that. Its **singleton twin is reliably red** on the same
+  break, because a `LocalActor` has no floor under it, and the deterministic
+  guard for the ordering is the in-drop test.
+
+### 12.9 `is_running()` was lying too, and it is a second consequence rather than a second decision
+
+A reviewer's independent analysis of the same window recommended a different
+remedy: give `Lent::ending` the `else` branch it was missing, calling
+`tokio::sync::mpsc::Receiver::close()` so that `Sender::is_closed()` becomes true
+at once while the buffer still drains — after which `deliver_to_local`'s
+`is_running()` read would have been *true* rather than removed.
+
+**Not adopted as the remedy, and adopted anyway for what it independently
+repairs.** The two halves:
+
+- It does not reach the keyed path. `deliver_to_actor` never read `is_running()`
+  and has no `LocalActor` to read it from, so a remedy that repairs the invariant
+  behind that read leaves every keyed answer where it was. This wave's brief is
+  precisely to remove that asymmetry, and the verdict is what removes it —
+  `deliver_to_local` reads no mailbox at all now, so the invariant has no reader
+  left to be true for.
+- **`LocalActor::is_running()` is public, and it lied on its own account.**
+  `supervise` takes the receiver *by value* and holds it across every
+  incarnation, so between `run_loop` returning on a permanent give-up and
+  `supervise` returning, `is_running()` answered `true` for an actor that would
+  never take another message, and `ask` acquired a permit into a queue nobody
+  would drain. Nothing to do with the wire.
+
+So `Inbox::close` exists, `Lent::ending` calls it on the non-restart arm, and
+`supervise` calls it on the factory give-up. One decision — made in `ending`,
+once — with two consequences published where each is needed: the `Standing` a
+dispatch reads, and the mailbox a caller meets. The restart arm closes nothing,
+which is the structural promise that a restart needs no re-queue, and the in-drop
+guard asserts both halves as `[(Restarting, false), (Gone, true)]`.
+
+Two alternatives the reviewer refuted are recorded so they are not re-derived:
+reordering `supervise` to drop `inbox` first is impossible, because the state dies
+inside `run_loop`, which holds the mailbox as a `&mut` through `Lent`; and closing
+unconditionally in `Lent`'s `Drop` is the right instant but destroys the design,
+since the mailbox must survive a restart. A third — publishing
+`Life::Ended(reason.clone())` early — would have let `ended()` resolve with the
+un-wrapped reason and lose `GaveUp { after, .. }`, because `supervise` rewrites it
+through `gave_up`. `Life` is deleted, so that one is now unreachable rather than
+refused.
+
+### 12.10 The prefixes are public, and the claim about them was false
+
+Three findings, one shape: the four `Failed` prefixes were a contract nobody could
+name and a claim nothing checked.
+
+- **They are `RemoteError::PANICKED`, `REFUSED`, `RESTARTING` and `DROPPED` now.**
+  Private `const`s in `local.rs` for four waves, documented as a peer's
+  discriminator in four rustdocs, while every caller — including this repository's
+  own tests — hard-coded `starts_with("dropped: ")`. Exporting them moves no ALPN:
+  `postcard_schema` hashes an enum's variants and fields, and an associated
+  constant is neither. `keylink/tests/protocol.rs`'s two pins are unmoved,
+  checked rather than assumed.
+- **"Every prefix a `RemoteError::Failed` carries on the served path" was false.**
+  keylink builds a `Failed` from at least three other places whose text is a whole
+  *sentence*: the registry's capacity refusal, an `ActorId` a peer sent that fails
+  validation, and a console follow refusal. None collides, and nothing would have
+  noticed if one did —
+  `no_failure_prefix_is_a_prefix_of_another` compares the four against each other
+  and would stay green while a `RouteError` variant beginning `"dropped: "` made
+  every peer's `starts_with` ambiguous. The claim is narrowed to *every prefix
+  `rendered` and `lost` build*, and `no_other_served_failure_begins_with_one_of_the_four`
+  renders the other three and checks them. What no guard can cover is a `Failed`
+  whose text came from a caller's own `Middleware`, which is exactly why naming
+  the constants is the other half of the fix.
+- **The `dropped: ` sentence asserted a cause the arm cannot know.** It read "the
+  reply was taken out of the turn and never answered" — the sanctioned
+  `reply.later()` + `drop` — while its own comment conceded that a handler
+  panicking after `later()` arrives on the same arm, where that is false and the
+  panic message is lost. It reads "the reply left its turn and was never answered"
+  now, and `a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer`
+  is the served case that had never been asserted at all: the existing test for it
+  is a *local* call that checks `is_err()` on a `MailboxClosed` and never reaches
+  `deliver_to_local`.
+
+### 12.11 Why this suite could not have caught it: one `multi_thread` in the whole tree
+
+`rg -n 'multi_thread|flavor' keylink/tests` returned exactly one hit before this
+wave, in `singleton.rs`. Every other test runs on a current-thread runtime, where
+an actor's entire teardown — hook, observers, every drop, the return, the task's
+exit — completes before any other task is polled. A peer therefore always reads
+the *last* value written, and every ordering defect in that teardown reads
+correct.
+
+That is the mechanical reason the regression shipped, and it is also why a
+previous record in `defer.rs` drew a conclusion its harness could not support: it
+recorded that breaking the old arm-2 guard to `if true` left
+`a_stopped_actor_still_tells_a_peer_no_such_actor` green and concluded "the `Life`
+read is late enough here". `Ended` won by *scheduling*, not by ordering. On more
+than one worker the same code reads `Life::Running` and is answered correctly
+through a different arm. Writing that second sentence is what would have exposed
+Finding 1 a wave earlier.
+
+`a_remote_caller_can_tell_restarting_from_gone` and its keyed twin run on four
+workers now. Under the fixed code both are deterministic, because the answer is
+settled before the window opens rather than raced against it — which is the
+difference between a guard and a coin toss, and is the argument for fixing the
+*ordering* rather than narrowing the *window*.

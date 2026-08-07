@@ -605,8 +605,8 @@ async fn a_live_actor_does_not_tell_a_peer_no_such_actor() {
 ///
 /// Made red by `scripts/break-once.sh keylink/src/local.rs` on the default
 /// `Inbox::ending`'s `Standing::Gone` → `Standing::Running`. Watched: `a stopped
-/// actor is gone, not merely unanswering: Remote(Failed("dropped: the reply was
-/// taken out of the turn and never answered"))`.
+/// actor is gone, not merely unanswering: Remote(Failed("dropped: the reply left
+/// its turn and was never answered"))`.
 #[tokio::test]
 async fn a_stopped_actor_still_tells_a_peer_no_such_actor() {
     let node = local_node().await;
@@ -654,8 +654,7 @@ async fn a_stopped_actor_still_tells_a_peer_no_such_actor() {
 /// Made red by `scripts/break-once.sh keylink/src/local.rs` on `LocalActor::abort`'s
 /// `self.fate.settle(Standing::Gone);` → `self.fate.settle(Standing::Running);`.
 /// Watched: `an aborted actor is gone, and its own loop will never say so:
-/// Remote(Failed("dropped: the reply was taken out of the turn and never
-/// answered"))`.
+/// Remote(Failed("dropped: the reply left its turn and was never answered"))`.
 #[tokio::test]
 async fn an_aborted_actor_tells_a_peer_no_such_actor() {
     let node = local_node().await;
@@ -788,7 +787,7 @@ async fn a_live_keyed_actor_does_not_tell_a_peer_no_such_actor() {
 /// `Mailbox`'s `Drop`, `self.fate.settle(Standing::Gone);` →
 /// `self.fate.settle(Standing::Running);`. Watched: `an aborted keyed actor is
 /// gone, and its own loop will never say so: Remote(Failed("dropped: the reply
-/// was taken out of the turn and never answered"))`.
+/// left its turn and was never answered"))`.
 #[tokio::test]
 async fn an_aborted_keyed_actor_tells_a_peer_no_such_actor() {
     let nodes = [local_node().await, local_node().await];
@@ -828,8 +827,7 @@ async fn an_aborted_keyed_actor_tells_a_peer_no_such_actor() {
 /// held by
 /// `registry::tests::an_expired_shutdown_budget_settles_the_served_answer_before_the_abort`.
 /// Watched: `an actor destroyed by an expired budget is gone:
-/// Remote(Failed("dropped: the reply was taken out of the turn and never
-/// answered"))`.
+/// Remote(Failed("dropped: the reply left its turn and was never answered"))`.
 #[tokio::test]
 async fn a_keyed_actor_destroyed_by_an_expired_budget_tells_a_peer_no_such_actor() {
     let nodes = [local_node().await, local_node().await];
@@ -857,6 +855,58 @@ async fn a_keyed_actor_destroyed_by_an_expired_budget_tells_a_peer_no_such_actor
         matches!(&lost, keylink::Error::Remote(RemoteError::NoSuchActor { id }) if id == "obra/4471"),
         "an actor destroyed by an expired budget is gone: {lost:?}"
     );
+}
+
+/// **The other half of the `dropped: ` arm, which had no served test at all.**
+///
+/// `a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_actor`
+/// is a **local** call: it asserts `is_err()` on a `MailboxClosed` and never
+/// reaches `deliver_to_local`, so nothing anywhere asserted what a *peer* reads
+/// for this. The arm's own comment concedes the case — "a handler that panics
+/// after taking `reply.later()` arrives here too" — and the sentence it rendered
+/// said "the reply was taken out of the turn and never answered", which names the
+/// sanctioned drop and is false of this one.
+///
+/// So the sentence names no cause now, and this is what pins that it covers both:
+/// a handler that panicked **without** consuming its reply reads exactly what a
+/// handler that dropped one deliberately reads. The panic message is gone, and
+/// that is the honest outcome rather than a gap — the `Reply` died in the unwind,
+/// so there is no channel left to render a `Panic` down.
+///
+/// Made red by `scripts/break-once.sh keylink/src/local.rs` on `lost`'s
+/// `Standing::Running` arm → `RemoteError::Failed(format!("{}bad", RemoteError::PANICKED))`,
+/// which is the answer this case would have if the fault reached the peer as a
+/// fault. Watched: `a panicking deferred handler loses the reply, and that is
+/// what the peer must read: "panicked: bad"`.
+#[tokio::test]
+async fn a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer() {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let book = orders::actor(Book::default());
+    let _server = Server::builder(&node)
+        .service(book.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("serves");
+    let client = orders::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+
+    let lost = client
+        .boom(1)
+        .await
+        .expect_err("the handler panicked holding the reply");
+    match lost {
+        keylink::Error::Remote(RemoteError::Failed(why)) => assert!(
+            why.starts_with(RemoteError::DROPPED),
+            "a panicking deferred handler loses the reply, and that is what the \
+             peer must read: {why:?}"
+        ),
+        other => panic!("the actor is alive and this is one lost reply: {other:?}"),
+    }
+
+    // Same connection: one bad message cost one message, exactly as the local
+    // twin asserts for a local caller.
+    assert_eq!(client.parked().await.expect("still serving"), 0);
 }
 
 /// [`parked`]'s keyed twin: wait by asking the actor rather than by sleeping.
