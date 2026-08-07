@@ -127,6 +127,25 @@ pub async fn guarded<F: Future>(fut: F) -> std::result::Result<F::Output, Panic>
     .await
 }
 
+/// Run one **synchronous** step, turning a panic into a value instead of a dead
+/// actor.
+///
+/// [`guarded`] covers a future, and a turn is not the only caller code an actor
+/// task runs. The keyed loop decodes the request and encodes the reply on that
+/// same task, and both execute a `Deserialize` and a `Serialize` the service
+/// author wrote — hand-written ones at that, since a *derived* `Serialize`
+/// cannot fail and a test that needs one to fail has to write it out. A panic
+/// in either lands one line outside `guarded` and produces, exactly, the failure
+/// `guarded`'s own documentation above says it prevents.
+///
+/// Synchronous on purpose rather than an `async` wrapper: neither call is a
+/// future, and wrapping them in one would put a borrow of the state across an
+/// await for no reason — the same trap `local.rs`'s observer catch avoids.
+#[doc(hidden)]
+pub fn catching<T>(work: impl FnOnce() -> T) -> std::result::Result<T, Panic> {
+    std::panic::catch_unwind(AssertUnwindSafe(work)).map_err(Panic::caught)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]

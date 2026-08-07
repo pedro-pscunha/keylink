@@ -16,6 +16,7 @@
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
+use n0_future::time::Instant;
 use postcard_schema::Schema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -221,8 +222,11 @@ pub struct Sealed {
 impl Sealed {
     /// Decode the payload as `T`, but only if the hashes agree.
     ///
-    /// `ours` comes from the registry entry — the hash the actor was mounted
-    /// with — never from the caller's own frame.
+    /// `ours` is never the caller's own frame, and its two callers get it from
+    /// different places: `System::deliver` passes the registry entry's hash,
+    /// the one the actor was mounted with, and a generated mailbox loop passes
+    /// that actor's own `schema()`, a compile-time constant of its type. A peer
+    /// influences neither, which is the part this argument rests on.
     ///
     /// # Errors
     ///
@@ -364,8 +368,42 @@ impl System<Mail> {
     /// 3. Look it up, spawning on first message if the system has a factory.
     /// 4. Compare the declared hash against the mounted one. **The payload is
     ///    still bytes.**
-    /// 5. Hand the sealed payload to the actor, which decodes it — and can only
+    /// 5. Wait for a mailbox permit, bounded by whatever budget a
+    ///    [`QueueTimeout`](crate::QueueTimeout) put on the context.
+    /// 6. Hand the sealed payload to the actor, which decodes it — and can only
     ///    decode it — through [`Sealed::open`].
+    ///
+    /// # Why step 5 is bounded here, and not only in the loop
+    ///
+    /// The loop's own deadline check runs when a message comes **off** the
+    /// mailbox, so it says nothing about one that never got on. Capacity is one
+    /// and turns are serial, so while an actor is inside a long turn every
+    /// caller past the first waits in `mail.send` — each holding a QUIC stream,
+    /// a [`BodyReader`] and an idempotency key claimed before dispatch — and
+    /// learns `TimedOut` only once that turn ends. A 50 ms budget against a ten
+    /// second turn was honoured at ten seconds, which is exactly the assumption
+    /// `QueueTimeout` exists because nobody can make. RFC-04 §16.7 called that
+    /// "milder than it sounds"; §16.10 says why it is not.
+    ///
+    /// The refusal is the value the other two dispatch paths produce for the
+    /// same condition, so a peer cannot tell them apart. The progress marker is
+    /// deliberately untouched by it: a message refused before it entered the
+    /// mailbox has not run, so the idempotency guard sees `NotDispatched` and
+    /// releases the key. Marking there would settle it `Interrupted` and
+    /// permanently refuse every retry of a call that never happened.
+    ///
+    /// # The send succeeding is itself a fact the key needs
+    ///
+    /// Once the permit is in hand the message will be taken, and nothing above
+    /// this can stop it. A caller that gives up from here on — a
+    /// [`Timeout`](crate::Timeout) expiring, an aborted connection task — is
+    /// giving up on work that runs anyway, so `enqueued()` is marked and the
+    /// key settles `Interrupted` rather than being handed back to a retry that
+    /// would do the work a second time. RFC-04 §16.12.
+    ///
+    /// It is marked *after* the send and not before, and that placement is the
+    /// whole of the precision: a caller refused at step 5 provably queued
+    /// nothing, and its key must still be claimable.
     async fn deliver(
         &self,
         cx: Context,
@@ -385,16 +423,44 @@ impl System<Mail> {
             });
         }
 
+        // Read before `cx` moves into the `Mail`, which is the only reason
+        // these are bindings rather than expressions at their use sites.
+        let budget = cx.queueing();
+        let progress = cx.progress();
         let (actor, payload) = request.seal();
         let (reply, answer) = oneshot::channel();
-        mail.send(Box::new(Mail {
+        let queueing = mail.send(Box::new(Mail {
             cx,
             payload,
             body,
             reply,
-        }))
-        .await
-        .map_err(|_| no_such_actor(&actor))?;
+        }));
+        let sent = match budget {
+            None => queueing.await,
+            // `saturating_duration_since` on `n0_future::time::Instant`, the
+            // clock `Queueing` was stamped with — tokio's natively, `web_time`'s
+            // in a browser, and `std::time::Instant` on neither, since that one
+            // panics on `wasm32-unknown-unknown`. Reading the same clock as
+            // `middleware.rs` is one fewer place that can drift from it.
+            //
+            // Dropping the send future is what makes the refusal honest: tokio
+            // does not queue a message whose send was cancelled before a permit
+            // arrived, so a message refused here provably never entered the
+            // mailbox. The local path relies on the same property.
+            Some(budget) => n0_future::time::timeout(
+                budget.deadline().saturating_duration_since(Instant::now()),
+                queueing,
+            )
+            .await
+            .map_err(|_| RemoteError::TimedOut {
+                millis: budget.millis(),
+            })?,
+        };
+        sent.map_err(|_| no_such_actor(&actor))?;
+        // Below every refusal above it, so no refusal here can be mistaken for
+        // a message that queued. Above the wait, because the wait is exactly
+        // what a caller gives up on.
+        progress.enqueued();
 
         answer.await.map_err(|_| no_such_actor(&actor))
     }

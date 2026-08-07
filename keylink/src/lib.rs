@@ -172,7 +172,7 @@ pub use local::{LocalActor, MailboxClosed, Queued};
 pub use middleware::{Caller, Context, Middleware, Next, QueueTimeout, Queueing, Rpc, Timeout};
 pub use node::{derive_alpn, schema_hash, Node};
 pub use observe::{Ended, Observer, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome};
-pub use panic::{guarded, Panic};
+pub use panic::{catching, guarded, Panic};
 pub use peer::{Dial, Peer};
 pub use reply::{Outcome, RemoteError, WireRequest, WireResponse};
 pub use rpc::{Dispatch, RpcClient, Server, ServerBuilder, Service, ServiceBuilder};

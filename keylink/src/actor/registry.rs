@@ -6,23 +6,36 @@
 //! decodes it, encodes it, or knows that a peer exists. `remote.rs` depends on
 //! this file and serves it. This file does not depend back.
 //!
-//! # The five places that still point the wrong way
+//! # What in this file still points the wrong way
 //!
-//! Four type-parameter defaults and one impl header name [`Mail`], which is a
-//! `remote.rs` type, and they are the whole of the dependency:
+//! RFC-04 §16.8 prices the crate split at six items and is the list of record.
+//! An earlier list of three was wrong in three ways, which is what a bill kept
+//! in two places costs; the four items that live in this file are:
 //!
-//! - `System<M = Mail>`, `SystemBuilder<M = Mail>`, `Mounted<M = Mail>` and
-//!   `Mailbox<M = Mail>`, because `keylink::System` written with no parameter
-//!   has to go on meaning what it always meant, and a default is the only way
-//!   to say that;
+//! - four type-parameter defaults — `System<M = Mail>`, `SystemBuilder<M = Mail>`,
+//!   `Mounted<M = Mail>`, `Mailbox<M = Mail>` — because `keylink::System`
+//!   written with no parameter has to go on meaning what it always meant, and a
+//!   default is the only way to say that;
 //! - `impl SystemBuilder<Mail>`, which exists for one associated constant,
-//!   because a default applies in type position and not in expression position.
+//!   because a default applies in type position and not in expression position;
+//! - three intra-doc links to `RemoteError`, a `reply.rs` type. Prose rather
+//!   than a code path, but an intra-doc link across a crate boundary still
+//!   needs a Cargo dependency to resolve;
+//! - the seam itself: `RouteError` and `route` are `pub(super)` here, and
+//!   across a crate boundary a within-module courtesy has to become a designed
+//!   public interface.
 //!
-//! All five are the same device with the same expiry. They are what a crate
-//! split would have to break, and breaking them is a change to the public API
-//! rather than a refactor — so they are listed here, together, instead of being
-//! discovered one at a time. Nothing else here names a transport type, and
-//! `rg 'Mail' registry.rs` is the check that says so.
+//! `rg 'super::|crate::' registry.rs` is the check that keeps that list honest.
+//! It returns seven lines: this one, the two imports, the three doc links, and
+//! the tests module's glob. Nothing in this file can name a type from the
+//! transport half except through an import or a qualified path, so a new one
+//! cannot arrive without adding a line to that output. `rg 'Mail'` is NOT that
+//! check and never was — it cannot see `RemoteError` at all, which is how three
+//! links to a wire type got in under a header claiming nothing else was there.
+//!
+//! The glob is the one hole, because it puts [`Mail`] in scope inside the tests
+//! without a line of its own. Running every test at a type that is not `Mail` is
+//! what covers it.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -71,18 +84,58 @@ pub type Mailbox<M = Mail> = mpsc::Receiver<Box<M>>;
 /// returned from a factory. Opaque on purpose: the registry owns the pairing of
 /// a hash with a mailbox, and nothing else may take them apart.
 ///
-/// `M` is the message the mailbox carries, defaulted to [`Mail`]. See
-/// [`System`] for why it is a parameter at all.
-#[derive(Debug)]
+/// `M` is the message the mailbox carries, defaulted to [`Mail`], which is the
+/// only supported instantiation. See [`System`] for why it is a parameter at all
+/// and why choosing your own gets you nothing.
 pub struct Mounted<M = Mail> {
     schema: u64,
     mail: mpsc::Sender<Box<M>>,
     task: JoinHandle<()>,
 }
 
+/// Hand-written for the same reason as [`System`]'s, and it was derived by
+/// mistake: `derive(Debug)` writes `impl<M: Debug> Debug`, which would make
+/// printing a handle depend on a message type nobody prints. None of the three
+/// fields needs it — a `u64`, an `mpsc::Sender` whose own `Debug` is
+/// unconditional, and a `JoinHandle<()>`.
+impl<M> fmt::Debug for Mounted<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Mounted")
+            .field("schema", &self.schema)
+            .field("mail", &self.mail)
+            .field("task", &self.task)
+            .finish()
+    }
+}
+
 /// Spawn one actor's task and give back the handle the registry stores.
 ///
 /// Called by the generated `spawn`, which supplies the loop.
+///
+/// # The mailbox must be named, and it did not used to be
+///
+/// A function's type parameter cannot carry a default — only a type's can — so
+/// the `M = Mail` that keeps `System` and [`Mounted`] spelled the way they
+/// always were does not reach this signature. `Mailbox` was a concrete alias
+/// before the registry became generic, which left the closure's argument fully
+/// determined; now `M` is free, and an unannotated closure is
+/// `error[E0282]: type annotations needed`, pointed at the closure's parameter
+/// — or at the binding, as `Mounted<_>`, if the handle is bound before it is
+/// used:
+///
+/// ```compile_fail
+/// keylink::mount(1, |mut inbox| async move { while inbox.recv().await.is_some() {} });
+/// ```
+///
+/// Naming the mailbox is the whole fix, and the generated `spawn` annotates the
+/// closure with the defaulted `Mailbox` alias every time — which is why the
+/// break reached no caller, and why nothing in the tree noticed it happening:
+///
+/// ```no_run
+/// keylink::mount(1, |mut inbox: keylink::Mailbox| async move {
+///     while inbox.recv().await.is_some() {}
+/// });
+/// ```
 ///
 /// # Panics
 ///
@@ -125,7 +178,7 @@ pub enum Eviction {
 /// Builds an actor's state on first message. See [`SystemBuilder::spawn_with`],
 /// which takes the closure directly — this alias is how the system stores it,
 /// not something a caller ever names.
-pub(crate) type Factory<M> = Arc<dyn Fn(&ActorId) -> Option<Mounted<M>> + Send + Sync>;
+type Factory<M> = Arc<dyn Fn(&ActorId) -> Option<Mounted<M>> + Send + Sync>;
 
 /// Why an actor could not be mounted.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -162,12 +215,24 @@ pub enum MountError {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(super) enum RouteError {
     /// Nothing is mounted under that id, and no factory built one either.
-    #[error("no actor is mounted as {id}")]
+    ///
+    /// No peer ever reads this sentence: `remote.rs` maps this arm to
+    /// `RemoteError::NoSuchActor`, which carries the one that goes on the wire.
+    /// It used to be that sentence word for word, with nothing keeping the two
+    /// in step — an invitation to edit a string here in the belief a caller
+    /// would see it. It says what the registry decided instead, which is the
+    /// only thing this half can be right about, and it exists at all because
+    /// `thiserror` wants a display on every variant.
+    #[error("nothing is mounted as {id} and no factory built one")]
     NoSuchActor {
         /// The id that was addressed.
         id: ActorId,
     },
     /// The registry is full, so the factory was never called.
+    ///
+    /// This sentence *is* rendered — `remote.rs` puts it inside
+    /// `RemoteError::Failed` — and `remote.rs`'s
+    /// `the_capacity_refusal_reads_the_same_by_hand_and_lazily` pins the words.
     #[error("the actor system is at its capacity of {capacity} live actors")]
     AtCapacity {
         /// The cap that was reached.
@@ -194,8 +259,8 @@ struct Registry<M> {
     /// On native it IS `tokio::time::Instant`, so `tokio::time::pause` and
     /// `advance` still drive it — which is what makes the eviction policy
     /// provable rather than sampled by a sleep long enough to usually work. The
-    /// three paused-clock tests at the bottom of this file are the only proof
-    /// that this indirection did not quietly break that.
+    /// paused-clock tests in this file's `tests` module are the only proof that
+    /// this indirection did not quietly break that.
     ///
     /// In a browser it is `web_time::Instant`, reading `performance.now()`.
     /// `std::time::Instant::now()` — which `tokio::time::Instant` resolves to
@@ -285,7 +350,7 @@ impl<M> Registry<M> {
     }
 }
 
-/// A registry of live actors, served behind one ALPN.
+/// A registry of live actors: which ones exist, and for how long.
 ///
 /// Cheap to clone: every clone names the same registry.
 ///
@@ -297,20 +362,45 @@ impl<M> Registry<M> {
 /// inside the one half of this module that has no business knowing either, and
 /// no import list would show it.
 ///
+/// **[`Mail`] is the only supported `M`.** The parameter is an implementation
+/// detail carrying a compatibility default, and it would be `#[doc(hidden)]` if
+/// Rust could hide a type parameter; it cannot, so this sentence is the only
+/// place the constraint can live. `System<YourType>` does compile, and there is
+/// no way to deliver a message to anything in it: every path that reaches an
+/// actor is either an inherent method on `System<Mail>` (`service`, `alpn`) or
+/// crate-private (`route`), and [`Mounted`] keeps its sender to itself. What you
+/// get is a map you can mount into, count, stop and evict, and never send to.
+/// The tests in this file are the exception that proves it — they are inside the
+/// crate, so they can call `route`, and RFC-04 §16.8 expects these defaults to
+/// go when the crate splits.
+///
 /// # `error[E0283]: type annotations needed`
 ///
 /// The default does not rescue every call site, and this is where somebody who
 /// has just met that error is looking. A default applies in **type position**,
-/// so there has to be a type position for it to apply in — and a system that is
-/// built and then touched only through the methods that never mention `M`
-/// ([`contains`](Self::contains), [`len`](Self::len),
-/// [`is_empty`](Self::is_empty), [`evict_idle`](Self::evict_idle),
-/// [`stop`](Self::stop), [`abort`](Self::abort)) never writes one:
+/// so there has to be a type position for it to apply in — and a `let` that
+/// binds what [`build`](SystemBuilder::build) returns without naming its type
+/// is not one:
 ///
 /// ```compile_fail
 /// let system = keylink::System::builder(keylink::Eviction::Never).build();
 /// assert!(system.is_empty());
 /// ```
+///
+/// The compiler points at `build`'s own `M: Send + 'static` bound, from the
+/// `.build()` line alone: that bound is what demands `M` be known, so the
+/// binding fails by itself and the second line never gets a chance to matter.
+/// The second line is what such a system goes on to be used for, and it is why
+/// nothing downstream rescues the binding either — [`contains`](Self::contains),
+/// [`len`](Self::len), [`is_empty`](Self::is_empty),
+/// [`evict_idle`](Self::evict_idle), [`stop`](Self::stop) and
+/// [`abort`](Self::abort) never mention `M`, so none of them pins it.
+///
+/// `compile_fail` says only that it failed, and writing `compile_fail,E0283`
+/// would not pin the code — rustdoc accepts a bogus `E0999` there and reports
+/// the doctest as passing. That the failure is `E0283` and not something else
+/// is checked by lifting the tag and reading the error, which is a thing a
+/// person does, not the harness.
 ///
 /// Name the type and it compiles. That is the whole fix:
 ///
@@ -482,7 +572,7 @@ impl<M> fmt::Debug for System<M> {
 /// Assembles a [`System`]: its eviction policy, its cap, and how it spawns.
 ///
 /// `M` is the system's message type, defaulted to [`Mail`] exactly as on
-/// [`System`].
+/// [`System`], and supported at [`Mail`] alone for the reason given there.
 pub struct SystemBuilder<M = Mail> {
     capacity: usize,
     eviction: Eviction,
@@ -605,20 +695,31 @@ fn spawn_sweeper<M: Send + 'static>(registry: &Arc<Registry<M>>, budget: Duratio
 
 #[cfg(test)]
 mod tests {
-    //! Every test here runs at `M = ()`, and that instantiation is the
+    //! Every test here runs at `M = Bare`, and that instantiation is the
     //! assertion.
     //!
     //! The header above claims this half places no requirement on what a mailbox
     //! carries. Run against [`Mail`] — which is what `Mounted` means when nobody
     //! says otherwise — that claim is an argument, because `Mail` satisfies any
-    //! bound one of these types might quietly grow. `()` satisfies almost none:
-    //! it is `Send + 'static` and nothing else, with no `Context`, no stream, no
-    //! serde and nothing a peer could have put there.
+    //! bound one of these types might quietly grow. So the witness is a type
+    //! that satisfies as little as a witness can, and `mount`, `route`, `stop`
+    //! and `build` all appear here at it: a bound on any of the four stops this
+    //! binary from compiling.
     //!
-    //! So `System<()>`, `Mounted<()>` and `Mailbox<()>` compiling at all is the
-    //! property the split exists for, checked rather than argued. A transport
-    //! bound added to `mount`, `route`, `stop` or `build` would leave a
-    //! `Mail`-typed test binary green and stops this one from compiling.
+    //! **`()` was the witness first, and it was the wrong one.** It is not
+    //! "`Send + 'static` and nothing else" — it is `Serialize`,
+    //! `DeserializeOwned`, `Schema`, `Clone`, `Copy`, `Default` and `Debug` as
+    //! well, so it satisfies the likeliest accidental bound of all, the one
+    //! encoding needs. Measured, not argued: with `M: Debug` on `build`, the
+    //! whole crate passed — 18 `test result: ok` lines, 0 failures.
+    //!
+    //! What the `Mail`-typed binaries cover is worth being exact about, because
+    //! it is most of the real cover: `Mail` is not `Serialize`, so a serde bound
+    //! on `build` fails `tests/api.rs`, `tests/actors.rs`, `tests/blobs.rs` and
+    //! `tests/actor_memory.rs` with no help from here — also measured. What they
+    //! cannot catch is a bound `Mail` happens to satisfy, and `Debug` is one,
+    //! because `Mail` derives it. That gap is what a witness with no derives at
+    //! all closes.
     //!
     //! Nothing here needs a message to *be* anything, which is the same point
     //! from the other side: mounting, the cap, eviction, routing and the
@@ -627,15 +728,31 @@ mod tests {
 
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
+    /// The witness: `Send + 'static`, which [`SystemBuilder::build`] requires
+    /// and no message type can do without, and not one thing more. No derives,
+    /// deliberately — every trait added here is a bound this file would stop
+    /// noticing.
+    struct Bare;
+
     /// An actor that does nothing at all, for testing the registry rather than
-    /// any message it carries — so its mailbox carries a message that is not
-    /// anything.
-    fn idler() -> Mounted<()> {
-        mount(1, |mut inbox: Mailbox<()>| async move {
+    /// any message it carries.
+    fn idler() -> Mounted<Bare> {
+        mount(1, |mut inbox: Mailbox<Bare>| async move {
             while inbox.recv().await.is_some() {}
         })
+    }
+
+    /// Printing a handle must not depend on what its mailbox carries, which a
+    /// `derive(Debug)` on [`Mounted`] would make it do — and nothing else would
+    /// notice, because nothing else here prints one. `Bare` is not `Debug`, so
+    /// this line is the notice.
+    #[tokio::test]
+    async fn a_mounted_actor_prints_without_help_from_its_message_type() {
+        assert!(format!("{:?}", idler()).starts_with("Mounted"));
     }
 
     /// Eviction is by last message, not by mount time, or a busy actor would be
@@ -678,6 +795,25 @@ mod tests {
         assert!(system.contains(&fresh));
     }
 
+    /// The boundary itself, which is the only place `< budget` and `<= budget`
+    /// disagree — 59 s and 90 s of a 60 s budget cannot tell them apart, and one
+    /// keystroke is all that separates "idle for its whole budget" from "idle
+    /// for a budget and a tick". A paused clock lands on it exactly, for free.
+    #[tokio::test(start_paused = true)]
+    async fn an_actor_idle_for_exactly_its_budget_is_evicted() {
+        let system = System::builder(Eviction::Idle(Duration::from_secs(60))).build();
+        let borderline = ActorId::new("borderline").expect("valid");
+        system.mount(borderline.clone(), idler()).expect("free");
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        system.evict_idle();
+
+        assert!(
+            !system.contains(&borderline),
+            "the budget is how long an actor may be idle, so spending all of it is spending it"
+        );
+    }
+
     /// `Eviction::Never` means never, however long nobody calls.
     #[tokio::test(start_paused = true)]
     async fn eviction_never_keeps_an_actor_nobody_addresses() {
@@ -693,7 +829,7 @@ mod tests {
 
     #[test]
     fn a_system_without_a_factory_never_grows_by_itself() {
-        let system: System<()> = System::builder(Eviction::Never).build();
+        let system: System<Bare> = System::builder(Eviction::Never).build();
         let error = system
             .route(&ActorId::new("nobody").expect("valid"))
             .expect_err("nothing is mounted and nothing builds it");
@@ -711,11 +847,24 @@ mod tests {
     /// The two refusals come from different enums, which is why both are here.
     /// `remote.rs`'s `the_capacity_refusal_reads_the_same_by_hand_and_lazily` is
     /// what keeps their sentences in step.
+    ///
+    /// The counter is the third assertion, and it is about memory rather than
+    /// about a message: the cap exists so that a peer naming ten thousand ids
+    /// this system has never heard of cannot make it build ten thousand actors.
+    /// Refusing *after* calling the factory would satisfy both `assert_eq!`s
+    /// above while doing exactly the work the cap is there to prevent — and
+    /// doing it under the write lock, where it stalls every other route and
+    /// mount rather than merely wasting a task.
     #[tokio::test]
     async fn a_full_registry_refuses_by_hand_and_lazily() {
+        let built = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&built);
         let system = System::builder(Eviction::Never)
             .capacity(1)
-            .spawn_with(|_| Some(idler()))
+            .spawn_with(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Some(idler())
+            })
             .build();
         system
             .mount(ActorId::new("first").expect("valid"), idler())
@@ -730,13 +879,36 @@ mod tests {
             .route(&ActorId::new("third").expect("valid"))
             .expect_err("the factory is never called past the cap");
         assert_eq!(lazily, RouteError::AtCapacity { capacity: 1 });
+        assert_eq!(
+            built.load(Ordering::SeqCst),
+            0,
+            "a refused message must cost no state and no task"
+        );
+    }
+
+    /// An id that is taken is [`MountError::Occupied`] even when the registry is
+    /// also full, because the two say different things to a caller: `Occupied`
+    /// means this id is somebody else's, `AtCapacity` means the system is out of
+    /// room. Checking the cap first would tell a caller re-mounting a live id to
+    /// go and make room, which would not help them once they had.
+    #[tokio::test]
+    async fn a_taken_id_is_occupied_even_when_the_registry_is_full() {
+        let system = System::builder(Eviction::Never).capacity(1).build();
+        let taken = ActorId::new("taken").expect("valid");
+        system.mount(taken.clone(), idler()).expect("free");
+
+        let again = system
+            .mount(taken.clone(), idler())
+            .expect_err("the id is taken");
+
+        assert_eq!(again, MountError::Occupied { id: taken });
     }
 
     /// The two lifecycle methods, at a message type with no wire behind it.
     ///
     /// They are the likeliest place for a transport bound to arrive by accident,
     /// because both await a task and one of them drops a sender — and neither
-    /// needs to know what that sender carries. Here it carries `()`.
+    /// needs to know what that sender carries. Here it carries a `Bare`.
     ///
     /// What each one does to state in flight is `remote.rs`'s and
     /// `tests/actors.rs`'s to prove, over a real actor with real state. This one

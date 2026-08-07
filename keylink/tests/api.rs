@@ -57,6 +57,17 @@ async fn every_re_exported_name_resolves_without_a_parameter() {
     let _ = actor_schema::<u8>("keylink/api");
     let _ = ActorReply::encode(&9u8);
     let _ = ActorRequest::new(ActorId::new("probe").expect("valid"), 7, &9u8);
+    // The one name whose default does not carry on its own. `mount`'s `M` is a
+    // *function* generic, and function generics cannot have defaults — so `M` is
+    // inferred, and the only thing here to infer it from is `Mailbox`, whose own
+    // default supplies `Mail`. Drop the `: Mailbox` annotation and this stops
+    // compiling with `E0282`, where before the parameterization it did not.
+    //
+    // Written out because the file above claims each name resolves
+    // unparameterized, and for this one that is true only with an annotation the
+    // generated code always happens to supply. A downstream caller writing
+    // `mount` by hand has to know that, and `mount` being `#[doc(hidden)]` is the
+    // reason this is a footnote rather than a break worth declaring.
     let _ = mount(1, |mut inbox: Mailbox| async move {
         while inbox.recv().await.is_some() {}
     });

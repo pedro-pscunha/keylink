@@ -18,14 +18,19 @@
 //!
 //! # Who settles a key, and who does not
 //!
-//! Only work that was actually entered settles a key. A layer that refuses a
+//! Work nobody can promise did not run settles a key. A layer that refuses a
 //! call **before** dispatch — an authorization rule, a [`QueueTimeout`] whose
 //! budget expired while the message was still queued — leaves the key
-//! claimable, because nothing ran and nothing is owed. A layer that refuses
-//! **after** dispatch, such as a [`Timeout`](crate::Timeout) that drops the wait
-//! for a running actor turn, settles the key as
+//! claimable, because that refusal is proof nothing ran and nothing is owed. A
+//! layer that gives up **after** dispatch, such as a
+//! [`Timeout`](crate::Timeout) that drops the wait for an actor turn already
+//! running or already queued to run, settles the key as
 //! [`Interrupted`](IdempotencyRefusal::Interrupted): whether the work landed is
 //! genuinely not known from there.
+//!
+//! The line is proof, not order. A message that reached a mailbox is one whose
+//! turn runs whether the caller stayed or not, so releasing its key hands a
+//! retry the same work to do twice — RFC-04 §16.12.
 //!
 //! That distinction is not visible in the [`Outcome`](crate::Outcome) a layer
 //! returns — `Outcome::Err` is what a panicking actor turn produces too — so it
@@ -240,6 +245,16 @@ pub enum IdempotencyRefusal {
     /// `postcard_schema` hashes the variant list into the ALPN: a second
     /// spelling of "too many at once" would move the protocol identity and
     /// break every handshake, to say something the caller acts on identically.
+    ///
+    /// So `limit` names the cap that was reached and **not which cap it was**,
+    /// and since [`MAX_WAITING_PER_PEER`] and [`MAX_RUNNING_PER_PEER`] are both
+    /// 128 for the reason each doc gives, a per-peer refusal cannot be told from
+    /// its sibling at all. That is the price of the one variant, and it is
+    /// charged where it costs least: a caller does the same thing either way —
+    /// stop adding load and ask again — and an operator who needs to know which
+    /// bound is binding has [`Idempotency::attaching_for`] on one side of it and
+    /// a bare key on the other, which is a question about the call that was
+    /// made rather than about the answer it got.
     #[error("too many calls with idempotency keys are in flight - the limit is {limit}")]
     TooManyRunning {
         /// The cap that was reached.
@@ -895,9 +910,10 @@ impl Drop for Guard {
         if self.settled {
             return;
         }
-        // Nothing ran, so nothing is owed and the key goes back. Anything else
-        // — entered and unfinished, or finished with nobody left to record it —
-        // is genuinely unknown.
+        // Nothing ran and somebody was in a position to know it, so nothing is
+        // owed and the key goes back. Anything else — entered and unfinished,
+        // finished with nobody left to record it, or still in a mailbox whose
+        // turn nobody stayed to watch — is genuinely unknown.
         if self.progress.as_ref().map(Progress::reached) == Some(Reached::NotDispatched) {
             self.ledger.release(self.peer, &self.key);
         } else {

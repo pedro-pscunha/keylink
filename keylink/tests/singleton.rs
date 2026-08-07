@@ -717,6 +717,176 @@ async fn a_queue_timeout_leaves_an_idempotency_key_claimable() {
     server.shutdown().await.expect("stops");
 }
 
+/// The budget both bounds below are given, and a hold that outlasts it several
+/// times over. A message queued behind that hold has provably run out of budget
+/// before the actor is free again, whichever bound is in front of it.
+const BUDGET: Duration = Duration::from_millis(100);
+const HOLD: u64 = 400;
+
+/// The three facts one keyed message behind a held turn leaves behind.
+///
+/// Three fields rather than one entry list, because the two bounds now agree on
+/// the list and differ in everything leading to it. Collapsing them would leave
+/// each of the properties below pinned by the accident that the others hold.
+struct BehindAHeldTurn {
+    /// What the actor had run once the holding turn was over and the refused
+    /// caller had long since been answered — read **before** the retry.
+    ///
+    /// Its own assertion, and not a step towards the last one, because
+    /// `local.rs` heads a section "The turn runs even if you stop waiting": *a
+    /// caller that gives up on a `reserve` has still reserved*. No test drops an
+    /// `ask` future and checks that; this line is the whole of what pins it,
+    /// and until the fix below it was pinned only by the doubled entry of a
+    /// defect.
+    before_the_retry: Vec<u64>,
+    /// What the retry under the same key was told. The bounds differ here and
+    /// nowhere else that a caller can see.
+    retry: Result<u64, keylink::Error>,
+    /// What the actor had run in the end.
+    entries: Vec<u64>,
+}
+
+/// One turn holds the actor; a second message queues behind it under an
+/// idempotency key, outlives `BUDGET`, and is retried under the same key.
+/// Answers on the actor's own entry list, which records what **ran** rather than
+/// what any caller was told.
+///
+/// The holding turn is a **local** call, so it never meets the layer: the bound
+/// under test then applies to exactly one message and the two runs differ in
+/// nothing else. That both doors share one mailbox is a separate property, and
+/// `local_and_remote_messages_share_one_mailbox` is where it is pinned.
+///
+/// Every entry list here is read through a **local** call issued after the
+/// message it reports on was already in the mailbox, so FIFO decides what it
+/// sees. Nothing waits on a clock to decide whether a turn has run.
+async fn entries_behind_a_held_turn(
+    bound: impl Middleware<ledger::Request, ledger::Response>,
+) -> BehindAHeldTurn {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let actor = ledger::actor(Ledger::default());
+    let server = Server::builder(&node)
+        .service(actor.service(Allowlist::anyone()).layer(bound).build())
+        .spawn()
+        .expect("serves");
+    let client = ledger::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+    let key = keylink::IdempotencyKey::new("post-2").expect("a valid key");
+
+    let held = {
+        let actor = actor.clone();
+        tokio::spawn(async move { actor.post(1, HOLD).await })
+    };
+    // Long enough that the held message is IN its turn, so the next one queues
+    // behind it rather than racing it for the permit.
+    n0_future::time::sleep(Duration::from_millis(80)).await;
+
+    let refused = client
+        .with_idempotency(key.clone())
+        .post(2, 0)
+        .await
+        .expect_err("the queued message outlives its budget behind the held turn");
+    assert!(
+        matches!(
+            refused,
+            keylink::Error::Remote(RemoteError::TimedOut { .. })
+        ),
+        "both bounds refuse this message, and the difference is what the actor does about it \
+         afterwards; got {refused:?}"
+    );
+    assert_eq!(held.await.expect("no panic").expect("running"), 1);
+
+    // Local, and issued behind the refused message, so it reports whether that
+    // message ran after its caller had already given up on it.
+    let before_the_retry = actor.entries().await.expect("running");
+
+    let retry = client.with_idempotency(key).post(2, 0).await;
+
+    // Local, and issued last, so it sits behind every message above in the one
+    // mailbox. FIFO, not a wall-clock guess about when the refused turn ran.
+    let entries = actor.entries().await.expect("running");
+    server.shutdown().await.expect("stops");
+    BehindAHeldTurn {
+        before_the_retry,
+        retry,
+        entries,
+    }
+}
+
+/// The two bounds through one scenario: each runs a keyed message **once**, and
+/// they differ in which retry is allowed to be that once.
+///
+/// `Timeout` sits outside the mailbox, so its budget expiring drops the wait for
+/// the reply and not the turn: the caller reads `TimedOut` while the message is
+/// queued, and the turn runs anyway. The key therefore settles `Interrupted` and
+/// the retry is refused — the honest answer, because nobody can say from out
+/// there whether the work landed. `QueueTimeout` is re-read on the actor's own
+/// task, so a message it refuses genuinely never runs and giving the key back is
+/// the truth: the retry is a first attempt and it is what does the work.
+///
+/// # This inverts a pin that recorded a defect
+///
+/// The `Timeout` half used to assert `[1, 2, 2]` and a retry that succeeded:
+/// nothing marked a still-queued message, the ledger gave the key back, the turn
+/// ran, and the retry ran the same work a second time — at-least-once, out of
+/// the module whose one promise is at-most-once. That pin asked to be changed
+/// deliberately by whoever fixed the behaviour, and RFC-04 §16.12 is that
+/// commit: the progress marker records reaching a mailbox as its own fact, which
+/// an arm that knows nothing ran then overrides.
+///
+/// Still **one** test, for the reason the pin gave: either half alone says
+/// nothing about the difference between the two bounds, and that difference is
+/// the whole of what `Timeout`'s and `QueueTimeout`'s rustdoc promise a reader.
+/// It is now a difference in the key and not in the work.
+#[tokio::test]
+async fn a_timeout_settles_the_key_it_gave_up_on_where_a_queue_timeout_leaves_it_claimable() {
+    let timed_out = entries_behind_a_held_turn(keylink::Timeout::after(BUDGET)).await;
+    assert_eq!(
+        timed_out.before_the_retry,
+        vec![1, 2],
+        "the turn ran after its caller was told TimedOut, which is `local.rs`'s promise that \
+         dropping the wait does not cancel the turn"
+    );
+    let refused = timed_out
+        .retry
+        .expect_err("the key of a message that was queued when its caller gave up must settle");
+    assert!(
+        matches!(
+            refused,
+            keylink::Error::Remote(RemoteError::Idempotency(
+                keylink::IdempotencyRefusal::Interrupted
+            ))
+        ),
+        "a caller that cannot be told whether its work landed must be refused rather than \
+         invited to run it again; got {refused:?}"
+    );
+    assert_eq!(
+        timed_out.entries,
+        vec![1, 2],
+        "the refused retry must not have run the work a second time"
+    );
+
+    let queued = entries_behind_a_held_turn(keylink::QueueTimeout::after(BUDGET)).await;
+    assert_eq!(
+        queued.before_the_retry,
+        vec![1],
+        "a message refused on the actor's own task never ran, which is what makes releasing \
+         its key the truth"
+    );
+    assert_eq!(
+        queued
+            .retry
+            .expect("the key must still be claimable, because the refusal proved nothing ran"),
+        2,
+    );
+    assert_eq!(
+        queued.entries,
+        vec![1, 2],
+        "the retry under the released key is the only time the work happened"
+    );
+}
+
 // ─────────────────────────────────────── what a lost turn tells a remote peer
 
 /// The name the observer below answers to, and therefore the exact text a peer

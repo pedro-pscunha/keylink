@@ -505,6 +505,29 @@ impl<A: Send + 'static> LocalActor<A> {
             + Send
             + 'static,
     {
+        self.ask_catching_queued(|| {}, turn).await
+    }
+
+    /// The same, calling `queued` the instant the message is provably in the
+    /// mailbox.
+    ///
+    /// That instant is invisible from outside, and telling the two sides of it
+    /// apart is the difference between a released idempotency key and a settled
+    /// one. Before it, a caller that gives up queued **nothing** — tokio drops
+    /// a send it cancelled — so its key is owed back. After it, the turn runs
+    /// whether anyone is still listening or not, so a released key invites a
+    /// retry that does the work a second time. RFC-04 §16.12.
+    async fn ask_catching_queued<T, F>(
+        &self,
+        queued: impl FnOnce() + Send,
+        turn: F,
+    ) -> Result<Result<T, Panic>, TurnLost>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(&'a mut A) -> Pin<Box<dyn Future<Output = T> + Send + 'a>>
+            + Send
+            + 'static,
+    {
         let (reply, answer) = oneshot::channel();
         self.deliver(Box::new(move |state, hooks| {
             Box::pin(async move {
@@ -519,6 +542,7 @@ impl<A: Send + 'static> LocalActor<A> {
         }))
         .await
         .map_err(|_| TurnLost::Gone)?;
+        queued();
         // The sender is dropped without sending when the task died mid-turn:
         // `abort`, a runtime shutdown, or a panicking `Drop` in the state. All
         // three mean the same thing to a caller, which is why they share an
@@ -551,6 +575,12 @@ impl<A: Send + 'static> LocalActor<A> {
     ///
     /// `None` for the deadline is [`ask_catching`](Self::ask_catching).
     ///
+    /// `queued` is called once the message is provably in the mailbox, and not
+    /// at all when it never got there. A served path settles an idempotency key
+    /// on that fact: the deadline decides what this call *returns*, and only
+    /// this callback can say whether a caller who stopped waiting left a turn
+    /// behind that will run anyway. Pass `|| {}` where no key is in play.
+    ///
     /// # Errors
     ///
     /// [`MailboxClosed`] when the actor is gone. A panic is inside
@@ -558,6 +588,7 @@ impl<A: Send + 'static> LocalActor<A> {
     pub async fn ask_catching_before<T, F>(
         &self,
         deadline: Option<Instant>,
+        queued: impl FnOnce() + Send,
         turn: F,
     ) -> Result<Queued<T>, TurnLost>
     where
@@ -567,11 +598,14 @@ impl<A: Send + 'static> LocalActor<A> {
             + 'static,
     {
         let Some(deadline) = deadline else {
-            return self.ask_catching(turn).await.map(Queued::Ran);
+            return self
+                .ask_catching_queued(queued, turn)
+                .await
+                .map(Queued::Ran);
         };
 
         let (reply, answer) = oneshot::channel();
-        let queued = n0_future::time::timeout(
+        let sent = n0_future::time::timeout(
             deadline.saturating_duration_since(Instant::now()),
             self.deliver(Box::new(move |state, hooks| {
                 Box::pin(async move {
@@ -590,18 +624,23 @@ impl<A: Send + 'static> LocalActor<A> {
         )
         .await;
 
-        match queued {
+        match sent {
             // The permit never arrived. Dropping the `send` future is what
             // makes this honest: tokio does not queue a message whose send was
-            // cancelled, so nothing is in the mailbox to run later.
+            // cancelled, so nothing is in the mailbox to run later — and
+            // `queued` is therefore not called, which is what keeps a key
+            // claimable for a message that never existed.
             Err(_elapsed) => Ok(Queued::Expired),
             Ok(Err(_closed)) => Err(TurnLost::Gone),
-            Ok(Ok(())) => match answer.await {
-                Err(_) => Err(TurnLost::Gone),
-                Ok(Answered::Expired) => Ok(Queued::Expired),
-                Ok(Answered::Ran(ran)) => Ok(Queued::Ran(ran)),
-                Ok(Answered::Refused { name }) => Err(TurnLost::Refused { name }),
-            },
+            Ok(Ok(())) => {
+                queued();
+                match answer.await {
+                    Err(_) => Err(TurnLost::Gone),
+                    Ok(Answered::Expired) => Ok(Queued::Expired),
+                    Ok(Answered::Ran(ran)) => Ok(Queued::Ran(ran)),
+                    Ok(Answered::Refused { name }) => Err(TurnLost::Refused { name }),
+                }
+            }
         }
     }
 

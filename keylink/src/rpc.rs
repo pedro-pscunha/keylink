@@ -397,9 +397,10 @@ where
     if let Some(guard) = keyed {
         match progress.reached() {
             Reached::Completed => guard.record(&frame, body.declared_len() != Some(0)),
-            // A layer said no without calling through, or entered and produced
-            // nothing. Dropping the guard is what settles those, and it settles
-            // them the same way whether this task returned or was aborted.
+            // A layer said no without calling through; or the work was entered,
+            // or merely reached a mailbox, and produced nothing. Dropping the
+            // guard is what settles those, and it settles them the same way
+            // whether this task returned or was aborted.
             Reached::NotDispatched | Reached::Dispatched => drop(guard),
         }
     }

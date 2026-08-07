@@ -17,7 +17,7 @@
 //! node, and the existing one-stream-per-call design already gives per-message
 //! concurrency between different actors. See RFC-02 §10.2 and RFC-04 §14.
 //!
-//! # Why this is two files
+//! # Why there are two halves
 //!
 //! That decision produced two answers to two unrelated questions, and they were
 //! written as one file. [`registry`] answers **which actor**: a keyed map of
@@ -31,9 +31,12 @@
 //! but because there is no type there to reach them through.
 //!
 //! The direction is the whole point. `remote.rs` names registry types freely;
-//! `registry.rs` names transport types only where the public API forces it, and
-//! its own header lists those five places by name so that the day somebody adds
-//! a sixth, they have to add it to a list that says it should not exist.
+//! `registry.rs` names transport types only where the public API forces it. Its
+//! own header names the four such places that are in it, and RFC-04 §16.8 is
+//! the list of record for all six that block the crate split — because a list
+//! kept in two places drifts, and this one did: three intra-doc links to a wire
+//! type were added, filed in the RFC, and left out of the header, which went on
+//! saying nothing else was there.
 
 mod registry;
 mod remote;

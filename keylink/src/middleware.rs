@@ -58,9 +58,14 @@ pub(crate) enum Reached {
     /// No layer called through. Nothing ran, so a claimed key owes nothing and
     /// is given back.
     NotDispatched,
-    /// The work started and did not report finishing — a `Timeout` that dropped
-    /// the wait for a running actor turn, or a connection that died. Whether it
-    /// took effect is unknown, which is what `Interrupted` says.
+    /// The work may have started and did not report finishing — a `Timeout`
+    /// that dropped the wait for an actor turn already running *or* already
+    /// queued, or a connection that died. Whether it took effect is unknown,
+    /// which is what `Interrupted` says.
+    ///
+    /// "May have" and not "did", since a message sitting in a mailbox is one
+    /// nobody can promise did not run. Answering that with a release is the
+    /// at-least-once defect RFC-04 §16.12 records.
     Dispatched,
     /// The work produced the answer the chain returned. The key settles as that
     /// answer.
@@ -106,38 +111,81 @@ pub(crate) enum Reached {
 #[derive(Debug, Clone)]
 pub struct Progress(Arc<AtomicU8>);
 
-/// Monotone by construction: `fetch_max` means a late mark cannot walk the
-/// state backwards, so the two marks can be made from the actor's task without
-/// ordering them against the accept task's read.
-const NOT_DISPATCHED: u8 = 0;
-const DISPATCHED: u8 = 1;
-const COMPLETED: u8 = 2;
+/// Facts about one call, not positions along it. `fetch_or` sets a bit and
+/// never clears one, which is the same property `fetch_max` was chosen for — a
+/// late mark cannot walk the state backwards, so marks made from the actor's
+/// task need no ordering against the accept task's read — without needing the
+/// facts to sit in one total order.
+///
+/// They cannot. What each fact owes a claimed key alternates: nothing marked
+/// releases, `ENQUEUED` settles, `UNRUN` releases, `DISPATCHED` settles. A
+/// threshold read can only answer something monotone along the order, and
+/// `UNRUN` happens *after* `ENQUEUED` and owes *less* than it. Ordering them
+/// was the wrong constraint, not the missing one.
+const ENQUEUED: u8 = 1;
+const UNRUN: u8 = 2;
+const DISPATCHED: u8 = 4;
+const COMPLETED: u8 = 8;
 
 impl Progress {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(AtomicU8::new(NOT_DISPATCHED)))
+        Self(Arc::new(AtomicU8::new(0)))
+    }
+
+    /// The message is in a mailbox and its fate is no longer this task's to
+    /// know. Marked by whichever code got the permit, because only that code
+    /// can tell a message that queued from one whose send was cancelled.
+    ///
+    /// **Not a settlement**, which is the whole of why marking here does not
+    /// re-open RFC-04 §16.6 and §16.7: [`unrun`](Self::unrun) outranks it, so a
+    /// [`QueueTimeout`](crate::QueueTimeout) refusing a still-queued message
+    /// still gives the key back. What it does buy is the case nothing else
+    /// covers — a caller that gives up on a queued message and never hears
+    /// which way it went, whose key would otherwise be released under a turn
+    /// that then runs.
+    #[doc(hidden)]
+    pub fn enqueued(&self) {
+        self.0.fetch_or(ENQUEUED, Ordering::Release);
+    }
+
+    /// The message came off a mailbox and no user code ran. Called by generated
+    /// dispatch, from every arm that ends a message without entering it.
+    ///
+    /// Silence would mean [`enqueued`](Self::enqueued), so an arm that knows
+    /// nothing ran has to say so rather than say nothing.
+    #[doc(hidden)]
+    pub fn unrun(&self) {
+        self.0.fetch_or(UNRUN, Ordering::Release);
     }
 
     /// The work is about to begin. Called by generated dispatch.
     #[doc(hidden)]
     pub fn dispatched(&self) {
-        self.0.fetch_max(DISPATCHED, Ordering::Release);
+        self.0.fetch_or(DISPATCHED, Ordering::Release);
     }
 
     /// The work produced its answer. Called by generated dispatch.
     #[doc(hidden)]
     pub fn completed(&self) {
-        self.0.fetch_max(COMPLETED, Ordering::Release);
+        self.0.fetch_or(COMPLETED, Ordering::Release);
     }
 
-    /// Written as thresholds rather than as a `match`, so there is no catch-all
-    /// arm and no unreachable state to name: the value is monotone, so every
-    /// `u8` maps to exactly one answer.
+    /// Read most-known first, so there is still no catch-all arm and no
+    /// unreachable state to name: every bit pattern maps to exactly one answer.
+    ///
+    /// The order is also what makes a double mark harmless rather than
+    /// ambiguous. A message that is both `DISPATCHED` and `UNRUN` is read as
+    /// dispatched, which is the conservative answer, and it is why an arm may
+    /// mark `unrun()` without first proving that nothing above it ran.
     pub(crate) fn reached(&self) -> Reached {
         let raw = self.0.load(Ordering::Acquire);
-        if raw >= COMPLETED {
+        if raw & COMPLETED != 0 {
             Reached::Completed
-        } else if raw >= DISPATCHED {
+        } else if raw & DISPATCHED != 0 {
+            Reached::Dispatched
+        } else if raw & UNRUN != 0 {
+            Reached::NotDispatched
+        } else if raw & ENQUEUED != 0 {
             Reached::Dispatched
         } else {
             Reached::NotDispatched
@@ -310,6 +358,51 @@ impl Queueing {
     pub fn millis(self) -> u64 {
         self.millis
     }
+
+    /// Whether the budget is spent. Asked here so that both dispatch paths ask
+    /// one question rather than each writing its own comparison.
+    ///
+    /// Generated code cannot write it: `deadline` is an
+    /// `n0_future::time::Instant` — tokio's natively, `web_time`'s in a browser,
+    /// and `std::time::Instant` on neither, because that one panics on
+    /// `wasm32-unknown-unknown` — and nothing in this crate's public surface
+    /// re-exports a clock for `service!` to name in the caller's crate. The
+    /// keyed loop reached for the one spelling available to it,
+    /// `!deadline().elapsed().is_zero()`, which is `now > deadline` and not the
+    /// `now >= deadline` that
+    /// [`LocalActor::ask_catching_before`](crate::LocalActor::ask_catching_before)
+    /// applies to the same budget. That divergence was written down twice, in
+    /// the macro and in RFC-04, as "a budget of exactly zero". It is every case
+    /// where `now == deadline`, and there are two ways to land on one:
+    ///
+    /// - **A paused clock.** `tokio::time::pause` advances only to timer edges,
+    ///   so it lands exactly on the deadline at any budget. There this is the
+    ///   ordinary case rather than an edge one, and a test written that way
+    ///   would watch one path refuse a message the other ran.
+    /// - **A browser.** On `wasm32-unknown-unknown` the clock is
+    ///   `web_time::Instant`, and its `now()` is `Performance.now()` — clamped
+    ///   to a tick, typically 1 ms and as coarse as 100 ms under Firefox's
+    ///   resist-fingerprinting. `deadline` is stamped from that same clamped
+    ///   clock, so it sits on a tick too, and `now` reaches it exactly for any
+    ///   budget that is a whole number of ticks. Under the usual 1 ms clamp
+    ///   that is every budget written in whole milliseconds. Not a test
+    ///   artefact: a target this crate compiles for.
+    ///
+    /// It is the native clock that hides all of this. Nanosecond resolution and
+    /// a channel hop between the stamp and the check mean `now == deadline` is
+    /// unreachable there at any budget — which is why the whole test suite
+    /// stays green whichever way this one comparison is written.
+    ///
+    /// `>=` rather than `>`, because the other half of this budget is
+    /// `n0_future::time::timeout` around the wait for a mailbox permit, and a
+    /// timer fires *at* its deadline. A message that has waited its whole budget
+    /// is already refused by that half; the half that runs on the actor's task
+    /// has to say the same thing about the same message.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn expired(self) -> bool {
+        Instant::now() >= self.deadline
+    }
 }
 
 /// Refuses a message that is still **queued** when its budget expires, and
@@ -324,11 +417,29 @@ impl Queueing {
 /// not load shedding; it is load shedding's shadow.
 ///
 /// This one sheds real load, because it refuses **before** the work starts. The
-/// deadline travels on the [`Context`] and is checked twice: once around the
-/// wait for a mailbox permit, and once on the actor's own task immediately
-/// before the turn begins. So a message it refuses is a message that never ran,
-/// which is also what makes it the only bound that composes with an
-/// [`IdempotencyKey`](crate::IdempotencyKey) — the key stays claimable.
+/// deadline travels on the [`Context`] and is checked in two places, on both of
+/// the ways an actor is served: once around the wait for a mailbox permit, and
+/// once on the actor's own task immediately before the turn begins. So a message
+/// it refuses is a message that never ran, which is also what makes it the only
+/// bound that composes with an [`IdempotencyKey`](crate::IdempotencyKey) — the
+/// key stays claimable.
+///
+/// # Neither check substitutes for the other, and the two paths got them apart
+///
+/// The second check bounds a message queued behind a busy actor. The first
+/// bounds a message that cannot be queued at all, because the mailbox is full —
+/// which is the state a load-shedding budget exists for. Named per path rather
+/// than left as one sentence about "the deadline", because the sentence above
+/// was true of one path and false of the other for as long as both existed:
+///
+/// - A singleton served with `Handle::service` has had both from the start, in
+///   [`LocalActor::ask_catching_before`](crate::LocalActor::ask_catching_before),
+///   which is the whole of that path's dispatch.
+/// - A keyed [`System`](crate::System) had **neither**: the layer compiled on
+///   `System::service` and guarded nothing there at any budget, because its loop
+///   never read the [`Context`]. RFC-04 §16.7. It gained the turn-side check
+///   first and the permit-side one after that, separately, because the first fix
+///   looked complete.
 ///
 /// # On a `Handler` it refuses nothing, and that is not a lie
 ///
@@ -402,6 +513,52 @@ pub trait Middleware<Req, Resp>: Send + Sync + 'static {
 /// When the budget expires the handler's future is dropped where it stands. A
 /// handler that must not be interrupted half way has to do that work in a task
 /// the drop cannot reach.
+///
+/// # On an actor it cancels nothing, and a key it gives up on stays refused
+///
+/// An actor's turn is exactly the work "a task the drop cannot reach" describes,
+/// because that is what a mailbox is. This layer runs outside it, so the budget
+/// expiring drops the *wait for the reply* and nothing else: the message is
+/// already queued and the turn runs to completion whatever the caller does. Ten
+/// callers get `TimedOut` at 100 ms and the actor still spends a hundred seconds
+/// producing replies nobody is waiting for. That is not load shedding.
+///
+/// Put an [`IdempotencyKey`](crate::IdempotencyKey) on the same call and the
+/// answer is honest, permanent, and probably not what the caller hoped for. A
+/// key settles on **what ran**, read the instant the chain answers, and this
+/// layer answers while the message is somewhere it cannot see — queued, or in a
+/// turn. Both settle
+/// [`Interrupted`](crate::IdempotencyRefusal::Interrupted), so every retry of
+/// that call is refused for as long as the ledger keeps the entry and the
+/// caller has to reconcile out of band.
+///
+/// That the two cases now agree is the fix, not an accident. A message still
+/// queued when the budget expired used to leave the key **released** — nothing
+/// had marked it — and then the turn ran, and the retry the released key invited
+/// ran the same work a second time: at-least-once, out of the module whose one
+/// promise is at-most-once. Reaching a mailbox is a fact the marker records, so
+/// giving up on a message that reached one can no longer be mistaken for giving
+/// up on one that never did. RFC-04 §16.12.
+///
+/// [`QueueTimeout`] is still the bound for an actor: it refuses only a message
+/// that has not started, which is what leaves the key *claimable* rather than
+/// settled, so the retry is a first attempt instead of a refusal. Keep this one
+/// for a [`Handler`](crate::Middleware), where dropping the future genuinely
+/// cancels the work — and for the one job on an actor that nothing else in the
+/// crate does, below.
+///
+/// # The only bound that answers a caller behind a turn that never returns
+///
+/// Both dispatch paths bound the wait for a mailbox *permit*, and neither
+/// bounds the wait for the *answer*. So a turn that never returns — a self-call
+/// deadlock, an await on something that never fires — holds its caller forever,
+/// and [`QueueTimeout`] cannot help: its permit-side check has already passed,
+/// and its turn-side check runs when the message is taken, which never happens.
+///
+/// This layer is what answers that caller. It is not a worse `QueueTimeout`; it
+/// is the liveness backstop for the case `QueueTimeout` structurally cannot
+/// see, which is why a marker bound refusing it on actor builders was rejected.
+/// RFC-04 §16.12.
 #[derive(Debug, Clone, Copy)]
 pub struct Timeout {
     budget: Duration,
@@ -443,4 +600,52 @@ pub(crate) fn wrap<Req: Send + 'static, Resp: Send + 'static>(
     inner: Next<Req, Resp>,
 ) -> Next<Req, Resp> {
     Arc::new(move |cx, req, body| layer.handle(cx, req, body, inner.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    //! One question, because [`Queueing::expired`] answers one thing that no
+    //! integration test in this repo can see: which side of `==` a spent budget
+    //! falls on.
+
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    /// A budget is spent **at** its deadline, not a tick later.
+    ///
+    /// Every other test in this repo is green either way, and none of them is
+    /// wrong to be: they run on a native clock, where nanosecond resolution and
+    /// a channel hop put `now == deadline` out of reach at any budget. A paused
+    /// clock advances only to timer edges, so it lands exactly on the deadline
+    /// for **every** budget — which is what makes the choice checkable here and
+    /// nowhere else in CI.
+    ///
+    /// It is reachable in production, on the one target CI cannot run: a
+    /// browser's `Performance.now()` is clamped to a tick, `deadline` is stamped
+    /// from that same clamped clock, and `now` therefore hits it exactly for any
+    /// whole-tick budget. `Queueing::expired` carries that argument; this test
+    /// is the only place it is executed.
+    ///
+    /// `>=` and not `>`, because the other half of the same budget is a
+    /// `n0_future::time::timeout` around the wait for a mailbox permit, and a
+    /// timer fires *at* its deadline. A message that has waited its whole budget
+    /// is already refused by that half.
+    #[tokio::test(start_paused = true)]
+    async fn a_budget_is_spent_at_its_deadline() {
+        let budget = Duration::from_millis(100);
+        let queueing = Queueing {
+            deadline: Instant::now() + budget,
+            millis: 100,
+        };
+
+        assert!(!queueing.expired(), "a budget just stamped is not spent");
+
+        n0_future::time::sleep(budget).await;
+        assert!(
+            queueing.expired(),
+            "a message that waited its whole budget must be refused, or the two halves of one \
+             QueueTimeout disagree about the same message"
+        );
+    }
 }

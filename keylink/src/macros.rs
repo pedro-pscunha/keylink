@@ -562,26 +562,48 @@ macro_rules! service {
                         // queueing ENDS when the message is taken, so whatever
                         // the decode below costs is not time spent waiting.
                         //
-                        // `elapsed` rather than `Instant::now() >= deadline`
-                        // because the clock is `n0_future::time::Instant` —
-                        // tokio's natively, `web_time`'s in a browser, and
-                        // `std::time::Instant` on neither, since that one
-                        // panics on `wasm32-unknown-unknown`. Generated code
-                        // cannot name it: nothing in `$crate` re-exports a
-                        // clock. Calling `elapsed` on the deadline follows
-                        // whichever clock stamped it, which is one fewer place
-                        // that can drift from `middleware.rs`. It saturates to
-                        // zero on both, so this reads "now is strictly past the
-                        // deadline" and differs from the local path only for a
-                        // zero-length budget, in the direction of running the
-                        // message rather than refusing it.
-                        let __expired = cx
-                            .queueing()
-                            .filter(|__budget| !__budget.deadline().elapsed().is_zero());
+                        // `Queueing::expired` and not a comparison written
+                        // here, because generated code cannot name the clock —
+                        // nothing in `$crate` re-exports one — and the spelling
+                        // that worked without naming it,
+                        // `!deadline().elapsed().is_zero()`, is `now >
+                        // deadline` where the local path is `now >= deadline`.
+                        // The comment this replaces called that "a zero-length
+                        // budget". It is every case where `now == deadline` — a
+                        // paused clock's ordinary case, and a browser's too,
+                        // where `Performance.now()` is clamped to a tick and the
+                        // deadline is stamped from that same clamped clock. So
+                        // the two paths disagreed on wasm at any whole-tick
+                        // budget, which is a shipped target rather than a test
+                        // artefact.
+                        //
+                        // There are still TWO comparisons, and this comment
+                        // claimed otherwise for an hour. `local.rs` writes its
+                        // own `Instant::now() >= deadline` inline, on the
+                        // actor's task, inside `ask_catching_before`. The two
+                        // now AGREE — `Queueing::expired` is that same `>=` —
+                        // but nothing makes them, and a pair of hand-written
+                        // comparisons drifting is precisely the defect above.
+                        // `ask_catching_before` takes a bare `Instant`; taking
+                        // the `Queueing` would leave one predicate rather than
+                        // two that agree by inspection.
+                        let __expired = cx.queueing().filter(|__budget| __budget.expired());
                         // The ONLY route from the payload's bytes to a typed
                         // message, and it compares the hashes first.
-                        let __answer = match payload.open::<Request>(schema()) {
-                            ::std::result::Result::Ok(__request) if __expired.is_none() => {
+                        //
+                        // Wrapped, because `open` runs the CALLER's
+                        // `Deserialize` on the actor's own task. Uncaught, a
+                        // panic there unwound out of the mounted task from one
+                        // line ABOVE `guarded` and produced, verbatim, the
+                        // failure `guarded` exists to prevent: the receiver
+                        // dropped, every later send failing, and the registry
+                        // still listing an id nobody can reach for the life of
+                        // the process. RFC-04 §16.11.
+                        let __decoded = $crate::catching(|| payload.open::<Request>(schema()));
+                        let __answer = match __decoded {
+                            ::std::result::Result::Ok(::std::result::Result::Ok(__request))
+                                if __expired.is_none() =>
+                            {
                                 // The hashes agreed and the bytes decoded, so
                                 // what follows is user code. Marking above the
                                 // match instead would report a schema mismatch
@@ -612,13 +634,48 @@ macro_rules! service {
                                         // `Interrupted` — "it ran, and whether
                                         // it took effect is unknown". RFC-05
                                         // §2.
-                                        match $crate::ActorReply::encode(&__response) {
-                                            ::std::result::Result::Ok(__encoded) => {
+                                        //
+                                        // Wrapped for the same reason the
+                                        // decode above is: `encode` runs the
+                                        // caller's `Serialize` here, on the
+                                        // actor's task, one line after
+                                        // `guarded` has let go. The panic arm
+                                        // leaves the marker exactly where the
+                                        // refusing arm leaves it, because the
+                                        // two describe the same fact — the turn
+                                        // ran and produced nothing the wire can
+                                        // carry.
+                                        match $crate::catching(|| {
+                                            $crate::ActorReply::encode(&__response)
+                                        }) {
+                                            ::std::result::Result::Ok(
+                                                ::std::result::Result::Ok(__encoded),
+                                            ) => {
                                                 __progress.completed();
                                                 ($crate::Outcome::Ok(__encoded), __body)
                                             }
-                                            ::std::result::Result::Err(__refusal) => (
+                                            ::std::result::Result::Ok(
+                                                ::std::result::Result::Err(__refusal),
+                                            ) => (
                                                 $crate::Outcome::Err(__refusal),
+                                                $crate::Body::empty(),
+                                            ),
+                                            // Says the REPLY panicked, not the
+                                            // actor. `Display for Panic` and
+                                            // `Panic::message` both render "the
+                                            // actor panicked: ..", which is
+                                            // false here and false above: the
+                                            // handler returned normally and the
+                                            // unwind came out of a `Serialize`.
+                                            // A peer told otherwise would look
+                                            // for a fault in the method that
+                                            // answered it.
+                                            ::std::result::Result::Err(_) => (
+                                                $crate::Outcome::Err($crate::RemoteError::Failed(
+                                                    "the reply's `Serialize` panicked after the \
+                                                     turn ran"
+                                                        .to_owned(),
+                                                )),
                                                 $crate::Body::empty(),
                                             ),
                                         }
@@ -638,15 +695,18 @@ macro_rules! service {
                             // because a peer must not be able to tell the two
                             // dispatch paths apart by the refusal it reads.
                             //
-                            // The progress marker is deliberately NOT touched.
-                            // `Drop for Guard` then sees `NotDispatched` and
-                            // RELEASES the key, which is what makes a retry of
-                            // a call that never happened a first attempt.
-                            // Marking `dispatched()` here would settle the key
-                            // `Interrupted` and permanently refuse every retry
-                            // of work nobody did — the failure §16.6 names one
-                            // arm along, and the one property that makes this
+                            // `unrun()` and not silence. Reaching the mailbox is
+                            // marked on the way in — §16.12 — so an arm that
+                            // says nothing says "queued, fate unknown", which
+                            // would settle the key `Interrupted` and
+                            // permanently refuse every retry of work nobody
+                            // did. That is §16.6's failure one arm along, and
+                            // it would cost the one property that makes this
                             // the only bound composing with an idempotency key.
+                            // Saying it explicitly outranks the enqueue mark,
+                            // so `Drop for Guard` sees `NotDispatched` and
+                            // RELEASES the key: the retry of a call that never
+                            // happened is a first attempt.
                             //
                             // BELOW the decode, not above it: a payload whose
                             // bytes are not a message of this contract is
@@ -661,16 +721,56 @@ macro_rules! service {
                             //
                             // The `0` is unreachable: this arm is only taken
                             // when `__expired` is `Some`.
-                            ::std::result::Result::Ok(_) => (
-                                $crate::Outcome::Err($crate::RemoteError::TimedOut {
-                                    millis: __expired.map_or(0, $crate::Queueing::millis),
-                                }),
-                                $crate::Body::empty(),
-                            ),
-                            ::std::result::Result::Err(__refusal) => (
-                                $crate::Outcome::Err(__refusal),
-                                $crate::Body::empty(),
-                            ),
+                            ::std::result::Result::Ok(::std::result::Result::Ok(_)) => {
+                                __progress.unrun();
+                                (
+                                    $crate::Outcome::Err($crate::RemoteError::TimedOut {
+                                        millis: __expired.map_or(0, $crate::Queueing::millis),
+                                    }),
+                                    $crate::Body::empty(),
+                                )
+                            }
+                            // The hashes disagreed, or the bytes are not a
+                            // message of this contract. Either way the actor
+                            // never saw it, and `unrun()` is how that is said
+                            // now that arriving in the mailbox speaks for
+                            // itself.
+                            ::std::result::Result::Ok(::std::result::Result::Err(__refusal)) => {
+                                __progress.unrun();
+                                ($crate::Outcome::Err(__refusal), $crate::Body::empty())
+                            }
+                            // Never `TimedOut`, whatever the budget says, and
+                            // that falls out of the shape rather than out of
+                            // arm order: a payload that panics its own
+                            // `Deserialize` is broken permanently, and
+                            // `TimedOut` invites a retry that can never
+                            // succeed. The same argument the expiry arm above
+                            // makes for sitting below the decode.
+                            //
+                            // `unrun()`, so `Drop for Guard` sees
+                            // `NotDispatched` and RELEASES the key: the unwind
+                            // came out of the CALLER's `Deserialize`, before
+                            // any of the actor's own code, so nothing is owed
+                            // and a retry of a call that never happened is a
+                            // first attempt. Naming the MESSAGE and not the
+                            // actor for the reason the encode arm gives.
+                            //
+                            // The mirror image of the encode-panic arm above,
+                            // which stays silent on purpose: there the turn had
+                            // already run, and silence there means `dispatched`
+                            // rather than `enqueued` because `dispatched`
+                            // outranks it.
+                            ::std::result::Result::Err(_) => {
+                                __progress.unrun();
+                                (
+                                    $crate::Outcome::Err($crate::RemoteError::Failed(
+                                        "the message's `Deserialize` panicked, so the actor \
+                                         never saw it"
+                                            .to_owned(),
+                                    )),
+                                    $crate::Body::empty(),
+                                )
+                            }
                         };
                         // The caller may have gone away mid-turn. Its stream is
                         // dead either way, so there is nothing to report.
@@ -854,11 +954,21 @@ macro_rules! service {
                 ///
                 /// Because the reply is the service's own typed `Response`,
                 /// everything that reads one keeps working: per-method
-                /// [`Middleware`](keylink::Middleware), the idempotency ledger,
-                /// and `blob` methods, whose address the server must see to
-                /// record a grant. The keyed actor system can offer none of
-                /// those three — RFC-04 §14.8 — because there the payload is
-                /// opaque to keylink by design.
+                /// [`Middleware`](keylink::Middleware) and `blob` methods,
+                /// whose address the server must see to record a grant. The
+                /// keyed actor system can offer neither — RFC-04 §14.8 —
+                /// because there the payload is opaque to keylink by design.
+                ///
+                /// The idempotency ledger is **not** a third thing on that list,
+                /// which is what this paragraph used to say. A key is claimed
+                /// and settled off the *envelope*, and the envelope is typed on
+                /// both paths, so it works on a keyed actor exactly as it works
+                /// here. What the keyed path lacks is a way to *send* one: the
+                /// generated `ActorClient` has no `with_idempotency`, so a key
+                /// gets there only from a peer building the envelope through
+                /// [`RpcClient`](keylink::RpcClient) by hand. Reading it as a
+                /// missing capability invites reasoning about a keyed actor as
+                /// if no key could ever arrive at one.
                 ///
                 /// The local [`Handle`] keeps working while this is served, and
                 /// messages from both sides share the one mailbox.
@@ -944,6 +1054,12 @@ macro_rules! service {
                             // out here is it known whether the answer survived
                             // an observer. See the `completed()` call below.
                             let __settled = __progress.clone();
+                            // A THIRD, for the one fact neither of the others
+                            // can reach: the message got a mailbox permit. Only
+                            // `ask_catching_before` sees that moment, and a
+                            // caller that gives up after it gave up on a turn
+                            // that runs anyway. §16.12.
+                            let __queued = __progress.clone();
                             // A `QueueTimeout` above this put a deadline on the
                             // context. Honoured HERE rather than by the layer,
                             // because a layer cannot tell a queued message from
@@ -953,6 +1069,7 @@ macro_rules! service {
                                 let __answer = actor
                                     .ask_catching_before(
                                         __queueing.map($crate::Queueing::deadline),
+                                        move || __queued.enqueued(),
                                         move |__state: &mut A| {
                                         ::std::boxed::Box::pin(async move {
                                             __progress.dispatched();
@@ -991,17 +1108,37 @@ macro_rules! service {
                                         ($crate::Outcome::Ok(__response), __body)
                                     }
                                     // A panic must not unwind out of a
-                                    // connection's task, so the remote caller is
-                                    // told what the keyed system tells it. The
-                                    // actor is still alive.
+                                    // connection's task, so the remote caller
+                                    // is told a value. The actor is still
+                                    // alive.
                                     //
-                                    // BOTH sides of `Failed` carry a prefix, and
-                                    // prefixing only the refusal below would be a
-                                    // guard that cannot fail: `Display for Panic`
-                                    // writes the bare message, panic text is
-                                    // often caller-derived, and a handler that
-                                    // panicked with a refusal's exact text would
-                                    // produce a byte-identical `Failed`.
+                                    // BOTH sides of `Failed` need marking, or a
+                                    // handler that panicked with the refusal
+                                    // below's exact text would produce a
+                                    // byte-identical `Failed` and no peer could
+                                    // tell a panic from an observer's veto.
+                                    // Panic text is often caller-derived, so
+                                    // that is reachable rather than theoretical.
+                                    //
+                                    // This side arrives marked ALREADY, which
+                                    // is what the comment here used to deny:
+                                    // `Panic::caught` builds its message as
+                                    // "the actor panicked: {message}" and
+                                    // `Display` writes that, so the `format!`
+                                    // below adds a SECOND prefix and a peer
+                                    // reads "panicked: the actor panicked: bad
+                                    // message". Nor does it match the keyed
+                                    // loop, which renders the same panic as
+                                    // `__panic.to_string()` and sends "the
+                                    // actor panicked: bad message".
+                                    //
+                                    // Left alone rather than fixed here:
+                                    // `both_halves_of_a_lost_turn_carry_their_own_prefix`
+                                    // pins `starts_with("panicked: ")`, and it
+                                    // is the ONLY test pinning either prefix.
+                                    // There is no keyed twin, which is how a
+                                    // stutter on one path and a bare rendering
+                                    // on the other both stayed green.
                                     ::std::result::Result::Ok($crate::Queued::Ran(
                                         ::std::result::Result::Err(__panic),
                                     )) => (
@@ -1011,21 +1148,36 @@ macro_rules! service {
                                         $crate::Body::empty(),
                                     ),
                                     // Refused while still queued, so nothing
-                                    // ran. The progress marker is untouched,
-                                    // which is what leaves an idempotency key
-                                    // claimable rather than settled - the only
-                                    // bound that composes with one.
+                                    // ran, and `unrun()` is what leaves an
+                                    // idempotency key claimable rather than
+                                    // settled — the only bound that composes
+                                    // with one. Silence would now mean
+                                    // `enqueued`, which settles.
+                                    //
+                                    // ONE call covers both halves of the
+                                    // budget, because `Queued::Expired`
+                                    // deliberately collapses them: the permit
+                                    // that never arrived (nothing was marked,
+                                    // and this adds a fact already true) and
+                                    // the turn-side refusal of a message that
+                                    // did queue (this outranks its enqueue
+                                    // mark). Neither ran, so neither owes
+                                    // anything, and this path never has to tell
+                                    // them apart.
                                     //
                                     // The `0` is unreachable: without a
                                     // `QueueTimeout` there is no deadline, and
                                     // without a deadline nothing expires.
-                                    ::std::result::Result::Ok($crate::Queued::Expired) => (
-                                        $crate::Outcome::Err($crate::RemoteError::TimedOut {
-                                            millis: __queueing
-                                                .map_or(0, $crate::Queueing::millis),
-                                        }),
-                                        $crate::Body::empty(),
-                                    ),
+                                    ::std::result::Result::Ok($crate::Queued::Expired) => {
+                                        __settled.unrun();
+                                        (
+                                            $crate::Outcome::Err($crate::RemoteError::TimedOut {
+                                                millis: __queueing
+                                                    .map_or(0, $crate::Queueing::millis),
+                                            }),
+                                            $crate::Body::empty(),
+                                        )
+                                    }
                                     // An observer refused THIS TURN. Not
                                     // `NoSuchActor`, which says "there is
                                     // nothing here, stop asking" — the turn ran
