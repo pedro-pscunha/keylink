@@ -307,11 +307,19 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// only one any phase built a *local* actor of — while the entire argument for the
 /// `Box::pin` at the local loop's await is an absolute ceiling (3,005 bytes without
 /// it against 1,597 with) that happens to sit between 1,861 and 2,048. The local
-/// path has **less** headroom than the keyed one, by 83 bytes now — 275 against
-/// 358, and the figure here read 339, which is the *cost* difference between the
-/// two paths rather than the headroom difference. Two subtractions with the same
-/// operands and different meanings, and the wrong one was written. What the local
-/// path pays for: a second
+/// path has **less** headroom than the keyed one: **2,029 against a 2,304 ceiling,
+/// where keyed is 1,722 against 2,048.**
+///
+/// Four numbers rather than the subtraction, deliberately. That sentence has now
+/// been wrong twice, both times because it stated a *derived* figure: first "339
+/// bytes", which is the cost difference between the paths and not the headroom
+/// difference — two subtractions over the same operands, and the wrong one written
+/// — and then the corrected pair, whose keyed half went stale the moment the keyed
+/// measurement moved 1,690 → 1,722 in the same wave. **A figure derived from
+/// another figure rots silently when the source is re-measured**, and nothing in a
+/// green run says so. So the operands are written and the reader subtracts.
+///
+/// What the local path pays for: a second
 /// channel, the `watch` that carries the ending, an `Arc<JoinHandle>` and the
 /// `finish` loop, against the registry entry and `HashMap` slot the keyed one pays
 /// for instead. So phase 4 builds bulky *local* actors and asserts the slope here too,
@@ -342,7 +350,11 @@ const BUDGET_PER_ACTOR: isize = 2048;
 ///
 /// It restores 275 bytes of headroom against the 187 this literal had at 1,861 —
 /// *more* than before, not "about the same", which the sentence here first
-/// claimed. The keyed one stays at 2,048 with 358 under it.
+/// claimed. `LOCAL_SLACK` **is** that headroom rather than a figure derived from
+/// it, which is the point of decomposing the ceiling. The keyed one is untouched:
+/// `BUDGET_PER_ACTOR` is still 2,048 and the measurement is 1,722, so the floor's
+/// 32 bytes came out of *its* margin and tightened that guard rather than
+/// loosening it.
 ///
 /// What is **not** relaxed is the thing this budget cannot see and
 /// [`SLOPE_SLACK_OVER_A_KILOBYTE`] can: the slope is 13 bytes over a kilobyte of

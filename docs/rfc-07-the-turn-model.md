@@ -3434,9 +3434,26 @@ guard working; the first response was to make the change cheaper, which landed
 2,029, which *passes*; it is raised anyway because nineteen bytes under a ceiling
 is inside the difference between one allocator and another, so a green run on this
 machine would say nothing about a Linux CI. The keyed budget stays at 2,048 with
-358 bytes under it. `SLOPE_SLACK_OVER_A_KILOBYTE` — the guard that catches
+**326** bytes under it. `SLOPE_SLACK_OVER_A_KILOBYTE` — the guard that catches
 *unbounded* growth rather than a constant — is untouched, and the slope is 13
 bytes over a kilobyte of declared message, flat as before.
+
+**That paragraph is superseded by the variance measurement above, and two things in
+it were wrong.** Its reason — *"nineteen bytes … is inside the difference between
+one allocator and another"* — is the argument the zero-variance measurement retired:
+there is no run-to-run difference on this machine to be inside of, and the slack is
+an allowance for an allocator that has never run this, which is a different and
+unmeasured claim. And **358 was `2048 − 1690`**, computed from the pre-floor keyed
+figure in the very commit that measured 1,722. It is 326.
+
+The house habit is to leave superseded reasoning visible and correct it in place,
+but here the correction landed *earlier* in the same section than the thing it
+corrects, which inverts the convention and reads as two live arguments. Hence this
+marker rather than a rewrite. It is also the **second** stale subtraction in this
+one paragraph's neighbourhood — the "339 bytes of headroom" sentence a few lines up
+was the same defect, found in round one — so the pattern is worth naming: a figure
+derived from another figure rots silently when the source is re-measured, and
+`2048 − measured` should not have been written out as a literal at all.
 
 Per call: nothing on the answered path. One uncontended `Mutex` lock on the arm
 where a reply already died.
