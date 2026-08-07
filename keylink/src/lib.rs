@@ -209,6 +209,11 @@ mod middleware;
 mod node;
 mod observe;
 mod panic;
+// Where an answer waits for the verdict of the turn that produced it. Its own
+// module and not four items in `local.rs`, because the invariant it holds — a
+// lot is a local of one turn, so nothing can be parked outside one — is a
+// property of these types together and of nothing else in that file.
+mod parking;
 mod peer;
 /// The durability adapter. Gated on the feature AND nothing else: unlike
 /// `blocking`, every line in it compiles for the browser, which is what makes

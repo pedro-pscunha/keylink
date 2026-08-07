@@ -831,9 +831,15 @@ That is why `Replied<T>` is generic against the issue's bare `Replied`. It has t
 carry the channel and the value; a payload-free token would have forced the
 immediate write.
 
-`later()` is the other case and it genuinely escapes. The answer is not this turn's
-output, so this turn's commit says nothing about it — which is what deferral *means*,
-and is stated at the type rather than left to be discovered.
+`later()` is the other case and it escapes *this* turn. **REVISED, 2026-08-07 (§6.10):
+it does not escape every turn.** The sentence here used to read "the answer is not this
+turn's output, so this turn's commit says nothing about it", and that was the whole of
+the durability window: the parked answer escaped the turn that received it and then
+escaped the turn that produced it as well. `Deferred::send` now parks the *value* for
+whichever turn is running when it is called, so the answer is committed by the turn that
+computed it. What deferral means is unchanged — the reply outlives the turn that
+*received* it — and what it never meant is that an answer computed from the state may
+cross before that state is stored.
 
 ### 4.4 The served path was not optional, and the criterion is what forced it
 
@@ -919,11 +925,16 @@ would tell one caller about another caller's fault — with a `Panic` that canno
 cloned to tell two.
 
 Three ways a parked reply does end, all of them the state's own doing: somebody
-`send`s it; somebody drops it, including a turn that takes it out of the state and
-then panics; or the actor ends, which drops the state and every reply in it, as
-`Gone`. An observer refusing the faulted turn reaches parked replies the same way
-`stop()` does. Pinned by
+`send`s it **in a turn that is then committed** (§6.10); somebody drops it, including a
+turn that takes it out of the state and then panics; or the actor ends, which drops the
+state and every reply in it, as `Gone`. An observer refusing the faulted turn reaches
+parked replies the same way `stop()` does. Pinned by
 `tests/defer.rs::a_reply_parked_before_a_fault_is_still_answered_after_it`.
+
+A turn that *sent* a parked reply and then panicked collapses into the second of those
+rather than being a fourth case, and §6.10 argues why: the value waited for a verdict, the
+verdict is a fault, and the channel is dropped unanswered — which is `Gone`, the same
+answer this section already gave for a turn that took one out and panicked.
 
 ### 4.8 The one thing `#[defer]` costs, said where a reader meets it
 
@@ -1298,17 +1309,27 @@ makes "an answered call is a stored call" survive a power cut rather than merely
 process restart. An adapter that skipped it would report a much better number and
 quietly mean something weaker.
 
-**"An answered call is a stored call" is true of the reply the *loop* sends, and this
-document shipped it unqualified.** An ordinary `rpc`, a `blob`, a `recv` and a feed item
-all go handler → observer chain → store → answer. A `#[defer]` method answering through
-`Deferred::send` does not: that call hands the value to the caller from inside the
-running handler, where *"this turn's observers neither see it nor gate it"*, so the
-caller holds its answer for the whole ~7.6 ms below. A crash there loses state somebody
-was already told about. Scoped in `persist.rs`'s module header, on the type, in
-`examples/durable_ledger.rs`, and demonstrated by
-`tests/persist.rs::a_deferred_reply_is_answered_before_its_turn_is_stored` — a caller
-holding a receipt for a debit that is not on the disk. A `#[defer]` method answering with
-`Reply::send` inside its own turn is gated normally and keeps the property.
+**SUPERSEDED by §6.10 — the paragraph below was true when it was written and is not
+true now. It is left because deleting it would hide what the number was scoped against.**
+
+> **"An answered call is a stored call" is true of the reply the *loop* sends, and this
+> document shipped it unqualified.** An ordinary `rpc`, a `blob`, a `recv` and a feed item
+> all go handler → observer chain → store → answer. A `#[defer]` method answering through
+> `Deferred::send` does not: that call hands the value to the caller from inside the
+> running handler, where *"this turn's observers neither see it nor gate it"*, so the
+> caller holds its answer for the whole ~7.6 ms below. A crash there loses state somebody
+> was already told about. Scoped in `persist.rs`'s module header, on the type, in
+> `examples/durable_ledger.rs`, and demonstrated by
+> `tests/persist.rs::a_deferred_reply_is_answered_before_its_turn_is_stored` — a caller
+> holding a receipt for a debit that is not on the disk. A `#[defer]` method answering with
+> `Reply::send` inside its own turn is gated normally and keeps the property.
+
+The claim now, in one sentence: **an answered call is a stored call, for every answer a
+*turn* produced.** A `#[defer]` method's parked answer waits for the same observer chain
+as any other, because `Deferred::send` parks the value instead of writing it. The one
+send that is not covered is one made from outside every turn — a `Deferred` handed to a
+spawned task, or reached from a `with_state` closure — and that is outside the claim
+rather than a hole in it. §6.10 has the argument and the four decisions it forced.
 
 So the number is not a defect to fix in the adapter — it is the price of the promise.
 It is recorded in `keylink/src/persist.rs`'s module documentation, in
@@ -1501,7 +1522,8 @@ that never existed.
 | `A: Sync` stays out of the design | `a_state_that_is_not_sync_is_still_persisted` | §6.5's two breaks |
 | the per-turn cost is measured, not estimated | `the_per_turn_store_cost` (`#[ignore]`) | §6.1 |
 | a refused turn is not stored on the way out | `a_turn_whose_store_failed_is_not_written_on_the_way_out` | put the `finish` retry back → `left: [1, 2], right: [1]` |
-| a `#[defer]` reply is answered before its turn is stored | `a_deferred_reply_is_answered_before_its_turn_is_stored` | drop the `deferred.send` → `MailboxClosed`; or stop storing → the refusal never happens |
+| ~~a `#[defer]` reply is answered before its turn is stored~~ **INVERTED by §6.10** | `a_deferred_reply_whose_turn_was_not_stored_is_refused` | `park` never finds a lot → `a refused turn's receipt reached its caller: Ok(60)`; or stop storing → the refusal never happens |
+| a `#[defer]` reply that IS answered is a stored one | `a_deferred_reply_that_is_answered_is_a_stored_reply` | `Verdict::Committed => drop(value)` → `the receipt reaches its caller when the turn commits: MailboxClosed` |
 | the restored state cannot be dropped on the way to the observer | `Opened::start_from` is the only route | write the old `let (_restored, saver) = ..` → `E0308`, `expected Opened<_, Files>, found (_, _)` |
 | both shipped crates still package | `mise run package` | drop `version` from keylink's `keylink-persist` dependency → `all dependencies must have a version requirement specified when packaging` |
 
@@ -1530,6 +1552,11 @@ did and no longer does.
   chain of the turn that produced it. That keeps `#[defer]`'s whole point — the reply
   still outlives the turn that *received* it — and costs one queue in the loop. It
   touches `local.rs`, so it is a decision for whoever owns the loop.
+
+  **DONE, 2026-08-07 — §6.10.** Built exactly as described, and the queue turned out to
+  belong to the *turn* rather than to the loop, which is what makes "nothing is parked at
+  `finish`" structural. This bullet is left as written because it is a true statement
+  about what Wave 5 did.
 - **Make the idempotency ledger survive a restart, or say the guarantee has changed.**
   Said, in `keylink/src/idempotency.rs`'s "What is NOT guaranteed". Durable state plus a
   volatile ledger is a **new cross-restart double-apply**, and this wave created it:
@@ -1604,6 +1631,81 @@ browser build and the "the port does not know the framework" claim.
 `mise run package` is in the gate now, because a manifest can stop being publishable
 without one line of code changing and nothing else in the gate looks. Watched by removing
 the version again.
+
+### 6.10 REVISED, 2026-08-07: the `#[defer]` window is closed, and what the closing decided
+
+§6.8 recorded the fix and did not build it: *"park the send as well as the reply, so the
+value is released after the observer chain of the turn that produced it."* Built, in
+`keylink/src/parking.rs`. A value handed to `Deferred::send` **during a turn** is held in
+that turn's lot and released after its observer chain, with the same verdict the turn's
+own caller is answered by. `#[defer]`'s point is untouched — the reply still outlives the
+turn that *received* it — and what it no longer does is outrun the turn that *answered*
+it.
+
+**The lot belongs to the turn, not to the loop**, which is the one place the built thing
+differs from the sketch and the difference is load bearing. `observed_turn` wraps the
+handler in a `Parking` future that owns the lot; the lot is reached through a thread-local
+that is exchanged in on poll-entry and restored on poll-exit, including on an unwinding
+poll. Three questions answer themselves from that:
+
+- **Nothing is parked at `finish`.** A lot cannot outlive the turn it is a local of, so
+  `run_loop` reaches the `finish` chain with nothing held. Structural rather than a drain
+  nobody would have watched fail — and it matters here because §6.4 already took
+  `Persist::finish` out for writing a turn its caller had been told was not committed.
+- **A cancelled turn answers `Gone`.** `abort()` drops the loop's future, which drops the
+  lot, which drops the reply channels in it. The turn never committed.
+- **A send from off the turn's task is answered immediately**, because there is no lot in
+  scope. That is the residual limit, and it is outside the claim rather than a hole in it:
+  nothing ran, no observer saw anything, and there is no commit for the answer to wait
+  for. Withholding it would hang a caller on a turn that may never come.
+
+**Four decisions, and the arguments rather than the outcomes.**
+
+1. **A refused turn refuses its parked answers, naming the same observer.** The turn's own
+   caller gets `Answered::Refused { name }`; so does every answer that turn parked, read
+   from the same two facts six lines apart in `observed_turn`, so the two cannot disagree.
+   The alternative — dropping them, so `Gone` — was rejected because `Gone` means *the
+   actor is not there* and a caller told that stops calling, while `Refused`'s own text is
+   *"it ran and was not committed"*, which is exactly what happened to the work behind the
+   answer. The Critical-1 mirror does not apply: a refusal ends the actor, so the state
+   this value was computed from is dropped rather than stored, and nobody is told "not
+   committed" about something that was.
+2. **A panicked turn drops them, so `Gone`.** Not `Faulted`, and not a near miss: there is
+   one `Panic`, it is the original payload rather than a message, `resume_unwind` on the
+   original payload is the difference between forwarding a panic and starting a second one,
+   and it belongs to the turn's own caller. A payload cannot be cloned to tell two, and a
+   second one manufactured from a string is what `panic.rs` refuses. `Gone` is also the
+   answer `Deferred`'s own documentation already gave for a fault that reaches a parked
+   reply, so this is one rule rather than a new one.
+3. **Shutdown needs no rule**, per the lot's ownership above.
+4. **Ordering: parked answers first, in send order; the turn's own reply last.** The lot is
+   a `Vec` and the release is a `for` loop, so send order is the release order. It runs
+   inside `observed_turn`, which returns *before* `turn` answers the turn's own reply — so
+   a handler that answers other callers and then returns a value of its own is read in
+   that order by everybody. Asserted at `parking.rs`'s own unit test, where the release is
+   observable directly; **deliberately not asserted across two spawned callers**, because
+   that would be a statement about tokio's scheduler rather than about the release.
+
+**`Reply::send` was left alone**, and that is a decision too. It already held its value in
+the `Replied` token until after the chain, so the property was never broken there. Routing
+it through the lot as well would have bought exact program order between a `#[defer]`
+handler's own reply and the answers it sent to other callers — an ordering no caller can
+observe — and cost a type erasure and one allocation per deferred reply that costs nothing
+today. Two mechanisms, because they hold two different things: the token holds *this
+turn's own* answer, which the turn function has in hand; the lot holds answers the turn
+function never sees.
+
+**The ALPN did not move.** `keylink/Probe/d3fe34471921164e` and
+`keylink/Inspect/7bbd34fa83c9060c` are unchanged and all five hash tests in
+`tests/protocol.rs` are green. A `Deferred` is local, never serialized, and not part of
+any declared type, so there is nothing here for the wire graph to hash.
+
+**`tests/persist.rs::a_deferred_reply_is_answered_before_its_turn_is_stored` was inverted,
+not deleted.** Its own doc said that if `Deferred::send` were ever made to wait for the
+chain the test would go red and that the redness was the notice. It went red — *"the
+parked caller was answered from inside the handler: MailboxClosed"* — and it is now
+`a_deferred_reply_whose_turn_was_not_stored_is_refused`, same vault, same failing store,
+opposite assertion, with the inversion recorded in its doc.
 
 ---
 

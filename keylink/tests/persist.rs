@@ -677,7 +677,7 @@ async fn a_keyed_actors_state_survives_its_own_process() {
     );
 }
 
-// ──────────────────────────────────── the one path where the headline is false
+// ────────────────────────── the path the headline used to be false on, and is not
 
 keylink::service! {
     service Teller;
@@ -724,8 +724,9 @@ impl teller::Actor for Vault {
         // field of `self`.
         for (amount, deferred) in std::mem::take(&mut self.waiting) {
             self.balance -= amount;
-            // **The receipt crosses to its caller here**, inside the handler.
-            // No observer has run and nothing has been stored.
+            // The receipt is **parked here** rather than crossing here. It waits
+            // for this turn's observer chain, and the store inside it, exactly as
+            // this method's own return value does.
             deferred.send(self.balance);
         }
         approved
@@ -770,48 +771,54 @@ async fn waiting_for(vault: &teller::Handle<Vault>, want: u64) {
     panic!("{want} withdrawals never parked");
 }
 
-/// **A `#[defer]` reply is answered BEFORE its turn is stored, and this test
-/// demonstrates the window rather than asserting it away.**
+/// **A `#[defer]` reply that its turn did not store does not reach its caller.**
 ///
-/// "An answered call is a stored call" is true of an ordinary `rpc`, where the
-/// loop answers after the observer chain. It is **false** for
-/// [`Deferred::send`], and that call is the whole point of `#[defer]`: the value
-/// crosses the channel from inside the running handler, and — `local.rs`, on the
-/// deferred arm — *"this turn's observers neither see it nor gate it"*.
+/// # INVERTED, 2026-08-07. This test used to pin the defect.
 ///
-/// The order for a parked reply is: handler mutates the state →
-/// `deferred.send(receipt)` → **the caller has its answer** → handler returns →
-/// `after_turn` → ~7.6 ms of `fsync`. A crash anywhere in that window loses
-/// state a caller was already told about.
+/// It was written as `a_deferred_reply_is_answered_before_its_turn_is_stored`,
+/// and it asserted the opposite of what it asserts now: that the withdrawal's
+/// caller **did** receive a receipt for 60 while the disk still said 100. Its
+/// own doc said that if `Deferred::send` were ever made to wait for the observer
+/// chain the test would go red, and that the redness was the notice. It was made
+/// to wait, it went red — `the parked caller was answered from inside the
+/// handler: MailboxClosed` — and this is that notice, honoured rather than
+/// deleted.
 ///
-/// A crash is not something a test can arrange, so the window is shown with the
-/// other failure that lands in the same place: the store **fails**. The
-/// withdrawal's caller still receives its receipt for a balance of 60, the
-/// approving turn is refused, and what is stored is still 100. Same window, same
-/// consequence — a caller holding a receipt for a debit that is not on the disk
-/// — with a hard assertion instead of a race.
+/// What changed is `parking.rs`: a value handed to [`Deferred::send`] during a
+/// turn is held until that turn's observer chain has accepted it, and released
+/// with the same verdict the turn's own caller is answered by. So the window
+/// this test used to demonstrate — handler mutates the state → the caller has
+/// its answer → ~7.6 ms of `fsync` → a crash in between — is not a window any
+/// more. `#[defer]`'s point is untouched: the reply still outlives the turn that
+/// **received** it.
 ///
-/// # This test pins a known limit, so changing it is the deliberate act
+/// # What it asserts now
 ///
-/// If `Deferred::send` is ever made to wait for the observer chain, this test
-/// goes red, and that redness is correct: it is the notice that a documented
-/// limit has been closed. Fix the limit, then change this test and the five
-/// places that scope the claim — `persist.rs`'s module header and type doc,
-/// `examples/durable_ledger.rs`, and RFC-07 §6.1 and §6.8.
+/// A crash is not something a test can arrange, so the commit point is shown
+/// with the other failure that lands in the same place: the store **fails**. The
+/// approving turn debits, sends the receipt, and is then refused by `persist` —
+/// and all three callers are told the same thing. The withdrawal's caller gets a
+/// refusal rather than a receipt, and the balance on the disk is still 100, so
+/// there is no receipt anywhere for a debit that is not stored.
+///
+/// A `Handle` folds every loss into `MailboxClosed`, so the precise
+/// `TurnLost::Refused { name: "persist" }` underneath is asserted in
+/// `local.rs::a_released_reply_is_refused_with_the_turn_that_released_it`, where
+/// the variant is visible.
 ///
 /// Watched to fail from both ends, because two facts have to hold at once and
 /// one break can only reach one of them:
 ///
-/// - drop the `deferred.send(..)` from `approve` — the receipt then never
-///   crosses, the parked caller is drained as the actor ends, and the assertion
-///   reads `the parked caller was answered from inside the handler:
-///   MailboxClosed`. That is what pins the answer to `Deferred::send` rather
-///   than to anything the loop does.
+/// - `scripts/break-once.sh keylink/src/parking.rs` on `park`'s
+///   `if let Some(mut lot) = slot.take() {` → `if let Some(mut lot) =
+///   Option::<Vec<Parked>>::None {`, which is the old behaviour exactly: the send
+///   escapes to the immediate branch. Watched: `a refused turn's receipt reached
+///   its caller: Ok(60)`.
 /// - make `Persist::after_turn` stop storing — the first assertion goes first,
 ///   because a store that never runs cannot fail and `approve` is not refused.
 ///   That is what pins the second half to a real write.
 #[tokio::test]
-async fn a_deferred_reply_is_answered_before_its_turn_is_stored() {
+async fn a_deferred_reply_whose_turn_was_not_stored_is_refused() {
     let store = Flaky::new();
     let id = StateId::new("vaults/sp-01").expect("valid");
     let opened = Persist::<Vault, _>::open(&store, &id)
@@ -838,13 +845,10 @@ async fn a_deferred_reply_is_answered_before_its_turn_is_stored() {
         "the approving turn's store failed, so that turn is refused"
     );
 
-    assert_eq!(
-        receipt
-            .await
-            .expect("the task joins")
-            .expect("the parked caller was answered from inside the handler"),
-        60,
-        "the receipt crossed the channel before the observer chain ran"
+    let answer = receipt.await.expect("the task joins");
+    assert!(
+        answer.is_err(),
+        "a refused turn's receipt reached its caller: {answer:?}"
     );
 
     match vault.ended().await {
@@ -855,9 +859,64 @@ async fn a_deferred_reply_is_answered_before_its_turn_is_stored() {
     assert_eq!(
         store.on_disk::<Vault>().expect("stored").balance,
         100,
-        "the debit is not stored and its caller holds a receipt for it: THIS is the \
-         #[defer] window, and it is a limit rather than a bug in the adapter"
+        "the debit is not stored, and now nobody holds a receipt for it"
     );
+}
+
+/// The other half, and the one that makes the pair a biconditional: a `#[defer]`
+/// reply that **is** answered is a stored one.
+///
+/// The refusal test above would still pass with `Deferred::send` deleted
+/// outright, which is the failure mode a withholding fix invites — everything is
+/// safe if nothing is ever answered. This one is the guard on the release: the
+/// receipt says 60, and the balance on the disk says 60 when the caller reads it,
+/// so the caller's answer and the `fsync` are the same event in the right order.
+///
+/// The disk is read **after** the receipt has been awaited, which is what makes
+/// it an ordering assertion rather than a coincidence: the store runs in
+/// `after_turn`, the release runs after the chain, so a receipt in hand implies a
+/// completed store. Under the old behaviour that implication ran the other way
+/// and this read could see 100.
+///
+/// Made red by `scripts/break-once.sh keylink/src/local.rs` on `Deferred::send`'s
+/// `Verdict::Committed => reply.answer(Answered::Ran(value)),` →
+/// `Verdict::Committed => drop(value),`. Watched: `the receipt reaches its
+/// caller when the turn commits: MailboxClosed`.
+#[tokio::test]
+async fn a_deferred_reply_that_is_answered_is_a_stored_reply() {
+    let store = Flaky::new();
+    let id = StateId::new("vaults/sp-02").expect("valid");
+    let (state, saver) = Persist::<Vault, _>::open(&store, &id)
+        .await
+        .expect("claims and loads")
+        .start_from(|| Vault {
+            balance: 100,
+            waiting: Vec::new(),
+        });
+
+    let vault = teller::actor_with(state, vec![Box::new(saver)]);
+
+    let receipt = {
+        let vault = vault.clone();
+        tokio::spawn(async move { vault.withdraw(40).await })
+    };
+    waiting_for(&vault, 1).await;
+
+    assert_eq!(vault.approve().await.expect("running"), 1);
+    assert_eq!(
+        receipt
+            .await
+            .expect("the task joins")
+            .expect("the receipt reaches its caller when the turn commits"),
+        60,
+    );
+    assert_eq!(
+        store.on_disk::<Vault>().expect("stored").balance,
+        60,
+        "the caller holds a receipt, so the debit is on the disk"
+    );
+
+    vault.stop().await;
 }
 
 // ───────────────────────────────────────────────── the bound that is NOT there

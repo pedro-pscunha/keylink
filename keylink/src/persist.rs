@@ -1,24 +1,40 @@
 //! The one adapter the [`Observer`] port is owed: a state written after every
 //! turn, in front of the reply.
 //!
-//! # "In front of the reply" means the reply the **loop** sends
+//! # "In front of the reply" means in front of **every** answer a turn produces
 //!
-//! Say the exception before the rule, because the rule is the quotable half.
 //! An ordinary `rpc`, a `blob`, a `recv`, a feed item: the handler returns, the
 //! observer chain runs, the store completes, and only then is the caller told
-//! anything. For those, an answered call is a stored call.
+//! anything. An answered call is a stored call.
 //!
-//! A `#[defer]` method that answers through [`Deferred::send`](crate::Deferred)
-//! is **not** one of those. That call hands the value straight to the caller
-//! from inside the running handler — *"this turn's observers neither see it nor
-//! gate it"* — so the caller holds its answer for the whole of the ~7.6 ms
-//! below, and a crash in that window loses state somebody was already told
-//! about. It is a real limit, not a caveat: `tests/persist.rs::
-//! a_deferred_reply_is_answered_before_its_turn_is_stored` demonstrates it with
-//! a receipt for a debit that is not on the disk.
+//! **A `#[defer]` method is one of those, and it was the exception until
+//! `parking.rs`.** [`Deferred::send`](crate::Deferred) used to hand the value
+//! straight to the caller from inside the running handler — *"this turn's
+//! observers neither see it nor gate it"* — so a caller held its answer for the
+//! whole of the ~7.6 ms below and a crash in that window lost state somebody was
+//! already told about. It now parks the value instead: the answer waits for the
+//! observer chain of the turn that produced it and is released with the same
+//! verdict that turn's own caller is answered by, so a store that fails takes the
+//! receipt with it. `tests/persist.rs::
+//! a_deferred_reply_whose_turn_was_not_stored_is_refused` is the same vault, the
+//! same failing store, and the opposite assertion to the one it used to make.
 //!
-//! A `#[defer]` method that answers with [`Reply::send`](crate::Reply) inside
-//! its own turn is gated normally and keeps the property.
+//! # The one thing left of the exception
+//!
+//! A [`Deferred`](crate::Deferred) is `Send` and `'static`, so it can be sent
+//! from a spawned task, or reached from a
+//! [`with_state`](crate::LocalActor::read) closure through interior mutability.
+//! Those sends cross **immediately**, and they are outside the claim rather than
+//! a hole in it: no turn ran, no observer saw anything, and there is no commit
+//! for the answer to wait for. Withholding them would hang a caller on a turn
+//! that may never come.
+//!
+//! So the claim, exactly: *an answered call is a stored call, for every answer a
+//! **turn** produced.* Answer from a turn, and the reply is behind the store.
+//! Answer from a task you spawned, and it is not — which is the same sentence the
+//! `with_state` paragraph on the type below makes about a read.
+//! `tests/defer.rs::a_deferred_sent_from_another_task_is_not_gated_by_the_turn_that_spawned_it`
+//! pins it.
 //!
 //! `keylink-persist` states the standard this module exists to meet — a port is
 //! justified by one adapter written on purpose — and until this file existed
@@ -152,9 +168,10 @@ use crate::{Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 ///     .start_from(Ledger::default);
 /// let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
 ///
-/// // An ordinary `rpc`, so the store is in front of the reply: this returning
-/// // `Ok` means the bytes are fsynced. A `#[defer]` method answers from inside
-/// // the handler and does NOT get that — see "the `#[defer]` window" below.
+/// // The store is in front of the reply, so this returning `Ok` means the bytes
+/// // are fsynced. A `#[defer]` method gets the same thing: its parked answer
+/// // waits for the same chain — see this module's header for the one send that
+/// // does not, which is the one made from a task you spawned yourself.
 /// ledger.post(1).await?;
 /// # Ok(())
 /// # }
@@ -162,11 +179,11 @@ use crate::{Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 ///
 /// # What is stored is exactly what was answered — **both** directions
 ///
-/// The first direction is the wave's headline: a turn is written before the
-/// loop tells its caller anything, so an answered `rpc` is a stored `rpc` —
-/// with the [`Deferred::send`](crate::Deferred) exception this module's header
-/// states first. The converse matters just as much and is easier to lose: **a
-/// turn that was not answered is not stored either.**
+/// The first direction is the wave's headline: a turn is written before anybody
+/// is told anything, so an answered `rpc` is a stored `rpc` — and so is a
+/// `#[defer]` method's parked answer, which waits for the same chain. The
+/// converse matters just as much and is easier to lose: **a turn that was not
+/// answered is not stored either.**
 ///
 /// A `store` that returns `Err` refuses the turn, which ends the actor and
 /// hands the caller
@@ -215,6 +232,12 @@ use crate::{Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 /// exactly those types, on purpose, to prove `D: Sync` is not required — and its
 /// `Durable::snapshot` reads the `Cell`. A `with_state` closure bumping it would
 /// be lost.
+///
+/// The same sentence covers a [`Deferred`](crate::Deferred) reached that way:
+/// a reply answered from a read is answered from outside every turn, so it
+/// crosses immediately rather than waiting for a chain that is not running. Both
+/// are the same fact — **a read is not a turn** — and this module's header states
+/// it as the one thing left of the `#[defer]` exception.
 ///
 /// Stated rather than guarded, because the alternative is `A: Sync`-shaped: the
 /// property "this closure does not mutate" is not one the type system holds for
