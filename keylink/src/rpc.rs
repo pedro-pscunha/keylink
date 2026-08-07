@@ -342,6 +342,23 @@ async fn refuse<Resp: Serialize>(send: &mut SendStream, refusal: RemoteError) ->
 /// doc comment says so, because a caller reading "a call with this key would run"
 /// off a service that keys nothing would be reading a false claim.
 ///
+/// # This query is NOT policed per method, and it cannot be
+///
+/// [`WireRequest::KeyState`] carries a key and no method name, so
+/// [`Keyable::Only`] and [`Keyable::Except`] have nothing to check it against. The
+/// policy covers the call path and not this one, and that is a property of the wire
+/// type rather than a check somebody forgot.
+///
+/// Nothing leaks by it. The query is peer-scoped by construction, and it can only
+/// report keys that were actually claimed — which under `Only` are only keys on
+/// accepted methods. A peer asking about a method it may not key is told `Fresh`,
+/// which is the truth.
+///
+/// Refusing the query under a policy was considered and rejected: [`NotKeyable`]
+/// carries the method a key was attached to, and there is no method here, so
+/// refusing would mean inventing one. Answering the fact beats naming a method the
+/// caller never sent.
+///
 /// [`NotKeyable`]: IdempotencyRefusal::NotKeyable
 async fn answer_key_state<Resp: Serialize>(
     send: &mut SendStream,
@@ -839,11 +856,13 @@ where
             layers: Vec::new(),
             blobs: None,
             declares_blobs: false,
-            // `Keyable::default()`, not `Keyable::Any` spelled out: the default
-            // lives in one place, on the type, so a reader who wants to know what
-            // a service that never names a policy does has one place to look.
-            keyable: Keyable::default(),
-            records: Records::default(),
+            // Spelled out rather than reached through `Default`, and neither type
+            // has one. `Keyable::Any` is the permissive setting and `Records::Memory`
+            // holds a caller's bytes for ten minutes, so both are decisions somebody
+            // makes — `Allowlist`'s doc makes the same argument about `anyone()`.
+            // This line IS the default, and it is the only place to look for it.
+            keyable: Keyable::Any,
+            records: Records::Memory,
         }
     }
 

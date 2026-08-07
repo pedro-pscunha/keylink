@@ -125,80 +125,188 @@ Checking would need the method list *at the builder*, which means a
 carries — a change to `macros.rs` for a mistake whose refusal already names the
 method it did not match. Declined, and recorded rather than left to be found.
 
+### 2.6 `key_state` is per-service, and therefore unpoliced within one
+
+`WireRequest::KeyState(key)` carries a key and **no method name**, so `Only` and
+`Except` have nothing to check a query against. The policy covers the *call* path and
+not the *query* path, and that asymmetry is a property of the wire type rather than an
+oversight in the check.
+
+It is not a leak, and the reasons are structural. The query is peer-scoped by
+construction — the id is the one iroh proved on the connection the question arrived
+on — and it can only report keys that were actually claimed, which under `Only` are
+only keys on accepted methods. So there is nothing a peer can learn by asking about a
+method it may not key: the answer is `Fresh`, which is the truth.
+
+Under `Keyable::None` there is no ledger at all, and the query answers `Fresh` for
+the same reason `answer_key_state` already answers `Fresh` for a **malformed** key:
+*"such a key can never have been claimed, because `claim_key` refuses it before the
+ledger sees it"*. Refusing the query instead was considered and rejected —
+`NotKeyable { method: String }` needs a method name and a `KeyState` query has none,
+so refusing means inventing a string, and inventing one to describe a query that
+carries no method is worse than answering the fact.
+
+What that costs is one sentence of `KeyState::Fresh`'s doc, which used to read *"A
+call with this key would run"* and is false on a service that would refuse it. It now
+separates the fact about the ledger from the prediction about the call, and
+`a_key_state_query_on_a_service_that_keys_nothing_is_fresh` holds it.
+
 ---
 
-## 3. `Records`: a key without a stored reply
+## 3. `Records`: at-most-once without holding the caller's reply
 
 ```rust
 pub enum Records {
-    Memory,   // the default, and what the crate did before
+    Memory,   // what the crate did before; written by `ServiceBuilder::new`
     None,     // the key still claims; every repeat is refused
 }
 ```
 
-The key **state** — running, done, interrupted, forgotten — is unaffected by this
-and never leaves memory. That is what gives at-most-once and nothing here can
-weaken it. `Records` is only about the reply bytes.
+### 3.1 The motive is retention, and the first version of this section was wrong
 
-The gap, measured: a settled `Entry` is **56 bytes** — a 40-byte `Slot` plus a
-16-byte `Instant` — beside a 24-byte `IdempotencyKey` and at most `MAX_KEY_LEN`
-bytes of heap behind it, against up to `MAX_RECORDED_BYTES` of reply, which is
-1 MiB. Roughly four orders of magnitude, and that gap is the whole reason the two
-are separable. `std::mem::size_of`, aarch64-apple-darwin (Darwin 27.0.0, arm64),
-rustc 1.97.1, 2026-08-07. The absolute number is not pinned by a test, because
-`Instant` is not obliged to be 16 bytes on `wasm32-unknown-unknown`, which this
-crate also builds for; the ratio is, by
-`the_key_state_is_orders_of_magnitude_below_a_reply`.
+**Retracted, and left standing rather than deleted, because the retracted version
+is the more instructive one.** This section originally argued that `Records::None`
+saves memory: a caller who only needs *"do not run this twice"* was paying to store
+up to a megabyte of reply it would never read.
 
-So `Records::None` gives up the answer and keeps the guarantee. The work runs at
-most once; the repeat is refused instead of replayed.
+That argument does not pay, and the reason is a constant doing double duty.
+`MAX_RECORDED_BYTES` is used **twice**: `Guard::record` reads it as a per-record
+ceiling (`frame.len() > limits.bytes`) and `evict` reads the same value as the
+**total pool across every peer** (`inner.bytes > limits.bytes`). So the record pool
+is 1 MiB *in total*, not per key, and what `Records::None` saves is that one
+megabyte once per process — roughly what its own tombstones cost, since
+`MAX_TOMBSTONES`'s doc puts that pool *"on the order of a megabyte"* too. A feature
+justified on that saving would not have paid for itself.
 
-### 3.1 `Forgotten`, and not a new `Discarded`
+**The motive is retention.** A reply frame is the caller's data, and under
+`Records::Memory` it sits in this process's heap for up to `RECORD_TTL` — ten
+minutes — so a retry can be answered with it. For most services that is exactly the
+trade the ledger exists to make. For a service handling data it would rather not
+hold, it is a ten-minute retention window nobody asked for, on bytes it was only
+ever asked to pass through once. What `Records::None` removes is not a quantity of
+bytes but a duration they are held for, and that is a privacy property rather than
+a capacity one.
 
-`Forgotten` meant *"it ran and the reply expired or was evicted"*. Under
-`Records::None` the reply never existed, so that sentence was about to become
-false — and a false doc comment is this repo's most-corrected defect. The variant
-is reused and its documentation now names three ways in: aged past `RECORD_TTL`,
-evicted under pressure, or never recorded because the service records none.
+Two things follow from the correction, and both improve the rest of this document.
+**§1's argument for `Keyable` gets stronger**: a 1 MiB total pool is filled by ten
+100 KB replies, so the eviction pressure `Keyable` guards against arrives far sooner
+than §1 implied. And **`MAX_RECORDS = 1024` is decorative above 1 KiB per reply** —
+the byte bound binds first and the entry bound is never reached. Neither is this
+RFC's to fix; both are recorded because the next person to read `MAX_RECORDED_BYTES`
+as a per-key figure will make the same mistake this section did.
 
-**The decision was taken in the world where the wire had already moved.** Wave 1
-added `NotKeyable` and moved both ALPN pins, so a `Discarded` variant would have
-cost nothing extra to carry. It is still not here, for three reasons.
+### 3.2 `Unrecordable`, not `Forgotten`, and not a new variant
 
-- `TooManyRunning`'s doc comment is this crate's standing ruling on exactly this
-  trade — *one variant rather than two, because the caller acts on them
-  identically* — and the caller's action here is `read the result out of your own
-  domain, do not re-run`, which is README limit 3's own wording and is the same
-  sentence for an eviction and for a service that records nothing. The open wire
-  lowered the price and supplied no benefit.
-- The operator distinction survives without a name. `Records::None` is a property
-  of the **whole service** and static: such a service answers `Forgotten` to every
-  keyed repeat, always, from the first one. There is nothing to disambiguate. This
-  is what separates it from `Unrecordable`, which is per-**method** — within one
-  service some methods record and some do not, and there a name is the only way to
-  tell which you met. The precedent cuts the other way from how it first looks.
-- One wire break, one cause. Carrying both variants in one commit would leave a
-  future reader of `tests/protocol.rs` unable to say which moved the hash.
+**Also a reversal.** This settled `Slot::Forgotten` first, and widened
+`Forgotten`'s doc to name a third cause: *"or never recorded, because the service
+records none"*.
 
-That per-method/per-service line is also why `Guard::record` short-circuits
-`carries_body` under `Records::None` rather than checking it first. `Unrecordable`
-blames the method, and under `Records::None` the method is fine.
+That put a configured choice under a name that means pressure, and RFC-05 §5 draws
+the line explicitly:
 
-### 3.2 A `Records::None` settle is a tombstone
+> Six variants, not five. `Unrecordable` is not `Forgotten`: one is a permanent
+> property of the method, the other is an eviction. Both mean "do not retry", and
+> merging them would make the query lie about why.
 
-`settle` routes on `matches!(slot, Slot::Done(_))`, so `Forgotten` lands in
-`Bucket::spent` and is bounded by `MAX_TOMBSTONES` rather than `MAX_RECORDS`. That
-is the right pool: a tombstone is what keeps the work from running twice and has to
-outlive the reply it never had. `Slot::held_bytes` needed no edit, because
-`Forgotten` already holds zero — checked against the match rather than assumed, and
+`Forgotten` has exactly two producers, `expire` and `evict`, and both are evictions.
+A configured retention policy is a permanent property. So it settles
+`Slot::Unrecordable`, whose own doc — *"the handler ran, and its reply is not
+something this ledger can hold"* — is true word for word of a service configured to
+hold none.
+
+**Reusing it is what keeps the refusal and the query honest for free.** `Slot::state`
+already maps `Unrecordable` to `KeyState::Unrecordable`, so a caller that *asks*
+gets the same story as a caller that *retries*. That is the argument against minting
+`Discarded`, and it is the reverse of how it first looks: a new refusal variant
+would have left `key_state` answering the old one until `KeyState` gained a seventh
+variant too — **two names on two enums to say what one existing name already says
+truthfully.** The wire was already breaking for `NotKeyable`, so the price was low;
+it was the benefit that was missing.
+
+What reuse costs, stated rather than glossed: three doc sites widened and one
+wire-visible `Display` string changed. `IdempotencyRefusal::Unrecordable` used to
+render *"the reply to this key carried a payload, which is not recorded"*, which was
+about to be false on a service that had never declared a `recv` method. It now names
+no cause at all, deliberately — which of the three applies is answerable from the
+service's own configuration and does not belong on a wire every service shares.
+
+**The arm order the earlier design forced does not exist any more.** Under
+`Forgotten` the retention cause and the `carries_body` cause produced *different*
+refusals, so choosing which to check first was a wire-visible decision, and putting
+retention first would have made `Unrecordable` unreachable and deleted README limit
+5. Both causes now land in the same slot, so there is nothing to sequence and limit 5
+is a property of the method again — held by
+`a_recv_method_is_refused_the_same_way_whatever_the_retention_policy`.
+
+### 3.2.1 It is not free, and the earlier text said it was
+
+The first version of this section said the key state *"is unaffected by this"*. The
+set of states is unaffected. The **retention window is not**.
+
+Under `Records::Memory` a settled key occupies a slot in the record pool and *then*
+becomes a tombstone. Under `Records::None` it enters the tombstone pool directly and
+forgoes the record pool's grace entirely: `8192 / (8192 + 1024)` — about **89% of
+the window**, so roughly an 11% cut. That lands on the one degradation README limit
+4 says a caller **cannot detect**, because past `MAX_TOMBSTONES` a key reads
+`KeyState::Fresh` and runs again.
+
+Small, and it is stated instead of sold as free. Held by
+`records_none_shortens_the_at_most_once_window`, which asserts it as a difference
+between two ledgers under one bound rather than as a number.
+
+### 3.2.2 It opts out of a principle this module states
+
+`idempotency.rs`'s own "What this takes from Restate" section says:
+
+> Taken: the reply is **replayed**, not refused — a caller that lost its answer
+> wants the answer, and refusing hands it nothing it did not already have.
+
+`Records::None` does the refused thing. That is not a reversal of the reasoning:
+"refusing hands it nothing it did not already have" is a claim about what is good
+for the *caller*, and it holds. What `Records` adds is that the reply is the
+caller's *data*, and holding it for ten minutes is a cost the serving side may not
+be willing to pay on the caller's behalf. The module doc now carries that paragraph,
+because a design principle a later feature opts out of has to say so where the
+principle is stated rather than in a release note.
+
+### 3.2.3 A retention settle is a tombstone
+
+`settle` routes on `matches!(slot, Slot::Done(_))`, so `Unrecordable` lands in
+`Bucket::spent` and is bounded by `MAX_TOMBSTONES` rather than `MAX_RECORDS`. The
+right pool: a tombstone is what keeps the work from running twice and has to outlive
+the reply it never had. `Slot::held_bytes` needed no edit because `Unrecordable`
+already holds zero — checked against the match rather than assumed, and
 `records_none_settles_the_key_and_holds_no_reply` asserts `inner.bytes == 0`.
+
+### 3.2.4 No `Default`, and the selectors are exhaustive
+
+`Keyable` and `Records` both had `#[derive(Default)]` and `#[non_exhaustive]` at
+first. Both are wrong on the crate's own rules, and `Allowlist` is the precedent —
+a per-service policy enum a caller constructs and hands to a builder, which is
+`#[derive(Debug, Clone)]` with neither attribute, and whose doc says *"There is
+deliberately no `Default`. Admitting everyone is a decision you make."*
+
+`Keyable::Any` is the permissive setting and `Records::Memory` holds a caller's
+payloads for ten minutes. Neither should be reachable by leaving a field out. The
+default lives in `ServiceBuilder::new`, spelled out on one line, which satisfies
+invariant 8 — every default reproduces today's behaviour — without an impl that
+hands it to anybody who forgets. And `CONTRIBUTING.md` reserves `#[non_exhaustive]`
+for **error** enums rather than for ones a caller constructs.
+
+The cost is that "the default is `Any`" is no longer assertable from a unit test.
+It is held over a real connection by `the_defaults_reproduce_todays_behaviour`
+instead, which is the better guard anyway: it asserts the default *service*
+behaves like the explicitly-configured one, which is the claim invariant 8 actually
+makes.
 
 ### 3.3 `Clone`, not `Copy`
 
-A tier below memory is the next thing this type grows, and it will hold a port —
+A tier below memory is the shape this would grow into, and it would hold a port —
 an `Arc<dyn ..>` — rather than a discriminant. `Copy` today would have to be
-withdrawn then, and withdrawing a trait impl is the breaking change
-`#[non_exhaustive]` does not cover.
+withdrawn then, and withdrawing a trait impl is a breaking change no attribute
+covers. Note that §8's cold tier is now cut, so this is caution against a shape
+that may never arrive; it costs nothing, and `Records` is constructed once per
+service.
 
 ---
 
@@ -286,17 +394,18 @@ twice, so the paragraph is a standing rule rather than history.
 
 ## 6. What every default does
 
-`Keyable::default()` is `Any`. `Records::default()` is `Memory`. Both reproduce the
-behaviour that existed before either type did, and `ServiceBuilder::new` writes
-`Keyable::default()` rather than `Keyable::Any` so the default lives in one place.
+Invariant 8 — every default reproduces today's behaviour — is satisfied by one line
+of `ServiceBuilder::new`, which writes `Keyable::Any` and `Records::Memory` spelled
+out. **Neither type has a `Default` impl**, and §3.2.4 is why: those are the
+permissive and the ten-minutes-of-retention settings, and `Allowlist`'s doc makes the
+argument for refusing to hand either one to somebody who left a field out.
 
-`the_defaults_reproduce_todays_behaviour` asserts it as a comparison over a real
-connection — one service naming neither policy, one naming both defaults out loud,
-both answering the repeat from the record — because asserting only the first would
-prove nothing the pre-existing tests do not.
-
-`#[default]` may sit on exactly one variant, so there is no state where a default is
-unset or ambiguous. That half is the compiler's and neither test tries to break it.
+So the claim is not assertable from a unit test, and it is stronger for it.
+`the_defaults_reproduce_todays_behaviour` asserts it over a real connection as a
+comparison — one service naming neither policy, one naming both values out loud, both
+answering the repeat from the record and both reading `Done` when asked. Asserting
+only the first would prove nothing the pre-existing tests do not; asserting
+`Keyable::default()` would only have proved that a `derive` was present.
 
 ---
 
@@ -313,38 +422,61 @@ unset or ambiguous. That half is the compiler's and neither test tries to break 
 - **Any change to the bounds.** `MAX_RECORDS`, `MAX_RECORDED_BYTES`,
   `MAX_TOMBSTONES` and `RECORD_TTL` are untouched. `Keyable` changes *what reaches*
   the pools, not how big they are.
-- **A tier below memory.** `Records` is shaped to grow one and does not have one.
-  See §8.
+- **A tier below memory.** Proposed, analysed, and **cut**. See §8, which records
+  why raising a bound beat building a tier.
+- **Any policing of `key_state` beyond the service level.** `WireRequest::KeyState`
+  carries a key and no method name, so `Only` and `Except` have nothing to check it
+  against and the query is unpoliced within a service. Not a leak — see §2.6 — but
+  worth knowing before anybody treats the policy as covering every wire path.
 
 ---
 
-## 8. Left for later: a cold tier
+## 8. The cold tier was analysed and cut, and a bound beat it
 
-`Records` exists as an enum with two variants because the third is a port —
-somewhere the reply bytes go when memory gives them up. Three things are already
-known about it and are recorded here so the next attempt starts from them rather
-than rediscovering them.
+A third `Records` variant — a port to somewhere the reply bytes go when memory gives
+them up — was specified, costed and **rejected**. The reasons are worth keeping,
+because a cold tier is the obvious next idea and this is the second time it has been
+proposed.
 
-- **An adapter that cannot delete is not an adapter.** A ledger tier that only
-  grows is not a tier, it is a leak with an index. That rules out
-  `keylink_persist::Claim`, which is one exclusive handle per `StateId` with
-  `load`/`store` and no delete — a single-state atomic replace, not a keyed table.
-- **`iroh-blobs` is not the first adapter either.** It has no public delete-by-hash,
-  and every `add_bytes` creates a permanent auto-named tag whose name `blobs.rs`
-  throws away, so every record would become a permanent GC root. Named or temp tags
-  plus a GC-enabled store constructor come first, and that is its own piece of work.
-- **Spill on eviction, never on record.** `Guard::record` runs before the reply
-  frame is written, so a cold write there adds disk latency to every keyed reply.
-  `evict` is where the bytes are being given up anyway — and it runs under a
-  `std::sync::Mutex`, so it cannot await: take the bytes, mark the slot, hand them
-  to a worker through a bounded channel, flip the slot when the write lands. **A
-  worker that fails or a channel that is full settles the slot as `Forgotten`**, and
-  that is the property that makes the whole tier safe: a cold tier can never break
-  at-most-once, only the ability to answer.
+**What it was for does not exist at the size claimed.** §3.1's correction is the
+whole argument: `MAX_RECORDED_BYTES` is 1 MiB and does double duty as the per-record
+ceiling *and* the total pool across every peer. So the pool holds exactly **one**
+maximum-size reply, and `MAX_RECORDS = 1024` is unreachable for any reply above
+1 KiB. A cold tier is a port, a worker, a bounded channel, two new `Slot` states, an
+on-disk bound, a startup truncate and a second eviction loop — to relieve one
+megabyte. Raising the bound buys the same capacity for none of it.
 
-Also known and unresolved: `Eviction` is already a public name in this crate for
-actor eviction, so a type naming which record memory sheds first needs a different
-word. §5 is the standard that decides it.
+**And the mechanics were worse than the brief that proposed them said.**
+
+- `keylink_persist::Claim` could not have been the adapter, and not only because it
+  has `load` and `store` and no delete. `.mise/tasks/framing` **fails the build** if
+  `Claim` is named outside `keylink-persist` at all, `impl Claim for` excepted — so a
+  cold module inside `keylink` could not legally have called it.
+- `iroh-blobs` cannot be the adapter while `forget(id)` is in the port, and the
+  reason is content addressing rather than a missing method. Two distinct record ids
+  whose reply frames are byte-identical map to **one** hash, so deleting by hash for
+  one id destroys the other's record. Refcounting — which is what tags are — is the
+  feature, not a prerequisite that could be skipped.
+- A digest-named record needs **insert-if-absent** to be safe, and the brief's own
+  doc comment for it claimed the opposite. It said a collision *"refuses a fresh key
+  as `Forgotten`: a false refusal, never a double apply"*. With an overwriting store
+  it is the reverse: two colliding keys of one peer share one record, last writer
+  wins, and a retry of key A is answered with **key B's reply frame** — which decodes
+  cleanly, because there is one ledger per service and therefore one response type.
+  A silently wrong answer, which is worse than a double apply. Recorded because
+  nothing built here has that shape and the next digest to enter this module will.
+
+**What replaces it: split the constant and raise the pool.** Not simply raise it —
+the double duty means raising `MAX_RECORDED_BYTES` to 64 MiB would also permit a
+single 64 MiB reply to be recorded. Two constants: a per-record ceiling that stays
+1 MiB, and a total pool that rises, each argued against what it bounds. That also
+makes `MAX_RECORDS` reachable for the first time, which is worth stating out loud
+since today it is decorative above 1 KiB per reply.
+
+**Not done in this change**, and deliberately held: it alters every existing
+service's memory ceiling and changes what `evict` does under load, so it wants its
+own commit with a measured argument per constant rather than riding on a policy
+change. It is the one piece of the analysis above that is still owed.
 
 ---
 
@@ -393,5 +525,22 @@ edits a doc comment above it.
   obvious behavioural version is the vacuous one: a refusal looks identical whether
   the ledger is absent or empty. §2.3.
 - It framed `Unrecordable` as a precedent *for* minting `Discarded`. Read closely it
-  is a precedent against: the distinction it draws is per-method, and
-  `Records::None` is per-service. §3.1.
+  is a precedent against — `Slot::state` maps it to a `KeyState` variant for free, so
+  a new refusal would have needed a second new name to stay honest. §3.2.
+- It sold `Records::None` on **memory**, and the saving is about one megabyte once
+  per process because `MAX_RECORDED_BYTES` is a total and not a per-key figure. The
+  motive is retention. §3.1.
+- It said the key state is *"not affected"* by `Records::None`. The set of states is
+  not; the at-most-once window is about 11% shorter. §3.2.1.
+- It specified `Slot::Forgotten` for the retention settle, which puts a configured
+  choice under a name that means pressure — the wrong side of the line RFC-05 §5
+  draws. §3.2.
+- Its `Keyed`/`Records` sketch carried `#[derive(Default)]` and `#[non_exhaustive]`,
+  and `Allowlist` is the precedent against both for a policy enum a caller
+  constructs. §3.2.4.
+- It named `Service` as the struct holding the ledger. The ledger is on
+  `RpcService`, and `Service` has type-erased it, so the brief's own goal — a reader
+  seeing the allocation not happen — was unreachable where it asked for it. §2.3.
+- Its fact table said `evict` runs inside `claim`. `evict` has exactly one caller,
+  `settle`; `claim` and `key_state` call `expire`, which is a second and unmentioned
+  producer of `Forgotten`.

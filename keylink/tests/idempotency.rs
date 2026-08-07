@@ -372,6 +372,12 @@ async fn a_refused_key_never_reaches_the_ledger() {
         .slow(0)
         .await
         .expect_err("refused, because `Slow` is not keyed");
+    assert_eq!(
+        fixture.client.key_state(key("shared")).await.expect("asks"),
+        keylink::KeyState::Fresh,
+        "a refused key must leave nothing behind for the query to find"
+    );
+
     let run = fixture
         .client
         .with_idempotency(key("shared"))
@@ -1021,7 +1027,7 @@ async fn start_recordless() -> Fixture {
 /// `let _ = slot;` followed by `self.ledger.release(self.peer, &self.key);` — the
 /// key given back instead of spent, which is the only shape at-most-once fails in.
 /// Watched: `panicked at .., the repeat is refused, not answered: 2`, `0 passed;
-/// 1 failed; 29 filtered out`. The `2` is the handler's counter: the repeat ran.
+/// 1 failed; 30 filtered out`. The `2` is the handler's counter: the repeat ran.
 ///
 /// **What that break does NOT reach is this test's last assertion**, and it is worth
 /// saying which half is unguarded. The break trips the `expect_err` above it, so the
@@ -1078,15 +1084,17 @@ async fn records_none_still_runs_the_work_at_most_once() {
 /// `Records::None` answers 1 then refuses. Asserting only the refusal would pass on
 /// a service that refused every repeat for some unrelated reason.
 ///
-/// `Forgotten` and not a variant of its own, which was a decision rather than an
-/// omission — `IdempotencyRefusal::Forgotten`'s doc comment carries the argument,
-/// including why the wire moving this wave anyway did not change it.
+/// `Unrecordable` and not a variant of its own, and not `Forgotten` either:
+/// RFC-05 §5 draws the axis as a permanent property against an eviction, and a
+/// configured retention policy is the former. `IdempotencyRefusal::Unrecordable`'s
+/// doc carries the three causes and the argument.
 ///
-/// Made red by `scripts/break-once.sh` replacing `Records::None => Slot::Forgotten,`
-/// with `Records::None => Slot::Done(frame.clone()),`. Watched: `panicked at ..,
-/// the repeat under `Records::None` is refused, not answered: 1`, `0 passed;
-/// 1 failed; 28 filtered out` — the `expect_err` fires because the repeat came back
-/// as the recorded reply.
+/// Made red by `scripts/break-once.sh` replacing
+/// `Guard::record`'s `recordable` flag to ignore the retention switch, its
+/// `matches!` on `self.ledger.records` replaced by `true`. Watched: `panicked at .., the repeat under
+/// `Records::None` is refused, not answered: 1`, `0 passed; 1 failed;
+/// 30 filtered out` — the `expect_err` fires because the repeat came back as the
+/// recorded reply.
 #[tokio::test]
 async fn records_none_refuses_the_repeat_instead_of_answering_it() {
     let recording = start().await;
@@ -1123,9 +1131,55 @@ async fn records_none_refuses_the_repeat_instead_of_answering_it() {
 
     assert_eq!(
         refusal(&refused),
-        IdempotencyRefusal::Forgotten,
-        "it ran, and its reply is not held - which is what `Forgotten` says"
+        IdempotencyRefusal::Unrecordable,
+        "it ran, and this service does not hold its reply"
     );
+}
+
+/// **A method whose reply already could not be recorded is unchanged by the
+/// switch**, and this is the test that says the two causes have not been merged
+/// into a behaviour change.
+///
+/// `Datasheet` is a `recv`: its reply carries a payload, so it settles
+/// `Unrecordable` on *every* service, `Records::Memory` included. Under
+/// `Records::None` it settles `Unrecordable` for a second, independent reason. The
+/// refusal is identical, and it has to be — README limit 5 is about the method and
+/// must not start depending on the service's retention policy.
+///
+/// This is the test the earlier `Forgotten` design could not have passed. Under it
+/// the two causes produced *different* refusals, so a `recv` method's documented
+/// behaviour changed when an unrelated setting moved. `Unrecordable` for both is
+/// what makes limit 5 a property of the method again.
+///
+/// Made red by `scripts/break-once.sh` replacing
+/// `Guard::record`'s settled slot from
+/// `Slot::Unrecordable` to `Slot::Forgotten`, which is the old design restored. Watched: `panicked at ..,
+/// assertion `left == right` failed: a recv method's refusal must not depend on
+/// the service's retention policy`, `left: Forgotten`, `right: Unrecordable`,
+/// `0 passed; 1 failed; 31 filtered out`.
+#[tokio::test]
+async fn a_recv_method_is_refused_the_same_way_whatever_the_retention_policy() {
+    for fixture in [start().await, start_recordless().await] {
+        fixture
+            .client
+            .with_idempotency(key("k"))
+            .datasheet(8)
+            .await
+            .expect("the first call runs and streams its body");
+
+        let refused = fixture
+            .client
+            .with_idempotency(key("k"))
+            .datasheet(8)
+            .await
+            .expect_err("a reply with a payload is never replayed");
+
+        assert_eq!(
+            refusal(&refused),
+            IdempotencyRefusal::Unrecordable,
+            "a recv method's refusal must not depend on the service's retention policy"
+        );
+    }
 }
 
 // ────────────────────────────────────────── the defaults, spelled and not
