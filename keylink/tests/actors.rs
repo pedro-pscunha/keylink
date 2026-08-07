@@ -2070,10 +2070,16 @@ async fn a_malformed_id_is_refused_without_taking_the_actors_mailbox_slot() {
     );
 }
 
-/// `LocalActor::ask_catching_before` bounds the wait for a mailbox permit, so a
-/// message that cannot get a slot is refused at its budget and — tokio not
-/// queueing a send that was cancelled before its permit arrived — provably never
-/// queued. The keyed walk awaited `mail.send` with no bound at all.
+/// `deliver_to_local` bounds the wait for a mailbox permit, so a message that
+/// cannot get a slot is refused at its budget and — tokio not queueing a send that
+/// was cancelled before its permit arrived — provably never queued. The keyed walk
+/// awaited `mail.send` with no bound at all.
+///
+/// The bound used to live in `LocalActor::ask_catching_before`, which this comment
+/// named until Wave 1b deleted it along with `Queued<T>`. Its one caller was
+/// `Handle::service`'s dispatch, which is `deliver_to_local` now — the twin of
+/// `deliver_to_actor`, in keylink, so the two halves of this test's subject are one
+/// timeout written once rather than two that disagreed.
 ///
 /// Capacity is one and turns are serial, so with an actor inside a long turn
 /// every caller past the first waits there: each holding a QUIC stream, a

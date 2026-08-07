@@ -114,8 +114,17 @@ impl fmt::Debug for Panic {
 /// Two things it does not fix, both by design. The state may be **logically
 /// torn**, which is the same hazard as a poisoned `Mutex` and is recovered from
 /// for the same reason. And `panic = "abort"` defeats it entirely.
-#[doc(hidden)]
-pub async fn guarded<F: Future>(fut: F) -> std::result::Result<F::Output, Panic> {
+///
+/// # `pub(crate)`, and it was `#[doc(hidden)] pub`
+///
+/// Generated code never named it. Until Wave 1b it did not have to — the turn was
+/// a boxed closure keylink built, and `guarded` was already inside it — and Wave
+/// 1b's mailbox enum removed the last reason it might have: every generated arm
+/// calls [`turn`](crate::turn), and the guard is inside *that*. So
+/// `rg '\$crate::guarded' keylink/src/macros.rs` finds nothing, and neither do
+/// `tests/`, `demo/` or the README. A `pub` nothing outside needs is a
+/// compatibility promise made by accident.
+pub(crate) async fn guarded<F: Future>(fut: F) -> std::result::Result<F::Output, Panic> {
     let mut fut = Box::pin(fut);
     std::future::poll_fn(move |cx| {
         match std::panic::catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
@@ -141,8 +150,10 @@ pub async fn guarded<F: Future>(fut: F) -> std::result::Result<F::Output, Panic>
 /// Synchronous on purpose rather than an `async` wrapper: neither call is a
 /// future, and wrapping them in one would put a borrow of the state across an
 /// await for no reason — the same trap `local.rs`'s observer catch avoids.
-#[doc(hidden)]
-pub fn catching<T>(work: impl FnOnce() -> T) -> std::result::Result<T, Panic> {
+///
+/// `pub(crate)` for the reason [`guarded`] is: no expansion names it, and the
+/// keyed decode/encode sites it was written for are keylink's own.
+pub(crate) fn catching<T>(work: impl FnOnce() -> T) -> std::result::Result<T, Panic> {
     std::panic::catch_unwind(AssertUnwindSafe(work)).map_err(Panic::caught)
 }
 

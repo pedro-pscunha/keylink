@@ -474,8 +474,9 @@ macro_rules! service {
             /// There used to be two dispatchers and the second one was
             /// `__keylink_local_method!`, whose arms called the trait method
             /// directly and bypassed everything a turn owes a caller. The comment
-            /// that admitted it argued the split was harmless "because the caller
-            /// is an argument now". It was not harmless: a `Handle` call ran no
+            /// that admitted it — on `__actor_turn`, where it is now recorded as
+            /// history — argued the split was harmless "because the caller is an
+            /// argument now". It was not harmless: a `Handle` call ran no
             /// observer chain through the loop's own reply channel, so a method
             /// kind that later wanted to defer its answer, or a feed that later
             /// wanted to share this loop, would have had to be built twice and
@@ -715,15 +716,29 @@ macro_rules! service {
             /// system's mailbox loop and the singleton service's dispatch. One
             /// match, so a kind cannot be routed two ways *over the wire*.
             ///
-            /// [`Handle`]'s own methods do not come through here — they call the
-            /// trait method directly, since a local call has no `Request` to
-            /// build and no `BodyReader` to pass. So there **are** two
-            /// dispatchers, and the second one is `__keylink_local_method!`.
-            /// That used to matter: each arm repeated a `caller(None)` hook by
-            /// hand, and a sixth method kind wired in without it would silently
-            /// inherit the last remote peer. The caller is an argument now, so
-            /// the two dispatchers can disagree about many things and no longer
-            /// about this one — a missing `Caller` is a compile error.
+            /// [`Handle`]'s own methods do not come through here, and that is
+            /// about the `Request` rather than about dispatch. A local call has
+            /// no `Request` to take apart and no `BodyReader` to pass, so it
+            /// enters at its own [`Mail`] variant and reaches its trait method
+            /// through `__keylink_mail_arm!` — the **same** `Turn for Mail` impl,
+            /// the same [`turn`](keylink::turn), the same queue deadline, panic
+            /// guard, observer chain, idempotency marks and reply channel a served
+            /// call gets. This function is the decode step in front of
+            /// `Mail::Served`; it is not a second dispatcher.
+            ///
+            /// **It was one, and this comment asserted it in the present tense
+            /// until Wave 1b's review.** Until Wave 1b, `__keylink_local_method!`'s
+            /// arms called the trait method directly and bypassed the loop, and
+            /// what stood here was *"there **are** two dispatchers, and the second
+            /// one is `__keylink_local_method!`"*. It then argued the split had
+            /// stopped mattering because the caller had become an argument — each
+            /// arm used to repeat a `caller(None)` hook by hand, and a sixth
+            /// method kind wired in without that line would silently have
+            /// inherited the last remote peer. That much was true, and it was the
+            /// smaller half: a turn's *policy* was still reachable only from the
+            /// loop, so anything a later kind wanted to do to a turn had to be
+            /// written twice and compiled fine when it was written once. Those
+            /// arms build a `Mail` now and call no trait method at all.
             async fn __actor_turn<A: Actor>(
                 state: &mut A,
                 cx: $crate::Caller<'_>,
@@ -1929,13 +1944,30 @@ macro_rules! __keylink_invoke_fn {
 /// What one `Mail` variant carries beside its declared arguments.
 ///
 /// `send` reads its upload **inside** the turn, so its variant has to carry the
-/// reader. The other four never touch one, and paying `size_of::<BodyReader>()`
-/// on every variant of every service to spare one field would be a tax on the
-/// mailbox — which is sized to its largest variant and eagerly allocated 32 deep.
+/// reader. The other four never touch one.
 ///
-/// A unit rather than `Option<BodyReader>`, because there is no case where a
-/// non-`send` kind might have a body: the kind decides it, at compile time, and
-/// a field that can only be one thing should be the type of that thing.
+/// A unit rather than `Option<BodyReader>`, and the argument is **type honesty**,
+/// not size: there is no case where a non-`send` kind *might* have a body — the
+/// kind decides it at compile time, and a field that can only ever be one thing
+/// should be the type of that thing. An `Option` would invite an arm for a `None`
+/// that cannot occur, which is the shape `__keylink_mail_arm!` destructures the
+/// unit to refuse.
+///
+/// # The size argument this used to make is measurably false
+///
+/// It read: paying `size_of::<BodyReader>()` on every variant "would be a tax on
+/// the mailbox — which is sized to its largest variant and eagerly allocated 32
+/// deep". Every clause is true and the conclusion does not follow, because the
+/// mailbox is **already** sized to `Mail::Served`, which carries a `BodyReader`
+/// unconditionally. Measured on `tests/actor_memory.rs`'s `ledger`, which declares
+/// one `u64` method: `size_of::<ledger::Mail>()` is 232 bytes, and 232 is exactly
+/// `Served` — `Origin` 120 + `Request` 8 + `BodyReader` 96 + `Reply` 8 — against
+/// 136 for the per-method variant. `Option<BodyReader>` is also 96 bytes, the
+/// niche being free, so widening all four unit fields would leave the enum at 232.
+/// The tax is zero.
+///
+/// Recorded rather than deleted, because a wrong reason on a hot-path type is
+/// worse than no reason: the next wave cites it instead of measuring.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_mail_body {
@@ -2292,13 +2324,15 @@ macro_rules! __keylink_actor_client_method {
 /// fail and no "wrong variant" to extract.
 ///
 /// **These arms used to call the trait method directly**, bypassing the mailbox
-/// loop's dispatch entirely, and `__actor_turn`'s comment admitted it: "there
-/// **are** two dispatchers, and the second one is `__keylink_local_method!`". It
-/// argued the split had stopped mattering because the caller became an argument.
-/// It had not. A turn's *policy* — the observer chain reached through the loop's
-/// own reply channel, the panic guard, the marks a served call makes — was
-/// reachable only from the loop, so anything a later kind wanted to do to a turn
-/// had to be written twice and compiled fine when it was written once.
+/// loop's dispatch entirely, and `__actor_turn`'s comment admitted it in those
+/// words — *"there **are** two dispatchers, and the second one is
+/// `__keylink_local_method!`"* — which it now carries in the past tense instead,
+/// because the sentence outlived the arms it described by one wave. It argued the
+/// split had stopped mattering because the caller became an argument. It had not.
+/// A turn's *policy* — the observer chain reached through the loop's own reply
+/// channel, the panic guard, the marks a served call makes — was reachable only
+/// from the loop, so anything a later kind wanted to do to a turn had to be
+/// written twice and compiled fine when it was written once.
 ///
 /// The `body: ()` on every arm is not padding. Only a `send` handler reads an
 /// upload inside its turn, so only `send`'s variant carries a `BodyReader`; the

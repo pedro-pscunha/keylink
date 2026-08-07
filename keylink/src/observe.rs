@@ -369,6 +369,28 @@ pub enum Ended {
 /// [`ask`](crate::LocalActor::ask) resumes into the calling task, and an error
 /// type that dropped it would make the crate's whole panic policy
 /// unimplementable on top of the catching path.
+///
+/// # Four now, because the fourth was being reported as [`Gone`](Self::Gone)
+///
+/// `Answered` has had a fourth state — "the queueing budget expired while this
+/// message waited, and nothing ran" — since before this enum existed, and
+/// `ask_catching` mapped it to `Gone` behind a comment reading *"a local origin
+/// carries no `Queueing`, so nothing can expire on this path. Typed rather than
+/// asserted."* It was neither: it mapped an impossible state onto a variant that
+/// means something else and specific — the actor is no longer running — so the
+/// first local origin to carry a queue budget would have reported a live actor as
+/// gone, silently, which is the same shape as the `>`-versus-`>=` deadline
+/// disagreement Wave 1b deleted.
+///
+/// Unreachable today, and written to be *correct* if something reaches it, which
+/// is the choice `Mail`'s `send` and `recv` variants already make one layer out.
+///
+/// # Exhaustive, and deliberately not `#[non_exhaustive]`
+///
+/// Like [`Ended`] and [`Departure`](crate::Departure): a caller matches this, and
+/// a wildcard arm is the collapse it exists to prevent. Sealing it would let a
+/// downstream `_` swallow a fifth answer exactly the way `Gone` swallowed this
+/// fourth one — the defect, not the fix.
 #[derive(Debug, thiserror::Error)]
 pub enum TurnLost {
     /// The actor was gone, or ended while this turn waited.
@@ -389,4 +411,15 @@ pub enum TurnLost {
     /// which happened and now says so.
     #[error("{0}")]
     Faulted(Panic),
+    /// A [`QueueTimeout`](crate::QueueTimeout) budget expired while the message
+    /// waited. It **never started**, so the actor is untouched and still running.
+    ///
+    /// Unreachable from a local call today, because a local
+    /// [`Origin`](crate::Origin) carries no [`Queueing`](crate::Queueing) and
+    /// there is nothing to expire. It exists because the state it names is one
+    /// `Answered` already has, and the alternative was reporting it as
+    /// [`Gone`](Self::Gone) — see this enum's own documentation for why that was
+    /// the wrong answer rather than a harmless one.
+    #[error("the queueing budget expired before this turn started: nothing ran")]
+    Expired,
 }

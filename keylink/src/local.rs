@@ -114,7 +114,7 @@
 //!
 //! The actor's task is detached, so nothing observes a panic that escapes the
 //! loop rather than a turn. Every path library code controls is inside
-//! [`guarded`], including the closure that produces the turn's future. What is
+//! `guarded`, including the closure that produces the turn's future. What is
 //! left is a user `Drop` — on the state when the actor ends, or on a reply value
 //! dropped here because the caller went away. Either kills the loop, and every
 //! handle then reports [`MailboxClosed`]: the same lie the panic policy exists
@@ -132,9 +132,13 @@ use n0_future::task::JoinHandle;
 use n0_future::time::Instant;
 use tokio::sync::{mpsc, oneshot, watch};
 
+// By module path and not from the crate root: Wave 2's review found `guarded` and
+// `catching` re-exported `pub` with no consumer outside this crate, so they are
+// `pub(crate)` now and the root no longer names them.
+use crate::panic::{catching, guarded};
 use crate::{
-    guarded, Body, Context, Ended, Observer, Origin, Outcome, Panic, Queueing, RemoteError,
-    TurnInfo, TurnLost, TurnOutcome,
+    Body, Context, Ended, Observer, Origin, Outcome, Panic, Queueing, RemoteError, TurnInfo,
+    TurnLost, TurnOutcome,
 };
 
 /// Messages that may wait ahead of the one being handled.
@@ -640,7 +644,9 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
                         // would put that size in the task's own future — where
                         // an actor pays for it while it is idle. Measured:
                         // 3,005 bytes per idle actor without this line against
-                        // 1,469 with it, at a service with one `u64` argument.
+                        // 1,597 with it, at a service with one `u64` argument.
+                        // (1,469 at Wave 1b; the `finish` loop below cost the
+                        // other 128 — `tests/actor_memory.rs` bisects it.)
                         if let Some(end) = Box::pin(mail.run(&mut state, &mut hooks)).await {
                             reason = end;
                             break;
@@ -695,7 +701,7 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
                 // hand each one its own copy of a fact there is only one of.
                 let ending: &Ended = &reason;
                 let watching: &mut dyn Observer<A> = &mut **observer;
-                let built = crate::catching(move || {
+                let built = catching(move || {
                     let watching = watching;
                     watching.finish(shared, ending)
                 });
@@ -791,22 +797,33 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
         match self.ask_catching(mail).await {
             Ok(value) => Ok(value),
             Err(TurnLost::Faulted(panic)) => panic.resume(),
-            Err(TurnLost::Gone | TurnLost::Refused { .. }) => Err(MailboxClosed),
+            // `Refused` ends the actor, so `MailboxClosed` is true of it by the
+            // time a caller reads it. `Expired` does NOT — and it cannot be
+            // reported precisely here, because this method has one error type by
+            // design. It is unreachable from a local origin today; if a later wave
+            // gives one a budget, this is the call that has to widen or the call
+            // sites have to move to `ask_catching`, and that is a decision rather
+            // than a mapping. Named here so it is a decision somebody makes.
+            Err(TurnLost::Gone | TurnLost::Refused { .. } | TurnLost::Expired) => {
+                Err(MailboxClosed)
+            }
         }
     }
 
     /// Run one turn and be *told* about a panic instead of having it resumed.
     ///
-    /// The three ways a turn produces no value are the three
-    /// [`TurnLost`] variants, in one layer. It used to be
-    /// `Result<Result<T, Panic>, TurnLost>` — two error positions for one
-    /// question, which is the shape a caller unwraps wrongly.
+    /// The ways a turn produces no value are the [`TurnLost`] variants, in one
+    /// layer. It used to be `Result<Result<T, Panic>, TurnLost>` — two error
+    /// positions for one question, which is the shape a caller unwraps wrongly.
     ///
     /// # Errors
     ///
     /// [`TurnLost::Gone`] when the actor is gone, [`TurnLost::Refused`] when an
-    /// observer refused the turn, and [`TurnLost::Faulted`] when the turn ran
-    /// and panicked — the actor survived that one and is still running.
+    /// observer refused the turn, [`TurnLost::Faulted`] when the turn ran and
+    /// panicked — the actor survived that one and is still running — and
+    /// [`TurnLost::Expired`] when a queueing budget ran out before the turn
+    /// started, which a local origin cannot do today and which is answered
+    /// truthfully rather than as `Gone` for the day one can.
     pub async fn ask_catching<T>(
         &self,
         mail: impl FnOnce(Origin, Reply<T>) -> M,
@@ -818,9 +835,24 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
             Answered::Ran(value) => Ok(value),
             Answered::Faulted(panic) => Err(TurnLost::Faulted(panic)),
             Answered::Refused { name } => Err(TurnLost::Refused { name }),
-            // A local origin carries no `Queueing`, so nothing can expire on
-            // this path. Typed rather than asserted.
-            Answered::Expired => Err(TurnLost::Gone),
+            // Unreachable from here today — a local `Origin` carries no
+            // `Queueing`, so there is no budget to expire — and answered with the
+            // variant that means what happened anyway.
+            //
+            // This arm read `Err(TurnLost::Gone)` behind a comment claiming the
+            // impossibility was "typed rather than asserted". It was asserted, by
+            // that comment, and the mapping underneath it was wrong: `Gone` means
+            // the actor is no longer running, and an expired budget leaves the
+            // actor untouched. The first local origin to carry a budget — a
+            // deferred reply's, a feed's — would have reported a live actor as
+            // gone through a public API, silently.
+            //
+            // Being unreachable, this arm has **no test and was not watched to
+            // fail**, and that is said here rather than left to be assumed:
+            // `ask_catching` builds its own `Origin::local()`, so nothing a test
+            // can hand it carries a `Queueing`. What is watched is the served
+            // twin, `rendered`'s `Expired` arm, which `tests/actors.rs` pins.
+            Answered::Expired => Err(TurnLost::Expired),
         }
     }
 

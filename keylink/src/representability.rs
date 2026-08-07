@@ -125,8 +125,14 @@ impl OriginIsNotClone for Origin {}
 /// claim to make here and this module must not imply one.
 ///
 /// What holds the two halves it *can* reach: coherence for the derive, and the
-/// private field for downstream construction (a `compile_fail,E0624` doctest on
-/// `Origin`, since a visibility claim is only false from outside the crate).
+/// private constructors for downstream construction — a bare `compile_fail`
+/// doctest on `Origin`, since a visibility claim is only false from outside the
+/// crate. It fails with `E0624`, and **that code is named in prose there and
+/// deliberately not on the fence**: rustdoc does not check the code after
+/// `compile_fail`, so an annotated one asserts a verification that does not
+/// happen. This sentence read `compile_fail,E0624` until Wave 1b's review, which
+/// made it the fourth site in this workspace claiming a check rustdoc never
+/// performs.
 /// What holds the third is the call graph — one `Context` per request in
 /// `serve_one`, delivered once — pinned as
 /// `actor::remote::tests::two_origins_over_one_cloned_context_still_share_one_marker`,

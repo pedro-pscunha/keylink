@@ -2,8 +2,8 @@
 //!
 //! One test in its own binary, because the measurement is a process-wide
 //! allocation counter and a second test running beside it would be noise. That
-//! is also why the two paths below are two **phases of one test** rather than two
-//! tests: cargo runs the tests in a binary on parallel threads, and `LIVE` is
+//! is also why the four measurements below are **phases of one test** rather than
+//! four tests: cargo runs the tests in a binary on parallel threads, and `LIVE` is
 //! process-wide, so a second `#[test]` would measure this one's allocations as
 //! well as its own.
 //!
@@ -18,6 +18,12 @@
 //! keyed one was measured here for months, which is exactly how a change to the
 //! local mailbox could have landed against a remembered number instead of a
 //! measured one.
+//!
+//! **And both are measured at two message sizes, not one.** A budget checked at a
+//! single `Mail` is a statement about whoever wrote that service; the *slope*
+//! between the two is what makes it a statement about keylink. Phase 3 does that
+//! for the keyed path and phase 4 for the local one, separately, because the box
+//! that holds the property is a different line of code on each.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -153,35 +159,69 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// Measured on this machine, at ten thousand actors of the `ledger` service
 /// below, with an empty state:
 ///
-/// | path | before the generated mailbox | after |
-/// |---|---|---|
-/// | keyed, mounted in a `System` | 1,671 | 1,159 |
-/// | local, `ledger::actor(..)`   | 1,725 | 1,469 |
+/// | path | before the generated mailbox (`c9056e0`) | Wave 1b (`c8712b0`) | Wave 2 (`836179c`) |
+/// |---|---|---|---|
+/// | keyed, mounted in a `System` | 1,671 | 1,159 | 1,159 |
+/// | local, `ledger::actor(..)`   | 1,725 | 1,469 | **1,597** |
 ///
-/// Both **fell**, which is not what a wave that replaces a fat pointer with an
-/// enum sounds like it should do. The mailbox slot is unchanged — `ledger::Mail`
-/// is 232 bytes either way — and what moved is the turn's state machine, which
-/// the old keyed loop inlined into the task's own future and the new one boxes.
+/// The first move **fell**, which is not what a wave that replaces a fat pointer
+/// with an enum sounds like it should do. The mailbox slot is unchanged —
+/// `ledger::Mail` is 232 bytes either way — and what moved is the turn's state
+/// machine, which the old keyed loop inlined into the task's own future and the new
+/// one boxes.
 ///
-/// The local path keeps a 310 byte margin over the keyed one: a second channel,
-/// the `watch` that carries `Ended`, and an `Arc<JoinHandle>`, against the
-/// registry entry and `HashMap` slot the keyed one pays for instead.
+/// # The second move is a 128 byte regression nothing measured, and this is it
+///
+/// The 1,469 in the middle column is what this file's documentation asserted until
+/// Wave 2's review, and the tree measures 1,597. Bisected by running this test at
+/// both commits: exactly 128 bytes per idle local actor, one allocator step, and
+/// **only on the local path** — the keyed column did not move.
+///
+/// That fits, and the fit names the cause. Wave 2d put the `finish` loop inside
+/// `LocalActor::spawn_observed`'s own async block, so it is in the task's future
+/// while the actor is idle. The keyed loop in `macros.rs::spawn` has no `finish`
+/// loop at all, which is why 1,159 held. Nothing in Wave 2 was wrong; what was
+/// wrong is that a wave which grows the loop's own frame reported no number, and
+/// the number it did not report is the one this budget is about.
+///
+/// # That margin is why this budget needs its own slope, and phase 4 is it
+///
+/// This literal was checked at exactly one `Mail` size for months — 232 bytes, the
+/// only one any phase built a *local* actor of — while the entire argument for the
+/// `Box::pin` at the local loop's await is an absolute ceiling (3,005 bytes without
+/// it against 1,597 with) that happens to sit between 1,597 and 2,048. The local
+/// path has **less** headroom than the keyed one, by 438 bytes now: a second
+/// channel, the `watch` that carries `Ended`, an `Arc<JoinHandle>` and the `finish`
+/// loop, against the registry entry and `HashMap` slot the keyed one pays for
+/// instead. So phase 4 builds bulky *local* actors and asserts the slope here too,
+/// against [`SLOPE_SLACK_OVER_A_KILOBYTE`], rather than trusting that a flat keyed
+/// slope implies a flat local one.
 const BUDGET_PER_LOCAL_ACTOR: isize = 2048;
 
 /// How much an idle actor is allowed to cost **because of what the service
 /// declares**, over the whole kilobyte between `ledger::Mail` and `bulky::Mail`.
 ///
-/// This is the literal that makes [`BUDGET_PER_ACTOR`] a statement about keylink.
-/// Without it, that budget is satisfiable by writing a small service and says
-/// nothing about anyone else's; with it, the claim is that the two budgets bound
-/// the framework because the *slope* is flat.
+/// This is the literal that makes [`BUDGET_PER_ACTOR`] and
+/// [`BUDGET_PER_LOCAL_ACTOR`] statements about keylink. Without it, either budget
+/// is satisfiable by writing a small service and says nothing about anyone else's;
+/// with it, the claim is that the budgets bound the framework because the *slope*
+/// is flat.
 ///
 /// Not zero, and deliberately not: `Empty` is the same state in both, but two
 /// services are two `HashMap`s, two `OnceLock`s of ALPN bytes and two
 /// monomorphisations, and the allocator's own rounding lands differently. What is
 /// asserted is that the difference is **noise beside the message**, not that it
 /// is nothing.
-const BUDGET_PER_DECLARED_BYTE: isize = 128;
+///
+/// # The name used to say `BUDGET_PER_DECLARED_BYTE`, and that was ~1,000× off
+///
+/// It is a total over the whole delta, not a rate. The `ledger`-to-`bulky` gap is
+/// 1,016 bytes of `Mail`, so 128 bytes of slack is a tolerated slope of about
+/// **0.126 bytes per declared byte** — while the old name asserted 128 of them,
+/// which is forty times the 2.9 B/B the unboxed design actually measured and
+/// would therefore have passed the very design this assertion exists to refuse.
+/// The check was right and the name described a different, useless one.
+const SLOPE_SLACK_OVER_A_KILOBYTE: isize = 128;
 
 #[tokio::test]
 async fn ten_thousand_idle_actors_fit_in_the_budget() {
@@ -299,17 +339,57 @@ async fn ten_thousand_idle_actors_fit_in_the_budget() {
          anything; they differ by {declared} bytes of Mail"
     );
     assert!(
-        each_bulky - each <= BUDGET_PER_DECLARED_BYTE,
-        "an idle actor costs {each_bulky} bytes for a service whose Mail is \
+        each_bulky - each <= SLOPE_SLACK_OVER_A_KILOBYTE,
+        "a keyed idle actor costs {each_bulky} bytes for a service whose Mail is \
          {declared} bytes larger, against {each} for the small one — a difference \
-         of {} bytes, over the {BUDGET_PER_DECLARED_BYTE} byte slack. An idle \
+         of {} bytes, over the {SLOPE_SLACK_OVER_A_KILOBYTE} byte slack. An idle \
          actor is paying for what the service declares, which is the property the \
          box on the turn's future exists to hold",
         each_bulky - each
     );
 
-    // Last, and the order is deliberate: the slope above is what makes these two
-    // statements about keylink, so a run that broke the slope should say so
+    // ── phase 4: the slope on the LOCAL path ─────────────────────────────────
+    //
+    // Phase 3 measured the slope for a KEYED actor only, so `BUDGET_PER_LOCAL_ACTOR`
+    // was checked at exactly one `Mail` size — and the local path is the one with
+    // less headroom, by the 310 bytes its second channel and `Arc<JoinHandle>` cost.
+    // The local loop boxes its turn at its own await, in its own line of code; a
+    // wave that removed that line and left the keyed one would have passed phase 3
+    // and every budget above.
+
+    let mut bulky_handles: Vec<bulky::Handle<Empty>> = Vec::with_capacity(ACTORS);
+    settle().await;
+
+    let before_bulky_local = LIVE.load(Ordering::Relaxed);
+    for _ in 0..ACTORS {
+        bulky_handles.push(bulky::actor(Empty));
+    }
+    settle().await;
+    let after_bulky_local = LIVE.load(Ordering::Relaxed);
+
+    let each_bulky_local = (after_bulky_local - before_bulky_local) / ACTORS as isize;
+    println!(
+        "a bulky idle LOCAL actor costs {each_bulky_local} bytes against \
+         {each_local} for the small one"
+    );
+
+    assert_eq!(bulky_handles.len(), ACTORS);
+    assert!(
+        bulky_handles.iter().all(bulky::Handle::is_running),
+        "a handle that already stopped is not an idle actor"
+    );
+    assert!(
+        each_bulky_local - each_local <= SLOPE_SLACK_OVER_A_KILOBYTE,
+        "a LOCAL idle actor costs {each_bulky_local} bytes for a service whose Mail \
+         is {declared} bytes larger, against {each_local} for the small one — a \
+         difference of {} bytes, over the {SLOPE_SLACK_OVER_A_KILOBYTE} byte slack. \
+         The box at the local loop's await is what holds this, and it is a \
+         different line of code from the keyed one",
+        each_bulky_local - each_local
+    );
+
+    // Last, and the order is deliberate: the two slopes above are what make these
+    // budgets statements about keylink, so a run that broke a slope should say so
     // rather than reporting whichever budget it happened to push over first.
     assert!(
         each <= BUDGET_PER_ACTOR,
@@ -323,6 +403,12 @@ async fn ten_thousand_idle_actors_fit_in_the_budget() {
         "a local idle actor costs {each_local} bytes, over the \
          {BUDGET_PER_LOCAL_ACTOR} byte budget — read BUDGET_PER_LOCAL_ACTOR's \
          documentation before moving the literal"
+    );
+    assert!(
+        each_bulky_local <= BUDGET_PER_LOCAL_ACTOR,
+        "a local idle actor of the BULKY service costs {each_bulky_local} bytes, \
+         over the {BUDGET_PER_LOCAL_ACTOR} byte budget — the budget bounds keylink \
+         only if it holds for a service nobody here wrote"
     );
 }
 

@@ -656,7 +656,81 @@ as the hazard — a *new* port added beside these two, which no probe here can f
 which this one would stay green next to. What closed is the second method that actually
 landed; what is still open is a third. Both are now written there.
 
-### 3.4 What Wave 2 (2a, 2b, 2d) did NOT do
+### 3.4 Corrections applied after Wave 1b/2's review, and the one number they found
+
+Seven findings from the review of Wave 1b were applied before 2c started. Five are
+documentation — a comment asserting in the present tense a thing that had been
+deleted, a fourth site claiming rustdoc checks an error code, a stale method name on
+a test, a measurably false size argument, and a constant whose name asserted a bound
+about 1,000× looser than the check underneath it. Two changed code, and both belong
+on the record here rather than only in a commit message.
+
+**`guarded` and `catching` are `pub(crate)`.** Wave 1b removed their last consumer
+outside the crate: `rg '\$crate::guarded' keylink/src/macros.rs` returns 0 where
+`c9056e0` returned 1, and nothing in `tests/`, `demo/` or the README calls either —
+the remaining hits are prose. Every generated arm calls `turn`, and the guard is
+inside that. §1.2 records the Wave 0 probe reaching them "through a path
+dependency"; that is history, and a probe rebuilt today would have to live in-crate
+or re-export them deliberately.
+
+**`TurnLost` has a fourth variant, `Expired`.** `ask_catching` mapped
+`Answered::Expired` to `TurnLost::Gone` behind a comment reading *"a local origin
+carries no `Queueing`, so nothing can expire on this path. Typed rather than
+asserted."* It was asserted, by that comment, and the mapping under it said a live
+actor was no longer running. Unreachable today, and reachable the moment a local
+origin gets a queue budget — which is what a deferred reply and a feed both are. So
+the variant exists now and the arm is correct if something reaches it, the same
+choice §2.1 made for the `send` and `recv` `Mail` variants nothing builds.
+
+`TurnLost` is **not** `#[non_exhaustive]`, against the review's suggested package,
+and the reason is `Ended`'s own: *"Exhaustive, like `Departure`: a caller matches it,
+and a wildcard arm is the collapse it exists to prevent."* Sealing it would let a
+downstream `_` swallow a fifth answer exactly the way `Gone` swallowed this fourth
+one. Nothing outside keylink constructs a `TurnLost`, so the additive argument for
+sealing is about matching, and matching is the thing that should break.
+
+#### The number: Wave 2 cost 128 bytes per idle **local** actor, and nothing measured it
+
+`tests/actor_memory.rs` asserted `BUDGET_PER_LOCAL_ACTOR` at exactly one `Mail`
+size, because phase 3 mounted `bulky::System` and never built a single
+`bulky::actor(..)`. Adding that phase found the drift immediately. Bisected by
+running the one test at two commits:
+
+| path | `c9056e0` | Wave 1b `c8712b0` | Wave 2 `836179c` |
+|---|---|---|---|
+| keyed, mounted in a `System` | 1,671 | 1,159 | 1,159 |
+| local, `ledger::actor(..)` | 1,725 | 1,469 | **1,597** |
+
+§2.5's table and three comments said 1,469. The keyed column did not move, which
+names the cause: **2d put the `finish` loop inside `LocalActor::spawn_observed`'s own
+async block**, so it sits in the task's future while the actor is idle, and
+`macros.rs::spawn`'s keyed loop has no `finish` loop at all. One allocator step.
+
+Nothing in 2d was wrong. What was wrong is that a wave which grows the loop's own
+frame reported no number, on the path with **less** headroom — the local margin over
+keyed is 438 bytes now, not 310 — and the whole argument for the `Box::pin` at that
+await is an absolute ceiling that sits between 1,597 and 2,048.
+
+The local slope is asserted now, separately from the keyed one, because the box that
+holds it is a different line of code. Red-tested by removing that line: a local idle
+actor goes to 3,005 bytes and a bulky one to 9,114, a slope of 6.0 B/B, and the
+assertion fires naming both. The old constant was called
+`BUDGET_PER_DECLARED_BYTE` — 128 bytes of slack over a 1,016 byte delta is 0.126
+B/B, so a name promising 128 B/B would not have caught even that. It is
+`SLOPE_SLACK_OVER_A_KILOBYTE`.
+
+#### The size argument that was false
+
+`__keylink_mail_body!` justified a unit field over `Option<BodyReader>` by "paying
+`size_of::<BodyReader>()` on every variant … would be a tax on the mailbox — which
+is sized to its largest variant". Measured: `size_of::<ledger::Mail>()` is 232, and
+232 is exactly `Served` — `Origin` 120 + `Request` 8 + `BodyReader` 96 + `Reply` 8 —
+against 136 for the per-method variant. `Option<BodyReader>` is also 96, the niche
+being free. So the enum would stay 232 bytes and the tax is zero. The decision is
+right for the reason the same comment's second half already gave; the size clause is
+gone.
+
+### 3.5 What Wave 2 (2a, 2b, 2d) did NOT do
 
 - **`#[defer]`.** A separate lane, and it needs its own `Send` probe: Wave 0 probed
   `oneshot::Sender<Answered<T>>` held *inside* a turn, and a `Deferred<T>` parked past
