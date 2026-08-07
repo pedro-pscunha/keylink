@@ -101,8 +101,80 @@ pub enum RemoteError {
     },
 
     /// Anything else the serving side wants to report.
+    ///
+    /// The `String` is a **discriminator** and not only a message on the served
+    /// paths keylink writes: see the prefix constants on this type.
     #[error("{0}")]
     Failed(String),
+}
+
+/// The prefixes [`RemoteError::Failed`] carries on keylink's own served paths.
+///
+/// **Public because a peer has to match on them, and could not name them.** The
+/// four were `const`s private to `local.rs` for four waves, documented as a
+/// contract in four rustdocs, while every caller in and out of this repository
+/// hard-coded `why.starts_with("dropped: ")`. A contract nobody can name by
+/// symbol is a string literal with a paragraph next to it.
+///
+/// Exporting them costs no ALPN move, and that is worth being exact about: they
+/// are **not** part of the hashed contract. `Envelope<WireResponse<Response>>`
+/// reaches `Outcome::Err(RemoteError)`, and `postcard_schema` hashes the enum's
+/// variants and fields. Associated constants are not either, so
+/// `keylink/tests/protocol.rs`'s two pins are unmoved by this — checked, not
+/// assumed.
+///
+/// # The property, and exactly what it is a property OF
+///
+/// **No one of these four is a prefix of another**, in either direction, so a
+/// peer matching with `starts_with` is never ambiguous.
+/// `local::tests::no_failure_prefix_is_a_prefix_of_another` holds it, and a fifth
+/// has to be added to that list by hand.
+///
+/// The claim used to read *"every prefix a `RemoteError::Failed` carries on the
+/// served path"*, and that was false. keylink builds a `Failed` from at least
+/// three other places whose text is a whole sentence rather than one of these:
+/// the registry's capacity refusal, an [`ActorId`](crate::ActorId) a peer sent
+/// that fails validation, and a console subscription refusal. None of them
+/// collides today, and the same guard checks that too — but the claim these
+/// constants can carry is the narrow one: **every prefix `rendered` and `lost`
+/// build.** A `Failed` whose text came from a caller's own
+/// [`Middleware`](crate::Middleware) is outside any guard here and always will
+/// be.
+impl RemoteError {
+    /// Your message exploded and the actor kept its state.
+    ///
+    /// The turn panicked, the panic was caught rather than unwound into a
+    /// connection task, and the actor is still serving. Followed by the panic's
+    /// own message, which is usually caller-derived.
+    pub const PANICKED: &'static str = "panicked: ";
+
+    /// The turn ran and was not committed.
+    ///
+    /// An [`Observer`](crate::Observer) refused it — a durability adapter that
+    /// could not write, most often — so the actor is ending for a reason worth
+    /// telling the peer apart from a fault. Followed by the observer's name.
+    pub const REFUSED: &'static str = "observer refused: ";
+
+    /// The incarnation that owed you an answer is gone, and another is coming.
+    ///
+    /// **Retry.** A supervised actor's state is dropped when an incarnation
+    /// ends, and a reply parked in that state dies with it; the supervisor had
+    /// already granted the restart when this was written. Followed by the ending
+    /// that caused it.
+    pub const RESTARTING: &'static str = "restarting: ";
+
+    /// The reply left its turn and was never answered, and the actor is there.
+    ///
+    /// **Do not retry blindly, and do not give up on the actor**: it is mounted,
+    /// it took the message, and it will answer the next one. A handler took
+    /// `reply.later()` and dropped the `Deferred` — sanctioned, and what that
+    /// type's `#[must_use]` asks for — or panicked after taking it.
+    ///
+    /// The sentence after it deliberately does **not** name a cause. It said
+    /// "the reply was taken out of the turn and never answered" for one wave,
+    /// which is false of the panicking half: nothing at the point of death can
+    /// tell the two apart, because both are one `Deferred::drop`.
+    pub const DROPPED: &'static str = "dropped: ";
 }
 
 /// The reply as it appears on the wire: a value, or a refusal.

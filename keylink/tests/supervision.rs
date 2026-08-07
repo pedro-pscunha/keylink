@@ -1004,7 +1004,35 @@ async fn a_handle_survives_its_actors_restart() {
 /// 1. `boom` faults → `Failed("panicked: ..")`, the actor survives the message;
 /// 2. the parked `place` → `Failed("restarting: ..")`, the incarnation did not;
 /// 3. once the budget is out → `NoSuchActor`, which is *gone* and is final.
-#[tokio::test]
+///
+/// # `multi_thread`, and it is the whole reason round 3 means anything
+///
+/// This was `#[tokio::test]` — current-thread — and round 3 passed for a reason
+/// that was **not** the one it asserts. The give-up published no verdict at all;
+/// the actor's task simply ran its whole teardown, returned, and dropped the
+/// receiver before the peer's task was ever polled again, so `Life::Ended` and a
+/// closed mailbox were what that peer eventually read. On more than one worker
+/// the same code answers `Failed("dropped: ..")` — *the actor is still there* —
+/// about an actor that will never answer again.
+///
+/// Four workers, then, so this test can see the window it is about. It is
+/// deterministic under either flavour now, because the verdict is settled before
+/// the state is dropped rather than raced against it — which is the difference
+/// between a guard and a coin toss, and is why the fix is not "close the window"
+/// but "answer before it opens".
+///
+/// `rg -n 'multi_thread' keylink/tests` returned exactly one hit before this, in
+/// `singleton.rs`. That is the mechanical reason nothing in this suite caught the
+/// regression.
+///
+/// Made red on round 3 by `scripts/break-once.sh keylink/src/local.rs` on
+/// `Lent::ending`'s `Standing::Gone` → `Standing::Running` — a supervisor that
+/// refuses the restart and tells the peer the actor is still there, which is the
+/// regression verbatim. Watched: `round 2: expected gone, got
+/// Remote(Failed("dropped: the reply left its turn and was never answered"))`.
+/// (The loop indexes its two rounds from one; round 3 above is the second round's
+/// second answer.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_remote_caller_can_tell_restarting_from_gone() {
     let server_node = local_node().await;
     let client_node = local_node().await;
@@ -1194,7 +1222,26 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
 /// which is a supervisor that grants the restart and tells the peer to stop
 /// asking anyway. Watched: `round 1: expected restarting: , got
 /// Remote(NoSuchActor { id: "desks/4471" })`.
-#[tokio::test]
+///
+/// **Round 2 is NOT reliably red under that break, and saying so is the point.**
+/// The same edit — `Lent::ending`'s `Standing::Gone` → `Standing::Running`, the
+/// regression itself — leaves this test green: `Mailbox`'s own `Drop` settles
+/// `Gone` a few instructions later, when `supervise` returns and lets go of the
+/// receiver it owns, and on this run the peer read after that rather than before.
+/// So round 2's answer here is correct by *either* of two writers and is not
+/// attributable to one, which makes it an assertion about the answer and not a
+/// guard on the verdict.
+///
+/// The deterministic guard for that ordering is
+/// `local::tests::an_ending_incarnation_settles_its_verdict_and_its_mailbox_before_its_state`,
+/// which observes inside the state's own `Drop` — the only instant that can see
+/// which writer got there first. Its singleton twin above *is* reliably red on
+/// round 2, because a `LocalActor` has no mailbox floor under it.
+///
+/// `multi_thread` for that twin's reason: on one worker the actor's whole
+/// teardown runs before the peer's task is polled again, so a peer here can only
+/// ever read the last value written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
     let server_node = local_node().await;
     let client_node = local_node().await;

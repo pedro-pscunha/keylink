@@ -268,6 +268,13 @@ impl<M> Mailbox<M> {
     pub(crate) fn fate(&self) -> Fate {
         self.fate.clone()
     }
+
+    /// Refuse further messages while letting the buffer drain. See
+    /// `local.rs`'s `Inbox::close`, which owns the argument: only a supervisor
+    /// calls this, on the path where there will be no next incarnation.
+    pub(crate) fn close(&mut self) {
+        self.slots.close();
+    }
 }
 
 /// An actor ready to run: its loop and the sender that reaches it.

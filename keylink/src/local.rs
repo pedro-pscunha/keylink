@@ -1347,6 +1347,30 @@ trait Inbox<A, M>: Send {
     fn ending(&mut self, _reason: &Ended) -> Standing {
         Standing::Gone
     }
+
+    /// Refuse messages from now on, **without** dropping what is already queued.
+    ///
+    /// `tokio::sync::mpsc::Receiver::close`, which is not the same as dropping the
+    /// receiver: every `Sender::is_closed()` becomes true immediately and the
+    /// buffer still drains. Only [`Lent`] and [`supervise`] call it, and only on a
+    /// path where there will be no next incarnation.
+    ///
+    /// # It exists because `is_running()` lied, and only on the supervised path
+    ///
+    /// An unsupervised actor gets this for free: [`run_loop`] owns its receiver
+    /// and drops it, so `!mail.is_closed()` is exact from that instant. A
+    /// supervised one does not — [`supervise`] takes the receiver **by value** and
+    /// holds it across every incarnation, so between `run_loop` returning on a
+    /// permanent give-up and `supervise` returning, `LocalActor::is_running()`
+    /// answered `true` for an actor that would never handle another message, and
+    /// `ask` queued into a mailbox nobody would drain.
+    ///
+    /// That window is instructions wide and has no await in it, which is why it is
+    /// invisible on a current-thread runtime and why the served answer is **not**
+    /// built on it: `deliver_to_local` reads the verdict, not the mailbox. This
+    /// repairs the public method rather than the wire answer, and the two are
+    /// deliberately separate — one fact, two consequences, decided at one place.
+    fn close(&mut self);
 }
 
 /// A [`LocalActor`]'s mailbox, which carries reads and the stop request too.
@@ -1356,6 +1380,10 @@ impl<A: Send, M: Send> Inbox<A, M> for mpsc::Receiver<Message<A, M>> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Message<A, M>>> {
         self.poll_recv(cx)
+    }
+
+    fn close(&mut self) {
+        Self::close(self);
     }
 }
 
@@ -1390,6 +1418,10 @@ impl<A: Send, M: Send> Inbox<A, M> for Keyed<M> {
     /// the entry [`System::status`](crate::System::status) reads.
     fn mark_busy(&self, running: bool) {
         self.0.mark_busy(running);
+    }
+
+    fn close(&mut self) {
+        self.0.close();
     }
 }
 
@@ -2095,11 +2127,32 @@ impl<A: Send, M: Send, I: Inbox<A, M>> Inbox<A, M> for Lent<'_, I> {
     /// give-up was told `dropped: `, *the actor is still there*, about an actor
     /// that would never answer again. A hook that has to hand a value back cannot
     /// have an arm that quietly says nothing.
+    ///
+    /// # The same arm closes the mailbox, and that is a second consequence rather
+    /// than a second decision
+    ///
+    /// A restart keeps the mailbox open with no re-queue, which is the whole
+    /// structural idea of [`Lent`]. A give-up must not: [`supervise`] owns the
+    /// receiver by value for the actor's whole life, so without this
+    /// [`LocalActor::is_running`] answered `true` for an actor that would never
+    /// take another message, and [`ask`](LocalActor::ask) queued into a mailbox
+    /// nobody would drain. `Receiver::close` refuses new senders immediately and
+    /// still lets the buffer drain, which is exactly what dropping the receiver
+    /// gives the *un*supervised path for free.
+    ///
+    /// It is deliberately **not** what a served dispatch reads — that is the
+    /// `Standing` this returns. One decision, made here, with two consequences
+    /// published at the two places that need them.
     fn ending(&mut self, reason: &Ended) -> Standing {
         if retryable(reason) && self.budget.spend(self.started.elapsed()) {
             return Standing::Restarting(Arc::new(reason.clone()));
         }
+        self.close();
         Standing::Gone
+    }
+
+    fn close(&mut self) {
+        self.inbox.close();
     }
 }
 
@@ -2155,6 +2208,10 @@ where
                 // kills every message still queued behind an actor that will
                 // never exist. Their callers must read *gone*, not *running*.
                 fate.settle(Standing::Gone);
+                // And the mailbox stops taking them, for `Lent::ending`'s reason:
+                // this actor will not run, so a caller must meet a closed mailbox
+                // now rather than a permit into a queue nobody will drain.
+                inbox.close();
                 return Ended::GaveUp {
                     after: budget.spent,
                     error: Arc::from(error),
@@ -2912,27 +2969,21 @@ impl<A, M> fmt::Debug for LocalActor<A, M> {
 
 // ─────────────────────────────────────────── what a peer is told about a turn
 
-// Every prefix a `RemoteError::Failed` carries on the served path, named once
-// each so that their one shared property is checked rather than asserted.
+// The four prefixes a `RemoteError::Failed` carries out of `rendered` and
+// `lost`. They live on `RemoteError` itself now, in `reply.rs`, because a peer
+// has to match on them and could not name them: this block held them as private
+// `const`s for four waves while every caller hard-coded the literal.
 //
-// The property: **no one of these is a prefix of another.** `Failed` carries a
-// `String` and not a variant — a variant sits inside the hashed contract and
-// would move every service's ALPN — so the string is the whole discriminator,
-// and a peer matching on it with `starts_with` needs the set to be unambiguous.
-// That claim was written into four rustdocs and held by nothing until a fourth
-// member made it worth a guard: `tests::no_failure_prefix_is_a_prefix_of_another`
-// is that guard, and **a fifth prefix has to be added to its list by hand.**
-
-/// Your message exploded and the actor kept its state. Built by [`rendered`].
-const PANICKED: &str = "panicked: ";
-/// The turn ran and was not committed. Built by [`rendered`].
-const REFUSED: &str = "observer refused: ";
-/// The incarnation that owed you an answer is gone and the next one is coming.
-/// Built by [`deliver_to_local`].
-const RESTARTING: &str = "restarting: ";
-/// The actor is still there, and this one reply was taken out of its turn and
-/// never answered. Built by [`deliver_to_local`].
-const DROPPED: &str = "dropped: ";
+// Aliased here rather than qualified at eight use sites, because the use sites
+// are `format!("{PANICKED}{panic}")` and the qualified spelling inside a format
+// string is noise. `reply.rs` carries the whole argument — the property, the
+// guard, and what the claim is a property *of*, which is narrower than this
+// block used to say.
+use crate::RemoteError as Failure;
+const PANICKED: &str = Failure::PANICKED;
+const REFUSED: &str = Failure::REFUSED;
+const RESTARTING: &str = Failure::RESTARTING;
+const DROPPED: &str = Failure::DROPPED;
 
 /// Render one answer as the pair a served dispatch returns.
 ///
@@ -3028,8 +3079,15 @@ pub(crate) fn rendered<Resp>(
 pub(crate) fn lost(standing: Standing, id: &str) -> RemoteError {
     match standing {
         Standing::Restarting(reason) => RemoteError::Failed(format!("{RESTARTING}{reason}")),
+        // The sentence names no **cause**, and that is the correction it carries.
+        // It read "the reply was taken out of the turn and never answered", which
+        // is the sanctioned `reply.later()` + `drop` and is false of the other
+        // half of this arm: a handler that panics after taking `reply.later()`
+        // arrives here too, and its panic message is lost rather than rendered.
+        // Nothing at the point of death can tell the two apart — both are one
+        // `Deferred::drop` — so the wording covers the set it can see.
         Standing::Running => RemoteError::Failed(format!(
-            "{DROPPED}the reply was taken out of the turn and never answered"
+            "{DROPPED}the reply left its turn and was never answered"
         )),
         // NOT a `Failed`: this is the one of the three where *there is nothing
         // here, stop asking* is true.
@@ -3199,6 +3257,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The other half of that property lives in `actor/remote.rs`, because the
+    /// producers it is about do: `no_other_served_failure_begins_with_one_of_the_four`.
+    ///
+    /// The block above claimed these four were *every* prefix a `Failed` carries
+    /// on the served path, and that was false in at least three places — each a
+    /// whole sentence rather than a prefix, which is why nothing collided and why
+    /// nothing would have noticed if something had. The claim is narrowed to what
+    /// it can be: every prefix [`rendered`] and [`lost`] build.
+    #[test]
+    fn the_four_are_only_what_rendered_and_lost_build() {
+        assert_eq!(
+            lost(Standing::Gone, "id"),
+            RemoteError::NoSuchActor {
+                id: "id".to_string()
+            },
+            "one of the three answers is not a `Failed` at all, so the set of \
+             prefixes is smaller than the set of answers"
+        );
     }
 
     /// The state a `Mutex` would otherwise be wrapped around.
@@ -3828,15 +3906,19 @@ mod tests {
     /// it is the real [`supervise`], the real [`run_loop`] and the real [`Lent`].
     struct Dying {
         fate: Fate,
-        seen: Arc<Mutex<Vec<Standing>>>,
+        /// A sender for this actor's own mailbox, so the record below can say
+        /// whether it is still taking messages at the same instant.
+        mail: mpsc::Sender<Message<Dying, Fatal>>,
+        seen: Arc<Mutex<Vec<(Standing, bool)>>>,
     }
 
     impl Drop for Dying {
         fn drop(&mut self) {
+            let record = (self.fate.standing(), self.mail.is_closed());
             self.seen
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push(self.fate.standing());
+                .push(record);
         }
     }
 
@@ -3856,38 +3938,54 @@ mod tests {
         }
     }
 
-    /// **The ordering claim, asserted rather than reasoned about.**
+    /// **Two ordering claims, asserted rather than reasoned about**, at the one
+    /// instant that can see them.
     ///
-    /// The verdict is settled *before* the state is dropped, so a peer whose
-    /// parked reply died with that state cannot read an earlier value. There is no
-    /// way to observe that from outside the actor — a served call reads the cell
-    /// on another task, and on a current-thread runtime the actor's task has
-    /// always finished by then, which is why an empirical probe of this window
-    /// proves nothing and hangs when pushed. So the observer is the state itself.
+    /// A dying incarnation settles two things before its state is dropped: the
+    /// verdict a served dispatch reads, and — on the arm where there will be no
+    /// next incarnation — the mailbox, so that `is_running()` and `ask` stop
+    /// lying. Both must land before the state dies, because that is when a parked
+    /// `Deferred` dies and a peer is woken.
     ///
-    /// Two incarnations and two records: the first fault is inside the budget and
-    /// dies `Restarting`, the second is not and dies `Gone`. `start_paused` for
-    /// `tests/supervision.rs`'s reason — an incarnation's measured lifetime is
-    /// then exactly zero, so the budget cannot reset under the test and the
-    /// backoff cannot cost wall time.
+    /// **There is no way to observe either from outside the actor**, and that is
+    /// the finding rather than a limitation of this test. The whole teardown runs
+    /// without an await, so on a current-thread runtime nothing else is polled
+    /// until it is over and every ordering — including a broken one — reads
+    /// correct; on a multi-thread one the window is instructions wide and the
+    /// probe becomes a race that hangs when pushed. So the observer is the state
+    /// itself, in its own `Drop`.
     ///
-    /// Made red by `scripts/break-once.sh keylink/src/local.rs`, replacing
-    /// `run_loop`'s `fate.settle(inbox.ending(&reason));` with a `Drop` guard
-    /// holding the same verdict — so it is decided in the same place, still
-    /// reaches [`supervise`], and is *published* at the end of `run_loop` instead:
-    /// after `drop(state)`. That is exactly the "decide afterwards" ordering this
-    /// design refuses, with nothing else changed. Watched: `an incarnation's
-    /// verdict must be settled before its state dies: [Running, Running]`.
+    /// Two incarnations and two records. The first fault is inside the budget:
+    /// `Restarting`, and the mailbox stays **open**, which is the structural
+    /// promise that a restart needs no re-queue. The second is not: `Gone`, and
+    /// the mailbox is closed. `start_paused` for `tests/supervision.rs`'s reason —
+    /// an incarnation's measured lifetime is then exactly zero, so the budget
+    /// cannot reset under the test and the backoff costs no wall time.
     ///
-    /// The blunter break — deleting the publish outright — is red too, and at a
-    /// *different* assertion: `an incarnation is there to take it: SendError`,
-    /// because `supervise` reads the same cell and stops restarting. Recorded
-    /// because it is the more informative half of the guard: there is one place
-    /// this fact is written, so losing it cannot cost only the peer's answer.
+    /// Made red three ways, each watched:
+    ///
+    /// - `scripts/break-once.sh keylink/src/local.rs`, replacing `run_loop`'s
+    ///   `fate.settle(inbox.ending(&reason));` with a `Drop` guard holding the
+    ///   same verdict — decided in the same place, still reaching [`supervise`],
+    ///   published at the end of `run_loop` instead, after `drop(state)`. That is
+    ///   exactly the "decide afterwards" ordering this design refuses, with
+    ///   nothing else changed. Watched: `an incarnation's verdict must be settled
+    ///   before its state dies: [(Running, false), (Running, true)]` — the second
+    ///   `true` is this same teardown's `close`, which lands on time and is what
+    ///   the record still has to show, since only the verdict was moved.
+    /// - the same file, deleting `Lent::ending`'s `self.close();`. Watched:
+    ///   `a give-up must close the mailbox and a restart must not: [(Restarting(
+    ///   Panicked { message: "this incarnation is over" }), false), (Gone, false)]`,
+    ///   with `left: [false, false]`.
+    /// - the blunter one — deleting the publish outright — is red too, and at a
+    ///   *different* assertion: `an incarnation is there to take it: SendError`,
+    ///   because [`supervise`] reads the same cell and stops restarting. Recorded
+    ///   because it is the more informative half: there is one place this fact is
+    ///   written, so losing it cannot cost only the peer's answer.
     #[tokio::test(start_paused = true)]
-    async fn an_incarnations_verdict_is_settled_before_its_state_is_dropped() {
+    async fn an_ending_incarnation_settles_its_verdict_and_its_mailbox_before_its_state() {
         let fate = Fate::default();
-        let seen: Arc<Mutex<Vec<Standing>>> = Arc::default();
+        let seen: Arc<Mutex<Vec<(Standing, bool)>>> = Arc::default();
         let (mail, inbox) = mpsc::channel::<Message<Dying, Fatal>>(1);
         let limit = Intensity::new(
             NonZeroU32::new(1).expect("one restart"),
@@ -3898,14 +3996,16 @@ mod tests {
         let running = {
             let held = fate.clone();
             let building = fate.clone();
+            let sending = mail.clone();
             let recorder = seen.clone();
             n0_future::task::spawn(async move {
                 let fate = held;
                 supervise(
                     move || {
                         let fate = building.clone();
+                        let mail = sending.clone();
                         let seen = recorder.clone();
-                        async move { Ok::<_, Stop>((Dying { fate, seen }, Vec::new(), ())) }
+                        async move { Ok::<_, Stop>((Dying { fate, mail, seen }, Vec::new(), ())) }
                     },
                     limit,
                     inbox,
@@ -3916,7 +4016,8 @@ mod tests {
         };
 
         // The second send waits for the permit the first message freed when an
-        // incarnation took it, so the two cannot land in one incarnation.
+        // incarnation took it, so the two cannot land in one incarnation — and
+        // both are queued long before the give-up closes anything.
         for _ in 0..2 {
             mail.send(Message::Mail(Box::new(Fatal)))
                 .await
@@ -3934,9 +4035,19 @@ mod tests {
         );
 
         let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let verdicts: Vec<&Standing> = seen.iter().map(|(standing, _)| standing).collect();
         assert!(
-            matches!(seen.as_slice(), [Standing::Restarting(_), Standing::Gone]),
+            matches!(
+                verdicts.as_slice(),
+                [Standing::Restarting(_), Standing::Gone]
+            ),
             "an incarnation's verdict must be settled before its state dies: {seen:?}"
+        );
+        let closed: Vec<bool> = seen.iter().map(|(_, closed)| *closed).collect();
+        assert_eq!(
+            closed.as_slice(),
+            [false, true],
+            "a give-up must close the mailbox and a restart must not: {seen:?}"
         );
     }
 }
