@@ -292,11 +292,12 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
    `IdempotentClient`, which has no `tell` method, so this limit is one the
    compiler enforces rather than one you have to remember. Work that has to
    arrive is an `rpc`.
-2. **The ledger is memory.** It dies with the process, and a restarted service
-   runs a retried call again. `keylink-persist` makes an actor's *state* durable
-   and does nothing for the ledger. keylink has no journal and this is not one.
+2. **The ledger is memory, so across a restart the guarantee is yours to keep.**
+   The ledger dies with the process. `keylink-persist` makes an actor's *state*
+   durable and does nothing for the ledger; keylink has no journal and this is not
+   one.
 
-   **Durable state makes this sharper, not milder.** While nothing survived a
+   **Durable state makes that sharper, not milder.** While nothing survived a
    restart, re-running a retried call was *correct* — a fresh process had a fresh
    state. It is not correct any more. A process that fsyncs turn *n*, records the
    reply in the in-memory ledger, and dies before the frame reaches the peer will,
@@ -304,23 +305,70 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
    run *n* again. The state is durable and the record that would have suppressed
    the repeat is not.
 
-   So **effectively-once is a property of one process's lifetime, not of a key.**
-   Across a restart the guarantee is at-least-once, and a handler that is not
-   idempotent against its own committed state will double-apply. This is the real
-   distance to a journalled system, and it is one sentence rather than a caveat
-   you can tune away.
+   So **effectively-once is a property of one process's lifetime, not of a key** —
+   for as long as the only thing that knows about the key is the ledger.
+   `cx.call()` is what changes that. It hands the handler a `CallId` — the calling
+   peer folded into a hash of its key, opaque so that no caller has to re-implement
+   the ledger's peer-scoping rule — and `Applied<T>` is a bounded set to keep them
+   in. Put one in your own state, and the dedupe is three lines that travel with
+   whatever snapshot that state already writes:
+
+   ```rust,ignore
+   let call = cx.peer().and_then(Context::call);
+   if let Some(&balance) = self.applied.get(call) { return balance; }
+   self.balance += amount;
+   self.applied.insert(call, self.balance);
+   ```
+
+   `APPLIED_CAPACITY` is 4096 calls by default — about 31 seconds of back-to-back
+   distinct keyed traffic at the 130 turns/s ceiling `Persist`'s `fsync` imposes,
+   which is longer than `MAX_ATTACH`. `Applied<()>` is the valueless form, for work
+   that has no answer to replay.
+
+   **What this does not buy, in full.** The duplicate still *enters the handler*
+   and still costs a turn — about 7.6 ms of `fsync` on a state it did not change —
+   because only a durable ledger could refuse it before dispatch. `key_state(key)`
+   still answers `Fresh` after a restart, so a peer learns nothing about a key your
+   domain is about to dedupe. And the dedupe is yours to write: keylink will not
+   write it, because the correct version knows what your answer is and whether
+   replaying it beats refusing.
+
+   **It also rests on the calling peer keeping its identity.** The peer is in the
+   hash, so a client that reconnects on a fresh keypair is a different caller, is
+   not recognised, and runs the work again — silently, and indistinguishably from a
+   first call, which is the degradation limit 4 below names as the one a caller
+   cannot detect. A long-lived `SecretKey` on the calling side is the precondition,
+   not a deployment preference.
+
+   `tests/persist.rs::a_retried_call_across_a_restart_is_applied_once` is the
+   proof, over two real nodes and the real file store: the process dies, the
+   restarted ledger answers `Fresh`, the retry is dispatched, and the work does not
+   happen twice.
 3. **A record answers for 600 s.** That is `RECORD_TTL`, alongside volume bounds
    of `MAX_RECORDS` — 1024 entries — and `MAX_RECORDED_BYTES` — 1 MiB of held
    reply. Past any of them the reply is dropped and the retry is *refused* as
    `Forgotten`:
    at-most-once still holds, and the answer does not. Read the result out of your
-   own domain; do not re-run the work.
+   own domain; do not re-run the work — and `cx.call()` from limit 2 is the
+   identifier to read it under.
 4. **Past `MAX_TOMBSTONES` — 8192, eight times the record bound — a key is
-   `Fresh` again and the retry runs.** This is the one edge where the guarantee
-   degrades: effectively-once, to at-most-once, to at-least-once. It is also the
-   one state a caller cannot detect, because `Fresh` is what "never used" looks
-   like too. The wide margin over the record bound is what makes it unlikely
+   `Fresh` again and the retry runs.** This is the one edge where the *ledger's*
+   guarantee degrades: effectively-once, to at-most-once, to at-least-once. It is
+   also the one state a caller cannot detect, because `Fresh` is what "never used"
+   looks like too. The wide margin over the record bound is what makes it unlikely
    rather than impossible.
+
+   **The real bound, beside it.** The margin is over *this ledger's* traffic, so
+   what it protects is the window between a call and its retry on one live process
+   — and a restart resets it to nothing, which is limit 2. Two bounds, then, and
+   they are different quantities: `MAX_TOMBSTONES` is how many other keys may pass
+   before this one is vacant again, and `APPLIED_CAPACITY` is how many other keys
+   may pass before your own state forgets it. The second is the one that survives a
+   restart, and it is the one you can raise.
+
+   Undetectable degradation has two doors, and this is the second: a caller on a
+   fresh keypair also gets `Fresh` from `Applied`, for the same reason and with the
+   same silence.
 5. **A reply that carries a payload is never recorded.** A `recv` method answers
    with a body beside its reply, and a body is streamed rather than held, so the
    repeat is refused as `Unrecordable` instead of being answered with a header
