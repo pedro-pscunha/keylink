@@ -682,3 +682,103 @@ impl Observer<Ledger> for Recorder {
 async fn a_read_cannot_mutate_either<M>(actor: &LocalActor<Ledger, M>) {
     let _: Result<ThroughShared, MailboxClosed> = actor.read(|state| state.post()).await;
 }
+
+// ─────────────────────── one reply channel, one answer: Wave 2c's `#[defer]`
+
+/// **`Replied` makes "forgot to answer" a compile error, and this is the half of
+/// that claim a type system can hold.**
+///
+/// The obligation to answer is the generated signature — a `#[defer]` method
+/// returns a `Replied<T>` and there is no way to build one but by consuming the
+/// `Reply` — and the positive doctest on [`Replied`](crate::Replied) is what pins
+/// it, because that fence goes red if the signature stops demanding a token.
+///
+/// What is left is the *at most once* half, and it is exactly `Clone`. Any of the
+/// three being `Clone` would make two tokens or two answers reachable from one
+/// channel:
+///
+/// - a cloned [`Reply`](crate::Reply) answers a caller twice, or answers it and
+///   parks it, and one of the two answers is silently dropped by the `oneshot`;
+/// - a cloned [`Deferred`](crate::Deferred) is two parked answers to one call —
+///   and unlike the `Reply` case the second one can arrive turns later, from a
+///   different task, with nothing on the stack to blame;
+/// - a cloned [`Replied`](crate::Replied) is a forged token: a handler that parked
+///   nothing could return one it kept from an earlier turn.
+///
+/// The break, executed by hand: add `#[derive(Clone)]` to any of the three in
+/// `local.rs`. Its concrete impl then overlaps the blanket one and it is `E0119:
+/// conflicting implementations`.
+///
+/// Coherence and not shadowing, for the reason this module's header gives, and
+/// in-crate rather than in `tests/` for the other reason it gives.
+trait AtMostOneAnswer {}
+impl<T: Clone> AtMostOneAnswer for T {}
+impl<T> AtMostOneAnswer for crate::Reply<T> {}
+impl<T> AtMostOneAnswer for crate::Deferred<T> {}
+impl<T> AtMostOneAnswer for crate::Replied<T> {}
+
+/// **RFC-07 §1.9's open question, answered here: parking a reply past the end of
+/// its turn does not make the loop's future non-`Send`.**
+///
+/// Wave 0 probed `oneshot::Sender<Answered<T>>` held *inside* a turn, which is what
+/// its own criterion stated, and said nothing about a channel the state keeps. §1.9
+/// flagged it and told Wave 2c to probe its own. This is that probe, and it is
+/// positive code: `spawn` requires `A: Send + 'static` and `M: Turn<A>`, and the
+/// loop holds `&mut A` across the turn's await and `&A` across the observer chain's.
+/// If a parked [`Deferred`](crate::Deferred) demanded `Sync`, this would not compile.
+///
+/// **The verdict is green, and it is green for a reason worth stating rather than a
+/// coincidence.** A `Deferred<T>` is `Send` when `T: Send` and is deliberately
+/// **not** `Sync`: its wrapped arm is a `Box<dyn FnOnce(..) + Send>`. A state that
+/// parks one is therefore `Send + !Sync` — which is not a problem but the *design*,
+/// the exact family `observe.rs` names by hand and the reason `A: Sync` is kept out.
+/// The loop never lends the state across an await by shared reference in a way that
+/// would need it: an observer's future is the observer's own choice, which is why
+/// `after_turn` is a plain `fn`.
+///
+/// **No stand-in types.** The state below holds a real `Deferred<u64>` beside a real
+/// `RefCell<u32>`, so the `!Sync`-ness is doubled and no single member's removal can
+/// make the probe vacuous — the house rule a unit-struct `Panic` earned through two
+/// revisions of RFC-06.
+///
+/// The break: bound `Parking: Sync` below, or make `spawn` require `A: Sync`.
+struct Parking {
+    /// A reply parked past its turn, which is the shape under test.
+    parked: Option<crate::Deferred<u64>>,
+    /// A second, independent reason to be `!Sync`, so the probe cannot go vacuous
+    /// by the first one moving.
+    counter: std::cell::RefCell<u32>,
+}
+
+/// A mailbox that does nothing, because what is under test is what the STATE holds
+/// across the loop's awaits rather than what a message does.
+enum Parked {}
+
+impl crate::Turn<Parking> for Parked {
+    async fn run(self, _state: &mut Parking, _hooks: &mut crate::Hooks<Parking>) -> Option<Ended> {
+        match self {}
+    }
+}
+
+/// The assertion: this spawns. `spawn` is `A: Send + 'static`, so a `Sync`
+/// requirement introduced by the parked channel would land here.
+fn a_state_that_parks_a_reply_is_still_an_actor() -> LocalActor<Parking, Parked> {
+    LocalActor::spawn(Parking {
+        parked: None,
+        counter: std::cell::RefCell::new(0),
+    })
+}
+
+/// And the two facts the spawn above rests on, stated so a reader does not have to
+/// infer them from a `spawn` compiling.
+///
+/// `Send` is asserted; `Sync` is deliberately **not**, and must not be — a
+/// `Deferred` holding a `Box<dyn FnOnce + Send>` is `!Sync`, and the whole design
+/// exists to make that fine.
+fn a_deferred_reply_is_send() {
+    fn requires_send<T: Send>() {}
+    requires_send::<crate::Deferred<u64>>();
+    requires_send::<crate::Replied<u64>>();
+    requires_send::<crate::Reply<u64>>();
+    requires_send::<Parking>();
+}

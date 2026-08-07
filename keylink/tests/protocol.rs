@@ -972,3 +972,69 @@ fn the_contract_hash_has_not_moved() {
          Read this test's documentation before updating the literal.\n"
     );
 }
+
+// ─────────────────────────────────────────────── and what must NOT move it
+
+// Two declarations of the SAME service, identical in every way except that one
+// method of the second is `#[defer]`. The service *name* is folded into the hash —
+// `schema_hash(protocol)` takes the protocol string — so two differently named
+// services would differ for a reason that has nothing to do with the attribute, and
+// the comparison would prove nothing. Same name, two modules, one difference.
+//
+// Deliberately not the `Probe` above: that one is pinned to a literal, and a second
+// declaration of it would be a second thing to keep in step.
+mod plain {
+    keylink::service! {
+        service Deferring;
+
+        rpc Fill(price: u64) -> u64;
+        rpc Place(size: u64) -> u64;
+    }
+}
+
+mod deferring {
+    keylink::service! {
+        service Deferring;
+
+        rpc Fill(price: u64) -> u64;
+        #[defer]
+        rpc Place(size: u64) -> u64;
+    }
+}
+
+/// **Adding `#[defer]` to a method does not move the contract hash**, and this pins
+/// it rather than asserting it in a comment.
+///
+/// `#[defer]` changes who holds a reply channel on the serving side. It does not
+/// change `Request`, `Response`, `WireRequest`, `WireResponse`, `Envelope` or
+/// `WireKinds` — the six types `Contract` is built from — so there is nothing in the
+/// hashed graph for it to touch. A deferred method is an ordinary `rpc` to the
+/// caller, blocking on its stream exactly as before.
+///
+/// The two declarations differ only in the attribute and are the same service by
+/// name, so the whole ALPN byte string is compared rather than the hash alone — a
+/// stronger assertion than splitting the hash out and one that cannot pass by the
+/// protocol prefix having drifted too.
+///
+/// Both ALPNs are compared, keyed and singleton, because the keyed contract hashes
+/// `Addressed<Request>` and a `#[defer]` method must not move that either.
+///
+/// The one thing this cannot prove is that the hash is *sensitive* to what it
+/// should be. Made red by changing the deferring `Place` to take an `i64`: observed
+/// `left: "keylink/Deferring/fc7ebbc70dab10a0"`, `right:
+/// "keylink/Deferring/aa439906ad24a918"` on the singleton arm.
+#[test]
+fn adding_defer_to_a_method_does_not_move_the_contract_hash() {
+    assert_eq!(
+        String::from_utf8_lossy(plain::deferring::alpn()),
+        String::from_utf8_lossy(deferring::deferring::alpn()),
+        "the ALPN moved for a change that is not on the wire: `#[defer]` decides who \
+         holds a reply channel on the serving side, and touches none of the six types \
+         `Contract` is built from"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(plain::deferring::keyed_alpn()),
+        String::from_utf8_lossy(deferring::deferring::keyed_alpn()),
+        "the keyed ALPN moved for a change that is not on the wire"
+    );
+}

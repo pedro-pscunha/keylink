@@ -168,7 +168,10 @@ pub use idempotency::{
     RECORD_TTL,
 };
 pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
-pub use local::{deliver_to_local, turn, Hooks, LocalActor, MailboxClosed, Reply, Turn};
+pub use local::{
+    deliver_to_local, turn, turn_deferred, Deferred, Hooks, LocalActor, MailboxClosed, Replied,
+    Reply, Turn,
+};
 pub use middleware::{Caller, Context, Middleware, Next, QueueTimeout, Queueing, Rpc, Timeout};
 pub use node::{derive_alpn, Node};
 pub use observe::{Ended, FinishFut, Observer, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome};

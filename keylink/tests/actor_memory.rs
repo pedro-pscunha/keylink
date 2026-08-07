@@ -166,7 +166,7 @@ const BUDGET_PER_ACTOR: isize = 2048;
 ///
 /// The first move **fell**, which is not what a wave that replaces a fat pointer
 /// with an enum sounds like it should do. The mailbox slot is unchanged —
-/// `ledger::Mail` is 232 bytes either way — and what moved is the turn's state
+/// `ledger::Mail` was 232 bytes either way — and what moved is the turn's state
 /// machine, which the old keyed loop inlined into the task's own future and the new
 /// one boxes.
 ///
@@ -186,7 +186,7 @@ const BUDGET_PER_ACTOR: isize = 2048;
 ///
 /// # That margin is why this budget needs its own slope, and phase 4 is it
 ///
-/// This literal was checked at exactly one `Mail` size for months — 232 bytes, the
+/// This literal was checked at exactly one `Mail` size for months — 248 bytes, the
 /// only one any phase built a *local* actor of — while the entire argument for the
 /// `Box::pin` at the local loop's await is an absolute ceiling (3,005 bytes without
 /// it against 1,597 with) that happens to sit between 1,597 and 2,048. The local

@@ -202,18 +202,73 @@ pub trait Turn<A>: Send + 'static {
 
 /// Where one turn's answer goes.
 ///
-/// Opaque on purpose. A generated mailbox variant carries one of these for its
-/// own method's return type, and generated code does exactly two things with it:
-/// puts it in a variant, and hands it to [`turn`]. It never builds one — keylink
-/// makes the pair — and it never reads one, so [`Answered`] stays `pub(crate)`
-/// and its fourth state was additive to a type nothing outside can match on.
-/// That prediction was tested by [`Answered::Faulted`] landing: not one
-/// generated line moved.
+/// A generated mailbox variant carries one of these for its own method's return
+/// type. For a method without `#[defer]`, generated code does exactly two things
+/// with it — puts it in a variant, and hands it to [`turn`] — and never builds one,
+/// because keylink makes the pair. `Answered`, the four-state answer this channel
+/// carries, therefore stays `pub(crate)`, and its fourth state was additive to a
+/// type nothing outside can match on: a prediction `Answered::Faulted` tested by
+/// landing without moving one generated line.
 ///
 /// Contrast the alias this replaces: `Answer<Resp>` was a transparent
 /// `oneshot::Sender<..>`, so tokio's channel type was in keylink's public API
 /// through a `#[doc(hidden)]` name. A newtype costs one field and buys the
 /// promise back.
+///
+/// # A `#[defer]` method's handler is handed one — an attribute, not a sixth kind
+///
+/// The distinction is not pedantry. A sixth method *kind* was refused, and it stays
+/// refused: a deferred method's wire types, client methods, blocking method and local
+/// `Handle` method are byte-for-byte an ordinary `rpc`'s, and only three of the
+/// thirteen helper macros in `macros.rs` know the attribute exists. What `#[defer]`
+/// changes is who holds this channel during the turn.
+///
+/// ```ignore
+/// keylink::service! {
+///     service Orders;
+///     #[defer]
+///     rpc Place(order: Order) -> Ack;
+/// }
+///
+/// async fn place(&mut self, cx: Caller<'_>, reply: Reply<Ack>, order: Order)
+///     -> Replied<Ack>
+/// {
+///     match self.can_fill(&order) {
+///         true  => reply.send(self.fill(order)),          // answered now
+///         false => {                                      // answered later
+///             let (deferred, replied) = reply.later();
+///             self.waiting.push((order, deferred));
+///             replied
+///         }
+///     }
+/// }
+/// ```
+///
+/// [`Replied<T>`](Replied) is what makes "forgot to answer" a compile error:
+/// there is no other way to make one, `Reply` is not [`Clone`], and both doors
+/// consume it. See [`Replied`] for what that does and does not prove.
+///
+/// # `send` does not send. It hands the channel back to the turn.
+///
+/// This is the load-bearing detail, and it is the reason a deferred method does
+/// not quietly cost a service its durability. [`send`](Self::send) returns the
+/// channel and the value inside the [`Replied`] token, and [`turn_deferred`]
+/// answers **after** the observer chain — so an answer given inside the turn is
+/// committed exactly as an ordinary method's return value is, and an observer that
+/// refuses withholds it. If `send` wrote to the channel directly, a durable actor
+/// would hand its caller a value the store never accepted, which is the one
+/// property RFC-06 exists for.
+///
+/// [`later`](Self::later) is the other case, and it genuinely escapes: the answer
+/// is not this turn's output, so this turn's commit says nothing about it.
+///
+/// # Two shapes of destination, because only generated code can name a `Response`
+///
+/// A deferred method reached from a peer has to put its value inside the service's
+/// own `Response` before it crosses the served reply channel — and the parked
+/// answer arrives when no generated code is running. So the wrapping goes *into*
+/// the channel, through [`wrapping`](Self::wrapping), and that is the one place
+/// this type is not a bare `oneshot::Sender`.
 ///
 /// # No door in from outside, held rather than claimed
 ///
@@ -239,15 +294,95 @@ pub trait Turn<A>: Send + 'static {
 /// // compile error in the library the moment it is renamed.
 /// let (_reply, _answer) = keylink::Reply::<u64>::channel();
 /// ```
-#[doc(hidden)]
-pub struct Reply<T>(oneshot::Sender<Answered<T>>);
+pub struct Reply<T> {
+    to: Answerer<T>,
+    /// The idempotency marker this answer settles, when the call came from a
+    /// peer. Held **here** rather than in [`turn`] so that a reply which leaves
+    /// its turn takes the mark with it: the mark and the answer are one event,
+    /// and a parked reply is the case that proves it. Without this, a deferred
+    /// served call would settle its key `Interrupted` on success and refuse every
+    /// retry of a call that worked.
+    settling: Option<crate::middleware::Progress>,
+}
+
+/// Where a [`Reply`] actually writes.
+///
+/// Two arms and not one, because a deferred method's value may have to become
+/// something else on the way out — see [`Reply::wrapping`]. The box is paid only
+/// by that case; every ordinary turn is [`Direct`](Self::Direct).
+enum Answerer<T> {
+    /// A `oneshot` keylink owns the other half of.
+    Direct(oneshot::Sender<Answered<T>>),
+    /// A channel for some other type, plus how a `T` reaches it.
+    ///
+    /// `FnOnce` and boxed, because the conversion is written by generated code in
+    /// the caller's crate and has to outlive the turn that installed it. It is
+    /// `Send` and deliberately not `Sync`, which is what a state parking one of
+    /// these stays: `A: Sync` is the bound this whole design keeps out.
+    Wrapped(Box<dyn FnOnce(Answered<T>) + Send>),
+}
 
 impl<T> Reply<T> {
     /// The pair. `pub(crate)`: keylink builds every reply channel, on the two
     /// paths that own the other half.
     pub(crate) fn channel() -> (Self, oneshot::Receiver<Answered<T>>) {
         let (reply, answer) = oneshot::channel();
-        (Self(reply), answer)
+        (
+            Self {
+                to: Answerer::Direct(reply),
+                settling: None,
+            },
+            answer,
+        )
+    }
+
+    /// Answer now — meaning *this turn's* answer is this value.
+    ///
+    /// The channel is handed back inside the [`Replied`] token rather than
+    /// written to, so [`turn_deferred`] answers after the observer chain. See
+    /// this type's own documentation for why that is not a detail.
+    #[must_use = "the token is the proof that this reply was answered, and a \
+                  `#[defer]` handler has to return it"]
+    pub fn send(self, value: T) -> Replied<T> {
+        Replied(Settled::Now(self, value))
+    }
+
+    /// Park the channel and answer from a later turn.
+    ///
+    /// The [`Deferred<T>`](Deferred) is the answer channel, free of this turn.
+    /// Keep it — in the state, most usefully — and [`send`](Deferred::send) on it
+    /// whenever the answer exists. Dropping it tells the caller
+    /// [`TurnLost::Gone`], which is what happens on its own if the actor ends
+    /// while a reply is parked in its state.
+    #[must_use = "the token is the proof that this reply was parked, and a \
+                  `#[defer]` handler has to return it"]
+    pub fn later(self) -> (Deferred<T>, Replied<T>) {
+        (Deferred(self), Replied(Settled::Later))
+    }
+
+    /// Turn a channel for `U` into one for `T`, given how a `T` becomes a `U`.
+    ///
+    /// `#[doc(hidden)]`: the one caller is a generated served arm for a
+    /// `#[defer]` method, which is the only code that can name both the method's
+    /// return type and the service's `Response`. The mark stays with the outer
+    /// channel, so an answer is settled once however many wrappings it crossed.
+    #[doc(hidden)]
+    pub fn wrapping<S>(self, wrap: impl FnOnce(S) -> T + Send + 'static) -> Reply<S>
+    where
+        T: Send + 'static,
+        S: 'static,
+    {
+        Reply {
+            to: Answerer::Wrapped(Box::new(move |answered| self.answer(answered.map(wrap)))),
+            settling: None,
+        }
+    }
+
+    /// Which idempotency key this answer settles. Installed by the turn, which is
+    /// the only thing holding the origin.
+    fn settling(mut self, progress: Option<crate::middleware::Progress>) -> Self {
+        self.settling = progress;
+        self
     }
 
     /// Answer, if anybody is still listening.
@@ -255,8 +390,185 @@ impl<T> Reply<T> {
     /// A dropped receiver is not an error here and never was: a local `tell`
     /// drops it deliberately, and a caller that gave up on its future is gone.
     /// Both mean the same thing to a turn that has already run.
+    ///
+    /// **The `completed` mark is here and nowhere else.** `Ran` and nothing else,
+    /// spelled as a positive match: a `Faulted` turn is not a completed one, and
+    /// an `Expired` or `Refused` one produced nothing to record. Marking where a
+    /// method returns instead would settle a key as an observer's veto and replay
+    /// that veto to every retry, for work whose effect was thrown away — RFC-06
+    /// §13.3.
     fn answer(self, answered: Answered<T>) {
-        let _ = self.0.send(answered);
+        if let (Some(progress), Answered::Ran(_)) = (&self.settling, &answered) {
+            progress.completed();
+        }
+        match self.to {
+            Answerer::Direct(sender) => {
+                let _ = sender.send(answered);
+            }
+            Answerer::Wrapped(wrapped) => wrapped(answered),
+        }
+    }
+}
+
+/// Proof that a handler answered its reply channel, or parked it.
+///
+/// There is no other way to make one. [`Reply`] is not [`Clone`] and its only two
+/// doors — [`send`](Reply::send) and [`later`](Reply::later) — each consume it and
+/// produce exactly one of these, so a `#[defer]` handler declared to return a
+/// `Replied<T>` cannot return without having answered or explicitly parked. This
+/// is Pekko's enforced-replies shape, and it is why deferral is safe to add as an
+/// attribute where a sixth method kind was refused.
+///
+/// # What it proves, and the one thing it does not
+///
+/// It proves the channel was **consumed**, which is stronger than a lint and
+/// weaker than "the caller got an answer". A handler that parks a reply and then
+/// drops the [`Deferred`] has satisfied this type and told its caller
+/// [`TurnLost::Gone`] — correctly, since nothing answered. What no type can force
+/// is that somebody eventually calls [`Deferred::send`]; what keylink guarantees
+/// is that the caller is never left waiting on a channel nobody holds.
+///
+/// It also does not survive a panic. A handler that panics before consuming its
+/// `Reply` drops it inside the unwinding future, so the caller is told `Gone`
+/// rather than being handed the panic the way [`LocalActor::ask`] hands one on
+/// every other kind. The actor still survives, the observer chain still reads
+/// [`TurnOutcome::Panicked`](crate::TurnOutcome), and the panic hook already ran
+/// at the fault — which is the trade [`notify`](LocalActor::notify) documents for
+/// a `tell`, arriving here for a structural reason instead of a policy one.
+///
+/// # Generic, against the sketch, and for the reason in [`Reply`]
+///
+/// Issue #3 writes it as a bare `Replied`. It carries `T` because
+/// [`Reply::send`] hands the channel and the value *back* to the turn rather than
+/// writing them, which is what keeps an answer given inside a turn under the
+/// observer chain's commit. A payload-free token would have forced `send` to write
+/// immediately, and a durable actor's caller would get values the store refused.
+///
+/// # The guard, and exactly which half of it each piece holds
+///
+/// **The positive fence is the load-bearing one, and that is not the arrangement a
+/// reader would expect.** It compiles a handler written the way `#[defer]` means it
+/// to be written, so it fails if the *generated signature* stops demanding a token
+/// — a defer arm that forgot the `Reply` argument, or returned `$ret` instead of
+/// `Replied<$ret>`, is what would make forgetting to answer legal, and this is what
+/// catches it. Red-tested: with the arm's `Output` changed to `()`, this fence goes
+/// red with `E0271`.
+///
+/// ```
+/// use keylink::{Caller, Reply, Replied};
+///
+/// keylink::service! {
+///     service Orders;
+///     #[defer]
+///     rpc Place(size: u64) -> u64;
+/// }
+///
+/// struct Book;
+///
+/// impl orders::Actor for Book {
+///     async fn place(&mut self, _cx: Caller<'_>, reply: Reply<u64>, size: u64)
+///         -> Replied<u64> {
+///         reply.send(size)
+///     }
+/// }
+/// ```
+///
+/// The `compile_fail` twin below shows the mistake, and **it proves less than it
+/// looks like it does.** Say so, because a reader will otherwise take it for the
+/// guard: an empty body not being a `Replied<u64>` is rustc's `E0308`, and it holds
+/// whatever keylink does. Red-tested by the same break as above, and it stayed
+/// **green** — the impl then mismatched the trait's `Output` instead, so it failed
+/// for an unrelated reason while the obligation it claims to pin was gone. That is
+/// precisely the shape this project keeps catching, and the honest response is to
+/// name which fence is the guard rather than to keep two and believe both.
+///
+/// ```compile_fail
+/// use keylink::{Caller, Reply, Replied};
+///
+/// keylink::service! {
+///     service Orders;
+///     #[defer]
+///     rpc Place(size: u64) -> u64;
+/// }
+///
+/// struct Book;
+///
+/// impl orders::Actor for Book {
+///     // Fails with `E0308`: expected `Replied<u64>`, found `()`. Codes in prose
+///     // and never on the fence — rustdoc does not check them.
+///     async fn place(&mut self, _cx: Caller<'_>, _reply: Reply<u64>, _size: u64)
+///         -> Replied<u64> {}
+/// }
+/// ```
+///
+/// The other half — that a `Replied` cannot be obtained *twice* from one `Reply`,
+/// which is what makes "answered once" the only reachable shape — is
+/// `representability.rs`'s coherence probe on [`Reply`], [`Deferred`] and this type
+/// not being [`Clone`]. That one is falsifiable by adding a derive, and it is.
+pub struct Replied<T>(Settled<T>);
+
+/// What a [`Replied`] token carries back to the turn.
+enum Settled<T> {
+    /// Answered inside the turn: the channel and the value, for the turn to send
+    /// once the observers have accepted it.
+    Now(Reply<T>, T),
+    /// Parked. The channel left with a [`Deferred`] and this turn owes nothing.
+    Later,
+}
+
+/// A reply channel that outlived its turn.
+///
+/// Hold it anywhere — the state is the useful place — and answer whenever the
+/// answer exists. `Send` and `'static`, so it can also go to another task; not
+/// `Clone`, because there is one answer.
+///
+/// Dropping it without answering is not an error and not silent: the caller's
+/// wait ends with [`TurnLost::Gone`], which is exactly what happens by itself when
+/// an actor ends with replies parked in its state.
+///
+/// # What a parked reply resolves to when a LATER turn faults
+///
+/// **Nothing. It stays parked.** Wave 2a gave `Answered` a `Faulted` state, and
+/// the question it raises is whether a fault reaches replies that were parked before
+/// it. It does not, and the reason is the same one that makes the whole panic policy
+/// worth having: `Faulted` is *that turn's* answer to *that turn's* caller, and the
+/// actor survives. So the state survives, so anything parked in it survives, and a
+/// later turn can still answer it.
+///
+/// That is the right answer rather than a convenient one. A parked reply is a
+/// promise the state made, and a message that exploded somewhere else is not
+/// information about that promise — answering it `Faulted` would tell one caller
+/// about another caller's fault, and `Panic` cannot be cloned to tell two.
+///
+/// Three ways a parked reply *does* end, all of them the state's own doing:
+///
+/// - somebody calls [`send`](Self::send);
+/// - somebody drops it — including a turn that takes it out of the state and then
+///   panics, which is the one case where a fault does resolve one, as `Gone`;
+/// - the actor ends, which drops the state and every reply in it, as `Gone`. An
+///   observer refusing the faulted turn is how a fault reaches parked replies
+///   *indirectly*, and it reaches them the same way `stop()` does.
+///
+/// Pinned by `tests/defer.rs::a_reply_parked_before_a_fault_is_still_answered_after_it`.
+#[must_use = "dropping a deferred reply answers the caller `Gone`; that is \
+              sometimes right, so say so with `drop`"]
+pub struct Deferred<T>(Reply<T>);
+
+impl<T> Deferred<T> {
+    /// Answer the caller that has been waiting since the turn this was parked in.
+    ///
+    /// Nothing is owed to the turn running now: the value crosses the channel
+    /// directly, and this turn's observers neither see it nor gate it. That is
+    /// what deferral means — the answer is not this turn's output — and it is the
+    /// difference from [`Reply::send`].
+    pub fn send(self, value: T) {
+        self.0.answer(Answered::Ran(value));
+    }
+}
+
+impl<T> fmt::Debug for Deferred<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Deferred").finish_non_exhaustive()
     }
 }
 
@@ -295,19 +607,47 @@ pub(crate) enum Answered<T> {
     },
 }
 
-/// One turn, its observers, and who is answered — RFC-06 §2.6 in one place, so
-/// the two catching paths cannot drift apart.
+impl<T> Answered<T> {
+    /// Carry the same answer about a different payload type.
+    ///
+    /// The three payload-free states pass through, which is the whole point: a
+    /// `#[defer]` method reached from a peer has its value wrapped in the
+    /// service's `Response` on the way out, and a fault, a refusal or an expired
+    /// budget must **not** be rewritten as one. Only [`Reply::wrapping`] calls it.
+    fn map<U>(self, wrap: impl FnOnce(T) -> U) -> Answered<U> {
+        match self {
+            Self::Ran(value) => Answered::Ran(wrap(value)),
+            Self::Faulted(panic) => Answered::Faulted(panic),
+            Self::Expired => Answered::Expired,
+            Self::Refused { name } => Answered::Refused { name },
+        }
+    }
+}
+
+/// One turn and its observers — RFC-06 §2.6 in one place, so the two catching
+/// paths cannot drift apart.
 ///
 /// The observer chain runs **inside** the same [`guarded`] as the handler.
 /// Outside it, an observer that panicked would unwind out of a detached task and
 /// be swallowed, which is the property this module's header states about every
 /// path library code controls.
+///
+/// # Three things out and not one `Answered`, because two turns read them
+///
+/// It used to fold the handler's `Result` and the observers' verdict into an
+/// `Answered<T>` here. [`turn_deferred`] cannot use that: on a refusal the fold
+/// discards the handler's value, and for a deferred method the handler's value is
+/// the [`Replied`] token — the only thing holding the reply channel the refusal has
+/// to be sent on. So the fold moved out to the two callers, which is where the
+/// question "who is answered" belongs, and this function answers only "what
+/// happened": the handler's outcome, the name of the observer that refused if one
+/// did, and the [`Ended`] either of those implies.
 async fn observed_turn<A, T, F>(
     state: &mut A,
     hooks: &mut [Box<dyn Observer<A>>],
     method: &'static str,
     turn: F,
-) -> (Answered<T>, Option<Ended>)
+) -> (Result<T, Panic>, Option<&'static str>, Option<Ended>)
 where
     A: 'static,
     // `Send` on `T` and not on `A`. The handler's value is held across the
@@ -390,29 +730,19 @@ where
         }
     }
 
-    // The one place the handler's `Result` becomes a discriminant. Written once
-    // and read by two arms below, so a fault cannot be reported as a value on
-    // one path and as a fault on the other.
-    let answered = match answer {
-        Ok(value) => Answered::Ran(value),
-        Err(panic) => Answered::Faulted(panic),
-    };
-
     match (refused, panicked) {
-        // Completed and accepted: the value. Or faulted and accepted, which is
-        // an observer that read `TurnOutcome::Panicked` and chose to continue.
-        (None, _) => (answered, None),
-        // Panicked and refused: the fault is STILL answered, and then the actor
-        // ends. `Answered::Faulted` is not a value, so the argument for
-        // withholding a reply never applied to it — and withholding here would
-        // reverse what this module's header promises about a panicking call.
-        (Some(_), Some(message)) => (answered, Some(Ended::Panicked { message })),
-        // Completed and refused: the turn ran and was not committed, so the
-        // caller is told it has no answer rather than given an uncommitted one.
-        (Some((name, error)), None) => (
-            Answered::Refused { name },
-            Some(Ended::Observer { name, error }),
-        ),
+        // Completed and accepted, or faulted and accepted — which is an observer
+        // that read `TurnOutcome::Panicked` and chose to continue.
+        (None, _) => (answer, None, None),
+        // Panicked and refused: the fault is still the handler's outcome and the
+        // actor ends naming the fault rather than the observer. A durability
+        // adapter refuses a panicked turn, so reporting the adapter here would
+        // point an operator at the wrong code.
+        (Some((name, _)), Some(message)) => (answer, Some(name), Some(Ended::Panicked { message })),
+        // Completed and refused: the turn ran and was not committed, so whoever
+        // holds the reply owes the caller a refusal rather than an uncommitted
+        // value.
+        (Some((name, error)), None) => (answer, Some(name), Some(Ended::Observer { name, error })),
     }
 }
 
@@ -444,12 +774,12 @@ where
 ///
 /// # And so are the progress marks
 ///
-/// `dispatched` before the handler, `completed` only on an answer an observer
-/// let through, `unrun` on a budget that expired. Marking `completed` where the
-/// method returns would settle an idempotency key as an observer's veto and
-/// replay that veto to every retry, for work whose effect was thrown away —
-/// RFC-06 §13.3. That reasoning was written twice, in two dispatchers, and this
-/// is where it is written once.
+/// `dispatched` before the handler and `unrun` on a budget that expired, both
+/// here; `completed` in [`Reply::answer`], which is the one place an answer
+/// happens. That reasoning was written twice, in two dispatchers, before Wave 1b
+/// put it in one — and Wave 2c moved the last mark one step further in, because a
+/// deferred reply is answered after the turn that received it has returned. A mark
+/// beside the answer cannot be forgotten by the path that answers late.
 ///
 /// # And so is the method's name
 ///
@@ -480,15 +810,113 @@ where
     // own.
     F: for<'b> FnOnce(Origin, &'b mut A) -> Pin<Box<dyn Future<Output = T> + Send + 'b>> + Send,
 {
-    // Read before the origin moves into the closure. `Progress` shares its
-    // `Arc` on clone deliberately, which is what lets a mark made on the actor's
-    // task be read back on the connection's.
+    let reply = began(&origin, reply)?;
+
+    let (ran, refused, end) =
+        observed_turn(state, hooks, method, move |state| turn(origin, state)).await;
+    // The one place the handler's outcome and the observers' verdict become a
+    // discriminant. A fault is answered even when an observer then refused —
+    // `Answered::Faulted` is not a value, so the argument for withholding one
+    // never applied to it, and withholding would reverse what this module's header
+    // promises about a panicking call. A turn that *completed* and was refused is
+    // withheld, because a caller must not be handed an uncommitted value.
+    reply.answer(match (ran, refused) {
+        (Ok(value), None) => Answered::Ran(value),
+        (Ok(_), Some(name)) => Answered::Refused { name },
+        (Err(panic), _) => Answered::Faulted(panic),
+    });
+    end
+}
+
+/// Run one message whose handler answers it — now, or from a later turn.
+///
+/// What a `#[defer]` method's generated arm calls. The difference from [`turn`] is
+/// one argument and one sentence: the [`Reply`] goes **into** the handler, and the
+/// handler returns a [`Replied`] token proving it did something with it.
+///
+/// Everything a turn owes anybody is still decided here, which is the reason this
+/// is a second function in this file rather than a second dispatcher in generated
+/// code: the queue deadline, the panic guard, the observer chain and the marks are
+/// the same ones, read from the same [`Origin`], through the same
+/// [`observed_turn`].
+///
+/// `#[doc(hidden)] pub` because the match that calls it is expanded into the
+/// **user's** crate.
+///
+/// # The three ways this ends, and who is answered in each
+///
+/// - **Answered inside the turn.** [`Reply::send`] handed the channel back, so the
+///   value is sent from here, *after* the observer chain — and an observer that
+///   refused turns it into [`Answered::Refused`] exactly as it would an ordinary
+///   method's return value. A deferred method that answers immediately is not a
+///   weaker method.
+/// - **Parked.** The channel left with a [`Deferred`] and this turn owes nothing.
+///   No mark is made, because no answer has happened; the mark travels with the
+///   channel and is made by [`Reply::answer`] whenever it is.
+/// - **Panicked before the channel was consumed.** The [`Reply`] was dropped
+///   inside the unwinding future, so there is nothing left to answer with and the
+///   caller's wait ends [`TurnLost::Gone`]. The actor survives, the observers saw
+///   [`TurnOutcome::Panicked`](crate::TurnOutcome), and the panic hook ran at the
+///   fault. This is the one thing `#[defer]` costs against every other kind, and
+///   [`Replied`] says so where a reader meets the type.
+#[doc(hidden)]
+pub async fn turn_deferred<A, T, F>(
+    state: &mut A,
+    hooks: &mut Hooks<A>,
+    origin: Origin,
+    method: &'static str,
+    reply: Reply<T>,
+    turn: F,
+) -> Option<Ended>
+where
+    A: 'static,
+    T: Send + 'static,
+    // The origin by value for [`turn`]'s reason, and the reply by value for a
+    // plainer one: the handler owns it from here.
+    F: for<'b> FnOnce(
+            Origin,
+            &'b mut A,
+            Reply<T>,
+        ) -> Pin<Box<dyn Future<Output = Replied<T>> + Send + 'b>>
+        + Send,
+{
+    let reply = began(&origin, reply)?;
+
+    let (ran, refused, end) = observed_turn(state, hooks, method, move |state| {
+        turn(origin, state, reply)
+    })
+    .await;
+    match ran {
+        Ok(Replied(Settled::Now(reply, value))) => reply.answer(match refused {
+            None => Answered::Ran(value),
+            Some(name) => Answered::Refused { name },
+        }),
+        Ok(Replied(Settled::Later)) => {}
+        // The `Panic` is dropped rather than reported, because the channel it
+        // would have been reported on went into the same future.
+        Err(_gone_with_the_reply) => {}
+    }
+    end
+}
+
+/// The deadline and the dispatch mark, shared by the two turns.
+///
+/// `None` means the budget expired and the caller has already been answered, so
+/// the turn must not run. Written once and taken by reference so that the two
+/// turns cannot disagree about when a turn begins — which is the disagreement Wave
+/// 1b found three copies of, two spelling the comparison `>` and one `>=`.
+fn began<T>(origin: &Origin, reply: Reply<T>) -> Option<Reply<T>> {
+    // `Progress` shares its `Arc` on clone deliberately, which is what lets a mark
+    // made on the actor's task be read back on the connection's.
     let progress = origin.caller().peer().map(Context::progress);
     let expired = origin
         .caller()
         .peer()
         .and_then(Context::queueing)
         .is_some_and(Queueing::expired);
+
+    // Installed before anything can answer, including the expiry below.
+    let reply = reply.settling(progress.clone());
 
     if expired {
         // Nothing ran, so nothing is owed. `unrun` outranks the enqueue mark
@@ -508,17 +936,7 @@ where
     if let Some(progress) = &progress {
         progress.dispatched();
     }
-    let (answered, end) =
-        observed_turn(state, hooks, method, move |state| turn(origin, state)).await;
-    // `Ran` and nothing else. A `Faulted` turn is not a completed one, and an
-    // `Expired` or `Refused` one is handled above or marked by the observer
-    // chain's own refusal — spelling this as a positive match is what keeps a
-    // fifth `Answered` state from silently settling a key.
-    if let (Some(progress), Answered::Ran(_)) = (&progress, &answered) {
-        progress.completed();
-    }
-    reply.answer(answered);
-    end
+    Some(reply)
 }
 
 /// The one message whose work is a caller's closure rather than a declared
@@ -1267,6 +1685,10 @@ mod tests {
     struct Counter {
         seen: Vec<u64>,
         inside: bool,
+        /// A reply parked past the turn that received it, which is what a
+        /// `#[defer]` handler does with one. Held by the state, so it dies when the
+        /// state does.
+        parked: Option<Deferred<usize>>,
     }
 
     /// A mailbox by hand, in the shape `service!` generates one.
@@ -1293,6 +1715,13 @@ mod tests {
         Boom { origin: Origin, reply: Reply<usize> },
         /// Never return.
         Wedge { origin: Origin, reply: Reply<usize> },
+        /// Park the reply in the state and answer nothing. The hand-written twin
+        /// of what `#[defer]` generates, here for the reason every other variant
+        /// is: this is where the loop lives, so a probe only the macro could build
+        /// would prove the macro and the loop agree rather than that the loop holds.
+        Park { origin: Origin, reply: Reply<usize> },
+        /// Answer whatever is parked, from a turn that is not the one that took it.
+        Release { origin: Origin, reply: Reply<usize> },
     }
 
     impl Turn<Counter> for Mail {
@@ -1339,6 +1768,36 @@ mod tests {
                             })
                         },
                     )
+                    .await
+                }
+                Mail::Park { origin, reply } => {
+                    turn_deferred(
+                        state,
+                        hooks,
+                        origin,
+                        "Park",
+                        reply,
+                        |_from, state, reply| {
+                            Box::pin(async move {
+                                let (deferred, replied) = reply.later();
+                                state.parked = Some(deferred);
+                                replied
+                            })
+                        },
+                    )
+                    .await
+                }
+                Mail::Release { origin, reply } => {
+                    turn(state, hooks, origin, "Release", reply, |_from, state| {
+                        Box::pin(async move {
+                            let parked = state.parked.take();
+                            let answered = usize::from(parked.is_some());
+                            if let Some(deferred) = parked {
+                                deferred.send(99);
+                            }
+                            answered
+                        })
+                    })
                     .await
                 }
             }
@@ -1510,6 +1969,76 @@ mod tests {
             wedged.await.expect("the caller is not itself aborted"),
             Err(MailboxClosed),
             "an aborted turn reports the actor as gone"
+        );
+    }
+
+    /// A reply parked past its turn is answered by a later one, and the value goes
+    /// to the caller that has been waiting since the first.
+    ///
+    /// The macro's twin of this is `tests/defer.rs`; this one is about the loop.
+    #[tokio::test]
+    async fn a_parked_reply_is_answered_by_a_later_turn() {
+        let actor: LocalActor<Counter, Mail> = LocalActor::spawn(Counter::default());
+
+        let parked = {
+            let actor = actor.clone();
+            tokio::spawn(async move {
+                actor
+                    .ask_catching(|origin, reply| Mail::Park { origin, reply })
+                    .await
+            })
+        };
+        // The `Park` turn has to have finished for `Release` to get a permit, so a
+        // successful `Release` is itself the proof that the reply outlived its turn.
+        let mut released = 0;
+        for _ in 0..200 {
+            released = actor
+                .ask(|origin, reply| Mail::Release { origin, reply })
+                .await
+                .expect("running");
+            if released == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(released, 1, "nothing was ever parked");
+        assert_eq!(
+            parked.await.expect("no panic").expect("answered"),
+            99,
+            "the parked caller got the later turn's value"
+        );
+    }
+
+    /// And the answer when nobody ever answers: **`TurnLost::Gone`, not a hang.**
+    ///
+    /// Here rather than only in `tests/defer.rs` because this is where the variant
+    /// is visible — a generated `Handle` folds every loss into `MailboxClosed`, so
+    /// the criterion's own words can only be asserted from inside the crate.
+    ///
+    /// The timeout is the assertion. A hang is not a failure to a harness.
+    #[tokio::test]
+    async fn a_parked_reply_whose_actor_ends_is_gone_rather_than_a_hang() {
+        let actor: LocalActor<Counter, Mail> = LocalActor::spawn(Counter::default());
+
+        let parked = {
+            let actor = actor.clone();
+            tokio::spawn(async move {
+                actor
+                    .ask_catching(|origin, reply| Mail::Park { origin, reply })
+                    .await
+            })
+        };
+        // Ordered behind the park, so the park has run by the time this returns.
+        actor.stop().await;
+
+        let lost = n0_future::time::timeout(Duration::from_secs(5), parked)
+            .await
+            .expect("a parked reply must not outlive its actor as a hang")
+            .expect("the caller is not itself panicking")
+            .expect_err("nothing answered it");
+        assert!(
+            matches!(lost, TurnLost::Gone),
+            "a reply parked in a state that was dropped said {lost:?}"
         );
     }
 

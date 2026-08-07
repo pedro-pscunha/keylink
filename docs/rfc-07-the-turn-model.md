@@ -742,3 +742,237 @@ gone.
   `TurnInfo` is local; `rendered`'s two wire strings are byte-identical.
   `keylink/tests/protocol.rs`'s `keylink/Probe/d3fe34471921164e` is unchanged and green.
 - **An incarnation counter.** See §3.1. It does not exist and was not added.
+
+---
+
+## 4. Wave 2c — `#[defer]`: an attribute the macro reads, and a reply that outlives its turn
+
+```rust
+keylink::service! {
+    service Orders;
+    rpc Fill(price: u64) -> u64;
+    #[defer]
+    rpc Place(size: u64) -> u64;
+}
+
+// generated
+async fn place(&mut self, cx: Caller<'_>, reply: Reply<u64>, size: u64) -> Replied<u64>;
+```
+
+`Replied` makes "forgot to answer" a compile error. `Reply` is not `Clone`, and its
+only two doors — `send(v)` and `later()` — each consume it and produce exactly one
+token, so a handler declared to return one cannot return without having answered or
+explicitly parked. Pekko's enforced-replies shape, and the reason deferral is safe as
+an attribute where a sixth method kind was refused.
+
+### 4.1 The muncher, and what it cost
+
+`macro_rules!` cannot match on `#[defer]`. `service!` had one matcher capturing
+`$( #[$meta:meta] )*`, and a `meta` fragment is an opaque AST node: nothing
+downstream can ask whether it is `defer`. Those metas are forwarded verbatim to nine
+sites, so `#[defer]` parsed and was re-emitted where it is not an attribute at all —
+`cannot find attribute` from inside a `paste!`, pointing at `macros.rs`.
+
+So `service!` is now three macros. `service!` itself is one arm that starts the walk;
+`__keylink_service_munch!` walks the raw tokens **before the fragment forms**, four
+arms and no state beyond two lists — one for the attribute keylink reads, one for the
+attributes it forwards — and hands
+`__keylink_service!` one record per method: `{ [attrs] [defer?] kind Name(args) ->
+Ret }`. `__keylink_service!` is the 1,300 lines that were `service!`'s body,
+unchanged except at three sites.
+
+**Three of thirteen helper macros take the flag**, and which three is itself the
+statement that the wire does not move: the `Actor` method, the mailbox arm and the
+served arm. `Request`, `Response`, `Contract`, the `Handler` method, both client
+methods, the blocking method and the local `Handle` method do not know the attribute
+exists, because a deferred method is byte-for-byte an ordinary `rpc` at every one of
+them.
+
+Each of the three has an arm for `[defer], rpc`, an arm for `[defer], <anything
+else>` that falls through to the ordinary shape, and the ordinary arms. The
+fall-through matters: `__keylink_defer_check!` is the single place a bad combination
+is refused, and if the three sites generated *deferring* shapes for a kind that
+cannot defer, that one clear error would arrive buried under a trait that no longer
+matches its mailbox.
+
+`#[defer]` is idempotent when doubled rather than an error, because a matcher that
+refused the second one reports "no rule expected this token", which is worse than
+nothing.
+
+Recursion is one frame per attribute plus one per declaration. The deepest service in
+this repository munches about a dozen frames against a default `recursion_limit` of
+128.
+
+### 4.2 The four refusals, and why they are messages rather than a missing arm
+
+`#[defer]` on a `tell`, `send`, `recv` or `blob` is a `compile_error!` naming what a
+deferred reply would have to be for that kind. Leaving the arm out would produce "no
+rule expected `tell`" pointing into a macro the author did not write — and worse, it
+would make the `compile_fail` doctest that pins the refusal **satisfiable without
+proving its claim**: renaming the `tell` arm away leaves the fence red for the wrong
+reason. Red-tested the other way instead, by making the arm a no-op: the fence goes
+green with *"Test compiled successfully, but it's marked `compile_fail`"*.
+
+### 4.3 `send` does not send, and that is the decision this wave got right
+
+The obvious `Reply::send` writes to the channel. That would have cost a `#[defer]`
+service its durability, silently: an answer given inside the turn would reach the
+caller **before** the observer chain ran, so a durability adapter refusing the write
+would leave the caller holding a value the store never accepted — the one property
+RFC-06 exists for, deleted by a convenience.
+
+So `send` hands the channel and the value *back* to the turn, inside the `Replied`
+token, and `turn_deferred` answers after the observers. An answer given inside a
+deferred turn is committed exactly as an ordinary method's return value is, and a
+refusal withholds it. Red-tested by making `send` answer immediately:
+`the observer refused this turn, so its answer must not reach the caller: got Ok(42)`.
+
+That is why `Replied<T>` is generic against the issue's bare `Replied`. It has to
+carry the channel and the value; a payload-free token would have forced the
+immediate write.
+
+`later()` is the other case and it genuinely escapes. The answer is not this turn's
+output, so this turn's commit says nothing about it — which is what deferral *means*,
+and is stated at the type rather than left to be discovered.
+
+### 4.4 The served path was not optional, and the criterion is what forced it
+
+The tempting scope cut was to refuse `#[defer]` on the actor-served paths the way
+`send` is refused, keeping `Reply<T>` a bare `oneshot::Sender` and leaving
+`__actor_turn` alone. **It does not work, and the criterion "the contract hash does
+not move for adding `#[defer]`" is what rules it out.** If the hash cannot move, the
+`Request` variant of a deferred method must exist. A macro cannot omit a match arm
+for it, so `Mail::Served`'s dispatch must have one, so the served path must be
+expressible. Any refusal late enough to be a `ServableAsActor::CHECK` is also too
+late: `Turn<A> for Mail` is instantiated by `actor()`, so a check inside the served
+arm would refuse a local-only actor too.
+
+Two things followed.
+
+**`Mail::Served` decodes the request in the loop's own match.** It used to hand the
+whole undecoded `Request` to one `turn` and let a generated `__actor_turn` match on it
+*inside* the turn's closure — by which point which of the two turns to run has
+already been chosen. The arms are written out by `service!` now and the per-method
+body is an expression macro, exactly as the local arms already were.
+`__actor_turn` and `__keylink_actor_invoke_fn!` are deleted, and the last dispatcher
+that was not the mailbox's own is gone with them.
+
+**`Reply<T>` grew a second shape.** A served reply is `Reply<(Response, Body)>` for
+every method; a deferred handler needs `Reply<$ret>`; and the parked answer arrives
+when no generated code is running, so nothing can apply the conversion at a call
+site. It travels *with* the channel instead:
+
+```rust
+enum Answerer<T> {
+    Direct(oneshot::Sender<Answered<T>>),
+    Wrapped(Box<dyn FnOnce(Answered<T>) + Send>),
+}
+```
+
+installed by `Reply::wrapping`, called only by a generated served arm for a
+`#[defer]` method. Measured cost: `Reply<T>` 8 → 24 bytes, and
+`size_of::<ledger::Mail>()` 232 → 248. Nothing per idle actor, because both mailboxes
+box their slot; one heap allocation per deferred **served** call, and none otherwise.
+
+`Answered::map` carries the three payload-free states through unchanged, which is the
+whole point of it: a fault, a refusal or an expired budget must not be rewritten as a
+`Response`.
+
+### 4.5 The `completed` mark moved into `Reply::answer`
+
+A deferred handler returns before it answers. Marking `completed` where the handler
+returns would settle a served key as recorded for a reply that may never exist —
+exactly the at-most-once hazard `idempotency.rs` holds — so the mark travels with the
+channel: `Reply` carries the `Progress`, and `Reply::answer` marks on `Ran` and
+nothing else.
+
+That makes it **one** marking site rather than two, which is stricter than what Wave
+1b left. `turn` and `turn_deferred` share `began`, which reads the deadline, answers
+`Expired`, marks `unrun` or `dispatched`, and installs the progress — so the two
+turns cannot disagree about when a turn begins, which is the disagreement Wave 1b
+found three copies of.
+
+### 4.6 §1.9's open question: the `Deferred` shape stayed `Send`
+
+Wave 0 probed `oneshot::Sender<Answered<T>>` held *inside* a turn and said nothing
+about a channel the state keeps. §1.9 flagged it. **Green, and green for a reason
+rather than a coincidence.**
+
+A `Deferred<T>` is `Send` when `T: Send` and deliberately **not** `Sync` — its wrapped
+arm is a `Box<dyn FnOnce + Send>`. A state that parks one is therefore `Send + !Sync`,
+which is not a problem but the design: it is the family `observe.rs` names by hand,
+and the reason `A: Sync` is kept out at all. The loop never lends the state across an
+await in a way that would need `Sync`, because an observer's future is the observer's
+own choice — which is why `after_turn` is a plain `fn`.
+
+The probe is `representability.rs`, positive code, with **no stand-in types**: a state
+holding a real `Deferred<u64>` beside a real `RefCell<u32>`, so no single member's
+removal makes it vacuous. Non-vacuity red-tested by bounding it `Sync`: `E0277`,
+attributed to `Deferred<u64>` itself and not only to the `RefCell`.
+
+### 4.7 What a `Deferred` parked past a fault resolves to: nothing. It stays parked.
+
+Wave 2a's `Faulted` is *that turn's* answer to *that turn's* caller. The actor
+survives a panic, so the state survives, so every promise the state was holding
+survives and a later turn can still answer it. Answering a parked reply `Faulted`
+would tell one caller about another caller's fault — with a `Panic` that cannot be
+cloned to tell two.
+
+Three ways a parked reply does end, all of them the state's own doing: somebody
+`send`s it; somebody drops it, including a turn that takes it out of the state and
+then panics; or the actor ends, which drops the state and every reply in it, as
+`Gone`. An observer refusing the faulted turn reaches parked replies the same way
+`stop()` does. Pinned by
+`tests/defer.rs::a_reply_parked_before_a_fault_is_still_answered_after_it`.
+
+### 4.8 The one thing `#[defer]` costs, said where a reader meets it
+
+A handler that **panics before consuming its `Reply`** drops it inside the unwinding
+future, so there is nothing left to answer with and the caller is told `Gone` —
+`MailboxClosed` through a generated `Handle` — rather than being handed the panic the
+way `ask` hands one on every other kind. The actor survives, the observers still read
+`TurnOutcome::Panicked`, and the panic hook already ran at the fault.
+
+Preserving the resumption would need the reply's destination handed back to the turn
+on drop, i.e. a return channel and a `Drop` impl on the reply of **every** method, to
+keep panic-resumption for the one kind whose premise is that its answer escapes the
+turn. Not built. Documented on `Replied`, and tested:
+`a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_actor`.
+
+### 4.9 One fence in this wave proves less than it looks like it does, and says so
+
+The `compile_fail` doctest showing a handler with an empty body is **not** the guard.
+An empty body not being a `Replied<u64>` is rustc's `E0308` and holds whatever keylink
+does. Red-tested by changing the generated arm's `Output` to `()`: the fence stayed
+**green** — the impl then mismatched the trait's associated type instead, failing for
+an unrelated reason while the obligation it claims to pin was gone.
+
+The guard is the **positive** fence beside it, which compiles a handler written the
+way `#[defer]` means it to be written and therefore goes red (`E0271`) the moment the
+generated signature stops demanding a token. Both are kept, and which one is the guard
+is now written down — because two fences and a belief in both is how this project
+keeps shipping guards that are satisfiable without proving their claim.
+
+The *at most once* half is `representability.rs`'s coherence probe: `Reply`,
+`Deferred` and `Replied` are not `Clone`. Red-tested with a hand-written `Clone` for
+`Deferred`: `E0119`.
+
+### 4.10 What Wave 2c did NOT do
+
+- **Move the ALPN.** Pinned, not asserted:
+  `adding_defer_to_a_method_does_not_move_the_contract_hash` compares two declarations
+  of the *same* service — the name is folded into the hash, so two differently named
+  ones would differ for a reason unrelated to the attribute — differing only in the
+  attribute, on both the singleton and the keyed ALPN. Red-tested by changing one
+  method's argument type. `keylink/Probe/d3fe34471921164e` is unchanged and green.
+- **Reach a keyed actor's observers.** `spawn` still hands an empty hook slice, so a
+  `#[defer]` method mounted in a `System` answers correctly and is observed by nobody
+  — exactly as every other kind is there. Still Wave 3's line.
+- **Give `notify` a deferred shape.** A local `tell` drops the receiving half before
+  the send, so a parked reply on that path answers into a channel nobody holds. There
+  is no `#[defer] tell`, and §4.2 has the refusal.
+- **Bound how long a reply may stay parked.** A `Deferred` held forever is a caller
+  waiting forever, and nothing here watches for it. `QueueTimeout` bounds the wait for
+  a *permit* and `turn` bounds a queued message, neither of which is this. A caller's
+  own `n0_future::time::timeout` is the answer today; a per-method budget on a
+  deferred reply would be a new mechanism and belongs with whichever wave wants one.
