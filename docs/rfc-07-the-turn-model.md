@@ -2276,9 +2276,11 @@ reads *"Scheduling arrives in Wave 7 as an actor, not as a core type."* What lan
 `keylink/src/compose/schedule.rs` is `after` and `every` — two free functions returning
 `Scheduled`, a newtype over a `JoinHandle` with a `detached` flag. Not an actor.
 
-**The departure was recorded nowhere until now.** `rg -in 'as an actor|core type|refused'
-keylink/src/compose/schedule.rs` → exit 1. §8.3 above discusses the vacuous guards and
-"a dropped `Scheduled` cancels" without ever engaging the row.
+**The "as an actor" departure was recorded nowhere until now.**
+`rg -in 'as an actor|core type' keylink/src/compose/schedule.rs` → exit 1. The command names
+the clause rather than the row, because the module doc *does* engage the row — its other
+clause, the one about `cancel`, below — and never this one. §8.3 above discusses the vacuous
+guards and "a dropped `Scheduled` cancels" without engaging either.
 
 **And the departure is right, which is why this is a correction and not a defect.** The row
 has two clauses and they are not the same claim. "Not a core type" is satisfied: nothing in
