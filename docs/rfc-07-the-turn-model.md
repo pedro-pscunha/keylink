@@ -3504,12 +3504,32 @@ two lines now, and `scripts/replay-fate-breaks.sh` runs the whole set.
 | `local::a_supervisor_between_incarnations_is_gone_when_it_is_destroyed` | `supervise`'s floor disarmed at its declaration |
 | `local::a_transient_factory_failure_does_not_overwrite_a_pending_restart` | the floor moved back inside the loop body |
 
-`scripts/replay-fate-breaks.sh` runs all twenty-two and **exits non-zero if any of
-them stops reddening its guard** — which it did not do when this section first
-cited it: it hard-coded one developer's absolute path, and its helper swallowed
-every exit code, so it could neither check the tree it shipped in nor report
-anything. Both fixed, and the failure path is proved by execution rather than
-asserted: a deliberately no-op break reports `✗ NOT RED` and the script exits 1.
+`scripts/replay-fate-breaks.sh` runs all twenty-two and asserts, for each, that
+**the exact sentence its guard's doc comment records as watched appears in the
+run**. It exits non-zero with a count if any is missing, and it refuses to start
+against a dirty tree, because `break-once.sh` restores a backup on EXIT and a run
+racing an unsaved edit restores over it.
+
+**It counted exit codes first, and that design cannot see the failure this harness
+exists for.** A break that stops reddening because a *second writer* masks it has
+happened three times in this tree — `Mailbox::drop` masking `System::abort`'s
+break, the same masking `drain`'s, and a whole-function `Floor` masking
+`Lent::ending`'s give-up arm, which is why §12.11's third attempt exists. A fourth
+time a break stayed red at a **different** assertion: the record for
+`an_ending_incarnation_..`'s blunt break said it reddens as `an incarnation is
+there to take it: SendError` *"because `supervise` reads the same cell"*, and three
+commits later the same wave deleted that read (§12.9's m1). `exit=101` is identical
+in all four. The recorded sentence is not.
+
+Proved by execution rather than argued, twice: a deliberately no-op break reports
+its recorded output missing and the script exits 1; and break 6 run against the
+*stale* expectation reports `exit=101` — genuinely red — **and still fails**, which
+is the historical case reproduced.
+
+Two smaller things it did wrong, both fixed: the exit code was the status of the
+**last** `run` only, so red-then-green exited 0 — worse than always zero, because a
+non-zero looked like it meant something — and `set -e` let one rotten record hide
+every record after it.
 
 **The ordering guard needs an in-drop observer, and that is a finding.** From
 outside the actor there is nothing to see: the whole teardown runs before any
