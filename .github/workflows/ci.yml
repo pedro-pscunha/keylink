@@ -32,6 +32,7 @@ jobs:
       - run: mise run lint
       - run: mise run features
       - run: mise run test
+      - run: mise run examples
       - run: mise run docs
 
   wasm:

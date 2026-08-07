@@ -362,9 +362,21 @@ impl Idempotency {
     /// Wait up to `budget` for a call already in flight under this key, then
     /// answer with whatever it settled as.
     ///
-    /// Capped server-side by [`MAX_ATTACH`]. A budget that runs out is
-    /// [`IdempotencyRefusal::InFlight`] — the same answer a non-attaching call
-    /// gets, and still the truth.
+    /// Capped server-side by [`MAX_ATTACH`], which is 30 seconds. A budget that
+    /// runs out is [`IdempotencyRefusal::InFlight`] — the same answer a
+    /// non-attaching call gets, and still the truth.
+    ///
+    /// **The cap is not yours to raise, and asking for more is not an error
+    /// here.** The budget is written on the envelope and read by the peer, so a
+    /// number refused on this side would stop nobody: a hand-rolled peer sends
+    /// whatever it likes, and the serving side caps it because holding a QUIC
+    /// stream open is its cost to pay, not the caller's. So `attaching_for(key,
+    /// Duration::from_secs(120))` is accepted and waits 30 seconds.
+    ///
+    /// A handler that routinely runs longer than [`MAX_ATTACH`] cannot be waited
+    /// out. Ask again — a second attach re-parks for another budget — or stop
+    /// waiting and ask [`key_state`](crate::RpcClient::key_state), which reports
+    /// without running anything.
     ///
     /// Only a *running* call is waited for. A key that already settled is
     /// answered at once, whether that answer is the reply, `Interrupted`,

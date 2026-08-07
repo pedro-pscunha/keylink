@@ -2064,6 +2064,15 @@ macro_rules! __keylink_service {
             /// whose methods are the ones written in `service!`.
             pub struct KeyedClient {
                 inner: $crate::RpcClient<$crate::Addressed<Request>, Response>,
+                /// Attached to every call [`ActorRef`] makes through this
+                /// handle. Held here rather than inside the client, because
+                /// `RpcClient::with_idempotency` gives back an
+                /// [`IdempotentClient`](keylink::IdempotentClient) — a type
+                /// with no `tell`, which is the point of it — and there is no
+                /// `tell` on this path to protect. So the key rides alongside
+                /// and `send_to` attaches it, instead of a second keyed twin of
+                /// this type and of [`ActorRef`] existing to hold it.
+                idempotency: ::core::option::Option<$crate::Idempotency>,
             }
 
             /// Every clone names the same connection. Written out rather than
@@ -2071,7 +2080,10 @@ macro_rules! __keylink_service {
             /// `Request: Clone, Response: Clone`, and neither appears in a field.
             impl ::core::clone::Clone for KeyedClient {
                 fn clone(&self) -> Self {
-                    Self { inner: self.inner.clone() }
+                    Self {
+                        inner: self.inner.clone(),
+                        idempotency: self.idempotency.clone(),
+                    }
                 }
             }
 
@@ -2091,6 +2103,7 @@ macro_rules! __keylink_service {
                 ) -> $crate::Result<Self> {
                     Ok(Self {
                         inner: $crate::RpcClient::connect(node, peer, keyed_alpn()).await?,
+                        idempotency: ::core::option::Option::None,
                     })
                 }
 
@@ -2115,7 +2128,8 @@ macro_rules! __keylink_service {
                     idempotency: impl ::core::convert::Into<$crate::Idempotency>,
                 ) -> Self {
                     Self {
-                        inner: self.inner.with_idempotency(idempotency),
+                        inner: self.inner.clone(),
+                        idempotency: ::core::option::Option::Some(idempotency.into()),
                     }
                 }
 
@@ -2151,9 +2165,16 @@ macro_rules! __keylink_service {
                     request: Request,
                     body: $crate::Body,
                 ) -> $crate::Result<(Response, $crate::BodyReader)> {
-                    self.inner
-                        .call($crate::Addressed::new(actor.clone(), request), body)
-                        .await
+                    let envelope = $crate::Addressed::new(actor.clone(), request);
+                    match &self.idempotency {
+                        ::core::option::Option::Some(key) => {
+                            self.inner
+                                .with_idempotency(key.clone())
+                                .call(envelope, body)
+                                .await
+                        }
+                        ::core::option::Option::None => self.inner.call(envelope, body).await,
+                    }
                 }
 
                 /// Point a handle at content this peer just named. Called by a
@@ -2276,12 +2297,16 @@ macro_rules! __keylink_service {
                 /// call already running under the key. See
                 /// [`RpcClient::with_idempotency`](keylink::RpcClient::with_idempotency)
                 /// for why the handle is meant for one call.
+                ///
+                /// Returns an [`IdempotentClient`], which has **no `tell`
+                /// method** — see that type for why the difference is a type
+                /// rather than a paragraph.
                 #[must_use]
                 pub fn with_idempotency(
                     &self,
                     idempotency: impl ::core::convert::Into<$crate::Idempotency>,
-                ) -> Self {
-                    Self {
+                ) -> IdempotentClient {
+                    IdempotentClient {
                         inner: self.inner.with_idempotency(idempotency),
                     }
                 }
@@ -2314,6 +2339,68 @@ macro_rules! __keylink_service {
 
                 $(
                     $crate::__keylink_client_method!(
+                        [$( #[$meta] )*],
+                        [<$kind>],
+                        [<$rpc:snake>],
+                        Request,
+                        $rpc,
+                        [<into_ $rpc:snake>],
+                        ($( $arg : $ty ),*),
+                        $ret
+                    );
+                )+
+
+                /// Close the connection gracefully.
+                pub async fn close(self) -> $crate::Result<()> {
+                    self.inner.close().await
+                }
+            }
+
+            /// The same connection, scoped to one idempotency key.
+            ///
+            /// Built by [`Client::with_idempotency`]. Its methods are
+            /// [`Client`]'s, minus every `tell`: a key promises the work runs
+            /// at most once, and the ledger keeps that promise by recording the
+            /// reply and answering a repeat with it, so a method with no reply
+            /// has nothing to record and could only discard the key.
+            ///
+            /// It used to be `Client` itself, and
+            /// `client.with_idempotency(key).some_tell(..)` therefore compiled
+            /// and sent no key at all. See
+            /// [`IdempotentClient`](keylink::IdempotentClient).
+            pub struct IdempotentClient {
+                inner: $crate::IdempotentClient<Request, Response>,
+            }
+
+            /// Every clone names the same connection and carries the same key.
+            /// Written out rather than derived for the reason [`Client`]'s is.
+            impl ::core::clone::Clone for IdempotentClient {
+                fn clone(&self) -> Self {
+                    Self { inner: self.inner.clone() }
+                }
+            }
+
+            impl IdempotentClient {
+                /// Ask what this peer's ledger knows about one of your keys.
+                ///
+                /// See [`Client::key_state`].
+                pub async fn key_state(
+                    &self,
+                    key: $crate::IdempotencyKey,
+                ) -> $crate::Result<$crate::KeyState> {
+                    self.inner.key_state(key).await
+                }
+
+                /// Await this peer's departure instead of meeting it on the
+                /// next call. See [`Watch`](keylink::Watch).
+                // No `#[must_use]`: `Watch` already carries one, and repeating
+                // it here is `clippy::double_must_use`.
+                pub fn watch(&self) -> $crate::Watch {
+                    self.inner.watch()
+                }
+
+                $(
+                    $crate::__keylink_idempotent_client_method!(
                         [$( #[$meta] )*],
                         [<$kind>],
                         [<$rpc:snake>],
@@ -2370,12 +2457,14 @@ macro_rules! __keylink_service {
                     ///
                     /// See the async twin,
                     /// [`Client::with_idempotency`](super::Client::with_idempotency).
+                    /// The returned type has no `tell`, for the reason given on
+                    /// [`IdempotentClient`](super::IdempotentClient).
                     #[must_use]
                     pub fn with_idempotency(
                         &self,
                         idempotency: impl ::core::convert::Into<$crate::Idempotency>,
-                    ) -> Self {
-                        Self {
+                    ) -> IdempotentClient {
+                        IdempotentClient {
                             inner: self.inner.with_idempotency(idempotency),
                             runtime: ::std::sync::Arc::clone(&self.runtime),
                         }
@@ -2407,10 +2496,85 @@ macro_rules! __keylink_service {
                         self.runtime.run(self.inner.close())?
                     }
                 }
+
+                /// The same connection, scoped to one idempotency key.
+                ///
+                /// See the async twin,
+                /// [`IdempotentClient`](super::IdempotentClient). No `tell`
+                /// here either, for the same reason.
+                pub struct IdempotentClient {
+                    inner: super::IdempotentClient,
+                    runtime: ::std::sync::Arc<$crate::blocking::Runtime>,
+                }
+
+                impl IdempotentClient {
+                    /// Ask what this peer's ledger knows about one of your keys.
+                    ///
+                    /// See the async twin,
+                    /// [`IdempotentClient::key_state`](super::IdempotentClient::key_state).
+                    pub fn key_state(
+                        &self,
+                        key: $crate::IdempotencyKey,
+                    ) -> $crate::Result<$crate::KeyState> {
+                        self.runtime.run(self.inner.key_state(key))?
+                    }
+
+                    $(
+                        $crate::__keylink_idempotent_blocking_method!(
+                            [$( #[$meta] )*],
+                            [<$kind>],
+                            [<$rpc:snake>],
+                            ($( $arg : $ty ),*),
+                            $ret
+                        );
+                    )+
+
+                    /// Close the connection gracefully.
+                    pub fn close(self) -> $crate::Result<()> {
+                        self.runtime.run(self.inner.close())?
+                    }
+                }
             }
             }
         }
         }
+    };
+}
+
+/// One method on a key-scoped client, or nothing at all when it is a `tell`.
+///
+/// The filter, and the only place the absence is decided. `service!` walks the
+/// declared methods once per client type; this arm set is what makes the
+/// key-scoped walk skip the kind that cannot carry a key. Everything else
+/// delegates to [`__keylink_client_method`], so a key-scoped `rpc` and a plain
+/// one are the same code rather than two copies that can drift.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_idempotent_client_method {
+    // The whole finding, in one arm. `RpcClient::tell` writes `None` for the
+    // key and always did; what changed is that a client holding a key no longer
+    // has a `tell` to call, so the discard is unreachable rather than silent.
+    ([$( #[$meta:meta] )*], tell, $name:ident, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], $kind:ident, $name:ident, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_client_method!(
+            [$( #[$meta] )*], $kind, $name, $req, $variant, $extract,
+            ($( $arg : $ty ),*), $ret
+        );
+    };
+}
+
+/// The blocking twin of [`__keylink_idempotent_client_method`], and it drops the
+/// same kind for the same reason.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_idempotent_blocking_method {
+    ([$( #[$meta:meta] )*], tell, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], $kind:ident, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_blocking_method!(
+            [$( #[$meta] )*], $kind, $name, ($( $arg : $ty ),*), $ret
+        );
     };
 }
 

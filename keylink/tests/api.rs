@@ -97,6 +97,12 @@ async fn the_generated_module_supplies_the_rest_fully_applied() {
     let _: depot::Mounted = depot::spawn(Counter(0));
     let _: Option<depot::Mail> = None;
     let _: Option<depot::KeyedClient> = None;
+    // The type `with_idempotency` hands back. Written from a consumer's
+    // position because that is the only place it can be: a caller names it to
+    // hold one in a struct or to return one, and until this line nothing
+    // outside `macros.rs` named it at all.
+    let _: Option<depot::IdempotentClient> = None;
+    let _: Option<depot::blocking::IdempotentClient> = None;
 
     // ── expression position ──────────────────────────────────────────────────
     // `Mail`, `Mailbox` and `Mounted` admit none: an alias, and two types a
@@ -105,6 +111,12 @@ async fn the_generated_module_supplies_the_rest_fully_applied() {
     let _ = depot::alpn();
     let _ = depot::SystemBuilder::DEFAULT_CAPACITY;
     let _ = depot::KeyedClient::close;
+    // Annotated, because `impl Into<Idempotency>` makes the function item
+    // generic and a bare path is `E0283`. The annotation is the assertion: it
+    // names the type `with_idempotency` returns, which is the whole finding.
+    let _: fn(&depot::Client, keylink::IdempotencyKey) -> depot::IdempotentClient =
+        depot::Client::with_idempotency;
+    let _ = depot::IdempotentClient::close;
     let _ = depot::at;
     let _ = depot::keyed_service(&system, Allowlist::anyone());
 

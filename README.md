@@ -42,8 +42,10 @@ call.
 `Result<()>`, never the declared type: there is no reply stream to decode one
 from. The `Ok` means the bytes reached the transport and nothing more — not
 delivery, not handling, and no order against a `call`. It does not accept an
-idempotency key either, and could not: the ledger answers a repeat with the
-recorded reply, and a `tell` has no reply to record. **There is no reliable
+idempotency key either, and the compiler is what says so: `with_idempotency`
+hands back an `IdempotentClient`, and a `tell` is not among its methods. The
+ledger answers a repeat with the recorded reply and a `tell` has no reply to
+record, so a key attached to one could only be discarded. **There is no reliable
 `tell`.** Anything that has to arrive is an `rpc`.
 
 **Large payloads.** A body is not framed: its extent is the rest of the stream
@@ -258,7 +260,13 @@ recipe rather than a feature:
    `Service`, not to the connection, so the retry meets the same record.
 3. **Ask to attach.** `Idempotency::attaching_for(key, budget)` waits for a call
    already in flight under the key instead of being refused with `InFlight` —
-   the difference between a retry that helps and a retry that races.
+   the difference between a retry that helps and a retry that races. **The
+   budget is capped at `MAX_ATTACH`, 30 s**, and the cap is the serving side's,
+   not yours: the budget arrives from the network and a peer asking to be held
+   for a year is asking for a QUIC stream to be held for a year. So a caller
+   with a 90-second handler cannot wait it out — it is refused at 30 s with the
+   work still running, which is `InFlight` and still the truth. Ask again, or
+   ask `key_state`.
 
 `examples/reliable_call.rs` is that recipe, compiled by the gate and run over two
 nodes. `tests/reliable.rs::a_retried_call_across_a_reconnect_runs_exactly_once` is
@@ -270,13 +278,17 @@ That is effectively-once for one `rpc`. Here is what it does not cover.
 
 1. **There is no reliable `tell`.** A `tell` has no reply stream, so nothing can
    ack it, nothing can refuse it, and it does not accept a key — there is no reply
-   to record and answer a repeat with. Work that has to arrive is an `rpc`.
+   to record and answer a repeat with. `with_idempotency` returns an
+   `IdempotentClient`, which has no `tell` method, so this limit is one the
+   compiler enforces rather than one you have to remember. Work that has to
+   arrive is an `rpc`.
 2. **The ledger is memory.** It dies with the process, and a restarted service
    runs a retried call again. `keylink-persist` makes an actor's *state* durable
    and does nothing for the ledger. keylink has no journal and this is not one.
 3. **A record answers for 600 s.** That is `RECORD_TTL`, alongside volume bounds
-   of `MAX_RECORDS` entries and `MAX_RECORDED_BYTES` of held reply. Past any of
-   them the reply is dropped and the retry is *refused* as `Forgotten`:
+   of `MAX_RECORDS` — 1024 entries — and `MAX_RECORDED_BYTES` — 1 MiB of held
+   reply. Past any of them the reply is dropped and the retry is *refused* as
+   `Forgotten`:
    at-most-once still holds, and the answer does not. Read the result out of your
    own domain; do not re-run the work.
 4. **Past `MAX_TOMBSTONES` — 8192, eight times the record bound — a key is

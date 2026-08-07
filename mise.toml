@@ -44,6 +44,7 @@ run = [
     { task = "lint" },
     { task = "features" },
     { task = "test" },
+    { task = "examples" },
     { task = "docs" },
     { task = "wasm" },
     { task = "wasm-web" },
@@ -92,6 +93,22 @@ run = [
 [tasks.test]
 description = "The whole workspace"
 run = "cargo test --workspace"
+
+[tasks.examples]
+description = "Every example RUNS. Building one asserts nothing"
+# `cargo test --workspace` compiles the examples and never executes one, so
+# `reliable_call`'s assertions — the retry did not re-run the work, and the key
+# settled `Done` afterwards — were dead code in the gate while the README said
+# the recipe was "compiled by the gate and run over two nodes". Half of that was
+# true.
+#
+# Named one at a time rather than `--examples`, because that flag builds them
+# and there is no cargo verb that runs them all. A new example must be added
+# here, and a reviewer who notices it is missing is the only check there is.
+run = [
+    "cargo run -p keylink --example reliable_call",
+    "cargo run -p keylink --example durable_ledger",
+]
 
 # ── documentation ───────────────────────────────────────────────────────────
 
