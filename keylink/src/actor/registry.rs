@@ -1074,11 +1074,22 @@ async fn drain<M>(entry: Entry<M>, budget: Duration) -> Ended {
         Ok(Ok(())) => Ended::Stopped,
         Ok(Err(_join)) => Ended::Vanished,
         Err(_expired) => {
-            // Settled before the abort, for `LocalActor::abort`'s reason: an
-            // aborted loop never reaches `Inbox::ending`, so nothing inside it
-            // can say what this destroyed. The runtime drops the actor's future
-            // only after it has seen the abort, so every reply killed by this
-            // teardown dies with `Gone` already published.
+            // Settled before the abort: an aborted loop never reaches
+            // `Inbox::ending`, so nothing inside it decides what this destroyed.
+            // The runtime drops the actor's future only after it has seen the
+            // abort, so every reply killed by this teardown dies with `Gone`
+            // already published.
+            //
+            // **What this still covers, narrowly**: a **hand-written** `mount`
+            // loop, which has no `run_loop` and therefore no floor. For every
+            // loop keylink generates, `run_loop`'s own floor is strictly earlier
+            // in the same drop and this is a belt.
+            // `an_expired_shutdown_budget_settles_the_served_answer_before_the_abort`
+            // is the guard, and it drives a hand-written loop for exactly that
+            // reason. The cross-reference here used to point at
+            // `LocalActor::abort`, whose settle was deleted in the same wave that
+            // added the floor — precisely because no break of it could be made
+            // red.
             fate.settle(Standing::Gone);
             // Before the second await, never after: an `abort` that has been
             // requested lands whether or not anybody is still waiting for it,
@@ -1569,6 +1580,11 @@ impl<M> System<M> {
         // aborted loop never reaches `Inbox::ending`, so a peer holding a parked
         // reply this destroys must read *gone* rather than *the actor is still
         // there*.
+        //
+        // **Narrowly**, like `drain`'s: what this covers that nothing else does
+        // is a **hand-written** `mount` loop, which has no `run_loop` and so no
+        // floor. `abort_settles_the_served_answer_before_it_destroys_the_actor`
+        // drives one for that reason.
         entry.fate.settle(Standing::Gone);
         entry.task.abort();
         let _ = entry.task.await;
@@ -3042,44 +3058,54 @@ mod tests {
         }
     }
 
-    /// A loop that will not return, holding a [`Recorder`] on its own cell —
-    /// with the mailbox moved somewhere it **structurally** outlives the
-    /// recorder.
+    /// The incarnation: it holds the [`Recorder`] and never returns.
     ///
-    /// The inner `async move` block captures the recorder and not the mailbox,
-    /// and the outer one owns the mailbox for the whole call. That is the shape
-    /// [`supervise`](crate::run_keyed_supervised) has: a supervisor's frame holds
-    /// the receiver across every incarnation, so the incarnation's state — and
-    /// every reply parked in it — dies while `Mailbox` is still very much alive.
-    /// What this records is therefore what somebody **outside** the task
-    /// published before asking for the destruction, and nothing else.
+    /// A **body local** of [`lending`], which is the whole point — see there.
+    async fn incarnation(recorder: Recorder, entered: oneshot::Sender<()>) {
+        let _recorder = recorder;
+        let _ = entered.send(());
+        std::future::pending::<()>().await;
+    }
+
+    /// Holds the mailbox as a **parameter** and awaits the incarnation as a body
+    /// local, so the mailbox outlives the recorder by the language's rule rather
+    /// than by generator layout.
     ///
-    /// **It used to be one block, and that was the defect in the guard.** With
-    /// the recorder and the mailbox in the same future, "the recorder drops
-    /// first" was a claim about generator drop order — the same reasoning
-    /// `local.rs`'s `abort` refuses as *a fact about rustc rather than about this
-    /// crate*. If it had ever flipped, `Mailbox`'s floor would have written
-    /// `Gone` before the recorder looked, and both tests below would have passed
-    /// with the settle they are about deleted.
+    /// Parameters drop after a body's locals, which is the same rule `run_loop`'s
+    /// own floor rests on. So a destroyed task drops the recorder — and, in the
+    /// real thing, the incarnation's state and every reply parked in it — while
+    /// `Mailbox` is still very much alive. That is
+    /// [`supervise`](crate::run_keyed_supervised)'s shape: the receiver belongs
+    /// to the supervisor's frame and outlives every incarnation.
+    ///
+    /// **Two earlier shapes were both weaker, and the second one only looked
+    /// stronger.** One future holding both made "the recorder drops first" a
+    /// claim about generator drop order — the reasoning `local.rs` refuses as *a
+    /// fact about rustc rather than about this crate*. Splitting them into two
+    /// `let`s in one block did not fix it: siblings in one scope drop in reverse
+    /// declaration order, which is the same category of guarantee. Only the
+    /// parameter/body-local split is structural, and if it ever flipped,
+    /// `Mailbox`'s floor would write `Gone` before the recorder looked and both
+    /// tests below would pass with the settle they are about deleted.
+    async fn lending(inbox: Mailbox<Bare>, recorder: Recorder, entered: oneshot::Sender<()>) {
+        incarnation(recorder, entered).await;
+        // Unreachable: the incarnation never returns. Written so that `inbox` is
+        // read here and cannot be mistaken for an unused parameter.
+        drop(inbox);
+    }
+
+    /// A loop that will not return, holding a [`Recorder`] on its own cell.
     fn recording(
         entered: oneshot::Sender<()>,
         seen: &Arc<std::sync::Mutex<Vec<Standing>>>,
     ) -> Mounted<Bare> {
         let seen = Arc::clone(seen);
         mount(move |inbox: Mailbox<Bare>| async move {
-            // Owned out here, so it cannot be dropped before the inner future is.
-            let inbox = inbox;
             let recorder = Recorder {
                 fate: inbox.fate(),
                 seen,
             };
-            let incarnation = async move {
-                let _recorder = recorder;
-                let _ = entered.send(());
-                std::future::pending::<()>().await;
-            };
-            incarnation.await;
-            drop(inbox);
+            lending(inbox, recorder, entered).await;
             Ended::Stopped
         })
     }
