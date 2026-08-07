@@ -475,3 +475,33 @@ defends is the **peer**, and no peer can reach any of this — every route to
 So it is documented rather than defended, at all three places a reader meets it:
 on `Progress`, on `Context::progress`, and on the `Middleware` trait, which is
 what someone about to write one actually reads.
+
+---
+
+## 12. Revision, 2026-08-07: the ALPN this document twice called settled has moved
+
+Appended rather than edited in place, per CONTRIBUTING.md. §6 and §11.2 both name
+`keylink/Probe/aa77e29e5e1ccdc7` — §6 as the value this programme moved the hash *to*,
+§11.2 as evidence that bounding the waiter counts moved nothing. Both were true when
+written. **The literal is now `keylink/Probe/d3fe34471921164e`.**
+
+The cause is not in this document. The per-service keyed actor rewrite deleted
+`RemoteError::ActorSchemaMismatch`, the fifth variant of six, which renumbers `Failed`
+from index 5 to index 4; `RemoteError` sits inside every service's hashed contract
+(`Envelope<WireResponse<Response>>` → `WireResponse::Call(Outcome<Resp>)` →
+`Outcome::Err(RemoteError)`) and postcard encodes a variant by its declaration index. So
+the move is wire-visible for every service, this document's `KeyState` path included, and
+restoring the variant at index 4 reproduces `aa77e29e5e1ccdc7` exactly. §6's own three
+reasons are untouched: the direction types and `Envelope.idempotency` are exactly as
+described. `tests/protocol.rs::the_contract_hash_has_not_moved` is still the pin, and it
+now records both moves and the step-1 answer for each.
+
+Two smaller consequences for readers of this file. `schema_hash` — RFC-04 §14.3's shared
+helper, referenced here as the source of an ALPN's trailing hex — is `pub(crate)` at
+`node.rs:149` rather than `pub`; `derive_alpn` is its only caller. And §11.5's argument
+that `Progress` cannot be sealed has grown a second instance worth reading beside it:
+`Origin`, the mailbox's owned provenance, withholds `Clone` and has no public
+constructor, and neither fact stops a caller from cloning the `Context` *before* two
+deliveries and sharing one marker. See `docs/rfc-07-the-turn-model.md` §1.6, where that
+claim has now been corrected twice. §11.5's conclusion — documented rather than defended,
+because every route to `Progress` is in-process — is what covers this one too.

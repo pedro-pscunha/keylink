@@ -3443,3 +3443,36 @@ chosen for it.
 
 Nothing on the wire moved: no `RemoteError` variant, no `postcard_schema` type,
 no ALPN. `keylink/Probe/aa77e29e5e1ccdc7` before and after.
+
+## 16.13 Revision, 2026-08-07: the ALPN moved, and two facts above are now stale
+
+Appended rather than edited in place, per CONTRIBUTING.md. Everything above stands as
+what was believed when it was written; these two things are no longer true of the code.
+
+**The pinned literal is `keylink/Probe/d3fe34471921164e`.** Every sentence above that
+says `keylink/Probe/aa77e29e5e1ccdc7` — §16.10's "before this change and after it",
+§16.11's "still pins", §16.12's "before and after" — was true of the change *it* was
+describing and is stale as a statement about the tree. The move has one cause, and it is
+not any of those changes: the per-service keyed rewrite **deleted
+`RemoteError::ActorSchemaMismatch`**, which was the fifth variant of six, so `Failed`
+renumbers from index 5 to index 4. `RemoteError` is inside every service's hashed
+contract — `Envelope<WireResponse<Response>>` → `WireResponse::Call(Outcome<Resp>)` →
+`Outcome::Err(RemoteError)` — and postcard encodes a variant by its declaration index, so
+this is wire-visible **for every service, singletons included**. Step 1 of
+CONTRIBUTING.md's rule was answered before the literal was touched, and the answer is
+yes: the variant reported per-actor schema drift inside one node-wide actor envelope, and
+there is no such envelope and no such drift left to report. Proved by construction —
+restoring the variant at index 4 reproduces `aa77e29e5e1ccdc7` exactly.
+`tests/protocol.rs::the_contract_hash_has_not_moved` carries the full argument.
+
+**§14.3's `schema_hash` is `pub(crate)`, not `pub`.** That section proposed
+`pub fn schema_hash<C: Schema>(protocol: &str) -> u64` so that two RFCs could share one
+source of truth for the hash. It exists at `node.rs:149` and is `pub(crate)`: nothing
+outside the crate names it, `derive_alpn` is the only caller, and a `pub` fn is a
+compatibility promise this crate does not need to make to keep the two RFCs honest. The
+"split it so both RFCs use one source of truth" reasoning is unaffected — the split
+happened; the visibility did not.
+
+The model that replaced this document's actor envelope is recorded in
+`docs/rfc-07-the-turn-model.md`. §1.6 there holds the mailbox's owned `Origin`, including
+two revisions correcting what withholding `Clone` on it actually buys.

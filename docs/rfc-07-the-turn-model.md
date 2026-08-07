@@ -155,6 +155,46 @@ amendment exists to fix.
    `Origin` is therefore **not `Clone`**, so the mistake is a compile error rather than a
    wrong answer on the wire.
 
+**Second revision, 2026-08-07 — the correction above overstated the guard, and this is the
+third pass on the same claim.** An adversarial review of Wave 1a produced three compiled
+counter-examples against that last sentence. It is recorded here rather than edited away
+because the pattern is the finding: this section has now been wrong about *what withholding
+`Clone` buys* in every version of it, each time in the safe-sounding direction.
+
+The sentence is false, and the reason is one word: **nobody clones the `Origin`.** What a
+caller clones is the `Context`, before the origin exists.
+
+1. `Origin::Peer(Context)` was a **public tuple variant** over a publicly-`Clone` `Context`,
+   so `(Origin::Peer(cx.clone()), Origin::Peer(cx))` type-checked from any crate — two
+   origins, one `Arc<AtomicU8>`.
+2. Worse, and untouched by taking that variant away: `deliver_to_actor` is
+   `#[doc(hidden)] pub` and takes `cx: Context` **by value**, so two calls with
+   `cx.clone()` and `cx` share one marker without naming `Origin` at all.
+3. The mark is writable from outside the crate too — `Caller::Peer(cx)` reaches
+   `cx.progress().completed()`, because `Progress`'s marks are `pub` for generated
+   dispatch to call.
+
+Wave 1a is what made any of this reachable downstream: the predecessor was a **private
+inherent method**, `System::deliver`.
+
+What Wave 1a's follow-up actually changed, and what it deliberately did not:
+
+- `Origin` is now `pub struct Origin(Provenance)` over a **private** enum, with
+  `pub(crate) local()` / `pub(crate) peer()` and `#[doc(hidden)] pub fn caller()`. That
+  closes (1) — generated code never constructs an origin, it destructures a `Mail` and
+  borrows out of it — and it is held by a `compile_fail,E0624` doctest.
+- (2) and (3) are **not closed**, and the documentation now says so in those words. While
+  `Context: Clone` and `deliver_to_actor` is `pub`, two deliveries can share one marker.
+  What makes it unreachable today is the call graph — `serve_one` builds one `Context` per
+  request and generated dispatch delivers once with it — which is a property of two call
+  sites, not of a type. `representability.rs` cannot state it: a compile-time probe refuses
+  shapes that do not type-check, and this one does. It is pinned instead by a unit test
+  that asserts the sharing is real, so the claim cannot quietly grow back.
+
+**A guard whose documentation overstates it is worse than no guard**, because the next
+author reads the guarantee and stops checking — which is exactly how this section got two
+revisions.
+
 ### 1.7 `Rc` is the wrong exemplar, and it would have failed the gate for the wrong reason
 
 Issue #3's Wave 0 bullet says to make the state `!Sync` by holding an `Rc` in it. `Rc<T>`

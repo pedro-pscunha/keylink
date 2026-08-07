@@ -114,6 +114,24 @@ impl OriginIsNotClone for Origin {}
 /// The other half, which coherence cannot see: no inherent method hands out a
 /// second `Origin` either. `Clone` is the obvious spelling; these are what an
 /// author reaches for when the derive is refused and the need feels real.
+///
+/// # A third half this file cannot reach, and saying so is the point
+///
+/// Neither probe touches the hazard as it would actually arrive, because **nobody
+/// duplicates the `Origin` — the caller clones the `Context` on the way in.**
+/// `deliver_to_actor` is `#[doc(hidden)] pub` and takes a `Context` by value, so
+/// two deliveries sharing one `Progress` type-check without naming `Origin`, and a
+/// probe can only refuse a shape that does *not* type-check. There is no negative
+/// claim to make here and this module must not imply one.
+///
+/// What holds the two halves it *can* reach: coherence for the derive, and the
+/// private field for downstream construction (a `compile_fail,E0624` doctest on
+/// `Origin`, since a visibility claim is only false from outside the crate).
+/// What holds the third is the call graph — one `Context` per request in
+/// `serve_one`, delivered once — pinned as
+/// `actor::remote::tests::two_origins_over_one_cloned_context_still_share_one_marker`,
+/// which asserts the sharing is real so that the prose above cannot quietly become
+/// a guarantee again.
 trait OriginHasNoDuplicator {
     fn duplicate(&self) -> NoSuchMethod {
         NoSuchMethod

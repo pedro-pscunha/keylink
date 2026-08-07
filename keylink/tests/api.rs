@@ -140,7 +140,17 @@ async fn the_hidden_seam_the_macro_writes_is_reachable_and_typed() {
     let _: fn(Origin, depot::Request, BodyReader, Answer<depot::Response>) -> depot::Mail =
         <depot::Actors as KeyedService>::mail;
 
-    // And `Origin` is buildable, exhaustive, and hands out a borrowed `Caller`.
-    let origin = Origin::Local;
-    assert!(matches!(origin.caller(), Caller::Local));
+    // And `Origin` hands out a BORROWED `Caller`, which is the whole reason the
+    // mailbox carries an owned origin instead of a `Caller<'static>` nobody can
+    // build (RFC-07 §1.6). Named as a function item, because out here there is no
+    // way to get an `Origin`: the field is private and both constructors are
+    // `pub(crate)`, so keylink hands one *in* to a generated loop and a downstream
+    // crate can never build a second one around a `Context` it already delivered.
+    //
+    // The annotation is the assertion twice over. It pins that `caller` is
+    // reachable from out here at all — a private one is `E0624` at the one site
+    // that must call it — and that the lifetime relates the borrow to the origin,
+    // so `for<'a> fn(&'a Origin) -> Caller<'a>` is what a turn gets and `'static`
+    // is not on offer.
+    let _: fn(&Origin) -> Caller<'_> = Origin::caller;
 }

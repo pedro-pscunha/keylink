@@ -41,6 +41,16 @@
 //! self-describing, so the ALPN is what establishes type identity, and it now
 //! covers the keyed request type exactly as it covers the singleton one. See
 //! [`derive_alpn`](crate::derive_alpn).
+//!
+//! Sound, and **a reduction in margin** — the half of the sentence that has to be
+//! said out loud. The old shape could refuse an *already admitted* peer whose
+//! actor had drifted without running `Deserialize` over one attacker-influenced
+//! byte: the declared hash was compared first and the payload stayed sealed
+//! behind it. Now the decoder runs for everything that gets past the handshake
+//! and the allowlist, and nothing else stands between a drifted admitted peer and
+//! postcard. That is the trade this section is recording, not only a redaction:
+//! one gate is strictly less defence in depth than two, and it is accepted because
+//! the remaining gate covers the exact type rather than an envelope.
 
 use std::fmt;
 
@@ -79,6 +89,15 @@ use crate::{ActorId, Body, BodyReader, Caller, Context, Outcome, RemoteError, Rp
 /// nevertheless reached through the `message` field's own `NamedType`, so
 /// `Addressed<ReqA>` and `Addressed<ReqB>` hash differently, and both differ
 /// from a bare `ReqA`. The hash is sound; the name is just uninformative.
+///
+/// # Release note: this `Debug` prints the request
+///
+/// `derive(Debug)` here, so `{:?}` on one of these prints the service's own
+/// payload. [`Mail`](struct@Mail)'s `Debug` is hand-written and prints only the
+/// origin, so a mailbox slot is safe to log; an `Addressed` is not. Nothing in
+/// keylink logs a request, which is what makes this latent rather than a leak —
+/// a `Middleware` or a `tracing` field that prints one is the caller's decision
+/// and is where a payload would reach a log.
 #[doc(hidden)]
 #[derive(Debug, Clone, Serialize, Deserialize, Schema)]
 pub struct Addressed<T> {
@@ -136,6 +155,18 @@ impl<T: Rpc> Rpc for Addressed<T> {
 /// `tokio::sync::oneshot::Sender<..>` in the expansion would make every
 /// `service!` user's build depend on tokio's module path rather than only on
 /// tokio being present.
+///
+/// # The tokio type is deliberately part of the promise
+///
+/// The alias hides the module path, **not the type**. It is transparent, so
+/// `tokio::sync::oneshot::Sender` is in keylink's public API and a tokio major
+/// bump is a keylink breaking change reached through a `#[doc(hidden)]` name.
+/// That is a decision and not an oversight: [`Mailbox`](crate::Mailbox) is
+/// `mpsc::Receiver<Box<M>>` and equally transparent, so newtyping this end alone
+/// would buy a promise the other end of the same channel still breaks, and give a
+/// mailbox slot two shapes to be built in for it. keylink depends on tokio's
+/// channels the way it depends on tokio's runtime; what the alias buys is
+/// spelling.
 #[doc(hidden)]
 pub type Answer<Resp> = oneshot::Sender<(Outcome<Resp>, Body)>;
 
@@ -147,7 +178,28 @@ pub type Answer<Resp> = oneshot::Sender<(Outcome<Resp>, Body)>;
 /// a mailbox message cannot simply carry a `Caller`. It carries this instead and
 /// the loop borrows a [`Caller`] out of it for the length of one turn.
 ///
-/// # Deliberately NOT `Clone`, and this is the load-bearing part
+/// # A newtype over a private enum, so there is no door in from outside
+///
+/// Generated code never *constructs* one of these. It destructures a
+/// [`Mail`](struct@Mail) keylink built and calls [`caller`](Self::caller) — the
+/// only thing the expansion needs. So the two cases are a private enum and the
+/// two constructors are `pub(crate)`, and a downstream crate meets an error
+/// instead of a way to make the mistake below:
+///
+/// ```compile_fail,E0624
+/// // `E0624: associated function `local` is private`. `Origin::Peer(cx)` is
+/// // `E0599`, there being no public variant to name either.
+/// //
+/// // rustdoc does NOT check the code after `compile_fail` — pinning `E0599` here
+/// // leaves this green, which was red-tested — so what this asserts is only
+/// // "does not compile", and the code is documentation. What stops it passing
+/// // for the WRONG reason, a rename, is the unit test that calls
+/// // `Origin::local()` from inside the crate: one pins that the name exists,
+/// // this one pins that it is out of reach.
+/// let _origin = keylink::Origin::local();
+/// ```
+///
+/// # Deliberately NOT `Clone`, and exactly how far that reaches
 ///
 /// [`Context`] does derive `Clone`, and `Context.progress` is a
 /// `Progress(Arc<AtomicU8>)` whose `Clone` shares the `Arc` **on purpose** —
@@ -161,27 +213,84 @@ pub type Answer<Resp> = oneshot::Sender<(Outcome<Resp>, Body)>;
 /// read `Reached::Completed` and record a reply it never produced — a silently
 /// wrong at-most-once answer, in the one place the crate promises otherwise.
 ///
-/// The fix is ownership, never cloning: [`deliver_to_actor`] takes the
-/// `Context` by value and moves it in here. Withholding `Clone` is what makes
-/// the mistake a compile error rather than something a peer finds out about.
-/// **Do not derive it.**
+/// Two things guard that, and both are narrower than they look:
+///
+/// - **No `Clone` on this type.** `representability.rs` holds it with a coherence
+///   probe rather than a comment, so adding the derive is `E0119` and not a review
+///   somebody has to remember to do. **Do not derive it.**
+/// - **No public constructor**, per the section above: the `Origin` a peer's
+///   message travels in is one keylink built.
+///
+/// ## What neither of them refuses, and this is the part to read
+///
+/// **Nobody clones an `Origin`. What a caller clones is the `Context` on its way
+/// in.** [`deliver_to_actor`] is `#[doc(hidden)] pub` and takes its `Context`
+/// **by value**, so the hazard type-checks from any crate, shares one marker
+/// across two deliveries, and never names `Origin` at all:
+///
+/// ```ignore
+/// let _ = deliver_to_actor::<S>(&system, cx.clone(), a, body_a).await;
+/// let _ = deliver_to_actor::<S>(&system, cx,         b, body_b).await;
+/// ```
+///
+/// The marker is writable from outside as well: [`caller`](Self::caller)'s
+/// `Caller::Peer(cx)` arm reaches `cx.progress()`, whose marks are `pub` because
+/// generated dispatch calls them, and `middleware.rs`'s `Progress` documents at
+/// length why there is nothing to seal them with.
+///
+/// So: the guard refuses the derive, and refuses downstream construction. It does
+/// **not** refuse a caller cloning a `Context` into two deliveries. What keeps
+/// that unreachable today is the call graph rather than the type — `serve_one`
+/// builds one `Context` per request and generated keyed dispatch calls
+/// [`deliver_to_actor`] once with it — which is a fact about two call sites in
+/// this crate: reviewable, and unenforced. `representability.rs` cannot state it,
+/// because a compile-time probe can only refuse a shape that does not type-check.
+///
+/// Written this plainly because the sentence here used to claim that withholding
+/// `Clone` made "the mistake a compile error rather than something a peer finds
+/// out about" — false for the half that matters. **A guard whose doc overstates
+/// it is worse than no guard: the next author trusts it and stops looking.**
+/// RFC-07 §1.6 carries the same correction, on its third pass.
 #[doc(hidden)]
 #[derive(Debug)]
-pub enum Origin {
+pub struct Origin(Provenance);
+
+/// The two cases, private so that neither is a construction path.
+#[derive(Debug)]
+enum Provenance {
     /// From inside this process, through the generated `Handle`. There is no
     /// peer, no handshake and no proven key.
     ///
     /// Unreachable today: the local handle runs its own loop in `local.rs` and
-    /// does not go through a keyed mailbox. The variant exists because
-    /// [`Origin`] is the shape the generated mailbox commits to, and giving the
-    /// local path a second shape to arrive in is the split this type exists to
-    /// avoid.
+    /// does not go through a keyed mailbox. The case exists because [`Origin`] is
+    /// the shape the generated mailbox commits to, and giving the local path a
+    /// second shape to arrive in is the split this type exists to avoid.
     Local,
     /// From a peer iroh proved at the handshake.
     Peer(Context),
 }
 
 impl Origin {
+    /// A message from inside this process.
+    ///
+    /// `allow(dead_code)` and not `expect`: nothing builds one on the keyed path
+    /// today — `local.rs` runs its own loop — and the unit tests below do build
+    /// one, so an `expect` would be unfulfilled under `cfg(test)` and warn there
+    /// instead.
+    #[allow(
+        dead_code,
+        reason = "the keyed local path arrives with the generated mailbox enum"
+    )]
+    pub(crate) fn local() -> Self {
+        Self(Provenance::Local)
+    }
+
+    /// A message from a peer, taking the `Context` **by value**: see this type's
+    /// documentation for what that does and does not buy.
+    pub(crate) fn peer(cx: Context) -> Self {
+        Self(Provenance::Peer(cx))
+    }
+
     /// Borrow a [`Caller`] out of this, for the length of one turn.
     ///
     /// `pub` because the loop that calls it is generated into the **user's**
@@ -191,9 +300,9 @@ impl Origin {
     #[doc(hidden)]
     #[must_use]
     pub fn caller(&self) -> Caller<'_> {
-        match self {
-            Self::Local => Caller::Local,
-            Self::Peer(cx) => Caller::Peer(cx),
+        match &self.0 {
+            Provenance::Local => Caller::Local,
+            Provenance::Peer(cx) => Caller::Peer(cx),
         }
     }
 }
@@ -371,7 +480,7 @@ pub async fn deliver_to_actor<S: KeyedService>(
     let budget = cx.queueing();
     let progress = cx.progress();
     let (reply, answer) = oneshot::channel();
-    let queueing = mail.send(Box::new(S::mail(Origin::Peer(cx), message, body, reply)));
+    let queueing = mail.send(Box::new(S::mail(Origin::peer(cx), message, body, reply)));
     let sent = match budget {
         None => queueing.await,
         // `saturating_duration_since` on `n0_future::time::Instant`, the clock
@@ -407,7 +516,70 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+    use crate::middleware::Reached;
     use crate::MountError;
+
+    /// A context in the shape `serve_one` builds one, with no endpoint anywhere
+    /// near it: `Context::new` is `pub(crate)`, which is exactly why the two tests
+    /// below can live here and nowhere downstream.
+    fn a_context() -> Context {
+        Context::new(
+            iroh::SecretKey::from_bytes(&[7; 32]).public(),
+            "Ledger",
+            "Post",
+        )
+    }
+
+    /// The provenance survives the newtype: each constructor lends out the
+    /// `Caller` its case names, and `Local` carries nothing to attribute.
+    #[test]
+    fn each_origin_lends_out_the_caller_its_case_names() {
+        assert!(matches!(Origin::local().caller(), Caller::Local));
+
+        let cx = a_context();
+        let peer = cx.peer();
+        let origin = Origin::peer(cx);
+        assert!(
+            matches!(origin.caller(), Caller::Peer(cx) if cx.peer() == peer),
+            "a peer's turn must be attributable to the key iroh proved"
+        );
+    }
+
+    /// **The hole, pinned as a test rather than claimed as a guarantee.**
+    ///
+    /// `Origin` is not `Clone` and has no public constructor, and neither fact
+    /// stops a caller from cloning the `Context` *before* two deliveries. This is
+    /// what that costs: one `completed()` mark, made through one origin, is read
+    /// back through the other — and `rpc.rs` reads exactly this to decide whether
+    /// an idempotency key is recorded or released, so the second call would record
+    /// a reply it never produced.
+    ///
+    /// Asserting the defect is deliberate. It is unreachable today because
+    /// `serve_one` builds one context per request and generated dispatch delivers
+    /// once with it — a property of two call sites, not of this type. If a later
+    /// wave closes it for real, this test goes red and says so, which is the only
+    /// way the documentation above gets corrected a fourth time instead of
+    /// drifting.
+    #[test]
+    fn two_origins_over_one_cloned_context_still_share_one_marker() {
+        let cx = a_context();
+        let first = Origin::peer(cx.clone());
+        let second = Origin::peer(cx);
+
+        let Caller::Peer(ran) = first.caller() else {
+            panic!("built from a context, so this is the peer arm");
+        };
+        ran.progress().completed();
+
+        let Caller::Peer(never_ran) = second.caller() else {
+            panic!("built from a context, so this is the peer arm");
+        };
+        assert_eq!(
+            never_ran.progress().reached(),
+            Reached::Completed,
+            "the marker is shared, so withholding Clone on Origin does not close this"
+        );
+    }
 
     /// Two types with IDENTICAL postcard encodings and different meanings.
     ///

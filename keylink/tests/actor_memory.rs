@@ -70,13 +70,35 @@ impl ledger::Actor for Empty {
 /// mailbox slot is boxed: unboxed it is hundreds of bytes, which would be
 /// kilobytes per idle actor and tens of megabytes across ten thousand.
 ///
-/// **The slot type is now per service**, and that raises the stakes rather than
-/// lowering them. `ledger::Mail` holds this service's own `Request` and a
-/// `oneshot::Sender` of its own `Response`, so it is sized to whichever is
-/// largest — a caller's decision rather than keylink's. The boxing is what keeps
-/// this budget a statement about keylink. `Empty` and a one-field request are
-/// deliberately the smallest case, so this measures the framework's floor and
-/// not a service's ceiling.
+/// **The slot type is now per service, and 2048 is therefore scoped to `ledger`
+/// on purpose.** Read this before treating a red run as a keylink regression.
+///
+/// `ledger::Mail` holds this service's own `Request` and a `oneshot::Sender` of
+/// its own `Response`, so it is sized to whichever is largest — a caller's
+/// decision rather than keylink's. Boxing keeps the *mailbox* out of that: a slot
+/// is a pointer, so the eager block is 32 × 8 bytes whatever `Mail` costs.
+///
+/// It does **not** keep the idle actor out of it, and the tempting sentence that
+/// it does was measured and is false. The actor's task is spawned at mount, and
+/// the future it runs destructures a `Mail` and holds those fields across the
+/// awaits of one turn, so the task allocation is sized to the service's own
+/// message. Measured in this test's own shape, at 2,000 actors per service:
+///
+/// | `size_of::<Mail>()` | bytes per idle actor |
+/// |---|---|
+/// | 232 (`ledger`, below) | 1,686 |
+/// | 1,248 (four `[u64; 32]` args) | 4,662 |
+///
+/// About 2.9 bytes of idle cost per byte of `Mail`, which puts the ceiling of this
+/// budget at a `Mail` of roughly 360 bytes. So `Empty` and a one-field request
+/// measure **keylink's floor for a small service**, not a bound any service holds.
+///
+/// **What that means for the generated mailbox enum.** When `Mail` becomes a
+/// per-service enum sized to its largest variant, this number moves for a reason
+/// that is the *service's* size and not a keylink regression. The response is to
+/// re-derive the budget from the new `size_of::<ledger::Mail>()` — which the test
+/// prints — and to check the framework part separately by shrinking the service,
+/// not to raise the literal until it passes.
 const BUDGET_PER_ACTOR: isize = 2048;
 
 #[tokio::test]
@@ -122,7 +144,10 @@ async fn ten_thousand_idle_actors_fit_in_the_budget() {
     assert_eq!(system.len(), ACTORS);
     assert!(
         each <= BUDGET_PER_ACTOR,
-        "an idle actor costs {each} bytes, over the {BUDGET_PER_ACTOR} byte budget"
+        "an idle actor costs {each} bytes, over the {BUDGET_PER_ACTOR} byte budget \
+         scoped to a ledger::Mail of {} bytes — read BUDGET_PER_ACTOR's \
+         documentation before moving the literal",
+        std::mem::size_of::<ledger::Mail>()
     );
 }
 

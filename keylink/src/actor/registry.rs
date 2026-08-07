@@ -105,9 +105,16 @@ const MAILBOX: usize = 1;
 /// **The pressure gets worse as `M` grows, and `M` is the caller's to grow.** A
 /// per-service message is sized to its largest request plus a reply channel of
 /// its largest response, so the slot stops being service-independent and the
-/// figures above are a floor rather than a typical case. The box is what keeps
-/// the ten-thousand-actor budget a statement about keylink rather than about
-/// whoever wrote the service.
+/// figures above are a floor rather than a typical case.
+///
+/// The box bounds what that costs **here**, and not what an idle actor costs. A
+/// slot is a pointer, so this block is 256 bytes whatever `M` is; but the task
+/// spawned beside it runs a future that destructures an `M` and holds those fields
+/// across a turn's awaits, and that allocation *is* sized to `M`. Measured, a
+/// 1,248 byte `M` costs 4,662 bytes per idle actor against 1,686 for a 232 byte
+/// one — so roughly three bytes of idle cost per byte of `M`, of which the box
+/// saves the one that would have been in this block. `tests/actor_memory.rs`
+/// documents what that does to a per-actor budget.
 ///
 /// Only the boxed row is reported by `tests/actor_memory.rs`; the unboxed row is
 /// that number plus the difference above, because the test never builds ten

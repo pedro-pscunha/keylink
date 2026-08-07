@@ -656,8 +656,11 @@ macro_rules! service {
                         let __caller = origin.caller();
                         // `Option`, because a local message has no peer, no
                         // connection and therefore no idempotency key to settle.
-                        // Nothing builds `Origin::Local` today; the local handle
-                        // runs its own loop in `local.rs`.
+                        // Nothing builds a local `Origin` today; the local handle
+                        // runs its own loop in `local.rs`. Nothing here builds an
+                        // `Origin` at ALL, which is why both of its constructors
+                        // are `pub(crate)`: this loop is handed one inside a
+                        // `Mail` and only ever borrows out of it.
                         //
                         // The third generated dispatch path, and the one that
                         // marked nothing at all. A key claimed for a message

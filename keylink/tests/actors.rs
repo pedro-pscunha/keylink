@@ -378,8 +378,23 @@ async fn an_oversized_id_is_refused_before_it_reaches_the_registry() {
     );
 }
 
-/// **The named replacement for
-/// `a_message_on_a_drifted_schema_is_refused_before_the_payload_is_decoded`.**
+/// **One of the two named replacements for
+/// `a_message_on_a_drifted_schema_is_refused_before_the_payload_is_decoded`, and
+/// the one that covers the case the old test was NOT about.**
+///
+/// Be exact about the split, because an earlier version of this note claimed the
+/// whole inheritance and pointed at one half of it. The deleted guard watched
+/// **two builds of one service** drift apart — one peer's actor declaring a hash
+/// the other's mount did not agree with. This test watches **two different
+/// services**, which is a neighbouring property and not that one. The same-build
+/// drift half lives in two other tests, and both are needed to make the claim:
+/// `tests/protocol.rs::the_keyed_alpn_hashes_the_keyed_wire_type` pins that a
+/// keyed ALPN hashes `Envelope<WireRequest<Addressed<Request>>>` — so a changed
+/// request type moves the string a peer must present — and
+/// `adding_a_remote_error_variant_moves_the_alpn`, below in this file, pins the
+/// same for the reply direction, where the drift is a variant index rather than a
+/// field. Between them, a rebuild that changes what either direction encodes
+/// cannot present the old ALPN.
 ///
 /// That test carried the assertion *"the payload must never have been decoded,
 /// let alone handled"*, and it was red-tested by comparing the declared hash
