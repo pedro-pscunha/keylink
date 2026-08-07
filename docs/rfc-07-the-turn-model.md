@@ -2316,15 +2316,17 @@ the argument so it is not inherited by omission a third time.
 **Issue #3's Wave 2c criterion** puts the safety claim in a `compile_fail` probe in
 `representability.rs`.
 
-**What landed** is a **positive** doctest at `keylink/src/local.rs:501-518`: a handler
+**What landed** is a **positive** doctest — the first fence under *"The guard, and exactly
+which half of it each piece holds"* in `Replied`'s rustdoc, `keylink/src/local.rs`: a handler
 written the way `#[defer]` means it to be written, which fails if the *generated signature*
 stops demanding a token. Red-tested — with the arm's `Output` changed to `()` it goes red
-with `E0271`.
+with `E0271`. Cited by item and heading rather than by line, because a line range is wrong
+the first time anything is inserted above it — and this one already was.
 
-**The `compile_fail` twin at `:529-546` is kept and demoted in place.** Under the same
-break it stayed **green**: the impl mismatched the trait's `Output` for an unrelated
-reason, so the fence went on passing while the obligation it claims to pin was gone. The
-doc says so, in those words, rather than keeping two fences and believing both.
+**The `compile_fail` twin, the second fence in that same section, is kept and demoted in
+place.** Under the same break it stayed **green**: the impl mismatched the trait's `Output`
+for an unrelated reason, so the fence went on passing while the obligation it claims to pin
+was gone. The doc says so, in those words, rather than keeping two fences and believing both.
 
 **This is C-4 applied a second time, not a new decision.** C-4 established that rustdoc
 ignores the error code on a `compile_fail` fence, so such a fence proves only "this does
