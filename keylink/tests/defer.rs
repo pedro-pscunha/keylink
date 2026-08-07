@@ -113,6 +113,13 @@ async fn parked(book: &orders::Handle<Book>, want: u64) {
 /// `size * price` rather than a constant, so the answer can only have come from the
 /// pairing of the two turns: 3 from the parked `place` and 7 from the `fill` that
 /// released it.
+///
+/// Made red by `scripts/break-once.sh`, replacing `Deferred::send`'s
+/// `self.0.answer(Answered::Ran(value));` with `drop((self, value));` — a park that
+/// takes the channel away and never gives it back. Watched: this fails at the
+/// answer, "the actor is running: MailboxClosed", which is what a caller sees when
+/// the channel dies unanswered. It prints rather than hangs because the wait is
+/// bounded by the sender being dropped, not by a timeout.
 #[tokio::test]
 async fn a_parked_reply_is_answered_from_a_later_turn() {
     let book = orders::actor(Book::default());
@@ -136,6 +143,17 @@ async fn a_parked_reply_is_answered_from_a_later_turn() {
 
 /// Two parked replies are two channels, and answering one does not answer the
 /// other. Enough to catch a design that kept "the" deferred reply per actor.
+///
+/// **Reddened, but not on its distinguishing claim, and that is worth saying.** The
+/// break is the one its sibling above uses — `Deferred::send`'s
+/// `self.0.answer(Answered::Ran(value));` replaced by `drop((self, value));` —
+/// watched here as "running: MailboxClosed" at the first order. That fails both
+/// tests, so it proves the parked channel is load-bearing and proves nothing about
+/// *two* of them. No one-literal edit isolates the plural: a `Reply` is built per
+/// call by generated code and `later` consumes it, so "the deferred reply per actor"
+/// is not a state this crate can be edited into — it would have to be designed in.
+/// This test is therefore a design pin against a shape that was never built, and it
+/// is that rather than a guard with a counter-example.
 #[tokio::test]
 async fn two_parked_replies_are_two_answers() {
     let book = orders::actor(Book::default());
@@ -329,6 +347,16 @@ async fn a_reply_parked_before_a_fault_is_still_answered_after_it() {
 /// `fill` answers it. So the value crosses `Reply::wrapping`'s boxed conversion,
 /// installed by a generated arm and invoked from a turn that ran later — which is
 /// the whole of what the served half of `#[defer]` is.
+///
+/// Made red by `scripts/break-once.sh`, replacing `Reply::wrapping`'s
+/// `Answerer::Wrapped(Box::new(move |answered| self.answer(answered.map(wrap))))`
+/// with a closure that drops all three — the conversion installed and then not
+/// performed. Watched: "the call succeeded: Remote(NoSuchActor { id: "Orders" })".
+///
+/// **That error names the wrong fault and it is a finding rather than a detail.**
+/// The actor exists, was reached, and ran the turn; a served reply that dies
+/// unanswered is reported to the peer as though the service had never been mounted.
+/// The test goes red either way — this is about what an operator would read.
 #[tokio::test]
 async fn a_peer_gets_an_answer_parked_past_its_own_turn() {
     let node = local_node().await;
@@ -355,6 +383,14 @@ async fn a_peer_gets_an_answer_parked_past_its_own_turn() {
 
 /// And the ordinary shape over the wire: answered inside the turn, so the peer sees
 /// nothing different from any other `rpc`.
+///
+/// Reddened by the same `Reply::wrapping` break its sibling above uses, watched here
+/// as "answers: Remote(NoSuchActor { id: "Orders" })" at the **first** assertion.
+/// So the break proves the deferred answer crosses the wire and proves nothing about
+/// this test's second claim — that an ordinary call on the same connection
+/// afterwards finds the stream whole. No one-literal edit was found that leaves a
+/// deferred call's stream half-used while still answering it, so that half is
+/// unwatched and is recorded as such rather than assumed.
 #[tokio::test]
 async fn a_peer_cannot_tell_a_deferred_method_from_an_ordinary_one() {
     let node = local_node().await;

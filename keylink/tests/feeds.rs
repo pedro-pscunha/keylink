@@ -272,6 +272,13 @@ async fn hold(
 /// test its last two fills when it was first written — a finished feed outranks a
 /// queued item on a different feed, because the ending is not a turn that can wait
 /// its place in a queue.
+///
+/// Made red by `scripts/break-once.sh`, replacing the loop's
+/// `mail_first = !mail_first;` with `mail_first = true;` — the alternation deleted
+/// and the mailbox given first refusal every time. Watched: left
+/// `[Held, Note(7), Fill(1), Fill(2), Fill(3)]` against right
+/// `[Held, Fill(1), Note(7), Fill(2), Fill(3)]`, which is the batching this test
+/// names.
 #[tokio::test]
 async fn an_actor_takes_feed_items_interleaved_with_its_mailbox() {
     let (wired, gate) = wired(Vec::new());
@@ -314,6 +321,12 @@ async fn an_actor_takes_feed_items_interleaved_with_its_mailbox() {
 /// Wave 2b predicted this field would need no widening for feeds, on the ground
 /// that it names whichever declaration produced the turn. This is that prediction
 /// executed.
+///
+/// Made red by `scripts/break-once.sh`, replacing the generated feed arm's
+/// `::core::stringify!($feed)` — the argument `feed_turn` reports as
+/// `TurnInfo::method` — with the literal `"on_fills"`, which is the handler's
+/// spelling rather than the declaration's and is the exact mistake this pins.
+/// Watched: left `Some(("on_fills", false))` against right `Some(("Fills", false))`.
 #[tokio::test]
 async fn a_feed_item_runs_the_observer_chain_and_the_turn_names_the_feed() {
     let (seen, mut reports) = mpsc::unbounded_channel();
@@ -342,6 +355,13 @@ async fn a_feed_item_runs_the_observer_chain_and_the_turn_names_the_feed() {
 ///
 /// The observer sees `TurnOutcome::Panicked` first, which is what a durability
 /// adapter needs in order to refuse the write.
+///
+/// Made red by `scripts/break-once.sh`, replacing `feed_turn`'s `end.or(faulted)`
+/// with `end` — the fault computed and then dropped, which is the silent-survival
+/// defect this exists to catch. Watched: "got Feed { name: "Fills" } — a feed's
+/// fault has nobody to be answered to, so it must end the actor rather than be
+/// dropped". The prose above predicted exactly that reading, and it is why the feed
+/// is dropped one item later: the break prints a wrong answer instead of hanging.
 #[tokio::test]
 async fn a_panic_in_a_feed_handler_ends_the_actor() {
     let (seen, mut reports) = mpsc::unbounded_channel();

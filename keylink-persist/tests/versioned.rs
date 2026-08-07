@@ -309,6 +309,13 @@ async fn what_is_stored_carries_a_header() {
 
 /// A snapshot survives the claim that wrote it, which is the whole port, now
 /// with a version stamp in front.
+///
+/// Made red by `scripts/break-once.sh`, replacing `FileClaim::store`'s
+/// `std::fs::rename(&temp, &snapshot)` with `std::fs::rename(&temp, &temp)` — the
+/// bytes written and fsynced into the temporary file, and the atomic step aimed at
+/// itself, so nothing is ever published under the snapshot's name. That is the
+/// defect the ordering exists to prevent and it succeeds silently. Watched: left
+/// `None` against right `Some(LedgerV1 { entries: [4, 5] })` at the second claim.
 #[tokio::test]
 async fn a_state_survives_the_claim_that_wrote_it() {
     let scratch = Scratch::new("survives");
@@ -372,6 +379,14 @@ async fn v1_bytes_load_into_a_v2_type_through_one_hop() {
 
 /// Two hops, and the v1 → v2 arm is what produces the total, so a chain that
 /// jumped straight to the last hop could not pass this.
+///
+/// Made red by `scripts/break-once.sh`, replacing `decode`'s
+/// `for from in stored..D::VERSION {` with `for from in (D::VERSION - 1)..D::VERSION {`
+/// — the jump the sentence above says could not pass. Watched: left
+/// `Some(LedgerV3 { total: 7, entries: [8], count: 1 })` against right
+/// `Some(LedgerV3 { total: 15, entries: [7, 8], count: 2 })`. The wrong answer is
+/// the interesting part: v1 bytes read as v2 bytes are a plausible v2, so the loss
+/// is an entry rather than an error.
 #[tokio::test]
 async fn v1_bytes_load_into_a_v3_type_through_two_hops() {
     let scratch = Scratch::new("two-hops");
@@ -508,6 +523,13 @@ async fn a_raw_unframed_snapshot_is_refused_rather_than_mis_parsed() {
     );
 }
 
+/// Made red by `scripts/break-once.sh`, replacing `unframe`'s
+/// `fault(FrameFault::TooShort { len: bytes.len() })` with
+/// `fault(FrameFault::WrongMagic)` — still refused, refused for a reason that is
+/// false about the file. Watched: "got Restore(NotAFrame { fault: WrongMagic })".
+/// Which fault a short file gets is the whole of what this pins; the refusal itself
+/// is `TooShort`'s only exit and cannot be edited away without the header's
+/// `try_into` failing anyway.
 #[tokio::test]
 async fn a_file_too_short_to_be_a_frame_is_refused() {
     let scratch = Scratch::new("short");
@@ -531,6 +553,13 @@ async fn a_file_too_short_to_be_a_frame_is_refused() {
 /// A header layout this build does not write is refused as a frame fault and
 /// not as a payload version — the two numbers are separate, and so are the two
 /// verdicts.
+///
+/// Made red by `scripts/break-once.sh`, replacing `unframe`'s
+/// `match layout.cmp(&LAYOUT) {` with `match Ordering::Equal {` — the layout check
+/// deleted while everything downstream still runs. Watched: this fails at the
+/// `expect_err`, "layout 2: Some(LedgerV1 { entries: [0] })". A build that skipped
+/// this check does not error; it hands back a ledger it decoded from a header it
+/// does not understand.
 #[tokio::test]
 async fn a_frame_layout_from_the_future_is_refused() {
     let scratch = Scratch::new("layout");
@@ -593,6 +622,13 @@ async fn a_frame_layout_older_than_this_build_is_refused_as_old() {
 
 /// What a `Durable` reports about its own bytes reaches the caller unchanged,
 /// and is the only variant it can report.
+///
+/// Made red by `scripts/break-once.sh`, replacing `decode`'s
+/// `return D::restore(payload);` with a `map_err` that rewrites whatever the state
+/// said as `RestoreError::Malformed("bad snapshot")` — this crate substituting its
+/// own summary for the one report that knows the payload's shape. Watched: "got
+/// "bad snapshot"". The assertion is `contains`, so it is the state's own words
+/// that are pinned, not the enum variant, which is the half a `matches!` would miss.
 #[tokio::test]
 async fn what_the_state_says_about_its_own_bytes_is_what_the_caller_sees() {
     let scratch = Scratch::new("malformed");
@@ -613,6 +649,13 @@ async fn what_the_state_says_about_its_own_bytes_is_what_the_caller_sees() {
 /// payload plus [`FRAME_LEN`]. This test exists because the alternative — a
 /// caller told "the snapshot is 128 bytes and the limit is 128" while being
 /// refused — is a number nobody can act on.
+///
+/// Made red by `scripts/break-once.sh`, replacing `FileClaim::store`'s
+/// `let offered = bytes.len() as u64;` with `let offered = (bytes.len() - 12) as u64;`
+/// — the limit measured against the payload while the disk takes the frame, which is
+/// the off-by-a-header this test is named for. Watched: the second store is
+/// **accepted**, so it fails at the `expect_err` with "over the limit: ()". A limit
+/// that undercounts does not report a wrong number; it lets a write through.
 #[tokio::test]
 async fn the_limit_counts_the_frame_and_the_error_says_which_number_it_is() {
     let scratch = Scratch::new("limit");
