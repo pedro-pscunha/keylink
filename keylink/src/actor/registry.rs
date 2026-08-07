@@ -508,6 +508,11 @@ struct Entry<M> {
 struct Registry<M> {
     entries: RwLock<HashMap<ActorId, Entry<M>>>,
     factory: Option<Factory<M>>,
+    /// Where mounts and endings are reported, when anybody asked. `None` is the
+    /// default and costs one `Option` check per mount and per teardown — never
+    /// per message, because routing to a live actor is not a lifecycle event.
+    /// See [`Lifecycle`].
+    lifecycle: Option<Arc<dyn Lifecycle>>,
     capacity: usize,
     /// How many messages may wait ahead of the one being handled, for every
     /// actor in this system. [`SystemBuilder::mailbox_depth`] is where it means
@@ -536,6 +541,30 @@ impl<M> Registry<M> {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
+    /// The two report sites, so that "is anybody listening" is asked in one
+    /// place rather than at each of the five call sites.
+    fn report_mounted(&self, id: &ActorId) {
+        if let Some(watching) = &self.lifecycle {
+            watching.mounted(id);
+        }
+    }
+
+    fn report_ended(&self, id: &ActorId, why: &Ended) {
+        if let Some(watching) = &self.lifecycle {
+            watching.ended(id, why);
+        }
+    }
+
+    /// The id to announce a mount under, or `None` when nobody is listening.
+    ///
+    /// The clone is the whole reason this is a method: a mount reports **after**
+    /// the write guard is released, so the key has to be copied out from under
+    /// it — and a registry with no [`Lifecycle`] must not pay for a `String`
+    /// clone on its mount path to produce a value nothing reads.
+    fn announcing(&self, id: &ActorId) -> Option<ActorId> {
+        self.lifecycle.as_ref().map(|_| id.clone())
+    }
+
     fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<ActorId, Entry<M>>> {
         // A panic under the lock must cost one message, not wedge the registry
         // for the life of the process. The same call the demo's handler makes.
@@ -560,15 +589,19 @@ impl<M> Registry<M> {
         // and `len()` cannot be asked while one is held. The count is the one
         // before this insert either way, which is what the cap is about.
         let live = entries.len();
-        match entries.entry(id.clone()) {
+        // The mount is announced after the guard below is released, so the arm
+        // that performs one hands the id out here rather than reporting in place.
+        // A lazy spawn is the mount NO caller sees: there is no `mount()` call to
+        // report from, which is half of why `Lifecycle` exists at all.
+        let (found, announce) = match entries.entry(id.clone()) {
             hash_map::Entry::Occupied(taken) => {
                 // Another message to the same new id won the race between the two
                 // locks. One id is one actor, so the loser adopts the winner's.
                 // `touch` inlined, because it wants a `&HashMap` this arm has
-                // handed to the entry.
+                // handed to the entry. Not a mount: the winner announced it.
                 let entry = taken.into_mut();
                 entry.last_seen.store(self.now(), Ordering::Relaxed);
-                Ok(entry.mail.clone())
+                (entry.mail.clone(), None)
             }
             hash_map::Entry::Vacant(free) => {
                 if live >= self.capacity {
@@ -584,10 +617,16 @@ impl<M> Registry<M> {
                 // [`Mounted`] for why the depth could not otherwise be a knob.
                 let entry = self.entry(mounted);
                 let found = entry.mail.clone();
+                let announce = self.announcing(free.key());
                 free.insert(entry);
-                Ok(found)
+                (found, announce)
             }
+        };
+        drop(entries);
+        if let Some(id) = announce {
+            self.report_mounted(&id);
         }
+        Ok(found)
     }
 
     fn touch(
@@ -706,21 +745,21 @@ impl<M> Registry<M> {
         // be torn down after the guard is gone. The predicate is the old
         // `retain`'s, inverted — `>=`, so an actor idle for exactly its budget is
         // evicted.
-        let expired: Vec<Entry<M>> = self
+        let expired: Vec<(ActorId, Entry<M>)> = self
             .write()
             .extract_if(|_, entry| {
                 now.saturating_sub(entry.last_seen.load(Ordering::Relaxed)) >= after
             })
-            .map(|(_, entry)| entry)
             .collect();
-        // The `Ended` of an actor nobody asked about is nobody's answer. It is
-        // computed anyway because `drain` is the one teardown and a second,
-        // quieter one is how the two would drift.
-        n0_future::join_all(
-            expired
-                .into_iter()
-                .map(|entry| drain(entry, shutdown_budget)),
-        )
+        // The id travels with the entry now, and it is the whole of the fix: an
+        // eviction's `Ended` used to be computed here and dropped, because there
+        // was nowhere to put it and nobody to hand it to. There is one place now,
+        // and it is optional — a system with no `Lifecycle` computes the same
+        // `Ended` and drops it exactly as before.
+        n0_future::join_all(expired.into_iter().map(|(id, entry)| async move {
+            let ended = drain(entry, shutdown_budget).await;
+            self.report_ended(&id, &ended);
+        }))
         .await;
     }
 }
@@ -821,7 +860,27 @@ async fn drain<M>(entry: Entry<M>, budget: Duration) -> Ended {
 /// - **no `queued`.** The total backlog is not observable, and the field that
 ///   claimed it is refused by name. [`Self::buffered`] is the part that can be
 ///   measured, said as a floor.
-#[derive(Debug, Clone)]
+///
+/// # It crosses the wire, and that was a decision about one ALPN
+///
+/// The three wire derives are here so that a console on another machine reads
+/// the same four fields a local caller does, rather than a parallel struct that
+/// would have to be kept in step by hand. The service that carries it —
+/// [`inspect`](crate::inspect) — is **new**, so its ALPN is derived for the
+/// first time from this shape and there is no hash to move. Nothing that
+/// existed before this wave carries an `ActorStatus`: the keyed and singleton
+/// ALPNs hash a service's own request and response types, and
+/// `keylink/tests/protocol.rs` pins them.
+///
+/// The cost is that this struct is now part of a wire contract. A fifth field
+/// is still additive in Rust — `#[non_exhaustive]` says so — and is **not**
+/// additive on the wire: it moves `keylink/Inspect`'s hash, and an old console
+/// is refused at the handshake rather than misparsing. That is the same trade
+/// [`derive_alpn`](crate::derive_alpn) makes everywhere, and it is the reason
+/// the two refused fields above are refused rather than reserved.
+#[derive(
+    Debug, Clone, serde::Serialize, serde::Deserialize, postcard_schema::Schema, PartialEq, Eq,
+)]
 #[non_exhaustive]
 pub struct ActorStatus {
     /// The id this actor is mounted under.
@@ -861,7 +920,79 @@ pub struct ActorStatus {
     /// compute a queue-length alert from. What it is good for is the question it
     /// answers exactly — is this actor's mailbox full, and therefore is anybody
     /// who sends to it going to block.
-    pub buffered: usize,
+    ///
+    /// # `u64` and not `usize`, and the reason is the browser
+    ///
+    /// The count comes from a `usize` and is widened here, because **`usize` has
+    /// no wire schema and that is deliberate**: `postcard_schema` implements
+    /// `Schema` for every fixed-width integer and for neither pointer-sized one,
+    /// since a type whose width is the *compiler's* choice cannot be half of a
+    /// contract between two machines. keylink builds for `wasm32-unknown-unknown`
+    /// and for 64-bit natives, so a console in a tab reading a server's
+    /// `ActorStatus` is exactly the pair that would disagree.
+    ///
+    /// The widening is lossless on every target keylink supports — `usize` is at
+    /// most 64 bits on all of them — and the field is bounded by
+    /// [`SystemBuilder::mailbox_depth`] anyway, which is a small number.
+    pub buffered: u64,
+}
+
+/// Where a [`System`] reports an actor arriving and an actor leaving.
+///
+/// Two methods, because a registry knows exactly two things about an actor's
+/// life that nothing else in the process can see. What happens *in between* is a
+/// turn, and a turn is [`Observer`](crate::Observer)'s — this trait deliberately
+/// has no third method for one, so there is one place to learn that a handler
+/// ran and it is not here.
+///
+/// # The ending is the reason this exists, and it closes a stated gap
+///
+/// [`Self::mounted`] could be reported by whoever called [`System::mount`]. Two
+/// mounts cannot: a lazily spawned actor is built inside
+/// [`SystemBuilder::spawn_with`]'s factory with no caller present, and an actor
+/// **evicted** by the sweeper is torn down on a timer with no caller present
+/// either. The second one was a documented hole — `Registry::sweep` computed an
+/// [`Ended`] for every actor it destroyed and dropped it, so a
+/// [`shutdown_budget`](Eviction::Idle::shutdown_budget) set below the longest
+/// turn destroyed that turn with no log, no counter, no observer and no caller,
+/// because the caller of an evicted actor is a peer whose stream is severed
+/// rather than answered. This is where that `Ended` now goes.
+///
+/// # Both methods are synchronous, and must not block
+///
+/// They are called on the task that mounted, shut down, aborted or swept — the
+/// sweeper's own task for an eviction — and a report that waits would make a
+/// diagnostic able to stall the thing it describes. That is
+/// [`Subscribers`](crate::Subscribers)' argument about
+/// `Connection::closed` one layer down: an observability path that can hold its
+/// subject open is a leak wearing a diagnostic's clothes.
+///
+/// So an implementation records and returns. keylink's own — [`Events`] — does
+/// exactly that: a bounded channel, `try_send`, and a count of what it could not
+/// fit, published as [`NodeStatus::lost`]. Losing a diagnostic loudly beats
+/// blocking a teardown quietly.
+///
+/// Neither call holds the registry's lock. [`System::mount`] releases the write
+/// guard before it reports, so an implementation may call back into the same
+/// system — [`System::status`], [`System::len`] — without deadlocking.
+///
+/// [`Events`]: crate::Events
+/// [`NodeStatus::lost`]: crate::NodeStatus
+pub trait Lifecycle: Send + Sync + 'static {
+    /// An actor is now mounted under `id` and its task is running.
+    ///
+    /// Reported after the registry's write guard is released, so the actor is
+    /// already addressable and may already have taken a turn.
+    fn mounted(&self, id: &ActorId);
+
+    /// The actor that was mounted under `id` is gone, and `why`.
+    ///
+    /// `why` is the same [`Ended`] the caller of [`System::shutdown`] is handed,
+    /// synthesised from the join — see that method for exactly what
+    /// [`Ended::Stopped`] and [`Ended::Vanished`] do and do not claim. An
+    /// eviction and an [`abort`](System::abort) report through here too, and
+    /// those have no caller to hand it to at all.
+    fn ended(&self, id: &ActorId, why: &Ended);
 }
 
 /// A registry of live actors: which ones exist, and for how long.
@@ -956,6 +1087,7 @@ impl<M> System<M> {
             mailbox_depth: DEFAULT_MAILBOX_DEPTH,
             eviction,
             factory: None,
+            lifecycle: None,
         }
     }
 
@@ -987,22 +1119,34 @@ impl<M> System<M> {
         // taken first. It is the count before this insert, which is the one the
         // cap is about.
         let live = entries.len();
-        match entries.entry(id) {
+        let announce = match entries.entry(id) {
             // The refusal clones the key it was given back out of the map, which
             // is the one allocation this shape costs and it is on the cold path.
-            hash_map::Entry::Occupied(taken) => Err(MountError::Occupied {
-                id: taken.key().clone(),
-            }),
+            hash_map::Entry::Occupied(taken) => {
+                return Err(MountError::Occupied {
+                    id: taken.key().clone(),
+                })
+            }
             hash_map::Entry::Vacant(free) => {
                 if live >= self.inner.capacity {
                     return Err(MountError::AtCapacity {
                         capacity: self.inner.capacity,
                     });
                 }
+                let announce = self.inner.announcing(free.key());
                 free.insert(self.inner.entry(actor));
-                Ok(())
+                announce
             }
+        };
+        // After the guard, never under it: a `Lifecycle` may ask this same system
+        // what is running, and an `RwLock` write guard held across that call is a
+        // deadlock the implementor could not have seen coming. A refusal above
+        // returns before this and announces nothing — there is no actor.
+        drop(entries);
+        if let Some(id) = announce {
+            self.inner.report_mounted(&id);
         }
+        Ok(())
     }
 
     /// Find the actor `id` addresses, spawning it if this system has a factory.
@@ -1134,7 +1278,12 @@ impl<M> System<M> {
     /// the loop somewhere to put it, not have the registry guess a second time.
     pub async fn shutdown(&self, id: &ActorId, budget: Duration) -> Option<Ended> {
         let entry = self.inner.write().remove(id)?;
-        Some(drain(entry, budget).await)
+        let ended = drain(entry, budget).await;
+        // The same value the caller is about to receive, and never a second
+        // determination of it: a `Lifecycle` and a caller who both watched this
+        // shutdown must not be able to be told different things.
+        self.inner.report_ended(id, &ended);
+        Some(ended)
     }
 
     /// Stop routing to `id` and cancel what the actor is doing where it stands.
@@ -1157,6 +1306,10 @@ impl<M> System<M> {
         };
         entry.task.abort();
         let _ = entry.task.await;
+        // [`Ended::Vanished`] and not a fourth spelling: an aborted task is what
+        // that variant means everywhere else in the crate, and `abort` is the one
+        // teardown that does not go through `drain` to say so.
+        self.inner.report_ended(id, &Ended::Vanished);
         true
     }
 
@@ -1191,6 +1344,30 @@ impl<M> System<M> {
     /// on other threads, and why [`ActorStatus`] says so out loud rather than
     /// pretending to a snapshot.
     ///
+    /// # Stale before you read it, and eviction is the reason to care
+    ///
+    /// Every row here is a fact about another task, so it is out of date the
+    /// instant it is returned. That is true of any diagnostic. What makes it
+    /// **actionable** staleness rather than the ordinary kind is
+    /// [`Eviction::Idle`]: a sweeper runs on a timer, on its own task, and it
+    /// removes actors this list has already named. So an [`ActorId`] read out of
+    /// this `Vec` may be unmounted before the next line of the caller's own code,
+    /// with nothing in between — no message, no error, no call the caller made.
+    ///
+    /// The consequence a caller has to hold: **this list is evidence, never a
+    /// precondition.** Never `status().iter().find(..)` and then act as if that
+    /// actor is there. Address it and handle
+    /// [`RemoteError::NoSuchActor`](crate::RemoteError::NoSuchActor), or mount it
+    /// under [`Eviction::Never`] where nothing sweeps. The other half of the same
+    /// clock is [`ActorStatus::idle_for`], which is the exact reading
+    /// [`Eviction::Idle::after`] is compared against — so a row whose `idle_for`
+    /// is near the policy is a row whose actor is about to go.
+    ///
+    /// This method is named for a reading and not for a snapshot, and it is the
+    /// only one: there is no `snapshot()` beside it. A second name would promise
+    /// the one property this cannot have — that every row was taken at one
+    /// instant — while doing exactly what this does.
+    ///
     /// `contains`, `len` and `is_empty` answer three questions this answers as
     /// well, and they stay: they take one lock and allocate nothing, which is what
     /// a hot path wants.
@@ -1210,10 +1387,17 @@ impl<M> System<M> {
                 // by the buffer they came from. It is written this way because a
                 // diagnostic must not be the thing that panics, and because the
                 // alternative is an `expect` on a path with nothing to say.
-                buffered: entry
-                    .mail
-                    .max_capacity()
-                    .saturating_sub(entry.mail.capacity()),
+                // `try_from` and not `as`, the same call `now()` makes: the
+                // widening cannot fail on any target keylink builds for, and a
+                // diagnostic must not be the thing that panics if one ever
+                // appears.
+                buffered: u64::try_from(
+                    entry
+                        .mail
+                        .max_capacity()
+                        .saturating_sub(entry.mail.capacity()),
+                )
+                .unwrap_or(u64::MAX),
             })
             .collect()
     }
@@ -1271,6 +1455,7 @@ pub struct SystemBuilder<M> {
     mailbox_depth: usize,
     eviction: Eviction,
     factory: Option<Factory<M>>,
+    lifecycle: Option<Arc<dyn Lifecycle>>,
 }
 
 /// The cap, as the generic half spells it. [`SystemBuilder::DEFAULT_CAPACITY`]
@@ -1322,6 +1507,26 @@ impl<M> SystemBuilder<M> {
     #[must_use]
     pub fn capacity(mut self, actors: usize) -> Self {
         self.capacity = actors;
+        self
+    }
+
+    /// Report every mount and every ending to `lifecycle`.
+    ///
+    /// Off when nobody says, which is the one arrangement that does not decide
+    /// anything for a caller who did not ask: a system with no sink computes the
+    /// same [`Ended`] on the same teardown path and drops it, exactly as every
+    /// system did before this method existed.
+    ///
+    /// [`Events`](crate::Events) is the one keylink ships, and it is what feeds
+    /// [`Inspector`](crate::Inspector) — but the parameter is the trait, so a
+    /// program that already has a log or a metric sink can implement two methods
+    /// and skip the console entirely.
+    ///
+    /// Read [`Lifecycle`] before implementing one: both methods are synchronous
+    /// and must not block, because a mount and an eviction wait for them.
+    #[must_use]
+    pub fn lifecycle(mut self, lifecycle: impl Lifecycle) -> Self {
+        self.lifecycle = Some(Arc::new(lifecycle));
         self
     }
 
@@ -1442,6 +1647,7 @@ impl<M> SystemBuilder<M> {
             inner: Arc::new(Registry {
                 entries: RwLock::new(HashMap::new()),
                 factory: self.factory,
+                lifecycle: self.lifecycle,
                 capacity: self.capacity,
                 mailbox_depth: self.mailbox_depth,
                 eviction: self.eviction,
@@ -1462,6 +1668,7 @@ impl<M> fmt::Debug for SystemBuilder<M> {
             .field("mailbox_depth", &self.mailbox_depth)
             .field("eviction", &self.eviction)
             .field("lazy_spawn", &self.factory.is_some())
+            .field("lifecycle", &self.lifecycle.is_some())
             .finish()
     }
 }
@@ -1582,6 +1789,26 @@ mod tests {
         })
     }
 
+    /// An actor that enters a turn and never leaves it.
+    ///
+    /// The shape a shutdown budget destroys. `finished` counts turns that ran to
+    /// the end, so a test can say "this work was thrown away" rather than "the
+    /// actor is gone", which is true of a clean drain too.
+    fn wedged(
+        entered: oneshot::Sender<()>,
+        hold: oneshot::Receiver<()>,
+        finished: &Arc<AtomicUsize>,
+    ) -> Mounted<Bare> {
+        let finished = Arc::clone(finished);
+        mount(|mut inbox: Mailbox<Bare>| async move {
+            if inbox.recv().await.is_some() {
+                let _ = entered.send(());
+                let _ = hold.await;
+                finished.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    }
+
     /// A depth, for a test that means one.
     fn depth(slots: usize) -> NonZeroUsize {
         NonZeroUsize::new(slots).expect("a test never asks for a zero-slot mailbox")
@@ -1600,6 +1827,176 @@ mod tests {
         let mut rows = system.status();
         assert_eq!(rows.len(), 1, "these tests mount exactly one actor");
         rows.remove(0)
+    }
+
+    /// A [`Lifecycle`] that remembers, so a test can assert on what a registry
+    /// said rather than on whether it said anything.
+    ///
+    /// Rendered to strings on the way in, deliberately: the assertions below are
+    /// then a list compared to a list, in order, which catches a report that is
+    /// duplicated or out of sequence — neither of which a set of counters would.
+    #[derive(Clone, Default)]
+    struct Reported(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl Reported {
+        fn seen(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl Lifecycle for Reported {
+        fn mounted(&self, id: &ActorId) {
+            self.0.lock().unwrap().push(format!("mounted {id}"));
+        }
+
+        fn ended(&self, id: &ActorId, why: &Ended) {
+            self.0.lock().unwrap().push(format!("ended {id} {why:?}"));
+        }
+    }
+
+    /// **Every way an actor arrives is reported, and every way it leaves.**
+    ///
+    /// Four of the five report sites in one sequence, in order. The two that
+    /// carry the design are the ones with no caller to report from: a **lazy
+    /// spawn** happens inside a factory that no caller can see, and it is why
+    /// this is a port on the registry rather than a line at each `mount` call
+    /// site. The other two arms are the ones that must **not** report: a refused
+    /// mount announces nothing because there is no actor, and routing to an
+    /// actor already there is not a second mount.
+    ///
+    /// Red-tested twice, once per direction: announcing from `System::mount`'s
+    /// `MountError::Occupied` arm puts a fifth line in the list below (a mount
+    /// that never happened), and making `Registry::route`'s vacant arm announce
+    /// nothing removes the second (a mount nobody would have heard about).
+    ///
+    /// A third break was tried and **retracted**, because it proved the test was
+    /// blind rather than sharp: announcing from `Registry::route`'s *Occupied*
+    /// arm left this green. That arm is only reached when two messages to one new
+    /// id race between the read lock and the write lock — the second `route` here
+    /// finds the actor on `touch`'s fast path and never reaches the match at all.
+    /// So the "a second route is not a second mount" claim below is carried by
+    /// the fast path, and the race arm is covered by argument rather than by this
+    /// test.
+    #[tokio::test]
+    async fn every_way_an_actor_arrives_and_leaves_is_reported() {
+        let reported = Reported::default();
+        let system: System<Bare> = System::builder(Eviction::Never)
+            .lifecycle(reported.clone())
+            .spawn_with(|_| Some(idler()))
+            .build();
+
+        let by_hand = ActorId::new("by-hand").expect("valid");
+        let lazily = ActorId::new("lazy").expect("valid");
+
+        system.mount(by_hand.clone(), idler()).expect("free");
+        assert!(
+            system.mount(by_hand.clone(), idler()).is_err(),
+            "the id is taken, and a refusal is not a mount"
+        );
+        system.route(&lazily).expect("the factory builds one");
+        system
+            .route(&lazily)
+            .expect("and the second message finds it");
+
+        assert!(matches!(
+            system.shutdown(&by_hand, TURN).await,
+            Some(Ended::Stopped)
+        ));
+        assert!(system.abort(&lazily).await);
+
+        assert_eq!(
+            reported.seen(),
+            [
+                "mounted by-hand",
+                "mounted lazy",
+                "ended by-hand Stopped",
+                "ended lazy Vanished",
+            ],
+            "two mounts and two endings, in order, with nothing said about the \
+             refusal or the second route"
+        );
+    }
+
+    /// **An eviction that destroys a busy actor is no longer silent**, which is
+    /// the gap `Registry::sweep`'s own documentation said Wave 6 owned.
+    ///
+    /// A `shutdown_budget` below the longest turn destroys that turn where it
+    /// stands, and until this wave **nothing anywhere said so**: the `Ended` the
+    /// sweeper computed was dropped, an aborted task's observers never run, and
+    /// the caller of an evicted actor is a peer whose stream is severed rather
+    /// than answered. The actor here is mid-turn with a budget of half a turn,
+    /// so the destruction is exact rather than sampled — the clock is paused and
+    /// nothing rests on which of two timers fires first.
+    ///
+    /// `handled == 0` is what makes this a test of the *silent* case: an actor
+    /// that had finished its turn would report the same `Vanished` for a much
+    /// less interesting reason.
+    ///
+    /// The actor is wedged on a channel rather than on a timer, deliberately:
+    /// the eviction clock is paused and advanced in this test, so a turn that
+    /// ended because *that* advance reached its `sleep` would be a different
+    /// test — and it is the one that was written first, where advancing 60 s to
+    /// trigger the eviction also completed the 100 ms turn it was meant to
+    /// destroy.
+    ///
+    /// Red-tested by dropping the `report_ended` call from `sweep`, which leaves
+    /// only the mount reported.
+    #[tokio::test(start_paused = true)]
+    async fn an_eviction_that_destroys_a_busy_actor_is_no_longer_silent() {
+        let reported = Reported::default();
+        let finished = Arc::new(AtomicUsize::new(0));
+        let system: System<Bare> = System::builder(Eviction::Idle {
+            after: Duration::from_secs(60),
+            shutdown_budget: TURN,
+        })
+        .lifecycle(reported.clone())
+        .build();
+
+        let (entered, started) = oneshot::channel();
+        // Held for the whole test, so the turn below is parked rather than
+        // resumed by a dropped sender.
+        let (_hold, held) = oneshot::channel::<()>();
+
+        let one = ActorId::new("one").expect("valid");
+        system
+            .mount(one.clone(), wedged(entered, held, &finished))
+            .expect("free");
+        system
+            .route(&one)
+            .expect("mounted")
+            .send(Box::new(Bare))
+            .await
+            .expect("the one slot is free");
+        started.await.expect("the actor enters its turn");
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        system.evict_idle().await;
+        // The sweeper's own tick lands at the same instant this call does, so
+        // which task took the entry is a race and which reported it is not:
+        // whoever drained it reports once, and `sleep` on a paused runtime is
+        // what lets that drain's budget expire. `advance` plus `yield_now` would
+        // not — a ready task keeps the runtime from reaching the timer.
+        for _ in 0..100 {
+            if reported.seen().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(TURN).await;
+        }
+
+        assert!(
+            !system.contains(&one),
+            "sixty seconds of a sixty second policy"
+        );
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            0,
+            "the turn was destroyed mid-flight, which is the case that was silent"
+        );
+        assert_eq!(
+            reported.seen(),
+            ["mounted one", "ended one Vanished"],
+            "and the ending the sweeper used to drop is now somebody's answer"
+        );
     }
 
     /// A policy for the tests that are about `after` and not about the budget.

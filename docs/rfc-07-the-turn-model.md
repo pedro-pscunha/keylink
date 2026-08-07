@@ -2018,3 +2018,312 @@ day it exists, `Names` takes it unchanged.
   is. A remote fan-out is `Subscribers` plus a reverse contract, which
   `subscribers.rs` already documents and which is a different thing wearing a
   similar name.
+
+## 9. Wave 6 — observability, and the layer that is a parked reply rather than a held handler
+
+Three layers were briefed. Two shipped, and the third shipped as its client half
+and no further; §9.8 says exactly what is missing and why that was the right cut.
+
+### 9.1 THE DECISION THIS WAVE OWNS — `snapshot()` was refused, and the reason is in `status()`'s own docs
+
+Issue #3 asks for `System::snapshot()`, "named `snapshot`, not `actors`, because
+eviction runs on a timer and the list is stale the instant it returns". Wave 4d had
+already shipped `System::status() -> Vec<ActorStatus>` with exactly the four fields
+6a asks for. So the wave's first question was whether `snapshot` is a rename, an
+addition, or nothing.
+
+**It is nothing, and `snapshot` would have been the worse of the two names.**
+`status()` samples each row as the iterator reaches it — a list of ten is ten
+readings, not one instant — and 4d's own documentation says so, in the words *"why
+`ActorStatus` says so out loud rather than pretending to a snapshot"*. A consistent
+list would mean holding the write lock across every read. So a method called
+`snapshot` would promise the one property this cannot have, while doing exactly
+what `status` does. Adding it beside `status` would break "one way to build a
+thing" twice over: a second name **and** a second, false claim.
+
+What the issue actually asked for and 4d had not delivered is the **documentation**:
+staleness stated at the method with eviction named as the cause. That is the change,
+and it is a paragraph rather than a method. It says the part a caller can act on —
+this list is evidence, never a precondition; never `status().find(..)` and then
+address the result as if it were there; `idle_for` is the same reading
+`Eviction::Idle::after` is compared against, so a row near the policy is a row whose
+actor is about to go. It also says, in one sentence, that there is no `snapshot()`
+beside it and why, so the next reader finds a decision rather than an omission.
+
+`incarnations` stays absent, as the brief directed and for Wave 2's reason: nothing
+in the crate counts one, and `representability.rs::an_actor_status_claims_only_what_it_measures`
+destructures all four fields with no `..`, so adding one is `E0027` at the doc
+comment that refuses it.
+
+### 9.2 A subscriber is a parked reply. That is the whole of 6b's design
+
+Issue #3's sketch has `feed Events(event: LifecycleEvent)` inside the `Inspect`
+service and calls the feed arm "the point", on the grounds that before Wave 3 a
+live console would have been *"a hand-rolled `recv` body held open inside a handler
+— which on an actor blocks every other turn"*. The diagnosis is exactly right and
+the prescription does not follow, because **a `feed` is not on the wire**. It is an
+actor's second *input*, wired at construction; it produces no `Request` variant, no
+client method and no ALPN movement. `feed Events` in a service block gives the
+`Inspect` actor a stream to consume. It gives a console nothing.
+
+So the wave had to answer the question the sketch skipped: how does a console
+*receive*? Three shapes were considered.
+
+- **Reverse dial** — `Subscribers` plus a `Console` service the console serves, which
+  is RFC-04 §4.4's Design B and is already supported. Refused: it makes the console a
+  **server**, and a browser tab cannot accept connections. 6c's stated point is that
+  keylink compiles for wasm32 so the client can be a tab, and this shape takes that
+  off the table.
+- **A `recv` body** — the reply streams events down beside itself. Workable, and it
+  needs a hand-written `AsyncRead` over a stream plus a second framing inside
+  keylink's framing. Two layers of length prefix to carry a type the wire already
+  knows how to encode.
+- **`#[defer]`** — Wave 2c. What shipped.
+
+`rpc Follow(after: u64) -> EventPage` is `#[defer]`. A caller with nothing new to
+read has its `Reply` parked and **the turn ends**; the actor goes straight back to
+its loop. A `LifecycleEvent` arriving on the `Events` feed is a turn like any other,
+and that turn answers everybody parked. The sketch's own diagnosis is satisfied by
+the two features the sketch was written to motivate, in the other order: `#[defer]`
+is what lets the reply outlive the turn, and the `feed` is what wakes it with no
+caller present.
+
+Nothing about it is on the wire beyond an ordinary `rpc`: a deferred method is
+indistinguishable from a plain one to a peer, which §4 established and
+`tests/protocol.rs::adding_defer_to_a_method_does_not_move_the_contract_hash`
+pins.
+
+### 9.3 The property that makes it checkable rather than believable
+
+"The console does not hold a handler open on an actor" is a claim a weak test passes
+without touching. A test that only checks *the console received an event* passes
+just as well against a `follow` sitting inside a turn holding `&mut Inspector`.
+
+`tests/inspect.rs::a_parked_subscriber_does_not_stop_the_actor_serving_turns` is
+ordered so that it cannot: a subscriber attaches and parks; the **inspect** actor
+then serves twenty more round trips; the **watched** actor serves one; and only then
+does the subscriber wake, **with the event that turn produced**. The last step is
+what stops the twenty being vacuous — twenty answered calls beside a subscriber that
+had already returned would prove nothing.
+
+Both halves are watched to fail, separately, because they are separately
+load-bearing:
+
+- a `sleep` inserted before `reply.later()`, so `follow` holds its turn → the twenty
+  calls never answer and the timeout fires: *"a handler held open by the subscriber
+  would never answer these: Elapsed(())"*;
+- `on_events` re-parking instead of answering → *"the feed turn must answer the
+  parked reply: Elapsed(())"*.
+
+### 9.4 Where events come from: two producers, one sequence, and a port on the registry
+
+A console needs three facts and no single existing seam has them. `Observer` sees
+turns and nothing else — it is owned by the actor, and `TurnInfo` carries no id
+because nothing inside a turn knows which registry entry it belongs to. The registry
+sees mounts and endings and never sees a turn.
+
+So there are two producers and one sink, `Events`, which is what makes them one
+sequence instead of two unrelated logs:
+
+| fact | producer | why not the other one |
+|---|---|---|
+| `Mounted` | the registry | a lazy `spawn_with` factory mounts with **no caller present** |
+| `Turn` / `Faulted` | `Events::observer(id)`, one per actor | only the actor sees what it ran |
+| `Ended` | the registry | an **evicted** actor has no caller either |
+
+The registry half is a new `pub trait Lifecycle` with two methods, on
+`SystemBuilder::lifecycle`. It names `ActorId` and `Ended` and nothing else, so
+`registry.rs`'s standing claim — that it names no wire type — is intact, and
+§16.8's bill does not grow. `LifecycleEvent` and its wire derives live in
+`console.rs`, on the other side of the port.
+
+**`Ended` is reported by the registry and not by `Observer::finish`, deliberately.**
+`finish` does not run for an aborted actor — its own documentation says so — which
+is precisely the case that needed a signal. Reporting from both would be two answers
+to one question.
+
+### 9.5 The gap this closes, which the tree had already written down
+
+`Registry::sweep` carried a header reading *"A known gap: an eviction that destroys
+a busy actor is silent"*, and ended: *"**Wave 6 owns this.** Its `System::snapshot`
+and the console are where a destroyed-on-eviction count belongs."* `Eviction::Idle`'s
+`shutdown_budget` carried the same sentence from the other side.
+
+It was literal. `sweep` computed an `Ended` for every actor it destroyed and dropped
+it on the floor — `.map(|(_, entry)| entry)`, the id discarded with it — so a budget
+below the longest turn destroyed that turn with no log, no counter, no observer and
+no caller, because the caller of an evicted actor is a peer whose stream is severed
+rather than answered.
+
+The id travels with the entry now and the `Ended` goes to the sink. A system with no
+`Lifecycle` computes the same value on the same path and drops it exactly as before,
+so nothing changes for anybody who did not ask.
+
+`an_eviction_that_destroys_a_busy_actor_is_no_longer_silent` proves the destructive
+case rather than a clean drain: the actor is *inside* a turn, wedged on a channel, and
+`finished == 0` is what says the work was thrown away. **Its first version was the
+instrument's fault, which is worth recording.** The actor slept 100 ms per turn and
+the test advanced the clock 60 seconds to trigger the eviction — which also completed
+the turn it was meant to destroy, so `finished` read 1. An actor parked on a channel
+cannot be resumed by the eviction clock. Red-tested by deleting the `report_ended`
+call from `sweep`: `["mounted one"]` against `["mounted one", "ended one Vanished"]`.
+
+### 9.6 Two things the compiler decided, and one it decided against
+
+**`usize` cannot cross keylink's wire, and that is right.** `ActorStatus::buffered`
+was a `usize` and `postcard_schema` implements `Schema` for every fixed-width integer
+and neither pointer-sized one. That is a deliberate refusal, not an omission: a type
+whose width is the compiler's choice cannot be half of a contract between two
+machines, and keylink builds for `wasm32-unknown-unknown` **and** for 64-bit natives
+— exactly the pair that would disagree. So `buffered` is now a `u64`, widened at the
+one construction site with the `u64::try_from(..).unwrap_or(u64::MAX)` the registry's
+own clock already uses. `NodeStatus::actors` is a `u64` for the same reason. This is
+a public signature change, reported rather than buried; it moved three call sites,
+all in tests.
+
+**`extern crate self as keylink;`, one line in `lib.rs`, and it is load-bearing.**
+`service!`'s generated rustdoc links back to the crate *by name* — `keylink::mount`,
+`keylink::MailboxClosed`, `keylink::RpcClient::key_state` and thirty more — because
+every other expansion of it is rendered in somebody else's crate, where that is the
+only spelling that resolves. Inside keylink there was no such path, so the moment the
+crate expanded the macro on a non-`#[cfg(test)]` item, `mise run docs` produced **69
+broken intra-doc links**, measured by commenting the line out. `representability.rs`
+has expanded `service!` for waves without hitting this only because rustdoc does not
+render test-only code. The alternative was an `allow(rustdoc::broken_intra_doc_links)`
+inside the macro, which would have turned those links off in every downstream crate
+to fix one crate's problem.
+
+**And the one refused: no new Cargo feature.** `console.rs` adds no dependency and no
+`cfg`, so gating it would double the feature lattice `mise run features` walks in
+exchange for removing four hundred lines from a build. It compiles for wasm32 like
+the rest of the crate.
+
+### 9.7 A new ALPN, pinned, and the old one proved not to have moved
+
+`keylink/Inspect/879d78ee456a20b7` is keylink's first wire contract of its own, and
+`tests/protocol.rs::the_inspect_contract_hash_has_not_moved` pins it beside the
+probe's.
+
+`keylink/Probe/d3fe34471921164e` **did not move**, which is the claim that mattered:
+`ActorStatus` gained `Serialize`, `Deserialize` and `Schema` in this wave, and a
+service's hash walks *its own* request and response types, so a struct no existing
+service carries cannot reach one. Both pins were watched together under a break that
+adds a variant to `EndReason`: `1 passed; 1 failed` — the inspect hash moved to
+`71d62d9cd8e8eb9c` and the probe's stayed put. One break, two facts: the new pin is
+sensitive, and the two contracts are independent.
+
+The cost is stated where a reader meets it, on `ActorStatus`: a fifth field is still
+additive in Rust and is **not** additive on the wire. It moves `keylink/Inspect`'s
+hash and an old console is refused at the handshake rather than handed four fields
+where it expected five. That is the same trade `derive_alpn` makes everywhere, and
+it is another reason the two refused fields are refused rather than reserved.
+
+### 9.8 What Wave 6 did NOT do
+
+- **Ship a rendered console.** 6c was briefed as the largest and least load-bearing
+  item, with explicit permission to descope it. What shipped is its **client half**:
+  `Console`, which owns the cursor — the one part of the protocol that is easy to
+  get wrong, since a console that forgets to advance it re-reads one page forever —
+  and is a client of nothing but `inspect`, so it compiles for a tab. What is not
+  here is a rendering: no TUI, no wasm demo page, no `demo/` binary. That is a
+  presentation layer over `Console::events()`, and it would have been the rushed
+  part.
+- **Report the parked-sender count.** Still not observable, still `buffered`'s
+  documented floor, and `Inspect` carries `ActorStatus` **itself** rather than a
+  wire twin, so `representability.rs`'s four-field destructure governs what a console
+  can be told. `the_inspect_service_reports_the_status_type_itself` pins that with a
+  coerced constructor: a parallel row struct is `E0308` there.
+- **Add an `incarnation` count.** §9.1. If Wave 9 adds a restart count it is that
+  wave's field to add, and it will move `keylink/Inspect`'s hash when it does.
+- **Guarantee delivery of an event.** `Events::record` is a `try_send` and never
+  blocks, because a diagnostic that can stall a mount or an eviction is worse than
+  one that skips an event — the same argument `Subscribers` makes about
+  `Connection::closed`, one layer up. This inverts the mailbox's rule on purpose:
+  there the sender is a caller and blocking is backpressure; here the sender is a
+  teardown. What is dropped is counted and published, at `NodeStatus::lost` for the
+  channel and `EventPage::lost` for the ring.
+- **Order events against anything but themselves.** A turn on one actor and a mount
+  of another are two tasks, and their order in the log is the order they reached the
+  channel.
+- **Bound the parked followers with a number.** Every parked `Deferred` is one open
+  QUIC stream, and iroh caps those at `max_concurrent_bidi_streams` per connection
+  times the peers the allowlist admits. A second cap would be a second bound on one
+  thing.
+- **Cover the lazy-spawn race arm.** `Registry::route`'s `Occupied` arm is reached
+  only when two messages to one new id race between the read lock and the write lock.
+  A break that announces from it left `every_way_an_actor_arrives_and_leaves_is_reported`
+  **green**, because the second `route` finds the actor on `touch`'s fast path and
+  never reaches the match. Watched, retracted, and recorded here: the "a second route
+  is not a second mount" claim is carried by the fast path, and the race arm is
+  covered by argument.
+- **Give `Inspector` a way to reach the system beyond `status()`.** It holds
+  `Arc<dyn Fn() -> Vec<ActorStatus>>` and not a `System<M>`, which is what lets one
+  console answer for a system of any service — a `service!` block generates concrete
+  types and cannot be generic in a mailbox. The erasure is narrow on purpose: there
+  is no mount, no shutdown, no abort and no downcast that gets them back.
+
+### 9.9 kameo's console, read — what was taken, and the four fields refused with reasons
+
+`~/repos/ext/kameo/src/console/{wire,server,registry}.rs` was read. It is a
+pull-based TCP server: the client opens a socket, sends one byte, and gets back a
+length-prefixed MessagePack `Snapshot` of the whole system. The transport half is
+the one keylink does not need — no listener, no `SocketAddr`, no auth to invent,
+because a console here is an ordinary peer on an ALPN behind an `Allowlist`. What
+was worth reading is its **field list**, which is far richer than `ActorStatus`, and
+going through it item by item is what produced the honest gaps below rather than a
+shorter list that looked complete.
+
+**Taken.** Its `MailboxStats::len` is `max_capacity - capacity`, the same derivation
+4d arrived at independently — which is some comfort that the reading is the natural
+one. Its `Snapshot::seq`, a monotonically increasing sequence the client uses to
+detect a source restart, is the shape of `EventPage::next`; keylink's is per-event
+rather than per-snapshot because the log is a stream and not a poll, and it carries
+the same property: a `next` that went backwards is a process that restarted.
+
+**Refused, each with a reason that is keylink's rather than kameo's.**
+
+- **`captured_at: SystemTime` and `uptime`.** kameo's client diffs `captured_at`
+  between two snapshots to get an accurate `dt` rather than trusting its own receive
+  time, which is a genuinely better instrument. keylink does not have the clock to
+  do it: `SystemTime::now()` panics on `wasm32-unknown-unknown` exactly as
+  `Instant::now()` does, and this crate's whole timekeeping is `n0_future::time`
+  precisely so a browser is not a special case. A field readable on one target and
+  fatal on another is worse than no field. `idle_for` is a `Duration` off the
+  registry's own epoch, which crosses fine and means the same thing on both.
+- **`grave_window` and `ActorStatus::Stopped { at, reason }`.** kameo keeps a dead
+  actor in the snapshot for five seconds so it fades rather than blinks away, and so
+  a very short-lived actor is visible for at least one poll. That is a real problem
+  with polling a list, and keylink does not have it: an ending is an **event** in an
+  ordered log, so a short-lived actor's whole life is three entries a console cannot
+  miss by polling at the wrong moment. Keeping a dead row in `status()` would put a
+  second meaning into a list documented as "what is running".
+- **`Links { parent, children, siblings }`, `SupervisionInfo`,
+  `SupervisorStrategy`, `ActorCounters::restarts`.** Nothing in keylink has a parent,
+  a child, a restart policy or a restart count. These are Wave 9's, and inventing
+  fields for them now is how an observational number becomes a fact people route on
+  before the thing it describes exists — Wave 2's argument about `incarnation`,
+  applied to five more fields at once.
+- **`RefCounts { strong, weak }` and `MailboxKind::Unbounded`.** Unrepresentable
+  here, and in the second case *deliberately*: `SystemBuilder` has no `unbounded`
+  spelling and `representability.rs::no_mailbox_can_be_asked_to_be_unbounded` holds
+  the probe that says so. A field with one reachable variant is a field claiming a
+  choice nobody has.
+
+**And the two that are honest gaps rather than refusals**, named here so the next
+wave finds a decision instead of an omission:
+
+- **`HandlerActivity { message, elapsed }`.** kameo reports *which* message a
+  handler is running and for how long, and calls it the primary slow-or-stuck
+  signal. `ActorStatus::busy` is the one-bit version of exactly that field.
+  keylink **can** measure it — `local.rs`'s one dispatch already knows the method
+  name and the moment the turn started, which is where `Busy` is set — so this is
+  a gap and not an impossibility. It was not taken here because it changes a field
+  4d shipped, at the end of a wave, unreviewed, and because the cost is on the turn
+  hot path: `Busy` is one `AtomicBool` written twice per turn, and carrying a name
+  and an instant is a different structure. It is the highest-value follow-up in this
+  area.
+- **`WaitEdge` and the wait-for graph.** kameo's client walks those edges to detect
+  deadlocks, which is the most valuable thing in its console. keylink cannot build
+  the graph today: a turn blocked on another actor is blocked inside a caller's
+  future, and nothing records who it is waiting for. `Handle` documents a self-call
+  as a deadlock rather than detecting one. Recorded as wanted and unbuilt.

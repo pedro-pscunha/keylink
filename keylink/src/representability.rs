@@ -901,7 +901,7 @@ fn no_mailbox_can_be_asked_to_be_unbounded(builder: beta::SystemBuilder) -> beta
 /// `#[non_exhaustive]` is what stops a *caller* writing this pattern, and it is
 /// also why the probe has to live inside the crate: outside, the same pattern is
 /// `E0638` on a clean tree, which is the wrong red for the right reason.
-fn an_actor_status_claims_only_what_it_measures(status: ActorStatus) -> (bool, usize) {
+fn an_actor_status_claims_only_what_it_measures(status: ActorStatus) -> (bool, u64) {
     let ActorStatus {
         id,
         idle_for,
@@ -910,4 +910,22 @@ fn an_actor_status_claims_only_what_it_measures(status: ActorStatus) -> (bool, u
     } = status;
     let _ = (id, idle_for);
     (busy, buffered)
+}
+
+/// The claim: what a console is told about an actor **is** an [`ActorStatus`],
+/// not a struct beside it — so the four-field probe above governs the wire as
+/// well as the local call.
+///
+/// A tuple-variant constructor coerced to a function pointer with the payload
+/// type written out, which is the shape the `mailbox_depth` probe above uses and
+/// for the same reason: it pins a *type*, and a type is what a parallel struct
+/// would change. `Response::Actors(SomeConsoleActorRow)` is `E0308` here.
+///
+/// This is the whole of "`Inspect` exposes no field that `ActorStatus` cannot
+/// measure": there is no second field list to keep in step, because there is no
+/// second struct. A field claiming the parked-sender count would have to be
+/// added to `ActorStatus`, where the destructure above refuses it.
+fn the_inspect_service_reports_the_status_type_itself() -> crate::inspect::Response {
+    let actors: fn(Vec<ActorStatus>) -> crate::inspect::Response = crate::inspect::Response::Actors;
+    actors(Vec::new())
 }

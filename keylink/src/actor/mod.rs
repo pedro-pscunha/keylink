@@ -98,6 +98,6 @@ mod registry;
 mod remote;
 
 pub use registry::{
-    mount, ActorStatus, Eviction, Mailbox, MountError, Mounted, System, SystemBuilder,
+    mount, ActorStatus, Eviction, Lifecycle, Mailbox, MountError, Mounted, System, SystemBuilder,
 };
 pub use remote::{deliver_to_actor, Addressed, KeyedService, Origin};

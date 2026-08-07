@@ -1110,6 +1110,36 @@ fn the_contract_hash_has_not_moved() {
     );
 }
 
+/// **keylink's own service has a contract too, and this is its first pin.**
+///
+/// Wave 6 gave keylink a `service!` block of its own — `keylink::inspect` — so
+/// the crate now carries two wire contracts rather than a macro and no users of
+/// it. This is that contract's literal, pinned on the day it was derived.
+///
+/// The two ALPNs are **independent**, and that independence is what the wave
+/// needed: `ActorStatus` gained `Serialize`, `Deserialize` and `Schema` so that
+/// a console could read it, and the pin above proves that decision reached no
+/// existing contract. `Probe` does not carry an `ActorStatus` and neither does
+/// any keyed or singleton service, because a service's hash walks *its own*
+/// request and response types.
+///
+/// The rule for this literal is the rule for the one above: when it goes red,
+/// decide whether the change *should* be visible to a console built against the
+/// old shape, and only then update it. A fifth field on `ActorStatus` moves this
+/// hash, which is the whole point — an old console is refused at the handshake
+/// rather than handed four fields where it expected five.
+#[test]
+fn the_inspect_contract_hash_has_not_moved() {
+    const PINNED: &str = "keylink/Inspect/879d78ee456a20b7";
+
+    assert_eq!(
+        String::from_utf8_lossy(keylink::inspect::alpn()),
+        PINNED,
+        "\nthe wire format of keylink's own `inspect` service changed.\n\
+         Read this test's documentation before updating the literal.\n"
+    );
+}
+
 // ─────────────────────────────────────────────── and what must NOT move it
 
 // Two declarations of the SAME service, identical in every way except that one

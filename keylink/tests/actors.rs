@@ -2631,7 +2631,7 @@ async fn until_idle(system: &gate::System) -> keylink::ActorStatus {
 /// The deterministic way to know a call is in the MAILBOX rather than somewhere on
 /// a QUIC stream, which is what every saturation assertion below rests on. Bounded
 /// for `until_idle`'s reason.
-async fn until_buffered(system: &gate::System, messages: usize) -> keylink::ActorStatus {
+async fn until_buffered(system: &gate::System, messages: u64) -> keylink::ActorStatus {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let row = gate_status(system);
@@ -2800,6 +2800,10 @@ async fn busy_is_true_during_a_feed_turn() {
 #[tokio::test]
 async fn a_saturated_mailbox_at_depth_does_not_starve_a_feed() {
     const SLOTS: usize = 3;
+    /// The same three, as `ActorStatus::buffered` reports them. `buffered` is a
+    /// `u64` and a mailbox depth is a `usize`, because only one of the two
+    /// crosses a wire — see `ActorStatus::buffered`.
+    const SLOTS_SENT: u64 = 3;
 
     // A whole-call `Timeout` and not the fixture's default `QueueTimeout`: three
     // messages are meant to sit in this mailbox for as long as the test needs, and
@@ -2830,13 +2834,13 @@ async fn a_saturated_mailbox_at_depth_does_not_starve_a_feed() {
     let watching = async {
         entered.recv().await.expect("`hold` enters its turn");
 
-        let full = until_buffered(system, SLOTS).await;
+        let full = until_buffered(system, SLOTS_SENT).await;
         assert!(
             full.busy,
             "the actor is inside `hold` while its mailbox fills"
         );
         assert_eq!(
-            full.buffered, SLOTS,
+            full.buffered, SLOTS_SENT,
             "and the mailbox is FULL: three messages in three slots, which is the \
              state a depth of one cannot hold still"
         );

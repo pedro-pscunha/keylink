@@ -54,6 +54,11 @@
 //! - **The compositions every actor system grows**, each with its backpressure
 //!   written down rather than inherited from an unbounded queue: fan-out, a
 //!   pool, a schedule and a name registry. See [`compose`].
+//! - **Its own introspection, served over itself.** [`System::status`] lists
+//!   what is running; [`inspect`] serves that list and a live lifecycle log on
+//!   an ALPN and an [`Allowlist`] of their own, and [`Console`] is the peer that
+//!   reads them. A subscriber is a parked reply rather than a held handler, so
+//!   watching an actor does not stop it.
 
 #![warn(missing_docs)]
 // `deny` and not `forbid`, and the difference is the one `unsafe impl` below.
@@ -156,6 +161,22 @@ compile_error!(
      `unsafe impl Send` beside it. Threaded wasm is not supported."
 );
 
+// So that keylink can expand its own `service!`.
+//
+// The macro's generated rustdoc links its way back to this crate by name —
+// `[`Handle::service`]`, `[`mount`](keylink::mount)` and a dozen more — because
+// every other expansion of it is rendered in somebody else's crate, where
+// `keylink::` is the only spelling that resolves. Inside keylink there is no such
+// path by default, so `mise run docs` (`-D warnings`, broken intra-doc links
+// included) fails on every one of those links the moment the crate expands the
+// macro on a non-`#[cfg(test)]` item. `representability.rs` has expanded it for
+// waves without hitting this, because rustdoc does not render test-only code.
+//
+// The alternative was `#[allow(rustdoc::broken_intra_doc_links)]` inside the
+// macro, which would have turned the links off in **every** downstream crate to
+// fix one crate's problem. This turns them on here instead.
+extern crate self as keylink;
+
 /// Gated on the feature AND compiled only where OS threads exist. The Cargo
 /// feature alone is not enough: it controls which dependency features are on,
 /// not whether this module's `tokio::signal` and `new_multi_thread` calls are
@@ -175,6 +196,10 @@ mod body;
 // intra-doc links in *this* file's scope, which turns every `[`Topic`]` in that
 // module doc into a broken link under `mise run docs`.
 pub mod compose;
+// A private module holding one `service!` invocation and the types around it.
+// The generated module — `inspect` — is re-exported at the root below, so a
+// caller writes `keylink::inspect::Client` and never `keylink::console::inspect`.
+mod console;
 mod error;
 mod idempotency;
 mod keys;
@@ -201,13 +226,17 @@ mod watch;
 mod wire;
 
 pub use actor::{
-    deliver_to_actor, mount, ActorStatus, Addressed, Eviction, KeyedService, Mailbox, MountError,
-    Mounted, Origin, System, SystemBuilder,
+    deliver_to_actor, mount, ActorStatus, Addressed, Eviction, KeyedService, Lifecycle, Mailbox,
+    MountError, Mounted, Origin, System, SystemBuilder,
 };
 pub use admission::{Admission, Admittance, DynamicAdmission, Revocable, Revocation};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
 pub use blobs::{BlobHandle, BlobId, Blobs, BlobsAdmission, Granting, Retention, MAX_GRANTS};
 pub use body::{Body, BodyReader};
+pub use console::{
+    inspect, Console, EndReason, EventPage, EventStream, Events, Inspector, LifecycleEvent,
+    NodeStatus,
+};
 pub use error::{ConfigError, Error, Result, Transport};
 pub use idempotency::{
     Idempotency, IdempotencyRefusal, KeyState, MAX_ATTACH, MAX_RECORDED_BYTES, MAX_RECORDS,
