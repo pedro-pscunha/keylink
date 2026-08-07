@@ -3398,6 +3398,42 @@ The one case genuinely outside the argument is a **runtime shutdown**, which
 destroys tasks without going through any of the three doors. It gets no class
 either: the task that would read the cell is being destroyed too.
 
+**A second residual, and the floor bounds it rather than closing it: a caller's
+`Drop` that panics on the restart path.** §12.11's floor answers it, and for this
+one case the floor is *necessarily late* — provably, not by a race:
+
+1. `run_loop`'s teardown reaches `drop(state)`, having already settled `Restarting`
+   and disarmed its own floor.
+2. The state's `Drop` — caller's code, outside any `catching` — panics.
+3. Drop glue continues **during that unwind**, which is where a `Deferred` parked
+   in that state dies and where its peer is woken.
+4. The unwind leaves `run_loop`, whose floor is spent.
+5. Only then does it reach `supervise`'s frame and fire that floor.
+
+Step 5 is in a strictly outer frame than step 3, so the floor **cannot** precede
+the death. It makes the cell right for every later reader; it does not make the
+answer right for the peer whose read that death woke, and that peer can still see
+`Failed("restarting: ..")` for an actor that will never come back. An end-to-end
+probe of it returned `NoSuchActor` — a race won by a wide margin, because the whole
+unwind completes before the peer task is polled, and not an order kept.
+
+**It is unfixable with this mechanism**, which is the part that makes it a residual
+rather than a defect: settling `Gone` before `drop(state)` would overwrite
+`Restarting` on the *normal* restart path, which is N2 exactly. What would close it
+is catching a caller's `Drop` — and that is the third instance of the decision
+§12.11 refuses for the factory and the feed, on the same grounds: it changes what a
+panicking `Drop` *means*, from an actor destroyed to an actor that restarts, which
+is a supervision-semantics choice with its own guards to write. Not attempted, and
+named here rather than left to be discovered.
+
+`a_state_that_panics_on_drop_mid_restart_is_gone_not_restarting` therefore asserts
+the cell's **final** value after joining the unwound task, not the value at the
+instant of death. That is the part the third disarm destroys and the part a
+regression would show; the cell-to-wire step is break 20's. The gap between them is
+this residual, and it is disclosed rather than papered over — which is the same
+distinction §12.3's table draws for `Mailbox::drop`, a floor whose ordering against
+a hand-written loop's own state is likewise unstated because it is unstateable.
+
 ### 12.5 What it costs, measured
 
 `tests/actor_memory.rs`, ten thousand idle actors, same machine:

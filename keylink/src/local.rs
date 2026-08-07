@@ -2065,9 +2065,18 @@ impl<'a> Floor<'a> {
     /// returns. `supervise` deliberately stays armed across [`run_loop`]: a
     /// caller's state whose `Drop` panics on the restart path unwinds after
     /// `run_loop`'s floor has been disarmed and after the verdict was settled
-    /// `Restarting`, and this is the only floor left under the `Deferred` dying in
+    /// `Restarting`, and this is the only floor left for the `Deferred` dying in
     /// that unwind. Disarming there answers *retry, another is coming* about an
     /// actor that will never come back.
+    ///
+    /// **"Left for" and not "left under": for that one case this floor is
+    /// necessarily LATE.** The `Deferred` dies inside `drop(state)`, in
+    /// `run_loop`'s frame; this floor fires when the unwind reaches `supervise`'s,
+    /// which is strictly outer. So it cannot precede the death — it makes the cell
+    /// right for every later reader without making it right for the peer that
+    /// death woke. RFC-07 §12.4 carries it as a bounded residual, and it is
+    /// unfixable with this mechanism: settling `Gone` *before* `drop(state)` would
+    /// overwrite `Restarting` on the normal restart path, which is N2 exactly.
     ///
     /// `a_state_that_panics_on_drop_mid_restart_is_gone_not_restarting` holds it,
     /// so the rule is enforced rather than merely written down.
@@ -2323,6 +2332,11 @@ where
     //   that unwind. This floor is the only thing left to catch it, and without
     //   it the peer reads `Failed("restarting: ..")` — *retry, another is
     //   coming* — about an actor that will never come back.
+    //
+    //   For *that* case the floor is necessarily late rather than early: the
+    //   death is inside `run_loop`'s frame and this fires in `supervise`'s, so it
+    //   corrects the cell rather than pre-empting the read. §12.4 records it as a
+    //   residual the floor bounds and does not close.
     //
     // So the rule on `Floor::disarm` is *immediately before each way the scope
     // returns*, and `run_loop` is not a way this scope returns. There is no third
@@ -4463,9 +4477,24 @@ mod tests {
     /// A restart is granted, so the cell holds `Restarting` and `run_loop`
     /// disarms its own floor at the settle. Then `drop(state)` panics. The unwind
     /// carries past `run_loop` — whose floor is spent — into `supervise`, and
-    /// `supervise`'s floor is the last thing between a `Deferred` dying in that
-    /// unwind and a peer being told *retry, another incarnation is coming* about
-    /// an actor that will never come back.
+    /// `supervise`'s floor is the only thing that will ever correct the cell from
+    /// `Restarting`, which is *retry, another incarnation is coming*, about an
+    /// actor that will never come back.
+    ///
+    /// # What this asserts, which is the cell's FINAL value and not the instant
+    ///
+    /// Stated because the distinction is the whole of the residual §12.4 records.
+    /// The `Deferred` dies inside `drop(state)`, in `run_loop`'s frame; this floor
+    /// fires when the unwind reaches `supervise`'s, which is strictly outer. **So
+    /// the floor is necessarily later than the death** — provably, not by a race —
+    /// and it corrects the cell for every later reader rather than pre-empting the
+    /// read the death woke. That peer can still see `Restarting`.
+    ///
+    /// This asserts the corrected value, after joining the unwound task, because
+    /// that is the part the third disarm would destroy and the part a regression
+    /// would show. It does **not** assert what a peer reads at the instant of
+    /// death, and no guard here does: `break 20` covers the cell-to-wire step, and
+    /// the gap between them is the residual rather than an untested claim.
     ///
     /// **This is why there is no third disarm**, and the history is worth keeping
     /// because the instruction to add one was reasonable and wrong: leaving the
