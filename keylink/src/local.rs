@@ -2057,6 +2057,20 @@ impl<'a> Floor<'a> {
     /// one. The rule that matters is not *how many* but *where*: a disarm that is
     /// not the last thing before a return leaves a window with no floor, which is
     /// exactly what an early disarm before `run_loop` did to the backoff.
+    ///
+    /// # "And nowhere else" includes around a nested call, and that is load-bearing
+    ///
+    /// Reading this rule as *disarm wherever the guarded code has its own floor*
+    /// is the mistake it invites, because a nested call is not a way this scope
+    /// returns. `supervise` deliberately stays armed across [`run_loop`]: a
+    /// caller's state whose `Drop` panics on the restart path unwinds after
+    /// `run_loop`'s floor has been disarmed and after the verdict was settled
+    /// `Restarting`, and this is the only floor left under the `Deferred` dying in
+    /// that unwind. Disarming there answers *retry, another is coming* about an
+    /// actor that will never come back.
+    ///
+    /// `a_state_that_panics_on_drop_mid_restart_is_gone_not_restarting` holds it,
+    /// so the rule is enforced rather than merely written down.
     fn disarm(&mut self) {
         self.armed = false;
     }
@@ -2298,10 +2312,27 @@ where
     // Both are the **false** answer this design refuses rather than the merely
     // less useful one RFC-07 §12.4 accepts.
     //
-    // Disarmed before the returns rather than around `run_loop` is what keeps the
+    // **Staying armed across `run_loop` is REQUIRED, not merely harmless.** This
+    // comment said "nothing else drops this, so nothing else can fire it", which
+    // reads as a licence to disarm here and re-arm after — and doing that
+    // reintroduces a defect:
+    //
+    //   a caller's state whose `Drop` **panics** on the restart path unwinds
+    //   `run_loop` *after* the verdict was settled `Restarting` and after
+    //   `run_loop`'s own floor was disarmed. The parked `Deferred` dies inside
+    //   that unwind. This floor is the only thing left to catch it, and without
+    //   it the peer reads `Failed("restarting: ..")` — *retry, another is
+    //   coming* — about an actor that will never come back.
+    //
+    // So the rule on `Floor::disarm` is *immediately before each way the scope
+    // returns*, and `run_loop` is not a way this scope returns. There is no third
+    // disarm, and `a_state_that_panics_on_drop_mid_restart_is_gone_not_restarting`
+    // is what stops one being added: it is the only guard in this design that
+    // holds a line whose correctness was otherwise defended by a comment.
+    //
+    // Disarming before the returns and nowhere else is also what keeps the
     // give-up guards attributable: a floor that fires *after* an explicit settle
     // re-writes the right answer over a broken one and leaves the break green.
-    // Nothing else drops this, so nothing else can fire it.
     let mut floor = Floor::armed(fate);
     let mut budget = Budget::new(limit);
     loop {
@@ -3421,7 +3452,16 @@ mod tests {
     ///
     /// Made red by `scripts/break-once.sh keylink/src/local.rs` on `lost`'s
     /// `Standing::Gone` arm → `RemoteError::Failed(format!("{DROPPED}{id}"))`.
-    /// Watched output recorded below.
+    /// Watched: `left: Failed("dropped: id")`, `right: NoSuchActor { id: "id" }`.
+    ///
+    /// **This was the third guard shipped with a promissory note instead of an
+    /// output**, after the two in `tests/supervision.rs`. It is worth naming as a
+    /// pattern rather than a slip: writing the record before running the break
+    /// leaves a sentence that reads like evidence, and the two earlier ones were
+    /// only caught because a reviewer grepped for the placeholder. The replay
+    /// script's premise — every break carries the substring its guard's doc
+    /// records — was false for this one, and its expected string came from a run
+    /// rather than from here.
     #[test]
     fn the_gone_answer_is_not_a_failed_and_carries_no_prefix() {
         assert_eq!(
@@ -4391,6 +4431,96 @@ mod tests {
 
         running.abort();
         let _ = running.await;
+        drop(mail);
+    }
+
+    /// A state whose `Drop` panics, which is the one unwind that happens **after**
+    /// the verdict is settled and after [`run_loop`]'s own floor is disarmed.
+    ///
+    /// A caller's `Drop` is caller's code, and nothing guards it: `run_loop`'s
+    /// teardown runs `drop(state)` outside any `catching`. Drop glue continues
+    /// during the unwind, so a `Deferred` parked in such a state still dies — with
+    /// `Restarting` in the cell and only [`supervise`]'s floor left above it.
+    struct Poisoned;
+
+    impl Drop for Poisoned {
+        fn drop(&mut self) {
+            panic!("the state exploded on its way out");
+        }
+    }
+
+    impl Turn<Poisoned> for Fatal {
+        async fn run(self, _state: &mut Poisoned, _hooks: &mut Hooks<Poisoned>) -> Option<Ended> {
+            Some(Ended::Panicked {
+                message: "this incarnation is over".to_string(),
+            })
+        }
+    }
+
+    /// **The guard for the one line in this design that only a comment defended:
+    /// [`supervise`]'s floor staying armed across [`run_loop`].**
+    ///
+    /// A restart is granted, so the cell holds `Restarting` and `run_loop`
+    /// disarms its own floor at the settle. Then `drop(state)` panics. The unwind
+    /// carries past `run_loop` — whose floor is spent — into `supervise`, and
+    /// `supervise`'s floor is the last thing between a `Deferred` dying in that
+    /// unwind and a peer being told *retry, another incarnation is coming* about
+    /// an actor that will never come back.
+    ///
+    /// **This is why there is no third disarm**, and the history is worth keeping
+    /// because the instruction to add one was reasonable and wrong: leaving the
+    /// floor armed across `run_loop` was declined on the grounds that it buys
+    /// nothing, which understated it. It is load-bearing, and nothing in the
+    /// replay set covered it — break 21 disarms at the *declaration*, a different
+    /// edit — so correct code was protected by prose.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/local.rs`, adding the third
+    /// disarm: `floor.disarm();` before the `run_loop` call and
+    /// `floor = Floor::armed(fate);` after it. Watched: `a state that panicked on
+    /// the way out is gone, not restarting: Restarting(Panicked { message: "this
+    /// incarnation is over" })`.
+    #[tokio::test]
+    async fn a_state_that_panics_on_drop_mid_restart_is_gone_not_restarting() {
+        let fate = Fate::default();
+        let (mail, inbox) = mpsc::channel::<Message<Poisoned, Fatal>>(1);
+        let limit = Intensity::new(
+            NonZeroU32::new(4).expect("four restarts"),
+            Duration::from_millis(100),
+        )
+        .expect("a 25ms backoff is not zero");
+
+        let running = {
+            let held = fate.clone();
+            n0_future::task::spawn(async move {
+                let fate = held;
+                supervise(
+                    move || async move { Ok::<_, Stop>((Poisoned, Vec::new(), ())) },
+                    limit,
+                    inbox,
+                    &fate,
+                )
+                .await
+            })
+        };
+
+        mail.send(Message::Mail(Box::new(Fatal)))
+            .await
+            .expect("the first incarnation takes it");
+        // The incarnation ends with a restart granted, and then its state panics
+        // on the way out — which unwinds the supervising task.
+        let joined = n0_future::time::timeout(Duration::from_secs(60), running)
+            .await
+            .expect("the task must unwind rather than hang");
+        assert!(
+            joined.is_err(),
+            "this test is about an unwind, so the task must not have returned normally"
+        );
+
+        assert!(
+            matches!(fate.standing(), Standing::Gone),
+            "a state that panicked on the way out is gone, not restarting: {:?}",
+            fate.standing()
+        );
         drop(mail);
     }
 }

@@ -107,7 +107,7 @@ keylink/src/local.rs \
   an_ending_incarnation_settles_its_verdict_and_its_mailbox_before_its_state -p keylink --lib
 
 run "5 give-up does not close the mailbox" \
-'a give-up must close the mailbox and a restart must not' \
+'a give-up must close the mailbox and a restart must not: [(Restarting(Panicked { message: "this incarnation is over" }), false), (Gone, false)]' \
 keylink/src/local.rs \
 '        self.close();
         Standing::Gone' \
@@ -276,6 +276,15 @@ keylink/src/local.rs \
     loop {
         let mut floor = Floor::armed(fate);' \
   a_transient_factory_failure_does_not_overwrite_a_pending_restart -p keylink --lib
+
+run "23 the third disarm around run_loop (load-bearing floor)" \
+'a state that panicked on the way out is gone, not restarting: Restarting(Panicked { message: "this incarnation is over" })' \
+keylink/src/local.rs \
+'        let (reason, verdict) = run_loop(state, hooks, feeds, lent, fate).await;' \
+'        floor.disarm();
+        let (reason, verdict) = run_loop(state, hooks, feeds, lent, fate).await;
+        floor = Floor::armed(fate);' \
+  a_state_that_panics_on_drop_mid_restart_is_gone_not_restarting -p keylink --lib
 
 if [ "$failed" -ne 0 ]; then
     echo "── $failed of $total recorded outputs were not reproduced"
