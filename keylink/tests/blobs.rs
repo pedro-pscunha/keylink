@@ -1280,3 +1280,203 @@ async fn a_keyed_service_with_blob_methods_and_no_store_is_refused_at_startup() 
         "expected a missing-store config error, got {error:?}"
     );
 }
+
+// ═════════════════════════════ a replayed address is not a bearer token
+//
+// Two lifetimes cross here and they are deliberately unequal:
+//
+// - the idempotency record, bounded by `MAX_RECORDS`, `MAX_RECORDED_BYTES` and
+//   `RECORD_TTL`, held in the service's `Ledger`;
+// - the grant, bounded by `MAX_GRANTS` and evicted **oldest first across every
+//   peer**, held in the node's grant book.
+//
+// A `blob` reply is recordable — the generated dispatch answers with
+// `Body::empty()`, so `declared_len()` is `Some(0)`, so `Guard::record` is
+// handed `carries_body: false` and stores the frame rather than
+// `Slot::Unrecordable`. And `serve_one` returns at `Claimed::Replay` **before**
+// the grant site, so a replay re-sends the recorded `BlobId` and records no
+// grant.
+//
+// The question that makes that either harmless or a hole is whether the address
+// carries any authority of its own. It does not: `admits_get` reads the grant
+// book on **every** request, so an address whose grant has been evicted is
+// refused however the caller came by it. The test below drives exactly the
+// sequence — record kept, grant evicted, key retried — and pins the refusal.
+
+// The service for the sequence: one pinned address under an idempotency key,
+// and a filler method that hands out a distinct address per call so grants can
+// be counted off the end of the book.
+keylink::service! {
+    service Vault;
+
+    blob Receipt(order: String) -> Manual;
+    blob Filler(nth: u64) -> Manual;
+}
+
+#[derive(Debug, Clone)]
+struct Strongroom {
+    receipt: BlobId,
+    /// One address per filler call. Distinct on purpose: a repeat grant takes no
+    /// second slot in the eviction queue, so a filler that returned one address
+    /// would evict nothing.
+    filler: std::sync::Arc<Vec<BlobId>>,
+    /// How many times `receipt` was entered. A replayed reply and a re-run one
+    /// are byte identical, so this is the only way to prove which path the retry
+    /// took — and "the replay never reaches the grant site" is a claim about the
+    /// path, not about the bytes.
+    entered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl vault::Handler for Strongroom {
+    async fn receipt(&self, _cx: &Context, _order: String) -> (Manual, BlobId) {
+        self.entered
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (Manual { pages: 7 }, self.receipt)
+    }
+
+    async fn filler(&self, _cx: &Context, nth: u64) -> (Manual, BlobId) {
+        (
+            Manual { pages: 0 },
+            *self
+                .filler
+                .get(nth as usize)
+                .expect("the test asks for an address it added"),
+        )
+    }
+}
+
+/// **The sequence, over three real endpoints: the record outlives the grant, the
+/// replay hands the address back, and the fetch is still refused.**
+///
+/// Countable rather than timed. Nothing here waits for `RECORD_TTL`; the record
+/// is shown to be present by asking the ledger (`key_state` is `Done`), and the
+/// grant is shown to be absent by `MAX_GRANTS` evictions, which is arithmetic.
+///
+/// The `Filler` flood is driven by a **second** peer, which is the part worth
+/// having: `Book::order` is one queue across every peer, so `flood` evicts
+/// `caller`'s grant without `caller` making a single call. A peer therefore
+/// cannot keep its own capability alive by being quiet.
+#[tokio::test]
+async fn a_replayed_blob_reply_hands_out_an_address_whose_grant_is_gone_and_the_fetch_is_refused() {
+    let server = local_node().await;
+    let caller = local_node().await;
+    let flood = local_node().await;
+    let blobs = Blobs::memory();
+
+    let receipt = blobs
+        .add_bytes(b"the receipt, recorded under a key".to_vec())
+        .await
+        .expect("stores");
+    let mut filler = Vec::with_capacity(keylink::MAX_GRANTS);
+    for nth in 0..keylink::MAX_GRANTS {
+        filler.push(
+            blobs
+                .add_bytes(format!("filler {nth}").into_bytes())
+                .await
+                .expect("stores"),
+        );
+    }
+
+    let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let strongroom = Strongroom {
+        receipt,
+        filler: std::sync::Arc::new(filler),
+        entered: std::sync::Arc::clone(&entered),
+    };
+    let _running = keylink::Server::builder(&server)
+        .service(
+            vault::service(strongroom, Allowlist::anyone())
+                .with_blobs(&blobs)
+                .build(),
+        )
+        .spawn()
+        .expect("one service with a store");
+    let server_addr = server.endpoint().addr();
+
+    let client = vault::Client::connect(&caller, server_addr.clone())
+        .await
+        .expect("the caller dials");
+    let flooder = vault::Client::connect(&flood, server_addr.clone())
+        .await
+        .expect("the flooding peer dials");
+
+    // 1. The keyed call. The grant is recorded at the grant site, and the reply
+    //    frame is recorded in the ledger because a `blob` reply carries no body.
+    let key = keylink::IdempotencyKey::new("receipt-42").expect("a valid key");
+    let (manual, handle) = client
+        .with_idempotency(key.clone())
+        .receipt("42".to_owned())
+        .await
+        .expect("the first call runs");
+    assert_eq!(manual.pages, 7);
+
+    // The control: the address the first reply carried is fetchable. Without
+    // this the refusal at the end proves nothing.
+    let mut sink = Vec::new();
+    handle.copy_to(&mut sink).await.expect("granted");
+    assert_eq!(sink, b"the receipt, recorded under a key");
+
+    // 2. Further grants, all to the OTHER peer. The caller's grant is the
+    //    oldest entry in the book, so it is the first one evicted — and one
+    //    grant is already recorded, so `MAX_GRANTS` more takes the queue exactly
+    //    one over the limit. One fewer evicts nothing, which is what the red
+    //    test for this file changes.
+    let to_evict = keylink::MAX_GRANTS;
+    for nth in 0..to_evict {
+        flooder
+            .filler(nth as u64)
+            .await
+            .expect("the filler call runs");
+    }
+
+    // 3. The record is still there. This is the half of "two lifetimes" that
+    //    makes the sequence reachable at all, and it is asserted rather than
+    //    assumed.
+    assert!(
+        matches!(
+            client.key_state(key.clone()).await.expect("answers"),
+            keylink::KeyState::Done
+        ),
+        "the reply frame must still be recorded, or there is nothing to replay"
+    );
+
+    // 4. The retry is answered from the record, and the recorded frame carries
+    //    the same address — the replay path never reaches the grant site.
+    let (replayed_manual, replayed) = client
+        .with_idempotency(key)
+        .receipt("42".to_owned())
+        .await
+        .expect("the retry is answered from the record");
+    assert_eq!(replayed_manual.pages, 7);
+    assert_eq!(
+        entered.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the retry must have been replayed, not re-run: a re-run would pass \
+         through the grant site and re-record the grant, which is the very thing \
+         the replay path is said to skip"
+    );
+
+    // 5. And it is worth nothing. The grant book is read per request, so the
+    //    address the replay handed back is refused exactly like an address the
+    //    handler never returned.
+    let mut sink = Vec::new();
+    let error = replayed
+        .copy_to(&mut sink)
+        .await
+        .expect_err("a replayed address whose grant was evicted must be refused");
+    assert_refused(&error, "a replayed address with no live grant");
+    assert!(
+        sink.is_empty(),
+        "nothing may be served before the refusal: got {} bytes",
+        sink.len()
+    );
+
+    // The same refusal for a peer that spells the address out by hand, so the
+    // refusal above is the grant book talking and not the handle's own state.
+    let mut sink = Vec::new();
+    let error = BlobHandle::new(&caller, server_addr, receipt)
+        .copy_to(&mut sink)
+        .await
+        .expect_err("the evicted grant is gone for every route to the address");
+    assert_refused(&error, "the address spelled out by hand");
+}
