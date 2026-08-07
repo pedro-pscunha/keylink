@@ -280,10 +280,18 @@ pub mod inspect {
 
     /// Named only so that the generated rustdoc above resolves its own
     /// cross-references. Nothing outside this crate has a use for one.
+    ///
+    /// `IdempotentClient` joined this list after the fact, and how it got here is
+    /// the argument for the list existing. It was added to `service!` on one
+    /// branch while this narrowing was written on another; each was green alone,
+    /// and `mise run docs` went red the first time the two were built together.
+    /// A generated doc comment cross-references its own module's siblings, so
+    /// **every** name `service!` learns to mention is a name this list must learn
+    /// too — which is a maintenance cost worth naming rather than a one-off.
     #[doc(hidden)]
     pub use crate::console::inspect::{
         actor, actor_with, at, keyed_service, serve, service, spawn, spawn_wired, Actor, Handler,
-        KeyedClient,
+        IdempotentClient, KeyedClient,
     };
 }
 pub use error::{ConfigError, Error, Result, Transport};
