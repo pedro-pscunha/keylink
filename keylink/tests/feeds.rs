@@ -682,13 +682,14 @@ async fn a_feed_turn_is_stored_on_the_same_rule_as_a_mailbox_turn() {
     marks.send(22).await.expect("the feed accepts");
     drop(marks);
     {
-        let (restored, saver) = Persist::<Tape, _>::open(&files, &id)
+        let opened = Persist::<Tape, _>::open(&files, &id)
             .await
             .expect("claims and loads");
-        assert!(restored.is_none(), "nothing has been stored yet");
+        assert!(!opened.was_stored(), "nothing has been stored yet");
+        let (state, saver) = opened.start_from(Tape::default);
 
         let tape = tape::actor_wired(
-            Tape::default(),
+            state,
             vec![Box::new(saver)],
             tape::Feeds::new(feed(mark_rx)),
         );
@@ -701,10 +702,11 @@ async fn a_feed_turn_is_stored_on_the_same_rule_as_a_mailbox_turn() {
     }
 
     // The claim is released with the actor, so a new "process" can open it.
-    let (restored, _saver) = Persist::<Tape, _>::open(&files, &id)
+    let opened = Persist::<Tape, _>::open(&files, &id)
         .await
         .expect("the claim was released with the actor");
-    let reloaded = restored.expect("something was stored");
+    assert!(opened.was_stored(), "something was stored");
+    let (reloaded, _saver) = opened.start_from(Tape::default);
     assert_eq!(
         reloaded.marks,
         vec![11, 22],

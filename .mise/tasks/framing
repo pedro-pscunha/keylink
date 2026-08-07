@@ -19,6 +19,20 @@
 # it, while NOT importing `Versioned`, which lives in the `versioned` module.
 # The one import that hands over the raw port and withholds the wrapper.
 #
+# **An IMPLEMENTOR of the port is exempt, and that exemption is the check's
+# correctness rather than a hole in it.** `impl Claim for MyStore` names the
+# trait because it has to; there is no spelling of "implement this trait" that
+# does not. So the check as first written refused, in-tree, exactly what
+# sealing the trait would have refused — while the paragraph at the bottom of
+# this comment rejects sealing for costing "the hexagon its whole point". Both
+# could not be true. A bucket adapter, a vault adapter, and the test-crate
+# adapter that makes a `store` fail on demand — the one that turns "a failed
+# store is not silently retried" from an argument into a red test — are all
+# the port working, not the port leaking. What is forbidden is *calling*
+# `Claim::store` on somebody else's claim, and that is the second check's job,
+# with a named allowlist. This one now catches the import route only where
+# nothing in the file defines the trait's other side.
+#
 # The second is the ordinary grep. It used to look for `.store(&` and
 # `.store(b"`, which is what a raw write looked like at the time; thirteen
 # lines of `claim.store(payload.as_slice())` walked through it. So it now
@@ -36,7 +50,9 @@
 # Sealing `Claim` would not help, and was considered: sealing stops a foreign
 # crate IMPLEMENTING a trait, not calling its methods, so it closes nothing
 # here — and the port exists to be implemented from outside, for a bucket or a
-# vault. It would cost the hexagon its whole point to buy nothing.
+# vault. It would cost the hexagon its whole point to buy nothing. The
+# implementor exemption above is what makes this paragraph true of the task
+# and not only of the type.
 set -euo pipefail
 
 root="${MISE_PROJECT_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
@@ -80,13 +96,28 @@ uncommented() { drop '^[^:]*:[0-9]+:\s*(//|/\*|\*)'; }
 
 fail=0
 
-named_outside="$(
+in_scope="$(
     scan --line-number --glob '*.rs' --glob '!keylink-persist/**' \
         'keylink_persist::(\*|Claim\b|\{[^}]*(\bClaim\b|\*))|\buse\s+keylink_persist\s+as\b' . \
         | uncommented
 )"
 
-if [[ -n "$named_outside" ]]; then
+# `impl Claim for X`, in either spelling and with or without generics. A file
+# holding one is an adapter for the port and keeps the trait's name for the
+# only reason Rust offers.
+implements='^\s*impl(\s*<[^>]*>)?\s+(keylink_persist::)?Claim(\s*<[^>]*>)?\s+for\b'
+
+named_outside=""
+while IFS= read -r hit; do
+    [[ -z "$hit" ]] && continue
+    # `path:line:text`, so the path is everything before the first colon.
+    if rg --quiet "$implements" "${hit%%:*}"; then
+        continue
+    fi
+    named_outside+="$hit"$'\n'
+done <<<"$in_scope"
+
+if [[ -n "${named_outside//[$'\n']/}" ]]; then
     fail=1
     echo "── keylink_persist::Claim is in scope outside keylink-persist:" >&2
     echo "$named_outside" >&2
@@ -97,6 +128,9 @@ if [[ -n "$named_outside" ]]; then
     echo >&2
     echo "A glob import counts. 'use keylink_persist::*' brings Claim in and" >&2
     echo "leaves Versioned behind, which is the wrong half of the crate." >&2
+    echo >&2
+    echo "IMPLEMENTING the port is not this. A file containing 'impl Claim for'" >&2
+    echo "is an adapter and is exempt — that is what the port is for." >&2
 fi
 
 # The allowlist, and why each file is on it:

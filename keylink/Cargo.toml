@@ -102,7 +102,14 @@ tokio = { version = "1", default-features = false, features = ["io-util", "sync"
 #
 # `default-features = false` drops the file adapter, and with it `tokio/fs`.
 # `persist-file` adds it back for whoever has a disk.
-keylink-persist = { path = "../keylink-persist", optional = true, default-features = false }
+#
+# **`version` beside `path`, and it is not optional decoration.** cargo strips an
+# unversioned dev-dependency when it packages, so this line was fine while it was
+# one; a real dependency without a version requirement is
+# `error: all dependencies must have a version requirement specified when
+# packaging`, and `cargo package -p keylink` failed from the commit that promoted
+# it. `mise run package` is the gate that says so now.
+keylink-persist = { path = "../keylink-persist", version = "0.1.0", optional = true, default-features = false }
 
 # Scoped by target rather than by cargo feature, on purpose. A feature that
 # enabled `tokio/fs` would fail inside mio, several crates away from the

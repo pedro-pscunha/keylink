@@ -47,6 +47,7 @@ run = [
     { task = "docs" },
     { task = "wasm" },
     { task = "wasm-web" },
+    { task = "package" },
 ]
 
 # ── what the hooks run ──────────────────────────────────────────────────────
@@ -103,6 +104,32 @@ description = "rustdoc as a gate, not as decoration"
 # `keylink-persist` declares `missing_docs` too and was not listed here, so its
 # own gate was decoration until this line named it.
 run = "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features -p keylink -p keylink-persist"
+
+# ── shipping ────────────────────────────────────────────────────────────────
+
+[tasks.package]
+description = "Both crates still package, so neither has become unpublishable"
+# A manifest can stop being publishable without one line of code changing, and
+# nothing else in this gate looks. It happened: Wave 5 promoted `keylink-persist`
+# from a dev-dependency to a real one, and cargo strips unversioned dev-deps when
+# it packages — so `keylink` went from packaging fine to
+# `error: all dependencies must have a version requirement specified when
+# packaging`, silently, in a commit about durability. `keylink-persist` was also
+# `publish = false`, which would have refused the publish a second way.
+#
+# `--no-verify` skips the rebuild from the packaged tarball, which the rest of
+# this gate has already done from the same sources. What is being checked is the
+# manifest, and that is what fails.
+#
+# `--allow-dirty` because this runs on a working tree, including in the commit
+# path.
+#
+# `--exclude demo` and not `-p keylink -p keylink-persist`: `demo` is
+# `publish = false` and depends on `keylink` by path with no version, which is
+# correct for a demo and is a manifest error for anything shipped. Excluding by
+# name means a NEW workspace member is checked by default, which is the way round
+# that fails loudly.
+run = "cargo package --workspace --exclude demo --no-verify --allow-dirty"
 
 # ── supply chain ────────────────────────────────────────────────────────────
 

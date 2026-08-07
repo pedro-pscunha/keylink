@@ -101,7 +101,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //  A snapshot from a *newer* build stops here with `FromTheFuture` rather
     //  than being read as far as this build understands: half a state is worse
     //  than none, and writing the truncation back would be worse still.
-    let (restored, saver) = match Persist::<Ledger, _>::open(&store, &id).await {
+    let opened = match Persist::<Ledger, _>::open(&store, &id).await {
         Ok(opened) => opened,
         Err(keylink_persist::Error::Busy { id }) => {
             // NOT a transient error to retry in a loop. Another process
@@ -113,27 +113,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Err(other) => return Err(other.into()),
     };
 
-    let state = match restored {
-        Some(state) => {
-            println!(
-                "restored {} entries from {}",
-                state.entries.len(),
-                root.display()
-            );
-            state
-        }
-        None => {
-            println!("first run: no snapshot under {}", root.display());
-            Ledger::default()
-        }
-    };
+    //  `was_stored` asks the question without taking the answer, and
+    //  `start_from` is the only way to reach the observer — so there is no
+    //  spelling of these two lines that starts the actor from an empty ledger
+    //  while a full one sits on the disk. That used to be a tuple, and
+    //  `let (_restored, saver) = ..` compiled clean.
+    let first_run = !opened.was_stored();
+    let (state, saver) = opened.start_from(Ledger::default);
+    if first_run {
+        println!("first run: no snapshot under {}", root.display());
+    } else {
+        println!(
+            "restored {} entries from {}",
+            state.entries.len(),
+            root.display()
+        );
+    }
 
     // ── 2. Start the actor with the adapter watching its turns.
     //
     //  There is no commit loop below this line, and that is the whole of what
     //  Wave 5 changed. `saver` is an `Observer`, so it runs inside every turn,
-    //  after the handler and **before the reply** — an answered call is a stored
-    //  call, and a panicked turn is refused rather than written.
+    //  after the handler and **before the reply the loop sends** — an answered
+    //  `rpc` is a stored `rpc`, and a panicked turn is refused rather than
+    //  written.
+    //
+    //  Neither method here is `#[defer]`, and that is why the sentence above
+    //  needs no asterisk. A `#[defer]` method answering through
+    //  `Deferred::send` hands its caller the value from inside the handler,
+    //  before the observer chain — see `keylink::Persist`'s module header.
     let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
     println!("carried over: total {}", ledger.total().await?);
 
@@ -157,12 +165,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //  it: **~7.6 ms** on the machine named in `keylink/src/persist.rs`, against
     //  ~18 µs for the same turn unobserved — about 130 turns per second per
     //  actor. That is the price of "a reply means it is on the disk", and the
-    //  knob that trades it away is a debounce, which `Observer::finish` is
-    //  already the guaranteed final flush for.
+    //  knob that trades it away is a debounce — which nothing here implements,
+    //  because a debounce gives up exactly the property this example is about.
     //
-    //  Nothing here is uncommitted any more. The window the previous version of
-    //  this example demonstrated — a turn the caller's loop had not got around
-    //  to storing — does not exist when the store is inside the turn.
+    //  Nothing in THIS example is uncommitted any more. The window the previous
+    //  version demonstrated — a turn the caller's loop had not got around to
+    //  storing — does not exist when the store is inside the turn. Two windows
+    //  the store's placement does not close, both named rather than implied:
+    //  a `#[defer]` method answering through `Deferred::send`, and the volatile
+    //  idempotency ledger a retrying peer is matched against (RFC-07 §6.8).
     ledger.stop().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     Ok(())

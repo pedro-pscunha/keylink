@@ -1,6 +1,25 @@
 //! The one adapter the [`Observer`] port is owed: a state written after every
 //! turn, in front of the reply.
 //!
+//! # "In front of the reply" means the reply the **loop** sends
+//!
+//! Say the exception before the rule, because the rule is the quotable half.
+//! An ordinary `rpc`, a `blob`, a `recv`, a feed item: the handler returns, the
+//! observer chain runs, the store completes, and only then is the caller told
+//! anything. For those, an answered call is a stored call.
+//!
+//! A `#[defer]` method that answers through [`Deferred::send`](crate::Deferred)
+//! is **not** one of those. That call hands the value straight to the caller
+//! from inside the running handler — *"this turn's observers neither see it nor
+//! gate it"* — so the caller holds its answer for the whole of the ~7.6 ms
+//! below, and a crash in that window loses state somebody was already told
+//! about. It is a real limit, not a caveat: `tests/persist.rs::
+//! a_deferred_reply_is_answered_before_its_turn_is_stored` demonstrates it with
+//! a receipt for a debit that is not on the disk.
+//!
+//! A `#[defer]` method that answers with [`Reply::send`](crate::Reply) inside
+//! its own turn is gated normally and keeps the property.
+//!
 //! `keylink-persist` states the standard this module exists to meet — a port is
 //! justified by one adapter written on purpose — and until this file existed
 //! every implementor of [`Observer`] in the workspace was a test or a
@@ -51,6 +70,20 @@
 //! run got. The debug and release columns agree to within 8%, which is the
 //! evidence that this is a syscall cost and not a code-generation one.
 //!
+//! **7.6 ms is a mean, and there is no tail in this table and no bound
+//! anywhere.** Nothing wraps [`Observer::after_turn`] in a timeout — not this
+//! adapter, not the loop — so the store's worst case is the actor's worst case.
+//! A store that hangs wedges the single loop that owns the state: no further
+//! turn runs, no feed item is taken, and `stop().await` never returns because
+//! it waits for the loop to reach its exit. The only escape is
+//! [`abort`](crate::LocalActor::abort), which cancels the task at its next
+//! await and therefore skips [`Observer::finish`] for every observer.
+//!
+//! That is a property of a filesystem `fsync` on a healthy local disk, where it
+//! is a fair trade. It is a different property against a network store, an NFS
+//! mount, or a full one — and an adapter for any of those should carry its own
+//! deadline, because there is nowhere else to put one.
+//!
 //! **It is two `fsync`s and a `rename`, and it is *supposed* to be expensive.**
 //! `keylink_persist::file::Files` syncs the temporary file and then the
 //! directory, which is what makes "an answered call is a stored call" survive a
@@ -59,10 +92,11 @@
 //! weaker.
 //!
 //! So the number is not a defect to fix here; it is the price of the promise, and
-//! the knob that trades it away is a debounce — which [`Observer::finish`] is
-//! already the guaranteed final flush for. A caller who wants the other trade
-//! today has it without any new machinery: write a state whose turns are cheap to
-//! lose, or reach for an adapter whose `store` does not sync.
+//! the knob that trades it away is a debounce — which nothing here implements
+//! and nothing here half-implements; see the type's own paragraph on why not.
+//! A caller who wants the other trade today has it without any new machinery:
+//! write a state whose turns are cheap to lose, or reach for an adapter whose
+//! `store` does not sync.
 //!
 //! Reproduce it with
 //! `cargo test -p keylink --test persist -- --ignored --nocapture`, which prints
@@ -74,7 +108,7 @@ use std::marker::PhantomData;
 use keylink_persist::versioned::{Snapshot, Versioned};
 use keylink_persist::{Durable, Snapshots, StateId};
 
-use crate::{Ended, FinishFut, Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
+use crate::{Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 
 /// Stores the state after every turn it accepts, and refuses a turn that
 /// panicked.
@@ -111,14 +145,85 @@ use crate::{Ended, FinishFut, Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 ///
 /// // The claim is taken here and held until the actor ends. `Ledger` is named
 /// // because nothing in the arguments says which state is being claimed — see
-/// // `open`.
-/// let (restored, saver) = Persist::<Ledger, _>::open(&store, &id).await?;
-/// let ledger = ledger::actor_with(restored.unwrap_or_default(), vec![Box::new(saver)]);
+/// // `open`. `start_from` is the only way to reach the observer, and it hands
+/// // over the restored state in the same expression.
+/// let (state, saver) = Persist::<Ledger, _>::open(&store, &id)
+///     .await?
+///     .start_from(Ledger::default);
+/// let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
 ///
-/// ledger.post(1).await?;   // stored, and fsynced, before this returns
+/// // An ordinary `rpc`, so the store is in front of the reply: this returning
+/// // `Ok` means the bytes are fsynced. A `#[defer]` method answers from inside
+/// // the handler and does NOT get that — see "the `#[defer]` window" below.
+/// ledger.post(1).await?;
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # What is stored is exactly what was answered — **both** directions
+///
+/// The first direction is the wave's headline: a turn is written before the
+/// loop tells its caller anything, so an answered `rpc` is a stored `rpc` —
+/// with the [`Deferred::send`](crate::Deferred) exception this module's header
+/// states first. The converse matters just as much and is easier to lose: **a
+/// turn that was not answered is not stored either.**
+///
+/// A `store` that returns `Err` refuses the turn, which ends the actor and
+/// hands the caller
+/// [`TurnLost::Refused`](crate::TurnLost::Refused) — whose text is *"it ran and
+/// was not committed"*, and which crosses the wire to a peer as
+/// `observer refused: persist` under the same sentence. That is a promise, and
+/// the only thing the caller has to act on. A caller who believes it replays;
+/// an operator who reads it replays.
+///
+/// So **this adapter does not write anything on the way out.** It implements
+/// no [`Observer::finish`], and it keeps no flag that would give one something
+/// to do. A state written after the actor ended could only be the state of the
+/// turn whose store just failed — the turn somebody was told was not committed
+/// — and writing it turns one lost turn into a **double apply** on the replay
+/// the refusal invites. For a `Post(entry)` on a ledger that is money.
+///
+/// It is the same trade the panicked turn takes, one line up: losing a turn is
+/// the conservative loss, and reproducing one on restart is not.
+///
+/// **A feed turn has no caller, so retrying its failed store would be
+/// harmless** — and this adapter still does not, because it cannot tell the two
+/// apart. [`TurnInfo`] carries the outcome and the method name and nothing
+/// about who is owed a reply. Fail closed.
+///
+/// # RFC-06 §7's debounce is **not** partly built here, on purpose
+///
+/// A debounce returns `Ok` from `after_turn` without writing, so the very first
+/// thing it gives up is the property above: an answered call stops being a
+/// stored call. Its `finish` is therefore answering a different question than
+/// this one would — "which of these several answered-and-unwritten turns do I
+/// still owe the disk, and what do I do when the last of them is also the one
+/// that failed" — and a `finish` written here in advance would be an answer to
+/// the question nobody asked yet. It would also have been wrong: the version
+/// this replaced retried the failed turn.
+///
+/// # `with_state` is a read, and a state that lies about that is not stored
+///
+/// A generated `Handle::with_state` — [`LocalActor::read`](crate::LocalActor)
+/// underneath — runs a closure against the state without going through the
+/// observer chain, because a read has nothing for an observer to accept or
+/// refuse. Nothing enforces that it *is* a read: a state whose fields are
+/// mutable through `&self` — a [`Cell`], a [`RefCell`], an [`AtomicU64`] — can
+/// be changed by that closure, and the change is answered and never stored.
+///
+/// This is not hypothetical for this crate. `tests/persist.rs`'s `Counter` holds
+/// exactly those types, on purpose, to prove `D: Sync` is not required — and its
+/// `Durable::snapshot` reads the `Cell`. A `with_state` closure bumping it would
+/// be lost.
+///
+/// Stated rather than guarded, because the alternative is `A: Sync`-shaped: the
+/// property "this closure does not mutate" is not one the type system holds for
+/// interior mutability, and running the observer chain on every read would pay
+/// the ~7.6 ms below for something that changed nothing. **Mutate in a turn.**
+///
+/// [`Cell`]: std::cell::Cell
+/// [`RefCell`]: std::cell::RefCell
+/// [`AtomicU64`]: std::sync::atomic::AtomicU64
 ///
 /// # Put it **last** in the chain
 ///
@@ -144,17 +249,14 @@ use crate::{Ended, FinishFut, Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 pub struct Persist<D, S: Snapshots> {
     /// The claim, wrapped so that everything written through it is framed.
     /// Owned, with no way back out to the raw claim.
+    ///
+    /// **The only field with a value in it, and that is the design.** An
+    /// adapter that remembered anything about the last turn would have to
+    /// decide what to do with that memory on the way out, and the one decision
+    /// available to it — write the state one last time — is the decision
+    /// [`Observer::finish`] is deliberately not used for here. See this type's
+    /// "what is stored is what was answered" paragraph.
     durable: Versioned<S::Claim>,
-    /// **There is a committed change that is not on the disk yet.**
-    ///
-    /// Set before the write and cleared after it, so a write that failed leaves
-    /// it standing — which is the one way [`Persist::finish`] finds work to do
-    /// today, and the flag a debounce would set for every turn it skipped.
-    ///
-    /// This is **not** RFC-06 §4.2's deleted `Durable::revision`, which was an
-    /// implementor-supplied counter with nothing connecting it to a mutation.
-    /// This is set by the one place that knows a turn happened.
-    dirty: bool,
     /// `fn() -> D` rather than `D`, so `Send` and `Sync` here are properties of
     /// the claim and nothing else — the same reason
     /// [`Snapshot`] gives for its own.
@@ -170,18 +272,19 @@ pub struct Persist<D, S: Snapshots> {
 impl<D: Durable, S: Snapshots> Persist<D, S> {
     /// Claim the state, read whatever is stored, and keep the claim.
     ///
-    /// `Ok((None, _))` is the first ever run: nothing has been stored, which is
-    /// not a failure. `Ok((Some(state), _))` is a restart, migrated through
-    /// [`Durable::migrate`] if what was stored is older.
+    /// **This is the only way to build one, and it does not hand one over on its
+    /// own.** A constructor that took a claim and skipped the read would let a
+    /// caller start an actor from `Default` and have the first turn overwrite a
+    /// perfectly good stored state — silently, and exactly once per deploy.
     ///
-    /// **This is the only way to build one, and the reason is the pair it
-    /// returns.** A constructor that took a claim and skipped the read would let
-    /// a caller start an actor from `Default` and have the first turn overwrite
-    /// a perfectly good stored state — silently, and exactly once per deploy.
-    /// Handing the restored state back with the adapter that will keep writing it
-    /// makes the read impossible to leave out.
+    /// This used to return `(Option<D>, Self)` under a sentence claiming that
+    /// pairing the two "makes the read impossible to leave out". It did not:
+    /// `Result` is `#[must_use]` but **a tuple element is not**, so
+    /// `let (_restored, saver) = ..` compiled clean and was the shortest form to
+    /// copy. It returns an [`Opened`] instead, which is one value, and the only
+    /// method that yields a `Persist` yields the state in the same expression.
     ///
-    /// The claim is exclusive from here until this value is dropped. A second
+    /// The claim is exclusive from here until that value is dropped. A second
     /// `open` on one [`StateId`] is [`Error::Busy`](keylink_persist::Error::Busy),
     /// not a second writer.
     ///
@@ -206,17 +309,71 @@ impl<D: Durable, S: Snapshots> Persist<D, S> {
     ///   bytes are not a frame this build can read, are from a newer build, or
     ///   [`Durable::restore`] refused them. Loud, and the stored bytes are left
     ///   alone.
-    pub async fn open(store: &S, id: &StateId) -> keylink_persist::Result<(Option<D>, Self)> {
+    pub async fn open(store: &S, id: &StateId) -> keylink_persist::Result<Opened<D, S>> {
         let durable = Versioned::new(store.claim(id).await?);
         let restored = durable.load::<D>().await?;
-        Ok((
+        Ok(Opened {
             restored,
-            Self {
+            saver: Self {
                 durable,
-                dirty: false,
                 state: PhantomData,
             },
-        ))
+        })
+    }
+}
+
+/// A claimed state, read, with the adapter that will keep writing it.
+///
+/// What [`Persist::open`] returns, and the reason it is a type rather than a
+/// tuple: **there is no way to take the observer without taking the state.**
+/// [`start_from`](Self::start_from) is the only method that hands over a
+/// [`Persist`], and it hands over the state in the same expression, so the
+/// shortest thing a reader can copy is the correct one.
+///
+/// Holding one of these holds the claim, which is what
+/// `tests/persist.rs::a_second_open_on_one_state_is_busy` leans on.
+#[must_use = "this holds the claim AND the state that was read back; dropping it \
+              starts the next run from nothing"]
+pub struct Opened<D, S: Snapshots> {
+    restored: Option<D>,
+    saver: Persist<D, S>,
+}
+
+impl<D: Durable, S: Snapshots> Opened<D, S> {
+    /// Whether anything was stored. `false` is the first ever run, which is not
+    /// a failure.
+    ///
+    /// Takes `&self`, so asking cannot lose the answer — the distinction an
+    /// operator logs and a test asserts, without a route to the state.
+    #[must_use]
+    pub fn was_stored(&self) -> bool {
+        self.restored.is_some()
+    }
+
+    /// The state to start the actor from, and the observer that will keep it
+    /// current.
+    ///
+    /// What was stored, migrated through [`Durable::migrate`] if it is older
+    /// than this build — or `first()` when nothing ever was. `first` is a
+    /// closure rather than a value so a restart does not build a starting state
+    /// it then throws away.
+    ///
+    /// ```ignore
+    /// let (state, saver) = Persist::<Ledger, _>::open(&store, &id).await?.start_from(Ledger::default);
+    /// let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+    /// ```
+    pub fn start_from(self, first: impl FnOnce() -> D) -> (D, Persist<D, S>) {
+        (self.restored.unwrap_or_else(first), self.saver)
+    }
+}
+
+impl<D, S: Snapshots> std::fmt::Debug for Opened<D, S> {
+    /// Whether there was anything to restore, and nothing else. The state is the
+    /// state's business.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Opened")
+            .field("was_stored", &self.restored.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -248,85 +405,53 @@ where
     ///
     /// A handler that panicked half-way through leaves the state half-applied,
     /// and a half-applied state written to the disk is worse than the turn being
-    /// lost: a restart would reproduce it. So the turn is refused, the actor
-    /// ends, and the flag below is not set.
+    /// lost: a restart would reproduce it. So the turn is refused and the actor
+    /// ends.
     ///
     /// The [`Stop`] reason is not what an operator reads, on purpose. The loop
     /// folds a refusal of a *panicked* turn into
     /// [`Ended::Panicked`](crate::Ended::Panicked) carrying the handler's own
     /// message, because reporting the durability adapter for a fault in a
     /// `service!` method points at the wrong code.
+    ///
+    /// # A `match`, and not an `if let`, because the default here is **write**
+    ///
+    /// [`TurnOutcome`] is exhaustive and deliberately not `#[non_exhaustive]`.
+    /// An `if let` on the one outcome that must not be stored puts every future
+    /// outcome in the `else` branch, and this `else` branch commits bytes to a
+    /// disk. A third outcome — `Cancelled`, say — would be persisted under a
+    /// rule nobody wrote and nothing would say so. The `match` makes it `E0004`
+    /// here, in keylink, at the line that decides; `representability.rs`'s
+    /// `every_outcome_is_named` holds the same tripwire for a build without
+    /// this feature.
     fn after_turn<'a>(&'a mut self, state: &'a D, turn: TurnInfo<'a>) -> TurnFut<'a> {
-        if let TurnOutcome::Panicked { .. } = turn.outcome {
-            return Box::pin(async {
-                Err(Stop::new(
-                    "a panicked turn is not stored: the state may be half-applied",
-                ))
-            });
-        }
+        let snapshot = match turn.outcome {
+            TurnOutcome::Completed => Snapshot::of(state),
+            TurnOutcome::Panicked { .. } => {
+                return Box::pin(async {
+                    Err(Stop::new(
+                        "a panicked turn is not stored: the state may be half-applied",
+                    ))
+                })
+            }
+        };
 
-        let snapshot = Snapshot::of(state);
-        // Before the write, so a write that fails leaves the flag standing.
-        self.dirty = true;
         Box::pin(async move {
             self.durable.store(&snapshot).await?;
-            self.dirty = false;
             Ok(())
         })
     }
 
-    /// One last write, if the last one did not land.
-    ///
-    /// **Today this costs nothing on every path but one.**
-    /// [`after_turn`](Observer::after_turn) stores on every turn it accepts and
-    /// clears the flag, so an actor that stopped normally arrives here clean and
-    /// this returns without touching the store. The one path that arrives dirty
-    /// is a `store` that returned `Err`: that ends the actor immediately, so the
-    /// state is complete and consistent and only the write is missing, and one
-    /// more attempt before it is dropped is the difference between losing the
-    /// last committed turn and not.
-    ///
-    /// `finish` runs **before** the state is dropped and before any waiter is
-    /// told the actor ended, which is what makes that attempt possible at all.
-    ///
-    /// # The `Ended::Panicked` arm looks redundant, and a debounce is why it is not
-    ///
-    /// With a store on every turn, a dirty flag at this point implies the last
-    /// turn *completed* — a panicked turn is refused above without setting it,
-    /// and a failed store ends the actor before another turn can panic. So the
-    /// check cannot fire today.
-    ///
-    /// It is here because it is the rule a debounce needs, and RFC-06 §7's
-    /// debounce is the reason this method exists. The moment `after_turn` stops
-    /// writing on every turn, "turn n completed and is unwritten, turn n+1
-    /// panicked" becomes reachable, the flag is standing over a half-applied
-    /// state, and [`Ended::Panicked`](crate::Ended::Panicked) is the only thing
-    /// here that says so. Losing one committed turn is the correct trade against
-    /// writing a state a restart would reproduce.
-    ///
-    /// A failure here is dropped rather than reported. There is nothing left to
-    /// refuse — [`Observer::finish`] is infallible because the actor has already
-    /// ended and its reason is already decided.
-    fn finish<'a>(&'a mut self, state: &'a D, ended: &'a Ended) -> FinishFut<'a> {
-        if !self.dirty || matches!(ended, Ended::Panicked { .. }) {
-            return Box::pin(async {});
-        }
-
-        let snapshot = Snapshot::of(state);
-        Box::pin(async move {
-            if self.durable.store(&snapshot).await.is_ok() {
-                self.dirty = false;
-            }
-        })
-    }
+    // No `finish`. The default — do nothing — is this adapter's policy, and the
+    // paragraph on the type says why: a state written after the actor ended
+    // could only be a state some caller was told was refused.
 }
 
 impl<D, S: Snapshots> std::fmt::Debug for Persist<D, S> {
-    /// The flag and nothing else. The claim is an adapter's business and the
-    /// snapshot bytes are the state's.
+    /// The name and nothing else, because there is nothing else. The claim is
+    /// an adapter's business, the snapshot bytes are the state's, and this type
+    /// deliberately remembers nothing between turns.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Persist")
-            .field("pending", &self.dirty)
-            .finish_non_exhaustive()
+        f.debug_struct("Persist").finish_non_exhaustive()
     }
 }
