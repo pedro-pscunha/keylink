@@ -256,10 +256,27 @@ pub trait Durable: Sized {
 ///
 /// Those three blocks are the reason this decision is not a comment. Delete an
 /// attribute and its block starts compiling, and rustdoc fails a `compile_fail`
-/// test that compiled. `keylink-persist/src/representability.rs` objects to
-/// `trybuild` for matching full rustc stderr; this does not — `compile_fail`
-/// annotated with an error code checks only that `E0639` appeared, and error
-/// codes are stable where diagnostic wording is not.
+/// test that compiled — watched, not assumed.
+///
+/// Each fails with `E0639: cannot create non-exhaustive variant using struct
+/// expression`. **The code is named here and deliberately NOT on the fences.**
+/// An earlier revision of this paragraph claimed a fence "annotated with an error
+/// code checks only that `E0639` appeared, and error codes are stable where
+/// diagnostic wording is not". The second half is true and the first is false:
+/// **rustdoc does not check the code at all.** Demonstrated twice while this
+/// crate was being reviewed — doctests annotated `compile_fail,E0308` that in
+/// fact fail with `E0425` (a typo in the probe body) or `E0282` pass green and
+/// silently, and swapping a pinned `E0624` for `E0599` elsewhere in this
+/// workspace left its test green too.
+///
+/// So an annotated code asserts a verification that does not happen, which is
+/// the shape of every guard this project has caught being satisfiable without
+/// proving its claim. `keylink-persist/src/representability.rs` objects to
+/// `trybuild` for matching full rustc stderr, and that objection stands; the
+/// answer is not a code on a fence but the narrower claim these three blocks can
+/// actually make — this does not compile — plus
+/// `keylink-persist/tests/versioned.rs` naming the variants from outside the
+/// crate, so a rename cannot pass here by making the name vanish.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RestoreError {
@@ -272,7 +289,7 @@ pub enum RestoreError {
     ///
     /// A [`Durable`] cannot report it, because it did not read the header:
     ///
-    /// ```compile_fail,E0639
+    /// ```compile_fail
     /// use keylink_persist::versioned::FrameFault;
     /// use keylink_persist::RestoreError;
     ///
@@ -294,7 +311,7 @@ pub enum RestoreError {
     ///
     /// A [`Durable`] cannot report it, because it made no version comparison:
     ///
-    /// ```compile_fail,E0639
+    /// ```compile_fail
     /// use keylink_persist::RestoreError;
     ///
     /// let _ = RestoreError::FromTheFuture { stored: 9, ours: 1 };
@@ -316,7 +333,7 @@ pub enum RestoreError {
     /// have: whether a gap is fatal depends on what is on the disk, and only
     /// the loader knows that.
     ///
-    /// ```compile_fail,E0639
+    /// ```compile_fail
     /// use keylink_persist::RestoreError;
     ///
     /// let _ = RestoreError::NoMigration { from: 1 };
