@@ -22,10 +22,19 @@
 //! overlap is `E0119`. The concrete impl therefore compiles only while the trait
 //! is absent.
 //!
+//! Shadowing also reads a **receiver** rather than a name, and the last probe in
+//! this file is that shape. Give one type an inherent `&mut self` method beside
+//! a trait `&self` method of the same name, returning different markers: a `&T`
+//! matches the trait method at its first receiver step, while a `&mut T` matches
+//! the inherent one a step earlier and outranks the trait there. The marker that
+//! comes back therefore says which borrow the caller was holding, so asserting
+//! on it pins a signature that promises `&T`.
+//!
 //! | The claim | The probe |
 //! |---|---|
-//! | no inherent method of this name | shadowing |
+//! | no inherent method of this name | shadowing, on the name |
 //! | no impl of this trait | coherence |
+//! | this parameter is `&T` and never `&mut T` | shadowing, on the receiver step |
 //!
 //! # Why this module is inside the crate rather than in `tests/`
 //!
@@ -55,8 +64,9 @@
 use std::ops::{Deref, DerefMut};
 
 use crate::{
-    ActorId, AdmittedPeer, Allowlist, BlobId, Eviction, IdempotencyKey, ProvenPeer, Retention,
-    Sealed,
+    ActorId, Admission, Admittance, AdmittedPeer, Allowlist, BlobId, DynamicAdmission, Eviction,
+    IdempotencyKey, LocalActor, MailboxClosed, Observer, ProvenPeer, Retention, Sealed, TurnFut,
+    TurnInfo,
 };
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
@@ -149,6 +159,32 @@ impl<T: Default> HasNoDefault for T {}
 impl HasNoDefault for Allowlist {}
 impl HasNoDefault for Eviction {}
 impl HasNoDefault for Retention {}
+/// The adapter inherits the property from the value it holds. A `Default` here
+/// would mean "a policy you did not name", and the only policy nobody named is
+/// the one that admits everyone.
+impl HasNoDefault for DynamicAdmission {}
+
+// ─────────────────────────────────── `Admission` has no permissive blanket impl
+
+/// The claim: nothing implements [`Admission`](crate::Admission) for every
+/// type, so a policy is something a caller writes rather than something they
+/// get by accident.
+///
+/// The probe is coherence, not shadowing, because a trait impl is invisible to
+/// name resolution. A concrete `impl Admission for Doorstop` overlaps a
+/// hypothetical `impl<T> Admission for T` exactly, and an overlap is `E0119`.
+/// So this impl compiles only while no blanket impl exists.
+///
+/// A blanket impl is the shape this crate must never grow: it would make every
+/// type a policy, including `()`, and the answer would be whatever the blanket
+/// said — which is the fail-open `Allowlist` has no `Default` to prevent.
+struct Doorstop;
+
+impl Admission for Doorstop {
+    fn admits(&self, _peer: &ProvenPeer) -> Admittance {
+        Admittance::Refused
+    }
+}
 
 // ───────────────────────────────── a proven peer cannot be built from a claim
 
@@ -365,3 +401,116 @@ trait KeyIsNotBorrowMut {}
 impl<T: AsMut<str>> KeyIsNotBorrowMut for T {}
 impl KeyIsNotBorrowMut for ActorId {}
 impl KeyIsNotBorrowMut for IdempotencyKey {}
+
+// ───────────────────────── an observer sees the state, and cannot call into it
+
+/// A state with one method, in the shape `service!` generates: the `Actor`
+/// trait a user writes is a set of `async fn method(&mut self, ..)`, and `post`
+/// is `durable_ledger`'s own with the parts a probe does not need taken off.
+///
+/// The method is inherent rather than declared on a trait, and that makes the
+/// probe below stronger rather than weaker. An inherent method outranks a trait
+/// method at the same receiver step, so a receiver that cannot reach this one
+/// cannot reach a `service!` method either.
+struct Ledger {
+    entries: Vec<u64>,
+}
+
+impl Ledger {
+    fn post(&mut self) -> ThroughMut {
+        self.entries.push(0);
+        ThroughMut
+    }
+}
+
+/// Which borrow a call to `post` went through. Two markers rather than the one
+/// [`NoSuchMethod`] the probes above share, because this probe is not asking
+/// whether a method exists — both of them do — but which of the two the
+/// receiver was able to reach.
+struct ThroughShared;
+
+/// The answer only a `&mut Ledger` can get. Nothing in this module should ever
+/// produce one; it exists so that reaching the mutable method is a type error
+/// with a name on it rather than a silent pass.
+struct ThroughMut;
+
+/// The `&self` half of the pair. A `&Ledger` finds this one, and a `&mut Ledger`
+/// never gets here because it matches the inherent method a step earlier.
+trait LedgerIsReadableThroughAShared {
+    fn post(&self) -> ThroughShared {
+        ThroughShared
+    }
+}
+
+impl LedgerIsReadableThroughAShared for Ledger {}
+
+/// The claim, RFC-06 §2.8: [`Observer::after_turn`](crate::Observer) takes `&A`
+/// and never `&mut A`, so no observer can call a `service!` method or assign to
+/// a field.
+///
+/// The probe is shadowing rather than coherence, because the claim is about name
+/// resolution and there is no impl whose absence would state it — coherence has
+/// nothing to overlap here. What it reads is the *receiver step*. A call on a
+/// `&Ledger` begins at self type `&Ledger`, where only `&self` methods live, so
+/// it finds the trait default and answers `ThroughShared`. A call on a
+/// `&mut Ledger` begins one step earlier, at self type `&mut Ledger`, where the
+/// inherent `&mut self` method matches — and, being inherent, outranks the trait
+/// — so it answers `ThroughMut`. The assertion names the first, so it holds
+/// exactly while the parameter is a shared reference.
+///
+/// The break: change `state: &'a A` to `state: &'a mut A` on
+/// `Observer::after_turn` in `observe.rs`. Leave this impl as written and it is
+/// a signature mismatch, `E0053`. Update it to match and `state.post()` resolves
+/// to the inherent method, so the assertion is `E0308`, expected `ThroughShared`
+/// and found `ThroughMut`. There is no third answer, which is the point.
+///
+/// # What this does not prove
+///
+/// It does not prove that an observer cannot mutate the state, and no probe here
+/// could. `&A` does not stop interior mutability: a state with an `AtomicU64`, a
+/// `Mutex` or a `RefCell` field is mutable through `&A`, and an observer holding
+/// one will mutate it with the compiler's blessing. What is proved is the
+/// narrower thing §2.8 states and nothing beyond it — the `&mut self` route is
+/// shut, so a `service!` method cannot be called and a field cannot be assigned.
+/// Whether any other route exists is decided by the state's own fields, and
+/// those are the caller's choice rather than keylink's.
+///
+/// It is silent about a *second* method, too. An `Observer` that grew
+/// `after_turn_mut(&mut self, state: &mut A)` would be a new port beside this
+/// one, and this probe would stay green next to it.
+struct Recorder;
+
+impl Observer<Ledger> for Recorder {
+    fn name(&self) -> &'static str {
+        "recorder"
+    }
+
+    fn after_turn<'a>(&'a mut self, state: &'a Ledger, _turn: TurnInfo<'a>) -> TurnFut<'a> {
+        let _: ThroughShared = state.post();
+        Box::pin(async { Ok(()) })
+    }
+}
+
+// ──────────────────────────── the same borrow, one rung down: LocalActor::read
+
+/// §2.8 names `Handle::with_state` in the same breath as the observer port, and
+/// it is the same claim: the closure takes `&A`, so a concern bolted on from
+/// outside cannot quietly become a second way to change the state.
+///
+/// The probe is the same one read through a bound rather than through a
+/// parameter. [`LocalActor::read`] promises `F: FnOnce(&A) -> T`, so the
+/// closure's argument is a `&Ledger` and `post` resolves to the trait default.
+/// Widen that bound to `FnOnce(&mut A) -> T` in `local.rs` and the argument is a
+/// `&mut Ledger`, the inherent method matches a step earlier, `T` infers as
+/// `ThroughMut`, and the annotation below says otherwise: `E0308`.
+///
+/// This proves the crate's own read path and not the macro's. The `with_state`
+/// generated in `macros.rs` re-declares `FnOnce(&A) -> T` before forwarding
+/// here, so the two bounds can drift apart, and closing that would take a probe
+/// inside `mod expansion` beside `no_streaming_on_a_local_handle`.
+///
+/// The limit above carries over unchanged. A read through `&A` cannot call a
+/// `service!` method; it can still touch a `Mutex` field.
+async fn a_read_cannot_mutate_either(actor: &LocalActor<Ledger>) {
+    let _: Result<ThroughShared, MailboxClosed> = actor.read(|state| state.post()).await;
+}

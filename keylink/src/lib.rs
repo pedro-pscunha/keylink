@@ -45,8 +45,24 @@
 //! - **Content addressing.** A `blob` method hands back an address; iroh-blobs
 //!   moves the bytes, admitted only against a grant keylink recorded when it
 //!   returned that address to that peer. See [`Blobs`].
+//! - **Extension, at two boundaries and not one.** [`Middleware`] intercepts a
+//!   **message on the wire**; [`Observer`] watches a **turn against the state**.
+//!   One sentence decides which to reach for, and neither grows toward the
+//!   other — an observer never sees a request or a reply payload, and a layer
+//!   never sees the state. Durability is the first thing built on the second
+//!   one, outside this crate.
 
 #![warn(missing_docs)]
+// `deny` and not `forbid`, and the difference is the one `unsafe impl` below.
+// `forbid` cannot be lifted at all, so it would make the browser body reader
+// unwritable; `deny` can be lifted exactly once, by name, at the site that needs
+// it. `#[expect]` rather than `#[allow]` for that site, so the day the impl goes
+// away the lift becomes an unfulfilled expectation and is removed with it — an
+// `allow` would sit there forever, silently re-opening the door.
+//
+// This is what turns "keylink contains exactly one `unsafe impl`" from a
+// sentence in two doc comments into something the compiler checks.
+#![deny(unsafe_code)]
 
 // Three features need an operating system facility a browser does not have, and
 // each says so here rather than letting the build fail somewhere unhelpful.
@@ -113,6 +129,7 @@ compile_error!(
 pub mod blocking;
 
 mod actor;
+mod admission;
 mod authz;
 mod blobs;
 mod body;
@@ -123,32 +140,43 @@ mod local;
 mod macros;
 mod middleware;
 mod node;
+mod observe;
+mod panic;
 mod peer;
 mod reply;
 #[cfg(test)]
 mod representability;
 mod rpc;
+mod subscribers;
 #[cfg(test)]
 mod testing;
 mod watch;
 mod wire;
 
 pub use actor::{
-    actor_schema, guarded, mount, ActorClient, ActorReply, ActorRequest, Eviction, Mail, Mailbox,
-    MountError, Mounted, Panic, Sealed, System, SystemBuilder,
+    actor_schema, mount, ActorClient, ActorReply, ActorRequest, Eviction, Mail, Mailbox,
+    MountError, Mounted, Sealed, System, SystemBuilder,
 };
+pub use admission::{Admission, Admittance, DynamicAdmission, Revocable, Revocation};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
 pub use blobs::{BlobHandle, BlobId, Blobs, BlobsAdmission, Granting, Retention, MAX_GRANTS};
 pub use body::{Body, BodyReader};
 pub use error::{ConfigError, Error, Result, Transport};
-pub use idempotency::{IdempotencyRefusal, MAX_RECORDED_BYTES, MAX_RECORDS};
+pub use idempotency::{
+    Idempotency, IdempotencyRefusal, KeyState, MAX_ATTACH, MAX_RECORDED_BYTES, MAX_RECORDS,
+    MAX_RUNNING, MAX_RUNNING_PER_PEER, MAX_TOMBSTONES, MAX_WAITING, MAX_WAITING_PER_PEER,
+    RECORD_TTL,
+};
 pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
-pub use local::{LocalActor, MailboxClosed};
-pub use middleware::{Context, Middleware, Next, Rpc, Timeout};
+pub use local::{LocalActor, MailboxClosed, Queued};
+pub use middleware::{Caller, Context, Middleware, Next, QueueTimeout, Queueing, Rpc, Timeout};
 pub use node::{derive_alpn, schema_hash, Node};
+pub use observe::{Ended, Observer, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome};
+pub use panic::{catching, guarded, Panic};
 pub use peer::{Dial, Peer};
-pub use reply::{Outcome, RemoteError, WireResponse};
+pub use reply::{Outcome, RemoteError, WireRequest, WireResponse};
 pub use rpc::{Dispatch, RpcClient, Server, ServerBuilder, Service, ServiceBuilder};
+pub use subscribers::Subscribers;
 pub use watch::{Departure, Watch};
 pub use wire::{Envelope, WireKinds, MAX_HEADER};
 

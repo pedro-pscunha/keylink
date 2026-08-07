@@ -5,13 +5,18 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use keylink::{
-    ActorClient, ActorId, Allowlist, Error, Eviction, MountError, Node, RemoteError, Server, System,
+    ActorClient, ActorId, ActorReply, ActorRequest, Allowlist, Body, BodyReader, Context, Error,
+    Eviction, IdempotencyKey, IdempotencyRefusal, Middleware, MountError, Next, Node, Outcome,
+    QueueTimeout, RemoteError, RpcClient, Server, System, Timeout,
 };
+use tokio::sync::{mpsc, oneshot, Semaphore};
 
 // ────────────────────────────────────────────────────────────── two services
 
@@ -59,7 +64,7 @@ struct Journal {
 }
 
 impl journal::Actor for Journal {
-    async fn apply(&mut self, entry: u64, hold_ms: u64) -> u64 {
+    async fn apply(&mut self, _cx: keylink::Caller<'_>, entry: u64, hold_ms: u64) -> u64 {
         // The await point `abort` cancels at, and the reason `stop` and `abort`
         // leave the state in different shapes.
         tokio::time::sleep(Duration::from_millis(hold_ms)).await;
@@ -67,11 +72,11 @@ impl journal::Actor for Journal {
         entry
     }
 
-    async fn entries(&mut self) -> Vec<u64> {
+    async fn entries(&mut self, _cx: keylink::Caller<'_>) -> Vec<u64> {
         self.applied.lock().expect("not poisoned").clone()
     }
 
-    async fn boom(&mut self) -> u64 {
+    async fn boom(&mut self, _cx: keylink::Caller<'_>) -> u64 {
         panic!("this message is bad");
     }
 }
@@ -783,29 +788,24 @@ keylink::service! {
     rpc WhoCalled() -> Option<String>;
 }
 
-#[derive(Default)]
-struct Doorman {
-    last: Option<String>,
-}
+struct Doorman;
 
 impl doorman::Actor for Doorman {
-    fn caller(&mut self, cx: Option<&keylink::Context>) {
-        self.last = cx.map(|cx| cx.peer().to_string());
-    }
-
-    async fn who_called(&mut self) -> Option<String> {
-        self.last.clone()
+    async fn who_called(&mut self, cx: keylink::Caller<'_>) -> Option<String> {
+        cx.peer().map(|cx| cx.peer().to_string())
     }
 }
 
 /// RFC-04 §12.2 test 10, on the path the RFC put it: a keyed actor sees the
 /// proven key of its caller.
 ///
-/// It had never been written. `Actor::caller` shipped with a default empty body
-/// and nothing in the tree overrode it, so the hook had no implementor and no
-/// test — which is indistinguishable from a hook that does not work.
+/// It had never been written until this file. The identity used to arrive
+/// through an `Actor::caller` hook that shipped with a default empty body,
+/// which nothing in the tree overrode — a hook with no implementor and no test
+/// is indistinguishable from one that does not work. It is an argument now, so
+/// a method that wants the caller cannot fail to be given one.
 ///
-/// Made red by passing `None` to `caller` in the mailbox loop.
+/// Made red by passing `Caller::Local` in the mailbox loop.
 #[tokio::test]
 async fn a_keyed_actor_sees_the_proven_key_of_its_caller() {
     let server = local_node().await;
@@ -820,7 +820,7 @@ async fn a_keyed_actor_sees_the_proven_key_of_its_caller() {
         .expect("the client dials the actor system");
 
     system
-        .mount(id("gate/1"), doorman::spawn(Doorman::default()))
+        .mount(id("gate/1"), doorman::spawn(Doorman))
         .expect("the id is free");
 
     assert_eq!(
@@ -830,5 +830,1220 @@ async fn a_keyed_actor_sees_the_proven_key_of_its_caller() {
             .unwrap(),
         Some(client_node.id().to_string()),
         "the actor must see the dialing peer's proven key, not None"
+    );
+}
+
+// ───────────────────────────────────────────── a key against a keyed actor
+
+/// A response the turn produces and the wire cannot carry.
+///
+/// The `Serialize` is written by hand because no derived one can fail: postcard
+/// reports a serialization error only from its flavor, and the `Vec` flavor
+/// `ActorReply::encode` uses has none. Without it the arm that decides what a
+/// turn owes when it ran and produced nothing sendable is unreachable from a
+/// test, and an unreachable arm is a decision nobody has checked.
+#[derive(Debug, Clone, serde::Deserialize, postcard_schema::Schema)]
+pub struct Untransmittable;
+
+impl serde::Serialize for Untransmittable {
+    fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom("this reply never encodes"))
+    }
+}
+
+/// An argument whose `Deserialize` **panics** where a garbage payload merely
+/// fails to decode.
+///
+/// Hand-written for the same reason [`Untransmittable`]'s `Serialize` is: a
+/// derived one cannot do this, so the arm that decides what a message owes when
+/// it destroyed the actor's task on the way in is unreachable from a test
+/// without it. The distance between the two types is one token — `Err(..)`
+/// against `panic!` — and the distance between their outcomes used to be an
+/// actor that answered the next message and one that answered nothing ever
+/// again.
+#[derive(Debug, Clone, serde::Serialize, postcard_schema::Schema)]
+pub struct Imploding;
+
+impl<'de> serde::Deserialize<'de> for Imploding {
+    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+        panic!("this request panics on the way off the wire");
+    }
+}
+
+// A fourth service, so the shape-for-shape pairing between `journal` and
+// `vault` survives a method being added here.
+keylink::service! {
+    service Ward;
+
+    /// Counts the turns that reached the state. A retry that ran a second time
+    /// is visible HERE and nowhere else: a replayed reply is byte identical to
+    /// a re-run one, which is the whole reason the ledger records the frame.
+    rpc Touch() -> u64;
+
+    /// The count, read without a key, so reading it never settles one.
+    rpc Touches() -> u64;
+
+    /// Mutates the state and then answers with something unencodable.
+    rpc Unsendable() -> Untransmittable;
+
+    /// Mutates the state and then panics, so the turn was entered and its
+    /// effect is whatever the panic left behind.
+    rpc Explode() -> u64;
+
+    /// Carries an argument that panics while being decoded, which happens on
+    /// the actor's own task and BEFORE the turn — so nothing is entered and
+    /// nothing is mutated.
+    rpc Implode(charge: Imploding) -> u64;
+
+    /// Mutates the state and then answers with something whose `Serialize`
+    /// panics rather than errors. [`Exploding`] is declared further down, with
+    /// the `fuse` service that first needed it.
+    rpc Detonate() -> Exploding;
+}
+
+#[derive(Default)]
+struct Ward {
+    touches: u64,
+}
+
+impl ward::Actor for Ward {
+    async fn touch(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+        self.touches += 1;
+        self.touches
+    }
+
+    async fn touches(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+        self.touches
+    }
+
+    async fn unsendable(&mut self, _cx: keylink::Caller<'_>) -> Untransmittable {
+        self.touches += 1;
+        Untransmittable
+    }
+
+    async fn explode(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+        self.touches += 1;
+        panic!("this turn dies after it mutated");
+    }
+
+    // Unreachable by construction: the argument cannot be decoded without
+    // panicking, so the loop never builds the `Request` this arm needs. Written
+    // as a panic rather than a `0` so that a decode which somehow succeeds is
+    // loud here instead of passing as a turn that touched nothing.
+    async fn implode(&mut self, _cx: keylink::Caller<'_>, _charge: Imploding) -> u64 {
+        unreachable!("the argument's `Deserialize` panics before the turn begins");
+    }
+
+    async fn detonate(&mut self, _cx: keylink::Caller<'_>) -> Exploding {
+        self.touches += 1;
+        Exploding
+    }
+}
+
+/// One `Ward`, reachable both the typed way and the way a hand-rolled peer
+/// reaches it.
+///
+/// The typed `ActorClient` exposes no `with_idempotency`, so nothing in
+/// keylink's own client sends a key to a keyed actor. The field is on the
+/// ENVELOPE of the system's ALPN, which is an ordinary
+/// `Envelope<WireRequest<ActorRequest>>`, so a peer that speaks the protocol by
+/// hand reaches it through the public `RpcClient`. Latent, not impossible —
+/// which is why these are integration tests and not unit ones.
+struct Keyed {
+    /// Carries the key. Speaks the envelope directly.
+    raw: RpcClient<ActorRequest, ActorReply>,
+    /// Reads the actor's own counter, without a key.
+    client: ActorClient,
+    _system: System,
+    _server: Server,
+    _nodes: [Node; 2],
+}
+
+async fn start_keyed() -> Keyed {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let system = mounted();
+    let running = Server::builder(&server)
+        .service(system.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("one service, no duplicate ALPN");
+    let raw = RpcClient::connect(&client_node, server.endpoint().addr(), System::alpn())
+        .await
+        .expect("the raw client dials the actor system");
+    let client = ActorClient::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("the typed client dials the actor system");
+    system
+        .mount(id("ward"), ward::spawn(Ward::default()))
+        .expect("the id is free");
+
+    Keyed {
+        raw,
+        client,
+        _system: system,
+        _server: running,
+        _nodes: [server, client_node],
+    }
+}
+
+/// One message to `ward`, under a key.
+async fn keyed(
+    fixture: &Keyed,
+    key: &str,
+    request: &ward::Request,
+) -> Result<ward::Response, Error> {
+    let envelope =
+        ActorRequest::new(id("ward"), ward::schema(), request).expect("the message encodes");
+    keyed_envelope(fixture, key, envelope).await
+}
+
+/// The same, for an envelope built by hand — the only way to reach a payload
+/// the actor's own loop cannot decode.
+async fn keyed_envelope(
+    fixture: &Keyed,
+    key: &str,
+    envelope: ActorRequest,
+) -> Result<ward::Response, Error> {
+    let (reply, _body) = fixture
+        .raw
+        .with_idempotency(IdempotencyKey::new(key).expect("a valid key"))
+        .call(envelope, keylink::Body::empty())
+        .await?;
+    reply.decode()
+}
+
+async fn touches(fixture: &Keyed) -> u64 {
+    ward::at(&fixture.client, id("ward"))
+        .touches()
+        .await
+        .expect("the actor answers")
+}
+
+/// The defect: of the three generated dispatch paths, the keyed `System` loop
+/// marked the progress marker nowhere. A key claimed for a message routed there
+/// was RELEASED once the turn had already mutated the actor, so the caller's
+/// retry ran the work again — at-least-once out of the module whose one promise
+/// is at-most-once.
+///
+/// Proved on the actor's counter and not on the reply, because a replayed reply
+/// and a re-run one are byte identical by construction. Made red by deleting
+/// the `completed()` call in `spawn`.
+#[tokio::test]
+async fn a_keyed_call_that_ran_a_turn_does_not_leave_the_key_claimable() {
+    let fixture = start_keyed().await;
+
+    let first = keyed(&fixture, "touch", &ward::Request::Touch {})
+        .await
+        .expect("the first call runs");
+    assert!(matches!(first, ward::Response::Touch(1)), "got {first:?}");
+
+    let again = keyed(&fixture, "touch", &ward::Request::Touch {})
+        .await
+        .expect("the retry is answered from the record");
+    assert!(matches!(again, ward::Response::Touch(1)), "got {again:?}");
+
+    assert_eq!(
+        touches(&fixture).await,
+        1,
+        "the retry must not have entered the turn a second time"
+    );
+}
+
+/// A payload the actor's loop cannot decode is refused before any user code
+/// runs, so nothing was entered and the key stays claimable. Settling it would
+/// refuse every retry of a message the actor never saw.
+///
+/// The declared hash is the RIGHT one, so `System::deliver`'s own comparison
+/// passes and the message reaches the mailbox loop. That is what makes this a
+/// test of `Sealed::open` inside the loop rather than of the check above it.
+/// Made red by marking `dispatched()` above the `match` instead of inside its
+/// `Ok` arm.
+#[tokio::test]
+async fn a_keyed_call_whose_payload_does_not_decode_leaves_the_key_claimable() {
+    let fixture = start_keyed().await;
+
+    // A variant index no variant has.
+    let garbage = ActorRequest::new(id("ward"), ward::schema(), &250u32).expect("the bytes encode");
+    let error = keyed_envelope(&fixture, "touch", garbage)
+        .await
+        .expect_err("the payload does not decode");
+    assert!(
+        matches!(error, Error::Remote(RemoteError::Failed(_))),
+        "got {error:?}"
+    );
+    assert_eq!(
+        touches(&fixture).await,
+        0,
+        "a payload that does not decode must not reach the turn"
+    );
+
+    let ran = keyed(&fixture, "touch", &ward::Request::Touch {})
+        .await
+        .expect("the key must still be claimable");
+    assert!(matches!(ran, ward::Response::Touch(1)), "got {ran:?}");
+}
+
+/// The same decision, for a payload that does not merely fail to decode but
+/// **panics** doing it. `Sealed::open` runs the caller's own `Deserialize` on
+/// the actor's task, and until `catching` went round it the unwind left the
+/// mailbox receiver dropped — so this call, and every later one to the same id,
+/// was answered `NoSuchActor` for an id the registry went on listing. RFC-04
+/// §16.11.
+///
+/// Two facts about the key, and they are the ones the arm has to get right.
+/// Nothing ran, so it is RELEASED rather than settled: the marker is untouched,
+/// `Drop for Guard` reads `NotDispatched`, and the retry below is therefore a
+/// first attempt rather than a permanent `Interrupted` for work nobody did.
+///
+/// Made red by dropping `catching` from around `payload.open` in `macros.rs`.
+#[tokio::test]
+async fn a_keyed_call_whose_payload_panics_while_decoding_leaves_the_key_claimable() {
+    let fixture = start_keyed().await;
+
+    let error = keyed(
+        &fixture,
+        "touch",
+        &ward::Request::Implode { charge: Imploding },
+    )
+    .await
+    .expect_err("the payload's `Deserialize` panics");
+    assert!(
+        matches!(
+            error,
+            Error::Remote(RemoteError::Failed(ref why)) if why.contains("`Deserialize` panicked")
+        ),
+        "the refusal must name the MESSAGE as what panicked, and must not be `NoSuchActor` \
+         about a mounted id: got {error:?}"
+    );
+
+    // One assertion, two facts: the actor is still there to answer, and the
+    // message that panicked never reached it.
+    assert_eq!(
+        touches(&fixture).await,
+        0,
+        "a payload that panics while decoding must cost that message and not the actor"
+    );
+
+    let ran = keyed(&fixture, "touch", &ward::Request::Touch {})
+        .await
+        .expect("the key must still be claimable");
+    assert!(matches!(ran, ward::Response::Touch(1)), "got {ran:?}");
+}
+
+/// The `ActorReply::encode` decision, pinned. The turn ran and mutated the
+/// state, and produced nothing the wire can carry.
+///
+/// Not `completed`: that would record the encoding refusal as this call's
+/// settled reply and replay that refusal to every retry, for work that really
+/// happened. Not released either: that would run the work again. `Interrupted`
+/// is what is left, and it is the truth — "it ran, and whether it took effect
+/// is unknown". Made red by moving `completed()` above the encode.
+#[tokio::test]
+async fn a_keyed_call_whose_reply_does_not_encode_settles_the_key_interrupted() {
+    let fixture = start_keyed().await;
+
+    let error = keyed(&fixture, "touch", &ward::Request::Unsendable {})
+        .await
+        .expect_err("the reply does not encode");
+    assert!(
+        matches!(error, Error::Remote(RemoteError::Failed(_))),
+        "got {error:?}"
+    );
+    assert_eq!(
+        touches(&fixture).await,
+        1,
+        "the turn ran, which is what makes the key owe something"
+    );
+
+    let retried = keyed(&fixture, "touch", &ward::Request::Unsendable {})
+        .await
+        .expect_err("the key settled, so the retry is refused rather than run");
+    assert!(
+        matches!(
+            retried,
+            Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::Interrupted))
+        ),
+        "got {retried:?}"
+    );
+    assert_eq!(
+        touches(&fixture).await,
+        1,
+        "the retry must not run the turn a second time"
+    );
+}
+
+/// The same decision, for a `Serialize` that **panics** where the test above
+/// merely errors. The turn ran and mutated and produced nothing transmissible,
+/// which is one fact however the encoding failed, so the key settles the one
+/// way: `Interrupted`.
+///
+/// Worth its own case rather than left to the argument that the two are siblings
+/// in one `match`. Only this one is reached by a panic, so a `completed()` added
+/// to the panic arm alone would leave the test above green while replaying the
+/// refusal to every retry of work that really happened.
+///
+/// Made red by marking `completed()` in that arm.
+#[tokio::test]
+async fn a_keyed_call_whose_reply_panics_while_encoding_settles_the_key_interrupted() {
+    let fixture = start_keyed().await;
+
+    let error = keyed(&fixture, "touch", &ward::Request::Detonate {})
+        .await
+        .expect_err("the reply's `Serialize` panics");
+    assert!(
+        matches!(
+            error,
+            Error::Remote(RemoteError::Failed(ref why)) if why.contains("`Serialize` panicked")
+        ),
+        "got {error:?}"
+    );
+    assert_eq!(
+        touches(&fixture).await,
+        1,
+        "the turn ran, which is what makes the key owe something"
+    );
+
+    let retried = keyed(&fixture, "touch", &ward::Request::Detonate {})
+        .await
+        .expect_err("the key settled, so the retry is refused rather than run");
+    assert!(
+        matches!(
+            retried,
+            Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::Interrupted))
+        ),
+        "got {retried:?}"
+    );
+    assert_eq!(
+        touches(&fixture).await,
+        1,
+        "the retry must not run the turn a second time"
+    );
+}
+
+/// The panic arm, for the same reason. A turn that panicked was entered, and
+/// whatever it mutated before it panicked is in the state the actor carries on
+/// with. Giving the key back would run that half-done work again.
+///
+/// This is also what guards the `dispatched()` mark itself: delete it and this
+/// key is released rather than settled, which is the defect one arm along.
+#[tokio::test]
+async fn a_keyed_call_whose_turn_panicked_settles_the_key_interrupted() {
+    let fixture = start_keyed().await;
+
+    let error = keyed(&fixture, "touch", &ward::Request::Explode {})
+        .await
+        .expect_err("the turn panics");
+    assert!(
+        matches!(error, Error::Remote(RemoteError::Failed(ref why)) if why.contains("this turn dies")),
+        "got {error:?}"
+    );
+    assert_eq!(
+        touches(&fixture).await,
+        1,
+        "the turn ran, and mutated, before it panicked"
+    );
+
+    let retried = keyed(&fixture, "touch", &ward::Request::Explode {})
+        .await
+        .expect_err("the key settled, so the retry is refused rather than run");
+    assert!(
+        matches!(
+            retried,
+            Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::Interrupted))
+        ),
+        "got {retried:?}"
+    );
+    assert_eq!(
+        touches(&fixture).await,
+        1,
+        "the retry must not run the turn a second time"
+    );
+}
+
+// ────────────────────────────── a budget that expires in a keyed mailbox
+
+// A fifth service. `Hold` is what makes the queue deterministic: while its turn
+// is inside the actor, the mailbox is the only place any other message can be,
+// and it stays there until this test says otherwise rather than until a sleep
+// guessed right.
+keylink::service! {
+    service Gate;
+
+    /// Holds the actor's one task open until the test releases it.
+    rpc Hold() -> u64;
+
+    /// Counts the turns that reached the state. A message refused before its
+    /// turn is visible HERE and nowhere else: the refusal a peer reads says
+    /// nothing about whether the actor was touched.
+    rpc Touch() -> u64;
+
+    /// The count, read without a key, so reading it never settles one.
+    rpc Touches() -> u64;
+}
+
+struct Gate {
+    /// Fires when `hold` enters its turn. Nothing else is sent until this
+    /// arrives, which is what makes the actor provably busy rather than
+    /// probably busy.
+    entered: mpsc::UnboundedSender<()>,
+    /// Closed until the test opens it. A `Semaphore` and not a `Notify`,
+    /// because a permit added before anyone waits still releases the waiter —
+    /// a `notify_one` arriving before `notified()` would hang this forever.
+    release: Arc<Semaphore>,
+    touches: u64,
+}
+
+impl gate::Actor for Gate {
+    async fn hold(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+        let _ = self.entered.send(());
+        self.release
+            .acquire()
+            .await
+            .expect("the test never closes the semaphore")
+            .forget();
+        self.touches
+    }
+
+    async fn touch(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+        self.touches += 1;
+        self.touches
+    }
+
+    async fn touches(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+        self.touches
+    }
+}
+
+/// Reports every call that has passed the `QueueTimeout` above it, carrying the
+/// budget that layer stamped.
+///
+/// This is what makes the wait below a proof rather than a guess. The deadline
+/// is `stamped_at + budget`, and this layer runs strictly after `stamped_at`,
+/// so waiting one whole budget from the moment this fires ends after the
+/// deadline whatever the machine was doing in between. Nothing is asserted
+/// about elapsed time; the wait only decides WHEN the actor is let go.
+struct Stamped(mpsc::UnboundedSender<Duration>);
+
+impl<Req: Send + 'static, Resp: Send + 'static> Middleware<Req, Resp> for Stamped {
+    fn handle(
+        &self,
+        cx: Context,
+        req: Req,
+        body: BodyReader,
+        next: Next<Req, Resp>,
+    ) -> Pin<Box<dyn Future<Output = (Outcome<Resp>, Body)> + Send>> {
+        if let Some(budget) = cx.queueing() {
+            let _ = self.0.send(Duration::from_millis(budget.millis()));
+        }
+        next(cx, req, body)
+    }
+}
+
+const BUDGET_MS: u64 = 200;
+
+/// Long enough that the hop from the layer to the mailbox loop cannot spend it:
+/// that hop is a channel send and a `recv`, with no network and no user code
+/// inside it. Every other message in these tests reaches its turn well inside
+/// it, and the one that does not is held out by a semaphore rather than by the
+/// clock.
+const BUDGET: Duration = Duration::from_millis(BUDGET_MS);
+
+/// One `Gate` behind a bound, reachable both the typed way and the way a
+/// hand-rolled peer carrying a key reaches it. See `Keyed` for why the key needs
+/// the raw client.
+struct Gated {
+    raw: RpcClient<ActorRequest, ActorReply>,
+    client: ActorClient,
+    /// Fires when a turn starts.
+    entered: mpsc::UnboundedReceiver<()>,
+    /// Fires when a call passes the `QueueTimeout`, carrying its budget.
+    stamped: mpsc::UnboundedReceiver<Duration>,
+    /// Lets `hold` return.
+    release: Arc<Semaphore>,
+    _system: System,
+    _server: Server,
+    _nodes: [Node; 2],
+}
+
+async fn start_gated() -> Gated {
+    gated_behind(QueueTimeout::after(BUDGET)).await
+}
+
+/// The same, behind whichever bound is under test.
+///
+/// `Timeout` and `QueueTimeout` answer the same caller in the same scenario and
+/// owe the caller's idempotency key opposite things, so the fixture they are
+/// compared through has to be one fixture. `Stamped` stays inside either bound
+/// and simply reports nothing under `Timeout`, which stamps no deadline — the
+/// tests that read `stamped` are the ones that supply a `QueueTimeout`.
+async fn gated_behind(bound: impl Middleware<ActorRequest, ActorReply>) -> Gated {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let system = mounted();
+    let (entered_tx, entered) = mpsc::unbounded_channel();
+    let (stamped_tx, stamped) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    let running = Server::builder(&server)
+        .service(
+            system
+                .service(Allowlist::anyone())
+                // `System::service` gives back an ordinary `ServiceBuilder`, so
+                // this compiles — and until RFC-04 §16.7 the deadline a
+                // `QueueTimeout` stamped was read by nobody on this path.
+                .layer(bound)
+                // Added second, so it sits INSIDE the bound and sees whatever
+                // that layer put on the context.
+                .layer(Stamped(stamped_tx))
+                .build(),
+        )
+        .spawn()
+        .expect("one service, no duplicate ALPN");
+    let raw = RpcClient::connect(&client_node, server.endpoint().addr(), System::alpn())
+        .await
+        .expect("the raw client dials the actor system");
+    let client = ActorClient::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("the typed client dials the actor system");
+    system
+        .mount(
+            id("gate"),
+            gate::spawn(Gate {
+                entered: entered_tx,
+                release: Arc::clone(&release),
+                touches: 0,
+            }),
+        )
+        .expect("the id is free");
+
+    Gated {
+        raw,
+        client,
+        entered,
+        stamped,
+        release,
+        _system: system,
+        _server: running,
+        _nodes: [server, client_node],
+    }
+}
+
+/// One envelope to `gate`, under a key.
+async fn keyed_gate(
+    raw: &RpcClient<ActorRequest, ActorReply>,
+    key: &str,
+    envelope: ActorRequest,
+) -> Result<gate::Response, Error> {
+    let (reply, _body) = raw
+        .with_idempotency(IdempotencyKey::new(key).expect("a valid key"))
+        .call(envelope, keylink::Body::empty())
+        .await?;
+    reply.decode()
+}
+
+/// One message to `gate`, as its own contract writes it.
+fn touch() -> ActorRequest {
+    ActorRequest::new(id("gate"), gate::schema(), &gate::Request::Touch {})
+        .expect("the message encodes")
+}
+
+async fn gate_touches(fixture: &Gated) -> u64 {
+    gate::at(&fixture.client, id("gate"))
+        .touches()
+        .await
+        .expect("the actor answers")
+}
+
+/// Puts one keyed message in the mailbox, keeps it there until its budget has
+/// provably run out, and gives back what it was answered.
+///
+/// Three facts have to hold at the moment the loop takes that message, and none
+/// of them is left to a race:
+///
+/// 1. **It is queued.** It is not sent until `hold` has entered its turn, and
+///    the mailbox holds a message while a turn runs, so the mailbox is the only
+///    place it can be.
+/// 2. **Its deadline has passed.** The wait starts only after the `Stamped`
+///    layer has seen the deadline stamped, and lasts a whole budget, so it ends
+///    after `stamped_at + budget` however slow anything in between was.
+/// 3. **It stays queued for all of that.** The actor is inside `hold`, waiting
+///    on a semaphore this test owns, and the permit is added last.
+async fn expired_in_the_queue(
+    fixture: &mut Gated,
+    key: &str,
+    envelope: ActorRequest,
+) -> Result<gate::Response, Error> {
+    let client = &fixture.client;
+    let raw = &fixture.raw;
+    let release = &fixture.release;
+    let entered = &mut fixture.entered;
+    let stamped = &mut fixture.stamped;
+    let (go, wait) = oneshot::channel();
+
+    let holding = async { gate::at(client, id("gate")).hold().await };
+    let queued = async {
+        wait.await.expect("the driver says when");
+        keyed_gate(raw, key, envelope).await
+    };
+    let driver = async {
+        entered.recv().await.expect("`hold` entered its turn");
+        // `hold`'s own stamp, drained here so the next one belongs to the
+        // message this is about.
+        stamped.recv().await.expect("`hold` was stamped");
+        go.send(()).expect("the queued call is waiting for this");
+
+        let budget = stamped.recv().await.expect("the queued call was stamped");
+        tokio::time::sleep(budget).await;
+        // Only now, with the deadline behind us and the message still in the
+        // mailbox, does the loop get to look at it.
+        release.add_permits(1);
+    };
+
+    let (held, refused, ()) = tokio::join!(holding, queued, driver);
+    held.expect("the holding turn answers");
+    refused
+}
+
+/// The defect: `QueueTimeout` layers onto `System::service` and compiles, and
+/// the keyed mailbox loop never read the deadline it stamps. A configured guard
+/// that does not guard, at any budget, with no error and no warning — on the
+/// path where the identical layer works one module over.
+///
+/// Made red by deleting the expiry arm from the loop in `macros.rs`.
+#[tokio::test]
+async fn a_keyed_message_still_queued_when_its_budget_expires_is_refused_before_its_turn() {
+    let mut fixture = start_gated().await;
+
+    let refused = expired_in_the_queue(&mut fixture, "queued", touch())
+        .await
+        .expect_err("a message whose budget ran out in the mailbox must be refused");
+
+    assert!(
+        matches!(refused, Error::Remote(RemoteError::TimedOut { millis }) if millis == BUDGET_MS),
+        "the refusal must be the one the local path produces, carrying the budget: got {refused:?}"
+    );
+    assert_eq!(
+        gate_touches(&fixture).await,
+        0,
+        "a refused message must not have entered the turn"
+    );
+}
+
+/// The interaction that matters, and the reason the fix touches the progress
+/// marker nowhere. A message refused while still queued has not run, so
+/// `Drop for Guard` must see `NotDispatched` and give the key back: the retry
+/// of a call that never happened is a first attempt.
+///
+/// Marking `dispatched()` on the expiry arm would settle the key `Interrupted`
+/// and refuse every retry of that call forever, which is the failure §16.6
+/// names one arm along. Made red by marking it.
+#[tokio::test]
+async fn a_keyed_message_that_expired_in_the_queue_leaves_its_key_claimable() {
+    let mut fixture = start_gated().await;
+
+    expired_in_the_queue(&mut fixture, "retried", touch())
+        .await
+        .expect_err("the budget ran out while it queued");
+
+    // The actor is free now, so this one runs rather than queues.
+    let ran = keyed_gate(&fixture.raw, "retried", touch())
+        .await
+        .expect("the key must still be claimable");
+    assert!(matches!(ran, gate::Response::Touch(1)), "got {ran:?}");
+    assert_eq!(
+        gate_touches(&fixture).await,
+        1,
+        "the retry must have entered the turn, which is what claimable means"
+    );
+}
+
+/// Which of two refusals an expired message gets when it is ALSO undecodable,
+/// pinned rather than left to whichever check happens to run first.
+///
+/// The decode wins. Bytes that are not a message of this contract are broken
+/// permanently, and `TimedOut` is a transient refusal that invites a retry
+/// which can never succeed. The local path decides it the same way round for
+/// free: there the accept loop decodes before any layer runs, so a bad payload
+/// is refused before a deadline exists at all. Either refusal leaves the key
+/// claimable, so the order costs the caller nothing but a truer answer.
+///
+/// The declared hash is the RIGHT one, so `System::deliver`'s own comparison
+/// passes and the message reaches the mailbox loop — the same construction
+/// `a_keyed_call_whose_payload_does_not_decode_leaves_the_key_claimable` uses.
+/// Made red by widening the expiry arm's pattern from `Ok(_)` to `_`, which is
+/// what checking the deadline ahead of the decode amounts to.
+#[tokio::test]
+async fn a_payload_that_does_not_decode_says_so_even_when_its_budget_expired() {
+    let mut fixture = start_gated().await;
+    // A variant index no variant has.
+    let garbage = ActorRequest::new(id("gate"), gate::schema(), &250u32).expect("the bytes encode");
+
+    let refused = expired_in_the_queue(&mut fixture, "garbage", garbage)
+        .await
+        .expect_err("the payload does not decode");
+
+    assert!(
+        matches!(refused, Error::Remote(RemoteError::Failed(_))),
+        "a permanently broken payload must not be reported as a transient timeout: got {refused:?}"
+    );
+    assert_eq!(
+        gate_touches(&fixture).await,
+        0,
+        "neither refusal may have entered the turn"
+    );
+}
+
+// ────────────────────────────── the one mailbox slot, and who may hold it
+
+/// Sends two messages to an actor that is already inside a turn, keeps it there
+/// until both budgets have provably run out, and reports what each was answered
+/// — together with whether the actor had already been let go when that answer
+/// arrived.
+///
+/// **The pair is deliberately identical in shape and unordered.** Capacity is
+/// one, so while the turn runs exactly one of the two takes the mailbox slot and
+/// exactly one is left waiting for a permit — and there is no way to observe
+/// which, because a slot is only provably occupied while nothing is draining it.
+/// Every assertion built on this is therefore true of both messages or a count
+/// over the pair, which is what keeps it free of a race no amount of sleeping
+/// would fix.
+///
+/// Nothing here asserts on elapsed time. The clock decides one thing only: when
+/// the actor is let go. Three budgets rather than the one
+/// [`expired_in_the_queue`] waits, because this reports an ORDER and not just an
+/// expiry — a caller refused at its own deadline is refused two whole budgets
+/// before the permit is added, which is the difference between a fact and a
+/// photo finish.
+async fn two_behind_a_held_turn(
+    fixture: &mut Gated,
+    messages: [ActorRequest; 2],
+) -> [(Result<ActorReply, Error>, bool); 2] {
+    let client = &fixture.client;
+    let raw = &fixture.raw;
+    let release = &fixture.release;
+    let entered = &mut fixture.entered;
+    let stamped = &mut fixture.stamped;
+    let let_go = AtomicBool::new(false);
+    let (go, wait) = oneshot::channel();
+    let [first, second] = messages;
+
+    let holding = async { gate::at(client, id("gate")).hold().await };
+    let sending = async {
+        wait.await.expect("the driver says when");
+        let answer = |message| async {
+            let answered = raw
+                .call(message, Body::empty())
+                .await
+                .map(|(reply, _body)| reply);
+            (answered, let_go.load(Ordering::Acquire))
+        };
+        tokio::join!(answer(first), answer(second))
+    };
+    let driver = async {
+        entered.recv().await.expect("`hold` entered its turn");
+        // `hold`'s own stamp, drained here so the next two belong to the
+        // messages this is about.
+        stamped.recv().await.expect("`hold` was stamped");
+        go.send(()).expect("the two calls are waiting for this");
+
+        let budget = stamped.recv().await.expect("one of the pair was stamped");
+        stamped.recv().await.expect("and the other");
+        tokio::time::sleep(budget * 3).await;
+        let_go.store(true, Ordering::Release);
+        release.add_permits(1);
+    };
+
+    let (held, (left, right), ()) = tokio::join!(holding, sending, driver);
+    held.expect("the holding turn answers");
+    [left, right]
+}
+
+/// `System::deliver` compares the declared hash against the registry entry's
+/// before the message goes anywhere near a mailbox, and the keyed loop compares
+/// the same two values again inside [`keylink::Sealed::open`]. The second check
+/// hides the first from any test that only reads the refusal: both produce a
+/// byte-identical `ActorSchemaMismatch`, so deleting `deliver`'s leaves
+/// `a_message_on_a_drifted_schema_is_refused_before_the_payload_is_decoded`
+/// green, and the whole suite with it.
+///
+/// What the first check actually buys is the mailbox slot. Capacity is one, so a
+/// drifted message that has to be carried to the actor's own task before anyone
+/// will look at its hash takes the one buffer a legitimate caller needs, and
+/// holds it for as long as the current turn lasts. A peer can do that with
+/// garbage, indefinitely, at no cost to itself.
+///
+/// Made red by deleting the `ours != request.schema` block from
+/// `System::deliver`. One of the two then cannot get a permit: it waits out its
+/// budget and comes back `TimedOut` — a transient answer inviting a retry, for a
+/// message that is permanently wrong — and neither is answered until the turn
+/// ends.
+#[tokio::test]
+async fn a_drifted_message_is_refused_without_taking_the_actors_mailbox_slot() {
+    let mut fixture = start_gated().await;
+    let drifted = || {
+        ActorRequest::new(id("gate"), journal::schema(), &journal::Request::Entries {})
+            .expect("the message encodes")
+    };
+
+    let answers = two_behind_a_held_turn(&mut fixture, [drifted(), drifted()]).await;
+
+    for (answered, let_go) in answers {
+        let error = answered.expect_err("the declared hash is not the one `gate` was mounted with");
+        assert!(
+            matches!(
+                error,
+                Error::Remote(RemoteError::ActorSchemaMismatch { ours, theirs })
+                    if ours == gate::schema() && theirs == journal::schema()
+            ),
+            "a drifted message must be refused on its own terms, not queued for a slot \
+             and then told to try again: got {error:?}"
+        );
+        assert!(
+            !let_go,
+            "a drifted message must be refused while the actor is still busy, which is \
+             what proves it never needed a mailbox permit"
+        );
+    }
+    assert_eq!(
+        gate_touches(&fixture).await,
+        0,
+        "neither message may have entered the turn"
+    );
+}
+
+/// `LocalActor::ask_catching_before` bounds the wait for a mailbox permit, so a
+/// message that cannot get a slot is refused at its budget and — tokio not
+/// queueing a send that was cancelled before its permit arrived — provably never
+/// queued. `System::deliver` awaited `mail.send` with no bound at all.
+///
+/// Capacity is one and turns are serial, so with an actor inside a long turn
+/// every caller past the first waits there: each holding a QUIC stream, a
+/// `BodyReader` and an idempotency key claimed before dispatch, and each
+/// learning `TimedOut` only once the turn ends. RFC-04 §16.7 called that milder
+/// than it sounds, on the assumption of short turns — which is the assumption
+/// `QueueTimeout` exists because nobody can make. A 50 ms budget against a ten
+/// second turn was honoured at ten seconds.
+///
+/// The assertion is a count over the pair rather than a claim about either one:
+/// exactly one of two identical messages can hold the slot, so exactly one must
+/// be answered before the actor is let go.
+///
+/// Made red by dropping the bound in `System::deliver` back to a bare
+/// `mail.send(..).await`, which leaves that count at zero.
+#[tokio::test]
+async fn a_caller_that_cannot_get_a_mailbox_permit_is_refused_at_its_budget() {
+    let mut fixture = start_gated().await;
+
+    let answers = two_behind_a_held_turn(&mut fixture, [touch(), touch()]).await;
+
+    let mut refused_before_the_turn_ended = 0;
+    for (answered, let_go) in answers {
+        let error = answered.expect_err("both budgets ran out before either could run");
+        assert!(
+            matches!(error, Error::Remote(RemoteError::TimedOut { millis }) if millis == BUDGET_MS),
+            "both paths must refuse with the value the local one produces: got {error:?}"
+        );
+        refused_before_the_turn_ended += usize::from(!let_go);
+    }
+
+    assert_eq!(
+        refused_before_the_turn_ended, 1,
+        "the caller that could not get a mailbox permit must be refused at its budget, \
+         not held for the whole turn it was never going to be admitted into"
+    );
+    assert_eq!(
+        gate_touches(&fixture).await,
+        0,
+        "a refused message must not have entered the turn"
+    );
+}
+
+// ────────────────────── the bound that gives up from outside the mailbox
+
+/// Puts one keyed message in the mailbox behind a held turn, lets the bound give
+/// up on it from outside, and only then lets the actor go.
+///
+/// Two facts hold at the moment the caller is answered, and neither is left to a
+/// race. **It is queued**: it is not sent until `hold` has entered its turn, and
+/// a turn that is running holds no mailbox slot, so the one slot is free and the
+/// mailbox is the only place the message can be. **It has not run**: the actor
+/// is inside `hold`, waiting on a semaphore this test owns, and the permit is
+/// added only after the caller already has its answer.
+///
+/// Nothing asserts on elapsed time. The clock decides one thing, which is when
+/// the layer above gives up.
+async fn queued_when_the_caller_gave_up(
+    fixture: &mut Gated,
+    key: &str,
+    envelope: ActorRequest,
+) -> Result<gate::Response, Error> {
+    let client = &fixture.client;
+    let raw = &fixture.raw;
+    let release = &fixture.release;
+    let entered = &mut fixture.entered;
+    let (go, wait) = oneshot::channel();
+
+    let holding = async { gate::at(client, id("gate")).hold().await };
+    let queued = async {
+        wait.await.expect("the driver says when");
+        let answered = keyed_gate(raw, key, envelope).await;
+        // Answered first, released second, and that order is what the caller's
+        // answer is about: it was told something while its message was still
+        // sitting in the mailbox, unrun.
+        release.add_permits(1);
+        answered
+    };
+    let driver = async {
+        entered.recv().await.expect("`hold` entered its turn");
+        go.send(()).expect("the queued call is waiting for this");
+    };
+
+    let (held, answered, ()) = tokio::join!(holding, queued, driver);
+    // Deliberately not asserted, and the reason is the property under test: the
+    // bound is watching this caller too, and `hold` outlasts any budget on
+    // purpose, so a `Timeout` refuses it and the turn goes on holding the actor
+    // regardless. What ends that turn is the semaphore, not the caller.
+    let _ = held;
+    answered
+}
+
+/// The keyed half of RFC-04 §16.12, and the latent one: `ActorClient` has no
+/// `with_idempotency`, so reaching this needs a hand-built envelope — the same
+/// reason the rest of the `Keyed` tests exist. The live half is on the singleton
+/// path, where the generated `Client` does have it.
+///
+/// A `Timeout` runs outside the mailbox, so its budget expiring drops the wait
+/// for the reply and not the turn. The message runs. Releasing its key would
+/// therefore hand the retry the same work to do a second time — at-least-once,
+/// out of the module whose one promise is at-most-once — so reaching the mailbox
+/// is marked, and the key settles `Interrupted` instead.
+///
+/// Made red by removing the `enqueued()` mark from `System::deliver`, which
+/// takes the retry back to a first attempt and the counter to two.
+#[tokio::test]
+async fn a_keyed_message_a_timeout_gave_up_on_in_the_mailbox_settles_its_key() {
+    let mut fixture = gated_behind(Timeout::after(BUDGET)).await;
+
+    let refused = queued_when_the_caller_gave_up(&mut fixture, "gave-up", touch())
+        .await
+        .expect_err("the budget expires while the message is still queued");
+    assert!(
+        matches!(refused, Error::Remote(RemoteError::TimedOut { millis }) if millis == BUDGET_MS),
+        "got {refused:?}"
+    );
+    assert_eq!(
+        gate_touches(&fixture).await,
+        1,
+        "the turn runs whether its caller stayed or not, which is exactly why giving the key \
+         back would be an invitation to run the work twice"
+    );
+
+    let retried = keyed_gate(&fixture.raw, "gave-up", touch())
+        .await
+        .expect_err("a key nobody can report on must be settled, not claimable");
+    assert!(
+        matches!(
+            retried,
+            Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::Interrupted))
+        ),
+        "got {retried:?}"
+    );
+    assert_eq!(
+        gate_touches(&fixture).await,
+        1,
+        "the refused retry must not have run the work a second time"
+    );
+}
+
+/// The same pair as [`two_behind_a_held_turn`], under keys: exactly one gets the
+/// one mailbox slot, and exactly one is left waiting for a permit it never gets.
+///
+/// **The pair is deliberately identical and unordered**, for that helper's
+/// reason: a slot is only provably occupied while nothing is draining it, so
+/// every assertion here is a count over the two.
+async fn two_keyed_behind_a_held_turn(
+    fixture: &mut Gated,
+    keys: [&str; 2],
+) -> [Result<gate::Response, Error>; 2] {
+    let client = &fixture.client;
+    let raw = &fixture.raw;
+    let release = &fixture.release;
+    let entered = &mut fixture.entered;
+    let (go, wait) = oneshot::channel();
+    let [first, second] = keys;
+
+    let holding = async { gate::at(client, id("gate")).hold().await };
+    let sending = async {
+        wait.await.expect("the driver says when");
+        let answered = tokio::join!(
+            keyed_gate(raw, first, touch()),
+            keyed_gate(raw, second, touch()),
+        );
+        release.add_permits(1);
+        answered
+    };
+    let driver = async {
+        entered.recv().await.expect("`hold` entered its turn");
+        go.send(()).expect("the two calls are waiting for this");
+    };
+
+    let (held, (left, right), ()) = tokio::join!(holding, sending, driver);
+    // Not asserted, for [`queued_when_the_caller_gave_up`]'s reason.
+    let _ = held;
+    [left, right]
+}
+
+/// What the mark being placed **after** the send buys, and it is the whole
+/// reason it is not placed before it.
+///
+/// One of these two got a mailbox permit and one did not, and no test can say
+/// which. The one that did leaves a turn behind that runs, so its key must
+/// settle. The one that did not queued nothing — tokio drops a send it cancelled
+/// — so its key is owed back and its retry is a first attempt. A mark taken on
+/// the way *into* `System::deliver` would be indistinguishable on every other
+/// assertion in this file and would burn that second key.
+///
+/// Made red by moving `progress.enqueued()` above `mail.send` in
+/// `System::deliver`, which settles both keys and leaves the count at two.
+#[tokio::test]
+async fn only_the_keyed_message_that_got_a_mailbox_permit_settles_its_key() {
+    let mut fixture = gated_behind(Timeout::after(BUDGET)).await;
+
+    for answered in two_keyed_behind_a_held_turn(&mut fixture, ["slot", "no-slot"]).await {
+        let error = answered.expect_err("both budgets ran out before either could be answered");
+        assert!(
+            matches!(error, Error::Remote(RemoteError::TimedOut { millis }) if millis == BUDGET_MS),
+            "got {error:?}"
+        );
+    }
+    assert_eq!(
+        gate_touches(&fixture).await,
+        1,
+        "exactly one of the two can hold the slot, so exactly one turn runs once the actor \
+         is let go"
+    );
+
+    let mut settled = 0;
+    for key in ["slot", "no-slot"] {
+        match keyed_gate(&fixture.raw, key, touch()).await {
+            Ok(_) => {}
+            Err(Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::Interrupted))) => {
+                settled += 1;
+            }
+            other => panic!("a retry is a first attempt or an Interrupted: got {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        settled, 1,
+        "the caller that never got a permit must keep its key, or a message that provably \
+         never queued is refused forever for work nobody did"
+    );
+    assert_eq!(
+        gate_touches(&fixture).await,
+        2,
+        "the released key's retry is the only work left to do, and it must have done it"
+    );
+}
+
+// ─────────────────────────────── what runs outside `guarded`, and what it costs
+
+/// A response whose `Serialize` **panics** where [`Untransmittable`]'s merely
+/// errors. One token apart, and a different outcome entirely — which is the
+/// whole reason this type is worth its lines.
+#[derive(Debug, Clone, serde::Deserialize, postcard_schema::Schema)]
+pub struct Exploding;
+
+impl serde::Serialize for Exploding {
+    fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+        panic!("this reply panics on the way to the wire");
+    }
+}
+
+// A sixth service, so the shape-for-shape pairing between `journal` and `vault`
+// survives a method being added here.
+keylink::service! {
+    service Fuse;
+
+    /// Answers with a value whose `Serialize` panics — on the actor's own task,
+    /// after the turn has returned and `guarded` has let go.
+    rpc Detonate() -> Exploding;
+
+    /// A message that detonates nothing, for asking afterwards whether the
+    /// actor is still there.
+    rpc Ping() -> u64;
+}
+
+struct Fuse;
+
+impl fuse::Actor for Fuse {
+    async fn detonate(&mut self, _cx: keylink::Caller<'_>) -> Exploding {
+        Exploding
+    }
+
+    async fn ping(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+        1
+    }
+}
+
+/// The scenario that proved the defect, inverted.
+///
+/// `guarded(..)` covered `__actor_turn` and stopped there. In the keyed mailbox
+/// loop `payload.open` ran before it and `ActorReply::encode` one line after
+/// it, and both execute **user** `Deserialize`/`Serialize` code on the actor's
+/// own task. A panic in either was outside every catch, so it unwound out of
+/// the mounted task and produced verbatim the failure `keylink/src/panic.rs`
+/// says `guarded` prevents: "one bad message drops the receiver, every later
+/// send fails, and the actor is unreachable for the life of the process while
+/// the registry still lists it as mounted". This test asserted exactly that,
+/// and it held.
+///
+/// Both calls are inside `catching` now, so the cost of a reply that cannot
+/// reach the wire is that reply. Neither call is on the actor's task on the
+/// local path, which is why this was a divergence between the two dispatchers
+/// rather than a property of the turn model.
+///
+/// Made red by dropping `catching` from around `ActorReply::encode` in
+/// `macros.rs`, which restores all three of the assertions below to their
+/// inverses.
+#[tokio::test]
+async fn a_reply_whose_serialize_panics_costs_that_message_and_not_the_actor() {
+    let fixture = start(mounted()).await;
+    fixture
+        .system
+        .mount(id("fuse"), fuse::spawn(Fuse))
+        .expect("the id is free");
+    assert_eq!(
+        fuse::at(&fixture.client, id("fuse")).ping().await.unwrap(),
+        1,
+        "the actor answers before the message that used to kill it"
+    );
+
+    // The turn itself is fine: it returns `Exploding`, and `guarded` sees no
+    // panic at all. The unwind happens in `ActorReply::encode`, one line later
+    // and one scope out.
+    let error = fuse::at(&fixture.client, id("fuse"))
+        .detonate()
+        .await
+        .expect_err("the reply's `Serialize` panics");
+    assert!(
+        matches!(
+            error,
+            Error::Remote(RemoteError::Failed(ref why)) if why.contains("`Serialize` panicked")
+        ),
+        "the caller must be told its REPLY panicked, not that a mounted actor does not \
+         exist: got {error:?}"
+    );
+
+    assert!(
+        fixture.system.contains(&id("fuse")),
+        "the registry goes on listing it — which is now the truth rather than a stale entry \
+         nothing reaps"
+    );
+
+    assert_eq!(
+        fuse::at(&fixture.client, id("fuse")).ping().await.unwrap(),
+        1,
+        "and the next caller is answered, which is the whole point of catching a panic \
+         instead of letting it unwind out of the mounted task"
     );
 }

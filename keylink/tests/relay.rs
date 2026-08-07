@@ -37,7 +37,7 @@ use iroh::endpoint::presets;
 use iroh::test_utils::{run_relay_server, DnsPkarrServer};
 use iroh::tls::CaTlsConfig;
 use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode};
-use keylink::{Allowlist, Node};
+use keylink::{Allowlist, Context, Node};
 
 /// Long enough that a loaded machine does not fail, short enough that a genuine
 /// hang is reported as one rather than running until the harness gives up.
@@ -55,7 +55,7 @@ keylink::service! {
 struct Server;
 
 impl echo::Handler for Server {
-    async fn ping(&self) -> String {
+    async fn ping(&self, _cx: &Context) -> String {
         "pong".to_string()
     }
 }

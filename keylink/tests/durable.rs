@@ -11,6 +11,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::Caller;
 use keylink_persist::{file::Files, Claim, Durable, RestoreError, Snapshots, StateId};
 
 keylink::service! {
@@ -29,13 +30,13 @@ struct Ledger {
 }
 
 impl ledger::Actor for Ledger {
-    async fn post(&mut self, entry: u64, hold_ms: u64) -> u64 {
+    async fn post(&mut self, _cx: Caller<'_>, entry: u64, hold_ms: u64) -> u64 {
         n0_future::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
         self.entries.push(entry);
         self.entries.len() as u64
     }
 
-    async fn entries(&mut self) -> Vec<u64> {
+    async fn entries(&mut self, _cx: Caller<'_>) -> Vec<u64> {
         self.entries.clone()
     }
 }

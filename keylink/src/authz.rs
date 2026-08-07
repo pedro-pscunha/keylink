@@ -98,6 +98,19 @@ impl ProvenPeer {
 pub struct AdmittedPeer(ProvenPeer);
 
 impl AdmittedPeer {
+    /// Mint one, for the accept path, one line after a policy said yes.
+    ///
+    /// `pub(crate)`, so [`Allowlist::admit`] remains the only constructor
+    /// *reachable from outside this crate* — which is the invariant that
+    /// matters. An [`Admission`](crate::Admission) implemented downstream
+    /// answers [`Admittance::Admitted`](crate::Admittance), which carries no
+    /// value; keylink turns that into the proof here. Making the trait return
+    /// an `AdmittedPeer` instead would have made the trait unimplementable
+    /// outside the crate, or the type mintable inside anyone's.
+    pub(crate) fn mint(peer: ProvenPeer) -> Self {
+        Self(peer)
+    }
+
     /// The identity underneath, for a ledger keyed on who rather than on
     /// whether.
     #[must_use]

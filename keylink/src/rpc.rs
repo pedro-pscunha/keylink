@@ -37,14 +37,15 @@ use iroh::{
 use n0_future::task::JoinSet;
 use serde::{de::DeserializeOwned, Serialize};
 
+use crate::admission::settle;
 use crate::error::ConfigError;
-use crate::idempotency::{Claim, Ledger};
-use crate::middleware::wrap;
+use crate::idempotency::{Claim, Guard, Ledger};
+use crate::middleware::{wrap, Reached};
 use crate::wire::FrameReader;
 use crate::{
-    wire, AdmittedPeer, Allowlist, BlobHandle, BlobId, Blobs, Body, BodyReader, Context, Error,
-    Granting, IdempotencyKey, IdempotencyRefusal, Middleware, Next, Node, Outcome, ProvenPeer,
-    RemoteError, Result, Rpc, WireResponse,
+    wire, Admission, AdmittedPeer, Allowlist, BlobHandle, BlobId, Blobs, Body, BodyReader, Context,
+    Error, Granting, Idempotency, IdempotencyKey, IdempotencyRefusal, KeyState, Middleware, Next,
+    Node, Outcome, RemoteError, Result, Rpc, WireRequest, WireResponse,
 };
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -75,7 +76,10 @@ pub type Dispatch<Req, Resp> =
 /// every stream that connection opens, concurrently.
 pub(crate) struct RpcService<Req, Resp> {
     next: Next<Req, Resp>,
-    allow: Arc<Allowlist>,
+    /// The policy this service admits against. An `Arc<dyn ..>` rather than a
+    /// generic parameter: the decision is made once per connection and does no
+    /// I/O, and a generic would reach every `service!` user's type errors.
+    admission: Arc<dyn Admission>,
     /// The content store this service grants against, when it declares `blob`
     /// methods. `None` for every service that does not, which is why an
     /// ordinary service pays nothing for this feature existing.
@@ -91,7 +95,7 @@ impl<Req, Resp> Clone for RpcService<Req, Resp> {
     fn clone(&self) -> Self {
         Self {
             next: self.next.clone(),
-            allow: self.allow.clone(),
+            admission: self.admission.clone(),
             blobs: self.blobs.clone(),
             ledger: self.ledger.clone(),
             _p: PhantomData,
@@ -101,27 +105,103 @@ impl<Req, Resp> Clone for RpcService<Req, Resp> {
 
 impl<Req, Resp> std::fmt::Debug for RpcService<Req, Resp> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RpcService")
-            .field("allow", &self.allow)
-            .finish_non_exhaustive()
+        f.debug_struct("RpcService").finish_non_exhaustive()
     }
 }
 
-/// What the caller's idempotency key is worth, or `None` when it sent no key.
+/// What the caller's idempotency key is worth, once any waiting is over.
+///
+/// Deliberately has no `Running` arm. Whether a caller waits for a call already
+/// in flight is decided in [`claim_key`], so nothing downstream of it has to
+/// remember that the question exists.
+enum Keyed {
+    /// No key was sent. Nothing to record and nothing to release.
+    None,
+    /// The key is ours for this call. Settle it when the chain returns.
+    Run(Guard),
+    /// Write these bytes. The handler is not entered.
+    Replay(Bytes),
+    /// Refuse. The handler is not entered.
+    Refuse(RemoteError),
+}
+
+/// Map a settled claim, treating "still running" as the refusal it has always
+/// been. Reached only by a caller that did not ask to attach, or one whose
+/// budget ran out — and `InFlight` is the truth in both cases.
+fn resolve(claim: Claim) -> Keyed {
+    match claim {
+        Claim::Fresh(guard) => Keyed::Run(guard),
+        Claim::Replay(frame) => Keyed::Replay(frame),
+        Claim::Refused(refusal) => Keyed::Refuse(refusal),
+        Claim::Running(_) => Keyed::Refuse(IdempotencyRefusal::InFlight.into()),
+    }
+}
+
+/// Take the key, waiting for a call already in flight when the caller asked to.
 ///
 /// The `validate` here is not a second opinion about
 /// [`IdempotencyKey::new`]. It is the only check this value has ever had:
 /// `derive(Deserialize)` builds the string field by field and never calls a
 /// constructor, so a peer's key arrives unchecked whatever our constructor
 /// allows. Skipping it would key a map on a string a peer chose the length of.
-fn claim_key(ledger: &Arc<Ledger>, peer: EndpointId, key: Option<IdempotencyKey>) -> Option<Claim> {
-    let key = key?;
-    if let Err(error) = key.validate() {
-        return Some(Claim::Refused(
-            IdempotencyRefusal::Malformed(error.to_string()).into(),
-        ));
+///
+/// # The wakeup, and the hazard it has to survive
+///
+/// `Notify::notify_waiters` wakes only the waiters registered when it is
+/// called, so a waiter that registers *after* the settle sleeps through it
+/// forever. That is the objection RFC-04 §3.3 raised against attach, and it was
+/// right. [`Notified::enable`](tokio::sync::futures::Notified::enable) answers
+/// it: the waiter is registered before the slot is re-read, so a settle landing
+/// in between is caught by the re-read rather than lost.
+///
+/// One wait and one re-claim, never a loop, so the work here is bounded by the
+/// caller's own budget and by nothing else.
+///
+/// # What the waiting itself is bounded by
+///
+/// A parked attacher holds no claim, so `MAX_RUNNING_PER_PEER` and `MAX_RUNNING`
+/// bound neither it nor the stream pair it keeps open. It takes a `Waiting` from
+/// the ledger instead, refused **before** it parks and given back by `Drop` —
+/// because the ordinary way a waiter stops waiting is that this task is aborted.
+async fn claim_key(ledger: &Arc<Ledger>, peer: EndpointId, idem: Option<Idempotency>) -> Keyed {
+    let Some(idem) = idem else {
+        return Keyed::None;
+    };
+    if let Err(error) = idem.key().validate() {
+        return Keyed::Refuse(IdempotencyRefusal::Malformed(error.to_string()).into());
     }
-    Some(ledger.claim(peer, key))
+    let key = idem.key().clone();
+
+    let notify = match ledger.claim(peer, key.clone()) {
+        Claim::Running(notify) => notify,
+        settled => return resolve(settled),
+    };
+    let Some(budget) = idem.attach_budget() else {
+        return Keyed::Refuse(IdempotencyRefusal::InFlight.into());
+    };
+    // Taken before anything parks, and held to the end of this function so it
+    // covers the wait AND the re-claim after it. A caller that is not going to
+    // wait never reaches here, so it never spends a place.
+    let _waiting = match ledger.wait(peer) {
+        Ok(waiting) => waiting,
+        Err(refusal) => return Keyed::Refuse(refusal),
+    };
+
+    let notified = notify.notified();
+    tokio::pin!(notified);
+    // Registered HERE, before the re-read below. Reversing these two lines is
+    // the dropped-wakeup bug, and it would pass every test that is not run
+    // under load.
+    notified.as_mut().enable();
+
+    match ledger.claim(peer, key.clone()) {
+        Claim::Running(_) => {}
+        settled => return resolve(settled),
+    }
+    if n0_future::time::timeout(budget, notified).await.is_err() {
+        return Keyed::Refuse(IdempotencyRefusal::InFlight.into());
+    }
+    resolve(ledger.claim(peer, key))
 }
 
 /// Write a recorded reply again, byte for byte.
@@ -133,7 +213,39 @@ async fn replay(send: &mut SendStream, frame: Bytes) -> Result<()> {
 
 /// Refuse a call that was never entered. Carries no body, like every refusal.
 async fn refuse<Resp: Serialize>(send: &mut SendStream, refusal: RemoteError) -> Result<()> {
-    wire::write_header(send, Some(0), None, &Outcome::<Resp>::Err(refusal)).await?;
+    wire::write_header(
+        send,
+        Some(0),
+        None,
+        &WireResponse::<Resp>::Call(Outcome::Err(refusal)),
+    )
+    .await?;
+    send.finish()?;
+    Ok(())
+}
+
+/// Answer a question about this peer's ledger.
+///
+/// No handler, no layer and no body: it is a read of keylink's own bookkeeping,
+/// and the only thing it could be authorized against is the connection's
+/// admission, which already happened. Peer-scoped by construction — the id is
+/// the one iroh proved here, so a peer cannot name another's key.
+///
+/// A key that would be refused as malformed is reported [`KeyState::Fresh`],
+/// which is not a fallback: such a key can never have been claimed, because
+/// [`claim_key`] refuses it before the ledger sees it.
+async fn answer_key_state<Resp: Serialize>(
+    send: &mut SendStream,
+    ledger: &Ledger,
+    peer: EndpointId,
+    key: &IdempotencyKey,
+) -> Result<()> {
+    let state = if key.validate().is_ok() {
+        ledger.key_state(peer, key)
+    } else {
+        KeyState::Fresh
+    };
+    wire::write_header(send, Some(0), None, &WireResponse::<Resp>::KeyState(state)).await?;
     send.finish()?;
     Ok(())
 }
@@ -180,22 +292,24 @@ where
     Resp: Serialize,
 {
     let mut frames = FrameReader::new(recv);
-    let Some(request) = frames.read_header::<Req>().await? else {
+    let Some(request) = frames.read_header::<WireRequest<Req>>().await? else {
+        return Ok(());
+    };
+    // A ledger query on a unidirectional stream has nowhere to send its answer,
+    // so it is dropped rather than half-answered. The generated client never
+    // sends one; a hand-rolled peer that does gets the `tell` guarantee, which
+    // is that nothing comes back.
+    let WireRequest::Call(message) = request.message else {
         return Ok(());
     };
 
-    let cx = Context::new(peer.id(), Req::SERVICE, request.message.method())
-        .with_actor(request.message.actor().cloned());
+    let cx = Context::new(peer.id(), Req::SERVICE, message.method())
+        .with_actor(message.actor().cloned());
 
     // The body reader is handed over for symmetry with `serve_one`: a `tell`
     // carries no body today, and a future kind that does will find the seam
     // already here rather than needing the signature changed.
-    let (_outcome, _body) = next(
-        cx,
-        request.message,
-        BodyReader::new(frames, request.body_len),
-    )
-    .await;
+    let (_outcome, _body) = next(cx, message, BodyReader::new(frames, request.body_len)).await;
     let _ = blobs;
     Ok(())
 }
@@ -217,29 +331,37 @@ where
     let mut frames = FrameReader::new(recv);
     // A stream opened and finished without a request is not an error; the peer
     // simply changed its mind.
-    let Some(mut request) = frames.read_header::<Req>().await? else {
+    let Some(request) = frames.read_header::<WireRequest<Req>>().await? else {
         return Ok(());
     };
 
-    let cx = Context::new(peer, Req::SERVICE, request.message.method())
-        .with_actor(request.message.actor().cloned());
-
-    // Claimed BEFORE the handler is entered, which is the whole at-most-once
-    // property: the only way back from a claimed key to a vacant one is
-    // eviction.
-    let guard = match claim_key(&ledger, peer, request.idempotency.take()) {
-        None => None,
-        Some(Claim::Fresh(guard)) => Some(guard),
-        Some(Claim::Replay(frame)) => return replay(&mut send, frame).await,
-        Some(Claim::Refused(refusal)) => return refuse::<Resp>(&mut send, refusal).await,
+    let message = match request.message {
+        WireRequest::KeyState(key) => {
+            return answer_key_state::<Resp>(&mut send, &ledger, peer, &key).await;
+        }
+        WireRequest::Call(message) => message,
     };
 
-    let (outcome, body) = next(
-        cx,
-        request.message,
-        BodyReader::new(frames, request.body_len),
-    )
-    .await;
+    let cx =
+        Context::new(peer, Req::SERVICE, message.method()).with_actor(message.actor().cloned());
+    // Kept while the chain runs, because the chain's own `Outcome` cannot say
+    // whether the work was entered — see `Reached`.
+    let progress = cx.progress();
+
+    // Claimed BEFORE the handler is entered, which is the whole at-most-once
+    // property: the only way back from a claimed key to a vacant one is a
+    // release, and a release happens exactly when nothing ran.
+    let keyed = match claim_key(&ledger, peer, request.idempotency).await {
+        Keyed::None => None,
+        // The guard watches the marker, so this task being ABORTED — the
+        // connection ended, the server shut down — still settles honestly, even
+        // though `Drop` is then the only code left running.
+        Keyed::Run(guard) => Some(guard.watching(progress.clone())),
+        Keyed::Replay(frame) => return replay(&mut send, frame).await,
+        Keyed::Refuse(refusal) => return refuse::<Resp>(&mut send, refusal).await,
+    };
+
+    let (outcome, body) = next(cx, message, BodyReader::new(frames, request.body_len)).await;
 
     // The grant is recorded BEFORE the reply is written, and that order is the
     // whole property: the address reaches the caller only in this reply, so a
@@ -256,16 +378,31 @@ where
         }
     }
 
-    let frame = wire::encode_header(body.declared_len(), None, &outcome)?;
-    // Recorded before the reply is written, so a reply lost on the way back
+    let frame = wire::encode_header(
+        body.declared_len(),
+        None,
+        &WireResponse::<Resp>::Call(outcome),
+    )?;
+    // Settled before the reply is written, so a reply lost on the way back
     // still replays. That is the failure this exists for: the handler finished
     // and the caller never heard.
+    //
+    // Which way it settles is decided by how far the call got, NOT by whether
+    // the chain returned an `Outcome::Err` — a refusing layer and a panicking
+    // actor turn produce the same value and owe completely different things.
     //
     // A reply with a payload behind it is recorded as unrecordable rather than
     // as itself. Bodies are streamed and never held, and a header replayed
     // without its payload decodes into a body that never arrives.
-    if let Some(guard) = guard {
-        guard.record(&frame, body.declared_len() != Some(0));
+    if let Some(guard) = keyed {
+        match progress.reached() {
+            Reached::Completed => guard.record(&frame, body.declared_len() != Some(0)),
+            // A layer said no without calling through; or the work was entered,
+            // or merely reached a mailbox, and produced nothing. Dropping the
+            // guard is what settles those, and it settles them the same way
+            // whether this task returned or was aborted.
+            Reached::NotDispatched | Reached::Dispatched => drop(guard),
+        }
     }
     wire::write_frame(&mut send, frame).await?;
     body.write_to(&mut send).await?;
@@ -315,11 +452,12 @@ where
     Resp: Serialize + Granting + Send + Sync + 'static,
 {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
-        // The handshake proved this key. Whether it is welcome is our call, and
-        // the answer is a value rather than a `bool` somebody must remember to
-        // have consulted — see `Allowlist::admit`.
-        let Some(admitted) = self.allow.admit(ProvenPeer::on(&connection)) else {
-            connection.close(1u32.into(), b"unauthorized");
+        // The handshake proved this key. Whether it is welcome is the policy's
+        // call, and what comes back is a value rather than a `bool` somebody
+        // must remember to have consulted — see `Admittance`. The policy also
+        // takes the live connection here, which is the whole of what makes a
+        // revocation later able to reach it.
+        let Some((admitted, _live)) = settle(self.admission.as_ref(), &connection) else {
             return Ok(());
         };
 
@@ -372,13 +510,118 @@ where
     }
 }
 
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::future::poll_fn;
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    // `Future` and `Poll` arrive through the glob; `poll_fn` does not.
+    use super::*;
+    use crate::idempotency::MAX_WAITING_PER_PEER;
+
+    /// A valid endpoint id, reused from `idempotency.rs` for the same reason.
+    const A: &str = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0";
+
+    /// The cap has to be met *before* the task parks, or it is not a cap: a
+    /// waiter that is refused after it waits has already spent the task and the
+    /// stream pair the refusal exists to save.
+    ///
+    /// `start_paused` is what makes that assertion honest rather than a race.
+    /// With the bound removed this call parks on its 30 second budget, tokio
+    /// auto-advances to the timer, and the answer comes back `InFlight` — so
+    /// the test fails on the variant rather than hanging.
+    #[tokio::test(start_paused = true)]
+    async fn an_attacher_over_the_cap_is_refused_before_it_parks() {
+        let ledger = Ledger::new();
+        let peer = EndpointId::from_str(A).expect("a valid endpoint id");
+        let key = IdempotencyKey::new("k").expect("a valid key");
+
+        let Claim::Fresh(_running) = ledger.claim(peer, key.clone()) else {
+            panic!("the first claim must be fresh");
+        };
+        let places: Vec<_> = (0..MAX_WAITING_PER_PEER)
+            .map(|_| ledger.wait(peer).expect("a free place"))
+            .collect();
+
+        let keyed = claim_key(
+            &ledger,
+            peer,
+            Some(Idempotency::attaching_for(key, Duration::from_secs(30))),
+        )
+        .await;
+
+        // Exhaustive, with no catch-all: the arm that would hide a regression
+        // here is the one nobody thought to name.
+        let refused = match keyed {
+            Keyed::Refuse(RemoteError::Idempotency(refusal)) => refusal,
+            Keyed::Refuse(other) => panic!("expected an idempotency refusal, got {other:?}"),
+            Keyed::None => panic!("expected a refusal, got no key at all"),
+            Keyed::Run(_) => panic!("expected a refusal, got the key"),
+            Keyed::Replay(_) => panic!("expected a refusal, got a replay"),
+        };
+        assert_eq!(
+            refused,
+            IdempotencyRefusal::TooManyRunning {
+                limit: u32::try_from(MAX_WAITING_PER_PEER).expect("a cap that fits"),
+            },
+            "an attacher past the cap must be turned away, not parked"
+        );
+        drop(places);
+    }
+
+    /// Taking a place before the park is only half the property: it has to be
+    /// **held** for the whole wait. `let _ = ledger.wait(peer)` takes one and
+    /// drops it on the same line, which leaves a cap that is enforced and a
+    /// bound that does not exist — every waiter frees its place before the next
+    /// one asks, so the ledger parks as many tasks as the network sends it.
+    ///
+    /// Polled once, so the attach reaches its park, and then the ledger is
+    /// asked for the place it should be holding. Deterministic on purpose:
+    /// there is no second task and no timer to race, which is what a test of a
+    /// concurrency bound usually gets wrong.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_attacher_keeps_its_place_for_the_whole_wait() {
+        let ledger = Ledger::new();
+        let peer = EndpointId::from_str(A).expect("a valid endpoint id");
+        let key = IdempotencyKey::new("k").expect("a valid key");
+
+        let Claim::Fresh(_running) = ledger.claim(peer, key.clone()) else {
+            panic!("the first claim must be fresh");
+        };
+        // Every place but one, so the attacher below takes the last.
+        let places: Vec<_> = (0..MAX_WAITING_PER_PEER - 1)
+            .map(|_| ledger.wait(peer).expect("a free place"))
+            .collect();
+
+        let mut attaching = Box::pin(claim_key(
+            &ledger,
+            peer,
+            Some(Idempotency::attaching_for(key, Duration::from_secs(30))),
+        ));
+        let answered = poll_fn(|cx| Poll::Ready(attaching.as_mut().poll(cx))).await;
+        assert!(
+            answered.is_pending(),
+            "the attacher must be parked, not answered"
+        );
+
+        assert!(
+            ledger.wait(peer).is_err(),
+            "a parked attacher must still be holding its place, or the cap bounds nothing"
+        );
+        drop(places);
+    }
+}
+
 /// Assembles one service: its allowlist, its handler, and the layers around it.
 ///
 /// Returned by the generated `service()`, so a caller adds behaviour without
 /// the macro knowing anything about it.
 pub struct ServiceBuilder<Req, Resp> {
     alpn: &'static [u8],
-    allow: Allowlist,
+    admission: Arc<dyn Admission>,
     base: Next<Req, Resp>,
     layers: Vec<Arc<dyn Middleware<Req, Resp>>>,
     blobs: Option<Blobs>,
@@ -398,7 +641,7 @@ where
     pub fn new(alpn: &'static [u8], allow: Allowlist, dispatch: Dispatch<Req, Resp>) -> Self {
         Self {
             alpn,
-            allow,
+            admission: Arc::new(allow),
             base: dispatch,
             layers: Vec::new(),
             blobs: None,
@@ -437,6 +680,28 @@ where
         self
     }
 
+    /// Admit against a policy rather than against the fixed list this was built
+    /// with.
+    ///
+    /// The list passed to the generated `service(handler, allow)` is itself an
+    /// [`Admission`] — it is the canonical one — so this replaces rather than
+    /// adds. Reach for it when the answer has to be able to change while the
+    /// service is running:
+    ///
+    /// ```ignore
+    /// let policy = Arc::new(DynamicAdmission::new(Allowlist::only([first])));
+    /// let service = inventory::service(handler, Allowlist::anyone())
+    ///     .admission(policy.clone())
+    ///     .build();
+    /// // ... later, without a restart, and closing whoever is no longer welcome
+    /// let closed = policy.replace(Allowlist::only([second]));
+    /// ```
+    #[must_use]
+    pub fn admission(mut self, admission: Arc<dyn Admission>) -> Self {
+        self.admission = admission;
+        self
+    }
+
     /// Add a layer. The first layer added is the outermost: it sees the request
     /// first and the reply last.
     #[must_use]
@@ -455,7 +720,7 @@ where
             alpn: self.alpn,
             handler: Box::new(RpcService {
                 next: chain,
-                allow: Arc::new(self.allow),
+                admission: self.admission,
                 blobs: self.blobs.clone(),
                 ledger: Ledger::new(),
                 _p: PhantomData,
@@ -470,7 +735,6 @@ impl<Req, Resp> std::fmt::Debug for ServiceBuilder<Req, Resp> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServiceBuilder")
             .field("alpn", &String::from_utf8_lossy(self.alpn))
-            .field("allow", &self.allow)
             .field("layers", &self.layers.len())
             .finish()
     }
@@ -684,8 +948,24 @@ pub struct RpcClient<Req, Resp> {
     endpoint: iroh::Endpoint,
     /// Attached to every call this client makes. See
     /// [`with_idempotency`](Self::with_idempotency).
-    idempotency: Option<IdempotencyKey>,
+    idempotency: Option<Idempotency>,
     _p: PhantomData<fn(Req) -> Resp>,
+}
+
+/// Every clone names the same connection, which is what lets a registry of
+/// peers hold typed clients rather than raw connections.
+///
+/// Written out rather than derived: `derive(Clone)` would demand
+/// `Req: Clone, Resp: Clone`, and neither appears in a field.
+impl<Req, Resp> Clone for RpcClient<Req, Resp> {
+    fn clone(&self) -> Self {
+        Self {
+            conn: self.conn.clone(),
+            endpoint: self.endpoint.clone(),
+            idempotency: self.idempotency.clone(),
+            _p: PhantomData,
+        }
+    }
 }
 
 impl<Req, Resp> RpcClient<Req, Resp> {
@@ -726,6 +1006,23 @@ impl<Req, Resp> RpcClient<Req, Resp> {
     /// Cheap: a `Connection` is a handle, so this shares one rather than
     /// opening another.
     ///
+    /// # Waiting for a call already in flight
+    ///
+    /// A bare key refuses on collision, which is what it has always done. Pass
+    /// an [`Idempotency`] instead to wait for the call already running under it
+    /// and take its answer:
+    ///
+    /// ```ignore
+    /// client
+    ///     .with_idempotency(Idempotency::attaching_for(key, Duration::from_secs(5)))
+    ///     .reserve("ADU-014".into(), 2)
+    ///     .await?;
+    /// ```
+    ///
+    /// This is what makes [`Peer`](crate::Peer)'s single re-issue compose with
+    /// a key: the re-issued call waits for the first one instead of meeting
+    /// [`IdempotencyRefusal::InFlight`].
+    ///
     /// # Make one call with it
     ///
     /// The key goes on EVERY call made through the returned client, so it is
@@ -735,11 +1032,11 @@ impl<Req, Resp> RpcClient<Req, Resp> {
     /// ([`Error::UnexpectedResponse`]). That is a loud failure rather than a
     /// wrong answer, but it is still a mistake worth not making.
     #[must_use]
-    pub fn with_idempotency(&self, key: IdempotencyKey) -> Self {
+    pub fn with_idempotency(&self, idempotency: impl Into<Idempotency>) -> Self {
         Self {
             conn: self.conn.clone(),
             endpoint: self.endpoint.clone(),
-            idempotency: Some(key),
+            idempotency: Some(idempotency.into()),
             _p: PhantomData,
         }
     }
@@ -791,7 +1088,7 @@ where
             &mut send,
             body.declared_len(),
             self.idempotency.as_ref(),
-            &request,
+            &WireRequest::Call(request),
         )
         .await?;
         body.write_to(&mut send).await?;
@@ -804,10 +1101,53 @@ where
             return Err(Error::Closed);
         };
         match response.message {
-            Outcome::Ok(value) => Ok((value, BodyReader::new(frames, response.body_len))),
+            WireResponse::Call(Outcome::Ok(value)) => {
+                Ok((value, BodyReader::new(frames, response.body_len)))
+            }
             // A refusal carries no body: the handler never ran, or never
             // finished, so there is nothing to stream.
-            Outcome::Err(refused) => Err(Error::Remote(refused)),
+            WireResponse::Call(Outcome::Err(refused)) => Err(Error::Remote(refused)),
+            other => Err(Error::UnexpectedResponse {
+                expected: "a call reply",
+                actual: other.arm(),
+            }),
+        }
+    }
+
+    /// Ask what the serving side's ledger knows about one of this client's
+    /// idempotency keys.
+    ///
+    /// The one state a caller cannot discover by retrying is
+    /// [`KeyState::Fresh`], because discovering it that way means executing.
+    /// This is how to ask without submitting the order again.
+    ///
+    /// Peer-scoped by construction: the answer comes from the ledger of this
+    /// connection's proven peer, so it can never report another peer's key.
+    /// Advisory, like every observation of a live system — a key that is
+    /// `Fresh` now can be claimed a microsecond later.
+    ///
+    /// It runs no handler and no layer: there is nothing to authorize past the
+    /// admission this connection already passed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Closed`] when the peer finishes the stream without answering,
+    /// plus any transport or codec failure.
+    pub async fn key_state(&self, key: IdempotencyKey) -> Result<KeyState> {
+        let (mut send, recv) = self.conn.open_bi().await?;
+        wire::write_header(&mut send, Some(0), None, &WireRequest::<Req>::KeyState(key)).await?;
+        send.finish()?;
+
+        let mut frames = FrameReader::new(recv);
+        let Some(response) = frames.read_header::<WireResponse<Resp>>().await? else {
+            return Err(Error::Closed);
+        };
+        match response.message {
+            WireResponse::KeyState(state) => Ok(state),
+            other => Err(Error::UnexpectedResponse {
+                expected: "a key-state reply",
+                actual: other.arm(),
+            }),
         }
     }
 
@@ -845,7 +1185,7 @@ where
         // `None` for the key: see above. `Some(0)` body length, because a
         // `tell` carries no payload and an open-ended stream would make the
         // receiver wait for an end that says nothing.
-        wire::write_header(&mut send, Some(0), None, &request).await?;
+        wire::write_header(&mut send, Some(0), None, &WireRequest::Call(request)).await?;
         send.finish()?;
         Ok(())
     }

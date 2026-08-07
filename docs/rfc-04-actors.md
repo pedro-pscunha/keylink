@@ -2211,3 +2211,1235 @@ which no estimate would have included because §12 does not name it.
    buys in-process is narrower — a caller cannot get more than one message ahead of the
    actor, so a caller that measures its own latency sees the actor's. The number was
    reasoned about, not profiled.
+
+---
+
+# 16. Append: what the correctness programme changed here
+
+**Appended, not edited.** Nothing above this line has been altered. §15 is the
+earlier postscript recording where §1.4, §2.2, §5.3 and §10.3 were wrong; this
+section is the same discipline applied to four more sections, plus one item that
+was designed and deliberately not built. RFC-05 records the idempotency half of
+the same programme.
+
+## 16.1 Answering §2.6 — who is calling is an argument, not a hook
+
+`Actor::caller` is **deleted**. Every generated `Actor` method now takes
+`cx: Caller<'_>` first, and every generated `Handler` method takes
+`cx: &Context` first.
+
+```rust
+pub enum Caller<'a> { Local, Peer(&'a Context) }
+```
+
+The hook it replaces ran before each message and asked the state to stash the
+value. Three things were wrong with that, and all three are gone.
+
+- **It occupied a name.** A service with an `rpc Caller()` could not be an
+  actor, because the generated method and the hook were two trait items called
+  `caller`. That restriction did not exist for a `Handler`, so it appeared only
+  when a service gained an actor — as a duplicate-definition error pointing at
+  library code.
+- **It was reachable from one dispatcher of two.** `__actor_turn` called it;
+  the local handle's methods each repeated it by hand. A sixth method kind wired
+  into the local macro without that line would have silently inherited the last
+  remote peer. That is RFC-01 §11.2b's "build the path twice" hazard, and the
+  code carried a comment admitting it. An argument cannot be forgotten: a
+  missing `Caller` is a compile error.
+- **The idiomatic way to write the hook was wrong.**
+  `if let Some(cx) = cx { self.peer = Some(cx.peer()) }` reads perfectly and
+  leaves the previous remote peer in place for the next *local* message, so an
+  actor authorizing on the stashed value authorizes an in-process caller as
+  whoever last dialled in. `Caller::Local` carries no peer, so there is nothing
+  to inherit.
+
+The asymmetry between the two traits is the point. An actor is reachable two
+ways and a handler one, so only one of them has a "nobody" state, and that state
+is a named variant rather than an `Option` — `authz.rs` records what an `Option`
+on an identity costs.
+
+## 16.2 Answering §6 — `QueueTimeout`, and why `Timeout` stays
+
+§6 argues the mailbox capacity. What it does not say is that **no layer can
+bound a turn**: a layer runs outside the mailbox, so a budget expiring drops the
+*wait for the reply*, not the turn. `Timeout::after(100ms)` in front of a
+ten-second method sheds no load at all — ten callers are refused at 100 ms and
+the actor still spends a hundred seconds producing replies nobody wants.
+
+`QueueTimeout` refuses only a message that has **not started**, and it can,
+because the check happens where a layer cannot reach:
+
+1. the wait for a mailbox permit is bounded, and giving up there means the
+   message was never queued;
+2. having been queued, the deadline is re-read **on the actor's own task**,
+   immediately before the turn begins.
+
+There is no third place, and there does not need to be: once the turn starts,
+stopping it means dropping `&mut A` mid-mutation, which is the one thing an
+actor must never do.
+
+`Timeout` is **kept**, and this wave decided that explicitly rather than by
+default. Nothing prevents layering it on an actor-served builder, because after
+RFC-05 §2 it is no longer *unsafe* there — merely ineffective at shedding load,
+and honest about the key it settles. On a concurrent `Handler`, dropping the
+future genuinely cancels the work, and `QueueTimeout` cannot do that. Two
+behaviours, not two doors to one thing, so "one way to build a thing" does not
+apply. A marker bound on the actor path's `layer` was considered and rejected:
+it would split `ServiceBuilder` in two to prevent a combination that is now
+merely suboptimal.
+
+On a `Handler`, `QueueTimeout` refuses nothing. That is not a lie — a handler is
+dispatched immediately and never queues, so no message it serves is ever "still
+queued when the budget expired". Item 10 below is the case where the same shape
+*would* have been a lie, and is why it was not built.
+
+## 16.3 Answering §10.4 — a `send` method cannot be served as an actor
+
+§10.4 records the asymmetry: a `send` handler reads its upload **inside** the
+turn, so an upload holds the actor for the whole transfer. Combined with §16.2 —
+no layer can bound a turn — that is not a cost, it is a denial of service with a
+one-line trigger. A peer declares a large body, stops writing, and holds the
+actor until iroh's connection idle timeout with nothing else answered, including
+the local `Handle`.
+
+So it does not compile. `DECLARES_SEND` folds at compile time exactly as
+`DECLARES_BLOBS` does, and `Handle::service` opens with
+
+```rust
+let () = ServableAsActor::<A>::CHECK;
+```
+
+where `ServableAsActor<A>` is generic in `A` **on purpose**: an associated const
+of a generic type is evaluated when it is instantiated, so the assertion fires at
+the site that serves an actor and nowhere else. A plain `const` would be
+evaluated where it is written and would refuse every service that merely
+*declares* a `send` method, including every one served the concurrent way, where
+a `send` is perfectly safe.
+
+Chosen over a startup `ConfigError`, which the programme's own success criteria
+asked for. A compile error beats a runtime one, keeps `Result` off the generated
+serve site, costs no new error variant, does not ripple into `spawn_with`'s
+`Fn(&ActorId) -> Option<Mounted>`, and matches what the rest of this crate does
+with claims of the form "there is no way to do X" — `representability.rs` exists
+for exactly that.
+
+Scoped to `send` alone, deliberately. A `recv` body is drained by the connection
+*after* the turn ends and a `blob`'s bytes move later on a different connection,
+so neither can hold an actor. Widening it would refuse two shapes that are safe.
+
+`keylink/tests/singleton.rs` used to serve a `send` method on an actor and
+*measure* the cost. Measuring a hazard is weaker than removing it, so that test
+is now the split it recommended: two services, two ALPNs, one node.
+
+## 16.4 Answering §4.4 — Design B, and the case it does not solve
+
+Design B is built, and it added **nothing to the wire**. The reverse contract is
+an ordinary `service!` block with its own derived ALPN, served by the side that
+dialled; the side that accepted dials back and becomes an ordinary client of it.
+No new method kind, no `WireKinds` field, no second meaning for an existing one.
+
+What keylink adds is `Subscribers<C>`, and its only non-obvious content — the
+reason it is a type rather than a `HashMap` at a call site — is that it evicts on
+`Departure` rather than on `Connection::closed`. `closed()` borrows a strong
+handle, so a registry that waited on one would keep every connection it had ever
+seen alive: a diagnostic that pins its subject open, which `watch.rs:35-42`
+calls a leak wearing a diagnostic's clothes.
+
+The property that makes the second connection worth its cost: **the reverse
+direction has its own allowlist**. A reverse channel bolted onto the forward
+connection would inherit the forward direction's admission, so admitting a peer
+to *ask* would admit it to *tell*, and those are not the same decision.
+
+**The NAT case, named because §4.4 did not name it.** The accept side dials
+back, so it needs a route to the peer that dialled in. With a discovery service
+the proven `EndpointId` is the whole address and this is free. Without one — a
+LAN, an air-gapped network, the hermetic test suite — the peer has to say where
+it is, and that is a **claim** where the identity is a **proof**. The two are
+reconciled at the one place that holds both: the handler compares the declared
+address's id against `cx.peer()` and refuses a mismatch, so a peer cannot make
+the accept side dial a third party by asking nicely. Behind a symmetric NAT with
+no relay, no address the peer can name will work, and Design B does not solve
+that; a relay does.
+
+## 16.5 Item 10, designed and NOT built: an abandoned turn
+
+The programme asked for a long-running turn to be able to observe that its
+caller has gone and bail at a safe point. The signal exists and costs nothing:
+`Mail.reply` is a `oneshot::Sender`, closed exactly when the caller's future was
+dropped — no task, no timer, no cancellation.
+
+It was not built, and the goal permitted that outcome in terms: *"Either put it
+somewhere only an actor turn can reach, or do not build it."* Three placements
+exist and each costs more than the item is worth.
+
+- **On `Context`.** `Context` is shared with `Handler`, where nothing wires the
+  signal, so the method would answer "no" for every handler forever. A method
+  that lies to half its callers is worse than an absent one.
+- **Inside `Caller`.** It stops being `Local | Peer(&Context)` — the enum §16.1
+  exists to introduce — and becomes a struct wrapping an `Origin` enum plus a
+  type-erased closed-signal. Distorting the wave's centrepiece for its smallest
+  item is the wrong trade.
+- **A second parameter on every actor method.** Every user pays, in every
+  signature, for a signal few need.
+
+Recorded here rather than forgotten. The shape that would justify it is a turn
+long enough that abandoning it matters — a batch, a scan — and that is also the
+shape §16.2 says to bound from inside the method, where the state is.
+
+## 16.6 The keyed `System` path marked nothing, and gave the key back
+
+Three generated paths dispatch a request, and each has to say how far its call
+got. They say it out of band, on the progress marker `Context` carries, because
+the `Outcome` cannot: `Outcome::Err` is what a refusing layer returns *and* what
+a panicking turn returns, so the value genuinely cannot name who produced it.
+RFC-05 §2 records why that channel exists at all.
+
+- **`service()`, the plain handler.** `dispatched()` on the way in,
+  `completed()` on the way out.
+- **`Handle::service()`, the local actor served over its own ALPN.**
+  `dispatched()` *inside* the turn closure, so a `QueueTimeout` refusing a
+  still-queued message leaves the key claimable; `completed()` outside it, on
+  the one arm holding an answer the turn produced, so an observer's veto does
+  not settle the key as the veto.
+- **`spawn()`, the keyed `System` mailbox loop — nothing.** It destructured
+  `Mail` and ran `__actor_turn` inside `guarded(..)` without touching
+  `cx.progress()` at any point.
+
+`Drop for Guard` reads that marker and reads nothing else, and `NotDispatched`
+means "no work was entered, give the key back so a retry is a first attempt". So
+a call carrying an idempotency key and addressed to a keyed actor claimed the
+key, ran the turn, mutated the actor, and then **released** the key on the way
+out. The key went vacant, the caller's retry was a first attempt, and the work
+ran again. That is at-least-once, produced by the module whose entire stated
+guarantee is at-most-once — the exact inversion it exists to prevent.
+
+### How reachable this is, stated honestly
+
+The typed `ActorClient` exposes no `with_idempotency`, so **nothing in keylink's
+own client can send one of these**. No user of the shipped API reaches it.
+
+It is not unreachable either. `idempotency` is a field on the `Envelope` that
+carries *every* ALPN, the actor system's included, and `RpcClient`,
+`ActorRequest`, `ActorReply` and `System::alpn` are all public. A peer that
+speaks the protocol by hand reaches it in four lines — which is exactly what
+`keylink/tests/actors.rs` now does. Latent, not impossible, and not a defect the
+client's shape can be relied on to keep buried: the moment `ActorClient` grows a
+`with_idempotency` it is a live one.
+
+### Where the two marks went
+
+`dispatched()` goes **inside the `Ok` arm of `payload.open::<Request>(schema())`**,
+immediately before the turn. A payload that fails that check fails it on the
+hashes or on the bytes, and both are decided before any user code runs. Marking
+above the `match` would report a message the actor never saw as work that ran,
+and settle its key `Interrupted` — refusing every retry of a call that never
+happened.
+
+`completed()` goes **on the arm where `ActorReply::encode` succeeded**, and
+nowhere else. The nested encode is the reason this is not simply "the turn
+returned": an encode that fails means the turn ran, mutated the state, and
+produced nothing the wire can carry. Marking completed there would record the
+*encoding refusal* as this call's settled reply and replay that refusal to every
+retry, for work that really did happen — the same failure §16's observer-veto
+argument names one path over. Leaving the marker at `dispatched` settles
+`Interrupted` instead: "it ran, and whether it took effect is unknown", which is
+the truth and is what the caller needs to hear.
+
+The **panic arm** leaves the marker where it is, for the same reason. A turn
+that panicked was entered, and whatever it mutated before it panicked is in the
+state the actor carries on with. `Interrupted` is right; giving the key back
+would run that half-done work a second time.
+
+### `System::deliver`'s five failure paths need nothing
+
+Every one of them was walked against the fix, and none of them wants a mark of
+its own — which is the same argument §16's first list makes: only the code that
+knows when the *work* begins may mark, and `deliver` never does.
+
+| Path | Marker on exit | Settles | Right? |
+| --- | --- | --- | --- |
+| `actor.validate()` refuses an over-long id | `NotDispatched` | released | yes — the registry was never consulted |
+| `route` finds nothing, or the system is at capacity | `NotDispatched` | released | yes — no actor, no turn |
+| the declared hash differs from the mounted one | `NotDispatched` | released | yes — the payload is dropped undecoded |
+| `mail.send` fails, the mailbox being closed | `NotDispatched` | released | yes — the message never entered the queue |
+| `answer.await` fails, the reply sender dropped | whatever the loop left | released *or* `Interrupted` | yes, and this is the one that needed the fix |
+
+The last row is the whole point. A `Mail` that was aborted **while still queued**
+leaves `NotDispatched`, and the key is released, because nothing ran. A `Mail`
+whose turn had **started** leaves `Dispatched`, and the key settles
+`Interrupted`, because it did. Before this section those two were the same
+answer, and the answer was the wrong one. **No change to `actor.rs` is
+required**, and none was made.
+
+### What is proved, and where
+
+Four tests in `keylink/tests/actors.rs`, all over a real QUIC connection, all
+reading the actor's own counter rather than a clock:
+
+1. a keyed call that ran a turn does not leave the key claimable — the retry is
+   answered from the record and the counter stays at one;
+2. a keyed call whose payload does not decode leaves the key claimable — the
+   retry runs;
+3. a keyed call whose reply does not encode settles `Interrupted`;
+4. a keyed call whose turn panicked settles `Interrupted`.
+
+Test 3 needs a response type that cannot be serialized, which no derived
+`Serialize` can be: postcard reports a serialization error only from its flavor,
+and the `Vec` flavor `ActorReply::encode` uses has none. The test writes one by
+hand. Without it the arm that decides what a turn owes when it ran and produced
+nothing sendable is unreachable, and an unreachable arm is a decision nobody has
+checked.
+
+## 16.7 The keyed `System` path never read the deadline it was handed
+
+§16.2 argues why `QueueTimeout` is the only bound that can shed an actor's load:
+a layer runs outside the mailbox and cannot tell a queued message from a running
+one, so the budget travels on the `Context` and the **serving side** decides.
+The layer's whole contribution is one line — `cx.queueing = Some(Queueing { .. })`
+— and it is worth nothing unless somebody reads it.
+
+Exactly one place did. `Handle::service`'s generated dispatch takes the deadline
+off the context and hands it to `ask_catching_before`, an expired message comes
+back `Queued::Expired`, and it is refused with `RemoteError::TimedOut` without
+the turn running. `spawn`'s mailbox loop — the keyed `System` path — destructured
+`Mail { cx, payload, body, reply }` and ran the turn, having consulted
+`cx.queueing()` nowhere.
+
+So the deadline was stamped and read by nobody. Not refused late, not refused
+approximately: **not refused**. No error at build time, no warning at run time,
+and no budget small enough to produce one. A configured guard that does not
+guard, on a path where the identical layer works one module over — and, worse
+than a guard that is merely absent, one whose presence in the builder is the
+operator's evidence that the load is bounded.
+
+### How reachable this is, stated honestly
+
+More reachable than §16.6's defect, and by a wide margin.
+
+`System::service` gives back an ordinary `ServiceBuilder<ActorRequest, ActorReply>`,
+`ServiceBuilder::layer` accepts any `Middleware<Req, Resp>`, and `QueueTimeout`
+implements that generically. So
+
+```rust
+system.service(allow).layer(QueueTimeout::after(Duration::from_millis(50)))
+```
+
+compiles today, out of the shipped API, with no hand-rolled envelope and no
+`with_idempotency` — the two things §16.6 needed before it could be provoked.
+Anyone who reads `QueueTimeout`'s own documentation reaches it: that page says
+the layer refuses a message still queued when its budget expires, and says
+nothing about a keyed actor being the exception. This is not a latent defect. It
+is the documented behaviour of a public combination, absent.
+
+### Where the check goes, and where it does not
+
+In the loop, on the actor's own task, the instant the message comes off the
+mailbox — which is the same place the local path checks, for the same reason
+§16.2 gives. Not in the layer, which cannot see the queue. Not before the send,
+where "queued" has not happened yet. There is no third place, because once the
+turn starts, stopping it means dropping `&mut A` mid-mutation.
+
+`System::deliver` gets no check of its own, on the argument §16.6 already makes
+for its five failure paths: only the code that knows when the *work* begins may
+speak about the work, and `deliver` never does. One asymmetry with the local path
+survives and is recorded rather than papered over — see the last section.
+
+### The decode goes first, and the reason is the caller's next move
+
+A message can be both expired and undecodable. The loop answers with the decode
+refusal.
+
+Bytes that are not a message of this contract are broken **permanently**;
+`TimedOut` is transient and its entire meaning to a caller is "try again". Report
+the timeout and a peer with a bad payload retries forever and never learns why.
+Report the decode failure and it learns on the first attempt. The local path
+decides it the same way round without having to think about it, because there the
+accept loop decodes before any layer runs, so a bad payload is refused before a
+deadline exists at all; putting the expiry check below `Sealed::open` is what
+makes the keyed path agree with it.
+
+Nothing is lost by the ordering. Both refusals leave the marker untouched and the
+key claimable, and the decode is not the unit `QueueTimeout` sheds — the **turn**
+is, the thing that holds `&mut A` for an unbounded time. A postcard parse of a
+buffer already in memory is not what a load-shedding budget exists to prevent.
+
+The clock is read before the decode all the same, and that is deliberate: a
+message stops being queued when it is taken, so whatever the decode costs is not
+time spent waiting. The order of the two *checks* and the order of the two
+*refusals* are separate decisions, and they go opposite ways on purpose.
+
+### The progress marker is not touched, and that is the whole interaction
+
+A message refused while still queued **has not run**. `Drop for Guard` reads
+`NotDispatched` and releases the key, so the caller's retry is a first attempt.
+
+Marking `dispatched()` on the expiry arm would settle that key `Interrupted` and
+permanently refuse every retry of a call that never happened — which is §16.6's
+failure one arm along, and worse than it: §16.6 gave a key back that it owed, and
+this would keep a key it did not. It is also precisely the property that makes
+`QueueTimeout` the only bound that composes with an `IdempotencyKey` at all
+(RFC-05). A `Timeout` cannot promise it, because a `Timeout` cannot tell.
+
+Nothing already in the tree guarded that. Marking `dispatched()` on the new arm
+was run against the whole suite: **one** test failed, and it is one of the three
+this section adds. An unguarded interaction between two correct-looking pieces is
+how the last three of these arrived.
+
+### The clock generated code cannot name
+
+`Queueing::deadline` is an `n0_future::time::Instant` — tokio's natively,
+`web_time`'s in a browser, and `std::time::Instant` on neither, because that one
+panics on `wasm32-unknown-unknown`. The generated loop cannot write
+`Instant::now()`: nothing in `keylink`'s public surface re-exports a clock, and
+`service!` expands in the caller's crate, which has no reason to depend on
+`n0_future`.
+
+So the loop asks the deadline instead: `deadline.elapsed()` follows whichever
+clock stamped it, which is one fewer place that can drift from `middleware.rs`'s
+choice. Both implementations saturate to zero for an instant in the future, so
+`!elapsed().is_zero()` reads "now is strictly past the deadline". That differs
+from the local path's `now >= deadline` at one point only — a budget of exactly
+zero — and it differs in the direction of running the message rather than
+refusing it, which is the direction a disagreement should fail in. Recovering the
+last tick needs a `Queueing::expired()` beside the other two accessors in
+`middleware.rs`; that file was outside this change's scope, and the tidier home
+for the comparison is there rather than in a macro.
+
+### What is proved, and where
+
+Three tests in `keylink/tests/actors.rs`, over a real QUIC connection, none of
+them asserting on elapsed time:
+
+1. a keyed message still queued when its budget expires comes back
+   `RemoteError::TimedOut` carrying that budget, and the actor's counter says it
+   never ran;
+2. the same message leaves its key claimable — the retry runs and the counter
+   moves to one;
+3. a payload that does not decode says so even when its budget had expired.
+
+"Still queued when the deadline passed" is made a fact rather than a race, in
+three parts. The actor is held inside a turn that waits on a semaphore the test
+owns, so the mailbox is the only place anything else can be and it stays there
+until the test says otherwise. A second layer, mounted *inside* the
+`QueueTimeout`, reports that a call has passed it — so the wait for the deadline
+starts after the stamp has provably happened, and a wait of one whole budget from
+there ends after `stamped_at + budget` however slow the machine was. The permit
+is added last. Nothing asserts that time elapsed; the clock only decides when the
+actor is let go, and the assertion is on the variant the peer receives.
+
+The refusal was compared against the local path's on the wire rather than by
+reading: both encode to `[1, 200, 1]` for a 200 ms budget. A peer cannot tell the
+two paths apart by what it is told, which is the property that lets an operator
+move an actor between them.
+
+### The third thing, and there are more
+
+Three things the local dispatch threads through and this loop does not, now:
+
+1. **Observers.** Decided, not missed: RFC-06 §5.3 puts the keyed path out of
+   scope, and `spawn`'s own documentation says so in a paragraph written for the
+   user who would otherwise get no durability and no explanation.
+2. **The progress marker** (§16.6). Missed.
+3. **The queueing deadline** (this section). Missed.
+
+One divergence argued for, two dropped on the floor. Both of the dropped ones
+were invisible for the same structural reason: `spawn` is a **second
+implementation** of dispatch rather than a caller of the first, so every value the
+local path threads through is a value this one has to be told about separately,
+and nothing fails when it is not.
+
+Two more are already visible, and neither is fixed here:
+
+- **The wait for a mailbox permit is unbounded on this path.** The local path
+  bounds it with the same deadline, so a message that cannot even get a slot is
+  refused at its budget; `System::deliver` awaits `mail.send` with no bound at
+  all. The consequence is milder than it sounds — capacity is one and turns are
+  serial, so a waiting message is admitted as soon as the current turn ends and
+  is then refused by the loop — but the caller waits for the permit instead of
+  being answered at its deadline. The fix is in `actor/remote.rs`, not in the
+  macro.
+- **A panicking turn is reported differently.** The local path answers
+  `Failed("panicked: …")`, and its own comment argues that both halves of
+  `Failed` must carry a prefix or the guard cannot fail. The keyed loop answers
+  `Failed(<bare panic text>)`, and a decode refusal on the same path is also an
+  unprefixed `Failed` — so the two are distinguishable only by what the panic
+  happened to say. Nothing here has one refusal masquerading as another yet, but
+  the argument that produced the prefix applies to this loop as written.
+
+The pattern says the useful thing: the count will keep going up while the two
+loops are written twice. What ends it is not another audit but a shared turn body
+the two dispatchers call — the same conclusion RFC-06 §5.3 reaches from the
+observer side, where the keyed path's answer to "what about observers?" is still
+a paragraph in a doc comment.
+
+## 16.8 What it would take to make this two crates
+
+§16.7 closed the third defect found in the keyed loop. This section records
+something different: the price of finishing the split that `actor/registry.rs`
+and `actor/remote.rs` started, written down now, while the reasons are still in
+somebody's head.
+
+The structural work is done. No field type, no parameter and no return type in
+`registry.rs` names a transport type, and the registry's tests instantiate
+`System<()>`, `Mounted<()>` and `Mailbox<()>`, so that is checked by the
+compiler rather than argued in a comment. What remains is compatibility, and
+compatibility has a bill.
+
+An earlier draft of this list had three items. It was wrong in three ways: one
+entry was filed against the wrong crate, and two were missing entirely. The
+corrected list is six.
+
+### Blocks `registry.rs` from becoming its own crate
+
+1. **The four `M = Mail` defaults.** `System<M = Mail>`, `SystemBuilder<M = Mail>`,
+   `Mounted<M = Mail>`, `Mailbox<M = Mail>`. A registry crate cannot name `Mail`,
+   so they go, and `keylink::System` stops meaning `System<Mail>`. The transport
+   crate has to supply `pub type System = registry::System<Mail>` and friends to
+   restore the unparameterized names.
+
+   **This is the expensive one, and not for the reason it looks.** Four of the
+   thirteen re-exported paths break, which is survivable. But `macros.rs` writes
+   `$crate::Mounted`, `$crate::Mailbox` and `$crate::mount` unparameterized, so
+   the macro must change — and generated code is expanded in the *caller's*
+   crate, which means every downstream user's generated code changes shape at
+   the same time. Nothing else on this list has that reach.
+
+   The obvious escape does not work: republishing defaulted aliases from a
+   facade module (`pub type System<M = Mail> = registry::System<M>;`) is
+   syntactically fine and is what a crate split would normally do, but a `pub type`
+   alias onto a pub-in-private struct renders in rustdoc as an alias stub with no
+   methods. Four documented structs would quietly become four alias pages — a
+   public API change wearing a refactor's clothes.
+
+2. **`impl SystemBuilder<Mail>`,** which exists for `DEFAULT_CAPACITY` alone. It
+   survives in neither crate: the registry crate cannot name `Mail`, the
+   transport crate cannot write an inherent impl on a foreign type, and an
+   extension trait does not rescue it because `SystemBuilder::DEFAULT_CAPACITY`
+   puts `M` back in expression position, where a default does not apply. The
+   constant moves to `impl<M> SystemBuilder<M>` and callers write
+   `SystemBuilder::<Mail>::DEFAULT_CAPACITY`.
+
+3. **The seam becomes a public API.** It is two `pub(super)` items today —
+   `RouteError`, and one `route` function on `System<M>`. Across a crate
+   boundary a within-module courtesy has to become a genuine public routing
+   interface, with a name, a doc comment and a compatibility promise. It was
+   four items before it was narrowed to two, and narrowing it was worth doing
+   precisely because this decision arrives later: the smaller the surface when
+   somebody has to design it, the less of it gets designed under time pressure.
+
+4. **Three intra-doc links from the registry half to `crate::RemoteError`.** All
+   three are true statements about what a peer is told, and none is a code path.
+   But an intra-doc link across a crate boundary needs a real Cargo dependency,
+   so the registry crate would take a **doc-only dependency** on whatever crate
+   owns `RemoteError` — or the three links become plain prose. Small, and a
+   dependency edge that exists purely for documentation deserves a deliberate
+   decision rather than a default.
+
+### Blocks the transport crate, not the registry
+
+5. **`impl System<Mail>`,** holding `alpn`, `service`, `dispatch` and `deliver`.
+   This was the entry filed against the wrong crate in the earlier draft. It
+   lives in `remote.rs`, so it does not stop the registry lifting out at all; it
+   stops the *transport* crate adding inherent methods to a type it does not
+   define. The replacement is an extension trait, at which point
+   `System::service(allow)` stops being a method call — the one item on this list
+   a reader of the current docs would not predict.
+
+6. **`impl From<RouteError> for RemoteError`.** Fine wherever `RemoteError`
+   lives, because the trait target is local there. It becomes a problem only if
+   `RouteError` and `RemoteError` end up in two crates and neither hosts the
+   impl, which depends on where `reply.rs` lands — a decision nobody has made.
+
+`Factory<M>` is `pub(crate)` and used only inside `registry.rs`; it simply
+becomes private. Listed so the count is honest.
+
+### The one cost already paid
+
+`System<M = Mail>` has an inference edge a default cannot fix: a system built and
+then touched only through the methods that never mention `M` has no type
+position to infer from, and meets `error[E0283]`. It is documented on `System`
+with a `compile_fail` doctest, and the doctest was itself checked to fail for
+`E0283` specifically rather than for any compile error at all — a `compile_fail`
+doctest passes for the wrong reason as easily as the right one.
+
+## 16.9 The `send` refusal guarded one of the two paths that serve an actor
+
+§10.4 argues that a service declaring a `send` method must not be served as an
+actor. A `send` handler reads its upload **inside** the serial turn, so a peer
+that declares a large body and then stops writing holds that actor until iroh's
+connection idle timeout, with nothing else on it answered. No layer bounds it: a
+layer refuses the caller without ending the turn.
+
+The argument is right and the refusal was built — `ServableAsActor::<A>::CHECK`,
+a `const` assert with a paragraph of explanation in its message, deliberately an
+*associated* const rather than a plain one so that merely declaring `send` is
+still fine for a service served the concurrent way.
+
+That last property is exactly what limited it. **An associated const on a
+generic type is evaluated only where it is instantiated**, and there was one
+instantiation, inside `Handle::service`. So:
+
+    let actor = depot::actor(Store);
+    actor.service(allow)      // refused at compile time, as designed
+    depot::spawn(Store)       // compiled, silently
+
+and the second is not a lesser path. It mounts into a keyed
+[`System`](../keylink/src/actor/registry.rs), is served over the system ALPN,
+and reaches every admitted peer. `System::deliver` puts the `BodyReader` into
+the `Mail`, and the loop hands it to the turn — the same body, in the same
+serial turn, for the same unbounded time. §10.4's denial of service, on the path
+§10.4 does not mention.
+
+The `QueueTimeout` of §16.7 does not help, and it is worth saying why rather
+than hoping: that refusal fires for a message still **queued**, and this message
+has already started. A budget bounds how long a call waits for a turn. Nothing
+here bounds how long a turn holds the actor once the body is inside it.
+
+`spawn` now instantiates `CHECK` too, and a second `compile_fail` doctest pins
+it — the existing one covers `Handle::service` alone, which is how this survived.
+That doctest was itself checked to fail for `E0080`, evaluation of a constant
+value, rather than merely failing: a `compile_fail` block passes for a typo as
+readily as for the assert it is meant to prove.
+
+**This is a breaking change.** A service declaring a `send` method can no longer
+be `spawn`ed. Nothing in this repository did so, and keylink is unpublished, so
+the cost is a compile error at a call site that was already unsafe.
+
+### The count, and what it says
+
+This is the sixth thing the keyed path was found not doing that the local path
+does, and the three found since §16.6 are not in the loop's behaviour at all:
+
+- the wait for a mailbox permit is unbounded here (`ask_catching_before` bounds
+  it there);
+- a panicking turn is reported as a bare `Failed` here and a prefixed one there,
+  which re-opens the ambiguity the prefix was added to close;
+- and this one, the missing compile guard.
+
+§16.7 called the pattern a property of how the loop was written. That was too
+narrow. The loop, `System::deliver`, and the call site each acquired their own
+version of a decision the local path made once, and no mechanism makes an
+omission visible in any of them — six were found by reading the two paths side
+by side, which is not a technique that scales or that anybody runs on a
+schedule. What would make it structural is routing `spawn` through `LocalActor`
+so there is one turn loop rather than two. That is a larger change than any of
+the six, and it is the one worth costing.
+
+Not yet audited: `System::deliver`'s failure paths beyond §16.6's table, and the
+blobs path.
+
+## 16.10 The one mailbox slot: who may hold it, and for how long
+
+§16.9 ended by naming what had not been audited. This section is that audit, and
+it found three things: a check whose worth nothing measured, a wait nothing
+bounded, and a panic nothing catches. Two are fixed here. The third is proved
+and left alone, because the fix is in `macros.rs` and belongs with the other
+work there.
+
+All three are about the same scarce resource. `MAILBOX` is **one**. An actor
+inside a turn has exactly one buffer behind it, and every question below is a
+question about who is allowed to occupy it and for how long.
+
+### `System::deliver`'s schema check was fully masked
+
+Delete the `ours != request.schema` block from `System::deliver` and
+`a_message_on_a_drifted_schema_is_refused_before_the_payload_is_decoded` — the
+test named for exactly that check — still passes. So does the rest of the suite.
+
+The reason is the generated keyed loop, which calls
+`payload.open::<Request>(schema())` and performs the identical comparison,
+returning a byte-identical `RemoteError::ActorSchemaMismatch { ours, theirs }`.
+Nothing a peer can read distinguishes the two.
+
+**This is a duplicated check, not a divergence, and neither copy should go.**
+`deliver` compares against the registry `Entry`'s schema and the loop against the
+generated `schema()`. They are provably equal for any `Mounted` that `spawn`
+produced, because `mount(schema(), ..)` is the single construction site — and if
+they ever did disagree, the system fails closed. The right response to a check
+that cannot be observed is not to remove it but to find out what it is for.
+
+What it is for is the slot. With `deliver`'s check gone, a drifted message is no
+longer refused on the **connection** task: it is carried into the mailbox, takes
+the one buffer, and waits out the current turn before anybody looks at its hash.
+A peer can hold that buffer with garbage, indefinitely, at no cost to itself,
+while legitimate callers queue for a permit behind it.
+
+The guard is now `a_drifted_message_is_refused_without_taking_the_actors_mailbox_slot`,
+and it is red on that deletion.
+
+### The wait for a mailbox permit was unbounded, and §16.7 was too kind to it
+
+`LocalActor::ask_catching_before` wraps the send in a timeout, so a message that
+cannot get a slot is refused at its budget — and, because tokio does not queue a
+send that was cancelled before its permit arrived, is **provably never queued**.
+`System::deliver` awaited `mail.send` with no bound at all.
+
+§16.7 listed this and called the consequence "milder than it sounds": capacity is
+one and turns are serial, so a waiting message is admitted as soon as the current
+turn ends and refused by the loop then. That is true and it is the wrong measure.
+It prices the defect in *turns* while the operator configured it in
+*milliseconds*. With `system.service(allow).layer(QueueTimeout::after(50ms))`,
+one actor inside a ten second turn and N callers: on the local path each is
+refused at 50 ms and its connection task returns; on the keyed path all N sit in
+`mail.send().await` for the whole ten seconds — each holding a QUIC stream, a
+`BodyReader` and an idempotency key claimed before dispatch — and learn
+`TimedOut` at ten seconds. A 50 ms budget honoured at 20,000% of itself is not a
+mild divergence, and short turns are exactly the assumption `QueueTimeout` exists
+because nobody can make.
+
+The fix bounds the send with the deadline the loop already reads. Four
+constraints, each of which is a correctness property rather than a preference:
+
+- **The refusal is the value the other paths produce** — `RemoteError::TimedOut`
+  carrying `Queueing::millis`, with an empty body. A peer must not be able to
+  tell the three dispatch paths apart by what it is told.
+- **The progress marker is not touched.** A message refused before it entered the
+  mailbox has not run, so `Drop for Guard` sees `NotDispatched` and releases the
+  key. Marking would settle it `Interrupted` and permanently refuse every retry
+  of a call that never happened — §16.7's argument, one layer up.
+- **The clock is `n0_future::time::Instant`,** read through
+  `saturating_duration_since` exactly as `ask_catching_before` reads it.
+  `std::time::Instant` panics on `wasm32-unknown-unknown`; there are no code hits
+  for it anywhere in `keylink/src`.
+- **No new `RemoteError` variant and no change to any hashed type.** The pinned
+  literal in `tests/protocol.rs` is `keylink/Probe/aa77e29e5e1ccdc7` before this
+  change and after it.
+
+§16.6's table of `System::deliver`'s failure paths gains a sixth row, and it
+wants no mark either:
+
+| Path | Marker on exit | Settles | Right? |
+| --- | --- | --- | --- |
+| the budget expires while waiting for a permit | `NotDispatched` | released | yes — the send was cancelled, so nothing was queued |
+
+### The guard had to be built out of a symmetry, not an ordering
+
+Both fixes are about a message that cannot get a permit, and neither is
+observable as a variant a peer receives. Two facts stand in the way. A slot is
+only provably occupied while nothing is draining it, so no test can wait for
+"the mailbox is full" — the loop takes the message the instant it is free to.
+And a caller blocked in `mail.send` is eventually admitted anyway once the turn
+ends, so it ends up with the same `TimedOut` it would have got from the bound,
+just later.
+
+So the pair of tests is built on a symmetry instead. Two **identical** messages
+are fired at an actor already inside a turn. Capacity is one, so exactly one of
+them takes the slot and exactly one is left waiting for a permit, and nothing has
+to know which. Every assertion is then either true of both messages or a count
+over the pair:
+
+- for two drifted messages, *both* must come back `ActorSchemaMismatch`, and both
+  must be answered while the actor is still held;
+- for two well-formed ones, both must come back `TimedOut` carrying the budget,
+  and *exactly one* must be answered before the actor is let go.
+
+Nothing asserts on elapsed time. The clock decides one thing, which is when the
+permit is added, and it waits three budgets rather than the one
+`expired_in_the_queue` waits — because this reports an order and not just an
+expiry, and a caller refused at its own deadline should be refused two whole
+budgets before the release rather than winning a photo finish.
+
+### `Sealed::open`'s stated provenance was wrong on one of its two paths
+
+`Sealed`'s documentation said `ours` "comes from the registry entry — the hash
+the actor was mounted with — never from the caller's own frame". That was written
+about `deliver`, and it is only true there. On the keyed loop path the value
+passed is the generated `schema()`, a compile-time constant of the actor's own
+type.
+
+The security content survives intact — a peer influences neither value — so this
+is a correction and not a defect. It is recorded because the sentence was the
+argument, and an argument that names one of two call sites is half an argument.
+
+### The keyed loop decodes and encodes outside `guarded`, and this one is not fixed
+
+`guarded(..)` covers `__actor_turn` and nothing else. `payload.open` sits before
+it and `ActorReply::encode` after it, and both run **user**
+`Deserialize`/`Serialize` code on the actor's own task. A panic in either is
+outside the catch.
+
+This was reproduced rather than argued. `a_reply_whose_serialize_panics_kills_the_actor_the_registry_goes_on_listing`
+gives a keyed actor a response type whose `Serialize` panics, and records what
+happens:
+
+1. the panic unwinds out of the mounted task, which dies;
+2. the reply sender is dropped without sending, so the caller is told
+   `RemoteError::NoSuchActor`;
+3. **`System::contains` still reports the actor**, because nothing reaps an entry
+   whose task died;
+4. every later call is `NoSuchActor` too, for the life of the process.
+
+That is verbatim the failure `panic.rs` says `guarded` prevents: "one bad message
+drops the receiver, every later send fails, and the actor is unreachable for the
+life of the process while the registry still lists it as mounted". Neither call
+is on the actor's task on the local path, so this is a divergence between the two
+dispatchers and not a property of the turn model.
+
+Nothing exotic reaches it. §16.6's test 3 already hand-writes a `Serialize` that
+returns `Err`, because no derived one can fail; the distance between a refused
+reply and a destroyed actor is that `Err(..)` becoming a `panic!`. The decode
+side is the same shape by inspection and is not covered by a test.
+
+**The fix is in `macros.rs` and is not made here.** The test asserts the broken
+behaviour, says so in its own doc comment, and must be inverted rather than
+deleted when the fix lands.
+
+### The count, again
+
+§16.9 counted six things the keyed path was found not doing that the local path
+does. This section closes the fourth — the unbounded permit wait — and adds a
+seventh:
+
+1. observers (argued, RFC-06 §5.3);
+2. the progress marker (§16.6, fixed);
+3. the queueing deadline (§16.7, fixed);
+4. the unbounded permit wait (**fixed here**);
+5. a panicking turn reported as a bare `Failed` rather than a prefixed one
+   (still open);
+6. the missing `send` compile guard (§16.9, fixed);
+7. `payload.open` and `ActorReply::encode` running outside `guarded`
+   (**proved here, not fixed**).
+
+Seven found by reading the two paths side by side, three of them in the two
+sittings since §16.7 said the count would keep going up. It was right, and the
+conclusion is unchanged: what ends this is one turn loop rather than two.
+
+## 16.11 `guarded` covered the turn, and the turn was not all of the user code
+
+§16.10 found "a panic nothing catches", proved it, and left it alone because the
+fix belonged in `macros.rs` with the rest of the generated-loop work. This is
+that fix — item 7 on the list above, now closed.
+
+`keylink/src/panic.rs` states what `guarded` exists to prevent, and the sentence
+is worth quoting because it had become a description of the shipped behaviour
+rather than of the behaviour it ruled out: "one bad message drops the receiver,
+every later send fails, and the actor is unreachable for the life of the process
+while the registry still lists it as mounted — so callers would be told
+`NoSuchActor` about an id that is, as far as anyone configured it, very much
+real."
+
+`guarded(..)` wrapped `__actor_turn` and stopped there. Two calls in the same
+loop ran **caller-written code on the actor's own task** outside it:
+
+- `payload.open::<Request>(schema())`, above the guard, runs the caller's
+  `Deserialize`;
+- `ActorReply::encode(&__response)`, one line below it and one scope out, runs
+  the caller's `Serialize`.
+
+A panic in either unwound out of the mounted task, dropping the mailbox receiver
+while the registry entry stayed. Every later caller — for the life of the
+process — was answered `NoSuchActor` for an id that was mounted, and
+`System::contains` went on agreeing that it was.
+
+Nothing exotic reaches this. A *derived* `Serialize` cannot fail, so a service
+author who needs one that can hand-writes it; `tests/actors.rs` already had one
+for exactly that reason, to reach the encode-**error** arm. The distance from
+that arm to a destroyed actor is `Err(..)` becoming `panic!`. The same holds for
+`Deserialize`, which is hand-written the moment a type needs validation the
+derive will not do.
+
+### Keyed-path only, and why the local path never had it
+
+On the local path neither call is on the actor's task. `serve_one` reads the
+request header and encodes the response frame on the **connection** task, and
+`Handle::service`'s dispatch hands the already-typed `Request` to the mailbox. A
+panic in either therefore costs one connection, which is a bounded and ordinary
+failure. This was a divergence between the two dispatchers, not a property of
+the turn model — the fifth on §16.10's list to have that shape.
+
+### The fix, and the three decisions in it
+
+Both calls are inside `catching` — `panic.rs`'s synchronous counterpart to
+`guarded`, added for this. Synchronous on purpose: neither call is a future, and
+wrapping one in an `async` block to reuse `guarded` would hold a borrow across an
+await for nothing, which is the trap `local.rs`'s observer catch was rewritten to
+avoid.
+
+**A decode panic leaves the progress marker untouched.** No user code ran, so
+`Drop for Guard` reads `NotDispatched` and RELEASES the key: a retry of a call
+that never happened is a first attempt. This is the same answer the expiry arm
+gives and for the same reason, and it is the one property that lets a bound
+compose with an idempotency key at all — §16.7.
+
+**An encode panic leaves the marker at `dispatched`, so the key settles
+`Interrupted`.** The turn ran and mutated. `completed` would record the panic
+refusal as this call's settled reply and replay it to every retry, for work that
+really happened; releasing would run that work a second time. `Interrupted` —
+"it ran, and whether it took effect is unknown" — is what is left, and it is the
+answer the encode-*error* arm beside it already gives. §16.6, RFC-05 §2.
+
+**Neither refusal is rendered through `Panic`.** `Panic::caught` builds its
+message as `format!("the actor panicked: {message}")`, and on both of these
+paths that is false: the handler returned normally and the unwind came out of a
+`Serialize`, or the handler was never entered at all. A peer told "the actor
+panicked" would look for the fault in the method that answered it. So the two
+arms carry fixed strings that name what actually panicked and what it cost:
+
+| what panicked | the peer reads | the key |
+|---|---|---|
+| the message's `Deserialize` | ``the message's `Deserialize` panicked, so the actor never saw it`` | released |
+| the reply's `Serialize` | ``the reply's `Serialize` panicked after the turn ran`` | `Interrupted` |
+| the turn | `the actor panicked: <text>` | `Interrupted` |
+
+Three failures a peer can tell apart, which is what `RemoteError::Failed`
+carrying a `String` costs: a variant would be inside the hashed contract and
+would move the ALPN. It did not move — `tests/protocol.rs` still pins
+`keylink/Probe/aa77e29e5e1ccdc7`.
+
+**What this gives up.** `Panic::message()` returns the *prefixed* string, not the
+panic payload's own text — `caught` stores the prefix in the field the accessor
+returns — and the payload is private. So generated code cannot carry the panic's
+own text without also asserting "the actor panicked". The text is not lost:
+the panic hook already ran and printed it, with a backtrace, at the fault, which
+is the placement `Panic::resume`'s own documentation argues for. Making
+`message()` return the raw text and moving the prefix into `Display` would let
+these two refusals carry detail honestly, and would also fix the double prefix
+in the singleton path's `format!("panicked: {}", __panic)`, which today renders
+`panicked: the actor panicked: ..`. That is a change to `panic.rs`, not here.
+
+That stutter survived for a reason worth naming, because it is the same reason
+§16.10 keeps finding these: **the pinning test exists only on the path that
+already had a prefix.**
+`both_halves_of_a_lost_turn_carry_their_own_prefix` asserts
+`starts_with("panicked: ")` against the local path and has no keyed twin, so the
+local path's double prefix and the keyed path's single one are both green. A
+property pinned on one of two dispatchers is a property pinned on neither.
+
+### The guards
+
+`a_reply_whose_serialize_panics_kills_the_actor_the_registry_goes_on_listing`
+recorded the defect and was inverted rather than deleted, so the fix is proved by
+the scenario that proved the fault:
+`a_reply_whose_serialize_panics_costs_that_message_and_not_the_actor`. Its
+counterpart `a_keyed_call_whose_payload_panics_while_decoding_leaves_the_key_claimable`
+sends a payload whose `Deserialize` panics under an idempotency key, and asserts
+the key is still claimable afterwards.
+
+Both go red on removing their own `catching`, and both fail with
+`Remote(NoSuchActor { .. })` for a mounted id — the defect, verbatim.
+
+`a_keyed_call_whose_reply_panics_while_encoding_settles_the_key_interrupted`
+pins the third decision. Its sibling covers the encode-**error** arm, and a
+`completed()` added to the panic arm alone would leave that sibling green — so
+the marker on each of the two new arms is guarded by a test that fails on that
+arm and no other.
+
+## 16.12 A `Timeout` and an `IdempotencyKey` on an actor were at-least-once
+
+Both are `pub`, both are the first name anyone reaches for, and together on an
+actor they ran the work twice.
+
+A keyed call queued behind a running turn under `Timeout::after(100ms)` is
+answered `TimedOut` while its message is still in the mailbox. `serve_one` reads
+`progress.reached()` the instant the chain answers, sees `NotDispatched` — no
+turn had started, so nothing had marked anything — and `Drop for Guard`
+**releases** the key. Then the turn runs and mutates the state. The caller's
+retry finds the key vacant, is treated as a first attempt, and does the same work
+a second time. Reproduced on an actor's own entry list as `[1, 2, 2]`, out of the
+module whose one stated promise is at-most-once.
+
+Which of the two answers a call got was a race between the mailbox and the
+budget, decided after the caller had already been told `TimedOut`: refused after
+the turn began, the key settled `Interrupted` and behaved; refused a moment
+earlier, it did this.
+
+### How reachable this is, stated honestly
+
+More reachable than §16.6 or §16.7, and on the opposite path from both.
+
+The **local** path is live. The generated singleton `Client` has
+`with_idempotency`, `Handle::service` takes any `Middleware`, and `Timeout` is
+re-exported at the crate root, so `Handle::service` + `Timeout` + a key is four
+lines of ordinary published API. No hand-built envelope, no internals.
+
+The **keyed** path has the same defect and §16.6's excuse: `ActorClient` still
+exposes no `with_idempotency`, so reaching it means speaking the envelope by
+hand through `RpcClient`. Latent, not impossible — which is why both halves are
+now pinned by integration tests rather than by unit ones.
+
+The one warning was `Timeout`'s own rustdoc, which had described the defect
+correctly and in full since the sitting before this one. Documentation is not a
+fix; it is a record that somebody knew.
+
+### A fourth position does not exist. A fourth fact does
+
+The obvious repair — a `Queued` state between `NOT_DISPATCHED` and `DISPATCHED`
+— cannot be written, and the reason is worth keeping because it is the reason
+this sat unrepaired. Put each fact beside what `Drop for Guard` owes for it:
+
+| fact | what the key owes |
+| --- | --- |
+| nothing marked | release |
+| `ENQUEUED` — in a mailbox, fate unknown | `Interrupted` |
+| `UNRUN` — taken off the mailbox, no user code ran | release |
+| `DISPATCHED` — user code was entered | `Interrupted` |
+| `COMPLETED` — user code produced the answer | record |
+
+`UNRUN` happens **after** `ENQUEUED` and owes **less** than it, so the answer
+alternates release → interrupted → release → interrupted. A threshold read can
+only express an answer that is monotone along the order it reads, and this one is
+not monotone along any order. The constraint was not "find the right position";
+it was that positions were the wrong shape.
+
+**Unless the operation changes.** What `fetch_max` actually bought is written at
+its own definition: *a late mark cannot walk the state backwards, so marks made
+from the actor's task need no ordering against the accept task's read.* That is
+monotonicity **under the update**, not comparability of the values — and
+`fetch_or` has it too. It sets a bit and never clears one.
+
+So `Progress` stops being a chain of positions and becomes a lattice of facts:
+
+```rust
+const ENQUEUED:   u8 = 1;
+const UNRUN:      u8 = 2;
+const DISPATCHED: u8 = 4;
+const COMPLETED:  u8 = 8;
+```
+
+and `reached()` reads in precedence order, most-known first: `COMPLETED`,
+`DISPATCHED`, `UNRUN`, `ENQUEUED`, nothing. The property the old comment
+celebrated survives intact — still no catch-all arm, still no unreachable state
+to name, every bit pattern mapping to exactly one answer — and the answer no
+longer has to be monotone in the marks.
+
+The precedence also makes a double mark harmless **by construction** rather than
+by argument. A message marked both `DISPATCHED` and `UNRUN` reads as dispatched,
+which is the conservative answer, so an arm may say `unrun()` without first
+proving that nothing above it ran.
+
+**`Reached` does not grow, and `Drop for Guard` is untouched.** It stays three
+arms because it is the *decision*: `ENQUEUED` maps to `Reached::Dispatched` and
+`UNRUN` to `Reached::NotDispatched`, and all the new knowledge is absorbed in
+`reached()`. One word on `Reached::Dispatched` loosened, from "the work started"
+to "the work may have started", because a message in a mailbox is one nobody can
+promise did not run.
+
+### Who marks what, and how the list was closed
+
+| site | mark |
+| --- | --- |
+| `System::deliver`, after `mail.send` resolves `Ok` | `enqueued()` |
+| `LocalActor::ask_catching_before`, once the permit is in hand | `enqueued()` |
+| keyed loop, queue-deadline expiry arm | `unrun()` |
+| keyed loop, decode-refusal arm (hash or bytes) | `unrun()` |
+| keyed loop, decode-**panic** arm | `unrun()` |
+| `Handle::service`, `Queued::Expired` arm | `unrun()` |
+
+The list is closed by a rule rather than by a search, which is the only way to
+know it is closed: once reaching a mailbox is a fact, **silence means "queued,
+fate unknown"**, so every arm that ends a message without entering user code has
+to say so out loud. That turns "find them all" into "read both dispatch loops'
+match arms and classify each one".
+
+The keyed loop's `match __decoded` has four arms. One enters user code; the other
+three — expiry, decode refusal, decode panic — are the three above. The local
+path's `match __answer` has five. `Ran(Ok(..))` marks `completed()`, `Ran(Err)`
+panicked *inside* the turn and so arrives already `dispatched`, `Refused` is an
+observer vetoing a turn that ran, `Gone` genuinely cannot tell — and
+`Queued::Expired` is the one arm that ends a message unrun.
+
+`Queued::Expired` collapses two cases on purpose, and **both** mean release, so
+one `unrun()` covers them without the local path having to tell them apart: the
+permit that never arrived (nothing was marked, and the call adds a fact already
+true) and the turn-side refusal of a message that did queue (the call outranks
+its enqueue mark).
+
+**The encode arms are unchanged, and their silence still means what it meant.**
+The encode-error and encode-panic arms leave the marker at `DISPATCHED`, which
+outranks everything below it, so "the turn ran and whether it took effect is
+unknown" survives without either arm saying anything. That the decode side flips
+from silence to a statement and the encode side does not is the whole shape of
+this change, and it falls out of the precedence rather than out of arm order.
+
+**`System::deliver`'s refusals before the send mark nothing**, which is right and
+is now load-bearing rather than incidental: the schema-hash refusal, the id
+validation, the routing miss and — since §16.10 — the permit-wait bound all
+refuse a message that provably never entered a mailbox, so their keys are owed
+back. The mark sits *below* every one of them.
+
+### This does not re-open §16.6 or §16.7
+
+Their objection is to marking on the way **in**, because a mark that *settles*
+would let a `QueueTimeout` refusing a message that never ran permanently refuse
+every retry of a call that never happened.
+
+`ENQUEUED` is not a settlement. It is a fact a later fact overrides, and the
+overriding is what §16.6 and §16.7 had no mechanism for. §16.7's three tests were
+run against this and are green:
+
+- `a_keyed_message_still_queued_when_its_budget_expires_is_refused_before_its_turn`
+- `a_keyed_message_that_expired_in_the_queue_leaves_its_key_claimable`
+- `a_payload_that_does_not_decode_says_so_even_when_its_budget_expired`
+
+The second is now also the guard for the keyed expiry arm's `unrun()`, which is
+the right place for it to be: the property §16.7 calls *"precisely the property
+that makes `QueueTimeout` the only bound that composes with an `IdempotencyKey`
+at all"* is the property that arm's one line preserves.
+
+### The one signature this cost, and why it could not be avoided
+
+`LocalActor::ask_catching_before` gains a parameter:
+
+```rust
+pub async fn ask_catching_before<T, F>(
+    &self,
+    deadline: Option<Instant>,
+    queued: impl FnOnce() + Send,
+    turn: F,
+) -> Result<Queued<T>, TurnLost>
+```
+
+**Marking before the call instead would be wrong, not merely untidy.** A
+`Timeout` expiring drops the whole dispatch future, so *no arm runs at all* — a
+mark taken before `ask_catching_before` would be the last word for a caller that
+never got a mailbox permit, and its key would be burned for a message that
+provably never queued. The moment the message is in the mailbox is visible in
+exactly one place, and that place is inside this method.
+
+**A callback rather than `Option<Progress>`.** `Progress` is `#[doc(hidden)] pub`
+and is not re-exported from `lib.rs`, so a parameter of that type would sit
+unnameable in a public signature and rustdoc would render a link to nowhere. The
+callback keeps every type in the signature nameable, keeps `local.rs` from ever
+naming `Progress`, and puts the decision in front of whoever writes the call.
+Its cost is that `Progress::enqueued` has to be `#[doc(hidden)] pub`, because the
+closure generated dispatch passes is expanded in the *caller's* crate — which
+leaves all four marks in one bucket rather than three in one and a fourth in
+another. `ask_catching` keeps its signature exactly and delegates to a private
+`ask_catching_queued`, so there is still one body.
+
+### §16.2's rejection stands, and its stated reason does not
+
+§16.2 rejected a marker bound on the actor path's `layer` because *"it would
+split `ServiceBuilder` in two to prevent a combination that is now merely
+suboptimal"*. **That premise is false.** The combination was not suboptimal; it
+was at-least-once, on the path reachable from the shipped client.
+
+The rejection survives on a better reason, and it is a capability argument rather
+than a cost one. Both dispatch paths bound only the wait for a mailbox
+**permit**; the wait for the **answer** is unbounded on both. A turn that never
+returns — a self-call deadlock, an await on something that never fires — holds
+its caller forever, and `QueueTimeout` structurally cannot help: its permit-side
+check has already passed, and its turn-side check runs when the message is
+*taken*, which never happens.
+
+`Timeout` is the only bound in the crate that answers that caller. It is not a
+worse `QueueTimeout`; it is the liveness backstop for the case `QueueTimeout`
+cannot see, so a marker bound would remove a capability nothing replaces. §16.2's
+*"two behaviours, not two doors to one"* is right, and stronger than the section
+claimed. Its cost estimate was right too — an opt-in `SerialSafe` allowlist makes
+every user-written layer stop compiling until it is annotated, so refusing one
+type costs every type an annotation.
+
+Recorded here rather than edited into §16.2, per this document's rule.
+
+### What this gives up, and the hazard in getting it back
+
+§16.6's table of `System::deliver`'s failure paths, row 5 — a message that
+queued and was then dropped **unrun**, because the actor was `stop`ped, `abort`ed
+or evicted before taking it — used to release its key and now settles
+`Interrupted`. Nothing in the suite asserts either answer; the row is prose.
+
+The direction is the safe one. `Interrupted` is conservative, at-most-once is
+preserved, and what is lost is precision on a rare path rather than a promise.
+Releasing is the failure mode this whole section exists to remove.
+
+Getting the precision back is **not** the twenty lines it looks like, and the
+reason is a drop-order hazard worth writing down before somebody tries. The shape
+is a token inside `Mail` whose `Drop` marks `unrun()`; precedence makes it safe
+to fire unconditionally, since `DISPATCHED` outranks it for a message that did
+run. But `Mail` also owns the `reply` sender, and `serve_one` reads `reached()`
+after `answer.await` resolves — which is when that sender drops. A token
+declared after `reply` drops after it, so the read can happen before the mark and
+the token buys nothing. It has to drop *first*, which makes the fix depend on
+field declaration order in a struct the keyed loop destructures. That is a real
+design decision and not a chore, so it is not in this change.
+
+The local path is the cheaper half of the same question: its `TurnLost::Gone`
+arm could mark `unrun()` today, with no drop order involved, and precedence would
+sort out the abort-mid-turn case because that arrives already `dispatched`. It is
+left alone deliberately. The arm does not *know* nothing ran — it would be
+claiming a fact and relying on the precedence read to correct it, which is the
+kind of implicit coupling the rest of this file argues against. If row 5 is worth
+recovering it should be recovered on both paths, in one sitting, with a test.
+
+### What is proved, and where
+
+The characterization pin from the previous sitting was **inverted, not deleted**,
+so the fix is proved by the scenario that proved the fault.
+`a_timeout_runs_a_keyed_message_twice_where_a_queue_timeout_runs_it_once` is now
+`a_timeout_settles_the_key_it_gave_up_on_where_a_queue_timeout_leaves_it_claimable`,
+and its helper answers three facts instead of one entry list, because the two
+bounds now agree on the list and differ in everything leading to it:
+
+1. what the actor had run once the holding turn was over and **before** the
+   retry — `[1, 2]` under `Timeout`, `[1]` under `QueueTimeout`;
+2. what the retry was told — `Idempotency(Interrupted)` under `Timeout`, the
+   answer under `QueueTimeout`;
+3. what the actor had run in the end — `[1, 2]` under both.
+
+Fact 1 earns its own line rather than riding on fact 3. `local.rs` heads a
+section *"The turn runs even if you stop waiting"* — *a caller that gives up on a
+`reserve` has still reserved* — and no test drops an `ask` future and checks it.
+That promise used to be pinned only by the doubled entry of the defect, so
+fixing the defect would have silently un-pinned it. It is a **pin and not a
+guard**: no line of this change makes it red, because the only change that would
+is skipping a turn whose caller hung up — which contradicts the promise, was
+rejected on those grounds, and is nowhere in the code.
+
+Two tests added on the keyed path, both over a real QUIC connection, neither
+asserting on elapsed time:
+
+- `a_keyed_message_a_timeout_gave_up_on_in_the_mailbox_settles_its_key` — the
+  defect itself, on the latent path.
+- `only_the_keyed_message_that_got_a_mailbox_permit_settles_its_key` — the
+  precision the mark's *placement* buys. Two identical keyed messages behind a
+  held turn, capacity one, so exactly one gets the slot and no test can say
+  which; the assertions are therefore counts over the pair. Exactly one retry is
+  refused `Interrupted` and the actor is touched twice.
+
+`start_gated` now delegates to `gated_behind(bound)`, because two bounds that owe
+a caller's key opposite things in the same scenario have to be compared through
+one fixture.
+
+### The guards, and what each was watched to fail with
+
+Every one below was broken with `scripts/break-once.sh` and watched.
+
+`Progress::unrun` made a no-op — `self.0.fetch_or(UNRUN, ..)` → `let _ = UNRUN;`
+— run against one guard at a time, because each scenario reaches exactly one
+`unrun()` site, which is what attributes the site to the guard:
+
+| site | guard | failure |
+| --- | --- | --- |
+| keyed expiry arm | `a_keyed_message_that_expired_in_the_queue_leaves_its_key_claimable` | `the key must still be claimable: Remote(Idempotency(Interrupted))` |
+| keyed decode-refusal arm | `a_keyed_call_whose_payload_does_not_decode_leaves_the_key_claimable` | same text |
+| keyed decode-panic arm | `a_keyed_call_whose_payload_panics_while_decoding_leaves_the_key_claimable` | same text |
+| local `Queued::Expired` arm | the inverted pin's `QueueTimeout` half | `the key must still be claimable, because the refusal proved nothing ran: Remote(Idempotency(Interrupted))` |
+
+The two enqueue marks, broken two ways each:
+
+- `progress.enqueued()` removed from `System::deliver` →
+  `a_keyed_message_a_timeout_gave_up_on_in_the_mailbox_settles_its_key` fails
+  with `a key nobody can report on must be settled, not claimable: Touch(2)`.
+  The `2` is the defect verbatim: the retry ran the work again.
+- `progress.enqueued()` moved **above** `mail.send` →
+  `only_the_keyed_message_that_got_a_mailbox_permit_settles_its_key` fails with
+  `left: 2, right: 1` on *the caller that never got a permit must keep its key*.
+  Both keys settle, so a message that provably never queued is refused forever.
+- the local `move || __queued.enqueued()` made a no-op →
+  the inverted pin's `Timeout` half fails with `the key of a message that was
+  queued when its caller gave up must settle: 3`. The retry ran and got the
+  ledger's third entry — `[1, 2, 2]`, the original defect.
+
+### The count, again
+
+§16.10 said the count of defects found in this loop would keep going up, and
+§16.11 said it again. This one is not in the keyed loop at all: it is in the
+marker every dispatch path shares, and it was reachable from the one path that
+had *nothing wrong with it* — a singleton served with `Handle::service`, which
+had marked correctly since it was written. What was missing was not a mark but a
+**fact**, and the type had no room for one because the wrong invariant had been
+chosen for it.
+
+Nothing on the wire moved: no `RemoteError` variant, no `postcard_schema` type,
+no ALPN. `keylink/Probe/aa77e29e5e1ccdc7` before and after.

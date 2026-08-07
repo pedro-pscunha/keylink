@@ -11,7 +11,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use keylink::{Allowlist, Body, BodyReader, Error, Node, Server as KeylinkServer};
+use keylink::{
+    Allowlist, Body, BodyReader, Context as KeylinkContext, Error, Node, Server as KeylinkServer,
+};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, ReadBuf};
@@ -45,16 +47,16 @@ keylink::service! {
 struct Server;
 
 impl probe::Handler for Server {
-    async fn ping(&self) -> String {
+    async fn ping(&self, _cx: &KeylinkContext) -> String {
         "pong".to_string()
     }
 
-    async fn slow(&self, ms: u64) -> u64 {
+    async fn slow(&self, _cx: &KeylinkContext, ms: u64) -> u64 {
         tokio::time::sleep(Duration::from_millis(ms)).await;
         ms
     }
 
-    async fn download(&self, len: u64) -> (Meta, Body) {
+    async fn download(&self, _cx: &KeylinkContext, len: u64) -> (Meta, Body) {
         let meta = Meta {
             bytes: len,
             checksum: Pattern::checksum(len),
@@ -64,7 +66,7 @@ impl probe::Handler for Server {
 
     /// Declares one length and sends another, which is how a real short read
     /// looks from the receiving end.
-    async fn mislabelled(&self, declare: u64, actually: u64) -> (Meta, Body) {
+    async fn mislabelled(&self, _cx: &KeylinkContext, declare: u64, actually: u64) -> (Meta, Body) {
         let meta = Meta {
             bytes: declare,
             checksum: 0,
@@ -75,7 +77,7 @@ impl probe::Handler for Server {
         )
     }
 
-    async fn upload(&self, _name: String, mut body: BodyReader) -> Received {
+    async fn upload(&self, _cx: &KeylinkContext, _name: String, mut body: BodyReader) -> Received {
         let mut checksum = Fnv1a::new();
         let mut bytes = 0u64;
         loop {
@@ -397,7 +399,7 @@ keylink::service! {
 struct Tele;
 
 impl telemetry::Handler for Tele {
-    async fn echo(&self, text: String) -> String {
+    async fn echo(&self, _cx: &KeylinkContext, text: String) -> String {
         text
     }
 }
@@ -701,11 +703,21 @@ struct DriftedContract {
     response: keylink::Envelope<probe::Response>,
 }
 
-/// The shape it must have: the same alias the wire names.
+/// The same drift on the request side, which arrived with the ledger query: the
+/// bare request, not the `WireRequest` the wire carries.
+#[derive(postcard_schema::Schema)]
+#[allow(dead_code)]
+struct RequestDriftedContract {
+    request: keylink::Envelope<probe::Request>,
+    response: keylink::Envelope<keylink::WireResponse<probe::Response>>,
+    kinds: keylink::WireKinds,
+}
+
+/// The shape it must have: the same two types the wire names.
 #[derive(postcard_schema::Schema)]
 #[allow(dead_code)]
 struct CorrectContract {
-    request: keylink::Envelope<probe::Request>,
+    request: keylink::Envelope<keylink::WireRequest<probe::Request>>,
     response: keylink::Envelope<keylink::WireResponse<probe::Response>>,
     kinds: keylink::WireKinds,
 }
@@ -724,12 +736,19 @@ fn the_alpn_hashes_the_response_type_the_wire_actually_carries() {
     const P: &str = concat!(env!("CARGO_PKG_NAME"), "/Probe");
 
     let drifted = keylink::derive_alpn::<DriftedContract>(P);
+    let request_drifted = keylink::derive_alpn::<RequestDriftedContract>(P);
     let correct = keylink::derive_alpn::<CorrectContract>(P);
 
     assert_ne!(
         drifted, correct,
         "wrapping the response in Outcome must change the hash, or the wrapper \
          is invisible to the gate"
+    );
+    assert_ne!(
+        request_drifted, correct,
+        "wrapping the request in WireRequest must change the hash too. A peer \
+         that cannot receive a ledger query decodes one as a call, which is the \
+         variant confusion this whole scheme exists to refuse"
     );
 
     let real = String::from_utf8_lossy(probe::alpn()).into_owned();
@@ -767,9 +786,29 @@ fn the_alpn_hashes_the_response_type_the_wire_actually_carries() {
 /// test green is how a fleet silently splits in half.
 ///
 /// A `postcard-schema` upgrade moves this legitimately.
+///
+/// # Moved once, deliberately, by the idempotency programme
+///
+/// `a51c5347dacb0df5` → `aa77e29e5e1ccdc7`. Step 1 was answered yes: the change
+/// IS wire-visible and has to be, three times over.
+///
+/// - The request direction is now `WireRequest<Request>`, because a caller can
+///   ask what the ledger knows about one of its keys and that question is not a
+///   method on anybody's service.
+/// - The response direction is now `WireResponse<Response>` as a two-armed enum
+///   rather than a bare `Outcome<Response>`, because that question needs an
+///   answer.
+/// - `Envelope.idempotency` carries `Idempotency` rather than
+///   `IdempotencyKey`, because a caller can now say how long to wait for a call
+///   already in flight under the key.
+///
+/// A peer built before this change would decode a `KeyState` reply as a call
+/// reply, which is exactly the postcard variant-confusion the derived ALPN
+/// exists to refuse. Refusing it at the handshake is the correct outcome, and
+/// costs nothing: keylink is unpublished, so there is no fleet to split.
 #[test]
 fn the_contract_hash_has_not_moved() {
-    const PINNED: &str = "keylink/Probe/a51c5347dacb0df5";
+    const PINNED: &str = "keylink/Probe/aa77e29e5e1ccdc7";
 
     assert_eq!(
         String::from_utf8_lossy(probe::alpn()),

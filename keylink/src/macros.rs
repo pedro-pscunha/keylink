@@ -46,6 +46,82 @@
 /// grants it to the caller: no other peer can fetch it, and nothing else in the
 /// store becomes reachable.
 ///
+/// ## A `send` method cannot be served as an actor
+///
+/// A `send` handler reads its upload **inside** the turn — RFC-04 §10.4 — and no
+/// layer can bound that, because a layer refuses the caller without ending the
+/// turn. So a peer that declares a large body and then stops writing would hold
+/// the actor until iroh's connection idle timeout, with nothing else answered,
+/// including the local `Handle`.
+///
+/// That is refused at compile time, at the site that serves the actor:
+///
+/// ```compile_fail
+/// use keylink::{Allowlist, BodyReader, Caller};
+///
+/// keylink::service! {
+///     service Depot;
+///     send Ingest(name: String) -> u64;
+/// }
+///
+/// struct Store;
+/// impl depot::Actor for Store {
+///     async fn ingest(&mut self, _cx: Caller<'_>, _n: String, _b: BodyReader) -> u64 { 0 }
+/// }
+///
+/// let actor = depot::actor(Store);
+/// let _ = actor.service(Allowlist::anyone());   // <- this line does not compile
+/// ```
+///
+/// And at the other site that serves one, which for a long time it was not.
+/// `CHECK` is an associated const on a generic type, so it is evaluated where it
+/// is *instantiated*; while `Handle::service` held the only instantiation, the
+/// identical service was refused there and mounted into a keyed
+/// [`System`](crate::System) without a word — over an ALPN, reachable by any
+/// admitted peer, with the body read inside the turn exactly as above. §16.9.
+///
+/// (`crate::` and not `keylink::` there, unlike every link in the *expansion*
+/// below: this comment is rendered inside keylink, and those are rendered in the
+/// caller's crate.)
+///
+/// ```compile_fail
+/// use keylink::{BodyReader, Caller};
+///
+/// keylink::service! {
+///     service Depot;
+///     send Ingest(name: String) -> u64;
+/// }
+///
+/// struct Store;
+/// impl depot::Actor for Store {
+///     async fn ingest(&mut self, _cx: Caller<'_>, _n: String, _b: BodyReader) -> u64 { 0 }
+/// }
+///
+/// let _ = depot::spawn(Store);                   // <- nor does this one
+/// ```
+///
+/// Serving the same service the concurrent way is fine, which is what makes the
+/// refusal above a statement about the actor path rather than about `send`:
+///
+/// ```no_run
+/// use keylink::{Allowlist, BodyReader, Context};
+///
+/// keylink::service! {
+///     service Depot;
+///     send Ingest(name: String) -> u64;
+/// }
+///
+/// struct Store;
+/// impl depot::Handler for Store {
+///     async fn ingest(&self, _cx: &Context, _n: String, _b: BodyReader) -> u64 { 0 }
+/// }
+///
+/// let _ = depot::service(Store, Allowlist::anyone()).build();
+/// ```
+///
+/// Put bulk transfer on a second service, which is what `README.md` recommends
+/// for it anyway.
+///
 /// RPC names are written in `CamelCase` (they become enum variants); the
 /// generated methods are `snake_case`.
 ///
@@ -108,12 +184,12 @@ macro_rules! service {
             /// Hashed to produce the ALPN, so the gate covers BOTH directions
             /// *and* keylink's own framing.
             ///
-            /// The response field MUST name `WireResponse`, the same alias the
-            /// wire names. Spelling the bare `Response` here is what let the
-            /// contract and the wire drift apart once already.
+            /// Both fields MUST name the `Wire*` types, the same ones the wire
+            /// names. Spelling the bare `Request` or `Response` here is what let
+            /// the contract and the wire drift apart once already.
             #[derive(::postcard_schema::Schema)]
             struct Contract {
-                request: $crate::Envelope<Request>,
+                request: $crate::Envelope<$crate::WireRequest<Request>>,
                 response: $crate::Envelope<$crate::WireResponse<Response>>,
                 /// keylink's own wire surface, so a peer built against a
                 /// keylink that cannot accept a `tell` is refused instead of
@@ -177,6 +253,38 @@ macro_rules! service {
             const DECLARES_BLOBS: bool =
                 false $( | $crate::__keylink_is_blob!([<$kind>]) )+;
 
+            /// Whether any method here reads an upload inside its turn, folded
+            /// the same way. Read by [`Handle::service`], which refuses to
+            /// compile for such a service.
+            const DECLARES_SEND: bool =
+                false $( | $crate::__keylink_is_send!([<$kind>]) )+;
+
+            /// The compile-time refusal for [`DECLARES_SEND`].
+            ///
+            /// Generic in `A` **on purpose**, and that is the whole trick: an
+            /// associated const of a generic type is evaluated when it is
+            /// instantiated, so this fires at the site that serves an actor and
+            /// nowhere else. A plain `const` would be evaluated where it is
+            /// written, and would refuse every service that merely *declares* a
+            /// `send` method — including every one served the concurrent way,
+            /// where a `send` is perfectly safe.
+            struct ServableAsActor<A>(::core::marker::PhantomData<A>);
+
+            impl<A> ServableAsActor<A> {
+                const CHECK: () = ::core::assert!(
+                    !DECLARES_SEND,
+                    "this service declares a `send` method, so it cannot be \
+                     served as an actor. A `send` handler reads its upload \
+                     INSIDE the serial turn, so a peer that declares a large \
+                     body and then stops writing holds the actor until iroh's \
+                     connection idle timeout, during which nothing else is \
+                     answered - including the local Handle. No layer can bound \
+                     that: a layer refuses the caller without ending the turn. \
+                     Serve this with `service(handler, allow)` instead, or move \
+                     the upload to a second service. RFC-04 s10.4."
+                );
+            }
+
             impl $crate::Rpc for Request {
                 const SERVICE: &'static str = stringify!($svc);
 
@@ -196,19 +304,29 @@ macro_rules! service {
             ) -> $crate::ServiceBuilder<Request, Response> {
                 let handler = ::std::sync::Arc::new(handler);
                 let dispatch: $crate::Dispatch<Request, Response> =
-                    ::std::sync::Arc::new(move |_cx: $crate::Context,
+                    ::std::sync::Arc::new(move |cx: $crate::Context,
                                                 req: Request,
                                                 body: $crate::BodyReader| {
                         let handler = handler.clone();
+                        // Marked HERE rather than around `base` in
+                        // `ServiceBuilder::build`, because only this code knows
+                        // when the work itself begins. What the idempotency
+                        // ledger does with a claimed key depends entirely on
+                        // these two calls: neither means a layer refused
+                        // without dispatching, one means the handler was
+                        // entered and never answered, both mean it answered.
+                        let __progress = cx.progress();
                         ::std::boxed::Box::pin(async move {
+                            __progress.dispatched();
                             let (__response, __body) = match req {
                                 $(
                                     Request::$rpc { $( $arg ),* } =>
                                         [<__invoke_ $rpc:snake>](
-                                            handler.as_ref(), body $(, $arg )*
+                                            handler.as_ref(), &cx, body $(, $arg )*
                                         ).await,
                                 )+
                             };
+                            __progress.completed();
                             ($crate::Outcome::Ok(__response), __body)
                         })
                     });
@@ -293,59 +411,36 @@ macro_rules! service {
             /// and must be `Sync`; an actor is owned by one task and never
             /// shared, so state holding an `Rc`, a `RefCell` or a `!Sync`
             /// client can be an actor and cannot be a `Handler`.
+            ///
+            /// # Who is calling
+            ///
+            /// Every method takes a [`Caller`](keylink::Caller) first, because an
+            /// actor is reachable two ways and the local way has no peer:
+            ///
+            /// ```ignore
+            /// async fn submit(&mut self, cx: Caller<'_>, order: Order) -> Fill {
+            ///     let who = match cx {
+            ///         Caller::Local     => Who::House,
+            ///         Caller::Peer(cx)  => Who::Trader(cx.peer()),
+            ///     };
+            /// }
+            /// ```
+            ///
+            /// This replaces a `caller(&mut self, Option<&Context>)` hook that
+            /// ran before each message and asked the state to stash the value.
+            /// Three things were wrong with it and all three are gone. It
+            /// occupied the name `caller`, so a service with an `rpc Caller()`
+            /// could not be an actor. It was only reachable from
+            /// `__actor_turn`, so the local-handle dispatcher had to repeat it
+            /// by hand in every arm and a sixth method kind wired in without
+            /// that line would silently inherit the last remote peer — RFC-01
+            /// §11.2b's hazard, in the code rather than in a comment. And
+            /// `if let Some(cx) = cx { self.peer = Some(cx.peer()) }` is the
+            /// idiomatic way to write it and leaves a stale peer behind, so a
+            /// local message could be authorized against whoever dialled in
+            /// last. An argument cannot be forgotten, cannot go stale, and
+            /// costs no name.
             pub trait Actor: Send + 'static {
-                /// Who sent the message that comes next, when anybody did.
-                ///
-                /// Called immediately before each message and never
-                /// concurrently with one, because the mailbox is serial. Stash
-                /// what you need in your own state. The default does nothing.
-                ///
-                /// A concurrent [`Handler`] could not have this: two calls
-                /// would race on the stashed value.
-                ///
-                /// # `None` is a message from this process
-                ///
-                /// A [`Handle`] call has no peer, no handshake and no proven
-                /// key, so there is nothing to pass. It is an `Option` rather
-                /// than a skipped call for exactly one reason: an actor that
-                /// stashes the caller and is reachable both ways would
-                /// otherwise authorize a local message against **the last peer
-                /// that happened to call it**. Assign what you are given,
-                /// including the `None`:
-                ///
-                /// ```ignore
-                /// fn caller(&mut self, cx: Option<&Context>) {
-                ///     self.peer = cx.map(Context::peer);
-                /// }
-                /// ```
-                ///
-                /// The `Option` makes that call reachable. It does not make the
-                /// wrong one impossible, and the wrong one is idiomatic:
-                ///
-                /// ```ignore
-                /// if let Some(cx) = cx { self.peer = Some(cx.peer()); }   // stale peer survives
-                /// ```
-                ///
-                /// Nothing here can catch that, because keylink cannot see what
-                /// your state does with the value. What the type buys is that
-                /// the local case is now in the signature, where it has to be
-                /// answered — not that it is answered correctly.
-                ///
-                /// # It occupies the name
-                ///
-                /// A service with an `rpc Caller()` cannot be an actor: the
-                /// generated method and this hook would be two trait items
-                /// called `caller`. [`Handler`] has no hook and no such
-                /// restriction, so the collision shows up only when a service
-                /// gains an actor — as a duplicate-definition error naming this
-                /// line. Rename the rpc.
-                ///
-                /// [`Handle`] reserves five more, and those fire whether or not
-                /// anybody calls [`actor`], because its impl block is generated
-                /// unconditionally: `service`, `serve`, `stop`, `abort` and
-                /// `is_running`.
-                fn caller(&mut self, _cx: ::core::option::Option<&$crate::Context>) {}
-
                 $(
                     $crate::__keylink_actor_method!(
                         [$( #[$meta] )*],
@@ -366,7 +461,7 @@ macro_rules! service {
                 );
             )+
 
-            /// One message against one actor: the caller hook, then the method.
+            /// One message against one actor.
             ///
             /// Generated **once** and used by both served paths: the keyed
             /// system's mailbox loop and the singleton service's dispatch. One
@@ -375,22 +470,22 @@ macro_rules! service {
             /// [`Handle`]'s own methods do not come through here — they call the
             /// trait method directly, since a local call has no `Request` to
             /// build and no `BodyReader` to pass. So there **are** two
-            /// dispatchers, and the second one is `__keylink_local_method!`,
-            /// whose arms each repeat the `caller(None)` hook by hand. A sixth
-            /// method kind wired into that macro without it would silently
-            /// inherit the last remote peer. That is RFC-01 §11.2b's hazard,
-            /// reported here rather than claimed absent.
+            /// dispatchers, and the second one is `__keylink_local_method!`.
+            /// That used to matter: each arm repeated a `caller(None)` hook by
+            /// hand, and a sixth method kind wired in without it would silently
+            /// inherit the last remote peer. The caller is an argument now, so
+            /// the two dispatchers can disagree about many things and no longer
+            /// about this one — a missing `Caller` is a compile error.
             async fn __actor_turn<A: Actor>(
                 state: &mut A,
-                cx: ::core::option::Option<&$crate::Context>,
+                cx: $crate::Caller<'_>,
                 request: Request,
                 body: $crate::BodyReader,
             ) -> (Response, $crate::Body) {
-                state.caller(cx);
                 match request {
                     $(
                         Request::$rpc { $( $arg ),* } =>
-                            [<__actor_ $rpc:snake>](state, body $(, $arg )*).await,
+                            [<__actor_ $rpc:snake>](state, cx, body $(, $arg )*).await,
                     )+
                 }
             }
@@ -409,33 +504,178 @@ macro_rules! service {
             /// is caught and reported as a refusal, and the next message runs
             /// against the state as it stands.
             ///
+            /// # No observers on this path
+            ///
+            /// A keyed actor gets **no** [`Observer`](keylink::Observer)s. This
+            /// runs its own loop over `__actor_turn` and never touches
+            /// `LocalActor`, which is where the observer chain lives. So an
+            /// actor mounted here and expecting durability would get no
+            /// durability, no compile error and no explanation — hence this
+            /// paragraph. Use [`actor_with`] for one actor that must be
+            /// observed. RFC-06 §5.3.
+            ///
             /// # Panics
             ///
             /// Panics when called outside a tokio runtime.
             #[must_use = "an unmounted actor is dropped, which stops the task \
                           this just started"]
             pub fn spawn<A: Actor>(mut state: A) -> $crate::Mounted {
+                // The same refusal `Handle::service` makes, and for longer than
+                // it was made here: `CHECK` is an associated const on a generic
+                // type, so it is evaluated only where it is INSTANTIATED, and
+                // for a long time the one instantiation was in `Handle::service`.
+                // A service declaring `send` was therefore refused by the local
+                // handle at compile time and accepted here without a word —
+                // where the body is read inside the serial turn exactly as it
+                // would have been, so a peer declaring a large body and then
+                // not writing it holds the actor until iroh's idle timeout.
+                //
+                // Not bounded by a layer, and not by a `QueueTimeout` either:
+                // that refuses a message still QUEUED, and this one has already
+                // started. RFC-04 §10.4 argues the whole thing and named only
+                // the path that was guarded. §16.9.
+                let () = ServableAsActor::<A>::CHECK;
                 $crate::mount(schema(), move |mut inbox: $crate::Mailbox| async move {
                     while let ::std::option::Option::Some(mail) = inbox.recv().await {
                         let $crate::Mail { cx, payload, body, reply } = *mail;
+                        // The third generated dispatch path, and the one that
+                        // marked nothing at all. A key claimed for a message
+                        // routed here was RELEASED once the turn had already
+                        // mutated the actor, so the caller's retry ran the work
+                        // a second time — at-least-once, out of the module
+                        // whose whole promise is at-most-once. RFC-04 §16.6.
+                        //
+                        // Taken before the turn because `cx` is only borrowed
+                        // by `Caller::Peer(&cx)` below.
+                        let __progress = cx.progress();
+                        // A `QueueTimeout` above the system's service stamped a
+                        // deadline on the context, and this loop was the one
+                        // dispatch path that never read it: the layer compiles
+                        // on `System::service` and guarded nothing there, at
+                        // any budget, with no error and no warning. RFC-04
+                        // §16.7.
+                        //
+                        // Read HERE, on the actor's own task and the instant
+                        // the message leaves the mailbox. Not in the layer,
+                        // which cannot tell a queued message from a running one
+                        // (RFC-04 §16.2), and not after the decode either:
+                        // queueing ENDS when the message is taken, so whatever
+                        // the decode below costs is not time spent waiting.
+                        //
+                        // `Queueing::expired` and not a comparison written
+                        // here, because generated code cannot name the clock —
+                        // nothing in `$crate` re-exports one — and the spelling
+                        // that worked without naming it,
+                        // `!deadline().elapsed().is_zero()`, is `now >
+                        // deadline` where the local path is `now >= deadline`.
+                        // The comment this replaces called that "a zero-length
+                        // budget". It is every case where `now == deadline` — a
+                        // paused clock's ordinary case, and a browser's too,
+                        // where `Performance.now()` is clamped to a tick and the
+                        // deadline is stamped from that same clamped clock. So
+                        // the two paths disagreed on wasm at any whole-tick
+                        // budget, which is a shipped target rather than a test
+                        // artefact.
+                        //
+                        // There are still TWO comparisons, and this comment
+                        // claimed otherwise for an hour. `local.rs` writes its
+                        // own `Instant::now() >= deadline` inline, on the
+                        // actor's task, inside `ask_catching_before`. The two
+                        // now AGREE — `Queueing::expired` is that same `>=` —
+                        // but nothing makes them, and a pair of hand-written
+                        // comparisons drifting is precisely the defect above.
+                        // `ask_catching_before` takes a bare `Instant`; taking
+                        // the `Queueing` would leave one predicate rather than
+                        // two that agree by inspection.
+                        let __expired = cx.queueing().filter(|__budget| __budget.expired());
                         // The ONLY route from the payload's bytes to a typed
                         // message, and it compares the hashes first.
-                        let __answer = match payload.open::<Request>(schema()) {
-                            ::std::result::Result::Ok(__request) => {
+                        //
+                        // Wrapped, because `open` runs the CALLER's
+                        // `Deserialize` on the actor's own task. Uncaught, a
+                        // panic there unwound out of the mounted task from one
+                        // line ABOVE `guarded` and produced, verbatim, the
+                        // failure `guarded` exists to prevent: the receiver
+                        // dropped, every later send failing, and the registry
+                        // still listing an id nobody can reach for the life of
+                        // the process. RFC-04 §16.11.
+                        let __decoded = $crate::catching(|| payload.open::<Request>(schema()));
+                        let __answer = match __decoded {
+                            ::std::result::Result::Ok(::std::result::Result::Ok(__request))
+                                if __expired.is_none() =>
+                            {
+                                // The hashes agreed and the bytes decoded, so
+                                // what follows is user code. Marking above the
+                                // match instead would report a schema mismatch
+                                // as work that ran, and settle a key for a
+                                // message the actor never saw.
+                                __progress.dispatched();
                                 let __turn = $crate::guarded(__actor_turn(
                                     &mut state,
-                                    ::core::option::Option::Some(&cx),
+                                    $crate::Caller::Peer(&cx),
                                     __request,
                                     body,
                                 ))
                                 .await;
                                 match __turn {
                                     ::std::result::Result::Ok((__response, __body)) => {
-                                        match $crate::ActorReply::encode(&__response) {
-                                            ::std::result::Result::Ok(__encoded) =>
-                                                ($crate::Outcome::Ok(__encoded), __body),
-                                            ::std::result::Result::Err(__refusal) => (
+                                        // `completed` goes on the encoded arm
+                                        // and nowhere else. An encode that
+                                        // fails means the turn ran, mutated
+                                        // the state and produced nothing
+                                        // transmissible; marking it completed
+                                        // would record the encoding refusal as
+                                        // this call's settled reply and replay
+                                        // that refusal to every retry, for work
+                                        // that really happened. The refusing
+                                        // arm below, and the panic arm after
+                                        // it, leave the marker at
+                                        // `dispatched`, which settles
+                                        // `Interrupted` — "it ran, and whether
+                                        // it took effect is unknown". RFC-05
+                                        // §2.
+                                        //
+                                        // Wrapped for the same reason the
+                                        // decode above is: `encode` runs the
+                                        // caller's `Serialize` here, on the
+                                        // actor's task, one line after
+                                        // `guarded` has let go. The panic arm
+                                        // leaves the marker exactly where the
+                                        // refusing arm leaves it, because the
+                                        // two describe the same fact — the turn
+                                        // ran and produced nothing the wire can
+                                        // carry.
+                                        match $crate::catching(|| {
+                                            $crate::ActorReply::encode(&__response)
+                                        }) {
+                                            ::std::result::Result::Ok(
+                                                ::std::result::Result::Ok(__encoded),
+                                            ) => {
+                                                __progress.completed();
+                                                ($crate::Outcome::Ok(__encoded), __body)
+                                            }
+                                            ::std::result::Result::Ok(
+                                                ::std::result::Result::Err(__refusal),
+                                            ) => (
                                                 $crate::Outcome::Err(__refusal),
+                                                $crate::Body::empty(),
+                                            ),
+                                            // Says the REPLY panicked, not the
+                                            // actor. `Display for Panic` and
+                                            // `Panic::message` both render "the
+                                            // actor panicked: ..", which is
+                                            // false here and false above: the
+                                            // handler returned normally and the
+                                            // unwind came out of a `Serialize`.
+                                            // A peer told otherwise would look
+                                            // for a fault in the method that
+                                            // answered it.
+                                            ::std::result::Result::Err(_) => (
+                                                $crate::Outcome::Err($crate::RemoteError::Failed(
+                                                    "the reply's `Serialize` panicked after the \
+                                                     turn ran"
+                                                        .to_owned(),
+                                                )),
                                                 $crate::Body::empty(),
                                             ),
                                         }
@@ -448,10 +688,89 @@ macro_rules! service {
                                     ),
                                 }
                             }
-                            ::std::result::Result::Err(__refusal) => (
-                                $crate::Outcome::Err(__refusal),
-                                $crate::Body::empty(),
-                            ),
+                            // Still queued when the budget ran out, so nothing
+                            // ran. Refused with the value the local path
+                            // produces for the same message — `TimedOut`
+                            // carrying `Queueing::millis`, and an empty body —
+                            // because a peer must not be able to tell the two
+                            // dispatch paths apart by the refusal it reads.
+                            //
+                            // `unrun()` and not silence. Reaching the mailbox is
+                            // marked on the way in — §16.12 — so an arm that
+                            // says nothing says "queued, fate unknown", which
+                            // would settle the key `Interrupted` and
+                            // permanently refuse every retry of work nobody
+                            // did. That is §16.6's failure one arm along, and
+                            // it would cost the one property that makes this
+                            // the only bound composing with an idempotency key.
+                            // Saying it explicitly outranks the enqueue mark,
+                            // so `Drop for Guard` sees `NotDispatched` and
+                            // RELEASES the key: the retry of a call that never
+                            // happened is a first attempt.
+                            //
+                            // BELOW the decode, not above it: a payload whose
+                            // bytes are not a message of this contract is
+                            // broken permanently, and `TimedOut` invites a
+                            // retry that can never succeed. The local path
+                            // decides it the same way round, because there the
+                            // accept loop decodes before any layer runs and so
+                            // refuses a bad payload before a deadline exists at
+                            // all. Either refusal leaves the key claimable, so
+                            // the order costs the caller nothing but a truer
+                            // answer.
+                            //
+                            // The `0` is unreachable: this arm is only taken
+                            // when `__expired` is `Some`.
+                            ::std::result::Result::Ok(::std::result::Result::Ok(_)) => {
+                                __progress.unrun();
+                                (
+                                    $crate::Outcome::Err($crate::RemoteError::TimedOut {
+                                        millis: __expired.map_or(0, $crate::Queueing::millis),
+                                    }),
+                                    $crate::Body::empty(),
+                                )
+                            }
+                            // The hashes disagreed, or the bytes are not a
+                            // message of this contract. Either way the actor
+                            // never saw it, and `unrun()` is how that is said
+                            // now that arriving in the mailbox speaks for
+                            // itself.
+                            ::std::result::Result::Ok(::std::result::Result::Err(__refusal)) => {
+                                __progress.unrun();
+                                ($crate::Outcome::Err(__refusal), $crate::Body::empty())
+                            }
+                            // Never `TimedOut`, whatever the budget says, and
+                            // that falls out of the shape rather than out of
+                            // arm order: a payload that panics its own
+                            // `Deserialize` is broken permanently, and
+                            // `TimedOut` invites a retry that can never
+                            // succeed. The same argument the expiry arm above
+                            // makes for sitting below the decode.
+                            //
+                            // `unrun()`, so `Drop for Guard` sees
+                            // `NotDispatched` and RELEASES the key: the unwind
+                            // came out of the CALLER's `Deserialize`, before
+                            // any of the actor's own code, so nothing is owed
+                            // and a retry of a call that never happened is a
+                            // first attempt. Naming the MESSAGE and not the
+                            // actor for the reason the encode arm gives.
+                            //
+                            // The mirror image of the encode-panic arm above,
+                            // which stays silent on purpose: there the turn had
+                            // already run, and silence there means `dispatched`
+                            // rather than `enqueued` because `dispatched`
+                            // outranks it.
+                            ::std::result::Result::Err(_) => {
+                                __progress.unrun();
+                                (
+                                    $crate::Outcome::Err($crate::RemoteError::Failed(
+                                        "the message's `Deserialize` panicked, so the actor \
+                                         never saw it"
+                                            .to_owned(),
+                                    )),
+                                    $crate::Body::empty(),
+                                )
+                            }
                         };
                         // The caller may have gone away mid-turn. Its stream is
                         // dead either way, so there is nothing to report.
@@ -483,7 +802,34 @@ macro_rules! service {
             /// [`blocking::Node::enter`](keylink::blocking::Node::enter).
             #[must_use]
             pub fn actor<A: Actor>(state: A) -> Handle<A> {
-                Handle { inner: $crate::LocalActor::spawn(state) }
+                actor_with(state, ::std::vec::Vec::new())
+            }
+
+            /// Start one actor of this service with observers watching its
+            /// turns.
+            ///
+            /// An [`Observer`](keylink::Observer) is called inside each turn,
+            /// after the method and **before the reply**, and it sees the state
+            /// and the outcome — never a request or a reply payload, which is
+            /// [`Middleware`](keylink::Middleware)'s half. Returning `Err` ends
+            /// the actor, and [`Handle::ended`] says which observer and why.
+            ///
+            /// ```ignore
+            /// let (state, saver) = keylink_durable::open(&store, id, Ledger::default).await?;
+            /// let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+            /// ledger.post(1).await?;   // stored before this returns
+            /// ```
+            ///
+            /// # Panics
+            ///
+            /// Panics when called outside a tokio runtime, like every other
+            /// spawn.
+            #[must_use]
+            pub fn actor_with<A: Actor>(
+                state: A,
+                observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
+            ) -> Handle<A> {
+                Handle { inner: $crate::LocalActor::spawn_observed(state, observers) }
             }
 
             /// A handle to an actor in this process.
@@ -608,11 +954,21 @@ macro_rules! service {
                 ///
                 /// Because the reply is the service's own typed `Response`,
                 /// everything that reads one keeps working: per-method
-                /// [`Middleware`](keylink::Middleware), the idempotency ledger,
-                /// and `blob` methods, whose address the server must see to
-                /// record a grant. The keyed actor system can offer none of
-                /// those three — RFC-04 §14.8 — because there the payload is
-                /// opaque to keylink by design.
+                /// [`Middleware`](keylink::Middleware) and `blob` methods,
+                /// whose address the server must see to record a grant. The
+                /// keyed actor system can offer neither — RFC-04 §14.8 —
+                /// because there the payload is opaque to keylink by design.
+                ///
+                /// The idempotency ledger is **not** a third thing on that list,
+                /// which is what this paragraph used to say. A key is claimed
+                /// and settled off the *envelope*, and the envelope is typed on
+                /// both paths, so it works on a keyed actor exactly as it works
+                /// here. What the keyed path lacks is a way to *send* one: the
+                /// generated `ActorClient` has no `with_idempotency`, so a key
+                /// gets there only from a peer building the envelope through
+                /// [`RpcClient`](keylink::RpcClient) by hand. Reading it as a
+                /// missing capability invites reasoning about a keyed actor as
+                /// if no key could ever arrive at one.
                 ///
                 /// The local [`Handle`] keeps working while this is served, and
                 /// messages from both sides share the one mailbox.
@@ -636,44 +992,90 @@ macro_rules! service {
                 /// So `Timeout::after(100ms)` in front of a method that takes
                 /// ten seconds does not shed load. Ten callers get `TimedOut` at
                 /// 100 ms and the actor still spends a hundred seconds producing
-                /// replies nobody is waiting for. Bound the work inside the
-                /// method instead, where `&mut self` is, or keep the slow method
-                /// off the actor.
+                /// replies nobody is waiting for.
                 ///
-                /// The same asymmetry breaks the guarantee an
-                /// [`IdempotencyKey`](keylink::IdempotencyKey) usually gives: a
-                /// refused call is recorded as the settled reply, and then the
-                /// turn runs and mutates the state anyway. The caller is told
-                /// `TimedOut`, keeps being told `TimedOut` on every retry, and
-                /// the actor has applied the message once. A key and a layer
-                /// that can refuse do not compose on this path.
+                /// [`QueueTimeout`](keylink::QueueTimeout) is the one that does
+                /// shed load here, and it is why `Timeout` is still worth
+                /// keeping elsewhere rather than being replaced: `QueueTimeout`
+                /// refuses only a message that has not started, and `Timeout` on
+                /// a concurrent [`Handler`] genuinely cancels the work. Two
+                /// behaviours, not two doors to one.
                 ///
-                /// # A `send` method can hold the actor for the idle timeout
+                /// What this paragraph used to say next was that a key and a
+                /// layer do not compose on this path — that a refused call was
+                /// recorded as the settled reply and the turn then ran and
+                /// mutated the state anyway. **That is fixed.** A turn that ran
+                /// and produced no answer anybody received now settles the key
+                /// as `Interrupted`, which is the truth rather than a lie the
+                /// caller would keep being told on every retry. It still does
+                /// not hand the retry the turn's real reply; RFC-05 §7 says why
+                /// and what that would cost.
+                ///
+                /// # A `send` method cannot be served this way at all
                 ///
                 /// A `send` handler reads its upload inside the turn — RFC-04
                 /// §10.4 — and no layer can bound that (see above). A peer that
-                /// declares a large body and then stops writing holds the actor
-                /// until iroh's connection idle timeout, during which nothing
-                /// else is answered, including the local [`Handle`]. Put bulk
-                /// transfer on a second service served with [`service`], which
-                /// is what the README already recommends for it.
+                /// declares a large body and then stops writing would hold the
+                /// actor until iroh's connection idle timeout, during which
+                /// nothing else is answered, including the local [`Handle`].
+                ///
+                /// So this no longer compiles for a service declaring one. Not a
+                /// startup error and not an opt-out: a compile error beats a
+                /// runtime one, keeps `Result` off this call site, and matches
+                /// what the rest of the crate does with claims of the form
+                /// "there is no way to do X". Put bulk transfer on a second
+                /// service served with [`service`], which is what the README
+                /// already recommends for it.
                 pub fn service(
                     &self,
                     allow: $crate::Allowlist,
                 ) -> $crate::ServiceBuilder<Request, Response> {
+                    // Reached by `serve` too, which goes through here. A service
+                    // declaring a `send` method stops compiling AT THIS CALL
+                    // SITE, and nowhere else.
+                    let () = ServableAsActor::<A>::CHECK;
                     let actor = self.inner.clone();
                     let dispatch: $crate::Dispatch<Request, Response> =
                         ::std::sync::Arc::new(move |cx: $crate::Context,
                                                     req: Request,
                                                     body: $crate::BodyReader| {
                             let actor = actor.clone();
+                            // Moved INTO the turn, which runs on the actor's own
+                            // task. That is what makes "dispatched" mean the
+                            // turn started rather than the message was queued:
+                            // a layer that refuses while the message is still
+                            // waiting leaves the key claimable, and a `Timeout`
+                            // that drops the wait for a turn already running
+                            // leaves it `Interrupted` — which is the truth,
+                            // because the turn runs on regardless.
+                            let __progress = cx.progress();
+                            // A SECOND handle, marked outside the turn. The
+                            // turn closure can only say the work started; only
+                            // out here is it known whether the answer survived
+                            // an observer. See the `completed()` call below.
+                            let __settled = __progress.clone();
+                            // A THIRD, for the one fact neither of the others
+                            // can reach: the message got a mailbox permit. Only
+                            // `ask_catching_before` sees that moment, and a
+                            // caller that gives up after it gave up on a turn
+                            // that runs anyway. §16.12.
+                            let __queued = __progress.clone();
+                            // A `QueueTimeout` above this put a deadline on the
+                            // context. Honoured HERE rather than by the layer,
+                            // because a layer cannot tell a queued message from
+                            // a running one and the actor's own task can.
+                            let __queueing = cx.queueing();
                             ::std::boxed::Box::pin(async move {
                                 let __answer = actor
-                                    .ask_catching(move |__state: &mut A| {
+                                    .ask_catching_before(
+                                        __queueing.map($crate::Queueing::deadline),
+                                        move || __queued.enqueued(),
+                                        move |__state: &mut A| {
                                         ::std::boxed::Box::pin(async move {
+                                            __progress.dispatched();
                                             __actor_turn(
                                                 __state,
-                                                ::core::option::Option::Some(&cx),
+                                                $crate::Caller::Peer(&cx),
                                                 req,
                                                 body,
                                             )
@@ -682,18 +1084,120 @@ macro_rules! service {
                                     })
                                     .await;
                                 match __answer {
-                                    ::std::result::Result::Ok(
+                                    // Marked HERE, and not inside the turn.
+                                    // An observer runs after the method and can
+                                    // refuse the turn it just watched, and a
+                                    // refused turn was NOT committed — so
+                                    // marking `completed` where the method
+                                    // returns would settle an idempotency key
+                                    // as the observer's veto and replay that
+                                    // veto to every retry, for work whose
+                                    // effect was thrown away. This arm is the
+                                    // only one holding an answer the turn
+                                    // itself produced; every other one leaves
+                                    // the marker at `dispatched`, which settles
+                                    // `Interrupted` — "it ran, and whether it
+                                    // took effect is unknown". That is the
+                                    // truth for a refused turn, whose mutation
+                                    // lived in memory and never reached a
+                                    // store. RFC-06 §13.3.
+                                    ::std::result::Result::Ok($crate::Queued::Ran(
                                         ::std::result::Result::Ok((__response, __body)),
-                                    ) => ($crate::Outcome::Ok(__response), __body),
+                                    )) => {
+                                        __settled.completed();
+                                        ($crate::Outcome::Ok(__response), __body)
+                                    }
                                     // A panic must not unwind out of a
-                                    // connection's task, so the remote caller is
-                                    // told what the keyed system tells it, in
-                                    // the same words. The actor is still alive.
-                                    ::std::result::Result::Ok(
+                                    // connection's task, so the remote caller
+                                    // is told a value. The actor is still
+                                    // alive.
+                                    //
+                                    // BOTH sides of `Failed` need marking, or a
+                                    // handler that panicked with the refusal
+                                    // below's exact text would produce a
+                                    // byte-identical `Failed` and no peer could
+                                    // tell a panic from an observer's veto.
+                                    // Panic text is often caller-derived, so
+                                    // that is reachable rather than theoretical.
+                                    //
+                                    // This side arrives marked ALREADY, which
+                                    // is what the comment here used to deny:
+                                    // `Panic::caught` builds its message as
+                                    // "the actor panicked: {message}" and
+                                    // `Display` writes that, so the `format!`
+                                    // below adds a SECOND prefix and a peer
+                                    // reads "panicked: the actor panicked: bad
+                                    // message". Nor does it match the keyed
+                                    // loop, which renders the same panic as
+                                    // `__panic.to_string()` and sends "the
+                                    // actor panicked: bad message".
+                                    //
+                                    // Left alone rather than fixed here:
+                                    // `both_halves_of_a_lost_turn_carry_their_own_prefix`
+                                    // pins `starts_with("panicked: ")`, and it
+                                    // is the ONLY test pinning either prefix.
+                                    // There is no keyed twin, which is how a
+                                    // stutter on one path and a bare rendering
+                                    // on the other both stayed green.
+                                    ::std::result::Result::Ok($crate::Queued::Ran(
                                         ::std::result::Result::Err(__panic),
+                                    )) => (
+                                        $crate::Outcome::Err($crate::RemoteError::Failed(
+                                            ::std::format!("panicked: {}", __panic),
+                                        )),
+                                        $crate::Body::empty(),
+                                    ),
+                                    // Refused while still queued, so nothing
+                                    // ran, and `unrun()` is what leaves an
+                                    // idempotency key claimable rather than
+                                    // settled — the only bound that composes
+                                    // with one. Silence would now mean
+                                    // `enqueued`, which settles.
+                                    //
+                                    // ONE call covers both halves of the
+                                    // budget, because `Queued::Expired`
+                                    // deliberately collapses them: the permit
+                                    // that never arrived (nothing was marked,
+                                    // and this adds a fact already true) and
+                                    // the turn-side refusal of a message that
+                                    // did queue (this outranks its enqueue
+                                    // mark). Neither ran, so neither owes
+                                    // anything, and this path never has to tell
+                                    // them apart.
+                                    //
+                                    // The `0` is unreachable: without a
+                                    // `QueueTimeout` there is no deadline, and
+                                    // without a deadline nothing expires.
+                                    ::std::result::Result::Ok($crate::Queued::Expired) => {
+                                        __settled.unrun();
+                                        (
+                                            $crate::Outcome::Err($crate::RemoteError::TimedOut {
+                                                millis: __queueing
+                                                    .map_or(0, $crate::Queueing::millis),
+                                            }),
+                                            $crate::Body::empty(),
+                                        )
+                                    }
+                                    // An observer refused THIS TURN. Not
+                                    // `NoSuchActor`, which says "there is
+                                    // nothing here, stop asking" — the turn ran
+                                    // and was not committed, and the actor is
+                                    // ending for a reason the peer should be
+                                    // able to read.
+                                    //
+                                    // A `String` payload and NOT a new
+                                    // `RemoteError` variant: a variant is inside
+                                    // the hashed contract, so it would move the
+                                    // ALPN and the pinned literal in
+                                    // `tests/protocol.rs`. The cost is that a
+                                    // peer must match on the string to tell a
+                                    // refusal from a panic, which is why both
+                                    // carry a prefix.
+                                    ::std::result::Result::Err(
+                                        $crate::TurnLost::Refused { name: __name },
                                     ) => (
                                         $crate::Outcome::Err($crate::RemoteError::Failed(
-                                            __panic.to_string(),
+                                            ::std::format!("observer refused: {}", __name),
                                         )),
                                         $crate::Body::empty(),
                                     ),
@@ -706,7 +1210,7 @@ macro_rules! service {
                                     // long as the server runs. The id is the
                                     // service name because a singleton has no
                                     // other one.
-                                    ::std::result::Result::Err(_gone) => (
+                                    ::std::result::Result::Err($crate::TurnLost::Gone) => (
                                         $crate::Outcome::Err(
                                             $crate::RemoteError::NoSuchActor {
                                                 id: stringify!($svc).to_owned(),
@@ -790,11 +1294,13 @@ macro_rules! service {
                     T: ::core::marker::Send + 'static,
                     F: ::core::ops::FnOnce(&A) -> T + ::core::marker::Send + 'static,
                 {
-                    self.inner
-                        .ask(move |__state: &mut A| ::std::boxed::Box::pin(async move {
-                            read(__state)
-                        }))
-                        .await
+                    // A READ, not a turn: it takes `&A`, cannot mutate, and
+                    // therefore runs no observers. Storing after it would be
+                    // waste, and it also closes a loop a future background
+                    // writer would create — a writer that read through a turn
+                    // would mark the actor dirty and schedule another read,
+                    // forever.
+                    self.inner.read(read).await
                 }
 
                 /// Stop after the messages already queued, then wait for the
@@ -824,6 +1330,23 @@ macro_rules! service {
                 #[must_use]
                 pub fn is_running(&self) -> bool {
                     self.inner.is_running()
+                }
+
+                /// Resolve when this actor ends, and say why.
+                ///
+                /// [`MailboxClosed`](keylink::MailboxClosed) says "gone", and it
+                /// must not be stretched to say "gave up on durability". This is
+                /// the second question, asked separately — and it is the only
+                /// way to learn that an [`Observer`](keylink::Observer) refused
+                /// a turn, because a local call is told `MailboxClosed` either
+                /// way.
+                ///
+                /// Holds no mailbox sender, so awaiting it does not keep the
+                /// actor alive: dropping every handle both ends the actor and
+                /// resolves this.
+                pub fn ended(&self) -> impl ::core::future::Future<Output = $crate::Ended>
+                    + ::core::marker::Send + 'static {
+                    self.inner.ended()
                 }
 
                 $(
@@ -906,6 +1429,19 @@ macro_rules! service {
                 inner: $crate::RpcClient<Request, Response>,
             }
 
+            /// Every clone names the same connection, and calls through them all
+            /// share its congestion-control state. Cheap, because a
+            /// `Connection` is a handle.
+            ///
+            /// Written out rather than derived: `#[derive(Clone)]` would demand
+            /// `Request: Clone, Response: Clone`, and neither appears in a
+            /// field.
+            impl ::core::clone::Clone for Client {
+                fn clone(&self) -> Self {
+                    Self { inner: self.inner.clone() }
+                }
+            }
+
             impl Client {
                 /// Dial a peer by public key.
                 pub async fn connect(
@@ -921,14 +1457,35 @@ macro_rules! service {
                 /// made through the handle it returns.
                 ///
                 /// The key is a transport concern rather than a domain one, so
-                /// it goes here instead of into every method signature. See
+                /// it goes here instead of into every method signature. Takes a
+                /// bare [`IdempotencyKey`](keylink::IdempotencyKey), which
+                /// refuses on collision, or an
+                /// [`Idempotency`](keylink::Idempotency), which can wait for the
+                /// call already running under the key. See
                 /// [`RpcClient::with_idempotency`](keylink::RpcClient::with_idempotency)
                 /// for why the handle is meant for one call.
                 #[must_use]
-                pub fn with_idempotency(&self, key: $crate::IdempotencyKey) -> Self {
+                pub fn with_idempotency(
+                    &self,
+                    idempotency: impl ::core::convert::Into<$crate::Idempotency>,
+                ) -> Self {
                     Self {
-                        inner: self.inner.with_idempotency(key),
+                        inner: self.inner.with_idempotency(idempotency),
                     }
+                }
+
+                /// Ask what this peer's ledger knows about one of your keys.
+                ///
+                /// See
+                /// [`RpcClient::key_state`](keylink::RpcClient::key_state). Runs
+                /// no handler, so it never appears in the [`Handler`] or
+                /// [`Actor`] traits — it is a question about keylink's own
+                /// bookkeeping rather than about your service.
+                pub async fn key_state(
+                    &self,
+                    key: $crate::IdempotencyKey,
+                ) -> $crate::Result<$crate::KeyState> {
+                    self.inner.key_state(key).await
                 }
 
                 /// Await this peer's departure instead of meeting it on the
@@ -1002,11 +1559,25 @@ macro_rules! service {
                     /// See the async twin,
                     /// [`Client::with_idempotency`](super::Client::with_idempotency).
                     #[must_use]
-                    pub fn with_idempotency(&self, key: $crate::IdempotencyKey) -> Self {
+                    pub fn with_idempotency(
+                        &self,
+                        idempotency: impl ::core::convert::Into<$crate::Idempotency>,
+                    ) -> Self {
                         Self {
-                            inner: self.inner.with_idempotency(key),
+                            inner: self.inner.with_idempotency(idempotency),
                             runtime: ::std::sync::Arc::clone(&self.runtime),
                         }
+                    }
+
+                    /// Ask what this peer's ledger knows about one of your keys.
+                    ///
+                    /// See the async twin,
+                    /// [`Client::key_state`](super::Client::key_state).
+                    pub fn key_state(
+                        &self,
+                        key: $crate::IdempotencyKey,
+                    ) -> $crate::Result<$crate::KeyState> {
+                        self.runtime.run(self.inner.key_state(key))?
                     }
 
                     $(
@@ -1148,6 +1719,33 @@ macro_rules! __keylink_is_blob {
     };
 }
 
+/// Whether one kind reads its upload inside the turn, folded into
+/// `DECLARES_SEND`.
+///
+/// Only `send`, and the narrowness is the point. A `recv` body is drained by the
+/// connection *after* the turn ends and a `blob`'s bytes move later on a
+/// different connection, so neither can hold an actor. Widening this to every
+/// streaming kind would refuse two services that are perfectly safe.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_is_send {
+    (rpc) => {
+        false
+    };
+    (tell) => {
+        false
+    };
+    (send) => {
+        true
+    };
+    (recv) => {
+        false
+    };
+    (blob) => {
+        false
+    };
+}
+
 /// One blocking client method. Streaming kinds produce nothing.
 #[doc(hidden)]
 #[macro_export]
@@ -1185,7 +1783,7 @@ macro_rules! __keylink_handler_method {
     ([$( #[$meta:meta] )*], rpc, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc.")]
-        fn $name(&self $(, $arg: $ty )*)
+        fn $name(&self, cx: &$crate::Context $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = $ret> + Send;
     };
     ([$( #[$meta:meta] )*], tell, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
@@ -1194,19 +1792,19 @@ macro_rules! __keylink_handler_method {
         ///
         /// The caller has already returned. Whatever this produces is dropped,
         /// including a panic, which is caught and costs one message.
-        fn $name(&self $(, $arg: $ty )*)
+        fn $name(&self, cx: &$crate::Context $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = $ret> + Send;
     };
     ([$( #[$meta:meta] )*], send, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc, reading the payload the caller streams up.")]
-        fn $name(&self $(, $arg: $ty )*, body: $crate::BodyReader)
+        fn $name(&self, cx: &$crate::Context $(, $arg: $ty )*, body: $crate::BodyReader)
             -> impl ::core::future::Future<Output = $ret> + Send;
     };
     ([$( #[$meta:meta] )*], recv, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc, returning a payload to stream back.")]
-        fn $name(&self $(, $arg: $ty )*)
+        fn $name(&self, cx: &$crate::Context $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = ($ret, $crate::Body)> + Send;
     };
     ([$( #[$meta:meta] )*], blob, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
@@ -1217,7 +1815,7 @@ macro_rules! __keylink_handler_method {
         /// generated dispatch records it against the peer that asked, so the
         /// handler names no ledger and there is no call to forget. Nothing else
         /// in the store becomes reachable.
-        fn $name(&self $(, $arg: $ty )*)
+        fn $name(&self, cx: &$crate::Context $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = ($ret, $crate::BlobId)> + Send;
     };
 }
@@ -1233,11 +1831,12 @@ macro_rules! __keylink_invoke_fn {
         ($( $arg:ident : $ty:ty ),*)) => {
         async fn $fname<H: $handler>(
             handler: &H,
+            cx: &$crate::Context,
             _body: $crate::BodyReader
             $(, $arg: $ty )*
         ) -> ($resp, $crate::Body) {
             (
-                $resp::$variant(handler.$method($( $arg ),*).await),
+                $resp::$variant(handler.$method(cx $(, $arg )*).await),
                 $crate::Body::empty(),
             )
         }
@@ -1249,11 +1848,12 @@ macro_rules! __keylink_invoke_fn {
         ($( $arg:ident : $ty:ty ),*)) => {
         async fn $fname<H: $handler>(
             handler: &H,
+            cx: &$crate::Context,
             _body: $crate::BodyReader
             $(, $arg: $ty )*
         ) -> ($resp, $crate::Body) {
             (
-                $resp::$variant(handler.$method($( $arg ),*).await),
+                $resp::$variant(handler.$method(cx $(, $arg )*).await),
                 $crate::Body::empty(),
             )
         }
@@ -1262,11 +1862,12 @@ macro_rules! __keylink_invoke_fn {
         ($( $arg:ident : $ty:ty ),*)) => {
         async fn $fname<H: $handler>(
             handler: &H,
+            cx: &$crate::Context,
             body: $crate::BodyReader
             $(, $arg: $ty )*
         ) -> ($resp, $crate::Body) {
             (
-                $resp::$variant(handler.$method($( $arg, )* body).await),
+                $resp::$variant(handler.$method(cx, $( $arg, )* body).await),
                 $crate::Body::empty(),
             )
         }
@@ -1275,10 +1876,11 @@ macro_rules! __keylink_invoke_fn {
         ($( $arg:ident : $ty:ty ),*)) => {
         async fn $fname<H: $handler>(
             handler: &H,
+            cx: &$crate::Context,
             _body: $crate::BodyReader
             $(, $arg: $ty )*
         ) -> ($resp, $crate::Body) {
-            let (value, body) = handler.$method($( $arg ),*).await;
+            let (value, body) = handler.$method(cx $(, $arg )*).await;
             ($resp::$variant(value), body)
         }
     };
@@ -1290,10 +1892,11 @@ macro_rules! __keylink_invoke_fn {
         ($( $arg:ident : $ty:ty ),*)) => {
         async fn $fname<H: $handler>(
             handler: &H,
+            cx: &$crate::Context,
             _body: $crate::BodyReader
             $(, $arg: $ty )*
         ) -> ($resp, $crate::Body) {
-            let (value, id) = handler.$method($( $arg ),*).await;
+            let (value, id) = handler.$method(cx $(, $arg )*).await;
             ($resp::$variant((value, id)), $crate::Body::empty())
         }
     };
@@ -1307,13 +1910,13 @@ macro_rules! __keylink_actor_method {
     ([$( #[$meta:meta] )*], rpc, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Answer the `", stringify!($name), "` rpc.")]
-        fn $name(&mut self $(, $arg: $ty )*)
+        fn $name(&mut self, cx: $crate::Caller<'_> $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = $ret> + Send;
     };
     ([$( #[$meta:meta] )*], tell, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Handle the `", stringify!($name), "` tell. Nothing is sent back.")]
-        fn $name(&mut self $(, $arg: $ty )*)
+        fn $name(&mut self, cx: $crate::Caller<'_> $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = $ret> + Send;
     };
     ([$( #[$meta:meta] )*], send, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
@@ -1322,7 +1925,7 @@ macro_rules! __keylink_actor_method {
         ///
         /// The body is read inside the turn, so
         /// [`abort`](keylink::System::abort) can truncate it.
-        fn $name(&mut self $(, $arg: $ty )*, body: $crate::BodyReader)
+        fn $name(&mut self, cx: $crate::Caller<'_> $(, $arg: $ty )*, body: $crate::BodyReader)
             -> impl ::core::future::Future<Output = $ret> + Send;
     };
     ([$( #[$meta:meta] )*], recv, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
@@ -1331,7 +1934,7 @@ macro_rules! __keylink_actor_method {
         ///
         /// The body is drained by the connection after the turn ends, so
         /// [`abort`](keylink::System::abort) cannot truncate it.
-        fn $name(&mut self $(, $arg: $ty )*)
+        fn $name(&mut self, cx: $crate::Caller<'_> $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = ($ret, $crate::Body)> + Send;
     };
     ([$( #[$meta:meta] )*], blob, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
@@ -1341,7 +1944,7 @@ macro_rules! __keylink_actor_method {
         /// Nothing is streamed during the turn: the address is the whole reply,
         /// and the bytes move later on the blobs connection. So
         /// [`abort`](keylink::System::abort) has nothing here to truncate.
-        fn $name(&mut self $(, $arg: $ty )*)
+        fn $name(&mut self, cx: $crate::Caller<'_> $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = ($ret, $crate::BlobId)> + Send;
     };
 }
@@ -1357,11 +1960,12 @@ macro_rules! __keylink_actor_invoke_fn {
         ($( $arg:ident : $ty:ty ),*)) => {
         async fn $fname<A: $actor>(
             state: &mut A,
+            cx: $crate::Caller<'_>,
             _body: $crate::BodyReader
             $(, $arg: $ty )*
         ) -> ($resp, $crate::Body) {
             (
-                $resp::$variant(state.$method($( $arg ),*).await),
+                $resp::$variant(state.$method(cx $(, $arg )*).await),
                 $crate::Body::empty(),
             )
         }
@@ -1372,11 +1976,12 @@ macro_rules! __keylink_actor_invoke_fn {
         ($( $arg:ident : $ty:ty ),*)) => {
         async fn $fname<A: $actor>(
             state: &mut A,
+            cx: $crate::Caller<'_>,
             _body: $crate::BodyReader
             $(, $arg: $ty )*
         ) -> ($resp, $crate::Body) {
             (
-                $resp::$variant(state.$method($( $arg ),*).await),
+                $resp::$variant(state.$method(cx $(, $arg )*).await),
                 $crate::Body::empty(),
             )
         }
@@ -1385,11 +1990,12 @@ macro_rules! __keylink_actor_invoke_fn {
         ($( $arg:ident : $ty:ty ),*)) => {
         async fn $fname<A: $actor>(
             state: &mut A,
+            cx: $crate::Caller<'_>,
             body: $crate::BodyReader
             $(, $arg: $ty )*
         ) -> ($resp, $crate::Body) {
             (
-                $resp::$variant(state.$method($( $arg, )* body).await),
+                $resp::$variant(state.$method(cx, $( $arg, )* body).await),
                 $crate::Body::empty(),
             )
         }
@@ -1398,10 +2004,11 @@ macro_rules! __keylink_actor_invoke_fn {
         ($( $arg:ident : $ty:ty ),*)) => {
         async fn $fname<A: $actor>(
             state: &mut A,
+            cx: $crate::Caller<'_>,
             _body: $crate::BodyReader
             $(, $arg: $ty )*
         ) -> ($resp, $crate::Body) {
-            let (value, body) = state.$method($( $arg ),*).await;
+            let (value, body) = state.$method(cx $(, $arg )*).await;
             ($resp::$variant(value), body)
         }
     };
@@ -1413,10 +2020,11 @@ macro_rules! __keylink_actor_invoke_fn {
         ($( $arg:ident : $ty:ty ),*)) => {
         async fn $fname<A: $actor>(
             state: &mut A,
+            cx: $crate::Caller<'_>,
             _body: $crate::BodyReader
             $(, $arg: $ty )*
         ) -> ($resp, $crate::Body) {
-            let (value, id) = state.$method($( $arg ),*).await;
+            let (value, id) = state.$method(cx $(, $arg )*).await;
             ($resp::$variant((value, id)), $crate::Body::empty())
         }
     };
@@ -1537,8 +2145,7 @@ macro_rules! __keylink_local_method {
             -> ::core::result::Result<$ret, $crate::MailboxClosed> {
             self.inner
                 .ask(move |__state: &mut A| ::std::boxed::Box::pin(async move {
-                    __state.caller(::core::option::Option::None);
-                    __state.$name($( $arg ),*).await
+                    __state.$name($crate::Caller::Local $(, $arg )*).await
                 }))
                 .await
         }
@@ -1568,8 +2175,7 @@ macro_rules! __keylink_local_method {
             -> ::core::result::Result<(), $crate::MailboxClosed> {
             self.inner
                 .notify(move |__state: &mut A| ::std::boxed::Box::pin(async move {
-                    __state.caller(::core::option::Option::None);
-                    __state.$name($( $arg ),*).await
+                    __state.$name($crate::Caller::Local $(, $arg )*).await
                 }))
                 .await
         }
@@ -1592,8 +2198,7 @@ macro_rules! __keylink_local_method {
             -> ::core::result::Result<($ret, $crate::BlobId), $crate::MailboxClosed> {
             self.inner
                 .ask(move |__state: &mut A| ::std::boxed::Box::pin(async move {
-                    __state.caller(::core::option::Option::None);
-                    __state.$name($( $arg ),*).await
+                    __state.$name($crate::Caller::Local $(, $arg )*).await
                 }))
                 .await
         }
@@ -1785,17 +2390,26 @@ mod expansion {
         struct Probe;
 
         impl expansion::Actor for Probe {
-            async fn ping(&mut self, n: u64) -> u64 {
+            async fn ping(&mut self, _cx: crate::Caller<'_>, n: u64) -> u64 {
                 n
             }
-            async fn fetch(&mut self, _name: String) -> (u64, crate::Body) {
+            async fn fetch(&mut self, _cx: crate::Caller<'_>, _name: String) -> (u64, crate::Body) {
                 (0, crate::Body::empty())
             }
-            async fn store(&mut self, _name: String, _body: crate::BodyReader) -> u64 {
+            async fn store(
+                &mut self,
+                _cx: crate::Caller<'_>,
+                _name: String,
+                _body: crate::BodyReader,
+            ) -> u64 {
                 0
             }
-            async fn note(&mut self, _line: String) {}
-            async fn manual(&mut self, _sku: String) -> (u64, crate::BlobId) {
+            async fn note(&mut self, _cx: crate::Caller<'_>, _line: String) {}
+            async fn manual(
+                &mut self,
+                _cx: crate::Caller<'_>,
+                _sku: String,
+            ) -> (u64, crate::BlobId) {
                 unreachable!("never called; this module only has to compile")
             }
         }

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use keylink::Allowlist;
+use keylink::{Allowlist, Context};
 
 mod common;
 use common::local_node;
@@ -24,11 +24,11 @@ keylink::service! {
 struct Notes(AtomicUsize);
 
 impl log::Handler for Arc<Notes> {
-    async fn note(&self, _line: String) {
+    async fn note(&self, _cx: &Context, _line: String) {
         self.0.fetch_add(1, Ordering::SeqCst);
     }
 
-    async fn count(&self) -> u64 {
+    async fn count(&self, _cx: &Context) -> u64 {
         self.0.load(Ordering::SeqCst) as u64
     }
 }

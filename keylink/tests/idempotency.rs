@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use keylink::{
-    Allowlist, Body, BodyReader, Context, Error, IdempotencyKey, IdempotencyRefusal, Middleware,
-    Next, Node, Outcome, RemoteError, Server as KeylinkServer,
+    Allowlist, Body, BodyReader, Caller, Context, Error, IdempotencyKey, IdempotencyRefusal,
+    Middleware, Next, Node, Outcome, RemoteError, Server as KeylinkServer,
 };
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
@@ -53,17 +53,17 @@ struct Till {
 }
 
 impl till::Handler for Till {
-    async fn reserve(&self, _sku: String, _qty: u32) -> u64 {
+    async fn reserve(&self, _cx: &Context, _sku: String, _qty: u32) -> u64 {
         self.reserves.next()
     }
 
-    async fn slow(&self, ms: u64) -> u64 {
+    async fn slow(&self, _cx: &Context, ms: u64) -> u64 {
         let run = self.slows.next();
         tokio::time::sleep(Duration::from_millis(ms)).await;
         run
     }
 
-    async fn datasheet(&self, bytes: u64) -> (Sheet, Body) {
+    async fn datasheet(&self, _cx: &Context, bytes: u64) -> (Sheet, Body) {
         let sheet = Sheet {
             runs: self.sheets.next(),
             bytes,
@@ -347,10 +347,106 @@ impl<Resp: Send + 'static> Middleware<till::Request, Resp> for RefuseOnce {
     }
 }
 
-/// A refusal is a legitimate result of a call, so it is recorded like any other.
-/// The rule is one execution per key, not one success per key.
+/// The sku `RefuseAfterRunning` reacts to. Anything else passes untouched, so
+/// the handler's run counter stays readable through an ordinary reply — which
+/// is how a test proves a repeat replayed instead of re-running.
+const REFUSED_SKU: &str = "REFUSE-ME";
+
+/// Lets the call through and then throws the reply away, which is what a layer
+/// doing post-hoc filtering looks like. The handler HAS run, so the refusal is
+/// the call's real and final answer.
+struct RefuseAfterRunning;
+
+impl<Resp: Send + 'static> Middleware<till::Request, Resp> for RefuseAfterRunning {
+    fn handle(
+        &self,
+        cx: Context,
+        req: till::Request,
+        body: BodyReader,
+        next: Next<till::Request, Resp>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (Outcome<Resp>, Body)> + Send>> {
+        let refuse = matches!(&req, till::Request::Reserve { sku, .. } if sku == REFUSED_SKU);
+        Box::pin(async move {
+            let reply = next(cx, req, body).await;
+            if refuse {
+                return (
+                    Outcome::Err(RemoteError::Unauthorized("after the fact".into())),
+                    Body::empty(),
+                );
+            }
+            reply
+        })
+    }
+}
+
+/// **Restated.** This test used to assert that *every* refusal is recorded,
+/// and it passed for a layer that refused without ever reaching the handler —
+/// which recorded, and replayed forever, an answer to a call that never ran.
+///
+/// The rule is one *execution* per key, not one *answer* per key. So the
+/// question a refusal has to answer first is whether anything ran. This is the
+/// arm where something did: the layer let the call through, the handler
+/// executed, and the refusal is the final answer to a call that happened. That
+/// answer is recorded and replayed, exactly as a success would be, because a
+/// retry must not run the work again.
+///
+/// The other two arms are the two tests below.
 #[tokio::test]
 async fn a_refusal_is_recorded_and_replayed() {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let _running = keylink::Server::builder(&server)
+        .service(
+            till::service(Till::default(), Allowlist::anyone())
+                .layer(RefuseAfterRunning)
+                .build(),
+        )
+        .spawn()
+        .expect("serves");
+    let client = till::Client::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("dials");
+
+    let first = client
+        .with_idempotency(key("k"))
+        .reserve(REFUSED_SKU.to_string(), 2)
+        .await
+        .expect_err("the layer refuses after the handler ran");
+    assert!(
+        matches!(first, Error::Remote(RemoteError::Unauthorized(_))),
+        "got {first:?}"
+    );
+
+    let repeat = client
+        .with_idempotency(key("k"))
+        .reserve(REFUSED_SKU.to_string(), 2)
+        .await
+        .expect_err("the repeat must replay the refusal, not run the handler again");
+    assert!(
+        matches!(repeat, Error::Remote(RemoteError::Unauthorized(_))),
+        "got {repeat:?}"
+    );
+
+    // The proof that it replayed rather than re-ran, and the reason the layer
+    // only refuses one sku: this call reports how many times the handler has
+    // been entered. Two — the refused call and this one. If the repeat had
+    // re-entered it, this would be three.
+    assert_eq!(
+        client
+            .reserve("ADU-014".to_string(), 2)
+            .await
+            .expect("this sku is not refused"),
+        2,
+        "the repeat must not have reached the handler"
+    );
+}
+
+/// Nothing ran, so nothing is owed. This is the headline defect: a layer that
+/// refuses **before** dispatch used to settle the key as that refusal, so the
+/// caller was told `Unauthorized` forever — for a call that had never happened,
+/// by a rule that had since stopped applying.
+#[tokio::test]
+async fn a_refusal_before_dispatch_leaves_the_key_claimable() {
     let server = local_node().await;
     let client_node = local_node().await;
     let _running = keylink::Server::builder(&server)
@@ -365,22 +461,142 @@ async fn a_refusal_is_recorded_and_replayed() {
         .await
         .expect("dials");
 
-    let _first = client
+    let refused = client
         .with_idempotency(key("k"))
         .reserve("ADU-014".to_string(), 2)
         .await
-        .expect_err("the layer refuses the first call");
-
-    let error = client
-        .with_idempotency(key("k"))
-        .reserve("ADU-014".to_string(), 2)
-        .await
-        .expect_err("the repeat must replay the refusal, not reach the now-open handler");
-
+        .expect_err("the layer refuses the first call without dispatching it");
     assert!(
-        matches!(error, Error::Remote(RemoteError::Unauthorized(_))),
-        "got {error:?}"
+        matches!(refused, Error::Remote(RemoteError::Unauthorized(_))),
+        "got {refused:?}"
     );
+
+    assert_eq!(
+        client
+            .with_idempotency(key("k"))
+            .reserve("ADU-014".to_string(), 2)
+            .await
+            .expect("the same key must be claimable again, because nothing ran under it"),
+        1,
+        "the handler must be entered for the first time here"
+    );
+}
+
+/// The third arm: dispatched, and no answer of its own came out. A `Timeout`
+/// drops the wait for a handler that is still running, so whether the work
+/// landed is genuinely unknown — and `Interrupted` is the only honest thing to
+/// record. Recording the layer's own `TimedOut` would tell the caller a lie
+/// with a straight face, forever.
+#[tokio::test]
+async fn a_refusal_after_dispatch_settles_interrupted() {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let _running = keylink::Server::builder(&server)
+        .service(
+            till::service(Till::default(), Allowlist::anyone())
+                .layer(keylink::Timeout::after(Duration::from_millis(50)))
+                .build(),
+        )
+        .spawn()
+        .expect("serves");
+    let client = till::Client::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("dials");
+
+    let timed_out = client
+        .with_idempotency(key("slow"))
+        .slow(5_000)
+        .await
+        .expect_err("the budget expires while the handler runs");
+    assert!(
+        matches!(timed_out, Error::Remote(RemoteError::TimedOut { .. })),
+        "got {timed_out:?}"
+    );
+
+    let repeat = client
+        .with_idempotency(key("slow"))
+        .slow(0)
+        .await
+        .expect_err("the repeat must not be answered with the layer's refusal");
+    assert!(
+        matches!(
+            repeat,
+            Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::Interrupted))
+        ),
+        "a dispatched call with no answer is unknown, not timed out: got {repeat:?}"
+    );
+}
+
+/// A serving task killed between the accept and the dispatch never entered
+/// anything, so its key is vacant rather than `Interrupted`.
+///
+/// The kill is real, not simulated: the client's connection ends while the
+/// layer is still deciding, the accept loop breaks, and `calls.shutdown()`
+/// aborts the task where it stands. `Drop for Guard` is then the only code left
+/// running, which is exactly why the decision lives there rather than at the
+/// call site.
+#[tokio::test]
+async fn an_abort_before_dispatch_does_not_report_interrupted() {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let _running = keylink::Server::builder(&server)
+        .service(
+            till::service(Till::default(), Allowlist::anyone())
+                .layer(StallBeforeDispatch(AtomicU64::new(0)))
+                .build(),
+        )
+        .spawn()
+        .expect("serves");
+
+    {
+        let client = till::Client::connect(&client_node, server.endpoint().addr())
+            .await
+            .expect("dials");
+        let scoped = client.with_idempotency(key("k"));
+        let stalling = scoped.reserve("ADU-014".to_string(), 2);
+        tokio::select! {
+            _ = stalling => panic!("the layer should still be stalling"),
+            () = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+        // Every handle goes here, which closes the connection.
+    }
+    // Long enough for the accept loop to see the close and abort the call.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let reconnected = till::Client::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("dials again");
+    assert_eq!(
+        reconnected
+            .with_idempotency(key("k"))
+            .reserve("ADU-014".to_string(), 2)
+            .await
+            .expect("a key nothing dispatched under must still be claimable"),
+        1,
+        "the aborted call never entered the handler, so this is its first entry"
+    );
+}
+
+/// Stalls the first call it sees for longer than the test waits, without ever
+/// calling `next`. Everything after it passes straight through.
+struct StallBeforeDispatch(AtomicU64);
+
+impl<Resp: Send + 'static> Middleware<till::Request, Resp> for StallBeforeDispatch {
+    fn handle(
+        &self,
+        cx: Context,
+        req: till::Request,
+        body: BodyReader,
+        next: Next<till::Request, Resp>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (Outcome<Resp>, Body)> + Send>> {
+        let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
+        Box::pin(async move {
+            if first {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            next(cx, req, body).await
+        })
+    }
 }
 
 /// A body is streamed and never held. Recording one would contradict the
@@ -420,7 +636,7 @@ keylink::service! {
 struct Depot(Counter);
 
 impl depot::Handler for Depot {
-    async fn reserve(&self, _sku: String, _qty: u32) -> u64 {
+    async fn reserve(&self, _cx: &Context, _sku: String, _qty: u32) -> u64 {
         self.0.next()
     }
 }
@@ -485,5 +701,270 @@ async fn a_second_different_call_through_one_scoped_client_is_refused() {
     assert!(
         matches!(error, Error::UnexpectedResponse { .. }),
         "the misuse must be caught, not silently mis-answered: got {error:?}"
+    );
+}
+
+// ────────────────────────────────────────── the ledger, asked rather than run
+
+/// The wire path for a ledger query, which has no handler, no layer and no body.
+///
+/// `Fresh` is the state this exists for: every other one can be discovered by
+/// retrying, and discovering `Fresh` by retrying means executing. The exhaustive
+/// per-state coverage is the unit test `key_state_reports_every_state`, which
+/// can reach eviction; this proves the question and answer survive the wire.
+#[tokio::test]
+async fn a_key_state_query_crosses_the_wire() {
+    let fixture = start().await;
+
+    assert_eq!(
+        fixture.client.key_state(key("never")).await.expect("asks"),
+        keylink::KeyState::Fresh
+    );
+
+    fixture
+        .client
+        .with_idempotency(key("used"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("runs");
+
+    assert_eq!(
+        fixture.client.key_state(key("used")).await.expect("asks"),
+        keylink::KeyState::Done
+    );
+    assert_eq!(
+        fixture.client.key_state(key("never")).await.expect("asks"),
+        keylink::KeyState::Fresh,
+        "asking must not itself claim the key"
+    );
+}
+
+/// A key one peer used must be invisible to another, and the query is the one
+/// place a peer could go looking. Peer-scoped by construction rather than by a
+/// check: the id comes from the connection the question arrived on.
+#[tokio::test]
+async fn a_key_state_query_cannot_read_another_peers_key() {
+    let server = local_node().await;
+    let first_node = local_node().await;
+    let second_node = local_node().await;
+    let _running = till::serve(&server, Till::default(), Allowlist::anyone()).expect("serves");
+
+    let first = till::Client::connect(&first_node, server.endpoint().addr())
+        .await
+        .expect("dials");
+    let second = till::Client::connect(&second_node, server.endpoint().addr())
+        .await
+        .expect("dials");
+
+    first
+        .with_idempotency(key("mine"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("runs");
+
+    assert_eq!(
+        first.key_state(key("mine")).await.expect("asks"),
+        keylink::KeyState::Done
+    );
+    assert_eq!(
+        second.key_state(key("mine")).await.expect("asks"),
+        keylink::KeyState::Fresh,
+        "one peer must not learn that another used a key"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────── attaching
+
+/// A second caller under a live key takes the running call's answer instead of
+/// being turned away. The two replies are the same run number, and a third,
+/// keyless call reports that the handler was entered exactly twice.
+#[tokio::test]
+async fn a_second_caller_attaches_to_a_live_key() {
+    let fixture = start().await;
+    let client = fixture.client;
+
+    let slow = {
+        let scoped = client.with_idempotency(key("k"));
+        tokio::spawn(async move { scoped.slow(400).await })
+    };
+    // Long enough that the claim is taken and the handler is inside its sleep.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let attached = client
+        .with_idempotency(keylink::Idempotency::attaching_for(
+            key("k"),
+            Duration::from_secs(5),
+        ))
+        .slow(0)
+        .await
+        .expect("the attaching caller is answered by the call already running");
+
+    let first = slow
+        .await
+        .expect("no panic")
+        .expect("the first call answers");
+    assert_eq!(
+        attached, first,
+        "the attaching caller must receive the running invocation's own reply"
+    );
+    assert_eq!(
+        client.slow(0).await.expect("runs"),
+        2,
+        "the handler ran twice: the original and this one - not three times"
+    );
+}
+
+/// Attaching is bounded. When the budget runs out the answer is `InFlight`,
+/// which is what a non-attaching caller gets and is still the truth: a call
+/// under this key is in dispatch now.
+#[tokio::test]
+async fn an_attach_that_outlives_its_budget_returns() {
+    let fixture = start().await;
+    let client = fixture.client;
+
+    let slow = {
+        let scoped = client.with_idempotency(key("k"));
+        tokio::spawn(async move { scoped.slow(3_000).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let error = client
+        .with_idempotency(keylink::Idempotency::attaching_for(
+            key("k"),
+            Duration::from_millis(150),
+        ))
+        .slow(0)
+        .await
+        .expect_err("the budget runs out while the first call is still running");
+
+    assert_eq!(refusal(&error), IdempotencyRefusal::InFlight);
+    slow.abort();
+}
+
+/// A settled key is answered at once. Attaching is about waiting for a call in
+/// flight, and there is nothing in flight here — waiting out the budget before
+/// replaying a record that already exists would be a bug that only ever showed
+/// up as latency.
+#[tokio::test]
+async fn attaching_to_a_settled_key_does_not_wait() {
+    let fixture = start().await;
+    let first = fixture
+        .client
+        .with_idempotency(key("k"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("runs");
+
+    let started = std::time::Instant::now();
+    let replayed = fixture
+        .client
+        .with_idempotency(keylink::Idempotency::attaching_for(
+            key("k"),
+            Duration::from_secs(30),
+        ))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("replays");
+
+    assert_eq!(replayed, first);
+    // A generous bound: the assertion is "it did not wait out 30 seconds", and
+    // load can only make a real network call slower, never faster.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a settled key must be answered without waiting: took {:?}",
+        started.elapsed()
+    );
+}
+
+// ─────────────────────────────────────────────── the actor path and a Timeout
+
+#[derive(Default)]
+struct TillActor {
+    reserves: u64,
+    slows: u64,
+}
+
+impl till::Actor for TillActor {
+    async fn reserve(&mut self, _cx: Caller<'_>, _sku: String, _qty: u32) -> u64 {
+        self.reserves += 1;
+        self.reserves
+    }
+
+    async fn slow(&mut self, _cx: Caller<'_>, ms: u64) -> u64 {
+        self.slows += 1;
+        let run = self.slows;
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        run
+    }
+
+    async fn datasheet(&mut self, _cx: Caller<'_>, bytes: u64) -> (Sheet, Body) {
+        (Sheet { runs: 0, bytes }, Body::from_bytes(vec![0u8; 0]))
+    }
+}
+
+/// The defect that made a key and a `Timeout` unusable together on an actor.
+///
+/// A layer cannot cancel a turn — it drops the *wait* for the reply, and the
+/// turn runs on and mutates. The refusal used to be recorded as the key's
+/// settled answer, so the caller was told `TimedOut` on every retry forever
+/// while the actor had applied the message exactly once.
+///
+/// Now the turn's own progress decides: it was entered and produced no answer
+/// anybody received, so the key is `Interrupted` — which is the truth, and
+/// which tells the caller to find out out of band instead of trusting a lie.
+///
+/// **Not** promised, and deliberately: the retry does not receive the turn's
+/// real reply. That needs the guard to travel inside the mailbox and be settled
+/// by the turn itself. See RFC-05 §7.
+#[tokio::test]
+async fn a_timed_out_actor_turn_does_not_record_the_refusal() {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let actor = till::actor(TillActor::default());
+    let _running = keylink::Server::builder(&server)
+        .service(
+            actor
+                .service(Allowlist::anyone())
+                .layer(keylink::Timeout::after(Duration::from_millis(50)))
+                .build(),
+        )
+        .spawn()
+        .expect("serves");
+    let client = till::Client::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("dials");
+
+    let timed_out = client
+        .with_idempotency(key("k"))
+        .slow(500)
+        .await
+        .expect_err("the budget expires while the turn runs");
+    assert!(
+        matches!(timed_out, Error::Remote(RemoteError::TimedOut { .. })),
+        "got {timed_out:?}"
+    );
+
+    // Let the turn finish, so the state really has been mutated by the time the
+    // retry asks. This is the half a `TimedOut` record used to hide.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let repeat = client
+        .with_idempotency(key("k"))
+        .slow(0)
+        .await
+        .expect_err("the repeat must not be told the layer's refusal");
+    assert_eq!(
+        refusal(&repeat),
+        IdempotencyRefusal::Interrupted,
+        "a turn that ran and whose reply nobody received is unknown, not timed out"
+    );
+
+    assert_eq!(
+        actor
+            .with_state(|state| state.slows)
+            .await
+            .expect("running"),
+        1,
+        "the turn ran exactly once, which is what the caller could not be told before"
     );
 }
