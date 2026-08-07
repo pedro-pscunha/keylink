@@ -769,6 +769,34 @@ fn a_state_that_parks_a_reply_is_still_an_actor() -> LocalActor<Parking, Parked>
     })
 }
 
+/// The one exhaustive match on [`Ended`] in the workspace, which is what makes
+/// "exhaustive by design" a thing the compiler checks rather than a paragraph.
+///
+/// [`Ended`] is deliberately **not** `#[non_exhaustive]`, and Wave 3 found the usual
+/// argument for that hollow: adding `Ended::Feed` produced **zero** `E0004`s, because
+/// every match in `keylink/tests` is one arm plus `other => panic!(..)` — an
+/// assertion about which ending happened, not a dispatch over all of them — and
+/// keylink itself only ever *builds* one. So there was nothing in the tree that a
+/// sixth variant would have to be reconciled with, which means the decision had no
+/// enforcement behind it either.
+///
+/// This is the enforcement, in the one form that costs nothing: a match with no
+/// wildcard. Wave 9's `Ended::GaveUp` is `E0004` **here**, in keylink, at a site
+/// whose doc comment is this one — so whoever adds it reads the reasoning on
+/// [`Ended`] before deciding, instead of adding a variant into silence.
+///
+/// It is **not** a claim that a wildcard is impossible; nothing can be. It is the
+/// tripwire that makes the next ending a decision rather than an omission.
+fn every_ending_is_named(ended: &Ended) -> &'static str {
+    match ended {
+        Ended::Stopped => "stopped",
+        Ended::Vanished => "vanished",
+        Ended::Panicked { .. } => "panicked",
+        Ended::Observer { .. } => "observer",
+        Ended::Feed { .. } => "feed",
+    }
+}
+
 /// And the two facts the spawn above rests on, stated so a reader does not have to
 /// infer them from a `spawn` compiling.
 ///

@@ -976,3 +976,285 @@ The *at most once* half is `representability.rs`'s coherence probe: `Reply`,
   a *permit* and `turn` bounds a queued message, neither of which is this. A caller's
   own `n0_future::time::timeout` is the answer today; a per-method budget on a
   deferred reply would be a new mechanism and belongs with whichever wave wants one.
+
+---
+
+## 5. Wave 3 — feeds: an actor's second input, and one loop at last
+
+```rust
+keylink::service! {
+    service Orders;
+    rpc  Cancel(id: OrderId) -> Result<(), Rejected>;
+    feed Fills(fill: Fill);            // local only, never on the wire
+}
+
+// generated on the Actor trait — no Caller (nobody called), no return (no reply)
+async fn on_fills(&mut self, fill: Fill);
+```
+
+Two things landed together because neither could land alone. A feed needs a `select`,
+and a `select` written twice is a `select` that will disagree with itself — so the
+generated keyed loop and `LocalActor`'s became **one** loop, which is where the
+observer chain, the panic guard and `finish` reach keyed actors.
+
+### 5.1 THE DECISION THIS WAVE OWNS — `Ended` stays exhaustive, and the usual argument for it was hollow
+
+`Ended::Feed { name }` is the first ending added since the enum had consumers, so the
+cost of exhaustiveness could finally be measured rather than predicted.
+
+**Measured, and it was zero.** Adding the variant produced **no `error[E0004]`
+anywhere in this workspace**, against a brief that expected eleven. Every match on an
+`Ended` in `keylink/tests` is one arm plus `other => panic!("got {other:?}")` — a test
+asserting *which* ending happened, which is not the collapse the exhaustiveness guards
+against and would be unaffected by sealing either way. keylink's own code builds
+`Ended` values and reads one only through `Debug`.
+
+So the "accept the churn" half of the choice decides nothing, and saying so matters
+more than the conclusion: the record must not claim a guard fired when it did not.
+What is left is the asymmetry between the two failures.
+
+- **Sealed**, a downstream matcher is *forced* to write `_ =>`, and that arm silently
+  swallows every ending added later. That is exactly how `TurnLost::Gone` swallowed a
+  fault for three waves (§3.4), and it is the ground on which Wave 2's review refused
+  to seal `TurnLost`.
+- **Exhaustive**, a downstream matcher gets a compile error the moment a new reason to
+  end exists, which is the moment it has a decision to make. The bill is a major
+  version per ending once this crate is published; today it is unpublished with no
+  downstream consumers at all.
+
+**Chosen: exhaustive.** "The actor stopped" and "the actor's feed died" ask an operator
+for different actions, and a type whose whole job is to say *which* must not be able to
+answer "one of the ones you have heard of".
+
+Because the churn argument turned out to be empty, the decision needed enforcement it
+did not have. `representability.rs::every_ending_is_named` is a `#[cfg(test)]` match
+with no wildcard — the only exhaustive match on `Ended` in the tree — so a new variant
+is one `E0004` **inside keylink**, at a site whose doc comment carries this reasoning.
+
+**What this means for Wave 9.** `Ended::GaveUp` — a supervisor that stopped restarting
+— lands the same way and should expect the same near-zero in-tree churn: one arm in
+`every_ending_is_named`, and whatever new tests it writes. It must **not** reach for
+`#[non_exhaustive]` to silence that one error, because a downstream `_` reporting a
+supervisor's give-up as an ordinary `Stopped` is precisely the failure this buys. If
+Wave 9 wants a *keyed* actor's ending to be observable at all it needs something else
+first — see §5.7.
+
+### 5.2 The five decisions the spec forces, and how each is held
+
+| decision | how it is held, not merely done |
+|---|---|
+| a feed takes no `Caller` and returns nothing | the generated trait method's signature; either one is `E0053` against the impl in `tests/feeds.rs` |
+| feeds are not on the wire | the muncher partitions declarations into two lists and no wire generator sees the second — pinned by `adding_a_feed_to_a_service_does_not_move_the_contract_hash` |
+| fair selection, not biased | `run_loop` alternates which input polls first; three tests assert exact sequences, all red-tested |
+| a feed does not consume a mailbox permit | structural: a feed item is a `Feed` and there is no `Mail` variant for one. Witnessed by `a_full_mailbox_still_admits_feed_items` |
+| a feed that ends, ends the actor | `Ended::Feed { name }`, red-tested |
+
+Two of those need the argument written out rather than tabulated.
+
+**A panic in a feed handler ends the actor, and that is deliberately unlike an `rpc`.**
+The issue's own text says a fault "faults the incarnation exactly as a panic in
+`cancel` does", and against this tree those are different behaviours: a panicking `rpc`
+costs its message and **not** the actor. The reason it can is that somebody is *told* —
+the panic crosses the reply channel as `TurnLost::Faulted` and `ask` resumes it in the
+caller (§3.1). A feed item has no channel and no caller, so the same policy would drop
+the fault on the floor and carry on with a state the handler may have left half
+applied. The criterion's wording is the correct one and the sketch's is not; the actor
+ends as `Ended::Panicked`, every observer's `finish` runs, and `ended()` names it.
+
+This is the same argument `Ended::Feed` makes about a feed that *stops*, and it is why
+a `feed` is a declaration rather than a `tell` fed from a stream. A `tell` is somebody
+in this process choosing fire-and-forget, and `notify` documents that nobody is told.
+Nobody chose anything here.
+
+**Fairness is two rotations and the numbers are stated.** `run_loop` alternates between
+the mailbox and the feeds; a generated `Feeds::poll_next` rotates among its own feeds
+through a table of function pointers, so a saturated feed cannot starve its siblings
+either. With everything ready at once the mailbox gets half the turns and each of `n`
+feeds gets `1/2n`. Said out loud, because "fair" without a number is how a priority
+knob gets argued for two waves later.
+
+### 5.3 A `feed` is not a sixth kind, and that is what made it two arms instead of twelve
+
+`$kind:ident` is matched positionally and discriminated by thirteen helper macros, each
+with a per-kind arm. A sixth kind would need an arm in every one of them — thirteen
+different spellings of "not on the wire", any one of which could be forgotten into a
+`Request` enum.
+
+So `__keylink_service_munch!` **partitions**. A `feed Name(item: Type);` goes into a
+second list and `__keylink_service!` receives `@wire [ .. ] @feeds [ .. ]`. The wire
+list expands into `Request`, `Response`, `Contract`, `WireKinds`, `Handler`, `Client`,
+`KeyedClient`, `Mail` and the rest exactly as before; the feed list reaches four sites
+and none of them is a wire site. **"Feeds are not on the wire" is a fact about which
+list a declaration is in**, checked by the compiler at every wire generator, rather
+than a claim thirteen macros have to keep agreeing about.
+
+Cost: two muncher arms for the declaration, plus one refusal each for `feed X() -> T;`
+and for a feed of any arity but one.
+
+**A feed declares exactly one argument**, and refusing the rest is not fussiness. The
+item type is `Stream::Item`, and a stream yields one value at a time; two arguments
+would make the item an anonymous tuple that nobody named. Several fields is a struct,
+which is a domain type. The refusal names the declaration and says what to write.
+
+`#[defer]` on a `feed` is `__keylink_defer_check!`'s sixth arm — "no reply channel to
+defer, and no caller to defer one to". Red-tested the way §4.2 requires: renaming the
+arm away leaves the fence red for the *wrong* reason, so it was broken by making the
+arm a no-op, which turns the fence green with *"Test compiled successfully, but it's
+marked `compile_fail`"*.
+
+### 5.4 The wiring API departs from the sketch, because the sketch cannot be written
+
+The issue shows `orders::actor(Book::new()).feed_fills(exchange.subscribe())`. `actor`
+returns a `Handle` to an actor that is **already running**, so there is no loop left to
+wire a feed into; and a builder can always be stopped early, so a declared feed left
+unwired would be a stream that never yields — silence a caller cannot tell from a quiet
+exchange.
+
+What landed instead:
+
+```rust
+let orders = orders::actor_wired(
+    Book::new(),
+    vec![Box::new(saver)],
+    orders::Feeds::new(exchange.subscribe()),
+);
+```
+
+`Feeds::new` takes **one argument per declared feed**, in declaration order, so
+forgetting one is `error[E0061]` at the call site. `actor`, `actor_with` and the keyed
+`spawn` wire none, and a service that declares a feed cannot reach them: `SpawnableUnfed`
+is a `const` assertion on a generic type — `ServableAsActor`'s trick — so it fires at
+the instantiation and nowhere else, and its message names the door to use. Red-tested by
+folding `DECLARES_FEEDS` to `false`, which turns the `compile_fail` fence green.
+
+Each stream is boxed: one allocation per feed per actor, paid once at spawn, against
+making `Handle`, `Mounted` and `System` generic in one parameter per declared feed.
+
+### 5.5 One loop, and what it took
+
+`local.rs::run_loop` is the loop. Both paths enter it with a state, a `Vec` of
+observers and a `Feeds`; `LocalActor::spawn_fed` does on the local side what the
+generated `__mount` does through `run_keyed` on the keyed one. `rg 'Turn::run|\.run\('
+keylink/src` returns exactly one turn-dispatch site, `local.rs::dispatch`.
+
+Three things had to be solved.
+
+**Two channel shapes, one loop.** A `LocalActor` queues `Message<A, M>` — it has a
+`read` and a `stop` — and a keyed actor's mailbox is `Mailbox<M>`, because the registry
+is generic in the service's message and knows nothing of `A`. Making those one channel
+would put the state's type on `System`, `Mounted` and `KeyedService`, cascading into
+`registry.rs` and `remote.rs`. Abstracting the *receive* instead costs a private
+`Inbox<A, M>` trait and two impls, and reaches nothing outside `local.rs`. **No line of
+`registry.rs` changed in this wave**, which was a constraint and is also the evidence
+that the seam is in the right place.
+
+The keyed impl is on a newtype rather than on `mpsc::Receiver<Box<M>>` directly, and the
+reason is inference rather than taste: while the local channel carried
+`Box<Message<A, M>>`, that type *was* a `Box<M2>`, so two bare impls left
+`Receiver<Box<Message<..>>>: Inbox<A, ?M>` with two solutions and every call site
+needing a turbofish — `E0283`, observed. Coherence allows such a pair, the trait
+parameters differing, which is what makes it a trap: it compiles as a definition and
+fails at the use.
+
+**A poll, not a future.** The obvious `async fn next(&mut self)` on `Feeds` has a
+cancellation hazard a synchronous poll does not: the loop would build that future, race
+it against the mailbox, and drop it every time the mailbox won — losing an item it had
+already taken, silently, under load. Polling the streams directly means there is no
+future to drop. It also means the loop needs no `select!` macro, which is not a detail:
+`tokio`'s is behind the `macros` feature, which keylink does **not** enable for
+`wasm32-unknown-unknown`, so a `tokio::select!` here would not compile for a browser at
+all. The spec's "plain `tokio::select!` is random-fair" is right about the property and
+unavailable as a mechanism.
+
+**The frame.** This wave cost 256 bytes per idle actor and it took three attempts to
+stop it costing 1,987.
+
+| path | Wave 2 (`836179c`) | first attempt | second | landed |
+|---|---|---|---|---|
+| keyed | 1,159 | 1,799 | 1,543 | **1,415** |
+| local | 1,597 | 2,109 | 1,853 | **1,853** |
+| slope over a kilobyte of arguments | 0 | 1,987 | 1,011 | **13** |
+
+Both regressions were the *same* mistake, and it is the mistake `tests/actor_memory.rs`
+exists for: a value sized by the caller's service materialised inside the loop's own
+future, which is what an idle actor holds.
+
+1. `async fn dispatch(turn: T, ..)` — an `async fn` stores **every argument** in the
+   future it returns, so the service's message lived in that future, which `run_loop`
+   awaits inline. The `Box::pin` inside was boxing a future that had already been paid
+   for. Slope 1,987, the assertion firing by a factor of fifteen.
+2. A plain `fn dispatch(turn: T, ..) -> Pin<Box<dyn Future>>` — better, and still
+   materialising the argument as a temporary in `run_loop`'s generator on the way in.
+   Slope 1,011, almost exactly `size_of::<bulky::Mail>() - size_of::<ledger::Mail>()`.
+
+The fix is a rule rather than a patch: **nothing sized by a service's declarations is
+ever spelled out inside the loop's future.** The box moved from the channel slot to
+`Message::Mail(Box<M>)` and `Fed::Item(Box<T>)`, and `dispatch` takes a `Box<T>` and
+unwraps it inside its own plain stack frame. That is allocation-neutral on the message
+path — the old slot box and the new mail box are one allocation either way — and it made
+the local channel slot a three-word enum, costing 512 bytes of eagerly allocated block
+until `Read` was thinned to a single-word box. `with_state` pays one extra allocation
+for that; it is a cross-cutting read, not a turn.
+
+Neither regression was visible in any other test, which is the argument for that file.
+
+### 5.6 The keyed-observer gap, closed
+
+`spawn_wired(state, observers, feeds)` is the general keyed door and the answer to the
+question `observe.rs` left open — who owns the `Vec` for a lazily spawned actor. The
+factory does:
+
+```rust
+.spawn_with(|id| Some(orders::spawn_wired(state, vec![Box::new(saver)], feeds(id))))
+```
+
+which is the state-observers-feeds triple re-incarnation needs. `spawn(state)` still
+means "no observers" and is still the door most keyed actors use; it is a shorthand now
+rather than a limit. RFC-06 §5.3's "no observers on the keyed path" is false and the
+paragraphs that said so are in the past tense, in `observe.rs` and on
+`Handle::service`.
+
+Pinned by `an_observer_attached_to_a_keyed_actor_runs`, which needs no node and no
+`KeyedClient` — a keyed actor with a feed is driven entirely in-process, so what is
+tested is the loop with no transport in the way to explain a pass. Red-tested by having
+`spawn_wired` pass an empty `Vec`.
+
+### 5.7 What Wave 3 did NOT do
+
+- **Give a keyed actor an `ended()` channel.** It is the one thing `spawn_wired` does
+  not deliver. An observer's `finish` is told why the actor stopped, so a durability
+  adapter still commits — but a keyed actor whose observer refused, whose handler
+  panicked or whose feed ended reports that to nothing a caller can await, and the
+  registry's eviction clock simply finds a task that already finished. `System::stop`
+  and `System::abort` await the task, not a reason. **This is Wave 9's first
+  requirement**: supervision cannot decide to restart something whose ending it cannot
+  read. It needs a field on `Mounted`, which means `registry.rs`, which is why it was
+  not taken here.
+- **Move the ALPN.** Pinned, not asserted:
+  `adding_a_feed_to_a_service_does_not_move_the_contract_hash` compares two
+  declarations of the same service differing only by two feeds, one of whose item types
+  is `[u8; 32]` — a type the wire graph has never seen, so a leak into `Request` or
+  `Response` would move the hash where a `u64` would not. Both ALPNs, keyed and
+  singleton. Red-tested by re-declaring the same `feed` as an `rpc`: the ALPN moves
+  from `keylink/Fed/15ef2886d11e6a37` to `keylink/Fed/15f62d61d7ba0efe`.
+  `keylink/Probe/d3fe34471921164e` is unchanged and green.
+- **Allow a service of nothing but feeds.** A `service!` generates a wire contract, and
+  a feeds-only service would be an empty protocol with a state attached. Refused by the
+  muncher with a message that says so. Whether a purely feed-driven actor deserves a
+  declaration of its own is an open question and not this wave's.
+- **Bound a feed.** Nothing rate-limits a feed, buffers it, or drops from it under
+  load: the stream is the caller's and so is its backpressure — a feed that yields
+  faster than the actor consumes simply fills whatever the caller wired. `QueueTimeout`
+  is about a mailbox permit and has no analogue here, because there is no permit.
+- **Reach a feed from a peer.** A feed is local in the way a `Handle` is local. A
+  remote event source is a `tell` on a wire contract, and the two are not the same
+  thing wearing different names.
+- **Use `tokio::time::pause`.** The wave was briefed to, and `tests/feeds.rs` reads no
+  clock at all instead — it gates the loop inside one turn, loads both inputs, and then
+  releases, so every ordering assertion is an exact sequence rather than a statistical
+  one. That is strictly stronger than a paused clock, and it is written at the top of
+  that file so the departure is not mistaken for an omission. The one claim it cannot
+  make is about a *continuously* saturated mailbox: with `MAILBOX = 1` on a
+  single-threaded test runtime the loop drains the slot and polls again before the
+  parked sender is rescheduled, so that state is unconstructible and the reverse
+  direction is asserted as "a queued message does not preempt a queued feed item".

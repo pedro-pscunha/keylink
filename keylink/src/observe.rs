@@ -45,22 +45,27 @@
 //! `Handle::with_state` already is. `representability.rs` holds the compile-time
 //! probe for the part that is true.
 //!
-//! # Not for the keyed system
+//! # A keyed actor is observed too, since Wave 3
 //!
-//! A keyed actor mounted in a [`System`](crate::System) gets no observers. That
-//! is a scope limit rather than an oversight, and it is written here, on
-//! [`Observer`], and beside `spawn`, because a user who mounts a keyed actor and
-//! expects durability would otherwise get no durability, no compile error and no
-//! explanation. RFC-06 §5.3.
+//! This section used to say the opposite, and the paragraph is kept in the past
+//! tense because the *shape* of the limit is the interesting part. A keyed actor
+//! mounted in a [`System`](crate::System) got no observers, first because `spawn`
+//! ran a second loop over its own dispatcher and never touched
+//! [`LocalActor`](crate::LocalActor) — two loops, and closing the gap meant
+//! merging them — and then, after Wave 1b made the dispatch one path, because
+//! `spawn` handed that one path an **empty** hook slice. RFC-06 §5.3.
 //!
-//! **The reason changed and shrank.** It used to be that `spawn` ran a second
-//! loop over its own dispatcher and never touched
-//! [`LocalActor`](crate::LocalActor), which is where this chain lived — two
-//! loops, and closing the gap meant merging them. There is one dispatch path
-//! now: `spawn`'s loop runs the same generated mailbox a local actor does and
-//! hands it an **empty** hook slice. So what is left is the slice, and the
-//! question of who owns the `Vec` for a lazily spawned actor — which is Wave 3's
-//! to answer, because a feed asks it about the same loop.
+//! What was left was the slice and the question of who owns the `Vec` for a
+//! lazily spawned actor. Feeds forced it, because a keyed actor with a feed needs
+//! the same `select!` a local one does: there is **one loop** now, in `local.rs`,
+//! and both paths enter it with a state, a `Vec` of observers and a set of feeds.
+//! The owner of the `Vec` is whoever builds the actor —
+//! `<service>::spawn_wired(state, observers, feeds)` for a keyed one, called from
+//! a [`spawn_with`](crate::SystemBuilder::spawn_with) factory when the actor is
+//! built on first message. That triple is also the shape re-incarnation needs.
+//!
+//! `<service>::spawn(state)` still means "no observers", and it is still the door
+//! most keyed actors use. It is now a shorthand rather than a limit.
 
 use std::error::Error;
 use std::fmt;
@@ -91,7 +96,11 @@ pub type FinishFut<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 ///
 /// Observers run in the order they were given, one after another, inside the
 /// same panic guard as the handler. A keyed actor mounted through
-/// [`System`](crate::System) has none — see the module documentation.
+/// [`System`](crate::System) is watched by whatever its factory gave it — see the
+/// module documentation.
+///
+/// A `feed` item is a turn like any other: [`after_turn`](Self::after_turn) runs
+/// for one, [`TurnInfo::method`] names the feed, and an `Err` ends the actor.
 pub trait Observer<A>: Send + 'static {
     /// Names this observer in [`Ended`] and in the refusal a peer sees.
     fn name(&self) -> &'static str;
@@ -317,8 +326,45 @@ impl fmt::Display for Stop {
 /// stretched to say "gave up on durability". This is the second question, asked
 /// separately.
 ///
-/// Exhaustive, like [`Departure`](crate::Departure): a caller matches it, and a
-/// wildcard arm is the collapse it exists to prevent.
+/// # Exhaustive, and deliberately not `#[non_exhaustive]` — decided once, here
+///
+/// Like [`Departure`](crate::Departure): a caller matches this, and a wildcard
+/// arm is the collapse it exists to prevent.
+///
+/// [`Feed`](Self::Feed) is the first ending added after the enum had consumers, so
+/// Wave 3 is where the cost of that decision could finally be measured instead of
+/// predicted. **It was measured, and it was zero**, which is not what the wave was
+/// briefed to expect: adding the variant produced **no** `error[E0004]` anywhere in
+/// this workspace. Every match on an `Ended` in `keylink/tests` is a single arm plus
+/// `other => panic!("got {other:?}")` — a test asserting *which* ending happened,
+/// which is not the collapse this enum guards against and would be unaffected by
+/// sealing either way. keylink's own code *builds* `Ended` values and reads one
+/// only through `Debug`.
+///
+/// So the churn argument decides nothing in either direction, and saying so matters
+/// more than the conclusion: the record must not claim a guard fired when it did
+/// not. What is left is the asymmetry between the two failures.
+///
+/// - Sealed, a downstream matcher is **forced** to write `_ =>`, and that arm
+///   silently swallows every ending added later. That is exactly how
+///   `TurnLost::Gone` swallowed a fault for three waves, and it is why Wave 2's
+///   review refused to seal `TurnLost` on this same ground.
+/// - Exhaustive, a downstream matcher gets a compile error at the moment a new
+///   reason to end exists, which is the moment it has a decision to make. The bill
+///   is a major version per ending once this crate is published, and today it is
+///   unpublished with no downstream consumers at all.
+///
+/// The bill is real and is the honest cost of the choice. It is worth paying,
+/// because "the actor stopped" and "the actor's feed died" ask an operator for
+/// different actions, and a type whose job is to say *which* must not be able to
+/// answer "one of the ones you have heard of".
+///
+/// **What this means for the next ending.** Wave 9's `GaveUp` — a supervisor that
+/// stopped restarting — lands the same way, and should expect the same near-zero
+/// in-tree churn. `representability.rs::every_ending_is_named` is a `#[cfg(test)]`
+/// match with no wildcard, so a new variant is one `E0004` **inside keylink** that
+/// points a reader at this paragraph rather than at nothing. Do not reach for
+/// `#[non_exhaustive]` to silence it.
 #[derive(Debug, Clone)]
 pub enum Ended {
     /// [`stop`](crate::LocalActor::stop) was called, or the last handle was
@@ -346,6 +392,24 @@ pub enum Ended {
         /// An `Arc` because [`Ended`] is `Clone` and many callers can await it.
         /// The conversion from [`Stop`]'s `Box` happens once, in the loop.
         error: Arc<dyn Error + Send + Sync>,
+    },
+    /// A `feed` produced its last item.
+    ///
+    /// **The actor stops, and that is the feature.** A feed is an input the actor
+    /// has no way to re-open and no way to poll: a market-data subscription that
+    /// silently ended leaves the state frozen at whatever it last saw, and every
+    /// later read of it is stale data served as fresh. Carrying on would be the
+    /// silent fallback this crate refuses everywhere else, so the actor ends and
+    /// says which feed did it.
+    ///
+    /// Carries no error, because a stream that ended reported nothing to carry.
+    /// `Stream::poll_next` answering `None` is the whole of what happened; if a
+    /// feed wants to explain itself, its item type is the place to do it.
+    Feed {
+        /// The feed's declared name, spelled the way
+        /// [`TurnInfo::method`](TurnInfo::method) spells it — `"Fills"`, not
+        /// `"on_fills"`.
+        name: &'static str,
     },
 }
 

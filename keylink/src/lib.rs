@@ -169,8 +169,8 @@ pub use idempotency::{
 };
 pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use local::{
-    deliver_to_local, turn, turn_deferred, Deferred, Hooks, LocalActor, MailboxClosed, Replied,
-    Reply, Turn,
+    deliver_to_local, feed_turn, run_keyed, turn, turn_deferred, Deferred, Fed, Feeds, Hooks,
+    LocalActor, MailboxClosed, Replied, Reply, Turn,
 };
 pub use middleware::{Caller, Context, Middleware, Next, QueueTimeout, Queueing, Rpc, Timeout};
 pub use node::{derive_alpn, Node};
@@ -186,5 +186,14 @@ pub use wire::{Envelope, WireKinds, MAX_HEADER};
 /// Re-exported so generated code and callers agree on types without extra
 /// imports at the call site.
 pub use iroh::{protocol::Router, EndpointAddr, EndpointId, SecretKey};
+
+/// The trait a `feed` is wired from, re-exported for the same reason.
+///
+/// A generated `Feeds::new` takes `impl Stream<Item = ..>`, so this trait is in
+/// keylink's public API whether or not it is named here — and it is
+/// `futures_core::Stream`, the one `tokio_stream`, `futures` and `async_stream` all
+/// implement, reached through the runtime shim the rest of the crate uses. Naming it
+/// here means a caller wiring a feed needs no direct dependency on any of them.
+pub use n0_future::Stream;
 #[doc(hidden)]
 pub use pastey;

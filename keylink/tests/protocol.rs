@@ -1038,3 +1038,67 @@ fn adding_defer_to_a_method_does_not_move_the_contract_hash() {
         "the keyed ALPN moved for a change that is not on the wire"
     );
 }
+
+// The same pattern for a `feed`, and for the same reason it has to be the same
+// pattern: two declarations of one service, identical but for the feed.
+mod unfed {
+    keylink::service! {
+        service Fed;
+
+        rpc Fill(price: u64) -> u64;
+    }
+}
+
+mod fed {
+    keylink::service! {
+        service Fed;
+
+        rpc Fill(price: u64) -> u64;
+        feed Ticks(tick: u64);
+        // Two, so the comparison also covers whatever a second one might add. A
+        // service with one feed and a service with two must both hash like a
+        // service with none.
+        feed Fills(fill: [u8; 32]);
+    }
+}
+
+/// **Adding a `feed` does not move the contract hash.**
+///
+/// The strongest form of "feeds are not on the wire", and it is stronger than the
+/// `#[defer]` twin above rather than merely parallel to it. `#[defer]` is an
+/// attribute on a method that *is* on the wire, so the claim there is that the
+/// attribute changes nothing. A `feed` adds a whole declaration, with an item type
+/// of its own — `[u8; 32]` here, a type the wire graph has never seen — and the
+/// claim is that a declaration can exist without touching the contract at all.
+///
+/// Structurally, that is because a feed is not a sixth `kind`: the muncher puts it
+/// in a second list, and `Request`, `Response`, `Contract`, `WireKinds`, `Handler`
+/// and both clients expand over the first list only. There is no arm anywhere that
+/// has to remember to leave a feed out.
+///
+/// `[u8; 32]` is not decoration. A `postcard_schema::Schema` reaches every type
+/// nested in a hashed one, so an item type that leaked into `Request` or `Response`
+/// through some forgotten repetition would move the hash — a plain `u64` would not,
+/// `Fill` already carrying one.
+///
+/// Both ALPNs, keyed and singleton, for the reason the twin gives.
+///
+/// The sensitivity this cannot prove itself is proved by the twin above, which was
+/// made red by changing an argument type. The pinned literal
+/// `keylink/Probe/d3fe34471921164e` in `the_contract_hash_has_not_moved` is the
+/// other half: it is unchanged by this wave.
+#[test]
+fn adding_a_feed_to_a_service_does_not_move_the_contract_hash() {
+    assert_eq!(
+        String::from_utf8_lossy(unfed::fed::alpn()),
+        String::from_utf8_lossy(fed::fed::alpn()),
+        "the ALPN moved for a declaration that is not on the wire: a `feed` has no \
+         `Request` variant, no `Response` variant and no `WireKinds` entry, and \
+         touches none of the six types `Contract` is built from"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(unfed::fed::keyed_alpn()),
+        String::from_utf8_lossy(fed::fed::keyed_alpn()),
+        "the keyed ALPN moved for a declaration that is not on the wire"
+    );
+}

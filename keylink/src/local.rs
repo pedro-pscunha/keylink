@@ -34,6 +34,26 @@
 //! - the loop can be given a second input beside the mailbox, because the
 //!   mailbox's item is a value it can match on rather than a call it must make.
 //!
+//! # One loop, two inputs, both paths
+//!
+//! The third of those is [`Feeds`], and building it is what finally made the loop
+//! singular. There were two loops until Wave 3 — this one, and a second that
+//! `service!` wrote into every crate that declared an actor — and Wave 1b had
+//! already reduced them to two loops around *one* dispatch. That was enough for
+//! the dispatch's own policy to be shared and not enough for anything a loop
+//! owns: a keyed actor had no observers and no `finish`, because those live in a
+//! loop.
+//!
+//! A second input forced the question, because a `select` written twice is a
+//! `select` that will disagree with itself. So `run_loop` is the loop, it takes
+//! its mailbox through a private [`Inbox`] trait so that a `LocalActor`'s channel
+//! and a keyed actor's can both reach it, and generated code calls
+//! [`run_keyed`] instead of writing a loop at all.
+//!
+//! A feed item and a mailbox message are both a [`Turn`], dispatched at one call
+//! site, so the panic guard, the observer chain and a durability adapter's commit
+//! reach a feed item because there is nowhere else for it to go.
+//!
 //! One boxed closure survives and it is deliberate: [`read`](LocalActor::read).
 //! That one takes an arbitrary caller closure rather than a declared method, so
 //! there is no enum a macro could generate for it. What it costs is smaller in
@@ -939,6 +959,165 @@ fn began<T>(origin: &Origin, reply: Reply<T>) -> Option<Reply<T>> {
     Some(reply)
 }
 
+/// Run one item from a `feed`: the handler, the observers, and nothing else.
+///
+/// The third turn, and it is the one that shows what the other two were carrying
+/// for a *caller*. A feed item has no [`Origin`], so there is no queue deadline to
+/// read and no idempotency mark to make; it has no [`Reply`], so there is nobody
+/// to answer. What is left is [`observed_turn`] — the handler inside the panic
+/// guard, then the observer chain — which is the part that is about the **state**
+/// rather than about whoever asked.
+///
+/// `#[doc(hidden)] pub` because the generated `Turn` impl for a feed item is
+/// expanded into the **user's** crate.
+///
+/// # A panic here ends the actor, and that is deliberately unlike an `rpc`
+///
+/// A panicking `rpc` costs its message and not the actor, and the reason it can is
+/// that somebody is **told**: the panic crosses the reply channel as
+/// [`TurnLost::Faulted`] and [`ask`](LocalActor::ask) resumes it in the caller. A
+/// feed item has no channel and no caller, so the same policy here would drop the
+/// fault on the floor and carry on with a state the handler may have left half
+/// applied — a silent partial write, which is the one outcome the whole crate is
+/// arranged to refuse.
+///
+/// So a feed's fault is reported the only way a feed can report anything: the
+/// actor ends as [`Ended::Panicked`], every observer's `finish` runs, and
+/// [`ended`](LocalActor::ended) names it. The panic hook has already printed at
+/// the fault.
+///
+/// This is the same argument [`Ended::Feed`] makes about a feed that *stops*, and
+/// it is the reason a `feed` is a different declaration rather than a `tell` from
+/// a stream: a `tell` is somebody in this process choosing fire-and-forget, and
+/// [`notify`](LocalActor::notify) documents that nobody is told. Nobody chose
+/// anything here.
+#[doc(hidden)]
+pub async fn feed_turn<A, F>(
+    state: &mut A,
+    hooks: &mut Hooks<A>,
+    feed: &'static str,
+    turn: F,
+) -> Option<Ended>
+where
+    A: 'static,
+    F: for<'b> FnOnce(&'b mut A) -> Pin<Box<dyn Future<Output = ()> + Send + 'b>> + Send,
+{
+    let (ran, _refused, end) = observed_turn(state, hooks, feed, turn).await;
+
+    // There is no reply channel to carry a fault and no caller to resume it into,
+    // so the ending is the only report a feed's panic can have.
+    let faulted = ran.err().map(|panic| Ended::Panicked {
+        message: panic.message().to_owned(),
+    });
+
+    // `end` first, and the order is the decision: an observer that refused a
+    // *panicked* turn is already reported by `observed_turn` as the fault rather than
+    // as the adapter, and one that refused a completed one must not have its refusal
+    // overwritten by a fault that did not happen.
+    end.or(faulted)
+}
+
+/// What a poll of an actor's feeds produced.
+///
+/// Two states and not `Option`, because the second one is not "nothing yet" — it
+/// is a fact that ends the actor, and giving it a name is what stops it being
+/// confused with [`Poll::Pending`](std::task::Poll::Pending) at the one site that
+/// reads both.
+///
+/// `#[doc(hidden)] pub` because a generated `Feeds` impl builds one.
+#[doc(hidden)]
+pub enum Fed<T> {
+    /// One item, from whichever feed produced it. A [`Turn`] like any other.
+    ///
+    /// Boxed for [`Message::Mail`]'s reason and it is the same reason exactly: an
+    /// item spelled out here would be spelled out in the loop's future, so an idle
+    /// actor would pay for the largest item any of its feeds can carry. A generated
+    /// poller allocates it, which is the one allocation per item a mailbox message
+    /// also costs.
+    Item(Box<T>),
+    /// A feed produced its last item. The actor ends as [`Ended::Feed`].
+    Ended {
+        /// The feed's declared name.
+        name: &'static str,
+    },
+}
+
+/// An actor's second input: a set of locally wired streams, polled beside the
+/// mailbox in one loop.
+///
+/// Implemented **only** by generated code, for the same reason [`Turn`] is: the
+/// members are the service's own `feed` declarations, so only a per-service type
+/// can name them. keylink owns when they are polled and what a poll means; the
+/// generated type owns which streams there are.
+///
+/// # A poll and not a future, which is what makes the loop's `select` honest
+///
+/// The obvious signature is `async fn next(&mut self)`, and it has a cancellation
+/// hazard that a synchronous poll does not: the loop would have to *build* that
+/// future, race it against the mailbox, and **drop it** every time the mailbox won.
+/// A future dropped after it had taken an item off a stream and before it handed it
+/// over loses the item, silently, under load. Polling the streams directly means
+/// there is no future to drop — a poll that returns
+/// [`Pending`](std::task::Poll::Pending) has taken nothing.
+///
+/// It also means the loop needs no `select!` macro, which matters more than it
+/// looks: `tokio`'s is behind the `macros` feature, which keylink does **not**
+/// enable for `wasm32-unknown-unknown` (see `Cargo.toml`'s target blocks), so a
+/// `tokio::select!` in this loop would not compile for a browser at all.
+///
+/// # Fairness is keylink's, in two places
+///
+/// The loop alternates which input it polls first, so neither the mailbox nor the
+/// feeds can starve the other: a saturated feed delays a message by at most one
+/// item, and the reverse. A generated `poll_next` rotates among *its own* feeds for
+/// the same reason, so a saturated feed cannot starve its siblings either. The
+/// mailbox therefore gets half the turns and each of `n` feeds gets `1/2n` of them
+/// when everything is ready at once — stated, because "fair" without a number is
+/// how a priority knob gets argued for later.
+#[doc(hidden)]
+pub trait Feeds<A>: Send + 'static {
+    /// One item from one feed, which is a turn against the state.
+    ///
+    /// A single type across every feed of a service — the generated enum, one
+    /// variant per declaration — so that a rotation among feeds can be a table
+    /// lookup rather than a match written per pair.
+    type Item: Turn<A>;
+
+    /// Poll every feed once, starting wherever the last item came from.
+    ///
+    /// Called directly by the loop, never wrapped in a future it might drop.
+    /// Returning [`Fed::Ended`] is terminal: the loop stops the actor, so a feed
+    /// is never polled after it has answered `None`.
+    fn poll_next(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Fed<Self::Item>>;
+}
+
+/// The feeds of an actor that has none.
+///
+/// A unit and not a `NoFeeds` marker, because `()` already means "nothing" and a
+/// named type would be a second way to say it. `spawn` and `spawn_observed` pass
+/// one, which is how a `LocalActor` whose service declares no feed pays nothing
+/// for them: [`Infallible`](std::convert::Infallible) is uninhabited, so the
+/// loop's feed arm is a branch on a value that cannot exist.
+impl<A: Send + 'static> Feeds<A> for () {
+    type Item = std::convert::Infallible;
+
+    fn poll_next(&mut self, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Fed<Self::Item>> {
+        // Pending forever, and never woken: there is nothing to wake it. The
+        // mailbox arm is the only one that can complete.
+        std::task::Poll::Pending
+    }
+}
+
+/// A turn that cannot be built, so the loop's feed arm can be written once.
+///
+/// The alternative was a second loop for an actor with no feeds, which is the
+/// divergence this wave exists to delete.
+impl<A: Send> Turn<A> for std::convert::Infallible {
+    async fn run(self, _state: &mut A, _hooks: &mut Hooks<A>) -> Option<Ended> {
+        match self {}
+    }
+}
+
 /// The one message whose work is a caller's closure rather than a declared
 /// method: [`LocalActor::read`].
 ///
@@ -948,18 +1127,365 @@ fn began<T>(origin: &Origin, reply: Reply<T>) -> Option<Reply<T>> {
 /// "whatever the caller wants to look at", and the alternative — making every
 /// read a declared method — would put a cross-cutting concern into the service's
 /// own wire contract.
-type Read<A> = Box<dyn FnOnce(&A) + Send>;
+type Read<A> = Box<Box<dyn FnOnce(&A) + Send>>;
 
 /// A turn, a read, or the request to stop after the messages already queued.
 enum Message<A, M> {
-    /// One of the service's own methods, as a value of its generated enum.
-    Mail(M),
+    /// One of the service's own methods, as a value of its generated enum,
+    /// **behind the pointer it will be dispatched from**.
+    ///
+    /// Boxed here rather than at the channel, and the difference is the whole of
+    /// `tests/actor_memory.rs`'s slope assertion. What must not happen is an unboxed
+    /// `M` appearing anywhere in the loop's own future, because that future is what
+    /// an idle actor holds — and a `Box<M>` *unwrapped* in the loop to be dispatched
+    /// is exactly that. So the box travels from the sender all the way to
+    /// [`dispatch`], which unwraps it inside its own plain stack frame.
+    ///
+    /// It also removes an allocation rather than adding one: the channel used to
+    /// carry `Box<Message<A, M>>` — one box for the message, none for the mail — and
+    /// now carries the enum directly, which is pointer-sized whatever `M` is.
+    Mail(Box<M>),
     /// [`LocalActor::read`]. Runs no observers, by design: a read takes `&A` and
     /// cannot mutate, so storing after it is waste.
     Read(Read<A>),
     /// Ends the loop, which drops the receiver, which is what makes every other
     /// handle report [`MailboxClosed`] from then on.
     Stop,
+}
+
+/// Where the loop takes its next message from.
+///
+/// **Private, and that is the whole reason this trait can exist at all.** The two
+/// paths into the loop carry different channel items: a [`LocalActor`] queues
+/// [`Message<A, M>`] — it has a `read` and a `stop` — and a keyed actor's mailbox
+/// is a [`Mailbox<M>`](crate::Mailbox), because the registry is generic in the
+/// service's message and knows nothing of `A`. Making those one channel would put
+/// the state's type on [`System`](crate::System), [`Mounted`](crate::Mounted) and
+/// `KeyedService`; abstracting the *receive* instead costs two impls and reaches
+/// nothing outside this file.
+///
+/// It is a synchronous poll rather than an `async fn` for [`Feeds`]'s reason, and
+/// here it is not even a trade: `mpsc::Receiver::poll_recv` is what the channel
+/// offers underneath `recv`.
+trait Inbox<A, M>: Send {
+    /// The next message, or `None` when every sender is gone.
+    fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Message<A, M>>>;
+}
+
+/// A [`LocalActor`]'s mailbox, which carries reads and the stop request too.
+impl<A: Send, M: Send> Inbox<A, M> for mpsc::Receiver<Message<A, M>> {
+    fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Message<A, M>>> {
+        self.poll_recv(cx)
+    }
+}
+
+/// A keyed actor's mailbox, which carries only the service's own messages.
+///
+/// A newtype and not a bare `mpsc::Receiver<Box<M>>`, and the reason is inference
+/// rather than taste. While the local channel carried `Box<Message<A, M>>`, that type
+/// **was** a `Box<M2>` with `M2 = Message<A, M>`, so two bare impls left
+/// `Receiver<Box<Message<..>>>: Inbox<A, ?M>` with two solutions and every call site
+/// needing a turbofish — `error[E0283]`, observed. Coherence allows such a pair, the
+/// trait parameters differing, which is exactly what makes it a trap: it compiles as
+/// a definition and fails at the use. The two channel shapes have diverged since, and
+/// the newtype stays so that the next pair of impls does not have to rediscover
+/// this.
+struct Keyed<M>(crate::Mailbox<M>);
+
+/// [`Message::Read`] and [`Message::Stop`] are unreachable on this path: a keyed
+/// actor is read through a method and stopped by
+/// [`System::stop`](crate::System::stop) dropping the registry's sender, which
+/// arrives here as `None`. The loop's arms for them are written to be *correct*
+/// rather than to panic, which is the choice `Mail`'s `send` and `recv` variants
+/// already make one layer out.
+impl<A: Send, M: Send> Inbox<A, M> for Keyed<M> {
+    fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Message<A, M>>> {
+        self.0.poll_recv(cx).map(|mail| mail.map(Message::Mail))
+    }
+}
+
+/// Which of an actor's two inputs produced the next thing to do.
+enum Taken<A, M, T> {
+    /// A mailbox message, or `None` for a mailbox nobody can send to any more.
+    Mail(Option<Message<A, M>>),
+    /// A feed item, or the feed that ended.
+    Fed(Fed<T>),
+}
+
+/// Wait until either input has something, without building a future over either.
+///
+/// `mail_first` is the fairness knob and it is the loop's, not a caller's: the loop
+/// flips it after every item, so the input that lost the last race gets first
+/// refusal on the next one. A starved feed is a **correctness** problem — stale
+/// state served as fresh — and a starved mailbox is a latency problem, so neither
+/// wins by default and there is deliberately no way to ask for one to.
+///
+/// The arm that is polled second is skipped entirely when the first is ready, which
+/// is what `select!` does too. It cannot lose a wakeup: the skipped input is polled
+/// on the next iteration, and this future is rebuilt each time round.
+async fn next<A, M, F, I>(inbox: &mut I, feeds: &mut F, mail_first: bool) -> Taken<A, M, F::Item>
+where
+    I: Inbox<A, M>,
+    F: Feeds<A>,
+{
+    std::future::poll_fn(move |cx| {
+        use std::task::Poll;
+
+        if mail_first {
+            if let Poll::Ready(message) = inbox.poll_next(cx) {
+                return Poll::Ready(Taken::Mail(message));
+            }
+            if let Poll::Ready(fed) = feeds.poll_next(cx) {
+                return Poll::Ready(Taken::Fed(fed));
+            }
+        } else {
+            if let Poll::Ready(fed) = feeds.poll_next(cx) {
+                return Poll::Ready(Taken::Fed(fed));
+            }
+            if let Poll::Ready(message) = inbox.poll_next(cx) {
+                return Poll::Ready(Taken::Mail(message));
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// **The** place a turn is run, for every input and both paths.
+///
+/// One generic function rather than a call per arm, so that `rg` answering "where
+/// is a turn dispatched" returns one line. A mailbox message and a feed item are
+/// both a [`Turn<A>`](Turn), which is the type-level version of the same statement.
+///
+/// The `Box::pin` is here for the reason this module's header gives, and being here
+/// is now part of it: the turn's state machine is sized by the caller's handler, and
+/// an unboxed await would put that size in the task's own future — where an actor
+/// pays for it while it is idle. Measured at Wave 1b: 3,005 bytes per idle actor
+/// without this line against 1,597 with it, at a service with one `u64` argument.
+/// One line, both paths.
+///
+/// # It returns a boxed future and is **not** an `async fn`, and that cost 1,987 bytes
+///
+/// The obvious spelling is `async fn dispatch(..) -> Option<Ended>` with the
+/// `Box::pin` inside, and it silently undoes the box it contains. An `async fn`
+/// stores **every argument** in the future it returns, so `turn` — the service's own
+/// message, sized to its largest variant — would live in *this* function's future,
+/// which `run_loop` then awaits inline and holds in the task's frame while the actor
+/// is idle. The inner box would still be there, boxing a future that had already
+/// been paid for.
+///
+/// Caught by `tests/actor_memory.rs`, which is the only reason it is written here
+/// rather than in a commit message: a keyed idle actor went from 1,159 to 1,799
+/// bytes, and the *slope* — the number that says an idle actor does not pay for what
+/// its service declares — went from 0 to **1,987 bytes** over a 1,016 byte message,
+/// firing the assertion by a factor of fifteen. The wave's own numbers, after both
+/// fixes, are 1,415 keyed and 1,853 local, with the slope back inside its 128 byte
+/// slack.
+///
+/// Returning `Pin<Box<dyn Future>>` puts `turn` inside the allocation instead, so
+/// `run_loop`'s frame holds one pointer. Same allocation count as Wave 1b's loop,
+/// one dispatch site instead of two.
+/// # And it takes the turn **boxed**, which cost another 1,011
+///
+/// The same defect one layer down. `run_loop` is an `async fn`, so a `T` handed to
+/// this one by value would be materialised in `run_loop`'s own frame on the way in —
+/// a temporary the generator has to have room for — and that room is per idle actor
+/// again. The first fix left exactly `size_of::<Mail>()` of slope behind for this
+/// reason: 1,011 bytes over a 1,016 byte message, measured.
+///
+/// So the box arrives from the sender ([`Message::Mail`]) or from the feed
+/// ([`Fed::Item`]) and is unwrapped **here**, in a plain function whose frame is a
+/// real stack frame rather than part of any generator. Nothing sized by the caller's
+/// service is ever spelled out inside the loop's future.
+#[expect(
+    clippy::boxed_local,
+    reason = "the box is the point, and the lint is reading one frame too few. The \
+              value arrives already boxed — from a mailbox slot or a feed's poller — \
+              and taking it by value would materialise it in `run_loop`'s generator on \
+              the way in, which is what an idle actor holds. Measured at 1,011 bytes \
+              of slope over a kilobyte of declared arguments; `tests/actor_memory.rs` \
+              is the assertion."
+)]
+fn dispatch<'a, A: 'a, T: Turn<A>>(
+    turn: Box<T>,
+    state: &'a mut A,
+    hooks: &'a mut Hooks<A>,
+) -> Pin<Box<dyn Future<Output = Option<Ended>> + Send + 'a>> {
+    Box::pin((*turn).run(state, hooks))
+}
+
+/// One actor: its two inputs, its observers, its ending.
+///
+/// **The one loop.** It used to be two — this one, and a second written by
+/// `service!` into every crate that declared an actor — and they disagreed twice
+/// before Wave 1b made the *dispatch* one path: one spelled a deadline `>` where the
+/// other spelled `>=`, and one rendered a panic bare where the other prefixed it.
+/// What was left after that was still two loops around one dispatch, which is why a
+/// keyed actor had no observers and no `finish`: those live in a loop, not in a
+/// dispatch. Feeds are what made the split untenable rather than merely untidy,
+/// because a second input needs a `select` and nobody wanted to write two.
+///
+/// Returns the reason instead of publishing it, because only the local path has
+/// anywhere to publish it to: a `LocalActor` has an `ended` watch channel and a
+/// keyed actor has none. Everything whose *order* matters happens in here.
+///
+/// # Teardown order, which is the fix rather than a detail
+///
+/// `finish` runs after the last turn and **before** anything is dropped, so a flush
+/// that needed the state still had it — RFC-06 §7's debounced store is unbuildable
+/// otherwise, a debounce being safe only with a guaranteed final flush.
+///
+/// Then the drops, in this order and for these reasons. `hooks` releases whatever an
+/// observer holds — a file claim, for the first adapter — before any waiter is told
+/// the actor ended, so `stop().await` returning means the claim is free. `inbox`
+/// closes the mailbox before the same moment: `is_running()` is `!mail.is_closed()`,
+/// which is false only once the receiver drops, and
+/// `stop_drains_what_was_sent_before_it` asserts exactly that immediately after
+/// `stop().await`. `feeds` releases the subscriptions. `state` goes last, which
+/// answers every [`Deferred`] parked in it as [`TurnLost::Gone`].
+///
+/// The `inbox` drop is ordering insurance whose absence no test here catches:
+/// RFC-06 §2.4 reports one teardown order failing 25 of 25 and the other passing 25
+/// of 25, and removing this line and running the guard 25 times on this tree failed
+/// 0 of 25. It stays because which order you get depends on capture order and
+/// nothing pins that — but it is listed among the guards that were NOT watched to
+/// fail, because a guard nobody has seen fail is not a guard.
+///
+/// **Unreachable on `abort` by construction, not by policy.** `abort()` is
+/// `task.abort()` and nothing else: the future is dropped at its next await and the
+/// loop never gets here. The one hole is on `abort`'s own doc — a turn that never
+/// reaches an await is not interrupted, so such an actor can exit the loop normally
+/// afterwards and then this does run.
+///
+/// # Two catches per observer in the `finish` chain, and no `guarded` around it
+///
+/// The same decision `observed_turn` makes one rung up, made here for both of its
+/// reasons. A single `guarded` around the whole chain would need a built future, so
+/// an `async` block, so a block capturing `&state` across an await — `Send` only
+/// when `A: Sync`, which is the bound this design exists to keep out. The leak is not
+/// a matter of care: this function is spawned under `A: Send + 'static` and nothing
+/// more, so an `A: Sync` requirement introduced here is a compile error in keylink
+/// itself rather than a downstream surprise. And it would stop the chain at the first
+/// panic, where `finish` is a flush: an adapter that fell over must not cost the next
+/// adapter its write, and there is no refusal left to short-circuit for.
+async fn run_loop<A, M, F, I>(
+    mut state: A,
+    mut hooks: Vec<Box<dyn Observer<A>>>,
+    mut feeds: F,
+    mut inbox: I,
+) -> Ended
+where
+    A: Send + 'static,
+    M: Turn<A>,
+    F: Feeds<A>,
+    I: Inbox<A, M>,
+{
+    let mut reason = Ended::Stopped;
+    // Which input gets first refusal. Flipped after every item, so the loop
+    // alternates rather than preferring one — see `next`.
+    let mut mail_first = true;
+
+    loop {
+        let taken = next(&mut inbox, &mut feeds, mail_first).await;
+        mail_first = !mail_first;
+
+        match taken {
+            Taken::Mail(Some(Message::Mail(mail))) => {
+                if let Some(end) = dispatch(mail, &mut state, &mut hooks).await {
+                    reason = end;
+                    break;
+                }
+            }
+            // No observers and no ending: a read cannot mutate, so there is
+            // nothing for an observer to accept or refuse.
+            Taken::Mail(Some(Message::Read(read))) => read(&state),
+            Taken::Mail(Some(Message::Stop)) => break,
+            // Every sender is gone, which for a `LocalActor` is the last handle
+            // being dropped and for a keyed actor is the registry unmounting it.
+            Taken::Mail(None) => break,
+            Taken::Fed(Fed::Item(item)) => {
+                if let Some(end) = dispatch(item, &mut state, &mut hooks).await {
+                    reason = end;
+                    break;
+                }
+            }
+            // No turn ran, so no observer saw one — but `finish` still does, which
+            // is what lets a durability adapter flush before the state goes.
+            Taken::Fed(Fed::Ended { name }) => {
+                reason = Ended::Feed { name };
+                break;
+            }
+        }
+    }
+
+    for observer in &mut hooks {
+        // Shared reborrow first, and the `FnOnce`-forcing rebind inside, for the
+        // reasons `observed_turn` spells out.
+        let shared: &A = &state;
+        // Borrowed OUT here and not inside: `&reason` taken in the closure body
+        // would make the closure own the `Ended` and the future borrow from its own
+        // capture, which is `E0515` — and cloning it per observer, which is what
+        // rustc suggests, would hand each one its own copy of a fact there is only
+        // one of.
+        let ending: &Ended = &reason;
+        let watching: &mut dyn Observer<A> = &mut **observer;
+        let built = catching(move || {
+            let watching = watching;
+            watching.finish(shared, ending)
+        });
+        // A panic in either half is dropped rather than reported. There is no caller
+        // to resume it into and no reason left to change: `reason` has already been
+        // handed to whichever observers ran before this one, and rewriting it here
+        // would make two observers of one ending disagree about it. The panic hook
+        // has already run at the fault, which is where the backtrace is.
+        if let Ok(future) = built {
+            let _ = guarded(future).await;
+        }
+    }
+
+    drop(hooks);
+    drop(inbox);
+    drop(feeds);
+    drop(state);
+    reason
+}
+
+/// Run one keyed actor: the same loop, entered from a
+/// [`System`](crate::System)'s mailbox.
+///
+/// `#[doc(hidden)] pub` because the generated keyed `spawn` calls it from inside
+/// [`mount`](crate::mount)'s closure, in the **user's** crate. It is the whole of
+/// what that closure does now; the ~150 lines it used to be were a second copy of
+/// the loop above.
+///
+/// The reason is dropped rather than published, and that is a real limit rather
+/// than an oversight: a keyed actor has no `ended()` channel, so the registry's
+/// eviction clock finds a task that already finished and nobody is told **why** it
+/// finished. An observer's `finish` is told, which is how a durability adapter
+/// still commits — but a keyed actor whose observer refused, whose handler panicked
+/// or whose feed ended reports that to nothing a caller can await. Wave 9's
+/// supervision is what wants that channel; it is not built here.
+#[doc(hidden)]
+pub async fn run_keyed<A, M, F>(
+    state: A,
+    hooks: Vec<Box<dyn Observer<A>>>,
+    feeds: F,
+    inbox: crate::Mailbox<M>,
+) where
+    A: Send + 'static,
+    M: Turn<A>,
+    F: Feeds<A>,
+{
+    let _reason: Ended = run_loop(state, hooks, feeds, Keyed(inbox)).await;
 }
 
 /// The actor is gone. The only way a local call fails.
@@ -996,7 +1522,7 @@ pub struct MailboxClosed;
 /// rather than one block demanding the union — so [`read`](Self::read) works on
 /// a `LocalActor` whose `M` nothing has ever run.
 pub struct LocalActor<A, M> {
-    mail: mpsc::Sender<Box<Message<A, M>>>,
+    mail: mpsc::Sender<Message<A, M>>,
     /// Why the actor ended, once it has. `Option`, starting at `None`, because
     /// a channel initialised with a reason reports that reason for a live
     /// actor. A receiver and never a sender, so awaiting it cannot keep the
@@ -1039,8 +1565,28 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
     ///
     /// Panics when called outside a tokio runtime, like every other spawn.
     #[must_use]
-    pub fn spawn_observed(mut state: A, mut hooks: Vec<Box<dyn Observer<A>>>) -> Self {
-        // `Box<Message<..>>`, and the box is the point. `tokio::sync::mpsc`
+    pub fn spawn_observed(state: A, hooks: Vec<Box<dyn Observer<A>>>) -> Self {
+        Self::spawn_fed(state, hooks, ())
+    }
+
+    /// Start an actor whose turns are watched and whose loop has a second input.
+    ///
+    /// The general door: state, observers and feeds together, which is the triple a
+    /// keyed actor's factory returns and the one re-incarnation will need. The two
+    /// above are shorthands for it.
+    ///
+    /// `feeds` is the service's own generated `Feeds`, so forgetting to wire a
+    /// declared feed is a missing argument to `Feeds::new` rather than a stream that
+    /// silently never yields. `()` is the feeds of an actor that has none.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a tokio runtime, like every other spawn.
+    #[must_use]
+    pub fn spawn_fed<F: Feeds<A>>(state: A, hooks: Vec<Box<dyn Observer<A>>>, feeds: F) -> Self {
+        // The channel carries the enum directly and `Message::Mail` carries the
+        // box: the same one allocation, in the place that keeps an unboxed `M` out
+        // of this task's future. `tokio::sync::mpsc`
         // allocates its first block of 32 slots eagerly, so a mailbox costs
         // `32 * size_of::<slot>()` whatever its capacity is — and the slot is no
         // longer a pointer-sized boxed closure but the service's own enum, sized
@@ -1049,116 +1595,19 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
         // message. `Mailbox` in `registry.rs` boxes for the same reason and
         // carries the measured table; this end had no box at all, because the
         // closure it used to carry made one by accident.
-        let (mail, mut inbox) = mpsc::channel::<Box<Message<A, M>>>(MAILBOX);
+        let (mail, inbox) = mpsc::channel::<Message<A, M>>(MAILBOX);
         let (ended, watching) = watch::channel::<Option<Ended>>(None);
         let task = n0_future::task::spawn(async move {
-            let mut reason = Ended::Stopped;
-            while let Some(message) = inbox.recv().await {
-                match *message {
-                    Message::Mail(mail) => {
-                        // `Box::pin` and not a bare await, for the reason this
-                        // module's header gives: the turn's state machine is
-                        // sized by the caller's handler, and an unboxed await
-                        // would put that size in the task's own future — where
-                        // an actor pays for it while it is idle. Measured:
-                        // 3,005 bytes per idle actor without this line against
-                        // 1,597 with it, at a service with one `u64` argument.
-                        // (1,469 at Wave 1b; the `finish` loop below cost the
-                        // other 128 — `tests/actor_memory.rs` bisects it.)
-                        if let Some(end) = Box::pin(mail.run(&mut state, &mut hooks)).await {
-                            reason = end;
-                            break;
-                        }
-                    }
-                    // No observers and no ending: a read cannot mutate, so
-                    // there is nothing for an observer to accept or refuse.
-                    Message::Read(read) => read(&state),
-                    Message::Stop => break,
-                }
-            }
-            // The last thing that happens with the state, and it happens BEFORE
-            // the three drops below — so `stop().await` returning still means
-            // every claim is free, and a flush that needed the state still had
-            // it. RFC-06 §7's debounced store is unbuildable without this: a
-            // debounce is only safe with a guaranteed final flush.
+            // Everything that happens to the state, its observers and its two
+            // inputs — including the whole teardown order — is in `run_loop`,
+            // which is the one loop both paths run. What is left here is the one
+            // thing only this path can do: publish the reason to whoever is
+            // awaiting `ended()`.
             //
-            // `reason` is already decided, and is lent rather than remade, so
-            // every observer is told what every waiter is about to be told.
-            //
-            // **Unreachable on `abort` by construction, not by policy.**
-            // `abort()` is `task.abort()` and nothing else: the future is
-            // dropped at its next await and the loop never gets here. The one
-            // hole is on `abort`'s own doc — a turn that never reaches an await
-            // is not interrupted, so such an actor can exit the loop normally
-            // afterwards and then this does run.
-            //
-            // TWO catches per observer and no `guarded` around the loop, which
-            // is the same decision `observed_turn` made one rung up and it is
-            // made here for both of its reasons.
-            //
-            // A single `guarded` around the whole loop would need a built
-            // future, so an `async` block, so a block capturing `&state` across
-            // an await — `Send` only when `A: Sync`, which is the bound this
-            // design exists to keep out. The leak is not a matter of care: this
-            // block is spawned under `A: Send + 'static` and nothing more, so an
-            // `A: Sync` requirement introduced here is a compile error in
-            // keylink itself rather than a downstream surprise.
-            //
-            // And it would stop the chain at the first panic. `finish` is a
-            // flush: an adapter that fell over must not cost the next adapter
-            // its write, and there is no refusal left to short-circuit for —
-            // `finish` is infallible and the reason is already fixed.
-            for observer in &mut hooks {
-                // Shared reborrow first, and the `FnOnce`-forcing rebind
-                // inside, for the reasons `observed_turn` spells out.
-                let shared: &A = &state;
-                // Borrowed OUT here and not inside: `&reason` taken in the
-                // closure body would make the closure own the `Ended` and the
-                // future borrow from its own capture, which is `E0515` — and
-                // cloning it per observer, which is what rustc suggests, would
-                // hand each one its own copy of a fact there is only one of.
-                let ending: &Ended = &reason;
-                let watching: &mut dyn Observer<A> = &mut **observer;
-                let built = catching(move || {
-                    let watching = watching;
-                    watching.finish(shared, ending)
-                });
-                // A panic in either half is dropped rather than reported. There
-                // is no caller to resume it into and no reason left to change:
-                // `reason` has already been handed to whichever observers ran
-                // before this one, and rewriting it here would make two
-                // observers of one ending disagree about it. The panic hook has
-                // already run at the fault, which is where the backtrace is.
-                if let Ok(future) = built {
-                    let _ = guarded(future).await;
-                }
-            }
-
-            // These three, in this order, and the order IS the fix.
-            //
-            // `drop(hooks)` releases whatever an observer holds — a file claim,
-            // for the first adapter — BEFORE anybody is told the actor ended,
-            // so `stop().await` returning means the claim is free.
-            //
-            // `drop(inbox)` closes the mailbox before the same moment.
-            // `is_running()` is `!mail.is_closed()`, which is false only once
-            // the RECEIVER drops; without this explicit drop the receiver lives
-            // until the async block ends, so `stop()` could return with
-            // `is_running()` still true — and `stop_drains_what_was_sent_before_it`
-            // asserts the opposite immediately after `stop().await`.
-            //
-            // **Not currently reproducible, and said so rather than claimed.**
-            // RFC-06 §2.4 reports one teardown order failing 25 of 25 and the
-            // other passing 25 of 25. Removing this line and running the guard
-            // 25 times on this tree failed 0 of 25: the block ends, dropping
-            // `inbox`, before the woken `stop()` waiter is polled. So the line
-            // is ordering insurance whose absence no test here catches. It
-            // stays because which order you get depends on the async block's
-            // capture order and nothing pins that — but it is listed among the
-            // guards that were NOT watched to fail, because a guard nobody has
-            // seen fail is not a guard.
-            drop(hooks);
-            drop(inbox);
+            // It happens after every drop `run_loop` makes, which is stronger
+            // than before: `stop().await` returning now means the state itself is
+            // gone, not merely that the observers' claims are.
+            let reason = run_loop(state, hooks, feeds, inbox).await;
             let _ = ended.send(Some(reason));
         });
         Self {
@@ -1305,7 +1754,7 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
         T: Send + 'static,
     {
         let (reply, answer) = Reply::channel();
-        self.send(Message::Mail(mail(Origin::local(), reply)))
+        self.send(Message::Mail(Box::new(mail(Origin::local(), reply))))
             .await
             .map_err(|_| TurnLost::Gone)?;
         // `RecvError` is a unit type: there is exactly one way to lose the
@@ -1350,7 +1799,8 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     {
         let (reply, answer) = Reply::channel();
         drop(answer);
-        self.send(Message::Mail(mail(Origin::local(), reply))).await
+        self.send(Message::Mail(Box::new(mail(Origin::local(), reply))))
+            .await
     }
 }
 
@@ -1396,7 +1846,7 @@ impl<A, M> LocalActor<A, M> {
         F: FnOnce(&A) -> T + Send + 'static,
     {
         let (reply, answer) = oneshot::channel();
-        self.send(Message::Read(Box::new(move |state| {
+        self.send(Message::Read(Box::new(Box::new(move |state| {
             // Caught synchronously rather than through `guarded`, and that is
             // not a shortcut: `guarded` takes a future, an async block holding
             // `&A` is `Send` only when `A: Sync`, and requiring `A: Sync` here
@@ -1405,7 +1855,7 @@ impl<A, M> LocalActor<A, M> {
             let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(state)))
                 .map_err(Panic::caught);
             let _ = reply.send(caught);
-        })))
+        }))))
         .await?;
         match answer.await.map_err(|_| MailboxClosed)? {
             Ok(value) => Ok(value),
@@ -1499,13 +1949,14 @@ impl<A, M> LocalActor<A, M> {
         !self.mail.is_closed()
     }
 
-    /// The one place a message enters the mailbox, and the one place the box is
-    /// put on.
+    /// The one place a message enters the mailbox.
+    ///
+    /// It used to be the one place the box was put on, too. The box moved into
+    /// [`Message::Mail`], where it stays until [`dispatch`] takes it off — because a
+    /// box that the loop unwraps buys nothing, and that is what
+    /// `tests/actor_memory.rs` measured.
     async fn send(&self, message: Message<A, M>) -> Result<(), MailboxClosed> {
-        self.mail
-            .send(Box::new(message))
-            .await
-            .map_err(|_| MailboxClosed)
+        self.mail.send(message).await.map_err(|_| MailboxClosed)
     }
 }
 
@@ -1629,7 +2080,7 @@ where
     let millis = budget.map_or(0, Queueing::millis);
 
     let (reply, answer) = Reply::channel();
-    let queueing = actor.send(Message::Mail(mail(Origin::peer(cx), reply)));
+    let queueing = actor.send(Message::Mail(Box::new(mail(Origin::peer(cx), reply))));
     let sent = match budget {
         None => queueing.await,
         Some(budget) => {

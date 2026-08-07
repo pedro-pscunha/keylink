@@ -109,6 +109,15 @@ fi
 #   tests/versioned.rs   the frame and the migration chain, from outside
 #   keylink/tests/durable.rs, keylink/examples/durable_ledger.rs
 #                        the two in-tree consumers, both storing a `Snapshot`
+#   keylink/tests/feeds.rs
+#                        the third, and the first to store from inside a turn:
+#                        an `Observer` whose `after_turn` takes `Snapshot::of`
+#                        synchronously and writes it through `Versioned::store`
+#                        before the reply. It is on this list for the same
+#                        reason `durable.rs` is — it stores a `Snapshot`, never
+#                        raw bytes — and it does NOT bring the `Claim` trait into
+#                        scope, naming `file::FileClaim` concretely instead, so
+#                        the first check above still covers it.
 stored_raw="$(
     scan --line-number --glob '*.rs' \
         --glob '!keylink-persist/src/versioned.rs' \
@@ -117,6 +126,7 @@ stored_raw="$(
         --glob '!keylink-persist/tests/versioned.rs' \
         --glob '!keylink/tests/durable.rs' \
         --glob '!keylink/examples/durable_ledger.rs' \
+        --glob '!keylink/tests/feeds.rs' \
         '\.store\([^)]' . \
         | drop 'Ordering::' \
         | uncommented

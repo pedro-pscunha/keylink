@@ -159,10 +159,35 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// Measured on this machine, at ten thousand actors of the `ledger` service
 /// below, with an empty state:
 ///
-/// | path | before the generated mailbox (`c9056e0`) | Wave 1b (`c8712b0`) | Wave 2 (`836179c`) |
-/// |---|---|---|---|
-/// | keyed, mounted in a `System` | 1,671 | 1,159 | 1,159 |
-/// | local, `ledger::actor(..)`   | 1,725 | 1,469 | **1,597** |
+/// | path | before the generated mailbox (`c9056e0`) | Wave 1b (`c8712b0`) | Wave 2 (`836179c`) | Wave 3 |
+/// |---|---|---|---|---|
+/// | keyed, mounted in a `System` | 1,671 | 1,159 | 1,159 | 1,415 |
+/// | local, `ledger::actor(..)`   | 1,725 | 1,469 | **1,597** | **1,853** |
+///
+/// # Wave 3's 256 bytes, on both paths, and what they bought
+///
+/// A second input costs one allocator step per actor and it is the same step on both
+/// paths, which is itself the news: the two loops became **one** loop, so a change to
+/// what a loop holds now moves both columns together instead of one silently. What is
+/// in the frame that was not: the `Fed`/`Taken` discriminants, the feeds value, and
+/// the fairness bit the loop alternates.
+///
+/// It cost three attempts to land it at 256 rather than at 1,987, and the middle two
+/// are recorded on `local.rs::dispatch` because both were the *same* mistake — a
+/// value sized by the caller's service materialised inside the loop's future. First
+/// an `async fn dispatch` stored its argument in the future it returned (slope 1,987,
+/// this file's phase-4 assertion firing by a factor of fifteen); then a boxed-future
+/// `dispatch` taking its turn **by value** left the temporary in `run_loop`'s own
+/// generator (slope 1,011, almost exactly `size_of::<bulky::Mail>() - size_of::<ledger::Mail>()`).
+/// Both were caught here and neither was visible in any other test.
+///
+/// The fix moved the box from the channel slot to `Message::Mail` and `Fed::Item`, so
+/// the mail arrives boxed and is unwrapped inside `dispatch`'s own plain stack frame.
+/// That is allocation-neutral on the message path — the old slot box and the new mail
+/// box are one allocation either way — and it made the local channel slot a
+/// three-word enum, which cost 512 bytes of eagerly allocated block until `Read` was
+/// thinned to a single-word box. `with_state` pays one extra allocation for that; it
+/// is a cross-cutting read, not a turn.
 ///
 /// The first move **fell**, which is not what a wave that replaces a fat pointer
 /// with an enum sounds like it should do. The mailbox slot is unchanged —
@@ -189,7 +214,7 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// This literal was checked at exactly one `Mail` size for months — 248 bytes, the
 /// only one any phase built a *local* actor of — while the entire argument for the
 /// `Box::pin` at the local loop's await is an absolute ceiling (3,005 bytes without
-/// it against 1,597 with) that happens to sit between 1,597 and 2,048. The local
+/// it against 1,597 with) that happens to sit between 1,853 and 2,048. The local
 /// path has **less** headroom than the keyed one, by 438 bytes now: a second
 /// channel, the `watch` that carries `Ended`, an `Arc<JoinHandle>` and the `finish`
 /// loop, against the registry entry and `HashMap` slot the keyed one pays for

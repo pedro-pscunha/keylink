@@ -163,6 +163,89 @@
 /// `into_<rpc>` whose catch-all arm is `unreachable_patterns`, and a probe should
 /// not be able to fail for that instead.
 ///
+/// ## `feed`: an actor's second input, and the one declaration with no wire form
+///
+/// ```ignore
+/// keylink::service! {
+///     service Orders;
+///     rpc  Cancel(id: OrderId) -> Result<(), Rejected>;
+///     feed Fills(fill: Fill);            // local only, never on the wire
+/// }
+///
+/// // generated on the Actor trait — no Caller (nobody called), no return (no
+/// // reply channel)
+/// async fn on_fills(&mut self, fill: Fill);
+/// ```
+///
+/// A feed is a locally wired [`Stream`](crate::Stream), selected against the
+/// mailbox inside the actor's own loop, so a feed item is a **turn**: the panic
+/// guard, the observer chain and a durability adapter's commit all apply to one.
+/// Wire it at spawn with `actor_wired(state, observers, Feeds::new(stream))`, or
+/// `spawn_wired(..)` for a keyed actor.
+///
+/// Four things follow, and each is a decision rather than an accident:
+///
+/// - **No `Caller` and no return.** Nobody called, so there is nobody to answer. A
+///   feed that needs a reply is an `rpc`.
+/// - **Not on the wire.** A `feed` produces no `Request` variant, no `Response`
+///   variant, no `WireKinds` entry and no client method, so **the ALPN does not
+///   move** when you add one. It is not a sixth `kind` at all: the muncher puts it
+///   in a second list, and the wire generators never see that list.
+/// - **Exactly one argument**, which is its item — a stream yields one value at a
+///   time. Several fields is a struct, which is a domain type rather than an
+///   argument list.
+/// - **A feed that ends, ends the actor**, as
+///   [`Ended::Feed`](crate::Ended::Feed). A silently dead subscription serving
+///   stale state is the failure that prevents.
+///
+/// `#[defer]` on a `feed` is a compile error, for the reason a `tell` is one: there
+/// is no reply to defer. `__keylink_defer_check!` has the message and this is it:
+///
+/// ```compile_fail
+/// keylink::service! {
+///     service Orders;
+///     rpc Fill(price: u64) -> u64;
+///     #[defer]
+///     feed Ticks(tick: u64);       // <- a `feed` has no reply, and no caller
+/// }
+/// ```
+///
+/// Nothing on the fence, for the reason the `tell` fence above gives. And the same
+/// hazard applies: renaming `__keylink_defer_check!`'s `feed` arm away leaves this
+/// fence red for the *wrong* reason — "no rule expected `feed`" — so it is
+/// red-tested the other way, by making that arm a no-op, which turns the fence
+/// green with *"Test compiled successfully, but it's marked `compile_fail`"*.
+///
+/// A service that declares a `feed` cannot be spawned through a door that wires
+/// none. An unwired feed would be a stream that never yields, which is silence a
+/// caller cannot tell apart from a quiet exchange, so the doors that take no
+/// `Feeds` refuse it at the call site instead:
+///
+/// ```compile_fail
+/// keylink::service! {
+///     service Orders;
+///     rpc Fill(price: u64) -> u64;
+///     feed Ticks(tick: u64);
+/// }
+///
+/// struct Book;
+/// impl orders::Actor for Book {
+///     async fn fill(&mut self, _cx: keylink::Caller<'_>, price: u64) -> u64 { price }
+///     async fn on_ticks(&mut self, _tick: u64) {}
+/// }
+///
+/// // Fails in `SpawnableUnfed::<Book>::CHECK`, a `const` assertion on a generic
+/// // type, so it is evaluated HERE — at the instantiation — and nowhere else.
+/// // `actor_wired(Book, vec![], orders::Feeds::new(stream))` is the door.
+/// let _ = orders::actor(Book);
+/// ```
+///
+/// The `rpc` in both fences is not padding: a `service!` of one method generates an
+/// `into_<rpc>` whose catch-all arm is `unreachable_patterns`, and a probe should not
+/// be able to fail for that instead. In the second, the `impl Actor` block is not
+/// padding either — without it the fence would pass on the missing impl rather than
+/// on the refusal, which is the shape of a guard that proves nothing.
+///
 /// The calling crate needs `serde`, `postcard-schema` and `tokio` as
 /// dependencies — the generated code derives against them by path.
 #[macro_export]
@@ -171,6 +254,7 @@ macro_rules! service {
         $crate::__keylink_service_munch! {
             @svc [ $svc ]
             @done [ ]
+            @feeds [ ]
             @attrs [ ]
             @defer [ ]
             @rest [ $( $rest )+ ]
@@ -198,7 +282,26 @@ macro_rules! service {
 ///
 /// Wave 1b established that a per-*kind* answer needs a helper macro
 /// (`__keylink_mail_body!` and its four siblings). A per-*attribute* answer needs a
-/// muncher, and this is the whole of it: four arms and no state beyond two lists.
+/// muncher, and this is the whole of it.
+///
+/// # It also partitions, and that is how `feed` cost two arms instead of twelve
+///
+/// A sixth declaration kind reached through `$kind:ident` would need an arm in each
+/// of the thirteen helper macros — `__keylink_response_ty!`, `__keylink_is_blob!`,
+/// `__keylink_client_method!` and the rest — every one of them saying "not on the
+/// wire" in a different shape, and one of them forgetting would put a `feed` in a
+/// `Request` enum.
+///
+/// So a `feed` is not a kind. It goes into a **second list** here, and
+/// [`__keylink_service`](crate::__keylink_service) receives
+/// `@wire [ .. ] @feeds [ .. ]`. The wire list expands into `Request`, `Response`,
+/// `Contract`, `Handler`, `Client`, `Mail` and the rest exactly as before, and the
+/// feed list reaches none of them. **"Feeds are not on the wire" is therefore a fact
+/// about which list a declaration is in**, checked by the compiler at every one of
+/// those sites, rather than a claim thirteen macros have to keep agreeing about.
+///
+/// The two arms it did cost are the well-formed `feed Name(item: Type);` and the
+/// refusal for any other shape of one.
 ///
 /// `#[defer]` is idempotent rather than an error when doubled, because a matcher
 /// that refused the second one would report it as "no rule expected this token",
@@ -212,27 +315,93 @@ macro_rules! service {
 macro_rules! __keylink_service_munch {
     // The one attribute keylink reads. Never forwarded.
     (
-        @svc $svc:tt @done [ $( $done:tt )* ] @attrs [ $( $attrs:tt )* ] @defer [ $( $_seen:tt )* ]
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @defer [ $( $_seen:tt )* ]
         @rest [ #[defer] $( $rest:tt )* ]
     ) => {
         $crate::__keylink_service_munch! {
-            @svc $svc @done [ $( $done )* ] @attrs [ $( $attrs )* ] @defer [ defer ]
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ $( $attrs )* ] @defer [ defer ]
             @rest [ $( $rest )* ]
         }
     };
     // Everything else, kept in order and forwarded verbatim.
     (
-        @svc $svc:tt @done [ $( $done:tt )* ] @attrs [ $( $attrs:tt )* ] @defer [ $( $seen:tt )* ]
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @defer [ $( $seen:tt )* ]
         @rest [ #[$meta:meta] $( $rest:tt )* ]
     ) => {
         $crate::__keylink_service_munch! {
-            @svc $svc @done [ $( $done )* ] @attrs [ $( $attrs )* #[$meta] ] @defer [ $( $seen )* ]
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ $( $attrs )* #[$meta] ] @defer [ $( $seen )* ]
             @rest [ $( $rest )* ]
         }
     };
-    // One complete declaration, which closes the attribute run above it.
+    // One `feed`, into the OTHER list. No return type, and exactly one argument.
+    //
+    // BEFORE the wire arm, and the order is load-bearing: `feed Fills(f: F) -> ();`
+    // matches the wire arm with `$kind = feed`, which would put a feed in the
+    // `Request` enum and then fail inside `__keylink_response_ty!` with "no rule
+    // expected `feed`", pointing at a macro the author did not write. The arm below
+    // catches that shape instead and says what is wrong with it.
     (
-        @svc $svc:tt @done [ $( $done:tt )* ] @attrs [ $( $attrs:tt )* ] @defer [ $( $seen:tt )* ]
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed $feed:ident ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $crate::__keylink_service_munch! {
+            @svc $svc
+            @done [ $( $done )* ]
+            @feeds [
+                $( $feeds )*
+                { [ $( $attrs )* ] [ $( $seen )* ] feed $feed ( $arg : $ty ) }
+            ]
+            @attrs [ ] @defer [ ]
+            @rest [ $( $rest )* ]
+        }
+    };
+    // A `feed` written with a return type.
+    (
+        @svc $svc:tt @done $done:tt @feeds $feeds:tt @attrs $attrs:tt @defer $defer:tt
+        @rest [ feed $feed:ident ( $( $anything:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        ::core::compile_error!(::core::concat!(
+            "`feed ",
+            ::core::stringify!($feed),
+            "` has no return type, because nothing is waiting for one. An item \
+             arrived off a stream; there is no caller and no reply channel, which \
+             is why the generated handler is `async fn on_",
+            ::core::stringify!($feed),
+            "(&mut self, item: Item)` and returns nothing. Write \
+             `feed ",
+            ::core::stringify!($feed),
+            "(item: Item);`. If something IS waiting for an answer, that something \
+             called: make it an `rpc`."
+        ));
+    };
+    // A `feed` that is not one argument. Said here rather than left to the
+    // catch-all, because the catch-all cannot name the declaration.
+    (
+        @svc $svc:tt @done $done:tt @feeds $feeds:tt @attrs $attrs:tt @defer $defer:tt
+        @rest [ feed $feed:ident ( $( $anything:tt )* ) ; $( $rest:tt )* ]
+    ) => {
+        ::core::compile_error!(::core::concat!(
+            "`feed ",
+            ::core::stringify!($feed),
+            "` must declare exactly one argument, which is its item. A feed is \
+             wired from a `Stream`, and a stream yields one value at a time - so \
+             `feed ",
+            ::core::stringify!($feed),
+            "(fill: Fill);` and then `Feeds::new(stream_of_fills)`. For several \
+             fields, name the struct: that is a domain type, not an argument list, \
+             and a feed with two arguments would only make the item an anonymous \
+             tuple."
+        ));
+    };
+    // One complete wire declaration, which closes the attribute run above it.
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @defer [ $( $seen:tt )* ]
         @rest [ $kind:ident $rpc:ident ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
     ) => {
         $crate::__keylink_service_munch! {
@@ -241,24 +410,49 @@ macro_rules! __keylink_service_munch {
                 $( $done )*
                 { [ $( $attrs )* ] [ $( $seen )* ] $kind $rpc ( $( $args )* ) -> $ret }
             ]
+            @feeds [ $( $feeds )* ]
             @attrs [ ] @defer [ ]
             @rest [ $( $rest )* ]
         }
     };
-    // Done, with at least one declaration and no attribute left dangling.
+    // Done, with at least one wire declaration and no attribute left dangling.
     (
-        @svc [ $svc:ident ] @done [ $( $done:tt )+ ] @attrs [ ] @defer [ ] @rest [ ]
+        @svc [ $svc:ident ] @done [ $( $done:tt )+ ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ ] @defer [ ] @rest [ ]
     ) => {
-        $crate::__keylink_service! { $svc; $( $done )+ }
+        $crate::__keylink_service! {
+            $svc;
+            @wire [ $( $done )+ ]
+            @feeds [ $( $feeds )* ]
+        }
+    };
+    // Feeds and nothing else. Refused, and the message says what is missing rather
+    // than "at least one declaration is required" — there ARE declarations.
+    (
+        @svc [ $svc:ident ] @done [ ] @feeds [ $( $feeds:tt )+ ]
+        @attrs [ ] @defer [ ] @rest [ ]
+    ) => {
+        ::core::compile_error!(::core::concat!(
+            "`service ",
+            ::core::stringify!($svc),
+            "` declares only feeds. A `service!` generates a wire contract - a \
+             `Request`, a `Response`, an ALPN, a `Client` and a `Handler` - and a \
+             feed is local: it has no variant, no schema and no client method, \
+             which is what 'feeds are not on the wire' means. So a feeds-only \
+             service would be an empty protocol with a state attached. Declare at \
+             least one `rpc`, `tell`, `send`, `recv` or `blob` beside the feeds, \
+             or write a plain struct on a task."
+        ));
     };
     // Anything else is a malformed declaration, and saying so beats "no rule
     // expected this token" pointing into a macro the author did not write.
     ( $( $anything:tt )* ) => {
         ::core::compile_error!(
             "a `service!` body is `service Name;` followed by one or more \
-             declarations of the form `kind Method(arg: Type) -> Ret;`, each \
-             optionally preceded by attributes. At least one declaration is \
-             required, and an attribute must be followed by a declaration."
+             declarations of the form `kind Method(arg: Type) -> Ret;` or \
+             `feed Name(item: Type);`, each optionally preceded by attributes. At \
+             least one non-feed declaration is required, and an attribute must be \
+             followed by a declaration."
         );
     };
 }
@@ -266,20 +460,31 @@ macro_rules! __keylink_service_munch {
 /// Everything `service!` generates, from declarations the muncher has already
 /// split into pass-through attributes and the interpreted `#[defer]`.
 ///
-/// One record per method: `{ [attrs] [defer?] kind Name(args) -> Ret }`. The
-/// `[defer?]` group is `[]` or `[defer]`, and it reaches exactly three of the
+/// Two lists, and the split is load-bearing.
+///
+/// `@wire` is one record per method — `{ [attrs] [defer?] kind Name(args) -> Ret }`.
+/// The `[defer?]` group is `[]` or `[defer]`, and it reaches exactly three of the
 /// thirteen helper macros — the `Actor` method, the mailbox arm and the served arm.
 /// The other ten do not know the attribute exists, because a deferred method's
 /// wire types, client methods, blocking method and local `Handle` method are
 /// byte-for-byte an ordinary `rpc`'s. That is the same statement as "the ALPN does
 /// not move", made in the shape of which macros take a parameter.
+///
+/// `@feeds` is one record per feed — `{ [attrs] [defer?] feed Name(item: Type) }` —
+/// and it expands at exactly four sites: the `Actor` trait's `on_*` method, the
+/// `Feed` item enum with its `Turn` impl, the `Feeds` bundle, and the `DECLARES_FEEDS`
+/// fold. It reaches **no** wire site at all, which is what makes "a feed is not on the
+/// wire" a compile-time property rather than thirteen agreeing macros. The `[defer?]`
+/// group is carried only so `__keylink_defer_check!` can refuse it.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_service {
     (
         $svc:ident;
-        $( { [ $( #[$meta:meta] )* ] [ $( $defer:tt )? ]
-             $kind:ident $rpc:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty } )+
+        @wire [ $( { [ $( #[$meta:meta] )* ] [ $( $defer:tt )? ]
+             $kind:ident $rpc:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty } )+ ]
+        @feeds [ $( { [ $( #[$fmeta:meta] )* ] [ $( $fdefer:tt )? ]
+             feed $feed:ident ( $farg:ident : $fty:ty ) } )* ]
     ) => {
         $crate::pastey::paste! {
         pub mod [<$svc:snake>] {
@@ -296,6 +501,9 @@ macro_rules! __keylink_service {
             // produces exactly one error — the one that says why — instead of that
             // error plus a service whose trait no longer matches its mailbox.
             $( $crate::__keylink_defer_check!([$( $defer )?], [<$kind>], $rpc); )+
+            // And once per feed, which is why the feed record carries a `[defer?]`
+            // group it otherwise has no use for.
+            $( $crate::__keylink_defer_check!([$( $fdefer )?], feed, $feed); )*
 
             #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, ::postcard_schema::Schema)]
             pub enum Request {
@@ -414,6 +622,14 @@ macro_rules! __keylink_service {
             const DECLARES_SEND: bool =
                 false $( | $crate::__keylink_is_send!([<$kind>]) )+;
 
+            /// Whether this service declares a `feed`.
+            ///
+            /// Folded from the feed list itself rather than from a per-kind helper,
+            /// which is the shape of the whole decision: a feed is a second list,
+            /// so "are there any" is a repetition over that list and needs no arm
+            /// anywhere else.
+            const DECLARES_FEEDS: bool = false $( | { let _ = ::core::stringify!($feed); true } )*;
+
             /// The compile-time refusal for [`DECLARES_SEND`].
             ///
             /// Generic in `A` **on purpose**, and that is the whole trick: an
@@ -437,6 +653,34 @@ macro_rules! __keylink_service {
                      that: a layer refuses the caller without ending the turn. \
                      Serve this with `service(handler, allow)` instead, or move \
                      the upload to a second service. RFC-04 s10.4."
+                );
+            }
+
+            /// The compile-time refusal for the doors that wire no feeds.
+            ///
+            /// Generic in `A` for the reason [`ServableAsActor`] is: an associated
+            /// const of a generic type is evaluated where it is *instantiated*, so
+            /// this fires at the call site that spawned an actor without its feeds
+            /// and nowhere else. A plain `const` would refuse the whole service at
+            /// the `service!` invocation.
+            ///
+            /// The alternative was letting an unwired feed be a stream that never
+            /// yields, which is the silent-fallback shape this crate refuses: an
+            /// actor that quietly never sees a fill is indistinguishable from an
+            /// exchange that is quiet.
+            struct SpawnableUnfed<A>(::core::marker::PhantomData<A>);
+
+            impl<A> SpawnableUnfed<A> {
+                const CHECK: () = ::core::assert!(
+                    !DECLARES_FEEDS,
+                    "this service declares a `feed`, so it cannot be spawned \
+                     through a door that wires none - an unwired feed would be a \
+                     stream that never yields, which is silence a caller cannot \
+                     tell from a quiet feed. Use `actor_wired(state, observers, \
+                     Feeds::new(..))` for one actor in this process, or \
+                     `spawn_wired(state, observers, Feeds::new(..))` for one \
+                     mounted in a System. `Feeds::new` takes one argument per \
+                     declared feed, so forgetting one is an argument count."
                 );
             }
 
@@ -706,6 +950,171 @@ macro_rules! __keylink_service {
                 }
             }
 
+            /// One item from one of this service's `feed`s.
+            ///
+            /// **Local only, and never serialized**, like [`Mail`] and for a
+            /// stronger reason: a feed has no wire form at all. It derives nothing
+            /// and no `Contract` field can reach it, which is what makes "adding a
+            /// feed does not move the ALPN" a property of the code rather than a
+            /// promise — `tests/protocol.rs` pins it by comparing two declarations
+            /// of the same service that differ only by a feed.
+            ///
+            /// One enum across every feed rather than one type per feed, so that
+            /// [`Feeds::poll_next`] can rotate among the feeds through a table of
+            /// pollers that all answer the same type.
+            ///
+            /// Uninhabited for a service that declares no feed, which is what lets
+            /// the loop's feed arm exist unconditionally: a branch on a value that
+            /// cannot be built costs nothing.
+            #[doc(hidden)]
+            pub enum Feed {
+                $(
+                    /// One item from this feed, carrying its declared argument.
+                    $feed($fty),
+                )*
+            }
+
+            /// A feed item is a turn, and this is where that stops being a slogan.
+            ///
+            /// The same trait [`Mail`] implements, so the loop dispatches both
+            /// through one call. What differs is what a turn owes anybody:
+            /// [`feed_turn`](keylink::feed_turn) runs the handler inside the panic
+            /// guard and then the observer chain, and there is no queue deadline to
+            /// read, no idempotency mark to make and nobody to answer — a feed has
+            /// no [`Origin`](keylink::Origin) and no reply channel, because nobody
+            /// called it.
+            impl<A: Actor> $crate::Turn<A> for Feed {
+                async fn run(
+                    self,
+                    __state: &mut A,
+                    __hooks: &mut $crate::Hooks<A>,
+                ) -> ::core::option::Option<$crate::Ended> {
+                    match self {
+                        $(
+                            Feed::$feed($farg) => $crate::feed_turn(
+                                __state,
+                                __hooks,
+                                // The DECLARED name, so `TurnInfo::method` spells a
+                                // feed the way it spells an rpc and an operator
+                                // reads one metrics label.
+                                ::core::stringify!($feed),
+                                move |__on: &mut A| ::std::boxed::Box::pin(async move {
+                                    __on.[<on_ $feed:snake>]($farg).await
+                                }),
+                            )
+                            .await,
+                        )*
+                    }
+                }
+            }
+
+            /// Every feed this service declares, wired to a stream each.
+            ///
+            /// Built once, at spawn, and handed to
+            /// [`actor_wired`] or [`spawn_wired`]. There is no way to add a feed to
+            /// a running actor and that is deliberate: the loop selects over a fixed
+            /// set, so a feed appearing later would need the loop to be
+            /// reconfigurable — a second input to the second input.
+            ///
+            /// # `new` takes one argument per feed, which is the guard
+            ///
+            /// Forgetting to wire a declared feed is `error[E0061]` at the call site
+            /// rather than a stream that never yields. That is why this is a
+            /// constructor and not a builder with one method per feed: a builder can
+            /// always be stopped early, and the sketch this replaces —
+            /// `actor(state).feed_fills(rx)` — cannot even be written, because
+            /// `actor` has already spawned the loop by then.
+            ///
+            /// Each stream is boxed. One allocation per feed per actor, paid once at
+            /// spawn, against making `Handle`, `Mounted` and `System` generic in one
+            /// type parameter per declared feed.
+            #[doc(hidden)]
+            pub struct Feeds {
+                $( [<$feed:snake>]: ::core::pin::Pin<
+                    ::std::boxed::Box<dyn $crate::Stream<Item = $fty> + ::core::marker::Send>
+                >, )*
+                /// Which feed gets first refusal on the next poll, so a saturated
+                /// feed cannot starve its siblings. See [`Feeds::poll_next`].
+                at: ::core::primitive::usize,
+            }
+
+            impl Feeds {
+                /// Wire every declared feed. One argument per `feed`, in
+                /// declaration order.
+                #[must_use]
+                pub fn new(
+                    $( [<$feed:snake>]: impl $crate::Stream<Item = $fty>
+                        + ::core::marker::Send + 'static, )*
+                ) -> Self {
+                    Self {
+                        $( [<$feed:snake>]: ::std::boxed::Box::pin([<$feed:snake>]), )*
+                        at: 0,
+                    }
+                }
+
+                /// One closure per feed, all answering the same type, so the
+                /// rotation below can be an index rather than a match written per
+                /// pair of feeds.
+                ///
+                /// Function pointers and not a `match` on the cursor, because
+                /// `macro_rules!` has no counter: numbering the arms of a match
+                /// would need the declarations munched into unary indices, and an
+                /// array literal needs none.
+                const POLLERS: &'static [fn(
+                    &mut Self,
+                    &mut ::core::task::Context<'_>,
+                ) -> ::core::task::Poll<$crate::Fed<Feed>>] = &[
+                    $(
+                        |__feeds: &mut Self, __cx: &mut ::core::task::Context<'_>| {
+                            match $crate::Stream::poll_next(
+                                ::core::pin::Pin::as_mut(&mut __feeds.[<$feed:snake>]),
+                                __cx,
+                            ) {
+                                // Boxed HERE, because an item spelled out in the
+                                // loop's future is a cost every idle actor of this
+                                // service pays — see `Fed::Item`.
+                                ::core::task::Poll::Ready(::core::option::Option::Some(
+                                    __item,
+                                )) => ::core::task::Poll::Ready($crate::Fed::Item(
+                                    ::std::boxed::Box::new(Feed::$feed(__item)),
+                                )),
+                                // The stream is done, which ends the actor. Never
+                                // polled again, so no `poll_next` after `None`.
+                                ::core::task::Poll::Ready(::core::option::Option::None) =>
+                                    ::core::task::Poll::Ready($crate::Fed::Ended {
+                                        name: ::core::stringify!($feed),
+                                    }),
+                                ::core::task::Poll::Pending =>
+                                    ::core::task::Poll::Pending,
+                            }
+                        },
+                    )*
+                ];
+            }
+
+            impl<A: Actor> $crate::Feeds<A> for Feeds {
+                type Item = Feed;
+
+                fn poll_next(
+                    &mut self,
+                    __cx: &mut ::core::task::Context<'_>,
+                ) -> ::core::task::Poll<$crate::Fed<Feed>> {
+                    let __n = Self::POLLERS.len();
+                    // Starts where the last item came from plus one, so `n` feeds
+                    // that are all ready are served round-robin instead of the
+                    // first one starving the rest. Zero feeds runs zero steps,
+                    // which is why the modulo below cannot divide by zero.
+                    for __step in 0..__n {
+                        let __i = (self.at + __step) % __n;
+                        if let ::core::task::Poll::Ready(__fed) = Self::POLLERS[__i](self, __cx) {
+                            self.at = (__i + 1) % __n;
+                            return ::core::task::Poll::Ready(__fed);
+                        }
+                    }
+                    ::core::task::Poll::Pending
+                }
+            }
+
             /// The receiving half of one actor's mailbox.
             #[doc(hidden)]
             pub type Mailbox = $crate::Mailbox<Mail>;
@@ -855,6 +1264,28 @@ macro_rules! __keylink_service {
             /// local message could be authorized against whoever dialled in
             /// last. An argument cannot be forgotten, cannot go stale, and
             /// costs no name.
+            /// # A `feed` method takes no `Caller` and returns nothing
+            ///
+            /// Written out here rather than in a helper macro, because there is one
+            /// shape and no kind to dispatch on — which is the point of a feed being
+            /// a second list.
+            ///
+            /// **No `Caller`, because nobody called.** A feed item came off a
+            /// stream this process wired; there is no local caller to name and no
+            /// peer to authorize against. Handing one in would mean inventing a
+            /// caller, and `Caller::Local` on a market-data item is exactly the
+            /// stale-peer hazard the `caller(&mut self, ..)` hook was deleted for.
+            ///
+            /// **No return, because there is no reply channel.** Nothing is waiting.
+            /// A feed that needs to answer somebody is an `rpc` — the distinction is
+            /// type-level rather than conventional, which is why it is a different
+            /// declaration and not a convention about a `tell`.
+            ///
+            /// It is a turn in every other respect: the panic guard, the observer
+            /// chain and a durability adapter's commit all apply, because the loop is
+            /// still keylink's. A panic here ends the actor rather than costing one
+            /// message — see [`feed_turn`](keylink::feed_turn) for why the `rpc`
+            /// policy cannot hold where nobody is told.
             pub trait Actor: Send + 'static {
                 $(
                     $crate::__keylink_actor_method!(
@@ -863,6 +1294,16 @@ macro_rules! __keylink_service {
                         [<$kind>], [<$rpc:snake>], ($( $arg : $ty ),*), $ret
                     );
                 )+
+                $(
+                    $( #[$fmeta] )*
+                    #[doc = concat!("Handle one item from the `", stringify!($feed), "` feed.")]
+                    ///
+                    /// No [`Caller`](keylink::Caller): nobody called. No return:
+                    /// there is no reply channel. See this trait's own
+                    /// documentation.
+                    fn [<on_ $feed:snake>](&mut self, $farg: $fty)
+                        -> impl ::core::future::Future<Output = ()> + ::core::marker::Send;
+                )*
             }
 
             /// Spawn one actor of this service, ready to be mounted.
@@ -879,29 +1320,27 @@ macro_rules! __keylink_service {
             /// is caught and reported as a refusal, and the next message runs
             /// against the state as it stands.
             ///
-            /// # No observers on this path
+            /// # No observers and no feeds on this door
             ///
-            /// A keyed actor gets **no** [`Observer`](keylink::Observer)s, and
-            /// the reason is now one line of code rather than a second loop: this
-            /// runs the same [`Mail`] dispatch a local actor does, and hands it an
-            /// **empty** hook slice. An actor mounted here and expecting
-            /// durability gets no durability, no compile error and no explanation
-            /// — hence this paragraph. Use [`actor_with`] for one actor that must
-            /// be observed. RFC-06 §5.3.
+            /// A shorthand rather than a limit, which it was until Wave 3. Use
+            /// [`spawn_wired`] for a keyed actor that must be observed, or that has
+            /// a feed — and a service that declares a feed cannot reach *this* door
+            /// at all, because `SpawnableUnfed` refuses it at the call site.
             ///
-            /// What it no longer is, is a *different* dispatcher. The keyed loop
-            /// used to read the queue deadline, mark idempotency progress, guard
-            /// the panic and render the refusal itself, in ~150 lines that had to
-            /// agree with `local.rs`'s and twice did not: one spelled the
-            /// deadline `>` where the other spelled `>=`, and one rendered a panic
-            /// bare where the other prefixed it.
+            /// What it no longer is, is a loop. The keyed loop used to read the
+            /// queue deadline, mark idempotency progress, guard the panic and render
+            /// the refusal itself, in ~150 lines that had to agree with `local.rs`'s
+            /// and twice did not: one spelled the deadline `>` where the other
+            /// spelled `>=`, and one rendered a panic bare where the other prefixed
+            /// it. Wave 1b made the *dispatch* one path and left two loops around
+            /// it; there is one loop now, and this is one call into it.
             ///
             /// # Panics
             ///
             /// Panics when called outside a tokio runtime.
             #[must_use = "an unmounted actor is dropped, which stops the task \
                           this just started"]
-            pub fn spawn<A: Actor>(mut state: A) -> Mounted {
+            pub fn spawn<A: Actor>(state: A) -> Mounted {
                 // The same refusal `Handle::service` makes, and for longer than
                 // it was made here: `CHECK` is an associated const on a generic
                 // type, so it is evaluated only where it is INSTANTIATED, and
@@ -917,33 +1356,73 @@ macro_rules! __keylink_service {
                 // started. RFC-04 §10.4 argues the whole thing and named only
                 // the path that was guarded. §16.9.
                 let () = ServableAsActor::<A>::CHECK;
-                $crate::mount(move |mut inbox: Mailbox| async move {
-                    while let ::std::option::Option::Some(mail) = inbox.recv().await {
-                        // `&mut []` and not a `Vec`: a keyed actor has no
-                        // observers, and an empty slice says so in the one place
-                        // that would otherwise have to be a second loop.
-                        //
-                        // `Some` is an ending, and there is nothing here to tell:
-                        // a keyed actor has no `ended()` channel, so the loop
-                        // stops and the registry's eviction clock finds a task
-                        // that already finished. That was true before this was
-                        // one loop; what changed is that the ending exists at all
-                        // on this path, which is what Wave 3 needs to hand a keyed
-                        // actor its observers.
-                        // Boxed at the await for the reason `local.rs` gives
-                        // at its own: an unboxed turn puts the caller's handler
-                        // state machine into the task's future, where an idle
-                        // actor pays for it. Measured on this loop: 2,567 bytes
-                        // per idle actor without the box against 1,159 with it,
-                        // and — the number that matters — 7,634 against 1,146
-                        // for a service whose arguments are a kilobyte bigger.
-                        if ::std::boxed::Box::pin($crate::Turn::run(*mail, &mut state, &mut []))
-                            .await
-                            .is_some()
-                        {
-                            break;
-                        }
-                    }
+                let () = SpawnableUnfed::<A>::CHECK;
+                __mount(state, ::std::vec::Vec::new(), ())
+            }
+
+            /// Spawn one keyed actor with its observers and its feeds.
+            ///
+            /// **The general keyed door, and the one that closed the observer gap.**
+            /// A keyed actor mounted through a [`System`](keylink::System) is watched
+            /// by whatever this was given: the same [`Observer`](keylink::Observer)
+            /// chain, the same panic guard and the same
+            /// [`finish`](keylink::Observer::finish) a local actor gets, because it
+            /// is the same loop. RFC-06 §5.3's "no observers on the keyed path" is
+            /// no longer true and the paragraph that said so is in the past tense.
+            ///
+            /// State, observers and feeds together, which is the shape a factory
+            /// needs — [`spawn_with`](keylink::SystemBuilder::spawn_with) builds an
+            /// actor on the first message to an unmounted id, and everything that
+            /// actor needs has to be produced by that one closure:
+            ///
+            /// ```ignore
+            /// let system = orders::SystemBuilder::default()
+            ///     .spawn_with(|id| {
+            ///         let (state, saver) = store.open_blocking(id)?;
+            ///         Some(orders::spawn_wired(
+            ///             state,
+            ///             vec![Box::new(saver)],
+            ///             orders::Feeds::new(exchange.subscribe(id)),
+            ///         ))
+            ///     })
+            ///     .build();
+            /// ```
+            ///
+            /// # What a keyed actor still does not get
+            ///
+            /// An `ended()` channel. The reason an actor stopped — an observer's
+            /// refusal, a fault, a feed that ended — reaches its own observers'
+            /// `finish` and nothing else, so a durability adapter still commits but
+            /// nobody outside can await *why*. `System::stop` and `System::abort`
+            /// await the task, not a reason.
+            ///
+            /// # Panics
+            ///
+            /// Panics when called outside a tokio runtime.
+            #[must_use = "an unmounted actor is dropped, which stops the task \
+                          this just started"]
+            pub fn spawn_wired<A: Actor>(
+                state: A,
+                observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
+                feeds: Feeds,
+            ) -> Mounted {
+                let () = ServableAsActor::<A>::CHECK;
+                __mount(state, observers, feeds)
+            }
+
+            /// What both keyed doors are, and the only place this service names
+            /// [`mount`](keylink::mount).
+            ///
+            /// Generic in the feeds so that [`spawn`]'s `()` and [`spawn_wired`]'s
+            /// [`Feeds`] go through one body: a second body is a second loop by
+            /// another name, and this wave exists to have one.
+            fn __mount<A: Actor, F: $crate::Feeds<A>>(
+                state: A,
+                observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
+                feeds: F,
+            ) -> Mounted {
+                $crate::mount(move |inbox: Mailbox| async move {
+                    $crate::run_keyed(state, observers, feeds, inbox).await;
                 })
             }
 
@@ -970,7 +1449,8 @@ macro_rules! __keylink_service {
             /// [`blocking::Node::enter`](keylink::blocking::Node::enter).
             #[must_use]
             pub fn actor<A: Actor>(state: A) -> Handle<A> {
-                actor_with(state, ::std::vec::Vec::new())
+                let () = SpawnableUnfed::<A>::CHECK;
+                Handle { inner: $crate::LocalActor::spawn_fed(state, ::std::vec::Vec::new(), ()) }
             }
 
             /// Start one actor of this service with observers watching its
@@ -997,7 +1477,45 @@ macro_rules! __keylink_service {
                 state: A,
                 observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
             ) -> Handle<A> {
-                Handle { inner: $crate::LocalActor::spawn_observed(state, observers) }
+                let () = SpawnableUnfed::<A>::CHECK;
+                Handle { inner: $crate::LocalActor::spawn_fed(state, observers, ()) }
+            }
+
+            /// Start one actor of this service with observers **and** feeds.
+            ///
+            /// The general local door: the triple a keyed factory returns, on the
+            /// path that has a [`Handle`]. [`actor`] and [`actor_with`] are
+            /// shorthands for it, and a service declaring a `feed` can use neither.
+            ///
+            /// ```ignore
+            /// let orders = orders::actor_wired(
+            ///     Book::new(),
+            ///     vec![Box::new(saver)],
+            ///     orders::Feeds::new(exchange.subscribe()),
+            /// );
+            /// orders.cancel(id).await?;      // the mailbox, as always
+            /// ```
+            ///
+            /// A feed item and a mailbox message are ordered at **one** `select`, so
+            /// the class of bug where an event is applied after the command that
+            /// should have preempted it does not arise: there is one arrival order,
+            /// not two.
+            ///
+            /// [`Feeds::new`] takes one argument per declared `feed`, in declaration
+            /// order, so a feed left unwired is an argument count rather than a
+            /// stream that never yields.
+            ///
+            /// # Panics
+            ///
+            /// Panics when called outside a tokio runtime, like every other
+            /// spawn.
+            #[must_use]
+            pub fn actor_wired<A: Actor>(
+                state: A,
+                observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
+                feeds: Feeds,
+            ) -> Handle<A> {
+                Handle { inner: $crate::LocalActor::spawn_fed(state, observers, feeds) }
             }
 
             /// A handle to an actor in this process.
@@ -1134,8 +1652,10 @@ macro_rules! __keylink_service {
                 /// authorization and `blob` methods all work through
                 /// [`keyed_service`] too. What is left of §14.8 is one QUIC
                 /// connection per actor *service* rather than one for a node's
-                /// whole fleet, and no observers on a keyed actor until the loop
-                /// question is settled.
+                /// whole fleet — and observers came off that list as well, since
+                /// [`spawn_wired`] runs the same loop this handle does. What a
+                /// keyed actor still lacks is an `ended()` channel, so nobody
+                /// outside can await *why* one stopped.
                 ///
                 /// The idempotency ledger was never on that list, which is what
                 /// this paragraph used to say and is worth keeping: a key is
@@ -2400,6 +2920,18 @@ macro_rules! __keylink_defer_check {
              the payload from the turn, or hand out a `blob` address instead."
         ));
     };
+    ([defer], feed, $rpc:ident) => {
+        ::core::compile_error!(::core::concat!(
+            "`#[defer]` on `feed ",
+            ::core::stringify!($rpc),
+            "`, and a `feed` has \
+             no reply channel to defer - and no caller to defer one TO. An item \
+             arrived off a stream nobody is waiting on, which is why the handler \
+             takes no `Caller` and returns nothing. If something is waiting for an \
+             answer, that something called: make it an `rpc`, and `#[defer]` it if \
+             the answer comes from a later turn."
+        ));
+    };
     ([defer], blob, $rpc:ident) => {
         ::core::compile_error!(::core::concat!(
             "`#[defer]` on `blob ",
@@ -2853,6 +3385,12 @@ mod expansion {
         // "build the blob path twice" risk lives: a kind added to one generator
         // and not the other compiles until somebody declares it.
         blob Manual(sku: String) -> u64;
+        // TWO feeds, and two is the number that matters: one feed's `POLLERS`
+        // table has nothing to rotate among, so the modulo arithmetic in
+        // `Feeds::poll_next` is only exercised from two up. It also means the
+        // service reaching `SpawnableUnfed::CHECK` below is a fed one.
+        feed Ticks(tick: u64);
+        feed Fills(fill: String);
     }
 
     /// The one claim in `__keylink_local_method!` that a reader cannot check by
@@ -2926,6 +3464,11 @@ mod expansion {
             ) -> (u64, crate::BlobId) {
                 unreachable!("never called; this module only has to compile")
             }
+            // No `Caller` and no return, which is the whole shape of a feed
+            // handler. That this compiles against the generated trait is the
+            // assertion: a signature with either would be `E0053`.
+            async fn on_ticks(&mut self, _tick: u64) {}
+            async fn on_fills(&mut self, _fill: String) {}
         }
 
         fn a_local_handle_streams_nothing(handle: expansion::Handle<Probe>) {
