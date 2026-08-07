@@ -2156,7 +2156,7 @@ supervisor is that closure's whole body, so `System::mount`, eviction, `shutdown
 and `System::status` see one task exactly as they do for an unsupervised keyed
 actor.
 
-### 9.1 THE DECISION THIS WAVE OWNS — the sliding window the design asked for cannot terminate
+### 9.1 THE DECISION THIS WAVE OWNS — the sliding window the design asked for cannot terminate, and the replacement terminates only *conditionally* (§9.1.1)
 
 Issue #3 specifies two things that do not compose: an OTP-shaped `Intensity`
 (*`max` restarts within `within`*) and a backoff of **`within / max`**. Spending
@@ -2178,18 +2178,71 @@ The steady state is exactly `max` restarts per `within`, for ever, and
 until the process died, which is the hot loop the backoff exists to prevent,
 arrived at by the mechanism that was supposed to prevent it.
 
-So `within` means something else here, and `Intensity`'s own documentation says
-so out loud: **`max` restarts in a row, and the count resets when one incarnation
-runs for `within` without ending.** `Intensity::new(3, 10s)` reads *three
-restarts in a row, and an actor that stayed up ten seconds has recovered*. The
-backoff is unchanged, `a_restart_storm_ends_the_actor` terminates at
-`after: max`, and `the_backoff_spreads_the_budget_across_its_window` still
-measures a full `within` of virtual time.
+So the second number means something else here, and it is **named** for what it
+means rather than documented into it: `Intensity::new(max, recovered_after)` is
+*`max` restarts in a row, and the count resets when one incarnation runs for
+`recovered_after` without ending*. `Intensity::new(3, 10s)` reads *three restarts
+in a row, and an actor that stayed up ten seconds has recovered*. The backoff is
+unchanged, `a_restart_storm_ends_the_actor` terminates at `after: max`, and
+`the_backoff_spreads_the_budget_across_its_window` still measures a full
+`recovered_after` of virtual time.
 
 The alternative — keeping the sliding window and pruning with `>` instead of
 `>=` — was considered and refused. It terminates only when the elapsed time is
 *exactly* the window, which is true of a paused clock and false of a real one, so
 it would have been a guard that passes in the test suite and fails in production.
+
+#### 9.1.1 CORRECTION — the replacement terminates *conditionally*, and this section said it terminated
+
+The heading above and the paragraph before this one were written as an
+unconditional claim, and they are not one. **Review found the defect §9.1 exists
+to have killed, reached from the replacement, with a compiled counter-example:**
+an `Intensity::new(2, 10ms)` whose every incarnation stays alive 50 ms and *then*
+fails built **nine** incarnations on a budget of two and was still running.
+
+The mechanism is `Budget::spend`'s reset, read against a *failing* incarnation:
+
+```rust
+if ran_for >= self.limit.recovered_after { self.used = 0; }
+```
+
+`ran_for` is how long the incarnation lasted, not how healthy it was, so an
+incarnation that reaches `recovered_after` and then faults resets the count on
+its way out. An actor whose failures are reliably slower than its
+`recovered_after` therefore never exhausts a budget and `Ended::GaveUp` is
+unreachable **for that actor** — which is §9.1's own defect, arrived at from the
+other side.
+
+**The policy is kept and the claim is narrowed, because the policy is right.**
+OTP's window has exactly this property, and an actor that stays up for the
+declared span between failures is a slow leak rather than a restart storm:
+giving up on it discards live state to fix nothing. So *recovered* means what it
+says, `Intensity` carries the precondition in prose —
+**`recovered_after` must outlast a failing incarnation, or `GaveUp` is
+unreachable** — and `a_failure_slower_than_its_recovery_span_never_gives_up`
+asserts the behaviour rather than leaving a later reader to find it. What the
+caller must take from it is that the number is chosen against an actor's
+**failure period**, not against its latency.
+
+**One case is not a precondition at all, and it is rejected rather than
+documented.** `Intensity::new(max, Duration::ZERO)` was constructible from safe
+public API, and `ran_for >= Duration::ZERO` is true of *every* incarnation that
+ever ran — so the reset fires on every failure for every actor, with nothing a
+caller could do to make the precondition hold, and `backoff()` is `ZERO` too: an
+unbounded restart loop with no sleep in it. `new` now returns `Option<Self>`, and
+the guard is on the **backoff** rather than on the span, because
+`recovered_after / max` truncates to nanoseconds and
+`Intensity::new(4, Duration::from_nanos(3))` is the same busy loop spelled
+differently. The property that buys is worth stating plainly: **for any
+`Intensity` that exists, `backoff()` is non-zero, so a supervisor always sleeps
+between incarnations.** `an_intensity_whose_backoff_would_be_zero_is_refused`
+is the guard; breaking it to `if false` was watched red.
+
+`Option` and not a panic: the same shape as `NonZeroU32::new`, one argument
+along, so both of `Intensity`'s numbers are checked where the value is built.
+That the wave reasoned the `max` half through — *"a budget of zero is `spawn_fed`
+spelled through a supervisor that does nothing"* — and did not apply the same
+reasoning to the duration is the honest summary of what this correction is.
 
 ### 9.2 The four properties that fall out with no mechanism
 
@@ -2357,8 +2410,35 @@ supervision as built is a statement about one.
 
 ### 9.9 Every criterion, and the break that proves it
 
-Twelve tests in `keylink/tests/supervision.rs`. Eleven were watched to fail under
-a one-literal break; the twelfth is recorded below as **not** proven by a break.
+Fourteen tests in `keylink/tests/supervision.rs`, every one of them watched to
+fail under a one-literal break. The twelve below are the wave's own; §9.1.1's two
+guards are the thirteenth and fourteenth.
+
+**Corrected after review, because the first version of this sentence and the
+table under it disagreed.** It read *"Eleven were watched to fail under a
+one-literal break; the twelfth is recorded below as **not** proven by a break"*,
+and then gave the twelfth a break anyway. The table is the accurate half and the
+sentence was stale: `.tmp/wave-9/red-tests.sh` runs twelve breaks, all twelve
+exited 101, and the commit message's *"all twelve exited 101"* is right. Verified
+by re-running break 3 on this branch — it exits 101.
+
+Two facts the first version left out, and both are about how much the twelve
+prove:
+
+- **The twelve breaks touch eight distinct source literals.** `retryable`'s
+  `Panicked | Feed => true` line carries three of them, its
+  `Observer { fatal, .. } => !fatal` line two (broken to `true` and to `false`),
+  and `Budget::spend`'s `max.get()` two. A criterion whose break shares a literal
+  with another's is evidenced against the same line of code, not against its own.
+- **Break 3 does not isolate the claim its test is named for.**
+  `a_supervised_actor_that_gave_up_answers_stop` opens by asserting the actor
+  gave up at all, so a budget that never refuses fails it at that *first*
+  assertion — `supervision.rs:349`, the bounded `ended()` helper — and never
+  reaches the `stop()` timeout the test exists for. Re-run and read: the red is
+  real, and it is a red about giving up rather than about `stop()`. No break in
+  this file isolates the `stop()` claim, and §9.9's own note explains why the
+  obvious one cannot: once the supervisor's task exits the `watch` sender drops
+  and `wait_for` returns `Err` whatever the predicate says.
 
 | criterion | break |
 |---|---|
@@ -2374,6 +2454,8 @@ a one-literal break; the twelfth is recorded below as **not** proven by a break.
 | `a_remote_caller_can_tell_restarting_from_gone` | the `"restarting: "` prefix → `"panicked: "` |
 | `a_keyed_actor_restarts_from_its_last_committed_state` | `retryable`: `Panicked \| Feed => false` |
 | `a_supervised_actor_that_gave_up_answers_stop` | `Budget::spend` never refuses, so the supervisor never exits |
+| `an_intensity_whose_backoff_would_be_zero_is_refused` | `Intensity::new`: `if limit.backoff().is_zero()` → `if false` |
+| `a_failure_slower_than_its_recovery_span_never_gives_up` | `Budget::spend`: `if ran_for >= self.limit.recovered_after` → `if false` |
 
 Plus one compile-time probe: `Intensity` in `representability.rs`'s
 `HasNoDefault`, which a `#[derive(Default)]` or a hand-written impl trips.
@@ -2401,12 +2483,44 @@ unbounded wait converts every interesting break into silence.
   keyed actor's `Ended::GaveUp` reaches its own observers' `finish` and nothing a
   caller can await, and `run_keyed_supervised` allocates a `Life` channel with no
   reader to keep one code path rather than two.
-- **Render `"restarting: "` on the *keyed* served path.** `deliver_to_actor` is
-  in `registry.rs`, and it has no supervisor-visible signal to read because a
-  keyed actor has no `Life` channel to publish one on. A `Deferred` lost to a
-  keyed restart is still reported `NoSuchActor`. This is the one asymmetry the
-  wave leaves, it is a consequence of the previous bullet, and it is stated here
-  rather than left to be found.
+- **Render `"restarting: "` on the *keyed* served path.** `deliver_to_actor` has
+  no supervisor-visible signal to read, because a keyed actor has no `Life`
+  channel anyone reads. A `Deferred` lost to a keyed restart is still reported
+  `NoSuchActor`. This is the one asymmetry the wave leaves, and it is a
+  consequence of the previous bullet.
+
+  *(Citation corrected: `deliver_to_actor` is `keylink/src/actor/remote.rs:419`,
+  not `registry.rs`. The zero-lines claim about `registry.rs` above is unaffected
+  and still verified — `remote.rs` is zero lines this wave too.)*
+
+  **Corrected after review: it is a *new* wrong answer, not a pre-existing gap,
+  and stating it here was not enough.** Before this wave keyed actors did not
+  restart, so the case could not arise; `NoSuchActor` on this path now says
+  *there is nothing here, stop asking* about an actor that is mid-restart and
+  about to answer the same peer again, and a client that treats the name as
+  terminal — which Wave 8's reliable-delivery recipe encourages — stops retrying
+  an actor that is coming back. The sentence now sits on the public
+  documentation of the door a user calls: the generated keyed
+  `spawn_supervised` and `run_keyed_supervised`, not only in this RFC.
+
+  **The proper fix is declined out loud, and it is not one paragraph.** Traced
+  rather than estimated: `run_keyed_supervised` builds the `Life` channel
+  *inside* the closure `mount` was already handed, in the user's crate, so
+  nothing outside that closure has ever seen it. Reaching it from
+  `deliver_to_actor` means `Life` stops being private to `local.rs`; `Mounted<M>`
+  carries a receiver beside its `Loop<M>`; `mount` grows a second door to build
+  that variant, or every keyed actor pays a `watch` channel it has no reader for;
+  `Registry`'s `Entry` stores it; `System::route` hands back a pair instead of a
+  mailbox; and only then does the served path have something to match on. Six
+  touch points across three files, one of them `Mounted` — a public type — and
+  the `Option`-shaped version of it is the *"second construction path that
+  quietly does less"* the house rules ban by name.
+
+  It is also the same seam §5.7's keyed-`ended()` gap wants, and doing it here
+  would re-shape that seam twice for the smaller half of the problem. So: the
+  trade is `registry.rs`'s *zero lines* against a wrong answer to a peer, the
+  wrong answer is documented on the door instead, and this is recorded as the
+  next question rather than left reading like an oversight.
 - **Build any of §9.8's refused designs**, or phase 3 in any part.
 - **Add a knob for the backoff**, an incarnation counter, or a way to ask an actor
   how many times it has restarted. `Ended::GaveUp::after` is a number the
@@ -2421,9 +2535,32 @@ unbounded wait converts every interesting break into silence.
 - **Measure the per-actor cost of the second `watch` state.** `Life` replaced
   `Option<Ended>` in the channel that already existed, so no allocation was added
   on the local path; `tests/actor_memory.rs` was run and not re-baselined.
+
+  **Corrected after review — "no allocation" was true and "nothing moved" was
+  not.** It is still one `watch` channel, but `Life` is **48 bytes** against
+  `Option<Ended>`'s **40**: `Ended` is 40 before and after this wave, so `GaveUp`
+  and the `fatal` field cost *zero*, and the eight bytes are `Option` niche-packing
+  into `Ended`'s spare discriminants where `Life`'s two payload-carrying variants
+  need a tag of their own. Measured and not reasoned — a throwaway `size_of`
+  probe in `local.rs`'s own test module, because `Life` is private:
+  `Ended = 40`, `Option<Ended> = 40`, `Life = 48`.
+
+  Re-baselined at ten thousand idle actors:
+
+  | | Wave 3 recorded | measured now |
+  |---|---|---|
+  | keyed, mounted in a `System` | 1,415 | **1,412** |
+  | local, `ledger::actor(..)` | 1,853 | **1,861** |
+
+  **Local is +8, exactly the `Life`.** Keyed is untouched by this wave — an
+  unsupervised keyed actor gets no `Life` at all — and its −3 is **not** Wave 9's:
+  it is Waves 4 through 8 measured against a figure last written down at Wave 3,
+  and it is recorded here rather than quietly overwritten, because a table nobody
+  re-measures is exactly where a number like that hides. Nothing failed and
+  nothing would have — `BUDGET_PER_LOCAL_ACTOR` is 2,048 — which is why *"the
+  suite ran green"* was not evidence and re-measuring was.
 - **Watch the `docs`, `features` or `wasm` gates fail on this diff.** They were
   run green; no red was manufactured for them.
-||||||| 223cf22
 ## 10. Wave 6 — observability, and the layer that is a parked reply rather than a held handler
 
 Three layers were briefed. Two shipped, and the third shipped as its client half

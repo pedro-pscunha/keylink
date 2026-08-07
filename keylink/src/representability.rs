@@ -308,7 +308,7 @@ impl HasNoDefault for Allowlist {}
 impl HasNoDefault for Eviction {}
 impl HasNoDefault for Retention {}
 impl HasNoDefault for Intensity {}
-/// The fourth and fifth are the fan-out's, and they are the same family read one
+/// The fifth and sixth are the fan-out's, and they are the same family read one
 /// layer up: [`Overflow`] is the choice between *the publisher waits* and *the
 /// slow subscriber is ended*, and both are decisions about the caller's data
 /// rather than ours.

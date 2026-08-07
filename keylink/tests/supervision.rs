@@ -22,8 +22,11 @@
 //!
 //! Every timing claim runs under `#[tokio::test(start_paused = true)]`, so
 //! `tokio::time::Instant` moves only when a timer the code under test set is the
-//! earliest thing the runtime has to do. The two tests that use real time —
-//! the two durable ones and `abort` — assert nothing about it.
+//! earliest thing the runtime has to do. **Four** tests use real time — the two
+//! durable ones, `abort`, and the two-node served one — and not one of them
+//! asserts anything about it. (This said *two* and named three; counted.)
+//! `an_intensity_whose_backoff_would_be_zero_is_refused` needs no runtime at
+//! all: it is a plain `#[test]` over a constructor.
 //!
 //! `tokio::time::advance` plus `yield_now` appears nowhere on purpose: it leaves
 //! the test task runnable, so the runtime never parks, the timer wheel is never
@@ -316,11 +319,12 @@ async fn store(name: &str) -> (Scratch, Files) {
     (scratch, files)
 }
 
-fn limit(max: u32, within: Duration) -> Intensity {
+fn limit(max: u32, recovered_after: Duration) -> Intensity {
     Intensity::new(
         NonZeroU32::new(max).expect("a budget of at least one"),
-        within,
+        recovered_after,
     )
+    .expect("a recovery span whose backoff is not zero")
 }
 
 /// How many times a factory has been called.
@@ -447,6 +451,102 @@ async fn a_restart_storm_ends_the_actor() {
     assert_eq!(seen(&built), 4, "one first incarnation and three restarts");
 }
 
+/// A supervisor that would never sleep is refused where it is built.
+///
+/// `Duration::ZERO` is the case worth naming: `ran_for >= Duration::ZERO` is true
+/// of every incarnation that ever ran, so the budget resets on every failure for
+/// **every** actor — `Ended::GaveUp` unreachable with no precondition left to
+/// violate — and the backoff would be zero, so the loop that then never
+/// terminates would spin with nothing to yield at.
+///
+/// The guard is on the *backoff* rather than on the span alone, because
+/// `recovered_after / max` truncates to nanoseconds: three nanoseconds across a
+/// budget of four is the same busy loop spelled differently, and rejecting only
+/// the literal `ZERO` would leave it reachable from safe code.
+#[test]
+fn an_intensity_whose_backoff_would_be_zero_is_refused() {
+    let four = NonZeroU32::new(4).expect("four");
+
+    assert!(
+        Intensity::new(four, Duration::ZERO).is_none(),
+        "a zero recovery span resets the budget on every failure, and never sleeps"
+    );
+    assert!(
+        Intensity::new(four, Duration::from_nanos(3)).is_none(),
+        "3ns over a budget of four truncates to a zero backoff, which is that loop again"
+    );
+    assert!(
+        Intensity::new(four, Duration::from_nanos(4)).is_some(),
+        "one nanosecond of backoff is a sleep, and this type does not judge how long"
+    );
+}
+
+/// **The precondition `Intensity` states, asserted rather than left to be
+/// found:** an incarnation that *reaches* `recovered_after` and then fails has
+/// recovered by this type's definition, so its failure starts a fresh budget and
+/// this actor never gives up.
+///
+/// `recovered_after` is 100 ms and every incarnation's feed keeps it alive for
+/// 500 ms, so a budget of two resets on every single failure. An actor whose
+/// budget did not reset would be gone after its third incarnation; this one
+/// reaches its sixth and is still running.
+///
+/// **That is the policy and not a hole in it** — OTP's window has the same
+/// property, and an actor that stays up for the declared span between failures
+/// is a slow leak rather than a restart storm, so giving up on it would discard
+/// live state to fix nothing. What it costs the caller is that the number is
+/// chosen against a **failure period**. The one span for which the
+/// unreachability holds for every actor is refused above.
+///
+/// Bounded twice: each incarnation announces itself on a channel, and the actor
+/// is aborted rather than left restarting for as long as the binary runs.
+#[tokio::test(start_paused = true)]
+async fn a_failure_slower_than_its_recovery_span_never_gives_up() {
+    let recovered_after = Duration::from_millis(100);
+    let alive = Duration::from_millis(500);
+    let (announce, mut built) = tokio::sync::mpsc::unbounded_channel();
+
+    let ticker = {
+        let counted = calls();
+        ticker::supervised(
+            move || {
+                let counted = counted.clone();
+                let announce = announce.clone();
+                async move {
+                    let at = counted.fetch_add(1, Ordering::SeqCst);
+                    let _ = announce.send(at);
+                    Ok((
+                        Ticker {
+                            seen: Arc::new(Mutex::new(Vec::new())),
+                        },
+                        Vec::new(),
+                        // One beat after `alive`, and then the end: the
+                        // incarnation lives `alive` and dies of `Ended::Feed`,
+                        // which is a restart-worthy ending exactly like a fault.
+                        ticker::Feeds::new(n0_future::stream::once_future(async move {
+                            tokio::time::sleep(alive).await;
+                            u64::from(at)
+                        })),
+                    ))
+                }
+            },
+            limit(2, recovered_after),
+        )
+    };
+
+    for expected in 0..6 {
+        let at = tokio::time::timeout(NO_PROGRESS, built.recv())
+            .await
+            .expect("a failure slower than its recovery span must restart for ever");
+        assert_eq!(at, Some(expected), "one factory call per incarnation");
+    }
+    assert!(
+        ticker.is_running(),
+        "and the actor is still running, which is the truth about it"
+    );
+    ticker.abort();
+}
+
 /// An actor that gave up still answers `stop()`.
 ///
 /// **The timeout is the assertion.** `stop` waits on the ending channel, and an
@@ -541,8 +641,8 @@ async fn a_restart_is_not_an_ending() {
     );
 }
 
-/// Spending the budget costs its whole window, because the backoff is
-/// `within / max` and there is no knob.
+/// Spending the budget costs the whole recovery span, because the backoff is
+/// `recovered_after / max` and there is no knob.
 ///
 /// That is what stops a supervised actor turning a permanent fault into a hot
 /// loop, and it is the reason `Intensity`'s two numbers are one decision rather
@@ -551,7 +651,7 @@ async fn a_restart_is_not_an_ending() {
 /// earliest thing the runtime has to do.
 #[tokio::test(start_paused = true)]
 async fn the_backoff_spreads_the_budget_across_its_window() {
-    let within = Duration::from_secs(8);
+    let recovered_after = Duration::from_secs(8);
     let started = tokio::time::Instant::now();
 
     let ticker = ticker::supervised(
@@ -564,7 +664,7 @@ async fn the_backoff_spreads_the_budget_across_its_window() {
                 ticker::Feeds::new(n0_future::stream::empty()),
             ))
         },
-        limit(4, within),
+        limit(4, recovered_after),
     );
 
     assert!(matches!(
@@ -574,12 +674,12 @@ async fn the_backoff_spreads_the_budget_across_its_window() {
 
     let spent = started.elapsed();
     assert!(
-        spent >= within,
-        "exhausting the budget must cost its window, not microseconds: {spent:?}"
+        spent >= recovered_after,
+        "exhausting the budget must cost its whole span, not microseconds: {spent:?}"
     );
     assert!(
-        spent < within * 2,
-        "and it must not cost more than one window: {spent:?}"
+        spent < recovered_after * 2,
+        "and it must not cost more than one span: {spent:?}"
     );
 }
 
