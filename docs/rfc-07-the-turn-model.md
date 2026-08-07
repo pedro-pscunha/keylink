@@ -1298,6 +1298,18 @@ makes "an answered call is a stored call" survive a power cut rather than merely
 process restart. An adapter that skipped it would report a much better number and
 quietly mean something weaker.
 
+**"An answered call is a stored call" is true of the reply the *loop* sends, and this
+document shipped it unqualified.** An ordinary `rpc`, a `blob`, a `recv` and a feed item
+all go handler → observer chain → store → answer. A `#[defer]` method answering through
+`Deferred::send` does not: that call hands the value to the caller from inside the
+running handler, where *"this turn's observers neither see it nor gate it"*, so the
+caller holds its answer for the whole ~7.6 ms below. A crash there loses state somebody
+was already told about. Scoped in `persist.rs`'s module header, on the type, in
+`examples/durable_ledger.rs`, and demonstrated by
+`tests/persist.rs::a_deferred_reply_is_answered_before_its_turn_is_stored` — a caller
+holding a receipt for a debit that is not on the disk. A `#[defer]` method answering with
+`Reply::send` inside its own turn is gated normally and keeps the property.
+
 So the number is not a defect to fix in the adapter — it is the price of the promise.
 It is recorded in `keylink/src/persist.rs`'s module documentation, in
 `keylink/examples/durable_ledger.rs`, and reproducible with
@@ -1305,8 +1317,8 @@ It is recorded in `keylink/src/persist.rs`'s module documentation, in
 asserts nothing about it. **There is no wall-clock assertion anywhere in this wave.**
 
 What the number decides: RFC-06 §7's debounce stops being a nice-to-have and becomes the
-obvious next knob, and `Observer::finish` — which Wave 2d added for exactly that reason
-— is already the guaranteed final flush it needs.
+obvious next knob. `Observer::finish` is the port hook it will need — but `Persist` does
+not implement one, and §6.4 says why the version that did was worse than nothing.
 
 ### 6.2 Placement: a module in `keylink`, not a third crate
 
@@ -1360,29 +1372,71 @@ Two files came **off** that allowlist in this wave, which is the part worth reco
 lost the hand-rolled `Saver` that prototyped this adapter. Neither stores anything now.
 A stale allowlist entry is a hole nobody can see.
 
-### 6.4 `dirty`, and why it is not RFC-06 §4.2's deleted `revision`
+**REVISED, 2026-08-07: the first check refused what the port is for.** It matched any
+file outside `keylink-persist` bringing `keylink_persist::Claim` into scope — and
+`impl Claim for MyStore` matches, because there is no spelling of "implement this trait"
+that does not name it. So the grep achieved in-tree exactly what sealing the trait would
+have, three lines below a paragraph in the same file rejecting sealing for costing *"the
+hexagon its whole point … the port exists to be implemented from outside, for a bucket
+or a vault"*. Both could not be true.
 
-`Persist` carries a `bool` meaning **there is a committed change that is not on the disk
-yet**. Set before the write, cleared after it, so a write that failed leaves it standing.
+It was not theoretical: the test-crate adapter that fails a `store` on demand — the one
+that turns §6.4's rule from an argument into a red test — is an in-tree implementor, and
+this gate is what stopped a reviewer compiling the counter-example. The check now exempts
+any file containing `impl … Claim … for`, and still catches a bare importer (watched:
+one file with `use keylink_persist::Claim;` and no impl, and the gate names it). What is
+forbidden is *calling* `Claim::store` on somebody else's claim, which is the second
+check's job and has a named allowlist.
 
-RFC-06 §4.2's `Durable::revision` was an implementor-supplied counter with nothing
-connecting it to a mutation, and it was deleted for that reason. This flag is set by the
-one place that knows a turn happened, and it is read in one place.
+### 6.4 REVISED, 2026-08-07: the `dirty` flag is gone, and its retry was a double-apply
 
-Today it costs nothing on every path but one. `after_turn` stores on every turn it
-accepts and clears the flag, so an actor that stopped normally reaches `finish` clean.
-The single path that arrives dirty is a `store` that returned `Err` — which ends the
-actor immediately, so the state is complete and consistent and only the write is
+This section used to describe a `bool` on `Persist` meaning "there is a committed change
+that is not on the disk yet", set before the write and cleared after it, and an
+`Observer::finish` that wrote the state one last time whenever the flag was standing.
+The paragraph read: *"the state is complete and consistent and only the write is
 missing, and one more attempt before the state is dropped is the difference between
-losing the last committed turn and not.
+losing the last committed turn and not."*
 
-**`finish`'s `Ended::Panicked` arm looks redundant and is not.** With a store on every
-turn it cannot fire: a panicked turn is refused without setting the flag, and a failed
-store ends the actor before another turn can panic. It is the rule a debounce needs. The
-moment `after_turn` stops writing on every turn, "turn n completed and is unwritten,
-turn n+1 panicked" is reachable, the flag stands over a half-applied state, and
-`Ended::Panicked` is the only thing there that says so. Losing one committed turn is the
-right trade against writing a state a restart would reproduce.
+**That was wrong, and a review caught it. It is money-adjacent, so the correction is
+recorded here in full rather than edited over.**
+
+The only thing that could leave the flag standing was a `store` that had already
+returned `Err`. That `Err` refuses the turn, which ends the actor, which hands the
+caller `TurnLost::Refused` — *"it ran and was not committed"* — and hands a peer
+`observer refused: persist` under a comment in `local.rs` saying the same thing. So the
+turn `finish` retried was **exactly** the turn somebody had been told was not committed.
+A caller acting on that refusal by replaying applied the entry twice; on a `Post(entry)`
+against a ledger that is money.
+
+The fix is a decision, and this is the direction taken: **the code was made to match the
+promise, not the promise weakened.** The refusal's text is what crosses the wire and the
+only thing the caller has, so it stands, and the retry goes.
+
+The rule the adapter now holds, in both directions:
+
+> **What is stored is exactly the set of turns that were answered.**
+
+The first half is the wave's headline. The second half — a turn that was not answered is
+not stored either — is the one that was broken, and it is now
+`tests/persist.rs::a_turn_whose_store_failed_is_not_written_on_the_way_out`, over two
+real nodes so the assertion is on the sentence a **peer** reads. Made red by putting the
+retry back: `left: [1, 2]`, `right: [1]`.
+
+Three consequences worth stating rather than leaving to be re-derived:
+
+- **A feed turn has no caller, so retrying its failed store really would be harmless.**
+  The adapter still does not, because it cannot tell the two apart: `TurnInfo` carries
+  the outcome and the method name and nothing about who is owed a reply. Fail closed.
+- **`finish` and the flag are both deleted, not repaired.** With the retry gone the flag
+  had no reader, and a `finish` that cannot legitimately write anything is not a
+  guaranteed final flush — it is speculative code for a debounce that does not exist. A
+  debounce returns `Ok` from `after_turn` **without** writing, which gives up "an
+  answered call is a stored call" on its own terms; its `finish` therefore answers a
+  different question than this one would have, and pre-building the answer got it wrong
+  once already.
+- **RFC-06 §4.2's deleted `Durable::revision` is still deleted for its own reason** — an
+  implementor-supplied counter with nothing connecting it to a mutation. That argument
+  did not depend on this flag existing.
 
 ### 6.5 The `A: Sync` trap, from the other side of the port
 
@@ -1440,12 +1494,16 @@ that never existed.
 | a panicked turn is not stored, and ends the actor | `a_panicked_turn_is_not_stored_and_ends_the_actor` | the panic arm never fires → `left: [1, 99], right: [1]` |
 | a refusal before `Persist` prevents the store | `a_refusal_before_persist_prevents_the_store` | swap the two observers → a refused turn is on the disk |
 | the claim is free the instant `stop().await` returns | `the_claim_is_free_the_instant_stop_returns` | `std::mem::forget(hooks)` in `run_loop` → `Busy { id: StateId("ledgers/sp-01") }` |
-| two `open`s on one `StateId`, the second `Error::Busy` | `a_second_open_on_one_state_is_busy` | — the store's own `try_lock`, already red-tested in `file.rs` |
+| two `open`s on one `StateId`, the second `Error::Busy` | `a_second_open_on_one_state_is_busy` | `WouldBlock` hands out a `FileClaim` instead of `Error::Busy` → `a second open on a claimed state must be refused` |
 | a feed turn is stored on the same rule | `feeds.rs::a_feed_turn_is_stored_on_the_same_rule_as_a_mailbox_turn` | `after_turn` does not store → `something was stored` |
 | a keyed actor's state survives its own process | `a_keyed_actors_state_survives_its_own_process` | empty hook slice → `left: [20], right: [10, 20]` |
 | a non-probe `Observer` implementor exists | `rg 'impl.*Observer<' keylink/src` | `keylink/src/persist.rs` is the only hit outside `#[cfg(test)]` |
 | `A: Sync` stays out of the design | `a_state_that_is_not_sync_is_still_persisted` | §6.5's two breaks |
 | the per-turn cost is measured, not estimated | `the_per_turn_store_cost` (`#[ignore]`) | §6.1 |
+| a refused turn is not stored on the way out | `a_turn_whose_store_failed_is_not_written_on_the_way_out` | put the `finish` retry back → `left: [1, 2], right: [1]` |
+| a `#[defer]` reply is answered before its turn is stored | `a_deferred_reply_is_answered_before_its_turn_is_stored` | drop the `deferred.send` → `MailboxClosed`; or stop storing → the refusal never happens |
+| the restored state cannot be dropped on the way to the observer | `Opened::start_from` is the only route | write the old `let (_restored, saver) = ..` → `E0308`, `expected Opened<_, Files>, found (_, _)` |
+| both shipped crates still package | `mise run package` | drop `version` from keylink's `keylink-persist` dependency → `all dependencies must have a version requirement specified when packaging` |
 
 `keylink/tests/durable.rs` is unchanged in behaviour and keeps committing once per run
 through `Handle::with_state`: **`with_state` survives and is not deprecated.** It is a
@@ -1455,13 +1513,37 @@ did and no longer does.
 
 ### 6.8 What Wave 5 did NOT do
 
-- **Debounce.** The number in §6.1 is the argument for it and `finish` is the flush it
-  needs, but nothing here batches. A caller who wants the other trade has it by choosing
-  a different adapter, not by configuring this one.
-- **Retry a failed store, except once at `finish`.** The `dirty` flag's one live path is
-  untested: making a real `Files` store fail *transiently* is not something this suite can
-  arrange — `limit()` fails permanently, and removing the directory breaks the lock the
-  claim holds. Listed among the guards that were **not** watched to fail.
+- **Debounce.** The number in §6.1 is the argument for it, but nothing here batches, and
+  §6.4 explains why no part of it was pre-built either. A caller who wants the other
+  trade has it by choosing a different adapter, not by configuring this one.
+- **Retry a failed store, at all.** The version that retried once at `finish` retried the
+  turn whose caller had been told it was not committed — §6.4. It is deleted, and the
+  path is no longer untested: it needs a store that fails **transiently**, which a real
+  `Files` cannot be asked to do (`limit()` fails permanently, and removing the directory
+  breaks the lock the claim holds), so `tests/persist.rs` implements the port a second
+  time. `Flaky` fails exactly one `store` and then works, which is what makes the break
+  discriminating.
+- **Close the `#[defer]` window.** `Deferred::send` answers from inside the running
+  handler, before the observer chain — §6.1. It is scoped in five places and
+  demonstrated by a test rather than argued about. **The honest fix, not built here:**
+  park the *send* as well as the reply, so the value is released after the observer
+  chain of the turn that produced it. That keeps `#[defer]`'s whole point — the reply
+  still outlives the turn that *received* it — and costs one queue in the loop. It
+  touches `local.rs`, so it is a decision for whoever owns the loop.
+- **Make the idempotency ledger survive a restart, or say the guarantee has changed.**
+  Said, in `keylink/src/idempotency.rs`'s "What is NOT guaranteed". Durable state plus a
+  volatile ledger is a **new cross-restart double-apply**, and this wave created it:
+  turn *n* is fsynced, `Guard::record` writes the replayable reply into memory, the
+  process dies before the frame reaches the peer, the peer retries, the restarted
+  process restores a state that already contains turn *n*, the ledger is empty,
+  `claim_key` answers `Claimed::Run`, and the handler runs turn *n* again. Neither half
+  is wrong alone; the pair is new. Effectively-once is a property of one process's
+  lifetime, not of a key.
+
+  **`README.md`'s limit 2 says "the ledger is memory … `keylink-persist` makes an
+  actor's *state* durable and does nothing for the ledger", which is true and stops one
+  sentence short of the consequence.** That file is owned by a parallel session, so this
+  wave did not stage it; the sentence it wants is the interleaving above.
 - **Move the ALPN.** `keylink/Probe/d3fe34471921164e` is unchanged, and all five hash
   tests in `tests/protocol.rs` are green. An observer is local: it is a constructor
   argument, not a declared type, so there is nothing for the wire graph to hash.
@@ -1485,6 +1567,43 @@ did and no longer does.
   generic `actor_with<A: Actor>` leaves `D` ambiguous even where exactly one type
   implements that service's `Actor`, because rustc will not pick an impl to resolve a
   type parameter. Documented on `open` rather than worked around.
+
+### 6.9 REVISED, 2026-08-07: two claims the manifest and the type system did not hold
+
+**`open` returned a tuple, and a tuple element is not `#[must_use]`.** The doc said
+*"handing the restored state back with the adapter that will keep writing it makes the
+read impossible to leave out"*. It did not: `let (_restored, saver) = ..` compiled clean,
+and it was the shortest form — which this wave's own tests wrote at five sites, with a
+sixth in `tests/feeds.rs` and one that passed `Ledger::default()` beside a restored state
+it had just read. An author copying the short form into a service with live stored state
+loses it on turn 1, silently, once per deploy.
+
+`open` returns `Opened<D, S>` now: one value, `#[must_use]`, with private fields.
+`was_stored()` asks the first-run question without taking anything, and `start_from`
+is the only method that yields a `Persist` — and it yields the state in the same
+expression. Every call site moved; the old spelling is `E0308`, watched.
+
+It is not a claim that the state cannot be *discarded* — `let (_state, saver) = ..
+.start_from(..)` still compiles, and no type can stop that. It is that the discard has to
+be written on purpose, instead of being the shortest thing to copy.
+
+**`keylink` could not be packaged, from the commit that made this dependency real.**
+`cargo package -p keylink` failed with *"all dependencies must have a version requirement
+specified when packaging"*: cargo strips unversioned dev-dependencies and the
+`keylink-persist` line was fine while it was one. `keylink-persist` was also
+`publish = false`, which would have refused the publish a second way, and `keylink`
+carries `description`/`license`/`repository` and a manifest comment about "a published
+build".
+
+Fixed both ways — `version = "0.1.0"` beside `path`, and `keylink-persist` is publishable
+— and **priced**: that is a second crate name on crates.io, released before `keylink` and
+version-bumped in lockstep whenever the port moves. It is what a port in its own crate
+costs once anything ships, and the alternative (folding the port back in) costs the
+browser build and the "the port does not know the framework" claim.
+
+`mise run package` is in the gate now, because a manifest can stop being publishable
+without one line of code changing and nothing else in the gate looks. Watched by removing
+the version again.
 
 ---
 

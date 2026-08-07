@@ -44,6 +44,28 @@
 //! - **Durability.** The record is memory. It dies with the process, and a
 //!   restarted service will run a retried call again. keylink has no journal and
 //!   this is not one. Durable execution is what [Restate] is for.
+//!
+//!   **A durable state makes that sentence sharper, and the sharper version is
+//!   a double-apply.** While nothing survived a restart, re-running a retried
+//!   call was a re-run against a state that had also been lost, so the work
+//!   happened once in total. [`Persist`](crate::Persist) changed that half and
+//!   not this one. The interleaving, all of it on the served path:
+//!
+//!   1. Turn *n* completes. The observer chain stores the state and `fsync`s it.
+//!   2. [`Reply::answer`](crate::Reply) marks the key `completed`, and
+//!      `Guard::record` writes the replayable reply into the **in-memory**
+//!      ledger.
+//!   3. The process dies before the reply frame reaches the peer.
+//!   4. The peer retries the same key. The restarted process restores a state
+//!      that **already contains turn *n***, its ledger is empty, `claim_key`
+//!      answers `Claimed::Run`, and the handler runs turn *n* a second time.
+//!
+//!   Neither half is wrong on its own: the state is exactly as durable as it
+//!   promises, and the ledger is exactly as volatile as it says. It is the pair
+//!   that is new, and it is the reason effectively-once is a property of one
+//!   process's lifetime rather than of a key. A durable ledger is what would
+//!   close it, and there is no cheap version — it has to be written on the same
+//!   commit as the state, or the two disagree in the other direction.
 //! - **A reply forever.** Records are bounded three ways — [`MAX_RECORDS`]
 //!   entries, [`MAX_RECORDED_BYTES`] of reply, and [`RECORD_TTL`] of age. Past
 //!   any of them the reply is dropped and the key becomes

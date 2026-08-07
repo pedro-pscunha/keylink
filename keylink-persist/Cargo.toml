@@ -8,7 +8,17 @@ rust-version = "1.91"
 description = "A port for actor state that outlives its process, and the local-file adapter."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pedrocunha/keylink"
-publish = false
+# Publishable, and it has to be. `keylink` depends on this crate for real —
+# `persist-file` is a default feature — and cargo refuses to publish a crate
+# whose dependency cannot be published. `publish = false` here made `keylink`
+# unpublishable, quietly, from the commit that added the dependency.
+#
+# **The price, stated rather than discovered later:** this is a second crate
+# name on crates.io, released before `keylink` and version-bumped in lockstep
+# whenever the port moves. That is what a port in its own crate costs once
+# anything ships. The alternative — folding the port back into `keylink` — costs
+# the browser build and the "the port does not know the framework" claim, which
+# is a worse trade.
 
 [features]
 # The local-file adapter. On by default because it is the one that exists.

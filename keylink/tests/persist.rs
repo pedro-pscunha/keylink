@@ -14,13 +14,14 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink::{
-    ActorId, Allowlist, Caller, Ended, Eviction, Observer, Persist, Server, Stop, TurnFut, TurnInfo,
+    ActorId, Allowlist, Caller, Deferred, Ended, Eviction, Observer, Persist, Replied, Reply,
+    Server, Stop, TurnFut, TurnInfo,
 };
 use std::time::Duration;
 
 use keylink_persist::file::Files;
 use keylink_persist::versioned::FRAME_LEN;
-use keylink_persist::{Durable, RestoreError, Snapshots, StateId};
+use keylink_persist::{Claim, Durable, RestoreError, Snapshots, StateId};
 
 mod common;
 use common::local_node;
@@ -128,6 +129,92 @@ fn snapshot_path(scratch: &Scratch) -> std::path::PathBuf {
     scratch.0.join("ledgers").join("sp-01.snapshot")
 }
 
+/// A **second adapter for the port**, whose `store` can be made to fail exactly
+/// once.
+///
+/// Not a mock of anything the house rule protects — not the ledger, not the
+/// mailbox, not the connection. It is the port being implemented from outside
+/// the crate that declares it, which is the only reason a port exists, and
+/// `.mise/tasks/framing` permits it for that reason: this file **implements**
+/// `Claim` rather than merely importing it, and the gate now tells those apart.
+///
+/// It exists because a real `Files` cannot be asked to fail **transiently**.
+/// `limit()` fails permanently and removing the directory breaks the lock the
+/// claim holds — RFC-07 §6.8 recorded exactly that as the reason the failed-store
+/// path shipped with no test on it at all.
+///
+/// One state, and the [`StateId`] is ignored: the tests that need two states, or
+/// exclusion between two holders, use `Files`.
+struct Flaky {
+    /// Armed between two turns. **Cleared by the failure it causes**, so the
+    /// next attempt succeeds — which is the whole point. A store that stayed
+    /// broken would make the break below go red for the wrong reason, and a red
+    /// test that cannot say which rule it caught is not a guard.
+    failing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// What is "on the disk": framed bytes, exactly what `Files` would hold.
+    stored: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+}
+
+impl Flaky {
+    fn new() -> Self {
+        Self {
+            failing: std::sync::Arc::default(),
+            stored: std::sync::Arc::default(),
+        }
+    }
+
+    /// The next `store`, and only the next one, returns `Err`.
+    fn fail_the_next_store(&self) {
+        self.failing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The stored state, read the way the `Files` tests read the file: raw,
+    /// because the claim is what the running actor is holding.
+    fn on_disk<D: Durable>(&self) -> Option<D> {
+        let framed = self.stored.lock().expect("not poisoned").clone();
+        framed.map(|bytes| D::restore(&bytes[FRAME_LEN..]).expect("restores"))
+    }
+}
+
+impl Snapshots for Flaky {
+    type Claim = FlakyClaim;
+
+    async fn claim(&self, _id: &StateId) -> keylink_persist::Result<FlakyClaim> {
+        Ok(FlakyClaim {
+            failing: std::sync::Arc::clone(&self.failing),
+            stored: std::sync::Arc::clone(&self.stored),
+        })
+    }
+}
+
+/// [`Flaky`]'s claim. Exclusivity is deliberately not modelled:
+/// `a_second_open_on_one_state_is_busy` holds that against the real adapter, and
+/// this one exists for one property.
+struct FlakyClaim {
+    failing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stored: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+}
+
+impl Claim for FlakyClaim {
+    async fn load(&self) -> keylink_persist::Result<Option<Vec<u8>>> {
+        Ok(self.stored.lock().expect("not poisoned").clone())
+    }
+
+    async fn store(&mut self, bytes: &[u8]) -> keylink_persist::Result<()> {
+        if self
+            .failing
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(keylink_persist::Error::Io(std::io::Error::other(
+                "the store said no, once",
+            )));
+        }
+        *self.stored.lock().expect("not poisoned") = Some(bytes.to_vec());
+        Ok(())
+    }
+}
+
 /// An observer that refuses everything, so the chain's short-circuit is
 /// reachable from a test.
 struct Refusing;
@@ -158,12 +245,15 @@ async fn a_state_survives_the_process_that_built_it() {
 
     // ── run one
     {
-        let (restored, saver) = Persist::<Ledger, _>::open(&files, &id)
+        let opened = Persist::<Ledger, _>::open(&files, &id)
             .await
             .expect("claims and loads");
-        assert!(restored.is_none(), "the first run has nothing stored");
+        assert!(!opened.was_stored(), "the first run has nothing stored");
 
-        let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(saver)]);
+        // `start_from` and not `Ledger::default()`, even here where the two are
+        // the same value. This line is the one an author copies.
+        let (state, saver) = opened.start_from(Ledger::default);
+        let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
         for entry in [1, 2, 3] {
             ledger.post(entry).await.expect("running");
         }
@@ -172,10 +262,11 @@ async fn a_state_survives_the_process_that_built_it() {
 
     // ── run two: as far as the store can tell, a new process
     {
-        let (restored, saver) = Persist::<Ledger, _>::open(&files, &id)
+        let opened = Persist::<Ledger, _>::open(&files, &id)
             .await
             .expect("claims and loads");
-        let state = restored.expect("run one stored something");
+        assert!(opened.was_stored(), "run one stored something");
+        let (state, saver) = opened.start_from(Ledger::default);
         assert_eq!(state.entries, vec![1, 2, 3]);
 
         let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
@@ -184,10 +275,12 @@ async fn a_state_survives_the_process_that_built_it() {
     }
 
     // ── run three, which stores nothing, so what it reads is run two's write
-    let (restored, _saver) = Persist::<Ledger, _>::open(&files, &id)
+    let opened = Persist::<Ledger, _>::open(&files, &id)
         .await
         .expect("claims and loads");
-    assert_eq!(restored.expect("stored").entries, vec![1, 2, 3, 4]);
+    assert!(opened.was_stored(), "run two stored something");
+    let (state, _saver) = opened.start_from(Ledger::default);
+    assert_eq!(state.entries, vec![1, 2, 3, 4]);
 }
 
 /// **The criterion: an answered call is a stored call — and the bytes are 4c's
@@ -208,11 +301,12 @@ async fn a_state_survives_the_process_that_built_it() {
 #[tokio::test]
 async fn an_answered_call_is_a_stored_call_and_its_bytes_are_framed() {
     let (scratch, files) = store("answered").await;
-    let (_restored, saver) = Persist::open(&files, &state_id())
+    let (state, saver) = Persist::open(&files, &state_id())
         .await
-        .expect("claims and loads");
+        .expect("claims and loads")
+        .start_from(Ledger::default);
 
-    let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(saver)]);
+    let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
     assert_eq!(ledger.post(0x2A).await.expect("running"), 1);
 
     // Nothing between the awaited call and this read.
@@ -269,11 +363,12 @@ async fn an_answered_call_is_a_stored_call_and_its_bytes_are_framed() {
 #[tokio::test]
 async fn a_panicked_turn_is_not_stored_and_ends_the_actor() {
     let (scratch, files) = store("panicked").await;
-    let (_restored, saver) = Persist::open(&files, &state_id())
+    let (state, saver) = Persist::open(&files, &state_id())
         .await
-        .expect("claims and loads");
+        .expect("claims and loads")
+        .start_from(Ledger::default);
 
-    let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(saver)]);
+    let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
     ledger.post(1).await.expect("running");
 
     // Spawned, because the panic is resumed in whoever awaited the call.
@@ -313,11 +408,12 @@ async fn a_panicked_turn_is_not_stored_and_ends_the_actor() {
 #[tokio::test]
 async fn a_refusal_before_persist_prevents_the_store() {
     let (scratch, files) = store("refused").await;
-    let (_restored, saver) = Persist::open(&files, &state_id())
+    let (state, saver) = Persist::open(&files, &state_id())
         .await
-        .expect("claims and loads");
+        .expect("claims and loads")
+        .start_from(Ledger::default);
 
-    let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(Refusing), Box::new(saver)]);
+    let ledger = ledger::actor_with(state, vec![Box::new(Refusing), Box::new(saver)]);
     assert!(ledger.post(7).await.is_err(), "the turn was refused");
 
     match ledger.ended().await {
@@ -327,6 +423,85 @@ async fn a_refusal_before_persist_prevents_the_store() {
     assert!(
         !snapshot_path(&scratch).exists(),
         "a refused turn must leave nothing on the disk"
+    );
+}
+
+/// **The criterion: what is stored is exactly what was answered — in the
+/// direction that is easy to lose.** A turn whose store failed was reported to
+/// its caller as *not committed*, so it must not reach the store afterwards
+/// either.
+///
+/// This is the path RFC-07 §6.8 listed as untested, and the version this
+/// replaced got it wrong. `Persist` kept a `dirty` flag set before the write,
+/// and `Observer::finish` stored the state one last time whenever the flag was
+/// still standing. The only thing that could leave it standing was a `store`
+/// that had already returned `Err` — the turn whose caller had already been
+/// handed a refusal. So the adapter wrote **precisely** the turn it had told
+/// somebody was not written, and a caller who acted on that refusal by replaying
+/// applied the entry twice.
+///
+/// # Over two real nodes, because the promise is a peer's
+///
+/// A local caller cannot see this: the generated handle collapses
+/// `Answered::Refused` into `MailboxClosed` — *"the actor is no longer
+/// running"* — and `ended()` is the only local route to the reason. A **peer**
+/// is told `observer refused: persist`, produced by `local.rs` under a comment
+/// reading *"The turn ran and was not committed"*, and that sentence is the
+/// whole of what the caller has to act on. Asserting it here is what makes the
+/// fix "the code was made to match the promise" rather than a preference.
+///
+/// Made red by putting the retry back — a `finish` that stores when a flag set
+/// before the write is still standing. `Flaky` then holds `[1, 2]` and the
+/// message names the double apply.
+#[tokio::test]
+async fn a_turn_whose_store_failed_is_not_written_on_the_way_out() {
+    let store = Flaky::new();
+    let opened = Persist::<Ledger, _>::open(&store, &state_id())
+        .await
+        .expect("claims and loads");
+    assert!(!opened.was_stored(), "the first run has nothing stored");
+    let (state, saver) = opened.start_from(Ledger::default);
+
+    let server = local_node().await;
+    let client_node = local_node().await;
+
+    let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+    let _running = ledger
+        .serve(&server, Allowlist::anyone())
+        .expect("one service, no duplicate ALPN");
+    let client = ledger::Client::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("the client dials the actor");
+
+    client.post(1).await.expect("the peer's call is answered");
+
+    store.fail_the_next_store();
+    let refused = client
+        .post(2)
+        .await
+        .expect_err("a store that failed refuses its turn");
+    assert!(
+        refused.to_string().contains("observer refused: persist"),
+        "the promise the peer acts on: got {refused}"
+    );
+
+    // `ended()` resolving means `run_loop` ran every observer's `finish` and
+    // dropped the state, so what is stored now is final. Read afterwards on
+    // purpose: the whole finding is about what happens *after* the refusal.
+    match ledger.ended().await {
+        Ended::Observer { name, .. } => assert_eq!(name, "persist"),
+        other => panic!("got {other:?}"),
+    }
+
+    assert_eq!(
+        store
+            .on_disk::<Ledger>()
+            .expect("the first post was stored")
+            .entries,
+        vec![1],
+        "entry 2's caller was told the turn was not committed, so it must not be \
+         stored: a peer or an operator who takes that refusal at its word and \
+         replays applies the entry twice"
     );
 }
 
@@ -347,9 +522,12 @@ async fn a_refusal_before_persist_prevents_the_store() {
 async fn the_claim_is_free_the_instant_stop_returns() {
     let (_scratch, files) = store("claim").await;
     let id = state_id();
-    let (_restored, saver) = Persist::open(&files, &id).await.expect("claims and loads");
+    let (state, saver) = Persist::open(&files, &id)
+        .await
+        .expect("claims and loads")
+        .start_from(Ledger::default);
 
-    let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(saver)]);
+    let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
     ledger.post(1).await.expect("running");
     ledger.stop().await;
 
@@ -365,24 +543,29 @@ async fn the_claim_is_free_the_instant_stop_returns() {
 /// Not a silent second writer, and not a transient error to retry: it means
 /// something else believes it owns this state, which is the whole reason the port
 /// has a claim in it at all.
+///
+/// Watched to fail — it was disclosed as unwatched and it is not any more. Make
+/// `Files::claim` hand out a `FileClaim` on `TryLockError::WouldBlock` instead
+/// of `Error::Busy`, which is the shape of any adapter that opens the file and
+/// forgets to lock it: `a second open on a claimed state must be refused`.
 #[tokio::test]
 async fn a_second_open_on_one_state_is_busy() {
     let (_scratch, files) = store("busy").await;
     let id = state_id();
 
-    let (_restored, _held) = Persist::<Ledger, _>::open(&files, &id)
+    // Holding the `Opened` holds the claim: the state and the observer are both
+    // still inside it, so there is nothing to bind and nothing to drop early.
+    let _held = Persist::<Ledger, _>::open(&files, &id)
         .await
         .expect("claims and loads");
 
-    // A `match` and not `expect_err`, because the success arm carries a `Ledger`
-    // and a `Persist`, and neither has a reason to be `Debug` for a test's sake.
-    match Persist::<Ledger, _>::open(&files, &id).await {
-        Err(refused) => assert!(
-            matches!(refused, keylink_persist::Error::Busy { .. }),
-            "got {refused:?}"
-        ),
-        Ok(_) => panic!("a second open on a claimed state must be refused"),
-    }
+    let refused = Persist::<Ledger, _>::open(&files, &id)
+        .await
+        .expect_err("a second open on a claimed state must be refused");
+    assert!(
+        matches!(refused, keylink_persist::Error::Busy { .. }),
+        "got {refused:?}"
+    );
 }
 
 // ───────────────────────────────────────────────────────── the keyed half
@@ -412,18 +595,15 @@ async fn a_keyed_actors_state_survives_its_own_process() {
     let client_node = local_node().await;
 
     for (run, entry, expected) in [(1u8, 10u64, vec![10u64]), (2, 20, vec![10, 20])] {
-        let (restored, saver) = Persist::<Ledger, _>::open(&files, &id)
+        let (state, saver) = Persist::<Ledger, _>::open(&files, &id)
             .await
-            .expect("claims and loads");
+            .expect("claims and loads")
+            .start_from(Ledger::default);
         let system = ledger::System::builder(Eviction::Never).capacity(4).build();
         system
             .mount(
                 actor.clone(),
-                ledger::spawn_wired(
-                    restored.unwrap_or_default(),
-                    vec![Box::new(saver)],
-                    ledger::Feeds::new(),
-                ),
+                ledger::spawn_wired(state, vec![Box::new(saver)], ledger::Feeds::new()),
             )
             .expect("mounts");
 
@@ -450,36 +630,233 @@ async fn a_keyed_actors_state_survives_its_own_process() {
 
         // Ends the actor, which drops its observers, which releases the claim —
         // the same teardown the local path runs, because it is the same loop.
+        // Dropping the observers is the whole of what durability needs here:
+        // every accepted turn was already stored before its reply.
         //
         // `shutdown` rather than `stop`: Wave 4b deleted `System::stop`, whose
         // rustdoc claimed `tokio::time::timeout` composes when a fired timeout
         // dropped the `JoinHandle` and detached a live actor still holding this
         // very `Claim`. Every caller names a budget now.
         //
-        // The budget is generous on purpose, and the number is not arbitrary:
-        // this actor's `Persist` observer stores on the way out, and a store is
-        // two `fsync`s plus a `rename` — measured at ~7.6 ms per turn on this
-        // machine (RFC-07 §6.1). A budget near that figure would be asserting
-        // the disk's latency rather than the teardown's correctness, and the
-        // failure would look like a flake. `Some(..)` is the claim: the id was
-        // mounted and the drain finished inside the budget, so the observers are
-        // dropped and the claim is free by the time `Persist::open` below runs.
-        assert!(
-            system
-                .shutdown(&actor, Duration::from_secs(5))
-                .await
-                .is_some(),
-            "the actor was mounted"
-        );
+        // `Some(Ended::Stopped)` and not `is_some()`, and the budget's old
+        // justification is gone with it.
+        //
+        // The comment here used to read: the 5 s is generous because "this
+        // actor's `Persist` observer stores on the way out", and `Some(..)` is
+        // the claim that "the drain finished inside the budget". Both were
+        // wrong. `shutdown` answers `Some` whenever the id was **mounted**, and
+        // an expired drain answers `Some(Ended::Vanished)` — so the assertion
+        // could not see the property the number was chosen for. And this
+        // adapter no longer writes on the way out at all: `Persist` implements
+        // no `Observer::finish`, so the teardown does no I/O and there is no
+        // `fsync` for a budget to leave room for.
+        //
+        // Verified rather than assumed, and the result is the honest reason the
+        // number is still 5 s: **a budget of one nanosecond passes this test**,
+        // because the drain completes on the first poll. So the 5 s buys
+        // headroom against a loaded CI box and nothing else, and this assertion
+        // is NOT watched to fail — nothing available here produces a
+        // `Vanished`. It is still strictly stronger than `is_some()`, which
+        // accepted every ending there is.
+        match system.shutdown(&actor, Duration::from_secs(5)).await {
+            Some(Ended::Stopped) => {}
+            other => panic!("the actor was mounted and must drain: got {other:?}"),
+        }
         drop(running);
     }
 
-    let (restored, _saver): (Option<Ledger>, _) =
-        Persist::open(&files, &id).await.expect("claims and loads");
+    let opened = Persist::<Ledger, _>::open(&files, &id)
+        .await
+        .expect("claims and loads");
+    assert!(opened.was_stored(), "the keyed runs stored something");
+    let (state, _saver) = opened.start_from(Ledger::default);
     assert_eq!(
-        restored.expect("the keyed runs stored something").entries,
+        state.entries,
         vec![10, 20],
         "a keyed actor's state must outlive its process exactly as a local one's does"
+    );
+}
+
+// ──────────────────────────────────── the one path where the headline is false
+
+keylink::service! {
+    service Teller;
+
+    /// Parked, and answered from a later `approve` — through
+    /// [`Deferred::send`], which is the call this whole section is about.
+    #[defer]
+    rpc Withdraw(amount: u64) -> u64;
+
+    /// Debits every parked withdrawal and hands each caller its receipt.
+    rpc Approve() -> u64;
+
+    /// How many withdrawals are parked. An ordinary `rpc`, so the test below
+    /// waits for a park by **asking** rather than by sleeping — `tests/defer.rs`
+    /// established the idiom and the reason: a `Waiting()` call takes a mailbox
+    /// permit like anything else, so it can only answer once the `withdraw` turn
+    /// has finished.
+    rpc Waiting() -> u64;
+}
+
+/// A balance, and the withdrawals waiting for somebody to approve them.
+///
+/// `waiting` is **not** part of the snapshot and cannot be: a [`Deferred`] is a
+/// live channel to a caller in this process. A restart answers nothing — the
+/// loop drains parked replies as `TurnLost::Gone` on the way out — which is a
+/// second reason a parked reply and a durable state need thinking about
+/// together.
+#[derive(Default)]
+struct Vault {
+    balance: u64,
+    waiting: Vec<(u64, Deferred<u64>)>,
+}
+
+impl teller::Actor for Vault {
+    async fn withdraw(&mut self, _cx: Caller<'_>, reply: Reply<u64>, amount: u64) -> Replied<u64> {
+        let (deferred, replied) = reply.later();
+        self.waiting.push((amount, deferred));
+        replied
+    }
+
+    async fn approve(&mut self, _cx: Caller<'_>) -> u64 {
+        let approved = self.waiting.len() as u64;
+        // `mem::take` and not `drain`, because the loop body touches a second
+        // field of `self`.
+        for (amount, deferred) in std::mem::take(&mut self.waiting) {
+            self.balance -= amount;
+            // **The receipt crosses to its caller here**, inside the handler.
+            // No observer has run and nothing has been stored.
+            deferred.send(self.balance);
+        }
+        approved
+    }
+
+    async fn waiting(&mut self, _cx: Caller<'_>) -> u64 {
+        self.waiting.len() as u64
+    }
+}
+
+impl Durable for Vault {
+    const VERSION: u32 = 1;
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.balance.to_le_bytes().to_vec()
+    }
+
+    fn restore(bytes: &[u8]) -> Result<Self, RestoreError> {
+        let balance: [u8; 8] = bytes.try_into().map_err(|_| {
+            RestoreError::Malformed(format!("a vault is 8 bytes, not {}", bytes.len()))
+        })?;
+        Ok(Self {
+            balance: u64::from_le_bytes(balance),
+            waiting: Vec::new(),
+        })
+    }
+
+    fn migrate(_from: u32, _bytes: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> {
+        Ok(None)
+    }
+}
+
+/// Wait for `want` withdrawals to be parked by asking, not by sleeping.
+/// `tests/defer.rs::parked`, with this file's names.
+async fn waiting_for(vault: &teller::Handle<Vault>, want: u64) {
+    for _ in 0..500 {
+        if vault.waiting().await.expect("the actor is running") == want {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("{want} withdrawals never parked");
+}
+
+/// **A `#[defer]` reply is answered BEFORE its turn is stored, and this test
+/// demonstrates the window rather than asserting it away.**
+///
+/// "An answered call is a stored call" is true of an ordinary `rpc`, where the
+/// loop answers after the observer chain. It is **false** for
+/// [`Deferred::send`], and that call is the whole point of `#[defer]`: the value
+/// crosses the channel from inside the running handler, and — `local.rs`, on the
+/// deferred arm — *"this turn's observers neither see it nor gate it"*.
+///
+/// The order for a parked reply is: handler mutates the state →
+/// `deferred.send(receipt)` → **the caller has its answer** → handler returns →
+/// `after_turn` → ~7.6 ms of `fsync`. A crash anywhere in that window loses
+/// state a caller was already told about.
+///
+/// A crash is not something a test can arrange, so the window is shown with the
+/// other failure that lands in the same place: the store **fails**. The
+/// withdrawal's caller still receives its receipt for a balance of 60, the
+/// approving turn is refused, and what is stored is still 100. Same window, same
+/// consequence — a caller holding a receipt for a debit that is not on the disk
+/// — with a hard assertion instead of a race.
+///
+/// # This test pins a known limit, so changing it is the deliberate act
+///
+/// If `Deferred::send` is ever made to wait for the observer chain, this test
+/// goes red, and that redness is correct: it is the notice that a documented
+/// limit has been closed. Fix the limit, then change this test and the five
+/// places that scope the claim — `persist.rs`'s module header and type doc,
+/// `examples/durable_ledger.rs`, and RFC-07 §6.1 and §6.8.
+///
+/// Watched to fail from both ends, because two facts have to hold at once and
+/// one break can only reach one of them:
+///
+/// - drop the `deferred.send(..)` from `approve` — the receipt then never
+///   crosses, the parked caller is drained as the actor ends, and the assertion
+///   reads `the parked caller was answered from inside the handler:
+///   MailboxClosed`. That is what pins the answer to `Deferred::send` rather
+///   than to anything the loop does.
+/// - make `Persist::after_turn` stop storing — the first assertion goes first,
+///   because a store that never runs cannot fail and `approve` is not refused.
+///   That is what pins the second half to a real write.
+#[tokio::test]
+async fn a_deferred_reply_is_answered_before_its_turn_is_stored() {
+    let store = Flaky::new();
+    let id = StateId::new("vaults/sp-01").expect("valid");
+    let opened = Persist::<Vault, _>::open(&store, &id)
+        .await
+        .expect("claims and loads");
+    assert!(!opened.was_stored(), "the first run has nothing stored");
+    let (state, saver) = opened.start_from(|| Vault {
+        balance: 100,
+        waiting: Vec::new(),
+    });
+
+    let vault = teller::actor_with(state, vec![Box::new(saver)]);
+
+    // Parked: `withdraw` mutates no balance, so the turn it stores is still 100.
+    let receipt = {
+        let vault = vault.clone();
+        tokio::spawn(async move { vault.withdraw(40).await })
+    };
+    waiting_for(&vault, 1).await;
+
+    store.fail_the_next_store();
+    assert!(
+        vault.approve().await.is_err(),
+        "the approving turn's store failed, so that turn is refused"
+    );
+
+    assert_eq!(
+        receipt
+            .await
+            .expect("the task joins")
+            .expect("the parked caller was answered from inside the handler"),
+        60,
+        "the receipt crossed the channel before the observer chain ran"
+    );
+
+    match vault.ended().await {
+        Ended::Observer { name, .. } => assert_eq!(name, "persist"),
+        other => panic!("got {other:?}"),
+    }
+
+    assert_eq!(
+        store.on_disk::<Vault>().expect("stored").balance,
+        100,
+        "the debit is not stored and its caller holds a receipt for it: THIS is the \
+         #[defer] window, and it is a limit rather than a bug in the adapter"
     );
 }
 
@@ -566,18 +943,22 @@ async fn a_state_that_is_not_sync_is_still_persisted() {
     let id = StateId::new("counters/hits").expect("valid");
 
     {
-        let (restored, saver) = Persist::<Counter, _>::open(&files, &id)
+        let (state, saver) = Persist::<Counter, _>::open(&files, &id)
             .await
-            .expect("claims and loads");
-        let counter = counting::actor_with(restored.unwrap_or_default(), vec![Box::new(saver)]);
+            .expect("claims and loads")
+            .start_from(Counter::default);
+        let counter = counting::actor_with(state, vec![Box::new(saver)]);
         assert_eq!(counter.hit().await.expect("running"), 1);
         assert_eq!(counter.hit().await.expect("running"), 2);
         counter.stop().await;
     }
 
-    let (restored, _saver): (Option<Counter>, _) =
-        Persist::open(&files, &id).await.expect("claims and loads");
-    assert_eq!(restored.expect("stored").hits.get(), 2);
+    let opened = Persist::<Counter, _>::open(&files, &id)
+        .await
+        .expect("claims and loads");
+    assert!(opened.was_stored(), "the run above stored something");
+    let (state, _saver) = opened.start_from(Counter::default);
+    assert_eq!(state.hits.get(), 2);
 }
 
 // ───────────────────────────────────────────────────────────── the measurement
@@ -618,8 +999,11 @@ async fn the_per_turn_store_cost() {
     let without = started.elapsed();
     bare.stop().await;
 
-    let (_restored, saver) = Persist::open(&files, &id).await.expect("claims and loads");
-    let stored = counting::actor_with(Counter::default(), vec![Box::new(saver)]);
+    let (state, saver) = Persist::open(&files, &id)
+        .await
+        .expect("claims and loads")
+        .start_from(Counter::default);
+    let stored = counting::actor_with(state, vec![Box::new(saver)]);
     let started = Instant::now();
     for _ in 0..TURNS {
         stored.hit().await.expect("running");

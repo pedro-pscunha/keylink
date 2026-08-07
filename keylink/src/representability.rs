@@ -77,6 +77,7 @@ use crate::{
     ActorId, ActorStatus, Admission, Admittance, AdmittedPeer, Allowlist, BlobId, Caller,
     DynamicAdmission, Ended, Eviction, FinishFut, IdempotencyKey, Intensity, LocalActor,
     MailboxClosed, MountError, Observer, Origin, ProvenPeer, Retention, TurnFut, TurnInfo,
+    TurnOutcome,
 };
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
@@ -818,6 +819,27 @@ fn every_ending_is_named(ended: &Ended) -> &'static str {
         Ended::Observer { .. } => "observer",
         Ended::Feed { .. } => "feed",
         Ended::GaveUp { .. } => "gave up",
+    }
+}
+
+/// The same tripwire for [`TurnOutcome`], and this one guards a **durability**
+/// decision rather than a report.
+///
+/// [`Persist::after_turn`](crate::Persist) refuses a panicked turn and stores
+/// every other one. Written as `if let TurnOutcome::Panicked { .. }` — which is
+/// what it was — a third outcome would have taken the `else` branch and been
+/// **written to the disk**, silently, under a rule nobody wrote. That adapter
+/// now matches exhaustively, so the day `TurnOutcome::Cancelled` exists it is
+/// `E0004` at the line that decides whether the bytes land.
+///
+/// This function exists beside it because that adapter is behind
+/// `#[cfg(feature = "persist")]`: a `--no-default-features` build has no such
+/// match, and a commitment that a feature flag can switch off is not one. Here
+/// it is unconditional.
+fn every_outcome_is_named(outcome: TurnOutcome<'_>) -> &'static str {
+    match outcome {
+        TurnOutcome::Completed => "completed",
+        TurnOutcome::Panicked { .. } => "panicked",
     }
 }
 

@@ -254,7 +254,7 @@ pub use observe::{Ended, FinishFut, Observer, Stop, TurnFut, TurnInfo, TurnLost,
 pub use panic::Panic;
 pub use peer::{Dial, Peer};
 #[cfg(feature = "persist")]
-pub use persist::Persist;
+pub use persist::{Opened, Persist};
 pub use reply::{Outcome, RemoteError, WireRequest, WireResponse};
 pub use rpc::{Dispatch, RpcClient, Server, ServerBuilder, Service, ServiceBuilder};
 pub use subscribers::Subscribers;

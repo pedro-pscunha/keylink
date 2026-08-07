@@ -376,10 +376,12 @@ async fn an_actor_restarts_from_its_last_committed_state() {
                     built.fetch_add(1, Ordering::SeqCst);
                     // The previous incarnation's claim is already released:
                     // `run_loop` drops the observers before this is called.
-                    let (restored, saver) = Persist::<Ledger, _>::open(&files, &id).await?;
+                    let (restored, saver) = Persist::<Ledger, _>::open(&files, &id)
+                        .await?
+                        .start_from(Ledger::default);
                     let observers: Vec<Box<dyn Observer<Ledger>>> =
                         vec![Box::new(saver), Box::new(RefuseFaults)];
-                    Ok((restored.unwrap_or_default(), observers, ()))
+                    Ok((restored, observers, ()))
                 }
             },
             limit(2, Duration::from_millis(50)),
@@ -936,14 +938,12 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
                     let built = built.clone();
                     async move {
                         built.fetch_add(1, Ordering::SeqCst);
-                        let (restored, saver) = Persist::<Ledger, _>::open(&files, &id).await?;
+                        let (restored, saver) = Persist::<Ledger, _>::open(&files, &id)
+                            .await?
+                            .start_from(Ledger::default);
                         let observers: Vec<Box<dyn Observer<Ledger>>> =
                             vec![Box::new(saver), Box::new(RefuseFaults)];
-                        Ok((
-                            restored.unwrap_or_default(),
-                            observers,
-                            ledger::Feeds::new(),
-                        ))
+                        Ok((restored, observers, ledger::Feeds::new()))
                     }
                 },
                 limit(2, Duration::from_millis(50)),
