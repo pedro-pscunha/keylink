@@ -38,8 +38,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink::{
-    mount, ActorId, Allowlist, Answer, BodyReader, Caller, Eviction, KeyedService, MountError,
-    Origin,
+    mount, ActorId, Allowlist, Body, BodyReader, Caller, Eviction, KeyedService, MountError,
+    Origin, Reply,
 };
 
 keylink::service! {
@@ -48,6 +48,14 @@ keylink::service! {
     rpc Count() -> u64;
     rpc Note(line: String) -> u64;
 }
+
+/// The exact signature `KeyedService::mail` has to keep, factored out because
+/// the annotation below is the assertion and `clippy::type_complexity` refuses
+/// it inline. A `type` is what that lint asks for, and it costs nothing here:
+/// every one of the six types is still written down in one place, which is what
+/// makes a change to any of them a red test in this file.
+type MailConstructor =
+    fn(Origin, depot::Request, BodyReader, Reply<(depot::Response, Body)>) -> depot::Mail;
 
 struct Counter(u64);
 
@@ -128,17 +136,19 @@ async fn the_hidden_seam_the_macro_writes_is_reachable_and_typed() {
     assert_eq!(id.as_str(), "obra/4471");
 
     // `KeyedService` is what carries a generated service's three types across
-    // the crate boundary, and `Answer` is the reply channel its `mail`
+    // the crate boundary, and `Reply<T>` is the reply channel its `mail`
     // constructor takes. Named as a function item rather than called: a
     // `BodyReader` is a QUIC stream's receiving half and has no public
-    // constructor, which is the correct shape — `mail` is implemented out here
-    // and called only by keylink, from a place that already holds one.
+    // constructor, and `Reply` has no public constructor either — keylink builds
+    // every reply channel — which is the correct shape. `mail` is implemented out
+    // here and called only by keylink, from a place that already holds both.
     //
-    // The annotation is the assertion. Every one of the five types in it is part
+    // The annotation is the assertion. Every one of the six types in it is part
     // of the seam, so a change to any of them is a red test here rather than a
-    // break inside somebody's expansion.
-    let _: fn(Origin, depot::Request, BodyReader, Answer<depot::Response>) -> depot::Mail =
-        <depot::Actors as KeyedService>::mail;
+    // break inside somebody's expansion. `Reply<(Response, Body)>` and not
+    // `Reply<Response>`: a `recv` reply and its body travel together off the
+    // actor's task, and the pair is what the loop answers with.
+    let _: MailConstructor = <depot::Actors as KeyedService>::mail;
 
     // And `Origin` hands out a BORROWED `Caller`, which is the whole reason the
     // mailbox carries an owned origin instead of a `Caller<'static>` nobody can

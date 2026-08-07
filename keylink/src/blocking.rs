@@ -325,12 +325,27 @@ mod tests {
     /// message is worth reading anyway. Silencing it would need
     /// `std::panic::set_hook`, which is process-global and would hide a real
     /// panic in whatever test happened to be running beside this one.
+    /// A mailbox that can carry nothing, for an actor that is never sent
+    /// anything.
+    ///
+    /// `LocalActor` needs a message type and the test below is about the
+    /// runtime, not about messages. Uninhabited rather than a unit struct, so
+    /// the one arm the loop needs is `match self {}` — there is no case, so
+    /// there is nothing to get wrong and nothing to mistake for a real mailbox.
+    enum Nothing {}
+
+    impl crate::Turn<()> for Nothing {
+        async fn run(self, _state: &mut (), _hooks: &mut crate::Hooks<()>) -> Option<crate::Ended> {
+            match self {}
+        }
+    }
+
     #[test]
     fn an_actor_needs_the_runtime_entered_and_enter_lends_it() {
         let node = Node::bind().expect("binds off a runtime thread");
 
         let without = std::panic::catch_unwind(|| {
-            let _ = crate::LocalActor::spawn(());
+            let _ = crate::LocalActor::<(), Nothing>::spawn(());
         });
         assert!(
             without.is_err(),
@@ -339,7 +354,7 @@ mod tests {
 
         let actor = {
             let _guard = node.enter().expect("a node off a runtime lends its own");
-            crate::LocalActor::spawn(())
+            crate::LocalActor::<(), Nothing>::spawn(())
         };
         assert!(actor.is_running(), "and with the runtime entered it starts");
     }

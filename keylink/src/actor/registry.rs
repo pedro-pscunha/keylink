@@ -89,39 +89,42 @@ const MAILBOX: usize = 1;
 ///
 /// A `tokio::sync::mpsc` channel allocates its first block of 32 slots eagerly,
 /// so a mailbox costs `32 * size_of::<M>()` whatever its capacity is, and the
-/// capacity is 1. At ten thousand idle actors, re-measured on this machine after
-/// the message type became per-service, against a service with one `u64`
-/// argument — the smallest case there is:
+/// capacity is 1. At ten thousand idle actors, measured on this machine against
+/// a service with one `u64` argument — the smallest case there is:
 ///
 /// | slot type  | per idle actor | ten thousand |
 /// |------------|----------------|--------------|
-/// | `Box<M>`   | 1,671 bytes    | 16.7 MB      |
-/// | `M`        | 8,839 bytes    | 88.4 MB      |
+/// | `Box<M>`   | 1,159 bytes    | 11.6 MB      |
+/// | `M`        | 8,327 bytes    | 83.3 MB      |
 ///
 /// The 7,168 byte difference is the block: that `M` is 232 bytes, so 32 of them
 /// is 7,424, against 256 for 32 pointers. The cost of boxing is one allocation
 /// per message, on a path that already allocates.
 ///
-/// **The pressure gets worse as `M` grows, and `M` is the caller's to grow.** A
-/// per-service message is sized to its largest request plus a reply channel of
-/// its largest response, so the slot stops being service-independent and the
-/// figures above are a floor rather than a typical case.
+/// # The box here is half of the decision, and the other half is in `local.rs`
 ///
-/// The box bounds what that costs **here**, and not what an idle actor costs. A
-/// slot is a pointer, so this block is 256 bytes whatever `M` is; but the task
-/// spawned beside it runs a future that destructures an `M` and holds those fields
-/// across a turn's awaits, and that allocation *is* sized to `M`. Measured, a
-/// 1,248 byte `M` costs 4,662 bytes per idle actor against 1,686 for a 232 byte
-/// one — so roughly three bytes of idle cost per byte of `M`, of which the box
-/// saves the one that would have been in this block. `tests/actor_memory.rs`
-/// documents what that does to a per-actor budget.
+/// The sentence that used to sit here — that the pressure "gets worse as `M`
+/// grows, and `M` is the caller's to grow" — was true and was about the wrong
+/// allocation. A slot is a pointer, so this block is 256 bytes whatever `M` is;
+/// but the **task** spawned beside it ran a future that inlined the whole turn's
+/// state machine, and *that* was sized to the service's own message. Measured
+/// then: 1,686 bytes per idle actor at a 232 byte `M` and 4,662 at a 1,248 byte
+/// one, so boxing the slot bought back one of every three bytes and left the
+/// other two.
 ///
-/// Only the boxed row is reported by `tests/actor_memory.rs`; the unboxed row is
-/// that number plus the difference above, because the test never builds ten
-/// thousand unboxed mailboxes — it would allocate 87 MB to measure a
-/// subtraction. Saying which row is checked matters here: every figure in this
-/// table except the boxed one was wrong for months, under a sentence claiming
-/// the whole thing was measured.
+/// The turn's future is boxed at its own loop's await now, for the same reason
+/// written one layer in, and the two together are what make an idle actor's cost
+/// keylink's rather than the service author's. Re-measured at the same pair of
+/// services: **1,159 bytes at 232 and 1,146 at 1,248** — flat, where it used to
+/// be 2.9 bytes of permanent cost per byte of message.
+/// `tests/actor_memory.rs` asserts that flatness rather than describing it, which
+/// is what turns this paragraph from a claim into a guard.
+///
+/// Only the boxed row above is measured; the unboxed row is that number plus the
+/// block difference, because the test never builds ten thousand unboxed mailboxes
+/// — it would allocate 83 MB to measure a subtraction. Saying which row is
+/// checked matters here: every figure in this table except the boxed one was
+/// wrong for months, under a sentence claiming the whole thing was measured.
 #[doc(hidden)]
 pub type Mailbox<M> = mpsc::Receiver<Box<M>>;
 

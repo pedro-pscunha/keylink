@@ -382,11 +382,10 @@ impl Queueing {
     /// re-exports a clock for `service!` to name in the caller's crate. The
     /// keyed loop reached for the one spelling available to it,
     /// `!deadline().elapsed().is_zero()`, which is `now > deadline` and not the
-    /// `now >= deadline` that
-    /// [`LocalActor::ask_catching_before`](crate::LocalActor::ask_catching_before)
-    /// applies to the same budget. That divergence was written down twice, in
-    /// the macro and in RFC-04, as "a budget of exactly zero". It is every case
-    /// where `now == deadline`, and there are two ways to land on one:
+    /// `now >= deadline` the singleton's own dispatch applied to the same budget.
+    /// That divergence was written down twice, in the macro and in RFC-04, as "a
+    /// budget of exactly zero". It is every case where `now == deadline`, and
+    /// there are two ways to land on one:
     ///
     /// - **A paused clock.** `tokio::time::pause` advances only to timer edges,
     ///   so it lands exactly on the deadline at any budget. There this is the
@@ -446,13 +445,21 @@ impl Queueing {
 /// was true of one path and false of the other for as long as both existed:
 ///
 /// - A singleton served with `Handle::service` has had both from the start, in
-///   [`LocalActor::ask_catching_before`](crate::LocalActor::ask_catching_before),
-///   which is the whole of that path's dispatch.
+///   what was then the whole of that path's dispatch.
 /// - A keyed [`System`](crate::System) had **neither**: the layer compiled on
 ///   `System::service` and guarded nothing there at any budget, because its loop
 ///   never read the [`Context`]. RFC-04 §16.7. It gained the turn-side check
 ///   first and the permit-side one after that, separately, because the first fix
 ///   looked complete.
+///
+/// **Both paths now make each check in one place, and neither writes it.** The
+/// permit-side bound is in `deliver_to_actor` for a keyed actor and in
+/// `deliver_to_local` for a singleton; the turn-side one is in `keylink::turn`,
+/// which every generated mailbox arm calls and which reads
+/// [`Queueing::expired`](Queueing::expired) off the origin the message arrived
+/// with.
+/// So the two paths cannot disagree about a comparison neither of them spells,
+/// which is what the three hand-written ones above turned out to be worth.
 ///
 /// # On a `Handler` it refuses nothing, and that is not a lie
 ///

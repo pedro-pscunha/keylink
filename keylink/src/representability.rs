@@ -646,6 +646,16 @@ impl Observer<Ledger> for Recorder {
 ///
 /// The limit above carries over unchanged. A read through `&A` cannot call a
 /// `service!` method; it can still touch a `Mutex` field.
-async fn a_read_cannot_mutate_either(actor: &LocalActor<Ledger>) {
+///
+/// # Generic in `M`, and that is itself the claim
+///
+/// `LocalActor` gained a second parameter — what its mailbox carries — when the
+/// mailbox stopped being a boxed closure. This probe is written over **any** `M`
+/// rather than over one service's generated enum, and it compiles, which states
+/// the property that made the parameter affordable: `read` needs to know nothing
+/// about a turn. Bound it to `M: Turn<A>` in `local.rs` and this stops compiling
+/// — `Ledger` is hand-written, is not a `service!`, and has no mailbox enum to
+/// name.
+async fn a_read_cannot_mutate_either<M>(actor: &LocalActor<Ledger, M>) {
     let _: Result<ThroughShared, MailboxClosed> = actor.read(|state| state.post()).await;
 }

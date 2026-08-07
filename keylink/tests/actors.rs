@@ -564,6 +564,90 @@ async fn a_panicking_message_costs_one_message_and_not_the_actor() {
     );
 }
 
+/// **The keyed twin the singleton test asked for and never had.**
+///
+/// `tests/singleton.rs::both_halves_of_a_lost_turn_carry_their_own_prefix` pins
+/// that a panic reaches a peer as `Failed("panicked: ..")` and an observer's veto
+/// as `Failed("observer refused: ..")`, because `RemoteError::Failed` carries a
+/// `String` rather than a variant — a variant would sit inside the hashed
+/// contract and move every service's ALPN — so **the string is the whole
+/// discriminator**.
+///
+/// It had no keyed counterpart, and the two paths drifted underneath that gap:
+/// the keyed loop rendered a panic as `Panic`'s own `Display` while the
+/// singleton's dispatch wrapped it in a second prefix, so one peer read `the
+/// actor panicked: this message is bad` and the other `panicked: the actor
+/// panicked: this message is bad` for the same fault. Both loops were green
+/// throughout, because neither test could see the other path.
+///
+/// This asserts the property that closes it: **the same panic, served both ways
+/// from one node, reaches a peer as byte-identical text.** Not "both contain
+/// panicked" — the test above this one already says that, and it is exactly what
+/// went on passing while the two disagreed.
+///
+/// The two ALPNs on one node are the point of the fixture rather than an
+/// accident: a service can be served as a singleton and as an actor system at
+/// once, so this is one process, one state type, two dispatch paths.
+///
+/// A keyed actor has no observers, so only the panic half has a twin here. The
+/// refusal half stays where the observers are.
+#[tokio::test]
+async fn one_panic_reads_the_same_whichever_way_the_service_is_served() {
+    let server = local_node().await;
+    let caller = local_node().await;
+
+    let system = mounted();
+    system
+        .mount(id("fragile"), journal::spawn(Journal::default()))
+        .expect("the id is free");
+    let singleton = journal::actor(Journal::default());
+
+    let running = Server::builder(&server)
+        .service(journal::keyed_service(&system, Allowlist::anyone()).build())
+        .service(singleton.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("the keyed and singleton ALPNs are distinct");
+
+    let to_keyed = journal::KeyedClient::connect(&caller, server.endpoint().addr())
+        .await
+        .expect("dials the actor system");
+    let to_singleton = journal::Client::connect(&caller, server.endpoint().addr())
+        .await
+        .expect("dials the same node's singleton");
+
+    let keyed = journal::at(&to_keyed, id("fragile"))
+        .boom()
+        .await
+        .expect_err("the handler panics");
+    let single = to_singleton
+        .boom()
+        .await
+        .expect_err("the same handler panics");
+
+    let (Error::Remote(RemoteError::Failed(keyed)), Error::Remote(RemoteError::Failed(single))) =
+        (&keyed, &single)
+    else {
+        panic!("both paths answer a panic with Failed; got {keyed:?} and {single:?}");
+    };
+    assert_eq!(
+        keyed, single,
+        "a peer must not be able to tell which dispatch path served it by reading \
+         how a panic was rendered"
+    );
+    assert!(
+        keyed.starts_with("panicked: "),
+        "and the prefix a peer discriminates on has to be there; got {keyed:?}"
+    );
+    assert!(
+        keyed.contains("this message is bad"),
+        "carrying what the handler panicked with; got {keyed:?}"
+    );
+
+    to_keyed.close().await.expect("closes");
+    to_singleton.close().await.expect("closes");
+    running.shutdown().await.expect("stops");
+}
+
 // ────────────────────────────────────────────────────────────────── lifecycle
 
 #[tokio::test]

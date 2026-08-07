@@ -18,9 +18,9 @@
 //! One ALPN **per service** replaces both. The keyed contract hashes
 //! `Envelope<WireRequest<Addressed<Request>>>` against
 //! `Envelope<WireResponse<Response>>`, so a peer built against different types
-//! is refused at the handshake, and a `System<Mail<Request, Response>>` cannot
-//! physically hold an actor of another service — the mismatch stops being a
-//! refusal and becomes unrepresentable.
+//! is refused at the handshake, and a `System` of one service's own generated
+//! mailbox enum cannot physically hold an actor of another service — the
+//! mismatch stops being a refusal and becomes unrepresentable.
 //!
 //! What that costs is stated where it is paid, and it is worth reading before
 //! reaching for the old shape again: two actor *services* can no longer share
@@ -52,15 +52,13 @@
 //! one gate is strictly less defence in depth than two, and it is accepted because
 //! the remaining gate covers the exact type rather than an envelope.
 
-use std::fmt;
-
 use n0_future::time::Instant;
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
 
 use super::registry::{RouteError, System};
-use crate::{ActorId, Body, BodyReader, Caller, Context, Outcome, RemoteError, Rpc};
+use crate::local::{rendered, Reply};
+use crate::{ActorId, Body, BodyReader, Caller, Context, Outcome, Queueing, RemoteError, Rpc};
 
 // ─────────────────────────────────────────────────────────── the wire wrapper
 
@@ -93,9 +91,10 @@ use crate::{ActorId, Body, BodyReader, Caller, Context, Outcome, RemoteError, Rp
 /// # Release note: this `Debug` prints the request
 ///
 /// `derive(Debug)` here, so `{:?}` on one of these prints the service's own
-/// payload. [`Mail`](struct@Mail)'s `Debug` is hand-written and prints only the
-/// origin, so a mailbox slot is safe to log; an `Addressed` is not. Nothing in
-/// keylink logs a request, which is what makes this latent rather than a leak —
+/// payload. The generated mailbox enum derives nothing at all — it is never
+/// printed and never serialized — so an `Addressed` is the one of the pair a
+/// `{:?}` can leak through. Nothing in keylink logs a request, which is what
+/// makes this latent rather than a leak —
 /// a `Middleware` or a `tracing` field that prints one is the caller's decision
 /// and is where a payload would reach a log.
 #[doc(hidden)]
@@ -148,28 +147,6 @@ impl<T: Rpc> Rpc for Addressed<T> {
 
 // ───────────────────────────────────────────────────── what a mailbox carries
 
-/// Where one keyed message's answer goes: the reply, and a body to stream
-/// beside it.
-///
-/// An alias because generated code has to name this channel, and spelling
-/// `tokio::sync::oneshot::Sender<..>` in the expansion would make every
-/// `service!` user's build depend on tokio's module path rather than only on
-/// tokio being present.
-///
-/// # The tokio type is deliberately part of the promise
-///
-/// The alias hides the module path, **not the type**. It is transparent, so
-/// `tokio::sync::oneshot::Sender` is in keylink's public API and a tokio major
-/// bump is a keylink breaking change reached through a `#[doc(hidden)]` name.
-/// That is a decision and not an oversight: [`Mailbox`](crate::Mailbox) is
-/// `mpsc::Receiver<Box<M>>` and equally transparent, so newtyping this end alone
-/// would buy a promise the other end of the same channel still breaks, and give a
-/// mailbox slot two shapes to be built in for it. keylink depends on tokio's
-/// channels the way it depends on tokio's runtime; what the alias buys is
-/// spelling.
-#[doc(hidden)]
-pub type Answer<Resp> = oneshot::Sender<(Outcome<Resp>, Body)>;
-
 /// Where a message reached an actor from.
 ///
 /// Owned, not borrowed. [`Caller<'a>::Peer`](Caller) holds a `&'a Context` and
@@ -181,7 +158,7 @@ pub type Answer<Resp> = oneshot::Sender<(Outcome<Resp>, Body)>;
 /// # A newtype over a private enum, so there is no door in from outside
 ///
 /// Generated code never *constructs* one of these. It destructures a
-/// [`Mail`](struct@Mail) keylink built and calls [`caller`](Self::caller) — the
+/// mailbox variant keylink built and calls [`caller`](Self::caller) — the
 /// only thing the expansion needs. So the two cases are a private enum and the
 /// two constructors are `pub(crate)`, and a downstream crate meets an error
 /// instead of a way to make the mistake below:
@@ -265,12 +242,15 @@ pub struct Origin(Provenance);
 #[derive(Debug)]
 enum Provenance {
     /// From inside this process, through the generated `Handle`. There is no
-    /// peer, no handshake and no proven key.
+    /// peer, no handshake and no proven key — so no idempotency key to settle
+    /// and no queue budget to expire, which is why every mark a turn makes is
+    /// `Option`-guarded rather than branched on the case.
     ///
-    /// Unreachable today: the local handle runs its own loop in `local.rs` and
-    /// does not go through a keyed mailbox. The case exists because [`Origin`] is
-    /// the shape the generated mailbox commits to, and giving the local path a
-    /// second shape to arrive in is the split this type exists to avoid.
+    /// This case existed for a wave with nothing building it, because [`Origin`]
+    /// was the shape the generated mailbox committed to and giving the local path
+    /// a second shape to arrive in was the split this type exists to avoid. The
+    /// local path arrives here now: `LocalActor::ask` and `LocalActor::notify`
+    /// build one per message.
     Local,
     /// From a peer iroh proved at the handshake.
     Peer(Context),
@@ -279,14 +259,11 @@ enum Provenance {
 impl Origin {
     /// A message from inside this process.
     ///
-    /// `allow(dead_code)` and not `expect`: nothing builds one on the keyed path
-    /// today — `local.rs` runs its own loop — and the unit tests below do build
-    /// one, so an `expect` would be unfulfilled under `cfg(test)` and warn there
-    /// instead.
-    #[allow(
-        dead_code,
-        reason = "the keyed local path arrives with the generated mailbox enum"
-    )]
+    /// `pub(crate)` and called from `local.rs`: a `Handle` method hands the
+    /// builder closure an origin rather than letting generated code write one, so
+    /// the expansion never names either constructor. It carried an
+    /// `allow(dead_code)` for one wave, while the mailbox it belongs in was still
+    /// a boxed closure and nothing built a local origin at all.
     pub(crate) fn local() -> Self {
         Self(Provenance::Local)
     }
@@ -313,41 +290,6 @@ impl Origin {
     }
 }
 
-/// One message on its way to an actor. Generated code destructures these.
-///
-/// **Boxed on the way into the mailbox**, and the reasoning for that — the
-/// eagerly allocated block of 32 slots, the measured table, and why the
-/// pressure grows with whatever a service puts in here — lives on
-/// [`Mailbox`](crate::Mailbox), where the `Box` is actually written.
-///
-/// Typed in both directions, which is the wave's whole subject: `Req` and
-/// `Resp` are the service's own, so nothing here is a `Vec<u8>` and nothing
-/// downstream has to decode.
-#[doc(hidden)]
-pub struct Mail<Req, Resp> {
-    /// Where the message came from, and who to attribute it to.
-    pub origin: Origin,
-    /// The service's own request, already decoded.
-    pub request: Req,
-    /// The payload streaming up beside the request.
-    pub body: BodyReader,
-    /// Where the answer goes.
-    pub reply: Answer<Resp>,
-}
-
-/// Hand-written for the same reason [`Mounted`](crate::Mounted)'s is: a derive
-/// writes `impl<Req: Debug, Resp: Debug> Debug`, which would make printing a
-/// mailbox slot depend on two types nobody prints. The origin is the only field
-/// worth naming anyway — a `BodyReader` is a stream and a `oneshot::Sender` is a
-/// channel.
-impl<Req, Resp> fmt::Debug for Mail<Req, Resp> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Mail")
-            .field("origin", &self.origin)
-            .finish_non_exhaustive()
-    }
-}
-
 // ────────────────────────────────────────── what a generated service declares
 
 /// What a generated keyed service tells keylink about itself.
@@ -361,13 +303,13 @@ impl<Req, Resp> fmt::Debug for Mail<Req, Resp> {
 /// `#[doc(hidden)] pub`, and a compatibility promise regardless: hidden hides it
 /// from the docs, not from the compiler.
 ///
-/// # Why [`Mail`](Self::Mail) is an associated type rather than the concrete one
+/// # [`Mail`](Self::Mail) is the service's own generated enum
 ///
-/// Today every implementor sets it to [`struct@Mail`]`<Request, Response>` and
-/// the indirection buys nothing. It is the seam the generated mailbox enum
-/// arrives through: when the mailbox stops being one struct and becomes a
-/// per-service enum with a typed reply channel per variant, this associated type
-/// is the only line that changes, and [`deliver_to_actor`] does not.
+/// It was an associated type standing in for one keylink-level struct, declared
+/// as the seam the generated enum would arrive through. This is that arrival:
+/// `Mail` is now `<service>::Mail`, one variant per declared method plus the one
+/// a peer's request lands in, and [`deliver_to_actor`] is unchanged by it — which
+/// is what the seam was for.
 #[doc(hidden)]
 pub trait KeyedService: Send + 'static {
     /// The service's own request, as it arrives inside an [`Addressed`].
@@ -377,12 +319,18 @@ pub trait KeyedService: Send + 'static {
     /// What this service's mailbox carries.
     type Mail: Send + 'static;
 
-    /// Build one mailbox slot out of the parts [`deliver_to_actor`] holds.
+    /// Build the mailbox variant a peer's request lands in, out of the parts
+    /// [`deliver_to_actor`] holds.
+    ///
+    /// The [`Origin`] is made **here**, by keylink, and handed in: generated code
+    /// receives one and never constructs one, which is what keeps both of
+    /// `Origin`'s constructors `pub(crate)` while the enum that carries one is
+    /// expanded in somebody else's crate.
     fn mail(
         origin: Origin,
         request: Self::Request,
         body: BodyReader,
-        reply: Answer<Self::Response>,
+        reply: Reply<(Self::Response, Body)>,
     ) -> Self::Mail;
 }
 
@@ -481,11 +429,11 @@ pub async fn deliver_to_actor<S: KeyedService>(
 
     let mail = system.route(&actor)?;
 
-    // Read before `cx` moves into the `Mail`, which is the only reason these
+    // Read before `cx` moves into the `Origin`, which is the only reason these
     // are bindings rather than expressions at their use sites.
     let budget = cx.queueing();
     let progress = cx.progress();
-    let (reply, answer) = oneshot::channel();
+    let (reply, answer) = Reply::channel();
     let queueing = mail.send(Box::new(S::mail(Origin::peer(cx), message, body, reply)));
     let sent = match budget {
         None => queueing.await,
@@ -514,7 +462,13 @@ pub async fn deliver_to_actor<S: KeyedService>(
     // caller gives up on.
     progress.enqueued();
 
-    answer.await.map_err(|_| no_such_actor(&actor))
+    // `rendered` and not a `match` written here: the singleton's served path
+    // answers the same four cases, and when the two were written separately they
+    // disagreed about how a panic reaches a peer. See its documentation.
+    answer
+        .await
+        .map(|answered| rendered(answered, budget.map_or(0, Queueing::millis)))
+        .map_err(|_| no_such_actor(&actor))
 }
 
 #[cfg(test)]

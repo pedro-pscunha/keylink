@@ -61,12 +61,36 @@ keylink::service! {
     rpc Note(entry: u64) -> u64;
 }
 
+// The same service with a **kilobyte** of declared arguments, so the third phase
+// can ask whether an idle actor's cost is keylink's or the service author's.
+//
+// Four `[u64; 32]`s, which is the shape Wave 1a measured the old design with —
+// kept identical so the two runs are comparable rather than merely both large.
+keylink::service! {
+    service Bulky;
+
+    rpc Note(a: [u64; 32], b: [u64; 32], c: [u64; 32], d: [u64; 32]) -> u64;
+}
+
 /// No state at all, so what is measured is the actor system and nothing else.
 struct Empty;
 
 impl ledger::Actor for Empty {
     async fn note(&mut self, _cx: Caller<'_>, entry: u64) -> u64 {
         entry
+    }
+}
+
+impl bulky::Actor for Empty {
+    async fn note(
+        &mut self,
+        _cx: Caller<'_>,
+        a: [u64; 32],
+        _b: [u64; 32],
+        _c: [u64; 32],
+        _d: [u64; 32],
+    ) -> u64 {
+        a[0]
     }
 }
 
@@ -82,35 +106,30 @@ impl ledger::Actor for Empty {
 /// mailbox slot is boxed: unboxed it is hundreds of bytes, which would be
 /// kilobytes per idle actor and tens of megabytes across ten thousand.
 ///
-/// **The slot type is now per service, and 2048 is therefore scoped to `ledger`
-/// on purpose.** Read this before treating a red run as a keylink regression.
+/// # This budget bounds keylink, and phase 3 is what makes that true
 ///
-/// `ledger::Mail` holds this service's own `Request` and a `oneshot::Sender` of
-/// its own `Response`, so it is sized to whichever is largest — a caller's
-/// decision rather than keylink's. Boxing keeps the *mailbox* out of that: a slot
-/// is a pointer, so the eager block is 32 × 8 bytes whatever `Mail` costs.
+/// It did not used to. `Mail` is the service's own type — sized to its largest
+/// request and its largest reply — and the task spawned beside the mailbox used
+/// to run a future that **inlined the whole turn's state machine**, so an idle
+/// actor's cost grew with whatever the caller declared. Measured against the old
+/// design: 1,686 bytes per idle actor at a 232 byte `Mail`, and 4,662 at a 1,248
+/// byte one. About 2.9 bytes of permanent cost per byte of message, which made
+/// this literal a bound on the *caller's* types wearing keylink's name.
 ///
-/// It does **not** keep the idle actor out of it, and the tempting sentence that
-/// it does was measured and is false. The actor's task is spawned at mount, and
-/// the future it runs destructures a `Mail` and holds those fields across the
-/// awaits of one turn, so the task allocation is sized to the service's own
-/// message. Measured in this test's own shape, at 2,000 actors per service:
+/// The turn's future is boxed at the loop's await now, exactly as the mailbox
+/// slot is boxed at the channel, and for the same reason written one layer in:
+/// the two things sized by the service are the message and the turn, and an
+/// **idle** actor should be paying for neither. What is left in the task's own
+/// frame is the loop — the state, the observers, one `recv`, one pointer.
 ///
-/// | `size_of::<Mail>()` | bytes per idle actor |
-/// |---|---|
-/// | 232 (`ledger`, below) | 1,686 |
-/// | 1,248 (four `[u64; 32]` args) | 4,662 |
+/// So the number to watch is not this one but the *difference* phase 3 measures,
+/// and the response to a red run here is to find the allocation, not to raise the
+/// literal.
 ///
-/// About 2.9 bytes of idle cost per byte of `Mail`, which puts the ceiling of this
-/// budget at a `Mail` of roughly 360 bytes. So `Empty` and a one-field request
-/// measure **keylink's floor for a small service**, not a bound any service holds.
-///
-/// **What that means for the generated mailbox enum.** When `Mail` becomes a
-/// per-service enum sized to its largest variant, this number moves for a reason
-/// that is the *service's* size and not a keylink regression. The response is to
-/// re-derive the budget from the new `size_of::<ledger::Mail>()` — which the test
-/// prints — and to check the framework part separately by shrinking the service,
-/// not to raise the literal until it passes.
+/// What it costs is one heap allocation per message for the turn's state machine,
+/// on a path that already allocates the mailbox slot, and — for a served call — a
+/// QUIC stream and a postcard decode. That is the trade, stated where it is paid:
+/// **an allocation per message against a kilobyte per idle actor.**
 const BUDGET_PER_ACTOR: isize = 2048;
 
 /// The same ceiling, for an actor started with `ledger::actor(..)` instead of
@@ -122,25 +141,47 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// [`Ended`](keylink::Ended) — and an `Arc<JoinHandle>`, and it has no registry
 /// entry, no [`ActorId`] and no `HashMap` slot.
 ///
-/// The mailbox is where the two paths differ most, and it is why this number is
-/// recorded before anything moves rather than afterwards. A keyed mailbox slot is
+/// The mailbox is where the two paths differ most, and it is why this number was
+/// recorded before anything moved rather than afterwards. A keyed mailbox slot is
 /// a `Box<M>`, so the eagerly allocated block of 32 is 256 bytes whatever the
-/// service is. A local mailbox slot is **not boxed**: today its message is a
-/// pointer-sized boxed closure and the block is small by accident of that shape,
-/// not by decision. Whatever the local slot becomes, it lands in this number, and
-/// this number was taken by measurement.
+/// service is. The local slot was **not** boxed: its message was a pointer-sized
+/// boxed closure, so the block was small by accident of that shape rather than by
+/// decision, and dropping an enum in where the fat pointer had been would have
+/// been a silent thirty-fold. It is boxed now, at the same place and for the same
+/// stated reason as the keyed one.
 ///
 /// Measured on this machine, at ten thousand actors of the `ledger` service
 /// below, with an empty state:
 ///
-/// | path | bytes per idle actor |
-/// |---|---|
-/// | keyed, mounted in a `System` | 1,671 |
-/// | local, `ledger::actor(..)`   | 1,725 |
+/// | path | before the generated mailbox | after |
+/// |---|---|---|
+/// | keyed, mounted in a `System` | 1,671 | 1,159 |
+/// | local, `ledger::actor(..)`   | 1,725 | 1,469 |
 ///
-/// The 54 byte difference is the second channel and the `Arc<JoinHandle>`,
-/// against the registry entry the keyed one pays for instead.
+/// Both **fell**, which is not what a wave that replaces a fat pointer with an
+/// enum sounds like it should do. The mailbox slot is unchanged — `ledger::Mail`
+/// is 232 bytes either way — and what moved is the turn's state machine, which
+/// the old keyed loop inlined into the task's own future and the new one boxes.
+///
+/// The local path keeps a 310 byte margin over the keyed one: a second channel,
+/// the `watch` that carries `Ended`, and an `Arc<JoinHandle>`, against the
+/// registry entry and `HashMap` slot the keyed one pays for instead.
 const BUDGET_PER_LOCAL_ACTOR: isize = 2048;
+
+/// How much an idle actor is allowed to cost **because of what the service
+/// declares**, over the whole kilobyte between `ledger::Mail` and `bulky::Mail`.
+///
+/// This is the literal that makes [`BUDGET_PER_ACTOR`] a statement about keylink.
+/// Without it, that budget is satisfiable by writing a small service and says
+/// nothing about anyone else's; with it, the claim is that the two budgets bound
+/// the framework because the *slope* is flat.
+///
+/// Not zero, and deliberately not: `Empty` is the same state in both, but two
+/// services are two `HashMap`s, two `OnceLock`s of ALPN bytes and two
+/// monomorphisations, and the allocator's own rounding lands differently. What is
+/// asserted is that the difference is **noise beside the message**, not that it
+/// is nothing.
+const BUDGET_PER_DECLARED_BYTE: isize = 128;
 
 #[tokio::test]
 async fn ten_thousand_idle_actors_fit_in_the_budget() {
@@ -216,6 +257,60 @@ async fn ten_thousand_idle_actors_fit_in_the_budget() {
         "a handle that already stopped is not an idle actor"
     );
 
+    // ── phase 3: the slope ───────────────────────────────────────────────────
+    //
+    // The one that makes the two budgets above statements about keylink. The
+    // same measurement, at a service whose declared arguments are a kilobyte
+    // larger — so if an idle actor's cost tracked the message, this would be
+    // thousands of bytes higher and the budgets would be bounding whoever wrote
+    // the service rather than the framework.
+
+    let bulky: bulky::System = bulky::System::builder(Eviction::Never)
+        .capacity(ACTORS)
+        .build();
+    settle().await;
+
+    let before_bulky = LIVE.load(Ordering::Relaxed);
+    for n in 0..ACTORS {
+        bulky
+            .mount(
+                ActorId::new(format!("obra/{n}")).expect("a valid id"),
+                bulky::spawn(Empty),
+            )
+            .expect("every id is distinct");
+    }
+    settle().await;
+    let after_bulky = LIVE.load(Ordering::Relaxed);
+
+    let each_bulky = (after_bulky - before_bulky) / ACTORS as isize;
+    let declared =
+        std::mem::size_of::<bulky::Mail>() as isize - std::mem::size_of::<ledger::Mail>() as isize;
+    println!(
+        "one bulky::Mail is {} bytes against ledger's {}, and a bulky idle actor \
+         costs {each_bulky} bytes against {each}",
+        std::mem::size_of::<bulky::Mail>(),
+        std::mem::size_of::<ledger::Mail>(),
+    );
+
+    assert_eq!(bulky.len(), ACTORS);
+    assert!(
+        declared > 512,
+        "the two services must differ by enough for the comparison to mean \
+         anything; they differ by {declared} bytes of Mail"
+    );
+    assert!(
+        each_bulky - each <= BUDGET_PER_DECLARED_BYTE,
+        "an idle actor costs {each_bulky} bytes for a service whose Mail is \
+         {declared} bytes larger, against {each} for the small one — a difference \
+         of {} bytes, over the {BUDGET_PER_DECLARED_BYTE} byte slack. An idle \
+         actor is paying for what the service declares, which is the property the \
+         box on the turn's future exists to hold",
+        each_bulky - each
+    );
+
+    // Last, and the order is deliberate: the slope above is what makes these two
+    // statements about keylink, so a run that broke the slope should say so
+    // rather than reporting whichever budget it happened to push over first.
     assert!(
         each <= BUDGET_PER_ACTOR,
         "a keyed idle actor costs {each} bytes, over the {BUDGET_PER_ACTOR} byte budget \

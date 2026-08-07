@@ -45,12 +45,20 @@
 //!
 //! # Not for the keyed system
 //!
-//! [`System`](crate::System) and `spawn` run their own loop and never touch
-//! [`LocalActor`](crate::LocalActor), so a keyed actor gets no observers. That is
-//! a scope limit rather than an oversight, and it is written here, on
+//! A keyed actor mounted in a [`System`](crate::System) gets no observers. That
+//! is a scope limit rather than an oversight, and it is written here, on
 //! [`Observer`], and beside `spawn`, because a user who mounts a keyed actor and
 //! expects durability would otherwise get no durability, no compile error and no
 //! explanation. RFC-06 §5.3.
+//!
+//! **The reason changed and shrank.** It used to be that `spawn` ran a second
+//! loop over its own dispatcher and never touched
+//! [`LocalActor`](crate::LocalActor), which is where this chain lived — two
+//! loops, and closing the gap meant merging them. There is one dispatch path
+//! now: `spawn`'s loop runs the same generated mailbox a local actor does and
+//! hands it an **empty** hook slice. So what is left is the slice, and the
+//! question of who owns the `Vec` for a lazily spawned actor — which is Wave 3's
+//! to answer, because a feed asks it about the same loop.
 
 use std::error::Error;
 use std::fmt;
