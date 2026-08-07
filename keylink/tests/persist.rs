@@ -1100,10 +1100,10 @@ keylink::service! {
     ///
     /// The whole subject: a retry of this that arrives after a restart meets an
     /// empty ledger, is dispatched, and must not add the amount again.
-    rpc Debit(amount: u64) -> u64;
+    rpc Credit(amount: u64) -> u64;
     /// The balance now.
     rpc Balance() -> u64;
-    /// How many times [`Debit`] actually did the work. This is the assertion —
+    /// How many times [`Credit`] actually did the work. This is the assertion —
     /// "it did not run twice" and not "the ledger refused it".
     rpc Runs() -> u64;
 }
@@ -1112,7 +1112,7 @@ keylink::service! {
 ///
 /// `applied` is the only new thing here, and it is in the caller's state rather
 /// than in keylink's — which is the design. The bound it carries is the caller's
-/// to argue, and this one is [`APPLIED_CAPACITY`](keylink::APPLIED_CAPACITY)
+/// to argue, and this one is [`APPLIED_BOUND`](keylink::APPLIED_BOUND)
 /// because nothing about a test argues for another number.
 #[derive(Default, Serialize, Deserialize)]
 struct Till {
@@ -1123,7 +1123,7 @@ struct Till {
 
 impl till::Actor for Till {
     /// The three lines the README's second limit now points at.
-    async fn debit(&mut self, cx: Caller<'_>, amount: u64) -> u64 {
+    async fn credit(&mut self, cx: Caller<'_>, amount: u64) -> u64 {
         let call = cx.peer().and_then(Context::call);
         if let Some(&balance) = self.applied.get(call) {
             return balance;
@@ -1213,9 +1213,18 @@ impl Serving {
 ///
 /// This is `README.md`'s second limit, rewritten and then guarded. The ledger is
 /// memory, so the restarted process answers the retried key
-/// [`Fresh`](keylink::KeyState::Fresh) and dispatches it — that cost is asserted
-/// here rather than hidden, because option E accepts it. What must not happen is
-/// the *work* happening twice, and `runs` is where that is read.
+/// [`Fresh`](keylink::KeyState::Fresh) and dispatches it — asserted here rather than
+/// hidden. What must not happen is the *work* happening twice, and `runs` is where
+/// that is read.
+///
+/// # The `Fresh` assertion is a description of the tree, not a requirement of it
+///
+/// It pins what a **volatile** ledger answers, which is what this tree has. A later
+/// wave that gives the ledger a durable record store would make this line go red by
+/// answering `Done` — and that redness would be **news, not a regression**: read it
+/// as "the ledger learned to remember" and update the assertion. Nothing else in
+/// this test depends on the answer; the dedupe below is the state's, and it holds
+/// whichever way the query goes.
 ///
 /// # Why it rebuilds from the store
 ///
@@ -1259,7 +1268,7 @@ async fn a_retried_call_across_a_restart_is_applied_once() {
     let actor = ActorId::new("tills/sp-01").expect("valid");
     let server = local_node().await;
     let caller = local_node().await;
-    let key = IdempotencyKey::new("debit-4471").expect("a valid key");
+    let key = IdempotencyKey::new("credit-4471").expect("a valid key");
 
     // ── the first process: the work happens and is stored, and the record that
     //    would have suppressed a repeat is in memory only.
@@ -1270,7 +1279,7 @@ async fn a_retried_call_across_a_restart_is_applied_once() {
             .expect("dials");
         assert_eq!(
             till::at(&client.with_idempotency(key.clone()), actor.clone())
-                .debit(50)
+                .credit(50)
                 .await
                 .expect("the keyed actor answers"),
             50,
@@ -1299,12 +1308,13 @@ async fn a_retried_call_across_a_restart_is_applied_once() {
     assert_eq!(
         client.key_state(key.clone()).await.expect("answers"),
         KeyState::Fresh,
-        "a restarted ledger knows nothing about the key, and E accepts that \
-         rather than closing it",
+        "TODAY a restarted ledger knows nothing about the key, because it is \
+         memory. A durable record store would answer this `Done` and that is \
+         news rather than a regression — see this test's own doc",
     );
     assert_eq!(
         till::at(&client.with_idempotency(key.clone()), actor.clone())
-            .debit(50)
+            .credit(50)
             .await
             .expect("the keyed actor answers"),
         50,
@@ -1329,10 +1339,10 @@ async fn a_retried_call_across_a_restart_is_applied_once() {
     // ── the first negative: a SECOND key from the SAME peer is a different call.
     //    Without this the wiring could hash any fixed key it liked and every
     //    assertion above would still hold — see this test's own break record.
-    let another = IdempotencyKey::new("debit-4472").expect("a valid key");
+    let another = IdempotencyKey::new("credit-4472").expect("a valid key");
     assert_eq!(
         till::at(&client.with_idempotency(another), actor.clone())
-            .debit(7)
+            .credit(7)
             .await
             .expect("the keyed actor answers"),
         57,
@@ -1354,7 +1364,7 @@ async fn a_retried_call_across_a_restart_is_applied_once() {
         .expect("dials");
     assert_eq!(
         till::at(&other.with_idempotency(key.clone()), actor.clone())
-            .debit(50)
+            .credit(50)
             .await
             .expect("the keyed actor answers"),
         107,
@@ -1772,7 +1782,8 @@ async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
     assert_eq!(
         client.key_state(second_key.clone()).await.expect("answers"),
         KeyState::Fresh,
-        "the ledger is memory here too",
+        "the ledger is memory here too, today; a durable record store would \
+         answer this differently and that would be news",
     );
     // Under a budget, because the failure mode of this assertion is a call that
     // PARKS: without the timeout an unrecognised retry hangs the suite instead of

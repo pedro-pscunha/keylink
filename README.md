@@ -340,18 +340,25 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
    with no `fsync` behind it is 18 µs, where 4096 entries is well under a second.
    Measure and divide, and treat the count as the guarantee.
 
-   The busiest window is the one right after the restart, when every peer's backoff
-   fires at once. A *recognised* retry inserts nothing, so the herd does not displace
-   its own records — but a reconnecting client that re-issues and then carries on
-   working supplies new work too, which is what spends the bound.
+   The busiest window is the one right after the restart, which *concentrates*
+   arrivals — every peer's backoff fires at once. What drains the set, though, is
+   only **first-time** keyed work: a recognised retry returns before it touches the
+   eviction order, so a herd of pure retries costs no places at all. A reconnecting
+   client supplies both, and it is the new work that spends the bound.
 
    **What this does not buy, in full.** The duplicate still *enters the handler*
    and still costs a turn — about 7.6 ms of `fsync` on a state it did not change —
-   because only a durable ledger could refuse it before dispatch. `key_state(key)`
-   still answers `Fresh` after a restart, so a peer learns nothing about a key your
-   domain is about to dedupe. And the dedupe is yours to write: keylink will not
-   write it, because the correct version knows what your answer is and whether
-   replaying it beats refusing.
+   because only a durable ledger could refuse it before dispatch, and that one is
+   structural: the record lives in your state, so reaching it means dispatching to
+   your state. And the dedupe is yours to write, because the correct version knows
+   what your answer is and whether replaying it beats refusing.
+
+   Separately, and *as the tree stands today*: `key_state(key)` answers `Fresh`
+   after a restart, because the ledger it reads is memory. A peer therefore learns
+   nothing about a key your domain is about to dedupe. That is a property of the
+   ledger being volatile rather than a limit of the query — a durable record store
+   would answer it again, with nothing here changing — so read it as the current
+   state and not as a closed door.
 
    **It also rests on the calling peer keeping its identity.** The peer is in the
    hash, so a client that reconnects on a fresh keypair is a different caller, is

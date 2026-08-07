@@ -39,11 +39,17 @@
 //!   [`Persist`](crate::Persist)-backed actor that turn is an `fsync` of a state
 //!   the handler did not change — about 7.6 ms, measured and dated in that type's
 //!   own module header.
-//! - **[`key_state`](crate::RpcClient::key_state) still answers
-//!   [`Fresh`](crate::KeyState::Fresh) after a restart.** The ledger is what that
-//!   query reads and the ledger genuinely knows nothing, so a peer learns nothing
-//!   about a key the domain is about to dedupe. Asking is still safe — it runs no
-//!   handler — it is just no longer informative across a restart.
+//! - **Today [`key_state`](crate::RpcClient::key_state) answers
+//!   [`Fresh`](crate::KeyState::Fresh) after a restart**, because the ledger is what
+//!   that query reads and the ledger is memory. So a peer currently learns nothing
+//!   about a key this state is about to deduplicate. Asking is still safe — it runs
+//!   no handler — it is just uninformative across a restart *as the tree stands*.
+//!
+//!   Stated that way on purpose: it is a property of the ledger being volatile, not
+//!   a limit of the query, and a durable record store would give the answer back
+//!   without anything here changing. What would **not** come back is the cost above
+//!   it — a duplicate entering the handler is a consequence of the record living in
+//!   the caller's state, and no store on disk alters that.
 //! - **The dedupe is yours to write.** Three lines, in the handler you are already
 //!   editing. keylink will not write them for you, because the only correct
 //!   version knows what your answer is and whether replaying it is better than
@@ -133,15 +139,24 @@ const DIGEST_BYTES: usize = 16;
 /// # A restart is when the window is most likely to be spent, not least
 ///
 /// While the process is down this state accepts nothing, so the downtime itself
-/// consumes none of the bound. What follows it is the opposite of quiet: every
-/// peer's backoff fires at once, so the busiest traffic this actor ever sees is
-/// exactly the traffic racing the retries that need the bound.
+/// consumes none of the bound. What follows it is the opposite of quiet: a restart
+/// **concentrates** arrivals, because every peer's backoff fires at once, so the
+/// busiest traffic this actor ever sees is exactly the traffic racing the retries
+/// that need the bound.
 ///
-/// One mechanical caveat, because it changes how bad that is: **a recognised retry
-/// inserts nothing.** [`insert`](Applied::insert) keeps the first answer, so a herd
-/// of retries does not displace one another's records — only *new* keyed work does.
-/// A reconnecting client that re-issues its pending call and then carries on
-/// working supplies both, which is why the burst still matters.
+/// **What actually drains the set is first-time keyed work, and nothing else.** A
+/// recognised retry costs no place: [`insert`](Applied::insert) returns on
+/// `Entry::Occupied` *before* it touches the eviction order, so a repeat neither
+/// replaces an answer nor displaces a neighbour —
+/// `a_recognised_retry_does_not_displace_anything` is the guard. A herd of pure
+/// retries could therefore arrive at any size and drain nothing.
+///
+/// So the drain rate is the rate of **distinct keys this state has not seen before**,
+/// which is bounded above by the adapter's turn rate and is usually well below it. A
+/// reconnecting client supplies both kinds — it re-issues its pending call and then
+/// carries on working — and it is only the second half that spends the bound. That
+/// makes the post-restart burst the worst window for reasons of arrival *rate*, not
+/// because retries eat their own records.
 ///
 /// # Cost, which is a consequence and not the argument
 ///
@@ -205,6 +220,27 @@ impl CallId {
     /// The peer goes in first and is a fixed thirty-two bytes, which is what makes
     /// the concatenation unambiguous without a length prefix: no `(peer, key)`
     /// pair can produce the same byte string as another.
+    ///
+    /// # The service and the method are absent, and that is decided
+    ///
+    /// **A key names a call, not a method.** The digest is scoped exactly as the
+    /// ledger's slots are, and that is the whole reason to leave both out.
+    ///
+    /// - **Method**, because the ledger does not scope by one either:
+    ///   `Bucket::slots` is a `HashMap<IdempotencyKey, Entry>`, so a caller that
+    ///   sends one key to two methods already gets one call out of the ledger — the
+    ///   second is answered with the first's recorded reply. Folding the method in
+    ///   here would make [`Applied`] *disagree* with the ledger, and the caller
+    ///   would meet one rule before a restart and another after it.
+    /// - **Service**, because an `Applied` lives inside one state, which is served
+    ///   behind one ALPN. The dimension is carried by where the set sits rather than
+    ///   by what is in the digest, and a `Ledger` is per built `Service` for the
+    ///   same reason.
+    ///
+    /// The consequence is reachable and belongs to the caller: two methods sharing
+    /// one `Applied` field will answer the second from the first's record, exactly
+    /// as the live ledger already would. If two methods must not share a key, give
+    /// them different keys — or different `Applied` fields.
     pub(crate) fn of(peer: EndpointId, key: &IdempotencyKey) -> Self {
         let mut id = [0u8; DIGEST_BYTES];
         id.copy_from_slice(&Self::digest(peer, key)[..DIGEST_BYTES]);
@@ -265,8 +301,15 @@ impl std::fmt::Debug for CallId {
 /// three lines:
 ///
 /// ```ignore
-/// async fn debit(&mut self, cx: Caller<'_>, amount: u64) -> u64 {
+/// async fn credit(&mut self, cx: Caller<'_>, amount: u64) -> u64 {
 ///     let call = cx.peer().and_then(Context::call);
+///     // Or, for a method that must NOT run without a key — see the paragraph on
+///     // what an unkeyed call gets, because the default here is silent:
+///     //
+///     //     let Some(call) = cx.peer().and_then(Context::call) else {
+///     //         return self.balance;   // or refuse; this method needs a key
+///     //     };
+///     //     let call = Some(call);
 ///     if let Some(&balance) = self.applied.get(call) {
 ///         return balance;
 ///     }
@@ -331,7 +374,16 @@ impl std::fmt::Debug for CallId {
 /// `Option<CallId>` that [`Context::call`](crate::Context::call) hands out, so the
 /// caller writes no `match`; a `None` reads as absent and stores as a no-op. A
 /// caller that sent no key asked for no de-duplication and gets none — the same
-/// answer `claim_key` gives it one layer up.
+/// answer `claim_key` gives it one layer up, which is why the shape is this one and
+/// not a `Result`.
+///
+/// **The default is silent, and for money it is the wrong default.** A peer that
+/// forgot `with_idempotency` — or reached the method through a `tell`, which cannot
+/// carry a key — runs with no de-duplication at all and nothing anywhere says so.
+/// If a method must not run unkeyed, say it in the handler, which is why the example
+/// above carries the `let ... else` form as well as the three-line one. keylink
+/// cannot say it for you: `Applied` is in your state and the decision is about your
+/// domain, not about the transport.
 #[derive(Debug, Clone)]
 pub struct Applied<T> {
     answers: HashMap<CallId, T>,
@@ -380,8 +432,17 @@ impl<T> Applied<T> {
 
     /// Whether this call has been applied, without asking what it answered.
     ///
-    /// For `Applied<()>`, where there is no answer to hand back and the only
-    /// question is whether the work already happened.
+    /// **This is `get(call).is_some()`, and it is kept for reading rather than for
+    /// capability.** Said plainly because the duplication is the kind a reviewer
+    /// should challenge, and the answer is not that it does something more. It is
+    /// that `Applied<()>`'s `get` returns `Option<&()>` — a value with no
+    /// information in it — so `self.applied.get(call).is_some()` asks the right
+    /// question through a type that cannot express it, and
+    /// `self.applied.seen(call)` asks it directly.
+    ///
+    /// The narrower surface is a real alternative and the cost of taking it is one
+    /// awkward line at every `Applied<()>` call site. That trade is the whole
+    /// argument; there is nothing else on this side of it.
     #[must_use]
     pub fn seen(&self, call: Option<CallId>) -> bool {
         call.is_some_and(|call| self.answers.contains_key(&call))
@@ -700,6 +761,43 @@ mod tests {
         assert_eq!(applied.len(), 1, "and it is one entry, not two");
     }
 
+    /// **A recognised retry displaces nothing**, which is the mechanism the bound's
+    /// own docs rest on when they say a post-restart herd of retries cannot drain
+    /// the set.
+    ///
+    /// The eviction order has to not grow on a repeat, and that is a *separate*
+    /// fact from the answer being kept: `Entry::Occupied` returns before
+    /// `order.push_back`, and nothing about `len()` would notice if it did not,
+    /// because the extra entry lands in `order` and not in `answers`. Which is why
+    /// this is its own test at a bound of two rather than another assertion on
+    /// [`the_first_answer_for_a_call_is_the_one_kept`].
+    ///
+    /// Made red by moving the push above the match — `Entry::Occupied(_) => return,`
+    /// → `Entry::Occupied(_) => { self.order.push_back(call); return }`. The repeat
+    /// then costs a place, `B` pushes the length past the bound, and `A` is evicted
+    /// by its own retry. Watched:
+    /// `a retry must not cost the set a place ... left: None right: Some(10)`.
+    #[test]
+    fn a_recognised_retry_does_not_displace_anything() {
+        let two = NonZeroUsize::new(2).expect("2 is not zero");
+        let mut applied: Applied<u64> = Applied::bounded(two);
+        let first = Some(CallId::of(peer(A), &key("credit-1")));
+        let second = Some(CallId::of(peer(A), &key("credit-2")));
+
+        applied.insert(first, 10);
+        applied.insert(first, 10); // the retry
+        applied.insert(second, 20);
+
+        assert_eq!(
+            applied.get(first),
+            Some(&10),
+            "a retry must not cost the set a place, or the retry of A is what \
+             evicts A",
+        );
+        assert_eq!(applied.get(second), Some(&20));
+        assert_eq!(applied.len(), 2);
+    }
+
     /// **The property that makes this durable at all**: what comes back has the
     /// same entries, the same eviction order **and the same bound**.
     ///
@@ -707,10 +805,17 @@ mod tests {
     /// `postcard::to_allocvec(self)` gets for free and what a hand-written one
     /// should reach for first.
     ///
-    /// The bound half is the one worth stating. A decoding that did not carry it
-    /// would substitute [`APPLIED_BOUND`] — 4096 where this state was built with 2
-    /// — so the round trip would look perfect on every assertion about entries and
-    /// would silently have widened the bound by three orders of magnitude.
+    /// The bound half is the one worth stating. **Nothing on the decode side names
+    /// a bound**: the value comes back through `from_bytes` alone, so if the
+    /// encoding did not carry it the decode would fall to [`APPLIED_BOUND`] — 4096
+    /// where this state was built with 2 — and every assertion about entries would
+    /// still pass while the bound had silently widened by three orders of magnitude.
+    ///
+    /// Two assertions catch that, deliberately: `bound()` reads it directly, and the
+    /// eviction at the end reads it *behaviourally* — a restored set with the wrong
+    /// bound does not evict on the third insert. The direct one fires first, so the
+    /// behavioural one is not watched here; reaching it needs the bound assertion
+    /// removed as well, which is a two-literal edit and not this harness's shape.
     ///
     /// Made red two ways:
     ///
