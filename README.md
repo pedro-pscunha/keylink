@@ -310,8 +310,7 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
    `cx.call()` is what changes that. It hands the handler a `CallId` — the calling
    peer folded into a hash of its key, opaque so that no caller has to re-implement
    the ledger's peer-scoping rule — and `Applied<T>` is a bounded set to keep them
-   in. Put one in your own state, and the dedupe is three lines that travel with
-   whatever snapshot that state already writes:
+   in. Put one in your own state, and the dedupe is three lines:
 
    ```rust,ignore
    let call = cx.peer().and_then(Context::call);
@@ -320,10 +319,31 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
    self.applied.insert(call, self.balance);
    ```
 
-   `APPLIED_CAPACITY` is 4096 calls by default — about 31 seconds of back-to-back
-   distinct keyed traffic at the 130 turns/s ceiling `Persist`'s `fsync` imposes,
-   which is longer than `MAX_ATTACH`. `Applied<()>` is the valueless form, for work
-   that has no answer to replay.
+   Insert in the turn that **applies**, as above, and never in a turn that merely
+   hears about the work: the two together are one snapshot and one `fsync`, and that
+   is the whole reason the set lives in your state rather than in keylink's. A
+   `#[defer]` method's parking turn is the trap — park the `CallId` beside the
+   `Deferred` and let the releasing turn record it, or a restart in between leaves a
+   record with no work behind it. `Applied<()>` is the valueless form for exactly
+   that shape, where there is no answer to replay.
+
+   `Applied` derives `Serialize`/`Deserialize` and no `Schema`, so it cannot reach an
+   ALPN and `postcard::to_allocvec(self)` keeps compiling when you add the field.
+   Take that encoder rather than writing your own: a hand-rolled snapshot that omits
+   the field compiles, passes every test, and starts empty after every restart, which
+   is the silent at-least-once this whole mechanism exists to prevent.
+
+   **`APPLIED_BOUND` is 4096 calls — and the unit is calls, not seconds.** It means
+   "4096 other pieces of keyed work may land between yours and its retry". Turning
+   that into a duration needs *your* adapter's turn rate: over `keylink-persist`'s
+   file store a turn is ~7.6 ms, so ~130/s and roughly 31 seconds — but the same turn
+   with no `fsync` behind it is 18 µs, where 4096 entries is well under a second.
+   Measure and divide, and treat the count as the guarantee.
+
+   The busiest window is the one right after the restart, when every peer's backoff
+   fires at once. A *recognised* retry inserts nothing, so the herd does not displace
+   its own records — but a reconnecting client that re-issues and then carries on
+   working supplies new work too, which is what spends the bound.
 
    **What this does not buy, in full.** The duplicate still *enters the handler*
    and still costs a turn — about 7.6 ms of `fsync` on a state it did not change —
@@ -349,8 +369,13 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
    reply. Past any of them the reply is dropped and the retry is *refused* as
    `Forgotten`:
    at-most-once still holds, and the answer does not. Read the result out of your
-   own domain; do not re-run the work — and `cx.call()` from limit 2 is the
-   identifier to read it under.
+   own domain; do not re-run the work.
+
+   **`cx.call()` is no help here, and it is worth saying so.** A `Forgotten` repeat
+   is refused *before* dispatch, so there is no turn, no `Context`, and nothing for
+   a handler to recognise — the advice above is the caller's to act on, in its own
+   domain, and limit 2's remedy is the serving side's. The two limits look adjacent
+   and are not.
 4. **Past `MAX_TOMBSTONES` — 8192, eight times the record bound — a key is
    `Fresh` again and the retry runs.** This is the one edge where the *ledger's*
    guarantee degrades: effectively-once, to at-most-once, to at-least-once. It is
@@ -362,7 +387,7 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
    what it protects is the window between a call and its retry on one live process
    — and a restart resets it to nothing, which is limit 2. Two bounds, then, and
    they are different quantities: `MAX_TOMBSTONES` is how many other keys may pass
-   before this one is vacant again, and `APPLIED_CAPACITY` is how many other keys
+   before this one is vacant again, and `APPLIED_BOUND` is how many other keys
    may pass before your own state forgets it. The second is the one that survives a
    restart, and it is the one you can raise.
 

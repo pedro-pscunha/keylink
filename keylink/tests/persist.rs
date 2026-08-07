@@ -14,17 +14,18 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink::{
-    ActorId, Allowlist, Applied, CallId, Caller, Context, Deferred, Ended, Eviction,
-    IdempotencyKey, KeyState, Observer, Persist, Replied, Reply, Server, Stop, TurnFut, TurnInfo,
+    ActorId, Allowlist, Applied, Caller, Context, Deferred, Ended, Eviction, IdempotencyKey,
+    KeyState, Observer, Persist, Replied, Reply, Server, Stop, TurnFut, TurnInfo,
 };
 use std::time::Duration;
 
 use keylink_persist::file::Files;
 use keylink_persist::versioned::FRAME_LEN;
 use keylink_persist::{Claim, Durable, RestoreError, Snapshots, StateId};
+use serde::{Deserialize, Serialize};
 
 mod common;
-use common::local_node;
+use common::{local_node, NO_PROGRESS};
 
 keylink::service! {
     service Ledger;
@@ -1113,7 +1114,7 @@ keylink::service! {
 /// than in keylink's — which is the design. The bound it carries is the caller's
 /// to argue, and this one is [`APPLIED_CAPACITY`](keylink::APPLIED_CAPACITY)
 /// because nothing about a test argues for another number.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Till {
     balance: u64,
     runs: u64,
@@ -1142,43 +1143,23 @@ impl till::Actor for Till {
     }
 }
 
-/// Balance, run count, then one `(id, answer)` pair per applied call, oldest
-/// first — which is the order [`Applied::iter`](keylink::Applied::iter) reports
-/// for exactly this reason.
+/// **`postcard::to_allocvec(self)`, which is the whole of it.**
+///
+/// This impl used to be thirty-five lines of hand-rolled framing, and writing it
+/// was the evidence that `Applied`'s "travels with whatever snapshot that state
+/// already writes" was false: a state encoded this way did not compile once the
+/// field was added, and one encoded by hand omitted it silently. `Applied` derives
+/// `Serialize`/`Deserialize` now — and no `Schema`, so none of this can reach an
+/// ALPN — and this is what the claim looks like when it is true.
 impl Durable for Till {
     const VERSION: u32 = 1;
 
     fn snapshot(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&self.balance.to_le_bytes());
-        bytes.extend_from_slice(&self.runs.to_le_bytes());
-        for (call, answer) in self.applied.iter() {
-            bytes.extend_from_slice(call.as_bytes());
-            bytes.extend_from_slice(&answer.to_le_bytes());
-        }
-        bytes
+        postcard::to_stdvec(self).expect("a till encodes")
     }
 
     fn restore(bytes: &[u8]) -> Result<Self, RestoreError> {
-        const HEAD: usize = 16;
-        const ENTRY: usize = 24;
-        if bytes.len() < HEAD || !(bytes.len() - HEAD).is_multiple_of(ENTRY) {
-            return Err(RestoreError::Malformed(format!(
-                "a till is 16 bytes and then whole 24-byte entries, and this is {} bytes",
-                bytes.len()
-            )));
-        }
-        let mut till = Self {
-            balance: u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes")),
-            runs: u64::from_le_bytes(bytes[8..HEAD].try_into().expect("8 bytes")),
-            applied: Applied::new(),
-        };
-        for entry in bytes[HEAD..].chunks_exact(ENTRY) {
-            let id: [u8; 16] = entry[..16].try_into().expect("16 bytes");
-            let answer = u64::from_le_bytes(entry[16..].try_into().expect("8 bytes"));
-            till.applied.insert(Some(CallId::from_bytes(id)), answer);
-        }
-        Ok(till)
+        postcard::from_bytes(bytes).map_err(|e| RestoreError::Malformed(e.to_string()))
     }
 
     fn migrate(_from: u32, _bytes: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> {
@@ -1420,18 +1401,31 @@ keylink::service! {
 /// - `seen` is a probe. Restoring it would make the second incarnation's answer a
 ///   function of the first's, which is the opposite of what the test reads it for.
 ///
-/// `parked` is [`Applied<()>`](keylink::Applied) and not `Applied<u64>`, and that
+/// `applied` is [`Applied<()>`](keylink::Applied) and not `Applied<u64>`, and that
 /// is the `#[defer]` decision made concrete: the turn that parks produces no
-/// answer, so there is nothing to record and nothing to replay. At-most-once is
-/// all this shape can have. `Till` above is the other shape.
+/// answer, so there is nothing to replay. At-most-once is all this shape can have.
+/// `Till` above is the other shape.
 ///
-/// `approve` deduplicates nothing on purpose. This state exists for one question
-/// and a second `Applied` in it would answer none of it better.
+/// # The id is parked beside the `Deferred`, and NOT recorded in the parking turn
+///
+/// This is the only interesting line in the file and it was wrong first time
+/// round. Recording the call when it parks witnesses that the request **arrived**,
+/// not that it was **applied** — `balance` is untouched at that point. A restart
+/// between the park and the approval would then leave a record with no work behind
+/// it, and the retry would be answered with the *pre-withdrawal* balance presented
+/// as that withdrawal's own result: a lost debit, reported as success.
+///
+/// So the `CallId` rides in `waiting` and is recorded by the turn that **applies**
+/// it. Then the record and the work are one `Snapshot` and one `fsync`, which is
+/// the property `Applied`-inside-the-state exists for, and re-parking after a
+/// restart is correct rather than a duplicate — nothing was applied, so nothing is
+/// being applied twice.
 #[derive(Default)]
 struct Booth {
     balance: u64,
-    waiting: Vec<(u64, Deferred<u64>)>,
-    parked: Applied<()>,
+    /// The amount, the call that asked for it, and the channel to answer it on.
+    waiting: Vec<(u64, Option<keylink::CallId>, Deferred<u64>)>,
+    applied: Applied<()>,
     seen: Vec<String>,
 }
 
@@ -1446,22 +1440,27 @@ impl booth::Actor for Booth {
     async fn withdraw(&mut self, cx: Caller<'_>, reply: Reply<u64>, amount: u64) -> Replied<u64> {
         let call = cx.peer().and_then(Context::call);
         self.seen.push(mark(cx));
-        if self.parked.seen(call) {
-            // Recognised, and there is no recorded answer to give — so the domain
-            // answers out of itself, which is all `Applied<()>` promises.
+        if self.applied.seen(call) {
+            // Applied already, and there is no recorded answer to give back — so
+            // the domain answers out of itself, which is all `Applied<()>` can
+            // promise.
             return reply.send(self.balance);
         }
-        self.parked.insert(call, ());
         let (deferred, replied) = reply.later();
-        self.waiting.push((amount, deferred));
+        // Parked, not recorded. See the type: recording here would witness the
+        // request's arrival rather than its application.
+        self.waiting.push((amount, call, deferred));
         replied
     }
 
     async fn approve(&mut self, cx: Caller<'_>) -> u64 {
         self.seen.push(mark(cx));
         let approved = self.waiting.len() as u64;
-        for (amount, deferred) in std::mem::take(&mut self.waiting) {
+        for (amount, call, deferred) in std::mem::take(&mut self.waiting) {
             self.balance -= amount;
+            // Recorded by the turn that applied it, so this observer chain stores
+            // the debit and the record together or neither.
+            self.applied.insert(call, ());
             deferred.send(self.balance);
         }
         approved
@@ -1476,40 +1475,50 @@ impl booth::Actor for Booth {
     }
 }
 
-/// Balance, then one id per parked call. Neither `waiting` nor `seen` is here —
-/// see the type.
+/// **A hand-written snapshot, on purpose — `Till` is the derived one.**
+///
+/// `Booth` cannot derive its own: `waiting` holds live channels and `seen` is a
+/// probe, so two of four fields must not be encoded. That is the other shape a real
+/// state comes in, and the point of writing it out here is that the `Applied` field
+/// is still **one line** rather than a loop, because the encoder lives on the type
+/// and not in this file.
 impl Durable for Booth {
     const VERSION: u32 = 1;
 
     fn snapshot(&self) -> Vec<u8> {
         let mut bytes = self.balance.to_le_bytes().to_vec();
-        for (call, ()) in self.parked.iter() {
-            bytes.extend_from_slice(call.as_bytes());
-        }
+        bytes.extend_from_slice(&postcard::to_stdvec(&self.applied).expect("an id set encodes"));
         bytes
     }
 
     fn restore(bytes: &[u8]) -> Result<Self, RestoreError> {
-        if bytes.len() < 8 || !(bytes.len() - 8).is_multiple_of(16) {
-            return Err(RestoreError::Malformed(format!(
-                "a booth is 8 bytes and then whole 16-byte ids, and this is {} bytes",
-                bytes.len()
-            )));
-        }
-        let mut booth = Self {
-            balance: u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes")),
+        let (balance, rest) = bytes.split_at_checked(8).ok_or_else(|| {
+            RestoreError::Malformed(format!("{} bytes is not a booth", bytes.len()))
+        })?;
+        Ok(Self {
+            balance: u64::from_le_bytes(balance.try_into().expect("8 bytes")),
+            applied: postcard::from_bytes(rest)
+                .map_err(|e| RestoreError::Malformed(e.to_string()))?,
             ..Self::default()
-        };
-        for id in bytes[8..].chunks_exact(16) {
-            let id: [u8; 16] = id.try_into().expect("16 bytes");
-            booth.parked.insert(Some(CallId::from_bytes(id)), ());
-        }
-        Ok(booth)
+        })
     }
 
     fn migrate(_from: u32, _bytes: &[u8]) -> Result<Option<Vec<u8>>, RestoreError> {
         Ok(None)
     }
+}
+
+/// The booth's snapshot, decoded off the disk while the actor still holds the claim.
+///
+/// Raw, for the reason [`snapshot_path`] gives: reading it back through
+/// `Versioned::load` would need the claim, and the claim is what the running actor
+/// is holding. This is what lets a test see what one turn stored *without* a
+/// restart, which is the only way to look at the state between a park and its
+/// approval.
+fn on_disk_booth(scratch: &Scratch) -> Booth {
+    let framed = std::fs::read(scratch.0.join("booths").join("sp-01.snapshot"))
+        .expect("the snapshot exists");
+    Booth::restore(&framed[FRAME_LEN..]).expect("restores")
 }
 
 /// Wait for `want` withdrawals to be parked by asking over the wire, not by
@@ -1614,13 +1623,31 @@ impl Booking {
 /// otherwise a second occurrence of the same text and the harness aborts on a
 /// match that is not unique, which is what it is for.
 ///
-/// Made red twice, both on `keylink/src/middleware.rs`'s `pub fn call` body:
+/// Made red four ways.
+///
+/// On `keylink/src/middleware.rs`'s `pub fn call` body:
 ///
 /// - `self.call` → `self.call.and(None)`, so no turn is named at all. Watched:
 ///   `the first withdrawal's turn carried its own key`, `left: "-" right: "-"`.
 /// - `self.call` → `self.call.filter(|_| self.method() != "Approve")`, so the
 ///   releasing turn loses its own name. Watched:
 ///   `and the keyed approval carried its own`, `left: "-" right: "-"`.
+///
+/// On the record's placement, which is step 1's guard — in this file,
+/// `self.waiting.push((amount, call, deferred));` →
+/// `self.applied.insert(call, ()); self.waiting.push((amount, call, deferred));`,
+/// which is the defect the type's own docs describe. Watched:
+/// `a parked call must NOT be recorded yet. A record here witnesses that the request
+/// ARRIVED, and a restart in this window would then answer the retry out of a state
+/// nothing was ever debited from — a lost withdrawal, reported as a success`.
+///
+/// And on step 4's budget, to prove the budget is load-bearing rather than
+/// decoration: `keylink/src/call.rs`'s
+/// `call.is_some_and(|call| self.answers.contains_key(&call))` →
+/// `call.is_some_and(|call| { let _ = call; false })`, so the retry is not
+/// recognised and parks. Watched:
+/// `an unrecognised retry parks and never answers; this must not park: Elapsed(())`
+/// — a named failure where, without the `timeout`, the suite would simply hang.
 ///
 /// # The leak itself has no break, and that is the argument
 ///
@@ -1633,7 +1660,7 @@ impl Booking {
 /// being true.
 #[tokio::test]
 async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
-    let (_scratch, files) = store("deferred-call-id").await;
+    let (scratch, files) = store("deferred-call-id").await;
     let id = StateId::new("booths/sp-01").expect("valid");
     let actor = ActorId::new("booths/sp-01").expect("valid");
     let server = local_node().await;
@@ -1654,6 +1681,19 @@ async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
         tokio::spawn(async move { booth::at(&keyed, actor).withdraw(40).await })
     };
     parked_over_the_wire(&client, &actor, 1).await;
+
+    // ── The record belongs to the turn that APPLIES. Read off the disk between the
+    //    park and the approval, which is the window a restart would land in.
+    let parked_only = on_disk_booth(&scratch);
+    assert_eq!(parked_only.balance, 100, "the parking turn debited nothing");
+    assert!(
+        parked_only.applied.is_empty(),
+        "a parked call must NOT be recorded yet. A record here witnesses that the \
+         request ARRIVED, and a restart in this window would then answer the retry \
+         out of a state nothing was ever debited from — a lost withdrawal, reported \
+         as a success",
+    );
+
     assert_eq!(
         booth::at(&client, actor.clone())
             .approve()
@@ -1665,6 +1705,15 @@ async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
         pending.await.expect("no panic").expect("answers"),
         60,
         "the parked caller is still answered from the later turn",
+    );
+
+    // ── And the releasing turn stored the debit and the record together.
+    let released = on_disk_booth(&scratch);
+    assert_eq!(released.balance, 60, "the releasing turn debited");
+    assert_eq!(
+        released.applied.len(),
+        1,
+        "and recorded the call it applied, on the same snapshot as the debit",
     );
 
     // ── 3: a keyed withdrawal, released by a KEYED approval.
@@ -1694,14 +1743,18 @@ async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
     );
     assert_eq!(
         seen[1], "-",
-        "the releasing turn carried NO key, and did not inherit the parked \
-         call's: {seen:?}",
+        "an unkeyed releasing turn is named by nothing, so it did not inherit the \
+         parked call's key either: {seen:?}",
     );
     assert_ne!(
         seen[2], "-",
         "the second withdrawal's turn carried its own key"
     );
     assert_ne!(seen[3], "-", "and the keyed approval carried its own");
+    // THE sharp assertion. The unkeyed case above is satisfied by an accessor that
+    // always answers `None`; this one is not, because both turns are keyed and the
+    // releasing turn still has to report the key of the call it is running under
+    // rather than the key of the reply it is releasing.
     assert_ne!(
         seen[2], seen[3],
         "the releasing turn is named by its OWN call, not by the one it released",
@@ -1710,7 +1763,7 @@ async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
 
     booking.stop(&actor).await;
 
-    // ── 4: the restart. The channel is gone; the record the parking turn wrote
+    // ── 4: the restart. The channel is gone; the record the RELEASING turn wrote
     //      is not.
     let booking = Booking::start(&files, &id, &actor, &server).await;
     let client = booth::KeyedClient::connect(&caller, server.endpoint().addr())
@@ -1721,11 +1774,17 @@ async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
         KeyState::Fresh,
         "the ledger is memory here too",
     );
+    // Under a budget, because the failure mode of this assertion is a call that
+    // PARKS: without the timeout an unrecognised retry hangs the suite instead of
+    // failing it, and a guard whose failure is a hang is not a guard.
     assert_eq!(
-        booth::at(&client.with_idempotency(second_key.clone()), actor.clone())
-            .withdraw(40)
-            .await
-            .expect("answers"),
+        tokio::time::timeout(
+            NO_PROGRESS,
+            booth::at(&client.with_idempotency(second_key.clone()), actor.clone()).withdraw(40),
+        )
+        .await
+        .expect("an unrecognised retry parks and never answers; this must not park")
+        .expect("answers"),
         20,
         "the retry is recognised out of the restored state and answered at once",
     );

@@ -17,12 +17,18 @@
 //! the actor, the progress marker and the queueing budget, and not the key. There
 //! was nothing to read the result *under*.
 //!
-//! [`CallId`] is that name and [`Applied`] is somewhere to keep it. Neither is
-//! held by this crate: the set lives in the caller's own state, beside the balance
-//! it is protecting, and travels with it into whatever `Durable` snapshot that
-//! state already writes. That placement is the design rather than an
-//! implementation detail — the bound on how far back the dedupe reaches is then
-//! argued in the one domain that knows what a duplicate costs it.
+//! [`CallId`] is that name and [`Applied`] is somewhere to keep it. Neither is held
+//! by this crate: the set lives in the caller's own state, beside the balance it is
+//! protecting, and is written by that state's own `Durable` snapshot — `Serialize`
+//! and `Deserialize` are derived so that a `postcard::to_allocvec(self)` snapshot
+//! keeps compiling when the field is added, and so that a hand-written one needs a
+//! line rather than a loop.
+//!
+//! That placement is the design rather than an implementation detail, and it buys
+//! two things. The bound on how far back the dedupe reaches is argued in the one
+//! domain that knows what a duplicate costs it. And the record shares a turn with
+//! the work it is a record *of*, so the observer chain stores both or neither —
+//! which no framework-held set could promise.
 //!
 //! # What this does not buy
 //!
@@ -59,45 +65,91 @@ use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 
 use iroh::EndpointId;
+use serde::{Deserialize, Serialize};
 
 use crate::IdempotencyKey;
 
 /// Bytes of digest a [`CallId`] keeps.
 ///
-/// Sixteen, out of blake3's thirty-two. Two peers cannot collide with each other
-/// at all — the peer is hashed in — so this is a birthday bound over **one
-/// caller's own keys**, at 2^64 of them, against a ledger that will not hold more
-/// than [`MAX_RECORDS`](crate::MAX_RECORDS) at a time. The other sixteen bytes
-/// would buy nothing a caller could reach.
+/// Sixteen, out of blake3's thirty-two — 128 bits, so about `2^-128` per pair of
+/// distinct calls. The population that matters is the entries of one [`Applied`],
+/// which is [`APPLIED_BOUND`] of them, so the chance that *any* pair inside one
+/// collides is about `4096²/2^129`, or `2^-105`. The other sixteen bytes would buy
+/// nothing a caller could reach.
+///
+/// # What folding the peer in does and does not do
+///
+/// It does **not** make cross-peer collisions impossible, and an earlier version of
+/// this comment said it did. A digest is not a namespace: two calls from two peers
+/// can land on the same sixteen bytes exactly as readily as two from one, and one
+/// [`Applied`] holds the ids of every peer that called that state — so an accidental
+/// cross-peer false hit is possible, at the `2^-105` above.
+///
+/// What it buys is the part that was ever a security property: a peer cannot
+/// **choose** to collide with another's key. The ledger gets that structurally, from
+/// per-peer buckets of plaintext keys, where a cross-peer hit is not representable.
+/// Here it is cryptographic — peer A would need a second preimage against a
+/// 128-bit truncation of blake3, which is `2^128` work, not the `2^64` a birthday
+/// search would cost if it could pick both sides, because B's key is fixed and not
+/// A's to move.
+///
+/// That is a genuine, if unreachable, weakening against the ledger's structural
+/// version, and it is the price of not exporting the scoping rule to every caller
+/// who wants to deduplicate. Naming it is cheaper than discovering it.
 const DIGEST_BYTES: usize = 16;
 
 /// Calls an [`Applied`] remembers before it starts forgetting the oldest.
 ///
-/// Judgement, not measurement — and the thing it is judged against is the
-/// **window a retry has to arrive in**, never a byte budget.
+/// Judgement, not measurement — and the thing it is judged against is the **window
+/// a retry has to arrive in**, never a byte budget.
 ///
-/// An id is displaced by the *distinct keyed calls this state accepts after it*,
-/// so the question is how much other traffic can land between the work and its
-/// retry. The ceiling on that rate is the durable actor's own: 7.6 ms per turn,
-/// about 130 turns per second, measured and dated in [`Persist`](crate::Persist)'s
-/// own module header. At that
-/// ceiling, 4096 entries is **about 31 seconds of back-to-back, all-distinct,
-/// fully saturated keyed traffic** — longer than
-/// [`MAX_ATTACH`](crate::MAX_ATTACH), which is the longest keylink itself will
-/// hold a stream open for a call it is waiting on. A retry later than that is one
-/// the caller's own backoff produced.
+/// **The unit is calls, not seconds, and that is the honest way to state it.** An id
+/// is displaced by the *distinct keyed calls this state accepts after it*, so 4096
+/// is "4096 other pieces of keyed work may land between yours and its retry". Every
+/// conversion of that into a duration needs a turn rate, and the turn rate is not
+/// keylink's to promise.
 ///
-/// The restart is *not* part of that window, which is what makes the margin wider
-/// than it looks: while the process is down this state accepts nothing, so nothing
-/// displaces anything. The 31 seconds is traffic arriving after the new process is
-/// serving and before the retry reaches it.
+/// # The seconds, and what they are conditional on
 ///
-/// What it costs is a consequence and not the argument: 4096 ids is 64 KiB, plus
-/// one `T` each and a `HashMap`'s overhead. Raise it with
-/// [`Applied::with_capacity`] if your callers back off for longer than your actor
-/// takes to fill it; there is no reason to lower it.
-pub const APPLIED_CAPACITY: NonZeroUsize = match NonZeroUsize::new(4096) {
-    Some(capacity) => capacity,
+/// On a [`Persist`](crate::Persist) actor over `keylink_persist::file::Files`, a
+/// turn costs about 7.6 ms — two `fsync`s and a `rename`, measured and dated in
+/// `Persist`'s own module header — so roughly 130 turns per second, and 4096 entries
+/// is about **31 seconds** of back-to-back, all-distinct, fully saturated keyed
+/// traffic.
+///
+/// **That number belongs to that adapter.** `Persist`'s header invites *"an adapter
+/// whose `store` does not sync"* and measures the same turn with no observer at
+/// **18 µs**. An actor storing at anything like that rate does thousands of turns a
+/// second, and 4096 entries is then well under a second, not 31. So: measure your
+/// own adapter's turn rate and divide. If you have no measurement, the count is
+/// still the guarantee and the seconds are not.
+///
+/// The comparison this used to draw against [`MAX_ATTACH`](crate::MAX_ATTACH) is
+/// gone, and it was wrong rather than merely loose: `MAX_ATTACH` bounds how long
+/// keylink holds a stream waiting on a call that is **in flight on a live process**,
+/// which is not the window a post-restart retry crosses. It was an unrelated
+/// quantity that happened to be near 31.
+///
+/// # A restart is when the window is most likely to be spent, not least
+///
+/// While the process is down this state accepts nothing, so the downtime itself
+/// consumes none of the bound. What follows it is the opposite of quiet: every
+/// peer's backoff fires at once, so the busiest traffic this actor ever sees is
+/// exactly the traffic racing the retries that need the bound.
+///
+/// One mechanical caveat, because it changes how bad that is: **a recognised retry
+/// inserts nothing.** [`insert`](Applied::insert) keeps the first answer, so a herd
+/// of retries does not displace one another's records — only *new* keyed work does.
+/// A reconnecting client that re-issues its pending call and then carries on
+/// working supplies both, which is why the burst still matters.
+///
+/// # Cost, which is a consequence and not the argument
+///
+/// 4096 ids is 64 KiB, plus one `T` each and a `HashMap`'s overhead. Raise it with
+/// [`Applied::bounded`] if your callers back off for longer than your actor takes to
+/// fill it; there is no reason to lower it.
+pub const APPLIED_BOUND: NonZeroUsize = match NonZeroUsize::new(4096) {
+    Some(bound) => bound,
     // Unreachable: 4096 is not zero. The arm exists because `NonZeroUsize::new`
     // is total and this crate denies `unwrap` in a `const` as everywhere else.
     None => NonZeroUsize::MIN,
@@ -126,15 +178,25 @@ pub const APPLIED_CAPACITY: NonZeroUsize = match NonZeroUsize::new(4096) {
 /// pair, so the same peer and the same key always name the same call, and a retry
 /// cannot fail to be recognised because the id came out different.
 ///
-/// # Not a wire type
+/// # `Serialize` yes, `Schema` never — and the difference is the whole rule
 ///
 /// It is derived on the serving side from something the peer sent, and it never
-/// goes back. There are no `Serialize`, `Deserialize` or `Schema` impls, and
-/// adding them would put a 16-byte digest into a hashed contract that would then
-/// have to hold still. [`as_bytes`](Self::as_bytes) and
-/// [`from_bytes`](Self::from_bytes) are what a state's own snapshot uses, which is
-/// the one place these bytes are meant to be written down.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// goes back on keylink's wire. An earlier version of this paragraph refused serde
+/// outright, saying it "would put a 16-byte digest into a hashed contract that
+/// would then have to hold still". That conflated two traits and cost the caller a
+/// hand-rolled encoder.
+///
+/// The contract keylink hashes is [`postcard_schema::Schema`], via
+/// `derive_alpn<C: Schema>` — and a type with no `Schema` impl **cannot appear in a
+/// `service!` signature at all**. So `Schema` is the one that would freeze the
+/// digest, and it is deliberately absent. `Serialize`/`Deserialize` cannot reach an
+/// ALPN, and they are what let a state whose `snapshot` is
+/// `postcard::to_allocvec(self)` keep compiling when an [`Applied`] field is added
+/// to it.
+///
+/// [`as_bytes`](Self::as_bytes) and [`from_bytes`](Self::from_bytes) remain, for a
+/// hand-written snapshot that wants the sixteen bytes and nothing around them.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CallId([u8; DIGEST_BYTES]);
 
 impl CallId {
@@ -216,21 +278,52 @@ impl std::fmt::Debug for CallId {
 ///
 /// `T` is your answer, so a recognised retry is *answered* rather than refused —
 /// effectively-once, across the restart the ledger cannot cross. `Applied<()>` is
-/// the other shape: it remembers that the work happened and holds no answer to
-/// give back, which is at-most-once and is all a `#[defer]` method can have. See
-/// [`seen`](Self::seen).
+/// the other shape: it holds no answer to give back, which is at-most-once and is
+/// all a `#[defer]` method can have. See [`seen`](Self::seen).
+///
+/// # Insert in the turn that APPLIES, not the turn that hears about it
+///
+/// An entry means "this state applied that call", so it belongs in the same turn as
+/// the mutation. Put the two together and the observer chain stores the work and
+/// the record on one snapshot and one `fsync`, or stores neither — which is the
+/// reason this type is embedded rather than framework-held, and the one thing about
+/// it that is load-bearing.
+///
+/// Splitting them is a real defect and not a style point. A `#[defer]` method that
+/// inserts when it **parks** has recorded that the request arrived, not that it was
+/// applied: a restart before the releasing turn then leaves a record with no work
+/// behind it, and the retry is answered out of a state nothing was ever applied to
+/// — a lost operation reported as a success. The parking turn is where the
+/// [`CallId`] is *available*; park it beside the [`Deferred`](crate::Deferred) and
+/// let the turn that applies do the recording.
 ///
 /// # It is yours, and that is the point
 ///
 /// keylink does not hold this, look at it, or bound it on your behalf. That is
-/// what makes [`APPLIED_CAPACITY`] arguable at all: a bound inside the framework
+/// what makes [`APPLIED_BOUND`] arguable at all: a bound inside the framework
 /// would have to be right for every state at once, and the number that matters is
 /// how long *your* callers back off for.
 ///
-/// It is also why nothing here touches durability. Your state already knows how to
-/// snapshot itself; [`iter`](Self::iter) hands the entries back oldest-first so a
-/// restore that replays them with [`insert`](Self::insert) rebuilds the same
-/// eviction order, and [`CallId::as_bytes`] is the sixteen bytes to write.
+/// # Snapshotting it
+///
+/// `Serialize` and `Deserialize` are derived, so a state whose `snapshot` is
+/// `postcard::to_allocvec(self)` keeps compiling when this field is added, and one
+/// whose snapshot is hand-written needs one line rather than a loop. The encoding
+/// carries the **bound** as well as the entries, so a round trip restores the
+/// same bound and the same next victim rather than silently reverting to
+/// [`APPLIED_BOUND`].
+///
+/// That matters more than it sounds: a hand-written snapshot that forgets this
+/// field compiles, passes every test, and starts empty after every restart — which
+/// is precisely the silent at-least-once this module exists to prevent. There is no
+/// encoder to get wrong now, which is the only defence available against a mistake
+/// nothing can observe.
+///
+/// [`iter`](Self::iter) is still there for a snapshot that wants the pairs itself;
+/// it reports oldest-first, so replaying it through [`insert`](Self::insert) into an
+/// `Applied` **of the same bound** rebuilds the same eviction order.
+///
+/// [`Snapshot`]: keylink_persist::versioned::Snapshot
 ///
 /// # What an unkeyed call gets
 ///
@@ -245,28 +338,34 @@ pub struct Applied<T> {
     /// The ids in `answers`, oldest first. The eviction order, and the order
     /// [`Applied::iter`] reports so that a snapshot round-trips.
     order: VecDeque<CallId>,
-    capacity: NonZeroUsize,
+    bound: NonZeroUsize,
 }
 
 impl<T> Applied<T> {
-    /// Remember up to [`APPLIED_CAPACITY`] calls.
+    /// Remember up to [`APPLIED_BOUND`] calls.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_capacity(APPLIED_CAPACITY)
+        Self::bounded(APPLIED_BOUND)
     }
 
-    /// Remember up to `capacity` calls.
+    /// Remember up to `bound` calls.
     ///
-    /// [`NonZeroUsize`] rather than `usize`, because a capacity of zero is an
-    /// `Applied` that accepts every insert and recognises nothing — at-least-once
-    /// wearing the type that says otherwise, which is exactly the silent
-    /// degradation this whole module exists to give a caller a way out of.
+    /// **`bounded` and not `with_capacity`.** std's `with_capacity` reserves room
+    /// and changes no behaviour; this reserves nothing, allocates nothing, and is
+    /// the point at which entries start being forgotten. Borrowing the std spelling
+    /// for the opposite meaning is how a caller ends up believing a bigger number is
+    /// only a performance knob.
+    ///
+    /// [`NonZeroUsize`] rather than `usize`, because a bound of zero is an `Applied`
+    /// that accepts every insert and recognises nothing — at-least-once wearing the
+    /// type that says otherwise, which is exactly the silent degradation this whole
+    /// module exists to give a caller a way out of.
     #[must_use]
-    pub fn with_capacity(capacity: NonZeroUsize) -> Self {
+    pub fn bounded(bound: NonZeroUsize) -> Self {
         Self {
             answers: HashMap::new(),
             order: VecDeque::new(),
-            capacity,
+            bound,
         }
     }
 
@@ -306,7 +405,7 @@ impl<T> Applied<T> {
             }
         }
         self.order.push_back(call);
-        while self.order.len() > self.capacity.get() {
+        while self.order.len() > self.bound.get() {
             if let Some(oldest) = self.order.pop_front() {
                 self.answers.remove(&oldest);
             }
@@ -326,16 +425,23 @@ impl<T> Applied<T> {
     }
 
     /// The bound this one was built with.
+    ///
+    /// Its one caller in this crate is
+    /// `a_snapshot_of_what_was_applied_round_trips_with_its_bound`, which is not an
+    /// accident: the type's docs promise that a round trip restores the bound, and
+    /// an accessor is what makes that promise assertable rather than decorative.
     #[must_use]
-    pub fn capacity(&self) -> NonZeroUsize {
-        self.capacity
+    pub fn bound(&self) -> NonZeroUsize {
+        self.bound
     }
 
     /// Every remembered call and its answer, **oldest first**.
     ///
     /// The order is the contract, not an accident of the container: it is the
     /// eviction order, so a snapshot written in it and replayed through
-    /// [`insert`](Self::insert) restores the same set *and* the same next victim.
+    /// [`insert`](Self::insert) — into an `Applied` of the **same bound** —
+    /// restores the same set *and* the same next victim. `Serialize` carries the
+    /// bound for you, which is why it is the one to reach for first.
     pub fn iter(&self) -> impl Iterator<Item = (CallId, &T)> {
         self.order
             .iter()
@@ -346,6 +452,35 @@ impl<T> Applied<T> {
 impl<T> Default for Applied<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The bound **and** the entries, oldest first, as a pair.
+///
+/// Hand-written rather than derived, for two reasons the derive cannot give. The
+/// `HashMap`'s iteration order is not stable, so a derived impl would write
+/// different bytes for one unchanged state and lose the eviction order with them;
+/// and the bound is not recoverable from the entries, so a decode that did not
+/// carry it would silently substitute [`APPLIED_BOUND`] for whatever the state was
+/// built with.
+impl<T: Serialize> Serialize for Applied<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (self.bound, self.iter().collect::<Vec<_>>()).serialize(serializer)
+    }
+}
+
+/// Replayed through [`Applied::insert`] in the order it was written, so the decoded
+/// value is one an ordinary sequence of inserts could have produced. Nothing here
+/// can construct a state the public API cannot.
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Applied<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (bound, entries): (NonZeroUsize, Vec<(CallId, T)>) =
+            Deserialize::deserialize(deserializer)?;
+        let mut applied = Self::bounded(bound);
+        for (call, answer) in entries {
+            applied.insert(Some(call), answer);
+        }
+        Ok(applied)
     }
 }
 
@@ -423,45 +558,64 @@ mod tests {
         );
     }
 
-    /// **The failure direction, at a width where the failure is reachable.**
+    /// **The failure direction, and the wrong answer it hands back.**
     ///
     /// A collision at sixteen bytes is not exhibitable and this test does not
-    /// pretend to exhibit one. What it pins is the *direction*: a digest too short
-    /// produces a **false hit** — two of one peer's keys becoming one id, so the
-    /// second is answered from the first's record — and never a false miss, which
-    /// is unreachable at any width because the digest is a total function of
-    /// exactly `(peer, key)`.
+    /// pretend to exhibit one. It forces one at a width where the pigeonhole
+    /// guarantees a pair inside 257 keys, and then asserts the **consequence**:
+    /// `Applied` answers one key's call with **another key's answer**. That is a
+    /// wrong answer returned as if it were right, which is a worse failure than the
+    /// refusal a short digest is sometimes assumed to produce, and it is the reason
+    /// the width is sixteen bytes rather than eight.
     ///
-    /// One byte, so the pigeonhole guarantees a pair inside 257 keys.
+    /// # Which assertion is the guard, and which is the demonstration
     ///
-    /// Made red by `DIGEST_BYTES: usize = 16` → `1`: the pair that collides at one
-    /// byte then collides at the real width too, and the second assertion fails.
+    /// Written down because the first version of this test was two-thirds
+    /// tautology — it re-asserted the predicate `find` had just matched on, and
+    /// then compared one call to itself.
+    ///
+    /// - The **guard** is the width assertion. Made red by
+    ///   `DIGEST_BYTES: usize = 16` → `1`: the pair that collides at one byte then
+    ///   collides at the real width too. Watched:
+    ///   `at DIGEST_BYTES the same pair must be two calls / left: CallId(4a) right: CallId(4a)`.
+    /// - The **demonstration** is the `Applied` half. It passes broken and
+    ///   unbroken, because it is asserted at the narrowed width on purpose, and it
+    ///   is here to state the consequence in executable form rather than in prose.
+    ///   It is not decoration: it goes red if `Applied` ever stops keying on the
+    ///   `CallId` alone, which is the only way this consequence could change.
+    ///
+    /// A false **miss** has no assertion and cannot have one: the digest is a total
+    /// function of exactly `(peer, key)`, so there is no input that makes one id
+    /// into two. What could still produce one is `CallId`'s `Hash` and `Eq`
+    /// disagreeing, and that is guarded by
+    /// [`a_keyed_call_is_answered_from_what_it_applied`].
     #[test]
     fn a_shortened_digest_fails_towards_a_false_hit() {
         let keys: Vec<IdempotencyKey> = (0..300).map(|n| key(&format!("k-{n}"))).collect();
-        let collision = keys
+        let (left, right) = keys
             .iter()
             .enumerate()
             .flat_map(|(i, left)| keys[i + 1..].iter().map(move |right| (left, right)))
             .find(|(left, right)| narrow(peer(A), left, 1) == narrow(peer(A), right, 1))
             .expect("257 keys cannot all differ in one byte");
 
-        let (left, right) = collision;
+        // The consequence: a state that applied `left` answers `right` with
+        // `left`'s answer. Nobody is refused and nobody is told.
+        let mut applied: Applied<u64> = Applied::new();
+        applied.insert(Some(narrow(peer(A), left, 1)), 50);
         assert_eq!(
-            narrow(peer(A), left, 1),
-            narrow(peer(A), right, 1),
-            "a one-byte id is what a false hit looks like: two keys, one call",
+            applied.get(Some(narrow(peer(A), right, 1))),
+            Some(&50),
+            "a digest too short answers one key's call with ANOTHER key's answer, \
+             and reports it as that call's own",
         );
+
+        // The guard: at the real width they are two calls, so the consequence
+        // above is a property of the narrowing and not of the design.
         assert_ne!(
             CallId::of(peer(A), left),
             CallId::of(peer(A), right),
             "at DIGEST_BYTES the same pair must be two calls",
-        );
-        assert_eq!(
-            CallId::of(peer(A), left),
-            CallId::of(peer(A), left),
-            "a false MISS is what would break a retry, and it is unreachable: \
-             the digest is a function of the pair and of nothing else",
         );
     }
 
@@ -513,7 +667,7 @@ mod tests {
     #[test]
     fn the_oldest_call_is_the_one_forgotten() {
         let two = NonZeroUsize::new(2).expect("2 is not zero");
-        let mut applied: Applied<u64> = Applied::with_capacity(two);
+        let mut applied: Applied<u64> = Applied::bounded(two);
         let calls: Vec<Option<CallId>> = (0..3)
             .map(|n| Some(CallId::of(peer(A), &key(&format!("debit-{n}")))))
             .collect();
@@ -546,41 +700,48 @@ mod tests {
         assert_eq!(applied.len(), 1, "and it is one entry, not two");
     }
 
-    /// **The property that makes this durable at all**: the entries can be written
-    /// down and read back, and what comes back has the same eviction order.
+    /// **The property that makes this durable at all**: what comes back has the
+    /// same entries, the same eviction order **and the same bound**.
     ///
-    /// This is the shape a state's own `Durable::snapshot` and `restore` take, so
-    /// the round trip goes through [`CallId::as_bytes`] and
-    /// [`CallId::from_bytes`] rather than cloning the value.
+    /// Through `postcard`, which is what a state whose `snapshot` is
+    /// `postcard::to_allocvec(self)` gets for free and what a hand-written one
+    /// should reach for first.
     ///
-    /// Made red by reversing [`Applied::iter`] — `self.order\n.iter()` →
-    /// `self.order\n.iter()\n.rev()\n.collect::<Vec<_>>()\n.into_iter()`, the
-    /// `collect` being what keeps the closure's lifetime the same shape — when the
-    /// restored set forgets the wrong entry. Watched:
-    /// `a restored set must evict in the order it was written`.
+    /// The bound half is the one worth stating. A decoding that did not carry it
+    /// would substitute [`APPLIED_BOUND`] — 4096 where this state was built with 2
+    /// — so the round trip would look perfect on every assertion about entries and
+    /// would silently have widened the bound by three orders of magnitude.
+    ///
+    /// Made red two ways:
+    ///
+    /// - reversing [`Applied::iter`] — `self.order\n.iter()` →
+    ///   `self.order\n.iter()\n.rev()\n.collect::<Vec<_>>()\n.into_iter()`, the
+    ///   `collect` being what keeps the closure's lifetime the same shape — when the
+    ///   restored set forgets the wrong entry.
+    /// - dropping the bound from the encoding: `(self.bound, self.iter()` →
+    ///   `(APPLIED_BOUND, self.iter()`, which is what a derived impl would have
+    ///   done and which the `bound()` assertion catches.
     #[test]
-    fn a_snapshot_of_what_was_applied_round_trips_with_its_eviction_order() {
+    fn a_snapshot_of_what_was_applied_round_trips_with_its_bound() {
         let two = NonZeroUsize::new(2).expect("2 is not zero");
-        let mut applied: Applied<u64> = Applied::with_capacity(two);
+        let mut applied: Applied<u64> = Applied::bounded(two);
         let calls: Vec<Option<CallId>> = (0..2)
             .map(|n| Some(CallId::of(peer(A), &key(&format!("debit-{n}")))))
             .collect();
         applied.insert(calls[0], 10);
         applied.insert(calls[1], 20);
 
-        // What a `snapshot` writes: sixteen bytes and an answer, in order.
-        let written: Vec<([u8; DIGEST_BYTES], u64)> = applied
-            .iter()
-            .map(|(call, answer)| (*call.as_bytes(), *answer))
-            .collect();
-        // What a `restore` does with them.
-        let mut restored: Applied<u64> = Applied::with_capacity(two);
-        for (bytes, answer) in written {
-            restored.insert(Some(CallId::from_bytes(bytes)), answer);
-        }
+        let written = postcard::to_stdvec(&applied).expect("encodes");
+        let mut restored: Applied<u64> = postcard::from_bytes(&written).expect("decodes");
 
         assert_eq!(restored.get(calls[0]), Some(&10));
         assert_eq!(restored.get(calls[1]), Some(&20));
+        assert_eq!(
+            restored.bound(),
+            two,
+            "a round trip that lost the bound would silently widen it to \
+             APPLIED_BOUND and no assertion about entries would notice",
+        );
 
         // And the next insert displaces the same entry the original would have.
         let third = Some(CallId::of(peer(A), &key("debit-2")));
@@ -590,5 +751,43 @@ mod tests {
             "a restored set must evict in the order it was written",
         );
         assert_eq!(restored.get(calls[1]), Some(&20));
+    }
+
+    /// The bytes are stable across encodings of one unchanged value.
+    ///
+    /// A derived impl over the inner `HashMap` would not be: its iteration order is
+    /// unspecified, so one state would encode to different bytes run to run, and the
+    /// eviction order would be whatever the map felt like that time. `Persist`
+    /// rewrites the snapshot every turn either way, so nothing breaks loudly — the
+    /// eviction order just stops being the one [`Applied::iter`] promises.
+    ///
+    /// Made red by `(self.bound, self.iter().collect::<Vec<_>>())` →
+    /// `(self.bound, self.answers.iter().map(|(c, a)| (*c, a)).collect::<Vec<_>>())`,
+    /// which is the derive's behaviour written out — the `map` only because
+    /// `HashMap::iter` hands back `&CallId`. Watched:
+    /// `and a decoded set must re-encode to the same bytes`.
+    ///
+    /// **It is the second assertion that goes red, not the first**, and the reason is
+    /// worth knowing before reading a failure here: two encodings of one *live* value
+    /// walk the same map and agree even under the break. What exposes the hash order
+    /// is a **decode**, which rebuilds the map and lands the entries somewhere else.
+    /// So the first assertion is the weaker of the pair and the round trip is what
+    /// carries the guard.
+    #[test]
+    fn one_unchanged_set_encodes_to_one_sequence_of_bytes() {
+        let mut applied: Applied<u64> = Applied::new();
+        for n in 0..32 {
+            applied.insert(Some(CallId::of(peer(A), &key(&format!("debit-{n}")))), n);
+        }
+        let once = postcard::to_stdvec(&applied).expect("encodes");
+        let twice = postcard::to_stdvec(&applied).expect("encodes");
+        assert_eq!(once, twice, "the encoding must not depend on a hash order");
+
+        let restored: Applied<u64> = postcard::from_bytes(&once).expect("decodes");
+        assert_eq!(
+            postcard::to_stdvec(&restored).expect("encodes"),
+            once,
+            "and a decoded set must re-encode to the same bytes",
+        );
     }
 }

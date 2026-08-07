@@ -244,7 +244,7 @@ pub use admission::{Admission, Admittance, DynamicAdmission, Revocable, Revocati
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
 pub use blobs::{BlobHandle, BlobId, Blobs, BlobsAdmission, Granting, Retention, MAX_GRANTS};
 pub use body::{Body, BodyReader};
-pub use call::{Applied, CallId, APPLIED_CAPACITY};
+pub use call::{Applied, CallId, APPLIED_BOUND};
 pub use console::{
     Console, EndReason, EventPage, EventStream, Events, FollowRefused, Inspector, LifecycleEvent,
     NodeKey, NodeStatus, MAX_FOLLOWERS,

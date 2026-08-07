@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use keylink::{
     Admission, Admittance, AdmittedPeer, Allowlist, Context, Departure, IdempotencyKey, KeyState,
-    Peer, ProvenPeer, Revocation, Server as KeylinkServer, APPLIED_CAPACITY, MAX_ATTACH,
+    Peer, ProvenPeer, Revocation, Server as KeylinkServer, APPLIED_BOUND, MAX_ATTACH,
     MAX_RECORDED_BYTES, MAX_RECORDS, MAX_TOMBSTONES, RECORD_TTL,
 };
 use postcard_schema::Schema;
@@ -284,7 +284,7 @@ async fn a_retried_call_across_a_reconnect_runs_exactly_once() {
 /// nothing. Both were fixed on the README's side — the numbers are printed
 /// there now — rather than by dropping the assertions, because a bound a reader
 /// cannot see is a bound they cannot plan around.
-/// `APPLIED_CAPACITY` joined this list with limit 2's rewrite, and it is the one
+/// `APPLIED_BOUND` joined this list with limit 2's rewrite, and it is the one
 /// entry here that is not the ledger's: it bounds a set that lives in the
 /// caller's own state. It belongs anyway, by this test's own rule — the README
 /// prints the number, and the README's argument for it is a comparison against
@@ -296,5 +296,5 @@ fn the_limits_the_readme_names_are_the_ones_the_ledger_uses() {
     assert_eq!(MAX_RECORDS, 1024);
     assert_eq!(MAX_RECORDED_BYTES, 1 << 20);
     assert_eq!(MAX_ATTACH, Duration::from_secs(30));
-    assert_eq!(APPLIED_CAPACITY.get(), 4096);
+    assert_eq!(APPLIED_BOUND.get(), 4096);
 }
