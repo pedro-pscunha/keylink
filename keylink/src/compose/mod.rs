@@ -44,6 +44,12 @@
 //! buffered, and nothing is silently dropped: `Topic`'s drop policy ends an
 //! actor, which is the loudest signal the crate has.
 //!
+//! Read that as a safety property and not only as a throughput one. An option
+//! that waits is an edge a deadlock can be built from; an option that ends the
+//! consumer is not, because nothing in it awaits. Which of the two applies, and
+//! when the difference bites, is stated on
+//! [`publish`](Topic::publish) rather than repeated here.
+//!
 //! # Designed against a mailbox of one, and where a deeper one would change this
 //!
 //! `local.rs`'s `LOCAL_MAILBOX_DEPTH` is 1 — as is `registry.rs`'s
