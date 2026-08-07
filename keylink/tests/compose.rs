@@ -206,6 +206,12 @@ fn numbered(member: keylink::compose::Member) -> u64 {
 
 // ─────────────────────────────────────────────────────────────────── the topic
 
+/// Made red by `scripts/break-once.sh`, replacing `publish_blocking`'s
+/// `for one in to {` with `for one in to.into_iter().take(1) {` — a fan-out that
+/// reaches the first subscriber and stops, which is the shape of every hand-rolled
+/// one that forgot a loop. Watched: this fails at the first publish, "every
+/// subscriber takes every item", left `Fanout { delivered: 1, dropped: 0, gone: 0 }`
+/// against right `Fanout { delivered: 3, dropped: 0, gone: 0 }`.
 #[tokio::test]
 async fn a_publisher_fans_out_to_three_subscribers_each_on_its_own_feed() {
     let topic = Topic::new(Overflow::BlockPublisher);
@@ -237,6 +243,20 @@ async fn a_publisher_fans_out_to_three_subscribers_each_on_its_own_feed() {
     }
 }
 
+/// **This one's own claim cannot be made red, and that is recorded rather than
+/// left to be rediscovered.** "A topic keeps no history" denies a buffer that does
+/// not exist: nothing in `topic.rs` holds a past item, so no edit turns `subscribe`
+/// into a replay — the defect would have to be *added*, and an addition is not a
+/// break. Wave 7 (`9a7fd1d`) reached the same verdict when this was written, and
+/// called it a regression pin rather than a guard.
+///
+/// What *is* reddenable is the counting half, and it was watched:
+/// `scripts/break-once.sh` replacing `publish_blocking`'s
+/// `Ok(()) => delivered += 1,` with `delivered += 2,` fails the second assertion,
+/// left `Fanout { delivered: 2, dropped: 0, gone: 0 }` against right
+/// `Fanout { delivered: 1, dropped: 0, gone: 0 }`. That proves the assertions are
+/// wired to the `Fanout` this publish produced. It does not prove the no-history
+/// property, and nothing can.
 #[tokio::test]
 async fn a_topic_with_nobody_listening_drops_the_item_rather_than_keeping_it() {
     let topic = Topic::new(Overflow::BlockPublisher);
@@ -266,6 +286,13 @@ async fn a_topic_with_nobody_listening_drops_the_item_rather_than_keeping_it() {
     assert_eq!(heard.recv().await, Some(2), "the first item it can see");
 }
 
+/// Red-tested in Wave 7 (`9a7fd1d`), and the output is pasted in that commit
+/// rather than here: folding `topic.rs`'s `const IN_FLIGHT: usize = 1` to `8` —
+/// the one number the whole no-third-policy argument rests on — turns this red at
+/// the second publish, left `Fanout { delivered: 2, dropped: 0, gone: 0 }` against
+/// right `Fanout { delivered: 1, dropped: 1, gone: 0 }`. A subscriber holding eight
+/// unread items is not slow by this module's definition, so nothing is dropped,
+/// nothing is unsubscribed, and no actor ends naming a feed.
 #[tokio::test]
 async fn a_slow_subscriber_is_unsubscribed_and_its_actor_ends_naming_the_feed() {
     let topic = Topic::new(Overflow::DropSubscriber);
@@ -331,6 +358,13 @@ async fn a_slow_subscriber_is_unsubscribed_and_its_actor_ends_naming_the_feed() 
     drop(fast);
 }
 
+/// The same break as its `DropSubscriber` sibling, watched against this half.
+/// Wave 7 recorded that `IN_FLIGHT` 1 → 8 turns both policies' guards red at once
+/// but pasted only the other one's output; this is the missing half.
+/// `scripts/break-once.sh` replacing `const IN_FLIGHT: usize = 1;` with `= 8;`
+/// watched: "the publisher waits for the slow subscriber rather than buffering for
+/// it". With eight slots the second `publish` returns on its first poll instead of
+/// parking, which is exactly the buffer this test exists to deny.
 #[tokio::test]
 async fn a_slow_subscriber_blocks_the_publisher_instead_of_growing_a_buffer() {
     let topic = Topic::new(Overflow::BlockPublisher);
@@ -391,6 +425,11 @@ async fn a_slow_subscriber_blocks_the_publisher_instead_of_growing_a_buffer() {
     assert_eq!(topic.subscribers(), 1);
 }
 
+/// Made red by `scripts/break-once.sh`, replacing `publish_blocking`'s
+/// `self.lock().retain(|one| !one.is_closed());` with `let _ = gone;` — the gone
+/// subscriber still counted, the entry never taken out. Watched: this fails at the
+/// count rather than at the `Fanout`, left `2` against right `1`. Counting and
+/// removing are two claims and this is the one a report alone cannot make.
 #[tokio::test]
 async fn a_subscription_dropped_is_a_subscriber_the_next_publish_prunes() {
     let topic = Topic::new(Overflow::BlockPublisher);
@@ -414,6 +453,14 @@ async fn a_subscription_dropped_is_a_subscriber_the_next_publish_prunes() {
 
 // ──────────────────────────────────────────────────────────────────── the pool
 
+/// Made red on the stronger half, which is the half worth watching:
+/// `scripts/break-once.sh` replacing `pick`'s `(Member(at), &self.inner.members[at])`
+/// with `(Member(at), &self.inner.members[(at + 1) % self.inner.size.get()])` — a
+/// pool that reports one member and dispatches to another. The round-robin
+/// assertion above **still passes** under that break; watched: the second one
+/// fails, "the pool's report and the actor that answered agree", left
+/// `[1, 2, 0, 1, 2, 0, 1]` against right `[0, 1, 2, 0, 1, 2, 0]`. That is the
+/// defect a cursor-only test cannot see.
 #[tokio::test]
 async fn a_pool_spreads_turns_and_each_member_says_which_one_it_is() {
     let pool = Pool::from_fn(NonZeroUsize::new(3).expect("three"), |member| {
@@ -466,6 +513,11 @@ async fn two_clones_of_a_pool_share_one_rotation() {
 
 // ─────────────────────────────────────────────────────────────── the scheduler
 
+/// Wave 7's break, re-run here for the output that commit did not paste:
+/// `scripts/break-once.sh` replacing `after`'s `sleep(delay).await;` with
+/// `sleep(Duration::ZERO).await;`. Watched: this fails at the 4,999 ms line, "not
+/// before the delay". That is the same break the `advance`-based version of this
+/// test **passed**, which is the whole reason the body below sleeps.
 #[tokio::test(start_paused = true)]
 async fn a_delayed_run_lands_after_the_delay_and_not_before() {
     let (ran, mut heard) = mpsc::unbounded_channel();
@@ -486,6 +538,12 @@ async fn a_delayed_run_lands_after_the_delay_and_not_before() {
     assert!(job.is_finished());
 }
 
+/// Red-tested in Wave 7 (`9a7fd1d`), with the output pasted there: `every`'s
+/// `work().await` replaced by a spawn per period — the exact pile of pending work
+/// this module's backpressure section refuses. Watched: "a run in progress must not
+/// be re-entered and its missed ticks must not queue". That break **passed** against
+/// the `advance`-based version of this test and fails against this one, which is why
+/// the body sleeps.
 #[tokio::test(start_paused = true)]
 async fn a_repeating_schedule_never_overlaps_and_never_queues_the_ticks_it_missed() {
     let (tick, mut heard) = mpsc::unbounded_channel();
@@ -536,6 +594,11 @@ async fn a_repeating_schedule_never_overlaps_and_never_queues_the_ticks_it_misse
     drop(sweep);
 }
 
+/// Made red by `scripts/break-once.sh`, replacing `Scheduled`'s `Drop` guard
+/// `if !self.detached {` with `if self.detached {` — a handle that detaches on drop,
+/// which is the `JoinHandle` behaviour this type exists to invert. Watched: this
+/// fails with its own message, "a dropped Scheduled cancels, unlike a dropped
+/// JoinHandle, which detaches".
 #[tokio::test(start_paused = true)]
 async fn a_dropped_schedule_runs_nothing() {
     let (ran, mut heard) = mpsc::unbounded_channel();
@@ -550,6 +613,11 @@ async fn a_dropped_schedule_runs_nothing() {
     );
 }
 
+/// Made red by `scripts/break-once.sh`, replacing `detach`'s
+/// `self.detached = true;` with `self.detached = false;` — a `detach` that says so
+/// in its name and does nothing, so `Drop` aborts anyway. Watched: left `None`
+/// against right `Some("ran")`, "`detach` is the one way to say `run without me`
+/// out loud".
 #[tokio::test(start_paused = true)]
 async fn a_detached_schedule_outlives_its_handle() {
     let (ran, mut heard) = mpsc::unbounded_channel();
@@ -568,6 +636,12 @@ async fn a_detached_schedule_outlives_its_handle() {
 
 // ───────────────────────────────────────────────────────────────── the registry
 
+/// Made red by `scripts/break-once.sh`, replacing the eviction task's
+/// `held.remove(&name);` with `held.reserve(0);` — the task still wakes on the
+/// ending, still finds its own entry under its own generation, and leaves it there.
+/// Watched: "an actor that ended is unregistered". That is [`settles`] failing
+/// rather than blocking, which is the reason it is a bounded spin: a registry that
+/// stopped evicting would otherwise hang this test instead of printing.
 #[tokio::test]
 async fn a_named_actor_is_reachable_by_name_and_unregistered_when_it_ends() {
     let names: Names<worker::Handle<Worker>> = Names::new();
@@ -606,6 +680,11 @@ async fn a_named_actor_is_reachable_by_name_and_unregistered_when_it_ends() {
     assert_eq!(names.registered(), 0);
 }
 
+/// Red-tested in Wave 7 (`9a7fd1d`), with the output pasted there: dropping the
+/// generation comparison from the eviction task lets the first incarnation's ending
+/// remove the second's entry, because both are filed under one `ActorId`. Watched:
+/// "an eviction that ignored the generation stamp would have removed the
+/// replacement", left `0` against right `1`.
 #[tokio::test]
 async fn the_ending_of_a_displaced_actor_does_not_evict_the_one_that_replaced_it() {
     let names: Names<worker::Handle<Worker>> = Names::new();
@@ -648,6 +727,12 @@ async fn the_ending_of_a_displaced_actor_does_not_evict_the_one_that_replaced_it
     );
 }
 
+/// Made red by `scripts/break-once.sh` on the same generation stamp its sibling
+/// watches, from the other side: replacing the eviction task's
+/// `.is_some_and(|entry| entry.generation == generation)` with `.is_some()`. The
+/// unregistered actor's task then wakes, finds *a* registration under the name —
+/// the later, unrelated one — and removes it. Watched: this fails at the second
+/// lookup, "untouched".
 #[tokio::test]
 async fn unregistering_frees_the_name_without_waiting_for_an_ending() {
     let names: Names<worker::Handle<Worker>> = Names::new();

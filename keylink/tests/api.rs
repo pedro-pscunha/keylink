@@ -89,6 +89,14 @@ async fn the_three_unparameterized_names_still_resolve_bare() {
     let _ = mount(|mut inbox: depot::Mailbox| async move { while inbox.recv().await.is_some() {} });
 }
 
+/// Made red by `scripts/break-once.sh`, replacing the generated
+/// `pub type SystemBuilder = $crate::SystemBuilder<Mail>;` with
+/// `pub type SystemBuilder<M> = $crate::SystemBuilder<M>;` — an alias that passes
+/// the parameter on instead of applying it, which is the shape this whole file
+/// exists to refuse. Watched: this does not run, it does not compile —
+/// `error[E0107]` at the type-position line here, "add missing generic argument",
+/// plus `E0282` where the expression-position use loses its inference. A compile
+/// error is the only red a compile-only test has.
 #[tokio::test]
 async fn the_generated_module_supplies_the_rest_fully_applied() {
     // ── type position ────────────────────────────────────────────────────────

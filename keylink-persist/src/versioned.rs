@@ -494,6 +494,12 @@ mod tests {
         }
     }
 
+    /// Made red by `scripts/break-once.sh`, replacing `frame`'s
+    /// `framed.extend_from_slice(&version.to_le_bytes());` with the `u64` widening
+    /// `&u64::from(version).to_le_bytes()` — a header that grew by four bytes while
+    /// [`FRAME_LEN`] went on saying twelve. Watched: left `23` against right `19`,
+    /// at the length assertion, which is the one that notices a header nobody
+    /// re-measured.
     #[test]
     fn the_header_is_the_documented_twelve_bytes() {
         let framed = frame(7, b"payload");
@@ -504,6 +510,13 @@ mod tests {
         assert_eq!(&framed[12..], b"payload");
     }
 
+    /// Made red by `scripts/break-once.sh`, replacing `unframe`'s
+    /// `Ok((version, &bytes[FRAME_LEN..]))` with `&bytes[FRAME_LEN + 1..]` — one
+    /// byte of payload eaten by the header. Watched: left
+    /// `(4, [104, 97, 116, 101, 118, 101, 114])` against right
+    /// `(4, [119, 104, 97, 116, 101, 118, 101, 114])`. The version still round-trips
+    /// under that break, which is why the payload is compared and not just the
+    /// stamp.
     #[test]
     fn a_frame_round_trips_through_unframe() {
         let framed = frame(4, b"whatever");
@@ -513,6 +526,15 @@ mod tests {
     /// The silent-corruption case, at the smallest scale it can be shown.
     /// Twenty-four raw bytes are three valid ledger entries, so a loader with
     /// no magic would hand back a `Ledger` built from the header.
+    ///
+    /// Made red by `scripts/break-once.sh`, replacing `unframe`'s
+    /// `if header[..MAGIC.len()] != MAGIC {` with `if false {` — the magic
+    /// comparison deleted, which is the state the crate was in before framing.
+    /// Watched: the `matches!` fails. What the break produces is worth reading: the
+    /// twenty-four raw bytes read as layout `0`, so they are refused as
+    /// `LayoutTooOld` instead of `WrongMagic` — a second refusal standing behind the
+    /// first, and the reason the *fault* is asserted rather than merely that an
+    /// error came back.
     #[test]
     fn raw_payload_bytes_are_not_a_frame() {
         let raw = Ledger(vec![1, 2, 3]).snapshot();
@@ -525,6 +547,16 @@ mod tests {
         ));
     }
 
+    /// "Says so" is the claim, and the number is the saying: made red by
+    /// `scripts/break-once.sh` replacing `unframe`'s
+    /// `fault(FrameFault::TooShort { len: bytes.len() })` with `{ len: 0 }` — still
+    /// refused, refused with a length that is not the file's. Watched: the
+    /// `matches!` fails on `len: 5`.
+    ///
+    /// The refusal itself has no counter-example: it is the `ok_or_else` on a
+    /// `[u8; FRAME_LEN]` conversion, so any edit that lets five bytes through stops
+    /// compiling. That is a guard whose *reason* is watchable and whose existence is
+    /// structural, and it is recorded that way rather than claimed to be more.
     #[test]
     fn a_file_too_short_to_hold_a_header_says_so() {
         assert!(matches!(
@@ -535,6 +567,13 @@ mod tests {
         ));
     }
 
+    /// Made red by `scripts/break-once.sh`, replacing `unframe`'s
+    /// `let layout = u16::from_le_bytes([header[6], header[7]]);` with
+    /// `let layout = LAYOUT;` — the layout assumed rather than read, so every file
+    /// on disk claims to be this build's. Watched: the `matches!` fails; `unframe`
+    /// returns `Ok` for a header stamped `2`. A different literal from the
+    /// integration test's, on purpose: that one deletes the comparison, this one
+    /// deletes the read, and the two failures are the two ways this check dies.
     #[test]
     fn a_header_layout_this_build_does_not_write_is_refused() {
         let mut framed = frame(1, b"12345678");
@@ -562,6 +601,12 @@ mod tests {
         ));
     }
 
+    /// Made red by `scripts/break-once.sh`, adding `.filter(|_| bytes.len() > FRAME_LEN)`
+    /// to `unframe`'s `bytes.get(..FRAME_LEN)` — a frame required to carry at least
+    /// one byte, which is the plausible reading of "too short" and the one that
+    /// makes an empty state unloadable. Watched: "a frame: NotAFrame { fault:
+    /// TooShort { len: 12 } }". The break is isolating rather than broad: every
+    /// other test in this module has a payload, so this is the only one it reddens.
     #[test]
     fn an_empty_payload_is_a_payload_and_not_a_fault() {
         let framed = frame(1, b"");
