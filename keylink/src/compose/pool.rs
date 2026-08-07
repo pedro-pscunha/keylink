@@ -62,9 +62,9 @@
 //!   — and each handle survives its own faults without the pool knowing. A
 //!   supervised member's mailbox outlives its incarnations, so `pick` keeps
 //!   working across a restart and nothing in this module has to learn about one.
-//!   That is why `rg -n 'supervised' keylink/src/compose/` finds only this
-//!   paragraph: composition and supervision compose, rather than one containing
-//!   the other.
+//!   That is the design rather than an omission: `compose` holds no supervision
+//!   mechanism of its own, because composition and supervision compose rather
+//!   than one containing the other.
 //! - **Not keyed.** If which member handles a message matters, the member is an
 //!   identity and the thing wanted is [`System`](crate::System) or
 //!   [`Names`](super::Names).
