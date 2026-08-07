@@ -3479,7 +3479,7 @@ comment. **Every one of them replays**, which is not a claim this section could
 make at first: six recorded a literal the harness cannot find exactly once —
 usually because the record itself quotes it, so the count is two — and an
 unreplayable record is the one thing a record must not be. They are anchored on
-two lines now, and `.tmp/keyed-fate/replay-all.sh` runs the whole set: twenty
+two lines now, and `scripts/replay-fate-breaks.sh` runs the whole set: twenty
 breaks, twenty non-zero exits, no aborts.
 
 | guard | break |
