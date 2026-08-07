@@ -2048,7 +2048,15 @@ impl<'a> Floor<'a> {
     }
 
     /// The guarded code reached a verdict of its own, so this must not overwrite
-    /// it. Called at exactly one place per floor.
+    /// it.
+    ///
+    /// **Called immediately before each way the guarded scope returns, and
+    /// nowhere else.** The doc here said "at exactly one place per floor", which
+    /// [`supervise`] has never satisfied — it has two returns — and stating a
+    /// discipline the tree does not keep is how the next author trusts the wrong
+    /// one. The rule that matters is not *how many* but *where*: a disarm that is
+    /// not the last thing before a return leaves a window with no floor, which is
+    /// exactly what an early disarm before `run_loop` did to the backoff.
     fn disarm(&mut self) {
         self.armed = false;
     }
@@ -2274,23 +2282,29 @@ where
     N: FnMut() -> Fut + Send,
     Fut: Future<Output = Result<Incarnation<A, F>, Stop>> + Send,
 {
+    // **One floor for the whole function, disarmed only immediately before each
+    // way out.** Everything it covers is a window where `run_loop` — and
+    // therefore the floor `run_loop` carries — does not exist: the caller's
+    // factory call, the transient-failure retry sleep, and the backoff between
+    // one incarnation and the next.
+    //
+    // It was a *per-iteration* floor first, and that shape had a hole at each
+    // end. `continue` drops a loop-body local, so the transient-failure retry —
+    // a documented, first-class path — dropped it **armed** and wrote `Gone` over
+    // a live `Restarting`: *stop asking*, about an actor the supervisor was
+    // actively rebuilding. And it was disarmed for the backoff at the bottom of
+    // the body, so an `abort` between incarnations left `Restarting` standing:
+    // *retry, another is coming*, about an actor that had just been destroyed.
+    // Both are the **false** answer this design refuses rather than the merely
+    // less useful one RFC-07 §12.4 accepts.
+    //
+    // Disarmed before the returns rather than around `run_loop` is what keeps the
+    // give-up guards attributable: a floor that fires *after* an explicit settle
+    // re-writes the right answer over a broken one and leaves the break green.
+    // Nothing else drops this, so nothing else can fire it.
+    let mut floor = Floor::armed(fate);
     let mut budget = Budget::new(limit);
     loop {
-        // The factory is the caller's code and this awaits it with no guard, so a
-        // panic in it unwinds before any incarnation exists — before `run_loop`,
-        // and therefore before the floor `run_loop` carries. This one covers
-        // exactly that window: armed per iteration, because a *later* factory
-        // call can panic just as the first can, and disarmed the moment the
-        // incarnation's own floor takes over.
-        //
-        // **Armed for the factory call and nothing else**, which the first
-        // version of this got wrong by holding it for the whole function. A floor
-        // that outlives what it guards fires on the normal give-up return too,
-        // writing `Gone` over the verdict a moment after the state died — the
-        // same value, so harmless on the wire, and it made two end-to-end guards
-        // unattributable: breaking `Lent::ending`'s give-up arm left both green,
-        // because this re-settled the right answer after the wrong one.
-        let mut floor = Floor::armed(fate);
         let built = factory().await;
         let (state, hooks, feeds) = match built {
             Ok(triple) => triple,
@@ -2322,10 +2336,6 @@ where
             }
         };
 
-        // The factory returned, so `run_loop` is about to carry its own floor and
-        // this one has nothing left to guard. Nothing between here and that call
-        // is a caller's code, so nothing between them can unwind.
-        floor.disarm();
         // The new incarnation is live from here. Without this the cell would keep
         // the previous one's `Restarting` for ever, and a reply this incarnation
         // dropped while perfectly alive would read as a restart. Published before
@@ -2348,6 +2358,10 @@ where
         // answer that nothing else can reach.
         let restarting = matches!(verdict, Standing::Restarting(_));
         if !restarting {
+            // `run_loop` settled its own verdict, so the floor must not write
+            // over it on the way out — that is what made this guard's break go
+            // green the first time.
+            floor.disarm();
             return match reason {
                 // Asked to stop, or every handle went. Not a failure, and not
                 // something anybody gave up on.
@@ -2355,6 +2369,10 @@ where
                 failed => gave_up(failed, budget.spent),
             };
         }
+        // Still armed across this, and that is the whole of N1: there is no
+        // `run_loop` between one incarnation and the next, so an `abort` landing
+        // here would otherwise leave the previous incarnation's `Restarting`
+        // standing for an actor that has been destroyed.
         n0_future::time::sleep(limit.backoff()).await;
     }
 }
@@ -4186,5 +4204,179 @@ mod tests {
             [false, true],
             "a give-up must close the mailbox and a restart must not: {seen:?}"
         );
+    }
+
+    /// Drive a supervisor to the point where it is **between** incarnations, and
+    /// hold it there.
+    ///
+    /// The window both guards below are about: the previous incarnation ended
+    /// with a restart granted, so the cell holds `Restarting` and there is no
+    /// `run_loop` anywhere — and therefore no floor but `supervise`'s own. The
+    /// factory parks on the second call rather than a `sleep` being timed, so the
+    /// window is entered deterministically and stays open until the test is done
+    /// with it.
+    ///
+    /// `calls` counts factory calls so a test can choose what the second one
+    /// does; `open` fires once the chosen call has been entered.
+    fn between_incarnations(
+        calls: &Arc<std::sync::atomic::AtomicUsize>,
+        open: Arc<tokio::sync::Notify>,
+        transient: bool,
+    ) -> (Fate, mpsc::Sender<Message<Dying, Fatal>>, JoinHandle<Ended>) {
+        use std::sync::atomic::AtomicUsize;
+
+        let fate = Fate::default();
+        let (mail, inbox) = mpsc::channel::<Message<Dying, Fatal>>(1);
+        let limit = Intensity::new(
+            NonZeroU32::new(4).expect("four restarts"),
+            Duration::from_millis(100),
+        )
+        .expect("a 25ms backoff is not zero");
+
+        let held = fate.clone();
+        let building = fate.clone();
+        let counted: Arc<AtomicUsize> = Arc::clone(calls);
+        let sending = mail.clone();
+        let running = n0_future::task::spawn(async move {
+            let fate = held;
+            supervise(
+                move || {
+                    let nth = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let fate = building.clone();
+                    let mail = sending.clone();
+                    let open = Arc::clone(&open);
+                    async move {
+                        match nth {
+                            // The first incarnation exists only to fault, so that
+                            // a restart is granted and the cell holds `Restarting`.
+                            0 => Ok((
+                                Dying {
+                                    fate,
+                                    mail,
+                                    seen: Arc::default(),
+                                },
+                                Vec::new(),
+                                (),
+                            )),
+                            // The second either fails transiently — the documented
+                            // path that `continue`s with budget left — or parks.
+                            1 if transient => {
+                                open.notify_one();
+                                Err(Stop::new(std::io::Error::other("not yet")))
+                            }
+                            _ => {
+                                open.notify_one();
+                                std::future::pending::<()>().await;
+                                unreachable!("parked for the rest of the test")
+                            }
+                        }
+                    }
+                },
+                limit,
+                inbox,
+                &fate,
+            )
+            .await
+        });
+        (fate, mail, running)
+    }
+
+    /// **N1: there is no `run_loop` between incarnations, and the window still
+    /// needs a floor.**
+    ///
+    /// A supervisor that has granted a restart leaves `Restarting` in the cell and
+    /// then backs off and calls the factory again — with no `run_loop` alive for
+    /// any of it. Destroy the actor in that window and the cell must stop saying
+    /// *retry, another incarnation is coming* about an actor that has been
+    /// destroyed.
+    ///
+    /// `LocalActor::abort` used to settle this itself, and **deleting that line
+    /// was a defect of mine**: I judged it unreachable because no break of it
+    /// could redden `an_aborted_actor_tells_a_peer_no_such_actor`, which aborts an
+    /// actor sitting *inside* `run_loop`, where the floor genuinely is earlier.
+    /// The line was not unguardable — it was unguarded, and this is the guard it
+    /// never had. The remedy is structural rather than the line coming back:
+    /// `supervise`'s floor stays armed across the backoff and the factory.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/local.rs`, disarming
+    /// `supervise`'s floor at its declaration. Watched: `an actor destroyed
+    /// between incarnations is gone, not restarting: Restarting(Panicked {
+    /// message: "this incarnation is over" })`.
+    #[tokio::test]
+    async fn a_supervisor_between_incarnations_is_gone_when_it_is_destroyed() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open = Arc::new(tokio::sync::Notify::new());
+        let (fate, mail, running) = between_incarnations(&calls, Arc::clone(&open), false);
+
+        mail.send(Message::Mail(Box::new(Fatal)))
+            .await
+            .expect("the first incarnation takes it");
+        // Parked inside the second factory call: restart granted, no `run_loop`.
+        open.notified().await;
+        assert!(
+            matches!(fate.standing(), Standing::Restarting(_)),
+            "the window this is about is the one where a restart is pending"
+        );
+
+        // Destroy it where it stands, exactly as `abort` does.
+        running.abort();
+        let _ = running.await;
+
+        assert!(
+            matches!(fate.standing(), Standing::Gone),
+            "an actor destroyed between incarnations is gone, not restarting: {:?}",
+            fate.standing()
+        );
+        drop(mail);
+    }
+
+    /// **N2: a transient factory failure must not overwrite a live `Restarting`.**
+    ///
+    /// `Stop::new` — non-fatal, budget left — is a first-class documented path:
+    /// the supervisor sleeps and tries again, and the actor is very much coming
+    /// back. The per-iteration floor this replaces was a loop-body local, so
+    /// `continue` dropped it **armed** and wrote `Gone` over the `Restarting` the
+    /// previous incarnation had settled. A peer reading in that window was told
+    /// *stop asking* about an actor being rebuilt.
+    ///
+    /// That is the **false** answer, not the merely less useful one: RFC-07 §12.4
+    /// accepts a late read that renders `dropped: `, which is true when it is
+    /// written, and refuses the generation counter for producing a sentence that
+    /// is not. This was on the wrong side of that line.
+    ///
+    /// The cell is read directly rather than through a peer, because what is
+    /// wrong here is the cell itself and no reply has to die to prove it.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/local.rs`, moving
+    /// `supervise`'s floor back inside the loop body — the shape this replaces,
+    /// verbatim. Watched: `a supervisor that is still rebuilding must not read as
+    /// gone: Gone`.
+    #[tokio::test]
+    async fn a_transient_factory_failure_does_not_overwrite_a_pending_restart() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open = Arc::new(tokio::sync::Notify::new());
+        let (fate, mail, running) = between_incarnations(&calls, Arc::clone(&open), true);
+
+        mail.send(Message::Mail(Box::new(Fatal)))
+            .await
+            .expect("the first incarnation takes it");
+        // The second factory call fails transiently and `continue`s; the third
+        // parks, which is how this waits for the retry to have happened.
+        open.notified().await;
+        open.notified().await;
+
+        assert!(
+            matches!(fate.standing(), Standing::Restarting(_)),
+            "a supervisor that is still rebuilding must not read as gone: {:?}",
+            fate.standing()
+        );
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "the transient failure has to have been retried for this to mean anything"
+        );
+
+        running.abort();
+        let _ = running.await;
+        drop(mail);
     }
 }
