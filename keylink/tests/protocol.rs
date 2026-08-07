@@ -1129,9 +1129,35 @@ fn the_contract_hash_has_not_moved() {
 /// hash, which is the whole point — an old console is refused at the handshake
 /// rather than handed four fields where it expected five.
 ///
-/// # It has moved once, and this is the decision
+/// # It has moved twice, and these are the decisions
 ///
-/// `879d78ee456a20b7` → `080c9e481c937d67`, when Wave 9 merged into Wave 6.
+/// ## `080c9e481c937d67` → `7bbd34fa83c9060c`, applying Wave 6's review
+///
+/// Three changes at once, and all three **should** be visible to a console:
+///
+/// - **`Follow` answers `Result<EventPage, FollowRefused>`.** It used to answer
+///   an `EventPage` and had no way to say no, so a cursor ahead of the node's
+///   log was *parked* — an entry in the inspector's waiting list that no event
+///   could release, and the reason that list stopped being bounded by anything.
+///   A console built against the old shape cannot decode a refusal, and a
+///   refusal is now the ordinary answer to two ordinary mistakes.
+/// - **`EventPage` gained `dropped`.** Events lost by the sink's `try_send`
+///   never get a sequence number, so `EventPage::lost` — arithmetic over
+///   sequence numbers — could not see them, and the loop this crate documents
+///   was blind to the likelier of the two losses. An old console reading a page
+///   without the field would report a complete stream that was not one.
+/// - **`NodeStatus::id` became `NodeKey`.** Identical bytes on the wire and a
+///   different *schema*: a struct where there was an array. That is the point —
+///   a raw `[u8; 32]` is assignable between a node key, a blob id, a hash and a
+///   secret key, and the newtype is what stops a console pointing one at the
+///   wrong one. A peer built against the array is refused at the handshake
+///   rather than reading one kind of thirty-two bytes as another.
+///
+/// **`Probe`'s hash did not move**, again, which is the same evidence it was the
+/// first time: three changes to one contract, none to the other, and exactly one
+/// of these two tests went red.
+///
+/// ## `879d78ee456a20b7` → `080c9e481c937d67`, when Wave 9 merged into Wave 6
 ///
 /// Wave 9 gave `Ended` a sixth variant (`GaveUp`) and gave `Ended::Observer` a
 /// `fatal` flag. `EndReason` is this service's wire rendering of `Ended` and
@@ -1151,9 +1177,13 @@ fn the_contract_hash_has_not_moved() {
 /// **`Probe`'s hash did not move in the same run**, which is the evidence that
 /// these two pins discriminate rather than both being satisfiable: one contract
 /// changed, one did not, and exactly one test went red.
+///
+/// [`FollowRefused`]: keylink::FollowRefused
+/// [`EventPage`]: keylink::EventPage
+/// [`NodeKey`]: keylink::NodeKey
 #[test]
 fn the_inspect_contract_hash_has_not_moved() {
-    const PINNED: &str = "keylink/Inspect/080c9e481c937d67";
+    const PINNED: &str = "keylink/Inspect/7bbd34fa83c9060c";
 
     assert_eq!(
         String::from_utf8_lossy(keylink::inspect::alpn()),

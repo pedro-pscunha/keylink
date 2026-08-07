@@ -700,6 +700,39 @@ impl<M> Registry<M> {
         Ok(found)
     }
 
+    /// One row per live actor. [`System::status`] is the door and carries what
+    /// every field does and does not claim; this is the body, here because
+    /// [`System::weak_status`] needs it reachable from a
+    /// [`Weak`](std::sync::Weak) that has no `System` around it.
+    fn status(&self) -> Vec<ActorStatus> {
+        let now = self.now();
+        self.read()
+            .iter()
+            .map(|(id, entry)| ActorStatus {
+                id: id.clone(),
+                idle_for: Duration::from_millis(
+                    now.saturating_sub(entry.last_seen.load(Ordering::Relaxed)),
+                ),
+                busy: entry.busy.running(),
+                // `saturating_sub` cannot fire: permits outstanding are bounded
+                // by the buffer they came from. It is written this way because a
+                // diagnostic must not be the thing that panics, and because the
+                // alternative is an `expect` on a path with nothing to say.
+                // `try_from` and not `as`, the same call `now()` makes: the
+                // widening cannot fail on any target keylink builds for, and a
+                // diagnostic must not be the thing that panics if one ever
+                // appears.
+                buffered: u64::try_from(
+                    entry
+                        .mail
+                        .max_capacity()
+                        .saturating_sub(entry.mail.capacity()),
+                )
+                .unwrap_or(u64::MAX),
+            })
+            .collect()
+    }
+
     fn touch(
         &self,
         entries: &HashMap<ActorId, Entry<M>>,
@@ -1484,35 +1517,35 @@ impl<M> System<M> {
     /// a hot path wants.
     #[must_use]
     pub fn status(&self) -> Vec<ActorStatus> {
-        let now = self.inner.now();
-        self.inner
-            .read()
-            .iter()
-            .map(|(id, entry)| ActorStatus {
-                id: id.clone(),
-                idle_for: Duration::from_millis(
-                    now.saturating_sub(entry.last_seen.load(Ordering::Relaxed)),
-                ),
-                busy: entry.busy.running(),
-                // `saturating_sub` cannot fire: permits outstanding are bounded
-                // by the buffer they came from. It is written this way because a
-                // diagnostic must not be the thing that panics, and because the
-                // alternative is an `expect` on a path with nothing to say.
-                // `try_from` and not `as`, the same call `now()` makes: the
-                // widening cannot fail on any target keylink builds for, and a
-                // diagnostic must not be the thing that panics if one ever
-                // appears.
-                buffered: u64::try_from(
-                    entry
-                        .mail
-                        .max_capacity()
-                        .saturating_sub(entry.mail.capacity()),
-                )
-                .unwrap_or(u64::MAX),
-            })
-            .collect()
+        self.inner.status()
     }
 
+    /// [`Self::status`], read through a handle that does **not** keep this
+    /// system alive.
+    ///
+    /// `pub(crate)`, and the one caller is [`Inspector`](crate::Inspector),
+    /// which erases a `System<M>` to a closure so that one console can answer
+    /// for a system of any service. Erasing it through a `System` clone made
+    /// that closure an *owner*: a program that dropped its own system went on
+    /// running every actor in it, because the inspect actor was holding the
+    /// registry — and [`spawn_sweeper`] is already `Weak` for exactly this
+    /// reason, so the strong reference here was the odd one out.
+    ///
+    /// `None` is the system being gone, which a caller must be able to tell
+    /// from a system with nothing in it. Returning an empty `Vec` for both would
+    /// report a shutting-down node as an idle one.
+    ///
+    /// An `impl Trait` return rather than the `Weak` itself, because
+    /// [`Registry`] is this module's and is not going to stop being.
+    pub(crate) fn weak_status(
+        &self,
+    ) -> impl Fn() -> Option<Vec<ActorStatus>> + Send + Sync + 'static
+    where
+        M: Send + 'static,
+    {
+        let weak = Arc::downgrade(&self.inner);
+        move || Weak::upgrade(&weak).map(|registry| registry.status())
+    }
     /// Evict every actor that has been idle past [`Eviction::Idle::after`], and
     /// destroy the ones that do not drain inside
     /// [`shutdown_budget`](Eviction::Idle::shutdown_budget).
