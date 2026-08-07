@@ -75,8 +75,8 @@ use std::ops::DerefMut;
 use crate::compose::{Overflow, Topic};
 use crate::{
     ActorId, ActorStatus, Admission, Admittance, AdmittedPeer, Allowlist, BlobId, Caller,
-    DynamicAdmission, Ended, Eviction, FinishFut, IdempotencyKey, LocalActor, MailboxClosed,
-    MountError, Observer, Origin, ProvenPeer, Retention, TurnFut, TurnInfo,
+    DynamicAdmission, Ended, Eviction, FinishFut, IdempotencyKey, Intensity, LocalActor,
+    MailboxClosed, MountError, Observer, Origin, ProvenPeer, Retention, TurnFut, TurnInfo,
 };
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
@@ -297,11 +297,16 @@ fn a_system_is_built_at_one_services_mail() -> beta::System {
 /// typed out rather than inherited.
 ///
 /// A hand-written impl trips this, and so does a `#[derive(Default)]`.
+/// [`Intensity`](crate::Intensity) is the fourth. A restart budget nobody chose
+/// is either a hot loop hiding a permanent fault or a give-up that discards a
+/// recoverable one, and which of the two a wrong number produces is a fact about
+/// the caller's actor rather than about keylink.
 trait HasNoDefault {}
 impl<T: Default> HasNoDefault for T {}
 impl HasNoDefault for Allowlist {}
 impl HasNoDefault for Eviction {}
 impl HasNoDefault for Retention {}
+impl HasNoDefault for Intensity {}
 /// The fourth and fifth are the fan-out's, and they are the same family read one
 /// layer up: [`Overflow`] is the choice between *the publisher waits* and *the
 /// slow subscriber is ended*, and both are decisions about the caller's data
@@ -812,6 +817,7 @@ fn every_ending_is_named(ended: &Ended) -> &'static str {
         Ended::Panicked { .. } => "panicked",
         Ended::Observer { .. } => "observer",
         Ended::Feed { .. } => "feed",
+        Ended::GaveUp { .. } => "gave up",
     }
 }
 

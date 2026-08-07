@@ -1440,6 +1440,55 @@ macro_rules! __keylink_service {
                 })
             }
 
+            /// Spawn one **supervised** keyed actor, ready to be mounted.
+            ///
+            /// [`spawn_wired`] with the triple produced by an `async` factory
+            /// rather than written at the call site — which is also what makes
+            /// this the keyed door a *durable* actor can use lazily. The
+            /// factory [`spawn_with`](keylink::SystemBuilder::spawn_with) takes
+            /// is a plain `Fn` and cannot `await`, so a keyed durable actor had
+            /// to be mounted eagerly after `Persist::open(..).await`; this one
+            /// awaits, once per incarnation, which is the same call the first
+            /// mount makes.
+            ///
+            /// Nothing changes in the registry: [`mount`](keylink::mount) takes
+            /// a closure over a mailbox, and the supervisor is that closure's
+            /// whole body. `System::mount`, eviction, `shutdown` and
+            /// `System::status` see one task, exactly as for an unsupervised
+            /// keyed actor.
+            ///
+            /// # A keyed actor still has no `ended()`
+            ///
+            /// So [`Ended::GaveUp`](keylink::Ended::GaveUp) reaches its own
+            /// observers' `finish` and nothing a caller can await. An actor that
+            /// has given up is an entry whose task has exited, which the
+            /// registry sees as an actor to re-route on the next message.
+            ///
+            /// # Panics
+            ///
+            /// Panics when called outside a tokio runtime.
+            #[must_use = "an unmounted actor is dropped, and the supervisor \
+                          that would have kept it alive goes with it"]
+            pub fn spawn_supervised<A: Actor, N, Fut, F>(
+                factory: N,
+                limit: $crate::Intensity,
+            ) -> Mounted
+            where
+                N: ::core::ops::FnMut() -> Fut + ::core::marker::Send + 'static,
+                Fut: ::core::future::Future<
+                        Output = ::core::result::Result<
+                            $crate::Incarnation<A, F>,
+                            $crate::Stop,
+                        >,
+                    > + ::core::marker::Send + 'static,
+                F: $crate::Feeds<A>,
+            {
+                let () = ServableAsActor::<A>::CHECK;
+                $crate::mount(move |inbox: Mailbox| async move {
+                    $crate::run_keyed_supervised(factory, limit, inbox).await;
+                })
+            }
+
             /// Start one actor of this service, here, in this process.
             ///
             /// No id, no registry, no schema hash, no serialization and no
@@ -1533,6 +1582,63 @@ macro_rules! __keylink_service {
                 feeds: Feeds,
             ) -> Handle<A> {
                 Handle { inner: $crate::LocalActor::spawn_fed(state, observers, feeds) }
+            }
+
+            /// Start one actor of this service that is **rebuilt** when an
+            /// incarnation fails.
+            ///
+            /// [`actor_wired`]'s three arguments, produced by one `async`
+            /// closure instead of written at the call site, so that every
+            /// incarnation gets its own state, its own observers and its own
+            /// feed subscriptions — and the previous ones are already dropped
+            /// when it is called.
+            ///
+            /// ```ignore
+            /// let ledger = ledger::supervised(
+            ///     move || {
+            ///         let store = store.clone();
+            ///         let id = id.clone();
+            ///         async move {
+            ///             // The claim the last incarnation held is already free.
+            ///             let (restored, saver) =
+            ///                 keylink::Persist::<Ledger, _>::open(&store, &id).await?;
+            ///             Ok((restored.unwrap_or_default(), vec![Box::new(saver) as _], ()))
+            ///         }
+            ///     },
+            ///     Intensity::new(NonZeroU32::new(3).unwrap(), Duration::from_secs(10)),
+            /// );
+            /// ```
+            ///
+            /// The feeds are whatever the factory returns: `()` for a service
+            /// with none, and [`Feeds::new`] for one that declares them. That is
+            /// [`actor`], [`actor_with`] and [`actor_wired`] collapsed into one
+            /// door rather than three, because a factory names its own triple
+            /// and there is nothing left for a shorthand to leave out.
+            ///
+            /// See [`LocalActor::spawn_supervised`](keylink::LocalActor::spawn_supervised)
+            /// for what a restart is worth, what it costs, and the four
+            /// properties that fall out of supervising in the actor's own task.
+            ///
+            /// # Panics
+            ///
+            /// Panics when called outside a tokio runtime, like every other
+            /// spawn.
+            #[must_use]
+            pub fn supervised<A: Actor, N, Fut, F>(
+                factory: N,
+                limit: $crate::Intensity,
+            ) -> Handle<A>
+            where
+                N: ::core::ops::FnMut() -> Fut + ::core::marker::Send + 'static,
+                Fut: ::core::future::Future<
+                        Output = ::core::result::Result<
+                            $crate::Incarnation<A, F>,
+                            $crate::Stop,
+                        >,
+                    > + ::core::marker::Send,
+                F: $crate::Feeds<A>,
+            {
+                Handle { inner: $crate::LocalActor::spawn_supervised(factory, limit) }
             }
 
             /// A handle to an actor in this process.

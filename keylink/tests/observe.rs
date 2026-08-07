@@ -434,7 +434,7 @@ async fn a_panicking_observer_ends_the_actor_and_is_named() {
     assert_eq!(ledger.post(1).await, Err(MailboxClosed));
 
     match ledger.ended().await {
-        Ended::Observer { name, error } => {
+        Ended::Observer { name, error, .. } => {
             assert_eq!(name, "exploding");
             assert!(
                 error.to_string().contains("the observer fell over"),
@@ -498,7 +498,7 @@ async fn a_refused_turn_answers_its_caller_with_nothing() {
     );
 
     match ledger.ended().await {
-        Ended::Observer { name, error } => {
+        Ended::Observer { name, error, .. } => {
             assert_eq!(name, "saver");
             assert!(error.to_string().contains("saver refused"), "got {error}");
         }
@@ -588,7 +588,7 @@ async fn an_observer_can_give_up_with_a_message_or_with_an_error() {
     let with_message = ledger::actor_with(Ledger::default(), vec![Box::new(GivesUp::WithMessage)]);
     assert_eq!(with_message.post(1).await, Err(MailboxClosed));
     match with_message.ended().await {
-        Ended::Observer { name, error } => {
+        Ended::Observer { name, error, .. } => {
             assert_eq!(name, "message");
             assert_eq!(error.to_string(), "the store said no");
         }
@@ -598,7 +598,7 @@ async fn an_observer_can_give_up_with_a_message_or_with_an_error() {
     let with_error = ledger::actor_with(Ledger::default(), vec![Box::new(GivesUp::WithError)]);
     assert_eq!(with_error.post(1).await, Err(MailboxClosed));
     match with_error.ended().await {
-        Ended::Observer { name, error } => {
+        Ended::Observer { name, error, .. } => {
             assert_eq!(name, "error");
             assert_eq!(error.to_string(), "the store is gone");
         }
@@ -675,7 +675,7 @@ async fn an_observer_that_panics_before_it_yields_is_still_named() {
     assert_eq!(ledger.post(1).await, Err(MailboxClosed));
 
     match ledger.ended().await {
-        Ended::Observer { name, error } => {
+        Ended::Observer { name, error, .. } => {
             assert_eq!(name, "early");
             assert!(
                 error.to_string().contains("fell over before it yielded"),

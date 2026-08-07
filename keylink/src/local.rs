@@ -145,8 +145,10 @@
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use n0_future::task::JoinHandle;
 use n0_future::time::Instant;
@@ -157,7 +159,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 // `pub(crate)` now and the root no longer names them.
 use crate::panic::{catching, guarded};
 use crate::{
-    Body, Context, Ended, Observer, Origin, Outcome, Panic, Queueing, RemoteError, TurnInfo,
+    Body, Context, Ended, Observer, Origin, Outcome, Panic, Queueing, RemoteError, Stop, TurnInfo,
     TurnLost, TurnOutcome,
 };
 
@@ -722,7 +724,9 @@ where
         method,
     };
 
-    let mut refused: Option<(&'static str, Arc<dyn Error + Send + Sync>)> = None;
+    // The third element is [`Stop::is_fatal`], carried out because it is the one
+    // thing about a refusal a supervisor reads and nothing else does.
+    let mut refused: Option<(&'static str, Arc<dyn Error + Send + Sync>, bool)> = None;
     for observer in hooks.iter_mut() {
         let name = observer.name();
         // TWO catches, because `after_turn` has two halves that can panic and
@@ -760,15 +764,20 @@ where
         match ran {
             Ok(Ok(())) => {}
             Ok(Err(stop)) => {
-                refused = Some((name, Arc::from(stop.into_reason())));
+                let (reason, fatal) = stop.into_parts();
+                refused = Some((name, Arc::from(reason), fatal));
                 break;
             }
             // `Panic` implements `Display` and not `Error`, and is not `Sync`,
             // so it cannot fill an `Arc<dyn Error + Send + Sync>` directly.
             // `to_string()` is what `RemoteError::Failed` already does with one.
+            //
+            // Never fatal: an observer that panicked made no claim about whether
+            // another incarnation would fare better, and answering one for it
+            // would be a claim nobody made.
             Err(panic) => {
                 let reason: Box<dyn Error + Send + Sync> = panic.to_string().into();
-                refused = Some((name, Arc::from(reason)));
+                refused = Some((name, Arc::from(reason), false));
                 break;
             }
         }
@@ -782,11 +791,21 @@ where
         // actor ends naming the fault rather than the observer. A durability
         // adapter refuses a panicked turn, so reporting the adapter here would
         // point an operator at the wrong code.
-        (Some((name, _)), Some(message)) => (answer, Some(name), Some(Ended::Panicked { message })),
+        //
+        // The refusal's `fatal` flag is dropped with the rest of it, and
+        // `Stop::fatal`'s own documentation says so: this ending names the fault,
+        // and a fault is the kind of thing another incarnation might not repeat.
+        (Some((name, _, _)), Some(message)) => {
+            (answer, Some(name), Some(Ended::Panicked { message }))
+        }
         // Completed and refused: the turn ran and was not committed, so whoever
         // holds the reply owes the caller a refusal rather than an uncommitted
         // value.
-        (Some((name, error)), None) => (answer, Some(name), Some(Ended::Observer { name, error })),
+        (Some((name, error, fatal)), None) => (
+            answer,
+            Some(name),
+            Some(Ended::Observer { name, error, fatal }),
+        ),
     }
 }
 
@@ -1210,6 +1229,22 @@ trait Inbox<A, M>: Send {
     /// keeping a flag beside it, and inventing one would be a second lifecycle
     /// fact about an actor whose reason for existing is that it has no registry.
     fn mark_busy(&self, _running: bool) {}
+
+    /// The loop knows why it is ending, and has dropped nothing yet.
+    ///
+    /// Called once, between the loop's exit and `finish` — which is the only
+    /// point where a supervisor's *another incarnation follows* decision can be
+    /// made **before** the state is dropped. Every [`Deferred`] parked in that
+    /// state dies with it, and a peer waiting on one has to be told whether this
+    /// actor is coming back; deciding afterwards would be a race against that
+    /// answer, reported to the peer as "there is nothing here" for an actor that
+    /// is mid-restart.
+    ///
+    /// Here rather than as a parameter on [`run_loop`] because this is the same
+    /// question [`mark_busy`](Self::mark_busy) is: something outside the loop
+    /// owns the mailbox and wants to know what the loop is doing. Two of the
+    /// three impls want neither, and both default to nothing.
+    fn ending(&mut self, _reason: &Ended) {}
 }
 
 /// A [`LocalActor`]'s mailbox, which carries reads and the stop request too.
@@ -1396,6 +1431,12 @@ fn dispatch<'a, A: 'a, T: Turn<A>>(
 /// `stop().await`. `feeds` releases the subscriptions. `state` goes last, which
 /// answers every [`Deferred`] parked in it as [`TurnLost::Gone`].
 ///
+/// Under [`supervise`] the `inbox` this drops is a [`Lent`] — a borrow of the
+/// mailbox the outer loop owns — so dropping it releases the borrow and closes
+/// nothing. That is the property the whole design rests on: the mailbox outlives
+/// the incarnation with no re-queue, and `is_running()` stays `true` across a
+/// restart, which is the truth.
+///
 /// The `inbox` drop is ordering insurance whose absence no test here catches:
 /// RFC-06 §2.4 reports one teardown order failing 25 of 25 and the other passing 25
 /// of 25, and removing this line and running the guard 25 times on this tree failed
@@ -1480,6 +1521,11 @@ where
         }
     }
 
+    // Before `finish`, before every drop, and therefore before a parked
+    // `Deferred` dies with the state. A supervisor decides here whether it is
+    // restarting; see `Inbox::ending`.
+    inbox.ending(&reason);
+
     for observer in &mut hooks {
         // Shared reborrow first, and the `FnOnce`-forcing rebind inside, for the
         // reasons `observed_turn` spells out.
@@ -1525,8 +1571,12 @@ where
 /// eviction clock finds a task that already finished and nobody is told **why** it
 /// finished. An observer's `finish` is told, which is how a durability adapter
 /// still commits — but a keyed actor whose observer refused, whose handler panicked
-/// or whose feed ended reports that to nothing a caller can await. Wave 9's
-/// supervision is what wants that channel; it is not built here.
+/// or whose feed ended reports that to nothing a caller can await.
+///
+/// Supervision arrived without needing it — [`run_keyed_supervised`] restarts a
+/// keyed actor and reads its incarnations' endings on the way past — so the gap
+/// is narrower than it looks and is still real: a supervised keyed actor's
+/// [`Ended::GaveUp`] reaches its own observers' `finish` and nothing outside.
 #[doc(hidden)]
 pub async fn run_keyed<A, M, F>(
     state: A,
@@ -1539,6 +1589,324 @@ pub async fn run_keyed<A, M, F>(
     F: Feeds<A>,
 {
     let _reason: Ended = run_loop(state, hooks, feeds, Keyed(inbox)).await;
+}
+
+// ───────────────────────────────────────────────────────────────── supervision
+
+/// How often a supervised actor may re-incarnate before it is given up on.
+///
+/// **No `Default`, and it is the `Eviction`/`Retention`/`Allowlist` family
+/// rather than a tuning knob.** A number nobody chose is either a restart loop
+/// that hides a permanent fault or a give-up that discards a recoverable one,
+/// and which of those a wrong value produces depends on the caller's actor.
+/// `representability.rs` holds the probe.
+///
+/// # `within` is how long an incarnation must last to count as recovered
+///
+/// It is **not** a sliding window over the last `within` of wall clock, and the
+/// difference is the whole of why this type is documented rather than obvious.
+/// The backoff below is `within / max`, so spending the budget takes exactly
+/// `within` — and against a sliding window of the same length the oldest restart
+/// falls out just as the newest is granted. That pair never terminates: an actor
+/// faulting on every turn restarts forever at exactly the permitted rate, and
+/// `Ended::GaveUp` becomes unreachable. Measured on paper before it was written,
+/// and it is the reason the accounting is the one below.
+///
+/// So: `max` consecutive restarts are allowed, and the count resets when one
+/// incarnation runs for `within` without ending. `Intensity::new(3, 10s)` means
+/// *three restarts in a row, and an actor that stayed up ten seconds has
+/// recovered*.
+///
+/// # The backoff is `within / max`, and there is no knob for it
+///
+/// Spreading the budget across its own window makes exhausting it cost `within`
+/// instead of microseconds, which is what stops a supervised actor from turning
+/// a permanent fault into a hot loop. Exponential backoff with jitter is the
+/// wrong instrument at this size: the budget is single digits, so an exponential
+/// has no room to grow in, and one actor restarting alone has no herd to
+/// disperse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Intensity {
+    max: NonZeroU32,
+    within: Duration,
+}
+
+impl Intensity {
+    /// `max` restarts in a row, and an incarnation lasting `within` has
+    /// recovered.
+    ///
+    /// `NonZeroU32` because a budget of zero is `LocalActor::spawn_fed` — an
+    /// actor with one incarnation — spelled through a supervisor that does
+    /// nothing, and one way to build a thing is the rule.
+    #[must_use]
+    pub fn new(max: NonZeroU32, within: Duration) -> Self {
+        Self { max, within }
+    }
+
+    /// How long to wait between one incarnation and the next.
+    fn backoff(&self) -> Duration {
+        self.within / self.max.get()
+    }
+}
+
+/// Everything one incarnation needs, in the order the doors already take it.
+///
+/// The triple [`actor_wired`] and [`spawn_wired`] are called with, produced by
+/// one closure so that a restart cannot rebuild the state and reuse last
+/// incarnation's observers — which for a durability adapter would mean reusing a
+/// claim that has to be re-acquired, and for a feed would mean a subscription
+/// nobody re-opened.
+///
+/// A tuple rather than a struct because it *is* those three arguments: a named
+/// type here would be a second spelling of a call site that already exists, and
+/// the reader would have to learn which field is which anyway.
+///
+/// [`actor_wired`]: crate::LocalActor::spawn_fed
+/// [`spawn_wired`]: crate::run_keyed
+pub type Incarnation<A, F> = (A, Vec<Box<dyn Observer<A>>>, F);
+
+/// What a supervised actor is doing, on the one channel that used to carry only
+/// its ending.
+///
+/// Three states and not `Option<Ended>` plus a second channel, because the
+/// middle one is a fact about an actor that has **not** ended and a second
+/// channel would be a second allocation per actor for a fact one of them can
+/// hold. It is private: [`LocalActor::ended`] answers the outside question, and
+/// [`deliver_to_local`] is the only other reader.
+#[derive(Debug, Clone)]
+enum Life {
+    /// An incarnation is running, or the first has not started yet.
+    Running,
+    /// The last incarnation ended for this reason, and another follows.
+    Restarting(Ended),
+    /// The actor is gone, and this is why.
+    Ended(Ended),
+}
+
+/// The restart accounting, kept by one supervisor for one actor.
+///
+/// Separate from [`Intensity`] because that is the caller's declaration and this
+/// is what happens to it — and because [`Lent`] borrows this across an
+/// incarnation while the declaration is `Copy`.
+struct Budget {
+    limit: Intensity,
+    /// Restarts since the last incarnation that lasted a whole `within`.
+    used: u32,
+    /// Restarts granted in total, which is what [`Ended::GaveUp`] reports.
+    spent: u32,
+}
+
+impl Budget {
+    fn new(limit: Intensity) -> Self {
+        Self {
+            limit,
+            used: 0,
+            spent: 0,
+        }
+    }
+
+    /// Grant a restart, or refuse because the budget is out.
+    ///
+    /// `ran_for` is how long the incarnation that just ended lasted; a factory
+    /// that failed before one existed passes `Duration::ZERO`, which is true and
+    /// is why it counts against the budget exactly like a fault. That is what
+    /// makes a state another machine has claimed end as [`Ended::GaveUp`] rather
+    /// than loop on a re-acquire that will never succeed.
+    fn spend(&mut self, ran_for: Duration) -> bool {
+        if ran_for >= self.limit.within {
+            self.used = 0;
+        }
+        if self.used >= self.limit.max.get() {
+            return false;
+        }
+        self.used += 1;
+        self.spent += 1;
+        true
+    }
+}
+
+/// Whether another incarnation is worth building.
+///
+/// A pure function of the ending, so that the supervisor's decision is readable
+/// in one place rather than spread across the loop that makes it.
+fn retryable(reason: &Ended) -> bool {
+    match reason {
+        // Somebody asked, or the last handle went. Restarting would be
+        // overruling them.
+        Ended::Stopped => false,
+        // `abort` drops the task at its next await, so the loop never reaches an
+        // ending to report. Written to be correct rather than to panic, which is
+        // the choice `Mail`'s `send` and `recv` variants already make.
+        Ended::Vanished => false,
+        // A supervisor's own ending. No supervisor sees another's.
+        Ended::GaveUp { .. } => false,
+        // The one ending an author can declare unrepeatable. See `Stop::fatal`.
+        Ended::Observer { fatal, .. } => !fatal,
+        // A fault and a dead feed are what a restart is for: the state goes back
+        // to its last commit, and the factory re-subscribes.
+        Ended::Panicked { .. } | Ended::Feed { .. } => true,
+    }
+}
+
+/// Turn an incarnation's ending into the actor's, now that there will be no more.
+fn gave_up(reason: Ended, after: u32) -> Ended {
+    let error: Arc<dyn Error + Send + Sync> = match reason {
+        // The observer's own error, chain and all, rather than its rendering.
+        Ended::Observer { error, .. } | Ended::GaveUp { error, .. } => error,
+        other => Arc::from(Box::<dyn Error + Send + Sync>::from(other.to_string())),
+    };
+    Ended::GaveUp { after, error }
+}
+
+/// The mailbox an incarnation is **lent**, and the supervisor's decision point.
+///
+/// The outer loop owns the receiver and hands one of these to each incarnation,
+/// which is the whole structural idea: `task`, `abort()` and the mailbox are the
+/// actor's rather than the incarnation's, so a restart needs no re-queue, cannot
+/// resolve [`ended`](LocalActor::ended), and leaves
+/// [`is_running`](LocalActor::is_running) `true` — which is the truth.
+struct Lent<'a, I> {
+    inbox: &'a mut I,
+    budget: &'a mut Budget,
+    life: &'a watch::Sender<Life>,
+    /// When this incarnation started, for [`Budget::spend`].
+    started: Instant,
+}
+
+impl<A: Send, M: Send, I: Inbox<A, M>> Inbox<A, M> for Lent<'_, I> {
+    fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Message<A, M>>> {
+        self.inbox.poll_next(cx)
+    }
+
+    fn mark_busy(&self, running: bool) {
+        self.inbox.mark_busy(running);
+    }
+
+    /// Decide, and publish the decision — **before** the state is dropped.
+    ///
+    /// The decision is made here and read back off the channel rather than
+    /// returned, so there is exactly one place a restart is granted and exactly
+    /// one place it is recorded. Doing it after [`run_loop`] returns would be a
+    /// race with the `Deferred` replies that die when the state does, and the
+    /// peer waiting on one would be told `NoSuchActor` for an actor that is
+    /// about to answer it.
+    ///
+    /// `send_replace` and not `send`: the value must land whether or not anyone
+    /// is listening, and a keyed supervised actor has no receiver at all.
+    fn ending(&mut self, reason: &Ended) {
+        if retryable(reason) && self.budget.spend(self.started.elapsed()) {
+            let _ = self.life.send_replace(Life::Restarting(reason.clone()));
+        }
+    }
+}
+
+/// The outer loop: build an incarnation, run it, decide, repeat.
+///
+/// **A loop around the actor's own task, not a second task spawning children.**
+/// RFC-04 §8 refused a `Supervisor` type and issue #3 refuses `Strategy`,
+/// `OneForAll`, `RestForOne` and parent/child trees for a reason that survives
+/// the overturn of §8 itself: in OTP `one_for_all` exists because a crashed
+/// process leaves its peers holding a dead pid, and here identity does not die
+/// with the incarnation — this loop keeps the `mpsc::Sender`, so a handle held
+/// anywhere goes on working. **There is no stale reference to repair.**
+///
+/// Runs on the actor's own task and owns `inbox` for the actor's whole life. The
+/// factory produces state, observers and feeds together, so each incarnation
+/// gets fresh ones and [`run_loop`] has dropped the old ones — including a
+/// durable `Claim`, which `observe.rs` says dies with the actor deliberately —
+/// before the next factory call. That is what bounds the re-acquire window to
+/// `backoff + claim latency` and stops the process racing itself for its own
+/// claim.
+async fn supervise<A, M, F, Fut, N, I>(
+    mut factory: N,
+    limit: Intensity,
+    mut inbox: I,
+    life: &watch::Sender<Life>,
+) -> Ended
+where
+    A: Send + 'static,
+    M: Turn<A>,
+    F: Feeds<A>,
+    I: Inbox<A, M>,
+    N: FnMut() -> Fut + Send,
+    Fut: Future<Output = Result<Incarnation<A, F>, Stop>> + Send,
+{
+    let mut budget = Budget::new(limit);
+    loop {
+        let built = factory().await;
+        let (state, hooks, feeds) = match built {
+            Ok(triple) => triple,
+            // No incarnation ran, so nothing published `Restarting` and nothing
+            // spent the budget. Both happen here instead, and the ZERO is the
+            // honest duration of a build that produced no actor.
+            Err(stop) => {
+                let (error, fatal) = stop.into_parts();
+                if !fatal && budget.spend(Duration::ZERO) {
+                    n0_future::time::sleep(limit.backoff()).await;
+                    continue;
+                }
+                return Ended::GaveUp {
+                    after: budget.spent,
+                    error: Arc::from(error),
+                };
+            }
+        };
+
+        let _ = life.send_replace(Life::Running);
+        let lent = Lent {
+            inbox: &mut inbox,
+            budget: &mut budget,
+            life,
+            started: Instant::now(),
+        };
+        let reason = run_loop(state, hooks, feeds, lent).await;
+
+        // The verdict `Lent::ending` recorded, read back off the one channel that
+        // holds it. `borrow` and not `borrow_and_update`: marking a value seen is
+        // `ended()`'s business, not this loop's.
+        let restarting = matches!(*life.borrow(), Life::Restarting(_));
+        if !restarting {
+            return match reason {
+                // Asked to stop, or every handle went. Not a failure, and not
+                // something anybody gave up on.
+                Ended::Stopped | Ended::Vanished => reason,
+                failed => gave_up(failed, budget.spent),
+            };
+        }
+        n0_future::time::sleep(limit.backoff()).await;
+    }
+}
+
+/// Run one **supervised** keyed actor: the same outer loop, entered from a
+/// [`System`](crate::System)'s mailbox.
+///
+/// `#[doc(hidden)] pub` for [`run_keyed`]'s reason: the generated keyed
+/// `spawn_supervised` calls it from inside [`mount`](crate::mount)'s closure, in
+/// the user's crate. The registry is untouched by any of this — `mount` takes a
+/// closure over a `Mailbox`, and this is that closure's whole body.
+///
+/// A keyed actor still has no `ended()` channel, so the [`Life`] this makes has
+/// no reader and `Ended::GaveUp` reaches nobody but the observers' `finish`. One
+/// small channel per supervised keyed actor is the cost of that; the alternative
+/// is an `Option` and a second path through the one loop, which is the split
+/// Wave 3 exists to have deleted.
+#[doc(hidden)]
+pub async fn run_keyed_supervised<A, M, F, Fut, N>(
+    factory: N,
+    limit: Intensity,
+    inbox: crate::Mailbox<M>,
+) where
+    A: Send + 'static,
+    M: Turn<A>,
+    F: Feeds<A>,
+    N: FnMut() -> Fut + Send,
+    Fut: Future<Output = Result<Incarnation<A, F>, Stop>> + Send,
+{
+    let (life, _no_reader) = watch::channel(Life::Running);
+    let _reason: Ended = supervise(factory, limit, Keyed(inbox), &life).await;
 }
 
 /// The actor is gone. The only way a local call fails.
@@ -1576,12 +1944,13 @@ pub struct MailboxClosed;
 /// a `LocalActor` whose `M` nothing has ever run.
 pub struct LocalActor<A, M> {
     mail: mpsc::Sender<Message<A, M>>,
-    /// Why the actor ended, once it has. `Option`, starting at `None`, because
-    /// a channel initialised with a reason reports that reason for a live
-    /// actor. A receiver and never a sender, so awaiting it cannot keep the
-    /// actor alive — which is exactly what an earlier design built on
-    /// `mail.closed()` did, making "the last handle was dropped" unreachable.
-    ended: watch::Receiver<Option<Ended>>,
+    /// What the actor is doing, and why it stopped once it has. Starts at
+    /// [`Life::Running`], because a channel initialised with a reason reports
+    /// that reason for a live actor. A receiver and never a sender, so awaiting
+    /// it cannot keep the actor alive — which is exactly what an earlier design
+    /// built on `mail.closed()` did, making "the last handle was dropped"
+    /// unreachable.
+    life: watch::Receiver<Life>,
     /// Held so a wedged actor can still be [aborted](Self::abort). Dropping a
     /// `JoinHandle` detaches the task on both targets — it does not cancel it —
     /// so this is the only handle on a turn that never returns.
@@ -1649,7 +2018,7 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
         // carries the measured table; this end had no box at all, because the
         // closure it used to carry made one by accident.
         let (mail, inbox) = mpsc::channel::<Message<A, M>>(LOCAL_MAILBOX_DEPTH);
-        let (ended, watching) = watch::channel::<Option<Ended>>(None);
+        let (life, watching) = watch::channel(Life::Running);
         let task = n0_future::task::spawn(async move {
             // Everything that happens to the state, its observers and its two
             // inputs — including the whole teardown order — is in `run_loop`,
@@ -1661,11 +2030,89 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
             // than before: `stop().await` returning now means the state itself is
             // gone, not merely that the observers' claims are.
             let reason = run_loop(state, hooks, feeds, inbox).await;
-            let _ = ended.send(Some(reason));
+            let _ = life.send_replace(Life::Ended(reason));
         });
         Self {
             mail,
-            ended: watching,
+            life: watching,
+            task: Arc::new(task),
+        }
+    }
+
+    /// Start an actor that is **rebuilt** when an incarnation fails.
+    ///
+    /// The factory produces state, observers and feeds together — the triple
+    /// [`spawn_fed`](Self::spawn_fed) takes — so every incarnation gets fresh
+    /// ones and the previous ones have already been dropped when it is called.
+    /// That ordering is the design rather than a detail: a durable observer owns
+    /// an exclusive `Claim` that *cannot* outlive its incarnation, so the claim
+    /// is released before the next `open` asks for it and the process never
+    /// races itself.
+    ///
+    /// It is `async` and fallible because claiming is I/O. A factory that fails
+    /// spends one restart exactly like a fault, so a state another machine has
+    /// taken ends [`Ended::GaveUp`] rather than looping forever on a re-acquire
+    /// that will never succeed; [`Stop::fatal`] skips even that.
+    ///
+    /// ```ignore
+    /// let limit = Intensity::new(NonZeroU32::new(3)?, Duration::from_secs(10));
+    /// let ledger = ledger::supervised(
+    ///     move || {
+    ///         let store = store.clone();
+    ///         let id = id.clone();
+    ///         async move {
+    ///             let (restored, saver) = Persist::<Ledger, _>::open(&store, &id).await?;
+    ///             Ok((restored.unwrap_or_default(), vec![Box::new(saver) as _], ()))
+    ///         }
+    ///     },
+    ///     limit,
+    /// );
+    /// ```
+    ///
+    /// # Four things that fall out of the shape, with no mechanism
+    ///
+    /// The supervisor is an outer loop on **this** actor's task rather than a
+    /// second task spawning children, so: [`abort`](Self::abort) destroys the
+    /// actor and not one incarnation; the mailbox outlives an incarnation with
+    /// no re-queue; [`ended`](Self::ended) **cannot** resolve on a restart; and
+    /// [`is_running`](Self::is_running) is `true` during one.
+    ///
+    /// # The gate this waited behind, so a later reader knows why
+    ///
+    /// Supervision was held until a durable [`Observer`] existed, and the reason
+    /// is not sequencing hygiene: **a restart is worth exactly the distance
+    /// between the state at fault and the state the next incarnation starts
+    /// from, and that distance is set by the commit point.** With no commit
+    /// point a restart is a panic guard plus data loss. [`Persist`] is that
+    /// commit point and its measured price is 7.6 ms per turn.
+    ///
+    /// RFC-04 §8's sharpest sentence still stands and this does not answer it:
+    /// *a peer that vanished is not fixed by restarting a local actor.*
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a tokio runtime, like every other spawn.
+    ///
+    /// [`Persist`]: crate::Persist
+    #[must_use]
+    pub fn spawn_supervised<N, Fut, F>(factory: N, limit: Intensity) -> Self
+    where
+        N: FnMut() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Incarnation<A, F>, Stop>> + Send,
+        F: Feeds<A>,
+    {
+        let (mail, inbox) = mpsc::channel::<Message<A, M>>(LOCAL_MAILBOX_DEPTH);
+        let (life, watching) = watch::channel(Life::Running);
+        let task = n0_future::task::spawn(async move {
+            // `supervise` owns the receiver and drops it on the way out, so the
+            // mailbox is closed before the ending is published — the ordering
+            // `spawn_fed` gets from `run_loop`, kept across the extra loop.
+            let reason = supervise(factory, limit, inbox, &life).await;
+            let _ = life.send_replace(Life::Ended(reason));
+        });
+        Self {
+            mail,
+            life: watching,
             task: Arc::new(task),
         }
     }
@@ -1928,14 +2375,25 @@ impl<A, M> LocalActor<A, M> {
     /// A turn that never reaches an await point is not interrupted by
     /// [`abort`](Self::abort), so this waits. That is today's behaviour and not
     /// a regression.
+    /// A restart is **not** an ending, and that is structural rather than a
+    /// filter written here: a supervised actor's incarnations run inside one
+    /// task, and only that task's exit publishes an ending at all.
     pub fn ended(&self) -> impl Future<Output = Ended> + Send + 'static {
-        let mut watching = self.ended.clone();
+        let mut watching = self.life.clone();
         async move {
             // `wait_for` and not `changed()`: a fresh receiver marks the current
             // value as seen, so `changed()` would wait forever on a second call.
             // A dropped sender is an aborted task, which never filled the value.
-            match watching.wait_for(Option::is_some).await {
-                Ok(seen) => seen.clone().unwrap_or(Ended::Vanished),
+            match watching
+                .wait_for(|life| matches!(life, Life::Ended(_)))
+                .await
+            {
+                Ok(seen) => match &*seen {
+                    Life::Ended(reason) => reason.clone(),
+                    // Unreachable: `wait_for` returned, so the predicate held.
+                    // Written to be correct rather than to panic.
+                    Life::Running | Life::Restarting(_) => Ended::Vanished,
+                },
                 Err(_) => Ended::Vanished,
             }
         }
@@ -1987,8 +2445,10 @@ impl<A, M> LocalActor<A, M> {
         // current value as seen and `changed()` would then wait forever on a
         // second call — and this is documented as idempotent. A dropped sender
         // is an aborted task, which is ended too, so the error is ignored.
-        let mut watching = self.ended.clone();
-        let _ = watching.wait_for(Option::is_some).await;
+        let mut watching = self.life.clone();
+        let _ = watching
+            .wait_for(|life| matches!(life, Life::Ended(_)))
+            .await;
     }
 
     /// Cancel the actor where it stands.
@@ -2036,7 +2496,7 @@ impl<A, M> Clone for LocalActor<A, M> {
     fn clone(&self) -> Self {
         Self {
             mail: self.mail.clone(),
-            ended: self.ended.clone(),
+            life: self.life.clone(),
             task: self.task.clone(),
         }
     }
@@ -2066,6 +2526,13 @@ impl<A, M> fmt::Debug for LocalActor<A, M> {
 /// hashed contract and would move every service's ALPN — so the **string is the
 /// whole discriminator** between "your message exploded" and "an observer vetoed
 /// the turn it just watched", and panic text is usually caller-derived.
+///
+/// There is a third prefix now — `"restarting: "`, built in
+/// [`deliver_to_local`] — and the two cannot be confused: `"panicked: "` means
+/// *your message exploded and the actor kept its state*, while `"restarting: "`
+/// means *the incarnation that owed you an answer is gone and the next one is
+/// coming*. Neither string is a prefix of the other, and neither is a
+/// [`RemoteError`] variant, so the contract hash does not move for either.
 ///
 /// The stutter is still there and is deliberately not fixed here:
 /// `Panic::caught` builds its message as `the actor panicked: {payload}`, and
@@ -2188,7 +2655,23 @@ where
 
     match answer.await {
         Ok(answered) => rendered(answered, millis),
-        Err(_) => gone(),
+        // The sender was dropped without sending, which on a supervised actor
+        // has one cause and it is not "gone": a `Deferred` parked in the state
+        // dies when the state does, and the actor is mid-restart. Telling that
+        // peer `NoSuchActor` — *there is nothing here, stop asking* — about an
+        // actor that is about to answer them again is the one defect supervision
+        // would otherwise introduce on the served path.
+        //
+        // `Life::Restarting` is published before the state is dropped, so this
+        // read cannot lose the race with the answer channel it is about. See
+        // `Inbox::ending`.
+        Err(_) => match &*actor.life.borrow() {
+            Life::Restarting(reason) => (
+                Outcome::Err(RemoteError::Failed(format!("restarting: {reason}"))),
+                Body::empty(),
+            ),
+            Life::Running | Life::Ended(_) => gone(),
+        },
     }
 }
 

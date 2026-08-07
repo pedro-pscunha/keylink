@@ -286,7 +286,17 @@ pub enum TurnOutcome<'a> {
 /// it wins — and [`Stop::new`] covers the other one. RFC-06 §10 lists an `Error`
 /// impl among the surface; that was a counting slip and this is the note it
 /// asked for rather than a silent departure.
-pub struct Stop(Box<dyn Error + Send + Sync>);
+///
+/// # The second field is a flag and not a second type, and coherence is why
+///
+/// [`fatal`](Self::fatal) needs to say one more thing than the boxed error
+/// carries, and it cannot say it through the type system: the blanket `From<E>`
+/// below overlaps **every** other `From` impl, so a `Fatal<E>` wrapper a caller
+/// could convert from is `error[E0119]`. An inherent associated function beside
+/// [`new`](Self::new), with the same `impl Into<Box<..>>` shape, is the one
+/// route the coherence rules leave open — so the discriminator is a field on
+/// this struct rather than a second error type.
+pub struct Stop(Box<dyn Error + Send + Sync>, bool);
 
 impl Stop {
     /// The only route for an observer that fails with a message rather than
@@ -296,26 +306,68 @@ impl Stop {
     /// impl a coherence error, so `From<String>` and `From<&str>` can never be
     /// added; without this an observer failing with a plain message would have
     /// to build the box by hand.
+    ///
+    /// A refusal made this way — or through the blanket `From` — is one a
+    /// supervisor may retry. Say [`fatal`](Self::fatal) when it is not.
     #[must_use]
     pub fn new(because: impl Into<Box<dyn Error + Send + Sync>>) -> Self {
-        Self(because.into())
+        Self(because.into(), false)
     }
 
-    /// The reason, for the loop that turns it into an [`Ended`].
-    pub(crate) fn into_reason(self) -> Box<dyn Error + Send + Sync> {
-        self.0
+    /// Refuse, and say that another incarnation cannot help.
+    ///
+    /// A snapshot written by a newer build, a claim another machine holds, a
+    /// configuration that is wrong rather than unlucky. A
+    /// [supervised](crate::LocalActor::spawn_supervised) actor gives up at once
+    /// on one of these instead of spending its whole budget proving the same
+    /// thing several times, each attempt costing a re-acquire.
+    ///
+    /// It means nothing to an actor nobody is supervising: the actor ends
+    /// either way, and the only difference is the `fatal` flag on
+    /// [`Ended::Observer`], which says *why* it will not be coming back.
+    ///
+    /// # It is honoured for a turn that **completed**, and not for one that faulted
+    ///
+    /// The loop reports a refused *panicked* turn as [`Ended::Panicked`] naming
+    /// the fault rather than the observer — a durability adapter refuses every
+    /// panicked turn, and reporting the adapter would point an operator at the
+    /// wrong code. That ending carries no observer and therefore no flag, so a
+    /// supervisor restarts after it. That is deliberate rather than a gap: the
+    /// reason the actor is ending is the fault, and a fault is exactly the kind
+    /// of thing another incarnation might not repeat.
+    #[must_use]
+    pub fn fatal(because: impl Into<Box<dyn Error + Send + Sync>>) -> Self {
+        Self(because.into(), true)
+    }
+
+    /// Whether this refusal said another incarnation cannot help.
+    #[must_use]
+    pub fn is_fatal(&self) -> bool {
+        self.1
+    }
+
+    /// The reason and the flag, for the loop that turns them into an [`Ended`].
+    ///
+    /// Named for the pair rather than for the reason: it used to be
+    /// `into_reason` returning one box, and a name that keeps promising one
+    /// thing while handing back two is how a caller drops the second.
+    pub(crate) fn into_parts(self) -> (Box<dyn Error + Send + Sync>, bool) {
+        (self.0, self.1)
     }
 }
 
 impl<E: Error + Send + Sync + 'static> From<E> for Stop {
     fn from(error: E) -> Self {
-        Self(Box::new(error))
+        Self(Box::new(error), false)
     }
 }
 
 impl fmt::Debug for Stop {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Stop").field(&self.0.to_string()).finish()
+        f.debug_tuple("Stop")
+            .field(&self.0.to_string())
+            .field(&self.1)
+            .finish()
     }
 }
 
@@ -370,6 +422,11 @@ impl fmt::Display for Stop {
 /// match with no wildcard, so a new variant is one `E0004` **inside keylink** that
 /// points a reader at this paragraph rather than at nothing. Do not reach for
 /// `#[non_exhaustive]` to silence it.
+///
+/// **And it was measured a second time.** Adding [`GaveUp`](Self::GaveUp) produced
+/// exactly one `error[E0004]` in this workspace, in `every_ending_is_named` and
+/// nowhere else — the prediction above, confirmed rather than assumed. The
+/// variant is named there and the enum stays exhaustive.
 #[derive(Debug, Clone)]
 pub enum Ended {
     /// [`stop`](crate::LocalActor::stop) was called, or the last handle was
@@ -397,6 +454,17 @@ pub enum Ended {
         /// An `Arc` because [`Ended`] is `Clone` and many callers can await it.
         /// The conversion from [`Stop`]'s `Box` happens once, in the loop.
         error: Arc<dyn Error + Send + Sync>,
+        /// Whether the observer said another incarnation cannot help.
+        ///
+        /// [`Stop::fatal`] against [`Stop::new`]. A `bool` and not a two-armed
+        /// enum because it is one author's yes-or-no about their own refusal
+        /// rather than a value set with room to grow, and because the surface
+        /// already spells it that way in [`Stop::is_fatal`].
+        ///
+        /// An observer that panicked lands here with `false`: it made no claim
+        /// at all, and inventing one for it would be the silent fallback this
+        /// crate refuses everywhere else.
+        fatal: bool,
     },
     /// A `feed` produced its last item.
     ///
@@ -416,6 +484,58 @@ pub enum Ended {
         /// `"on_fills"`.
         name: &'static str,
     },
+    /// A supervisor stopped re-incarnating this actor.
+    ///
+    /// The only ending a [supervised](crate::LocalActor::spawn_supervised) actor
+    /// can reach that an unsupervised one cannot, and the reason the whole enum
+    /// is worth having: "gone" is already
+    /// [`MailboxClosed`](crate::MailboxClosed)'s answer, and an operator needs
+    /// to know whether this actor stopped because somebody asked it to or
+    /// because it could not be kept alive.
+    ///
+    /// The mailbox closes when this is published, so every later call reports
+    /// [`MailboxClosed`](crate::MailboxClosed) and a peer is told
+    /// [`RemoteError::NoSuchActor`](crate::RemoteError::NoSuchActor).
+    GaveUp {
+        /// How many incarnations were spent before giving up.
+        ///
+        /// **Restarts, not incarnations**, so `0` means the first one was the
+        /// last: an [`Intensity`](crate::Intensity) budget that was never
+        /// touched, because the factory failed fatally, an observer said
+        /// [`Stop::fatal`], or [`stop`](crate::LocalActor::stop) is not what
+        /// happened here at all. It is a number this supervisor counted, not a
+        /// counter on the actor — `LocalActor::incarnations()` deliberately does
+        /// not exist.
+        after: u32,
+        /// The last incarnation's reason for ending, or the factory's reason for
+        /// refusing to build one.
+        ///
+        /// An `Arc` for [`Observer`](Self::Observer)'s reason: [`Ended`] is
+        /// `Clone` and many callers can await it.
+        error: Arc<dyn Error + Send + Sync>,
+    },
+}
+
+/// One line, for a log or for the string a peer is handed.
+///
+/// [`Debug`](fmt::Debug) is derived and prints the fields; this prints the
+/// sentence. `local.rs` puts one of these behind a `"restarting: "` prefix on the
+/// served path, and a struct-literal rendering there would be noise on a wire.
+impl fmt::Display for Ended {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stopped => f.write_str("the actor was stopped"),
+            Self::Vanished => f.write_str("the actor's task was cancelled"),
+            Self::Panicked { message } => write!(f, "a turn panicked: {message}"),
+            Self::Observer { name, error, .. } => {
+                write!(f, "the {name} observer gave up: {error}")
+            }
+            Self::Feed { name } => write!(f, "the {name} feed ended"),
+            Self::GaveUp { after, error } => {
+                write!(f, "gave up after {after} restarts: {error}")
+            }
+        }
+    }
 }
 
 /// Why a turn produced no value.

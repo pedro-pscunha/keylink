@@ -2018,3 +2018,289 @@ day it exists, `Names` takes it unchanged.
   is. A remote fan-out is `Subscribers` plus a reverse contract, which
   `subscribers.rs` already documents and which is a different thing wearing a
   similar name.
+
+---
+
+## 9. Wave 9 — supervision, phases 1 and 2
+
+**The supervisor is an outer loop on the actor's own task.** Not a type, not a
+tree, not a second task spawning children: `LocalActor::spawn_supervised` wraps
+the loop that already exists, owns the mailbox for the actor's whole life, and
+lends it to one incarnation at a time. The whole of the new public surface is
+`Intensity`, `Incarnation<A, F>`, `Stop::fatal`, `Stop::is_fatal`,
+`Ended::GaveUp`, one `fatal` field on `Ended::Observer`, `Display for Ended`, and
+two generated doors — `supervised` and `spawn_supervised`.
+
+`registry.rs` is untouched — **zero lines**, verified by `git diff --numstat`.
+`mount` takes a closure over a `Mailbox<M>`, and the
+supervisor is that closure's whole body, so `System::mount`, eviction, `shutdown`
+and `System::status` see one task exactly as they do for an unsupervised keyed
+actor.
+
+### 9.1 THE DECISION THIS WAVE OWNS — the sliding window the design asked for cannot terminate
+
+Issue #3 specifies two things that do not compose: an OTP-shaped `Intensity`
+(*`max` restarts within `within`*) and a backoff of **`within / max`**. Spending
+the budget therefore takes exactly `within` — and against a sliding window of the
+same length, the oldest restart falls out of the window at the instant the newest
+one is granted. Worked through with `max = 4`, `within = 8s`, `backoff = 2s`:
+
+| restart | at | restarts in the last 8s | granted? |
+|---|---|---|---|
+| 1 | 0s | 0 | yes |
+| 2 | 2s | 1 | yes |
+| 3 | 4s | 2 | yes |
+| 4 | 6s | 3 | yes |
+| 5 | 8s | **3** — the one at 0s has just aged out | yes |
+| … | … | 3, for ever | yes |
+
+The steady state is exactly `max` restarts per `within`, for ever, and
+`Ended::GaveUp` is unreachable. An actor faulting on every turn would restart
+until the process died, which is the hot loop the backoff exists to prevent,
+arrived at by the mechanism that was supposed to prevent it.
+
+So `within` means something else here, and `Intensity`'s own documentation says
+so out loud: **`max` restarts in a row, and the count resets when one incarnation
+runs for `within` without ending.** `Intensity::new(3, 10s)` reads *three
+restarts in a row, and an actor that stayed up ten seconds has recovered*. The
+backoff is unchanged, `a_restart_storm_ends_the_actor` terminates at
+`after: max`, and `the_backoff_spreads_the_budget_across_its_window` still
+measures a full `within` of virtual time.
+
+The alternative — keeping the sliding window and pruning with `>` instead of
+`>=` — was considered and refused. It terminates only when the elapsed time is
+*exactly* the window, which is true of a paused clock and false of a real one, so
+it would have been a guard that passes in the test suite and fails in production.
+
+### 9.2 The four properties that fall out with no mechanism
+
+They are worth naming because each is a mechanism this design did **not** have to
+build:
+
+- **`task: Arc<JoinHandle<()>>` and `abort()` are unchanged.** The task is the
+  supervisor's, so `abort` destroys the actor rather than one incarnation.
+  `abort_destroys_a_supervised_actor_rather_than_one_incarnation`.
+- **The mailbox outlives the incarnation for free.** No re-queue, no
+  `push_front`. `run_loop` drops a `Lent` — a borrow — and closes nothing;
+  messages queued during a restart are handled by the next incarnation.
+- **`ended()` *cannot* fire on a restart.** Only the task's exit publishes
+  `Life::Ended`, and a restart is not an exit. `a_restart_is_not_an_ending`.
+- **`is_running()` is true during one**, which is the truth.
+
+And the reason this is not OTP: `one_for_all` exists because a crashed Erlang
+process leaves its peers holding a **dead pid**. Here identity does not die with
+the incarnation — the outer loop keeps the `mpsc::Sender` — so **there is no
+stale reference to repair**. `a_handle_survives_its_actors_restart` is that
+sentence as a test. What remains is *state* coupling, and a group restart is both
+too broad (it discards a healthy actor's live state) and too narrow (it cannot
+say *what* went stale) to fix it. That is a message, not a strategy.
+
+### 9.3 `Stop::fatal` is an inherent function, and the flag is a field, because of coherence
+
+`Stop` has a blanket `impl<E: Error + Send + Sync + 'static> From<E>`, which makes
+**every** other `From` impl an `error[E0119]`. So a `Fatal<E>` wrapper a caller
+could convert from cannot exist, and `fatal` is an inherent associated function
+with `new`'s exact `impl Into<Box<dyn Error + Send + Sync>>` shape. The
+discriminator then has nowhere to live but a second field on the tuple struct,
+which is what `into_reason` becoming `into_parts` is: a name that went on
+promising one value while handing back two is how a caller drops the second.
+
+**A fatal refusal of a turn that *panicked* is not honoured, and that is
+deliberate.** The loop reports a refused fault as `Ended::Panicked` naming the
+handler rather than the observer — a durability adapter refuses every panicked
+turn, and reporting the adapter points an operator at the wrong code. That ending
+carries no observer and therefore no flag. The rule is on `Stop::fatal`'s own
+documentation: the reason the actor is ending is the fault, and a fault is the
+kind of thing another incarnation might not repeat.
+
+### 9.4 `Ended::GaveUp` was predicted to cost one `E0004`, and it cost exactly one
+
+§5.1 decided `Ended` stays exhaustive, measured the churn of adding `Feed` at
+**zero**, and predicted that Wave 9's `GaveUp` would land the same way with
+`representability.rs::every_ending_is_named` as the one `E0004`. Measured, by
+deleting that arm and building `--all-features --all-targets`:
+
+```
+$ cargo check -p keylink --all-features --all-targets 2>&1 | grep -c 'error\[E0004\]'
+1
+error[E0004]: non-exhaustive patterns: `&observe::Ended::GaveUp { .. }` not covered
+   --> keylink/src/representability.rs:814:11
+```
+
+`#[non_exhaustive]` was not reached for. The `fatal` field on `Ended::Observer`
+did cost churn — five `error[E0027]`s in `keylink/tests/observe.rs`, all fixed
+with `..` — which is the honest price of a struct variant gaining a field and is
+recorded rather than buried.
+
+### 9.5 The re-acquire window, bounded three ways
+
+A durable `Claim` **cannot** outlive an incarnation: `observe.rs` states that it
+dies with the actor deliberately, and reaching a shared one needs an async mutex
+the port rejects by name, because `Claim` is `!Sync` and `store` takes
+`&mut self`. So supervision has to release and re-acquire, and the window is
+bounded three ways:
+
+1. **The old claim is dropped before the next incarnation is built.**
+   `run_loop`'s teardown drops `hooks` before it returns, and the factory is
+   called after it returns, so the process never races itself for its own claim.
+   `an_observer_is_rebuilt_for_each_incarnation` asserts the *order* —
+   `built 0, dropped 0, built 1, …` — not a count.
+2. **A failed re-acquire counts against the budget.** The factory is `async` and
+   fallible for exactly this reason, and a build that produced no actor spends
+   one restart with `Duration::ZERO` on the clock. A state another machine has
+   taken therefore ends `Ended::GaveUp` rather than looping.
+3. **The window is `backoff + claim latency`**, and the backoff is `within / max`.
+
+That the factory is `async` has a second consequence worth stating: the keyed
+`spawn_supervised` is the first keyed door a durable actor can use **lazily**.
+`SystemBuilder::spawn_with`'s factory is a plain `Fn` and cannot `await`, which is
+why §6.6's keyed durable actor is mounted eagerly after `Persist::open(..).await`.
+
+### 9.6 The served path: `"restarting: "` is a defect fix, not decoration
+
+The one message a restart genuinely loses is a `Deferred` parked in the state,
+because the state is dropped when the incarnation ends. Every other message
+survives: a turn in flight is always answered before the loop breaks, and queued
+turns stay in the mailbox the supervisor owns.
+
+Before this wave that lost reply was rendered `RemoteError::NoSuchActor` —
+*there is nothing here, stop asking* — which is true of an unsupervised actor and
+a **lie** about one that is mid-restart and about to answer the same peer again.
+So `deliver_to_local` reads the supervisor's decision and renders
+`Failed("restarting: {reason}")`. A prefixed string and not a new variant, so the
+ALPN does not move; `keylink/tests/protocol.rs` still pins
+`keylink/Probe/d3fe34471921164e`.
+
+**The ordering is the whole of it.** The decision is made and published in
+`Inbox::ending`, which `run_loop` calls between the loop's exit and `finish` —
+*before* anything is dropped. Deciding after `run_loop` returned would be a race
+against the very answer channel it is about, and the peer would read
+`NoSuchActor` for a restarting actor about half the time. That is why the hook is
+on `Inbox` — the trait through which something outside the loop already owns the
+mailbox and already learns what the loop is doing, via `mark_busy` — rather than
+a parameter two of three callers would pass `|_| {}` to.
+
+Three prefixes now, and none is a prefix of another: `"panicked: "` (your message
+exploded, the actor kept its state), `"observer refused: "` (the turn ran and was
+not committed), `"restarting: "` (the incarnation that owed you an answer is
+gone). `a_remote_caller_can_tell_restarting_from_gone` asserts all three
+distinctions on one QUIC connection between two real nodes.
+
+### 9.7 Phase 3 — REFUSED, and its trigger rewritten
+
+Under supervision a faulted turn's idempotency key still settles `Interrupted`, a
+permanent refusal. Releasing it — via a fourth `Reached` state and a per-mount
+`AfterFault { Retryable, Unknown }` declaration — is **refused, and nothing of it
+is built.**
+
+The reason stands on its own merits and is not documentation: *the premise "the
+restart rolled it back, so we know it did not land" is true of keylink's state
+and not of the world.* A turn that charges a card over HTTP and then panics
+leaves the card charged; the restart rolls back the in-memory struct and nothing
+else. Releasing that key lets a retry charge it twice, which is the exact
+double-effect the ledger exists to prevent. Phases 1–2 need none of it, so
+supervision ships with **no new failure mode**.
+
+**Its trigger is rewritten, and this is the one thing this wave changes about the
+refusal.** It used to read *a service exists that (a) uses idempotency keys, (b)
+faults in practice, and (c) whose author can state its turns have no effects
+outside the actor's state* — a declaration, which is the shape that killed
+`Restartable`. It now reads:
+
+> **Journaled side effects land.**
+
+Durable *execution*, as against the durable *state* keylink now has: an effect
+recorded as completed before the fault is not re-issued on replay, so the
+premise above stops being false at the root rather than being asserted around.
+That converts a permanent refusal into a sequenced one. It is still per-method
+and not per-mount when it arrives — Wave 2c's `#[defer]` established the
+attribute grammar — and the arm easiest to miss is still that a *panicking* turn
+is answered **and** faults the incarnation, so a generated panic arm would have to
+release its key too.
+
+### 9.8 Refused in this wave, with the reason, and one caveat recorded
+
+`Supervisor`, `Strategy`, `OneForAll`/`RestForOne`, parent/child trees,
+`Watching { PerIncarnation, Outliving }`, a fault-injection seam, and an
+incarnation counter. §9.2 carries the argument for the first four;
+`Watching`'s only candidate consumer was the durable `Claim`, and it cannot
+outlive an incarnation; a fault-injection seam is unnecessary because the factory
+is a closure, an `Observer` is a user impl, and a panicking turn is one line of
+test. `LocalActor::incarnations()` does not exist, was confirmed absent
+repo-wide, and none was added.
+
+**One caveat the owner recorded, and it is the next question rather than this
+wave's.** The dead-pid argument defeats sibling-*restart* strategies and does not
+touch **ordered shutdown, escalation, or lifecycle grouping**. Those are judged
+wanted. They are not built here, and nothing in this wave forecloses them: a
+group that shuts down in an order is a statement about several actors, and
+supervision as built is a statement about one.
+
+### 9.9 Every criterion, and the break that proves it
+
+Twelve tests in `keylink/tests/supervision.rs`. Eleven were watched to fail under
+a one-literal break; the twelfth is recorded below as **not** proven by a break.
+
+| criterion | break |
+|---|---|
+| `an_actor_restarts_from_its_last_committed_state` | `retryable`: `Panicked \| Feed => false` |
+| `a_restart_storm_ends_the_actor` | `Budget::spend`: `max.get()` → `max.get() + 1` |
+| `a_restart_is_not_an_ending` | `Lent::ending` publishes `Life::Ended` |
+| `the_backoff_spreads_the_budget_across_its_window` | `Intensity::backoff` → `Duration::ZERO` |
+| `a_fatal_stop_skips_the_budget` | `retryable`: `Observer { fatal } => true` |
+| `an_observer_is_rebuilt_for_each_incarnation` | `run_loop`: `drop(hooks)` → `mem::forget(hooks)` |
+| `a_feed_is_resubscribed_on_each_incarnation` | `retryable`: `Panicked \| Feed => false` |
+| `abort_destroys_a_supervised_actor…` | `abort`: `self.task.abort()` → a no-op |
+| `a_handle_survives_its_actors_restart` | `retryable`: `Observer { fatal } => false` |
+| `a_remote_caller_can_tell_restarting_from_gone` | the `"restarting: "` prefix → `"panicked: "` |
+| `a_keyed_actor_restarts_from_its_last_committed_state` | `retryable`: `Panicked \| Feed => false` |
+| `a_supervised_actor_that_gave_up_answers_stop` | `Budget::spend` never refuses, so the supervisor never exits |
+
+Plus one compile-time probe: `Intensity` in `representability.rs`'s
+`HasNoDefault`, which a `#[derive(Default)]` or a hand-written impl trips.
+
+**Two of those breaks were themselves found to be defective, and the fix is a
+rule.** The first attempt at `a_supervised_actor_that_gave_up_answers_stop`
+broke `stop()`'s wait predicate and came back **green**: once the supervisor's
+task exits, the `watch` sender drops and `wait_for` returns `Err` whatever the
+predicate says, so `stop()` cannot hang for an actor that ended. The only way it
+can go wrong is a supervisor that never exits — which is the break above. And
+the first attempt at `a_fatal_stop_skips_the_budget` *hung* rather than failed,
+because an unbounded `ended().await` on an actor that no longer ends is a hang,
+and a hang is not a red a harness can read. So **every `ended()` in
+`tests/supervision.rs` goes through one bounded helper**, and the two-line
+version of the lesson is: a guard's break must produce a *failure*, and an
+unbounded wait converts every interesting break into silence.
+
+### 9.10 What Wave 9 did NOT do
+
+- **Touch `registry.rs`.** Zero lines, and `rg -i 'supervis' keylink/src/actor/registry.rs`
+  returns nothing, so there was no stale claim to correct either. Every
+  registry-visible fact about a supervised keyed actor — one task, one mailbox,
+  one entry — is unchanged, because `mount` already took a closure.
+- **Give a keyed actor an `ended()` channel.** Still §5.7's gap. A supervised
+  keyed actor's `Ended::GaveUp` reaches its own observers' `finish` and nothing a
+  caller can await, and `run_keyed_supervised` allocates a `Life` channel with no
+  reader to keep one code path rather than two.
+- **Render `"restarting: "` on the *keyed* served path.** `deliver_to_actor` is
+  in `registry.rs`, and it has no supervisor-visible signal to read because a
+  keyed actor has no `Life` channel to publish one on. A `Deferred` lost to a
+  keyed restart is still reported `NoSuchActor`. This is the one asymmetry the
+  wave leaves, it is a consequence of the previous bullet, and it is stated here
+  rather than left to be found.
+- **Build any of §9.8's refused designs**, or phase 3 in any part.
+- **Add a knob for the backoff**, an incarnation counter, or a way to ask an actor
+  how many times it has restarted. `Ended::GaveUp::after` is a number the
+  supervisor counted on its way out, not a counter kept beside the actor.
+- **Restart on `Ended::Stopped` or `Ended::Vanished`.** Somebody asked, or the
+  last handle went; restarting would be overruling them.
+- **Bound the *first* factory call.** A supervised actor whose factory fails
+  immediately and fatally ends `GaveUp { after: 0 }` before any incarnation ran,
+  which is honest but means `spawn_supervised` can hand back a handle to an actor
+  that never existed. There is no `Result` on the call, because the failure is
+  asynchronous and `ended()` is where it is reported.
+- **Measure the per-actor cost of the second `watch` state.** `Life` replaced
+  `Option<Ended>` in the channel that already existed, so no allocation was added
+  on the local path; `tests/actor_memory.rs` was run and not re-baselined.
+- **Watch the `docs`, `features` or `wasm` gates fail on this diff.** They were
+  run green; no red was manufactured for them.

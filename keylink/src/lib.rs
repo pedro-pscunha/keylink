@@ -216,8 +216,8 @@ pub use idempotency::{
 };
 pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use local::{
-    deliver_to_local, feed_turn, run_keyed, turn, turn_deferred, Deferred, Fed, Feeds, Hooks,
-    LocalActor, MailboxClosed, Replied, Reply, Turn,
+    deliver_to_local, feed_turn, run_keyed, run_keyed_supervised, turn, turn_deferred, Deferred,
+    Fed, Feeds, Hooks, Incarnation, Intensity, LocalActor, MailboxClosed, Replied, Reply, Turn,
 };
 pub use middleware::{Caller, Context, Middleware, Next, QueueTimeout, Queueing, Rpc, Timeout};
 pub use node::{derive_alpn, Node};
