@@ -1,11 +1,16 @@
 //! The frame and the migration chain, from outside the crate.
 //!
-//! Outside on purpose, and not only for tidiness. `#[non_exhaustive]` on
-//! [`RestoreError::FromTheFuture`] and [`RestoreError::NoMigration`] is inert
-//! inside `keylink-persist` and in force here, so a `Durable` written in this
-//! file is under the same rule a caller's is: it can report
-//! [`RestoreError::Malformed`] and nothing else. If that ever stopped being
-//! true, this file would be the thing that stopped compiling.
+//! Outside on purpose, and not only for tidiness. Every `Durable` here is under
+//! the rule a caller's is — it reports [`RestoreError::Malformed`] and nothing
+//! else — so the ledgers below are the shape a caller actually writes.
+//!
+//! **This file is not the guard for that rule, and an earlier version of this
+//! comment claimed it was.** `#[non_exhaustive]` forbids *construction* and
+//! nothing else. These tests only ever match the loader's verdicts, always with
+//! `..`, which is exactly as legal on an ordinary variant — delete the three
+//! attributes and the whole suite stays green. The guard is where the boundary
+//! is: the `compile_fail,E0639` doctests on each variant in
+//! `keylink-persist/src/lib.rs`, because a doctest compiles as its own crate.
 //!
 //! Every snapshot is written and read through the real file adapter, and the
 //! two hostile inputs — an unframed file and a frame from the future — are put
@@ -16,7 +21,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink_persist::file::Files;
-use keylink_persist::versioned::{FrameFault, Versioned, FRAME_LEN};
+use keylink_persist::versioned::{FrameFault, Snapshot, Versioned, FRAME_LEN};
 use keylink_persist::{Durable, Error, RestoreError, Snapshots, StateId};
 
 // ────────────────────────────────────────────── three versions of one ledger
@@ -282,10 +287,7 @@ async fn what_is_stored_carries_a_header() {
     let ledger = LedgerV1 {
         entries: vec![1, 2, 3],
     };
-    state
-        .store::<LedgerV1>(&ledger.snapshot())
-        .await
-        .expect("stores");
+    state.store(&Snapshot::of(&ledger)).await.expect("stores");
 
     let on_disk = std::fs::read(scratch.snapshot_path()).expect("reads");
     assert_eq!(&on_disk[..6], b"klsnap", "the magic is the first six bytes");
@@ -310,12 +312,9 @@ async fn a_state_survives_the_claim_that_wrote_it() {
             "nothing stored yet is the first run, not a failure"
         );
         state
-            .store::<LedgerV1>(
-                &LedgerV1 {
-                    entries: vec![4, 5],
-                }
-                .snapshot(),
-            )
+            .store(&Snapshot::of(&LedgerV1 {
+                entries: vec![4, 5],
+            }))
             .await
             .expect("stores");
     }
@@ -342,12 +341,9 @@ async fn v1_bytes_load_into_a_v2_type_through_one_hop() {
     {
         let mut state = Versioned::new(files.claim(&id()).await.expect("claims"));
         state
-            .store::<LedgerV1>(
-                &LedgerV1 {
-                    entries: vec![10, 20, 30],
-                }
-                .snapshot(),
-            )
+            .store(&Snapshot::of(&LedgerV1 {
+                entries: vec![10, 20, 30],
+            }))
             .await
             .expect("stores");
     }
@@ -374,12 +370,9 @@ async fn v1_bytes_load_into_a_v3_type_through_two_hops() {
     {
         let mut state = Versioned::new(files.claim(&id()).await.expect("claims"));
         state
-            .store::<LedgerV1>(
-                &LedgerV1 {
-                    entries: vec![7, 8],
-                }
-                .snapshot(),
-            )
+            .store(&Snapshot::of(&LedgerV1 {
+                entries: vec![7, 8],
+            }))
             .await
             .expect("stores");
     }
@@ -445,7 +438,7 @@ async fn a_gap_in_the_chain_names_the_missing_hop() {
     {
         let mut state = Versioned::new(files.claim(&id()).await.expect("claims"));
         state
-            .store::<LedgerV1>(&LedgerV1 { entries: vec![1] }.snapshot())
+            .store(&Snapshot::of(&LedgerV1 { entries: vec![1] }))
             .await
             .expect("stores");
     }
@@ -584,23 +577,17 @@ async fn the_limit_counts_the_frame_and_the_error_says_which_number_it_is() {
     // Two entries: sixteen bytes of payload, and the frame fills the limit
     // exactly.
     state
-        .store::<LedgerV1>(
-            &LedgerV1 {
-                entries: vec![1, 2],
-            }
-            .snapshot(),
-        )
+        .store(&Snapshot::of(&LedgerV1 {
+            entries: vec![1, 2],
+        }))
         .await
         .expect("exactly at the limit");
 
     // One more entry is eight bytes over.
     let error = state
-        .store::<LedgerV1>(
-            &LedgerV1 {
-                entries: vec![1, 2, 3],
-            }
-            .snapshot(),
-        )
+        .store(&Snapshot::of(&LedgerV1 {
+            entries: vec![1, 2, 3],
+        }))
         .await
         .expect_err("over the limit");
 
@@ -619,5 +606,41 @@ async fn the_limit_counts_the_frame_and_the_error_says_which_number_it_is() {
         Some(LedgerV1 {
             entries: vec![1, 2]
         })
+    );
+}
+
+/// A limit below [`FRAME_LEN`] leaves no room for a payload, so **every** store
+/// through the wrapper is refused, including an empty one. That is documented
+/// on [`Files::limit`](keylink_persist::file::Files::limit) and this is what
+/// keeps it true.
+///
+/// It is a store that can never succeed rather than an error at configuration
+/// time, because `limit` is a builder that returns `Self`. So the floor is a
+/// documented number and a test, and the refusal is at least loud: it names
+/// both sides, and `offered` is twelve against a limit below twelve, which is
+/// the shape of the mistake rather than a puzzle.
+///
+/// Made red by having `Files::limit` clamp upward — `self.limit = bytes.max(12)`
+/// — which is the tempting fix and a silent fallback: the store would then
+/// quietly not have the limit it was configured with.
+#[tokio::test]
+async fn a_limit_under_the_frame_refuses_even_an_empty_snapshot() {
+    let scratch = Scratch::new("floor");
+    let files = open(&scratch).await;
+    let files = files.limit((FRAME_LEN - 1) as u64);
+
+    let mut state = Versioned::new(files.claim(&id()).await.expect("claims"));
+    let error = state
+        .store(&Snapshot::of(&LedgerV1 { entries: vec![] }))
+        .await
+        .expect_err("there is no room for a header, let alone a payload");
+
+    assert!(
+        matches!(
+            error,
+            Error::TooLarge { offered, limit }
+                if offered == FRAME_LEN as u64 && limit == (FRAME_LEN - 1) as u64
+        ),
+        "got {error:?}"
     );
 }

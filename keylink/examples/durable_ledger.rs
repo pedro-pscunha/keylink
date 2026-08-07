@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use keylink::{Allowlist, Caller, Node};
 use keylink_persist::file::Files;
-use keylink_persist::versioned::Versioned;
+use keylink_persist::versioned::{Snapshot, Versioned};
 use keylink_persist::{Durable, RestoreError, Snapshots, StateId};
 
 keylink::service! {
@@ -138,8 +138,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ledger.post(entry).await?;
 
         // `with_state` takes a turn, so it cannot read a half-applied one.
-        let bytes = ledger.with_state(Ledger::snapshot).await?;
-        claim.store::<Ledger>(&bytes).await?;
+        // `Snapshot::of` runs inside that turn, and the value it hands back is
+        // what tells `store` which version to stamp — there is no way from here
+        // to stamp a number this state did not declare.
+        let snapshot = ledger.with_state(Snapshot::of).await?;
+        claim.store(&snapshot).await?;
     }
     println!("after three posts: total {}", ledger.total().await?);
 

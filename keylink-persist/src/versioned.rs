@@ -14,6 +14,11 @@
 //! of a `Versioned` has no route to the bytes underneath it. Adapters stay dumb
 //! and the framed path is the only one a caller has.
 //!
+//! [`Versioned::store`] then takes a [`Snapshot<D>`](Snapshot) and not a
+//! `&[u8]`, so the version it stamps is the version of the type that produced
+//! the bytes rather than a type parameter a caller named beside them.
+//! [`Snapshot`] documents the silent corruption the `&[u8]` signature allowed.
+//!
 //! The `framing` task in `mise.toml` is the belt to those braces: it fails if
 //! [`Claim`] is named outside this crate at all, because a trait method is only
 //! callable where the trait is in scope.
@@ -46,7 +51,17 @@
 //! `version` is a `u32` because that is what [`Durable::VERSION`] is: four
 //! billion revisions of one state is not a second break. `layout` is a `u16`
 //! because this table is expected to change approximately never, and the two
-//! together keep the header at twelve bytes, which is `u32`-aligned.
+//! together keep the header at twelve bytes.
+//!
+//! **Twelve is load-bearing, and not because it is `u32`-aligned.** It is
+//! load-bearing because it is *not* a multiple of eight. The magic is the first
+//! line against an unframed file and a payload's own length check is the second:
+//! a raw `Vec<u64>` file is `8n` bytes, so on the day its first twelve bytes
+//! happen to spell a valid header the payload handed on is `8n − 12` bytes,
+//! which is `≡ 4 (mod 8)` for every `n` and therefore never a whole number of
+//! `u64`s. Widening `layout` to a `u32` for tidiness would take [`FRAME_LEN`] to
+//! sixteen and close that second line while looking like housekeeping, so the
+//! property is asserted at compile time below rather than written down here.
 //!
 //! The magic is ASCII on purpose, so `head -c6` on a snapshot file answers
 //! "what is this" without a tool.
@@ -64,6 +79,8 @@
 //! writes the truncation back over the original. There is no partial read here:
 //! a snapshot from the future is an error and the stored bytes are not touched.
 
+use std::marker::PhantomData;
+
 use crate::{Claim, Durable, RestoreError, Result};
 
 // ────────────────────────────────────────────────────────────────── the frame
@@ -80,6 +97,20 @@ const LAYOUT: u16 = 1;
 /// reaches the adapter and what reaches the adapter is the payload plus this.
 /// See [`Error::TooLarge`](crate::Error::TooLarge).
 pub const FRAME_LEN: usize = 12;
+
+/// The header length is not a multiple of eight, and that is a property the
+/// module header argues from rather than a coincidence.
+///
+/// A payload of whole `u64`s is `8n` bytes. If a header ever grew to a multiple
+/// of eight, an unframed file whose leading bytes happened to spell a valid
+/// header would hand on a payload that was still a whole number of `u64`s, and
+/// the last check between a legacy file and a silently wrong state would be
+/// gone. Widening `layout` to a `u32` is exactly the tidy-looking change that
+/// does it, so it stops here instead of on somebody's disk.
+const _: () = assert!(
+    !FRAME_LEN.is_multiple_of(8),
+    "FRAME_LEN must not be a multiple of 8: see the byte-layout section"
+);
 
 /// Which header check refused the stored bytes.
 ///
@@ -178,6 +209,84 @@ fn decode<D: Durable>(bytes: &[u8]) -> std::result::Result<D, RestoreError> {
     D::restore(&current)
 }
 
+// ──────────────────────────────────────────────────────────────── the payload
+
+/// Bytes a [`Durable`] wrote, carrying which one wrote them.
+///
+/// # Why this is not a `&[u8]`
+///
+/// [`Versioned::store`] stamps [`D::VERSION`](Durable::VERSION) into the frame,
+/// so it has to know which `D` produced the payload. Raw bytes cannot say, and
+/// a `store::<D>(&[u8])` that took them let a caller **assert** a version
+/// instead of proving one:
+///
+/// ```text
+/// let v1 = LedgerV1 { entries: vec![10, 20, 30] };   // VERSION = 1
+/// state.store::<LedgerV3>(&v1.snapshot()).await?;    // VERSION = 3. Compiled.
+/// ```
+///
+/// Nothing was wrong at either end. The stamp said 3, so the next load took the
+/// equal-versions fast path, skipped the migration chain entirely and handed v1
+/// bytes to `LedgerV3::restore`, which read the first entry as a total and the
+/// last as a count. That is worse than the unbumped-`VERSION` hazard
+/// [`Durable::VERSION`] documents as "the failure nobody can type against",
+/// because this one *was* typeable against — `&[u8]` had erased the one thing
+/// the type parameter needed to know.
+///
+/// So the only way to make one of these is [`of`](Self::of), which calls
+/// [`Durable::snapshot`] itself. `D` is inferred from the value rather than
+/// named beside it, and the mismatch above is `E0308` at the call site instead
+/// of a stamp on a disk.
+///
+/// # What it still is not
+///
+/// It is not a `&D`. By the time a state is committed it lives inside an actor,
+/// and the only consistent read of it is through a turn, so the bytes have to
+/// be taken *during* one and outlive it —
+/// `handle.with_state(Snapshot::of).await?` does exactly that and hands back a
+/// value, not a borrow. That is the shape both in-tree consumers use.
+///
+/// There is deliberately **no probe about reading the bytes back out**, and
+/// there is no accessor either. The bytes were never the secret —
+/// [`Durable::snapshot`] is public, so anyone holding the state already has
+/// them. What `keylink-persist/src/representability.rs` pins is the other
+/// direction: no second constructor, and no `From<Vec<u8>>`, because either one
+/// hands `D` back to whoever is writing the annotation.
+pub struct Snapshot<D: Durable> {
+    bytes: Vec<u8>,
+    /// `fn() -> D` rather than `D`, so this is `Send`, `Sync` and `'static`
+    /// exactly as often as a `Vec<u8>` is, whatever `D` turns out to be. A
+    /// snapshot travels back from a turn; a `PhantomData<D>` would make that
+    /// depend on properties of `D` that have nothing to do with its bytes.
+    durable: PhantomData<fn() -> D>,
+}
+
+impl<D: Durable> Snapshot<D> {
+    /// Take `state`'s snapshot, remembering what took it.
+    ///
+    /// Call it **inside a turn** — `handle.with_state(Snapshot::of)` — where
+    /// `&D` is exclusive. That is what makes the bytes a consistent point rather
+    /// than a torn read, and it is the same rule
+    /// [`Durable::snapshot`] states for itself.
+    pub fn of(state: &D) -> Self {
+        Self {
+            bytes: state.snapshot(),
+            durable: PhantomData,
+        }
+    }
+}
+
+impl<D: Durable> std::fmt::Debug for Snapshot<D> {
+    /// The length and nothing else. A snapshot's bytes are the caller's
+    /// encoding and this crate never looks inside one, including here.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("version", &D::VERSION)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
 // ──────────────────────────────────────────────────────────────── the wrapper
 
 /// A claim that only ever sees framed bytes.
@@ -190,7 +299,7 @@ fn decode<D: Durable>(bytes: &[u8]) -> std::result::Result<D, RestoreError> {
 /// ```no_run
 /// # use keylink_persist::{Durable, RestoreError, Snapshots, StateId};
 /// # use keylink_persist::file::Files;
-/// # use keylink_persist::versioned::Versioned;
+/// # use keylink_persist::versioned::{Snapshot, Versioned};
 /// # struct Counter(u64);
 /// # impl Durable for Counter {
 /// #     const VERSION: u32 = 1;
@@ -206,7 +315,7 @@ fn decode<D: Durable>(bytes: &[u8]) -> std::result::Result<D, RestoreError> {
 /// let mut counter = state.load::<Counter>().await?.unwrap_or(Counter(0));
 ///
 /// counter.0 += 1;
-/// state.store::<Counter>(&counter.snapshot()).await?;
+/// state.store(&Snapshot::of(&counter)).await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -259,13 +368,11 @@ impl<C: Claim> Versioned<C> {
     /// Frame `snapshot` as version [`D::VERSION`](Durable::VERSION) and replace
     /// what is stored.
     ///
-    /// `snapshot` is [`D::snapshot`](Durable::snapshot)'s output. It arrives as
-    /// bytes rather than as a `&D` because by the time a state is committed it
-    /// usually lives inside an actor, and the only consistent read of it is
-    /// through a turn — `handle.with_state(D::snapshot)` hands back bytes, not
-    /// a borrow that outlives the turn. Naming `D` at the call site is the
-    /// price, and it is not much of one: `D` is what decides the version stamp,
-    /// so spelling it out is the honest thing to ask for.
+    /// **`D` is inferred from `snapshot` and cannot be told.** That is the whole
+    /// reason [`Snapshot`] exists rather than a `&[u8]`: the version stamped
+    /// here is the version of the type that produced these bytes, proved by the
+    /// argument rather than asserted by a turbofish beside it. [`Snapshot`]
+    /// documents what the `&[u8]` version of this signature allowed.
     ///
     /// Atomic, because [`Claim::store`] is. A crash during this leaves either
     /// the previous framed snapshot or the new one.
@@ -274,11 +381,11 @@ impl<C: Claim> Versioned<C> {
     ///
     /// - [`Error::TooLarge`](crate::Error::TooLarge) when the frame **plus**
     ///   the payload is over the adapter's limit. The number it reports is what
-    ///   reached the adapter, which is [`FRAME_LEN`] more than `snapshot.len()`.
+    ///   reached the adapter, which is [`FRAME_LEN`] more than the payload.
     /// - [`Error::Io`](crate::Error::Io) when the write fails. The previous
     ///   snapshot is intact.
-    pub async fn store<D: Durable>(&mut self, snapshot: &[u8]) -> Result<()> {
-        self.claim.store(&frame(D::VERSION, snapshot)).await
+    pub async fn store<D: Durable>(&mut self, snapshot: &Snapshot<D>) -> Result<()> {
+        self.claim.store(&frame(D::VERSION, &snapshot.bytes)).await
     }
 }
 

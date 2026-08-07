@@ -980,3 +980,47 @@ absent, and §5.3's argument from `Claim::store(&mut self)` on a non-`Sync` clai
 is untouched — `Versioned` owns the claim and inherits both properties. A
 compile-time probe in `keylink-persist/src/representability.rs` now pins the
 `Send + 'static` half of that, which §5.3 previously only asserted in prose.
+
+---
+
+## 15. Revision 7 — the version stamp is proved by the payload, not named beside it
+
+§14's last paragraph says a `Saver` "holds a `Versioned<C>` and calls
+`store::<A>(&bytes)`". **That signature is gone**, and it was removed because it
+was unsound in exactly the way §14 was arguing it was not.
+
+`store::<D>(&[u8])` let a caller *assert* a version rather than prove one:
+
+```rust
+let v1 = LedgerV1 { entries: vec![10, 20, 30] };   // VERSION = 1
+state.store::<LedgerV3>(&v1.snapshot()).await?;    // VERSION = 3. Compiled clean.
+```
+
+The frame then said 3, so the next load took the equal-versions fast path,
+skipped the migration chain and handed v1 bytes to `LedgerV3::restore`, which
+read the first entry as a total and the last as a count. Silent at both ends.
+§14 argues that `VERSION` is safer than the cut `revision` because "forgetting
+to bump it cannot silence a store" — true, and beside the point of this one:
+this defect was not a forgotten bump, it was a *typeable* lie, and `&[u8]` had
+erased the one thing the type parameter needed to know.
+
+`store` now takes a `versioned::Snapshot<D>`, whose only constructor calls
+`D::snapshot` itself, so `D` is inferred from the payload:
+
+```rust
+let snapshot = ledger.with_state(Snapshot::of).await?;   // inside the turn
+claim.store(&snapshot).await?;                           // D = Ledger, not a name
+```
+
+**Nothing else in §4.2 moves.** Step 2 still takes the snapshot *synchronously*,
+before the future is built — `Snapshot::of` is a synchronous call on `&A`, which
+is what keeps `A: Sync` off the design. `Snapshot<A>` is `Send` and `'static`
+whatever `A` is, because its type parameter is carried as
+`PhantomData<fn() -> A>` rather than as an `A`, so a `Saver` may hold one across
+its own `await` without acquiring a bound. Step 3 is
+`self.claim.store(&snapshot).await` and still takes `&mut self`, so §5.3's
+argument from `Claim::store(&mut self)` on a non-`Sync` claim is untouched, as
+is §14's reading of it.
+
+**`Claim` is unchanged.** The port still takes raw bytes, because an adapter for
+a bucket or a vault must not learn what a frame is. Only the wrapper moved.

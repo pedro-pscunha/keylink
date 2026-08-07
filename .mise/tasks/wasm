@@ -10,6 +10,13 @@
 # `llvm-ar` comes from the `llvm-tools` component, which rust-toolchain.toml
 # installs. The path is derived from the host triple so this works on a
 # developer's Mac and on CI's Linux without either naming the other.
+#
+# `keylink-persist` is built too. Its `std::fs` and `tokio` are behind
+# `feature = "file"`, which `--no-default-features` turns off, so the risk was
+# always small — but `versioned.rs` and `representability.rs` are code that
+# lives on the no-file end of that switch, and a target nobody builds is a
+# target that breaks. `--no-default-features` applies to both packages, which
+# is what drops the adapter.
 set -euo pipefail
 
 ar="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-ar"
@@ -20,4 +27,5 @@ if [ ! -x "$ar" ]; then
 fi
 
 AR_wasm32_unknown_unknown="$ar" \
-    cargo build --target wasm32-unknown-unknown -p keylink --no-default-features
+    cargo build --target wasm32-unknown-unknown -p keylink -p keylink-persist \
+        --no-default-features

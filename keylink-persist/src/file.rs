@@ -74,6 +74,22 @@ impl Files {
     /// [`Versioned`](crate::versioned::Versioned) is the payload plus
     /// [`FRAME_LEN`](crate::versioned::FRAME_LEN). Headroom for one snapshot is
     /// therefore `bytes - FRAME_LEN`.
+    ///
+    /// # The floor
+    ///
+    /// **`FRAME_LEN` is the smallest limit that can ever store anything.**
+    /// Below it the subtraction above is negative: `limit(0)` — a plausible
+    /// default, and one typo away from a real number — leaves a store that
+    /// refuses every write forever, empty ones included, with
+    /// [`Error::TooLarge`] naming twelve bytes against a limit of zero.
+    ///
+    /// It is not rejected here, because this is a builder that returns `Self`
+    /// and the alternatives are worse: clamping upward is a silent fallback,
+    /// and panicking on a configuration value is a crash where a refused store
+    /// already says the same thing at the same volume. So the floor is a
+    /// documented number, and
+    /// `a_limit_under_the_frame_refuses_even_an_empty_snapshot` in
+    /// `keylink-persist/tests/versioned.rs` is what keeps this paragraph true.
     #[must_use]
     pub fn limit(mut self, bytes: u64) -> Self {
         self.limit = bytes;

@@ -12,7 +12,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink::Caller;
-use keylink_persist::versioned::Versioned;
+use keylink_persist::versioned::{Snapshot, Versioned};
 use keylink_persist::{file::Files, Durable, RestoreError, Snapshots, StateId};
 
 keylink::service! {
@@ -113,9 +113,11 @@ async fn run(files: &Files, id: &StateId, entries: &[u64]) -> Vec<u64> {
         ledger.post(*entry, 0).await.expect("running");
     }
 
-    // Between turns, so it cannot see a half-applied one.
-    let bytes = ledger.with_state(Ledger::snapshot).await.expect("running");
-    durable.store::<Ledger>(&bytes).await.expect("stores");
+    // Between turns, so it cannot see a half-applied one. `Snapshot::of` is
+    // taken *inside* the turn and comes back as a value, which is what ties the
+    // version stamp to `Ledger` rather than to a turbofish written here.
+    let snapshot = ledger.with_state(Snapshot::of).await.expect("running");
+    durable.store(&snapshot).await.expect("stores");
 
     let seen = ledger.entries().await.expect("running");
     ledger.stop().await;

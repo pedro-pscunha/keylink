@@ -32,6 +32,11 @@
 //! | no impl of this trait | coherence |
 //! | this trait has no method of this name | ambiguity between two traits |
 //! | this trait does not require `Sync` | an impl for a `!Sync` type |
+//! | this generic is inferred, not named | a call site with no turbofish |
+//!
+//! The last one is the only **positive** shape here, and it is positive because
+//! what it guards is a signature rather than a method somebody might add. See
+//! `the_stamp_is_inferred_from_the_snapshot`.
 //!
 //! # Why this module is in `keylink-persist` and not in `keylink`
 //!
@@ -55,9 +60,13 @@
 //! [`RestoreError::NoMigration`](crate::RestoreError::NoMigration) carry it so
 //! that a `Durable` implementation cannot construct them and lie about
 //! provenance — but here, in the defining crate, they construct fine, and
-//! `decode` constructs both. rustc enforces the attribute across the crate
-//! boundary and no in-crate probe can see it. The compiler is the gate; this
-//! module is not.
+//! `decode` constructs both. No in-crate probe can see it, and neither can
+//! `keylink-persist/tests/versioned.rs`, which is outside the crate but only
+//! ever *matches* those variants: matching one, with `..`, is legal on an
+//! ordinary variant too. **Construction is the one thing the attribute
+//! forbids**, so the guard is a `compile_fail,E0639` doctest on each of the
+//! three variants — a doctest compiles as its own crate, which is where the
+//! attribute bites.
 //!
 //! **A trait method having no default body is not probeable.** That
 //! [`Durable::migrate`](crate::Durable::migrate) is required rather than
@@ -65,7 +74,9 @@
 //! asserting it would need a compile-*fail* harness. `trybuild` is the usual
 //! tool and it matches full rustc stderr, so a compiler release that rewords a
 //! diagnostic turns the gate red on a tree nobody touched. The probes here
-//! carry no error text at all.
+//! carry no error text at all — and the `compile_fail` doctests named above
+//! carry an error *code*, not a message, which is the same trade made once and
+//! deliberately: `E0639` is stable where its wording is not.
 //!
 //! **`Claim::store` taking `&mut self` is not probed.** The method returns
 //! `impl Future` in the trait, so its signature cannot be named as a function
@@ -96,8 +107,8 @@ use std::cell::RefCell;
 use std::future::{self, Future};
 use std::ops::{Deref, DerefMut};
 
-use crate::versioned::Versioned;
-use crate::{Claim, Result};
+use crate::versioned::{Snapshot, Versioned};
+use crate::{Claim, Durable, RestoreError, Result};
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
 /// would return, so an inherent method that shadows one is a type error rather
@@ -291,6 +302,115 @@ impl AWrapperDoesNotLendItsClaim for Versioned<ProbeClaim> {}
 trait AWrapperDoesNotLendItsClaimMutably {}
 impl<T: AsMut<ProbeClaim>> AWrapperDoesNotLendItsClaimMutably for T {}
 impl AWrapperDoesNotLendItsClaimMutably for Versioned<ProbeClaim> {}
+
+// ─────────────────────────── the version stamp comes from the type, not a name
+
+/// A [`Durable`] with nothing interesting about it. It exists so the probes
+/// below have a concrete `D` to name, and its bodies are never run.
+struct ProbeDurable;
+
+impl Durable for ProbeDurable {
+    const VERSION: u32 = 1;
+
+    fn snapshot(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    fn restore(_: &[u8]) -> std::result::Result<Self, RestoreError> {
+        Ok(Self)
+    }
+
+    fn migrate(_: u32, _: &[u8]) -> std::result::Result<Option<Vec<u8>>, RestoreError> {
+        Ok(None)
+    }
+}
+
+/// The claim: [`Versioned::store`] learns `D` from its argument, and cannot be
+/// told a `D` the payload did not come from.
+///
+/// This one is a **positive** assertion rather than an absence, because the
+/// failure it guards is a signature and not a method. `store::<D>(&[u8])`
+/// compiled a v1 payload stamped as version 3 — the loader then took the
+/// equal-versions fast path, skipped the chain and handed v1 bytes to a v3
+/// `restore`. Nothing was misspelled and nothing could have caught it, because
+/// `&[u8]` erased the only thing the stamp needed.
+///
+/// There is no turbofish below, and that is the whole probe. `D` is fixed by
+/// the argument's type. Change the parameter back to `&[u8]` and `D` has
+/// nothing to infer from, so this line is `E0282`; leave the parameter a
+/// `Snapshot` but let it be a *different* `D` and it is `E0308`. Either way this
+/// module stops compiling, which is what the doc sentence above claims.
+async fn the_stamp_is_inferred_from_the_snapshot<C: Claim>(
+    state: &mut Versioned<C>,
+    snapshot: &Snapshot<ProbeDurable>,
+) -> Result<()> {
+    state.store(snapshot).await
+}
+
+/// The absence half: there is no second way to make one.
+///
+/// [`Snapshot::of`](crate::versioned::Snapshot::of) calls
+/// [`Durable::snapshot`] itself, and that call is the whole proof — it is why
+/// the type parameter names the state that wrote the bytes rather than a state
+/// somebody wrote next to them. A constructor taking bytes hands the defect
+/// straight back under a new name: `Snapshot::<V3>::from_bytes(v1_bytes)` reads
+/// exactly as harmlessly as `store::<V3>(&v1_bytes)` did, and is the same bug.
+///
+/// **This probe is a path and not a method call**, which is the difference
+/// between it working and not. A constructor is an associated function with no
+/// receiver, so `snapshot.from_bytes()` could never resolve to one; the
+/// shadowing rule that catches it is the one for paths, where an inherent
+/// associated item is found before a trait's.
+///
+/// The break: add `pub fn from_bytes(bytes: Vec<u8>) -> Self` to `Snapshot`.
+/// `Snapshot::<ProbeDurable>::from_bytes()` then resolves to the inherent
+/// function, which wants an argument, and this module stops compiling.
+///
+/// # What this does not prove
+///
+/// Only these names, as ever. It also says nothing about an accessor handing
+/// the bytes back out, and deliberately: [`Durable::snapshot`] is public, so
+/// the bytes were never the secret. The version stamp is.
+trait ASnapshotComesOnlyFromItsState {
+    #[allow(
+        clippy::new_ret_no_self,
+        reason = "the probe's whole job is to return something that is not Self"
+    )]
+    fn new() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn from_bytes() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn from_raw() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn from_vec() -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn from_payload() -> NoSuchMethod {
+        NoSuchMethod
+    }
+}
+
+impl<D: Durable> ASnapshotComesOnlyFromItsState for Snapshot<D> {}
+
+fn a_snapshot_comes_only_from_its_state() {
+    type Probe = Snapshot<ProbeDurable>;
+    let _: NoSuchMethod = Probe::new();
+    let _: NoSuchMethod = Probe::from_bytes();
+    let _: NoSuchMethod = Probe::from_raw();
+    let _: NoSuchMethod = Probe::from_vec();
+    let _: NoSuchMethod = Probe::from_payload();
+}
+
+/// The conversion half, which no name-based probe can see. An
+/// `impl<D: Durable> From<Vec<u8>> for Snapshot<D>` is one `.into()` from being
+/// the `&[u8]` signature again, with the version once more chosen by whoever
+/// wrote the annotation instead of by whoever wrote the bytes.
+trait ASnapshotIsNotConvertibleFromBytes {}
+impl<T: From<Vec<u8>>> ASnapshotIsNotConvertibleFromBytes for T {}
+impl ASnapshotIsNotConvertibleFromBytes for Snapshot<ProbeDurable> {}
 
 // ──────────────────────────────────── the port does not know about the frame
 

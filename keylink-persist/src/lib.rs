@@ -48,6 +48,11 @@
 //! `Versioned` cannot write an unframed byte, and an adapter author never
 //! learns that versions exist.
 //!
+//! What it stores is a [`Snapshot<D>`](versioned::Snapshot) rather than bytes,
+//! so the version in the header is the one declared by the type that produced
+//! the payload. Naming `D` beside a `&[u8]` instead let a caller stamp a v1
+//! snapshot as v3, which the loader then believed.
+//!
 //! The header carries a magic, which is what makes an unframed file — anything
 //! this crate wrote before framing existed — a loud error rather than a payload
 //! misread as garbage. [`versioned`] documents the layout byte by byte.
@@ -238,6 +243,23 @@ pub trait Durable: Sized {
 /// A [`Durable::restore`] that could return `FromTheFuture` could claim a
 /// version comparison it never made. [`Malformed`](Self::Malformed) stays
 /// constructible; it is the implementor's channel and the only one it needs.
+///
+/// # How that is guarded
+///
+/// `#[non_exhaustive]` is inert inside its defining crate, so
+/// `keylink-persist/src/representability.rs` cannot see it and the tests in
+/// `keylink-persist/tests/versioned.rs` cannot either — a test that only ever
+/// *matches* a variant, always with `..`, matches an ordinary variant exactly
+/// as happily. Construction is the one thing the attribute forbids, so the
+/// guard is a `compile_fail` doctest on each of the three variants: a doctest
+/// compiles as its own crate, which is where the attribute is in force.
+///
+/// Those three blocks are the reason this decision is not a comment. Delete an
+/// attribute and its block starts compiling, and rustdoc fails a `compile_fail`
+/// test that compiled. `keylink-persist/src/representability.rs` objects to
+/// `trybuild` for matching full rustc stderr; this does not — `compile_fail`
+/// annotated with an error code checks only that `E0639` appeared, and error
+/// codes are stable where diagnostic wording is not.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RestoreError {
@@ -247,6 +269,15 @@ pub enum RestoreError {
     /// that is the whole reason the frame carries a magic. Without one, an
     /// unframed file would be read as header-plus-payload and restore
     /// successfully with garbage.
+    ///
+    /// A [`Durable`] cannot report it, because it did not read the header:
+    ///
+    /// ```compile_fail,E0639
+    /// use keylink_persist::versioned::FrameFault;
+    /// use keylink_persist::RestoreError;
+    ///
+    /// let _ = RestoreError::NotAFrame { fault: FrameFault::WrongMagic };
+    /// ```
     #[error("the stored bytes are not a snapshot frame this build can read: {fault}")]
     #[non_exhaustive]
     NotAFrame {
@@ -260,6 +291,14 @@ pub enum RestoreError {
     /// tempting alternative is to read the fields this build knows and drop the
     /// rest, which discards whatever the newer build added and then writes the
     /// truncation back over it.
+    ///
+    /// A [`Durable`] cannot report it, because it made no version comparison:
+    ///
+    /// ```compile_fail,E0639
+    /// use keylink_persist::RestoreError;
+    ///
+    /// let _ = RestoreError::FromTheFuture { stored: 9, ours: 1 };
+    /// ```
     #[error("the snapshot is version {stored} and this build understands {ours}")]
     #[non_exhaustive]
     FromTheFuture {
@@ -271,6 +310,17 @@ pub enum RestoreError {
 
     /// The migration chain has a gap: [`Durable::migrate`] has no hop from
     /// `from` to `from + 1`, and the loader will not jump over it.
+    ///
+    /// A [`Durable`] cannot report it, which is precisely why
+    /// [`migrate`](Durable::migrate) returns `Ok(None)` for a hop it does not
+    /// have: whether a gap is fatal depends on what is on the disk, and only
+    /// the loader knows that.
+    ///
+    /// ```compile_fail,E0639
+    /// use keylink_persist::RestoreError;
+    ///
+    /// let _ = RestoreError::NoMigration { from: 1 };
+    /// ```
     #[error("no migration from version {from}")]
     #[non_exhaustive]
     NoMigration {
