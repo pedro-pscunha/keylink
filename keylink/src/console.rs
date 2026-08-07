@@ -167,11 +167,32 @@ pub enum EndReason {
         name: String,
         /// Why it gave up.
         error: String,
+        /// Whether the observer said another incarnation cannot help.
+        ///
+        /// Carried rather than dropped because it is the difference between "this
+        /// turn was refused" and "this actor is not coming back", and a console
+        /// that showed the first for the second would send an operator looking for
+        /// a restart that was never going to happen.
+        fatal: bool,
     },
     /// [`Ended::Feed`].
     Feed {
         /// The feed's declared name.
         name: String,
+    },
+    /// [`Ended::GaveUp`] — a supervisor stopped re-incarnating this actor.
+    ///
+    /// The one ending a console most needs to distinguish, and the reason
+    /// [`Ended`] is worth putting on a wire at all: every other variant means
+    /// something asked the actor to stop, and this one means it could not be kept
+    /// alive.
+    GaveUp {
+        /// Restarts spent before giving up. `0` means the first incarnation was
+        /// the last — see [`Ended::GaveUp::after`], whose sense this copies.
+        after: u32,
+        /// The last incarnation's reason, or the factory's reason for refusing to
+        /// build one, through `Display`.
+        error: String,
     },
 }
 
@@ -184,12 +205,17 @@ impl From<&Ended> for EndReason {
             Ended::Panicked { message } => Self::Panicked {
                 message: message.clone(),
             },
-            Ended::Observer { name, error } => Self::Observer {
+            Ended::Observer { name, error, fatal } => Self::Observer {
                 name: (*name).to_owned(),
                 error: error.to_string(),
+                fatal: *fatal,
             },
             Ended::Feed { name } => Self::Feed {
                 name: (*name).to_owned(),
+            },
+            Ended::GaveUp { after, error } => Self::GaveUp {
+                after: *after,
+                error: error.to_string(),
             },
         }
     }

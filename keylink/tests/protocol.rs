@@ -1128,9 +1128,32 @@ fn the_contract_hash_has_not_moved() {
 /// old shape, and only then update it. A fifth field on `ActorStatus` moves this
 /// hash, which is the whole point — an old console is refused at the handshake
 /// rather than handed four fields where it expected five.
+///
+/// # It has moved once, and this is the decision
+///
+/// `879d78ee456a20b7` → `080c9e481c937d67`, when Wave 9 merged into Wave 6.
+///
+/// Wave 9 gave `Ended` a sixth variant (`GaveUp`) and gave `Ended::Observer` a
+/// `fatal` flag. `EndReason` is this service's wire rendering of `Ended` and
+/// carries no wildcard arm, deliberately, so the merge did not compile until both
+/// were answered here — `E0027` for the field, and `E0004` waiting behind it for
+/// the variant. That is the guard working: a textual merge of two branches that
+/// never saw each other produced a wire type quietly missing an ending, and the
+/// compiler refused it.
+///
+/// The change **should** be visible to a console. `GaveUp` is the one ending that
+/// means *this actor could not be kept alive*, as against every other variant,
+/// which means something asked it to stop; and `fatal` is the difference between
+/// "this turn was refused" and "there will be no next incarnation". A console
+/// built against the old shape would render a supervised actor's death as an
+/// unknown ending, so being refused at the handshake is the correct outcome.
+///
+/// **`Probe`'s hash did not move in the same run**, which is the evidence that
+/// these two pins discriminate rather than both being satisfiable: one contract
+/// changed, one did not, and exactly one test went red.
 #[test]
 fn the_inspect_contract_hash_has_not_moved() {
-    const PINNED: &str = "keylink/Inspect/879d78ee456a20b7";
+    const PINNED: &str = "keylink/Inspect/080c9e481c937d67";
 
     assert_eq!(
         String::from_utf8_lossy(keylink::inspect::alpn()),
