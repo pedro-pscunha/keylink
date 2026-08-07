@@ -1140,7 +1140,9 @@ impl Drop for Scratch {
 fn wedged(claim: impl Send + 'static) -> journal::Mounted {
     keylink::mount(|inbox: journal::Mailbox| async move {
         let _wedged = (claim, inbox);
-        std::future::pending::<()>().await;
+        // `pending::<Ended>` and not `pending::<()>`: a loop has to name its
+        // ending now, and this one never reaches an end to name.
+        std::future::pending::<keylink::Ended>().await
     })
 }
 
@@ -1181,7 +1183,7 @@ fn wedged_once_drained(
         let _held = claim;
         while inbox.recv().await.is_some() {}
         let _ = closed.send(());
-        std::future::pending::<()>().await;
+        std::future::pending::<keylink::Ended>().await
     })
 }
 

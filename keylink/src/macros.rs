@@ -1436,7 +1436,10 @@ macro_rules! __keylink_service {
                 feeds: F,
             ) -> Mounted {
                 $crate::mount(move |inbox: Mailbox| async move {
-                    $crate::run_keyed(state, observers, feeds, inbox).await;
+                    // Returned, never discarded: `keylink::mount`'s `Loop` is
+                    // what turns this value into the registry removing its own
+                    // entry, and a `;` here is the defect that costs.
+                    $crate::run_keyed(state, observers, feeds, inbox).await
                 })
             }
 
@@ -1460,9 +1463,13 @@ macro_rules! __keylink_service {
             /// # A keyed actor still has no `ended()`
             ///
             /// So [`Ended::GaveUp`](keylink::Ended::GaveUp) reaches its own
-            /// observers' `finish` and nothing a caller can await. An actor that
-            /// has given up is an entry whose task has exited, which the
-            /// registry sees as an actor to re-route on the next message.
+            /// observers' `finish` and nothing a **caller** can await — a handle
+            /// is what would hold that channel, and a keyed actor is addressed
+            /// by id. It does reach the system's
+            /// [`Lifecycle`](keylink::Lifecycle): an actor that has given up
+            /// returns its ending from the loop, and the registry unmounts its
+            /// own entry with it, so the id is free again and a lazy factory may
+            /// serve the next message by building a fresh one.
             ///
             /// # Panics
             ///
@@ -1485,7 +1492,7 @@ macro_rules! __keylink_service {
             {
                 let () = ServableAsActor::<A>::CHECK;
                 $crate::mount(move |inbox: Mailbox| async move {
-                    $crate::run_keyed_supervised(factory, limit, inbox).await;
+                    $crate::run_keyed_supervised(factory, limit, inbox).await
                 })
             }
 

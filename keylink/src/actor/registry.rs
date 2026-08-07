@@ -295,7 +295,25 @@ pub struct Mounted<M> {
 ///
 /// An alias because the type is written twice — here and in [`mount`] — and a
 /// nine-line type spelled twice is a place for the two to disagree.
-type Loop<M> = Box<dyn FnOnce(Mailbox<M>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+///
+/// # It resolves to an [`Ended`], and that return type is the fourth way out
+///
+/// A registry entry left the map at three sites — [`System::shutdown`],
+/// [`System::abort`] and [`Registry::sweep`] — and every one of them is
+/// *somebody asking*. The fourth way out has no asker: a feed that ends, a
+/// handler that panics, an observer that refuses, all end the loop where it
+/// stands. The task finished, the receiver dropped, and the [`Entry`] survived
+/// forever: [`System::status`] listed the actor with `busy: false` while a real
+/// call to it answered
+/// [`NoSuchActor`](crate::RemoteError::NoSuchActor), and no [`Lifecycle`] was
+/// ever told. Under [`Eviction::Never`] that was permanent.
+///
+/// `Output = Ended` is the repair, and it is a *type* rather than a call because
+/// the reason was the part that kept getting lost — `run_keyed` computed the
+/// true [`Ended`] and dropped it on the floor. A loop that cannot return without
+/// naming its ending cannot drop it, and [`Registry::entry`] is the one place
+/// that ending is turned into a removal and a report.
+type Loop<M> = Box<dyn FnOnce(Mailbox<M>) -> Pin<Box<dyn Future<Output = Ended> + Send>> + Send>;
 
 /// Hand-written for the same reason as [`System`]'s, and it was derived by
 /// mistake: `derive(Debug)` writes `impl<M: Debug> Debug`, which would make
@@ -329,7 +347,10 @@ impl<M> fmt::Debug for Mounted<M> {
 /// used:
 ///
 /// ```compile_fail
-/// keylink::mount(|mut inbox| async move { while inbox.recv().await.is_some() {} });
+/// keylink::mount(|mut inbox| async move {
+///     while inbox.recv().await.is_some() {}
+///     keylink::Ended::Stopped
+/// });
 /// ```
 ///
 /// That hazard is unchanged by the per-service rewrite and it is worth being
@@ -339,10 +360,18 @@ impl<M> fmt::Debug for Mounted<M> {
 /// in type position where this signature has none. The generated `spawn`
 /// annotates the closure with its own `Mailbox` alias every time, which is why
 /// the break reaches no caller.
+///
+/// # The loop must say why it stopped
+///
+/// `F::Output` is [`Ended`] and not `()`, so a hand-written loop cannot fall off
+/// its own end without naming an ending. [`Loop`] carries the defect that
+/// demands it. A loop that simply ran out of messages returns
+/// [`Ended::Stopped`], which is the same value [`drain`] synthesises from a task
+/// that returned.
 #[doc(hidden)]
 pub fn mount<M, F>(run: impl FnOnce(Mailbox<M>) -> F + Send + 'static) -> Mounted<M>
 where
-    F: Future<Output = ()> + Send + 'static,
+    F: Future<Output = Ended> + Send + 'static,
 {
     Mounted {
         run: Box::new(move |inbox| Box::pin(run(inbox))),
@@ -555,6 +584,38 @@ impl<M> Registry<M> {
         }
     }
 
+    /// An actor ended itself. Take it out of the map, and report why.
+    ///
+    /// **The fourth way out**, and the only one with nobody to answer to: a feed
+    /// that ended, a handler that panicked, an observer that refused, a
+    /// supervisor that gave up. [`Loop`] carries what leaving that entry behind
+    /// cost. Called from the actor's own task, by the wrapper
+    /// [`Registry::entry`] spawns, with the [`Ended`] the loop returned — which
+    /// is the *true* reason rather than [`drain`]'s synthesis from a join.
+    ///
+    /// # It reports only if the entry was still ours, and that is the whole
+    /// interlock
+    ///
+    /// [`System::shutdown`], [`System::abort`] and [`Registry::sweep`] all take
+    /// the entry out **before** they await the task, and each reports its own
+    /// ending afterwards. So when one of them is the cause, this finds nothing
+    /// and says nothing, and the ending is reported exactly once by whoever
+    /// asked for it. When nobody asked, this is the only site that can report at
+    /// all.
+    ///
+    /// The removed [`Entry`] holds the `JoinHandle` of the task running this
+    /// line. Dropping it detaches a task that is finishing anyway, which is the
+    /// one case where a detach costs nothing.
+    fn reap(&self, id: &ActorId, why: &Ended) {
+        // The guard dies with the statement, so `report_ended` runs without it:
+        // a `Lifecycle` may ask this same system what is running, exactly as at
+        // `System::mount`'s report site.
+        let ours = self.write().remove(id).is_some();
+        if ours {
+            self.report_ended(id, why);
+        }
+    }
+
     /// The id to announce a mount under, or `None` when nobody is listening.
     ///
     /// The clone is the whole reason this is a method: a mount reports **after**
@@ -576,7 +637,17 @@ impl<M> Registry<M> {
     }
 
     /// Find the actor, spawning it if the system was given a factory.
-    fn route(&self, id: &ActorId) -> std::result::Result<mpsc::Sender<Box<M>>, RouteError> {
+    ///
+    /// `self: &Arc<Self>` because a lazy spawn reaches [`Registry::entry`], and
+    /// the task that starts there holds a [`Weak`](std::sync::Weak) back to this
+    /// registry so it can reap its own entry. There is no other reason.
+    fn route(
+        self: &Arc<Self>,
+        id: &ActorId,
+    ) -> std::result::Result<mpsc::Sender<Box<M>>, RouteError>
+    where
+        M: Send + 'static,
+    {
         if let Some(found) = self.touch(&self.read(), id) {
             return Ok(found);
         }
@@ -615,7 +686,7 @@ impl<M> Registry<M> {
                 // The sender comes out of the entry rather than out of the
                 // `Mounted`, because the mailbox is made here now — see
                 // [`Mounted`] for why the depth could not otherwise be a knob.
-                let entry = self.entry(mounted);
+                let entry = self.entry(free.key(), mounted);
                 let found = entry.mail.clone();
                 let announce = self.announcing(free.key());
                 free.insert(entry);
@@ -662,19 +733,52 @@ impl<M> Registry<M> {
     /// type-checks and the argument does not have to be re-made. It also drops
     /// the second lookup each of them was doing.
     ///
+    /// # The task is wrapped, and the wrapper is what closes the fourth way out
+    ///
+    /// The loop resolves to an [`Ended`] — see [`Loop`] — and the wrapper hands
+    /// it to [`Registry::reap`], which is the only site that can unmount an
+    /// actor **nobody asked to unmount**. A [`Weak`](std::sync::Weak) and not an
+    /// `Arc`, and not for tidiness: the registry owns the [`Entry`], the entry
+    /// owns the `JoinHandle`, and a strong reference here would close that ring.
+    /// A program that dropped every [`System`] clone would keep the registry —
+    /// and therefore every actor's own sender — alive off its actors' tasks, so
+    /// `Taken::Mail(None)` would become unreachable and nothing would ever end.
+    ///
+    /// A `None` from `upgrade` is the honest case rather than an error: the last
+    /// [`System`] is gone, so there is no map to take the entry out of and
+    /// nobody left holding a [`Lifecycle`] to tell.
+    ///
     /// # Panics
     ///
     /// Panics when called outside a tokio runtime, like every other spawn.
-    fn entry(&self, mounted: Mounted<M>) -> Entry<M> {
+    fn entry(self: &Arc<Self>, id: &ActorId, mounted: Mounted<M>) -> Entry<M>
+    where
+        M: Send + 'static,
+    {
         let (mail, slots) = mpsc::channel(self.mailbox_depth);
         let busy = Busy::default();
         let inbox = Mailbox {
             slots,
             busy: busy.clone(),
         };
+        // Built here rather than inside the task, so the loop is still a future
+        // that has never been polled at the moment the spawn takes it — which is
+        // what [`Mounted`] is for and what a refused mount rests on.
+        let running = (mounted.run)(inbox);
+        let registry = Arc::downgrade(self);
+        // One `ActorId` clone per live actor, held for its life. The map already
+        // holds one, and this is the copy the reaping task addresses it by —
+        // unconditional, unlike `announcing`'s, because removing the entry is
+        // not something only a `Lifecycle` wants.
+        let id = id.clone();
         Entry {
             mail,
-            task: n0_future::task::spawn((mounted.run)(inbox)),
+            task: n0_future::task::spawn(async move {
+                let why = running.await;
+                if let Some(registry) = registry.upgrade() {
+                    registry.reap(&id, &why);
+                }
+            }),
             last_seen: AtomicU64::new(self.now()),
             busy,
         }
@@ -1113,7 +1217,10 @@ impl<M> System<M> {
     ///
     /// [`MountError::Occupied`] when the id is taken, and
     /// [`MountError::AtCapacity`] when the registry is full.
-    pub fn mount(&self, id: ActorId, actor: Mounted<M>) -> std::result::Result<(), MountError> {
+    pub fn mount(&self, id: ActorId, actor: Mounted<M>) -> std::result::Result<(), MountError>
+    where
+        M: Send + 'static,
+    {
         let mut entries = self.inner.write();
         // See `Registry::route`: a `VacantEntry` borrows the map, so the count is
         // taken first. It is the count before this insert, which is the one the
@@ -1134,7 +1241,8 @@ impl<M> System<M> {
                     });
                 }
                 let announce = self.inner.announcing(free.key());
-                free.insert(self.inner.entry(actor));
+                let entry = self.inner.entry(free.key(), actor);
+                free.insert(entry);
                 announce
             }
         };
@@ -1165,7 +1273,10 @@ impl<M> System<M> {
     pub(super) fn route(
         &self,
         id: &ActorId,
-    ) -> std::result::Result<mpsc::Sender<Box<M>>, RouteError> {
+    ) -> std::result::Result<mpsc::Sender<Box<M>>, RouteError>
+    where
+        M: Send + 'static,
+    {
         self.inner.route(id)
     }
 
@@ -1753,7 +1864,27 @@ mod tests {
     /// An actor that does nothing at all, for testing the registry rather than
     /// any message it carries.
     fn idler() -> Mounted<Bare> {
-        mount(|mut inbox: Mailbox<Bare>| async move { while inbox.recv().await.is_some() {} })
+        mount(|mut inbox: Mailbox<Bare>| async move {
+            while inbox.recv().await.is_some() {}
+            Ended::Stopped
+        })
+    }
+
+    /// An actor that ends **itself**, on a signal no registry gave it.
+    ///
+    /// The fourth way out, in the smallest shape there is: nothing calls
+    /// `shutdown`, nothing calls `abort`, no sweeper runs, and the loop returns
+    /// anyway. `Ended::Feed` is the reason a real one most often ends this way —
+    /// a subscription that ran out — and any of the four would do here.
+    fn self_ending(go: oneshot::Receiver<()>) -> Mounted<Bare> {
+        mount(|inbox: Mailbox<Bare>| async move {
+            // Held, so the mailbox stays open and the entry stays routable right
+            // up to the ending: an actor that had already dropped its receiver
+            // would be a weaker case.
+            let _inbox = inbox;
+            let _ = go.await;
+            Ended::Feed { name: "ticks" }
+        })
     }
 
     /// An actor that takes nothing until its gate opens, then drains everything
@@ -1769,6 +1900,7 @@ mod tests {
             while inbox.recv().await.is_some() {
                 taken.fetch_add(1, Ordering::SeqCst);
             }
+            Ended::Stopped
         })
     }
 
@@ -1786,6 +1918,7 @@ mod tests {
                 n0_future::time::sleep(TURN).await;
                 handled.fetch_add(1, Ordering::SeqCst);
             }
+            Ended::Stopped
         })
     }
 
@@ -1806,6 +1939,7 @@ mod tests {
                 let _ = hold.await;
                 finished.fetch_add(1, Ordering::SeqCst);
             }
+            Ended::Stopped
         })
     }
 
@@ -1914,6 +2048,127 @@ mod tests {
             ],
             "two mounts and two endings, in order, with nothing said about the \
              refusal or the second route"
+        );
+    }
+
+    /// **An actor that ends itself leaves the registry, and says why.**
+    ///
+    /// The fourth way out, which had no site. Nothing here calls `shutdown`,
+    /// nothing calls `abort`, and `Eviction::Never` means no sweeper runs — so
+    /// every one of the three sites that used to remove an entry is *absent by
+    /// construction*, and the loop returning is the whole of what happens.
+    ///
+    /// Three assertions, because the defect had three faces on one node at one
+    /// instant and a test of any one of them alone would have missed the others:
+    ///
+    /// 1. `contains` is false — the entry is gone, so `System::status` and the
+    ///    console's actor list cannot report an actor a call would refuse;
+    /// 2. the id is **free again**, which is what a `mount` succeeding proves. A
+    ///    stale entry made a self-ended id permanently unmountable under
+    ///    `Eviction::Never`;
+    /// 3. the ending is reported, **with the reason the loop had** — `Feed`, not
+    ///    `Stopped` and not `Vanished`. That is the half `drain`'s synthesis
+    ///    from a join could never have produced: a loop that returns normally
+    ///    joins `Ok(())` whatever ended it.
+    ///
+    /// Red-tested with `scripts/break-once.sh` by replacing `Registry::reap`'s
+    /// body with `let _ = (id, why);`, which is the code as it stood before this
+    /// fix. Watched to fail on assertion 1, printing
+    /// `a self-ended actor must not still be mounted`.
+    #[tokio::test]
+    async fn an_actor_that_ends_itself_is_unmounted_and_reported() {
+        let reported = Reported::default();
+        let system: System<Bare> = System::builder(Eviction::Never)
+            .lifecycle(reported.clone())
+            .build();
+
+        let (end_it, go) = oneshot::channel();
+        let alone = ActorId::new("alone").expect("valid");
+        system
+            .mount(alone.clone(), self_ending(go))
+            .expect("the id is free");
+        assert!(system.contains(&alone), "mounted, before it ends itself");
+
+        end_it.send(()).expect("the actor is waiting on this");
+        // The reap happens on the actor's own task, so the assertions below need
+        // it to have been scheduled. `yield_now` is enough and a clock is not:
+        // nothing in this test is timed.
+        for _ in 0..8 {
+            if !reported.seen().is_empty() && reported.seen().len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            !system.contains(&alone),
+            "a self-ended actor must not still be mounted"
+        );
+        assert!(
+            system.is_empty(),
+            "and `System::status` reads the same map: {:?}",
+            system.status()
+        );
+        system
+            .mount(alone.clone(), idler())
+            .expect("the id a self-ended actor held must be free again");
+        assert_eq!(
+            reported.seen(),
+            [
+                "mounted alone",
+                "ended alone Feed { name: \"ticks\" }",
+                "mounted alone",
+            ],
+            "the loop's own reason, reported once, and the id reusable after it"
+        );
+    }
+
+    /// **A shutdown that races the actor's own ending reports it exactly once.**
+    ///
+    /// The interlock `Registry::reap` rests on, in the shape that would break it:
+    /// both the caller and the loop have a reason in hand at the same moment.
+    /// `shutdown` takes the entry out **before** it awaits, so the reap that runs
+    /// during that await finds nothing and says nothing — and the caller's answer
+    /// and the `Lifecycle`'s are still the same single value, which is the
+    /// property `System::shutdown` already promised.
+    ///
+    /// Red-tested by dropping the `is_some()` interlock from `reap` — reporting
+    /// unconditionally — which puts `ended raced Feed { name: "ticks" }` in the
+    /// list beside `ended raced Stopped`.
+    #[tokio::test]
+    async fn an_ending_the_loop_and_a_shutdown_both_saw_is_reported_once() {
+        let reported = Reported::default();
+        let system: System<Bare> = System::builder(Eviction::Never)
+            .lifecycle(reported.clone())
+            .build();
+
+        let (end_it, go) = oneshot::channel();
+        let raced = ActorId::new("raced").expect("valid");
+        system
+            .mount(raced.clone(), self_ending(go))
+            .expect("the id is free");
+
+        // Released and then shut down in the same breath: the loop is runnable
+        // and `shutdown` removes the entry before its first await, so which of
+        // the two gets there first is a race and the assertion is that it does
+        // not matter.
+        end_it.send(()).expect("the actor is waiting on this");
+        let ended = system
+            .shutdown(&raced, TURN)
+            .await
+            .expect("it was mounted when the call was made");
+        assert!(
+            matches!(ended, Ended::Stopped),
+            "the loop had already returned, so the join is clean: got {ended:?}"
+        );
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            reported.seen(),
+            ["mounted raced", "ended raced Stopped"],
+            "one mount, one ending, and never both determinations of it"
         );
     }
 
@@ -2226,6 +2481,7 @@ mod tests {
             mount(|mut inbox: Mailbox<Bare>| async move {
                 started.fetch_add(1, Ordering::SeqCst);
                 while inbox.recv().await.is_some() {}
+                Ended::Stopped
             })
         };
 

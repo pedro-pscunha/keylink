@@ -1566,29 +1566,35 @@ where
 /// what that closure does now; the ~150 lines it used to be were a second copy of
 /// the loop above.
 ///
-/// The reason is dropped rather than published, and that is a real limit rather
-/// than an oversight: a keyed actor has no `ended()` channel, so the registry's
-/// eviction clock finds a task that already finished and nobody is told **why** it
-/// finished. An observer's `finish` is told, which is how a durability adapter
-/// still commits — but a keyed actor whose observer refused, whose handler panicked
-/// or whose feed ended reports that to nothing a caller can await.
+/// # The reason is **returned**, and it used to be dropped
 ///
-/// Supervision arrived without needing it — [`run_keyed_supervised`] restarts a
-/// keyed actor and reads its incarnations' endings on the way past — so the gap
-/// is narrower than it looks and is still real: a supervised keyed actor's
-/// [`Ended::GaveUp`] reaches its own observers' `finish` and nothing outside.
+/// This function's whole body was `let _reason: Ended = run_loop(..).await;`, and
+/// the discarded binding was a live defect rather than a stylistic one. A keyed
+/// actor that ends **on its own** — a feed that ran out, a handler that panicked,
+/// an observer that refused — leaves a registry entry nothing removes:
+/// [`System::status`](crate::System::status) went on listing it with `busy:
+/// false` while a real call to it answered
+/// [`NoSuchActor`](crate::RemoteError::NoSuchActor), and no
+/// [`Lifecycle`](crate::Lifecycle) was told. `keylink::mount`'s `Loop` carries
+/// the full argument; the return type here is the half of it that lives in this
+/// file.
+///
+/// So a keyed actor still has no `ended()` channel for a *caller* to await — a
+/// handle is what would hold one, and a keyed actor is addressed by id — but the
+/// ending is no longer lost: the registry reaps its own entry with this value.
 #[doc(hidden)]
 pub async fn run_keyed<A, M, F>(
     state: A,
     hooks: Vec<Box<dyn Observer<A>>>,
     feeds: F,
     inbox: crate::Mailbox<M>,
-) where
+) -> Ended
+where
     A: Send + 'static,
     M: Turn<A>,
     F: Feeds<A>,
 {
-    let _reason: Ended = run_loop(state, hooks, feeds, Keyed(inbox)).await;
+    run_loop(state, hooks, feeds, Keyed(inbox)).await
 }
 
 // ───────────────────────────────────────────────────────────────── supervision
@@ -1888,17 +1894,30 @@ where
 /// the user's crate. The registry is untouched by any of this — `mount` takes a
 /// closure over a `Mailbox`, and this is that closure's whole body.
 ///
-/// A keyed actor still has no `ended()` channel, so the [`Life`] this makes has
-/// no reader and `Ended::GaveUp` reaches nobody but the observers' `finish`. One
-/// small channel per supervised keyed actor is the cost of that; the alternative
-/// is an `Option` and a second path through the one loop, which is the split
-/// Wave 3 exists to have deleted.
+/// A keyed actor still has no `ended()` channel for a caller to await, so the
+/// [`Life`] this makes has no reader. One small channel per supervised keyed
+/// actor is the cost of that; the alternative is an `Option` and a second path
+/// through the one loop, which is the split Wave 3 exists to have deleted.
+///
+/// # One mechanism serves both keyed paths, and that is not a coincidence
+///
+/// [`run_keyed`] returns the ending it used to drop, and so does this — the same
+/// return type, reaped at the same site, because a **restart is not an ending**.
+/// [`supervise`] runs many incarnations behind one `Output`, and it returns only
+/// once there will be no more, which is exactly the instant the registry entry
+/// should go. A per-path mechanism would have had to decide that again; a return
+/// type does not.
+///
+/// [`Ended::GaveUp`] is therefore the one ending this path can produce that the
+/// unsupervised one cannot, and it now reaches the same
+/// [`Lifecycle`](crate::Lifecycle) as every other.
 #[doc(hidden)]
 pub async fn run_keyed_supervised<A, M, F, Fut, N>(
     factory: N,
     limit: Intensity,
     inbox: crate::Mailbox<M>,
-) where
+) -> Ended
+where
     A: Send + 'static,
     M: Turn<A>,
     F: Feeds<A>,
@@ -1906,7 +1925,7 @@ pub async fn run_keyed_supervised<A, M, F, Fut, N>(
     Fut: Future<Output = Result<Incarnation<A, F>, Stop>> + Send,
 {
     let (life, _no_reader) = watch::channel(Life::Running);
-    let _reason: Ended = supervise(factory, limit, Keyed(inbox), &life).await;
+    supervise(factory, limit, Keyed(inbox), &life).await
 }
 
 /// The actor is gone. The only way a local call fails.

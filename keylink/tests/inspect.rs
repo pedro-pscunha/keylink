@@ -23,6 +23,7 @@ use keylink::{
     inspect, ActorId, Allowlist, Caller, Console, EndReason, Ended, Error, EventPage, Events,
     Eviction, Inspector, LifecycleEvent, Node, Server,
 };
+use tokio::sync::mpsc;
 
 mod common;
 use common::local_node;
@@ -33,6 +34,13 @@ keylink::service! {
     service Journal;
     rpc Post(entry: u64) -> u64;
     rpc Entries() -> Vec<u64>;
+
+    /// A second input, and the reason it is here is the ending it makes
+    /// reachable: a feed that runs out ends its actor **on its own**, with no
+    /// caller, no `shutdown` and no sweeper. That is the one way an actor leaves
+    /// a registry that nobody asks for, and this file is where a console watches
+    /// it happen.
+    feed Ticks(tick: u64);
 }
 
 #[derive(Default)]
@@ -49,6 +57,19 @@ impl journal::Actor for Journal {
     async fn entries(&mut self, _cx: Caller<'_>) -> Vec<u64> {
         self.entries.clone()
     }
+
+    async fn on_ticks(&mut self, tick: u64) {
+        self.entries.push(tick);
+    }
+}
+
+/// A feed backed by a channel, so a test decides when it ends.
+///
+/// `poll_fn` over `Receiver::poll_recv` rather than `tokio_stream`, which is not
+/// a dependency here — the same helper `tests/feeds.rs` writes, for the same
+/// reason.
+fn feed(mut items: mpsc::Receiver<u64>) -> impl keylink::Stream<Item = u64> + Send + 'static {
+    n0_future::stream::poll_fn(move |cx| items.poll_recv(cx))
 }
 
 // ──────────────────────────────────────────────────────────────────── the fixture
@@ -90,23 +111,32 @@ impl Watched {
             .expect("the console peer is admitted")
     }
 
-    /// Mount an actor that reports its turns.
+    /// Mount an actor that reports its turns, and hand back the feed it listens
+    /// to.
     ///
     /// `spawn_wired` and not `spawn`, because an observer is how a turn becomes
     /// an event: the registry sees mounts and endings, and only the actor sees
-    /// what it ran. `Feeds::new()` takes no arguments — `journal` declares no
-    /// feed.
-    fn mount(&self, who: &ActorId) {
+    /// what it ran.
+    ///
+    /// **The returned sender has to be kept.** Dropping it ends the feed, which
+    /// ends the actor — so a test that ignores it is a test whose actors are
+    /// racing it to the exit. That is exactly what
+    /// `an_actor_that_ends_itself_is_delisted_and_reported_to_the_console`
+    /// does on purpose.
+    #[must_use = "dropping the feed's sender ends the actor this just mounted"]
+    fn mount(&self, who: &ActorId) -> mpsc::Sender<u64> {
+        let (ticks, from) = mpsc::channel(4);
         self.system
             .mount(
                 who.clone(),
                 journal::spawn_wired(
                     Journal::default(),
                     vec![self.events.observer(who.clone())],
-                    journal::Feeds::new(),
+                    journal::Feeds::new(feed(from)),
                 ),
             )
             .expect("the id is free");
+        ticks
     }
 }
 
@@ -189,9 +219,9 @@ async fn until(console: &mut Console, what: &str, enough: impl Fn(&[LifecycleEve
 #[tokio::test]
 async fn the_actor_list_reaches_a_peer_with_every_field_intact() {
     let watched = start(Eviction::Never, 64, true).await;
-    for n in 0..3 {
-        watched.mount(&id(&format!("obra/{n}")));
-    }
+    let _ticks: Vec<_> = (0..3)
+        .map(|n| watched.mount(&id(&format!("obra/{n}"))))
+        .collect();
     assert_eq!(
         journal::at(&watched.journal, id("obra/1"))
             .post(7)
@@ -262,7 +292,7 @@ async fn the_actor_list_reaches_a_peer_with_every_field_intact() {
 #[tokio::test]
 async fn a_peer_the_inspect_allowlist_refuses_gets_nothing() {
     let watched = start(Eviction::Never, 64, false).await;
-    watched.mount(&id("obra/0"));
+    let _ticks = watched.mount(&id("obra/0"));
 
     assert_eq!(
         journal::at(&watched.journal, id("obra/0"))
@@ -310,7 +340,7 @@ async fn a_console_observes_a_mount_a_turn_and_an_ending() {
     let mut console = watched.console().await.expect("admitted");
 
     let who = id("obra/7");
-    watched.mount(&who);
+    let _ticks = watched.mount(&who);
     assert_eq!(
         journal::at(&watched.journal, who.clone())
             .post(3)
@@ -347,6 +377,103 @@ async fn a_console_observes_a_mount_a_turn_and_an_ending() {
     .await;
 }
 
+/// **An actor that ends itself is delisted, and the console is told why.**
+///
+/// The way an actor leaves that **nobody calls** — which is the same
+/// no-caller-present category the `Lifecycle` port exists to close, and the one
+/// its own test missed. Nothing here calls `shutdown`, nothing calls `abort`,
+/// and `Eviction::Never` means no sweeper runs: the feed's sender is dropped and
+/// the actor's loop returns on its own.
+///
+/// Three facts about one node at one moment, because the defect was all three at
+/// once and any one of them alone is a weaker test:
+///
+/// 1. the console's **actor list** no longer names it. Before the fix, `Actors()`
+///    and `System::status` both reported it mounted with `busy: false`, forever,
+///    under `Eviction::Never`;
+/// 2. the console's **event log** carries the ending, with the loop's own reason
+///    — `Feed { name: "Ticks" }`, which no synthesis from a join could produce;
+/// 3. a **real call** to it is refused. That is the pairing that made the stale
+///    entry a lie rather than merely stale: the list said yes and the wire said
+///    `NoSuchActor`, at the same instant, on the same node.
+///
+/// The list is asked first on purpose, as a bounded poll rather than through
+/// `until`: `until` fails by exhausting a thirty second timeout, and a guard that
+/// fails by waiting is much weaker than one that prints the rows it saw.
+///
+/// Red-tested by `scripts/break-once.sh` on `keylink/src/macros.rs`, restoring
+/// the discarded ending — `run_keyed(state, observers, feeds, inbox).await` back
+/// to `...await;` with a `Loop` of `Output = ()`. Since that no longer compiles,
+/// the break that *is* watched is `Registry::reap`'s body, in
+/// `registry.rs::an_actor_that_ends_itself_is_unmounted_and_reported`; this test
+/// then fails on fact 2 with the actor still listed.
+#[tokio::test]
+async fn an_actor_that_ends_itself_is_delisted_and_reported_to_the_console() {
+    let watched = start(Eviction::Never, 64, true).await;
+    let mut console = watched.console().await.expect("admitted");
+
+    let who = id("self-ender");
+    let ticks = watched.mount(&who);
+    assert_eq!(
+        journal::at(&watched.journal, who.clone())
+            .post(1)
+            .await
+            .expect("the actor answers while its feed is open"),
+        1
+    );
+
+    // The only thing this test does to the actor. No `shutdown`, no `abort`, no
+    // sweeper, and no caller anywhere with a reason to be told.
+    drop(ticks);
+
+    // The delisting is asked first, and as a **bounded poll that prints**: a
+    // guard whose failure is a hang is much weaker than one that says what it
+    // saw. Ten reads over one second is enough for a loop that has nothing to do
+    // but return — and when it is broken, the last `rows` is the whole evidence.
+    let mut rows = Vec::new();
+    for _ in 0..10 {
+        rows = console.actors().await.expect("the inspect actor answers");
+        if !rows.iter().any(|row| row.id == who) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !rows.iter().any(|row| row.id == who),
+        "a self-ended actor must not still be listed: {rows:#?}"
+    );
+
+    until(
+        &mut console,
+        "the self-ending never reached the console's event log",
+        |seen| {
+            seen.contains(&LifecycleEvent::Ended {
+                id: who.clone(),
+                why: EndReason::Feed {
+                    name: "Ticks".to_owned(),
+                },
+            })
+        },
+    )
+    .await;
+
+    let refused = journal::at(&watched.journal, who.clone())
+        .post(2)
+        .await
+        .expect_err("the actor is gone, so the call has nothing to reach");
+    assert!(
+        matches!(
+            refused,
+            Error::Remote(keylink::RemoteError::NoSuchActor { .. })
+        ),
+        "and the wire says the same thing the list does: {refused:?}"
+    );
+
+    // The id is free, which is the operational half: under `Eviction::Never` a
+    // stale entry made a self-ended id unmountable for the life of the process.
+    let _again = watched.mount(&who);
+}
+
 /// **The console does not hold a handler open on an actor.**
 ///
 /// This is the criterion the whole `#[defer]` design exists for, and a weaker
@@ -368,7 +495,7 @@ async fn a_console_observes_a_mount_a_turn_and_an_ending() {
 async fn a_parked_subscriber_does_not_stop_the_actor_serving_turns() {
     let watched = start(Eviction::Never, 64, true).await;
     let who = id("obra/0");
-    watched.mount(&who);
+    let _ticks = watched.mount(&who);
 
     let mut follower = watched.console().await.expect("admitted");
     // Catch the cursor up on everything recorded so far, so that the next call
@@ -438,9 +565,9 @@ async fn a_console_behind_the_ring_is_told_exactly_how_much_it_missed() {
     const MOUNTS: usize = 4;
 
     let watched = start(Eviction::Never, HISTORY, true).await;
-    for n in 0..MOUNTS {
-        watched.mount(&id(&format!("obra/{n}")));
-    }
+    let _ticks: Vec<_> = (0..MOUNTS)
+        .map(|n| watched.mount(&id(&format!("obra/{n}"))))
+        .collect();
 
     // `follow(0)` does not advance anything on the node, so asking again is free
     // and this loop is how the test waits for all four mounts to have been
