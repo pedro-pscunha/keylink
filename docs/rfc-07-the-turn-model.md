@@ -2238,6 +2238,25 @@ differently. The property that buys is worth stating plainly: **for any
 between incarnations.** `an_intensity_whose_backoff_would_be_zero_is_refused`
 is the guard; breaking it to `if false` was watched red.
 
+**And the rejection must not be read as closing more than it does — asked
+directly, answered directly.** It closes two cases exactly and narrows a third
+without closing it:
+
+| case | closed? | why |
+|---|---|---|
+| `recovered_after == 0` | **yes, exactly** | `ran_for >= ZERO` holds for every incarnation that ever ran, so the reset is unconditional for **every** actor. It is the only value of which that is formally true. |
+| backoff truncates to zero (`recovered_after < max` ns) | **yes** | integer division on nanoseconds; a restart loop with no `sleep` in it. This is why the guard is on the backoff and not on the span. |
+| `recovered_after` shorter than a *failing* incarnation's life | **no, and not closable here** | `Intensity::new(4, Duration::from_nanos(4))` is accepted — backoff 1 ns — and no real incarnation ends in four nanoseconds, so its budget resets on every failure exactly as `ZERO`'s would. |
+
+The third differs from the first two **in kind and not in degree**: where that
+line falls is a fact about the caller's actor, not about the value, so no
+constructor can see it. So the honest summary is that **the guard bounds the
+sleep, not the hazard** — it removes the spin and the one unconditional value,
+and the documented precondition carries everything else. That is stated on
+`Intensity` itself rather than left to be inferred from the fact that `new`
+returns an `Option`, because a constructor that refuses *something* invites the
+reading that everything it accepts is safe.
+
 `Option` and not a panic: the same shape as `NonZeroU32::new`, one argument
 along, so both of `Intensity`'s numbers are checked where the value is built.
 That the wave reasoned the `max` half through — *"a budget of zero is `spawn_fed`
@@ -2267,15 +2286,38 @@ sentence as a test. What remains is *state* coupling, and a group restart is bot
 too broad (it discards a healthy actor's live state) and too narrow (it cannot
 say *what* went stale) to fix it. That is a message, not a strategy.
 
-### 9.3 `Stop::fatal` is an inherent function, and the flag is a field, because of coherence
+### 9.3 `Stop::fatal` is an inherent function because of coherence — and the flag is a `bool` for a different reason
 
 `Stop` has a blanket `impl<E: Error + Send + Sync + 'static> From<E>`, which makes
 **every** other `From` impl an `error[E0119]`. So a `Fatal<E>` wrapper a caller
 could convert from cannot exist, and `fatal` is an inherent associated function
 with `new`'s exact `impl Into<Box<dyn Error + Send + Sync>>` shape. The
-discriminator then has nowhere to live but a second field on the tuple struct,
+discriminator therefore travels beside the error rather than inside its type,
 which is what `into_reason` becoming `into_parts` is: a name that went on
 promising one value while handing back two is how a caller drops the second.
+
+**Corrected after review — the heading of this section used to end at
+"because of coherence", and the sentence under it read "the discriminator then
+has nowhere to live but a second field on the tuple struct".** That is one step
+further than coherence reaches. What `E0119` forbids is the *convertible
+wrapper*; it says nothing about how the discriminator is spelled once it is a
+field. A `pub(crate) enum Severity { Retryable, Fatal }` as `Stop`'s second field
+has no coherence problem at all — nothing converts *from* it — and compiles.
+
+It stays a `bool` for a weaker, ordinary reason, and the weak reason is worth
+writing down precisely because it is weak: **the two-state fact is already on the
+public surface as a `bool`, twice** — `Stop::is_fatal(&self) -> bool` and
+`Ended::Observer.fatal`, the latter argued separately and soundly. `into_parts`
+is `pub(crate)` with exactly two callers, both in `local.rs`, so an enum would
+buy a self-describing return at two sites and be a private synonym for a shape
+the public API spells as a `bool` regardless. **That is a judgement, not a
+constraint, and the type is unchanged — only the claim is.**
+
+*(The first draft of this correction said "`into_parts` is public, so a private
+enum could not appear in its return type". It is `pub(crate)`. The docs gate
+caught it as a private-intra-doc-link error, which is the second time in this
+one section that an argument was stated more strongly than it holds. Recorded,
+because that is the pattern worth noticing rather than the fact.)*
 
 **A fatal refusal of a turn that *panicked* is not honoured, and that is
 deliberate.** The loop reports a refused fault as `Ended::Panicked` naming the
@@ -2284,6 +2326,18 @@ turn, and reporting the adapter points an operator at the wrong code. That endin
 carries no observer and therefore no flag. The rule is on `Stop::fatal`'s own
 documentation: the reason the actor is ending is the fault, and a fault is the
 kind of thing another incarnation might not repeat.
+
+**That rule now has a test, which is the second thing review found here.** It was
+a deliberate, documented contract held by prose in three places and by nothing
+executable, so a later change to `retryable` or to `local.rs`'s `(refused,
+panicked)` match would have broken it silently.
+`a_fatal_refusal_of_a_panicked_turn_is_not_honoured` drives an observer that
+returns `Stop::fatal` from `after_turn` on a turn that panicked and asserts the
+actor is **rebuilt anyway**. The residual risk the review graded *defensible*
+stands and is unchanged: the primary `fatal` case — a claim another machine
+holds, a snapshot from a newer build — is detected at `Persist::open` in the
+**factory**, and `supervise`'s `if !fatal && budget.spend(..)` does honour it
+there.
 
 ### 9.4 `Ended::GaveUp` was predicted to cost one `E0004`, and it cost exactly one
 
@@ -2410,9 +2464,13 @@ supervision as built is a statement about one.
 
 ### 9.9 Every criterion, and the break that proves it
 
-Fourteen tests in `keylink/tests/supervision.rs`, every one of them watched to
-fail under a one-literal break. The twelve below are the wave's own; §9.1.1's two
-guards are the thirteenth and fourteenth.
+Fifteen tests in `keylink/tests/supervision.rs`, every one of them watched to
+fail under a break. The twelve below are the wave's own; §9.1.1's two guards and
+§9.3's `a_fatal_refusal_of_a_panicked_turn_is_not_honoured` are the three review
+added. **Fourteen of the fifteen breaks are one literal; the fifteenth is two
+adjacent lines**, because honouring a flag the loop drops means rebinding the
+match arm's pattern and its body together, and splitting that into one line does
+not compile.
 
 **Corrected after review, because the first version of this sentence and the
 table under it disagreed.** It read *"Eleven were watched to fail under a
@@ -2456,6 +2514,7 @@ prove:
 | `a_supervised_actor_that_gave_up_answers_stop` | `Budget::spend` never refuses, so the supervisor never exits |
 | `an_intensity_whose_backoff_would_be_zero_is_refused` | `Intensity::new`: `if limit.backoff().is_zero()` → `if false` |
 | `a_failure_slower_than_its_recovery_span_never_gives_up` | `Budget::spend`: `if ran_for >= self.limit.recovered_after` → `if false` |
+| `a_fatal_refusal_of_a_panicked_turn_is_not_honoured` | `run_loop`'s `(refused, panicked)` match: the `Some(..), Some(message)` arm rebound to `Ended::Observer { name, error, fatal }` — i.e. the flag honoured |
 
 Plus one compile-time probe: `Intensity` in `representability.rs`'s
 `HasNoDefault`, which a `#[derive(Default)]` or a hand-written impl trips.
@@ -2489,9 +2548,15 @@ unbounded wait converts every interesting break into silence.
   `NoSuchActor`. This is the one asymmetry the wave leaves, and it is a
   consequence of the previous bullet.
 
-  *(Citation corrected: `deliver_to_actor` is `keylink/src/actor/remote.rs:419`,
-  not `registry.rs`. The zero-lines claim about `registry.rs` above is unaffected
-  and still verified — `remote.rs` is zero lines this wave too.)*
+  **Citation corrected: `deliver_to_actor` is `keylink/src/actor/remote.rs:419`,
+  and it has never been in `registry.rs`.** `rg -n 'deliver_to_actor'
+  keylink/src/actor/registry.rs` returns nothing. The wrong location was written
+  here and in `.tmp/wave-9/commit.txt`, and from there it was copied into the
+  wave's review and into the brief that commissioned this fix — four places, each
+  taking it from the last without checking. **The commit message is immutable and
+  still says `registry.rs`; this line is the correction, and it is the one to
+  believe.** The zero-lines claim about `registry.rs` above is unaffected and
+  still verified — `remote.rs` is zero lines this wave too.
 
   **Corrected after review: it is a *new* wrong answer, not a pre-existing gap,
   and stating it here was not enough.** Before this wave keyed actors did not

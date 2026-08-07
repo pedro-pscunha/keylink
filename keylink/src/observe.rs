@@ -287,15 +287,34 @@ pub enum TurnOutcome<'a> {
 /// impl among the surface; that was a counting slip and this is the note it
 /// asked for rather than a silent departure.
 ///
-/// # The second field is a flag and not a second type, and coherence is why
+/// # Coherence rules out a `Fatal<E>` a caller converts from — and nothing else
 ///
 /// [`fatal`](Self::fatal) needs to say one more thing than the boxed error
-/// carries, and it cannot say it through the type system: the blanket `From<E>`
-/// below overlaps **every** other `From` impl, so a `Fatal<E>` wrapper a caller
-/// could convert from is `error[E0119]`. An inherent associated function beside
-/// [`new`](Self::new), with the same `impl Into<Box<..>>` shape, is the one
-/// route the coherence rules leave open — so the discriminator is a field on
-/// this struct rather than a second error type.
+/// carries, and the obvious way to say it — a `Fatal<E>` wrapper an observer
+/// writes `Err(Fatal(io_error).into())` against — is **`error[E0119]`**, because
+/// the blanket `From<E>` below overlaps every other `From` impl. So the
+/// constructor is an inherent associated function beside [`new`](Self::new),
+/// with the same `impl Into<Box<..>>` shape, and the discriminator travels
+/// beside the error rather than inside its type.
+///
+/// **That is the whole of what coherence decides, and it is less than it looks.**
+/// It rules out the *convertible wrapper*. It says nothing about how the
+/// discriminator is spelled once it is a field: a
+/// `pub(crate) enum Severity { Retryable, Fatal }` here would have no coherence
+/// problem at all — nothing converts *from* it — and would compile.
+///
+/// It is a `bool` for a weaker and more ordinary reason, and the reason is
+/// written down rather than implied because the first version of this note let
+/// the coherence argument carry the field's *type*, which it does not reach.
+/// **The two-state fact is already on the public surface as a `bool`, twice**:
+/// [`is_fatal`](Self::is_fatal) here, and `fatal` on
+/// [`Ended::Observer`](crate::Ended::Observer) — which is argued separately and
+/// on its own merits further down. `into_parts` is `pub(crate)` and has two
+/// callers, both in `local.rs`, so an internal enum would buy a self-describing
+/// return at those two sites and be a private synonym for a shape the public API
+/// spells as a `bool` anyway. That is a judgement about one type against three
+/// call sites, not a constraint — and calling it a constraint is what this
+/// paragraph is fixing.
 pub struct Stop(Box<dyn Error + Send + Sync>, bool);
 
 impl Stop {

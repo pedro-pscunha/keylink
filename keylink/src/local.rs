@@ -1632,11 +1632,31 @@ pub async fn run_keyed<A, M, F>(
 /// holds this exact behaviour, so a later reader finds it asserted rather than
 /// discovers it.
 ///
-/// The one case that is a fact about the *value* rather than about the caller's
-/// actor — a `recovered_after` so small that the backoff truncates to zero, of
-/// which `Duration::ZERO` is the limit — is refused by [`new`](Self::new)
-/// instead of documented. There the unreachability holds for **every** actor and
-/// the restart loop has no sleep in it.
+/// # What [`new`](Self::new) rejects, and what it deliberately does not
+///
+/// The rejection closes two things exactly, and **narrows a third without
+/// closing it.** Worth spelling out, because a constructor that refuses a value
+/// invites the reading that everything it accepts is safe:
+///
+/// - **`Duration::ZERO` — closed.** `ran_for >= Duration::ZERO` is true of every
+///   incarnation that ever ran, including one that ended instantly, so the reset
+///   fires for **every** actor with no precondition left for a caller to hold.
+///   That is the only value of which this is formally true.
+/// - **A backoff that truncates to zero — closed.** `recovered_after / max` is
+///   integer division on nanoseconds, so anything under `max` nanoseconds is a
+///   restart loop with no sleep in it. `new` refuses those too, which is why the
+///   guard is written on the backoff.
+/// - **A `recovered_after` shorter than a failing incarnation's life — NOT
+///   closed, and not closable here.** `Intensity::new(4, Duration::from_nanos(4))`
+///   is accepted: its backoff is one nanosecond, and no real incarnation ends in
+///   four nanoseconds, so in practice its budget resets on every failure just as
+///   `ZERO`'s would. The difference from the two above is not degree but kind —
+///   where that line falls is a fact about the caller's actor, not about the
+///   value, so nothing a constructor can see decides it.
+///
+/// So the guard bounds the **sleep**, not the hazard. The precondition above is
+/// what carries the rest, and it is prose because there is nothing else for it
+/// to be.
 ///
 /// # The backoff is `recovered_after / max`, and there is no knob for it
 ///
@@ -1670,6 +1690,12 @@ impl Intensity {
     /// naming: `ran_for >= Duration::ZERO` is true of every incarnation that
     /// ever ran, so the budget resets on every failure for every actor, and the
     /// loop that then never terminates would spin with no `sleep` in it at all.
+    ///
+    /// **This does not make every accepted value safe**, and the type's own
+    /// documentation says which third case it leaves open:
+    /// `Intensity::new(4, Duration::from_nanos(4))` is accepted and is still a
+    /// budget that resets on every real failure. The guard bounds the sleep; the
+    /// precondition bounds the rest, and only the caller knows it.
     ///
     /// `Option` and the same shape as [`NonZeroU32::new`], one argument along,
     /// rather than a panic: a value a caller passed is checked where it is

@@ -235,7 +235,14 @@ impl<A: Send + 'static> Observer<A> for RefuseOnce {
 /// A `service!` method that panics does **not** end its actor by itself — the
 /// loop catches it and the next message runs — so an observer is what turns a
 /// fault into an ending, and therefore into a restart.
-struct RefuseFaults;
+///
+/// `fatal` picks which refusal it makes, and the interesting value is `true`:
+/// the loop **drops** the flag on a refused fault, so the two behave the same.
+/// That is the contract `a_fatal_refusal_of_a_panicked_turn_is_not_honoured`
+/// exists to pin.
+struct RefuseFaults {
+    fatal: bool,
+}
 
 impl<A: Send + 'static> Observer<A> for RefuseFaults {
     fn name(&self) -> &'static str {
@@ -244,11 +251,12 @@ impl<A: Send + 'static> Observer<A> for RefuseFaults {
 
     fn after_turn<'a>(&'a mut self, _state: &'a A, turn: TurnInfo<'a>) -> TurnFut<'a> {
         let faulted = matches!(turn.outcome, TurnOutcome::Panicked { .. });
+        let fatal = self.fatal;
         Box::pin(async move {
-            if faulted {
-                Err(Stop::new("a panicked turn is not committed"))
-            } else {
-                Ok(())
+            match (faulted, fatal) {
+                (false, _) => Ok(()),
+                (true, false) => Err(Stop::new("a panicked turn is not committed")),
+                (true, true) => Err(Stop::fatal("a panicked turn is not committed, ever")),
             }
         })
     }
@@ -384,7 +392,7 @@ async fn an_actor_restarts_from_its_last_committed_state() {
                         .await?
                         .start_from(Ledger::default);
                     let observers: Vec<Box<dyn Observer<Ledger>>> =
-                        vec![Box::new(saver), Box::new(RefuseFaults)];
+                        vec![Box::new(saver), Box::new(RefuseFaults { fatal: false })];
                     Ok((restored, observers, ()))
                 }
             },
@@ -727,6 +735,76 @@ async fn a_fatal_stop_skips_the_budget() {
     assert_eq!(seen(&built), 1, "built once, and never rebuilt");
 }
 
+/// The other half of `Stop::fatal`, and the half that had no test: **a fatal
+/// refusal of a turn that *panicked* is not honoured.**
+///
+/// `local.rs`'s `(refused, panicked)` match reports a refused fault as
+/// `Ended::Panicked` naming the handler rather than the observer, because a
+/// durability adapter refuses every panicked turn and reporting the adapter
+/// points an operator at the wrong code. That ending carries no observer, so it
+/// carries no flag, so `retryable` restarts. Deliberate, documented in three
+/// places, and until now held by prose alone — a later change to `retryable` or
+/// to that match would have moved it in silence.
+///
+/// Contrast `a_fatal_stop_skips_the_budget` directly above: same `Stop::fatal`,
+/// same budget, and the opposite outcome, because there the turn *completed*.
+/// Which of the two you get is decided by the turn's outcome and not by the
+/// observer's insistence.
+///
+/// The residual risk this leaves is graded and small: the case that motivates
+/// `fatal` at all — a claim another machine holds, a snapshot from a newer build
+/// — is detected at `Persist::open` in the **factory**, and `supervise` honours
+/// the flag there (`if !fatal && budget.spend(..)`). What is unreachable is a
+/// fatal refusal raised from `after_turn` on a fault, and that is bounded by the
+/// budget rather than unbounded.
+#[tokio::test(start_paused = true)]
+async fn a_fatal_refusal_of_a_panicked_turn_is_not_honoured() {
+    let (announce, mut built) = tokio::sync::mpsc::unbounded_channel();
+    let ledger = {
+        let counted = calls();
+        ledger::supervised(
+            move || {
+                let counted = counted.clone();
+                let announce = announce.clone();
+                async move {
+                    let _ = announce.send(counted.fetch_add(1, Ordering::SeqCst));
+                    let observers: Vec<Box<dyn Observer<Ledger>>> =
+                        vec![Box::new(RefuseFaults { fatal: true })];
+                    Ok((Ledger::default(), observers, ()))
+                }
+            },
+            limit(2, Duration::from_secs(4)),
+        )
+    };
+
+    let first = tokio::time::timeout(NO_PROGRESS, built.recv())
+        .await
+        .expect("the first incarnation is built at spawn");
+    assert_eq!(first, Some(0), "the first incarnation");
+
+    // Applied, and then panicked. The observer refuses it **fatally** — and the
+    // loop drops the flag along with the rest of the refusal.
+    ledger.bad(9).await.expect("queued");
+
+    let second = tokio::time::timeout(NO_PROGRESS, built.recv())
+        .await
+        .expect("a fatal refusal of a PANICKED turn must not stop the rebuild");
+    assert_eq!(
+        second,
+        Some(1),
+        "the actor is rebuilt: `Stop::fatal` is not honoured when the turn faulted"
+    );
+    assert!(ledger.is_running(), "and the second incarnation is up");
+    assert_eq!(
+        ledger
+            .entries()
+            .await
+            .expect("the second incarnation answers"),
+        Vec::<u64>::new(),
+        "and it is a fresh one, so the half-applied entry went with the old state"
+    );
+}
+
 /// Every incarnation gets its own observers, and the old ones are dropped
 /// **before** the new ones are built.
 ///
@@ -935,7 +1013,8 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
     // inside one test without a storm.
     let desk = desk::supervised(
         move || async move {
-            let observers: Vec<Box<dyn Observer<Desk>>> = vec![Box::new(RefuseFaults)];
+            let observers: Vec<Box<dyn Observer<Desk>>> =
+                vec![Box::new(RefuseFaults { fatal: false })];
             Ok((Desk::default(), observers, ()))
         },
         limit(1, Duration::from_millis(50)),
@@ -1042,7 +1121,7 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
                             .await?
                             .start_from(Ledger::default);
                         let observers: Vec<Box<dyn Observer<Ledger>>> =
-                            vec![Box::new(saver), Box::new(RefuseFaults)];
+                            vec![Box::new(saver), Box::new(RefuseFaults { fatal: false })];
                         Ok((restored, observers, ledger::Feeds::new()))
                     }
                 },
