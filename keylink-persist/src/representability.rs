@@ -64,9 +64,18 @@
 //! `keylink-persist/tests/versioned.rs`, which is outside the crate but only
 //! ever *matches* those variants: matching one, with `..`, is legal on an
 //! ordinary variant too. **Construction is the one thing the attribute
-//! forbids**, so the guard is a `compile_fail,E0639` doctest on each of the
-//! three variants — a doctest compiles as its own crate, which is where the
-//! attribute bites.
+//! forbids**, so the guard is a `compile_fail` doctest on each of the three
+//! variants — a doctest compiles as its own crate, which is where the attribute
+//! bites.
+//!
+//! Each fails with `E0639: cannot create non-exhaustive variant using struct
+//! expression`, and that code is prose here and **deliberately not on the
+//! fences**: rustdoc does not check the code after `compile_fail` at all, so a
+//! fence carrying one asserts a verification that never happens. Each fence
+//! claims exactly the one thing it can — this does not compile. What stops it
+//! claiming that for the wrong reason, a rename making the variant vanish rather
+//! than the attribute holding, is `keylink-persist/tests/versioned.rs` naming
+//! all three variants from outside the crate.
 //!
 //! **A trait method having no default body is not probeable.** That
 //! [`Durable::migrate`](crate::Durable::migrate) is required rather than
@@ -74,9 +83,14 @@
 //! asserting it would need a compile-*fail* harness. `trybuild` is the usual
 //! tool and it matches full rustc stderr, so a compiler release that rewords a
 //! diagnostic turns the gate red on a tree nobody touched. The probes here
-//! carry no error text at all — and the `compile_fail` doctests named above
-//! carry an error *code*, not a message, which is the same trade made once and
-//! deliberately: `E0639` is stable where its wording is not.
+//! carry no error text at all, and neither do the `compile_fail` fences named
+//! above. An earlier revision of this paragraph said those fences "carry an
+//! error *code*, not a message, which is the same trade made once and
+//! deliberately: `E0639` is stable where its wording is not". The stability
+//! half is true. **The trade was never made**, because rustdoc does not check
+//! the code — so `compile_fail,E0639` bought the appearance of a narrower
+//! assertion and none of the assertion, which is the objection to `trybuild`
+//! arriving by the other door. The codes came off the fences in `2e1e7a7`.
 //!
 //! **`Claim::store` taking `&mut self` is not probed.** The method returns
 //! `impl Future` in the trait, so its signature cannot be named as a function

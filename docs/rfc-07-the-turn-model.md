@@ -182,7 +182,11 @@ What Wave 1a's follow-up actually changed, and what it deliberately did not:
 - `Origin` is now `pub struct Origin(Provenance)` over a **private** enum, with
   `pub(crate) local()` / `pub(crate) peer()` and `#[doc(hidden)] pub fn caller()`. That
   closes (1) — generated code never constructs an origin, it destructures a `Mail` and
-  borrows out of it — and it is held by a `compile_fail,E0624` doctest.
+  borrows out of it — and it is held by a `compile_fail` doctest on `Origin` in
+  `keylink/src/actor/remote.rs`, which fails with `E0624: associated function 'local' is
+  private` and, on `Origin::Peer(cx)`, with `E0599`, there being no public variant left
+  to name. **Third revision, 2026-08-07 — that bullet read `compile_fail,E0624` until
+  now, and there is no code on that fence.** See §1.6.1.
 - (2) and (3) are **not closed**, and the documentation now says so in those words. While
   `Context: Clone` and `deliver_to_actor` is `pub`, two deliveries can share one marker.
   What makes it unreachable today is the call graph — `serve_one` builds one `Context` per
@@ -194,6 +198,40 @@ What Wave 1a's follow-up actually changed, and what it deliberately did not:
 **A guard whose documentation overstates it is worse than no guard**, because the next
 author reads the guarantee and stops checking — which is exactly how this section got two
 revisions.
+
+#### 1.6.1 Third revision, 2026-08-07: the fence had no code, and this is the same wave's own record going stale
+
+The bullet above described the guard on `Origin`'s constructors as *"a `compile_fail,E0624`
+doctest"*. **No fence in this workspace carries an error code.**
+`grep -rEn '```compile_fail[,[:space:]]*[A-Za-z0-9]' .` returns nothing over the whole
+tree; nine bare `compile_fail` fences remain, three of them in `keylink-persist/src/lib.rs`
+and one of them the `Origin` fence this bullet is about.
+
+What makes this worth a subsection rather than a silent correction is **whose record it
+was**. The bullet was written by `24b7c1b` at 02:48:54, and `3504670` took the code off
+that exact fence at 02:54:46 — **six minutes and one commit later**, under the title *"the
+error code belongs in the prose, not on the fence"*. So the document recording a guard
+outlived the guard's own wording by six minutes, in the same wave, on the same day, and
+survived a merge and two further waves before an adversarial review of Wave 1b found it.
+Two sibling claims went the same way in `keylink-persist` and are corrected in
+`keylink-persist/src/representability.rs` and `keylink-persist/tests/versioned.rs`.
+
+The reason no fence carries a code: **rustdoc does not check the code after
+`compile_fail`.** Demonstrated rather than argued, twice in this workspace — three
+doctests annotated `compile_fail,E0308` that in fact fail with `E0425` (a typo in the
+probe body) or `E0282` all passed green and silently, and swapping the pinned `E0624` on
+this very fence for `E0599` left the test green, which was red-tested. An annotated code
+therefore asserts a verification that does not happen, which is the shape of every guard
+this project has caught being satisfiable without proving its claim.
+
+So the fence asserts exactly one thing — **this does not compile** — and the codes are
+prose, both in the bullet above and inside the fence's own comments. What stops the fence
+passing for the *wrong* reason, a rename making `local` vanish rather than the privacy
+holding, is the in-crate unit test that calls `Origin::local()` and would go red if the
+name were gone: one pins that the name exists, the fence pins that it is out of reach.
+
+`representability.rs` objects to `trybuild` for matching full rustc stderr, and that
+objection stands. The answer is not a code on a fence.
 
 ### 1.7 `Rc` is the wrong exemplar, and it would have failed the gate for the wrong reason
 

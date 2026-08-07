@@ -858,6 +858,9 @@ actor dispatch calls **that**. So the callers are now:
 | `LocalActor::ask` | `ask_catching` |
 | generated actor dispatch in `macros.rs` | `ask_catching_before` |
 
+> **Superseded — `ask_catching_before` is deleted, and generated dispatch calls neither
+> of these. `ask_catching` is down to one caller again. See §16 below.**
+
 Both error types move to `TurnLost`. §2.7's mapping applies to
 `ask_catching_before`, not to `ask_catching`, and `ask` still maps everything to
 `MailboxClosed` exactly as §2.7 says.
@@ -888,6 +891,10 @@ enum Answered<T> {
 value*. A dropped sender stays `Gone`. Row 3 of §2.6 is unchanged from the
 caller's side: `ask` maps `TurnLost::Refused` to `MailboxClosed`.
 
+> **Superseded — there is no `Queued<T>` to keep answering anything. `Answered<T>` landed
+> and is what the loop puts on the reply channel; the sentence about the division of labour
+> now describes `Answered` alone. See §16 below.**
+
 ### 13.3 A refused turn settles an idempotency key as the refusal
 
 Wave A made the served path settle a key on **what ran**, using a progress marker
@@ -908,6 +915,9 @@ The waves added `Caller`, `QueueTimeout`, `Queueing`, `Queued`, `Idempotency`,
 and `Revocation`. None collides with §10's fourteen. `Queued` and `TurnLost` sit
 beside each other in one rustdoc index and mean different things, which §13.2
 names rather than leaves to a reader.
+
+> **Superseded — `Queued<T>` is deleted, so the collision it was worth naming cannot
+> happen and `TurnLost` sits alone. The other eleven names stand. See §16 below.**
 
 ### 13.5 What did not change
 
@@ -1024,3 +1034,79 @@ is §14's reading of it.
 
 **`Claim` is unchanged.** The port still takes raw bytes, because an adapter for
 a bucket or a vault must not learn what a frame is. Only the wrapper moved.
+
+---
+
+## 16. Revision 8 — §13's vocabulary: `Queued<T>` and `ask_catching_before` are deleted
+
+**Appended, not edited.** Nothing above this line has been altered except three pointer
+lines under §13.1, §13.2 and §13.4 saying that this section supersedes them. §13 was
+written as *"line references above are stale, and three factual premises changed"*; this is
+the same service performed on §13 itself.
+
+`c8712b0` replaced `Message::Turn(Box<dyn FnOnce(..)>)` with a mailbox enum that the
+`service!` expansion generates — one variant per declared method, carrying that method's own
+arguments and a `Reply<T>` of its own return type — and collapsed the two dispatchers into
+one `keylink::turn`. **The deletion is recorded in `docs/rfc-07-the-turn-model.md` §2.4**,
+which is the head of the record for the turn model and the section to read before this one.
+
+### What §13 says that is no longer true
+
+**§13.1's table.** `LocalActor::ask_catching_before` does not exist.
+`grep -rn 'ask_catching_before' keylink/src/` finds nothing, and generated dispatch calls
+neither method in that table: it calls `$crate::deliver_to_local`, keylink's own twin of
+`deliver_to_actor`, which sends `Message::Mail` into the mailbox itself. So §10's original
+claim is nearly true again — `ask_catching` has **one** non-test caller, `LocalActor::ask`,
+plus three call sites in `local.rs`'s own test module, and none in `keylink/tests/`, `demo/`
+or the README. §13.1's correction of §10 was right about its wave and is now a round trip.
+
+**§13.2's `Queued<T>` sentence.** There is no `Queued<T>`. `Answered<T>` did land, which is
+what §13.2 proposed and it is the section's substance — but as a `pub(crate)` type, and with
+one more variant than the sketch:
+
+```rust
+pub(crate) enum Answered<T> {
+    Ran(T),
+    Faulted(Panic),
+    Expired,
+    Refused { name: &'static str },
+}
+```
+
+`Ran(Result<T, Panic>)` was flattened into `Ran` and `Faulted`, so the distinction between a
+turn that produced a value and one that panicked lives in the discriminant where a `match`
+has to answer it. That is what §13.2's own argument asked for — the reply is *sent* rather
+than withheld, so a refusal keeps its name and does not arrive as `TurnLost::Gone` — one
+step further in. `TurnLost` is untouched and `ask` still maps `Refused` to `MailboxClosed`,
+so **§2.6 row 3 and §2.7 read exactly as written**.
+
+`Answered` being `pub(crate)` is the part worth carrying forward: a fourth state added to it
+is additive to a type nothing outside keylink can match on.
+
+**§13.4's name count.** `Queued` was one of the twelve names checked against §10's
+fourteen. It is gone, so the collision §13.4 thought worth naming — `Queued` and `TurnLost`
+side by side in one rustdoc index, meaning different things — cannot happen. The other
+eleven stand.
+
+### What did not change, and this is the point of the note
+
+**No part of this RFC's *design* moves.** §2.6's table, §2.7's mapping, the boundary rule in
+§2.1, `stop()` releasing the claim in §2.4, and every argument in §13.6 about a refused turn
+settling `Interrupted` rather than the refusal are all about *where the observer chain runs
+and who is answered*, and the chain still runs inside one `guarded`. It is now literally one
+place rather than two that agree: `keylink::turn` is the single site holding the deadline,
+the guard, the observers, the marks and the reply, which is the property §13.6 had to
+establish by argument across two dispatchers.
+
+§13.5's last sentence needs one correction of the same kind. It says *"§5.3's exclusion of
+the keyed `System` path is unaffected: `macros.rs`'s `spawn()` still runs its own loop over
+`__actor_turn`."* Half of that holds. `spawn()` does still run its own
+`while let Some(mail) = inbox.recv().await`, but the **turn** inside it is `$crate::turn`
+handed `&mut []` — an empty hook slice, in the one place that would otherwise have to be a
+second loop. So §5.3's exclusion is now a one-line decision rather than a structural fact,
+which is exactly how RFC-07 §2.6 records it: deferred to Wave 3 because feeds ask the same
+question about the same loop, not blocked. §5.3 is on issue #3's list to be superseded and
+removed outright, so it is not repaired here.
+
+Found by an adversarial review of Wave 1b, which read §13.1's table and §13.4's name list as
+current vocabulary — which is what they present themselves as.

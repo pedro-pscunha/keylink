@@ -3225,6 +3225,9 @@ promise did not run.
 | keyed loop, decode-**panic** arm | `unrun()` |
 | `Handle::service`, `Queued::Expired` arm | `unrun()` |
 
+> **Superseded — every one of these six rows names a site that no longer exists. The rule
+> that closed the list still holds and now closes over three sites. See §16.14 below.**
+
 The list is closed by a rule rather than by a search, which is the only way to
 know it is closed: once reaching a mailbox is a fact, **silence means "queued,
 fate unknown"**, so every arm that ends a message without entering user code has
@@ -3476,3 +3479,78 @@ happened; the visibility did not.
 The model that replaced this document's actor envelope is recorded in
 `docs/rfc-07-the-turn-model.md`. §1.6 there holds the mailbox's owned `Origin`, including
 two revisions correcting what withholding `Clone` on it actually buys.
+
+## 16.14 Revision, 2026-08-07: §16.12's closed list is closed over six sites that no longer exist
+
+Appended rather than edited in place, per CONTRIBUTING.md. §16.12's table and the four
+paragraphs under it stand as what was believed when they were written; the marks are in
+three places now, and this says where.
+
+**A closed list with dead rows is worse than an open one**, and the reason is stated by
+§16.12 itself: *"The list is closed by a rule rather than by a search, which is the only
+way to know it is closed."* That is exactly why this note exists. The next wave audits its
+own arms against that table, and four of the six rows name a construct it will not find —
+so the audit either comes back silently clean or sends the auditor looking for a loop that
+was deleted. The rule survives untouched. Only the sites moved.
+
+### What deleted them
+
+`c8712b0` — RFC-07 §2 — replaced `Message::Turn(Box<dyn FnOnce(..)>)` with a mailbox enum
+the `service!` expansion generates, and collapsed the two dispatchers into one
+`keylink::turn`. RFC-07 §2.4 records the deletions in one sentence: *"`Queued<T>` and
+`ask_catching_before` are deleted. Their one caller was `Handle::service`'s dispatch, which
+is now `deliver_to_local` — the twin of `deliver_to_actor`, in keylink, sharing one
+`rendered`."* Both symbols in rows 2 and 6 are gone from the crate;
+`grep -rn 'Queued\|ask_catching_before' keylink/src/` finds only two comments mentioning
+them in passing.
+
+### Where each row went
+
+Read as `file:symbol` and not as `file:line`, deliberately: this note was written while
+another wave was editing `local.rs`, and a line number in a document is a claim that goes
+stale the way §16.12's did.
+
+| §16.12's row | where the mark is now |
+| --- | --- |
+| `System::deliver`, after `mail.send` resolves `Ok` → `enqueued()` | `keylink/src/actor/remote.rs::deliver_to_actor` — same placement, below every refusal above it and above the wait, for the reason §16.12 gives |
+| `LocalActor::ask_catching_before`, once the permit is in hand → `enqueued()` | `keylink/src/local.rs::deliver_to_local`, after `sent.is_err()` is ruled out |
+| keyed loop, queue-deadline expiry arm → `unrun()` | `keylink/src/local.rs::turn`, the `if expired` arm |
+| keyed loop, decode-refusal arm → `unrun()` | **no such arm.** See below |
+| keyed loop, decode-**panic** arm → `unrun()` | **no such arm.** See below |
+| `Handle::service`, `Queued::Expired` arm → `unrun()` | `keylink/src/local.rs::turn`, the same `if expired` arm as row 3 |
+
+Rows 3 and 6 landing on one arm is the whole of `c8712b0`: the queue deadline was three
+hand-written comparisons across two dispatchers, two spelled `>` and one `>=`, and it is
+one `Queueing::expired` call in one place now. The divergence `middleware.rs` documents as
+wasm-visible is gone because neither path spells a comparison any more.
+
+`dispatched()` and `completed()` moved with it — both are in `keylink::turn`, and
+`completed()` is still a positive match on `Answered::Ran`, which is what keeps a fifth
+`Answered` state from silently settling a key. The plain non-actor service dispatch keeps
+its own pair in `macros.rs`, unchanged and outside this table's scope.
+
+### The two decode arms are gone, and nothing is owed in their place
+
+This is the one row where "moved" would be the wrong word, so it is worth being explicit:
+those arms existed because a keyed actor's mailbox carried **encoded bytes** and the loop
+decoded them *after* `serve_one` had claimed the key. A refusal or a panic there had
+therefore claimed a key for work that never ran, and had to say `unrun()`.
+
+The generated mailbox carries the method's **declared argument types**. There is no second
+decode, so there is no arm to refuse in, and `grep -rn 'unrun()' keylink/src/` returns one
+call and one comment about it. The one decode that can still fail is
+`frames.read_header::<WireRequest<Req>>()` at the top of `serve_one`, which runs **before**
+`claim_key` — so a malformed request claims nothing and there is no key to hand back.
+§16.7's *"The decode goes first, and the reason is the caller's next move"* is now true of
+the only decode there is.
+
+### What is unchanged
+
+The precedence — `COMPLETED`, `DISPATCHED`, `UNRUN`, `ENQUEUED`, nothing — the three-arm
+`Reached`, `Drop for Guard`, and the argument in §16.12 that `ENQUEUED` is a fact a later
+fact overrides rather than a settlement. §16.7's three named tests are still the guards, and
+the second of them is still the guard for the expiry arm's `unrun()`; it now covers both
+dispatch paths at once, because there is only one arm left for it to cover.
+
+Found by an adversarial review of Wave 1b, which read the table as the audit surface it
+claims to be and could not find four of its six rows.

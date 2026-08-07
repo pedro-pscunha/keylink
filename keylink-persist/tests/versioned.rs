@@ -9,8 +9,18 @@
 //! nothing else. These tests only ever match the loader's verdicts, always with
 //! `..`, which is exactly as legal on an ordinary variant — delete the three
 //! attributes and the whole suite stays green. The guard is where the boundary
-//! is: the `compile_fail,E0639` doctests on each variant in
+//! is: the `compile_fail` doctests on each variant in
 //! `keylink-persist/src/lib.rs`, because a doctest compiles as its own crate.
+//!
+//! Those fences carry **no error code**, and an earlier version of this comment
+//! said they carried `E0639`. They fail with it — `cannot create non-exhaustive
+//! variant using struct expression` — and it is named in prose there, because
+//! rustdoc does not check the code after `compile_fail` at all. So each fence
+//! asserts one thing: this does not compile. What keeps it from asserting that
+//! for the wrong reason — a rename making a variant vanish rather than the
+//! attribute holding — is **this file**, which names all three variants from
+//! outside the crate. Not the guard for the attribute, and the guard that the
+//! attribute's guard is testing the right names.
 //!
 //! Every snapshot is written and read through the real file adapter, and the
 //! two hostile inputs — an unframed file and a frame from the future — are put
