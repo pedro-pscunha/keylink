@@ -1471,7 +1471,7 @@ macro_rules! __keylink_service {
             /// own entry with it, so the id is free again and a lazy factory may
             /// serve the next message by building a fresh one.
             ///
-            /// # A peer whose reply is lost to a restart is told `NoSuchActor`
+            /// # A peer whose reply dies is told `NoSuchActor`, for every reason it can die
             ///
             /// **The one message a restart loses is a `#[defer]`red reply parked
             /// in the state, and on the keyed served path that loss reaches the
@@ -1482,12 +1482,25 @@ macro_rules! __keylink_service {
             /// that treats `NoSuchActor` as terminal, which is what the name
             /// tells it to do, stops retrying an actor that is coming back.
             ///
-            /// [`supervised`] does not have this: the local served path reads
-            /// the supervisor's decision and renders `Failed("restarting: ..")`.
-            /// The keyed one cannot, because the signal it would read is the
-            /// channel the section above says has no reader. Every *other*
-            /// message survives: a turn in flight is answered before the loop
-            /// breaks, and queued turns stay in the mailbox the supervisor owns.
+            /// **A restart is only one of the three ways that channel dies, and
+            /// this path renders all three the same.** The other two need no
+            /// supervisor at all: a handler that takes `reply.later()` and drops
+            /// the `Deferred` — sanctioned, and what its `#[must_use]` asks for —
+            /// and an actor that has genuinely ended. So a plain unsupervised
+            /// keyed actor says *there is nothing here* about a reply it dropped
+            /// while running.
+            ///
+            /// [`supervised`] does not have any of it: the local served path
+            /// separates the three, reading the supervisor's decision for
+            /// `Failed("restarting: ..")`, `is_running()` for
+            /// `Failed("dropped: ..")`, and keeping `NoSuchActor` for an actor
+            /// that is really gone. The keyed one cannot do the first, because
+            /// the signal it would read is the channel the section above says has
+            /// no reader; the other two want a mounted-vs-gone answer from the
+            /// registry and are a design rather than a line, so they are named
+            /// here rather than half-built. Every *other* message survives a
+            /// restart: a turn in flight is answered before the loop breaks, and
+            /// queued turns stay in the mailbox the supervisor owns.
             ///
             /// # Panics
             ///

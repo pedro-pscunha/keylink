@@ -79,6 +79,15 @@ pub enum RemoteError {
     /// Deliberately does NOT distinguish "never existed" from "was stopped".
     /// The caller's next action is the same either way, and telling them apart
     /// would leak that an id was once real.
+    ///
+    /// **Both of those are about the id, and that is the whole of what this
+    /// variant claims.** A call that reached a live actor and lost its answer is
+    /// not one of them: a handler may take a `#[defer]`red reply out of its turn
+    /// and drop it, which answers nobody while the actor goes on serving the
+    /// same connection. That reads as [`Failed`](Self::Failed) under a
+    /// `"dropped: "` prefix instead, because a peer told `NoSuchActor` is being
+    /// told to stop asking and it would be false. `local.rs`'s `deliver_to_local`
+    /// is where the three causes are separated.
     #[error("no actor is mounted as {id}")]
     NoSuchActor {
         /// The id that was addressed.
