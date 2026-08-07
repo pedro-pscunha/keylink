@@ -226,10 +226,14 @@ pub struct Mailbox<M> {
 /// generates do not rely on this at all; they settle inside [`run_loop`], where
 /// the ordering is stated and holds.
 ///
-/// It is load-bearing in exactly one generated case: a supervised keyed actor
-/// whose *factory* gives up before any incarnation exists settles through
-/// `supervise` rather than through a loop, and this is the second place that
-/// same fact is written.
+/// **Where it is load-bearing, corrected.** This said the one generated case was
+/// a supervised keyed actor whose *factory* gives up — which is wrong twice:
+/// `supervise` settles `Gone` explicitly on that path, so this is redundant
+/// there, and the case it *does* answer is an **aborted unsupervised keyed**
+/// actor, where `run_loop` owns the mailbox as a parameter and drops it before
+/// the state. `defer::an_aborted_keyed_actor_tells_a_peer_no_such_actor` and its
+/// expired-budget twin both record that breaking this line is what reddens them,
+/// while breaking the teardown door's own settle leaves them green.
 ///
 /// [`run_loop`]: crate::run_keyed
 impl<M> Drop for Mailbox<M> {
@@ -3038,25 +3042,44 @@ mod tests {
         }
     }
 
-    /// A loop that will not return, holding a [`Recorder`] on its own cell.
+    /// A loop that will not return, holding a [`Recorder`] on its own cell —
+    /// with the mailbox moved somewhere it **structurally** outlives the
+    /// recorder.
     ///
-    /// The recorder is a body local of the async block and the mailbox is its
-    /// capture, so a destroyed future drops the recorder **first** — before
-    /// `Mailbox`'s own `Drop` writes its floor. That is what makes this an
-    /// observer of what somebody *outside* the task published before asking for
-    /// the destruction, which is the ordering the two teardown doors keep.
+    /// The inner `async move` block captures the recorder and not the mailbox,
+    /// and the outer one owns the mailbox for the whole call. That is the shape
+    /// [`supervise`](crate::run_keyed_supervised) has: a supervisor's frame holds
+    /// the receiver across every incarnation, so the incarnation's state — and
+    /// every reply parked in it — dies while `Mailbox` is still very much alive.
+    /// What this records is therefore what somebody **outside** the task
+    /// published before asking for the destruction, and nothing else.
+    ///
+    /// **It used to be one block, and that was the defect in the guard.** With
+    /// the recorder and the mailbox in the same future, "the recorder drops
+    /// first" was a claim about generator drop order — the same reasoning
+    /// `local.rs`'s `abort` refuses as *a fact about rustc rather than about this
+    /// crate*. If it had ever flipped, `Mailbox`'s floor would have written
+    /// `Gone` before the recorder looked, and both tests below would have passed
+    /// with the settle they are about deleted.
     fn recording(
         entered: oneshot::Sender<()>,
         seen: &Arc<std::sync::Mutex<Vec<Standing>>>,
     ) -> Mounted<Bare> {
         let seen = Arc::clone(seen);
         mount(move |inbox: Mailbox<Bare>| async move {
-            let _recorder = Recorder {
+            // Owned out here, so it cannot be dropped before the inner future is.
+            let inbox = inbox;
+            let recorder = Recorder {
                 fate: inbox.fate(),
                 seen,
             };
-            let _ = entered.send(());
-            std::future::pending::<()>().await;
+            let incarnation = async move {
+                let _recorder = recorder;
+                let _ = entered.send(());
+                std::future::pending::<()>().await;
+            };
+            incarnation.await;
+            drop(inbox);
             Ended::Stopped
         })
     }

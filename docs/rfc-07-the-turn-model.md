@@ -3475,7 +3475,12 @@ They are corrected here rather than edited there, per this file's habit:
 ### 12.8 Every guard, and the break that proves it
 
 Each was watched red; each records the break and the exact output in its own doc
-comment.
+comment. **Every one of them replays**, which is not a claim this section could
+make at first: six recorded a literal the harness cannot find exactly once —
+usually because the record itself quotes it, so the count is two — and an
+unreplayable record is the one thing a record must not be. They are anchored on
+two lines now, and `.tmp/keyed-fate/replay-all.sh` runs the whole set: twenty
+breaks, twenty non-zero exits, no aborts.
 
 | guard | break |
 |---|---|
@@ -3493,6 +3498,10 @@ comment.
 | `defer::an_aborted_actor_tells_a_peer_no_such_actor` | `LocalActor::abort`'s settle → `Standing::Running` |
 | `defer::an_aborted_keyed_actor_tells_a_peer_no_such_actor` | `Mailbox`'s `Drop` → `Standing::Running` |
 | `defer::a_keyed_actor_destroyed_by_an_expired_budget_tells_a_peer_no_such_actor` | the same |
+| `supervision::a_peer_whose_factory_panicked_is_told_the_actor_is_gone` | `supervise`'s per-iteration floor disarmed before the factory call |
+| `supervision::a_peer_whose_feed_panicked_is_told_the_actor_is_gone` | `run_loop`'s floor disarmed before the loop |
+| `local::the_gone_answer_is_not_a_failed_and_carries_no_prefix` | `lost`'s `Gone` arm becomes a `Failed` |
+| `reply::the_four_prefixes_are_the_text_a_peer_matches_on` | `DROPPED` → `"lost: "` |
 
 **The ordering guard needs an in-drop observer, and that is a finding.** From
 outside the actor there is nothing to see: the whole teardown runs before any
@@ -3581,17 +3590,77 @@ name and a claim nothing checked.
   renders the other three and checks them. What no guard can cover is a `Failed`
   whose text came from a caller's own `Middleware`, which is exactly why naming
   the constants is the other half of the fix.
-- **The `dropped: ` sentence asserted a cause the arm cannot know.** It read "the
-  reply was taken out of the turn and never answered" — the sanctioned
-  `reply.later()` + `drop` — while its own comment conceded that a handler
-  panicking after `later()` arrives on the same arm, where that is false and the
-  panic message is lost. It reads "the reply left its turn and was never answered"
-  now, and `a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer`
-  is the served case that had never been asserted at all: the existing test for it
+- **The `dropped: ` sentence asserted a cause the arm cannot know — twice.** It
+  read "the reply was taken out of the turn and never answered", the sanctioned
+  `reply.later()` + `drop`. The first correction changed it to "the reply left its
+  turn and was never answered" and this section claimed the sentence had stopped
+  asserting a cause. **It had not.** That is the same claim in different words,
+  and it is false of a *third* producer this arm has: a handler that panics
+  **before** consuming the channel drops the `Reply` itself, inside the turn —
+  never a `Deferred`, and the reply never left. `turn_deferred` had named that
+  case since `#[defer]` landed, and
+  `a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer` is
+  precisely the guard the reword shipped alongside, exercising the case the reword
+  was false about.
+
+  It reads **"the actor is serving and this reply was never answered"** now, which
+  says nothing about where the reply died, because nothing at the point of death
+  can. The three producers are named in the code rather than summarised. The
+  served case had never been asserted at all before that guard: the existing test
   is a *local* call that checks `is_err()` on a `MailboxClosed` and never reaches
   `deliver_to_local`.
 
-### 12.11 Why this suite could not have caught it: one `multi_thread` in the whole tree
+### 12.11 The path with no settle, which was on the side this wave called correct
+
+Two panics reach no settle, because they reach no loop: a caller's `factory`,
+awaited by `supervise` with no guard, and a caller's `Feeds::poll_next`, polled by
+`next` inside a `poll_fn` with no guard — the mailbox turn has `catching` around
+it and the second input does not. Either unwinds the actor's whole task. Nothing
+publishes an ending and nothing settled the verdict, so the cell kept `Running`
+and a peer whose reply died in that unwind was told `dropped: `, *the actor is
+serving*, about an actor that would never answer again. The feed half reaches
+**unsupervised local** actors, which have no supervisor anywhere near them.
+
+**It was a regression, and that is why it is fixed here rather than filed.**
+`deliver_to_local` used to read `is_running()` beside the verdict; an unwind drops
+the `mpsc::Receiver`, and `Receiver::drop` closes the channel *before* it drains,
+so `is_closed()` was already true when the dying reply woke its peer and the old
+code fell through to `gone()`. Deleting the cross-check — correct on its own
+terms, since the converse of that implication was the defect this wave exists to
+fix — deleted the only thing covering an unwind. Reproduced by execution before
+anything was changed: both new guards fail on the pre-fix tree with
+`Remote(Failed("dropped: ..."))`.
+
+The remedy is a `Floor`: a guard that settles `Gone` unless the code it guards
+reached a verdict of its own. `run_loop` carries one, disarmed at the settle;
+`supervise` carries one **per iteration**, armed across the factory call and
+disarmed the moment the incarnation's own floor takes over. It rests on the
+language's drop order — reverse declaration, and a body's locals before the
+function's parameters — so a floor declared first in a body drops before `state`,
+`inbox` and `feeds`. That is a floor under an explicit settle, not the mechanism:
+on every path the loop reaches, the verdict is settled at the top of the teardown
+and the floor is disarmed.
+
+**Catching the two panics instead was considered and refused for this wave**, not
+omitted: `guarded` around `factory().await` and `catching` around
+`feeds.poll_next` would remove the unwind rather than floor it, and would turn
+both into a named `Ended` a caller could await — but that changes what a panicking
+factory and a panicking feed *mean* (`GaveUp`, and an ending, where today they
+vanish the task), which is a supervision-semantics decision with its own guards to
+write. The floor is correct under either and stays correct if they are caught
+later.
+
+**Two things fell out of building it, and both are recorded because they cost a
+guard.** A floor held for the whole of `supervise` fires on the normal give-up
+return too, writing the right answer a moment after the wrong one — which left two
+end-to-end guards green under the break they exist for. Hence per-iteration. And
+`LocalActor::abort`'s own settle became unreachable: no break of it can be made
+red, because the floor is strictly earlier in the same drop. **It is deleted.**
+`System::abort`'s and `drain`'s settles survive on a narrower claim than they were
+first documented with — they answer for a **hand-written** `mount` loop, which has
+no `run_loop` and therefore no floor, and their guards say so.
+
+### 12.12 Why this suite could not have caught it: one `multi_thread` in the whole tree
 
 `rg -n 'multi_thread|flavor' keylink/tests` returned exactly one hit before this
 wave, in `singleton.rs`. Every other test runs on a current-thread runtime, where

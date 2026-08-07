@@ -231,9 +231,11 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// discriminants; and `Life` is **48**, because its two payload-carrying
 /// variants need a tag of their own. Eight bytes, once, per **local** actor.
 ///
-/// The keyed column is untouched by supervision — an unsupervised keyed actor
-/// gets no `Life`, and a supervised one builds its own inside `mount`'s closure
-/// — and its **−3 is not Wave 9's**: it is Waves 4 through 8 measured against a
+/// The keyed column was untouched by supervision — an unsupervised keyed actor
+/// got no `Life`, and a supervised one built its own inside `mount`'s closure.
+/// (Past tense throughout this section: `Life` is **deleted**, and the paragraph
+/// below records what replaced it. The claim was true when it was measured and
+/// is history now.) Its **−3 is not Wave 9's**: it is Waves 4 through 8 against a
 /// figure last written down at Wave 3. Neither move was caught by anything,
 /// because both budgets are 2,048 and both paths have hundreds of bytes of
 /// headroom. That is the argument for re-measuring rather than for a tighter
@@ -291,7 +293,11 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// only one any phase built a *local* actor of — while the entire argument for the
 /// `Box::pin` at the local loop's await is an absolute ceiling (3,005 bytes without
 /// it against 1,597 with) that happens to sit between 1,861 and 2,048. The local
-/// path has **less** headroom than the keyed one, by 339 bytes now: a second
+/// path has **less** headroom than the keyed one, by 83 bytes now — 275 against
+/// 358, and the figure here read 339, which is the *cost* difference between the
+/// two paths rather than the headroom difference. Two subtractions with the same
+/// operands and different meanings, and the wrong one was written. What the local
+/// path pays for: a second
 /// channel, the `watch` that carries the ending, an `Arc<JoinHandle>` and the
 /// `finish` loop, against the registry entry and `HashMap` slot the keyed one pays
 /// for instead. So phase 4 builds bulky *local* actors and asserts the slope here too,
@@ -309,13 +315,40 @@ const BUDGET_PER_ACTOR: isize = 2048;
 ///
 /// It is raised anyway, and only to the extent that 2,029 under 2,048 is not a
 /// budget: nineteen bytes is inside the noise between one allocator and another,
-/// so a green run here would say nothing about the same code on a Linux CI. 2,304
-/// restores about the headroom this literal had at 1,861, and the keyed one stays
-/// at 2,048 with 358 bytes under it. What is **not** relaxed is the thing this
-/// budget cannot see and [`SLOPE_SLACK_OVER_A_KILOBYTE`] can: the slope is 13
-/// bytes over a kilobyte of declared message, flat as before, and no number in
-/// phase 4 or 5 moved.
-const BUDGET_PER_LOCAL_ACTOR: isize = 2304;
+/// so a green run here would say nothing about the same code on a Linux CI.
+///
+/// # It is `measured + slack`, and the slack is the thing to argue about
+///
+/// "Nineteen bytes is allocator noise" is an argument that re-licenses a raise
+/// every wave, which is how a ceiling stops biting. So the ceiling is not a
+/// number any more: it is **the measurement plus a slack named once**, and a wave
+/// that grows an idle actor has to argue with [`LOCAL_SLACK`] rather than with
+/// this literal. The slack is what an allocator may differ by between machines;
+/// it is not room to grow into.
+///
+/// It restores 275 bytes of headroom against the 187 this literal had at 1,861 —
+/// *more* than before, not "about the same", which the sentence here first
+/// claimed. The keyed one stays at 2,048 with 358 under it.
+///
+/// What is **not** relaxed is the thing this budget cannot see and
+/// [`SLOPE_SLACK_OVER_A_KILOBYTE`] can: the slope is 13 bytes over a kilobyte of
+/// declared message, flat as before, and no number in phase 4 or 5 moved.
+const BUDGET_PER_LOCAL_ACTOR: isize = LOCAL_MEASURED + LOCAL_SLACK;
+
+/// What a local idle actor measured on this machine, at `ledger::Mail`.
+///
+/// Moving this is the deliberate act. A wave that grows an idle actor edits a
+/// number that says *what it costs*, next to a slack that says *what an allocator
+/// may differ by* — rather than a single ceiling where the two are indistinguishable.
+const LOCAL_MEASURED: isize = 2_029;
+
+/// How far another allocator may land from [`LOCAL_MEASURED`].
+///
+/// Not room to grow into, and the reason this exists rather than being folded
+/// into one literal: the raise that introduced it was argued as "nineteen bytes
+/// is inside the noise", and that argument works exactly once before it becomes
+/// a licence. Named, it is the thing the next wave has to disagree with.
+const LOCAL_SLACK: isize = 275;
 
 /// How much an idle actor is allowed to cost **because of what the service
 /// declares**, over the whole kilobyte between `ledger::Mail` and `bulky::Mail`.
