@@ -26,6 +26,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -94,17 +95,70 @@ struct Journal {
     /// device `Gate::hold` uses further down this file, for the same reason
     /// written there: provably busy rather than probably busy.
     entered: Option<mpsc::UnboundedSender<u64>>,
+    /// Acquired inside the turn, after `entered` has fired and before the hold.
+    ///
+    /// `None` for every test that does not need one turn to wait for another. What
+    /// it buys is *overlap*: two turns can be held inside their handlers at the
+    /// same moment, which is a fact a channel can carry and a stopwatch cannot.
+    release: Option<Arc<Semaphore>>,
+    /// Counts handlers that are inside a turn at the same moment.
+    ///
+    /// `None` unless a test is about overlap. Shared between actors on purpose:
+    /// that is what makes it able to say "two of you were in there at once".
+    inside: Option<Arc<Inside>>,
+}
+
+/// How many handlers were inside a turn at the same moment, and the most there
+/// ever were.
+///
+/// The overlap proof, in the one form that discriminates in **both** directions
+/// and reads no clock: a peak of two says two turns ran at once, and a peak of one
+/// says none ever did. A test that asserts only the second is asserting something a
+/// broken counter also satisfies, which is why the concurrency half below asserts
+/// two on the same machinery the serial half asserts one on.
+#[derive(Default)]
+struct Inside {
+    live: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl Inside {
+    fn enter(&self) {
+        let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(live, Ordering::SeqCst);
+    }
+
+    fn leave(&self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
 }
 
 impl journal::Actor for Journal {
     async fn apply(&mut self, _cx: keylink::Caller<'_>, entry: u64, hold_ms: u64) -> u64 {
+        if let Some(inside) = &self.inside {
+            inside.enter();
+        }
         if let Some(entered) = &self.entered {
             let _ = entered.send(entry);
+        }
+        if let Some(release) = &self.release {
+            release
+                .acquire()
+                .await
+                .expect("the test never closes the semaphore")
+                .forget();
         }
         // The await point `abort` cancels at, and the reason `stop` and `abort`
         // leave the state in different shapes.
         tokio::time::sleep(Duration::from_millis(hold_ms)).await;
         self.applied.lock().expect("not poisoned").push(entry);
+        if let Some(inside) = &self.inside {
+            inside.leave();
+        }
         entry
     }
 
@@ -921,6 +975,8 @@ async fn shutdown_inside_its_budget_answers_the_turn_in_flight_and_the_one_queue
             journal::spawn(Journal {
                 applied: applied.clone(),
                 entered: Some(entered_tx),
+                release: None,
+                inside: None,
             }),
         )
         .expect("the id is free");
@@ -982,6 +1038,8 @@ async fn abort_destroys_the_message_in_flight() {
             journal::spawn(Journal {
                 applied: applied.clone(),
                 entered: None,
+                release: None,
+                inside: None,
             }),
         )
         .expect("the id is free");
@@ -1411,49 +1469,168 @@ async fn a_refused_mount_leaves_no_actor_holding_the_claim_it_was_built_around()
 // ─────────────────────────────────────────────────────────────── concurrency
 
 /// The actor bargain, both halves in one test: one actor is serial, and two
-/// actors are not. Made red by serialising dispatch behind one lock, or by
-/// handing each message to a fresh task.
+/// actors are not.
+///
+/// # This test used to read a stopwatch, and it flaked three times in one run
+///
+/// It measured two calls to two actors and asserted the pair took less than one
+/// and a half holds, then two calls to one actor and asserted they took at least
+/// two. The second is safe — load only makes it truer — and the first is the
+/// shape CONTRIBUTING.md forbids by name: *"a load spike is not a bug in your
+/// code."* Under a loaded machine, two genuinely concurrent 200 ms turns take
+/// longer than 300 ms of wall clock and the assertion fails on a correct tree.
+///
+/// Both halves are counted overlap now, and both get **stronger** under load
+/// rather than weaker. `Inside` records how many handlers were inside a turn at
+/// the same moment, and the two halves assert opposite peaks on the same counter:
+///
+/// - **concurrent**: two actors, each announcing its entry and then waiting on a
+///   semaphore nobody releases until *both* announcements have arrived. The peak is
+///   **2**. If dispatch were serialised anywhere the second announcement could
+///   never come, so the failure mode is the timeout guard rather than a wrong
+///   number.
+/// - **serial**: a third actor, two messages, the second provably in the *mailbox*
+///   before the first is let go — `System::status` reporting `busy` with
+///   `buffered == 1` is what makes "in the mailbox" observable rather than
+///   inferred. Both turns run, and the peak is **1**.
+///
+/// A peak of 1 on a counter just watched to reach 2 is a fact about the loop rather
+/// than about the instrument, and that pairing is the whole design here. The first
+/// version of this rewrite asserted the serial half with
+/// `entered.try_recv().is_err()` instead, and **that assertion was vacuous**:
+/// watched under `break-once.sh`, releasing the held turn before the check left the
+/// test green, because a scheduler hop is not a turn.
+///
+/// Made red by serialising dispatch behind one lock, or by handing each message to
+/// a fresh task. Watched, by sending the concurrent half's second call to the
+/// **first** actor's id: the second entry never arrives, and the timeout guard
+/// fails the test at 31 s instead of hanging.
 #[tokio::test]
 async fn different_actors_run_concurrently_while_one_actor_stays_serial() {
-    const HOLD_MS: u64 = 200;
-
     let fixture = start(mounted()).await;
+    let (entered_tx, mut entered) = mpsc::unbounded_channel();
+    // Nobody is let out of a turn until the test says so, and the test does not say
+    // so until it has watched every turn it is waiting for arrive.
+    let hold = Arc::new(Semaphore::new(0));
+    let together = Arc::new(Inside::default());
+    let alone = Arc::new(Inside::default());
+    let holder = |inside: &Arc<Inside>| Journal {
+        applied: Arc::new(Mutex::new(Vec::new())),
+        entered: Some(entered_tx.clone()),
+        release: Some(Arc::clone(&hold)),
+        inside: Some(Arc::clone(inside)),
+    };
     for name in ["a", "b"] {
         fixture
             .system
-            .mount(id(name), journal::spawn(Journal::default()))
+            .mount(id(name), journal::spawn(holder(&together)))
             .expect("the id is free");
     }
+    fixture
+        .system
+        .mount(id("c"), journal::spawn(holder(&alone)))
+        .expect("the id is free");
 
     let a = journal::at(&fixture.client, id("a"));
     let b = journal::at(&fixture.client, id("b"));
+    let c = journal::at(&fixture.client, id("c"));
 
-    let across = Instant::now();
-    let (first, second) = tokio::join!(a.apply(1, HOLD_MS), b.apply(1, HOLD_MS));
-    let across = across.elapsed();
-    first.unwrap();
-    second.unwrap();
+    // ── two actors overlap ───────────────────────────────────────────────────
+    let concurrent = async {
+        let (first, second) = tokio::join!(a.apply(1, 0), b.apply(1, 0));
+        first.expect("the first actor answers");
+        second.expect("the second actor answers");
+    };
+    let watching = async {
+        for _ in 0..2 {
+            // The second of these cannot arrive unless two handlers are inside
+            // their turns at once, because the first is still waiting on a permit
+            // nobody has added.
+            assert_eq!(
+                entered.recv().await,
+                Some(1),
+                "two actors must not queue behind each other"
+            );
+        }
+        assert_eq!(
+            together.peak(),
+            2,
+            "two handlers inside a turn at the same moment, counted"
+        );
+        hold.add_permits(2);
+    };
+    // The guard is generous by three orders of magnitude and asserts nothing about
+    // speed: it turns a serialised dispatch from a hang into a failure.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(concurrent, watching)
+    })
+    .await
+    .expect("two actors must not queue behind each other");
 
-    let within = Instant::now();
-    let (third, fourth) = tokio::join!(a.apply(2, HOLD_MS), a.apply(3, HOLD_MS));
-    let within = within.elapsed();
-    third.unwrap();
-    fourth.unwrap();
+    // ── one actor does not ───────────────────────────────────────────────────
+    let queued = async {
+        assert_eq!(
+            entered.recv().await,
+            Some(2),
+            "the message sent first is the turn that starts"
+        );
 
-    let hold = Duration::from_millis(HOLD_MS);
-    assert!(
-        across < hold * 3 / 2,
-        "two actors must not queue behind each other: {across:?} for two {hold:?} messages"
+        let behind = journal::at(&fixture.client, id("c"));
+        let sending = behind.apply(3, 0);
+        let checking = async {
+            // Waiting until the message is in the MAILBOX rather than somewhere on
+            // a QUIC stream. `buffered` is what makes that observable, and at the
+            // default depth of one it is exactly this call's message.
+            let held = loop {
+                let row = status_of(&fixture.system, &id("c"));
+                if row.buffered == 1 {
+                    break row;
+                }
+                tokio::task::yield_now().await;
+            };
+            assert!(
+                held.busy,
+                "the first turn is still inside its handler, so the actor is busy \
+                 while its next message waits"
+            );
+            hold.add_permits(2);
+            assert_eq!(
+                entered.recv().await,
+                Some(3),
+                "and the queued message gets its turn once the one ahead of it ends"
+            );
+        };
+        let (answered, ()) = tokio::join!(sending, checking);
+        answered.expect("the queued call answers");
+    };
+    let serial = async {
+        c.apply(2, 0).await.expect("the holding call answers");
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(serial, queued)
+    })
+    .await
+    .expect("a queued message must be handled once the turn ahead of it ends");
+
+    assert_eq!(
+        alone.peak(),
+        1,
+        "one actor handles its messages one at a time — on the counter that just \
+         reported 2 for two actors, which is what makes this 1 a fact about the \
+         loop rather than about the counter"
     );
-    assert!(
-        within >= hold * 2,
-        "one actor must handle its messages one at a time: {within:?} for two {hold:?} messages"
-    );
-
     // Serial, and therefore in order, with no lock anywhere in the handler.
-    assert_eq!(a.entries().await.unwrap(), vec![1, 2, 3]);
+    assert_eq!(c.entries().await.unwrap(), vec![2, 3]);
+    assert_eq!(a.entries().await.unwrap(), vec![1]);
+}
 
-    println!("across two actors {across:?}, within one actor {within:?} (hold {hold:?})");
+/// The one row a status assertion is about, by id.
+fn status_of(system: &journal::System, id: &ActorId) -> keylink::ActorStatus {
+    system
+        .status()
+        .into_iter()
+        .find(|row| &row.id == id)
+        .expect("the actor is mounted")
 }
 
 // ─────────────────────────────────────────────────────────────── the contract
@@ -2207,6 +2384,11 @@ keylink::service! {
 
     /// The count, read without a key, so reading it never settles one.
     rpc Touches() -> u64;
+
+    /// The actor's second input, so `busy` can be watched over a turn no mailbox
+    /// produced. Wave 3 made a feed item a turn; `ActorStatus::busy` has to agree,
+    /// and a flag maintained inside the mailbox's own receive would not.
+    feed Ticks(tick: u64);
 }
 
 struct Gate {
@@ -2219,6 +2401,12 @@ struct Gate {
     /// a `notify_one` arriving before `notified()` would hang this forever.
     release: Arc<Semaphore>,
     touches: u64,
+    /// Every turn this actor ran, in order: `Some(tick)` for a feed item and
+    /// `None` for a mailbox message. What a fairness assertion reads.
+    turns: mpsc::UnboundedSender<Option<u64>>,
+    /// Held before a feed turn returns, exactly as `release` is for `hold`, so a
+    /// test can look at an actor that is provably inside a FEED turn.
+    ticked: Arc<Semaphore>,
 }
 
 impl gate::Actor for Gate {
@@ -2234,11 +2422,24 @@ impl gate::Actor for Gate {
 
     async fn touch(&mut self, _cx: keylink::Caller<'_>) -> u64 {
         self.touches += 1;
+        let _ = self.turns.send(None);
         self.touches
     }
 
     async fn touches(&mut self, _cx: keylink::Caller<'_>) -> u64 {
         self.touches
+    }
+
+    /// The feed's handler, held on its own semaphore for `hold`'s reason: a test
+    /// that wants to look at an actor inside a feed turn needs that turn to still
+    /// be going on when it looks.
+    async fn on_ticks(&mut self, tick: u64) {
+        let _ = self.turns.send(Some(tick));
+        self.ticked
+            .acquire()
+            .await
+            .expect("the test never closes the semaphore")
+            .forget();
     }
 }
 
@@ -2288,7 +2489,15 @@ struct Gated {
     stamped: mpsc::UnboundedReceiver<Duration>,
     /// Lets `hold` return.
     release: Arc<Semaphore>,
-    _system: gate::System,
+    /// The near end of the `Ticks` feed. Held for the fixture's whole life, and
+    /// that is load-bearing rather than tidy: a feed that ENDS ends the actor.
+    ticks: mpsc::Sender<u64>,
+    /// Lets a feed turn return.
+    ticked: Arc<Semaphore>,
+    /// Every turn the actor ran, in order. `Some(tick)` is a feed turn.
+    turns: mpsc::UnboundedReceiver<Option<u64>>,
+    /// Read by the `status` tests, which is why it is not `_system`.
+    system: gate::System,
     _server: Server,
     _nodes: [Node; 2],
 }
@@ -2296,6 +2505,10 @@ struct Gated {
 async fn start_gated() -> Gated {
     gated_behind(QueueTimeout::after(BUDGET)).await
 }
+
+/// The depth `Gated` is built at unless a test says otherwise: the default, so
+/// every test that predates the knob still runs at one slot.
+const ONE_SLOT: usize = 1;
 
 /// The same, behind whichever bound is under test.
 ///
@@ -2305,12 +2518,26 @@ async fn start_gated() -> Gated {
 /// and simply reports nothing under `Timeout`, which stamps no deadline — the
 /// tests that read `stamped` are the ones that supply a `QueueTimeout`.
 async fn gated_behind(bound: impl Middleware<GateWire, gate::Response>) -> Gated {
+    gated_at_depth(bound, ONE_SLOT).await
+}
+
+/// The same, at a stated mailbox depth.
+///
+/// Only the saturation test needs more than one slot, and it needs the rest of
+/// this fixture unchanged — two real nodes, the same service, the same bound — so
+/// the depth is a parameter here rather than a second fixture drifting beside it.
+async fn gated_at_depth(bound: impl Middleware<GateWire, gate::Response>, depth: usize) -> Gated {
     let server = local_node().await;
     let client_node = local_node().await;
-    let system: gate::System = gate::System::builder(Eviction::Never).build();
+    let system: gate::System = gate::System::builder(Eviction::Never)
+        .mailbox_depth(NonZeroUsize::new(depth).expect("a mailbox depth is never zero"))
+        .build();
     let (entered_tx, entered) = mpsc::unbounded_channel();
     let (stamped_tx, stamped) = mpsc::unbounded_channel();
+    let (turns_tx, turns) = mpsc::unbounded_channel();
+    let (ticks, tick_rx) = mpsc::channel(16);
     let release = Arc::new(Semaphore::new(0));
+    let ticked = Arc::new(Semaphore::new(0));
     let running = Server::builder(&server)
         .service(
             gate::keyed_service(&system, Allowlist::anyone())
@@ -2331,11 +2558,20 @@ async fn gated_behind(bound: impl Middleware<GateWire, gate::Response>) -> Gated
     system
         .mount(
             id("gate"),
-            gate::spawn(Gate {
-                entered: entered_tx,
-                release: Arc::clone(&release),
-                touches: 0,
-            }),
+            // `spawn_wired` and not `spawn`: a service that declares a feed has to
+            // be handed one, which is the missing-argument the generated
+            // `ServableAsActor` check exists to produce.
+            gate::spawn_wired(
+                Gate {
+                    entered: entered_tx,
+                    release: Arc::clone(&release),
+                    touches: 0,
+                    turns: turns_tx,
+                    ticked: Arc::clone(&ticked),
+                },
+                Vec::new(),
+                gate::Feeds::new(ticking(tick_rx)),
+            ),
         )
         .expect("the id is free");
 
@@ -2344,10 +2580,294 @@ async fn gated_behind(bound: impl Middleware<GateWire, gate::Response>) -> Gated
         entered,
         stamped,
         release,
-        _system: system,
+        ticks,
+        ticked,
+        turns,
+        system,
         _server: running,
         _nodes: [server, client_node],
     }
+}
+
+/// A feed backed by a channel, so a test decides exactly what is queued and when.
+///
+/// `poll_fn` over `Receiver::poll_recv`, which is `tests/feeds.rs`'s helper — a
+/// plain `Stream` is all a feed wants, and nothing here names a keylink type.
+fn ticking(mut items: mpsc::Receiver<u64>) -> impl keylink::Stream<Item = u64> + Send + 'static {
+    n0_future::stream::poll_fn(move |cx| items.poll_recv(cx))
+}
+
+/// The one row the `gate` fixture's status assertions are about.
+///
+/// Takes the system rather than the fixture so a test can hold this borrow beside
+/// a `&mut` on one of the fixture's channels, which every test below needs.
+fn gate_status(system: &gate::System) -> keylink::ActorStatus {
+    let mut rows = system.status();
+    assert_eq!(rows.len(), 1, "the gate fixture mounts exactly one actor");
+    rows.remove(0)
+}
+
+/// Wait until no turn is running, and hand back that reading.
+///
+/// Bounded, so a `busy` that never clears fails the test instead of hanging it.
+/// Nothing here asserts how long anything took: the guard is three orders of
+/// magnitude out, and its expiry means the flag is stuck rather than slow.
+async fn until_idle(system: &gate::System) -> keylink::ActorStatus {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let row = gate_status(system);
+            if !row.busy {
+                return row;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a turn that has answered its caller must clear `busy`")
+}
+
+/// Wait until the mailbox holds `messages`, and hand back that reading.
+///
+/// The deterministic way to know a call is in the MAILBOX rather than somewhere on
+/// a QUIC stream, which is what every saturation assertion below rests on. Bounded
+/// for `until_idle`'s reason.
+async fn until_buffered(system: &gate::System, messages: usize) -> keylink::ActorStatus {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let row = gate_status(system);
+            if row.buffered == messages {
+                return row;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{messages} messages must reach the mailbox"))
+}
+
+// ───────────────────────────────────────────────────────── what is running now
+
+/// **`busy` is true during a turn and false between turns**, over two real nodes.
+///
+/// The signal this asserts did not exist before item 4d and could not be faked from
+/// what did: `last_seen` is stamped when a message is *routed*, and a mailbox's
+/// `capacity` is restored the moment the loop *receives* — before the handler is
+/// entered. Both say "busy" about an actor that has not started, and neither says
+/// anything at all about a turn that is still going.
+///
+/// Over the wire on purpose. The flag is set in `local.rs`'s one loop, and the keyed
+/// path reaches that loop through generated code and a mailbox the registry made, so
+/// an in-process assertion would leave the delivery path untested.
+///
+/// Made red by moving the flag into `Mailbox::recv` — which is where the design that
+/// asked for this put it — or by clearing it before the handler returns.
+#[tokio::test]
+async fn busy_is_true_during_a_turn_and_false_between_turns() {
+    let mut fixture = start_gated().await;
+    let client = &fixture.client;
+    let release = &fixture.release;
+    let system = &fixture.system;
+    let entered = &mut fixture.entered;
+
+    let before = gate_status(system);
+    assert!(!before.busy, "nothing has been called yet");
+    assert_eq!(before.buffered, 0);
+
+    let holding = async { gate::at(client, id("gate")).hold().await };
+    let watching = async {
+        entered.recv().await.expect("`hold` enters its turn");
+        let during = gate_status(system);
+        assert!(
+            during.busy,
+            "the handler is inside `hold`, so a turn is running"
+        );
+        assert_eq!(
+            during.buffered, 0,
+            "and the mailbox is empty: this message is IN the turn rather than \
+             waiting for one, which is the distinction `capacity` alone cannot make"
+        );
+        release.add_permits(1);
+    };
+    let (answered, ()) = tokio::join!(holding, watching);
+    answered.expect("the held call answers");
+
+    let after = until_idle(system).await;
+    assert_eq!(after.buffered, 0, "and nothing is left waiting");
+}
+
+/// **`busy` stays true across an `await` inside a turn.**
+///
+/// The claim that makes the flag worth having: a turn parked on I/O is a turn that
+/// is running. `Gate::hold` is parked on a semaphore for the whole of this test, so
+/// every reading below is taken while the handler is suspended at an `await` and has
+/// executed nothing since.
+///
+/// The reading is taken twice, and the second time with a message provably in the
+/// mailbox — which is what makes this more than "the flag we set is still set". A
+/// loop that had finished the turn would have taken that message: at the default
+/// depth of one, `buffered == 1` and `busy` together say the loop is neither at its
+/// receive nor between turns.
+#[tokio::test]
+async fn busy_stays_true_across_an_await_inside_a_turn() {
+    let mut fixture = start_gated().await;
+    let client = &fixture.client;
+    let release = &fixture.release;
+    let system = &fixture.system;
+    let entered = &mut fixture.entered;
+
+    let holding = async { gate::at(client, id("gate")).hold().await };
+    let queued = async { gate::at(client, id("gate")).touch().await };
+    let watching = async {
+        entered.recv().await.expect("`hold` enters its turn");
+        // Many chances for the actor's task to be polled again, none of which the
+        // handler can use: it is waiting on a permit nobody has added.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            gate_status(system).busy,
+            "a turn suspended at an await is still a turn"
+        );
+
+        let held = until_buffered(system, 1).await;
+        assert!(
+            held.busy,
+            "and it is still running with a message waiting behind it, which a \
+             loop between turns would already have taken"
+        );
+
+        release.add_permits(1);
+    };
+
+    let (first, second, ()) = tokio::join!(holding, queued, watching);
+    first.expect("the held call answers");
+    assert_eq!(second.expect("the queued call answers"), 1);
+    until_idle(system).await;
+}
+
+/// **`busy` is true during a feed turn as well as a mailbox turn.**
+///
+/// This is the criterion that decided where the flag lives. The design this
+/// implements put it inside `Mailbox::recv` — cleared on the way in, set on the way
+/// out — and a feed item never touches a mailbox, so that flag reads `false` through
+/// every feed turn. After Wave 3 it is worse than wrong: the receive is a
+/// synchronous poll the loop skips entirely on any iteration where the feed was
+/// ready first, so the flag would be *stale* rather than merely unset.
+///
+/// So it is maintained in `run_loop`, around the one dispatch both inputs go
+/// through, and this test is the difference between the two placements.
+#[tokio::test]
+async fn busy_is_true_during_a_feed_turn() {
+    let mut fixture = start_gated().await;
+    let system = &fixture.system;
+
+    fixture.ticks.send(7).await.expect("the feed accepts");
+    assert_eq!(
+        fixture.turns.recv().await,
+        Some(Some(7)),
+        "the feed item reaches the handler"
+    );
+
+    let during = gate_status(system);
+    assert!(during.busy, "a feed item is a turn, and it is running now");
+    assert_eq!(
+        during.buffered, 0,
+        "with no mailbox message involved anywhere: a feed does not consume a slot"
+    );
+
+    fixture.ticked.add_permits(1);
+    until_idle(&fixture.system).await;
+}
+
+/// **A saturated mailbox at depth > 1 still does not starve a feed.**
+///
+/// `tests/feeds.rs` pins the fairness rule at the default depth and says what it
+/// cannot reach: *"with `MAILBOX = 1` on a single-threaded test runtime, the loop
+/// takes the slot's message, runs the turn and polls again without yielding, so the
+/// parked sender has not been rescheduled and the mailbox is deterministically
+/// empty at the next poll."* A depth of three removes that limit — three messages
+/// are genuinely in the mailbox, and `buffered` says so before anything is released
+/// — so this is the saturated case that could not be built before item 4a.
+///
+/// The order is exact rather than statistical, because everything is loaded while
+/// the loop is held: `hold` is turn one and is a mailbox turn, so the loop's
+/// alternation gives the **feed** first refusal on turn two. A mailbox-first loop
+/// puts the tick last instead.
+///
+/// Red-tested by deleting the loop's alternation — `mail_first = true` in
+/// `keylink/src/local.rs` — which is `tests/feeds.rs`'s break for the same rule.
+/// Watched: the tick arrives fourth.
+#[tokio::test]
+async fn a_saturated_mailbox_at_depth_does_not_starve_a_feed() {
+    const SLOTS: usize = 3;
+
+    // A whole-call `Timeout` and not the fixture's default `QueueTimeout`: three
+    // messages are meant to sit in this mailbox for as long as the test needs, and
+    // a queue budget would refuse them for doing it.
+    let mut fixture = gated_at_depth(Timeout::after(Duration::from_secs(60)), SLOTS).await;
+    let client = &fixture.client;
+    let release = &fixture.release;
+    let ticks = &fixture.ticks;
+    let ticked = &fixture.ticked;
+    let system = &fixture.system;
+    let entered = &mut fixture.entered;
+    let turns = &mut fixture.turns;
+
+    let holding = async { gate::at(client, id("gate")).hold().await };
+    let saturating = async {
+        // Bound first: `gate::at` returns a borrowing handle, so the three
+        // futures have to outlive the temporaries they are built from.
+        let (first, second, third) = (
+            gate::at(client, id("gate")),
+            gate::at(client, id("gate")),
+            gate::at(client, id("gate")),
+        );
+        let (one, two, three) = tokio::join!(first.touch(), second.touch(), third.touch());
+        one.expect("answers");
+        two.expect("answers");
+        three.expect("answers");
+    };
+    let watching = async {
+        entered.recv().await.expect("`hold` enters its turn");
+
+        let full = until_buffered(system, SLOTS).await;
+        assert!(
+            full.busy,
+            "the actor is inside `hold` while its mailbox fills"
+        );
+        assert_eq!(
+            full.buffered, SLOTS,
+            "and the mailbox is FULL: three messages in three slots, which is the \
+             state a depth of one cannot hold still"
+        );
+
+        // Queued last and served first. The feed's item is not in the mailbox and
+        // consumed no slot to get here.
+        ticks.send(7).await.expect("the feed accepts");
+        ticked.add_permits(1);
+        release.add_permits(1);
+
+        let mut order = Vec::new();
+        for _ in 0..4 {
+            order.push(turns.recv().await.expect("four turns run"));
+        }
+        order
+    };
+
+    let (held, (), order) = tokio::join!(holding, saturating, watching);
+    held.expect("the held call answers");
+
+    assert_eq!(
+        order[0],
+        Some(7),
+        "the feed item must be taken BEFORE the three messages already queued: a \
+         saturated mailbox does not starve a feed. Order was {order:?}"
+    );
+    assert_eq!(
+        &order[1..],
+        &[None, None, None],
+        "and the three mailbox turns follow it"
+    );
 }
 
 /// A keyed handle to `gate`, under `key`.

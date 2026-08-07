@@ -191,8 +191,8 @@ mod watch;
 mod wire;
 
 pub use actor::{
-    deliver_to_actor, mount, Addressed, Eviction, KeyedService, Mailbox, MountError, Mounted,
-    Origin, System, SystemBuilder,
+    deliver_to_actor, mount, ActorStatus, Addressed, Eviction, KeyedService, Mailbox, MountError,
+    Mounted, Origin, System, SystemBuilder,
 };
 pub use admission::{Admission, Admittance, DynamicAdmission, Revocable, Revocation};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};

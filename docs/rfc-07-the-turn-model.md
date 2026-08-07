@@ -1485,3 +1485,307 @@ did and no longer does.
   generic `actor_with<A: Actor>` leaves `D` ambiguous even where exactly one type
   implements that service's `Actor`, because rustc will not pick an impl to resolve a
   type parameter. Documented on `open` rather than worked around.
+
+---
+
+## 7. Wave 4a and 4d — mailbox depth becomes a knob, and a registry can be asked what it is doing
+
+Two items, in this order because the second one's field list depends on the first one's
+answer: whether `ActorStatus` carries a buffered count at all depends on whether depth
+can exceed one.
+
+### 7.1 The knob is on the system, and that is what made it possible at all
+
+`MAILBOX = 1` was a constant in two places. The registry's is now
+`DEFAULT_MAILBOX_DEPTH`, the default behind
+`SystemBuilder::mailbox_depth(NonZeroUsize)`.
+
+**A builder method with a documented default, not a mandatory argument.** The
+`Eviction`/`Retention`/`Allowlist` family has no `Default` because a wrong choice there
+loses state or admits a stranger. Depth is latency against memory: a wrong value is
+slower or fatter, both visible and both recoverable, so forcing every call site to state
+one is friction with no matching hazard. `representability.rs`'s `HasNoDefault` probe is
+deliberately **not** extended to depth.
+
+**`NonZeroUsize` and not `usize`.** `mpsc::channel(0)` panics, and after this wave the
+channel is created per actor inside `Registry::entry` — so a zero would panic at the
+first *mount*, or inside a lazy factory on a serving node, one message after the builder
+that caused it returned. The type moves that from an untestable runtime panic to an
+argument nobody can write. Saturating a zero up to one would have been the silent
+fallback this crate refuses everywhere else.
+
+**The structural change is that `Mounted<M>` no longer holds a mailbox.** It held the
+sender and an already-built future, so the channel — and therefore the depth — was fixed
+by `mount()` before any registry saw the actor. A knob on `SystemBuilder` would have
+applied to nothing. `Mounted` now carries `FnOnce(Mailbox<M>) -> impl Future` and
+`Registry::entry` makes the channel, which is:
+
+- the **only** place a mailbox is created, so the depth reaches a lazily spawned actor as
+  well as a hand-mounted one — and a factory is a `Fn(&ActorId) -> Option<Mounted<M>>`
+  with no argument for a depth and no caller present to supply one, so a per-`spawn`
+  depth could not have covered the case a serving node builds by itself;
+- source-compatible: every existing call site compiles unchanged, generated code
+  included. `mount(|inbox: Mailbox| ..)` is the same line it was.
+
+The cost is a second transient `Box` per mount, on a path that already allocates a
+channel and a task. Nothing the registry *keeps* is boxed by it, and
+`tests/actor_memory.rs` shows the per-idle-actor figure unmoved.
+
+### 7.2 `unbounded` is refused permanently, and a full mailbox blocks
+
+An unbounded mailbox converts backpressure into memory growth: a latency problem becomes
+an OOM, at a moment nobody chose, in a process that had been reporting healthy. That is
+the inversion of failing loudly, so it is the one kameo feature rejected outright rather
+than deferred.
+
+The refusal is a compile-time probe, not a sentence.
+`representability.rs::no_mailbox_can_be_asked_to_be_unbounded` holds two, because the two
+ways it would arrive cannot see each other: a shadowing probe on the *names*
+(`unbounded`, `unbounded_mailbox`, `without_backpressure`), and a coerced function item
+pinning `mailbox_depth`'s parameter to `NonZeroUsize` — which is the shape the refusal
+would really arrive in, since nobody adds a method called `unbounded`, they widen the
+argument of the one that exists. Both were watched to fail:
+
+- an inherent `unbounded(&self) -> usize` on `SystemBuilder` →
+  `error[E0308]: expected NoSuchMethod, found usize`;
+- `mailbox_depth(mut self, depth: usize)` → `expected fn pointer ... found fn item`.
+
+What neither reaches is `tokio::sync::mpsc::unbounded_channel` called directly inside the
+crate. That is a claim about a foreign function and no probe on a local type can make it;
+`rg 'unbounded_channel' keylink/src keylink-persist/src` is the check, and its only matches
+are the two sentences of the probe's own documentation. The tests use unbounded channels
+for their own logs, which are not mailboxes.
+
+**A full mailbox blocks the sender. It never drops and never errors.**
+`registry.rs::a_full_mailbox_blocks_the_sender_and_never_loses_the_message` watches all
+three outcomes an overflow policy chooses between: the send has not returned while the
+mailbox is full, it returns `Ok` once a slot frees, and the actor counts both messages.
+Red-tested by moving the default from one to two, which makes the second send return at
+once.
+
+The one caller-visible exception is opt-in and is not the mailbox dropping anything: a
+`QueueTimeout` layer turns the wait into `RemoteError::TimedOut`, and a message refused
+that way provably never entered the mailbox, because the send future is dropped before a
+permit arrives.
+
+### 7.3 The 32-slot fact, measured — and the claim it corrects
+
+`tokio::sync::mpsc` allocates its first block of 32 slots eagerly, so the "latency versus
+memory" trade does not exist below 32. `tests/actor_memory.rs`'s depth phase measures it
+rather than reading tokio's source, because the table on `Mailbox` carried three figures
+about this allocator that were wrong for months under a sentence claiming they were
+measured. At two thousand idle keyed actors, `aarch64-apple-darwin`, 2026-08-07:
+
+| mailbox depth | bytes per idle actor |
+|---|---|
+| 1 (the default) | 1,424 |
+| 32 | 1,424 |
+| 1,024 | 1,424 |
+
+**Identical, not merely close — and the flatness goes further than the claim needed.**
+Issue #3 says the trade "only becomes true above 32". Measured, it does not become true
+at 1,024 either: later blocks are allocated when messages *arrive*, not when capacity is
+declared, so declaring a deep mailbox costs nothing at all until something fills it. The
+trade is about a mailbox that is **full**, not one that is deep. That correction is in
+the knob's own rustdoc.
+
+Two things this measurement needed to be honest:
+
+- The ids must not mention the depth. `depth/1024/1999` is two characters longer than
+  `depth/32/1999`, and that `String` size class showed up as 7 bytes per actor of
+  "mailbox cost" in the first run.
+- The phase was red-tested, because a measurement nobody has watched move is not a
+  measurement: leaking a `Vec::with_capacity(depth)` per mailbox inside `Registry::entry`
+  — the shape of the cost this phase exists to refuse — gives 1,425 / 1,456 / 2,448 and
+  fires the flatness assertion at depth 32.
+
+What is **not** measured: a mailbox actually holding more than 32 messages allocates a
+second block. Stated in the test's header as reasoning rather than as a measurement.
+
+### 7.4 The shutdown budget's meaning is depth-dependent, and that is a defect surface
+
+`shutdown(id, budget)` drains everything an actor has: at depth 1 that is at most one
+queued turn plus the one in flight, at depth `N` up to `N + 1`. A budget sized against
+the default therefore silently under-drains at any deeper setting — and an expired budget
+does not wait, it destroys the actor where it stands, which is 4b's detach defect
+arriving through the other door.
+
+`a_budget_sized_for_the_default_depth_under_drains_at_a_deeper_one` proves it with the
+same budget twice: at depth 1 the actor drains and reports `Ended::Stopped`; at depth 3
+the same budget covers two of four turns and it reports `Ended::Vanished` with two turns'
+work destroyed. Exact rather than sampled — the clock is paused, a turn is one `TURN`,
+and the budget is two and a half of them, so no assertion rests on which of two
+simultaneous timers fires first. Red-tested by making `Registry::entry` build every
+channel at the default depth: the deep system then reports `Stopped`.
+
+The relationship is documented at the builder method and not only here, which is what the
+item asked for.
+
+### 7.5 The local path keeps its constant, and issue #3's premise about it was wrong
+
+Item 4a's framing says the constant's argument "reasons from `max_concurrent_bidi_streams`
+— a bound that does not exist off the wire". That is true of `registry.rs`. It is **not**
+true of `local.rs`, which as of this tree already made the in-process argument in full:
+*"In-process there is no transport and no such bound — a caller can spawn ten thousand
+tasks that each send"*, and then refused to raise the number for a reason that is a
+hazard rather than a preference:
+
+> Raising it would let callers run ahead without feeling it, and would make a self-`tell`
+> succeed more often — which is worse, not better, because `Handle` documents self-calls
+> as a deadlock and the difference between "usually" and "always" is what makes a deadlock
+> a production incident instead of a test failure.
+
+So the local path is exactly the case with the matching hazard 4a says depth lacks: a
+`LocalActor` is addressed from whatever task holds the handle, *including its own turn*,
+and a deeper mailbox turns a documented always-deadlock into an intermittent one. An
+intermittent deadlock is not a slower program; it is a different program in production
+than in the tests. A keyed actor is addressed from another task — a QUIC stream's — so
+there the trade really is only latency against memory.
+
+The decision: **the knob is on the keyed path only.** `local.rs`'s constant keeps its
+value, is renamed `LOCAL_MAILBOX_DEPTH` so that `rg MAILBOX keylink/src` shows the pair
+and which of the two is a default, and gains the cross-reference saying why the asymmetry
+exists — so the next reader finds a decision rather than an oversight. If a case for a local knob arrives, it has to
+answer the self-call hazard first, and the answer is not a bigger number.
+
+### 7.6 4d — `System::status()`, and the signal `busy` needed
+
+```rust
+#[non_exhaustive]
+pub struct ActorStatus {
+    pub id: ActorId,
+    pub idle_for: Duration,
+    pub busy: bool,
+    pub buffered: usize,
+}
+impl<M> System<M> { pub fn status(&self) -> Vec<ActorStatus>; }
+```
+
+Shipped as sketched, including the two fields that are **not** there: no `incarnation`
+(nothing in the crate counts one — Wave 2 looked and deliberately added no counter), and
+no `queued`. `representability.rs::an_actor_status_claims_only_what_it_measures`
+destructures all four fields with no `..`, so a fifth is `E0027` at a doc comment
+recording those two refusals. Watched: adding a `queued: usize` **together with a value
+for it in `status()`** makes that probe the only error in the build, which is the one
+shape the field list alone can catch.
+
+`idle_for` is `now - last_seen` on the registry's own `n0_future::time` epoch — the same
+reading `Eviction::Idle` compares against, never `std::time`, which panics on
+`wasm32-unknown-unknown`. The test makes the two numbers agree at the boundary rather
+than merely exist: at 59 s of a 60 s policy `status` says 59 and the sweep leaves the
+actor alone; one second later the sweep takes it. It is *last routed*, not *last handled*
+— a message still in the mailbox has already reset it, exactly as it has for eviction.
+
+**`buffered`, and the name is the design.** `max_capacity() - capacity()` is exact for
+what the channel holds; the parked-sender count is not observable at all, because
+`Semaphore` does not expose its waiters. So the field is a documented **floor**, and the
+test asserts both halves: three messages in three slots read 3, and a fourth sender
+parked on a permit leaves it at 3.
+
+That test is also this wave's own vacuity story. Its first version asserted only "3 with
+three messages queued" — and deleting the subtraction in `status()`, so that `buffered`
+reported the channel's *capacity*, left it **green**, because a field reporting the depth
+says 3 too. The readings are now taken from zero and one message at a time, and the same
+break fails three tests. A guard that cannot tell the measurement from the constant is
+not a guard.
+
+### 7.7 Where the `busy` flag lives, and why not where the issue put it
+
+`busy` needed a signal that did not exist. `last_seen` is stamped on *route*, and
+`capacity()` is restored the moment the loop *receives* — before the handler is entered.
+Both say "busy" about an actor that has not started and neither says anything about a turn
+still going.
+
+Issue #3's answer: make `Mailbox<M>` a `#[doc(hidden)]` newtype with one `recv` that
+clears the flag on the way in and sets it on the way out. **Half of that is what shipped
+and half of it is a defect**, and the defect is the criterion two lines below it in the
+same item:
+
+1. **A feed item is a turn and it never touches the mailbox.** A flag maintained inside
+   the receive reads `false` through every feed turn, so "`busy` is true during a feed
+   turn as well as a mailbox turn" cannot hold.
+2. After Wave 3 the receive is `Inbox::poll_next`, a synchronous poll that the loop
+   **skips entirely** on any iteration where the feed was ready first. So the flag would
+   not merely be unset during a feed turn; it would hold whatever the last mailbox turn
+   left in it. Stale, not wrong.
+
+What shipped instead. `Mailbox<M>` **does** become a newtype, because something has to
+carry the flag from the registry (which makes the channel) to the loop (which knows when a
+turn starts) — and doing that through the mailbox costs the generated code nothing, while
+widening `mount`'s closure would have put the pairing in every expansion of `service!` in
+the world. That is the item's own rejected alternative, and rejecting it was right.
+
+But the flag is set and cleared in **`local.rs`'s `run_loop`**, around the one dispatch
+both inputs go through, reached by one defaulted method on Wave 3's private `Inbox` trait:
+
+```rust
+inbox.mark_busy(true);
+let ended = dispatch(mail, &mut state, &mut hooks).await;
+inbox.mark_busy(false);
+```
+
+`Inbox::mark_busy` defaults to nothing, so a `LocalActor` — which has no registry entry
+to report to — costs a no-op, and `Keyed<M>` forwards to the mailbox's flag. This keeps
+every property the item wanted: one place, in keylink's own code, not in generated code
+where two sites could drift. It adds the one the item's spelling could not have: both
+inputs, by construction, because there is one dispatch.
+
+Red-tested per arm, separately, because they are separately load-bearing: clearing the
+flag on the mail arm fails the two mailbox tests and leaves the feed test green, and
+clearing it on the feed arm fails only `busy_is_true_during_a_feed_turn`.
+
+**One honest limit, stated on `Mailbox` rather than left to be discovered.** `mount` is
+`#[doc(hidden)] pub`, so a loop can be written by hand — the tests in `registry.rs` and
+`tests/actors.rs` do exactly that, to build actors that will not drain — and such a loop
+reports no turns, so `busy` stays `false` for it. Every actor a `service!` produces runs
+the one loop. A flag set inside `recv` would have been *worse* here, not better: `recv`
+cannot see when the turn it handed out ended, so it would read `true` for an idle actor
+from its first message until its last.
+
+### 7.8 The tests, and one that got stronger by losing its stopwatch
+
+`tests/actors.rs::different_actors_run_concurrently_while_one_actor_stays_serial` asserted
+`across < hold * 3 / 2` on the wall clock and flaked three times in one run under
+concurrent load. CONTRIBUTING.md forbids exactly this: *"Do not assert on wall-clock
+time… a load spike is not a bug in your code."*
+
+Both halves are counted overlap now. `Inside` records how many handlers were inside a
+turn at the same moment and the most that ever were, and the two halves assert **opposite
+peaks on the same counter**: two actors reach a peak of 2, and a third actor handling two
+messages — the second provably in the mailbox, because `status` reports `busy` with
+`buffered == 1` — has a peak of 1. A peak of 1 on a counter just watched to reach 2 is a
+fact about the loop rather than about the instrument. Both halves get stronger under load,
+and a serialised dispatch fails the timeout guard instead of hanging.
+
+That pairing exists because the first rewrite was vacuous. It asserted the serial half
+with `entered.try_recv().is_err()`, and under `break-once.sh` — releasing the held turn
+before the check — it stayed **green**, because a scheduler hop is not a turn. Watched,
+retracted, replaced.
+
+The saturated-feed test is the other place depth bought a stronger claim than the tree
+could previously make. `tests/feeds.rs` says of the same rule at depth 1: *"the loop takes
+the slot's message, runs the turn and polls again without yielding, so the parked sender
+has not been rescheduled and the mailbox is deterministically empty at the next poll."* At
+depth 3, three messages are genuinely in the mailbox and `buffered` says so before
+anything is released, so `a_saturated_mailbox_at_depth_does_not_starve_a_feed` asserts an
+exact position: the feed's item is taken **before** the three messages queued ahead of it.
+Red-tested with the loop's alternation deleted, which puts the tick fourth.
+
+### 7.9 What Waves 4a and 4d did NOT do
+
+- **Give the local path a depth knob.** §7.5 is the argument, not an omission.
+- **Move the ALPN.** `keylink/Probe/d3fe34471921164e` is unchanged. Depth and status are
+  local: no request variant, no schema, nothing a peer can see. A `feed` was added to the
+  `gate` service inside `tests/actors.rs` and a feed is local too — it produces no wire
+  type — so no hash in `tests/protocol.rs` moved.
+- **Report the parked-sender count.** It is not observable. `buffered` says so in its own
+  documentation and the probe keeps a field from claiming otherwise.
+- **Measure a mailbox holding more than 32 messages.** §7.3.
+- **Sort `status()`.** The map is a `HashMap` and the order is arbitrary. Sorting a
+  diagnostic nobody asked to have sorted is a cost every caller pays for one caller.
+- **Sample all rows at one instant.** Each row is read as the iterator reaches it, so ten
+  rows are ten readings. `ActorStatus`'s documentation says so rather than pretending to a
+  snapshot; a consistent one would mean holding the write lock across every read.
+- **Give a keyed actor an `ended()` channel.** Still §5.7's gap, and still Wave 9's.
+- **Watch the `docs`, `features` or `wasm` gates fail on this diff.** They were run green;
+  no red was manufactured for them.

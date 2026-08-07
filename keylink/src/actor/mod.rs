@@ -97,5 +97,7 @@
 mod registry;
 mod remote;
 
-pub use registry::{mount, Eviction, Mailbox, MountError, Mounted, System, SystemBuilder};
+pub use registry::{
+    mount, ActorStatus, Eviction, Mailbox, MountError, Mounted, System, SystemBuilder,
+};
 pub use remote::{deliver_to_actor, Addressed, KeyedService, Origin};

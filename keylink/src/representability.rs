@@ -69,12 +69,13 @@
 #![cfg(test)]
 #![allow(dead_code, reason = "the proof is that this module compiles")]
 
+use std::num::NonZeroUsize;
 use std::ops::DerefMut;
 
 use crate::{
-    ActorId, Admission, Admittance, AdmittedPeer, Allowlist, BlobId, Caller, DynamicAdmission,
-    Ended, Eviction, FinishFut, IdempotencyKey, LocalActor, MailboxClosed, MountError, Observer,
-    Origin, ProvenPeer, Retention, TurnFut, TurnInfo,
+    ActorId, ActorStatus, Admission, Admittance, AdmittedPeer, Allowlist, BlobId, Caller,
+    DynamicAdmission, Ended, Eviction, FinishFut, IdempotencyKey, LocalActor, MailboxClosed,
+    MountError, Observer, Origin, ProvenPeer, Retention, TurnFut, TurnInfo,
 };
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
@@ -809,4 +810,87 @@ fn a_deferred_reply_is_send() {
     requires_send::<crate::Replied<u64>>();
     requires_send::<crate::Reply<u64>>();
     requires_send::<Parking>();
+}
+
+// ───────────────────────────────────── no mailbox can be asked to be unbounded
+
+/// The claim: **an unbounded mailbox is not sayable.** Not absent from the
+/// documentation — absent from the language of the API.
+///
+/// It is the one thing this project rejects outright rather than defers, because
+/// it inverts the invariant the rest of the design is built on: an unbounded queue
+/// turns backpressure into memory growth, so a latency problem becomes an OOM at a
+/// moment nobody chose, in a process that had been reporting healthy.
+///
+/// Two probes, because the two ways it would arrive cannot see each other.
+///
+/// **A second constructor**, caught by shadowing on the name. While
+/// `SystemBuilder` has no inherent method of these names each call resolves to the
+/// trait default and hands back the marker; add `pub fn unbounded(self) -> Self`
+/// and the inherent method outranks the trait, the marker is not what comes back,
+/// and this module stops compiling.
+///
+/// **A wider depth type**, caught by pinning the signature. The coerced function
+/// item below says `NonZeroUsize` and nothing else, so an `Option<usize>` whose
+/// `None` meant unbounded — or an `enum Depth { Bounded(..), Unbounded }` — is
+/// `E0308` at that line. This is the shape the refusal would actually arrive in:
+/// nobody adds a method called `unbounded`, they widen the argument of the one
+/// that already exists.
+///
+/// # What neither probe reaches, and it is worth naming
+///
+/// `tokio::sync::mpsc::unbounded_channel` called somewhere inside the crate. That
+/// is a claim about a foreign function, and this module's own header explains why
+/// no probe can make one: rustc will not reason negatively about another crate's
+/// API. The check is `rg 'unbounded_channel' keylink/src keylink-persist/src`,
+/// whose only two matches are this sentence and the one above it. The tests use
+/// unbounded channels for their own logs, which are not mailboxes and are not on
+/// this path.
+trait NoUnboundedMailbox {
+    fn unbounded(&self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn unbounded_mailbox(&self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+    fn without_backpressure(&self) -> NoSuchMethod {
+        NoSuchMethod
+    }
+}
+
+impl NoUnboundedMailbox for beta::SystemBuilder {}
+
+fn no_mailbox_can_be_asked_to_be_unbounded(builder: beta::SystemBuilder) -> beta::SystemBuilder {
+    let _: NoSuchMethod = builder.unbounded();
+    let _: NoSuchMethod = builder.unbounded_mailbox();
+    let _: NoSuchMethod = builder.without_backpressure();
+
+    let depth: fn(beta::SystemBuilder, NonZeroUsize) -> beta::SystemBuilder =
+        beta::SystemBuilder::mailbox_depth;
+    depth(builder, NonZeroUsize::MIN)
+}
+
+// ────────────────────────────── a status reports only what a registry can read
+
+/// The claim: [`ActorStatus`] has **exactly these four fields**, so a fifth is a
+/// decision somebody makes at this line rather than a field that appears.
+///
+/// A destructuring pattern with no `..`, which is `E0027` the moment a field is
+/// added — in keylink, at the doc comment that records which fields were refused
+/// and why: an `incarnation` that nothing in the crate counts, and a `queued` that
+/// would claim the parked senders [`ActorStatus::buffered`] documents itself as
+/// unable to see.
+///
+/// `#[non_exhaustive]` is what stops a *caller* writing this pattern, and it is
+/// also why the probe has to live inside the crate: outside, the same pattern is
+/// `E0638` on a clean tree, which is the wrong red for the right reason.
+fn an_actor_status_claims_only_what_it_measures(status: ActorStatus) -> (bool, usize) {
+    let ActorStatus {
+        id,
+        idle_for,
+        busy,
+        buffered,
+    } = status;
+    let _ = (id, idle_for);
+    (busy, buffered)
 }

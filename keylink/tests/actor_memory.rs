@@ -24,10 +24,41 @@
 //! between the two is what makes it a statement about keylink. Phase 3 does that
 //! for the keyed path and phase 4 for the local one, separately, because the box
 //! that holds the property is a different line of code on each.
+//!
+//! # The measured fact behind `SystemBuilder::mailbox_depth`, published here
+//!
+//! Phase 5 measures what a deeper mailbox costs while it is empty, which is the
+//! whole of that knob's "below 32 it is free" claim. On this machine
+//! (`aarch64-apple-darwin`, `2026-08-07`), at two thousand idle keyed actors of the
+//! `ledger` service below:
+//!
+//! | mailbox depth | bytes per idle actor |
+//! |---|---|
+//! | 1 (the default) | 1,424 |
+//! | 32 | 1,424 |
+//! | 1,024 | 1,424 |
+//!
+//! Flat — identical, not merely close — and flat further than the claim needed:
+//! `tokio::sync::mpsc` allocates its first block of 32 slots eagerly and every
+//! later block **when messages arrive**, so declaring a depth costs nothing at all
+//! until something fills it. If the eager allocation were `depth` slots instead of
+//! 32, the last row would be about 8 KiB per actor larger, and phase 5 asserts
+//! against that number rather than against a tolerance nobody can read.
+//!
+//! Red-tested by leaking a `Vec::with_capacity(depth)` per mailbox inside
+//! `Registry::entry`, which is the shape of the cost this phase exists to refuse:
+//! 1,425 / 1,456 / 2,448 bytes, and the flatness assertion fires at depth 32.
+//! Watched — a measurement nobody has seen move is not a measurement either.
+//!
+//! What that does *not* say: a mailbox actually holding more than 32 messages
+//! allocates a second block. The trade the knob's documentation names is about a
+//! **full** mailbox, not a deep one, and this test measures the empty case
+//! because that is the one every idle actor pays.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::alloc::{GlobalAlloc, Layout, System as Libc};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use keylink::{ActorId, Caller, Eviction};
@@ -413,6 +444,49 @@ async fn ten_thousand_idle_actors_fit_in_the_budget() {
         each_bulky_local - each_local
     );
 
+    // ── phase 5: what a deeper mailbox costs while it is empty ───────────────
+    //
+    // `SystemBuilder::mailbox_depth` documents a memory trade that does not
+    // begin until 32, and this is the measurement that sentence rests on rather
+    // than a reading of tokio's source. Three depths, all measured here at the
+    // same actor count so the comparison is between depths and nothing else.
+
+    let depths = [1usize, 32, 1_024];
+    let mut costs = Vec::with_capacity(depths.len());
+    // Kept alive until the end of the test: dropping a system tears down its
+    // actors on their own tasks, and a teardown running underneath the next
+    // baseline would be measured as the next system's savings.
+    let mut kept = Vec::with_capacity(depths.len());
+    for depth in depths {
+        let (each_at_depth, system) = keyed_at_depth(depth).await;
+        println!("a keyed idle actor at mailbox depth {depth} costs {each_at_depth} bytes");
+        costs.push(each_at_depth);
+        kept.push(system);
+    }
+
+    let flat = costs[0];
+    for (depth, cost) in depths.iter().zip(&costs) {
+        assert!(
+            (cost - flat).abs() <= ONE_POINTER,
+            "an idle mailbox at depth {depth} cost {cost} bytes against {flat} at \
+             depth 1. The first block of 32 slots is allocated eagerly and the rest \
+             are not, so an EMPTY mailbox costs the same at every depth — and \
+             `SystemBuilder::mailbox_depth`'s claim that depth is free below 32 is \
+             this number"
+        );
+    }
+    // The hypothesis this refutes by name, rather than by a tolerance: that the
+    // eager allocation is `depth` slots. It would put 8 KiB per actor between the
+    // first row and the last.
+    let capacity_shaped = (1_024 - 1) * std::mem::size_of::<*const ()>() as isize;
+    assert!(
+        costs[2] - flat < capacity_shaped / 2,
+        "at depth 1,024 an idle actor cost {} bytes against {flat} at depth 1. A \
+         mailbox that eagerly allocated its whole capacity would differ by about \
+         {capacity_shaped} bytes here",
+        costs[2]
+    );
+
     // Last, and the order is deliberate: the two slopes above are what make these
     // budgets statements about keylink, so a run that broke a slope should say so
     // rather than reporting whichever budget it happened to push over first.
@@ -435,6 +509,51 @@ async fn ten_thousand_idle_actors_fit_in_the_budget() {
          over the {BUDGET_PER_LOCAL_ACTOR} byte budget — the budget bounds keylink \
          only if it holds for a service nobody here wrote"
     );
+}
+
+/// One pointer of allocator rounding, which is the slack phase 5 allows between
+/// two depths that must cost the same.
+///
+/// The expected difference is exactly zero. It is not asserted as zero because
+/// these are deltas divided by an actor count, and one allocation landing in a
+/// different size class would make a true reading fail — while eight bytes is
+/// nowhere near the 256 a second block of slots would cost, let alone the 8 KiB a
+/// capacity-shaped allocation would.
+const ONE_POINTER: isize = 8;
+
+/// Two thousand, not ten: phase 5 compares three systems against each other rather
+/// than against a budget, and a per-actor difference of 256 bytes — one block of
+/// slots — is unmissable at this count. Ten thousand of each would triple the
+/// slowest test in the suite to sharpen a number that is already exact.
+const ACTORS_PER_DEPTH: usize = 2_000;
+
+/// The per-idle-actor cost of a keyed system at one mailbox depth, and the system,
+/// which the caller must keep alive — see phase 5.
+async fn keyed_at_depth(depth: usize) -> (isize, ledger::System) {
+    let system: ledger::System = ledger::System::builder(Eviction::Never)
+        .capacity(ACTORS_PER_DEPTH)
+        .mailbox_depth(NonZeroUsize::new(depth).expect("a mailbox depth is never zero"))
+        .build();
+    settle().await;
+
+    let before = LIVE.load(Ordering::Relaxed);
+    for n in 0..ACTORS_PER_DEPTH {
+        // The id must not mention the depth, and that is not tidiness: each system
+        // is its own map, so the same ids are free — and `depth/1024/1999` is two
+        // characters longer than `depth/32/1999`, which measured as 7 bytes per
+        // actor of "cost" that was a `String` size class rather than a mailbox.
+        system
+            .mount(
+                ActorId::new(format!("depth/{n}")).expect("a valid id"),
+                ledger::spawn(Empty),
+            )
+            .expect("every id is distinct");
+    }
+    settle().await;
+    let after = LIVE.load(Ordering::Relaxed);
+
+    assert_eq!(system.len(), ACTORS_PER_DEPTH);
+    ((after - before) / ACTORS_PER_DEPTH as isize, system)
 }
 
 /// Let every spawned task run until it parks.

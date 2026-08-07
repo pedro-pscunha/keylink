@@ -54,8 +54,9 @@ use std::collections::hash_map;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
@@ -65,26 +66,54 @@ use tokio::sync::mpsc;
 
 use crate::{ActorId, Ended};
 
-/// Messages that may wait ahead of the one being handled.
+/// Messages that may wait ahead of the one being handled, when nobody says.
 ///
-/// One, deliberately, and there is no overflow policy because there is no
-/// overflow to have a policy about.
+/// One, which is where this started as a constant and where it stays as a
+/// default: at one, every caller feels the actor's own pace immediately, and a
+/// default that hides an actor's pace from the caller who is waiting on it is the
+/// wrong one to inherit.
 ///
-/// A message occupies a QUIC stream from the moment it arrives until its reply
-/// is written, including the time it spends here. `max_concurrent_bidi_streams`
-/// is 100, so a peer cannot have more than 100 messages outstanding against this
-/// actor whatever this number is. The queue is bounded by the transport, and
-/// the 101st `open_bi` blocks ON THE CALLING MACHINE — which is where you want
-/// a slow actor to be felt.
+/// **What the number means, and every consequence of moving it, is on
+/// [`SystemBuilder::mailbox_depth`]** — one place, because this used to be two
+/// constants with two different arguments and only one of them was about the
+/// registry. There is no `unbounded`, here or there; that is stated at the
+/// builder because that is where somebody would go looking for it.
+const DEFAULT_MAILBOX_DEPTH: usize = 1;
+
+/// Whether a turn is running right now: one bit, shared by an actor's loop and
+/// its registry entry.
 ///
-/// Raising this does not raise the ceiling. It moves messages out of the
-/// transport, where the peer feels them, into a buffer where nobody does, and
-/// it adds that much latency to every message behind a slow one.
+/// An `Arc<AtomicBool>` behind a name, so that the pair cannot be assembled from
+/// two unrelated flags and so the invariant has one place to be written. The
+/// invariant is: **`local.rs`'s `run_loop` sets it on the way into a turn and
+/// clears it on the way out, for both of an actor's inputs, and nothing else
+/// writes it.** [`System::status`] reads it.
 ///
-/// Before changing this, read RFC-04 section 6. If the transport ever stops
-/// bounding in-flight calls, this whole argument dies and a real policy is
-/// needed.
-const MAILBOX: usize = 1;
+/// The loop and not [`Mailbox::recv`], which is where the design this implements
+/// first put it, and the reason is a feed. A feed item is a turn and it never
+/// touches the mailbox, so a flag maintained inside the receive reads *false*
+/// through every feed turn — and after Wave 3 the receive is a synchronous poll
+/// that the loop may skip entirely on any iteration where the feed was ready
+/// first, which leaves it stale rather than merely wrong. The loop is the one
+/// place that sees both inputs, and it is keylink's own code rather than
+/// generated code, which is the other half of what the design asked for.
+///
+/// `Relaxed` on both ends, for [`Entry::last_seen`]'s reason: this orders nothing
+/// but itself, and a status read is a diagnostic that may be one turn stale in
+/// exchange for costing an actor's hot path nothing.
+#[derive(Clone, Default)]
+pub(crate) struct Busy(Arc<AtomicBool>);
+
+impl Busy {
+    /// Called by the loop, on the way into and out of every turn.
+    pub(crate) fn set(&self, running: bool) {
+        self.0.store(running, Ordering::Relaxed);
+    }
+
+    fn running(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 // ──────────────────────────────────────────────────────────────── the mailbox
 
@@ -98,9 +127,10 @@ const MAILBOX: usize = 1;
 /// whatever `M` happens to be this month.
 ///
 /// A `tokio::sync::mpsc` channel allocates its first block of 32 slots eagerly,
-/// so a mailbox costs `32 * size_of::<M>()` whatever its capacity is, and the
-/// capacity is 1. At ten thousand idle actors, measured on this machine against
-/// a service with one `u64` argument — the smallest case there is:
+/// so a mailbox costs `32 * size_of::<M>()` whatever its capacity is — which is
+/// why [`SystemBuilder::mailbox_depth`] is free to move below 32 and measured to
+/// be. At ten thousand idle actors, measured on this machine against a service
+/// with one `u64` argument — the smallest case there is:
 ///
 /// | slot type  | per idle actor | ten thousand |
 /// |------------|----------------|--------------|
@@ -135,8 +165,61 @@ const MAILBOX: usize = 1;
 /// — it would allocate 83 MB to measure a subtraction. Saying which row is
 /// checked matters here: every figure in this table except the boxed one was
 /// wrong for months, under a sentence claiming the whole thing was measured.
+///
+/// # A struct, and it was a `pub type` alias
+///
+/// It carries two things now, and the second one is why it stopped being an
+/// alias: the slots, and the [`Busy`] flag [`System::status`] reads. The flag has
+/// to travel from the registry — which creates the channel — to the loop, which
+/// is the only thing that knows when a turn starts. Widening [`mount`]'s closure
+/// to take a second argument would have carried it just as well and put the
+/// pairing in **generated** code, one expansion per `service!` in the world, so
+/// that two sites could drift about which of them was authoritative. Through the
+/// mailbox it costs the generated code nothing: `mount(|inbox: Mailbox| ..)` is
+/// the same line it was.
+///
+/// # `recv` here does NOT touch that flag, and a hand-written loop is why
+///
+/// [`mount`] is `#[doc(hidden)] pub`, so a loop can be written by hand — the
+/// tests in this file, in `tests/api.rs` and in `tests/actors.rs` do exactly that,
+/// three of them to build an actor that will not drain. Such a loop never reports a
+/// turn, so
+/// [`ActorStatus::busy`] stays `false` for it. That is the honest answer rather
+/// than a flag `recv` sets: `recv` cannot see when the turn it handed out ended,
+/// so a flag set here would read `true` for an idle actor from its first message
+/// until its last. Every actor a `service!` produces runs `local.rs`'s one loop,
+/// which is where the flag is maintained.
 #[doc(hidden)]
-pub type Mailbox<M> = mpsc::Receiver<Box<M>>;
+pub struct Mailbox<M> {
+    slots: mpsc::Receiver<Box<M>>,
+    busy: Busy,
+}
+
+impl<M> Mailbox<M> {
+    /// The next message, or `None` once the registry has let go of the sender.
+    ///
+    /// `#[doc(hidden)] pub`, like [`mount`] itself, and for the same reason: a
+    /// hand-written loop outside this crate — every one of them a test — needs to
+    /// take its messages somehow.
+    #[doc(hidden)]
+    pub async fn recv(&mut self) -> Option<Box<M>> {
+        self.slots.recv().await
+    }
+
+    /// The same receive as a poll, which is what the one loop wants: it selects
+    /// against a feed without building a future over either input.
+    pub(crate) fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Box<M>>> {
+        self.slots.poll_recv(cx)
+    }
+
+    /// Report a turn starting or ending. See [`Busy`] for whose job this is.
+    pub(crate) fn mark_busy(&self, running: bool) {
+        self.busy.set(running);
+    }
+}
 
 /// An actor ready to run: its loop and the sender that reaches it.
 ///
@@ -173,6 +256,24 @@ pub type Mailbox<M> = mpsc::Receiver<Box<M>>;
 /// and it is transient: nothing the registry *keeps* is boxed by this, so the
 /// measured per-idle-actor cost above is untouched.
 ///
+/// # It holds the loop's *builder*, and it used to hold the mailbox too
+///
+/// [`mount`] made the channel, so the depth was fixed before any registry saw the
+/// actor — which is exactly why the depth could only ever be a constant. A knob
+/// on [`SystemBuilder`] would have applied to nothing: the closure has already
+/// taken its receiver by then, and a lazily spawned actor's channel is made
+/// inside `Registry::route`, where no caller is present to name anything.
+///
+/// So this carries `FnOnce(Mailbox<M>) -> impl Future` and the **registry** makes
+/// the channel, in `Registry::entry`, with its own depth. Every existing call
+/// site is unchanged — `spawn(state)` still hands back one of these and
+/// [`System::mount`] still takes it — and depth becomes a property of the system
+/// an actor is mounted in rather than of the line that built it. That is the
+/// right home for it twice over: it is the same decision for every actor a system
+/// serves, and a system is the only thing a lazy factory's actors have in common.
+///
+/// The second `Box` is the cost, one per mount, transient like the first.
+///
 /// `#[must_use]` on the **type** as well as on the generated `spawn`, because an
 /// attribute on one function covers one function. Dropping one of these drops an
 /// actor's state, and it can be produced by [`mount`], by a factory, or by any
@@ -183,34 +284,40 @@ pub type Mailbox<M> = mpsc::Receiver<Box<M>>;
 #[must_use = "an unmounted actor is dropped, and the state it was built around \
               goes with it"]
 pub struct Mounted<M> {
-    mail: mpsc::Sender<Box<M>>,
-    /// Polled for the first time by [`Registry::entry`]. Boxed because the
-    /// closure's future type is the caller's, and this struct is named in
-    /// public signatures where a second parameter for it would be noise.
-    run: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    /// Called once, by [`Registry::entry`], with the mailbox that registry made.
+    /// Boxed twice because both the closure and the future it returns are the
+    /// caller's own types, and this struct is named in public signatures where two
+    /// more parameters would be noise.
+    run: Loop<M>,
 }
+
+/// One actor's loop, before it has a mailbox to run against.
+///
+/// An alias because the type is written twice — here and in [`mount`] — and a
+/// nine-line type spelled twice is a place for the two to disagree.
+type Loop<M> = Box<dyn FnOnce(Mailbox<M>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 
 /// Hand-written for the same reason as [`System`]'s, and it was derived by
 /// mistake: `derive(Debug)` writes `impl<M: Debug> Debug`, which would make
-/// printing a handle depend on a message type nobody prints. The sender does not
-/// need it — its own `Debug` is unconditional — and the loop has none to borrow:
-/// a `dyn Future` cannot be printed, which is what `finish_non_exhaustive` says
-/// out loud rather than by inventing a placeholder for it.
+/// printing a handle depend on a message type nobody prints. There is nothing
+/// left inside to borrow a `Debug` from — a `dyn FnOnce` cannot be printed, and
+/// the sender this used to show belongs to the registry now — which is what
+/// `finish_non_exhaustive` says out loud rather than by inventing a placeholder.
 impl<M> fmt::Debug for Mounted<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Mounted")
-            .field("mail", &self.mail)
-            .finish_non_exhaustive()
+        f.debug_struct("Mounted").finish_non_exhaustive()
     }
 }
 
-/// Build one actor's mailbox and hold its loop until a registry accepts it.
+/// Hold one actor's loop until a registry accepts it and gives it a mailbox.
 ///
 /// Called by the generated `spawn`, which supplies the loop.
 ///
-/// **Nothing is spawned here.** The loop runs from [`System::mount`], or from the
-/// insert a lazy spawn makes, which is what makes a refused mount cost no task —
-/// see [`Mounted`] for the defect that argument comes from.
+/// **Nothing is spawned here, and nothing is allocated for a mailbox either.**
+/// The loop runs from [`System::mount`], or from the insert a lazy spawn makes,
+/// which is what makes a refused mount cost no task — see [`Mounted`] for the
+/// defect that argument comes from, and for why the channel is the registry's to
+/// make.
 ///
 /// # The mailbox must be named
 ///
@@ -233,14 +340,12 @@ impl<M> fmt::Debug for Mounted<M> {
 /// annotates the closure with its own `Mailbox` alias every time, which is why
 /// the break reaches no caller.
 #[doc(hidden)]
-pub fn mount<M, F>(run: impl FnOnce(Mailbox<M>) -> F) -> Mounted<M>
+pub fn mount<M, F>(run: impl FnOnce(Mailbox<M>) -> F + Send + 'static) -> Mounted<M>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let (mail, inbox) = mpsc::channel(MAILBOX);
     Mounted {
-        mail,
-        run: Box::pin(run(inbox)),
+        run: Box::new(move |inbox| Box::pin(run(inbox))),
     }
 }
 
@@ -395,12 +500,19 @@ struct Entry<M> {
     /// Milliseconds since the registry's epoch, as of the last message routed
     /// here. An atomic so that touching an actor stays on the read lock.
     last_seen: AtomicU64,
+    /// Whether this actor is inside a turn. Written by its loop, read by
+    /// [`System::status`] — see [`Busy`], which owns the invariant.
+    busy: Busy,
 }
 
 struct Registry<M> {
     entries: RwLock<HashMap<ActorId, Entry<M>>>,
     factory: Option<Factory<M>>,
     capacity: usize,
+    /// How many messages may wait ahead of the one being handled, for every
+    /// actor in this system. [`SystemBuilder::mailbox_depth`] is where it means
+    /// something.
+    mailbox_depth: usize,
     eviction: Eviction,
     /// `n0_future::time::Instant`, which is neither of the obvious two.
     ///
@@ -467,8 +579,12 @@ impl<M> Registry<M> {
                 let Some(mounted) = factory(id) else {
                     return Err(RouteError::NoSuchActor { id: id.clone() });
                 };
-                let found = mounted.mail.clone();
-                free.insert(self.entry(mounted));
+                // The sender comes out of the entry rather than out of the
+                // `Mounted`, because the mailbox is made here now — see
+                // [`Mounted`] for why the depth could not otherwise be a knob.
+                let entry = self.entry(mounted);
+                let found = entry.mail.clone();
+                free.insert(entry);
                 Ok(found)
             }
         }
@@ -484,10 +600,13 @@ impl<M> Registry<M> {
         Some(entry.mail.clone())
     }
 
-    /// Start the loop and pair the task with the sender that reaches it.
+    /// Make the mailbox, start the loop, and pair the task with the sender that
+    /// reaches it.
     ///
     /// **The only place an actor's task is spawned**, which is what lets
-    /// [`Mounted`] be refused for free.
+    /// [`Mounted`] be refused for free — and **the only place a mailbox is
+    /// created**, which is what lets [`SystemBuilder::mailbox_depth`] reach a
+    /// lazily spawned actor as well as a hand-mounted one.
     ///
     /// # Every caller inserts through a `VacantEntry`, and that is structural
     ///
@@ -508,10 +627,17 @@ impl<M> Registry<M> {
     ///
     /// Panics when called outside a tokio runtime, like every other spawn.
     fn entry(&self, mounted: Mounted<M>) -> Entry<M> {
+        let (mail, slots) = mpsc::channel(self.mailbox_depth);
+        let busy = Busy::default();
+        let inbox = Mailbox {
+            slots,
+            busy: busy.clone(),
+        };
         Entry {
-            mail: mounted.mail,
-            task: n0_future::task::spawn(mounted.run),
+            mail,
+            task: n0_future::task::spawn((mounted.run)(inbox)),
             last_seen: AtomicU64::new(self.now()),
+            busy,
         }
     }
 
@@ -677,6 +803,67 @@ async fn drain<M>(entry: Entry<M>, budget: Duration) -> Ended {
     }
 }
 
+// ─────────────────────────────────────────────────────────── what is running
+
+/// What one mounted actor is doing, as of the moment [`System::status`] looked.
+///
+/// Stale the instant it is returned — an actor takes its next message on another
+/// task — so it answers "what was going on" and never "what is guaranteed now".
+///
+/// `#[non_exhaustive]`: the registry builds these and a caller reads them, so a
+/// field arriving later must not be a breaking change. What is deliberately
+/// **not** here is as much of the design as what is:
+///
+/// - **no `incarnation`.** Nothing in the crate counts one — Wave 2 looked and
+///   added no counter — and inventing one to fill a field is how an observational
+///   number becomes a fact people route on. It belongs to the wave that makes
+///   re-incarnation a thing that happens.
+/// - **no `queued`.** The total backlog is not observable, and the field that
+///   claimed it is refused by name. [`Self::buffered`] is the part that can be
+///   measured, said as a floor.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ActorStatus {
+    /// The id this actor is mounted under.
+    pub id: ActorId,
+    /// How long since a message was last routed to this actor.
+    ///
+    /// The same clock and the same reading [`Eviction::Idle::after`] is compared
+    /// against — `n0_future::time`, so `tokio::time::pause` drives it natively and
+    /// a browser reads `performance.now()`. Never `std::time::Instant`, which
+    /// panics on `wasm32-unknown-unknown`.
+    ///
+    /// It is *last routed*, not *last handled*: a message sitting in the mailbox
+    /// has already reset this. That is what eviction means by idle, and a second
+    /// definition here would be a second answer to one question.
+    pub idle_for: Duration,
+    /// Whether a turn is running right now.
+    ///
+    /// True from the moment the loop takes a message or a feed item until that
+    /// turn's handler returns, including across every `await` inside it. A turn
+    /// that is parked on I/O is a turn that is running.
+    ///
+    /// `false` for an actor whose loop was written by hand around
+    /// [`mount`](crate::mount) rather than by `service!` — see
+    /// [`Mailbox`](crate::Mailbox). Every actor a service declares runs the
+    /// generated loop.
+    pub busy: bool,
+    /// Messages sitting in the mailbox.
+    ///
+    /// **A floor on the real backlog, not the backlog.** This is exactly
+    /// `max_capacity() - capacity()`, which is exact for what the channel is
+    /// *holding* — and callers parked waiting for a permit are not observable at
+    /// all, because `tokio`'s `Semaphore` does not expose its waiters. Four
+    /// hundred senders can be queued behind a `buffered` of 3.
+    ///
+    /// So: 0 or 1 at the default depth of one, at most
+    /// [`SystemBuilder::mailbox_depth`] at any other, and never a number to
+    /// compute a queue-length alert from. What it is good for is the question it
+    /// answers exactly — is this actor's mailbox full, and therefore is anybody
+    /// who sends to it going to block.
+    pub buffered: usize,
+}
+
 /// A registry of live actors: which ones exist, and for how long.
 ///
 /// Cheap to clone: every clone names the same registry.
@@ -766,6 +953,7 @@ impl<M> System<M> {
     pub fn builder(eviction: Eviction) -> SystemBuilder<M> {
         SystemBuilder {
             capacity: DEFAULT_CAPACITY,
+            mailbox_depth: DEFAULT_MAILBOX_DEPTH,
             eviction,
             factory: None,
         }
@@ -990,6 +1178,46 @@ impl<M> System<M> {
         self.len() == 0
     }
 
+    /// What every mounted actor is doing, as of now.
+    ///
+    /// One [`ActorStatus`] per live actor, in no particular order — the map is a
+    /// `HashMap` and sorting a diagnostic nobody asked to be sorted is a cost
+    /// every caller pays for one caller's benefit.
+    ///
+    /// Read under the read lock, so it does not stop an actor being addressed
+    /// while it runs; it does briefly stop one being mounted or unmounted. Each
+    /// row is sampled as the iterator reaches it, so a list of ten is ten readings
+    /// and not one instant — which is the honest shape for a fact about ten tasks
+    /// on other threads, and why [`ActorStatus`] says so out loud rather than
+    /// pretending to a snapshot.
+    ///
+    /// `contains`, `len` and `is_empty` answer three questions this answers as
+    /// well, and they stay: they take one lock and allocate nothing, which is what
+    /// a hot path wants.
+    #[must_use]
+    pub fn status(&self) -> Vec<ActorStatus> {
+        let now = self.inner.now();
+        self.inner
+            .read()
+            .iter()
+            .map(|(id, entry)| ActorStatus {
+                id: id.clone(),
+                idle_for: Duration::from_millis(
+                    now.saturating_sub(entry.last_seen.load(Ordering::Relaxed)),
+                ),
+                busy: entry.busy.running(),
+                // `saturating_sub` cannot fire: permits outstanding are bounded
+                // by the buffer they came from. It is written this way because a
+                // diagnostic must not be the thing that panics, and because the
+                // alternative is an `expect` on a path with nothing to say.
+                buffered: entry
+                    .mail
+                    .max_capacity()
+                    .saturating_sub(entry.mail.capacity()),
+            })
+            .collect()
+    }
+
     /// Evict every actor that has been idle past [`Eviction::Idle::after`], and
     /// destroy the ones that do not drain inside
     /// [`shutdown_budget`](Eviction::Idle::shutdown_budget).
@@ -1027,6 +1255,7 @@ impl<M> fmt::Debug for System<M> {
         f.debug_struct("System")
             .field("live", &self.len())
             .field("capacity", &self.inner.capacity)
+            .field("mailbox_depth", &self.inner.mailbox_depth)
             .field("eviction", &self.inner.eviction)
             .field("lazy_spawn", &self.inner.factory.is_some())
             .finish()
@@ -1039,6 +1268,7 @@ impl<M> fmt::Debug for System<M> {
 /// default for the same reason.
 pub struct SystemBuilder<M> {
     capacity: usize,
+    mailbox_depth: usize,
     eviction: Eviction,
     factory: Option<Factory<M>>,
 }
@@ -1095,6 +1325,108 @@ impl<M> SystemBuilder<M> {
         self
     }
 
+    /// How many messages may wait ahead of the one an actor is handling.
+    ///
+    /// **One when nobody says.** This is a tuning decision rather than a
+    /// correctness one, which is why it has a default at all while
+    /// [`Eviction`]/`Retention`/`Allowlist` do not: a wrong depth is slower or
+    /// fatter, and both are visible and recoverable. A wrong eviction policy loses
+    /// state and a wrong allowlist admits a stranger.
+    ///
+    /// # What the number means — and this doc names no recommended one
+    ///
+    /// Depth is **the boundary between backpressure the caller feels and
+    /// backpressure the actor absorbs.** At one, every caller waits for the actor
+    /// it is addressing, so a caller that measures its own latency has measured
+    /// the actor's. At `N`, the first `N` callers hand their message over and go on
+    /// as if the actor were fast; the `N + 1`th feels the whole queue at once.
+    ///
+    /// Nothing here recommends a value, deliberately. A number in a doc gets
+    /// copied into services it was never measured against; the trade above is the
+    /// thing to reason from. Two questions decide it: does anything downstream act
+    /// on how long this actor took, and how long is the longest turn.
+    ///
+    /// # A full mailbox BLOCKS the sender. It never drops and it never errors
+    ///
+    /// There is no overflow policy because there is no overflow: past the last
+    /// slot, `send` parks the sending task until the loop frees a permit. Nothing
+    /// in this crate calls `try_send`, and there is **no `unbounded` spelling —
+    /// permanently.** An unbounded mailbox converts backpressure into memory
+    /// growth: a latency problem becomes an OOM, at a moment nobody chose, in a
+    /// process that had been reporting healthy. That is the inversion of failing
+    /// loudly, so it is refused rather than deferred, and
+    /// `keylink/src/representability.rs` holds the probe that says it cannot be
+    /// asked for.
+    ///
+    /// One caller-visible exception, and it is opt-in and does not queue: a
+    /// [`QueueTimeout`](crate::QueueTimeout) layer turns the wait into
+    /// [`RemoteError::TimedOut`](crate::RemoteError::TimedOut) for a peer, and a
+    /// message refused that way provably never entered the mailbox — the send
+    /// future is dropped before a permit arrives. That is a deadline a service
+    /// asked for, not the mailbox dropping anything.
+    ///
+    /// # Below 32 there is no memory trade at all, and it is measured
+    ///
+    /// `tokio::sync::mpsc` allocates its first block of 32 slots eagerly, so an
+    /// idle mailbox costs the same at depth 1 as at depth 32 — and, measured,
+    /// the same at 1,024, because further blocks are allocated when messages
+    /// actually arrive rather than when capacity is declared. Below 32 the knob
+    /// buys latency for **free** and its whole cost is semantic: what the caller
+    /// stops feeling.
+    ///
+    /// `tests/actor_memory.rs`'s depth phase is that measurement, at ten thousand
+    /// idle actors, printing the per-actor cost at each depth. It is measured and
+    /// not asserted from the tokio source because this crate has been wrong about
+    /// this allocator's shape before — the table on [`Mailbox`](crate::Mailbox)
+    /// carried three wrong figures under a sentence claiming they were measured.
+    ///
+    /// What is **not** measured, and follows from the same block size: past 32
+    /// queued messages a real queue does allocate again. The trade in the heading
+    /// is about a mailbox that is *full*, not about one that is *deep*.
+    ///
+    /// # The shutdown budget's meaning moves with this, and under-draining is a defect
+    ///
+    /// [`System::shutdown`] and [`Eviction::Idle::shutdown_budget`] give an actor
+    /// one budget to finish **everything it has**: at depth 1 that is at most one
+    /// queued turn plus the one in flight, and at depth `N` it is up to `N + 1`. A
+    /// budget chosen against the default therefore silently under-drains at any
+    /// deeper setting, and an expired budget does not wait — it destroys the actor
+    /// where it stands, which is the detach defect the budget exists to remove
+    /// arriving by the other door.
+    ///
+    /// So raising this raises the budget you owe, by up to `N` turns. Nothing can
+    /// check that for you: the budget is a `Duration` and the queue is a count.
+    ///
+    /// # What you still cannot see, and it is the part that hurts
+    ///
+    /// The wait list behind the last slot is unbounded and **unobservable**.
+    /// [`ActorStatus::buffered`] reports what the channel is holding, exactly, and
+    /// there is no number anywhere for the senders parked behind it, because
+    /// `Semaphore` does not expose its waiters. A deeper mailbox does not shorten
+    /// that list; it moves the first `N` entries of it somewhere countable.
+    ///
+    /// # Why `NonZeroUsize`
+    ///
+    /// `mpsc::channel(0)` panics, and after this wave the channel is created per
+    /// actor in `Registry::entry` — so a zero would panic on the first *mount*,
+    /// or worse, inside a lazy factory on a serving node, one message after the
+    /// builder that caused it returned. The type moves that from a runtime panic
+    /// nobody can test for to an argument that cannot be written. Saturating a
+    /// zero up to one would be the silent fallback this crate refuses everywhere
+    /// else.
+    ///
+    /// # It is a property of the system, not of the actor
+    ///
+    /// Every actor in this system gets this depth, including one a lazy
+    /// [`spawn_with`](Self::spawn_with) factory builds — the factory is a `Fn` with
+    /// no argument for it and no caller present to supply one. Per-actor depths
+    /// would be a second construction path for a mailbox, and there is one.
+    #[must_use]
+    pub fn mailbox_depth(mut self, depth: NonZeroUsize) -> Self {
+        self.mailbox_depth = depth.get();
+        self
+    }
+
     /// Start the system, and the sweeper that enforces its eviction policy.
     ///
     /// # Panics
@@ -1111,6 +1443,7 @@ impl<M> SystemBuilder<M> {
                 entries: RwLock::new(HashMap::new()),
                 factory: self.factory,
                 capacity: self.capacity,
+                mailbox_depth: self.mailbox_depth,
                 eviction: self.eviction,
                 epoch: Instant::now(),
             }),
@@ -1126,6 +1459,7 @@ impl<M> fmt::Debug for SystemBuilder<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SystemBuilder")
             .field("capacity", &self.capacity)
+            .field("mailbox_depth", &self.mailbox_depth)
             .field("eviction", &self.eviction)
             .field("lazy_spawn", &self.factory.is_some())
             .finish()
@@ -1199,6 +1533,8 @@ mod tests {
 
     use std::sync::atomic::AtomicUsize;
 
+    use tokio::sync::oneshot;
+
     use super::*;
 
     /// The witness: `Send + 'static`, which [`SystemBuilder::build`] requires
@@ -1211,6 +1547,59 @@ mod tests {
     /// any message it carries.
     fn idler() -> Mounted<Bare> {
         mount(|mut inbox: Mailbox<Bare>| async move { while inbox.recv().await.is_some() {} })
+    }
+
+    /// An actor that takes nothing until its gate opens, then drains everything
+    /// and counts what it took.
+    ///
+    /// The device every depth test needs: while it is closed, the mailbox fills
+    /// deterministically, because the one thing that could empty it is not running
+    /// yet. Nothing here reads a clock.
+    fn gated(gate: oneshot::Receiver<()>, taken: &Arc<AtomicUsize>) -> Mounted<Bare> {
+        let taken = Arc::clone(taken);
+        mount(|mut inbox: Mailbox<Bare>| async move {
+            let _ = gate.await;
+            while inbox.recv().await.is_some() {
+                taken.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    }
+
+    /// One turn, for the tests that size a shutdown budget in turns.
+    const TURN: Duration = Duration::from_millis(100);
+
+    /// An actor whose every turn takes exactly one [`TURN`].
+    ///
+    /// `n0_future::time::sleep`, so a paused clock drives it and the budget
+    /// arithmetic below is exact rather than sampled.
+    fn slow(handled: &Arc<AtomicUsize>) -> Mounted<Bare> {
+        let handled = Arc::clone(handled);
+        mount(|mut inbox: Mailbox<Bare>| async move {
+            while inbox.recv().await.is_some() {
+                n0_future::time::sleep(TURN).await;
+                handled.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    }
+
+    /// A depth, for a test that means one.
+    fn depth(slots: usize) -> NonZeroUsize {
+        NonZeroUsize::new(slots).expect("a test never asks for a zero-slot mailbox")
+    }
+
+    /// Let every spawned task run until it parks, without letting the clock move:
+    /// a ready task keeps a paused runtime from auto-advancing to the next timer.
+    async fn settle() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The one row a single-actor test is about.
+    fn only(system: &System<Bare>) -> ActorStatus {
+        let mut rows = system.status();
+        assert_eq!(rows.len(), 1, "these tests mount exactly one actor");
+        rows.remove(0)
     }
 
     /// A policy for the tests that are about `after` and not about the budget.
@@ -1466,6 +1855,329 @@ mod tests {
             0,
             "a refused mount must start no task: a MountError hands nothing back, \
              so anything running by now is unreachable forever"
+        );
+    }
+
+    // ───────────────────────────────────────────────────── the mailbox's depth
+
+    /// **A full mailbox blocks the sender.** It does not drop the message and it
+    /// does not hand back an error.
+    ///
+    /// Those are the three things an overflow policy can do, and this watches all
+    /// three rather than asserting the one: the send has **not returned** while the
+    /// mailbox is full, so it is not a refusal; it returns **`Ok`** once a slot
+    /// frees, so nothing was dropped; and the actor counts **both** messages, so
+    /// nothing was lost between the two.
+    ///
+    /// Red-tested by moving [`DEFAULT_MAILBOX_DEPTH`] from one to two, through
+    /// `scripts/break-once.sh` on that constant's own line: with a second slot the
+    /// second send completes at once and the parked assertion fires. Watched.
+    ///
+    /// The break is described rather than pasted, and every red-test note in this
+    /// module is, for a mechanical reason worth knowing: `break-once.sh` requires
+    /// its literal to occur **exactly once** in the file it edits, and a doc
+    /// comment quoting the line it breaks is a second occurrence. Pasted commands
+    /// live in the files whose code is elsewhere.
+    #[tokio::test]
+    async fn a_full_mailbox_blocks_the_sender_and_never_loses_the_message() {
+        let (open, gate) = oneshot::channel();
+        let taken = Arc::new(AtomicUsize::new(0));
+        let system = System::builder(Eviction::Never).build();
+        let held = ActorId::new("held").expect("valid");
+        system
+            .mount(held.clone(), gated(gate, &taken))
+            .expect("free");
+
+        let mail = system.route(&held).expect("mounted");
+        assert_eq!(only(&system).buffered, 0, "nothing is waiting yet");
+        mail.send(Box::new(Bare))
+            .await
+            .expect("the one slot is free");
+
+        // Nowhere for a second message to go: one slot, one message in it, and the
+        // loop is not taking anything until the gate opens.
+        let (sent, mut second) = oneshot::channel();
+        let parked = mail.clone();
+        n0_future::task::spawn(async move {
+            let _ = sent.send(parked.send(Box::new(Bare)).await.is_ok());
+        });
+        settle().await;
+
+        assert!(
+            matches!(second.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "a send into a full mailbox must park. A return here is an overflow \
+             policy — a refusal or a drop — and there is deliberately none"
+        );
+        let full = only(&system);
+        assert_eq!(
+            full.buffered, 1,
+            "the default depth is one slot, and it is full"
+        );
+        assert!(!full.busy, "the loop is at its gate: no turn has started");
+        assert_eq!(taken.load(Ordering::SeqCst), 0);
+
+        let _ = open.send(());
+        assert!(
+            second.await.expect("the sending task reports"),
+            "the parked send must complete, and complete successfully: a full \
+             mailbox delays a message, and never refuses or drops one"
+        );
+
+        // Both messages, counted by the actor itself. `drop(mail)` first, because
+        // the loop ends when every sender is gone and this test holds one.
+        drop(mail);
+        assert!(matches!(
+            system.shutdown(&held, Duration::from_secs(60)).await,
+            Some(Ended::Stopped)
+        ));
+        assert_eq!(
+            taken.load(Ordering::SeqCst),
+            2,
+            "the blocked message was delivered, not dropped"
+        );
+    }
+
+    /// **`buffered` is exact for what the mailbox holds, and counts nobody parked
+    /// behind it.**
+    ///
+    /// Both halves at once, at a depth where the two can differ: three messages in
+    /// three slots is a `buffered` of 3, and a fourth sender parked on a permit
+    /// leaves it at 3. That is the floor the field's documentation claims, observed
+    /// — and the reason the field is not called `queued`, which at this moment
+    /// would be four.
+    ///
+    /// Red-tested by deleting the subtraction in [`System::status`], so that
+    /// `buffered` reports the channel's capacity instead of its contents. Watched:
+    /// this test, `a_full_mailbox_blocks_the_sender_and_never_loses_the_message` and
+    /// `status_reports_every_actor_with_the_idle_for_eviction_reads` all fail.
+    ///
+    /// **The first version of this test passed that break**, which is why the
+    /// zero-and-then-one-at-a-time readings above exist: it asserted only "3 with
+    /// three messages queued", and a field reporting the depth says 3 too. A guard
+    /// that cannot tell the measurement from the constant is not a guard, and this
+    /// one was watched to be vacuous before it was watched to fail.
+    #[tokio::test]
+    async fn buffered_is_exact_at_depth_and_counts_no_parked_sender() {
+        let (open, gate) = oneshot::channel();
+        let taken = Arc::new(AtomicUsize::new(0));
+        let system = System::builder(Eviction::Never)
+            .mailbox_depth(depth(3))
+            .build();
+        let held = ActorId::new("held").expect("valid");
+        system
+            .mount(held.clone(), gated(gate, &taken))
+            .expect("free");
+
+        let mail = system.route(&held).expect("mounted");
+        // Counted up one at a time, and from zero, because that is what makes this
+        // a count rather than a restatement of the depth. A `buffered` that simply
+        // reported `max_capacity()` would satisfy "3 at three messages" — measured:
+        // deleting the subtraction in `status` left this test passing until these
+        // intermediate readings were added.
+        assert_eq!(
+            only(&system).buffered,
+            0,
+            "an untouched mailbox holds nothing, whatever its depth"
+        );
+        for expected in 1..=3 {
+            mail.send(Box::new(Bare))
+                .await
+                .expect("three slots, three messages");
+            assert_eq!(
+                only(&system).buffered,
+                expected,
+                "each message is counted as it lands"
+            );
+        }
+
+        let (sent, mut fourth) = oneshot::channel();
+        let parked = mail.clone();
+        n0_future::task::spawn(async move {
+            let _ = sent.send(parked.send(Box::new(Bare)).await.is_ok());
+        });
+        settle().await;
+        assert!(
+            matches!(fourth.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "the fourth sender is parked on a permit"
+        );
+        assert_eq!(
+            only(&system).buffered,
+            3,
+            "and it is invisible: `buffered` is a FLOOR on the backlog, because \
+             tokio's Semaphore does not expose its waiters"
+        );
+
+        let _ = open.send(());
+        assert!(fourth.await.expect("the sending task reports"));
+        settle().await;
+        assert_eq!(
+            only(&system).buffered,
+            0,
+            "and it falls again as the loop drains: a count, in both directions"
+        );
+        drop(mail);
+        assert!(matches!(
+            system.shutdown(&held, Duration::from_secs(60)).await,
+            Some(Ended::Stopped)
+        ));
+        assert_eq!(taken.load(Ordering::SeqCst), 4);
+    }
+
+    /// **`status` reports every mounted actor, on the clock eviction reads.**
+    ///
+    /// The two numbers are made to agree at the boundary rather than merely both
+    /// exist: at 59 s of a 60 s policy `idle_for` says 59 and the sweep leaves the
+    /// actor alone; one second later the sweep takes it. An `idle_for` computed off
+    /// a second clock — `std::time`, which panics in a browser, or a per-status
+    /// `Instant` — would drift from the decision and this is where it would show.
+    ///
+    /// Routing is what resets it, which is what `idle_for` means: last *addressed*,
+    /// not last handled. A message still sitting in the mailbox has already reset
+    /// it, exactly as it has for eviction.
+    #[tokio::test(start_paused = true)]
+    async fn status_reports_every_actor_with_the_idle_for_eviction_reads() {
+        let system = System::builder(idle_after(Duration::from_secs(60))).build();
+        let one = ActorId::new("one").expect("valid");
+        let two = ActorId::new("two").expect("valid");
+        system.mount(one.clone(), idler()).expect("free");
+        system.mount(two.clone(), idler()).expect("free");
+
+        tokio::time::advance(Duration::from_secs(59)).await;
+        let rows = system.status();
+        assert_eq!(rows.len(), 2, "every mounted actor, not a sample");
+        for row in &rows {
+            assert_eq!(row.idle_for, Duration::from_secs(59));
+            assert!(!row.busy, "an idler is never in a turn");
+            assert_eq!(row.buffered, 0, "and nothing is waiting for it");
+        }
+        system.evict_idle().await;
+        assert_eq!(
+            system.len(),
+            2,
+            "59 s of a 60 s policy is not idle enough, which is the same number \
+             `status` just reported"
+        );
+
+        system.route(&one).expect("mounted");
+        let addressed = system
+            .status()
+            .into_iter()
+            .find(|row| row.id == one)
+            .expect("still mounted");
+        assert_eq!(
+            addressed.idle_for,
+            Duration::ZERO,
+            "routing resets it, because routing is what eviction counts from"
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        system.evict_idle().await;
+        assert!(system.contains(&one), "one second idle, of sixty");
+        assert!(
+            !system.contains(&two),
+            "and the actor `status` reported at 59 s is the one the next second took"
+        );
+    }
+
+    /// **The shutdown budget's meaning is depth-dependent**, and a budget sized
+    /// against the default silently under-drains at any deeper one.
+    ///
+    /// The same budget, the same actor, the same four-turn arithmetic, twice: at
+    /// depth 1 there is one queued turn plus one in flight and the budget covers
+    /// both, so the actor drains and reports [`Ended::Stopped`]. At depth 3 there
+    /// are three queued plus one in flight, the budget covers two of the four, and
+    /// the actor is **destroyed** with two turns' work thrown away — which is the
+    /// detach defect the budget exists to remove, arriving through the other door.
+    ///
+    /// Both numbers are exact rather than sampled: the clock is paused, a turn is
+    /// one `TURN`, and the budget is two and a half of them, so no assertion rests
+    /// on which of two simultaneous timers a runtime fires first.
+    ///
+    /// Red-tested by making [`Registry::entry`] build every channel at
+    /// [`DEFAULT_MAILBOX_DEPTH`] instead of the system's depth — the one literal in
+    /// its `mpsc::channel` argument, which is the whole of what the knob does.
+    /// Watched: `Some(Stopped)` where this asserts `Vanished`, because a deep system
+    /// whose mailboxes are shallow drains like a shallow one.
+    #[tokio::test(start_paused = true)]
+    async fn a_budget_sized_for_the_default_depth_under_drains_at_a_deeper_one() {
+        /// Queue everything one mailbox of `slots` can hold, plus the one in
+        /// flight, and shut down with `budget`.
+        async fn drain_at(slots: usize, budget: Duration) -> (Option<Ended>, usize) {
+            let handled = Arc::new(AtomicUsize::new(0));
+            let system = System::builder(Eviction::Never)
+                .mailbox_depth(depth(slots))
+                .build();
+            let id = ActorId::new("slow").expect("valid");
+            system.mount(id.clone(), slow(&handled)).expect("free");
+
+            let mail = system.route(&id).expect("mounted");
+            for _ in 0..=slots {
+                mail.send(Box::new(Bare))
+                    .await
+                    .expect("a slot, or the loop");
+            }
+            // The registry's is not the only sender while this test holds one, and
+            // a loop whose channel never closes cannot drain by any budget.
+            drop(mail);
+            let ended = system.shutdown(&id, budget).await;
+            (ended, handled.load(Ordering::SeqCst))
+        }
+
+        let budget = TURN * 5 / 2;
+
+        let (shallow, at_one) = drain_at(1, budget).await;
+        assert!(
+            matches!(shallow, Some(Ended::Stopped)),
+            "two turns inside two and a half: {shallow:?}"
+        );
+        assert_eq!(at_one, 2, "one queued plus one in flight, both answered");
+
+        let (deep, at_three) = drain_at(3, budget).await;
+        assert!(
+            matches!(deep, Some(Ended::Vanished)),
+            "four turns do not fit in two and a half, so the actor is destroyed \
+             rather than drained: {deep:?}"
+        );
+        assert_eq!(
+            at_three, 2,
+            "the same budget bought the same two turns — and at this depth two of \
+             the four queued turns went with the actor"
+        );
+    }
+
+    /// The depth is the **system's**, so it reaches an actor a factory built as
+    /// well as one a caller mounted, and the default is one.
+    ///
+    /// The lazy half is why the knob is here rather than on the generated `spawn`:
+    /// a factory is a `Fn(&ActorId) -> Option<Mounted<M>>` with no argument for a
+    /// depth and no caller present to supply one, so a per-`spawn` depth would have
+    /// covered every actor except the ones a serving node builds by itself.
+    #[tokio::test]
+    async fn the_mailbox_depth_is_the_systems_and_defaults_to_one() {
+        let by_default = System::builder(Eviction::Never).build();
+        let plain = ActorId::new("plain").expect("valid");
+        by_default.mount(plain.clone(), idler()).expect("free");
+        assert_eq!(
+            by_default.route(&plain).expect("mounted").max_capacity(),
+            1,
+            "the documented default: one message may wait ahead of the one being \
+             handled"
+        );
+
+        let deeper = System::builder(Eviction::Never)
+            .mailbox_depth(depth(4))
+            .spawn_with(|_| Some(idler()))
+            .build();
+        let by_hand = ActorId::new("by-hand").expect("valid");
+        deeper.mount(by_hand.clone(), idler()).expect("free");
+        assert_eq!(deeper.route(&by_hand).expect("mounted").max_capacity(), 4);
+        assert_eq!(
+            deeper
+                .route(&ActorId::new("lazily").expect("valid"))
+                .expect("the factory builds it")
+                .max_capacity(),
+            4,
+            "including an actor nobody mounted by hand"
         );
     }
 }

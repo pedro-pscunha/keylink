@@ -187,7 +187,31 @@ use crate::{
 /// [`Handle`](crate::LocalActor) documents self-calls as a deadlock and the
 /// difference between "usually" and "always" is what makes a deadlock a
 /// production incident instead of a test failure.
-const MAILBOX: usize = 1;
+///
+/// # A constant where the keyed one is a knob, and the name says which
+///
+/// `DEFAULT_MAILBOX_DEPTH` in `registry.rs` is a default and this is a value:
+/// nothing overrides it, and the paragraphs below are why.
+///
+/// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth) makes the
+/// registry's depth a builder method. This one stays fixed, and the asymmetry is
+/// the paragraph above rather than an oversight: on this path, depth has the
+/// "matching hazard" the keyed one lacks. A keyed actor is addressed from another
+/// task — a QUIC stream's — so a deeper mailbox trades latency for a longer queue
+/// and nothing else. A `LocalActor` is addressed from *whatever task holds the
+/// handle*, including its own turn, and there a deeper mailbox turns a documented
+/// always-deadlock into an intermittent one. An intermittent deadlock is not a
+/// slower program; it is a different program in production than in the tests.
+///
+/// The other half of the argument above stands too, and it is now measurable
+/// elsewhere: the parked-sender list has no length anybody can read on **either**
+/// path. What the keyed path gained is
+/// [`ActorStatus::buffered`](crate::ActorStatus::buffered), which reports what
+/// the channel holds and says in its own documentation that it is a floor.
+///
+/// If a case for a local knob ever arrives, it needs to answer the self-call
+/// hazard first, and the answer is not a bigger number.
+const LOCAL_MAILBOX_DEPTH: usize = 1;
 
 /// The observers an actor lends to one turn.
 ///
@@ -1173,6 +1197,19 @@ trait Inbox<A, M>: Send {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Message<A, M>>>;
+
+    /// A turn is starting, or the one that was running has ended.
+    ///
+    /// Called by [`run_loop`] around **every** dispatch, for either input, which
+    /// is the whole reason it is here rather than inside a receive: a feed item is
+    /// a turn and it never comes through a mailbox. `keylink::Busy` carries the
+    /// rest of that argument.
+    ///
+    /// Defaulted to nothing, because a [`LocalActor`] has nowhere to report it to.
+    /// Its caller holds a handle and can ask that; there is no registry entry
+    /// keeping a flag beside it, and inventing one would be a second lifecycle
+    /// fact about an actor whose reason for existing is that it has no registry.
+    fn mark_busy(&self, _running: bool) {}
 }
 
 /// A [`LocalActor`]'s mailbox, which carries reads and the stop request too.
@@ -1210,6 +1247,12 @@ impl<A: Send, M: Send> Inbox<A, M> for Keyed<M> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Message<A, M>>> {
         self.0.poll_recv(cx).map(|mail| mail.map(Message::Mail))
+    }
+
+    /// The mailbox is what the registry kept a handle on, so it is the way back to
+    /// the entry [`System::status`](crate::System::status) reads.
+    fn mark_busy(&self, running: bool) {
+        self.0.mark_busy(running);
     }
 }
 
@@ -1400,7 +1443,14 @@ where
 
         match taken {
             Taken::Mail(Some(Message::Mail(mail))) => {
-                if let Some(end) = dispatch(mail, &mut state, &mut hooks).await {
+                // The two lines around this await are the whole of
+                // `ActorStatus::busy`, and they are here — in the one loop, at the
+                // one dispatch — rather than inside the receive, so that a feed
+                // turn and a mailbox turn cannot disagree about what a turn is.
+                inbox.mark_busy(true);
+                let ended = dispatch(mail, &mut state, &mut hooks).await;
+                inbox.mark_busy(false);
+                if let Some(end) = ended {
                     reason = end;
                     break;
                 }
@@ -1413,7 +1463,10 @@ where
             // being dropped and for a keyed actor is the registry unmounting it.
             Taken::Mail(None) => break,
             Taken::Fed(Fed::Item(item)) => {
-                if let Some(end) = dispatch(item, &mut state, &mut hooks).await {
+                inbox.mark_busy(true);
+                let ended = dispatch(item, &mut state, &mut hooks).await;
+                inbox.mark_busy(false);
+                if let Some(end) = ended {
                     reason = end;
                     break;
                 }
@@ -1595,7 +1648,7 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
         // message. `Mailbox` in `registry.rs` boxes for the same reason and
         // carries the measured table; this end had no box at all, because the
         // closure it used to carry made one by accident.
-        let (mail, inbox) = mpsc::channel::<Message<A, M>>(MAILBOX);
+        let (mail, inbox) = mpsc::channel::<Message<A, M>>(LOCAL_MAILBOX_DEPTH);
         let (ended, watching) = watch::channel::<Option<Ended>>(None);
         let task = n0_future::task::spawn(async move {
             // Everything that happens to the state, its observers and its two
