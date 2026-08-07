@@ -32,10 +32,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use keylink::{
-    ActorId, Addressed, Allowlist, Body, BodyReader, Context, Error, Eviction, IdempotencyKey,
-    IdempotencyRefusal, Middleware, MountError, Next, Node, Outcome, QueueTimeout, RemoteError,
-    RpcClient, Server, Timeout,
+    ActorId, Addressed, Allowlist, Body, BodyReader, Context, Ended, Error, Eviction,
+    IdempotencyKey, IdempotencyRefusal, Middleware, MountError, Next, Node, Outcome, QueueTimeout,
+    RemoteError, RpcClient, Server, Timeout,
 };
+// The port and its file adapter, for the one thing a counter cannot show: what a
+// detached actor is still HOLDING. `Claim` is deliberately not in scope — nothing
+// here loads or stores, and `mise run framing` is what keeps that honest.
+use keylink_persist::{file::Files, Snapshots, StateId};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
 // ────────────────────────────────────────────────────────────── two services
@@ -322,7 +326,11 @@ async fn a_stopped_actor_is_indistinguishable_from_one_that_never_existed() {
         .system
         .mount(id("was/real"), journal::spawn(Journal::default()))
         .expect("the id is free");
-    assert!(fixture.system.stop(&id("was/real")).await);
+    assert!(fixture
+        .system
+        .shutdown(&id("was/real"), Duration::from_secs(5))
+        .await
+        .is_some());
 
     let stopped = journal::at(&fixture.client, id("was/real"))
         .apply(1, 0)
@@ -752,8 +760,14 @@ async fn lazy_spawn_stops_at_the_capacity() {
 /// touches, which is a race this test cannot win under load and did not.
 #[tokio::test]
 async fn an_idle_actor_is_evicted_without_anyone_asking() {
-    let fixture =
-        start(journal::System::builder(Eviction::Idle(Duration::from_millis(60))).build()).await;
+    let fixture = start(
+        journal::System::builder(Eviction::Idle {
+            after: Duration::from_millis(60),
+            shutdown_budget: Duration::from_secs(5),
+        })
+        .build(),
+    )
+    .await;
     fixture
         .system
         .mount(id("idle"), journal::spawn(Journal::default()))
@@ -769,18 +783,42 @@ async fn an_idle_actor_is_evicted_without_anyone_asking() {
     );
 }
 
-/// Eviction is `stop`, not `abort`: the actor is not cut off mid-turn, and its
-/// caller gets an answer rather than a severed stream.
+/// Eviction is `shutdown`, not `abort`: the actor is not cut off mid-turn, and
+/// its caller gets an answer rather than a severed stream.
+///
+/// # What the two numbers mean, because this test changed shape with the budget
+///
+/// It was `Eviction::Idle(30ms)` against a 250 ms turn, under the name
+/// `eviction_never_cuts_off_a_message_in_flight`. "Never" was true, and it was
+/// true for the wrong reason: the sweeper dropped the entry and **detached** the
+/// task, so nothing could have cut the turn off because nothing was waiting for
+/// it. The turn finished on an actor that no longer existed as far as the system
+/// was concerned, and if it had never finished, nothing would ever have noticed.
+///
+/// With a budget the two numbers are independent and both are deliberate. `after`
+/// stays 30 ms: the actor is stale almost at once, which is what puts the
+/// eviction inside the turn. `shutdown_budget` is five seconds, comfortably more
+/// than the 250 ms the turn holds, and **that** is what buys the answer. The name
+/// says `inside_its_shutdown_budget` because that is the condition; the converse
+/// — a turn that outlives the budget being destroyed — is
+/// `an_eviction_whose_budget_expires_destroys_the_actor` below, and the two
+/// together are the whole of what an eviction budget means.
 #[tokio::test]
-async fn eviction_never_cuts_off_a_message_in_flight() {
-    let fixture =
-        start(journal::System::builder(Eviction::Idle(Duration::from_millis(30))).build()).await;
+async fn eviction_inside_its_shutdown_budget_does_not_cut_off_a_message_in_flight() {
+    let fixture = start(
+        journal::System::builder(Eviction::Idle {
+            after: Duration::from_millis(30),
+            shutdown_budget: Duration::from_secs(5),
+        })
+        .build(),
+    )
+    .await;
     fixture
         .system
         .mount(id("slow"), journal::spawn(Journal::default()))
         .expect("the id is free");
 
-    // In flight for far longer than the eviction budget.
+    // In flight for far longer than `after`, and far inside the budget.
     let answered = journal::at(&fixture.client, id("slow")).apply(5, 250).await;
 
     assert_eq!(
@@ -795,9 +833,12 @@ async fn eviction_never_cuts_off_a_message_in_flight() {
 #[tokio::test]
 async fn the_connection_outlives_the_actors_on_it() {
     let fixture = start(
-        journal::System::builder(Eviction::Idle(Duration::from_millis(40)))
-            .spawn_with(|_| Some(journal::spawn(Journal::default())))
-            .build(),
+        journal::System::builder(Eviction::Idle {
+            after: Duration::from_millis(40),
+            shutdown_budget: Duration::from_secs(5),
+        })
+        .spawn_with(|_| Some(journal::spawn(Journal::default())))
+        .build(),
     )
     .await;
 
@@ -821,12 +862,31 @@ async fn the_connection_outlives_the_actors_on_it() {
     );
 }
 
-// ───────────────────────────────────────────────────────────── stop vs abort
+// ───────────────────────────────────────────────────────── shutdown vs abort
 
-/// `stop` drains: the message in flight finishes and its effect on the state is
-/// real. Made red by making `stop` an alias of `abort`.
+/// `shutdown` inside its budget drains: the turn in flight AND the one queued
+/// behind it both finish, both are answered, and both effects on the state are
+/// real. Made red by making `shutdown` an alias of `abort`.
+///
+/// Two calls and not one, because "queued turns are answered" is the claim and
+/// one message in flight does not queue anything. `MAILBOX` is 1, so the second
+/// `apply` is buffered behind the first and is the queued turn; the budget covers
+/// both holds together, which is the depth-versus-budget relationship 4a's doc
+/// names — at depth N a budget has to cover N + 1 turns, not one.
+///
+/// # The three numbers, and why they are not tighter
+///
+/// This is one of the wall-clock tests in this file — a paused clock cannot
+/// sequence two real QUIC calls against each other — so the margins are wide on
+/// purpose rather than snug. What must hold is an ORDER, not a duration: the
+/// second call has to reach the mailbox before the shutdown removes the entry,
+/// or it is answered `NoSuchActor` and this test fails for a reason that is not
+/// about draining. 400 ms of hold, the second call at 40 ms and the shutdown at
+/// 120 ms leave two 80 ms windows for a loopback stream on an already-open
+/// connection, which is three orders of magnitude of headroom. Do not shrink them
+/// to make the suite faster; shrink the hold if anything.
 #[tokio::test]
-async fn stop_lets_the_message_in_flight_finish() {
+async fn shutdown_inside_its_budget_answers_the_turn_in_flight_and_the_one_queued() {
     let applied = Arc::new(Mutex::new(Vec::new()));
     let fixture = start(mounted()).await;
     fixture
@@ -839,31 +899,50 @@ async fn stop_lets_the_message_in_flight_finish() {
         )
         .expect("the id is free");
 
-    let client_call = {
+    let running = {
         let client = &fixture.client;
-        async move { journal::at(client, id("doc")).apply(1, 200).await }
+        async move { journal::at(client, id("doc")).apply(1, 400).await }
+    };
+    let queued = {
+        let client = &fixture.client;
+        async move {
+            // Behind the first, which owns the actor for 400 ms.
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            journal::at(client, id("doc")).apply(2, 0).await
+        }
     };
     let stopping = async {
-        // Long enough that the message is inside the actor, short enough that
-        // it is still running.
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        fixture.system.stop(&id("doc")).await
+        // Long enough that the first message is inside the actor and the second
+        // is behind it, short enough that the first is still running.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        fixture
+            .system
+            .shutdown(&id("doc"), Duration::from_secs(5))
+            .await
     };
 
-    let (answered, was_mounted) = tokio::join!(client_call, stopping);
+    let (first, second, ended) = tokio::join!(running, queued, stopping);
 
-    assert!(was_mounted);
-    assert_eq!(answered.unwrap(), 1, "the caller must still get its answer");
+    assert!(
+        matches!(ended, Some(Ended::Stopped)),
+        "a shutdown that drained inside its budget is Stopped, got {ended:?}"
+    );
+    assert_eq!(
+        first.unwrap(),
+        1,
+        "the caller in flight must get its answer"
+    );
+    assert_eq!(second.unwrap(), 2, "and so must the caller behind it");
     assert_eq!(
         *applied.lock().unwrap(),
-        vec![1],
-        "stop preserves the work the actor had already accepted"
+        vec![1, 2],
+        "shutdown preserves the work the actor had already accepted, in order"
     );
 }
 
 /// `abort` cancels: the task's future is dropped at its await point, the state
 /// goes with it, and the mutation never happened. Made red by making `abort` an
-/// alias of `stop`.
+/// alias of a `shutdown` whose budget covers the turn.
 #[tokio::test]
 async fn abort_destroys_the_message_in_flight() {
     let applied = Arc::new(Mutex::new(Vec::new()));
@@ -900,11 +979,220 @@ async fn abort_destroys_the_message_in_flight() {
     );
 }
 
+/// `None` is what the old `stop`'s `false` was, and `abort` keeps the `bool`
+/// because it has only ever had one thing to say.
 #[tokio::test]
-async fn stopping_an_unmounted_id_says_so_rather_than_pretending() {
+async fn shutting_down_an_unmounted_id_says_so_rather_than_pretending() {
     let system = mounted();
-    assert!(!system.stop(&id("nobody")).await);
+    assert!(system
+        .shutdown(&id("nobody"), Duration::from_secs(5))
+        .await
+        .is_none());
     assert!(!system.abort(&id("nobody")).await);
+}
+
+// ───────────────────────────────── an expired budget, and what it must destroy
+//
+// The three tests below are one claim from three sides: **a teardown nobody
+// waited for is not a teardown.** A `JoinHandle` that is dropped rather than
+// aborted DETACHES its task on both of keylink's targets — verified against
+// n0-future 0.3.2, whose native branch is tokio's and whose wasm branch has no
+// `impl Drop for JoinHandle` at all — so every path that let go of one left an
+// actor running with its state, and its state's exclusive resources, and no way
+// back to it. A counter cannot show that; a file lock can, which is why these
+// three reach for the durability port. Nothing here loads or stores a snapshot:
+// the claim is used purely as the thing only a dead task releases.
+
+/// A scratch directory that removes itself.
+///
+/// A third copy of a five-line struct that `tests/durable.rs` and
+/// `keylink-persist/src/file.rs` also have, and it stays a copy: the value in it
+/// is the *unique path*, and a shared helper would have to be given the calling
+/// binary's name to keep that property. Small enough to not be worth a
+/// dependency, and small enough to not be worth a fourth crate.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "keylink-actors-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        Self(path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// An actor that will never finish a turn, holding something only a dead task
+/// releases.
+///
+/// `pending()` and not a long `sleep`: a sleep would let a paused clock jump past
+/// it and make the test pass for the wrong reason. This loop cannot be drained by
+/// any budget, so the only thing that ends it is the abort — which is exactly the
+/// question.
+///
+/// It holds the receiver too, so closing the registry's sender genuinely does
+/// nothing here. That is what a wedged actor looks like: the mailbox is shut and
+/// the turn does not care.
+fn wedged(claim: impl Send + 'static) -> journal::Mounted {
+    keylink::mount(|inbox: journal::Mailbox| async move {
+        let _wedged = (claim, inbox);
+        std::future::pending::<()>().await;
+    })
+}
+
+/// A `shutdown` whose budget expires **destroys** the actor, and the proof is
+/// that its exclusive claim can be taken again.
+///
+/// Made red by `scripts/break-once.sh`, replacing `drain`'s
+/// `std::pin::pin!(task)` with `std::pin::pin!(n0_future::task::spawn(async move
+/// { let _ = task.await; }))` — one literal, and the deleted `System::stop`'s
+/// exact shape: the expiry then aborts a *wrapper* task and drops the real
+/// handle, which detaches. Watched: this test and
+/// `an_eviction_whose_budget_expires_destroys_the_actor` both fail on their last
+/// line with `Busy { id: StateId("wedged/4471") }`.
+///
+/// Paused clock, so the fifty milliseconds cost nothing and mean exactly fifty
+/// milliseconds. Every await between the mount and the shutdown is the shutdown's
+/// own, and the system has no sweeper, so there is no second thing that could
+/// have done this.
+#[tokio::test(start_paused = true)]
+async fn a_shutdown_whose_budget_expires_destroys_the_actor() {
+    let scratch = Scratch::new("shutdown-budget");
+    let files = Files::open(&scratch.0).await.expect("the store opens");
+    let held = StateId::new("wedged/4471").expect("a valid state id");
+    let claim = files.claim(&held).await.expect("nothing holds it yet");
+
+    let system = mounted();
+    system
+        .mount(id("wedged"), wedged(claim))
+        .expect("the id is free");
+
+    let ended = system
+        .shutdown(&id("wedged"), Duration::from_millis(50))
+        .await;
+
+    assert!(
+        matches!(ended, Some(Ended::Vanished)),
+        "an actor that would not drain was destroyed, which is Vanished, got {ended:?}"
+    );
+    assert!(system.is_empty(), "and it is out of the map either way");
+    files
+        .claim(&held)
+        .await
+        .expect("the destroyed actor released its claim; if this is Busy, it is still running");
+}
+
+/// The same, done by the sweeper's budget instead of a caller's.
+///
+/// `Eviction::Idle`'s own rustdoc claimed *"Eviction is `System::stop`, not
+/// `System::abort`"*, and the sweeper it described never awaited anything at all:
+/// it dropped entries inside a `retain`, under the write lock, which detached
+/// every task it evicted. This is that sentence turned into a test.
+///
+/// `after` is a minute, which makes the sweeper's own tick thirty seconds; the
+/// budget is fifty milliseconds and is the only number this test is about. The two
+/// paths into `sweep` race for one write lock and `extract_if` runs before its
+/// first await, so whichever gets there removes the entry and the other finds
+/// nothing — which is why the assertions below are about the CLAIM and about the
+/// map being empty, and not about which of the two did it. Either answer is the
+/// one under test: an eviction whose budget expires destroys the actor.
+#[tokio::test(start_paused = true)]
+async fn an_eviction_whose_budget_expires_destroys_the_actor() {
+    let scratch = Scratch::new("eviction-budget");
+    let files = Files::open(&scratch.0).await.expect("the store opens");
+    let held = StateId::new("wedged/4471").expect("a valid state id");
+    let claim = files.claim(&held).await.expect("nothing holds it yet");
+
+    let system: journal::System = journal::System::builder(Eviction::Idle {
+        after: Duration::from_secs(60),
+        shutdown_budget: Duration::from_millis(50),
+    })
+    .build();
+    system
+        .mount(id("wedged"), wedged(claim))
+        .expect("the id is free");
+
+    tokio::time::advance(Duration::from_secs(90)).await;
+    system.evict_idle().await;
+
+    assert!(system.is_empty(), "the idle actor is evicted");
+    files
+        .claim(&held)
+        .await
+        .expect("the evicted actor released its claim; if this is Busy, it was detached");
+}
+
+/// A refused mount leaks nothing, on both refusals.
+///
+/// The second detach, and it was never a budget problem: `System::mount` takes a
+/// `Mounted` by value and drops it on `Occupied` and on `AtCapacity`, and the
+/// task used to be **already spawned** by then — the generated `spawn` started
+/// it. `MountError` hands nothing back, so the caller who was refused had no
+/// handle, and neither did the registry. Every refused mount was a live actor
+/// nobody could reach, holding whatever its state held.
+///
+/// `Mounted` carries an unstarted future now, so both refusals drop a loop that
+/// has never been polled. Nothing is awaited between the claim and the refusal:
+/// the release is synchronous, inside `mount`, which is the strongest form the
+/// guarantee has.
+///
+/// Made red by `scripts/break-once.sh`, replacing `mount`'s
+/// `run: Box::pin(run(inbox)),` with `run: { let started =
+/// n0_future::task::spawn(run(inbox)); Box::pin(async move { let _ =
+/// started.await; }) },` — the defect restored in one literal, spawning at
+/// `mount()` and letting the refusal drop the handle. Watched: this test fails at
+/// the first re-claim with `Busy { id: StateId("refused/4471") }`, and
+/// `registry.rs`'s `neither_refusal_starts_the_actor_it_refused` fails at
+/// `left: 2, right: 0` on the same break. That one watches the same property with
+/// a counter and no filesystem; this one watches what a counter cannot, which is
+/// the resource still held.
+#[tokio::test]
+async fn a_refused_mount_leaves_no_actor_holding_the_claim_it_was_built_around() {
+    let scratch = Scratch::new("refused-mount");
+    let files = Files::open(&scratch.0).await.expect("the store opens");
+    let held = StateId::new("refused/4471").expect("a valid state id");
+
+    let system: journal::System = journal::System::builder(Eviction::Never)
+        .capacity(1)
+        .build();
+    system
+        .mount(id("taken"), journal::spawn(Journal::default()))
+        .expect("the id is free");
+
+    let occupied = {
+        let claim = files.claim(&held).await.expect("nothing holds it yet");
+        system
+            .mount(id("taken"), wedged(claim))
+            .expect_err("the id is taken")
+    };
+    assert!(
+        matches!(occupied, MountError::Occupied { .. }),
+        "{occupied}"
+    );
+    files
+        .claim(&held)
+        .await
+        .expect("an actor refused as Occupied is never started, so it holds nothing");
+
+    let full = {
+        let claim = files.claim(&held).await.expect("the refusal released it");
+        system
+            .mount(id("second"), wedged(claim))
+            .expect_err("the cap is one and one is mounted")
+    };
+    assert!(matches!(full, MountError::AtCapacity { .. }), "{full}");
+    files
+        .claim(&held)
+        .await
+        .expect("nor is an actor refused as AtCapacity");
 }
 
 // ─────────────────────────────────────────────────────────────── concurrency

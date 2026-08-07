@@ -896,11 +896,13 @@ macro_rules! __keylink_service {
             /// deadline `>` where the other spelled `>=`, and one rendered a panic
             /// bare where the other prefixed it.
             ///
-            /// # Panics
-            ///
-            /// Panics when called outside a tokio runtime.
-            #[must_use = "an unmounted actor is dropped, which stops the task \
-                          this just started"]
+            /// Nothing runs until this is mounted:
+            /// [`System::mount`](keylink::System::mount) is what starts the
+            /// task, so a `Mounted` that is refused or dropped costs no task at
+            /// all. That is where the tokio-runtime panic lives now, and it is
+            /// why this function has none.
+            #[must_use = "an unmounted actor is dropped, and the state it was \
+                          built around goes with it"]
             pub fn spawn<A: Actor>(mut state: A) -> Mounted {
                 // The same refusal `Handle::service` makes, and for longer than
                 // it was made here: `CHECK` is an associated const on a generic
