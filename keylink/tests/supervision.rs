@@ -1171,3 +1171,133 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
     );
     assert_eq!(seen(&built), 2, "one factory call per incarnation");
 }
+
+/// **The keyed twin of `a_remote_caller_can_tell_restarting_from_gone`, and the
+/// asymmetry it closes.**
+///
+/// Wave 9 gave the singleton served path three answers and left the keyed one
+/// with `NoSuchActor` for all three, because the supervisor's verdict lived on a
+/// channel `deliver_to_actor` could not see. The verdict is a cell on the registry
+/// entry now, so this is the same test on the same two prefixes, over a `System`:
+///
+/// 1. `boom` faults → `Failed("panicked: ..")`, the actor survives the message;
+/// 2. the parked `place` → `Failed("restarting: ..")`, the incarnation did not;
+/// 3. once the budget is out → `NoSuchActor`, which is *gone* and is final.
+///
+/// Round 2 is worth naming separately: it is the **give-up**, where the old
+/// singleton split answered `dropped: ` — *the actor is still there* — because the
+/// mailbox `supervise` owns for the actor's whole life still read open. Both paths
+/// answer it from the verdict now, and neither reads a mailbox.
+///
+/// Made red by `scripts/break-once.sh keylink/src/local.rs` on `Lent::ending`'s
+/// `return Standing::Restarting(reason.clone());` → `return Standing::Gone;`,
+/// which is a supervisor that grants the restart and tells the peer to stop
+/// asking anyway. Watched: `round 1: expected restarting: , got
+/// Remote(NoSuchActor { id: "desks/4471" })`.
+#[tokio::test]
+async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
+    let server_node = local_node().await;
+    let client_node = local_node().await;
+    let desk_id = keylink::ActorId::new("desks/4471").expect("valid");
+
+    // One restart, so the second fault is terminal and "gone" is reachable
+    // inside one test without a storm.
+    let system = desk::System::builder(keylink::Eviction::Never).build();
+    system
+        .mount(
+            desk_id.clone(),
+            desk::spawn_supervised(
+                move || async move {
+                    let observers: Vec<Box<dyn Observer<Desk>>> =
+                        vec![Box::new(RefuseFaults { fatal: false })];
+                    Ok((Desk::default(), observers, ()))
+                },
+                limit(1, Duration::from_millis(50)),
+            ),
+        )
+        .expect("mounts");
+
+    let _server = Server::builder(&server_node)
+        .service(desk::keyed_service(&system, Allowlist::anyone()).build())
+        .spawn()
+        .expect("one service, one ALPN");
+    let client = desk::KeyedClient::connect(&client_node, server_node.endpoint().addr())
+        .await
+        .expect("the client dials the actor system");
+
+    for (round, expected) in [(1u8, "restarting: "), (2, "gone")] {
+        // Parked by the handler and never answered. Held across the fault below.
+        let placing = {
+            let client = client.clone();
+            let id = desk_id.clone();
+            tokio::spawn(async move { desk::at(&client, id).place(round.into()).await })
+        };
+        // **Asked, never assumed**, for the singleton twin's reason: a fault that
+        // overtook the park would end the incarnation the park was meant to be
+        // lost with, leaving the order sitting in the *next* one for ever.
+        for _ in 0..1_000 {
+            if desk::at(&client, desk_id.clone())
+                .parked()
+                .await
+                .expect("the actor answers")
+                == 1
+            {
+                break;
+            }
+            n0_future::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            desk::at(&client, desk_id.clone())
+                .parked()
+                .await
+                .expect("the actor answers"),
+            1,
+            "round {round}: the order has to be parked before the fault"
+        );
+
+        let faulted = desk::at(&client, desk_id.clone())
+            .boom()
+            .await
+            .expect_err("boom panics");
+        assert!(
+            matches!(&faulted, keylink::Error::Remote(RemoteError::Failed(why))
+                     if why.starts_with("panicked: ")),
+            "round {round}: a fault keeps its own prefix on the keyed path too: \
+             got {faulted:?}"
+        );
+
+        let placed = placing
+            .await
+            .expect("the caller task is not itself panicking")
+            .expect_err("a parked reply whose incarnation ended is not answered");
+        match (&placed, expected) {
+            (keylink::Error::Remote(RemoteError::Failed(why)), "restarting: ") => assert!(
+                why.starts_with("restarting: "),
+                "round {round}: a lost reply on a restarting keyed actor must say \
+                 so: got {why}"
+            ),
+            (keylink::Error::Remote(RemoteError::NoSuchActor { .. }), "gone") => {}
+            _ => panic!("round {round}: expected {expected}, got {placed:?}"),
+        }
+    }
+
+    // And it stays gone, through the other door: the loop returned its ending,
+    // so the registry reaped its own entry and there is nothing left to route to.
+    for _ in 0..1_000 {
+        if !system.contains(&desk_id) {
+            break;
+        }
+        n0_future::time::sleep(Duration::from_millis(1)).await;
+    }
+    let after = desk::at(&client, desk_id.clone())
+        .place(3)
+        .await
+        .expect_err("the actor gave up");
+    assert!(
+        matches!(
+            after,
+            keylink::Error::Remote(RemoteError::NoSuchActor { .. })
+        ),
+        "a keyed actor that gave up is unmounted and gone for good: got {after:?}"
+    );
+}

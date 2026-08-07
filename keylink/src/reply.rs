@@ -86,8 +86,14 @@ pub enum RemoteError {
     /// and drop it, which answers nobody while the actor goes on serving the
     /// same connection. That reads as [`Failed`](Self::Failed) under a
     /// `"dropped: "` prefix instead, because a peer told `NoSuchActor` is being
-    /// told to stop asking and it would be false. `local.rs`'s `deliver_to_local`
-    /// is where the three causes are separated.
+    /// told to stop asking and it would be false.
+    ///
+    /// **On both served paths**, which this sentence could not say for one wave:
+    /// `local.rs`'s `deliver_to_local` separated the causes and
+    /// `actor/remote.rs`'s `deliver_to_actor` rendered all of them as this
+    /// variant, so the paragraph above was a promise a keyed actor did not keep.
+    /// The two render through `local.rs`'s `lost` now, off a verdict each actor's
+    /// own loop settles before it drops anything.
     #[error("no actor is mounted as {id}")]
     NoSuchActor {
         /// The id that was addressed.

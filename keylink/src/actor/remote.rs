@@ -57,7 +57,7 @@ use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 
 use super::registry::{RouteError, System};
-use crate::local::{rendered, Reply};
+use crate::local::{lost, rendered, Reply};
 use crate::{ActorId, Body, BodyReader, Caller, Context, Outcome, Queueing, RemoteError, Rpc};
 
 // ─────────────────────────────────────────────────────────── the wire wrapper
@@ -415,6 +415,12 @@ impl From<RouteError> for RemoteError {
 /// [`RemoteError::NoSuchActor`] when nothing is mounted and no factory built
 /// one, and [`RemoteError::TimedOut`] when the queue budget expired before a
 /// permit arrived.
+///
+/// And three more once the message *did* reach an actor and the answer did not
+/// come back, which is [`lost`]'s vocabulary rather than this function's:
+/// `Failed("restarting: ..")` for an incarnation that ended with another coming,
+/// `Failed("dropped: ..")` for a reply a live actor took out of its turn and never
+/// answered, and `NoSuchActor` again for an actor that is genuinely finished.
 #[doc(hidden)]
 pub async fn deliver_to_actor<S: KeyedService>(
     system: &System<S::Mail>,
@@ -427,14 +433,16 @@ pub async fn deliver_to_actor<S: KeyedService>(
         .validate()
         .map_err(|err| RemoteError::Failed(err.to_string()))?;
 
-    let mail = system.route(&actor)?;
+    let route = system.route(&actor)?;
 
     // Read before `cx` moves into the `Origin`, which is the only reason these
     // are bindings rather than expressions at their use sites.
     let budget = cx.queueing();
     let progress = cx.progress();
     let (reply, answer) = Reply::channel();
-    let queueing = mail.send(Box::new(S::mail(Origin::peer(cx), message, body, reply)));
+    let queueing = route
+        .mail
+        .send(Box::new(S::mail(Origin::peer(cx), message, body, reply)));
     let sent = match budget {
         None => queueing.await,
         // `saturating_duration_since` on `n0_future::time::Instant`, the clock
@@ -462,13 +470,27 @@ pub async fn deliver_to_actor<S: KeyedService>(
     // caller gives up on.
     progress.enqueued();
 
-    // `rendered` and not a `match` written here: the singleton's served path
-    // answers the same four cases, and when the two were written separately they
-    // disagreed about how a panic reaches a peer. See its documentation.
+    // `rendered` and `lost`, not two matches written here: the singleton's served
+    // path answers the same cases, and when the two were written separately they
+    // disagreed — about how a panic reaches a peer, and then about whether a dead
+    // reply channel has one cause or three. See their documentation.
+    //
+    // `lost` is where the three-way answer stopped being the local path's alone.
+    // This arm was `no_such_actor(&actor)` for every cause: an ordinary keyed
+    // actor with no supervisor anywhere near it, whose handler took
+    // `reply.later()` and dropped the `Deferred` — the move that type's own
+    // `#[must_use]` asks for — told the peer *no actor is mounted as X* about an
+    // actor that answers the next call on this same connection.
+    //
+    // The cell `route` handed back is settled by that actor's own loop before it
+    // drops anything, so this read happens-after the verdict for the drop that
+    // woke it. What it cannot close is the *late* direction, and
+    // `deliver_to_local` states it in full: an actor that moved on between the
+    // death and this read is described as it is now rather than as it was.
     answer
         .await
         .map(|answered| rendered(answered, budget.map_or(0, Queueing::millis)))
-        .map_err(|_| no_such_actor(&actor))
+        .map_err(|_| lost(route.fate.standing(), actor.as_str()))
 }
 
 #[cfg(test)]

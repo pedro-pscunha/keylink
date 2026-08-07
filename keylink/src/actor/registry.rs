@@ -64,6 +64,7 @@ use n0_future::task::{AbortOnDropHandle, JoinHandle};
 use n0_future::time::Instant;
 use tokio::sync::mpsc;
 
+use crate::local::{Fate, Standing};
 use crate::{ActorId, Ended};
 
 /// Messages that may wait ahead of the one being handled, when nobody says.
@@ -189,10 +190,52 @@ impl Busy {
 /// so a flag set here would read `true` for an idle actor from its first message
 /// until its last. Every actor a `service!` produces runs `local.rs`'s one loop,
 /// which is where the flag is maintained.
+///
+/// # It carries a second cell now, for the same reason and a different question
+///
+/// [`Fate`] rides here beside [`Busy`], by the identical argument: the registry
+/// makes it, the loop is the only thing that knows what to write in it, and the
+/// alternative — widening [`mount`]'s closure — puts the pairing in **generated**
+/// code, one expansion per `service!` in the world. Through the mailbox it costs
+/// generated code nothing: `mount(|inbox: Mailbox| ..)` is the same line it was,
+/// and `run_keyed` takes the cell off the mailbox it was already handed.
+///
+/// The two are not folded into one allocation, and the reason is on [`Fate`]: a
+/// [`LocalActor`](crate::LocalActor) needs the fate and deliberately has no
+/// `Busy`.
 #[doc(hidden)]
 pub struct Mailbox<M> {
     slots: mpsc::Receiver<Box<M>>,
     busy: Busy,
+    fate: Fate,
+}
+
+/// The floor under a **hand-written** loop, and nothing more than a floor.
+///
+/// [`mount`] is `#[doc(hidden)] pub`, so a loop can be written by hand, and such
+/// a loop never calls the `Inbox::ending` hook where every loop keylink generates
+/// settles its own fate. Without this, a hand-written actor that returned would
+/// leave its cell reading `Running` for ever, and a peer whose reply died with it
+/// would be told the actor is still there.
+///
+/// **What it does not claim.** A `Drop` runs its body before its fields, so this
+/// store lands before the receiver closes and before whatever is queued behind it
+/// is dropped — that much is exact. Where it sits relative to a *hand-written*
+/// loop's own state is not knowable from here: that state is whatever the
+/// closure captured, and the closure decides the order. The loops keylink
+/// generates do not rely on this at all; they settle inside [`run_loop`], where
+/// the ordering is stated and holds.
+///
+/// It is load-bearing in exactly one generated case: a supervised keyed actor
+/// whose *factory* gives up before any incarnation exists settles through
+/// `supervise` rather than through a loop, and this is the second place that
+/// same fact is written.
+///
+/// [`run_loop`]: crate::run_keyed
+impl<M> Drop for Mailbox<M> {
+    fn drop(&mut self) {
+        self.fate.settle(Standing::Gone);
+    }
 }
 
 impl<M> Mailbox<M> {
@@ -218,6 +261,12 @@ impl<M> Mailbox<M> {
     /// Report a turn starting or ending. See [`Busy`] for whose job this is.
     pub(crate) fn mark_busy(&self, running: bool) {
         self.busy.set(running);
+    }
+
+    /// The cell this actor's loop settles on its way out, and a served dispatch
+    /// reads when a reply dies. See [`Fate`].
+    pub(crate) fn fate(&self) -> Fate {
+        self.fate.clone()
     }
 }
 
@@ -532,6 +581,38 @@ struct Entry<M> {
     /// Whether this actor is inside a turn. Written by its loop, read by
     /// [`System::status`] — see [`Busy`], which owns the invariant.
     busy: Busy,
+    /// What a peer whose reply died is told. Written by this actor's loop, read
+    /// by `deliver_to_actor` — see [`Fate`], which owns that invariant, and
+    /// [`Route`], which is how it leaves the registry.
+    fate: Fate,
+}
+
+/// Where a message goes, and what its caller is told if the answer never comes.
+///
+/// [`Registry::route`]'s answer, and a struct rather than the bare sender it used
+/// to be. The pair travels together because they are read together: a dispatch
+/// sends on the first, and reads the second in the one case where the send
+/// succeeded and no answer followed. Looking the fate up again at that point
+/// would take a second read lock and could find a *different* actor — an
+/// eviction and a lazy re-spawn under the same id — so the answer would be about
+/// somebody else's incarnation.
+pub(super) struct Route<M> {
+    /// One end of the actor's mailbox, cloned out of the entry.
+    pub(super) mail: mpsc::Sender<Box<M>>,
+    /// The cell that actor's own loop settles before it drops anything.
+    pub(super) fate: Fate,
+}
+
+/// Hand-written for [`System`]'s reason: the derive would write `impl<M: Debug>`,
+/// and `M` is a mailbox message that owns a reply channel and a stream. It exists
+/// at all because `Result::expect_err` wants the `Ok` side printable, which is
+/// what this file's own routing tests do with one.
+impl<M> fmt::Debug for Route<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Route")
+            .field("fate", &self.fate)
+            .finish_non_exhaustive()
+    }
 }
 
 struct Registry<M> {
@@ -641,10 +722,7 @@ impl<M> Registry<M> {
     /// `self: &Arc<Self>` because a lazy spawn reaches [`Registry::entry`], and
     /// the task that starts there holds a [`Weak`](std::sync::Weak) back to this
     /// registry so it can reap its own entry. There is no other reason.
-    fn route(
-        self: &Arc<Self>,
-        id: &ActorId,
-    ) -> std::result::Result<mpsc::Sender<Box<M>>, RouteError>
+    fn route(self: &Arc<Self>, id: &ActorId) -> std::result::Result<Route<M>, RouteError>
     where
         M: Send + 'static,
     {
@@ -672,7 +750,13 @@ impl<M> Registry<M> {
                 // handed to the entry. Not a mount: the winner announced it.
                 let entry = taken.into_mut();
                 entry.last_seen.store(self.now(), Ordering::Relaxed);
-                (entry.mail.clone(), None)
+                (
+                    Route {
+                        mail: entry.mail.clone(),
+                        fate: entry.fate.clone(),
+                    },
+                    None,
+                )
             }
             hash_map::Entry::Vacant(free) => {
                 if live >= self.capacity {
@@ -687,7 +771,10 @@ impl<M> Registry<M> {
                 // `Mounted`, because the mailbox is made here now — see
                 // [`Mounted`] for why the depth could not otherwise be a knob.
                 let entry = self.entry(free.key(), mounted);
-                let found = entry.mail.clone();
+                let found = Route {
+                    mail: entry.mail.clone(),
+                    fate: entry.fate.clone(),
+                };
                 let announce = self.announcing(free.key());
                 free.insert(entry);
                 (found, announce)
@@ -733,14 +820,13 @@ impl<M> Registry<M> {
             .collect()
     }
 
-    fn touch(
-        &self,
-        entries: &HashMap<ActorId, Entry<M>>,
-        id: &ActorId,
-    ) -> Option<mpsc::Sender<Box<M>>> {
+    fn touch(&self, entries: &HashMap<ActorId, Entry<M>>, id: &ActorId) -> Option<Route<M>> {
         let entry = entries.get(id)?;
         entry.last_seen.store(self.now(), Ordering::Relaxed);
-        Some(entry.mail.clone())
+        Some(Route {
+            mail: entry.mail.clone(),
+            fate: entry.fate.clone(),
+        })
     }
 
     /// Make the mailbox, start the loop, and pair the task with the sender that
@@ -790,9 +876,11 @@ impl<M> Registry<M> {
     {
         let (mail, slots) = mpsc::channel(self.mailbox_depth);
         let busy = Busy::default();
+        let fate = Fate::default();
         let inbox = Mailbox {
             slots,
             busy: busy.clone(),
+            fate: fate.clone(),
         };
         // Built here rather than inside the task, so the loop is still a future
         // that has never been polled at the moment the spawn takes it — which is
@@ -814,6 +902,7 @@ impl<M> Registry<M> {
             }),
             last_seen: AtomicU64::new(self.now()),
             busy,
+            fate,
         }
     }
 
@@ -962,7 +1051,9 @@ impl<M> Registry<M> {
 /// The `Ended` is **synthesised from the join**, not read from the actor, and
 /// [`System::shutdown`] carries the argument for that and states its residual.
 async fn drain<M>(entry: Entry<M>, budget: Duration) -> Ended {
-    let Entry { mail, task, .. } = entry;
+    let Entry {
+        mail, task, fate, ..
+    } = entry;
     // Dropping the registry's sender is what ends the loop. The task lives while
     // any other sender does, which is what lets a message already in flight
     // finish rather than be cancelled.
@@ -972,6 +1063,12 @@ async fn drain<M>(entry: Entry<M>, budget: Duration) -> Ended {
         Ok(Ok(())) => Ended::Stopped,
         Ok(Err(_join)) => Ended::Vanished,
         Err(_expired) => {
+            // Settled before the abort, for `LocalActor::abort`'s reason: an
+            // aborted loop never reaches `Inbox::ending`, so nothing inside it
+            // can say what this destroyed. The runtime drops the actor's future
+            // only after it has seen the abort, so every reply killed by this
+            // teardown dies with `Gone` already published.
+            fate.settle(Standing::Gone);
             // Before the second await, never after: an `abort` that has been
             // requested lands whether or not anybody is still waiting for it,
             // which is the asymmetry that made `abort` correct and `stop` not.
@@ -1306,10 +1403,7 @@ impl<M> System<M> {
     /// # Errors
     ///
     /// [`RouteError`], which `remote.rs` translates into what a peer is told.
-    pub(super) fn route(
-        &self,
-        id: &ActorId,
-    ) -> std::result::Result<mpsc::Sender<Box<M>>, RouteError>
+    pub(super) fn route(&self, id: &ActorId) -> std::result::Result<Route<M>, RouteError>
     where
         M: Send + 'static,
     {
@@ -1460,6 +1554,11 @@ impl<M> System<M> {
         let Some(entry) = self.inner.write().remove(id) else {
             return false;
         };
+        // Before the abort and before the await, for `drain`'s reason: an
+        // aborted loop never reaches `Inbox::ending`, so a peer holding a parked
+        // reply this destroys must read *gone* rather than *the actor is still
+        // there*.
+        entry.fate.settle(Standing::Gone);
         entry.task.abort();
         let _ = entry.task.await;
         // [`Ended::Vanished`] and not a fourth spelling: an aborted task is what
@@ -2284,6 +2383,7 @@ mod tests {
         system
             .route(&one)
             .expect("mounted")
+            .mail
             .send(Box::new(Bare))
             .await
             .expect("the one slot is free");
@@ -2606,7 +2706,7 @@ mod tests {
             .mount(held.clone(), gated(gate, &taken))
             .expect("free");
 
-        let mail = system.route(&held).expect("mounted");
+        let mail = system.route(&held).expect("mounted").mail;
         assert_eq!(only(&system).buffered, 0, "nothing is waiting yet");
         mail.send(Box::new(Bare))
             .await
@@ -2686,7 +2786,7 @@ mod tests {
             .mount(held.clone(), gated(gate, &taken))
             .expect("free");
 
-        let mail = system.route(&held).expect("mounted");
+        let mail = system.route(&held).expect("mounted").mail;
         // Counted up one at a time, and from zero, because that is what makes this
         // a count rather than a restatement of the depth. A `buffered` that simply
         // reported `max_capacity()` would satisfy "3 at three messages" — measured:
@@ -2828,7 +2928,7 @@ mod tests {
             let id = ActorId::new("slow").expect("valid");
             system.mount(id.clone(), slow(&handled)).expect("free");
 
-            let mail = system.route(&id).expect("mounted");
+            let mail = system.route(&id).expect("mounted").mail;
             for _ in 0..=slots {
                 mail.send(Box::new(Bare))
                     .await
@@ -2876,7 +2976,11 @@ mod tests {
         let plain = ActorId::new("plain").expect("valid");
         by_default.mount(plain.clone(), idler()).expect("free");
         assert_eq!(
-            by_default.route(&plain).expect("mounted").max_capacity(),
+            by_default
+                .route(&plain)
+                .expect("mounted")
+                .mail
+                .max_capacity(),
             1,
             "the documented default: one message may wait ahead of the one being \
              handled"
@@ -2888,14 +2992,137 @@ mod tests {
             .build();
         let by_hand = ActorId::new("by-hand").expect("valid");
         deeper.mount(by_hand.clone(), idler()).expect("free");
-        assert_eq!(deeper.route(&by_hand).expect("mounted").max_capacity(), 4);
+        assert_eq!(
+            deeper.route(&by_hand).expect("mounted").mail.max_capacity(),
+            4
+        );
         assert_eq!(
             deeper
                 .route(&ActorId::new("lazily").expect("valid"))
                 .expect("the factory builds it")
+                .mail
                 .max_capacity(),
             4,
             "including an actor nobody mounted by hand"
+        );
+    }
+
+    // ─────────────────────── what a destroyed actor tells a waiting peer
+
+    /// Reads its own actor's [`Standing`] as the task that holds it is destroyed.
+    ///
+    /// The stand-in for a `Deferred` parked in a real actor's state: both die
+    /// exactly when the task's future is dropped, so what this records is what a
+    /// peer woken by that death can read. It has to be an in-drop observer,
+    /// because from outside the task there is nothing to see — the whole teardown
+    /// runs before any other task is polled, so a served call always reads the
+    /// final value and every ordering here would look correct.
+    struct Recorder {
+        fate: Fate,
+        seen: Arc<std::sync::Mutex<Vec<Standing>>>,
+    }
+
+    impl Drop for Recorder {
+        fn drop(&mut self) {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(self.fate.standing());
+        }
+    }
+
+    /// A loop that will not return, holding a [`Recorder`] on its own cell.
+    ///
+    /// The recorder is a body local of the async block and the mailbox is its
+    /// capture, so a destroyed future drops the recorder **first** — before
+    /// `Mailbox`'s own `Drop` writes its floor. That is what makes this an
+    /// observer of what somebody *outside* the task published before asking for
+    /// the destruction, which is the ordering the two teardown doors keep.
+    fn recording(
+        entered: oneshot::Sender<()>,
+        seen: &Arc<std::sync::Mutex<Vec<Standing>>>,
+    ) -> Mounted<Bare> {
+        let seen = Arc::clone(seen);
+        mount(move |inbox: Mailbox<Bare>| async move {
+            let _recorder = Recorder {
+                fate: inbox.fate(),
+                seen,
+            };
+            let _ = entered.send(());
+            std::future::pending::<()>().await;
+            Ended::Stopped
+        })
+    }
+
+    /// [`System::abort`] settles the served answer **before** it destroys the
+    /// task.
+    ///
+    /// An aborted loop never reaches `Inbox::ending`, so nothing inside it can say
+    /// what was destroyed. `Mailbox`'s `Drop` is a floor and it is *too late* on
+    /// the path that matters: a supervised keyed actor's mailbox belongs to the
+    /// supervisor's frame, which outlives the incarnation whose state — and whose
+    /// parked replies — the destruction kills first. So the publish is on this
+    /// door, before the request lands on the runtime.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs` on
+    /// `System::abort`'s `entry.fate.settle(Standing::Gone);` →
+    /// `entry.fate.settle(Standing::Running);`. Watched: `an aborted actor is
+    /// gone before it is destroyed: [Running]`.
+    #[tokio::test]
+    async fn abort_settles_the_served_answer_before_it_destroys_the_actor() {
+        let seen: Arc<std::sync::Mutex<Vec<Standing>>> = Arc::default();
+        let (entered, started) = oneshot::channel();
+        let system: System<Bare> = System::builder(Eviction::Never).build();
+        let doomed = ActorId::new("doomed").expect("valid");
+        system
+            .mount(doomed.clone(), recording(entered, &seen))
+            .expect("free");
+        started.await.expect("the loop reaches its wait");
+
+        assert!(system.abort(&doomed).await, "it was mounted");
+
+        let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert!(
+            matches!(seen.as_slice(), [Standing::Gone]),
+            "an aborted actor is gone before it is destroyed: {seen:?}"
+        );
+    }
+
+    /// And the other teardown door: a [`System::shutdown`] whose budget expires
+    /// ends in an abort, and that abort needs the same publish.
+    ///
+    /// A separate line in [`drain`] rather than a share of the one above, because
+    /// `abort` never drains and `drain` is the only place a *timed-out* teardown
+    /// destroys anything.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs` on
+    /// `drain`'s `fate.settle(Standing::Gone);` → `fate.settle(Standing::Running);`.
+    /// Watched: `an actor destroyed by an expired budget is gone before it is
+    /// destroyed: [Running]`.
+    #[tokio::test]
+    async fn an_expired_shutdown_budget_settles_the_served_answer_before_the_abort() {
+        let seen: Arc<std::sync::Mutex<Vec<Standing>>> = Arc::default();
+        let (entered, started) = oneshot::channel();
+        let system: System<Bare> = System::builder(Eviction::Never).build();
+        let doomed = ActorId::new("doomed").expect("valid");
+        system
+            .mount(doomed.clone(), recording(entered, &seen))
+            .expect("free");
+        started.await.expect("the loop reaches its wait");
+
+        assert!(
+            matches!(
+                system.shutdown(&doomed, Duration::from_millis(10)).await,
+                Some(Ended::Vanished)
+            ),
+            "a loop that never returns cannot drain"
+        );
+
+        let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert!(
+            matches!(seen.as_slice(), [Standing::Gone]),
+            "an actor destroyed by an expired budget is gone before it is \
+             destroyed: {seen:?}"
         );
     }
 }
