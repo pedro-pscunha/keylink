@@ -466,10 +466,25 @@ impl Keyable {
 /// Where the replies recorded under a key live.
 ///
 /// **The key STATE — running, done, interrupted, forgotten — is not affected by
-/// this and never leaves memory.** That is what gives at-most-once, it is about
-/// forty bytes an entry, and no setting here can weaken it. This type is only
-/// about the reply *bytes*, which are up to [`MAX_RECORDED_BYTES`] each — four
-/// orders of magnitude more, and the reason the two are separable at all.
+/// this and never leaves memory.** That is what gives at-most-once, and no setting
+/// here can weaken it. This type is only about the reply *bytes*, which are up to
+/// [`MAX_RECORDED_BYTES`] each.
+///
+/// # The gap, measured rather than asserted
+///
+/// A settled entry costs **56 bytes** of `Entry` — a 40-byte `Slot` plus a 16-byte
+/// `Instant` — beside its key, which is a 24-byte `IdempotencyKey` and at most
+/// [`MAX_KEY_LEN`](crate::MAX_KEY_LEN) bytes of heap behind it. The reply it may
+/// hold is up to [`MAX_RECORDED_BYTES`], which is 1 MiB. So the state is roughly
+/// four orders of magnitude smaller than what this type is about, and that gap is
+/// the reason the two are separable at all.
+///
+/// `std::mem::size_of`, `cargo test -p keylink --lib`, aarch64-apple-darwin
+/// (Darwin 27.0.0, arm64), rustc 1.97.1, 2026-08-07. Reproduce by printing
+/// `size_of::<Entry>()` from this module's test mod; the ratio the sentence above
+/// rests on is guarded by `the_key_state_is_orders_of_magnitude_below_a_reply`,
+/// which does not pin the absolute number because `Instant` is not the same width
+/// on every target this crate builds for.
 ///
 /// Set it with [`ServiceBuilder::records`](crate::ServiceBuilder::records). The
 /// default is [`Memory`](Self::Memory), which is what this crate did before the
@@ -1544,6 +1559,34 @@ mod tests {
             assert!(
                 matches!(ledger.claim(peer(A), key("nothing")), Claim::Fresh(_)),
                 "a key nothing ran under must still be claimable"
+            );
+        }
+
+        /// The ratio [`Records`]'s doc comment rests on, held as a ratio rather than
+        /// as the 56 bytes measured there.
+        ///
+        /// A size assertion would be a platform assertion: `Instant` is 16 bytes on
+        /// this target and is not obliged to be on `wasm32-unknown-unknown`, which
+        /// this crate also builds for. What the argument for [`Records::None`]
+        /// actually needs is that the state is negligible beside the reply, and a
+        /// factor of a thousand is that with three orders of magnitude to spare.
+        ///
+        /// Made red by `scripts/break-once.sh` shrinking [`MAX_RECORDED_BYTES`]
+        /// from a mebibyte to a kibibyte — `1 << 20` to `1 << 10` on its `const`
+        /// line. Spelled that way rather than quoting the whole line, because a
+        /// record that contains the literal it breaks makes `break-once.sh` abort
+        /// with `expected exactly one occurrence, found 2`; it did, and that abort
+        /// is the harness working. Watched: `1000 settled entries must still be
+        /// negligible beside one reply: 56 bytes each against 1024`, `0 passed;
+        /// 1 failed; 145 filtered out` — and the `56` in that message is the same
+        /// number [`Records`]'s doc comment cites, printed by the assertion itself.
+        #[test]
+        fn the_key_state_is_orders_of_magnitude_below_a_reply() {
+            assert!(
+                std::mem::size_of::<Entry>() * 1000 < MAX_RECORDED_BYTES,
+                "1000 settled entries must still be negligible beside one reply: \
+                 {} bytes each against {MAX_RECORDED_BYTES}",
+                std::mem::size_of::<Entry>()
             );
         }
 
