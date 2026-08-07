@@ -713,6 +713,45 @@ struct RequestDriftedContract {
     kinds: keylink::WireKinds,
 }
 
+/// The keyed twin of [`RequestDriftedContract`], and the shape the hand-written
+/// actor contract actually had until Wave 1a.
+///
+/// `actor/remote.rs` declared `request: Envelope<ActorRequest>` while `serve_one`
+/// read `WireRequest<Req>` off the frame. The generated path spelled it
+/// correctly and this test refused the drift for it; the hand-written contract
+/// evaded the test by not being generated, so the keyed ALPN was derived from a
+/// type that was not what the keyed wire carried.
+///
+/// Pinned here so the hole cannot reopen through the generated keyed contract
+/// the way it opened through the hand-written one.
+#[derive(postcard_schema::Schema)]
+#[allow(dead_code)]
+struct KeyedRequestDriftedContract {
+    request: keylink::Envelope<keylink::Addressed<probe::Request>>,
+    response: keylink::Envelope<keylink::WireResponse<probe::Response>>,
+    kinds: keylink::WireKinds,
+}
+
+/// The other keyed drift, and the one that would be invisible without a test:
+/// the request arm forgetting the `Addressed` wrapper altogether, so a keyed
+/// contract and a singleton contract hash the same request type.
+#[derive(postcard_schema::Schema)]
+#[allow(dead_code)]
+struct KeyedUnaddressedContract {
+    request: keylink::Envelope<keylink::WireRequest<probe::Request>>,
+    response: keylink::Envelope<keylink::WireResponse<probe::Response>>,
+    kinds: keylink::WireKinds,
+}
+
+/// The shape the keyed contract must have.
+#[derive(postcard_schema::Schema)]
+#[allow(dead_code)]
+struct CorrectKeyedContract {
+    request: keylink::Envelope<keylink::WireRequest<keylink::Addressed<probe::Request>>>,
+    response: keylink::Envelope<keylink::WireResponse<probe::Response>>,
+    kinds: keylink::WireKinds,
+}
+
 /// The shape it must have: the same two types the wire names.
 #[derive(postcard_schema::Schema)]
 #[allow(dead_code)]
@@ -764,6 +803,82 @@ fn the_alpn_hashes_the_response_type_the_wire_actually_carries() {
     );
 }
 
+/// The same assertion for the KEYED contract, which is the one that was wrong.
+///
+/// Before Wave 1a there was one hand-written actor contract for every service on
+/// a node, it declared `Envelope<ActorRequest>`, and `serve_one` read
+/// `WireRequest<ActorRequest>`. Two builds whose `WireRequest` shape differed
+/// could therefore agree on the actor ALPN and then disagree on the wire — the
+/// precise failure the derived ALPN exists to prevent, evading the test above by
+/// living outside the macro.
+///
+/// Three drifts are refused here rather than one. Dropping `WireRequest` is the
+/// original defect. Dropping `Addressed` is the new one this shape makes
+/// possible, and it is the more dangerous of the two: it would make the keyed
+/// contract hash the *singleton's* request type, so a peer holding a singleton
+/// client could complete a handshake against an actor system and then send a
+/// message with no actor id in it.
+#[test]
+fn the_keyed_alpn_hashes_the_keyed_wire_type() {
+    // Must match what the macro builds: concat!(CARGO_PKG_NAME, "/", service,
+    // "/keyed").
+    const P: &str = concat!(env!("CARGO_PKG_NAME"), "/Probe/keyed");
+
+    let request_drifted = keylink::derive_alpn::<KeyedRequestDriftedContract>(P);
+    let unaddressed = keylink::derive_alpn::<KeyedUnaddressedContract>(P);
+    let correct = keylink::derive_alpn::<CorrectKeyedContract>(P);
+
+    assert_ne!(
+        request_drifted, correct,
+        "wrapping the keyed request in WireRequest must change the hash. A peer \
+         that cannot receive a ledger query decodes one as a call, which is the \
+         variant confusion this whole scheme exists to refuse"
+    );
+    assert_ne!(
+        unaddressed, correct,
+        "wrapping the request in Addressed must change the hash, or a keyed \
+         contract and a singleton contract agree about a wire that carries an \
+         actor id in one direction and not the other"
+    );
+
+    let real = String::from_utf8_lossy(probe::keyed_alpn()).into_owned();
+    let correct_hash = String::from_utf8_lossy(&correct)
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+
+    assert!(
+        real.ends_with(&correct_hash),
+        "the generated keyed ALPN must hash the keyed wire type.\n  generated: {real}\n  expected suffix: {correct_hash}"
+    );
+}
+
+/// A service served both ways at once answers on two different ALPNs, and both
+/// register on one node.
+///
+/// One router owns one ALPN, so a collision here would be
+/// `ConfigError::DuplicateAlpn` at startup — on a tree where nothing looked
+/// wrong, because the two contracts are built from the same `Request` and
+/// `Response` and only their wrappers differ.
+#[tokio::test]
+async fn a_service_serves_as_a_singleton_and_as_an_actor_system_on_one_node() {
+    let node = local_node().await;
+    let system: probe::System = probe::System::builder(keylink::Eviction::Never).build();
+
+    assert_ne!(
+        probe::alpn(),
+        probe::keyed_alpn(),
+        "the two contracts must not hash the same, or one node cannot serve both"
+    );
+
+    let _running = keylink::Server::builder(&node)
+        .service(probe::service(Server, Allowlist::anyone()).build())
+        .service(probe::keyed_service(&system, Allowlist::anyone()).build())
+        .spawn()
+        .expect("one service, served both ways, on one node");
+}
+
 /// The contract hash, pinned to a literal.
 ///
 /// Every other test in this repository compiles BOTH peers from one source
@@ -806,9 +921,39 @@ fn the_alpn_hashes_the_response_type_the_wire_actually_carries() {
 /// reply, which is exactly the postcard variant-confusion the derived ALPN
 /// exists to refuse. Refusing it at the handshake is the correct outcome, and
 /// costs nothing: keylink is unpublished, so there is no fleet to split.
+///
+/// # Moved a second time, by the per-service keyed rewrite
+///
+/// `aa77e29e5e1ccdc7` → `d3fe34471921164e`. **Step 1 was answered before the
+/// literal was touched, and the answer is yes.**
+///
+/// `RemoteError::ActorSchemaMismatch` was deleted. It was the fifth variant of
+/// six, and removing it renumbers `Failed` from index 5 to index 4. `RemoteError`
+/// is inside every service's hashed contract —
+/// `Envelope<WireResponse<Response>>` reaches `WireResponse::Call(Outcome<Resp>)`
+/// reaches `Outcome::Err(RemoteError)` — and postcard encodes an enum variant by
+/// its declaration index. So a peer built before this change writes a refusal
+/// under a number the new one does not have, and a peer built after would read
+/// an old `Failed` as whatever now sits at 5. Under a variant *insertion* rather
+/// than a removal that is silent and wrong; here it is a decode failure. Either
+/// way it is the drift this hash exists to refuse, so the hash MUST move.
+///
+/// It is not a rename and not a doc edit. Nothing else in `probe`'s transitive
+/// contract graph changed: `Envelope`, `WireRequest`, `WireResponse`,
+/// `WireKinds` and `Outcome` are untouched, and `probe`'s own `Request` and
+/// `Response` are untouched. One cause, one move.
+///
+/// **This is wire-visible for every service, singletons included** — the keyed
+/// rewrite is where the variant became unnecessary, but the cost lands on the
+/// whole fleet because `RemoteError` belongs to every service keylink carries.
+/// The variant was there to report per-actor schema drift inside one system-wide
+/// actor envelope. A keyed system is per-service now, its ALPN hashes
+/// `Envelope<WireRequest<Addressed<Request>>>`, drift is refused at the
+/// handshake, and a `System` of one service physically cannot hold an actor of
+/// another. There is nothing left for the variant to say.
 #[test]
 fn the_contract_hash_has_not_moved() {
-    const PINNED: &str = "keylink/Probe/aa77e29e5e1ccdc7";
+    const PINNED: &str = "keylink/Probe/d3fe34471921164e";
 
     assert_eq!(
         String::from_utf8_lossy(probe::alpn()),

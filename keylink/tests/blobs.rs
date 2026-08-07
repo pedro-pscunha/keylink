@@ -1152,150 +1152,131 @@ async fn a_blob_response_carries_the_reply_and_the_address_together() {
     );
 }
 
-// ═════════════════════════════════════════════ the actor path, ruled out
+// ═══════════════════════════════════════════ the actor path, ruled back IN
 //
-// RFC-01 §11.2a from the other direction. Putting the `BlobId` in the
-// per-actor payload is right for the ALPN — it is what stops an address
-// arriving under a mismatched schema — and it also puts the address out of
-// reach of the granting seam, because `ActorReply` is opaque bytes the actor
-// system never decodes.
+// RFC-01 §11.2a, answered a second time and differently. Putting the `BlobId`
+// in the per-actor payload was right for the ALPN, and it ALSO put the address
+// out of reach of the granting seam — because the keyed reply was an opaque
+// `ActorReply` the actor system never decoded, and `serve_one` reads a grant off
+// the reply through `Granting`.
 //
-// So the `blob` kind works on plain services and NOT through the KEYED actor
-// system. It does work on a singleton actor served with `Handle::service`,
-// which puts the mailbox behind the service's own typed `Response` and leaves
-// `Granting` exactly where it was — the address is readable, so the grant is
-// recorded. That is one of the three §14.8 costs capability A does not pay, and
-// it is a property of keyed addressing rather than of actors.
+// So `blob` worked on plain services and on a singleton actor served with
+// `Handle::service`, and NOT through the keyed system. Two tests pinned that:
+// `ActorRef` had no `datasheet` method, and the address reachable the hard way
+// was refused on fetch. Both are deleted here, deliberately, because both stated
+// a limitation that no longer exists.
 //
-// The outcome that would be unacceptable is the third one: appearing to work
-// while never granting, which hands a peer an address nothing will serve. Both
-// halves are pinned below — the supported path does not exist here, and the
-// unsupported one fails closed.
+// A keyed actor answers with the service's own typed `Response`. `Granting` is
+// the same generated impl the singleton path uses, `serve_one` reads it in the
+// same place, and the grant is recorded before the reply is written. The
+// limitation was a consequence of payload opacity, not of keyed addressing —
+// which is what removing the opacity demonstrates.
+//
+// The outcome that would be unacceptable is unchanged: appearing to work while
+// never granting. So this pins the grant end to end, over two real nodes, rather
+// than asserting that a method exists.
 
-/// Returned by the absence probe. Distinct from anything a real method would
-/// return, so an inherent method that shadows it is a type error rather than a
-/// silent pass.
-struct NoSuchMethod;
-
-/// `ActorRef` must have no `datasheet`, because a handle it returned could not
-/// have been granted.
+/// A `blob` method on a KEYED actor hands out an address the peer can fetch.
 ///
-/// An inherent method outranks a trait method, so while no inherent
-/// `datasheet` exists the call resolves here and the marker checks out. Add one
-/// and this stops compiling — which is the point: the day somebody wires the
-/// actor seam, they must delete this probe deliberately rather than discover
-/// later that it silently started handing out ungranted addresses.
-trait ActorRefHasNoBlobMethod {
-    fn datasheet(&self, _sku: String) -> NoSuchMethod {
-        NoSuchMethod
-    }
-}
-
-impl ActorRefHasNoBlobMethod for catalog::ActorRef<'_> {}
-
-#[allow(dead_code)]
-fn the_actor_handle_has_no_blob_method(actor: &catalog::ActorRef<'_>) {
-    let _: NoSuchMethod = actor.datasheet(String::new());
-}
-
-/// And the unsupported route fails closed rather than quietly.
+/// The whole chain in one test, because every link is new: the generated
+/// `ActorRef::datasheet` exists at all; the reply is typed, so `Granting` can see
+/// the address; `keyed_service(..).with_blobs(..)` puts the store where
+/// `serve_one` can record against it; and the fetch then succeeds on the blobs
+/// connection.
 ///
-/// A `blob` method still exists on the `Actor` trait, so a service CAN be
-/// mounted as an actor and reached through a raw `ActorClient::call`. That
-/// route returns the address with no grant behind it, because the actor
-/// system's reply is opaque and `serve_one` has nothing to read. The fetch is
-/// then refused, which is the safe direction and the one to pin.
+/// The unpublished id in the same store is the control. It proves the grant is
+/// per-address rather than "this peer may fetch anything", which is the failure
+/// a test that only fetched the granted id would pass.
 #[tokio::test]
-async fn an_actor_mounted_blob_method_hands_out_an_address_that_is_refused() {
-    use keylink::{ActorClient, Eviction, System};
-
+async fn a_keyed_actors_blob_method_grants_the_address_it_returns() {
     let server = local_node().await;
     let caller = local_node().await;
     let blobs = Blobs::memory();
-    let granted = blobs
-        .add_bytes(b"reached the ordinary way, and granted".to_vec())
+    let published = blobs
+        .add_bytes(b"the datasheet a keyed actor handed out".to_vec())
         .await
         .expect("stores");
-    let ungranted = blobs
-        .add_bytes(b"handed out by the actor path, granted by nobody".to_vec())
+    let unpublished = blobs
+        .add_bytes(b"in the same store, returned by nobody".to_vec())
         .await
         .expect("stores");
 
-    let system = System::builder(Eviction::Never).build();
+    let system: catalog::System = catalog::System::builder(keylink::Eviction::Never).build();
     system
         .mount(
             keylink::ActorId::new("warehouse").expect("a valid id"),
-            // The ACTOR returns the address nobody grants.
             catalog::spawn(Warehouse {
-                published: ungranted,
-                unpublished: ungranted,
+                published,
+                unpublished,
             }),
         )
         .expect("mounts");
 
-    // The node ALSO serves the same service the ordinary way, so
-    // `/iroh-bytes/4` really is mounted and a fetch reaches the grant check.
-    // Without this the address is unfetchable for the weaker reason that the
-    // node serves no blobs at all, and the test would pass while proving
-    // nothing about grants.
     let _running = keylink::Server::builder(&server)
-        .service(system.service(Allowlist::anyone()).build())
         .service(
-            // The PLAIN route returns a different address, and grants it. That
-            // is what gets the caller admitted at the blobs connection, so the
-            // fetch below reaches the per-hash check instead of stopping at
-            // "this peer holds no grants at all".
-            catalog::service(
-                Warehouse {
-                    published: granted,
-                    unpublished: granted,
-                },
-                Allowlist::anyone(),
-            )
-            .with_blobs(&blobs)
-            .build(),
+            catalog::keyed_service(&system, Allowlist::anyone())
+                .with_blobs(&blobs)
+                .build(),
         )
         .spawn()
-        .expect("an actor system beside the same service mounted plainly");
+        .expect("a keyed actor system that serves content");
 
-    let client = ActorClient::connect(&caller, server.endpoint().addr())
+    let client = catalog::KeyedClient::connect(&caller, server.endpoint().addr())
         .await
-        .expect("dials the actor system");
+        .expect("dials the keyed system");
+    let actor = catalog::at(
+        &client,
+        keylink::ActorId::new("warehouse").expect("a valid id"),
+    );
 
-    // The raw route: the reply decodes, so the address does arrive.
-    let (response, _body) = client
-        .call::<catalog::Request, catalog::Response>(
-            &keylink::ActorId::new("warehouse").expect("a valid id"),
-            catalog::schema(),
-            &catalog::Request::Datasheet {
-                sku: "ADU-014".to_owned(),
-            },
-            keylink::Body::empty(),
-        )
-        .await
-        .expect("the actor answers");
-    let catalog::Response::Datasheet((_manual, id)) = response else {
-        panic!("expected the datasheet reply");
-    };
-    assert_eq!(id, ungranted, "the address arrives");
-
-    // First earn a grant the ordinary way, so this peer IS admitted at the
-    // blobs connection. Without this the fetch below is refused for the weaker
-    // reason that the peer holds no grants at all, and the test stays green
-    // even with the per-hash check deleted. It did.
-    let plain = catalog::Client::connect(&caller, server.endpoint().addr())
-        .await
-        .expect("dials the plain service");
-    let (_manual, _handle) = plain
+    let (manual, handle) = actor
         .datasheet("ADU-014".to_owned())
         .await
-        .expect("the plain route answers");
+        .expect("the actor answers with a reply and a handle");
+    assert_eq!(manual.pages, 42);
 
-    // And the actor's address is worth nothing, because nothing granted it.
+    let mut fetched = Vec::new();
+    handle
+        .copy_to(&mut fetched)
+        .await
+        .expect("the address a keyed actor returned must be fetchable");
+    assert_eq!(fetched, b"the datasheet a keyed actor handed out");
+
+    // And nothing else in the store came with it.
     let mut sink = Vec::new();
-    let error = BlobHandle::new(&caller, server.endpoint().addr(), id)
+    let error = BlobHandle::new(&caller, server.endpoint().addr(), unpublished)
         .copy_to(&mut sink)
         .await
-        .expect_err("an address from the actor path must not be fetchable");
-    assert_refused(&error, "an address the actor path never granted");
+        .expect_err("an address nobody returned must not be fetchable");
+    assert_refused(&error, "content the keyed actor never named");
+}
+
+/// The startup refusal that could not fire before, and now can.
+///
+/// `ServerBuilder::spawn` compares `DECLARES_BLOBS` against the store a service
+/// was given. The keyed path never reported the flag — `System::service` did not
+/// call `__keylink_declares_blobs` — so `ConfigError::MissingBlobStore` was a
+/// check whose flag was always false there, and a keyed service declaring `blob`
+/// started happily and granted nothing.
+///
+/// It is a real check now, and this is a behaviour change worth pinning rather
+/// than discovering: a keyed service with a `blob` method and no store is
+/// refused at startup instead of at the first fetch.
+#[tokio::test]
+async fn a_keyed_service_with_blob_methods_and_no_store_is_refused_at_startup() {
+    let node = local_node().await;
+    let system: catalog::System = catalog::System::builder(keylink::Eviction::Never).build();
+
+    let error = keylink::Server::builder(&node)
+        .service(catalog::keyed_service(&system, Allowlist::anyone()).build())
+        .spawn()
+        .expect_err("a keyed service declaring `blob` must be given a store");
+
+    assert!(
+        matches!(
+            error,
+            Error::Config(keylink::ConfigError::MissingBlobStore { .. })
+        ),
+        "expected a missing-store config error, got {error:?}"
+    );
 }

@@ -12,7 +12,7 @@
 use std::alloc::{GlobalAlloc, Layout, System as Libc};
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use keylink::{ActorId, Caller, Eviction, System};
+use keylink::{ActorId, Caller, Eviction};
 
 /// Counts live heap bytes. Relaxed ordering: this is a measurement, and a
 /// missed reordering costs one allocation's worth of accuracy out of millions.
@@ -66,16 +66,26 @@ impl ledger::Actor for Empty {
 ///
 /// The cost is dominated by two allocations: the spawned task, and the mailbox.
 /// `tokio::sync::mpsc` allocates its first block of 32 slots eagerly, so the
-/// mailbox costs `32 * size_of::<T>()` whatever its capacity is. That is why
-/// `Mail` is boxed on the way in: unboxed it is hundreds of bytes, which would
-/// be kilobytes per idle actor and tens of megabytes across ten thousand.
+/// mailbox costs `32 * size_of::<T>()` whatever its capacity is. That is why a
+/// mailbox slot is boxed: unboxed it is hundreds of bytes, which would be
+/// kilobytes per idle actor and tens of megabytes across ten thousand.
+///
+/// **The slot type is now per service**, and that raises the stakes rather than
+/// lowering them. `ledger::Mail` holds this service's own `Request` and a
+/// `oneshot::Sender` of its own `Response`, so it is sized to whichever is
+/// largest — a caller's decision rather than keylink's. The boxing is what keeps
+/// this budget a statement about keylink. `Empty` and a one-field request are
+/// deliberately the smallest case, so this measures the framework's floor and
+/// not a service's ceiling.
 const BUDGET_PER_ACTOR: isize = 2048;
 
 #[tokio::test]
 async fn ten_thousand_idle_actors_fit_in_the_budget() {
     const ACTORS: usize = 10_000;
 
-    let system = System::builder(Eviction::Never).capacity(ACTORS).build();
+    let system: ledger::System = ledger::System::builder(Eviction::Never)
+        .capacity(ACTORS)
+        .build();
     settle().await;
 
     let before = LIVE.load(Ordering::Relaxed);
@@ -96,12 +106,17 @@ async fn ten_thousand_idle_actors_fit_in_the_budget() {
     println!("{ACTORS} idle actors cost {total} bytes, {each} bytes each");
 
     // The boxing decision, in numbers rather than in prose. A mailbox holds one
-    // eagerly allocated block of 32 slots, so an unboxed `Mail` would cost this
+    // eagerly allocated block of 32 slots, so an unboxed slot would cost this
     // much per idle actor on its own.
-    let unboxed = std::mem::size_of::<keylink::Mail>() * 32;
+    //
+    // `ledger::Mail` and not `keylink::Mail`: the slot is this service's own
+    // type, and there is no service-independent number to print any more. That
+    // is the honest version of the table `Mailbox`'s documentation carries — the
+    // figure moves with whoever wrote the service.
+    let unboxed = std::mem::size_of::<ledger::Mail>() * 32;
     println!(
-        "one Mail is {} bytes; unboxed, a mailbox alone would be {unboxed} bytes per actor",
-        std::mem::size_of::<keylink::Mail>()
+        "one ledger::Mail is {} bytes; unboxed, a mailbox alone would be {unboxed} bytes per actor",
+        std::mem::size_of::<ledger::Mail>()
     );
 
     assert_eq!(system.len(), ACTORS);
