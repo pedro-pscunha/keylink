@@ -301,7 +301,7 @@ pub mod inspect {
 }
 pub use error::{ConfigError, Error, Result, Transport};
 pub use idempotency::{
-    Idempotency, IdempotencyRefusal, KeyState, Keyable, MAX_ATTACH, MAX_RECORDED_BYTES,
+    Idempotency, IdempotencyRefusal, KeyState, Keyable, Records, MAX_ATTACH, MAX_RECORDED_BYTES,
     MAX_RECORDS, MAX_RUNNING, MAX_RUNNING_PER_PEER, MAX_TOMBSTONES, MAX_WAITING,
     MAX_WAITING_PER_PEER, RECORD_TTL,
 };

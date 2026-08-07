@@ -19,7 +19,8 @@
 //!    be rescued by a default in expression position — `DEFAULT_CAPACITY` — is
 //!    reached through the alias instead.
 //! 4. **The serving side's idempotency policy resolves from out here** —
-//!    `Keyable`, `ServiceBuilder::keyable` and `IdempotencyRefusal::NotKeyable`.
+//!    `Keyable`, `Records`, `ServiceBuilder::keyable`, `ServiceBuilder::records`
+//!    and `IdempotencyRefusal::NotKeyable`.
 //!    Not part of the actor surface, and here for the reason in the paragraph
 //!    below: this is the only consumer-position file in the repo, and `rpc.rs`
 //!    deliberately reaches `Keyable` through `crate::idempotency` so that the root
@@ -45,7 +46,7 @@
 
 use keylink::{
     mount, ActorId, Allowlist, Body, BodyReader, Caller, Ended, Eviction, Keyable, KeyedService,
-    MountError, Origin, Reply,
+    MountError, Origin, Records, Reply,
 };
 
 keylink::service! {
@@ -142,8 +143,8 @@ async fn the_generated_module_supplies_the_rest_fully_applied() {
 
 /// **The serving side's idempotency policy, written from a consumer's position.**
 ///
-/// This file's header scopes it to the actor surface, and these three names are not
-/// part of that. They are here anyway for the reason the header gives: this is the
+/// This file's header scopes it to the actor surface, and these names are not part
+/// of that. They are here anyway for the reason the header gives: this is the
 /// only place in the repo that writes keylink's own names the way a downstream crate
 /// writes them, and a policy a caller cannot reach from outside is a policy that
 /// does not exist. `keyable` in particular is reached through a `ServiceBuilder` the
@@ -186,11 +187,20 @@ async fn the_generated_module_supplies_the_rest_fully_applied() {
 ///
 /// The library itself still compiled under that edit — nothing in-crate calls the
 /// method — which is what makes this annotation the only thing holding the name.
+///
+/// `ServiceBuilder::records` is the same story and was watched the same way, by
+/// replacing `pub fn records(mut self, records: Records) -> Self {` with
+/// `pub fn recording(mut self, records: Records) -> Self {`: `error[E0599]: no
+/// associated function or constant named `records` found for struct
+/// `ServiceBuilder<Req, Resp>` in the current scope`, and `error: could not compile
+/// `keylink` (test "api") due to 1 previous error` — the library again untouched.
 #[tokio::test]
 async fn the_serving_side_key_policy_resolves_from_outside() {
     // ── type position ────────────────────────────────────────────────────────
     let _: Keyable = Keyable::Any;
     let _: Option<Keyable> = None;
+    let _: Records = Records::Memory;
+    let _: Option<Records> = None;
 
     // ── expression position ──────────────────────────────────────────────────
     let _ = Keyable::Only(&["Count"]);
@@ -204,6 +214,12 @@ async fn the_serving_side_key_policy_resolves_from_outside() {
         Keyable,
     ) -> keylink::ServiceBuilder<depot::Request, depot::Response> =
         keylink::ServiceBuilder::keyable;
+    let _ = Records::None;
+    let _: fn(
+        keylink::ServiceBuilder<depot::Request, depot::Response>,
+        Records,
+    ) -> keylink::ServiceBuilder<depot::Request, depot::Response> =
+        keylink::ServiceBuilder::records;
     // And the refusal a caller has to be able to match on, since it is what a
     // refused key arrives as.
     let _ = keylink::IdempotencyRefusal::NotKeyable {

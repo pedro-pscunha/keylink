@@ -44,7 +44,7 @@ use crate::error::ConfigError;
 // `tests/api.rs` is the only place that writes it from a consumer's position. An
 // in-crate `crate::Keyable` would make the library itself the thing that fails
 // when the re-export goes, which would leave that test proving nothing.
-use crate::idempotency::{Claim, Guard, Keyable, Ledger};
+use crate::idempotency::{Claim, Guard, Keyable, Ledger, Records};
 use crate::middleware::{wrap, Reached};
 use crate::wire::FrameReader;
 use crate::{
@@ -135,8 +135,8 @@ impl Keys {
     /// The one place the two are decided together, which is what lets
     /// `keyed_none_builds_no_ledger` probe the absence directly rather than
     /// reaching through an erased handler for it.
-    fn new(keyable: Keyable) -> Self {
-        let ledger = keyable.needs_a_ledger().then(Ledger::new);
+    fn new(keyable: Keyable, records: Records) -> Self {
+        let ledger = keyable.needs_a_ledger().then(|| Ledger::new(records));
         Self { keyable, ledger }
     }
 
@@ -676,11 +676,11 @@ mod tests {
     #[test]
     fn keyed_none_builds_no_ledger() {
         assert!(
-            Keys::new(Keyable::None).ledger.is_none(),
+            Keys::new(Keyable::None, Records::Memory).ledger.is_none(),
             "`Keyable::None` must not allocate a ledger nothing can ever write to"
         );
         assert!(
-            Keys::new(Keyable::Any).ledger.is_some(),
+            Keys::new(Keyable::Any, Records::Memory).ledger.is_some(),
             "and every other policy must have one, or no key works at all"
         );
     }
@@ -696,7 +696,7 @@ mod tests {
     /// `panicked at .., a refused method must not, or the policy decides nothing`, `0 passed; 1 failed; 138 filtered out`.
     #[test]
     fn the_ledger_is_reachable_only_through_the_policy() {
-        let keys = Keys::new(Keyable::Only(&["Reserve"]));
+        let keys = Keys::new(Keyable::Only(&["Reserve"]), Records::Memory);
         assert!(
             keys.ledger_for("Reserve").is_some(),
             "an accepted method must reach the ledger"
@@ -717,7 +717,7 @@ mod tests {
     /// the test fails on the variant rather than hanging.
     #[tokio::test(start_paused = true)]
     async fn an_attacher_over_the_cap_is_refused_before_it_parks() {
-        let ledger = Ledger::new();
+        let ledger = Ledger::new(Records::Memory);
         let peer = EndpointId::from_str(A).expect("a valid endpoint id");
         let key = IdempotencyKey::new("k").expect("a valid key");
 
@@ -767,7 +767,7 @@ mod tests {
     /// concurrency bound usually gets wrong.
     #[tokio::test(start_paused = true)]
     async fn a_parked_attacher_keeps_its_place_for_the_whole_wait() {
-        let ledger = Ledger::new();
+        let ledger = Ledger::new(Records::Memory);
         let peer = EndpointId::from_str(A).expect("a valid endpoint id");
         let key = IdempotencyKey::new("k").expect("a valid key");
 
@@ -819,6 +819,9 @@ pub struct ServiceBuilder<Req, Resp> {
     /// Which methods accept an idempotency key. [`Keyable::Any`] by default, which
     /// is what this crate did before the type existed.
     keyable: Keyable,
+    /// Where the replies of the accepted ones live. [`Records::Memory`] by
+    /// default, for the same reason.
+    records: Records,
 }
 
 impl<Req, Resp> ServiceBuilder<Req, Resp>
@@ -840,6 +843,7 @@ where
             // lives in one place, on the type, so a reader who wants to know what
             // a service that never names a policy does has one place to look.
             keyable: Keyable::default(),
+            records: Records::default(),
         }
     }
 
@@ -932,6 +936,31 @@ where
         self
     }
 
+    /// Decide where the replies recorded under a key live.
+    ///
+    /// [`Records::None`] is at-most-once without paying to store a reply: the key
+    /// still claims, so the work still runs once, and every repeat is
+    /// [`IdempotencyRefusal::Forgotten`](crate::IdempotencyRefusal::Forgotten)
+    /// rather than the reply. Reach for it when the caller can read the result out
+    /// of its own domain and only needed *"do not run this twice"*.
+    ///
+    /// ```ignore
+    /// till::service(handler, Allowlist::anyone())
+    ///     .keyable(Keyable::Only(&["Reserve"]))
+    ///     .records(Records::None)
+    ///     .build()
+    /// ```
+    ///
+    /// The default is [`Records::Memory`], so a service that never calls this
+    /// behaves exactly as it did before the method existed. **No setting here can
+    /// weaken at-most-once** — the key state never leaves memory whatever this
+    /// says, and [`Records`] is only about the reply bytes.
+    #[must_use]
+    pub fn records(mut self, records: Records) -> Self {
+        self.records = records;
+        self
+    }
+
     /// Freeze the chain and erase the schema.
     pub fn build(self) -> Service {
         let mut chain = self.base;
@@ -944,7 +973,7 @@ where
                 next: chain,
                 admission: self.admission,
                 blobs: self.blobs.clone(),
-                keys: Keys::new(self.keyable),
+                keys: Keys::new(self.keyable, self.records),
                 _p: PhantomData,
             }),
             blobs: self.blobs,

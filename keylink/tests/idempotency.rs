@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use keylink::{
     ActorId, Allowlist, Body, BodyReader, Caller, Context, Error, Eviction, IdempotencyKey,
-    IdempotencyRefusal, Keyable, Middleware, Next, Node, Outcome, RemoteError,
+    IdempotencyRefusal, Keyable, Middleware, Next, Node, Outcome, Records, RemoteError,
     Server as KeylinkServer,
 };
 use postcard_schema::Schema;
@@ -975,6 +975,237 @@ async fn two_services_on_one_node_do_not_share_a_ledger() {
     assert_eq!(
         run, 1,
         "the second service must run, not answer from the first service's record"
+    );
+}
+
+// ──────────────────────────────── a key without a stored reply
+
+/// A `till` served with the reply bytes going nowhere.
+///
+/// `Keyable::Any` deliberately, so nothing in these two tests is decided by
+/// Wave 1's policy: every method still accepts a key, and the only thing that
+/// changed is what a settled key holds.
+async fn start_recordless() -> Fixture {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let running = KeylinkServer::builder(&server)
+        .service(
+            till::service(Till::default(), Allowlist::anyone())
+                .records(Records::None)
+                .build(),
+        )
+        .spawn()
+        .expect("one service, no duplicate ALPN");
+    let client = till::Client::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("the client dials the server");
+
+    Fixture {
+        client,
+        _server: running,
+        _nodes: vec![server, client_node],
+    }
+}
+
+/// **`Records::None` gives up the answer and keeps at-most-once.** This is the
+/// half that matters: the work runs once and the repeat does not run it again.
+///
+/// The evidence is the handler's own counter, read through a *third* key. The
+/// first call answers 1. If the refused repeat had run the handler, the third key
+/// would answer 3; it answers 2, so the repeat entered nothing. A test that only
+/// asserted the refusal would be satisfied by a service that ran the work and
+/// then refused to say so.
+///
+/// Made red by `scripts/break-once.sh` replacing `Guard::record`'s
+/// `self.ledger.settle(self.peer, &self.key, slot);` with
+/// `let _ = slot;` followed by `self.ledger.release(self.peer, &self.key);` — the
+/// key given back instead of spent, which is the only shape at-most-once fails in.
+/// Watched: `panicked at .., the repeat is refused, not answered: 2`, `0 passed;
+/// 1 failed; 29 filtered out`. The `2` is the handler's counter: the repeat ran.
+///
+/// **What that break does NOT reach is this test's last assertion**, and it is worth
+/// saying which half is unguarded. The break trips the `expect_err` above it, so the
+/// counter check never runs. The case the counter check exists for is subtler — a
+/// service that refuses the repeat *and* enters the handler anyway — and that would
+/// mean `serve_one` claiming after `next(..)` rather than before, which is a
+/// reordering of two statements and not a substitution `break-once.sh` can express.
+/// Standing in for it, and it is the ordering the whole module rests on:
+///
+/// ```sh
+/// rg -n 'claim_key\(&keys|let \(outcome, body\) = next\(' keylink/src/rpc.rs
+/// ```
+///
+/// Exactly two matches, and the `claim_key` one must carry the LOWER line number.
+/// `a_refusal_before_dispatch_leaves_the_key_claimable` and
+/// `an_abort_before_dispatch_does_not_report_interrupted` are what would notice if
+/// the two ever swapped.
+#[tokio::test]
+async fn records_none_still_runs_the_work_at_most_once() {
+    let fixture = start_recordless().await;
+
+    let first = fixture
+        .client
+        .with_idempotency(key("k"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("the first call runs");
+    assert_eq!(first, 1, "the handler ran once");
+
+    let _refused = fixture
+        .client
+        .with_idempotency(key("k"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect_err("the repeat is refused, not answered");
+
+    let after = fixture
+        .client
+        .with_idempotency(key("fresh"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("a different key is different work");
+    assert_eq!(
+        after, 2,
+        "the refused repeat must not have entered the handler: 3 here means it did"
+    );
+}
+
+/// The half `Records::None` gives up, said out loud: the repeat gets
+/// `Forgotten` rather than the reply.
+///
+/// Asserted against the identical call on a **default** service, in the same test,
+/// because the claim is a difference. `Records::Memory` answers 1 twice;
+/// `Records::None` answers 1 then refuses. Asserting only the refusal would pass on
+/// a service that refused every repeat for some unrelated reason.
+///
+/// `Forgotten` and not a variant of its own, which was a decision rather than an
+/// omission — `IdempotencyRefusal::Forgotten`'s doc comment carries the argument,
+/// including why the wire moving this wave anyway did not change it.
+///
+/// Made red by `scripts/break-once.sh` replacing `Records::None => Slot::Forgotten,`
+/// with `Records::None => Slot::Done(frame.clone()),`. Watched: `panicked at ..,
+/// the repeat under `Records::None` is refused, not answered: 1`, `0 passed;
+/// 1 failed; 28 filtered out` — the `expect_err` fires because the repeat came back
+/// as the recorded reply.
+#[tokio::test]
+async fn records_none_refuses_the_repeat_instead_of_answering_it() {
+    let recording = start().await;
+    let first = recording
+        .client
+        .with_idempotency(key("k"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("runs");
+    assert_eq!(
+        recording
+            .client
+            .with_idempotency(key("k"))
+            .reserve("ADU-014".to_string(), 2)
+            .await
+            .expect("a recording service answers the repeat from its record"),
+        first,
+        "this is what `Records::Memory` does, and it is the contrast"
+    );
+
+    let recordless = start_recordless().await;
+    recordless
+        .client
+        .with_idempotency(key("k"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("the first call runs on both");
+    let refused = recordless
+        .client
+        .with_idempotency(key("k"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect_err("the repeat under `Records::None` is refused, not answered");
+
+    assert_eq!(
+        refusal(&refused),
+        IdempotencyRefusal::Forgotten,
+        "it ran, and its reply is not held - which is what `Forgotten` says"
+    );
+}
+
+// ────────────────────────────────────────── the defaults, spelled and not
+
+/// **A service that names neither policy behaves as one that names both
+/// defaults.** That is the whole compatibility claim of both waves, and it is
+/// asserted as a comparison rather than as a re-run of
+/// `a_repeated_key_does_not_run_the_handler_twice`.
+///
+/// `till` is built with no `.keyable()` and no `.records()` call. `depot` names
+/// `Keyable::Any` and `Records::Memory` out loud. Both must answer the repeat from
+/// the record, and both must be `Done` when asked. Asserting only one of the two
+/// services would prove nothing the tests above this line do not.
+///
+/// The unit half — that `Keyable::default()` IS `Any` and `Records::default()` IS
+/// `Memory` — is `idempotency::tests::policy::the_default_policy_keys_every_method`
+/// and `idempotency::tests::records::the_default_records_in_memory`. This is the
+/// half that says the two spellings meet over a real connection.
+///
+/// Made red by `scripts/break-once.sh` replacing `keyable: Keyable::default(),` in
+/// `ServiceBuilder::new` with `keyable: Keyable::None,`. Watched: `panicked at ..,
+/// the unnamed default must record: Remote(Idempotency(NotKeyable { method:
+/// "Reserve" }))`, `0 passed; 1 failed; 28 filtered out`.
+#[tokio::test]
+async fn the_defaults_reproduce_todays_behaviour() {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let _running = KeylinkServer::builder(&server)
+        .service(till::service(Till::default(), Allowlist::anyone()).build())
+        .service(
+            depot::service(Depot::default(), Allowlist::anyone())
+                .keyable(Keyable::Any)
+                .records(Records::Memory)
+                .build(),
+        )
+        .spawn()
+        .expect("distinct ALPNs register cleanly");
+
+    let addr = server.endpoint().addr();
+    let unnamed = till::Client::connect(&client_node, addr.clone())
+        .await
+        .expect("dials");
+    let spelled = depot::Client::connect(&client_node, addr)
+        .await
+        .expect("dials");
+
+    let first = unnamed
+        .with_idempotency(key("k"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("the unnamed default must record");
+    assert_eq!(
+        unnamed
+            .with_idempotency(key("k"))
+            .reserve("ADU-014".to_string(), 2)
+            .await
+            .expect("and must replay"),
+        first,
+        "a service naming no policy must answer the repeat from the record"
+    );
+
+    let also = spelled
+        .with_idempotency(key("k"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("the spelled default must record");
+    assert_eq!(
+        spelled
+            .with_idempotency(key("k"))
+            .reserve("ADU-014".to_string(), 2)
+            .await
+            .expect("and must replay"),
+        also,
+        "spelling the default out loud must change nothing"
+    );
+
+    assert_eq!(
+        unnamed.key_state(key("k")).await.expect("asks"),
+        keylink::KeyState::Done,
+        "and the ledger must agree with the replay"
     );
 }
 
