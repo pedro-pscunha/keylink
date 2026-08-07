@@ -86,6 +86,14 @@ keylink::service! {
     service Ticker;
 
     rpc Beats() -> u64;
+    /// Parked in the state and never answered, so that a peer is holding a live
+    /// reply channel at the instant something unwinds this actor's task.
+    ///
+    /// [`Desk`] has the same method, and the duplication is deliberate: the two
+    /// panics that escape a turn's guard — a factory's and a feed's — need an
+    /// actor that has **both** a feed and a parked reply, and `Desk` has no feed.
+    #[defer]
+    rpc Park(order: u64) -> u64;
     /// The input a supervisor cannot re-open by itself. A feed that ends stops
     /// the actor by design, so a factory handing out a fresh stream per
     /// incarnation is the only thing that can re-attempt one.
@@ -164,6 +172,17 @@ impl Durable for Ledger {
 /// list rather than a count.
 struct Ticker {
     seen: Arc<Mutex<Vec<u64>>>,
+    /// Held by the state, so it dies exactly when the state does.
+    parked: Vec<Deferred<u64>>,
+}
+
+impl Ticker {
+    fn new(seen: &Arc<Mutex<Vec<u64>>>) -> Self {
+        Self {
+            seen: Arc::clone(seen),
+            parked: Vec::new(),
+        }
+    }
 }
 
 impl ticker::Actor for Ticker {
@@ -171,8 +190,39 @@ impl ticker::Actor for Ticker {
         self.seen.lock().expect("not poisoned").len() as u64
     }
 
+    /// Records the order in `seen` as well as parking it, so that `beats()` — a
+    /// method the whole file already has — is how a test waits for the park to
+    /// have **happened** rather than assuming it won a race with a peer.
+    async fn park(&mut self, _cx: Caller<'_>, reply: Reply<u64>, order: u64) -> Replied<u64> {
+        let (deferred, replied) = reply.later();
+        self.parked.push(deferred);
+        self.seen.lock().expect("not poisoned").push(order);
+        replied
+    }
+
     async fn on_beat(&mut self, beat: u64) {
         self.seen.lock().expect("not poisoned").push(beat);
+    }
+}
+
+/// A feed whose `poll_next` **panics**, once somebody arms it.
+///
+/// `run_loop` polls a caller's `Feeds` directly, inside a `poll_fn`, with no
+/// `catching` around it — so this panic unwinds the actor's whole task rather
+/// than ending one turn. It is armed rather than immediate so that a test can
+/// get a reply parked first, and it parks as `Pending` until then: every
+/// mailbox message wakes the loop and gives it another poll.
+struct Exploding(Arc<std::sync::atomic::AtomicBool>);
+
+impl Stream for Exploding {
+    type Item = u64;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<u64>> {
+        assert!(!self.0.load(Ordering::SeqCst), "the feed exploded");
+        std::task::Poll::Pending
     }
 }
 
@@ -434,9 +484,7 @@ async fn a_restart_storm_ends_the_actor() {
                 async move {
                     built.fetch_add(1, Ordering::SeqCst);
                     Ok((
-                        Ticker {
-                            seen: Arc::new(Mutex::new(Vec::new())),
-                        },
+                        Ticker::new(&Arc::new(Mutex::new(Vec::new()))),
                         Vec::new(),
                         ticker::Feeds::new(n0_future::stream::empty()),
                     ))
@@ -524,9 +572,7 @@ async fn a_failure_slower_than_its_recovery_span_never_gives_up() {
                     let at = counted.fetch_add(1, Ordering::SeqCst);
                     let _ = announce.send(at);
                     Ok((
-                        Ticker {
-                            seen: Arc::new(Mutex::new(Vec::new())),
-                        },
+                        Ticker::new(&Arc::new(Mutex::new(Vec::new()))),
                         Vec::new(),
                         // One beat after `alive`, and then the end: the
                         // incarnation lives `alive` and dies of `Ended::Feed`,
@@ -566,9 +612,7 @@ async fn a_supervised_actor_that_gave_up_answers_stop() {
     let ticker = ticker::supervised(
         move || async move {
             Ok((
-                Ticker {
-                    seen: Arc::new(Mutex::new(Vec::new())),
-                },
+                Ticker::new(&Arc::new(Mutex::new(Vec::new()))),
                 Vec::new(),
                 ticker::Feeds::new(n0_future::stream::empty()),
             ))
@@ -619,9 +663,7 @@ async fn a_restart_is_not_an_ending() {
                         _ => Box::pin(n0_future::stream::pending()),
                     };
                     Ok((
-                        Ticker {
-                            seen: Arc::new(Mutex::new(Vec::new())),
-                        },
+                        Ticker::new(&Arc::new(Mutex::new(Vec::new()))),
                         Vec::new(),
                         ticker::Feeds::new(beats),
                     ))
@@ -665,9 +707,7 @@ async fn the_backoff_spreads_the_budget_across_its_window() {
     let ticker = ticker::supervised(
         move || async move {
             Ok((
-                Ticker {
-                    seen: Arc::new(Mutex::new(Vec::new())),
-                },
+                Ticker::new(&Arc::new(Mutex::new(Vec::new()))),
                 Vec::new(),
                 ticker::Feeds::new(n0_future::stream::empty()),
             ))
@@ -829,9 +869,7 @@ async fn an_observer_is_rebuilt_for_each_incarnation() {
                     let observers: Vec<Box<dyn Observer<Ticker>>> =
                         vec![Box::new(Tracked::new(at, &log))];
                     Ok((
-                        Ticker {
-                            seen: Arc::new(Mutex::new(Vec::new())),
-                        },
+                        Ticker::new(&Arc::new(Mutex::new(Vec::new()))),
                         observers,
                         ticker::Feeds::new(n0_future::stream::empty()),
                     ))
@@ -882,7 +920,7 @@ async fn a_feed_is_resubscribed_on_each_incarnation() {
                 async move {
                     let at = built.fetch_add(1, Ordering::SeqCst);
                     Ok((
-                        Ticker { seen: beats },
+                        Ticker::new(&beats),
                         Vec::new(),
                         // One item, then the end: the feed both feeds the actor
                         // and kills it, which is the shape a re-subscription has
@@ -1029,7 +1067,8 @@ async fn a_handle_survives_its_actors_restart() {
 /// `Lent::ending`'s `Standing::Gone` → `Standing::Running` — a supervisor that
 /// refuses the restart and tells the peer the actor is still there, which is the
 /// regression verbatim. Watched: `round 2: expected gone, got
-/// Remote(Failed("dropped: the reply left its turn and was never answered"))`.
+/// Remote(Failed("dropped: the actor is serving and this reply was never
+/// answered"))`.
 /// (The loop indexes its two rounds from one; round 3 above is the second round's
 /// second answer.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1218,7 +1257,7 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
 /// answer it from the verdict now, and neither reads a mailbox.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/local.rs` on `Lent::ending`'s
-/// `return Standing::Restarting(reason.clone());` → `return Standing::Gone;`,
+/// `return Standing::Restarting(Arc::new(reason.clone()));` → `return Standing::Gone;`,
 /// which is a supervisor that grants the restart and tells the peer to stop
 /// asking anyway. Watched: `round 1: expected restarting: , got
 /// Remote(NoSuchActor { id: "desks/4471" })`.
@@ -1346,5 +1385,162 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
             keylink::Error::Remote(RemoteError::NoSuchActor { .. })
         ),
         "a keyed actor that gave up is unmounted and gone for good: got {after:?}"
+    );
+}
+
+// ────────────────── the two panics that escape every guard in the loop
+
+/// **A panic in the caller's `factory` leaves the actor gone, and the peer must
+/// be told so.**
+///
+/// `supervise` calls `factory().await` with no `catching` and no `guarded` around
+/// it, and neither `spawn_*` block wraps the future it awaits — so a panic in a
+/// caller's factory unwinds the whole task. Nothing publishes an ending, and
+/// nothing settles the served verdict either: the cell keeps `Standing::Running`
+/// for the rest of the process.
+///
+/// That is the one path this wave's design left without a settle, and it is on
+/// the side the wave called already correct. What the peer read for it was
+/// `Failed("dropped: ..")` — *the actor is serving, it will answer your next
+/// call* — about an actor that will never answer anything.
+///
+/// It is also a **regression against `5ecd057`**, which is why it is fixed here
+/// rather than filed: the old arm read `Life::Running if actor.is_running()`, an
+/// unwind drops the `mpsc::Receiver`, and `Receiver::drop` closes the channel
+/// *before* it drains — so `is_closed()` was already true when the queued
+/// message's reply died, and the old code fell through to `gone()`. Deleting that
+/// cross-check deleted the only thing covering this.
+///
+/// The message is **queued** rather than parked: the factory panics before any
+/// state exists, so the reply that dies is the one riding the mailbox message the
+/// unwind drops.
+///
+/// Made red by `scripts/break-once.sh keylink/src/local.rs`, deleting
+/// `supervise`'s floor. Watched output is recorded at the end of this comment
+/// once it was seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_whose_factory_panicked_is_told_the_actor_is_gone() {
+    let server_node = local_node().await;
+    let client_node = local_node().await;
+
+    let go = Arc::new(tokio::sync::Notify::new());
+    let ticker = {
+        let go = Arc::clone(&go);
+        // Turbofished because a factory that only ever diverges pins neither the
+        // feeds type nor the error: `error[E0283]: type annotations needed`, and
+        // the annotation belongs here rather than on an unreachable value.
+        ticker::supervised::<Ticker, _, _, ticker::Feeds>(
+            move || {
+                let go = Arc::clone(&go);
+                async move {
+                    // Held open until the peer's call is sitting in the mailbox,
+                    // so that the unwind is what kills it.
+                    go.notified().await;
+                    panic!("the factory exploded");
+                }
+            },
+            limit(3, Duration::from_millis(50)),
+        )
+    };
+    let _server = Server::builder(&server_node)
+        .service(ticker.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("one service, one ALPN");
+    let client = ticker::Client::connect(&client_node, server_node.endpoint().addr())
+        .await
+        .expect("the dial");
+
+    let calling = tokio::spawn(async move { client.beats().await });
+    // The send has to have landed before the unwind, or this proves nothing: a
+    // call refused at the mailbox is a different path, and already correct.
+    n0_future::time::sleep(Duration::from_millis(100)).await;
+    go.notify_one();
+
+    let lost = n0_future::time::timeout(NO_PROGRESS, calling)
+        .await
+        .expect("a peer must not hang on an actor whose factory died")
+        .expect("the caller task is not itself panicking")
+        .expect_err("nothing ever ran the call");
+    assert!(
+        matches!(
+            &lost,
+            keylink::Error::Remote(RemoteError::NoSuchActor { .. })
+        ),
+        "a peer whose actor died in its own factory must not be told it is \
+         serving: {lost:?}"
+    );
+}
+
+/// **The same hole through a caller's `feed`, and this one reaches an
+/// unsupervised actor.**
+///
+/// `run_loop` polls `Feeds::poll_next` directly inside a `poll_fn`, with no
+/// `catching` around it — a mailbox turn has a panic guard and the second input
+/// does not. So a panic in a caller's `Stream` unwinds the task exactly as a
+/// factory's does, and it needs no supervisor at all: this is
+/// `ticker::actor_wired`, one incarnation, no `Intensity` anywhere.
+///
+/// The reply is **parked** here rather than queued, because the state exists:
+/// what dies is a `Deferred` the state was holding, which is the case the whole
+/// three-way answer is about.
+///
+/// Made red by `scripts/break-once.sh keylink/src/local.rs`, deleting
+/// `run_loop`'s floor. Watched output is recorded at the end of this comment
+/// once it was seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_whose_feed_panicked_is_told_the_actor_is_gone() {
+    let server_node = local_node().await;
+    let client_node = local_node().await;
+
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let beats = Arc::new(Mutex::new(Vec::new()));
+    let ticker = ticker::actor_wired(
+        Ticker::new(&beats),
+        Vec::new(),
+        ticker::Feeds::new(Exploding(Arc::clone(&armed))),
+    );
+    let _server = Server::builder(&server_node)
+        .service(ticker.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("one service, one ALPN");
+    let client = ticker::Client::connect(&client_node, server_node.endpoint().addr())
+        .await
+        .expect("the dial");
+
+    let parking = {
+        let client = client.clone();
+        tokio::spawn(async move { client.park(1).await })
+    };
+    // **Asked, never assumed.** `park` records its order, so this is the park
+    // having happened rather than a guess that a peer's call won its race.
+    for _ in 0..1_000 {
+        if ticker.beats().await.expect("the actor is running") == 1 {
+            break;
+        }
+        n0_future::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        ticker.beats().await.expect("the actor is running"),
+        1,
+        "the reply has to be parked in the state before the feed goes"
+    );
+
+    armed.store(true, Ordering::SeqCst);
+    // Wake the loop, so it polls the feed it is now armed to die on. The call
+    // itself may be answered or lost; neither is what this test is about.
+    let _ = ticker.beats().await;
+
+    let lost = n0_future::time::timeout(NO_PROGRESS, parking)
+        .await
+        .expect("a peer must not hang on an actor whose feed died")
+        .expect("the caller task is not itself panicking")
+        .expect_err("the state was destroyed holding it");
+    assert!(
+        matches!(
+            &lost,
+            keylink::Error::Remote(RemoteError::NoSuchActor { .. })
+        ),
+        "a peer whose actor died in its own feed must not be told it is serving: \
+         {lost:?}"
     );
 }

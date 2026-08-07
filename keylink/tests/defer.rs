@@ -550,8 +550,9 @@ async fn a_peer_gets_an_answer_parked_past_its_own_turn() {
 /// the same connection, which is the half `NoSuchActor` denies.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/local.rs` on the arm itself,
-/// `lost`'s `Standing::Running => RemoteError::Failed(..)` →
-/// `Standing::Running => RemoteError::NoSuchActor { id: id.to_owned() }`, which
+/// `lost`'s whole `Standing::Running` arm — the two-line `format!` and its
+/// closing `)),` — replaced by
+/// `Standing::Running => RemoteError::NoSuchActor { id: id.to_owned() },`, which
 /// collapses the split back into the pre-fix single answer. Watched:
 /// `a live actor must not be reported as absent: Remote(NoSuchActor { id: "Orders" })`.
 #[tokio::test]
@@ -604,9 +605,10 @@ async fn a_live_actor_does_not_tell_a_peer_no_such_actor() {
 /// than by ordering; see the twin below for the case where that luck ran out.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/local.rs` on the default
-/// `Inbox::ending`'s `Standing::Gone` → `Standing::Running`. Watched: `a stopped
-/// actor is gone, not merely unanswering: Remote(Failed("dropped: the reply left
-/// its turn and was never answered"))`.
+/// `Inbox::ending` — anchored on its whole three-line body, since a bare
+/// `Standing::Gone` occurs fourteen times in this file and the harness aborts
+/// on an ambiguous anchor. Watched: `a stopped actor is gone, not merely
+/// unanswering: Remote(Failed("dropped: the actor is serving and this reply was never answered"))`.
 #[tokio::test]
 async fn a_stopped_actor_still_tells_a_peer_no_such_actor() {
     let node = local_node().await;
@@ -651,10 +653,16 @@ async fn a_stopped_actor_still_tells_a_peer_no_such_actor() {
 /// and false outright for a supervised one, whose receiver belongs to the
 /// supervisor's frame.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/local.rs` on `LocalActor::abort`'s
-/// `self.fate.settle(Standing::Gone);` → `self.fate.settle(Standing::Running);`.
-/// Watched: `an aborted actor is gone, and its own loop will never say so:
-/// Remote(Failed("dropped: the reply left its turn and was never answered"))`.
+/// Made red by `scripts/break-once.sh keylink/src/local.rs` on `Floor`'s own
+/// `Drop`, `self.fate.settle(Standing::Gone);` → `Standing::Running`. Watched:
+/// `an aborted actor is gone, and its own loop will never say so:
+/// Remote(Failed("dropped: the actor is serving and this reply was never answered"))`.
+///
+/// **`LocalActor::abort` used to settle this itself, and that line is deleted.**
+/// Once `run_loop` carried a floor, no break of the settle in `abort` could be
+/// made red — this test stays green with the whole line removed, because the
+/// floor is strictly earlier in the same drop. A line that cannot be made red is
+/// not a guard.
 #[tokio::test]
 async fn an_aborted_actor_tells_a_peer_no_such_actor() {
     let node = local_node().await;
@@ -786,8 +794,8 @@ async fn a_live_keyed_actor_does_not_tell_a_peer_no_such_actor() {
 /// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs` on
 /// `Mailbox`'s `Drop`, `self.fate.settle(Standing::Gone);` →
 /// `self.fate.settle(Standing::Running);`. Watched: `an aborted keyed actor is
-/// gone, and its own loop will never say so: Remote(Failed("dropped: the reply
-/// left its turn and was never answered"))`.
+/// gone, and its own loop will never say so:
+/// Remote(Failed("dropped: the actor is serving and this reply was never answered"))`.
 #[tokio::test]
 async fn an_aborted_keyed_actor_tells_a_peer_no_such_actor() {
     let nodes = [local_node().await, local_node().await];
@@ -827,7 +835,7 @@ async fn an_aborted_keyed_actor_tells_a_peer_no_such_actor() {
 /// held by
 /// `registry::tests::an_expired_shutdown_budget_settles_the_served_answer_before_the_abort`.
 /// Watched: `an actor destroyed by an expired budget is gone:
-/// Remote(Failed("dropped: the reply left its turn and was never answered"))`.
+/// Remote(Failed("dropped: the actor is serving and this reply was never answered"))`.
 #[tokio::test]
 async fn a_keyed_actor_destroyed_by_an_expired_budget_tells_a_peer_no_such_actor() {
     let nodes = [local_node().await, local_node().await];
@@ -865,7 +873,10 @@ async fn a_keyed_actor_destroyed_by_an_expired_budget_tells_a_peer_no_such_actor
 /// for this. The arm's own comment concedes the case — "a handler that panics
 /// after taking `reply.later()` arrives here too" — and the sentence it rendered
 /// said "the reply was taken out of the turn and never answered", which names the
-/// sanctioned drop and is false of this one.
+/// sanctioned drop and is false of this one — as was the reword that followed it,
+/// "the reply left its turn", since here the reply never left the turn at all: it
+/// was a `Reply` that died *inside* the handler, and never a `Deferred`. The
+/// sentence names the actor now and nothing else.
 ///
 /// So the sentence names no cause now, and this is what pins that it covers both:
 /// a handler that panicked **without** consuming its reply reads exactly what a

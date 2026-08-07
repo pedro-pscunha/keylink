@@ -1383,7 +1383,12 @@ impl<A: Send, M: Send> Inbox<A, M> for mpsc::Receiver<Message<A, M>> {
     }
 
     fn close(&mut self) {
-        Self::close(self);
+        // Fully qualified, and not `Self::close(self)`. That spelling resolves to
+        // the inherent method only because inherent methods win path resolution
+        // over trait ones — so an upstream rename turns it into unconditional
+        // recursion with no diagnostic at all, which is a stack overflow rather
+        // than a compile error.
+        mpsc::Receiver::close(self);
     }
 }
 
@@ -1601,13 +1606,19 @@ async fn run_loop<A, M, F, I>(
     mut feeds: F,
     mut inbox: I,
     fate: &Fate,
-) -> Ended
+) -> (Ended, Standing)
 where
     A: Send + 'static,
     M: Turn<A>,
     F: Feeds<A>,
     I: Inbox<A, M>,
 {
+    // **Declared first, so it drops last among this body's locals — and every
+    // body local drops before a parameter.** `state` is a parameter, so an
+    // unwind through this function settles the verdict before the state, and
+    // therefore before every `Deferred` parked in it, dies. See [`Floor`] for
+    // what that is a floor under and what it is not.
+    let mut floor = Floor::armed(fate);
     let mut reason = Ended::Stopped;
     // Which input gets first refusal. Flipped after every item, so the loop
     // alternates rather than preferring one — see `next`.
@@ -1667,7 +1678,14 @@ where
     // those deaths has a happens-before edge to this store through the reply
     // channel it was waiting on. `deliver_to_local` and `deliver_to_actor` both
     // read the result and cannot be early.
-    fate.settle(inbox.ending(&reason));
+    //
+    // Disarmed first, because from here the loop has an answer of its own and a
+    // floor that fired afterwards would overwrite a `Restarting` with `Gone` —
+    // which is a live actor reported as finished, the mirror of the defect the
+    // floor exists for.
+    floor.disarm();
+    let verdict = inbox.ending(&reason);
+    fate.settle(verdict.clone());
 
     for observer in &mut hooks {
         // Shared reborrow first, and the `FnOnce`-forcing rebind inside, for the
@@ -1698,7 +1716,7 @@ where
     drop(inbox);
     drop(feeds);
     drop(state);
-    reason
+    (reason, verdict)
 }
 
 /// Run one keyed actor: the same loop, entered from a
@@ -1741,7 +1759,7 @@ where
     // loop settles on its way out is what `deliver_to_actor` reads. Taken before
     // the mailbox moves into `Keyed`.
     let fate = inbox.fate();
-    run_loop(state, hooks, feeds, Keyed(inbox), &fate).await
+    run_loop(state, hooks, feeds, Keyed(inbox), &fate).await.0
 }
 
 // ───────────────────────────────────────────────────────────────── supervision
@@ -1975,6 +1993,75 @@ pub(crate) enum Standing {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Fate(Arc<Mutex<Standing>>);
 
+/// Settles [`Standing::Gone`] if the code it guards never reached a verdict of
+/// its own.
+///
+/// # The hole it fills, which the wave that built [`Fate`] left open
+///
+/// Every settle in this file is on a path the loop *reaches*. Two panics do not
+/// reach one: a caller's `factory`, awaited by [`supervise`] with no guard, and a
+/// caller's `Feeds::poll_next`, polled by [`next`] inside a `poll_fn` with no
+/// guard — the mailbox turn has [`catching`] around it and the second input does
+/// not. Either unwinds the actor's whole task, so nothing publishes an ending and
+/// nothing settled the verdict: the cell kept `Running` for the rest of the
+/// process and a peer whose reply died in that unwind was told `dropped: `, *the
+/// actor is serving*, about an actor that would never answer again.
+///
+/// It was a **regression** against the shape this design replaced, which is why
+/// it is a floor here and not a filed defect. `deliver_to_local` used to read
+/// `is_running()` beside the verdict; an unwind drops the `mpsc::Receiver`, and
+/// `Receiver::drop` closes the channel *before* it drains, so `is_closed()` was
+/// already true when the queued message's reply died. Deleting the cross-check
+/// deleted the only thing covering an unwind.
+///
+/// # What it rests on, stated rather than assumed
+///
+/// Drop order: **reverse declaration, and a body's locals before the function's
+/// parameters.** So a `Floor` declared first in a body drops before `state`,
+/// `inbox` and `feeds`, which are parameters — which is the whole of the
+/// ordering claim, and it is the language's rule rather than an optimisation.
+///
+/// It is a *floor*, not the mechanism. On every path the loop reaches, the
+/// verdict is settled explicitly at the top of the teardown and this is
+/// disarmed; the floor only has to beat the drops that follow an unwind. The
+/// keyed path has a second one in `Mailbox`'s `Drop`, and this one covers the
+/// local path, which has no `Mailbox` at all.
+///
+/// # Why not catch the two panics instead
+///
+/// Considered and refused for this wave, deliberately rather than by omission:
+/// `guarded` around `factory().await` and `catching` around `feeds.poll_next`
+/// would remove the unwind rather than floor it, and would turn both into a named
+/// [`Ended`] a caller could await. It also changes what a panicking factory and a
+/// panicking feed *mean* — today they vanish the task, and that would make them
+/// `GaveUp` and an ending respectively. That is a supervision-semantics decision
+/// with its own guards to write, and it is not this wave's. The floor is correct
+/// under either, and stays correct if the panics are caught later.
+struct Floor<'a> {
+    fate: &'a Fate,
+    armed: bool,
+}
+
+impl<'a> Floor<'a> {
+    fn armed(fate: &'a Fate) -> Self {
+        Self { fate, armed: true }
+    }
+
+    /// The guarded code reached a verdict of its own, so this must not overwrite
+    /// it. Called at exactly one place per floor.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Floor<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.fate.settle(Standing::Gone);
+        }
+    }
+}
+
 impl Fate {
     /// Publish what a reply that dies **from here on** means.
     ///
@@ -2189,6 +2276,21 @@ where
 {
     let mut budget = Budget::new(limit);
     loop {
+        // The factory is the caller's code and this awaits it with no guard, so a
+        // panic in it unwinds before any incarnation exists — before `run_loop`,
+        // and therefore before the floor `run_loop` carries. This one covers
+        // exactly that window: armed per iteration, because a *later* factory
+        // call can panic just as the first can, and disarmed the moment the
+        // incarnation's own floor takes over.
+        //
+        // **Armed for the factory call and nothing else**, which the first
+        // version of this got wrong by holding it for the whole function. A floor
+        // that outlives what it guards fires on the normal give-up return too,
+        // writing `Gone` over the verdict a moment after the state died — the
+        // same value, so harmless on the wire, and it made two end-to-end guards
+        // unattributable: breaking `Lent::ending`'s give-up arm left both green,
+        // because this re-settled the right answer after the wrong one.
+        let mut floor = Floor::armed(fate);
         let built = factory().await;
         let (state, hooks, feeds) = match built {
             Ok(triple) => triple,
@@ -2207,6 +2309,7 @@ where
                 // parameter and drops on the way out, and dropping it is what
                 // kills every message still queued behind an actor that will
                 // never exist. Their callers must read *gone*, not *running*.
+                floor.disarm();
                 fate.settle(Standing::Gone);
                 // And the mailbox stops taking them, for `Lent::ending`'s reason:
                 // this actor will not run, so a caller must meet a closed mailbox
@@ -2219,6 +2322,10 @@ where
             }
         };
 
+        // The factory returned, so `run_loop` is about to carry its own floor and
+        // this one has nothing left to guard. Nothing between here and that call
+        // is a caller's code, so nothing between them can unwind.
+        floor.disarm();
         // The new incarnation is live from here. Without this the cell would keep
         // the previous one's `Restarting` for ever, and a reply this incarnation
         // dropped while perfectly alive would read as a restart. Published before
@@ -2230,15 +2337,16 @@ where
             budget: &mut budget,
             started: Instant::now(),
         };
-        let reason = run_loop(state, hooks, feeds, lent, fate).await;
+        let (reason, verdict) = run_loop(state, hooks, feeds, lent, fate).await;
 
-        // The verdict `Lent::ending` made, read back off the one cell that holds
-        // it — the same cell a peer whose reply just died is reading, which is
-        // what stops a supervisor and a peer from disagreeing about whether this
-        // actor is coming back. It used to be a third state on the `ended`
-        // channel, written by `Lent::ending` on the restart arm alone; see there
-        // for what the arm that wrote nothing cost.
-        let restarting = matches!(fate.standing(), Standing::Restarting(_));
+        // The verdict `Lent::ending` made, **returned** rather than read back out
+        // of the cell. It was a read: `matches!(fate.standing(), ..)`, which was
+        // benign and was one writer away from not being. Four doors settle that
+        // cell now — this function, the loop, the two teardowns and `Mailbox`'s
+        // own `Drop` — and a supervisor asking a shared cell what it had just
+        // decided would be the first of them to be wrong. It has one path to the
+        // answer that nothing else can reach.
+        let restarting = matches!(verdict, Standing::Restarting(_));
         if !restarting {
             return match reason {
                 // Asked to stop, or every handle went. Not a failure, and not
@@ -2461,7 +2569,7 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
             // It happens after every drop `run_loop` makes, which is stronger
             // than before: `stop().await` returning now means the state itself is
             // gone, not merely that the observers' claims are.
-            let reason = run_loop(state, hooks, feeds, inbox, &fate).await;
+            let (reason, _verdict) = run_loop(state, hooks, feeds, inbox, &fate).await;
             let _ = ended.send_replace(Some(reason));
         });
         Self {
@@ -2904,23 +3012,29 @@ impl<A, M> LocalActor<A, M> {
     /// dropped turn do get [`MailboxClosed`]: dropping the receiver drains the
     /// buffer, and each queued turn owns its reply channel.
     ///
-    /// # The served answer is settled first, and the order is the point
+    /// # What a peer whose reply this destroys is told, and where that comes from
     ///
     /// An aborted task never reaches the loop's own ending hook, so nothing
-    /// inside it can say what this destroyed. The publish therefore happens **here**,
-    /// before the request lands: the runtime drops the actor's future only after
-    /// it has observed the abort, and it drops the state after that, so every
-    /// reply this kills dies with `Standing::Gone` already published. A peer
-    /// waiting on a parked reply reads *gone* rather than *the actor is still
-    /// there and dropped your answer*.
+    /// inside the loop *decides* anything here — but something inside it still
+    /// answers: the loop's own floor is a body local, so the cancelled future
+    /// drops it before the `state` parameter, and every reply this kills dies
+    /// with `Standing::Gone` already settled. A peer reads *gone* rather than
+    /// *the actor is serving and dropped your answer*.
     ///
-    /// It is not merely a belt for the supervised path either. On an unsupervised
-    /// actor the mailbox receiver does drop before the state, so `is_closed()`
-    /// would have answered — but only by leaning on the order a cancelled
-    /// future's parameters drop in, which is a fact about rustc rather than
-    /// about this crate.
+    /// **This method used to settle that itself, and the line is deleted.** It
+    /// was written before the floor existed, and once the floor was added no
+    /// break of the settle here could be made red — `an_aborted_actor_tells_a_peer_no_such_actor`
+    /// stays green with the whole line removed, because the floor is strictly
+    /// earlier in the same drop. A line that cannot be made red is not a guard,
+    /// it is a second writer nobody can hold to account, so it went.
+    /// [`System::abort`](crate::System::abort) and `drain` keep theirs, and their
+    /// guards say exactly what those still cover: a **hand-written** `mount`
+    /// loop, which has no `run_loop` and therefore no floor.
+    ///
+    /// The shape both of those replaced leaned on `!mail.is_closed()`, which is
+    /// right for an unsupervised actor and false for a supervised one, whose
+    /// receiver belongs to the supervisor's frame and outlives every incarnation.
     pub fn abort(&self) {
-        self.fate.settle(Standing::Gone);
         self.task.abort();
     }
 
@@ -3079,15 +3193,28 @@ pub(crate) fn rendered<Resp>(
 pub(crate) fn lost(standing: Standing, id: &str) -> RemoteError {
     match standing {
         Standing::Restarting(reason) => RemoteError::Failed(format!("{RESTARTING}{reason}")),
-        // The sentence names no **cause**, and that is the correction it carries.
-        // It read "the reply was taken out of the turn and never answered", which
-        // is the sanctioned `reply.later()` + `drop` and is false of the other
-        // half of this arm: a handler that panics after taking `reply.later()`
-        // arrives here too, and its panic message is lost rather than rendered.
-        // Nothing at the point of death can tell the two apart — both are one
-        // `Deferred::drop` — so the wording covers the set it can see.
+        // **The sentence says what is true of the actor and nothing about where
+        // the reply died**, because this arm has three producers and no way to
+        // tell them apart:
+        //
+        // 1. a handler took `reply.later()` and dropped the `Deferred` — the
+        //    sanctioned move, and what that type's `#[must_use]` asks for;
+        // 2. a handler panicked *after* `reply.later()`, so the `Deferred` died
+        //    in the unwind and its panic message is lost rather than rendered;
+        // 3. a handler panicked **before** consuming the channel at all, so what
+        //    died is the `Reply` itself, inside the turn — `turn_deferred` has
+        //    named this case since `#[defer]` landed. The reply never left the
+        //    turn, and it was never a `Deferred`.
+        //
+        // It has been wrong twice, both times by naming a cause. "The reply was
+        // taken out of the turn and never answered" describes only (1); "the
+        // reply left its turn" is the same claim in different words, and is false
+        // of (3) — the case
+        // `defer::a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer`
+        // exercises. What all three share is the actor: it is mounted, it took
+        // the message, and it will answer the next one.
         Standing::Running => RemoteError::Failed(format!(
-            "{DROPPED}the reply left its turn and was never answered"
+            "{DROPPED}the actor is serving and this reply was never answered"
         )),
         // NOT a `Failed`: this is the one of the three where *there is nothing
         // here, stop asking* is true.
@@ -3259,16 +3386,26 @@ mod tests {
         }
     }
 
-    /// The other half of that property lives in `actor/remote.rs`, because the
-    /// producers it is about do: `no_other_served_failure_begins_with_one_of_the_four`.
+    /// One of [`lost`]'s three answers is not a [`RemoteError::Failed`] at all,
+    /// so it carries no prefix and no `starts_with` will ever find it.
     ///
-    /// The block above claimed these four were *every* prefix a `Failed` carries
-    /// on the served path, and that was false in at least three places — each a
-    /// whole sentence rather than a prefix, which is why nothing collided and why
-    /// nothing would have noticed if something had. The claim is narrowed to what
-    /// it can be: every prefix [`rendered`] and [`lost`] build.
+    /// **Renamed, because the old name promised a property nothing here checks.**
+    /// It was `the_four_are_only_what_rendered_and_lost_build` — a set equality,
+    /// against a body that asserts one arm. The set half lives in
+    /// `remote::no_other_served_failure_begins_with_one_of_the_four`, which
+    /// renders the other producers; this one holds the smaller fact that makes
+    /// the count come out: three answers, two prefixes.
+    ///
+    /// It matters to a peer rather than to a reader. A client that matches only
+    /// on prefixes never sees *gone*, which is the one answer that means **stop
+    /// asking** — so `NoSuchActor` staying a variant is what keeps it impossible
+    /// to miss.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/local.rs` on `lost`'s
+    /// `Standing::Gone` arm → `RemoteError::Failed(format!("{DROPPED}{id}"))`.
+    /// Watched output recorded below.
     #[test]
-    fn the_four_are_only_what_rendered_and_lost_build() {
+    fn the_gone_answer_is_not_a_failed_and_carries_no_prefix() {
         assert_eq!(
             lost(Standing::Gone, "id"),
             RemoteError::NoSuchActor {

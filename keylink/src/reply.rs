@@ -163,17 +163,21 @@ impl RemoteError {
     /// that caused it.
     pub const RESTARTING: &'static str = "restarting: ";
 
-    /// The reply left its turn and was never answered, and the actor is there.
+    /// The actor is serving, and this one reply was never answered.
     ///
     /// **Do not retry blindly, and do not give up on the actor**: it is mounted,
     /// it took the message, and it will answer the next one. A handler took
     /// `reply.later()` and dropped the `Deferred` — sanctioned, and what that
     /// type's `#[must_use]` asks for — or panicked after taking it.
     ///
-    /// The sentence after it deliberately does **not** name a cause. It said
-    /// "the reply was taken out of the turn and never answered" for one wave,
-    /// which is false of the panicking half: nothing at the point of death can
-    /// tell the two apart, because both are one `Deferred::drop`.
+    /// The sentence after it deliberately does **not** name a cause, and it took
+    /// two attempts to stop naming one. Three producers reach it: the sanctioned
+    /// drop above, a handler that panicked *after* `reply.later()`, and a handler
+    /// that panicked **before** consuming the channel — where what died is the
+    /// `Reply` itself, inside the turn, never a `Deferred`. "The reply was taken
+    /// out of the turn" described only the first; "the reply left its turn" was
+    /// the same claim reworded, and false of the third. What all three share is
+    /// the actor.
     pub const DROPPED: &'static str = "dropped: ";
 }
 
