@@ -852,20 +852,23 @@ impl<M> Registry<M> {
     /// push every other actor's eviction past its own deadline — a queue that
     /// grows under exactly the condition it exists to clear.
     ///
-    /// # A known gap: an eviction that destroys a busy actor is silent
+    /// # A gap that Wave 6 closed, and the residual it left
     ///
-    /// The [`Ended`] each teardown computes is dropped here, deliberately — see
-    /// the comment on the `join_all` — and an aborted task's observers never run.
-    /// So a `shutdown_budget` set below the longest turn destroys turns with **no
-    /// signal anywhere**: no log, no counter, no observer, and no caller, because
-    /// the caller of an evicted actor is a peer whose stream is severed rather
-    /// than answered. The crate has no logging seam to report it through, and
-    /// adding one here would be a second, quieter path beside the observers.
+    /// This paragraph read *"the [`Ended`] each teardown computes is dropped
+    /// here, deliberately"*, and named Wave 6 as the wave that would own it. It
+    /// does not any more: the `join_all` below hands each teardown's `Ended` to
+    /// the system's `Lifecycle`, and
+    /// `an_eviction_that_destroys_a_busy_actor_is_no_longer_silent` is the guard.
+    /// A system with no [`Lifecycle`] computes the same `Ended` and drops it
+    /// exactly as before, which is the only case the old sentence still describes.
     ///
-    /// **Wave 6 owns this.** Its `System::snapshot` and the console are where a
-    /// destroyed-on-eviction count belongs, beside the other per-actor facts,
-    /// rather than in a sweeper that would have to invent a channel to carry it.
-    /// Until then, the mitigation is the budget itself: pick it from the longest
+    /// **The residual is the observers, and it is real.** An aborted task's
+    /// `finish` never runs, so a `shutdown_budget` set below the longest turn
+    /// destroys that turn with no observer told and no caller answered — the
+    /// caller of an evicted actor is a peer whose stream is severed rather than
+    /// answered. What is no longer true is *no signal anywhere*: the ending
+    /// reaches a `Lifecycle`, and through [`Events`](crate::Events) a console.
+    /// The mitigation for the rest is the budget itself: pick it from the longest
     /// turn plus the queue behind it, as [`Eviction::Idle::shutdown_budget`] says.
     async fn sweep(&self) {
         let Eviction::Idle {
@@ -1381,10 +1384,9 @@ impl<M> System<M> {
     ///
     /// # The `Ended` is synthesised here, and what that costs
     ///
-    /// A registry entry has no `ended` channel — the keyed loop computes an
-    /// [`Ended`] and drops it, because a keyed actor has no `ended()` for anyone
-    /// to await — so this reports what the *join* said: the task returned, or it
-    /// did not.
+    /// A registry entry has no `ended` channel — a keyed actor has no `ended()`
+    /// for a caller to await — so this reports what the *join* said: the task
+    /// returned, or it did not.
     ///
     /// **That is not the whole truth, and the gap is new.** The argument this
     /// design inherited was that a synthesised `Ended` "cannot lie", because
@@ -1416,10 +1418,20 @@ impl<M> System<M> {
     /// it — the join is authoritative and a channel adds nothing, and in the one
     /// case they could disagree the channel is *worse*: an aborted loop never
     /// fills it, so the receiver reports `Vanished` from a dropped sender, which
-    /// is the join's answer arrived by a longer route. The residual is a question
-    /// about the **loop**, which is the half that knows: the keyed loop already
-    /// computes the true `Ended` and throws it away. Whoever wants it should give
-    /// the loop somewhere to put it, not have the registry guess a second time.
+    /// is the join's answer arrived by a longer route.
+    ///
+    /// **The residual named here has since been closed, and this is what it
+    /// cost.** The paragraph used to end *"the keyed loop already computes the
+    /// true `Ended` and throws it away. Whoever wants it should give the loop
+    /// somewhere to put it, not have the registry guess a second time."* That is
+    /// what `Loop` is: the loop returns its ending and `Registry::reap`
+    /// reports it. It does not change what **this** call says, and deliberately
+    /// so — the two are still one determination each, of two different facts.
+    /// This call answers *did it drain*, from the join, for the caller who asked.
+    /// `reap` answers *why it ended*, from the loop, when nobody asked. The
+    /// interlock is that exactly one of them ever fires for one ending, so the
+    /// `Stopped`-for-an-observer's-refusal case above is still what a caller of
+    /// **this** method sees, and it is still honest about being about this call.
     pub async fn shutdown(&self, id: &ActorId, budget: Duration) -> Option<Ended> {
         let entry = self.inner.write().remove(id)?;
         let ended = drain(entry, budget).await;
