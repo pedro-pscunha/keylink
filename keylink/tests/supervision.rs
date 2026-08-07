@@ -1415,9 +1415,16 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
 /// state exists, so the reply that dies is the one riding the mailbox message the
 /// unwind drops.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/local.rs`, deleting
-/// `supervise`'s floor. Watched output is recorded at the end of this comment
-/// once it was seen.
+/// Made red by `scripts/break-once.sh keylink/src/local.rs`, disarming
+/// `supervise`'s floor at its declaration. Watched: `a peer whose actor died in
+/// its own factory must not be told it is serving: Remote(Failed("dropped: the
+/// actor is serving and this reply was never answered"))`.
+///
+/// **Disarming and not deleting**, because deleting the line leaves two
+/// `floor.disarm()` calls with nothing to name and the break becomes
+/// `error[E0425]: cannot find value `floor``. That is the compiler catching it,
+/// not the test, and a record that quotes a build failure is not evidence the
+/// guard works.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_whose_factory_panicked_is_told_the_actor_is_gone() {
     let server_node = local_node().await;
@@ -1484,9 +1491,10 @@ async fn a_peer_whose_factory_panicked_is_told_the_actor_is_gone() {
 /// what dies is a `Deferred` the state was holding, which is the case the whole
 /// three-way answer is about.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/local.rs`, deleting
-/// `run_loop`'s floor. Watched output is recorded at the end of this comment
-/// once it was seen.
+/// Made red by `scripts/break-once.sh keylink/src/local.rs`, disarming
+/// `run_loop`'s floor immediately after it is armed. Watched: `a peer whose actor
+/// died in its own feed must not be told it is serving: Remote(Failed("dropped:
+/// the actor is serving and this reply was never answered"))`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_whose_feed_panicked_is_told_the_actor_is_gone() {
     let server_node = local_node().await;
