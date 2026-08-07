@@ -76,6 +76,24 @@
 //! Both constructors are `#[must_use]`, so ignoring the handle is a warning
 //! rather than a silent no-op, and [`Scheduled::detach`] is the one way to say
 //! "run without me" out loud.
+//!
+//! ## There is no `cancel` method, and its absence is a decision
+//!
+//! One shipped, briefly: `pub fn cancel(self)`, whose own doc conceded the
+//! premise — *"The same thing `drop` does"* — and which had **zero** call sites
+//! anywhere in the tree. It is deleted, and the reason is worth keeping so it is
+//! not re-derived a third time.
+//!
+//! Issue #3's refused-designs table already held the row: *"`Timer::cancel`
+//! beside 'dropping cancels it' is two ways to do one thing."* That is the whole
+//! argument. A second spelling of one behaviour costs a reader the question
+//! "which of these two does the thing I mean", costs the crate a permanent
+//! compatibility promise once it is published, and buys a `drop(sweep)` that
+//! reads marginally more deliberate than `drop(sweep)`.
+//!
+//! `drop` is the one way, and `a_dropped_schedule_runs_nothing` is the guard
+//! behind it. [`detach`](Scheduled::detach) exists for the opposite reason: it
+//! is the *only* way to get behaviour `drop` does not give.
 
 use std::fmt;
 use std::future::Future;
@@ -102,14 +120,6 @@ pub struct Scheduled {
 }
 
 impl Scheduled {
-    /// Cancel now, rather than at the end of the enclosing scope.
-    ///
-    /// The same thing `drop` does, spelled so that a call site cancelling on
-    /// purpose reads as a decision instead of as a value going out of scope.
-    pub fn cancel(self) {
-        self.task.abort();
-    }
-
     /// Let the work outlive this handle.
     ///
     /// For a one-shot [`after`] that genuinely is fire-and-forget: nothing can
