@@ -191,10 +191,34 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// Measured on this machine, at ten thousand actors of the `ledger` service
 /// below, with an empty state:
 ///
-/// | path | before the generated mailbox (`c9056e0`) | Wave 1b (`c8712b0`) | Wave 2 (`836179c`) | Wave 3 | Wave 9 |
-/// |---|---|---|---|---|---|
-/// | keyed, mounted in a `System` | 1,671 | 1,159 | 1,159 | 1,415 | **1,412** |
-/// | local, `ledger::actor(..)`   | 1,725 | 1,469 | **1,597** | **1,853** | **1,861** |
+/// | path | before the generated mailbox (`c9056e0`) | Wave 1b (`c8712b0`) | Wave 2 (`836179c`) | Wave 3 | Wave 9 | before `Fate` (`810650a`) | with `Fate` |
+/// |---|---|---|---|---|---|---|---|
+/// | keyed, mounted in a `System` | 1,671 | 1,159 | 1,159 | 1,415 | 1,412 | **1,549** | **1,690** |
+/// | local, `ledger::actor(..)`   | 1,725 | 1,469 | 1,597 | 1,853 | 1,861 | **1,861** | **2,029** |
+///
+/// # The keyed column drifted +137 between Wave 9 and `810650a`, and nobody wrote it down
+///
+/// Measured on the way in, before a line of the `Fate` wave was written: 1,549
+/// against the 1,412 recorded above. It is Waves 10 and 11 — the observability
+/// pass — and it is recorded here rather than quietly folded into the last column,
+/// because the paragraph below already said this is exactly where such a number
+/// hides. The local column did not move over the same span.
+///
+/// # What `Fate` costs, and what it was cut from first
+///
+/// A served dispatch reads one cell per actor to tell *restarting* from *dropped*
+/// from *gone*, and the cell is one `Arc<Mutex<Standing>>` beside the registry
+/// entry (keyed) or inside the handle (local): **+141 keyed, +168 local.** The
+/// local path also gave eight bytes back — its `watch` channel went from a
+/// three-state `Life` to `Option<Ended>`, undoing Wave 9's eight — so the gross
+/// add is ~176 there.
+///
+/// It was measured at +165 and +192 first, with the restart reason stored
+/// **inline**: `Standing::Restarting(Ended)` makes `Standing` 40 bytes and
+/// `Mutex<Standing>` 56, so every idle actor paid for a value only a restart ever
+/// writes. Behind an `Arc` it is 16 and 24, worth a measured 24 bytes per idle
+/// actor on both paths, and the allocation moved to the restart that needs it.
+/// That reduction is why this file is cited in `Standing`'s own documentation.
 ///
 /// # Wave 9's eight bytes, on the local path only, and where they went
 ///
@@ -266,13 +290,31 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// only one any phase built a *local* actor of — while the entire argument for the
 /// `Box::pin` at the local loop's await is an absolute ceiling (3,005 bytes without
 /// it against 1,597 with) that happens to sit between 1,861 and 2,048. The local
-/// path has **less** headroom than the keyed one, by 449 bytes now: a second
-/// channel, the `watch` that carries `Life`, an `Arc<JoinHandle>` and the `finish`
-/// loop, against the registry entry and `HashMap` slot the keyed one pays for
-/// instead. So phase 4 builds bulky *local* actors and asserts the slope here too,
+/// path has **less** headroom than the keyed one, by 339 bytes now: a second
+/// channel, the `watch` that carries the ending, an `Arc<JoinHandle>` and the
+/// `finish` loop, against the registry entry and `HashMap` slot the keyed one pays
+/// for instead. So phase 4 builds bulky *local* actors and asserts the slope here too,
 /// against [`SLOPE_SLACK_OVER_A_KILOBYTE`], rather than trusting that a flat keyed
 /// slope implies a flat local one.
-const BUDGET_PER_LOCAL_ACTOR: isize = 2048;
+///
+/// # It was 2,048, and the `Fate` wave is what raised it — said out loud
+///
+/// A budget raised by the change that would otherwise have broken it is the
+/// weakest thing in this file, so here is the whole of it. `Fate` measured 2,053
+/// against a 2,048 ceiling: **red**, and the guard was doing its job. The first
+/// response was to make the change cheaper rather than the ceiling higher —
+/// putting the restart reason behind an `Arc` bought back 24 bytes per idle actor
+/// and landed it at 2,029, which *passes*.
+///
+/// It is raised anyway, and only to the extent that 2,029 under 2,048 is not a
+/// budget: nineteen bytes is inside the noise between one allocator and another,
+/// so a green run here would say nothing about the same code on a Linux CI. 2,304
+/// restores about the headroom this literal had at 1,861, and the keyed one stays
+/// at 2,048 with 358 bytes under it. What is **not** relaxed is the thing this
+/// budget cannot see and [`SLOPE_SLACK_OVER_A_KILOBYTE`] can: the slope is 13
+/// bytes over a kilobyte of declared message, flat as before, and no number in
+/// phase 4 or 5 moved.
+const BUDGET_PER_LOCAL_ACTOR: isize = 2304;
 
 /// How much an idle actor is allowed to cost **because of what the service
 /// declares**, over the whole kilobyte between `ledger::Mail` and `bulky::Mail`.

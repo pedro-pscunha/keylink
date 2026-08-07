@@ -1471,36 +1471,41 @@ macro_rules! __keylink_service {
             /// own entry with it, so the id is free again and a lazy factory may
             /// serve the next message by building a fresh one.
             ///
-            /// # A peer whose reply dies is told `NoSuchActor`, for every reason it can die
+            /// # What a peer whose reply dies is told, and it is three answers
             ///
-            /// **The one message a restart loses is a `#[defer]`red reply parked
-            /// in the state, and on the keyed served path that loss reaches the
-            /// peer as
-            /// [`RemoteError::NoSuchActor`](keylink::RemoteError::NoSuchActor)**
-            /// — *there is nothing here, stop asking* — about an actor that is
-            /// mid-restart and about to answer that same peer again. A client
-            /// that treats `NoSuchActor` as terminal, which is what the name
-            /// tells it to do, stops retrying an actor that is coming back.
+            /// The one message a restart loses is a `#[defer]`red reply parked in
+            /// the state, because the state is dropped when the incarnation ends.
+            /// That loss reaches the peer as `Failed("restarting: {reason}")` —
+            /// *the incarnation that owed you an answer is gone, another is
+            /// coming, retry*.
             ///
-            /// **A restart is only one of the three ways that channel dies, and
-            /// this path renders all three the same.** The other two need no
-            /// supervisor at all: a handler that takes `reply.later()` and drops
-            /// the `Deferred` — sanctioned, and what its `#[must_use]` asks for —
-            /// and an actor that has genuinely ended. So a plain unsupervised
-            /// keyed actor says *there is nothing here* about a reply it dropped
-            /// while running.
+            /// A restart is one of **three** ways that channel dies, and the other
+            /// two need no supervisor at all: a handler that takes
+            /// `reply.later()` and drops the `Deferred` — sanctioned, and what its
+            /// `#[must_use]` asks for — reads `Failed("dropped: ..")`, and an
+            /// actor that has genuinely ended, or was aborted or evicted, reads
+            /// [`RemoteError::NoSuchActor`](keylink::RemoteError::NoSuchActor).
+            /// The three answers are three different next moves: retry, do not
+            /// retry this one call, stop asking.
             ///
-            /// [`supervised`] does not have any of it: the local served path
-            /// separates the three, reading the supervisor's decision for
-            /// `Failed("restarting: ..")`, `is_running()` for
-            /// `Failed("dropped: ..")`, and keeping `NoSuchActor` for an actor
-            /// that is really gone. The keyed one cannot do the first, because
-            /// the signal it would read is the channel the section above says has
-            /// no reader; the other two want a mounted-vs-gone answer from the
-            /// registry and are a design rather than a line, so they are named
-            /// here rather than half-built. Every *other* message survives a
-            /// restart: a turn in flight is answered before the loop breaks, and
-            /// queued turns stay in the mailbox the supervisor owns.
+            /// **This paragraph read the other way round for one wave**, and the
+            /// correction is worth keeping rather than deleting: every one of the
+            /// three arrived as `NoSuchActor` — *there is nothing here, stop
+            /// asking* — so a client that treats the name as terminal, which is
+            /// what the name tells it to do, stopped retrying an actor that was
+            /// coming back, and a plain **unsupervised** keyed actor said *no
+            /// actor is mounted as X* about a reply it dropped while running. The
+            /// signal was said to be unreachable because it lived on a channel
+            /// nothing outside `mount`'s closure could see. It does not live there
+            /// now: each actor's loop settles a verdict into a cell the registry
+            /// made, next to the one `System::status` already reads, and
+            /// `deliver_to_actor` and `deliver_to_local` render it through one
+            /// function. Nothing about this signature, `mount`, `Mounted` or the
+            /// registry's API changed for it.
+            ///
+            /// Every *other* message survives a restart: a turn in flight is
+            /// answered before the loop breaks, and queued turns stay in the
+            /// mailbox the supervisor owns.
             ///
             /// # Panics
             ///
