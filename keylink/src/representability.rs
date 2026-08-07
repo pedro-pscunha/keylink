@@ -225,6 +225,11 @@ impl beta::Actor for BetaState {
 /// ALPN a contract identifier at all. Both are runtime assertions rather than
 /// probes, because the values exist and there is nothing to be unable to
 /// represent.
+///
+/// Made red by `scripts/break-once.sh keylink/src/macros.rs`, replacing
+/// `keyed_alpn`'s `derive_alpn::<KeyedContract>(KEYED_PROTOCOL)` with
+/// `alpn().to_vec()`. Watched: `assertion `left != right` failed`, both sides
+/// `keylink/Alpha/8d5e509da907517a`.
 #[test]
 fn a_services_two_alpns_differ_from_each_other_and_from_another_services() {
     assert_ne!(alpha::alpn(), alpha::keyed_alpn());

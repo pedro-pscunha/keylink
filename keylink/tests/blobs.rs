@@ -1187,6 +1187,12 @@ async fn a_blob_response_carries_the_reply_and_the_address_together() {
 /// The unpublished id in the same store is the control. It proves the grant is
 /// per-address rather than "this peer may fetch anything", which is the failure
 /// a test that only fetched the granted id would pass.
+///
+/// Made red by `scripts/break-once.sh keylink/src/macros.rs`, replacing the
+/// generated `Granting::granted` arm's `__keylink_granted_id!` with `None` — a
+/// reply that carries an address and never declares it, which is the shape of
+/// the defect `Granting` exists to prevent. Watched: `the address a keyed actor
+/// returned must be fetchable: BlobRefused { id: BlobId(78063835..) }`.
 #[tokio::test]
 async fn a_keyed_actors_blob_method_grants_the_address_it_returns() {
     let server = local_node().await;

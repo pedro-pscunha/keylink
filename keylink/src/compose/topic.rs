@@ -180,12 +180,21 @@ pub struct Fanout {
 /// a topic clone of its own, or a feed that is not a topic. It is the same shape
 /// as [`Names`](super::Names)' rule, from the other side — there a registry keeps
 /// an actor alive, here a publisher's departure ends one.
+///
+/// **With one window, and it is the blocking publish.**
+/// [`Overflow::BlockPublisher`] snapshots the senders and releases the lock before
+/// awaiting any of them — deliberately, because a fan-out holding a mutex across
+/// an await is the deadlock this crate is arranged to avoid — so for the duration
+/// of that fan-out a clone of every sender lives on the publisher's stack. A last
+/// `Topic` clone dropped during that window ends its subscribers when the
+/// **publish** finishes, not when the topic does. The delay is bounded by the
+/// slowest subscriber, which is the same bound the publisher itself is under.
 #[derive(Debug)]
 pub struct Topic<T> {
-    /// The sending half of every live subscriber's channel, and the **only**
-    /// place one is held. Removing an entry therefore closes that subscriber's
-    /// stream, which is what makes [`Overflow::DropSubscriber`] loud rather than
-    /// silent.
+    /// The sending half of every live subscriber's channel, and — outside the
+    /// window named on the type above — the **only** place one is held. Removing
+    /// an entry therefore closes that subscriber's stream, which is what makes
+    /// [`Overflow::DropSubscriber`] loud rather than silent.
     to: Arc<Mutex<Vec<mpsc::Sender<T>>>>,
     overflow: Overflow,
 }
@@ -230,10 +239,23 @@ impl<T> Topic<T> {
 
     /// Poison recovery rather than propagation, the call
     /// [`Subscribers`](crate::Subscribers) and the idempotency ledger both make:
-    /// one bad publish should cost one publish. Nothing here can panic while the
-    /// lock is held — `try_send` cannot, and the blocking path releases the lock
-    /// before it awaits — so this arm is unreachable in practice and must still
-    /// be typed.
+    /// one bad publish should cost one publish.
+    ///
+    /// **And this arm is reachable, by caller code.** An earlier version of this
+    /// doc argued it could not be — "`try_send` cannot panic, and the blocking
+    /// path releases the lock before it awaits" — and that argument is wrong on
+    /// its own file: [`publish_dropping`](Self::publish_dropping) calls
+    /// `item.clone()` **inside** `self.lock().retain(..)`, and `T: Clone` is the
+    /// caller's implementation. A `Clone` that panics unwinds out of the closure
+    /// with the guard held and poisons the mutex.
+    ///
+    /// So the recovery is load-bearing rather than defensive: without it, one
+    /// caller's panicking `Clone` would turn every later `publish`, `subscribe`
+    /// and `subscribers` on that topic into a panic of its own, which is the
+    /// opposite of "one bad publish costs one publish". Cloning outside the lock
+    /// is not the alternative it sounds like — the number of clones is the number
+    /// of live subscribers, which is what the lock is protecting. Pinned by
+    /// `tests/compose.rs::a_panicking_clone_costs_one_publish_and_not_the_topic`.
     fn lock(&self) -> MutexGuard<'_, Vec<mpsc::Sender<T>>> {
         self.to.lock().unwrap_or_else(PoisonError::into_inner)
     }
