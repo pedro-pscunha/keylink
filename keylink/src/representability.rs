@@ -65,6 +65,29 @@
 //! rustc stderr, so a compiler release that rewords a diagnostic turns the gate
 //! red on a tree nobody touched. These probes carry no error text at all, cost
 //! nothing to maintain, and compile as part of the ordinary test build.
+//!
+//! # A claim no probe here can reach, and why its stand-in is a test
+//!
+//! **A cycle of blocking sends.** An `ask` awaiting an actor whose handler awaits
+//! the first one back deadlocks, and nothing in this file can refuse it: both
+//! handles have the same type, and `macros.rs` already gives the reason — "no
+//! type can tell one actor's handle from another's". A cycle is a property of
+//! *which* handle a handler calls at run time, so there is no name to shadow and
+//! no impl to overlap.
+//!
+//! It is also the one claim here with no `rg` stand-in, and that is the
+//! difference from the `unbounded_channel` note further down. That one is a
+//! token, so its absence is greppable; a cycle is built out of ordinary sends
+//! that are each correct alone, so no pattern matches the defect rather than the
+//! mechanism. A grep can only bound the search:
+//! `rg -c 'self\.mail\.send' keylink/src/local.rs` reports `1` and exits 0,
+//! because every local mailbox message funnels through `LocalActor::send` — and
+//! that count says nothing about whether two trips through it form a loop, which
+//! is the whole of the gap. The keyed path and `Topic`'s fan-out have their own
+//! sends and are not behind that funnel.
+//!
+//! So the stand-in is a test rather than a probe: `keylink/tests/cycles.rs`
+//! builds A → B → A and watches it hang under a timeout.
 
 #![cfg(test)]
 #![allow(dead_code, reason = "the proof is that this module compiles")]
