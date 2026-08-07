@@ -191,10 +191,24 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// Measured on this machine, at ten thousand actors of the `ledger` service
 /// below, with an empty state:
 ///
-/// | path | before the generated mailbox (`c9056e0`) | Wave 1b (`c8712b0`) | Wave 2 (`836179c`) | Wave 3 | Wave 9 | before `Fate` (`810650a`) | with `Fate` |
-/// |---|---|---|---|---|---|---|---|
-/// | keyed, mounted in a `System` | 1,671 | 1,159 | 1,159 | 1,415 | 1,412 | **1,549** | **1,690** |
-/// | local, `ledger::actor(..)`   | 1,725 | 1,469 | 1,597 | 1,853 | 1,861 | **1,861** | **2,029** |
+/// | path | before the generated mailbox (`c9056e0`) | Wave 1b (`c8712b0`) | Wave 2 (`836179c`) | Wave 3 | Wave 9 | before `Fate` (`810650a`) | `Fate` | with the `Floor` |
+/// |---|---|---|---|---|---|---|---|---|
+/// | keyed, mounted in a `System` | 1,671 | 1,159 | 1,159 | 1,415 | 1,412 | 1,549 | 1,690 | **1,722** |
+/// | local, `ledger::actor(..)`   | 1,725 | 1,469 | 1,597 | 1,853 | 1,861 | 1,861 | **2,029** | **2,029** |
+///
+/// # The `Floor` cost 32 bytes on the keyed path and nothing measurable on the local one
+///
+/// Re-measured because the column before it was written *before* the floor
+/// existed, and a stale figure in this table is the one defect its own
+/// documentation keeps warning about. Keyed 1,690 → **1,722**; local 2,029 →
+/// **2,029**, unmoved to the byte. The floor is a `&Fate` and a `bool` in two
+/// frames — `run_loop`'s and `supervise`'s — and only the keyed path crossed an
+/// allocator step with it.
+///
+/// **Run-to-run variance on this machine is exactly zero**: five consecutive runs
+/// produced byte-identical totals on both paths, 17,224,418 and 20,291,072. That
+/// matters for [`LOCAL_SLACK`], which is *not* an allowance for noise here — there
+/// is none — and says so.
 ///
 /// # The keyed column drifted +137 between Wave 9 and `810650a`, and nobody wrote it down
 ///
@@ -348,6 +362,28 @@ const LOCAL_MEASURED: isize = 2_029;
 /// into one literal: the raise that introduced it was argued as "nineteen bytes
 /// is inside the noise", and that argument works exactly once before it becomes
 /// a licence. Named, it is the thing the next wave has to disagree with.
+///
+/// # It is **not** an allowance for noise, and that was measured
+///
+/// Five consecutive runs of this test produce byte-identical totals on both
+/// paths. The allocation pattern is deterministic and so is macOS's allocator
+/// here, so run-to-run variance is **zero** — the original argument for the raise,
+/// "nineteen bytes is inside the noise between one allocator and another", was
+/// therefore about the wrong thing. There is no noise to be inside of on this
+/// machine.
+///
+/// What it actually allows for is **an allocator this has never run against**: a
+/// different libc, a different size-class table, jemalloc or mimalloc under a
+/// downstream binary. That is real — the boxed-slot table above turns on
+/// size-class behaviour — and it is also **unmeasured**, which is the honest
+/// status of this number. 275 is the headroom the raise happened to buy, not a
+/// figure derived from anything.
+///
+/// So it is a judgement, and the way to retire it is one measurement rather than
+/// one argument: run this test once on a Linux CI and replace this constant with
+/// `max(measured) - LOCAL_MEASURED` across the machines that matter, or with zero
+/// if they agree. Until then it is deliberately larger than it needs to be on the
+/// one machine that has run it.
 const LOCAL_SLACK: isize = 275;
 
 /// How much an idle actor is allowed to cost **because of what the service

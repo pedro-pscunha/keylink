@@ -3402,13 +3402,24 @@ either: the task that would read the cell is being destroyed too.
 
 `tests/actor_memory.rs`, ten thousand idle actors, same machine:
 
-| path | before (`810650a`) | with `Fate` |
-|---|---|---|
-| keyed, mounted in a `System` | 1,549 | **1,690** |
-| local, `ledger::actor(..)` | 1,861 | **2,029** |
+| path | before (`810650a`) | with `Fate` | with the `Floor` (§12.11) |
+|---|---|---|---|
+| keyed, mounted in a `System` | 1,549 | 1,690 | **1,722** |
+| local, `ledger::actor(..)` | 1,861 | **2,029** | **2,029** |
 
-**+141 keyed, +168 local**, one `Arc<Mutex<Standing>>` per actor plus the handles
-that reach it. The local path also gave eight bytes back (below).
+**+141 keyed, +168 local** for the cell — one `Arc<Mutex<Standing>>` per actor plus
+the handles that reach it — and the local path gave eight bytes back (below). The
+floor added **32 more on the keyed path and nothing measurable on the local one**:
+it is a `&Fate` and a `bool` in two frames, and only the keyed one crossed an
+allocator step with it. Re-measured because the middle column was written before
+the floor existed, and a stale figure in that table is the defect it warns about.
+
+**Run-to-run variance on this machine is zero** — five consecutive runs, identical
+totals to the byte on both paths. That retires the argument the budget raise was
+made on ("nineteen bytes is inside the noise"): there is no noise here, so
+`LOCAL_SLACK` is an allowance for **an allocator this has never run against**,
+which is real, unmeasured, and now says so. One Linux CI run replaces it with a
+measurement.
 
 It measured **+165 and +192** first, with `Standing::Restarting(Ended)` inline:
 `Ended` is 40 bytes, so `Standing` was 40 and `Mutex<Standing>` 56, and every idle
