@@ -2103,6 +2103,16 @@ where
 /// giving it one reaches `Mounted`, `mount` and the registry entry, so this door
 /// leaves the asymmetry rather than making it. RFC-07 §9.10 names that cost.
 ///
+/// **The asymmetry is wider than a restart, and only the local half is closed.**
+/// A restart is one of *three* ways a served reply dies, and the other two are
+/// not supervision's doing at all: a handler that takes `reply.later()` and
+/// drops the `Deferred` — sanctioned, and what its `#[must_use]` asks for — and
+/// an actor that has genuinely ended. `deliver_to_local` tells those apart and
+/// renders the middle one `Failed("dropped: ..")`; **this keyed path renders all
+/// three as [`RemoteError::NoSuchActor`]**, so a plain unsupervised keyed actor
+/// says *there is nothing here* about a reply it dropped while running. Same
+/// missing reader, one door rather than two.
+///
 /// Every *other* message survives a keyed restart: a turn in flight is answered
 /// before the loop breaks, and queued turns stay in the mailbox the supervisor
 /// owns.
@@ -2728,6 +2738,28 @@ impl<A, M> fmt::Debug for LocalActor<A, M> {
 
 // ─────────────────────────────────────────── what a peer is told about a turn
 
+// Every prefix a `RemoteError::Failed` carries on the served path, named once
+// each so that their one shared property is checked rather than asserted.
+//
+// The property: **no one of these is a prefix of another.** `Failed` carries a
+// `String` and not a variant — a variant sits inside the hashed contract and
+// would move every service's ALPN — so the string is the whole discriminator,
+// and a peer matching on it with `starts_with` needs the set to be unambiguous.
+// That claim was written into four rustdocs and held by nothing until a fourth
+// member made it worth a guard: `tests::no_failure_prefix_is_a_prefix_of_another`
+// is that guard, and **a fifth prefix has to be added to its list by hand.**
+
+/// Your message exploded and the actor kept its state. Built by [`rendered`].
+const PANICKED: &str = "panicked: ";
+/// The turn ran and was not committed. Built by [`rendered`].
+const REFUSED: &str = "observer refused: ";
+/// The incarnation that owed you an answer is gone and the next one is coming.
+/// Built by [`deliver_to_local`].
+const RESTARTING: &str = "restarting: ";
+/// The actor is still there, and this one reply was taken out of its turn and
+/// never answered. Built by [`deliver_to_local`].
+const DROPPED: &str = "dropped: ";
+
 /// Render one answer as the pair a served dispatch returns.
 ///
 /// **Two dispatch paths reach this and they used to disagree.** The keyed loop
@@ -2743,12 +2775,12 @@ impl<A, M> fmt::Debug for LocalActor<A, M> {
 /// whole discriminator** between "your message exploded" and "an observer vetoed
 /// the turn it just watched", and panic text is usually caller-derived.
 ///
-/// There is a third prefix now — `"restarting: "`, built in
-/// [`deliver_to_local`] — and the two cannot be confused: `"panicked: "` means
-/// *your message exploded and the actor kept its state*, while `"restarting: "`
-/// means *the incarnation that owed you an answer is gone and the next one is
-/// coming*. Neither string is a prefix of the other, and neither is a
-/// [`RemoteError`] variant, so the contract hash does not move for either.
+/// There are two more now — [`RESTARTING`] and [`DROPPED`], both built in
+/// [`deliver_to_local`] on the arm that answers a reply channel that died
+/// without sending. The four are declared together above, with the one property
+/// they share and the test that holds it: none of them is a prefix of another,
+/// and none is a [`RemoteError`] variant, so the contract hash does not move for
+/// any of them.
 ///
 /// The stutter is still there and is deliberately not fixed here:
 /// `Panic::caught` builds its message as `the actor panicked: {payload}`, and
@@ -2765,14 +2797,14 @@ pub(crate) fn rendered<Resp>(
         // A panic must not unwind out of a connection's task, so the remote
         // caller is told a value. The actor is still alive.
         Answered::Faulted(panic) => (
-            Outcome::Err(RemoteError::Failed(format!("panicked: {panic}"))),
+            Outcome::Err(RemoteError::Failed(format!("{PANICKED}{panic}"))),
             Body::empty(),
         ),
         // NOT `NoSuchActor`, which says "there is nothing here, stop asking".
         // The turn ran and was not committed, and the actor is ending for a
         // reason the peer should be able to read.
         Answered::Refused { name } => (
-            Outcome::Err(RemoteError::Failed(format!("observer refused: {name}"))),
+            Outcome::Err(RemoteError::Failed(format!("{REFUSED}{name}"))),
             Body::empty(),
         ),
         // Queued and never started. The value the other bound produces for the
@@ -2871,23 +2903,51 @@ where
 
     match answer.await {
         Ok(answered) => rendered(answered, millis),
-        // The sender was dropped without sending, which on a supervised actor
-        // has one cause and it is not "gone": a `Deferred` parked in the state
-        // dies when the state does, and the actor is mid-restart. Telling that
-        // peer `NoSuchActor` — *there is nothing here, stop asking* — about an
-        // actor that is about to answer them again is the one defect supervision
-        // would otherwise introduce on the served path.
+        // The sender was dropped without sending, and there are three causes
+        // rather than one. Each gets its own answer, because `NoSuchActor` says
+        // *there is nothing here, stop asking* and two of the three are lies.
         //
-        // `Life::Restarting` is published before the state is dropped, so this
-        // read cannot be *early*: the sender cannot have died before the verdict
-        // it belongs to was published. It can be late — the next incarnation has
-        // already published `Running` by the time this borrows — and that
-        // renders `NoSuchActor` for a restart that has already finished, which
-        // is the one direction the ordering does not close and the harmless one.
-        // See `Inbox::ending`.
+        // 1. **Mid-restart.** A `Deferred` parked in the state dies when the
+        //    state does, and the next incarnation is coming. `Life::Restarting`
+        //    is published before the state is dropped, so this read cannot be
+        //    *early*: the sender cannot have died before the verdict it belongs
+        //    to was published. It can be late — the next incarnation has already
+        //    published `Running` by the time this borrows — and that lands in
+        //    arm 2, which is the one direction the ordering does not close and
+        //    the harmless one. See `Inbox::ending`.
+        //
+        // 2. **A live actor dropped one reply.** `#[defer]` makes this a
+        //    sanctioned move rather than misuse: `Deferred`'s `#[must_use]`
+        //    tells a handler to say `drop` out loud, and a handler that panics
+        //    after taking `reply.later()` arrives here too. The actor is there,
+        //    ran the turn, and answers the next call on the same connection —
+        //    so what is gone is the *reply*, not the actor, and the string says
+        //    which. `is_running()` and not the `Life` channel, because the
+        //    channel cannot tell arm 2 from arm 3 (see below).
+        //
+        // 3. **The actor ended.** `run_loop` drops `inbox` before `state`, so a
+        //    reply the state took to the grave is seen by a peer whose mailbox
+        //    handle is *already* closed — the drop that woke this future
+        //    happens-after the close. That ordering is what makes `is_running()`
+        //    exact here and `Life` not: `Life::Ended` is published after
+        //    `run_loop` returns, which is after the state drop, so a `Life` read
+        //    on this path can still say `Running` for an actor that is gone.
+        //
+        // The fourth prefix. `"panicked: "`, `"observer refused: "`,
+        // `"restarting: "`, `"dropped: "` — no one of them is a prefix of
+        // another, and none is a `RemoteError` variant, so the contract hash
+        // does not move. Pinned by
+        // `tests/defer.rs::a_live_actor_does_not_tell_a_peer_no_such_actor` and
+        // its twin `a_stopped_actor_still_tells_a_peer_no_such_actor`.
         Err(_) => match &*actor.life.borrow() {
             Life::Restarting(reason) => (
-                Outcome::Err(RemoteError::Failed(format!("restarting: {reason}"))),
+                Outcome::Err(RemoteError::Failed(format!("{RESTARTING}{reason}"))),
+                Body::empty(),
+            ),
+            Life::Running if actor.is_running() => (
+                Outcome::Err(RemoteError::Failed(format!(
+                    "{DROPPED}the reply was taken out of the turn and never answered"
+                ))),
                 Body::empty(),
             ),
             Life::Running | Life::Ended(_) => gone(),
@@ -2902,6 +2962,34 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// The one property the four served-path prefixes share.
+    ///
+    /// A peer reads `RemoteError::Failed`'s text to tell "your message exploded"
+    /// from "the actor is restarting" from "this reply was dropped", because the
+    /// alternative — a variant per cause — sits inside the hashed contract and
+    /// moves every service's ALPN. A prefix that is a prefix of another makes
+    /// `starts_with` ambiguous and the discriminator stops discriminating.
+    ///
+    /// Written into four rustdocs before it was written into a test. The list is
+    /// spelled out here, so **a fifth prefix has to be added to it by hand**; it
+    /// names the consts rather than the strings, so it cannot drift from the wire.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/local.rs`, giving [`DROPPED`]
+    /// the value `"panicked: dropped: "`. Watched:
+    /// `"panicked: " is a prefix of "panicked: dropped: "`.
+    #[test]
+    fn no_failure_prefix_is_a_prefix_of_another() {
+        let all = [PANICKED, REFUSED, RESTARTING, DROPPED];
+        for (i, outer) in all.iter().enumerate() {
+            for (j, inner) in all.iter().enumerate() {
+                assert!(
+                    i == j || !inner.starts_with(outer),
+                    "{outer:?} is a prefix of {inner:?}",
+                );
+            }
+        }
+    }
 
     /// The state a `Mutex` would otherwise be wrapped around.
     #[derive(Default)]

@@ -33,7 +33,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use keylink::{
-    Allowlist, Caller, Deferred, Ended, Observer, Replied, Reply, Server, Stop, TurnFut, TurnInfo,
+    Allowlist, Caller, Deferred, Ended, Observer, RemoteError, Replied, Reply, Server, Stop,
+    TurnFut, TurnInfo,
 };
 
 mod common;
@@ -61,6 +62,13 @@ keylink::service! {
     /// Panics before it consumes its reply.
     #[defer]
     rpc Boom(size: u64) -> u64;
+
+    /// Takes the reply out and **drops** it, without panicking and without
+    /// ending the actor. The sanctioned way a live actor loses one reply —
+    /// `Deferred`'s own `#[must_use]` says so — and the only cause of a dead
+    /// reply channel that is neither a fault nor an ending.
+    #[defer]
+    rpc Abandon(size: u64) -> u64;
 
     /// Answers every parked order **and then panics**. The sends happen inside
     /// the turn, so nothing that turn produced crosses.
@@ -103,6 +111,13 @@ impl orders::Actor for Book {
 
     async fn boom(&mut self, _cx: Caller<'_>, _reply: Reply<u64>, _size: u64) -> Replied<u64> {
         panic!("no price for that");
+    }
+
+    async fn abandon(&mut self, _cx: Caller<'_>, reply: Reply<u64>, _size: u64) -> Replied<u64> {
+        let (deferred, replied) = reply.later();
+        // Saying it out loud, which is what the `#[must_use]` asks for.
+        drop(deferred);
+        replied
     }
 
     async fn fill_then_boom(&mut self, _cx: Caller<'_>) -> u64 {
@@ -486,12 +501,17 @@ async fn a_deferred_sent_from_another_task_is_not_gated_by_the_turn_that_spawned
 /// Made red by `scripts/break-once.sh`, replacing `Reply::wrapping`'s
 /// `Answerer::Wrapped(Box::new(move |answered| self.answer(answered.map(wrap))))`
 /// with a closure that drops all three — the conversion installed and then not
-/// performed. Watched: "the call succeeded: Remote(NoSuchActor { id: "Orders" })".
+/// performed. Watched, when this was written: `the call succeeded:
+/// Remote(NoSuchActor { id: "Orders" })`.
 ///
-/// **That error names the wrong fault and it is a finding rather than a detail.**
-/// The actor exists, was reached, and ran the turn; a served reply that dies
-/// unanswered is reported to the peer as though the service had never been mounted.
-/// The test goes red either way — this is about what an operator would read.
+/// **That error named the wrong fault, and it was a finding rather than a detail.**
+/// The actor exists, was reached, and ran the turn; a served reply that died
+/// unanswered was reported to the peer as though the service had never been mounted.
+/// The test went red either way — the finding was about what an operator reads.
+/// **Fixed:** `deliver_to_local` now splits the dead-channel arm three ways, and the
+/// same break watched under it prints `Remote(Failed("dropped: the reply was taken
+/// out of the turn and never answered"))`. `a_live_actor_does_not_tell_a_peer_no_such_actor`
+/// reaches the same rendering through the public API with nothing broken at all.
 #[tokio::test]
 async fn a_peer_gets_an_answer_parked_past_its_own_turn() {
     let node = local_node().await;
@@ -514,6 +534,147 @@ async fn a_peer_gets_an_answer_parked_past_its_own_turn() {
         .expect("a peer must not hang on a parked reply")
         .expect("the caller is not itself panicking");
     assert_eq!(answer.expect("the call succeeded"), 21);
+}
+
+/// A **live** actor must not be reported to a peer as absent.
+///
+/// The served path had one `Err(_)` arm for a dead reply channel and rendered it
+/// [`RemoteError::NoSuchActor`] — *there is nothing here, stop asking*. `#[defer]`
+/// added a cause that channel can die from **while the actor is running**: a handler
+/// takes `reply.later()` and drops the `Deferred`. That is sanctioned rather than
+/// misuse — `Deferred`'s own `#[must_use]` says "dropping a deferred reply answers
+/// the caller `Gone`; that is sometimes right, so say so with `drop`" — so the
+/// answer a peer reads for it has to be true.
+///
+/// No supervision, no panic, no `stop()`. The actor answers the very next call on
+/// the same connection, which is the half `NoSuchActor` denies.
+///
+/// Made red by `scripts/break-once.sh keylink/src/local.rs` on the arm itself,
+/// `Life::Running if actor.is_running() => (` → `Life::Running if false => (`,
+/// which collapses the split back into the pre-fix single arm. Watched:
+/// `a live actor must not be reported as absent: Remote(NoSuchActor { id: "Orders" })`.
+#[tokio::test]
+async fn a_live_actor_does_not_tell_a_peer_no_such_actor() {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let book = orders::actor(Book::default());
+    let _server = Server::builder(&node)
+        .service(book.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("serves");
+    let client = orders::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+
+    let lost = client
+        .abandon(3)
+        .await
+        .expect_err("a dropped `Deferred` answers nobody");
+    match lost {
+        keylink::Error::Remote(RemoteError::Failed(why)) => assert!(
+            why.starts_with("dropped: "),
+            "a lost reply is its own answer and names itself: {why}"
+        ),
+        other => panic!("a live actor must not be reported as absent: {other:?}"),
+    }
+
+    // Same connection, immediately after. This is what makes the finding a
+    // defect rather than a wording preference.
+    assert_eq!(
+        client.parked().await.expect("the actor is still serving"),
+        0,
+        "the actor answers the call after the one it was reported absent for"
+    );
+    assert!(book.is_running(), "and nothing ended");
+}
+
+/// The other half: an actor that really has **stopped** still answers `NoSuchActor`.
+///
+/// The split above must not cost the case it was carved out of. A stopped actor's
+/// parked reply is a *gone* actor and not an abandoned one, and the peer's next
+/// action — stop asking — is the right one.
+///
+/// **Which arm catches it was measured, not assumed.** `Life::Ended` is published
+/// after `run_loop` returns, i.e. after the state drop that kills this reply, so on
+/// paper this could read `Running` and land in the `dropped: ` arm. It does not:
+/// breaking `Life::Running if actor.is_running() => (` to `if true` leaves this test
+/// **green**, so the `Life` read is late enough here and `Ended` is what answers.
+/// The `is_running()` condition earns its place on `abort()` instead — see the twin
+/// below, where `Life::Ended` is never published at all.
+///
+/// Made red by `scripts/break-once.sh keylink/src/local.rs` on
+/// `Life::Running | Life::Ended(_) => gone(),` → the same arm rendering
+/// `Failed("dropped: broken")`. Watched: `a stopped actor is gone, not merely
+/// unanswering: Remote(Failed("dropped: broken"))`.
+#[tokio::test]
+async fn a_stopped_actor_still_tells_a_peer_no_such_actor() {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let book = orders::actor(Book::default());
+    let _server = Server::builder(&node)
+        .service(book.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("serves");
+    let client = orders::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+
+    let placing = tokio::spawn(async move { client.place(3).await });
+    parked(&book, 1).await;
+    book.stop().await;
+
+    let lost = n0_future::time::timeout(Duration::from_secs(10), placing)
+        .await
+        .expect("a peer must not hang on a reply its actor took to the grave")
+        .expect("the caller is not itself panicking")
+        .expect_err("the state died holding it");
+    assert!(
+        matches!(&lost, keylink::Error::Remote(RemoteError::NoSuchActor { id }) if id == "Orders"),
+        "a stopped actor is gone, not merely unanswering: {lost:?}"
+    );
+}
+
+/// And an **aborted** actor, which is the case that makes `is_running()` the reader
+/// rather than the [`Life`] channel.
+///
+/// `abort()` destroys the task, so `Life::Ended` is *never published*: an aborted
+/// actor reads `Life::Running` for the rest of the process. A split that asked the
+/// `Life` channel alone would tell every peer holding a parked reply that a destroyed
+/// actor merely dropped their answer and is still there. Dropping the loop's future
+/// drops `inbox` before `state` — parameters drop in reverse declaration order — so
+/// the mailbox is closed by the time the state kills the reply that wakes the peer.
+///
+/// Made red by `scripts/break-once.sh keylink/src/local.rs` on
+/// `Life::Running if actor.is_running() => (` → `Life::Running if true => (`, which
+/// is the `Life`-only split. Watched: `an aborted actor is gone, and its Life channel
+/// will never say so: Remote(Failed("dropped: the reply was taken out of the turn and
+/// never answered"))`.
+#[tokio::test]
+async fn an_aborted_actor_tells_a_peer_no_such_actor() {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let book = orders::actor(Book::default());
+    let _server = Server::builder(&node)
+        .service(book.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("serves");
+    let client = orders::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+
+    let placing = tokio::spawn(async move { client.place(3).await });
+    parked(&book, 1).await;
+    book.abort();
+
+    let lost = n0_future::time::timeout(Duration::from_secs(10), placing)
+        .await
+        .expect("a peer must not hang on a reply its actor was killed holding")
+        .expect("the caller is not itself panicking")
+        .expect_err("the state was destroyed holding it");
+    assert!(
+        matches!(&lost, keylink::Error::Remote(RemoteError::NoSuchActor { id }) if id == "Orders"),
+        "an aborted actor is gone, and its Life channel will never say so: {lost:?}"
+    );
 }
 
 /// And the ordinary shape over the wire: answered inside the turn, so the peer sees
