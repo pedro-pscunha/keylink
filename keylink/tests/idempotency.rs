@@ -10,8 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use keylink::{
-    Allowlist, Body, BodyReader, Caller, Context, Error, IdempotencyKey, IdempotencyRefusal,
-    Middleware, Next, Node, Outcome, RemoteError, Server as KeylinkServer,
+    ActorId, Allowlist, Body, BodyReader, Caller, Context, Error, Eviction, IdempotencyKey,
+    IdempotencyRefusal, Keyable, Middleware, Next, Node, Outcome, RemoteError,
+    Server as KeylinkServer,
 };
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
@@ -87,6 +88,33 @@ async fn start() -> Fixture {
     let server = local_node().await;
     let client_node = local_node().await;
     let running = till::serve(&server, Till::default(), Allowlist::anyone()).expect("serves");
+    let client = till::Client::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("the client dials the server");
+
+    Fixture {
+        client,
+        _server: running,
+        _nodes: vec![server, client_node],
+    }
+}
+
+/// The same `till`, served under a policy of the test's choosing.
+///
+/// A fresh node pair per call, deliberately: reusing a live service would prove
+/// the behaviour of whatever policy that service was built with rather than of the
+/// one under test, and the policy is fixed at `build()`.
+async fn start_keyable(keyable: Keyable) -> Fixture {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let running = KeylinkServer::builder(&server)
+        .service(
+            till::service(Till::default(), Allowlist::anyone())
+                .keyable(keyable)
+                .build(),
+        )
+        .spawn()
+        .expect("one service, no duplicate ALPN");
     let client = till::Client::connect(&client_node, server.endpoint().addr())
         .await
         .expect("the client dials the server");
@@ -237,6 +265,275 @@ async fn a_refused_key_leaves_the_handler_reachable() {
         .expect("a valid key still works");
 
     assert_eq!(run, 1, "the refusal must not have run the handler");
+}
+
+// ────────────────────────────────── which methods accept a key at all
+
+/// **The headline of the wave: the serving side decides, and a key on a method it
+/// does not key is refused rather than ignored.**
+///
+/// Both directions in one test, because the claim is that the policy
+/// *discriminates*. `Only(&["Reserve"])` implemented as "accept everything" and as
+/// "refuse everything" are each half-green under a one-sided assertion, and one of
+/// those two is what a wiring mistake produces.
+///
+/// The refusal is asserted whole rather than by `matches!`, so the method name it
+/// carries is part of the claim: a refusal that named the wrong method would tell a
+/// caller to go and look at code that is fine.
+///
+/// Made red by `scripts/break-once.sh` replacing
+/// `Self::Only(named) => named.contains(&method),` in `Keyable::accepts` with the
+/// same line plus `|| true` — a policy that says yes to everything, which is the
+/// shape a wiring mistake takes. Watched: `panicked at ..,
+/// `Slow` is not in this service's policy: 1`
+/// — the `expect_err` fires because the call went through and answered run 1.
+/// Across the whole file that one edit reddens three tests and no more:
+/// `24 passed; 3 failed`.
+#[tokio::test]
+async fn a_key_on_a_method_the_service_does_not_key_is_refused() {
+    let fixture = start_keyable(Keyable::Only(&["Reserve"])).await;
+
+    let refused = fixture
+        .client
+        .with_idempotency(key("k"))
+        .slow(0)
+        .await
+        .expect_err("`Slow` is not in this service's policy");
+    assert_eq!(
+        refusal(&refused),
+        IdempotencyRefusal::NotKeyable {
+            method: "Slow".to_owned()
+        },
+        "the refusal must name the method it refused"
+    );
+
+    assert!(
+        fixture
+            .client
+            .with_idempotency(key("k"))
+            .reserve("ADU-014".to_string(), 2)
+            .await
+            .is_ok(),
+        "`Reserve` IS in the policy, so a key on it must still be taken"
+    );
+}
+
+/// **A refused key never reaches the ledger**, and the ordering is what proves it.
+///
+/// `IdempotencyKey::validate` is the first step on the road to `Ledger::claim` —
+/// nothing else stands between a key and a claimed slot — so a refusal that beats
+/// *validation* cannot have claimed a slot or evicted anybody's record. A smuggled
+/// oversized key is refusable two ways, and which refusal comes back says which
+/// check ran first. That is the strongest statement available from outside: a
+/// refusal looks the same on the wire whether the ledger was consulted or not, so
+/// the assertion has to be about order.
+///
+/// The second half is the ledger's own side of it. A *valid* key refused on `Slow`
+/// is still a first attempt on `Reserve`, so the refusal spent nothing — not a
+/// tombstone, not a slot.
+///
+/// Made red by `scripts/break-once.sh` replacing
+/// `Self::Only(named) => named.contains(&method),` in `Keyable::accepts` with the
+/// same line plus `|| true`. A policy that accepts everything is exactly a policy
+/// that is not above the ledger: the key then reaches `validate`, and the answer
+/// changes identity. Watched: `panicked at ..,
+/// assertion `left == right` failed: a key the ledger would refuse as malformed
+/// must be refused by the POLICY first, or the policy is not above the ledger`,
+/// `left: Malformed("config: invalid idempotency key: 129 bytes exceeds the 128
+/// byte cap")`, `right: NotKeyable { method: "Slow" }`, `0 passed; 1 failed;
+/// 26 filtered out`.
+///
+/// The break this test would most like — swapping the two statements in `claim_key`
+/// — is a reordering rather than a substitution, so `break-once.sh` cannot express
+/// it. The break above is what a reordering would *look like from out here*, and it
+/// is the same assertion that catches both.
+#[tokio::test]
+async fn a_refused_key_never_reaches_the_ledger() {
+    let fixture = start_keyable(Keyable::Only(&["Reserve"])).await;
+
+    let refused = fixture
+        .client
+        .with_idempotency(smuggled(&"x".repeat(keylink::MAX_KEY_LEN + 1)))
+        .slow(0)
+        .await
+        .expect_err("refusable two ways over");
+    assert_eq!(
+        refusal(&refused),
+        IdempotencyRefusal::NotKeyable {
+            method: "Slow".to_owned()
+        },
+        "a key the ledger would refuse as malformed must be refused by the POLICY \
+         first, or the policy is not above the ledger"
+    );
+
+    let _spent_nothing = fixture
+        .client
+        .with_idempotency(key("shared"))
+        .slow(0)
+        .await
+        .expect_err("refused, because `Slow` is not keyed");
+    let run = fixture
+        .client
+        .with_idempotency(key("shared"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("the refused key must still be claimable");
+
+    assert_eq!(
+        run, 1,
+        "a refused key must leave neither a record nor a tombstone behind"
+    );
+}
+
+/// An unkeyed call is the path this feature must not touch, and `Keyable::None` is
+/// the policy most able to touch it: there is no ledger at all on that service, so
+/// a call that reached for one would be reaching for `None`.
+///
+/// Made red by `scripts/break-once.sh` replacing `claim_key`'s
+/// `return Claimed::None;` with
+/// `return Claimed::Refuse(IdempotencyRefusal::InFlight.into());` — the unkeyed
+/// early return, gone. Watched: `panicked at ..,
+/// a call with no key needs no policy: Remote(Idempotency(InFlight))`,
+/// `0 passed; 1 failed; 26 filtered out`.
+///
+/// **That break reddens four tests, and the breadth is the finding rather than a
+/// weakness of this one.** Whole-file run: `23 passed; 4 failed` —
+/// `a_call_without_a_key_runs_every_time`, `a_refusal_is_recorded_and_replayed`,
+/// `a_second_caller_attaches_to_a_live_key` and this test. The unkeyed path is
+/// load-bearing under most of the file; what this test adds is the one service the
+/// others never build, the one with no ledger at all, where a call reaching for a
+/// ledger would be reaching for `None`.
+#[tokio::test]
+async fn an_unkeyed_call_is_unaffected_by_any_policy() {
+    let fixture = start_keyable(Keyable::None).await;
+
+    let first = fixture
+        .client
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("a call with no key needs no policy");
+    let second = fixture
+        .client
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("and neither does the next one");
+
+    assert_eq!(
+        second,
+        first + 1,
+        "an unkeyed call must run every time, on a service with no ledger at all"
+    );
+}
+
+/// A service with no ledger still answers a ledger query, and the answer is
+/// `Fresh` — which is a fact there rather than a fallback, because nothing was ever
+/// recorded.
+///
+/// This is the one branch `answer_key_state` gained: `keys.ledger.as_deref()` is
+/// `None`, and the alternative to answering was refusing a question that has no
+/// method name to refuse under.
+///
+/// Made red by `scripts/break-once.sh` replacing
+/// `Some(_) | None => KeyState::Fresh,` with
+/// `Some(_) | None => KeyState::Interrupted,`. Watched: `panicked at ..,
+/// assertion `left == right` failed: no ledger
+/// means nothing was recorded, which is what `Fresh` reports`, `left: Interrupted`,
+/// `right: Fresh`, `2 passed; 1 failed; 24 filtered out` — the other two
+/// `a_key_state_query_*` tests stay green, because they run on a service that has
+/// a ledger and never reach the arm.
+#[tokio::test]
+async fn a_key_state_query_on_a_service_that_keys_nothing_is_fresh() {
+    let fixture = start_keyable(Keyable::None).await;
+
+    assert_eq!(
+        fixture.client.key_state(key("never")).await.expect("asks"),
+        keylink::KeyState::Fresh,
+        "no ledger means nothing was recorded, which is what `Fresh` reports"
+    );
+}
+
+/// The policy is a property of the **service**, not of the singleton dispatch path,
+/// so a keyed actor system serving the same schema applies it with no second
+/// mechanism.
+///
+/// It works because `Rpc::method` is implemented for `Addressed<Request>` and
+/// forwards to the inner request, so `keyed_service`'s `ServiceBuilder` reads the
+/// real method name rather than a constant. That is the whole of why Wave 1 needed
+/// no change to `macros.rs`.
+///
+/// Made red by `scripts/break-once.sh` replacing this test's own
+/// `.keyable(Keyable::Only(&["Reserve"]))` with `.keyable(Keyable::Any)`. That is
+/// the test-literal break on purpose: a keyed service to which the policy was never
+/// applied behaves *identically* to one configured `Keyable::Any`, so neutralising
+/// the policy here reproduces exactly the defect this test exists to catch.
+/// Watched: `panicked at .., `Slow` is not in
+/// this service's policy, actor or not: 1`, `0 passed; 1 failed; 26 filtered out`.
+///
+/// Red a second way, from production code, under the
+/// `Self::Only(..) || true` break recorded on
+/// `a_key_on_a_method_the_service_does_not_key_is_refused`: watched there as one of
+/// three failures, this test among them, which is the evidence that the singleton
+/// and keyed paths share one policy rather than two.
+///
+/// The break this test cannot run is the one in `actor/remote.rs`, where
+/// `Rpc::method` for `Addressed<T>` forwards to the inner request. That file belongs
+/// to another branch in flight, and `break-once.sh` restores from a backup on
+/// `trap EXIT` — an interrupted run would write a stale copy over somebody else's
+/// live edit. Standing in for it, and printing the body rather than the signature,
+/// because a signature is identical either way:
+///
+/// ```sh
+/// rg -n -A1 'fn method\(&self\) -> &.static str \{' keylink/src/actor/remote.rs
+/// ```
+///
+/// Two matches today, and both must be read: `139: fn method(..) {` followed by
+/// `140: self.message.method()`, which is the impl this test rests on, and
+/// `573:`/`574: match self {`, a `Rpc` impl inside that file's own test module.
+/// A constant at 140 is the defect; a third match is a third `Rpc` impl and wants
+/// looking at.
+#[tokio::test]
+async fn a_keyed_actor_service_applies_the_same_policy() {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let system: till::System = till::System::builder(Eviction::Never).build();
+    let _running = KeylinkServer::builder(&server)
+        .service(
+            till::keyed_service(&system, Allowlist::anyone())
+                .keyable(Keyable::Only(&["Reserve"]))
+                .build(),
+        )
+        .spawn()
+        .expect("one service, no duplicate ALPN");
+    let client = till::KeyedClient::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("the typed keyed client dials the actor system");
+    system
+        .mount(
+            ActorId::new("till").expect("a valid actor id"),
+            till::spawn(TillActor::default()),
+        )
+        .expect("the id is free");
+
+    let keyed = client.with_idempotency(key("k"));
+    let refused = till::at(&keyed, ActorId::new("till").expect("valid"))
+        .slow(0)
+        .await
+        .expect_err("`Slow` is not in this service's policy, actor or not");
+    assert_eq!(
+        refusal(&refused),
+        IdempotencyRefusal::NotKeyable {
+            method: "Slow".to_owned()
+        },
+        "the keyed path must read the real method name, not a constant"
+    );
+
+    assert!(
+        till::at(&keyed, ActorId::new("till").expect("valid"))
+            .reserve("ADU-014".to_string(), 2)
+            .await
+            .is_ok(),
+        "`Reserve` is in the policy on this path too"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────── scoping

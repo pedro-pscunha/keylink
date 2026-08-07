@@ -282,11 +282,164 @@ pub enum IdempotencyRefusal {
         /// The cap that was reached.
         limit: u32,
     },
+
+    /// This service does not accept an idempotency key on this method.
+    ///
+    /// A serving side decides which of its methods a key is worth recording for
+    /// — see [`Keyable`] — and this is what a key on any other method is answered
+    /// with.
+    ///
+    /// **Refused rather than ignored, and that is the whole of why this variant
+    /// exists.** A caller that wrote `with_idempotency` believes the call runs
+    /// at most once. Running it and recording nothing would hand that caller a
+    /// guarantee it does not have, silently, on the one path it cannot check —
+    /// and it would be discovered by a double booking rather than by an error.
+    /// Every other refusal in this enum is here for the same reason: the answer
+    /// a caller can act on beats the answer that looks like success.
+    ///
+    /// **No layer can produce this instead.** The key is claimed *before* the
+    /// [`Middleware`](crate::Middleware) chain runs — `serve_one` claims, then
+    /// calls `next` — so a layer never meets an unclaimed key and could only
+    /// refuse one already in the ledger. The decision has to live where the
+    /// claim is.
+    ///
+    /// `method` names the method in the `CamelCase` spelling
+    /// [`Rpc::method`](crate::Rpc::method) returns. Redundant to the caller,
+    /// which knows which call it made — one stream per call, so this refusal
+    /// arrives on that call's own stream — and carried anyway for the reason
+    /// [`RemoteError::NoSuchActor`](crate::RemoteError::NoSuchActor) carries the
+    /// id it was given: a log line read away from the call site has to say what
+    /// it is about. `String` rather than `&'static str`, because this crosses
+    /// the wire inside [`RemoteError`] and has to `Deserialize`.
+    #[error("this service does not accept an idempotency key on {method}")]
+    NotKeyable {
+        /// The method a key was attached to, `CamelCase` as `service!` wrote it.
+        method: String,
+    },
 }
 
 impl From<IdempotencyRefusal> for RemoteError {
     fn from(refusal: IdempotencyRefusal) -> Self {
         Self::Idempotency(refusal)
+    }
+}
+
+/// Which methods of this service accept an idempotency key.
+///
+/// The **serving** side decides this, and until this type existed it could not.
+/// A peer attached a key to whatever it liked, and one pool of [`MAX_RECORDS`]
+/// entries served the whole service — so a method whose reply is worth nothing
+/// to record, a quote lookup asked a thousand times a second, evicted the
+/// records of the methods that needed them. The ledger has no way to tell a
+/// record it should keep from one it should never have taken. This is where that
+/// is said.
+///
+/// Set it with [`ServiceBuilder::keyable`](crate::ServiceBuilder::keyable). The
+/// default is [`Any`](Self::Any), which is what this crate did before the type
+/// existed.
+///
+/// # Why this is not called `Keyed`
+///
+/// `Keyed` is the obvious name and it is taken. In this crate a **keyed** thing
+/// is one addressed by an [`ActorId`](crate::ActorId) —
+/// [`KeyedService`](crate::KeyedService), `KeyedClient`, `keyed_service`,
+/// `keyed_alpn`, `run_keyed` — and `keylink::Keyed` would sit two lines below
+/// `keylink::KeyedService` in the same export list meaning a different key
+/// entirely. `rpc.rs`'s `Claimed` was renamed *out of* the word for exactly this,
+/// and its doc comment records the decision; taking the word back for the
+/// idempotency side would undo a rename this crate already paid for.
+///
+/// **Keyable** is what the type actually decides: whether a key may be attached
+/// to a method. `Keyable::Any`, `Keyable::None` — nothing here is ever said of an
+/// actor, so there is nothing to disambiguate. `Keying` and `Idempotent` were the
+/// other two candidates: the first keeps the stem a reader has to disambiguate,
+/// and the second reads as a property of the reply rather than of the method.
+///
+/// # Method names are `CamelCase`
+///
+/// These are the names `service!` writes into the generated `Request` enum,
+/// which is what [`Rpc::method`](crate::Rpc::method) returns. `rpc
+/// reserve_stock(..)` is `"ReserveStock"` here. Reach for the `snake_case`
+/// spelling — which is the first thing a reader does — and the policy accepts
+/// nothing, silently, because a name that matches no method simply never
+/// matches.
+///
+/// ```ignore
+/// keylink::service! {
+///     service Till;
+///     rpc reserve(sku: String, qty: u32) -> u64;
+///     rpc quote(sku: String) -> u64;
+/// }
+///
+/// // A key on `Reserve` is recorded. A key on `Quote` is refused with
+/// // `IdempotencyRefusal::NotKeyable`.
+/// till::service(handler, Allowlist::anyone())
+///     .keyed(Keyable::Only(&["Reserve"]))
+///     .build()
+/// ```
+///
+/// # A name matching no method is not a startup error, and it could be
+///
+/// Nothing checks these names against the service's own methods, so a typo is
+/// discovered on the first call rather than at `spawn`. Checking would need the
+/// method list *at the builder*, which means a `const METHODS` on
+/// [`Rpc`](crate::Rpc) that every generated service carries — a change to the
+/// macro, for a mistake whose refusal already names the method it did not match.
+/// Left undone deliberately, and recorded here rather than discovered.
+///
+/// # `&'static`, so the policy is code
+///
+/// A runtime-computed list is not representable, and that is the intent: which
+/// methods are worth recording is a property of the service's design, not of its
+/// data. A decision that has to change while the service runs is
+/// [`Admission`](crate::Admission)'s shape — a port with a live policy behind it
+/// — and nobody has asked for one here.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub enum Keyable {
+    /// Every method accepts one. What this crate did before this type existed,
+    /// and therefore the default.
+    #[default]
+    Any,
+    /// These, and nothing else.
+    Only(&'static [&'static str]),
+    /// Everything except these.
+    Except(&'static [&'static str]),
+    /// No method accepts one, and no ledger is built.
+    None,
+}
+
+impl Keyable {
+    /// Whether a key on `method` is accepted rather than refused.
+    ///
+    /// `&'static str`, matching [`Rpc::method`](crate::Rpc::method), which is
+    /// where every real caller's argument comes from. A shorter lifetime would
+    /// mean `contains` could not be used against a `&'static [&'static str]` and
+    /// the loop would have to be spelled out — a borrow relaxed for nobody.
+    pub(crate) fn accepts(&self, method: &'static str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Only(named) => named.contains(&method),
+            Self::Except(named) => !named.contains(&method),
+            Self::None => false,
+        }
+    }
+
+    /// Whether this policy needs a ledger allocated for it at all.
+    ///
+    /// [`None`](Self::None) is the one variant that does not, and that is what
+    /// it is *for*: a service that keys nothing holds no map, no queues and no
+    /// counters, and a reader can see the allocation not happen.
+    ///
+    /// `Only(&[])` accepts nothing either and still gets one. Two spellings of
+    /// the same absence would be two things to keep in step, and what `Only(&[])`
+    /// builds is an empty `HashMap` that every call refuses before reaching. So
+    /// this is an implication rather than an equivalence — **no ledger means no
+    /// key is accepted, and the converse is not claimed** — and no refusal is
+    /// ever decided by the ledger's absence. [`accepts`](Self::accepts) decides
+    /// every refusal, including every one of `None`'s.
+    pub(crate) fn needs_a_ledger(&self) -> bool {
+        !matches!(self, Self::None)
     }
 }
 
@@ -306,7 +459,14 @@ impl From<IdempotencyRefusal> for RemoteError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, postcard_schema::Schema)]
 pub enum KeyState {
     /// No record. Either never used, or its tombstone was dropped past
-    /// [`MAX_TOMBSTONES`]. A call with this key would run.
+    /// [`MAX_TOMBSTONES`].
+    ///
+    /// A call with this key would run **if the service accepts a key on the
+    /// method** — see [`Keyable`]. On a method the service does not key, every call
+    /// is [`IdempotencyRefusal::NotKeyable`] and every key reads `Fresh` forever,
+    /// because nothing was ever recorded. That is a fact about the ledger rather
+    /// than a prediction about the call, and this variant only ever claimed the
+    /// former.
     Fresh,
     /// A call is in dispatch under this key now.
     Running,
@@ -1046,6 +1206,105 @@ mod tests {
             Err(RemoteError::Idempotency(refusal)) => refusal,
             Err(other) => panic!("expected an idempotency refusal, got {other:?}"),
             Ok(_) => panic!("expected a refusal, got a place to wait in"),
+        }
+    }
+
+    /// [`Keyable`], which decides whether anything below this module runs at all.
+    ///
+    /// Exhaustive over the four variants here, in one place, so the wire test
+    /// `a_key_on_a_method_the_service_does_not_key_is_refused` only has to prove
+    /// the policy is *wired in* rather than that every variant is right. Same
+    /// split as `key_state_reports_every_state` beside
+    /// `a_key_state_query_crosses_the_wire`.
+    mod policy {
+        use super::*;
+
+        /// Both directions for every variant. One direction per variant would
+        /// pass for a policy that answered a constant, which is the failure this
+        /// exists to refuse: `Only` that accepted everything and `Except` that
+        /// refused everything are each half-green under a one-sided test.
+        ///
+        /// Made red by `scripts/break-once.sh` replacing
+        /// `Self::Only(named) => named.contains(&method),` with the same line plus
+        /// `|| true`. Watched: `2 passed; 3 failed` of this module's five —
+        /// `every_variant_accepts_and_refuses_what_it_says`,
+        /// `an_empty_only_accepts_nothing_and_still_needs_a_ledger` and
+        /// `a_snake_case_name_matches_nothing`. Three tests catching one edit is
+        /// the intended overlap: each states a different consequence of `Only`
+        /// meaning what it says.
+        ///
+        /// Made red a second way, on the other end of the sweep, by replacing
+        /// `Self::Any => true,` with `Self::Any => false,`. Watched: `assertion
+        /// failed: Keyable::Any.accepts("Reserve")`, `3 passed; 2 failed`,
+        /// the second being
+        /// `the_default_policy_keys_every_method`.
+        #[test]
+        fn every_variant_accepts_and_refuses_what_it_says() {
+            assert!(Keyable::Any.accepts("Reserve"));
+            assert!(Keyable::Any.accepts("Quote"));
+
+            assert!(Keyable::Only(&["Reserve"]).accepts("Reserve"));
+            assert!(!Keyable::Only(&["Reserve"]).accepts("Quote"));
+
+            assert!(!Keyable::Except(&["Quote"]).accepts("Quote"));
+            assert!(Keyable::Except(&["Quote"]).accepts("Reserve"));
+        }
+
+        /// Split out from the sweep above because it is the variant with a
+        /// second consequence — no ledger — and the two halves of `None` belong
+        /// beside each other.
+        ///
+        /// Made red by `scripts/break-once.sh` replacing `Self::None => false,`
+        /// with `Self::None => true,`. Watched: `assertion failed:
+        /// !Keyable::None.accepts("Reserve")`, `4 passed; 1 failed`, and no other test in the crate noticed — which is
+        /// why this one exists.
+        #[test]
+        fn keyed_none_accepts_no_method() {
+            assert!(!Keyable::None.accepts("Reserve"));
+            assert!(!Keyable::None.needs_a_ledger());
+        }
+
+        /// The empty list is the spelling `needs_a_ledger` deliberately does not
+        /// recognise, and this pins the asymmetry rather than leaving it in prose:
+        /// it accepts nothing and still builds a ledger, so "no ledger" is a
+        /// consequence of `None` and never the cause of a refusal.
+        ///
+        /// Red under the same `Self::Only(..) || true` break recorded on the sweep
+        /// above; watched there.
+        #[test]
+        fn an_empty_only_accepts_nothing_and_still_needs_a_ledger() {
+            assert!(!Keyable::Only(&[]).accepts("Reserve"));
+            assert!(Keyable::Only(&[]).needs_a_ledger());
+        }
+
+        /// The default is the behaviour that existed before the type did. A
+        /// different default would change every service that never names one,
+        /// silently, which is the one way this feature could break a caller.
+        ///
+        /// Made red by `scripts/break-once.sh` replacing `Self::Any => true,` with
+        /// `Self::Any => false,`. Watched: `3 passed; 2 failed`, this test among
+        /// them. What that break does NOT reach is the `#[default]` attribute
+        /// itself — `matches!(Keyable::default(), Keyable::Any)` stays green under
+        /// it, and moving `#[default]` to another variant is a two-literal edit
+        /// `break-once.sh` cannot express. That half is held by the compiler
+        /// instead: exactly one variant may carry the attribute, so there is no
+        /// state where the default is unset or ambiguous.
+        #[test]
+        fn the_default_policy_keys_every_method() {
+            assert!(matches!(Keyable::default(), Keyable::Any));
+            assert!(Keyable::default().accepts("Reserve"));
+        }
+
+        /// `CamelCase`, because a reader reaches for the other spelling first and
+        /// the failure is silent — a `snake_case` name matches no method, so the
+        /// policy refuses every call and says nothing about why.
+        ///
+        /// Red under the same `Self::Only(..) || true` break recorded on the sweep
+        /// above; watched there. `assertion failed:
+        /// !Keyable::Only(&["reserve"]).accepts("Reserve")`.
+        #[test]
+        fn a_snake_case_name_matches_nothing() {
+            assert!(!Keyable::Only(&["reserve"]).accepts("Reserve"));
         }
     }
 

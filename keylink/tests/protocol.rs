@@ -1035,9 +1035,55 @@ async fn a_service_serves_as_a_singleton_and_as_an_actor_system_on_one_node() {
 /// `Envelope<WireRequest<Addressed<Request>>>`, drift is refused at the
 /// handshake, and a `System` of one service physically cannot hold an actor of
 /// another. There is nothing left for the variant to say.
+///
+/// # Moved a third time, to price a refusal a serving side needs
+///
+/// `d3fe34471921164e` → `d75913b8a4742547`. **Step 1 was answered first, and the
+/// answer is yes.**
+///
+/// `IdempotencyRefusal` gained a seventh variant, `NotKeyable { method: String }`,
+/// so that a serving side can say which of its methods accept an idempotency key
+/// — [`Keyable`](keylink::Keyable) — and refuse a key on any other. `postcard_schema`
+/// hashes the variant *list*, and `IdempotencyRefusal` is inside every service's
+/// contract by the same route `RemoteError` is: `Envelope<WireResponse<Response>>`
+/// → `WireResponse::Call(Outcome<Resp>)` → `Outcome::Err(RemoteError)` →
+/// `RemoteError::Idempotency(IdempotencyRefusal)`. So the move is wire-visible for
+/// every service, singletons included, exactly as the second move was.
+///
+/// **The alternative was to reuse an existing variant, and it was rejected for
+/// being false.** `Malformed` says the key is empty or oversized; the key here is
+/// well formed and the *method* is what does not take one. `Unrecordable` says the
+/// reply carried a payload. `Forgotten` says it ran and the reply is gone —
+/// nothing ran. A refusal that misdescribes itself sends the caller to fix the
+/// wrong thing, and the hash exists precisely so that the honest version can be
+/// paid for once.
+///
+/// The other alternative was a fifth `RemoteError::Failed` prefix, which keeps the
+/// hash still. Rejected: the four prefixes are load-bearing as a `starts_with`
+/// discriminator, a guard asserts none is a prefix of another, and adding
+/// wire-format vocabulary to dodge a wire-format change trades a checked break for
+/// an unchecked one.
+///
+/// Appended rather than inserted, so no existing variant is renumbered. That is
+/// belt and braces here — the hash moves either way and the handshake refuses the
+/// old peer either way — and it is the habit that keeps a *silent* misdecode off
+/// the table when a hash somehow does not move.
+///
+/// **Measured, not reasoned about, and it caught a naming change on the way.** The
+/// variant was first written `NotKeyed`, which gave `keylink/Probe/68a16a96e45f8da8`
+/// and `keylink/Inspect/7ebc3f421c33c62a`; renaming it to `NotKeyable` — because
+/// `Keyed` is the keyed-actor word, see [`Keyable`](keylink::Keyable) — moved both
+/// again, to the literals below. So the hash is sensitive to a variant's **name**
+/// and not only to the shape of what it carries, which is worth knowing before
+/// anybody assumes a rename is free. Both pairs were read off a failing run of this
+/// file rather than derived.
+///
+/// One cause, one move: nothing else in `probe`'s contract graph changed in the
+/// commit that moved this literal. `Keyable` and `Records` are serving-side
+/// configuration and appear on no wire.
 #[test]
 fn the_contract_hash_has_not_moved() {
-    const PINNED: &str = "keylink/Probe/d3fe34471921164e";
+    const PINNED: &str = "keylink/Probe/d75913b8a4742547";
 
     assert_eq!(
         String::from_utf8_lossy(probe::alpn()),
@@ -1066,7 +1112,28 @@ fn the_contract_hash_has_not_moved() {
 /// hash, which is the whole point — an old console is refused at the handshake
 /// rather than handed four fields where it expected five.
 ///
-/// # It has moved twice, and these are the decisions
+/// # It has moved three times, and these are the decisions
+///
+/// ## `7bbd34fa83c9060c` → `0572763878b7fb9d`, pricing `IdempotencyRefusal::NotKeyable`
+///
+/// The full argument is on [`the_contract_hash_has_not_moved`], because the cause
+/// belongs to neither service: `IdempotencyRefusal` gained `NotKeyable`, and it sits
+/// inside *every* contract by way of `Outcome::Err(RemoteError)` →
+/// `RemoteError::Idempotency(..)`. Step 1 was answered yes there.
+///
+/// **This is the first time both pins moved in one commit, and that is the
+/// evidence rather than an embarrassment.** The two entries below each say
+/// "`Probe`'s hash did not move" as proof these pins discriminate. The converse
+/// proof is this one: a change to a type shared by every service must move *both*,
+/// and a change to one service's own request or response types must move exactly
+/// one. A shared change that moved only one pin would mean a service was hashing
+/// something other than what it carries — which is the drift RFC-05 §6 and
+/// [`WireResponse`](keylink::WireResponse)'s own doc comment record as having
+/// happened once already.
+///
+/// `Inspect` carries no idempotency key on any of its own methods and this still
+/// moves its ALPN, which is exactly the cost the variant was weighed against. It is
+/// paid once, pre-1.0, by a crate with no fleet.
 ///
 /// ## `080c9e481c937d67` → `7bbd34fa83c9060c`, applying Wave 6's review
 ///
@@ -1120,7 +1187,7 @@ fn the_contract_hash_has_not_moved() {
 /// [`NodeKey`]: keylink::NodeKey
 #[test]
 fn the_inspect_contract_hash_has_not_moved() {
-    const PINNED: &str = "keylink/Inspect/7bbd34fa83c9060c";
+    const PINNED: &str = "keylink/Inspect/0572763878b7fb9d";
 
     assert_eq!(
         String::from_utf8_lossy(keylink::inspect::alpn()),

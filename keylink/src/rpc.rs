@@ -39,7 +39,12 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::admission::settle;
 use crate::error::ConfigError;
-use crate::idempotency::{Claim, Guard, Ledger};
+// `Keyable` through the module rather than through the crate root, unlike its
+// siblings below: the root re-export is a promise to a *consumer*, and
+// `tests/api.rs` is the only place that writes it from a consumer's position. An
+// in-crate `crate::Keyable` would make the library itself the thing that fails
+// when the re-export goes, which would leave that test proving nothing.
+use crate::idempotency::{Claim, Guard, Keyable, Ledger};
 use crate::middleware::{wrap, Reached};
 use crate::wire::FrameReader;
 use crate::{
@@ -84,10 +89,9 @@ pub(crate) struct RpcService<Req, Resp> {
     /// methods. `None` for every service that does not, which is why an
     /// ordinary service pays nothing for this feature existing.
     blobs: Option<Blobs>,
-    /// Every recorded reply for THIS service. One per service rather than one
-    /// per node, because a record is an encoded reply of this service's
-    /// response type. See [`Ledger`].
-    ledger: Arc<Ledger>,
+    /// What this service does with an idempotency key: which methods accept
+    /// one, and where the accepted ones are recorded.
+    keys: Keys,
     _p: PhantomData<fn(Req) -> Resp>,
 }
 
@@ -97,9 +101,56 @@ impl<Req, Resp> Clone for RpcService<Req, Resp> {
             next: self.next.clone(),
             admission: self.admission.clone(),
             blobs: self.blobs.clone(),
-            ledger: self.ledger.clone(),
+            keys: self.keys.clone(),
             _p: PhantomData,
         }
+    }
+}
+
+/// One service's whole answer to "what happens to an idempotency key here?".
+///
+/// One value rather than a [`Keyable`] beside an `Option<Arc<Ledger>>`, because the
+/// two are read together on every keyed call and handing one on without the other
+/// is the mistake this makes unwritable. It also puts the invariant in one place
+/// instead of at each site that reads it.
+#[derive(Debug, Clone)]
+struct Keys {
+    /// Which methods accept a key. Consulted before the key is validated and
+    /// before the ledger is touched.
+    keyable: Keyable,
+    /// Every recorded reply for THIS service. One per service rather than one
+    /// per node, because a record is an encoded reply of this service's response
+    /// type. See [`Ledger`].
+    ///
+    /// `None` when [`Keyable::None`] was configured — not an empty ledger, no
+    /// ledger. The `Option` is also what makes the claim path unable to reach a
+    /// ledger that does not exist without an `unwrap`: [`Keys::ledger_for`]
+    /// returns the two facts at once or neither.
+    ledger: Option<Arc<Ledger>>,
+}
+
+impl Keys {
+    /// Build the policy and, if it needs one, the ledger it records into.
+    ///
+    /// The one place the two are decided together, which is what lets
+    /// `keyed_none_builds_no_ledger` probe the absence directly rather than
+    /// reaching through an erased handler for it.
+    fn new(keyable: Keyable) -> Self {
+        let ledger = keyable.needs_a_ledger().then(Ledger::new);
+        Self { keyable, ledger }
+    }
+
+    /// The ledger a key on `method` belongs in, or `None` if this service does
+    /// not accept one there.
+    ///
+    /// Both conditions in one answer on purpose. [`Keyable::accepts`] is what
+    /// decides every refusal, `Keyable::None` included; the missing ledger is a
+    /// consequence of that variant rather than a second policy, and its `None`
+    /// here is belt and braces over a decision already taken.
+    fn ledger_for(&self, method: &'static str) -> Option<&Arc<Ledger>> {
+        self.ledger
+            .as_ref()
+            .filter(|_| self.keyable.accepts(method))
     }
 }
 
@@ -120,6 +171,13 @@ impl<Req, Resp> std::fmt::Debug for RpcService<Req, Resp> {
 /// and this is about an idempotency key. Two unrelated keys, one word, one
 /// crate. Renamed at the root rather than worked around at the call sites that
 /// meet the other meaning.
+///
+/// **The word was asked for a second time and refused again.** The serving-side
+/// policy deciding which methods accept an idempotency key was drafted as
+/// `Keyed`, which would have put `keylink::Keyed` two lines under
+/// `keylink::KeyedService` in one export list, meaning a different key. It ships
+/// as [`Keyable`], whose own doc comment carries the argument. So this paragraph
+/// is not history: it is the standing rule, and it has now decided two names.
 enum Claimed {
     /// No key was sent. Nothing to record and nothing to release.
     None,
@@ -145,6 +203,29 @@ fn resolve(claim: Claim) -> Claimed {
 
 /// Take the key, waiting for a call already in flight when the caller asked to.
 ///
+/// # The serving side's own decision comes first
+///
+/// A key on a method this service does not key is [`NotKeyable`], and that is
+/// settled **before** the key is validated and therefore before the ledger is
+/// reached at all: a refused key can neither claim a slot nor evict somebody
+/// else's record. The order is visible rather than incidental — the `validate`
+/// below is the first step on the road to `Ledger::claim`, and the policy check is
+/// above it.
+///
+/// Refused, never ignored. A caller that wrote `with_idempotency` believes the
+/// call runs at most once; running it and recording nothing would hand it a
+/// guarantee it does not have, on the one path it cannot check. See [`NotKeyable`]
+/// for the whole argument, and [`Keyable`] for who decides.
+///
+/// **A [`Middleware`] cannot do this instead.** `serve_one` claims the key and
+/// *then* calls the chain, so a layer never meets an unclaimed key — by the time
+/// the outermost layer runs, the slot is already taken. That is why the decision
+/// is a property of the service rather than a layer somebody installs.
+///
+/// [`NotKeyable`]: IdempotencyRefusal::NotKeyable
+///
+/// # The key itself
+///
 /// The `validate` here is not a second opinion about
 /// [`IdempotencyKey::new`]. It is the only check this value has ever had:
 /// `derive(Deserialize)` builds the string field by field and never calls a
@@ -169,9 +250,22 @@ fn resolve(claim: Claim) -> Claimed {
 /// bound neither it nor the stream pair it keeps open. It takes a `Waiting` from
 /// the ledger instead, refused **before** it parks and given back by `Drop` —
 /// because the ordinary way a waiter stops waiting is that this task is aborted.
-async fn claim_key(ledger: &Arc<Ledger>, peer: EndpointId, idem: Option<Idempotency>) -> Claimed {
+async fn claim_key(
+    keys: &Keys,
+    method: &'static str,
+    peer: EndpointId,
+    idem: Option<Idempotency>,
+) -> Claimed {
     let Some(idem) = idem else {
         return Claimed::None;
+    };
+    let Some(ledger) = keys.ledger_for(method) else {
+        return Claimed::Refuse(
+            IdempotencyRefusal::NotKeyable {
+                method: method.to_owned(),
+            }
+            .into(),
+        );
     };
     if let Err(error) = idem.key().validate() {
         return Claimed::Refuse(IdempotencyRefusal::Malformed(error.to_string()).into());
@@ -240,16 +334,24 @@ async fn refuse<Resp: Serialize>(send: &mut SendStream, refusal: RemoteError) ->
 /// A key that would be refused as malformed is reported [`KeyState::Fresh`],
 /// which is not a fallback: such a key can never have been claimed, because
 /// [`claim_key`] refuses it before the ledger sees it.
+///
+/// A service with no ledger — [`Keyable::None`] — reports `Fresh` for the same
+/// reason, and it is a fact there too: nothing was ever recorded, so no key was
+/// ever used. What `Fresh` does NOT promise on such a service is that a call
+/// carrying the key would run; it would be refused [`NotKeyable`]. `KeyState`'s own
+/// doc comment says so, because a caller reading "a call with this key would run"
+/// off a service that keys nothing would be reading a false claim.
+///
+/// [`NotKeyable`]: IdempotencyRefusal::NotKeyable
 async fn answer_key_state<Resp: Serialize>(
     send: &mut SendStream,
-    ledger: &Ledger,
+    ledger: Option<&Ledger>,
     peer: EndpointId,
     key: &IdempotencyKey,
 ) -> Result<()> {
-    let state = if key.validate().is_ok() {
-        ledger.key_state(peer, key)
-    } else {
-        KeyState::Fresh
+    let state = match ledger {
+        Some(ledger) if key.validate().is_ok() => ledger.key_state(peer, key),
+        Some(_) | None => KeyState::Fresh,
     };
     wire::write_header(send, Some(0), None, &WireResponse::<Resp>::KeyState(state)).await?;
     send.finish()?;
@@ -282,6 +384,12 @@ fn reap_finished<T: 'static>(calls: &mut JoinSet<T>) {
 /// The shape of `serve_one` minus every reply. Nothing is written back, so
 /// there is no `SendStream`, no idempotency record — the ledger records a reply
 /// frame, and there is none — and no body to stream out.
+///
+/// No [`Keyable`] check either, for the same reason: there is no stream to refuse
+/// on. A key on the envelope of a `tell` is dropped rather than answered, which
+/// the generated client cannot produce — `with_idempotency` returns an
+/// [`IdempotentClient`], which has no `tell` — and which a hand-rolled peer gets
+/// the `tell` guarantee for, namely that nothing comes back.
 ///
 /// A failure here is deliberately dropped rather than propagated. The caller
 /// has already gone: it wrote, finished the stream, and returned. There is
@@ -323,7 +431,7 @@ where
 /// Answer one call on its own stream.
 async fn serve_one<Req, Resp>(
     next: Next<Req, Resp>,
-    ledger: Arc<Ledger>,
+    keys: Keys,
     blobs: Option<Blobs>,
     admitted: AdmittedPeer,
     mut send: SendStream,
@@ -343,7 +451,7 @@ where
 
     let message = match request.message {
         WireRequest::KeyState(key) => {
-            return answer_key_state::<Resp>(&mut send, &ledger, peer, &key).await;
+            return answer_key_state::<Resp>(&mut send, keys.ledger.as_deref(), peer, &key).await;
         }
         WireRequest::Call(message) => message,
     };
@@ -357,7 +465,12 @@ where
     // Claimed BEFORE the handler is entered, which is the whole at-most-once
     // property: the only way back from a claimed key to a vacant one is a
     // release, and a release happens exactly when nothing ran.
-    let keyed = match claim_key(&ledger, peer, request.idempotency).await {
+    //
+    // `keys` is also where this service says which methods accept a key at all,
+    // and a key on any other is refused here rather than quietly dropped. An
+    // UNKEYED call still costs nothing: `request.idempotency` is `None`, which is
+    // the first thing `claim_key` reads and the only thing it needs.
+    let keyed = match claim_key(&keys, message.method(), peer, request.idempotency).await {
         Claimed::None => None,
         // The guard watches the marker, so this task being ABORTED — the
         // connection ended, the server shut down — still settles honestly, even
@@ -489,7 +602,7 @@ where
                 Ok(Stream::Bi((send, recv))) => {
                     calls.spawn(serve_one(
                         self.next.clone(),
-                        self.ledger.clone(),
+                        self.keys.clone(),
                         self.blobs.clone(),
                         admitted,
                         send,
@@ -531,6 +644,69 @@ mod tests {
     /// A valid endpoint id, reused from `idempotency.rs` for the same reason.
     const A: &str = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0";
 
+    /// A policy that keys everything, wrapped around a ledger a test already has.
+    ///
+    /// The attach tests below are about the waiting caps and not about the policy,
+    /// so they take the shape a default-configured service has.
+    fn any(ledger: &Arc<Ledger>) -> Keys {
+        Keys {
+            keyable: Keyable::Any,
+            ledger: Some(Arc::clone(ledger)),
+        }
+    }
+
+    /// **`Keyable::None` builds no ledger — not an empty one, none at all.**
+    ///
+    /// Asserted on the field `build()` actually fills, through the one constructor
+    /// `build()` calls, so a stub cannot satisfy it: the assertion is
+    /// `Option::is_none` on the ledger a served call would claim in. The `is_some`
+    /// half is what stops "always `None`" passing — a policy that allocated
+    /// nothing ever would be a service where no key works at all.
+    ///
+    /// It cannot be asserted over the wire. A refusal looks identical whether it
+    /// came from a missing ledger or an empty one, which is the whole reason this
+    /// probe reaches for the field instead. The behaviour half is
+    /// `tests/idempotency.rs::a_key_on_a_method_the_service_does_not_key_is_refused`.
+    ///
+    /// Made red by `scripts/break-once.sh` replacing the body of
+    /// `Keyable::needs_a_ledger` — `!matches!(self, Self::None)` — with `true`.
+    /// Watched: `panicked at .., `Keyable::None` must not allocate a ledger nothing
+    /// can ever write to`, `0 passed; 1 failed;
+    /// 138 filtered out`. No other test in the crate noticed the edit.
+    #[test]
+    fn keyed_none_builds_no_ledger() {
+        assert!(
+            Keys::new(Keyable::None).ledger.is_none(),
+            "`Keyable::None` must not allocate a ledger nothing can ever write to"
+        );
+        assert!(
+            Keys::new(Keyable::Any).ledger.is_some(),
+            "and every other policy must have one, or no key works at all"
+        );
+    }
+
+    /// The seam the whole of Wave 1 hangs on: one lookup answers *both* "is this
+    /// method keyed?" and "where do its records go?", so no call site can take the
+    /// ledger while ignoring the policy.
+    ///
+    /// Made red by `scripts/break-once.sh` replacing
+    /// `self.ledger.as_ref().filter(|_| self.keyable.accepts(method))` with
+    /// `self.ledger.as_ref()` — the edit that would make the policy decorative
+    /// while every idempotency test that predates this wave stayed green. Watched:
+    /// `panicked at .., a refused method must not, or the policy decides nothing`, `0 passed; 1 failed; 138 filtered out`.
+    #[test]
+    fn the_ledger_is_reachable_only_through_the_policy() {
+        let keys = Keys::new(Keyable::Only(&["Reserve"]));
+        assert!(
+            keys.ledger_for("Reserve").is_some(),
+            "an accepted method must reach the ledger"
+        );
+        assert!(
+            keys.ledger_for("Quote").is_none(),
+            "a refused method must not, or the policy decides nothing"
+        );
+    }
+
     /// The cap has to be met *before* the task parks, or it is not a cap: a
     /// waiter that is refused after it waits has already spent the task and the
     /// stream pair the refusal exists to save.
@@ -553,7 +729,8 @@ mod tests {
             .collect();
 
         let keyed = claim_key(
-            &ledger,
+            &any(&ledger),
+            "Probe",
             peer,
             Some(Idempotency::attaching_for(key, Duration::from_secs(30))),
         )
@@ -602,8 +779,12 @@ mod tests {
             .map(|_| ledger.wait(peer).expect("a free place"))
             .collect();
 
+        // Bound rather than inlined: `&any(&ledger)` is a temporary freed at the
+        // end of the statement, and `attaching` outlives it (`E0716`).
+        let keys = any(&ledger);
         let mut attaching = Box::pin(claim_key(
-            &ledger,
+            &keys,
+            "Probe",
             peer,
             Some(Idempotency::attaching_for(key, Duration::from_secs(30))),
         ));
@@ -635,6 +816,9 @@ pub struct ServiceBuilder<Req, Resp> {
     /// spawn, so "this service serves content but was given no store" is a
     /// startup error rather than a refusal on the first call.
     declares_blobs: bool,
+    /// Which methods accept an idempotency key. [`Keyable::Any`] by default, which
+    /// is what this crate did before the type existed.
+    keyable: Keyable,
 }
 
 impl<Req, Resp> ServiceBuilder<Req, Resp>
@@ -652,6 +836,10 @@ where
             layers: Vec::new(),
             blobs: None,
             declares_blobs: false,
+            // `Keyable::default()`, not `Keyable::Any` spelled out: the default
+            // lives in one place, on the type, so a reader who wants to know what
+            // a service that never names a policy does has one place to look.
+            keyable: Keyable::default(),
         }
     }
 
@@ -716,6 +904,34 @@ where
         self
     }
 
+    /// Decide which of this service's methods accept an idempotency key.
+    ///
+    /// Without this a peer attaches a key to whatever it likes, and the records
+    /// of the methods that needed one are evicted by the methods that did not.
+    /// Read [`Keyable`] for the whole argument and for the `CamelCase` spelling the
+    /// method names take.
+    ///
+    /// ```ignore
+    /// till::service(handler, Allowlist::anyone())
+    ///     .keyed(Keyable::Only(&["Reserve"]))
+    ///     .build()
+    /// ```
+    ///
+    /// The default is [`Keyable::Any`], so a service that never calls this behaves
+    /// exactly as it did before the method existed. A key on a method the policy
+    /// refuses is answered
+    /// [`IdempotencyRefusal::NotKeyable`](crate::IdempotencyRefusal::NotKeyable) —
+    /// refused rather than ignored, because a caller that attached a key believes
+    /// it is protected.
+    ///
+    /// This is not something a [`Middleware`] could do instead: the key is claimed
+    /// before the layer chain runs, so a layer never sees an unclaimed one.
+    #[must_use]
+    pub fn keyable(mut self, keyable: Keyable) -> Self {
+        self.keyable = keyable;
+        self
+    }
+
     /// Freeze the chain and erase the schema.
     pub fn build(self) -> Service {
         let mut chain = self.base;
@@ -728,7 +944,7 @@ where
                 next: chain,
                 admission: self.admission,
                 blobs: self.blobs.clone(),
-                ledger: Ledger::new(),
+                keys: Keys::new(self.keyable),
                 _p: PhantomData,
             }),
             blobs: self.blobs,
