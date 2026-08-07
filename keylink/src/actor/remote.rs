@@ -186,16 +186,22 @@ pub type Answer<Resp> = oneshot::Sender<(Outcome<Resp>, Body)>;
 /// two constructors are `pub(crate)`, and a downstream crate meets an error
 /// instead of a way to make the mistake below:
 ///
-/// ```compile_fail,E0624
-/// // `E0624: associated function `local` is private`. `Origin::Peer(cx)` is
-/// // `E0599`, there being no public variant to name either.
+/// ```compile_fail
+/// // Fails with `E0624: associated function `local` is private`, and
+/// // `Origin::Peer(cx)` with `E0599`, there being no public variant to name.
 /// //
-/// // rustdoc does NOT check the code after `compile_fail` — pinning `E0599` here
-/// // leaves this green, which was red-tested — so what this asserts is only
-/// // "does not compile", and the code is documentation. What stops it passing
-/// // for the WRONG reason, a rename, is the unit test that calls
-/// // `Origin::local()` from inside the crate: one pins that the name exists,
-/// // this one pins that it is out of reach.
+/// // The codes are named HERE and deliberately NOT in the fence. rustdoc does
+/// // not check the code after `compile_fail` — pinning `E0599` on the fence
+/// // leaves this green, which was red-tested — so an annotated code asserts
+/// // verification it does not perform. This project has shipped four guards
+/// // that were satisfiable without proving their claim; a fence that reads
+/// // `compile_fail,E0624` is how the fifth would look.
+/// //
+/// // So this asserts exactly one thing: it does not compile. What stops it
+/// // passing for the WRONG reason — a rename making the name vanish rather
+/// // than the privacy holding — is the unit test that calls `Origin::local()`
+/// // from inside the crate. One pins that the name exists, this pins that it
+/// // is out of reach.
 /// let _origin = keylink::Origin::local();
 /// ```
 ///
