@@ -442,6 +442,12 @@ cd "$repo"
 #     commits`. They are claims about what git did, not about the hook. Two are
 #     there because `cmp` of two empty files passes; the third is there because
 #     scenario 10 asserts nothing at all if the two HEADs happen to agree.
+#   * CANARIES ON GIT ITSELF, both in Part Three: `a RELATIVE core.hooksPath runs
+#     the pushing worktree's own hook` and `an ABSOLUTE core.hooksPath runs the
+#     owning checkout's hook instead`. No break in this repository can move them,
+#     and that is the point — they pin the external rule that
+#     `scripts/install-hooks.sh` argues its choice from. If a future git changes
+#     the rule, they redden and that argument gets re-opened instead of inherited.
 
 # The hook under test, alone in its own hooks directory. Part One's directory
 # holds a `pre-commit`, and a commit made while setting up a push scenario would
@@ -705,9 +711,118 @@ assert "a push from a linked worktree of the OWNING checkout's HEAD is REFUSED" 
 assert "the refusal names the worktree's HEAD and not the owning checkout's" \
     grep -qF "HEAD -> $side_head" "$pushlog"
 
+# ══ PART THREE — scripts/install-hooks.sh, and WHICH hook file runs ═════════
+#
+# Every scenario above asks what a hook DOES. These ask which file git runs at
+# all, which is the question `core.hooksPath` answers and the one the installer
+# writes an answer to.
+#
+# ── two of these rows assert GIT's behaviour, not ours, and that is deliberate ─
+#
+# `install-hooks.sh` chooses a RELATIVE value, and its header argues that choice
+# from one measured fact: git resolves a relative `core.hooksPath` against the
+# working-tree root, so each worktree runs its own branch's hooks, while an
+# absolute value makes every worktree run one checkout's. No break in this
+# repository can redden that pair — it is a canary on an external dependency. If a
+# future git changes the rule, these rows go red and the decision in that header
+# has to be re-argued rather than quietly inherited.
+#
+# The other three rows are ours: the installer must write the relative value, and
+# must never chain our hooks to a copy of themselves.
+#
+# ── MADE RED, RUN AND WATCHED, NAMING THE ROWS ────────────────────────────────
+#
+# Same method as Part Two: the perturbation goes into a copy of
+# `scripts/install-hooks.sh` beside copies of the hooks and this script, and the
+# unperturbed control is run first and must be green.
+#
+# I1. **Restore the literal-only test, which IS the historical defect.** In
+#     `scripts/install-hooks.sh`, replace
+#     `if [ -z "$previous" ] || [ "$ours" = yes ]; then` with
+#     `if [ -z "$previous" ] || [ "$previous" = .githooks ]; then`. Watched:
+#
+#         FAIL the installer leaves a foreign hooks.chain alone
+#         FAIL the installer treats a SIBLING worktree's .githooks as ours too
+#
+# I2. **Compare only the current worktree.** Replace
+#     `done < <(git worktree list --porcelain | sed -n 's/^worktree //p')` with
+#     `done <<<"$PWD"`. Watched — one row, which is what makes the sibling case
+#     worth its own scenario rather than an assumption:
+#
+#         FAIL the installer treats a SIBLING worktree's .githooks as ours too
+#
+# I3. **Write an absolute value, reversing the decision.** Replace
+#     `git config core.hooksPath .githooks` with
+#     `git config core.hooksPath "$PWD/.githooks"`. Watched:
+#
+#         FAIL the installer writes the relative core.hooksPath
+#
+#     This is the row that pins the CHOICE rather than an implementation detail,
+#     which is why it has a break at all: the argument for relative lives in that
+#     script's header, and a silent flip to absolute would leave the header arguing
+#     for a value the script no longer writes.
+echo
+echo "── PART THREE: which hook file runs, and what the installer writes"
+
+# Two checkouts carrying DELIBERATELY DIFFERENT hook files, so the question "which
+# one ran" has an observable answer. Neither is the real hook: what is under test
+# is resolution, and a stub that names itself is the only way to see it.
+newrepo "$scratch/paths"
+mkdir -p .githooks
+printf '#!/usr/bin/env bash\ncat >/dev/null\necho "RAN: owner"\n' >.githooks/pre-push
+chmod +x .githooks/pre-push
+git add -A
+git commit -q -m "hooks in the owning checkout"
+git init -q --bare "$scratch/remote-paths"
+git remote add origin "$scratch/remote-paths"
+git worktree add -q -b side "$scratch/paths-side" HEAD
+cd "$scratch/paths-side"
+printf '#!/usr/bin/env bash\ncat >/dev/null\necho "RAN: worktree"\n' >.githooks/pre-push
+chmod +x .githooks/pre-push
+git add -A
+git commit -q -m "different hooks in the linked worktree"
+
+git config core.hooksPath .githooks
+push origin side:refs/heads/rel
+assert "a RELATIVE core.hooksPath runs the pushing worktree's own hook" \
+    grep -q "RAN: worktree" "$pushlog"
+git config core.hooksPath "$scratch/paths/.githooks"
+push origin side:refs/heads/abs
+assert "an ABSOLUTE core.hooksPath runs the owning checkout's hook instead" \
+    grep -q "RAN: owner" "$pushlog"
+
+# ── the installer must not chain our hooks to a copy of themselves ────────────
+#
+# Measured before this row existed: with `core.hooksPath` already an ABSOLUTE path
+# to the repository's own `.githooks`, the installer wrote that path into
+# `hooks.chain` — losing the global scanner it exists to preserve, and pointing the
+# hook at itself. The next commit hung, killed at a timeout with no output. The
+# trigger was the value's SPELLING, so this row uses the absolute spelling.
+cd "$scratch/paths"
+mkdir -p scripts "$scratch/global-hooks"
+cp "$root/scripts/install-hooks.sh" scripts/
+chmod +x scripts/install-hooks.sh
+printf '#!/usr/bin/env bash\necho SCANNER\n' >"$scratch/global-hooks/pre-commit"
+chmod +x "$scratch/global-hooks/pre-commit"
+git config core.hooksPath "$scratch/paths/.githooks"
+git config hooks.chain "$scratch/global-hooks"
+./scripts/install-hooks.sh >/dev/null 2>&1
+assert "the installer leaves a foreign hooks.chain alone" \
+    test "$(git config --get hooks.chain)" = "$scratch/global-hooks"
+assert "the installer writes the relative core.hooksPath" \
+    test "$(git config --get core.hooksPath)" = ".githooks"
+
+# The sibling-worktree spelling, which is the live shape when the script is run
+# from a linked worktree rather than from the checkout the path names.
+git config core.hooksPath "$scratch/paths-side/.githooks"
+git config hooks.chain "$scratch/global-hooks"
+./scripts/install-hooks.sh >/dev/null 2>&1
+assert "the installer treats a SIBLING worktree's .githooks as ours too" \
+    test "$(git config --get hooks.chain)" = "$scratch/global-hooks"
+
 if [ "$fail" -ne 0 ]; then
     echo "── FAILED" >&2
     exit 1
 fi
 echo
-echo "── all $checks assertions hold, across both hooks"
+echo "── all $checks assertions hold, across both hooks and the installer"

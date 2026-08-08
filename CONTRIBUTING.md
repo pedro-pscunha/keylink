@@ -48,6 +48,16 @@ Two consequences worth knowing before you hit them:
 - **The gate runs on your machine, on your OS.** CI ran Linux. Nothing checks the
   other platform any more.
 
+**In a worktree, the hooks are your branch's own.** `./scripts/install-hooks.sh`
+writes `core.hooksPath` as the relative `.githooks`, and git resolves that against
+the working-tree root — so each worktree runs the hooks of the branch checked out
+in it, and a gate change arrives in a worktree when that worktree rebases. The
+script's header carries the measurement and argues the choice against the absolute
+value, which makes every worktree run one checkout's hooks instead. One hazard
+comes with it: a branch whose tree has no `.githooks/` runs **no hook at all**, and
+the push succeeds. To exercise a hook change without touching any configuration,
+run `mise run hook-guard`.
+
 The `pre-push` hook reads git's list of ref updates before it runs any of that,
 and it answers differently for two shapes of push. A push whose updates are ALL
 deletions skips the gate and prints that it did: a deletion carries no tree, so
