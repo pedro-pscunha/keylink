@@ -160,7 +160,9 @@ work without either naming the other.
 
 Three features need an operating system facility a browser does not have, and
 each refuses the target with its own `compile_error!`: `blocking`, `fs`, `env`.
-CI asserts that all three actually fire. A `compile_error!` nobody triggers is a
+`mise run wasm-guards` asserts that all three actually fire — that check was
+CI's until the workflow was deleted, and it moved into `gate` in the same
+change. A `compile_error!` nobody triggers is a
 comment.
 
 What is claimed: the crate compiles and links for `wasm32-unknown-unknown`.
