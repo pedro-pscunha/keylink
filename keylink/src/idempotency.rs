@@ -2307,6 +2307,22 @@ mod tests {
         /// The test is also renamed, because *"the byte budget"* stopped being one
         /// thing. `pool_bytes` is left at its default here on purpose — nothing
         /// about this assertion involves it.
+        ///
+        /// **This is one of the two guards that hold the setter-to-field mapping**,
+        /// which is the defect class a public `Limits` introduces: a setter writing
+        /// the wrong field, with the suite green. Made red by
+        /// `scripts/break-once.sh` swapping `Limits::frame_bytes`'s body to write the
+        /// other field — anchored on `self.frame_bytes = bytes;` indented, which is
+        /// unique against this unindented quote. Watched: `panicked at .., assertion
+        /// `left == right` failed, left: Forgotten, right: Unrecordable`.
+        ///
+        /// `Forgotten` is the *right* half of the finding: under the swap the ceiling
+        /// keeps its default so the 65-byte frame is recordable, settles `Done`, and
+        /// then `evict` sees 65 over a 64-byte pool and downgrades it. So the swap
+        /// does not merely fail — it produces exactly the refusal that
+        /// `a_reply_under_the_ceiling_and_over_the_pool_is_forgotten_not_unrecordable`
+        /// exists to distinguish, which is why the two bounds need separate guards
+        /// rather than one.
         #[test]
         fn a_reply_over_the_frame_ceiling_is_not_replayed() {
             let ledger = bounded(Limits::default().frame_bytes(nz(64)));
@@ -2356,6 +2372,18 @@ mod tests {
         /// `pool_bytes`, not `frame_bytes`: sixteen frames of 16 bytes are each far
         /// inside the ceiling, and what is asserted is the sum they are allowed to
         /// reach together.
+        ///
+        /// **This is the other of the two guards that hold the setter-to-field
+        /// mapping.** Made red by `scripts/break-once.sh` swapping
+        /// `Limits::pool_bytes`'s body to write the other field — anchored on
+        /// `self.pool_bytes = bytes;` indented, unique against this unindented quote.
+        /// Watched: `panicked at .., held 1024 bytes over a 64 byte budget`.
+        ///
+        /// The 1024 is the finding rather than an arbitrary number: under the swap
+        /// the pool keeps its 1 MiB default, every 16-byte frame is far under the
+        /// ceiling the value landed on, and `pool_records` at 1024 never binds — so
+        /// all sixty-four frames are held and nothing evicts. A swap here is
+        /// **not** a smaller bound; it is no bound at all.
         #[test]
         fn the_recorded_bytes_stay_inside_their_bound() {
             let ledger = bounded(Limits::default().pool_bytes(nz(64)));
@@ -2730,16 +2758,23 @@ mod tests {
         /// longer fires the loop it was chosen for", because the loop not firing is
         /// invisible from the assertions. A break was NOT invented to fill the slot.
         ///
-        /// What a bad pool-versus-frame mapping *does* redden, and where to look if
-        /// one is suspected:
+        /// What a bad pool-versus-frame mapping *does* redden — **both measured, both
+        /// carrying their own break record, neither claimed from reasoning**:
         ///
-        /// - `the_recorded_bytes_stay_inside_their_bound` — asserts the pool sum, so
-        ///   `pool_bytes` writing `frame_bytes` fails it.
+        /// - `the_recorded_bytes_stay_inside_their_bound` — asserts the pool sum.
+        ///   Swapping `pool_bytes`'s body gives `held 1024 bytes over a 64 byte
+        ///   budget`.
         /// - `a_reply_over_the_frame_ceiling_is_not_replayed` — asserts the ceiling's
-        ///   refusal, so `frame_bytes` writing `pool_bytes` fails it.
+        ///   refusal. Swapping `frame_bytes`'s body gives `left: Forgotten, right:
+        ///   Unrecordable`.
         ///
         /// Between them those two hold the mapping. This test holds the arithmetic,
         /// and its four clauses are what a reviewer checks by reading.
+        ///
+        /// **The first version of this paragraph asserted both of those without
+        /// running either**, which is the same substitution of a property for a
+        /// measurement that the section heading above objects to — written into the
+        /// commit whose subject is that distinction. Both are now replays.
         #[test]
         fn the_counters_agree_with_the_maps_on_every_path() {
             let ledger = bounded(

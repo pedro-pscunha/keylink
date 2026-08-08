@@ -408,6 +408,20 @@ ANCHORS = [
     # fragment does not begin its line.
     ("L2", "keylink/tests/idempotency.rs", "keylink/tests/idempotency.rs",
      "    let tight = start_limited(Limits::default().pool_records(nz(1)).tombstones(nz(1))).await;"),
+    # ── L3 and L4 hold the defect class a public `Limits` introduces: a SETTER
+    # WRITING THE WRONG FIELD, with the suite green. Both swap one setter's body to
+    # assign the other field, and both are same-file rows, so both literals carry
+    # their eight spaces of indentation and both records quote them with none.
+    #
+    # These two were added a commit late, and the reason is worth keeping: the
+    # paragraph on `the_counters_agree_with_the_maps_on_every_path` NAMED both tests
+    # as the ones a bad mapping reddens, and asserted it without running either.
+    # Reasoning, in the commit whose subject is that a reviewable claim is not a
+    # reddenable one. Measuring turned two sentences into two records.
+    ("L3", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
+     "        self.pool_bytes = bytes;"),
+    ("L4", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
+     "        self.frame_bytes = bytes;"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -836,9 +850,9 @@ for record, lives_in, target, literal in ANCHORS:
 # **FIFTH tree, and read off a run again rather than carried.** The value has now
 # been 102, 104, 106, 110, 111 and 113 depending on which tree measured it, and a
 # figure carried across a rebase has been wrong on three of them. This one was
-# measured by resolving the rebase conflict, running the loop, and taking what it
+# measured by resolving each rebase conflict, running the loop, and taking what it
 # printed — `113` — not by adding two to `111`.
-RECORD_BLOCKS = 113
+RECORD_BLOCKS = 115
 
 harness_blocks: list[str] = []
 for path in sorted(
