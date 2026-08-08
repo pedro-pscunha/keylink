@@ -207,9 +207,9 @@ async fn until_buffered(system: &queue::System, messages: u64) {
 /// ran: the first draft sent a `tell` and did not compile. The doc said the first
 /// `N` callers
 /// "hand their message over and go on as if the actor were fast" while "the
-/// `N + 1`th feels the whole queue at once". On the keyed path no caller can do
-/// either, and the reason is a design decision rather than a timing accident: the
-/// sender on a keyed mailbox is **the serving task, not the peer**.
+/// `N + 1`th feels the whole queue at once". Through a generated keyed client no
+/// caller can do either, and the reason is a design decision rather than a timing
+/// accident: the sender on a keyed mailbox is **the serving task, not the peer**.
 ///
 /// `__keylink_actor_client_method!` in `keylink/src/macros.rs` generates **no**
 /// method at all for a `tell` on a keyed `ActorRef`, with a comment saying why —
@@ -219,15 +219,43 @@ async fn until_buffered(system: &queue::System, messages: u64) {
 /// waiting for the actor. That is what the two assertions below hold together: the
 /// mailbox took three messages, and all four callers are still waiting.
 ///
+/// # The one caller this test does not build, and why it does not weaken the above
+///
+/// **A hand-rolled peer reaches this same mailbox without awaiting the actor**, and
+/// every part of the spelling is public: [`keylink::RpcClient::tell`] is generic over
+/// any `Serialize` request and opens a unidirectional stream, `keylink::Addressed`
+/// wraps a request with an actor id, and the generated module exports both `Request`
+/// and `keyed_alpn()`. `rpc.rs`'s accept loop takes a unidirectional stream on every
+/// served connection, keyed included, and `serve_one_tell` reads the actor off the
+/// envelope. **The macro arm cited above says this itself** — "a keyed `tell` really
+/// would work … `serve_one_tell` walks the same dispatch a call does" — so what is
+/// absent is the generated *method*, not the wire path. That is the far side of the
+/// same sentence as above: the serving task is the sender, so a `tell` peer has
+/// returned by the time the mailbox is even offered the message.
+///
+/// **The deleted claim is unreachable on that path too, which is why finding this
+/// `tell` is not a reason to bring it back.** That caller returns at every depth and
+/// never feels the queue — there is no `N`th caller going on quickly and no `N + 1`th
+/// feeling the queue at once, because *none* of them feels it. The old sentence was
+/// wrong for both kinds of caller, for two different reasons.
+///
+/// This test uses the generated client deliberately: that is the caller
+/// `mailbox_depth`'s doc is written for, and a `tell` peer has no reading to take —
+/// it cannot tell a queued message from a lost one, which is the guarantee
+/// `RpcClient::tell` documents it does not give.
+///
 /// What the knob moves is therefore where the queue is *held* and who can *see*
 /// it, which is the trade the rest of that doc describes correctly.
 ///
-/// # No clock, and no order across streams
+/// # No clock in any assertion, and no order across streams
 ///
-/// Nothing here reads a clock, so nothing rests on how loaded the machine is. The
-/// exactness comes from three signals: `hold` is released by a semaphore rather
-/// than by a timer, `Arrived` says every message has reached the serving side, and
-/// [`keylink::ActorStatus::buffered`] is exactly `max_capacity() - capacity()`.
+/// Nothing here *asserts on* a clock, so nothing rests on how loaded the machine is.
+/// One clock is read — `until_buffered` bounds its poll loop with a 30 second
+/// `tokio::time::timeout` — and that budget can only turn a hang into a failure,
+/// which its own doc says. The exactness comes from three signals: `hold` is released
+/// by a semaphore rather than by a timer, `Arrived` says every message has reached the
+/// serving side, and [`keylink::ActorStatus::buffered`] is exactly
+/// `max_capacity() - capacity()`.
 ///
 /// It asserts nothing about the order the four messages are *handled* in. Each call
 /// takes its own QUIC stream and `ActorRef`'s own documentation says two calls can
@@ -242,22 +270,54 @@ async fn until_buffered(system: &queue::System, messages: u64) {
 /// at "3 messages must reach the mailbox" after its 30 second budget, because a
 /// system asked for three slots that builds one never reaches a `buffered` of 3.
 ///
-/// **This break is shared, and the record says so rather than claiming this test is
-/// its only reader.** `registry.rs` already records the same substitution for
+/// **This break is shared, and the record names every guard it reaches rather than
+/// claiming this test is its only reader.** `registry.rs` already records the same
+/// substitution for
 /// `a_budget_sized_for_the_default_depth_under_drains_at_a_deeper_one`, which is the
-/// clue that it must redden more than one guard. Run against each by name and
-/// watched, all three failing: this test, that one, and
-/// `a_saturated_mailbox_at_depth_does_not_starve_a_feed` in `tests/actors.rs`. The
-/// count is over the three guards named here and is not a claim about the whole
-/// suite, which was not run.
+/// clue that it must reach more than one. Every call site of `mailbox_depth` outside
+/// this file was found by search and then run against the break by name. **The
+/// outcomes are not uniform: one guard HANGS rather than reddens**, so a run that
+/// stalls here is the break working and not a broken harness. Watched, each by name:
+///
+/// - this test — panics in `until_buffered` at "3 messages must reach the mailbox",
+///   after its 30 second budget;
+/// - `a_budget_sized_for_the_default_depth_under_drains_at_a_deeper_one`, in
+///   `registry.rs`'s `the mailbox's depth` section — fails its `Ended::Vanished`
+///   assertion, because a deep system whose mailboxes are shallow drains like a
+///   shallow one;
+/// - `the_mailbox_depth_is_the_systems_and_defaults_to_one`, in that same section and
+///   named after the knob itself — fails `left: 1, right: 4` on the first
+///   `max_capacity()` reading of its `depth(4)` system;
+/// - `a_saturated_mailbox_at_depth_does_not_starve_a_feed` in `tests/actors.rs` —
+///   panics after its own 30 second budget;
+/// - `buffered_is_exact_at_depth_and_counts_no_parked_sender`, also in that section —
+///   **HANGS. It never reports at all.** Its actor holds every turn, so nothing ever
+///   frees a permit: at one slot the second of its three `mail.send(..).await`s parks
+///   forever, before the assertion that would have caught the wrong count. Killed
+///   here at 120 seconds.
+///
+/// One further call site is reached and the break is **invisible** there, which is
+/// worth a line because it is a guard on this knob that cannot report on it.
+/// `ten_thousand_idle_actors_fit_in_the_budget` in `tests/actor_memory.rs` asserts that
+/// its three depths cost the *same* bytes per actor, so a break making all three of
+/// them depth 1 satisfies it by flattening the thing it measures. Run both ways here:
+/// depths 1, 32 and 1,024 each printed **1738 bytes** on the honest tree and **1738
+/// bytes** under the break, and the test passed both times. Not one figure moved. That
+/// guard is about the allocator's block size and is no evidence about the knob.
+///
+/// Nothing outside those six call sites was run, and this is not a claim about the
+/// whole suite.
 ///
 /// So this break says "the knob is disconnected" and not "this test is the only
-/// thing watching the knob". What is unique here is the *caller*-side half. Both
-/// other guards do check that their callers are eventually answered — the
-/// saturation test expects three `touch` replies — but neither asserts that a caller
-/// is **still waiting** at a chosen moment. That is the assertion no other guard
-/// makes: a message the mailbox has accepted still leaves its caller waiting, which
-/// is precisely the sentence this file corrected.
+/// thing watching the knob". What is unique here is the *caller*-side half. Of the four
+/// guards above, `a_saturated_mailbox_at_depth_does_not_starve_a_feed` is the only one
+/// with callers over a wire at all, and it checks that they are eventually answered —
+/// three `touch` replies. The other three have no caller awaiting a reply at all: one
+/// reads only `max_capacity()`, and two put messages into `mail` by hand. **Not one of
+/// them asserts that a caller is still waiting at a chosen moment.** That is the
+/// assertion only this file
+/// makes: a message the mailbox has accepted still leaves its caller waiting, which is
+/// precisely the sentence this file corrected.
 #[tokio::test]
 async fn a_mailbox_holds_exactly_its_depth_and_releases_no_caller_early() {
     /// Deeper than the default, and small enough that the whole population sits well
@@ -266,13 +326,16 @@ async fn a_mailbox_holds_exactly_its_depth_and_releases_no_caller_early() {
     /// read 4 — which is what makes the equality below two-sided rather than a
     /// floor.
     const SLOTS: usize = 3;
-    /// The same three, as `ActorStatus::buffered` reports them. `buffered` is a
-    /// `u64` and a mailbox depth is a `usize`, because only one of the two crosses
-    /// a wire.
-    const SLOTS_FILLED: u64 = 3;
     /// One more than the mailbox can hold, so exactly one message is parked
     /// outside it.
     const CALLERS: usize = SLOTS + 1;
+
+    // The same three, as `ActorStatus::buffered` reports them: `buffered` is a `u64`
+    // and a mailbox depth is a `usize`, because only one of the two crosses a wire.
+    // Converted rather than written out a second time — a second literal would go on
+    // compiling after an edit to `SLOTS`, and would leave the assertions below
+    // checking the old number.
+    let slots_filled = u64::try_from(SLOTS).expect("three fits in a u64");
 
     let mut fixture = at_depth(SLOTS).await;
     let client = &fixture.client;
@@ -326,10 +389,10 @@ async fn a_mailbox_holds_exactly_its_depth_and_releases_no_caller_early() {
                 .expect("every caller's message arrives");
         }
 
-        until_buffered(system, SLOTS_FILLED).await;
+        until_buffered(system, slots_filled).await;
         assert_eq!(
             buffered(system),
-            SLOTS_FILLED,
+            slots_filled,
             "the mailbox must hold every message its depth allows and not one \
              more: {CALLERS} messages have reached the serving side and {SLOTS} \
              slots exist, so one is parked in a serving task where nothing can \
@@ -455,16 +518,28 @@ async fn what_a_deeper_mailbox_buys_the_caller() {
         println!("   depth {depth:>4}");
         println!("      alone   : {alone:>9.1} µs/call  (the control: no queue)");
         println!("      burst   : {fastest:>9.1} µs fastest, {slowest:>9.1} µs slowest");
-        println!("      drain   : {drained:>9.1} µs/turn  (service side, queue preloaded)");
+        println!(
+            "      drain   : {drained:>9.1} µs/queued turn  (service side, the release \
+             included)"
+        );
     }
 }
 
 /// Park `callers` messages behind a held turn, release it, and time the whole
-/// queue in microseconds per turn.
+/// queue in microseconds per queued turn.
 ///
 /// The one figure here that depth can move, and the reason it needs its own
 /// helper: the queue has to be provably loaded before the clock starts, which is
 /// `Arrived` plus a semaphore rather than a sleep.
+///
+/// **The clock covers `callers + 1` turns and the divisor is `callers`, deliberately.**
+/// The held turn's own release is inside the window — the permit is added after
+/// `Instant::now()` — so the released actor's wakeup is charged to the queued turns
+/// rather than excluded from them. That adds the same absolute overstatement at both
+/// depths, which is a *larger share* of the deep row because the deep row is the
+/// smaller number. So it compresses the ratio between the two depths rather than
+/// widening it, and the contrast reported is a floor on the real one. Hence "per
+/// queued turn" and not "per turn": the row names what this divides by.
 async fn drain_at_depth(fixture: &mut Fixture, callers: u32) -> f64 {
     use n0_future::time::Instant;
 

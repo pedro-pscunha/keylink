@@ -1840,15 +1840,35 @@ impl<M> SystemBuilder<M> {
     ///
     /// **A deeper mailbox drains the whole queue faster. It does not move
     /// backpressure off the caller, and this paragraph used to say it did.** Every
-    /// keyed call waits for the actor it is addressing, at every depth, and that is
-    /// a property of the client surface rather than of the timings below:
-    /// `__keylink_actor_client_method!` in `keylink/src/macros.rs` generates **no**
-    /// method for a `tell` on a keyed `ActorRef`, and its own comment gives the
-    /// reason — four keyed refusals are decided after the bytes reach the wire and
-    /// are reported on the reply. So a keyed caller awaits a reply or it does not
-    /// call, and a message the mailbox has *accepted* still leaves its caller
-    /// waiting. `keylink/tests/mailbox_latency.rs` asserts exactly that, at three
-    /// slots with four callers.
+    /// keyed call *through a generated client* waits for the actor it is addressing,
+    /// at every depth, and that is a property of the client surface rather than of
+    /// the timings below: `__keylink_actor_client_method!` in
+    /// `keylink/src/macros.rs` generates **no** method for a `tell` on a keyed
+    /// `ActorRef`, and its own comment gives the reason — four keyed refusals are
+    /// decided after the bytes reach the wire and are reported on the reply. So a
+    /// caller holding a generated keyed client awaits a reply or it does not call,
+    /// and a message the mailbox has *accepted* still leaves its caller waiting.
+    /// `keylink/tests/mailbox_latency.rs` asserts exactly that, at three slots with
+    /// four callers.
+    ///
+    /// **A hand-rolled peer is outside that bound, and the same macro arm says so in
+    /// its own comment**: "a keyed `tell` really would work — `RpcClient::tell` writes
+    /// a `WireRequest::Call` on a unidirectional stream and `serve_one_tell` walks the
+    /// same dispatch a call does". That is
+    /// [`RpcClient::tell`](crate::RpcClient::tell), generic over any `Serialize`
+    /// request. What is absent is the generated *method*, not the wire path. So a peer
+    /// that dials a service's `keyed_alpn()` and writes an `Addressed` request by hand
+    /// reaches this mailbox without awaiting anything, and the sender on the mailbox
+    /// is the serving task rather than the peer — the peer returned when the bytes
+    /// went out.
+    ///
+    /// **That does not bring the deleted sentence back. It takes the caller out of the
+    /// picture altogether.** Such a peer returns at every depth and never feels this
+    /// queue at all, so the staircase the deleted prose described — the first `N`
+    /// callers going on and the `N + 1`th feeling the whole queue — is unreachable on
+    /// that path too, and for a blunter reason. The sentence was wrong for both kinds
+    /// of caller, for two different reasons. Finding the `tell` is a reason to read
+    /// this paragraph, not to restore that one.
     ///
     /// What depth buys is the hop **between** turns. At one slot every turn but the
     /// first waits for a parked sender to be woken and rescheduled before the loop
@@ -1859,7 +1879,7 @@ impl<M> SystemBuilder<M> {
     ///
     /// | 32 concurrent callers, one actor | depth 1 | depth 32 | runs |
     /// |---|---|---|---|
-    /// | drain, once the queue is loaded | 18.8 – 20.5 µs/turn | 1.3 – 1.9 µs/turn | 4 |
+    /// | drain, per queued turn, the release included | 18.8 – 20.5 µs | 1.3 – 1.9 µs | 4 |
     /// | slowest caller's own wait | 717 – 779 µs | 165 – 234 µs | 4 |
     /// | fastest caller's own wait | 378 – 453 µs | 155 – 222 µs | 4 |
     /// | that spread, within one run | 1.7 – 1.9× | 1.03 – 1.07× | 4 |
@@ -1884,8 +1904,11 @@ impl<M> SystemBuilder<M> {
     /// one does not look like.
     ///
     /// The debug profile agrees in direction over four more runs, at 6.8 to 9.8
-    /// times for the same drain ratio, so this is a scheduling cost rather than a
-    /// code-generation one.
+    /// times for the same drain ratio. That rules out one thing and states nothing
+    /// else: the gap is not an artifact of the optimization level. It does not
+    /// separate a task wakeup from a permit acquisition, or from any other per-turn
+    /// constant a debug build inflates. What the gap *is* comes from the mechanism
+    /// paragraph above, which argues it from the code.
     ///
     /// Nothing here recommends a value, deliberately. A number in a doc gets
     /// copied into services it was never measured against; the trade above is the
@@ -1926,7 +1949,7 @@ impl<M> SystemBuilder<M> {
     /// `keylink/tests/mailbox_latency.rs` and are tabled under "What the number
     /// means" above. Neither citation covers the other.
     ///
-    /// `tests/actor_memory.rs`'s depth phase is that measurement, printing the
+    /// `tests/actor_memory.rs`'s depth phase is that BYTE measurement, printing the
     /// per-actor cost at each depth. It runs at that file's `ACTORS_PER_DEPTH` —
     /// **two thousand** idle actors per depth — and that constant's own doc argues
     /// the count: phase 5 compares three systems against each other rather than

@@ -3735,16 +3735,39 @@ because it reports what the channel holds and never the senders parked behind it
 **A third claim, in `mailbox_depth`'s own rustdoc rather than in this document, was
 also wrong and is now corrected.** It said that at depth `N` the first `N` callers
 "hand their message over and go on as if the actor were fast" while "the `N + 1`th
-feels the whole queue at once". No keyed caller can do either: the generated keyed
-client has no `tell` at all — `__keylink_actor_client_method!` emits nothing for one,
-deliberately, because four keyed refusals are only knowable from a reply — so every
-keyed caller awaits the actor at every depth. The guard is
+feels the whole queue at once". No caller *through a generated keyed client* can do
+either: that client has no `tell` at all — `__keylink_actor_client_method!` emits
+nothing for one, deliberately, because four keyed refusals are only knowable from a
+reply — so every such caller awaits the actor at every depth. The guard is
 `a_mailbox_holds_exactly_its_depth_and_releases_no_caller_early`, which holds three
 messages in a three-slot mailbox and asserts that none of the four callers has been
 answered.
+
+**The bound on that sentence is the generated client, and it is stated because the
+tree refutes the unbounded form.** A hand-rolled peer can reach the same keyed mailbox
+without awaiting the actor: `RpcClient::tell` is generic over any `Serialize` request,
+and the macro arm that withholds the generated method says in its own comment that "a
+keyed `tell` really would work … `serve_one_tell` walks the same dispatch a call
+does". What is withheld is the method, not the wire path. **That peer does not rescue
+the deleted claim either** — it returns at every depth and never feels the queue at
+all, so there is no `N + 1`th caller feeling anything. The claim fails on both paths,
+for two different reasons, and a later reader who finds `RpcClient::tell` has found
+the reason this paragraph exists rather than a reason to revert.
 
 **§15.10 item 3 is NOT answered by any of this.** That item is about capacity 1 on the
 **local** path, and nothing above touches it: `LOCAL_MAILBOX_DEPTH` is private, has no
 knob by decision, and the argument in `keylink/src/local.rs` for keeping it at one is a
 self-call hazard rather than a latency trade. A number measured through two QUIC
 endpoints says nothing about a mailbox both ends of which are in one process.
+
+**And the refutation above must not be carried across to it — item 3's sentence is
+sound.** Item 3 says capacity 1 in-process buys "a caller cannot get more than one
+message ahead of the actor", which reads like the local twin of the claim deleted above.
+It is not the same claim, and the difference is which callers get a fire-and-forget
+method. `__keylink_local_method!`'s `tell` arm generates one for a local handle — its
+`Ok` means "the message is in the mailbox", so a local caller does hand a message over
+and go on, and the capacity is what bounds how far ahead it can get. The keyed arm of
+`__keylink_actor_client_method!` generates nothing. So capacity buys a *readable* bound
+on the local path and buys no such thing for a generated keyed client, and the sentence
+that is false above is true there for that reason. Anybody deleting item 3 on the
+strength of this section is deleting a true statement.
