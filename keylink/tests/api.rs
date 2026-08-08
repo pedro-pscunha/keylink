@@ -120,6 +120,11 @@ async fn the_generated_module_supplies_the_rest_fully_applied() {
     // hold one in a struct or to return one, and until this line nothing
     // outside `macros.rs` named it at all.
     let _: Option<depot::IdempotentClient> = None;
+    // The `blocking` twin of the line above, and the only line in this file that
+    // needs a feature. `macros.rs` generates the whole `blocking` module behind
+    // `#[cfg(feature = "blocking")]`, so this names the same condition rather
+    // than taking the surrounding test out of a `--no-default-features` build.
+    #[cfg(feature = "blocking")]
     let _: Option<depot::blocking::IdempotentClient> = None;
 
     // ── expression position ──────────────────────────────────────────────────

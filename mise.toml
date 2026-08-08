@@ -209,8 +209,18 @@ run = "cargo clippy -p keylink --lib --all-features -- -D warnings"
 
 [tasks.lint]
 description = "Clippy at both feature ends, every target"
-# --no-default-features is scoped to the library on purpose: the integration
-# tests use the blocking API, so they cannot compile without it.
+# `--no-default-features` is scoped to the library, and the reason it gives has
+# CHANGED. It used to be that the integration tests could not compile without the
+# blocking API; they can now, and `.mise/tasks/features` runs
+# `cargo check -p keylink --all-targets --no-default-features` to keep it that way.
+#
+# It stays `--lib` here on cost. Clippy over keylink's test and example targets at
+# a second feature resolution is a full extra build of the most expensive targets
+# in the workspace, and `features` already answers the question this line would
+# answer — does the all-off end compile — for one `cargo check`. What is still
+# unchecked is a clippy LINT that fires only without a feature and only in a test.
+# Named rather than closed: it is the cheaper half of a check nothing had at all
+# until the targets started compiling.
 run = [
     "cargo clippy --all-targets --all-features -- -D warnings",
     "cargo clippy -p keylink --lib --no-default-features -- -D warnings",

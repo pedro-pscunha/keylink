@@ -111,8 +111,20 @@ tokio = { version = "1", default-features = false, features = ["io-util", "sync"
 #
 # What changed: the dependency is real, so tests name it as a normal dependency
 # rather than a dev one. `--no-default-features` therefore takes it out of the
-# integration tests too, exactly as it takes out the blocking API they use — see
-# `.mise/tasks/features` for why that task builds `--lib` only.
+# integration tests too, exactly as it takes out the blocking API they use.
+#
+# **This used to be the end of the sentence, and the end of the story.** It said
+# so, `mise.toml`'s `lint` said so, and `.mise/tasks/features` argued for it — that
+# `keylink/tests/` simply could not build at the all-off end, so no tool ever
+# looked. It builds now: every item that needs the adapter carries
+# `#[cfg(feature = "persist-file")]`, every item that needs the synchronous API
+# carries `#[cfg(feature = "blocking")]`, and `examples/durable_ledger.rs` declares
+# `required-features` below. `.mise/tasks/features` runs
+# `cargo check -p keylink --all-targets --no-default-features` and holds the
+# argument for why that is worth its build.
+#
+# Nothing moved into `default` to get there. A caller who writes
+# `default-features = false` gets exactly what they got before.
 #
 # `default-features = false` drops the file adapter, and with it `tokio/fs`.
 # `persist-file` adds it back for whoever has a disk.
@@ -226,3 +238,17 @@ web-sys = { version = "0.3", features = ["Blob", "File", "ReadableStream"] }
 
 [lints]
 workspace = true
+
+# `required-features` and not a `#![cfg]` at the top of the file, because this is
+# the one target shape where the file-level gate does not work: an example needs a
+# `fn main`, and `#![cfg(..)]` that is false removes it, which is
+# `error[E0601]: main function not found` rather than a skipped target. cargo
+# skips a target whose required features are off, so `--all-targets` at
+# `--no-default-features` never reaches it.
+#
+# `mise run examples` runs at default features, where `persist-file` is on, so
+# the example still runs in the gate. Declaring it here does NOT disable
+# autodiscovery — `reliable_call` needs no entry and has none.
+[[example]]
+name = "durable_ledger"
+required-features = ["persist-file"]

@@ -11,6 +11,13 @@
 //! served node in it, and it used to carry the caller loop this file makes
 //! unnecessary.
 
+// WHOLE FILE, and the only honest gate for it: `persist-file` is this file's
+// subject, not a detail of one test. `keylink::Persist` needs `persist`, the
+// `Files` store every test here drives needs the adapter half, and there is no
+// test in here that means anything without both. A per-test gate would be
+// thirty-two copies of one condition. `tests/browser.rs` does the same thing with
+// a target instead of a feature.
+#![cfg(feature = "persist-file")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink::{

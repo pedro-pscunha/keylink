@@ -352,6 +352,11 @@ async fn read_to_bytes_refuses_a_body_over_the_callers_cap() {
 
 /// A real file leaves the disk on one side and arrives byte-identical on the
 /// other, without either side holding it.
+/// `fs`, for `Body::from_file` and nothing else in this test. Gated at the test
+/// rather than at the file, so `--no-default-features` still builds the rest of
+/// `protocol.rs` — including both ALPN pins, which are the two assertions in this
+/// file that must never be skipped by a feature flag.
+#[cfg(feature = "fs")]
 #[tokio::test]
 async fn a_file_streams_up_from_disk_intact() {
     const LEN: usize = 3 * 1024 * 1024;
@@ -652,6 +657,10 @@ async fn a_timeout_layer_refuses_a_slow_handler() {
 ///
 /// Not a `#[tokio::test]` on purpose — this must run on a plain thread, which
 /// is exactly the situation the blocking API exists for.
+/// `blocking`, which supplies both `keylink::blocking::Node` and the generated
+/// `probe::blocking::Client` this test dials with. Without it there is no
+/// synchronous API for a test about the synchronous API to be about.
+#[cfg(feature = "blocking")]
 #[test]
 fn a_synchronous_program_can_call_a_service() {
     // The server side still needs a runtime; it is a separate one, which is

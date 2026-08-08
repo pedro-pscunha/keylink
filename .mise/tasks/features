@@ -14,11 +14,30 @@
 # to close, and it had one — `authz.rs`'s `unset_env_fails_closed` called
 # `Allowlist::from_env` with no gate of its own.
 #
-# `--lib` and not `--all-targets`, deliberately. The integration tests under
-# `keylink/tests/` use the blocking API and `Body::from_file`, so they cannot
-# compile without the features that provide them, and demanding it would only
-# teach us to add feature gates to tests that legitimately want the feature.
-# `lint` builds those at the all-features end, which is where they belong.
+# `--lib` in the loop, and `--all-targets` ONCE at the bottom. This paragraph used
+# to refuse the second half outright: the tests under `keylink/tests/` use the
+# blocking API and `Body::from_file`, so they could not compile without the
+# features that provide them, "and demanding it would only teach us to add feature
+# gates to tests that legitimately want the feature".
+#
+# **That prediction was right about the mechanism and wrong about the price.** The
+# gates were added — they are `#[cfg(feature = "persist-file")]` on the durability
+# half of five files, `#[cfg(feature = "blocking")]` on two tests and one `let`,
+# `#[cfg(feature = "fs")]` on one test, and `required-features` on one example —
+# and what they bought is not tidiness. It is that `--all-targets` at the all-off
+# end is now RUNNABLE, so a lint or an error that only appears without a feature is
+# reachable in a test and an example for the first time. Before, the only thing
+# any tool could say about `keylink/tests/` at that end was that it did not build.
+#
+# The 24-build loop stays `--lib` and is not multiplied by targets. The lattice
+# middle is a library question — a feature-gated item called from another
+# feature's code — and paying 24 test-target builds to ask it again is the cost
+# this task was shaped to avoid.
+#
+# What the gates cost, measured with `cargo nextest list -p keylink --all-targets`
+# at both ends: 319 tests at default features, 292 at `--no-default-features`. The
+# 27 that go are named by that same command, and every one names a feature in its
+# own file. Nothing appears at the all-off end that is absent at default.
 #
 # The durability adapter multiplies this list by three rather than by four, and
 # saying which three is the point. `persist-file` implies `persist`, so
@@ -72,3 +91,21 @@ done
 # off.
 echo "── keylink doctests: no default features"
 cargo test -p keylink --doc --no-default-features
+
+# Every TARGET at the all-off end, once. This is the half the paragraph at the top
+# of this file used to refuse, and it lives here rather than in `gate` for two
+# reasons: this task already owns the all-off end, so it is not a seventeenth step,
+# and by the time it runs the loop above has built keylink's dependency graph at
+# this exact feature resolution 24 times over, so the dependencies are warm and
+# what this compiles is keylink's own targets.
+#
+# `check` and not `test --no-run`: this asks whether the targets COMPILE at the
+# all-off end, and it is `mise run test` that runs them at default features.
+#
+# It went green by adding feature gates and NOT by turning a feature on. That
+# distinction is the whole value: `default-features = false` must keep meaning
+# what a caller who writes it gets. `cargo check -p keylink --all-targets` at
+# default features is separately green with no dead-code warning, which is what
+# says the gates cover exactly the items that need them and not one more.
+echo "── keylink every target: no default features"
+cargo check -p keylink --all-targets --no-default-features
