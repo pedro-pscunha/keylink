@@ -47,21 +47,30 @@ slow-timeout = { period = "20s" }
 #
 # ── THE BREAK, RUN AND WATCHED ──────────────────────────────────────────────
 #
-# Not quoted, because the break is a deletion and `break-once.sh` runs `cargo
-# test`, under which this file does nothing at all — that harness cannot reach
-# this guard. Described instead, per CONTRIBUTING.md.
+# `break-once.sh` reaches this now — pass `BREAK_RUNNER`, because the harness
+# defaults to `cargo test`, under which this whole file is never read:
 #
-# The edit: delete the `[[profile.default.overrides]]` block below, so no group
-# applies to `binary(drift)`. Then `cargo nextest run --test drift`.
+#   BREAK_RUNNER="mise x -- cargo nextest run" ./scripts/break-once.sh \
+#       .config/nextest.toml "max-threads = 1" "max-threads = 2" "" --test drift
 #
-# Watched on 2026-08-08:
-#   with the group     2 passed, 10.621s total  — 9.510s + 1.111s, a SUM, which
-#                      is itself the evidence that they did not overlap
-#   without the group  1 passed, 1 FAILED in 0.765s,
-#                      a_peer_built_from_other_types_is_refused_at_the_handshake
-#   restored           2 passed, 2.081s
+# Quote `max-threads = 1` and NOT `binary(drift)`: the latter appears twice in
+# this file, once in this comment, and the harness aborts on a non-unique anchor.
 #
-# So the failure is a red, and a load-dependent one. Do not expect it every run.
+# **Removing the serialization does not fail one way. Both were watched, on
+# 2026-08-08:**
+#   with the group        2 passed, 10.621s total — 9.510s + 1.111s, a SUM,
+#                         which is itself the evidence they did not overlap
+#   group deleted         1 passed, 1 FAILED in 0.765s
+#   max-threads = 2       2 PASSED — and the first took **104.662s** instead of
+#                         9.5s, because two `cargo build` invocations fought for
+#                         the machine and the package-cache lock. exit=0.
+#
+# So an unguarded run is either an intermittent red or a 10x slowdown that still
+# reports green. The second is why `slow-timeout` above is set: it printed
+# `SLOW [> 20.000s]` five times and was the only thing that said so.
+#
+# Do NOT expect a red on every unguarded run. A break record claiming one would
+# be disproved by the second row above.
 [test-groups.drift-builds]
 max-threads = 1
 

@@ -1177,3 +1177,26 @@ removed outright, so it is not repaired here.
 
 Found by an adversarial review of Wave 1b, which read §13.1's table and §13.4's name list as
 current vocabulary — which is what they present themselves as.
+
+---
+
+## Appendix, 2026-08-08: two line citations in §"Three things the new member inherits" have rotted
+
+Appended rather than edited, per CONTRIBUTING.md — the value of the record is what was
+believed at the time.
+
+That section cites `mise.toml:87` for `cargo test --workspace` and `mise.toml:108` for the
+MSRV check. Both line numbers moved, and the first command no longer exists.
+
+`tasks.test` now runs two commands, because `cargo nextest run` executes test binaries as
+parallel processes and **never runs doctests**:
+
+```
+cargo nextest run --workspace
+cargo test --workspace --doc --no-fail-fast
+```
+
+The claim the section was making still holds — a new workspace member is picked up by
+`--workspace` and must pass the MSRV check on day one. Only the coordinates are wrong.
+
+This is the failure a line-number citation invites. Cite the task name, not the line.
