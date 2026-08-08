@@ -118,6 +118,18 @@ ANCHORS = [
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
 #
+# **What a row here MEANS, and it is narrower than it looks: this record once had a
+# quoted search literal, somebody removed it on purpose, and here is why.** It does
+# NOT mean "has no quoted literal" - most records in this repo have none and were
+# never converted, and they do not belong here.
+#
+# That distinction has to hold before the population ever gets classified in bulk.
+# A migration that swept every unquoted record into this list would make every row
+# assert a deliberateness nobody checked - which is this convention's own failure
+# mode arriving through the fix for it. If a standing category is wanted for records
+# **born** without a quote, it needs its own name and its own list; provenance may
+# not matter to a reader, but the deliberateness does.
+#
 # **This is documentation and NOT a check, and the reason is worth stating because
 # it looks checkable and is not.** The obvious assertion — "the retired literal no
 # longer appears in the record's file" — fails immediately: a record that explains

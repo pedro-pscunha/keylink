@@ -785,8 +785,13 @@ So it is decided per record, and the two axes are independent:
   anchors resolve, because the record's quote sits in a `///` comment **without**
   indentation while the code carries it — so the indented search literal is unique and
   the record's copy is not a second occurrence. Same-file quoting is legitimate **when
-  indentation disambiguates**, and fails only at column 0, or on a fragment, where
-  there is no indentation to add or nothing for it to attach to.
+  indentation disambiguates**.
+
+  **And the exclusion is sharper than "column 0 or a fragment", which are symptoms:
+  it fails exactly when the record's quote is BYTE-IDENTICAL to the code.** Those two
+  are simply the ways that happens — code at column 0 has no indentation for the quote
+  to lack, and a fragment has none to carry. State the property and the two cases fall
+  out of it; state the two cases and a third way of colliding goes unnoticed.
 - **Positional anchors: describe.** The alternative is a gate that reddens for every
   unrelated export and trains people to re-quote mechanically, which is worse than no
   gate.
