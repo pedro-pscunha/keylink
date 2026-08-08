@@ -1784,6 +1784,10 @@ macro_rules! __keylink_service {
                     f.debug_struct("Handle")
                         .field("service", &stringify!($svc))
                         .field("running", &self.inner.is_running())
+                        // Follows `LocalActor`'s own `Debug`, which gained this
+                        // in the same commit. A handle printing one of the two
+                        // facts its holder can ask for is the drift this avoids.
+                        .field("busy", &self.inner.is_busy())
                         .finish()
                 }
             }

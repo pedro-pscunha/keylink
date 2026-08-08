@@ -1959,15 +1959,25 @@ let ended = dispatch(mail, &mut state, &mut hooks).await;
 inbox.mark_busy(false);
 ```
 
-`Inbox::mark_busy` defaults to nothing, so a `LocalActor` — which has no registry entry
-to report to — costs a no-op, and `Keyed<M>` forwards to the mailbox's flag. This keeps
-every property the item wanted: one place, in keylink's own code, not in generated code
-where two sites could drift. It adds the one the item's spelling could not have: both
-inputs, by construction, because there is one dispatch.
+`Inbox::mark_busy` is defaulted, and `Keyed<M>` forwards to the mailbox's flag. This
+keeps every property the item wanted: one place, in keylink's own code, not in generated
+code where two sites could drift. It adds the one the item's spelling could not have:
+both inputs, by construction, because there is one dispatch.
+
+**This paragraph used to say a `LocalActor` "has no registry entry to report to" and so
+costs a no-op. That stopped being true when `Watched` shipped**, and the sentence is
+corrected here rather than deleted, because the reasoning it carried is the reasoning the
+seam was designed on. A `LocalActor` still has no registry entry; what changed is that it
+carries the cell on its handle instead, which is where its `Fate` already lived. The
+refusal that stood on `mark_busy` itself weighed an idle actor, whose holder can ask the
+handle — and a wedged one cannot be asked, because the question queues behind the turn.
+A bare `mpsc::Receiver` still takes the default, and the supervision tests that hand
+`supervise` one are why it stays.
 
 Red-tested per arm, separately, because they are separately load-bearing: clearing the
-flag on the mail arm fails the two mailbox tests and leaves the feed test green, and
-clearing it on the feed arm fails only `busy_is_true_during_a_feed_turn`.
+flag on the mail arm fails the two mailbox tests, `a_turn_reports_busy_and_a_read_does_not`
+on the local side, and leaves the feed test green; clearing it on the feed arm fails only
+`busy_is_true_during_a_feed_turn`.
 
 **One honest limit, stated on `Mailbox` rather than left to be discovered.** `mount` is
 `#[doc(hidden)] pub`, so a loop can be written by hand — the tests in `registry.rs` and

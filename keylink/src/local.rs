@@ -1317,8 +1317,8 @@ trait Inbox<A, M>: Send {
     /// Written by whoever has somewhere to put it: [`Keyed`] writes the registry
     /// entry [`System::status`](crate::System::status) reads, [`Watched`] writes
     /// the cell a [`LocalActor`] carries on its handle, and a bare
-    /// `mpsc::Receiver` keeps this default — three tests hand `supervise` one and
-    /// want no cell at all.
+    /// `mpsc::Receiver` keeps this default — the supervision tests in this module
+    /// hand `supervise` one and want no cell at all.
     ///
     /// # What the refusal that stood here weighed, and what it did not
     ///
@@ -1349,10 +1349,11 @@ trait Inbox<A, M>: Send {
     ///
     /// Here rather than as a parameter on [`run_loop`] because this is the same
     /// question [`mark_busy`](Self::mark_busy) is: something outside the loop
-    /// owns the mailbox and wants to know what the loop is doing. Two of the
-    /// three impls have no supervisor above them, so the default is the answer
-    /// for both — a loop that reached this line and is nobody's incarnation will
-    /// not run again.
+    /// owns the mailbox and wants to know what the loop is doing. Only [`Lent`]
+    /// has a supervisor above it, so every other impl takes the default — a loop
+    /// that reached this line and is nobody's incarnation will not run again.
+    /// Counted that way rather than "two of three", which is what stood here and
+    /// was already stale one impl later.
     ///
     /// **It returns the verdict rather than publishing it**, and that is the
     /// whole reason the give-up case cannot be forgotten again: [`run_loop`]
@@ -1414,8 +1415,8 @@ impl<A: Send, M: Send> Inbox<A, M> for mpsc::Receiver<Message<A, M>> {
 ///
 /// A newtype for [`Keyed`]'s reason and one it does not have: `mpsc::Receiver` is
 /// a foreign type, so there is nowhere on it to put a cell. The bare impl above
-/// stays rather than moving here, because three tests hand [`supervise`] a raw
-/// receiver and want the empty default.
+/// stays rather than moving here, because the supervision tests in this module
+/// hand [`supervise`] a raw receiver and want the empty default.
 ///
 /// # The cell is cleared on drop, and that is the half the loop cannot do
 ///
@@ -1426,12 +1427,17 @@ impl<A: Send, M: Send> Inbox<A, M> for mpsc::Receiver<Message<A, M>> {
 /// `Drop` the handle would answer "busy" for ever about an actor that is gone.
 ///
 /// **A clear inside `supervise` would not reach either of them** — and it was
-/// tried. It is dead by construction: every [`Ended`] that `retryable` grants a
-/// restart to is a value `dispatch` **returned**, so the clear on the next line
-/// already ran. It is worse than dead, because `run_keyed_supervised` hands the
-/// same function a [`Keyed`], which would make `supervise` a second writer of the
-/// registry's flag — and `Busy`'s own invariant in `registry.rs` is that
-/// `run_loop` writes it and *nothing else does*.
+/// tried. It is dead, by the two arms `retryable` grants a restart to and not by
+/// one rule over both. `Ended::Panicked` and a non-fatal `Ended::Observer` are
+/// values `dispatch` **returned**, so the clear on the next line already ran.
+/// `Ended::Feed` is built on the `Taken::Fed(Fed::Ended { .. })` arm, which runs
+/// no dispatch at all, so the flag was never set. Either way the supervisor
+/// would be storing `false` over `false`.
+///
+/// It is worse than dead, because `run_keyed_supervised` hands the same function
+/// a [`Keyed`], which would make `supervise` a second writer of the registry's
+/// flag — and `Busy`'s own invariant in `registry.rs` is that `run_loop` writes
+/// it and *nothing else does*.
 struct Watched<A, M> {
     rx: mpsc::Receiver<Message<A, M>>,
     busy: Arc<AtomicBool>,
@@ -3231,10 +3237,19 @@ impl<A, M> LocalActor<A, M> {
     /// between this answer and the next line. `false` from a live actor means "no
     /// turn was running at the instant this loaded".
     ///
-    /// **`false` after an [`abort`](Self::abort) or an escaping unwind**, because
-    /// [`Watched`] clears the cell on drop. The alternative — leaving it set,
-    /// which is what the loop alone would do — is a handle reporting "busy" for
-    /// ever about an actor that is gone.
+    /// # After an abort, and the caveat is the one `abort` already carries
+    ///
+    /// The cell is cleared when the actor's mailbox is dropped, so an escaping
+    /// unwind and a cancelled task both end with this `false` rather than stuck
+    /// at `true` — a handle reporting "busy" for ever about an actor that is gone
+    /// is what the loop alone would leave behind.
+    ///
+    /// **But [`abort`](Self::abort) is asynchronous**, exactly as its own
+    /// documentation and [`is_running`](Self::is_running)'s say: it cancels the
+    /// task at its next await, so this can still answer `true` between the call
+    /// and the runtime dropping the task. Measured, immediately after `abort()`:
+    /// `is_busy` and `is_running` both `true`. Await [`ended`](Self::ended) for
+    /// the point where both have settled.
     #[must_use]
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::Relaxed)
@@ -3242,14 +3257,22 @@ impl<A, M> LocalActor<A, M> {
 
     /// How many messages are waiting ahead of the one being handled.
     ///
-    /// Zero or one at [`LOCAL_MAILBOX_DEPTH`], and never a number to compute a
-    /// queue-length alert from. What it is good for is the question it answers
-    /// exactly — **is this actor's mailbox full, and therefore will the next
-    /// caller block on the permit.** `ActorStatus::buffered` is the keyed twin and
-    /// carries the same warning.
+    /// Zero or one at the local mailbox depth, which is a constant and not a
+    /// knob — never a number to compute a queue-length alert from. What it is
+    /// good for is the question it answers exactly — **is this actor's mailbox
+    /// full, and therefore will the next caller block on the permit.**
     ///
-    /// It reads the **sender**, so it is the one fact here that an
-    /// [`abort`](Self::abort) does not change.
+    /// `ActorStatus::buffered` answers that same question on the keyed side, and
+    /// the two are **not** counting the same set: a keyed mailbox carries only
+    /// the service's own messages, while this channel also carries a
+    /// [`read`](Self::read) and the stop request. One queued read reads `1` here.
+    /// The "will the next caller block" answer is exact either way; the
+    /// equivalence is not.
+    ///
+    /// It reads the sender, and an [`abort`](Self::abort) still moves it: the
+    /// receiver drops, the queued message drops with it, and the permit comes
+    /// back. Measured — `1` with a read queued behind a wedged turn, `0` once
+    /// [`ended`](Self::ended) has resolved.
     ///
     /// Paired with [`is_busy`](Self::is_busy) it separates three states rather
     /// than two: idle, in a turn with the slot free, and in a turn with the next
@@ -4091,11 +4114,16 @@ mod tests {
     /// The supervised path wraps its receiver too — which is a **second** call
     /// site and therefore a second thing to forget.
     ///
-    /// This is the guard for that, and it exists because I proved it was missing:
-    /// with `spawn_supervised` passing its raw receiver, the whole lib suite —
-    /// including all three tests above — stayed green at 169. Every one of them
-    /// reaches the actor through `spawn_fed`, so `is_busy` would have answered
-    /// `false` for ever on every supervised actor and nothing would have said so.
+    /// This is the guard for that, and it exists because its absence was
+    /// measured: with `spawn_supervised` passing its raw receiver, **not one test
+    /// in the lib suite went red** — including its three siblings here, which all
+    /// reach the actor through `spawn_fed`. `is_busy` would have answered `false`
+    /// for ever on every supervised actor and nothing would have said so.
+    ///
+    /// Named siblings rather than a pass count, because a count rots on the next
+    /// test anybody adds: `a_turn_reports_busy_and_a_read_does_not`,
+    /// `a_full_mailbox_is_visible_before_a_caller_blocks_on_it` and
+    /// `an_aborted_turn_does_not_leave_the_handle_reporting_busy`.
     ///
     /// **Watched break, `spawn_supervised`, `Watched { rx: inbox, busy }` →
     /// `inbox`:** `a_supervised_actor_reports_busy_through_its_handle ... FAILED`,
