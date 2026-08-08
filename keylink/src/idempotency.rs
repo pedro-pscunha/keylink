@@ -888,7 +888,7 @@ impl Idempotency {
         &self.key
     }
 
-    /// How long the caller asked to be held, capped at `cap`.
+    /// How long the caller asked to be held, under `cap`.
     ///
     /// Capped here rather than at the constructor, because the value that
     /// matters is the one that arrived from the network and never met a
@@ -909,9 +909,9 @@ impl Idempotency {
     /// **What the parameter makes unrepresentable is reading the budget without
     /// naming a ceiling. It does not make a bad ceiling unrepresentable, and the
     /// difference matters because this doc once claimed otherwise.**
-    /// `attach_budget(Duration::MAX)` compiles, and so would
-    /// `attach_budget(MAX_ATTACH)` at a future call site — which is the operator's
-    /// setting ignored again, by the same shape this change removed.
+    /// `attach_budget(Attaching::For(Duration::MAX))` compiles, and so would
+    /// `attach_budget(Attaching::For(MAX_ATTACH))` at a future call site — which is
+    /// the operator's setting ignored again, by the same shape this change removed.
     ///
     /// That residue is the design's own argument turned on itself, so it is written
     /// here rather than left for a reader to notice: the case against clamping in
@@ -926,9 +926,19 @@ impl Idempotency {
     /// technique; if a second serving path ever reads a budget, that is the moment
     /// to reach for it.
     ///
-    /// `None` means the caller did not ask to attach at all. That is refused
-    /// [`IdempotencyRefusal::InFlight`] rather than capped, so `cap` never
-    /// applies to it.
+    /// **[`Attaching`] arrived after that paragraph and did not close it**, which is
+    /// worth saying because it is a wrapper and looks like the one described above.
+    /// It removed a different hole: [`Duration::ZERO`](Duration) naming two acts at
+    /// one call site. `Attaching::For(Duration::MAX)` is still a bad ceiling typed
+    /// out in full, so what remains here is what remained before.
+    ///
+    /// `None` has two producers and one meaning at the accept path: **the caller
+    /// did not ask to attach**, or **the operator set [`Attaching::Forbidden`]**.
+    /// Either is refused [`IdempotencyRefusal::InFlight`] rather than capped,
+    /// before `Ledger::wait` — so neither spends a waiting place and neither parks.
+    /// The two are indistinguishable from here on purpose, and
+    /// [`Attaching::Forbidden`] carries the argument: the caller knows which it
+    /// did, and the refusal is true of both.
     ///
     /// # `pub(crate)`, and the parameter is the reason
     ///
@@ -945,7 +955,16 @@ impl Idempotency {
     /// Removing it is free while the crate is unpublished and leaves nothing to
     /// price.
     #[must_use]
-    pub(crate) fn attach_budget(&self, cap: Duration) -> Option<Duration> {
+    pub(crate) fn attach_budget(&self, cap: Attaching) -> Option<Duration> {
+        // A guard clause and not a `match` arm, so that the clamp below keeps the
+        // indentation its registered anchors A2 and A2b quote — a `match` puts it
+        // one level deeper and turns a whole-line anchor into a mid-line fragment,
+        // which `mise run anchors` reported when this was written the other way.
+        // `claim_key` reads the `Option` this returns with the same `let ... else`,
+        // one function away.
+        let Attaching::For(cap) = cap else {
+            return None;
+        };
         self.attach_for_millis
             .map(|millis| Duration::from_millis(millis).min(cap))
     }
@@ -1214,7 +1233,7 @@ pub struct Limits {
     waiting: NonZeroUsize,
     waiting_per_peer: NonZeroUsize,
     ttl: Duration,
-    attach: Duration,
+    attach: Attaching,
 }
 
 /// Every bound constant in this module is a non-zero literal, so the `None` arm is
@@ -1251,7 +1270,7 @@ impl Default for Limits {
             waiting: nonzero(MAX_WAITING),
             waiting_per_peer: nonzero(MAX_WAITING_PER_PEER),
             ttl: RECORD_TTL,
-            attach: MAX_ATTACH,
+            attach: Attaching::For(MAX_ATTACH),
         }
     }
 }
@@ -1456,9 +1475,13 @@ impl Limits {
     /// keeps the value out of that range without minting a refusal variant, which
     /// would move both ALPN pins.
     ///
-    /// A caller that does not want to be parked at all already has the switch, and
-    /// it is on the *calling* side: not asking to attach is answered
-    /// [`InFlight`](IdempotencyRefusal::InFlight), which is the right refusal.
+    /// A caller that does not want to be parked at all has its own switch on the
+    /// *calling* side: not asking to attach is answered
+    /// [`InFlight`](IdempotencyRefusal::InFlight), which is the right refusal. The
+    /// serving side's switch is [`Attaching::Forbidden`] on
+    /// [`attach`](Self::attach), which answers the same refusal for the same reason
+    /// and spends no place here either. Neither is this bound: this one is a count of
+    /// the attachers that WERE admitted.
     ///
     /// A value above [`u32::MAX`] **disables** this bound rather than refusing
     /// loudly — see [`running`](Self::running) for why the `u32` clamp is never
@@ -1513,12 +1536,20 @@ impl Limits {
         self
     }
 
-    /// The longest an attaching call is held waiting for a call already in flight
-    /// under its key.
+    /// Whether an attaching call is admitted at all, and the longest one is held
+    /// waiting for a call already in flight under its key.
     ///
-    /// Defaults to [`MAX_ATTACH`], 30 seconds. A [`Duration`] rather than a
-    /// non-zero type for [`ttl`](Self::ttl)'s reason: the language offers no
-    /// `NonZero` for one, so these two are the fields that can be set to zero.
+    /// Defaults to [`Attaching::For`]`(`[`MAX_ATTACH`]`)`, 30 seconds. The duration
+    /// inside that variant is a [`Duration`] rather than a non-zero type for
+    /// [`ttl`](Self::ttl)'s reason: the language offers no `NonZero` for one, so a
+    /// hold of zero is representable here and on `ttl` and nowhere else on this type.
+    ///
+    /// [`Attaching::Forbidden`] is the other act, and it is the one that admits
+    /// nothing: `Idempotency::attach_budget` answers `None` for it, and the accept
+    /// path refuses a `None` [`InFlight`](IdempotencyRefusal::InFlight) before
+    /// `Ledger::wait`. So nothing parks and no
+    /// [`waiting`](Self::waiting) place is spent. Everything below is about the
+    /// [`For`](Attaching::For) arm.
     ///
     /// **This is a ceiling on a number a peer chose, and the smaller of the two
     /// governs.** A caller names its own budget in
@@ -1532,25 +1563,35 @@ impl Limits {
     /// setter existed a caller could set the count and not the duration, so it
     /// controlled one factor of a product.
     ///
-    /// **Zero does not turn attaching off, and what separates the two is a waiting
-    /// place.** `Idempotency::attach_budget` returns
-    /// `Some(Duration::ZERO)` and not `None`, so a zero ceiling carries the caller
-    /// through the whole accept path: it spends a [`waiting`](Self::waiting) place,
-    /// re-claims the key once — so a call that settles in that instant is still
-    /// answered from the record — and only then expires. What zero buys is that no
-    /// attacher is ever *held*. What it does not buy is the machinery not running.
+    /// **A zero hold does not turn attaching off, and what separates the two is a
+    /// waiting place.** `Idempotency::attach_budget` returns `Some(Duration::ZERO)`
+    /// for [`For(Duration::ZERO)`](Attaching::For) and not `None`, so a zero ceiling
+    /// carries the caller through the whole accept path: it spends a
+    /// [`waiting`](Self::waiting) place, re-claims the key once — so a call that
+    /// settles in that instant is still answered from the record — and only then
+    /// expires. What zero buys is that no attacher is ever *held*. What it does not
+    /// buy is the machinery not running. [`Attaching::Forbidden`] is what buys that,
+    /// and it is why the setting is an enum: an earlier version of this paragraph
+    /// said zero "turns the feature off", which was wrong on a reachable path, and a
+    /// duration had no way to say the thing that sentence meant.
     ///
-    /// **So the refusal is not one refusal.** It is
+    /// **So a zero hold is not one refusal.** It is
     /// [`InFlight`](IdempotencyRefusal::InFlight) when a place was free, and
     /// [`TooManyRunning`](IdempotencyRefusal::TooManyRunning) when the waiting pool
     /// was already full, because `Ledger::wait` is reached either way and refuses
-    /// with the count it exceeded. An earlier version of this paragraph said zero
-    /// "turns the feature off" and named `InFlight` alone; both halves were wrong on
-    /// a reachable path.
+    /// with the count it exceeded. [`Attaching::Forbidden`] is `InFlight` at every
+    /// pool state, because it never reaches that call.
+    /// `rpc::tests::a_forbidden_ceiling_is_refused_without_a_waiting_place` and
+    /// `rpc::tests::a_zero_hold_still_spends_a_waiting_place` hold the pair, against
+    /// one exhausted pool so that neither can drift from the other.
     ///
-    /// A caller that wants never to be parked already has the switch, and it is on
-    /// the *calling* side — see [`waiting`](Self::waiting). Setting this to zero is
-    /// the serving side refusing to hold, which is not the same act.
+    /// **Three acts, and each has its own door.** A caller that wants never to be
+    /// parked does not ask to attach, which is the *calling* side — see
+    /// [`waiting`](Self::waiting). A service that will admit an attacher and hold it
+    /// for no time sets [`For(Duration::ZERO)`](Attaching::For). A service that will
+    /// not admit one sets [`Attaching::Forbidden`]. Only the first was expressible
+    /// before this setting took an enum, and the second was standing in for the
+    /// third.
     ///
     /// # No layer can stand in for this, and the ordering is why
     ///
@@ -1565,18 +1606,84 @@ impl Limits {
     ///
     /// # There is a top of the range, and it does not raise the ceiling
     ///
-    /// **A value larger than any budget a peer sends disables the cap**, and past
-    /// that point the wait is bounded by the *peer's* number alone.
+    /// **A [`For`](Attaching::For) larger than any budget a peer sends disables the
+    /// cap**, and past that point the wait is bounded by the *peer's* number alone.
     /// [`Idempotency::attaching_for`] carries whole milliseconds in a `u64` and
     /// saturates, so the largest request is [`u64::MAX`] of them — about 584
     /// million years. Set this near that and a peer holds a stream for as long as
     /// it likes. The bound is disabled by a large value rather than made loud, the
     /// same shape [`running`](Self::running) describes for its `u32`.
     #[must_use]
-    pub fn attach(mut self, attach: Duration) -> Self {
+    pub fn attach(mut self, attach: Attaching) -> Self {
         self.attach = attach;
         self
     }
+}
+
+/// Whether this service admits an attaching call, and for how long it holds one.
+///
+/// What [`Limits::attach`] takes. The two variants are two different acts by the
+/// operator, and a [`Duration`] on its own could name only the first:
+///
+/// - [`For`](Self::For) **admits** the attacher, and bounds the hold.
+/// - [`Forbidden`](Self::Forbidden) **refuses to admit it**, before a waiting place
+///   is spent and before anything parks.
+///
+/// # Why zero does not mean *forbidden*, and why this type exists
+///
+/// Because zero already means something else on a reachable path.
+/// `For(Duration::ZERO)` carries the caller through the whole accept path: it
+/// spends a [`waiting`](Limits::waiting) place, re-claims the key once — so a call
+/// that settles in that instant is still answered from the record — and only then
+/// expires. It stops the *hold*, not the park. [`Limits::attach`] carries that in
+/// full, including that an earlier version of its own paragraph said zero "turns
+/// the feature off" and was wrong on a reachable path.
+///
+/// So a second meaning stacked on the same zero would be a value whose act a
+/// reader has to look up. A variant is the act, in the word the operator typed.
+///
+/// **A `bool` beside the duration, rejected**, and twice over: two fields that
+/// interact where one does the work, and a flag at a call site that names nothing.
+/// `middleware.rs` states this crate's rule for the shape — *"a known value set is
+/// an enum"* — and `authz.rs` records what an [`Option`] on one costs.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use keylink::{Attaching, Limits};
+///
+/// // Admit an attacher and hold it for at most five seconds.
+/// let bounded = Limits::default().attach(Attaching::For(Duration::from_secs(5)));
+///
+/// // Admit nothing. Every attaching call is refused at once.
+/// let none = Limits::default().attach(Attaching::Forbidden);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attaching {
+    /// Admit the attacher, and hold it for at most this long.
+    ///
+    /// A ceiling on a number the peer chose, so the smaller of the two governs.
+    /// [`Limits::attach`] describes what both ends of this range do, zero included.
+    For(Duration),
+    /// Admit no attacher at all.
+    ///
+    /// `Idempotency::attach_budget` answers `None` for this, and the accept path
+    /// already refuses a `None` [`InFlight`](IdempotencyRefusal::InFlight) **before**
+    /// it reaches `Ledger::wait` — so no [`waiting`](Limits::waiting) place is
+    /// spent, nothing parks, and nothing re-claims. That is the whole difference
+    /// from [`For(Duration::ZERO)`](Self::For), which spends one of each.
+    ///
+    /// # The refusal does not say which of two things happened
+    ///
+    /// A caller that never asked to attach is refused
+    /// [`InFlight`](IdempotencyRefusal::InFlight) as well, so at this seam the
+    /// operator's setting and that caller collapse into one answer. Recorded rather
+    /// than left for a reader to discover: the **caller** knows which of the two it
+    /// did, and *the call is running, ask again when it finishes* is true of both.
+    /// What the refusal does not tell a caller is whether asking to attach would
+    /// have helped. Against this setting it never would.
+    Forbidden,
 }
 
 impl fmt::Debug for Limits {
@@ -1648,13 +1755,17 @@ impl Ledger {
         })
     }
 
-    /// This service's ceiling on an attaching call's budget.
+    /// Whether this service admits an attaching call, and its ceiling if it does.
     ///
     /// The one bound read from outside the ledger, because the clamp is applied on
     /// the accept path — `Idempotency::attach_budget` takes it there. A
     /// crate-private reader rather than a getter on [`Limits`], which deliberately
     /// offers none.
-    pub(crate) fn attach_cap(&self) -> Duration {
+    ///
+    /// Returns an [`Attaching`] and not a [`Duration`], so that
+    /// [`Attaching::Forbidden`] reaches the accept path as a value rather than as a
+    /// duration a reader has to interpret.
+    pub(crate) fn attach_cap(&self) -> Attaching {
         self.limits.attach
     }
 
@@ -3497,16 +3608,19 @@ mod tests {
         #[test]
         fn a_budget_is_capped_at_the_cap_it_is_given() {
             let over = Idempotency::attaching_for(key("k"), Duration::from_secs(3600));
-            assert_eq!(over.attach_budget(MAX_ATTACH), Some(MAX_ATTACH));
             assert_eq!(
-                over.attach_budget(Duration::from_secs(1)),
+                over.attach_budget(Attaching::For(MAX_ATTACH)),
+                Some(MAX_ATTACH)
+            );
+            assert_eq!(
+                over.attach_budget(Attaching::For(Duration::from_secs(1))),
                 Some(Duration::from_secs(1)),
                 "the ceiling is the argument, never the constant"
             );
 
             let under = Idempotency::attaching_for(key("k"), Duration::from_secs(1));
             assert_eq!(
-                under.attach_budget(MAX_ATTACH),
+                under.attach_budget(Attaching::For(MAX_ATTACH)),
                 Some(Duration::from_secs(1)),
                 "and a request under the ceiling is kept, not raised to it"
             );
@@ -3517,9 +3631,49 @@ mod tests {
         #[test]
         fn a_bare_key_does_not_attach() {
             let idem: Idempotency = key("k").into();
-            assert_eq!(idem.attach_budget(MAX_ATTACH), None);
-            assert_eq!(idem.attach_budget(Duration::ZERO), None);
+            assert_eq!(idem.attach_budget(Attaching::For(MAX_ATTACH)), None);
+            assert_eq!(idem.attach_budget(Attaching::For(Duration::ZERO)), None);
             assert_eq!(idem.key(), &key("k"));
+        }
+
+        /// **The collapse this design accepts, asserted rather than left to be
+        /// discovered.** `None` has two producers — a caller that did not ask, and an
+        /// operator that set [`Attaching::Forbidden`] — and this seam cannot tell them
+        /// apart. Both are refused [`IdempotencyRefusal::InFlight`], which is true of
+        /// both, and the caller is the party that knows which it did.
+        ///
+        /// A request the operator forbids is refused whatever it asked for, so the
+        /// asking value is varied here and the answer is not. That is the half a
+        /// reader would otherwise have to infer from an arm order.
+        ///
+        /// Made red by `scripts/break-once.sh` replacing `return None;` in
+        /// `Idempotency::attach_budget` with `return Some(Duration::ZERO);`, which is
+        /// [`Attaching::Forbidden`] collapsing into a zero hold. The search literal
+        /// carries that line's twelve spaces of indentation, so this record's
+        /// unindented copy is not a second occurrence. Watched, under `cargo test`:
+        /// `assertion `left == right` failed: a forbidden setting refuses whatever
+        /// the peer asked for`, `left: Some(0ns)`, `right: None`.
+        #[test]
+        fn a_forbidden_ceiling_answers_none_for_every_request() {
+            assert_eq!(
+                Idempotency::attaching_for(key("k"), Duration::from_secs(3600))
+                    .attach_budget(Attaching::Forbidden),
+                None,
+                "a forbidden setting refuses whatever the peer asked for"
+            );
+            assert_eq!(
+                Idempotency::attaching_for(key("k"), Duration::ZERO)
+                    .attach_budget(Attaching::Forbidden),
+                None,
+                "a forbidden setting refuses whatever the peer asked for"
+            );
+
+            let bare: Idempotency = key("k").into();
+            assert_eq!(
+                bare.attach_budget(Attaching::Forbidden),
+                None,
+                "and a caller that never asked is the same answer, which is the collapse"
+            );
         }
 
         /// The default ceiling is the constant, not a second copy of thirty
@@ -3533,20 +3687,20 @@ mod tests {
         /// [`Limits::attach`] instead would assert the setter and not the default.
         ///
         /// Made red by `scripts/break-once.sh` replacing
-        /// `attach: MAX_ATTACH,` in `impl Default for Limits` with
-        /// `attach: Duration::from_secs(1),`. The search literal carries that
-        /// line's twelve spaces of indentation, so this record's unindented copy of
-        /// it is not a second occurrence — the same-file remedy rot mode 1
-        /// prescribes. Watched, under `cargo test`:
+        /// `attach: Attaching::For(MAX_ATTACH),` in `impl Default for Limits` with
+        /// `attach: Attaching::For(Duration::from_secs(1)),`. The search literal
+        /// carries that line's twelve spaces of indentation, so this record's
+        /// unindented copy of it is not a second occurrence — the same-file remedy
+        /// rot mode 1 prescribes. Watched, under `cargo test`:
         /// `assertion `left == right` failed: the default ceiling must be the
-        /// constant the README prints`, `left: 1s`, `right: 30s`. The same edit
-        /// reddens `rpc.rs`'s
+        /// constant the README prints`, `left: For(1s)`, `right: For(30s)`. The same
+        /// edit reddens `rpc.rs`'s
         /// `a_peer_over_the_attach_ceiling_is_held_for_the_default`.
         #[test]
         fn the_default_attach_ceiling_is_max_attach() {
             assert_eq!(
                 Limits::default().attach,
-                MAX_ATTACH,
+                Attaching::For(MAX_ATTACH),
                 "the default ceiling must be the constant the README prints"
             );
         }

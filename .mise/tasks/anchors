@@ -504,10 +504,14 @@ ANCHORS = [
     # one edit to the shipped default reddens a struct-level guard in
     # `idempotency.rs` and an accept-path guard in `rpc.rs`, and only the pair says
     # the default reaches the wire path rather than only the struct.
+    # Re-quoted on `limit-docs`: the field took an `Attaching`, so the default became
+    # `Attaching::For(MAX_ATTACH)` and both rows rotted at once. This gate reported it,
+    # which is the case it exists for — the two records' own prose was updated in the
+    # same edit and nothing else would have compared them.
     ("A3", "keylink/src/rpc.rs", "keylink/src/idempotency.rs",
-     "            attach: MAX_ATTACH,"),
+     "            attach: Attaching::For(MAX_ATTACH),"),
     ("A4", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
-     "            attach: MAX_ATTACH,"),
+     "            attach: Attaching::For(MAX_ATTACH),"),
     # A5 holds the TOP of the pool bounds' range, which their rustdoc argued only at
     # the zero end. The first line of a two-line `while` condition, and a whole line
     # in its own right - the `||` under it belongs to `rustfmt`, so a reflow gives
@@ -534,6 +538,19 @@ ANCHORS = [
     # method the service's `Keyable` policy leaves out.
     ("M1", "keylink/tests/protocol.rs", "keylink/tests/protocol.rs",
      "            if cx.method() == \"Ping\" && cx.call().is_none() {"),
+    # M2 and M3 are ONE literal and two `lives_in` files, the A3/A4 shape: one edit to
+    # `Idempotency::attach_budget`'s guard clause reddens the arithmetic guard in
+    # `idempotency.rs` AND the accept-path guard in `rpc.rs`, and only the pair says
+    # that `Attaching::Forbidden` reaches the accept path rather than only the method.
+    #
+    # A guard clause rather than a `match` arm on purpose, and A2 is the reason: a
+    # `match` puts the clamp one level deeper, which turns A2 and A2b from whole-line
+    # anchors into mid-line fragments. This gate reported that too, on the first
+    # attempt, before either row was touched.
+    ("M2", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
+     "            return None;"),
+    ("M3", "keylink/src/rpc.rs", "keylink/src/idempotency.rs",
+     "            return None;"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -1216,11 +1233,24 @@ for record in sorted(set(REDNESS) - row_ids):
 # two commits on one branch each needing their own measurement is the whole reason
 # a carried value goes stale.
 #
-# 123 → the figure below on `limit-docs`, off `080fec7`, for the required-key layer:
-# ONE block, `a_layer_can_require_an_idempotency_key`, registered as M1. **Read off a
-# FAILURE, the same way the line above was**: the tripwire was left at 123 and the
-# pre-commit hook answered `124 comment blocks mention break-once.sh` from the walk.
-RECORD_BLOCKS = 124
+# 123 → 124 on `limit-docs`, off `080fec7`, for the required-key layer: ONE block,
+# `a_layer_can_require_an_idempotency_key`, registered as M1. **Read off a FAILURE,
+# the same way the line above was**: the tripwire was left at 123 and the pre-commit
+# hook answered `124 comment blocks mention break-once.sh` from the walk.
+#
+# 124 → the figure below, two commits later on the same branch, for `Attaching`:
+# THREE new blocks and TWO new rows, which is not one-per-row.
+# `a_forbidden_ceiling_is_refused_without_a_waiting_place` and
+# `a_forbidden_ceiling_answers_none_for_every_request` cite one literal from two files
+# and are M3 and M2; `a_zero_hold_still_spends_a_waiting_place` cites **A2's** literal
+# with a replacement of its own, so it is a block without a row — the same shape
+# `an_attach_ceiling_of_zero_refuses_the_attacher_at_once` already has.
+#
+# Read off a run of this task at this tree, not from adding three: the same commit
+# also re-quoted A3 and A4, which moves no block, and reshaped
+# `Idempotency::attach_budget` to keep A2 and A2b whole-line, which moves none either.
+# A subtraction over those would have needed both facts and had neither.
+RECORD_BLOCKS = 127
 
 # The one marker the tripwire counts, and the two phrasings records use INSTEAD of
 # naming the harness. Both are read by the same walk, so the blind spot below is a

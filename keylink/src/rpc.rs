@@ -692,7 +692,9 @@ mod tests {
 
     // `Future` and `Poll` arrive through the glob; `poll_fn` does not.
     use super::*;
-    use crate::idempotency::{MAX_ATTACH, MAX_WAITING_PER_PEER};
+    // `Attaching` is named only by these tests: the accept path passes
+    // `ledger.attach_cap()` straight through and never spells the type.
+    use crate::idempotency::{Attaching, MAX_ATTACH, MAX_WAITING_PER_PEER};
 
     /// A valid endpoint id, reused from `idempotency.rs` for the same reason.
     const A: &str = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0";
@@ -942,7 +944,7 @@ mod tests {
     async fn an_attach_ceiling_below_the_peers_request_governs() {
         assert_eq!(
             held_for(
-                Limits::default().attach(Duration::from_secs(1)),
+                Limits::default().attach(Attaching::For(Duration::from_secs(1))),
                 Duration::from_secs(30),
             )
             .await,
@@ -957,8 +959,9 @@ mod tests {
     /// literal here rots in the one direction nothing catches: lower the constant
     /// and a hard-coded 30 would assert a ceiling the ledger no longer has.
     ///
-    /// Made red by `scripts/break-once.sh` replacing `attach: MAX_ATTACH,` in
-    /// `impl Default for Limits` with `attach: Duration::from_secs(1),` — the same
+    /// Made red by `scripts/break-once.sh` replacing
+    /// `attach: Attaching::For(MAX_ATTACH),` in `impl Default for Limits` with
+    /// `attach: Attaching::For(Duration::from_secs(1)),` — the same
     /// edit `idempotency.rs`'s `the_default_attach_ceiling_is_max_attach` records,
     /// and this is the guard that says the default reaches the accept path rather
     /// than only the struct. Watched, under `cargo test`:
@@ -996,8 +999,8 @@ mod tests {
         );
     }
 
-    /// Zero is representable on this bound — [`Duration`] has no `NonZero` — so
-    /// what it does is asserted rather than argued.
+    /// Zero is representable inside [`Attaching::For`] — [`Duration`] has no
+    /// `NonZero` — so what it does is asserted rather than argued.
     ///
     /// **What it measures is the hold, which is zero, and NOT that attaching is
     /// turned off.** The attacher still spends a waiting place and re-claims once
@@ -1006,6 +1009,8 @@ mod tests {
     /// and a zero ceiling meeting an exhausted pool is refused `TooManyRunning`
     /// instead. `Limits::attach` carries that distinction; the guard deliberately
     /// covers one arm of it, and naming which arm is the point of this paragraph.
+    /// [`Attaching::Forbidden`] is the setting that does turn it off, and
+    /// `a_forbidden_ceiling_is_refused_without_a_waiting_place` holds that.
     ///
     /// `representability.rs`'s `no_ledger_bound_can_be_asked_to_be_zero` names this
     /// test as one of its two stated exceptions, `ttl`'s being the other.
@@ -1021,12 +1026,119 @@ mod tests {
     async fn an_attach_ceiling_of_zero_refuses_the_attacher_at_once() {
         assert_eq!(
             held_for(
-                Limits::default().attach(Duration::ZERO),
+                Limits::default().attach(Attaching::For(Duration::ZERO)),
                 Duration::from_secs(30)
             )
             .await,
             Duration::ZERO,
             "a zero ceiling must refuse without waiting"
+        );
+    }
+
+    /// Fill every waiting place this peer has, then attach, and answer the refusal.
+    ///
+    /// **The exhausted pool is what makes the two settings tell each other apart**,
+    /// and it is the only observation available: [`Limits`] offers no getters and the
+    /// ledger publishes no waiter count. A setting that needs a place cannot get one
+    /// here and is refused [`TooManyRunning`](IdempotencyRefusal::TooManyRunning) by
+    /// `Ledger::wait`; a setting that needs none never reaches that call and is
+    /// refused [`InFlight`](IdempotencyRefusal::InFlight). So the refusal *names*
+    /// which side of `ledger.wait` the call was turned away on.
+    ///
+    /// One fixture for both, following `actors.rs`'s `gated_behind`: two settings that
+    /// owe a caller opposite things in the same scenario have to be compared through
+    /// one fixture, or the scenario drifts between them.
+    ///
+    /// `start_paused` for `held_for`'s reason — a setting that DOES park must reach
+    /// its answer without a wall-clock wait.
+    async fn refused_with_no_places(attaching: Attaching) -> IdempotencyRefusal {
+        let ledger = Ledger::new(Limits::default().attach(attaching), Records::Memory);
+        let peer = EndpointId::from_str(A).expect("a valid endpoint id");
+        let key = IdempotencyKey::new("k").expect("a valid key");
+
+        let Claim::Fresh(_running) = ledger.claim(peer, key.clone()) else {
+            panic!("the first claim must be fresh");
+        };
+        let places: Vec<_> = (0..MAX_WAITING_PER_PEER)
+            .map(|_| ledger.wait(peer).expect("a free place"))
+            .collect();
+
+        let keyed = claim_key(
+            &any(&ledger),
+            "Probe",
+            peer,
+            Some(Idempotency::attaching_for(key, Duration::from_secs(30))),
+        )
+        .await;
+
+        // Exhaustive, with no catch-all, for the reason
+        // `an_attacher_over_the_cap_is_refused_before_it_parks` gives: the arm that
+        // hides a regression is the one nobody thought to name.
+        let refused = match keyed {
+            Claimed::Refuse(RemoteError::Idempotency(refusal)) => refusal,
+            Claimed::Refuse(other) => panic!("expected an idempotency refusal, got {other:?}"),
+            Claimed::None => panic!("expected a refusal, got no key at all"),
+            Claimed::Run(_) => panic!("expected a refusal, got the key"),
+            Claimed::Replay(_) => panic!("expected a refusal, got a replay"),
+        };
+        drop(places);
+        refused
+    }
+
+    /// **The property [`Attaching::Forbidden`] exists for**: the operator refuses to
+    /// ADMIT an attacher, not merely to hold one.
+    ///
+    /// The pool has no place left, and the answer is
+    /// [`InFlight`](IdempotencyRefusal::InFlight) rather than
+    /// [`TooManyRunning`](IdempotencyRefusal::TooManyRunning) — which can only happen
+    /// if `Ledger::wait` was never reached. That is the assertion: no waiting place is
+    /// spent, so nothing parks and nothing re-claims.
+    ///
+    /// Paired with `a_zero_hold_still_spends_a_waiting_place`, which is the same
+    /// scenario at the setting this one is not.
+    ///
+    /// Made red by `scripts/break-once.sh` replacing `return None;` in
+    /// `Idempotency::attach_budget` with `return Some(Duration::ZERO);` in
+    /// `keylink/src/idempotency.rs`, which is [`Attaching::Forbidden`] collapsing
+    /// into a zero hold. The same edit reddens `idempotency.rs`'s
+    /// `a_forbidden_ceiling_answers_none_for_every_request`, and leaves
+    /// `a_zero_hold_still_spends_a_waiting_place` **green** — the pair below is what
+    /// makes that asymmetry visible. Watched, under `cargo test`:
+    /// `assertion `left == right` failed: a forbidden setting must be refused before
+    /// a place is asked for`, `left: TooManyRunning { limit: 128 }`,
+    /// `right: InFlight`.
+    #[tokio::test(start_paused = true)]
+    async fn a_forbidden_ceiling_is_refused_without_a_waiting_place() {
+        assert_eq!(
+            refused_with_no_places(Attaching::Forbidden).await,
+            IdempotencyRefusal::InFlight,
+            "a forbidden setting must be refused before a place is asked for"
+        );
+    }
+
+    /// The other half, and the whole reason zero is not spelled `Forbidden`: a zero
+    /// hold still ASKS for a waiting place, so an exhausted pool turns it away with
+    /// the count it exceeded.
+    ///
+    /// `Limits::attach`'s own doc claims exactly this — *"`TooManyRunning` when the
+    /// waiting pool was already full"* — and nothing asserted it until here.
+    ///
+    /// Made red by `scripts/break-once.sh` appending `.filter(|held| !held.is_zero())`
+    /// to `.map(|millis| Duration::from_millis(millis).min(cap))` in
+    /// `keylink/src/idempotency.rs`, which is a zero hold collapsing into
+    /// [`Attaching::Forbidden`] — the inverse of the break above, and the reason these
+    /// two are a pair rather than one test twice. That is A2's registered literal with
+    /// a replacement of its own, so it adds no row. Watched, under `cargo test`:
+    /// `assertion `left == right` failed: a zero hold must still spend a waiting
+    /// place`, `left: InFlight`, `right: TooManyRunning { limit: 128 }`.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_hold_still_spends_a_waiting_place() {
+        assert_eq!(
+            refused_with_no_places(Attaching::For(Duration::ZERO)).await,
+            IdempotencyRefusal::TooManyRunning {
+                limit: u32::try_from(MAX_WAITING_PER_PEER).expect("a cap that fits"),
+            },
+            "a zero hold must still spend a waiting place"
         );
     }
 }
