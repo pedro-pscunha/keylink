@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+#MISE description="The three feature guards must refuse the browser target IN KEYLINK'S OWN WORDS"
+#
+# `blocking`, `fs` and `env` each need an OS facility a browser does not have,
+# and `lib.rs` refuses each of them on wasm with a `compile_error!`. This asserts
+# that those refusals FIRE.
+#
+# # Why this greps the message instead of reading the exit code
+#
+# The version that lived in `.github/workflows/ci.yml` asserted only that
+# `cargo check` failed. **That assertion is vacuous**, and it was measured:
+# change the `fs` guard's `target_os = "unknown"` to something that never
+# matches, and the check stayed green — because the build fails anyway, deep
+# inside tokio and mio, once `fs` turns `tokio/fs` on for a target that has no
+# filesystem.
+#
+# So the exit code proves "this does not build", which nobody doubted. The claim
+# worth guarding is the one that workflow's own comment made and did not check:
+# that it fails **in keylink's words**, at the first error, rather than 48 errors
+# deep in a dependency. A caller who sees mio's output does not learn to pass
+# `--no-default-features`.
+#
+# Hence: the failure must mention keylink's own text. That is red the moment a
+# `compile_error!` stops firing, whether or not something else still refuses.
+set -uo pipefail
+
+# One distinctive fragment per guard, taken from `lib.rs`. Short enough to
+# survive rewording of the sentence around it, specific enough that only
+# keylink's own message contains it.
+expect_blocking="needs OS threads"
+expect_fs="needs a filesystem"
+expect_env="needs a process environment"
+
+failed=0
+for feature in blocking fs env; do
+    eval "want=\$expect_$feature"
+
+    out="$(cargo check -p keylink --target wasm32-unknown-unknown \
+        --no-default-features --features "$feature" 2>&1)" && {
+        echo "FAIL: '$feature' BUILT for wasm; its compile_error! guard is gone" >&2
+        failed=1
+        continue
+    }
+
+    if grep -qF -- "$want" <<<"$out"; then
+        echo "ok: '$feature' refuses the browser target in keylink's own words"
+    else
+        echo "FAIL: '$feature' failed to build, but not through keylink's guard." >&2
+        echo "      Expected the error to mention: $want" >&2
+        echo "      A dependency refused it instead, which tells a caller nothing." >&2
+        failed=1
+    fi
+done
+
+exit "$failed"

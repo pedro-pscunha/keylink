@@ -468,9 +468,29 @@ transfer now has to make.
 
 ```sh
 ./scripts/install-hooks.sh   # once per clone — the hooks are not automatic
-mise run gate                # everything CI runs except deny and msrv
-mise run deny                # by hand, whenever you change a dependency
+mise run gate                # the whole gate. There is no other one
 ```
+
+**GitHub Actions CI is disabled, and `mise run gate` is the gate.** The workflow
+was removed rather than left switched off, because a workflow nobody runs still
+looks like coverage. The `pre-push` hook runs `gate`, so the check happens
+before a push instead of after one — and `./scripts/install-hooks.sh` is what
+makes that true for a clone, which is why it is the first line above.
+
+What that costs, stated rather than discovered: **the gate now runs on one
+machine, on one OS.** CI ran Linux, and a developer on a Mac no longer has
+anything checking that the tree builds on the other one. Nothing in the gate is
+weaker than it was — `wasm-guards`, `msrv` and `deny` moved into `gate` in the
+same change that removed the workflow, so the three checks only CI ran are still
+run — but they are run wherever you are, not everywhere.
+
+`wasm-guards` is also **stronger** than the loop it replaces. The workflow
+asserted only that `blocking`, `fs` and `env` fail to build for wasm, which is
+vacuous: they fail anyway, deep inside tokio, once the feature turns on
+something a browser has no facility for. Disabling the `fs` guard left the CI
+check green. The task now requires the failure to quote keylink's own
+`compile_error!`, which is the claim the workflow's comment made and did not
+check.
 
 You need [`mise`](https://mise.jdx.dev) and rustup, and nothing else.
 `rust-toolchain.toml` asks for the `wasm32-unknown-unknown` target and the
@@ -494,8 +514,8 @@ argument for fixing the sharp things now.
 Known gaps, in rough priority order:
 
 - **Never run in a browser.** The crate compiles and links for
-  `wasm32-unknown-unknown` and CI gates that, but no `.wasm` has been loaded in a
-  tab. Threaded wasm is refused outright: the local mailbox holds a thread-affine
+  `wasm32-unknown-unknown` and `mise run gate` gates that, but no `.wasm` has
+  been loaded in a tab. Threaded wasm is refused outright: the local mailbox holds a thread-affine
   task handle behind a `Send + Sync` type.
 - **A running actor turn cannot be bounded from outside.** `Timeout` drops the
   wait for the reply, not the turn, so it sheds no load once a turn has started.

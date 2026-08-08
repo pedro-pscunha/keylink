@@ -1827,6 +1827,10 @@ macro_rules! __keylink_service {
                     f.debug_struct("Handle")
                         .field("service", &stringify!($svc))
                         .field("running", &self.inner.is_running())
+                        // Follows `LocalActor`'s own `Debug`, which gained this
+                        // in the same commit. A handle printing one of the two
+                        // facts its holder can ask for is the drift this avoids.
+                        .field("busy", &self.inner.is_busy())
                         .finish()
                 }
             }
@@ -2082,6 +2086,27 @@ macro_rules! __keylink_service {
                 #[must_use]
                 pub fn is_running(&self) -> bool {
                     self.inner.is_running()
+                }
+
+                /// Whether a turn is running right now.
+                ///
+                /// [`is_running`](Self::is_running) answers `true` for an actor
+                /// wedged inside a turn and for one sitting idle. This separates
+                /// them, and it is the question you cannot ask the actor: a
+                /// message asking would queue behind the turn that wedged it.
+                #[must_use]
+                pub fn is_busy(&self) -> bool {
+                    self.inner.is_busy()
+                }
+
+                /// How many messages are waiting ahead of the one being handled.
+                ///
+                /// Zero or one at the local mailbox depth, and never a number to
+                /// compute a queue-length alert from. What it answers exactly is
+                /// whether the next caller will block on the permit.
+                #[must_use]
+                pub fn buffered(&self) -> u64 {
+                    self.inner.buffered()
                 }
 
                 /// Resolve when this actor ends, and say why.
