@@ -2782,17 +2782,16 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     /// reserved. Use [`ask_catching`](Self::ask_catching) on a served path, and
     /// on any path put the bound inside the method rather than around the call.
     ///
-    /// # Nothing bounds the answer on **this** path, and `abort` is the only
-    /// recovery
+    /// # Nothing bounds the answer on this path, and `abort` is the only recovery
     ///
     /// A turn that never returns leaves this call waiting for ever. The two
     /// **cycle** shapes are documented where they are built — a self-call, on the
     /// generated `Handle`, and a ring of two or more actors, in the section below
     /// that one — and neither is detectable by a type. A turn can also simply
-    /// await something that never fires, which is neither shape and is the
-    /// commonest of the three.
+    /// await something that never fires, which is neither shape.
     ///
-    /// Both dispatch paths bound the wait for a mailbox *permit*, and neither
+    /// With a [`QueueTimeout`](crate::QueueTimeout) installed, both dispatch paths
+    /// bound the wait for a mailbox *permit*, and neither
     /// bounds the wait for the *answer*. The crate's answer-bound is
     /// [`Timeout`](crate::Timeout) — and it is a
     /// [`Middleware`](crate::Middleware), so it reaches a served dispatch and not

@@ -310,19 +310,30 @@ async fn a_running_turn_leaves_exactly_one_free_permit_behind_it() {
 /// ping or they measure the pings instead.
 ///
 /// Reddened by making the cycle not a cycle: `scripts/break-once.sh` on this
-/// file, loosening `hop`'s early return so it fires one hop sooner — the
-/// equality against zero becomes `<= 1` — which stops the chain before the second
-/// edge closes. Watched: "A -> B -> A must hang", in 0.00s, because a chain that
-/// stops answers before the timeout can start. That is the intended red, and it
-/// is why the break is on the hop count rather than on the crate: the hang is the
-/// *absence* of a mechanism, so no crate line can be edited to remove it.
+/// file, searching for `hop`'s early-return line — its equality test against zero
+/// — and replacing it with `if hops <= 1 {`, so the chain stops one hop early and
+/// never closes the second edge. Watched: "A -> B -> A must hang", in 0.00s,
+/// because a chain that stops answers before the timeout can start. That is the
+/// intended red, and it is why the break is on the hop count rather than on the
+/// crate: the hang is the *absence* of a mechanism, so no crate line can be edited
+/// to remove it.
 ///
-/// **Described rather than quoted, deliberately.** `break-once.sh` aborts unless
-/// its search literal occurs exactly once in the target file, and the target here
-/// is this file — so a record that spelled the literal out would appear beside the
-/// line it breaks and make its own break unrunnable. The records that break `src/`
-/// still quote, because there the record lives in a different file from its target
-/// and quoting costs nothing.
+/// # The convention, and it is narrower than "describe the edit"
+///
+/// `break-once.sh` greps and counts **only its search literal**; the replacement is
+/// never searched (`scripts/break-once.sh`: `grep -qF -- "$from"`, then
+/// `assert text.count(old) == 1`). So exactly one half is dangerous to quote.
+///
+/// **The search literal must not appear in the file it targets; the replacement is
+/// always quoted verbatim.** Spelling out a search literal beside the line it
+/// breaks puts the count at two and aborts the harness — which is why the two
+/// records in this file describe their search and quote their replacement. The
+/// records that break `src/` quote both halves, because there the record lives in
+/// a different file from its target and neither half can collide.
+///
+/// An earlier version of this paragraph said "describe the edit", which is one
+/// argument too wide: it left a reader inventing replacement code that has to
+/// compile, for no safety gained.
 #[tokio::test]
 async fn a_two_actor_cycle_hangs_and_wedges_both_actors() {
     let (a, b, _gate, _entered) = ring_of_two();
@@ -460,14 +471,15 @@ async fn aborting_one_actor_of_a_cycle_frees_the_other_and_destroys_it() {
 /// paragraph is about; here it is not the binding constraint, and the hang is
 /// unconditional rather than load-dependent.
 ///
-/// Made red by `scripts/break-once.sh` on this file, replacing the `with_state`
-/// call in `self_read` with an immediately-ready `Ok` — a read that never enters
-/// the mailbox — while keeping the handle binding used, so the break is a
-/// behaviour change and not a dead-code build failure. Watched: "a read from
+/// Made red by `scripts/break-once.sh` on this file, searching for the
+/// `with_state` call in `self_read` and replacing it with
+/// `std::future::ready(Ok::<u64, keylink::MailboxClosed>({ let _ = me; 0 }))` — a
+/// read that never enters the mailbox, keeping the handle binding used so the break
+/// is a behaviour change and not a dead-code build failure. Watched: "a read from
 /// inside a turn must hang", in 0.00s.
 ///
-/// Described and not quoted, for the reason the two-actor record above gives: the
-/// target file is this one.
+/// Search described, replacement quoted, for the reason the two-actor record above
+/// gives: the target file is this one, so only the search half can collide.
 #[tokio::test]
 async fn a_read_from_inside_a_turn_is_a_self_deadlock() {
     let (a, _b, _gate, _entered) = ring_of_two();
