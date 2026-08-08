@@ -120,10 +120,10 @@ async fn nap_taken_beside<F: Future>(work: F) -> Duration {
 /// until the thread is released, so it takes about 400 ms — the sleeper is *held to
 /// the length of somebody else's blocking call*, having asked for a twentieth of it.
 ///
-/// Made red by `scripts/break-once.sh` on this file, searching for `offload`'s whole
-/// one-line call to the `offloaded` wrapper above and replacing it with `work()` —
-/// the mistake, written into the method that exists to avoid it. Watched, at the
-/// first assertion:
+/// Made red by `scripts/break-once.sh` on this file, searching for `offload`'s call
+/// to the wrapper above — pass it **with its eight spaces of indentation** —
+/// `offloaded(work).await`, and replacing it with `work()` — the mistake, written
+/// into the method that exists to avoid it. Watched, at the first assertion:
 ///
 /// > `spawn_blocking` leaves the worker free, so an unrelated 20ms sleep must not be
 /// > held to the length of the block: took …
@@ -133,11 +133,12 @@ async fn nap_taken_beside<F: Future>(work: F) -> Duration {
 /// the order of magnitude — the 20 ms sleep comes back at four hundred and
 /// something, i.e. held to the full length of somebody else's block.
 ///
-/// Search described and replacement quoted, per `tests/cycles.rs`'s convention: the
-/// target file is this one, so only the search half can collide. `work()` is quoted
-/// because a reader must not have to invent compiling Rust — `offload` returns
-/// `u64`, so a bare `nap(millis);` would not type-check, and an earlier draft of
-/// this record made exactly that mistake.
+/// Both halves quoted, under the indentation rule `tests/cycles.rs` states: this
+/// record's copy sits unindented in a `///` line while the code carries eight
+/// spaces, so the indented literal is unique. `work()` is quoted rather than
+/// described because a reader must not have to invent compiling Rust — `offload`
+/// returns `u64`, so a bare `nap(millis);` would not type-check, and an earlier
+/// draft of this record made exactly that mistake.
 #[tokio::test]
 async fn a_synchronous_block_starves_the_runtime_and_spawn_blocking_does_not() {
     let mill = mill::actor(Mill);

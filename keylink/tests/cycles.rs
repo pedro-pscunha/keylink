@@ -309,31 +309,37 @@ async fn a_running_turn_leaves_exactly_one_free_permit_behind_it() {
 /// on its way to timing out, so the permit assertions have to happen before any
 /// ping or they measure the pings instead.
 ///
-/// Reddened by making the cycle not a cycle: `scripts/break-once.sh` on this
-/// file, searching for `hop`'s early-return line — its equality test against zero
-/// — and replacing it with `if hops <= 1 {`, so the chain stops one hop early and
-/// never closes the second edge. Watched: "A -> B -> A must hang", in 0.00s,
-/// because a chain that stops answers before the timeout can start. That is the
-/// intended red, and it is why the break is on the hop count rather than on the
-/// crate: the hang is the *absence* of a mechanism, so no crate line can be edited
-/// to remove it.
+/// Reddened by making the cycle not a cycle: `scripts/break-once.sh` on this file,
+/// searching for `hop`'s early-return line — pass it **with its eight spaces of
+/// indentation** — `if hops == 0 {`, and replacing it with `if hops <= 1 {`, so the
+/// chain stops one hop early and never closes the second edge. Watched:
+/// "A -> B -> A must hang", in 0.00s, because a chain that stops answers before the
+/// timeout can start. That is the intended red, and it is why the break is on the
+/// hop count rather than on the crate: the hang is the *absence* of a mechanism, so
+/// no crate line can be edited to remove it.
 ///
-/// # The convention, and it is narrower than "describe the edit"
+/// # The convention, and it is narrower twice over
 ///
 /// `break-once.sh` greps and counts **only its search literal**; the replacement is
 /// never searched (`scripts/break-once.sh`: `grep -qF -- "$from"`, then
-/// `assert text.count(old) == 1`). So exactly one half is dangerous to quote.
+/// `assert text.count(old) == 1`). So the replacement is always safe to quote, and
+/// a one-line search paired with a multi-line replacement is legal — the harness
+/// never cares how many lines the edit *site* spans, only the search literal.
 ///
-/// **The search literal must not appear in the file it targets; the replacement is
-/// always quoted verbatim.** Spelling out a search literal beside the line it
-/// breaks puts the count at two and aborts the harness — which is why the two
-/// records in this file describe their search and quote their replacement. The
-/// records that break `src/` quote both halves, because there the record lives in
-/// a different file from its target and neither half can collide.
+/// **And the search literal is safe to quote here too**, which is the second
+/// narrowing and the one that took these records off the ungated side. A record in
+/// the file it breaks does not collide with its own quote provided the search
+/// carries the code's **indentation**: this quote sits unindented inside a `///`
+/// line while the code carries eight spaces, so the indented literal is unique and
+/// the record's copy is not a second occurrence.
 ///
-/// An earlier version of this paragraph said "describe the edit", which is one
-/// argument too wide: it left a reader inventing replacement code that has to
-/// compile, for no safety gained.
+/// Two earlier versions of this paragraph were wrong in the same direction, and both
+/// were reasoned rather than measured. The first said "describe the edit", which
+/// left a reader inventing replacement code that had to compile. The second said a
+/// search literal "must not appear in the file it targets" — true of the **bare**
+/// literal, false of the **indented** one, so it described what was quotable all
+/// along. The counts are in `.mise/tasks/anchors`, which registers the indented form
+/// and re-checks it on every run.
 #[tokio::test]
 async fn a_two_actor_cycle_hangs_and_wedges_both_actors() {
     let (a, b, _gate, _entered) = ring_of_two();
@@ -471,15 +477,19 @@ async fn aborting_one_actor_of_a_cycle_frees_the_other_and_destroys_it() {
 /// paragraph is about; here it is not the binding constraint, and the hang is
 /// unconditional rather than load-dependent.
 ///
-/// Made red by `scripts/break-once.sh` on this file, searching for the
-/// `with_state` call in `self_read` and replacing it with
+/// Made red by `scripts/break-once.sh` on this file, searching for `self_read`'s
+/// read line — pass it **with its eight spaces of indentation** —
+/// `me.with_state(|state: &Peer| state.bumps)`, and replacing it with
 /// `std::future::ready(Ok::<u64, keylink::MailboxClosed>({ let _ = me; 0 }))` — a
 /// read that never enters the mailbox, keeping the handle binding used so the break
 /// is a behaviour change and not a dead-code build failure. Watched: "a read from
 /// inside a turn must hang", in 0.00s.
 ///
-/// Search described, replacement quoted, for the reason the two-actor record above
-/// gives: the target file is this one, so only the search half can collide.
+/// Both halves quoted, under the indentation rule the two-actor record above states.
+/// The search line is the **first** line of a three-line chain and is a whole line
+/// in its own right, which is what makes it quotable; the `.await` and
+/// `.unwrap_or` below it are `rustfmt`'s to move, and if it ever reflows this anchor
+/// goes to count 0 — loud, and what `.mise/tasks/anchors` exists to catch.
 #[tokio::test]
 async fn a_read_from_inside_a_turn_is_a_self_deadlock() {
     let (a, _b, _gate, _entered) = ring_of_two();

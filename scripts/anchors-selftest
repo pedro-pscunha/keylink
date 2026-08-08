@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""`mise run anchors` must name the failure it actually has.
+
+MISE description="The anchors gate reports each failure class as itself, not as anchor rot"
+"""
+# This exists because the gate had ONE counter for five checks and printed the
+# anchor-rot playbook on all of them. The population tripwire fires for every
+# branch that adds a record block — the normal case — so the normal case produced
+# `N of M quoted break anchors no longer resolve` plus thirty lines headed
+# `THIS MEANS THE ANCHOR MOVED. FOLLOW IT.` about rot that did not exist.
+#
+# A wrong count gets distrusted; a wrong DIAGNOSIS with a procedure attached gets
+# followed. So the fix needs a guard, and the guard has to assert BOTH directions:
+# the playbook must be absent when no anchor moved, and present when one did.
+# Asserting only the absence would pass on a build that never prints it at all.
+#
+# ── why this perturbs a COPY and never the tree ──────────────────────────────
+#
+# The obvious shape is `scripts/break-once.sh`, and it does not fit: that harness
+# runs `cargo test`, and the thing under test here is a Python gate. The next
+# shape is to edit `.mise/tasks/anchors` in place and restore it — which is the
+# orphan hazard that harness already carries, in a script with no `trap`. So this
+# copies the task to a temp file, perturbs the COPY, and runs that. The tree is
+# never written to, so an interrupted run cannot leave a stale restore behind.
+#
+# The copy still resolves the repo correctly: the task computes ROOT from
+# `git rev-parse --show-toplevel`, which answers from the cwd and not from the
+# script's own path. So a copy in /tmp reads the same tree the original would.
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+
+ROOT = pathlib.Path(
+    subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+)
+TASK = ROOT / ".mise" / "tasks" / "anchors"
+PLAYBOOK = "THIS MEANS THE ANCHOR MOVED"
+
+source = TASK.read_text()
+failures: list[str] = []
+
+
+def run(text: str) -> tuple[int, str]:
+    """Run a perturbed copy of the task and return its exit code and merged output."""
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tmp:
+        tmp.write(text)
+        path = tmp.name
+    try:
+        done = subprocess.run(
+            [sys.executable, path], capture_output=True, text=True, cwd=ROOT
+        )
+        return done.returncode, done.stdout + done.stderr
+    finally:
+        pathlib.Path(path).unlink(missing_ok=True)
+
+
+def check(name: str, condition: bool, detail: str) -> None:
+    if condition:
+        print(f"ok: {name}")
+    else:
+        failures.append(name)
+        print(f"FAIL {name}", file=sys.stderr)
+        print(f"     {detail}", file=sys.stderr)
+
+
+# ── the tree as it stands must be green, or the two probes below prove nothing ──
+#
+# A gate that is already red would satisfy "exits 1" for the wrong reason, and the
+# absence probe would then be measuring the wrong run.
+code, out = run(source)
+check(
+    "the unperturbed task passes",
+    code == 0,
+    f"exit {code}; the probes below cannot be trusted until this is green:\n{out}",
+)
+
+# ── probe 1: the population tripwire must NOT claim an anchor moved ────────────
+#
+# Perturbing RECORD_BLOCKS is exactly what a branch adding records does to this
+# gate, so this probe is the normal case rather than an exotic one.
+blocks = re.search(r"^RECORD_BLOCKS = (\d+)$", source, re.M)
+if blocks is None:
+    check("RECORD_BLOCKS is findable", False, "no `RECORD_BLOCKS = <n>` line in the task")
+else:
+    wrong = int(blocks.group(1)) + 1
+    code, out = run(
+        source.replace(blocks.group(0), f"RECORD_BLOCKS = {wrong}", 1)
+    )
+    check("a population mismatch fails the gate", code == 1, f"exit {code}, expected 1")
+    check(
+        "a population mismatch says so",
+        "FAIL population" in out,
+        "expected `FAIL population` in the output",
+    )
+    check(
+        "a population mismatch does NOT print the anchor-rot playbook",
+        PLAYBOOK not in out,
+        "the playbook fired for a failure that is not anchor rot - this is the "
+        "defect the two-counter split fixes, and it has come back",
+    )
+    # The message's CONTENT, not just which block fired. The counter split stops the
+    # rot playbook arriving; these three assert the population failure says the right
+    # thing on its own, because that is what a contributor actually reads.
+    check(
+        "a population mismatch names the number counted from the tree",
+        f"to {int(blocks.group(1))}," in out,
+        "the failure should state the measured count as the value to set, or the "
+        "contributor computes one instead",
+    )
+    check(
+        "a population mismatch says re-measure and never carry",
+        "RE-MEASURE, never carry" in out,
+        "the re-measure instruction is missing - a value carried across a rebase is "
+        "the way this constant goes stale",
+    )
+    check(
+        "a population mismatch forbids deleting a row",
+        "NOTHING here asks you to delete a row" in out,
+        "the shortest path out of this message must not be deletion: removing a row "
+        "turns a working check into a silent pass, and that is what the wrong "
+        "playbook used to point at",
+    )
+
+# ── probe 2: a real resolution failure MUST print the playbook ─────────────────
+#
+# The other direction, and the one that stops the fix from being "never print it".
+# Corrupting the first row's literal is a count-0 rot: the anchor is simply gone.
+row = re.search(r'^    \("([^"]+)", "([^"]+)", "([^"]+)",\n?\s*"', source, re.M)
+if row is None:
+    check("an ANCHORS row is findable", False, "could not locate a row to perturb")
+else:
+    rid = row.group(1)
+    # Append a marker to that row's literal, so it resolves to nothing. Done on the
+    # first row only, and by targeting its opening quote, so no other row moves.
+    at = source.index(row.group(0)) + len(row.group(0))
+    broken = source[:at] + "zzz-no-such-anchor-zzz" + source[at:]
+    code, out = run(broken)
+    check("a rotted anchor fails the gate", code == 1, f"exit {code}, expected 1")
+    check(
+        "a rotted anchor DOES print the anchor-rot playbook",
+        PLAYBOOK in out,
+        f"row {rid} was made unresolvable and the playbook did not fire - the "
+        "remedy is now unreachable for the failure it belongs to",
+    )
+    check(
+        "a rotted anchor names the row",
+        f"FAIL {rid}" in out,
+        f"expected `FAIL {rid}` in the output",
+    )
+
+print()
+if failures:
+    print(f"{len(failures)} self-test check(s) failed: {', '.join(failures)}",
+          file=sys.stderr)
+    sys.exit(1)
+print("ok: the anchors gate reports each failure class as itself")
