@@ -51,7 +51,10 @@ MISE description="Replay each REDNESS row's break and check it reddens its own g
 #
 #     mise run replay-anchors            # every row in REDNESS
 #     mise run replay-anchors L5 A5      # named rows only
+#
+#     REPLAY_REGISTRY=/tmp/drifted mise run replay-anchors L5    # this task, tested
 import ast
+import os
 import pathlib
 import subprocess
 import sys
@@ -64,7 +67,12 @@ ROOT = pathlib.Path(
         check=True,
     ).stdout.strip()
 )
-TASK = ROOT / ".mise" / "tasks" / "anchors"
+# Overridable so THAT THIS TASK IS ITSELF TESTABLE: point it at a copy of the
+# registry carrying a deliberately wrong sentence and the failure arm below must
+# fire. Without the override the only way to reach that arm is to COMMIT a wrong
+# value, and the tree must be clean before this will run at all — so the arm would
+# stay unexercised, which for a checker is the same as absent.
+TASK = pathlib.Path(os.environ.get("REPLAY_REGISTRY", ROOT / ".mise" / "tasks" / "anchors"))
 
 
 def registry(name: str):

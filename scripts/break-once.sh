@@ -81,6 +81,12 @@ echo "── runner: ${runner[*]}"
 # `tee` keeps the whole run on stdout, where every consumer already looks, and
 # leaves a copy behind. The copy is NOT deleted: it is the evidence for whatever
 # the searcher concluded, and its path is printed for that reason.
+#
+# **PREVENTIVE, and the margin is one line.** Measured 2026-08-08 over the nine
+# breaks `REDNESS` registers: every watched sentence fell inside the fifteen-line
+# window, so `tail` hid none of them — and `A1`'s sat at line 26 of 40, one line
+# inside it. One more line of runner output before the panic and that row would
+# have reported a break that did not redden.
 log="$(mktemp -t break-once)"
 set +e
 "${runner[@]}" "$@" "$filter" 2>&1 | tee "$log"

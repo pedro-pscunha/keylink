@@ -604,11 +604,13 @@ DESCRIBED = [
 # what to write nor what to expect. Three ways out.
 #
 #   * PARSE the replacement and the watched sentence out of the record's prose.
-#     Rejected, and MEASURED rather than argued: the "Watched:" sentences in this
-#     tree are comma-joined prose - `left: 5, right: 0` - while the panic
-#     `assert_eq!` prints puts `left:` and `right:` on their own lines. A parser fed
-#     the record's own words would assert a string no run can contain, so it fails
-#     on CORRECT records. And the general objection this file already carries: a
+#     Rejected, and MEASURED rather than argued. The "Watched:" sentences here are
+#     comma-joined prose while the panic `assert_eq!` prints is not. Searched in L5's
+#     own run: `after n=9: spent, left: 5, right: 0` does NOT occur, and neither does
+#     `left: 5, right: 0`; what occurs is `assertion \`left == right\` failed: after
+#     n=9: spent` with `left: 5` and `right: 0` on the two lines under it. So a parser
+#     fed the record's own words asserts a string no run can contain, and it fails on
+#     CORRECT records. And the general objection this file already carries: a
 #     heuristic that misses a record checks nothing while reporting success.
 #   * A GENERIC destructive substitution - blank the line, invert the comparison.
 #     Rejected: a generic edit can redden a DIFFERENT test than the record names,
@@ -632,8 +634,13 @@ DESCRIBED = [
 # Those rows are resolution-checked and unreplayed - the state every row was in.
 #
 # `watched` is a substring of the RUN's output, not of the record's prose, for the
-# parsing reason above. Every entry was run and watched at `080fec7`; where the
-# record's sentence and the run disagreed, the run won and the record was corrected.
+# parsing reason above - each one is a single line lifted out of a watched run.
+#
+# **All nine were run and watched at `76d0f8f`, and none of them disagreed with its
+# record.** That is worth writing down because the opposite was expected: the reason
+# for replaying at all is that two records had claimed more redness than they had. A
+# clean sweep of nine says these nine are sound, and says nothing about the rest.
+# Every run exited 101, so each break reached its test rather than aborting.
 #
 # id -> (replacement, watched substring, test filter, extra runner arguments)
 REDNESS = {
