@@ -182,7 +182,7 @@ read with no handler and no body.
 
 ```rust
 pub struct Idempotency { key: IdempotencyKey, attach_for_millis: Option<u64> }
-impl Idempotency { fn new(key); fn attaching_for(key, budget); fn key(); fn attach_budget(); }
+impl Idempotency { fn new(key); fn attaching_for(key, budget); fn key(); pub(crate) fn attach_budget(cap); }
 impl From<IdempotencyKey> for Idempotency {}          // every call site keeps compiling
 impl Client { fn with_idempotency(&self, impl Into<Idempotency>) -> Self }
 ```

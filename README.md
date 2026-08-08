@@ -287,11 +287,14 @@ also **voids limit 2's remedy on every method outside the policy**, because
 keeps at-most-once and gives up the answer on purpose so that a caller's payload is
 not held for the 600 s of limit 3. It narrows limit 4's window from `MAX_TOMBSTONES`
 plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. And `ServiceBuilder::limits`
-replaces the numbers themselves: every constant limits 3, 4 and 5 print is a default
-rather than a fixed value, which is how a service bounds its own memory instead of
-only its exposure. **The margin limit 4 names is the one to keep** — it is a property
-of the default, so narrowing it takes on the degradation that limit says a caller
-cannot detect. See `docs/rfc-08-serving-side-keys.md`.
+replaces the numbers themselves: `RECORD_TTL`, `MAX_RECORDS`, `MAX_RECORDED_BYTES`,
+`MAX_RECORDED_FRAME` and `MAX_TOMBSTONES` are the **defaults** of `Limits` fields
+rather than fixed values, which is how a service bounds its own memory instead of only
+its exposure. Not every constant these limits print: `MAX_HEADER` is the wire's own cap
+and `APPLIED_BOUND` bounds a set in the caller's state, and neither is a `Limits`
+field. **The margin limit 4 names is the one to keep** — it is a property of the
+default, so narrowing it takes on the degradation that limit says a caller cannot
+detect. See `docs/rfc-08-serving-side-keys.md`.
 
 1. **There is no reliable `tell`.** A `tell` has no reply stream, so nothing can
    ack it, nothing can refuse it, and it does not accept a key — there is no reply

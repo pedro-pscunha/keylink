@@ -297,8 +297,14 @@ async fn claim_key(
         return Claimed::Refuse(IdempotencyRefusal::InFlight.into());
     };
     // Taken before anything parks, and held to the end of this function so it
-    // covers the wait AND the re-claim after it. A caller that is not going to
-    // wait never reaches here, so it never spends a place.
+    // covers the wait AND the re-claim after it. A caller that did not ASK to attach
+    // never reaches here, so it never spends a place.
+    //
+    // But "will not wait" is not the same as "did not ask": a service with
+    // `Limits::attach` at zero gets `Some(ZERO)` above, reaches this line, spends a
+    // place, and expires at the timeout below. So a zero ceiling is refused
+    // `TooManyRunning` rather than `InFlight` once the waiting pool is full, which is
+    // what `Limits::attach`'s own doc now says instead of "turns the feature off".
     let _waiting = match ledger.wait(peer) {
         Ok(waiting) => waiting,
         Err(refusal) => return Claimed::Refuse(refusal),
@@ -970,9 +976,10 @@ mod tests {
     /// The clamp is a `min` and not an assignment, so a modest request is not
     /// rounded **up** to the service's ceiling.
     ///
-    /// This is the guard the other two cannot be: both of those pass when the
-    /// ceiling replaces the request outright, because in both the ceiling is the
-    /// smaller number.
+    /// **This is the guard the other three cannot be**, and the two break sets are
+    /// disjoint: cap removal reddens the other three and leaves this one green, while
+    /// the edit below reddens this one alone. All four measured one run at a time,
+    /// because the first version of this claim said "two" in a record one file away.
     ///
     /// Made red by `scripts/break-once.sh` replacing
     /// `.map(|millis| Duration::from_millis(millis).min(cap))` with
@@ -992,9 +999,14 @@ mod tests {
     /// Zero is representable on this bound — [`Duration`] has no `NonZero` — so
     /// what it does is asserted rather than argued.
     ///
-    /// It turns attaching off for this service: the answer is the
-    /// [`InFlight`](IdempotencyRefusal::InFlight) a caller who never asked to
-    /// attach already gets, and it arrives without the task waiting for anything.
+    /// **What it measures is the hold, which is zero, and NOT that attaching is
+    /// turned off.** The attacher still spends a waiting place and re-claims once
+    /// before expiring — this test gets
+    /// [`InFlight`](IdempotencyRefusal::InFlight) because the pool has a place free,
+    /// and a zero ceiling meeting an exhausted pool is refused `TooManyRunning`
+    /// instead. `Limits::attach` carries that distinction; the guard deliberately
+    /// covers one arm of it, and naming which arm is the point of this paragraph.
+    ///
     /// `representability.rs`'s `no_ledger_bound_can_be_asked_to_be_zero` names this
     /// test as one of its two stated exceptions, `ttl`'s being the other.
     ///

@@ -753,9 +753,14 @@ macro_rules! __keylink_service {
             /// there for a different reason, and a reader wanting different bounds
             /// has none to look for it.
             ///
-            /// **Not a `Limits` parameter, deliberately.** Issue #13 refused a long
-            /// parameter list for that type, and a fourth way to build a service
-            /// costs more than a default a caller can read here.
+            /// **Not a `Limits` parameter, deliberately, and the reason is this
+            /// function's own signature.** Issue #13 lists "adding a parameter to
+            /// `serve`" as one of three surfaces that are genuinely breaking once
+            /// this crate is published — which is why it asked for a documentation
+            /// fix here rather than a signature change. A fourth way to build a
+            /// service also costs more than a default a caller can read, but that
+            /// argument is about a `Limits` *constructor* and not about this
+            /// parameter.
             pub fn serve<H: Handler>(
                 node: &$crate::Node,
                 handler: H,
@@ -2025,6 +2030,12 @@ macro_rules! __keylink_service {
                 /// them, go through [`Self::service`] and
                 /// [`Server::builder`](keylink::Server::builder) — the route the
                 /// paragraph above names for a different reason.
+                ///
+                /// **No `Limits` parameter here either, and for the reason
+                /// [`serve`] gives**: issue #13 lists adding a parameter to these
+                /// front doors as one of three surfaces that genuinely break once
+                /// this crate is published, so it asked for a documented default
+                /// rather than a wider signature.
                 ///
                 /// # The server holds the actor, and holds it past `shutdown`
                 ///

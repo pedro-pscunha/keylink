@@ -287,8 +287,11 @@ pub const MAX_RUNNING: usize = 4096;
 /// A parked attacher holds no claim, so neither running cap can see it or the
 /// QUIC stream pair it is holding open: one claimed key plus 40 connections of
 /// 100 streams each parks 4000 tasks for [`MAX_ATTACH`] and meets no bound.
-/// **This bound and [`Limits::attach`] are the two factors of that product**, and
-/// both are the serving side's to set — the count here, the duration there.
+/// **The count and the duration are the two factors of that product**, and both are
+/// the serving side's to set: the count through [`Limits::waiting_per_peer`], which
+/// defaults to this constant, and the duration through [`Limits::attach`]. This is a
+/// `const` and sets nothing by itself — a distinction this crate had just finished
+/// removing from [`MAX_ATTACH`]'s own doc when it reappeared here.
 /// Same number as [`MAX_RUNNING_PER_PEER`], because that is also the legitimate
 /// ceiling — a [`Peer`](crate::Peer) re-issue produces at most one attacher per
 /// running claim, and running claims are capped there.
@@ -867,13 +870,30 @@ impl Idempotency {
     /// Taking the cap as an argument rather than returning the raw request is
     /// deliberate: an uncapped accessor returns a number a **peer** chose, and
     /// nothing in a signature would then say that its one caller must clamp it.
-    /// The wrong use is unrepresentable instead.
+    /// **Reading the budget without naming a ceiling** is what the parameter makes
+    /// unrepresentable — not every misuse, since `attach_budget(Duration::MAX)`
+    /// compiles and means what it says.
     ///
     /// `None` means the caller did not ask to attach at all. That is refused
     /// [`IdempotencyRefusal::InFlight`] rather than capped, so `cap` never
     /// applies to it.
+    ///
+    /// # `pub(crate)`, and the parameter is the reason
+    ///
+    /// This was `pub` until the cap became an argument. The only correct argument is
+    /// the serving side's [`Limits::attach`], and **no caller outside this crate can
+    /// obtain it**: it is not on the wire, and `Limits` exposes no getter. A public
+    /// method whose one valid argument is unobtainable from outside is a leak rather
+    /// than an API, and `CONTRIBUTING.md`'s test agrees — no macro, no test, no
+    /// example and no README line names it.
+    ///
+    /// Issue #13 lists "changing what the `pub` `Idempotency::attach_budget`
+    /// returns" as one of three surfaces that stop being free at publish. This change
+    /// is exactly that, so the choice was to price the surface or remove it.
+    /// Removing it is free while the crate is unpublished and leaves nothing to
+    /// price.
     #[must_use]
-    pub fn attach_budget(&self, cap: Duration) -> Option<Duration> {
+    pub(crate) fn attach_budget(&self, cap: Duration) -> Option<Duration> {
         self.attach_for_millis
             .map(|millis| Duration::from_millis(millis).min(cap))
     }
@@ -1012,7 +1032,7 @@ struct Inner {
 ///
 /// **[`MAX_ATTACH`] was on that list, as the one bound "genuinely the ledger's
 /// and still absent", and the reason given for its absence was wrong.** It said
-/// the cap is applied in [`Idempotency::attach_budget`], "which holds no
+/// the cap is applied in `Idempotency::attach_budget`, "which holds no
 /// ledger" — true of the method and false of its only caller. The serving side's
 /// `claim_key` binds the ledger before it reads the budget, so it holds this
 /// value at the instant it applies the cap, and it now passes it in. The ceiling
@@ -1026,6 +1046,13 @@ struct Inner {
 /// Because nine of its ten fields are tuning decisions whose wrong value is
 /// **visible in a refusal** — every one of them refuses through
 /// [`IdempotencyRefusal`]. Slower or fatter, and both visible and recoverable.
+///
+/// **Visible at the SMALL end of the range, and three fields go quiet at the large
+/// one.** A value too low refuses, loudly and per call. A value too high can put its
+/// own bound out of reach, and a bound that never fires reports nothing at all — so
+/// [`pool_records`](Self::pool_records), [`pool_bytes`](Self::pool_bytes) and
+/// [`attach`](Self::attach) each document that end of their own range, because no
+/// refusal will. The safety of this `Default` is a claim about departures downward.
 /// Only the four running and waiting bounds put the exceeded figure *in* the
 /// refusal, via [`TooManyRunning`](IdempotencyRefusal::TooManyRunning); the pool
 /// bounds and the ceiling answer
@@ -1096,11 +1123,11 @@ struct Inner {
 /// **A constructor taking every bound at once, rejected.**
 /// `Limits::new(1024, 1048576, 8192, ..)` compiles with any two of its `usize`
 /// arguments transposed and [`Limits::default().pool_records(n)`](Self::pool_records)
-/// cannot, because the name is at the call site rather than in the position.
-/// [`attach`](Self::attach) is the second argument, arriving as evidence: it took
-/// this type from nine bounds to ten, which is one more positional parameter for
-/// every existing caller of such a constructor and no change at all for a caller of
-/// the setters.
+/// cannot, because the name is at the call site rather than in the position. And the
+/// second reason is [`attach`](Self::attach) itself, which arrived as evidence while
+/// this paragraph was being written: it took this type from nine bounds to ten, which
+/// is one more positional parameter for every existing caller of such a constructor
+/// and no change at all for a caller of the setters.
 ///
 /// **A setter returning `Result`, rejected.** The shape follows `Files::limit` in
 /// `keylink-persist`, whose own doc gives the reason a builder documents its floor
@@ -1193,11 +1220,16 @@ impl Limits {
     ///
     /// # What a maximal value does, and it is the opposite of bounding
     ///
-    /// `Ledger::evict` drops records *while* the held count is over this number, so
-    /// at [`NonZeroUsize::MAX`] that condition is unreachable and the loop body
-    /// never runs: **the record pool evicts nothing, and what bounds it is
-    /// [`ttl`](Self::ttl) alone.** Every settled reply is held until it expires, and
-    /// the memory that costs is whatever the traffic was.
+    /// `Ledger::evict` drops records *while* the held count is over this number
+    /// **or** the byte total is over [`pool_bytes`](Self::pool_bytes), so
+    /// [`NonZeroUsize::MAX`] here makes one half of that condition unreachable and
+    /// not the whole of it. **Maximal on both, and the loop body never runs: the
+    /// record pool evicts nothing, and what bounds it is [`ttl`](Self::ttl) alone.**
+    /// Maximal here with a small `pool_bytes` and the byte half still fires, so the
+    /// pool still evicts — this paragraph asserted the conclusion from one field
+    /// until a review read the condition. Where nothing evicts, every settled reply
+    /// is held until it expires and the memory that costs is whatever the traffic
+    /// was.
     ///
     /// Nothing refuses, which is what makes this end of the range quieter than the
     /// other one. Zero is loud — every retry reads
@@ -1448,10 +1480,25 @@ impl Limits {
     /// setter existed a caller could set the count and not the duration, so it
     /// controlled one factor of a product.
     ///
-    /// Zero refuses every attaching call
-    /// [`InFlight`](IdempotencyRefusal::InFlight), which is the answer a caller
-    /// who never asked to attach already gets — so it turns the feature off for
-    /// this service rather than producing a refusal nobody can read.
+    /// **Zero does not turn attaching off, and what separates the two is a waiting
+    /// place.** `Idempotency::attach_budget` returns
+    /// `Some(Duration::ZERO)` and not `None`, so a zero ceiling carries the caller
+    /// through the whole accept path: it spends a [`waiting`](Self::waiting) place,
+    /// re-claims the key once — so a call that settles in that instant is still
+    /// answered from the record — and only then expires. What zero buys is that no
+    /// attacher is ever *held*. What it does not buy is the machinery not running.
+    ///
+    /// **So the refusal is not one refusal.** It is
+    /// [`InFlight`](IdempotencyRefusal::InFlight) when a place was free, and
+    /// [`TooManyRunning`](IdempotencyRefusal::TooManyRunning) when the waiting pool
+    /// was already full, because `Ledger::wait` is reached either way and refuses
+    /// with the count it exceeded. An earlier version of this paragraph said zero
+    /// "turns the feature off" and named `InFlight` alone; both halves were wrong on
+    /// a reachable path.
+    ///
+    /// A caller that wants never to be parked already has the switch, and it is on
+    /// the *calling* side — see [`waiting`](Self::waiting). Setting this to zero is
+    /// the serving side refusing to hold, which is not the same act.
     ///
     /// # No layer can stand in for this, and the ordering is why
     ///
@@ -1552,7 +1599,7 @@ impl Ledger {
     /// This service's ceiling on an attaching call's budget.
     ///
     /// The one bound read from outside the ledger, because the clamp is applied on
-    /// the accept path — [`Idempotency::attach_budget`] takes it there. A
+    /// the accept path — `Idempotency::attach_budget` takes it there. A
     /// crate-private reader rather than a getter on [`Limits`], which deliberately
     /// offers none.
     pub(crate) fn attach_cap(&self) -> Duration {
@@ -2713,9 +2760,20 @@ mod tests {
         /// carries its eight spaces of indentation and this record's copy has none.
         /// Watched, under `cargo test`:
         /// `assertion `left == right` failed: a bound nothing can reach must evict
-        /// nothing`, `left: 0`, `right: 64`. The same edit reddens both guards above,
-        /// which is expected of an unconditional evict and is why this record names
-        /// the assertion rather than a count of failures.
+        /// nothing`, `left: 0`, `right: 64`.
+        ///
+        /// **That edit reddens `the_record_count_stays_inside_its_bound` above and
+        /// leaves `the_recorded_bytes_stay_inside_their_bound` GREEN.** Measured —
+        /// `1 passed; 1 failed` on one run over both — after this record first claimed
+        /// it reddened both. The reason is a property of the byte guard rather than of
+        /// this one: it asserts `bytes <= 64`, and unconditional eviction empties the
+        /// pool, which satisfies an upper bound. **An upper bound cannot see
+        /// over-eviction**, so that guard is one-sided by construction and this edit
+        /// is invisible to it.
+        ///
+        /// Worth the sentence because the first filter used to check this,
+        /// `stays_inside`, matched only one of the two names — the other reads
+        /// `stay_inside` — so a run that looked like it covered both covered one.
         #[test]
         fn a_maximal_pool_evicts_nothing() {
             let ledger = bounded(
@@ -3364,9 +3422,23 @@ mod tests {
         /// `.map(|millis| Duration::from_millis(millis))`, which is the cap going
         /// away rather than moving. Watched, under `cargo test`:
         /// `assertion `left == right` failed`, `left: Some(3600s)`,
-        /// `right: Some(30s)`. That edit also reddens two guards on the accept path
-        /// in `rpc.rs`, and `.map(|_| cap)` — the cap swallowing a smaller request
-        /// — reddens this test's third assertion and one of those two.
+        /// `right: Some(30s)`.
+        ///
+        /// **The two break sets are DISJOINT on the accept path, and this record used
+        /// to claim they overlapped.** Measured, one `break-once.sh` run per guard:
+        /// cap removal reddens three of the four guards in `rpc.rs` —
+        /// `an_attach_ceiling_below_the_peers_request_governs`,
+        /// `a_peer_over_the_attach_ceiling_is_held_for_the_default` and
+        /// `an_attach_ceiling_of_zero_refuses_the_attacher_at_once` — and leaves
+        /// `a_peer_under_the_attach_ceiling_keeps_its_own_budget` **green**, because
+        /// under it the peer's request is already the smaller number. `.map(|_| cap)`
+        /// reddens exactly that fourth one, plus this test's third assertion.
+        ///
+        /// The old wording said "two guards" and sent a reader to "one of those two",
+        /// which named no guard at all: the guard `.map(|_| cap)` reddens is precisely
+        /// the one cap removal cannot. That is also why the fourth guard exists, and
+        /// `rpc.rs`'s own record says so one file away — two records disagreed and the
+        /// registered one was the wrong one.
         #[test]
         fn a_budget_is_capped_at_the_cap_it_is_given() {
             let over = Idempotency::attaching_for(key("k"), Duration::from_secs(3600));
