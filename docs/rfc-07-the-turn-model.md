@@ -1974,9 +1974,12 @@ handle — and a wedged one cannot be asked, because the question queues behind 
 A bare `mpsc::Receiver` still takes the default, and the supervision tests that hand
 `supervise` one are why it stays.
 
-Red-tested per arm, separately, because they are separately load-bearing. Breaking the
-**mail** arm reddens seven tests across **two cargo targets**, and leaves
-`busy_is_true_during_a_feed_turn` green. Breaking the **feed** arm reddens only that one.
+Red-tested per arm, separately, because they are separately load-bearing. Both arms were
+broken and both counts below were watched, one arm at a time.
+
+Breaking the **mail** arm reddens seven tests across **two cargo targets** and leaves
+`busy_is_true_during_a_feed_turn` green. Breaking the **feed** arm reddens exactly that
+one — `--lib` stays at 170 green, `--test actors` at `47 passed; 1 failed`.
 
 `cargo test -p keylink --lib` — three, all added with `LocalActor::is_busy`:
 
