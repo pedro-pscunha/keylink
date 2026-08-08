@@ -439,7 +439,7 @@ pub enum IdempotencyRefusal {
     /// [`Rpc::method`](crate::Rpc::method) returns. Redundant to the caller,
     /// which knows which call it made — one stream per call, so this refusal
     /// arrives on that call's own stream — and carried anyway for the reason
-    /// [`RemoteError::NoSuchActor`](crate::RemoteError::NoSuchActor) carries the
+    /// [`RemoteError::NoSuchActor`] carries the
     /// id it was given: a log line read away from the call site has to say what
     /// it is about. `String` rather than `&'static str`, because this crosses
     /// the wire inside [`RemoteError`] and has to `Deserialize`.
@@ -768,7 +768,7 @@ pub struct Idempotency {
     /// under the same key. `None` refuses immediately.
     ///
     /// Millis rather than a `Duration`, matching
-    /// [`RemoteError::TimedOut`](crate::RemoteError::TimedOut), so `Duration`'s
+    /// [`RemoteError::TimedOut`], so `Duration`'s
     /// `Schema` impl never enters the hashed contract.
     attach_for_millis: Option<u64>,
 }

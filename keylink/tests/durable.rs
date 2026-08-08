@@ -9,6 +9,11 @@
 //! the state.** A restart is simulated by dropping every handle to the actor and
 //! building a new one from the store, which is all a new process would do.
 
+// WHOLE FILE, for `tests/persist.rs`'s reason: every test here drives the file
+// adapter, so `persist-file` is the subject rather than a detail. The header above
+// says it in words already — "the file adapter" is half of what the hexagon is
+// demonstrated with.
+#![cfg(feature = "persist-file")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink::Caller;

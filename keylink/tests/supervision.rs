@@ -41,11 +41,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(feature = "persist-file")]
+use keylink::Persist;
 use keylink::{
-    Allowlist, Caller, Deferred, Ended, Intensity, Observer, Persist, RemoteError, Replied, Reply,
-    Server, Stop, Stream, TurnFut, TurnInfo, TurnOutcome,
+    Allowlist, Caller, Deferred, Ended, Intensity, Observer, RemoteError, Replied, Reply, Server,
+    Stop, Stream, TurnFut, TurnInfo, TurnOutcome,
 };
+#[cfg(feature = "persist-file")]
 use keylink_persist::file::Files;
+#[cfg(feature = "persist-file")]
 use keylink_persist::{Durable, RestoreError, StateId};
 
 mod common;
@@ -93,8 +97,7 @@ keylink::service! {
     /// panics that escape a turn's guard — a factory's and a feed's — need an
     /// actor that has **both** a feed and a parked reply, and `Desk` has no feed.
     ///
-    /// # This moved `Ticker`'s ALPN, and the reason is the `rpc` rather than the
-    /// `#[defer]`
+    /// # This moved `Ticker`'s ALPN, and the reason is the `rpc` rather than the `#[defer]`
     ///
     /// Worth stating where it was done rather than only in a report. The attribute
     /// is free — `protocol.rs` holds
@@ -162,6 +165,7 @@ impl ledger::Actor for Ledger {
     }
 }
 
+#[cfg(feature = "persist-file")]
 impl Durable for Ledger {
     const VERSION: u32 = 1;
 
@@ -375,8 +379,10 @@ impl<A: Send + 'static> Observer<A> for Tracked {
 // ─────────────────────────────────────────────────────────────────── fixtures
 
 /// A scratch directory that removes itself.
+#[cfg(feature = "persist-file")]
 struct Scratch(std::path::PathBuf);
 
+#[cfg(feature = "persist-file")]
 impl Scratch {
     fn new(name: &str) -> Self {
         let path =
@@ -386,12 +392,14 @@ impl Scratch {
     }
 }
 
+#[cfg(feature = "persist-file")]
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
+#[cfg(feature = "persist-file")]
 async fn store(name: &str) -> (Scratch, Files) {
     let scratch = Scratch::new(name);
     let files = Files::open(&scratch.0).await.expect("opens");
@@ -442,6 +450,7 @@ async fn ended(waiting: impl std::future::Future<Output = Ended>) -> Ended {
 /// snapshot, which stops at the last turn that was committed.
 ///
 /// Real time and a real file store, and nothing here asserts a duration.
+#[cfg(feature = "persist-file")]
 #[tokio::test]
 async fn an_actor_restarts_from_its_last_committed_state() {
     let (_scratch, files) = store("committed").await;
@@ -1185,6 +1194,7 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
 /// This is also the keyed door a durable actor could not use lazily before:
 /// `SystemBuilder::spawn_with`'s factory is a plain `Fn` and cannot `await`, and
 /// `Persist::open` is I/O. This factory awaits, once per incarnation.
+#[cfg(feature = "persist-file")]
 #[tokio::test]
 async fn a_keyed_actor_restarts_from_its_last_committed_state() {
     let (_scratch, files) = store("keyed").await;

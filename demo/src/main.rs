@@ -1,7 +1,9 @@
 //! An inventory service across two machines.
 //!
-//!   cargo run -p demo -- serve
-//!   cargo run -p demo -- connect <endpoint-id> [file-to-upload]
+//! ```text
+//! cargo run -p demo -- serve
+//! cargo run -p demo -- connect <endpoint-id> [file-to-upload]
+//! ```
 //!
 //! Note what is NOT in this file: no IP address, no port, no framing, no
 //! serialization call, no ALPN string, no version number. The domain types and

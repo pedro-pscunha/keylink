@@ -38,8 +38,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use keylink::{Caller, Ended, Observer, Persist, Stream, TurnFut, TurnInfo, TurnOutcome};
+#[cfg(feature = "persist-file")]
+use keylink::Persist;
+use keylink::{Caller, Ended, Observer, Stream, TurnFut, TurnInfo, TurnOutcome};
+#[cfg(feature = "persist-file")]
 use keylink_persist::file::Files;
+#[cfg(feature = "persist-file")]
 use keylink_persist::{Durable, RestoreError, StateId};
 use tokio::sync::{mpsc, oneshot};
 
@@ -619,6 +623,7 @@ impl tape::Actor for Tape {
 
 /// Eight bytes per mark, little-endian. The encoding is the state's decision and
 /// the port never looks inside — `tests/durable.rs` says the same of its ledger.
+#[cfg(feature = "persist-file")]
 impl Durable for Tape {
     const VERSION: u32 = 1;
 
@@ -647,8 +652,10 @@ impl Durable for Tape {
 }
 
 /// A scratch directory that removes itself.
+#[cfg(feature = "persist-file")]
 struct Scratch(std::path::PathBuf);
 
+#[cfg(feature = "persist-file")]
 impl Scratch {
     fn new(name: &str) -> Self {
         let path =
@@ -658,6 +665,7 @@ impl Scratch {
     }
 }
 
+#[cfg(feature = "persist-file")]
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -683,6 +691,7 @@ impl Drop for Scratch {
 ///
 /// Made red by having `feed_turn` skip the observer chain — the reload then comes
 /// back empty, because nothing ever wrote.
+#[cfg(feature = "persist-file")]
 #[tokio::test]
 async fn a_feed_turn_is_stored_on_the_same_rule_as_a_mailbox_turn() {
     let scratch = Scratch::new("committed");

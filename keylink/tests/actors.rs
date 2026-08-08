@@ -40,6 +40,29 @@ use keylink::{
 // The port and its file adapter, for the one thing a counter cannot show: what a
 // detached actor is still HOLDING. `Claim` is deliberately not in scope — nothing
 // here loads or stores, and `mise run framing` is what keeps that honest.
+//
+// Gated, and so is every item that uses it — `Scratch`, `wedged`, `Dropped`,
+// `wedged_once_drained`, their impls, and the tests of the holding-the-claim run
+// below. NOT the file: a `#![cfg]` here would take **43** unrelated tests out of a
+// `--no-default-features` build with them. This file holds 48, and 5 need the
+// adapter. The condition is `persist-file` and not `persist`, because `Files` is
+// the adapter half.
+//
+// (That said "a hundred-odd" until the merge gate caught it. The figure came from
+// `grep -c '^async fn \|#\[tokio::test\]'`, which counts the ATTRIBUTE line and the
+// `fn` line as two — an item count read as a test count. `cargo nextest list -p
+// keylink --test actors` counts tests, and counts 48.)
+//
+// **The compiler says whether that set is right, so no count is written here.**
+// `cargo check -p keylink --no-default-features --all-targets` builds this file
+// with no error AND no `dead_code` warning, and only one set of attributes does
+// both: gate too little and it is an unresolved `keylink_persist`, gate too much
+// and the leftover helper is never used. Both halves were observed while this
+// was being written.
+//
+// Attributes and not a `#[cfg] mod`, because wrapping would prefix the test
+// names, and a test name here is a thing break records and filters cite.
+#[cfg(feature = "persist-file")]
 use keylink_persist::{file::Files, Snapshots, StateId};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
@@ -1106,8 +1129,18 @@ async fn shutting_down_an_unmounted_id_says_so_rather_than_pretending() {
 /// is the *unique path*, and a shared helper would have to be given the calling
 /// binary's name to keep that property. Small enough to not be worth a
 /// dependency, and small enough to not be worth a fourth crate.
+///
+/// **The `persist-file` gate below is now a third copy too, and that argument does
+/// NOT cover it.** The reason above is about the unique path; the feature condition
+/// is identical in all three places and duplicated only because the struct is. If a
+/// fourth copy appears, that is the point at which the gate is repeated more than
+/// the thing it guards, and the shared-helper trade is worth re-opening on the
+/// feature's terms rather than on the path's. Noted once, here, rather than three
+/// times.
+#[cfg(feature = "persist-file")]
 struct Scratch(std::path::PathBuf);
 
+#[cfg(feature = "persist-file")]
 impl Scratch {
     fn new(name: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
@@ -1120,6 +1153,7 @@ impl Scratch {
     }
 }
 
+#[cfg(feature = "persist-file")]
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -1137,6 +1171,7 @@ impl Drop for Scratch {
 /// It holds the receiver too, so closing the registry's sender genuinely does
 /// nothing here. That is what a wedged actor looks like: the mailbox is shut and
 /// the turn does not care.
+#[cfg(feature = "persist-file")]
 fn wedged(claim: impl Send + 'static) -> journal::Mounted {
     keylink::mount(|inbox: journal::Mailbox| async move {
         let _wedged = (claim, inbox);
@@ -1158,8 +1193,10 @@ fn wedged(claim: impl Send + 'static) -> journal::Mounted {
 /// released. Awaiting it is what makes a destroyed-actor test deterministic
 /// instead of a yield-and-hope; a **detached** actor never drops anything, so
 /// the wait is bounded by a `timeout` and its expiry is the failure.
+#[cfg(feature = "persist-file")]
 struct Dropped(Option<oneshot::Sender<()>>);
 
+#[cfg(feature = "persist-file")]
 impl Drop for Dropped {
     fn drop(&mut self) {
         if let Some(fired) = self.0.take() {
@@ -1175,6 +1212,7 @@ impl Drop for Dropped {
 /// budget has started running. That is the window
 /// `Eviction::Idle::shutdown_budget` documents, observed rather than slept
 /// through.
+#[cfg(feature = "persist-file")]
 fn wedged_once_drained(
     claim: impl Send + 'static,
     closed: oneshot::Sender<()>,
@@ -1202,6 +1240,7 @@ fn wedged_once_drained(
 /// milliseconds. Every await between the mount and the shutdown is the shutdown's
 /// own, and the system has no sweeper, so there is no second thing that could
 /// have done this.
+#[cfg(feature = "persist-file")]
 #[tokio::test(start_paused = true)]
 async fn a_shutdown_whose_budget_expires_destroys_the_actor() {
     let scratch = Scratch::new("shutdown-budget");
@@ -1247,6 +1286,7 @@ async fn a_shutdown_whose_budget_expires_destroys_the_actor() {
 /// this, and a paused clock makes the millisecond free. Made red by replacing
 /// `drain`'s `AbortOnDropHandle::new(task)` with a bare `task` — see the module's
 /// own record of what that break printed.
+#[cfg(feature = "persist-file")]
 #[tokio::test(start_paused = true)]
 async fn a_dropped_shutdown_destroys_the_actor_it_has_already_unmounted() {
     let scratch = Scratch::new("dropped-shutdown");
@@ -1308,6 +1348,7 @@ async fn a_dropped_shutdown_destroys_the_actor_it_has_already_unmounted() {
 /// dropped and says so. The `timeout` around that wait is the failure mode — a
 /// detached actor never drops anything, so it expires — and under a paused clock
 /// it costs nothing.
+#[cfg(feature = "persist-file")]
 #[tokio::test(start_paused = true)]
 async fn an_eviction_whose_budget_expires_destroys_the_actor() {
     let scratch = Scratch::new("eviction-budget");
@@ -1360,6 +1401,7 @@ async fn an_eviction_whose_budget_expires_destroys_the_actor() {
 /// test that finishes in milliseconds. A paused clock would auto-advance past
 /// that minute the first time this task waited on the filesystem, destroying the
 /// actor whose survival is the point.
+#[cfg(feature = "persist-file")]
 #[tokio::test]
 async fn an_evicted_actor_still_holds_its_state_after_its_id_is_free_again() {
     let scratch = Scratch::new("eviction-window");
@@ -1427,6 +1469,7 @@ async fn an_evicted_actor_still_holds_its_state_after_its_id_is_free_again() {
 /// `left: 2, right: 0` on the same break. That one watches the same property with
 /// a counter and no filesystem; this one watches what a counter cannot, which is
 /// the resource still held.
+#[cfg(feature = "persist-file")]
 #[tokio::test]
 async fn a_refused_mount_leaves_no_actor_holding_the_claim_it_was_built_around() {
     let scratch = Scratch::new("refused-mount");

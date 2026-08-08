@@ -11,6 +11,20 @@
 //! served node in it, and it used to carry the caller loop this file makes
 //! unnecessary.
 
+// WHOLE FILE, and the only honest gate for it: `persist-file` is this file's
+// subject, not a detail of one test. `keylink::Persist` needs `persist`, the
+// `Files` store every test here drives needs the adapter half, and there is no
+// test in here that means anything without both — all 13 of them leave at the
+// all-off end, which is the whole file. Gating per item would repeat one condition
+// on every item here rather than on a subset, and a condition true of everything
+// belongs at the top. `tests/browser.rs` does the same thing with a target instead
+// of a feature.
+//
+// (This said "thirty-two copies of one condition" until the merge gate caught it.
+// `cargo nextest list -p keylink --test persist` counts 13, or 15 with
+// `--run-ignored all` for two `#[ignore]`d measurements. Thirty-two was a grep that
+// counted each test's attribute line and its `fn` line separately.)
+#![cfg(feature = "persist-file")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink::{

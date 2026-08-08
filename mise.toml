@@ -209,8 +209,18 @@ run = "cargo clippy -p keylink --lib --all-features -- -D warnings"
 
 [tasks.lint]
 description = "Clippy at both feature ends, every target"
-# --no-default-features is scoped to the library on purpose: the integration
-# tests use the blocking API, so they cannot compile without it.
+# `--no-default-features` is scoped to the library, and the reason it gives has
+# CHANGED. It used to be that the integration tests could not compile without the
+# blocking API; they can now, and `.mise/tasks/features` runs
+# `cargo check -p keylink --all-targets --no-default-features` to keep it that way.
+#
+# It stays `--lib` here on cost. Clippy over keylink's test and example targets at
+# a second feature resolution is a full extra build of the most expensive targets
+# in the workspace, and `features` already answers the question this line would
+# answer — does the all-off end compile — for one `cargo check`. What is still
+# unchecked is a clippy LINT that fires only without a feature and only in a test.
+# Named rather than closed: it is the cheaper half of a check nothing had at all
+# until the targets started compiling.
 run = [
     "cargo clippy --all-targets --all-features -- -D warnings",
     "cargo clippy -p keylink --lib --no-default-features -- -D warnings",
@@ -264,35 +274,70 @@ description = "rustdoc as a gate, not as decoration"
 # `keylink-persist` declares `missing_docs` too and was not listed here, so its
 # own gate was decoration until this line named it.
 #
-# ── TWO KNOWN HOLES IN THIS GATE. Both measured, neither closed here.
+# `--document-private-items` is what makes that true of more than the public
+# surface. WITHOUT it, rustdoc resolves no intra-doc link in a private item at
+# all — not the item and not its doc comment — which in this crate is every
+# private module's header and most of the prose a maintainer reads. The flag was
+# off while 49 errors stood behind it, and the commit before this one is the pass
+# that cleared them: 7 links that resolved to nothing, and 42 reports of
+# `rustdoc::redundant_explicit_links` over 24 lines. The lint is not allowed. An
+# allow would hide the next instance, and that class is the first thing a reader
+# meets on the day somebody writes `[`X`](X)` again.
 #
-# 1. WITHOUT `--document-private-items`, rustdoc does not resolve intra-doc links
-#    in private items at all — not the item, not its doc comment, not a
-#    `#[cfg(test)] mod` inside it. That is most of the prose in this crate: every
-#    private module's header and every break record in a unit-test module.
+# Do not carry a number out of this comment. What the flag covers is the claim;
+# what it costs is one `cargo doc` invocation, the same one, with one more flag.
 #
-#    Turning it on is NOT free, which is why it is not on.
+# ── THREE KNOWN HOLES IN THIS GATE. All three measured, none closed here.
 #
-#    A SNAPSHOT AND NOT A STANDING COUNT — the numbers below were measured on
-#    2026-08-07 (-03:00) and are being actively fixed, so expect them to fall. The
-#    offset is there so this snapshot can be ordered against another one. Do not read
-#    a smaller count as this comment being wrong; re-measure with
-#    `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items
-#    --all-features -p keylink -p keylink-persist` and turn the flag on for good
-#    when it reaches zero. What does not go stale is the shape: private items are
-#    unchecked today, and that is the reason to finish the job.
+# 1. A `#[cfg(test)] mod` is NOT reached, flag or no flag, and the comment this
+#    replaced said the opposite — it listed "every break record in a unit-test
+#    module" among what the flag would buy. It buys none of them.
 #
-#    As measured: **48 errors across 12 files** — 40 `redundant explicit link
-#    target`, which are mechanical, and **8 genuinely unresolved links that no
-#    gate in this repo had ever seen**:
-#      console.rs   `Allowlist`, `Self::follow`, `Self::on_events` (x2)
-#      local.rs     `crate::System::stop`, `crate::Busy`
-#      macros.rs    `Addressed`
-#      watch.rs     `LocalActor::spawn_supervised`
-#    Flipping the flag without fixing those 48 lands a red gate on the default
-#    branch, so it wants its own pass across files several branches own. The 8
-#    above are real broken links in shipped documentation and are worth fixing
-#    on their own merits.
+#    THE DECISIVE EVIDENCE IS A THREE-ARM CONTROL, in one run, and the third arm
+#    came from the merge-gate reviewer rather than from this branch. Three broken
+#    links in `authz.rs`, one rustdoc pass, 2 errors:
+#
+#      PubItemNoSuchItem                on a `pub` method        REPORTED
+#      NonCfgPrivateModuleNoSuchItem    private mod, no cfg      REPORTED
+#      InsideCfgTestModNoSuchItem       inside `#[cfg(test)] mod`  silent
+#
+#    **The middle arm is what makes this isolation rather than correlation.** The
+#    first version of this control had two arms — the cfg one against a `pub`
+#    method — which differ in TWO ways: the cfg, and being public with a
+#    re-exported path. The reviewer added a private module in the same file,
+#    identical in privacy and nesting and differing only by having no
+#    `#[cfg(test)]`. It is REPORTED, so privacy and nesting are ruled out and the
+#    cfg is the isolated variable. Reproduced here before being written down.
+#
+#    Without any control at all, silence and "rustdoc never ran" are one output.
+#
+#    Corroborating, and NOT decisive on its own: rustdoc emits no page for such a
+#    module. `target/doc/keylink/authz/` holds `enum.Allowlist.html`,
+#    `struct.AdmittedPeer.html`, `struct.ProvenPeer.html`, `index.html` and
+#    `sidebar-items.js`, and `find target/doc/keylink -iname '*tests*'` returns
+#    nothing. Weaker because an absent page has several explanations besides this
+#    one — an item with no public path, a naming scheme nobody predicted, output
+#    written somewhere this search did not look. It agrees with the control rather
+#    than standing in for it.
+#
+#    THE MECHANISM IS NOW HALF OBSERVED, and the boundary is worth being exact
+#    about. `cargo doc -v` prints every rustdoc invocation, and all three carry
+#    ONLY `feature="…"` cfgs — no bare `test` cfg and no `--test` flag. So "cargo
+#    passes no test cfg" is a measurement, not a belief.
+#
+#    A grep returning nothing is not a finding on its own, so the pattern was fed
+#    a synthetic line carrying `--cfg 'test'` and `--test` first: it matched 2. The
+#    same pattern against the real `-v` log matches 0.
+#
+#    **What stays unverified is the step from "no test cfg" to "the item is gone
+#    before rustdoc documents it".** That is language semantics rather than
+#    anything this task can measure, and it is the only part still inferred.
+#
+#    `lib.rs`'s own reasoning beside `extern crate self as keylink` reaches the
+#    same conclusion from the other direction: `representability.rs` expands
+#    `service!` and never hit the link failures, "because rustdoc does not render
+#    test-only code". Two independent statements, one measured and one reasoned,
+#    and the replaced comment contradicted both.
 #
 # 2. `tests/*.rs` is unreachable EITHER WAY. cargo builds integration tests as
 #    separate crates and never hands them to rustdoc, so a broken intra-doc link
@@ -303,7 +348,116 @@ description = "rustdoc as a gate, not as decoration"
 #    link the crate graph — so the standing remedy is to grep for the old name
 #    after any rename that touches a documented item. Stated rather than worked
 #    around, because a workaround nobody maintains is worse than a known hole.
-run = "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features -p keylink -p keylink-persist"
+#
+# 3. A link inside the `service!` body is linted for KEYLINK and for nobody
+#    else, so `crate::` where `keylink::` was meant is undetectable. The macro
+#    body IS expanded and IS linted here — the `Addressed` link this task's
+#    predecessor left broken was reported at `macros.rs`, from an expansion, and
+#    only under `--document-private-items`. What no rustdoc run reaches is the
+#    same link expanded in a crate that is NOT keylink, where `crate::` means
+#    that crate.
+#
+#    MEASURED, and it refuted the plan that put `demo` here: `send_to`'s
+#    `[`Addressed`](keylink::Addressed)` was rewritten to `crate::Addressed`.
+#    keylink stayed green, correctly — `crate::` is keylink there. `demo`, which
+#    expands the same macro and imports no `Addressed`, ALSO stayed green, at
+#    exit 0. rustdoc does not lint an intra-doc link whose doc comment came from
+#    another crate's macro, which is reasonable of it — a downstream crate cannot
+#    fix an upstream macro — and it means no gate step can be bought here. The
+#    standing remedy is the convention `macros.rs` already follows everywhere:
+#    inside the macro body, write `keylink::Foo`, never `crate::Foo`.
+#
+# `demo` is documented anyway, and the reason is bigger than the one it replaced.
+# **It TRIPLES the number of `service!` expansions rustdoc checks, from one to
+# three.** Derived, not counted by hand — a generated service module is the
+# directory holding a `trait.Actor.html`, and after this task runs there are
+# exactly three:
+#
+#   target/doc/keylink/console/inspect      `Inspect`, the only one before this
+#   target/doc/demo/inventory               \  the two `-p demo` adds
+#   target/doc/demo/dock                    /
+#
+# `representability.rs` expands the macro too and is NOT among them, which is
+# `lib.rs`'s "rustdoc does not render test-only code" showing up as an absence.
+#
+# It also widens which METHOD KINDS are checked at all. `Inspect` declares `rpc`,
+# `#[defer] rpc` and `feed`; `demo` adds `recv` and `send`. Neither declares `tell`
+# or `blob`, so those two kinds stay unchecked either way — stated because a
+# reader counting three expansions could otherwise assume the macro is covered.
+#
+# And its OWN prose, which is where this started. `main.rs`'s header had
+# `cargo run -p demo -- connect <endpoint-id>` in a 3-space indent, which is a
+# paragraph and not a code block, so rustdoc read `<endpoint-id>` as an HTML tag.
+# The line dates from 5939216 — `git log -1 -L4,4:demo/src/main.rs`, which is the
+# line's own commit and not the file's last touch — so it had been broken for as
+# long as it had existed, with nothing in the repository able to say so. It is a
+# fenced block now.
+#
+# WATCHED, on the exact line this task runs: putting the 3-space indent back gave
+# exit 101, `error: unclosed HTML tag 'endpoint-id'` at `demo/src/main.rs:4:36`,
+# and `error: could not document 'demo'` — two error lines, one diagnostic. Not
+# registered in `.mise/tasks/anchors`: a row there is a source line
+# `break-once.sh` flips to redden a TEST, and this is a claim about rustdoc, so it
+# is described here instead — the third option that task's own header allows.
+#
+# One invocation and not two. Selecting `demo` costs one extra rustdoc unit and
+# saves a dependency rebuild, and the reason is which FEATURE RESOLUTION each
+# selection asks for: `lint` and `test` both build the whole workspace, so the
+# resolution that INCLUDES `demo` is the one already materialised when this step
+# runs. A `-p keylink -p keylink-persist` selection is the odd one out — its
+# narrower package set resolves features differently, so it needs dependency
+# artifacts nothing else in the gate builds.
+#
+# MEASURED with a cleaned doc dir and the workspace check restored BEFORE EACH
+# form, run in both orders. Two columns, and they point opposite ways:
+#
+#                             Documenting   Checking (first use)
+#   this line, with `-p demo`      3              0
+#   the same line without it       2             12
+#   `--workspace` afterwards       0              0   — neither invalidates `lint`
+#
+# **An earlier version of this table said 1 in the Documenting column, and that
+# number was the ONLY thing in it supporting the word "cheaper".** It came from a
+# procedure that ran the workspace check once at the start rather than before each
+# form, on a doc dir this form had already populated, so it counted `demo` alone.
+# From a clean doc dir it is 3, in either order. The real Documenting comparison,
+# 3 against 2, mildly OPPOSES the conclusion; the `Checking` column carries it.
+#
+# The 12 is ONE observation, not a stable figure: reproducing it needs the
+# two-crate resolution's dependency artifacts absent, and `cargo clean --doc` does
+# not arrange that. What is stable across every ordering is 3 against 2 documented
+# and 0 against non-zero compiled.
+#
+# In package terms `demo` adds exactly TWO that `-p keylink --all-features` does
+# not already compile, `anyhow` and `demo` itself, derived by comparing
+# `cargo tree -p demo --prefix none --no-dedupe` with the same for keylink.
+#
+# **The cold-tree cost is NOT established, for either form.** A separate
+# `cargo doc -p demo` invocation on a tree that has never built demo's doc profile
+# was measured elsewhere at 31 `Checking` lines. That is a real number about a
+# different command, and it is why this is one invocation and not two.
+#
+# `--all-features` reaches `demo`'s `swap-variants` here, which is the feature
+# that reorders two variants to prove the ALPN refuses the handshake. It changes
+# which variants the generated docs list and nothing else; no rustdoc check in
+# this repository depends on their order.
+#
+# `headings` runs first and is not a seventeenth gate step — it is inside this
+# one, because it checks the same artifact and takes no compile. It reads tracked
+# FILES rather than rustdoc's output, so it sees inside `keylink/tests/`, where
+# one of the six headings it was written against lived.
+#
+# **That does not close hole 2, and saying it did would be the same trade this
+# comment keeps refusing.** Hole 2 is about intra-doc LINKS, and a broken one in
+# `keylink/tests/` is still invisible to everything here. What `headings` shows is
+# narrower and still worth having: for one defect class, reading the file is the
+# whole instrument, so the hole does not apply to it.
+#
+# Cheapest first, as everywhere else in this gate.
+run = [
+    { task = "headings" },
+    "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --all-features -p keylink -p keylink-persist -p demo",
+]
 
 # ── shipping ────────────────────────────────────────────────────────────────
 

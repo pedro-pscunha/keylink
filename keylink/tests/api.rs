@@ -120,6 +120,18 @@ async fn the_generated_module_supplies_the_rest_fully_applied() {
     // hold one in a struct or to return one, and until this line nothing
     // outside `macros.rs` named it at all.
     let _: Option<depot::IdempotentClient> = None;
+    // The `blocking` twin of the line above, and the only line in this file that
+    // needs a feature. `macros.rs` generates the whole `blocking` module behind
+    // `#[cfg(feature = "blocking")]`, so this names the same condition rather
+    // than taking the surrounding test out of a `--no-default-features` build.
+    //
+    // **The consequence, stated because the alternative is a silence.** This test
+    // runs at BOTH feature ends under one name, asserting one line fewer at the
+    // all-off end. Every other gate on this branch removes a whole test, so its
+    // absence from a run is visible in the list; this one is not. A test name here
+    // is a thing break records and filters cite, so a reader who sees the name pass
+    // at `--no-default-features` should know it proved one type less.
+    #[cfg(feature = "blocking")]
     let _: Option<depot::blocking::IdempotentClient> = None;
 
     // ── expression position ──────────────────────────────────────────────────

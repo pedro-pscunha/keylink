@@ -519,7 +519,7 @@ impl Blobs {
 /// Implemented by every generated `Response`, so the RPC layer can record a
 /// grant without knowing anything about the service's types. `serve_one` is the
 /// only reader, and it is the only place that holds both the store and the
-/// [`AdmittedPeer`](crate::AdmittedPeer) — the handler has neither, and
+/// [`AdmittedPeer`] — the handler has neither, and
 /// `accept` has no address.
 ///
 /// This is what keeps the store out of `Dispatch`, `Next` and `Context`: the

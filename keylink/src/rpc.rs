@@ -1105,13 +1105,13 @@ where
     ///
     /// Required exactly when the service declares a `blob` method: without it
     /// [`ServerBuilder::spawn`] raises
-    /// [`ConfigError::MissingBlobStore`](crate::ConfigError::MissingBlobStore).
+    /// [`ConfigError::MissingBlobStore`].
     /// A service with no `blob` methods never needs one, which is why this is a
     /// builder method rather than a parameter every service would carry.
     ///
     /// One node has one content store. Two services on one node may share a
     /// [`Blobs`], and two DIFFERENT stores are
-    /// [`ConfigError::ConflictingBlobStores`](crate::ConfigError::ConflictingBlobStores):
+    /// [`ConfigError::ConflictingBlobStores`]:
     /// there is one blobs ALPN, so there can be one store behind it.
     #[must_use]
     pub fn with_blobs(mut self, blobs: &Blobs) -> Self {
@@ -1165,7 +1165,7 @@ where
     /// The default is [`Keyable::Any`], so a service that never calls this behaves
     /// exactly as it did before the method existed. A key on a method the policy
     /// refuses is answered
-    /// [`IdempotencyRefusal::NotKeyable`](crate::IdempotencyRefusal::NotKeyable) —
+    /// [`IdempotencyRefusal::NotKeyable`] —
     /// refused rather than ignored, because a caller that attached a key believes
     /// it is protected.
     ///
@@ -1181,7 +1181,7 @@ where
     ///
     /// [`Records::None`] is at-most-once with no retention: the key still claims, so
     /// the work still runs once, and every repeat is
-    /// [`IdempotencyRefusal::Unrecordable`](crate::IdempotencyRefusal::Unrecordable)
+    /// [`IdempotencyRefusal::Unrecordable`]
     /// rather than the reply. Reach for it when the reply is data this service would
     /// rather not keep, and the caller can read the result out of its own domain.
     ///
@@ -1328,7 +1328,7 @@ impl Service {
     /// # Authorization
     ///
     /// A foreign protocol brings its own admission rules, or none. [`Allowlist`]
-    /// does NOT cover it, and neither does [`Middleware`](crate::Middleware).
+    /// does NOT cover it, and neither does [`Middleware`].
     /// Read the protocol's documentation before you mount it, and assume it
     /// admits everyone until you have found the sentence that says otherwise.
     ///
@@ -1652,7 +1652,7 @@ where
     /// # Errors
     ///
     /// Everything [`RpcClient::call`] reports, plus the refusals a key can
-    /// meet — see [`IdempotencyRefusal`](crate::IdempotencyRefusal).
+    /// meet — see [`IdempotencyRefusal`].
     pub async fn call(&self, request: Req, body: Body) -> Result<(Resp, BodyReader)> {
         self.inner.call(request, body).await
     }

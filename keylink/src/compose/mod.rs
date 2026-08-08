@@ -18,8 +18,7 @@
 //! it already exists under keylink's own names, and the last section here is the
 //! mapping and the argument for not adding an alias.
 //!
-//! # Every one of these states its backpressure, because that is what was
-//! missing from the versions this is modelled on
+//! # Every one of these states its backpressure, because that is what was missing from the versions this is modelled on
 //!
 //! `kameo/actors/` implements all four in about 2,400 lines, and its versions
 //! predate the argument this crate is built around: they assume an **unbounded**

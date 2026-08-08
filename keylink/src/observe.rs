@@ -308,7 +308,7 @@ pub enum TurnOutcome<'a> {
 /// the coherence argument carry the field's *type*, which it does not reach.
 /// **The two-state fact is already on the public surface as a `bool`, twice**:
 /// [`is_fatal`](Self::is_fatal) here, and `fatal` on
-/// [`Ended::Observer`](crate::Ended::Observer) — which is argued separately and
+/// [`Ended::Observer`] — which is argued separately and
 /// on its own merits further down. `into_parts` is `pub(crate)` and has two
 /// callers, both in `local.rs`, so an internal enum would buy a self-describing
 /// return at those two sites and be a private synonym for a shape the public API

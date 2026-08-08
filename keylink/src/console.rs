@@ -4,7 +4,7 @@
 //! about them, and nothing else, and only from inside itself. This module is the
 //! other side of both limits: [`System::status`] is the whole list, and
 //! [`Inspect`](crate::inspect) is that list plus a live event log, served on its **own**
-//! ALPN behind its **own** [`Allowlist`], beside whatever else the node serves.
+//! ALPN behind its **own** [`Allowlist`](crate::Allowlist), beside whatever else the node serves.
 //!
 //! ```ignore
 //! let (events, stream) = Events::new(EVENT_DEPTH);
@@ -658,7 +658,7 @@ crate::service! {
     service Inspect;
 
     /// Every actor mounted on this node, with the four fields
-    /// [`ActorStatus`](keylink::ActorStatus) measures.
+    /// [`ActorStatus`] measures.
     ///
     /// Stale on arrival, and the reason is
     /// [`System::status`](keylink::System::status)' — an id read here may have
@@ -676,8 +676,8 @@ crate::service! {
     ///
     /// Not every call parks. A cursor **ahead** of this node's log is refused
     /// rather than waited on, and so is a call that arrives with
-    /// [`MAX_FOLLOWERS`](keylink::MAX_FOLLOWERS) already parked — see
-    /// [`FollowRefused`](keylink::FollowRefused), which carries why each of those
+    /// [`MAX_FOLLOWERS`] already parked — see
+    /// [`FollowRefused`], which carries why each of those
     /// is a refusal and not a wait.
     ///
     /// `core::result::Result` spelled in full because `Result` inside this crate
@@ -688,7 +688,7 @@ crate::service! {
     rpc Follow(after: u64) -> ::core::result::Result<EventPage, FollowRefused>;
 
     /// Where the events come from. Local, wired at construction, never on the
-    /// wire — see [`Events`](keylink::Events).
+    /// wire — see [`Events`].
     feed Events(event: LifecycleEvent);
 }
 
@@ -741,12 +741,12 @@ pub struct Inspector {
     ///
     /// **Bounded twice, and the second bound is what makes the first one true.**
     /// [`MAX_FOLLOWERS`] caps the length outright. And every cursor in here is
-    /// `<= seq` as of its park — [`Self::follow`] refuses the rest — so the very
-    /// next recorded event has a sequence number past all of them and
-    /// [`Self::on_events`] empties the whole list. Nothing accumulates across
-    /// events, which is what the previous version's stated bound *claimed* and
-    /// could not deliver: an entry survived the QUIC stream it was said to be
-    /// one of.
+    /// `<= seq` as of its park — [`follow`](inspect::Actor::follow) refuses the
+    /// rest — so the very next recorded event has a sequence number past all of
+    /// them and [`on_events`](inspect::Actor::on_events) empties the whole list.
+    /// Nothing accumulates across events, which is what the previous version's
+    /// stated bound *claimed* and could not deliver: an entry survived the QUIC
+    /// stream it was said to be one of.
     waiting: Vec<(u64, Deferred<Followed>)>,
 }
 
@@ -794,8 +794,8 @@ impl Inspector {
     /// has at least one event to be handed. That is why the emptiness
     /// [`EventPage::events`] rules out is ruled out *structurally* rather than by
     /// a check — the two callers are [`Self::page`], which applies the
-    /// precondition, and [`Self::on_events`], where the precondition is the
-    /// invariant [`Self::waiting`] is kept under.
+    /// precondition, and [`on_events`](inspect::Actor::on_events), where the
+    /// precondition is the invariant [`Self::waiting`] is kept under.
     fn page_after(&self, after: u64) -> EventPage {
         let events: Vec<LifecycleEvent> = self
             .log
