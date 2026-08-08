@@ -50,9 +50,11 @@ set -euo pipefail
 # capture happens here and every decision downstream reads the variable.
 #
 # Command substitution strips EVERY trailing newline, so `$updates` holds the
-# update lines without their final LF. `redeliver` puts exactly one back, and
-# that is byte-exact rather than approximately right: git terminates each update
-# with one LF and writes nothing after the last one.
+# update lines without their final LF. The forward below puts exactly one back with
+# `<<<`, and that is byte-exact rather than approximately right: git terminates each
+# update with one LF and writes nothing after the last one. Verified by comparing
+# what git sent against what the chain received, in one repository, at 402 bytes and
+# at 116,698 bytes — sha256 equal in both.
 updates="$(cat)"
 
 # Chain to whatever hook was configured before this repo took over
@@ -73,22 +75,54 @@ updates="$(cat)"
 # path outside this repository, so it can gain a `pre-push` between two pushes
 # without one line here changing — and a forward that is correct only today
 # breaks silently on the day it starts mattering.
-redeliver() {
-    # An `if` and not `[ -n "$updates" ] && printf ...`: the `&&` form returns 1
-    # when the test fails, and under `set -o pipefail` that return code would
-    # fail the whole pipeline and kill the hook on the empty-stdin path.
-    #
-    # Empty in, empty out. `printf '%s\n' ""` writes a lone LF, which git never
-    # sends and which a reader splitting on newlines takes as one malformed
-    # update.
-    if [ -n "$updates" ]; then
-        printf '%s\n' "$updates"
-    fi
-}
-
+# ── A HERE-STRING AND NOT A PIPE, for the reason this file's own header gives ──
+#
+# This was `redeliver | "$chain/pre-push" "$@"`, with `redeliver` a function that
+# `printf`ed `$updates`. A pipe adds a failure path a here-string does not have: a
+# chained hook that exits WITHOUT draining its stdin closes the read end, the writer
+# takes SIGPIPE, and `pipefail` plus `set -e` abort this hook — **refusing the push**.
+#
+# MEASURED both ways, with a chained hook spelled `exit 0` and every branch at HEAD
+# so the guard below cannot be what refuses:
+#
+#     2 refs, 402 bytes         pipe: push SUCCEEDS   here-string: push SUCCEEDS
+#     401 refs, 116,698 bytes   pipe: REFUSED         here-string: push SUCCEEDS
+#
+# At 402 bytes the write fits in one pipe buffer and completes before the reader is
+# gone, so a small push cannot see this at all. It takes a payload past the buffer to
+# be deterministic — a few hundred refs, which `git push --mirror` reaches. **This
+# file's own standard is that a forward correct only today breaks silently on the day
+# it starts mattering, and that standard reaches this spelling.**
+#
+# What the refusal looked like, quoted rather than characterised — it is not silent,
+# it is worse than silent, because it reads as a bug in this file. The line number is
+# part of the quote and belongs to the OLD spelling, where 85 was the `printf`:
+#
+#     .githooks/pre-push: line 85: printf: write error: Broken pipe
+#     error: failed to push some refs to '<remote>'
+#
+# Nothing there names the gate, the chain, or a decision. A developer seeing it has
+# no way to tell a refusal from a crash.
+#
+# THE DIFFERENCE IN KIND, and it is why the fix is not a bigger buffer: bash backs a
+# here-string with a TEMP FILE, so the chained hook reads a seekable file rather than
+# a pipe. There is no writer left to kill, and no pipeline for `pipefail` to judge.
+#
+# Byte-exact by construction rather than by arithmetic. Command substitution stripped
+# every trailing newline from `$updates`, and `<<<` appends exactly one LF back —
+# the same single LF `printf '%s\n'` wrote, and the one git terminates its last
+# update with.
+#
+# Two arms rather than one, because `<<<""` writes a lone LF. Git never sends that,
+# and a reader splitting on newlines takes it as one malformed update — so the empty
+# case gets `/dev/null`, which is a genuinely empty stdin.
 chain="$(git config --get hooks.chain || true)"
 if [ -n "$chain" ] && [ -x "$chain/pre-push" ]; then
-    redeliver | "$chain/pre-push" "$@"
+    if [ -n "$updates" ]; then
+        "$chain/pre-push" "$@" <<<"$updates"
+    else
+        "$chain/pre-push" "$@" </dev/null
+    fi
 fi
 
 # ── what this push actually delivers ─────────────────────────────────────────
@@ -158,12 +192,39 @@ fi
 # Refused before the gate runs, because running it would produce the false green
 # rather than avoid it.
 #
-# ── THE TWO PUSHES THIS REFUSES THAT NOBODY WOULD CALL WRONG ──────────────────
+# ── WHAT THIS REFUSES THAT NOBODY WOULD CALL WRONG — MEASURED, NOT LISTED ─────
 #
-# A tag pointing at an older commit, and `git push --all` — or any
-# `git push <remote> <branch>` naming a branch that is not the one checked out.
-# All of them legitimately send a sha that is not HEAD, and all of them are
-# refused here.
+# **The refusal is a property of the REFS a push carries and never of the command
+# that carried them.** This comment used to name commands, and that was wrong in
+# both directions. Every row below was run against this hook with a stub gate:
+#
+#     git push --all, every branch AT HEAD       ACCEPTED, gate ran, both refs landed
+#     git push --all, one branch NOT at HEAD     REFUSED
+#     a LIGHTWEIGHT tag at HEAD                  ACCEPTED, gate ran
+#     an ANNOTATED tag at HEAD                   REFUSED
+#     an annotated tag at an OLDER commit        REFUSED
+#
+# So `git push --all` is not refused as such. It is refused as soon as ANY branch it
+# carries is not at HEAD, and in a repository whose branches all sit at HEAD it goes
+# through the gate and lands. `git push <remote> <branch>` naming a sibling branch is
+# the same story: refused because that branch's tip is not HEAD, not because it was
+# named.
+#
+# **AN ANNOTATED TAG AT THE TIP IS REFUSED, AND THAT IS THE ONE NOBODY PREDICTS.**
+# `git tag -a v1.0 && git push origin v1.0` at the tip delivers neither an older
+# commit nor another branch, and it is still refused — because git writes the TAG
+# OBJECT's sha on this hook's stdin, not the sha of the commit the tag points at.
+# Measured, with a hook that only dumps what it was sent: HEAD was `f584d78`,
+# `refs/tags/ann` resolved to `ff12f9a`, and `refs/tags/ann^{commit}` resolved back
+# to `f584d78`. The sha compared below is therefore the tag object's, and it never
+# equals HEAD for ANY annotated tag. A lightweight tag at the tip sends the commit
+# sha itself and is accepted.
+#
+# Dereferencing with `^{commit}` would let the tip case through and is not done,
+# because it is a carve-out of exactly the kind the next paragraph rejects — and it
+# would not help the case this refusal exists for, a tag two commits back, which
+# still has to be refused. One rule that is easy to state beats two that are easy to
+# get wrong. CONTRIBUTING.md lists the annotated tag among the legitimate bypasses.
 #
 # Refused rather than carved out, because a carve-out has to claim something
 # this hook cannot check. `mise run pre-push` compiles and tests the working
@@ -206,7 +267,10 @@ if [ -n "$delivering" ]; then
         fi
     done <<<"$delivering"
     if [ -n "$stale" ]; then
-        echo "error: this push delivers a commit that is not HEAD." >&2
+        # "an object" and not "a commit": for an annotated tag the sha below is the
+        # TAG OBJECT's, which is not a commit at all. The message named a commit and
+        # was therefore false in the one case a reader would bring it to.
+        echo "error: this push delivers an object that is not HEAD." >&2
         echo >&2
         printf '%s' "$stale" >&2
         echo "    HEAD -> $head_sha" >&2
@@ -216,12 +280,18 @@ if [ -n "$delivering" ]; then
         echo "  this push does not deliver, which is how a green gate and a delivered" >&2
         echo "  ref came to disagree without either half reporting anything." >&2
         echo >&2
-        echo "  Remedy: deliver HEAD.  git push <remote> HEAD:<branch>" >&2
+        echo "  For a BRANCH, the remedy is to deliver HEAD:" >&2
+        echo "          git push <remote> HEAD:<branch>" >&2
         echo "          or check out the branch you mean and push that." >&2
         echo >&2
-        echo "  A tag pointing at an older commit and 'git push --all' land here too," >&2
-        echo "  deliberately. The comment above this message in .githooks/pre-push" >&2
-        echo "  says why, and the answer for both is the flag below." >&2
+        echo "  For a TAG there is no such remedy, and the flag below is the answer." >&2
+        echo "  Git sends a tag's own object sha, so EVERY annotated tag lands here —" >&2
+        echo "  including one created at this very commit. A lightweight tag at HEAD" >&2
+        echo "  sends the commit sha and passes." >&2
+        echo >&2
+        echo "  'git push --all' lands here only when one of the branches it carries" >&2
+        echo "  is not at HEAD. The comment above this message in .githooks/pre-push" >&2
+        echo "  measures each of these cases." >&2
         echo >&2
         echo "  To push anyway, knowing nothing has checked what you are delivering:" >&2
         echo "  git push --no-verify" >&2

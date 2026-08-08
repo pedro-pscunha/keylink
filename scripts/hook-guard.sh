@@ -47,8 +47,8 @@
 #
 #        FAIL an amend of an ungated Rust commit RE-RUNS the gate — the gate did NOT run
 #
-# 2. **Make it gate everything.** Replace the `if ! printf '%s\n' "$linted" |
-#    grep -qE ...; then` line with `if false; then`. Watched: it reddens **every row
+# 2. **Make it gate everything.** Replace the `if ! grep -qE ... <<<"$linted"; then`
+#    line with `if false; then`. Watched: it reddens **every row
 #    that expects a skip** — the two ordinary negatives AND the reword, which is the
 #    one this record omitted while the reword scenario existed:
 #
@@ -76,9 +76,57 @@
 #    the guard would certify a hook that is dead in every worktree this repo is
 #    developed in.
 #
+# 4. **Restore the pipe, which is the shape `main` carries right now.** In
+#    `.githooks/pre-commit`, replace
+#
+#        if ! grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$' <<<"$linted"; then
+#
+#    with
+#
+#        if ! printf '%s\n' "$linted" | grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$'; then
+#
+#    Watched — one row, and it is a row no other scenario in this file can reach:
+#
+#        FAIL a commit staging Rust beside a path list larger than one pipe buffer runs the gate — the gate did NOT run
+#
+#    Every other row here stages a handful of files, which is under one pipe buffer
+#    and therefore green against the defective spelling. That is why scenario 7
+#    exists at all: the bug is invisible at every size the rest of this script uses,
+#    and it fails in the direction that reports success.
+#
 # Quoting those literals is safe for the reason `break-once.sh` cares about: this
 # record is not in the file whose literal it quotes, so the anchor stays unique in
 # its target.
+#
+# ── WHY NONE OF THESE ROWS IS IN `.mise/tasks/anchors`, AND IT IS NOT AN OVERSIGHT
+#
+# Every record here quotes an exact production line, which is precisely what that
+# registry exists to stop rotting. Registering them was proposed and is **not
+# possible as that task stands** — it would redden the gate rather than guard
+# anything, and the reason was measured rather than read:
+#
+#   * `anchors`' record-quote check calls `quoted_spans(lives_in)`, which keeps only
+#     lines starting `///`, `//!` or `//`. It has no `#` arm. Run against
+#     `scripts/hook-guard.sh` and `.githooks/pre-push` it finds **0** backticked
+#     spans in each, against 228 in `keylink/src/rpc.rs`. So a row whose `lives_in`
+#     is this file fails with "this task's literal is NOT QUOTED by its own record"
+#     while the record quotes it plainly.
+#   * the population walk globs `*.rs` under `keylink` and `keylink-persist` only, so
+#     a shell block is not in the denominator either. That half is why these records
+#     never appear in the "harness blocks" figure.
+#
+# The sentence at `.mise/tasks/anchors`'s L5 — "`break-once.sh` takes a FILE, so any
+# production line in it is a legal target" — is about which LINE may be broken, not
+# about which files the registry can read. Reading it as the second thing is what
+# made registration look free.
+#
+# **So the exposure is real and it is named here rather than closed:** an edit to
+# `.githooks/pre-push` can silently rot up to ten literals quoted in this file, and
+# no gate says so. Teaching `quoted_spans` a `#` marker and widening the walk would
+# close it, in the task that owns those two functions rather than here.
+# `scripts/break-hook-record.sh` is the partial answer available today — a replay
+# aborts when a quoted literal is missing or no longer unique, which is the same
+# precondition `anchors` checks, on demand instead of every gate.
 #
 # `rebasing=no` counts **1** in `.githooks/pre-commit`, measured with `grep -cF`
 # after this record was written. The near-miss is worth naming, because the first
@@ -265,6 +313,46 @@ check yes "an amend at an edit stop that STAGES Rust still runs the gate"
 GIT_EDITOR=: git rebase --continue >/dev/null 2>&1
 cd "$repo"
 
+# ── 7. A STAGED LIST LARGER THAN ONE PIPE BUFFER, which every scenario above is
+#       too small to see. The filter used to be `printf ... | grep -qE ...`, and
+#       `grep -q` exits at its first match and closes the pipe — so `printf` took
+#       SIGPIPE, `pipefail` failed the pipeline, `!` inverted that, and the hook
+#       skipped the gate on a commit staging Rust while exiting 0.
+#
+#       THE RUST FILE HAS TO SORT EARLY, and that is the whole scenario rather than
+#       a detail. Git lists staged paths in sort order, so with the match at the END
+#       grep reads the entire list, never closes the pipe early, and this row stays
+#       green against the defect. `aa.rs` sorts before `big/`.
+#
+#       Sized well above a 64 KiB pipe rather than just over it: Linux allows a pipe
+#       to be enlarged to 1 MiB, so a payload tuned to this machine's capacity would
+#       be a row that passes on somebody else's. No figure is written here — the row
+#       PRINTS the size it actually built, which cannot go stale the way a number in
+#       this comment would.
+#
+#       Index entries written straight to the index with `--index-info`, so twelve
+#       thousand paths cost one process and no files on disk. It is LAST in Part One
+#       because it leaves those paths in the index with no working-tree file behind
+#       them; Part Two builds its own repositories and never sees this one.
+blob="$(git hash-object -w --stdin </dev/null)"
+python3 - "$blob" <<'PY' | git update-index --index-info
+import sys
+blob = sys.argv[1]
+pad = "q" * 200
+for i in range(12000):
+    sys.stdout.write(f"100644 {blob}\tbig/{pad}{i:06d}.txt\n")
+PY
+echo "fn wide() {}" >aa.rs
+git add aa.rs
+wide_bytes="$(git diff --cached --name-only --diff-filter=ACMR | wc -c | tr -d ' ')"
+fresh
+git commit -qm "a wide commit that also stages Rust"
+check yes "a commit staging Rust beside a path list larger than one pipe buffer runs the gate"
+# Printed rather than asserted against a threshold. The size that matters is the
+# kernel's pipe capacity, which this script cannot read, so the row's job is to be
+# far above any of them and the number's job is to let a reader confirm it was.
+echo "       (the staged path list measured $wide_bytes bytes)"
+
 # ══ PART TWO — .githooks/pre-push ═══════════════════════════════════════════
 #
 # A push has TWO subjects, and this hook is the only place they can be compared.
@@ -317,6 +405,14 @@ cd "$repo"
 #         a push from a linked worktree of the OWNING checkout's HEAD never reaches the gate
 #         a push from a linked worktree of the OWNING checkout's HEAD is REFUSED
 #         the refusal names the worktree's HEAD and not the owning checkout's
+#         an ANNOTATED tag at HEAD never reaches the gate
+#         an ANNOTATED tag at HEAD is REFUSED, git having sent the tag object's sha
+#         the tag refusal names an OBJECT rather than a commit
+#
+#     Twenty-one rows, re-measured when scenario 12 was added rather than assumed to
+#     be unchanged: a new scenario silently widens the redness of every earlier break
+#     that disables the machinery it depends on. The last three rows are that
+#     widening.
 #
 #     `a deletion-only push RUNS the chained hook` does NOT move, and that is
 #     worth more than the list: the chain is still REACHED, it is only handed
@@ -338,7 +434,8 @@ cd "$repo"
 #
 # H4. **Drop the comparison against HEAD.** Replace
 #     `        if [ "$sha" != "$head_sha" ]; then` with `        if false; then`.
-#     Watched:
+#     Watched — twelve rows, the last three of them added by scenario 12 and measured
+#     rather than inferred:
 #
 #         a delivered sha that is not HEAD never reaches the gate
 #         a delivered sha that is not HEAD is REFUSED
@@ -349,10 +446,13 @@ cd "$repo"
 #         a push from a linked worktree of the OWNING checkout's HEAD never reaches the gate
 #         a push from a linked worktree of the OWNING checkout's HEAD is REFUSED
 #         the refusal names the worktree's HEAD and not the owning checkout's
+#         an ANNOTATED tag at HEAD never reaches the gate
+#         an ANNOTATED tag at HEAD is REFUSED, git having sent the tag object's sha
+#         the tag refusal names an OBJECT rather than a commit
 #
 # H5. **Stop re-delivering stdin to the chain.** Replace
-#     `    redeliver | "$chain/pre-push" "$@"` with
-#     `    "$chain/pre-push" "$@"`, which is what the line was before this
+#     `        "$chain/pre-push" "$@" <<<"$updates"` with
+#     `        "$chain/pre-push" "$@"`, which is what the line was before this
 #     change. The chained hook still runs and reads EOF on its first line.
 #     Watched:
 #
@@ -365,8 +465,9 @@ cd "$repo"
 #     exits 0, so nothing but a byte comparison can tell it from one that
 #     checked.
 #
-# H6. **Skip the HOOK rather than the GATE.** Replace the same line with
-#     `    case "$updates" in "(delete) "*) exit 0 ;; *) redeliver | "$chain/pre-push" "$@" ;; esac`
+# H6. **Skip the HOOK rather than the GATE.** Replace
+#     `    if [ -n "$updates" ]; then` with
+#     `    case "$updates" in "(delete) "*) exit 0 ;; esac; if [ -n "$updates" ]; then`
 #     — a hook that returns early for a deletion instead of only skipping the
 #     gate. Watched:
 #
@@ -376,10 +477,32 @@ cd "$repo"
 #
 # H7. **Re-deliver unconditionally.** Replace
 #     `    if [ -n "$updates" ]; then` with `    if true; then`, so an empty
-#     capture sends a lone LF. The indented spelling counts once; the unindented
-#     one guarding the classification loop is a different line. Watched:
+#     capture takes the here-string arm and `<<<""` sends a lone LF. The indented
+#     spelling counts once; the unindented one guarding the classification loop is a
+#     different line. Watched:
 #
 #         empty stdin hands the chained hook nothing, not a blank line
+#
+# H11. **Restore the PIPE to the chain.** Replace the two-arm forward
+#
+#          if [ -n "$updates" ]; then
+#              "$chain/pre-push" "$@" <<<"$updates"
+#          else
+#              "$chain/pre-push" "$@" </dev/null
+#          fi
+#
+#      with `    redeliver_pipe | "$chain/pre-push" "$@"`, defining
+#      `redeliver_pipe() { if [ -n "$updates" ]; then printf '%s\n' "$updates"; fi; }`
+#      above it — the spelling this file carried before. Watched:
+#
+#          a push whose chained hook never drains stdin still SUCCEEDS
+#
+#      **Only that row, and only because of its payload.** Every other chain row
+#      here pushes a handful of refs, which fits in one pipe buffer and completes
+#      before the reader is gone, so all of them stay green against the pipe. The
+#      scenario forces the payload past the buffer and gives the chain a hook that
+#      exits without reading, which is what turns the writer's SIGPIPE into a
+#      refused push under `pipefail`.
 #
 # H8. **Hard-code forty zeros.** Replace
 #     `        "" | *[!0]*) return 1 ;;` with a first arm matching a 40-character
@@ -438,10 +561,16 @@ cd "$repo"
 #     the hook rather than widening it.
 #   * ANTI-VACUITY PRECONDITIONS on the measurement itself: `git delivered an
 #     update line to compare against`, `git delivered exactly one line, its LF
-#     included`, and `the linked worktree and its owning checkout sit at different
-#     commits`. They are claims about what git did, not about the hook. Two are
-#     there because `cmp` of two empty files passes; the third is there because
-#     scenario 10 asserts nothing at all if the two HEADs happen to agree.
+#     included`, `the linked worktree and its owning checkout sit at different
+#     commits`, `the wide push's update payload exceeds one 64 KiB pipe buffer`, and
+#     scenario 12's pair `the annotated tag's OBJECT sha differs from HEAD` and `the
+#     annotated tag nevertheless POINTS at HEAD`. They are claims about what git did,
+#     not about the hook. Two are there because `cmp` of two empty files passes; the
+#     third is there because scenario 10 asserts nothing at all if the two HEADs
+#     happen to agree; the fourth is there because scenario 11 passes against the very
+#     spelling it exists to reject as soon as its payload drops below one buffer; the
+#     last pair is there because a tag refusal is only interesting once the tag is
+#     known to point at HEAD.
 #   * CANARIES ON GIT ITSELF, both in Part Three: `a RELATIVE core.hooksPath runs
 #     the pushing worktree's own hook` and `an ABSOLUTE core.hooksPath runs the
 #     owning checkout's hook instead`. No break in this repository can move them,
@@ -593,8 +722,11 @@ push origin "$older_sha:refs/heads/older"
 #       sha with `-> ` in front of it.
 check no "a delivered sha that is not HEAD never reaches the gate"
 assert "a delivered sha that is not HEAD is REFUSED" test "$pushed_status" -ne 0
+# "an object" and not "a commit": for an annotated tag the refused sha is the TAG
+# OBJECT's, which is not a commit. The message was reworded once this row's own
+# scenario 12 measured that case, and the assertion follows the message.
 assert "the refusal says what it refused" \
-    grep -qF "delivers a commit that is not HEAD" "$pushlog"
+    grep -qF "delivers an object that is not HEAD" "$pushlog"
 #       `--` because the pattern starts with `-`, which grep reads as an option
 #       and reports as a usage error. That direction is the safe one: the row
 #       went red rather than green when the arrow was first added.
@@ -711,6 +843,87 @@ assert "a push from a linked worktree of the OWNING checkout's HEAD is REFUSED" 
 assert "the refusal names the worktree's HEAD and not the owning checkout's" \
     grep -qF "HEAD -> $side_head" "$pushlog"
 
+# ── 11. A CHAINED HOOK THAT NEVER DRAINS ITS STDIN, on a payload past one pipe
+#       buffer. Every chain row above hands the chain a few hundred bytes and a stub
+#       that reads all of them, so every one of those rows is green whether the
+#       forward is a pipe or a here-string. This is the only row that tells them
+#       apart.
+#
+#       The forward used to be `redeliver | "$chain/pre-push" "$@"`. A chain that
+#       exits without reading closes the read end, the writer takes SIGPIPE, and
+#       `pipefail` with `set -e` turns that into a REFUSED push whose entire output
+#       is `printf: write error: Broken pipe` — indistinguishable from a crash.
+#       Measured at 401 refs and 116,698 bytes: the pipe spelling refused, the
+#       here-string succeeded. At 402 bytes both spellings succeed, which is why the
+#       payload here is deliberately large.
+#
+#       EVERY BRANCH SITS AT HEAD, so the not-HEAD guard cannot be what refuses.
+#       Without that this row would pass for the wrong reason.
+mkdir -p "$scratch/chain-nonreader"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$scratch/chain-nonreader/pre-push"
+chmod +x "$scratch/chain-nonreader/pre-push"
+newrepo "$scratch/push-wide"
+echo "one" >one.txt
+git add one.txt
+git commit -q -m "one"
+git init -q --bare "$scratch/remote-wide"
+git remote add origin "$scratch/remote-wide"
+wide_pad="$(printf 'b%.0s' $(seq 1 90))"
+for i in $(seq 1 400); do git branch "$wide_pad$i"; done
+# The payload git is about to write, reconstructed in git's own shape. An
+# anti-vacuity precondition: below one buffer the pipe spelling passes too, so
+# without this the row could quietly stop testing anything.
+wide_bytes="$(git for-each-ref \
+    --format='%(refname) %(objectname) %(refname) 0000000000000000000000000000000000000000' \
+    refs/heads | wc -c | tr -d ' ')"
+assert "the wide push's update payload exceeds one 64 KiB pipe buffer" \
+    test "$wide_bytes" -gt 65536
+git config hooks.chain "$scratch/chain-nonreader"
+fresh
+push --all origin
+assert "a push whose chained hook never drains stdin still SUCCEEDS" \
+    test "$pushed_status" -eq 0
+git config hooks.chain ""
+
+# ── 12. TAGS, where the sha git writes on stdin is not the sha a reader expects.
+#       Four places in this repository now tell a contributor that an annotated tag
+#       at the tip is refused, and until this scenario existed nothing checked it.
+#
+#       A LIGHTWEIGHT tag names a commit, so at HEAD it sends HEAD and passes. An
+#       ANNOTATED tag is its own object, and git writes THAT object's sha — so the
+#       comparison below can never equal HEAD, no matter where the tag points. The
+#       two preconditions say exactly that about git: the object sha differs from
+#       HEAD while the tag still resolves to HEAD. Without them a green refusal row
+#       could be a refusal for some other reason entirely.
+#
+#       This is the most ordinary tag push there is, and it is refused. The refusal
+#       is deliberate — see the comment above the message in `.githooks/pre-push` —
+#       and CONTRIBUTING.md lists it as a legitimate `--no-verify`.
+newrepo "$scratch/push-tags"
+echo "one" >one.txt
+git add one.txt
+git commit -q -m "one"
+git init -q --bare "$scratch/remote-tags"
+git remote add origin "$scratch/remote-tags"
+tag_head="$(git rev-parse HEAD)"
+git tag light
+git tag -a ann -m "annotated"
+assert "the annotated tag's OBJECT sha differs from HEAD" \
+    test "$(git rev-parse refs/tags/ann)" != "$tag_head"
+assert "the annotated tag nevertheless POINTS at HEAD" \
+    test "$(git rev-parse 'refs/tags/ann^{commit}')" = "$tag_head"
+fresh
+push origin light
+check yes "a LIGHTWEIGHT tag at HEAD reaches the gate"
+assert "a LIGHTWEIGHT tag at HEAD is accepted" test "$pushed_status" -eq 0
+fresh
+push origin ann
+check no "an ANNOTATED tag at HEAD never reaches the gate"
+assert "an ANNOTATED tag at HEAD is REFUSED, git having sent the tag object's sha" \
+    test "$pushed_status" -ne 0
+assert "the tag refusal names an OBJECT rather than a commit" \
+    grep -qF "delivers an object that is not HEAD" "$pushlog"
+
 # ══ PART THREE — scripts/install-hooks.sh, and WHICH hook file runs ═════════
 #
 # Every scenario above asks what a hook DOES. These ask which file git runs at
@@ -735,6 +948,23 @@ assert "the refusal names the worktree's HEAD and not the owning checkout's" \
 # Same method as Part Two: the perturbation goes into a copy of
 # `scripts/install-hooks.sh` beside copies of the hooks and this script, and the
 # unperturbed control is run first and must be green.
+#
+# **`scripts/break-hook-record.sh` is what does that, and until it existed this
+# sentence was written in a voice that implied something did.** It copies the tree,
+# runs this script AND `.mise/tasks/task-lists` as a control, refuses to report a
+# perturbed result unless both come back with no failures, and fails a perturbation
+# that reddens nothing.
+#
+#     scripts/break-hook-record.sh .githooks/pre-push from-literal.txt to-literal.txt
+#
+# **Which records have been through it, named rather than implied: 4, H1, H4 and
+# H11.** Those are the ones this session added or whose row list it changed, and the
+# printed sets matched them exactly — 1, 21, 12 and 1 rows. The rest predate the
+# script and their row lists remain one author's watched run, which is the whole
+# reason the script exists. Replaying them is worth doing and is not done here.
+#
+# Comparing the rows it prints against the rows a record names is still the reader's
+# job — these records are prose, and nothing parses them.
 #
 # I1. **Restore the literal-only test, which IS the historical defect.** In
 #     `scripts/install-hooks.sh`, replace

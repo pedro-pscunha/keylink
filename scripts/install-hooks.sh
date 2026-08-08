@@ -117,7 +117,9 @@ echo "  pre-push    the full gate: every target, both feature ends,"
 echo "              every feature subset, the tests, the docs,"
 echo "              and the browser target"
 echo "              — skipped for a push that only DELETES branches, and"
-echo "                refused for a push delivering a commit that is not HEAD"
+echo "                refused for a push delivering an object that is not HEAD."
+echo "                Any ANNOTATED tag lands there, one at HEAD included,"
+echo "                because git sends the tag object's own sha."
 echo
 echo "bypass with --no-verify; see CONTRIBUTING.md for when that is legitimate."
 
