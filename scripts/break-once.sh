@@ -82,11 +82,20 @@ echo "── runner: ${runner[*]}"
 # leaves a copy behind. The copy is NOT deleted: it is the evidence for whatever
 # the searcher concluded, and its path is printed for that reason.
 #
-# **PREVENTIVE, and the margin is one line.** Measured 2026-08-08 over the nine
-# breaks `REDNESS` registers: every watched sentence fell inside the fifteen-line
-# window, so `tail` hid none of them — and `A1`'s sat at line 26 of 40, one line
-# inside it. One more line of runner output before the panic and that row would
+# **PREVENTIVE, and SIX of the nine sat one line inside the window.** Measured
+# 2026-08-08 (-03:00) over the breaks `REDNESS` registers: `tail` hid none of them.
+#
+# The quantity that decides survival is how many lines FOLLOW the sentence, because
+# `tail -15` counts from the END — so fourteen lines after it is the last position
+# that survives. Every row measured 11 to 13 lines after, and L5, A1, A2, A3, A4 and
+# A5 all sat at 13. One more line printed after the panic and six of the nine would
 # have reported a break that did not redden.
+#
+# **The from-the-top figure is the one not to quote, and quoting it is the mistake
+# this paragraph corrects.** It first read "A1's sat at line 26 of 40, one line
+# inside" — true of A1 and singling out the wrong row, because most rows sit at 14
+# of 28 and share A1's margin exactly. The distance from the top is the compiler and
+# the test runner talking; only the distance from the end is the margin.
 log="$(mktemp -t break-once)"
 set +e
 "${runner[@]}" "$@" "$filter" 2>&1 | tee "$log"
