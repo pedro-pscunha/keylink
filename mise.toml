@@ -41,6 +41,12 @@ description = "Everything CI runs, in CI's order. Cheapest failures first"
 run = [
     { task = "framing" },
     { task = "anchors" },
+    # Immediately after the task it guards, and in both lists rather than only in
+    # `pre-commit`, because `anchors` is in both: a guard that does not run where the
+    # thing it guards runs is a guard on paper. It asserts that `anchors` reports each
+    # failure class as itself — the defect that reached `main` once was a passing gate
+    # printing the anchor-rot playbook, which no green/red check can see.
+    { task = "anchors-selftest" },
     { task = "fmt-check" },
     { task = "lint" },
     { task = "features" },
@@ -59,6 +65,7 @@ description = "Fast enough that nobody is tempted to bypass it. Seconds, warm"
 run = [
     { task = "framing" },
     { task = "anchors" },
+    { task = "anchors-selftest" },
     { task = "fmt-check" },
     { task = "lint-fast" },
 ]

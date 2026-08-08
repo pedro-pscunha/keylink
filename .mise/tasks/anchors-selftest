@@ -40,7 +40,12 @@ ROOT = pathlib.Path(
         check=True,
     ).stdout.strip()
 )
-TASK = ROOT / ".mise" / "tasks" / "anchors"
+# The task under test, overridable by argv[1] so that THIS GUARD IS ITSELF
+# TESTABLE: point it at a deliberately drifted copy and it must go red. Without
+# that the only way to check the guard was to edit the tree, which is the hazard
+# the temp-copy design exists to avoid — so the override is not a convenience, it
+# is what lets the guard be verified the same way it verifies the gate.
+TASK = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / ".mise" / "tasks" / "anchors"
 PLAYBOOK = "THIS MEANS THE ANCHOR MOVED"
 
 source = TASK.read_text()
@@ -131,16 +136,41 @@ else:
 # ── probe 2: a real resolution failure MUST print the playbook ─────────────────
 #
 # The other direction, and the one that stops the fix from being "never print it".
-# Corrupting the first row's literal is a count-0 rot: the anchor is simply gone.
-row = re.search(r'^    \("([^"]+)", "([^"]+)", "([^"]+)",\n?\s*"', source, re.M)
+#
+# ── why this perturbs the TARGET and not the LITERAL, which is where the first
+#    version of this probe was wrong ──────────────────────────────────────────
+#
+# Corrupting a row's literal looks like the obvious rot and is **unusable as an
+# attribution probe**, because TWO checks read a literal: resolution reads it
+# against `target`, and the record-quote check reads it against `lives_in`. A
+# corrupted literal fails both. The record-quote check then supplies `bad` on its
+# own, forcing exit 1 — so the probe passes even when resolution has stopped
+# contributing to `bad` at all, and **that is precisely the drift that produces a
+# green gate printing the rot playbook.** The probe would have watched the defect
+# go by.
+#
+# Repointing `target` at another existing file fires exactly ONE check: resolution
+# reads a file that does not contain the literal, while the record-quote check
+# reads the unchanged `lives_in` and stays happy. So the exit code is attributable
+# to resolution, which is the only thing this probe is trying to assert.
+#
+# Verified both ways rather than reasoned: delete `bad += 1` from the resolution
+# loop and this probe returns exit 0, so `a rotted anchor fails the gate` reddens.
+# Run this guard against a drifted copy — `anchors-selftest <path>` — to see it.
+row = re.search(r'^    \("([^"]+)", "([^"]+)", "([^"]+)",', source, re.M)
 if row is None:
     check("an ANCHORS row is findable", False, "could not locate a row to perturb")
 else:
-    rid = row.group(1)
-    # Append a marker to that row's literal, so it resolves to nothing. Done on the
-    # first row only, and by targeting its opening quote, so no other row moves.
-    at = source.index(row.group(0)) + len(row.group(0))
-    broken = source[:at] + "zzz-no-such-anchor-zzz" + source[at:]
+    rid, lives_in, target = row.group(1), row.group(2), row.group(3)
+    # A file that certainly exists and certainly does not hold the first row's
+    # literal. Chosen from the repo rather than invented, so the failure is a real
+    # count-0 rot and not a missing-file error on a different code path.
+    decoy = "Cargo.toml" if target != "Cargo.toml" else "README.md"
+    broken = source.replace(
+        f'("{rid}", "{lives_in}", "{target}",',
+        f'("{rid}", "{lives_in}", "{decoy}",',
+        1,
+    )
     code, out = run(broken)
     check("a rotted anchor fails the gate", code == 1, f"exit {code}, expected 1")
     check(

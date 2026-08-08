@@ -380,6 +380,16 @@ ANCHORS = [
     # and `cargo fmt` split it across three lines - so the code was restructured to
     # put the call behind a short wrapper whose call site the formatter leaves alone.
     # Measured after formatting rather than predicted; the prediction was wrong.
+    #
+    # **That is a THIRD option beyond quote-or-describe - reshape the code so the
+    # anchor is one line - and it is the first instance here, so it needs its bound
+    # stated in the same breath.** Acceptable in a test, where the wrapper is
+    # test-local and reads at least as well as the inline call it replaced. **Never a
+    # reason to reshape library code:** an anchor is a property of a record, and
+    # bending `src/` to keep a harness happy is the gate deciding the shape of the
+    # thing it measures. Where a `src/` anchor cannot be a stable single line, the
+    # answer is to describe the search edit and lose the row - accepting the ungated
+    # side - not to move the code.
     ("D8", "keylink/tests/blocking_work.rs", "keylink/tests/blocking_work.rs",
      "        offloaded(work).await"),
 ]
@@ -482,7 +492,15 @@ spancache: dict[str, set[str]] = {}
 # lied. That is this file's own mode-5 argument about records, which is a claim
 # about *which* thing failed, turned on the file itself. Every check below already
 # prints its own remedy; only resolution's lives in the shared block, so only
-# resolution may trigger it. `scripts/anchors-selftest` asserts both directions.
+# resolution may trigger it. `mise run anchors-selftest` asserts both directions, and
+# runs immediately after this task in both `pre-commit` and `gate`.
+#
+# **The drift that guard exists for is one deletion away, and it is silent.** Remove
+# the `bad += 1` below and leave `unresolved += 1`: this task then prints the
+# anchor-rot playbook, prints the green summary underneath it, and **exits 0.** A
+# passing gate advertising rot. Nothing about a green run looks wrong, which is why
+# the two lines being adjacent and independent is worth a paragraph rather than a
+# comma.
 bad = 0
 unresolved = 0
 

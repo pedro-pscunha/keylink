@@ -133,6 +133,13 @@ async fn nap_taken_beside<F: Future>(work: F) -> Duration {
 /// the order of magnitude — the 20 ms sleep comes back at four hundred and
 /// something, i.e. held to the full length of somebody else's block.
 ///
+/// **The matchable prefix ends at `the block: took`**, and that is stated because
+/// `scripts/replay-fate-breaks.sh` asserts with `rg -qF` — a fixed-string test, in
+/// which `…` matches nothing. This record is not in that script's set today, so
+/// nothing is broken; whoever adds it must assert the prefix and not the sentence,
+/// or the ellipsis produces a false rot signal. Which would be this file's own
+/// defect one level up: a check failing for a reason unrelated to its claim.
+///
 /// Both halves quoted, under the indentation rule `tests/cycles.rs` states: this
 /// record's copy sits unindented in a `///` line while the code carries eight
 /// spaces, so the indented literal is unique. `work()` is quoted rather than
