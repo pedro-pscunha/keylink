@@ -18,12 +18,15 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 # a 0 aborts at the grep before a backup exists, and a 2 aborts at the python
 # assert with the backup already restored by `trap EXIT`.
 #
-# ── three ways a quoted anchor rots, all three found on one branch ───────────
+# ── four ways a quoted anchor rots, all four found across three branches ────
 #
-# 1. **Same file.** A record in the file it breaks makes its own anchor a second
-#    occurrence: count 2. Quoting can never work there, so those records
-#    describe the search edit instead — and still quote the REPLACEMENT, which
-#    is always safe because `break-once.sh` never searches `$to`.
+# 1. **Same file.** A record in the file it breaks can make its own anchor a
+#    second occurrence: count 2. NOT always, though - a `///` quote carries no
+#    indentation while the code does, so an INDENTED search literal stays unique
+#    and the record's copy is not a second occurrence. Same-file quoting works
+#    where indentation disambiguates, and fails at column 0 or on a fragment.
+#    Where it cannot work, describe the search edit - and still quote the
+#    REPLACEMENT, which is always safe because `break-once.sh` never searches it.
 # 2. **The formatter rewrapped it.** A record quoted a one-line expression;
 #    `rustfmt` split it across three when the function's signature widened.
 #    Count 0, cross-file, nothing anybody wrote by hand. The formatter owns the

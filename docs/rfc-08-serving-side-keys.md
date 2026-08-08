@@ -704,6 +704,45 @@ So the rule gains a clause: **a quoted anchor must be a whole line, including it
 indentation, and for a line whose text prefixes another it must include the trailing
 newline.** The abort reads as the harness failing when it is the record that is wrong.
 
+#### The fifth mode, which no resolution check can see
+
+A record's watched message is a claim about **which assertion fires first**, so it
+rots when an assertion is added **above** the recorded one. Found on a sibling branch:
+a later commit inserted an on-disk check above where a value was read, so a different
+assertion now fires. Nothing broke, nothing was red, and the guard was always correct
+— **the record described a race it no longer wins.**
+
+All four rules above permit it. Not same-file, nothing rewrapped, no ordered list, a
+whole line. And `break-once.sh` reports failure either way, because the test still
+fails. **Only comparing the recorded sentence against a fresh run finds it**, which is
+what `scripts/replay-fate-breaks.sh` does on the set it covers.
+
+`mise run anchors` cannot see this and says so in its own header. It answers the
+narrower question of whether the break can be **started**. The check that finds mode
+five is a replay, and the standing rule that follows is: **every branch re-runs its own
+full record set during its rebase.** Seventeen break/test pairs measured at 69 seconds,
+so cost is not a reason to skip it — the reason not to re-run *another* branch's set is
+scope, never cost.
+
+#### A record that quotes no message at all is unverifiable, and that is a failure
+
+Three of four defects on that same branch were this shape: the record described the
+*effect* — *"the two ids become equal"* — and never said what was watched. There is
+nothing to compare a re-run against, so such a record can be shown neither stale nor
+current.
+
+**The design rule for any checker, including this one: "no message recorded" must be a
+FAILURE, not a pass.** A checker keyed on mismatch alone calls all three green, which
+is the silent-success case again — and it is the arm to write *first*, because these
+are the records nobody can audit.
+
+#### Never quote the value under test
+
+Cite the guard, not the value, reaches one step further than we had it. A record beside
+a digest test declined to quote the digest, because **quoting it makes the record rot on
+exactly the change the test exists to catch.** *"`left` and `right` the same `CallId`"*
+is the durable form. This is the same rule pointed at the guard's own subject.
+
 #### The question that reaches all four
 
 **Is the anchor's uniqueness a property of the line, or of its neighbours?** — with the
@@ -741,8 +780,13 @@ checkable about it is the assertion substring, by a human.
 
 So it is decided per record, and the two axes are independent:
 
-- **Same-file records: describe, always.** Quoting cannot work there at all, so
-  replayability was never on offer and rot-immunity is free.
+- **Same-file records: describe *when quoting cannot be made unique*, which is not
+  always.** This said "always" and that was too strong. A sibling branch's same-file
+  anchors resolve, because the record's quote sits in a `///` comment **without**
+  indentation while the code carries it — so the indented search literal is unique and
+  the record's copy is not a second occurrence. Same-file quoting is legitimate **when
+  indentation disambiguates**, and fails only at column 0, or on a fragment, where
+  there is no indentation to add or nothing for it to attach to.
 - **Positional anchors: describe.** The alternative is a gate that reddens for every
   unrelated export and trains people to re-quote mechanically, which is worse than no
   gate.
