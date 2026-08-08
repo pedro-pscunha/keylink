@@ -135,6 +135,13 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 # experiment and its record is a paragraph that branch rewrote. Its break stopped
 # reddening and this task never moved.
 #
+# **And the registry cannot even REPRESENT the part that goes wrong.** A row is
+# `(id, lives_in, target, literal)` — there is **no watched-message field**. So no
+# edit to any row can state the claim that died, and no edit to any row can repair
+# it. A reader who accepts this limitation and then goes looking for the row change
+# that expresses it will not find one, which is why the absence is written down here
+# rather than left to be discovered.
+#
 # So the repair belongs to **the branch that falsifies a row, in the same commit
 # that rewrites the file** — otherwise some checkout-able commit has a tree and a
 # registry that disagree, and there is no tree from which that is visible. The
@@ -412,8 +419,15 @@ for record, lives_in, target, literal in ANCHORS:
         # count. An earlier version named it anyway, one line above the two lines
         # that refute it - and a contributor sent to look for a cause that cannot
         # apply, finding nothing wrong, reaches for the deletion this task argues
-        # against. The split is 11 cross-file and 8 same-file, so BOTH arms fire in
-        # practice and which one you get is decided by the row, not by the list.
+        # against. BOTH arms fire in practice - the list holds cross-file and
+        # same-file rows in comparable numbers - and which one you get is decided by
+        # the row, not by the list.
+        #
+        # No split is written here on purpose. The first version said "11 cross-file
+        # and 8 same-file" and was stale ONE COMMIT later, because six conversions in
+        # the same range moved five rows to same-file and one to cross-file. The
+        # conclusion is what this comment needs and the conclusion does not depend on
+        # the ratio; a count here is a value this file cannot keep true.
         likely = (
             "a second occurrence appeared in the TARGET - a new call site, a copied "
             "line, or a doc comment there quoting it. It may also be a PREFIX "
@@ -517,9 +531,15 @@ for record in sorted(FRAGMENT_ANCHORS - fragments):
 # BACKQUOTES, and demanding EQUALITY rather than containment, fixes a second hole
 # in the same expression: `flat` collapses `        self.call\n` to `self.call`,
 # which is a substring of the prose `self.call = call;`, `self.call.and(None)` and
-# `self.call.filter(..)` in that same record. Four spans CONTAIN it and exactly one
-# EQUALS it, so equality is what distinguishes the record's search quote from its
-# own replacement literals.
+# `self.call.filter(..)` in that same record. Four DISTINCT spans CONTAIN it and
+# exactly one DISTINCT span EQUALS it, so equality is what distinguishes the record's
+# search quote from its own replacement literals.
+#
+# Distinct, because the haystack below is a `set`. By OCCURRENCE the same measurement
+# reads 6 and 2, since two records quote that anchor. Every other figure in this file
+# is an occurrence count, so the unit is named here rather than inferred - a
+# re-measurer who gets 6 and 2, disagrees, and re-derives is the failure the
+# DESCRIBED header warns about.
 #
 # **Not by comparing indentation, which cannot work here.** The obvious reading -
 # "compare the quoted form with its indentation" - reddens 9 of the 19 rows,
@@ -654,7 +674,7 @@ for record, lives_in, target, literal in ANCHORS:
 # this one exists to be.
 RECORD_BLOCKS = 102
 
-blocks = 0
+harness_blocks: list[str] = []
 for path in sorted(
     list((ROOT / "keylink").rglob("*.rs")) + list((ROOT / "keylink-persist").rglob("*.rs"))
 ):
@@ -669,7 +689,32 @@ for path in sorted(
             run = []
     if run:
         found.append(" ".join(run))
-    blocks += sum(1 for b in found if "break-once.sh" in b)
+    harness_blocks += [b for b in found if "break-once.sh" in b]
+blocks = len(harness_blocks)
+
+# ── coverage: an INTERSECTION, because the two populations are different units ──
+#
+# The first version of the line below printed `RECORD_BLOCKS - len(ANCHORS)`, which
+# **subtracts a row count from a block count**. It read as coverage, it was wrong,
+# and it was wrong in the FLATTERING direction - 77 unchecked where the true figure
+# is 89. Two reasons the subtraction cannot work:
+#
+#   * several rows can live in ONE block, so rows do not map onto blocks 1:1; and
+#   * a row's record need not be a harness block at all. Eight of them are not: their
+#     records say "Made red by .." without naming `break-once.sh`, which is exactly
+#     the population the paragraph above declares this tripwire blind to. Those rows
+#     cannot be "of those 102" in any sense.
+#
+# `882bd35` on this branch is the same defect one level up - **a gate cannot claim a
+# denominator it cannot compute.** So the numbers below are an intersection measured
+# both directions, and nothing is subtracted across units.
+registered = {flat(literal) for _, _, _, literal in ANCHORS}
+harness_spans = [
+    {flat(span) for span in re.findall(r"`([^`]*)`", block)} for block in harness_blocks
+]
+blocks_carrying = sum(1 for spans in harness_spans if spans & registered)
+quotable_anywhere = set().union(*harness_spans) if harness_spans else set()
+rows_unseen = [rid for rid, _, _, lit in ANCHORS if flat(lit) not in quotable_anywhere]
 
 if blocks != RECORD_BLOCKS:
     bad += 1
@@ -744,8 +789,14 @@ print(
 )
 # Computed, never written down: the tripwire agreeing with the population says the
 # population has not MOVED, and says nothing about how much of it is registered.
-# Anybody reading the two lines above as coverage needs this third one.
+# Anybody reading the two lines above as coverage needs this third one - and it
+# reports each population in ITS OWN unit, because the first version of this line
+# subtracted rows from blocks and overstated coverage by twelve blocks.
 print(
-    f"    the tripwire agrees at {RECORD_BLOCKS} blocks; {len(ANCHORS)} of those "
-    f"{RECORD_BLOCKS} carry a row, so {RECORD_BLOCKS - len(ANCHORS)} are unchecked"
+    f"    {blocks_carrying} of the {blocks} harness blocks carry a registered row, "
+    f"so {blocks - blocks_carrying} do not"
+)
+print(
+    f"    and {len(rows_unseen)} of the {len(ANCHORS)} rows sit in records this "
+    "tripwire cannot see at all - they never say `break-once.sh`"
 )
