@@ -708,10 +708,10 @@ def comment_blocks(text: str) -> list[str]:
     was quoted only in wrapped form. What the readers did disagree about is the
     hazard surface, measured 2026-08-08 (-03:00) over the blocks naming the
     harness: with the marker kept, 99 of 1629 backticked spans carried an embedded
-    `///` or `//!`; with it stripped, 3 did, and those three are spans whose own
-    text is about a marker. That pair of figures bounds nothing and is not a
-    constant - it says the disagreement had a surface, and a re-measurer on a later
-    tree should expect two different numbers.
+    `///` or `//!`; with it stripped, 3 did, and all three of those ARE the marker,
+    quoted as `///` by a comment discussing one. That pair of figures bounds nothing
+    and is not a constant - it says the disagreement had a surface, and a
+    re-measurer on a later tree will get two different numbers.
 
     Runs stop at a line that is not a comment, which was the readers' SECOND
     difference and was also inert: joining a whole file's comment lines and joining

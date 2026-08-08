@@ -127,7 +127,7 @@ for record in plan:
         print(f"     ✓ still red at: {watched}")
         continue
     failed.append(record)
-    print(f"     ✗ the recorded sentence is NOT in this run. Expected to find:")
+    print("     ✗ the recorded sentence is NOT in this run. Expected to find:")
     print(f"         {watched}")
     print("       A break that went green, one whose anchor aborted, and one red at a")
     print("       DIFFERENT assertion all land here. Read the log the harness printed")
