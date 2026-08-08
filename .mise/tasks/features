@@ -21,23 +21,48 @@
 # gates to tests that legitimately want the feature".
 #
 # **That prediction was right about the mechanism and wrong about the price.** The
-# gates were added — they are `#[cfg(feature = "persist-file")]` on the durability
-# half of five files, `#[cfg(feature = "blocking")]` on two tests and one `let`,
-# `#[cfg(feature = "fs")]` on one test, and `required-features` on one example —
-# and what they bought is not tidiness. It is that `--all-targets` at the all-off
-# end is now RUNNABLE, so a lint or an error that only appears without a feature is
-# reachable in a test and an example for the first time. Before, the only thing
-# any tool could say about `keylink/tests/` at that end was that it did not build.
+# gates were added, and what they bought is not tidiness. It is that `--all-targets`
+# at the all-off end is now RUNNABLE, so a lint or an error that only appears
+# without a feature is reachable in a test and an example for the first time.
+# Before, the only thing any tool could say about `keylink/tests/` at that end was
+# that it did not build.
+#
+# The inventory, if you want it, is derived rather than written down here — count
+# ATTRIBUTES and not grep hits, because a comment quoting an attribute is not one:
+#
+#     grep -rhE '^\s*#!?\[cfg\(feature = "[a-z-]+"\)\]\s*$' keylink/tests/ | sort | uniq -c
+#
+# At the time of writing that gives 33 `persist-file`, 2 `blocking` and 1 `fs`
+# across seven files, plus `required-features` on one example. Two of the 33 are
+# whole-file `#![cfg]`, in `persist.rs` and `durable.rs`. **A first draft of this
+# paragraph said "two tests and one `let`" for `blocking` and it is one test and
+# one `let`** — the third hit was a comment quoting the attribute.
 #
 # The 24-build loop stays `--lib` and is not multiplied by targets. The lattice
 # middle is a library question — a feature-gated item called from another
 # feature's code — and paying 24 test-target builds to ask it again is the cost
 # this task was shaped to avoid.
 #
-# What the gates cost, measured with `cargo nextest list -p keylink --all-targets`
-# at both ends: 319 tests at default features, 292 at `--no-default-features`. The
-# 27 that go are named by that same command, and every one names a feature in its
-# own file. Nothing appears at the all-off end that is absent at default.
+# What the gates cost. **TWO pairs of figures, because the obvious command and the
+# interesting subset are not the same, and an earlier version of this paragraph
+# quoted the subset under the command that reports the superset.**
+#
+#   cargo nextest list -p keylink --all-targets                     498 -> 466, 32 go
+#   cargo nextest list -p keylink --all-targets -E 'kind(test)'      319 -> 292, 27 go
+#
+# each run once with `--no-default-features` and once without.
+#
+# The 27 are integration tests, one per gated target. **The other five are LIBRARY
+# unit tests, and they leave for their own reasons** — `authz::tests::
+# unset_env_fails_closed` needs `env`, and four `blocking::tests::*` need
+# `blocking`. Those five were already gated before this branch; nothing here
+# touched them. The lib holds 179 unit tests at default features and 174 without.
+#
+# So **32 is what leaves and 27 is what these gates account for.** Quote the wrong
+# one and a reader who re-runs the obvious command gets 32 and concludes the record
+# is short by five.
+#
+# Nothing appears at the all-off end that is absent at default, either way.
 #
 # The durability adapter multiplies this list by three rather than by four, and
 # saying which three is the point. `persist-file` implies `persist`, so

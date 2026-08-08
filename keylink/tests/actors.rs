@@ -43,9 +43,15 @@ use keylink::{
 //
 // Gated, and so is every item that uses it — `Scratch`, `wedged`, `Dropped`,
 // `wedged_once_drained`, their impls, and the tests of the holding-the-claim run
-// below. NOT the file: a `#![cfg]` here would take a hundred-odd unrelated tests
-// out of a `--no-default-features` build with them. The condition is
-// `persist-file` and not `persist`, because `Files` is the adapter half.
+// below. NOT the file: a `#![cfg]` here would take **43** unrelated tests out of a
+// `--no-default-features` build with them. This file holds 48, and 5 need the
+// adapter. The condition is `persist-file` and not `persist`, because `Files` is
+// the adapter half.
+//
+// (That said "a hundred-odd" until the merge gate caught it. The figure came from
+// `grep -c '^async fn \|#\[tokio::test\]'`, which counts the ATTRIBUTE line and the
+// `fn` line as two — an item count read as a test count. `cargo nextest list -p
+// keylink --test actors` counts tests, and counts 48.)
 //
 // **The compiler says whether that set is right, so no count is written here.**
 // `cargo check -p keylink --no-default-features --all-targets` builds this file
@@ -1123,6 +1129,14 @@ async fn shutting_down_an_unmounted_id_says_so_rather_than_pretending() {
 /// is the *unique path*, and a shared helper would have to be given the calling
 /// binary's name to keep that property. Small enough to not be worth a
 /// dependency, and small enough to not be worth a fourth crate.
+///
+/// **The `persist-file` gate below is now a third copy too, and that argument does
+/// NOT cover it.** The reason above is about the unique path; the feature condition
+/// is identical in all three places and duplicated only because the struct is. If a
+/// fourth copy appears, that is the point at which the gate is repeated more than
+/// the thing it guards, and the shared-helper trade is worth re-opening on the
+/// feature's terms rather than on the path's. Noted once, here, rather than three
+/// times.
 #[cfg(feature = "persist-file")]
 struct Scratch(std::path::PathBuf);
 
