@@ -40,7 +40,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use keylink::compose::{Overflow, Subscription, Topic};
-use keylink::{Caller, Replied, Reply};
+use keylink::{Caller, Ended, Replied, Reply};
 use tokio::sync::Notify;
 
 keylink::service! {
@@ -371,6 +371,18 @@ async fn aborting_one_actor_of_a_cycle_frees_the_other_and_destroys_it() {
         .expect("B is still running: only A was aborted");
     assert!(!a.is_running(), "A was aborted");
     assert!(b.is_running(), "B was not");
+
+    // The other half of "abort is the recovery", and the half `ask`'s
+    // documentation now leans on: a wedged actor's `ended` never resolves,
+    // because only its loop fills it. Aborting the task drops the sender, and
+    // that is what makes this answer at all.
+    let ended = n0_future::time::timeout(SETTLE, a.ended())
+        .await
+        .expect("aborting is what makes a wedged actor's `ended` resolve");
+    assert!(
+        matches!(ended, Ended::Vanished),
+        "an aborted task filled nothing, so the reason is `Vanished`, not {ended:?}"
+    );
 }
 
 // ────────────────────────────────────────────────────── the read inside a turn
