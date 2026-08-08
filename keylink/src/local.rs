@@ -111,6 +111,39 @@
 //! kinds out of five, and a compile error that needs a decision for the rest —
 //! which is the honest version of what §5.3 promised.
 //!
+//! # Blocking work in a handler, and which thread pays for it
+//!
+//! A turn is the unit of serialization, so a handler that spends 400 ms holds its
+//! actor for 400 ms **however it spends them**. That much is the actor model
+//! working. What the handler chooses is who *else* pays.
+//!
+//! `tokio::task::spawn_blocking(..).await` moves the work to the blocking pool and
+//! yields: the turn is occupied, and the runtime's worker thread is free. Blocking
+//! the thread **synchronously** occupies both — the turn *and* a worker — so
+//! unrelated tasks on that runtime stall. With `W` workers it takes `W` concurrent
+//! synchronous blocks to stop the runtime outright and fewer to degrade it; on a
+//! current-thread runtime one is enough to stop everything. `blocking::Node` runs a
+//! multi-threaded runtime on purpose, so a program built on it degrades rather than
+//! stops — the rule is the same and the blast radius is not.
+//!
+//! **Nothing reports this.** No error is produced, no lint fires, and the actor is
+//! correct from its own point of view; the damage lands on tasks that have nothing
+//! to do with it. That is the profile of a defect that ships, which is the reason
+//! this paragraph exists at all.
+//!
+//! `keylink-persist/src/file.rs` is the worked example, on both of its blocking
+//! calls — a lock-file open, and a write plus `sync_all` plus rename — and it is the
+//! reference for what belongs in the pool: bounded work that returns. For work that
+//! never returns, a parked actor loop or a blocking `recv` of your own, the pool is
+//! the wrong tool and a dedicated `std::thread` is the right one, because a pool
+//! slot never given back is a slot every other caller waits for.
+//!
+//! `spawn_blocking` does **not** make one actor concurrent: the next call still
+//! waits for this turn to return. That is the turn doing its job rather than a cost
+//! of the pool, and it is the belief worth checking, because moving work off the
+//! worker feels like parallelism and is not. Both halves are guarded in
+//! `tests/blocking_work.rs`.
+//!
 //! # A panic reaches the caller of an `ask`
 //!
 //! If the handler panics, the panic is caught so the **actor survives**, and
@@ -576,6 +609,27 @@ enum Settled<T> {
 /// Dropping it without answering is not an error and not silent: the caller's
 /// wait ends with [`TurnLost::Gone`], which is exactly what happens by itself when
 /// an actor ends with replies parked in its state.
+///
+/// # This is how a handler calls another actor — but parking is only half of it
+///
+/// A handler that awaits another actor whose handler calls back deadlocks, and
+/// the generated `Handle` documents why. This type is the way out, and the way
+/// out is precise: **returning from the turn** is what breaks the cycle, because
+/// the loop goes back to polling and can take the peer's message and run it.
+/// [`later`](Reply::later) is what makes returning possible while a caller is
+/// still owed an answer — so park the reply, hand the outbound call to a spawned
+/// task, and return.
+///
+/// Parking on its own fixes nothing. A handler that calls `later` and then awaits
+/// the peer *without returning* hangs exactly as before: the turn has not ended,
+/// so the loop is not polling, so the park bought nothing.
+/// `tests/cycles.rs` is a pair of twins that differ in the `tokio::spawn` alone
+/// and disagree, which is what makes that a mechanism rather than a suggestion.
+///
+/// And the mechanism is **not** about the mailbox permit. The permit is free in
+/// the hanging case too — a running turn released its own when it took the message
+/// it is running — so a cycle-breaker that only freed a permit would break
+/// nothing. What was missing was a loop that would *run* the message.
 ///
 /// # What a parked reply resolves to when a LATER turn faults
 ///
@@ -2760,6 +2814,40 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     /// another task's mailbox. A caller that gives up on a `reserve` has still
     /// reserved. Use [`ask_catching`](Self::ask_catching) on a served path, and
     /// on any path put the bound inside the method rather than around the call.
+    ///
+    /// # Nothing bounds the answer on this path, and `abort` is the only recovery
+    ///
+    /// A turn that never returns leaves this call waiting for ever. The two
+    /// **cycle** shapes are documented where they are built — a self-call, on the
+    /// generated `Handle`, and a ring of two or more actors, in the section below
+    /// that one — and neither is detectable by a type. A turn can also simply
+    /// await something that never fires, which is neither shape.
+    ///
+    /// With a [`QueueTimeout`](crate::QueueTimeout) installed, both dispatch paths
+    /// bound the wait for a mailbox *permit*, and neither
+    /// bounds the wait for the *answer*. The crate's answer-bound is
+    /// [`Timeout`](crate::Timeout) — and it is a
+    /// [`Middleware`](crate::Middleware), so it reaches a served dispatch and not
+    /// a local call. A local `ask` carries
+    /// [`Caller::Local`](crate::Caller::Local), which has no peer and therefore
+    /// no queueing budget to spend in the first place. So a local caller behind a
+    /// wedged turn gets no timeout and no refusal.
+    ///
+    /// Neither liveness seam reveals it either, which is the part worth knowing.
+    /// [`is_running`](Self::is_running) reads the mailbox, and a wedged actor's
+    /// mailbox is open, so it answers `true`. [`ended`](Self::ended) never
+    /// resolves, because only the loop fills it and the loop is inside the turn.
+    /// Asking `ended` *why* is the usual companion to a lost call, and it is the
+    /// one thing that does not work for the one loss with no reason. Supervision
+    /// does not reach it: a supervised actor decides to restart when its **loop**
+    /// ends, and this loop does not end.
+    ///
+    /// [`abort`](Self::abort) is the recovery and it is the only one. It destroys
+    /// the state — that is the price, and it is why it is a separate method — and
+    /// it is also what makes `ended` resolve, as
+    /// [`Ended::Vanished`](crate::Ended), since an aborted task filled nothing.
+    /// In a two-actor ring it frees the other actor and destroys only the one it
+    /// names. Guarded at N = 2 by `tests/cycles.rs`.
     ///
     /// # Panics
     ///

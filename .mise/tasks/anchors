@@ -324,6 +324,74 @@ ANCHORS = [
      "    drop(route);"),
     ("P2", "keylink/tests/defer.rs", "keylink/src/actor/remote.rs",
      "    drop(route);"),
+    # ── from the deadlock-audit branch. `D` rather than a number above `R28`,
+    # because `R12`-`R14`, `R21`-`R24` and `R27` are reserved gaps that nothing
+    # enumerates, and a fresh letter cannot collide with them by arithmetic - the
+    # same reason `call-id` took `C`.
+    #
+    # EIGHT rows and EIGHT distinct literals: no two share one, and no literal
+    # appears against two targets. Checked as `(target, literal)` pairs, because
+    # this list's headline counts ROWS and two existing rows share a literal - so
+    # the numbers coinciding here is a measurement and not an assumption.
+    #
+    # THREE are same-file (D6, D7, D8) and legitimate under the narrowed rule: the
+    # record's quote sits unindented inside a `///` line while the code carries its
+    # indentation, so the indented literal is unique and the record's copy is not a
+    # second occurrence. Their bare forms count 2. All three were DESCRIBED first,
+    # on a stated reason that measurement showed to be false — "the target file is
+    # this one, so only the search half can collide" is true of the bare literal and
+    # says nothing about the indented one. Third instance of that shape in this
+    # registry, and the general form is worth the line: state the measurement that
+    # made quoting impossible, never the property that made it look impossible.
+    ("D1", "keylink/tests/cycles.rs", "keylink/src/local.rs",
+     "const LOCAL_MAILBOX_DEPTH: usize = 1;"),
+    ("D2", "keylink/tests/cycles.rs", "keylink/src/local.rs",
+     "        self.task.abort();"),
+    # A whole line at twelve spaces, inside `Deferred::send`'s parking callback. Its
+    # record quoted it WITHOUT the indentation until this branch, which made the
+    # record's literal a non-whole-line - mode 4 - while still resolving. Widened
+    # here. It is also the one row of the eight sitting inside a multi-line closure,
+    # so it is the first to re-check after any churn in `Deferred::send`.
+    #
+    # AND IT IS CITED BY A SECOND, PRE-EXISTING RECORD:
+    # `tests/persist.rs::a_deferred_reply_that_is_answered_is_a_stored_reply`
+    # breaks the same line, with a different replacement and a different watched
+    # message, and was unregistered on `main`. So this row's blast radius is two
+    # records in two files, and the count of ROWS understates it - the same reason
+    # `C5` carries a note. Found by decomposing `blocks_carrying`, which came out one
+    # higher than the eight rows added here could explain; the extra block was that
+    # record. Anyone re-quoting this anchor must fix `persist.rs` too, and nothing
+    # here will say so, because a row names one `lives_in`.
+    ("D3", "keylink/tests/cycles.rs", "keylink/src/local.rs",
+     "            Verdict::Committed => reply.answer(Answered::Ran(value)),"),
+    ("D4", "keylink/tests/cycles.rs", "keylink/src/compose/topic.rs",
+     "            Overflow::DropSubscriber => self.publish_dropping(item),"),
+    ("D5", "keylink/tests/cycles.rs", "keylink/src/compose/topic.rs",
+     "            Overflow::BlockPublisher => self.publish_blocking(item).await,"),
+    ("D6", "keylink/tests/cycles.rs", "keylink/tests/cycles.rs",
+     "        if hops == 0 {"),
+    # The FIRST line of a three-line chain, and a whole line in its own right, which
+    # is what makes it quotable. The `.await` and `.unwrap_or` under it belong to
+    # `rustfmt`; if it reflows this goes to count 0, which is loud and is what this
+    # gate is for.
+    ("D7", "keylink/tests/cycles.rs", "keylink/tests/cycles.rs",
+     "        me.with_state(|state: &Peer| state.bumps)"),
+    # Written inline as `tokio::task::spawn_blocking(work).await.expect(..)` first,
+    # and `cargo fmt` split it across three lines - so the code was restructured to
+    # put the call behind a short wrapper whose call site the formatter leaves alone.
+    # Measured after formatting rather than predicted; the prediction was wrong.
+    #
+    # **That is a THIRD option beyond quote-or-describe - reshape the code so the
+    # anchor is one line - and it is the first instance here, so it needs its bound
+    # stated in the same breath.** Acceptable in a test, where the wrapper is
+    # test-local and reads at least as well as the inline call it replaced. **Never a
+    # reason to reshape library code:** an anchor is a property of a record, and
+    # bending `src/` to keep a harness happy is the gate deciding the shape of the
+    # thing it measures. Where a `src/` anchor cannot be a stable single line, the
+    # answer is to describe the search edit and lose the row - accepting the ungated
+    # side - not to move the code.
+    ("D8", "keylink/tests/blocking_work.rs", "keylink/tests/blocking_work.rs",
+     "        offloaded(work).await"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -403,7 +471,38 @@ def flat(text: str) -> str:
 
 cache: dict[str, str] = {}
 spancache: dict[str, set[str]] = {}
+
+# TWO counters, and the split is the whole of a defect this task shipped with.
+#
+# `bad` decides the exit code and is raised by all five checks below: anchor
+# resolution, an undeclared fragment, an over-declared fragment, the record-quote
+# check, and the population tripwire. `unresolved` is raised by **resolution
+# alone**.
+#
+# They were one counter, and the anchor-rot playbook at the bottom was printed on
+# it — so the population tripwire, which fires for **every branch that adds a
+# record block** and is therefore the normal case, produced `1 of 25 quoted break
+# anchors no longer resolve` and thirty lines headed `THIS MEANS THE ANCHOR MOVED.
+# FOLLOW IT.` about rot that did not exist. Found on the first branch to add
+# records after this task landed: all 25 rows resolved, verified by parsing
+# `ANCHORS` and counting each literal independently.
+#
+# A wrong number gets distrusted. A wrong DIAGNOSIS with a procedure attached gets
+# followed — the contributor confirms all rows resolve before concluding the tool
+# lied. That is this file's own mode-5 argument about records, which is a claim
+# about *which* thing failed, turned on the file itself. Every check below already
+# prints its own remedy; only resolution's lives in the shared block, so only
+# resolution may trigger it. `mise run anchors-selftest` asserts both directions, and
+# runs immediately after this task in both `pre-commit` and `gate`.
+#
+# **The drift that guard exists for is one deletion away, and it is silent.** Remove
+# the `bad += 1` below and leave `unresolved += 1`: this task then prints the
+# anchor-rot playbook, prints the green summary underneath it, and **exits 0.** A
+# passing gate advertising rot. Nothing about a green run looks wrong, which is why
+# the two lines being adjacent and independent is worth a paragraph rather than a
+# comma.
 bad = 0
+unresolved = 0
 
 for record, lives_in, target, literal in ANCHORS:
     if target not in cache:
@@ -412,6 +511,7 @@ for record, lives_in, target, literal in ANCHORS:
     if found == 1:
         continue
     bad += 1
+    unresolved += 1
     same_file = lives_in == target
     if found == 0:
         reason = "IS GONE - `break-once.sh` aborts at its grep, before any backup"
@@ -703,7 +803,16 @@ for record, lives_in, target, literal in ANCHORS:
 # bisect script. Nothing here needs changing for that - the tip is correct, and the
 # alternative is a constant that measures less than the tree, which is the thing
 # this one exists to be.
-RECORD_BLOCKS = 103
+# 103 → 111 on the deadlock-audit branch: eight new harness blocks, seven in
+# `tests/cycles.rs` and one in `tests/blocking_work.rs`.
+#
+# **Re-measured from this tree by running the loop below and reading what it
+# counted.** That it equals `103 + 8` is a RESULT, not the method — and this
+# constant has now been measured three times on three trees, `110` against
+# `155e868` and `111` against `2cc0c1d`, so a value carried across a rebase would
+# have been wrong twice. The arithmetic agreeing twice is what makes it a trap:
+# it looks like a derivation and it is a coincidence of two disjoint edits.
+RECORD_BLOCKS = 111
 
 harness_blocks: list[str] = []
 for path in sorted(
@@ -753,19 +862,57 @@ if blocks != RECORD_BLOCKS:
           f"RECORD_BLOCKS says {RECORD_BLOCKS}.", file=sys.stderr)
     print("       A record was added or removed. Decide whether it needs a row",
           file=sys.stderr)
-    print("       above - most will not, and that is fine - then update this",
+    print("       above - most will not, and that is fine - then set the constant",
           file=sys.stderr)
-    print("       number. This exists so the decision is forced, not skipped.",
+    print(f"       to {blocks}, the number counted from THIS tree just now.",
+          file=sys.stderr)
+    print("       This exists so the decision is forced, not skipped.",
+          file=sys.stderr)
+    print(file=sys.stderr)
+    # Two sentences that exist because of how this failure is actually met.
+    #
+    # RE-MEASURE, NEVER CARRY. The constant is a property of a tree, so a value
+    # brought across a rebase is stale the moment a sibling branch adds or removes a
+    # record. Measured three times on three trees inside one day: 102, then 110, then
+    # 111. Twice the arithmetic happened to agree, which is worse than it failing —
+    # an agreeing subtraction reads as a derivation. `parked-drain`'s figures are the
+    # counter-example that settles it: carrying blocks went 13 → 15 while the
+    # population went 102 → 103, so the unchecked count FELL, 89 → 88. A subtraction
+    # whose inputs both move is how a stale figure keeps looking current.
+    print("       RE-MEASURE, never carry: this constant describes ONE tree, so a",
+          file=sys.stderr)
+    print("       value brought across a rebase is stale as soon as a sibling",
+          file=sys.stderr)
+    print("       branch adds or removes a record. Do not compute it either - an",
+          file=sys.stderr)
+    print("       agreeing subtraction reads as a derivation and is a coincidence.",
+          file=sys.stderr)
+    print(file=sys.stderr)
+    # And the sentence that matters most, because of where the wrong remedy pointed.
+    #
+    # This failure used to be reported by the anchor-rot summary below, whose remedy
+    # block discusses DELETING A REGISTRY ROW — the one action that turns a check into
+    # a silent pass. So a stale count was answered with a procedure for removing a
+    # guard. The counter split stops that summary firing here; this line stops the
+    # reading surviving in a contributor's head.
+    print("       NOTHING here asks you to delete a row. A stale count is a stale",
+          file=sys.stderr)
+    print("       count: no anchor moved, no record is unreplayable, and removing",
+          file=sys.stderr)
+    print("       an entry would turn a working check into a silent pass.",
           file=sys.stderr)
     print(file=sys.stderr)
 
-if bad:
+if unresolved:
+    # Gated on `unresolved` and NOT on `bad`: this block is resolution's remedy and
+    # nobody else's. See the two-counter note beside their declaration.
+    #
     # The remedy belongs HERE and not only in RFC-08 §9.2, because a contributor
     # meets the failure and not the convention. Without it the shortest path to
     # green is to delete the entry — which removes the check while reporting
     # success, the exact silent-success case this task exists to prevent.
     print(
-        f"{bad} of {len(ANCHORS)} quoted break anchors no longer resolve, so those\n"
+        f"{unresolved} of {len(ANCHORS)} quoted break anchors no longer resolve, so those\n"
         "records cannot be replayed and nothing else would have said so.\n"
         "\n"
         "THIS MEANS THE ANCHOR MOVED. FOLLOW IT.\n"
@@ -807,6 +954,11 @@ if bad:
         "RFC-08 §9.2 carries the full argument.",
         file=sys.stderr,
     )
+
+# Separate from the block above, and after it, so that a failure in any of the five
+# checks still fails the gate while only resolution prints the playbook. Folding this
+# back into `if unresolved:` would make the other four checks report and then exit 0.
+if bad:
     sys.exit(1)
 
 print(

@@ -1733,9 +1733,10 @@ macro_rules! __keylink_service {
             /// # An actor must not call itself. Any method, including `tell`.
             ///
             /// A handler that awaits **any** method on a handle to its own actor
-            /// can deadlock, and the mechanism is worth knowing because two of
-            /// the three cases are load-dependent — they pass every test and
-            /// appear in production.
+            /// can deadlock, and the mechanism is worth knowing because one of
+            /// the four cases is load-dependent — it passes every test and
+            /// appears in production, while the other three fail the first time
+            /// they run.
             ///
             /// - **`rpc`, always.** The reply cannot be produced until the actor
             ///   takes the next message, and the actor is busy being this
@@ -1748,6 +1749,10 @@ macro_rules! __keylink_service {
             ///   only the actor can free it.
             /// - **[`stop`](Self::stop), always.** It takes a permit like any
             ///   message, and then waits for a loop that cannot exit.
+            /// - **[`with_state`](Self::with_state), always.** A read is a
+            ///   message too. It takes the free permit and then waits for the
+            ///   loop to run the closure, so the one method that never touches
+            ///   `&mut self` still deadlocks exactly like an `rpc`.
             ///
             /// An earlier version of this comment said a self `tell` was fine
             /// because it waits for nothing. It waits for a permit.
@@ -1758,6 +1763,44 @@ macro_rules! __keylink_service {
             /// round trip. If the work must happen *after* the current turn,
             /// spawn a task that holds a handle; that task is not the actor and
             /// can wait for a permit safely.
+            ///
+            /// # The count of actors does not matter: `A → B → A` hangs too
+            ///
+            /// Nothing above needs the handle to be your **own**. Actor A calling
+            /// actor B, whose handler calls A, hangs both for ever, and so does
+            /// any longer ring. A handler holds `&mut A` and `A` can hold another
+            /// actor's handle, so two collaborating actors each holding the
+            /// other's is an ordinary design and not an exotic one — it is the
+            /// shape a reader is most likely to build.
+            ///
+            /// It is **worse than the self-`tell` case above, not milder.** Both
+            /// sends succeed, and for two different reasons: the **opening** send
+            /// A→B lands because B is idle with an empty mailbox, and the
+            /// **closing** send B→A lands because A's loop released its own permit
+            /// when it took the message it is now running. So nothing complains at
+            /// either end. What neither caller gets is an *answer*, because the
+            /// only task that could produce one is the task waiting for it. A ring
+            /// therefore needs no contention and hangs the first time it runs — the
+            /// load-dependence that lets the self-`tell` case survive testing is
+            /// absent, and the deadlock is unconditional.
+            ///
+            /// Both actors are then stuck in **two different ways**, which is
+            /// worth knowing when reading a stack: a further call to A blocks in
+            /// `send`, because B's message took A's one free permit, while a
+            /// further call to B is accepted and blocks on the answer.
+            ///
+            /// The remedy across two actors is not "call it on `&mut self`" —
+            /// there is no `&mut` to reach. It is to stop being inside the turn:
+            /// park the reply with
+            /// [`Reply::later`](keylink::Reply::later), hand the outbound call to
+            /// a spawned task and **return**, so the loop is polling again when
+            /// the peer calls back. Parking alone is not enough; see
+            /// [`Deferred`](keylink::Deferred), which says which half does the
+            /// work.
+            ///
+            /// `keylink/tests/cycles.rs` builds the two-actor ring and watches it
+            /// hang under a timeout, and pins the recovery: `abort` frees the
+            /// *other* actor and destroys the one it names.
             ///
             /// # Which methods are here
             ///
