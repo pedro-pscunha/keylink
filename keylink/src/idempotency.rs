@@ -870,9 +870,26 @@ impl Idempotency {
     /// Taking the cap as an argument rather than returning the raw request is
     /// deliberate: an uncapped accessor returns a number a **peer** chose, and
     /// nothing in a signature would then say that its one caller must clamp it.
-    /// **Reading the budget without naming a ceiling** is what the parameter makes
-    /// unrepresentable — not every misuse, since `attach_budget(Duration::MAX)`
-    /// compiles and means what it says.
+    ///
+    /// **What the parameter makes unrepresentable is reading the budget without
+    /// naming a ceiling. It does not make a bad ceiling unrepresentable, and the
+    /// difference matters because this doc once claimed otherwise.**
+    /// `attach_budget(Duration::MAX)` compiles, and so would
+    /// `attach_budget(MAX_ATTACH)` at a future call site — which is the operator's
+    /// setting ignored again, by the same shape this change removed.
+    ///
+    /// That residue is the design's own argument turned on itself, so it is written
+    /// here rather than left for a reader to notice: the case against clamping in
+    /// `claim_key` is that deleting a `min` there **breaks no type**, and passing a
+    /// permissive `cap` breaks no type either. What the parameter buys is a
+    /// narrower hole — from *any* caller silently forgetting to clamp, to a caller
+    /// having to name a ceiling and being able to name a bad one — and a hole that
+    /// has to be typed out is one a reviewer can see. It is one call site today.
+    ///
+    /// A newtype over the cap would close it. It is not worth a wrapper for one
+    /// caller, which is a judgement about this call site and not about the
+    /// technique; if a second serving path ever reads a budget, that is the moment
+    /// to reach for it.
     ///
     /// `None` means the caller did not ask to attach at all. That is refused
     /// [`IdempotencyRefusal::InFlight`] rather than capped, so `cap` never
