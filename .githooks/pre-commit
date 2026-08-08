@@ -38,8 +38,15 @@ fi
 # not record whether a commit was verified, so "was `HEAD` already gated?" is not
 # a question this hook can ask — only "does the commit I am about to write touch
 # code the gate cares about?". Re-running is the answer that cannot be wrong in
-# the dangerous direction. It costs ~0.5 s on a warm tree, which an amend always
+# the dangerous direction. It cost ~0.5 s on a warm tree, which an amend always
 # has, because the commit it is amending just built one.
+#
+# THAT FIGURE WAS MEASURED AT A LIST LENGTH THAT NO LONGER EXISTS, so treat it as
+# an order of magnitude and not a number. It was taken when `mise run pre-commit`
+# was three tasks; `anchors` made it four. The two non-cargo tasks measure 0.20 s
+# (`framing`) and 0.08 s (`anchors`) on this machine, so the rounded claim
+# survives — but the end-to-end figure has not been re-measured, because
+# re-measuring it runs clippy. Re-measure before quoting it.
 #
 # There is NO signal for an amend in git's environment, and this was verified
 # rather than assumed: every `GIT_*` variable is byte-identical between an
@@ -50,8 +57,63 @@ fi
 # The check over-fires on `git commit -m '... --amend ...'`, because the message
 # is in that command line too. That costs one extra gate run and no correctness,
 # which is the direction to be wrong in.
+#
+# ── AND A REBASE IS REPLAYING, NOT AUTHORING, which is the one place the
+# ── paragraph above must not apply.
+#
+# A plain replay never reaches this hook, so the case that matters is the one that
+# does. MEASURED on git 2.54.0 (Apple Git-157), inside a linked worktree:
+#
+#     git rebase <upstream>, two commits replayed   hook fires 0 times
+#     git rebase -i with a `reword` step            hook fires ONCE
+#     the `edit` stop itself                        hook fires 0 times
+#     git rebase --continue after that stop         hook fires 0 times
+#
+# A `reword` fires because git's sequencer spawns `git commit --amend
+# --no-gpg-sign -e --allow-empty` and does NOT pass `--no-verify`. The check above
+# then sees `--amend` and is right to — it IS an amend — so the gate runs against
+# a commit the developer is replaying rather than writing.
+#
+# That is worth refusing for a reason stronger than its cost. `lint-fast` runs
+# clippy against the WORKING TREE, and mid-rebase the working tree sits at an
+# intermediate commit, which has no obligation to be clippy-clean. A failure there
+# stops the rebase mid-flight, and the only way out is `git commit --amend
+# --no-verify` and then `git rebase --continue` — which trains exactly the bypass
+# this file's header calls illegitimate. A gate has to fail where the developer
+# can act on it, and inside a replay they cannot: repairing that tree is a
+# different operation from the reword they asked for.
+#
+# The incoherence is what settles it. Within ONE `git rebase -i`, a `pick` of an
+# ungated commit skips and a `reword` of that same commit gates. The discriminator
+# is whether a message happened to change, which is orthogonal to whether the code
+# was ever checked. Skipping here widens nothing that a plain replay does not
+# already leave open; it makes the two agree.
+#
+# WHAT IS SKIPPED IS THE DETECTOR AND NOT THE HOOK, and that difference is the
+# whole design. Clearing `amend_base` sends a rebase-driven commit down the
+# ordinary path, which is already right for both shapes it meets there:
+#
+#   - at a `reword` the index matches HEAD, so the diff is EMPTY and the early
+#     exit below fires. Measured: `git diff --cached --name-only` prints nothing.
+#   - at an `edit` stop where the developer STAGED code, that diff is NOT empty,
+#     so the gate still runs. That is the one moment inside a rebase when a human
+#     is genuinely authoring, and it stays gated.
+#
+# An early `exit 0` here would have thrown the second one away.
+#
+# `git rev-parse --git-path` rather than a literal `.git/rebase-merge`, and that
+# is not a style preference. In a LINKED WORKTREE `.git` is a FILE, so
+# `[ -d .git/rebase-merge ]` is false even in the middle of a rebase — measured
+# `no` during an actual `reword`. This repo is developed in several worktrees at
+# once, so the literal form would be dead code exactly where the work happens.
+rebasing=no
+if [ -d "$(git rev-parse --git-path rebase-merge)" ] ||
+    [ -d "$(git rev-parse --git-path rebase-apply)" ]; then
+    rebasing=yes
+fi
+
 amend_base=""
-if ps -o args= -p "$PPID" 2>/dev/null | grep -qw -- '--amend'; then
+if [ "$rebasing" = no ] && ps -o args= -p "$PPID" 2>/dev/null | grep -qw -- '--amend'; then
     # The empty tree when amending a root commit, so there is one code path here
     # rather than a special case that only fires on a repository's first commit.
     amend_base="$(git rev-parse --verify --quiet HEAD~1 || git hash-object -t tree /dev/null)"
@@ -75,8 +137,18 @@ if command -v mise >/dev/null 2>&1; then
     exec mise run pre-commit
 fi
 
-# `mise` is how the gate is defined; these are the same two commands, inlined
-# so a contributor without it is still gated rather than silently ungated.
+# `mise` is how the gate is defined, and this path runs the same checks so that a
+# contributor without it is still gated rather than silently ungated.
+#
+# It said "the same two commands" while `pre-commit` already ran THREE tasks —
+# `framing` was never inlined — and then `anchors` made it four. Naming the list is
+# what keeps that honest, so: `framing`, `anchors`, `fmt-check`, `lint-fast`.
+#
+# The first two are scripts, so they are invoked rather than reimplemented; a
+# second copy of their logic is a second thing to drift. Both read their own root
+# and run standalone without `mise` in the environment.
 echo "note: 'mise' is not installed - running the same checks directly" >&2
+.mise/tasks/framing
+.mise/tasks/anchors
 cargo fmt --all -- --check
 cargo clippy -p keylink --lib --all-features -- -D warnings
