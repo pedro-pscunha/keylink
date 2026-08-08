@@ -2465,13 +2465,13 @@ impl<A: Send, M: Send, I: Inbox<A, M>> Inbox<A, M> for Lent<'_, I> {
 /// did not survive* into *the work did not happen* is a claim only the caller can make,
 /// because only the caller knows what its handler touched.
 ///
-/// **Nothing guards the combination**, and that is a fact about the suite rather than a
-/// hedge: `tests/supervision.rs` names no idempotency key and `tests/actors.rs` mounts
-/// no supervisor, so the two halves of this paragraph are established by reading the
-/// code above and not by a check.
-/// `tests/supervision.rs::a_keyed_call_whose_turn_panicked_stays_interrupted_across_a_restart`
-/// was added with this paragraph and pins the answer a caller gets; it does not make
-/// the answer right, which is what the paragraph above is for.
+/// **Nothing guarded the combination until this branch.** `tests/actors.rs` still mounts
+/// no supervisor, and no test named an idempotency key on a supervised actor before
+/// `tests/supervision.rs::a_keyed_call_whose_turn_panicked_stays_interrupted_across_a_restart`,
+/// which was added with this paragraph. **What it pins is the answer a caller gets, not
+/// that the answer is right** — the paragraphs above are what argue that, and no test can
+/// stand in for them: the claim they make is about the world the handler touched, which
+/// the suite cannot reach.
 async fn supervise<A, M, F, Fut, N, I>(
     mut factory: N,
     limit: Intensity,

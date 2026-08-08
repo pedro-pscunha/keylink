@@ -341,12 +341,15 @@ pub enum IdempotencyRefusal {
     /// unknown, and no record can make it known. Decide out of band, then use a
     /// different key.
     ///
-    /// # A supervised actor's restart lands here, and this refusal is then coarser than what the crate knows
+    /// # A supervised actor's restart lands here
     ///
     /// A panicked turn on a [supervised](crate::LocalActor::spawn_supervised) actor
     /// whose [`Observer`](crate::Observer) refuses the fault restarts from the last
     /// committed state — so the turn's effect on that state is gone, and a retry under
     /// the key still reads this. The ledger is not told: it survives a restart intact.
+    /// **The refusal is then coarser than what the crate knows**: the crate knows the
+    /// turn's effect on the state did not survive, and this variant can only say that
+    /// whether the work took effect is unknown.
     /// `local.rs`'s `supervise` carries the chain, why the gap is left open, and which
     /// parts of it nothing guards.
     ///
@@ -1518,11 +1521,20 @@ impl Limits {
     /// hold of zero is representable here and on `ttl` and nowhere else on this type.
     ///
     /// [`Attaching::Forbidden`] is the other act, and it is the one that admits
-    /// nothing: `Idempotency::attach_budget` answers `None` for it, and the accept
-    /// path refuses a `None` [`InFlight`](IdempotencyRefusal::InFlight) before
-    /// `Ledger::wait`. So nothing parks and no
-    /// [`waiting`](Self::waiting) place is spent. Everything below is about the
-    /// [`UpTo`](Attaching::UpTo) arm.
+    /// nothing: `claim_key` matches it on its own line, above the budget it would
+    /// otherwise read and before `Ledger::wait`, so nothing parks and no
+    /// [`waiting`](Self::waiting) place is spent.
+    ///
+    /// **[`Attaching`] carries the argument for both acts, and this setter deliberately
+    /// does not repeat it**: which refusal each one produces, what a zero hold still
+    /// spends, and why zero is not spelled [`Forbidden`](Attaching::Forbidden). That
+    /// argument used to sit here as well, at length. The edit that moved the operator's
+    /// refusal out of `Idempotency::attach_budget` and into `claim_key` had to land in
+    /// every copy of it, and **this setter's copy is the one it missed** — the paragraph
+    /// above went on saying that `attach_budget` answers `None` for
+    /// [`Forbidden`](Attaching::Forbidden), which after that edit it never does. One home
+    /// is what stops the next such edit having to be right in a place its author is not
+    /// reading. Everything below is about the [`UpTo`](Attaching::UpTo) arm.
     ///
     /// **This is a ceiling on a number a peer chose, and the smaller of the two
     /// governs.** A caller names its own budget in
@@ -1535,36 +1547,6 @@ impl Limits {
     /// cap can see, and the cost of a flood is *waiters × duration*. Before this
     /// setter existed a caller could set the count and not the duration, so it
     /// controlled one factor of a product.
-    ///
-    /// **A zero hold does not turn attaching off, and what separates the two is a
-    /// waiting place.** `Idempotency::attach_budget` returns `Some(Duration::ZERO)`
-    /// for [`UpTo(Duration::ZERO)`](Attaching::UpTo) and not `None`, so a zero ceiling
-    /// carries the caller through the whole accept path: it spends a
-    /// [`waiting`](Self::waiting) place, re-claims the key once — so a call that
-    /// settles in that instant is still answered from the record — and only then
-    /// expires. What zero buys is that no attacher is ever *held*. What it does not
-    /// buy is the machinery not running. [`Attaching::Forbidden`] is what buys that,
-    /// and it is why the setting is an enum: an earlier version of this paragraph
-    /// said zero "turns the feature off", which was wrong on a reachable path, and a
-    /// duration had no way to say the thing that sentence meant.
-    ///
-    /// **So a zero hold is not one refusal.** It is
-    /// [`InFlight`](IdempotencyRefusal::InFlight) when a place was free, and
-    /// [`TooManyRunning`](IdempotencyRefusal::TooManyRunning) when the waiting pool
-    /// was already full, because `Ledger::wait` is reached either way and refuses
-    /// with the count it exceeded. [`Attaching::Forbidden`] is `InFlight` at every
-    /// pool state, because it never reaches that call.
-    /// `rpc::tests::a_forbidden_ceiling_is_refused_without_a_waiting_place` and
-    /// `rpc::tests::a_zero_hold_still_spends_a_waiting_place` hold the pair, against
-    /// one exhausted pool so that neither can drift from the other.
-    ///
-    /// **Three acts, and each has its own door.** A caller that wants never to be
-    /// parked does not ask to attach, which is the *calling* side — see
-    /// [`waiting`](Self::waiting). A service that will admit an attacher and hold it
-    /// for no time sets [`UpTo(Duration::ZERO)`](Attaching::UpTo). A service that will
-    /// not admit one sets [`Attaching::Forbidden`]. Only the first was expressible
-    /// before this setting took an enum, and the second was standing in for the
-    /// third.
     ///
     /// # No layer can stand in for this, and the ordering is why
     ///
@@ -1611,13 +1593,35 @@ impl Limits {
 ///
 /// Because zero already means something else on a reachable path.
 /// `UpTo(Duration::ZERO)` carries the caller through the whole accept path: it
-/// spends a [`waiting`](Limits::waiting) place, re-claims the key once, and only
-/// then expires. It stops the *hold*, not the park. [`Limits::attach`] carries that
-/// in full, including that an earlier version of its own paragraph said zero "turns
-/// the feature off" and was wrong on a reachable path.
+/// spends a [`waiting`](Limits::waiting) place, re-claims the key once — so a call
+/// that settles in that instant is still answered from the record — and only then
+/// expires. It stops the *hold*, not the park. What zero does not buy is the machinery
+/// not running, and an earlier version of [`Limits::attach`]'s own doc said zero "turns
+/// the feature off": wrong on that path, and the sentence this type exists to make
+/// unwritable.
 ///
 /// So a second meaning stacked on the same zero would be a value whose act a
 /// reader has to look up. A variant is the act, in the word the operator typed.
+///
+/// # The two settings answer with different refusals
+///
+/// `UpTo(Duration::ZERO)` is [`InFlight`](IdempotencyRefusal::InFlight) when a place
+/// was free, and [`TooManyRunning`](IdempotencyRefusal::TooManyRunning) when the
+/// waiting pool was already full, because `Ledger::wait` is reached either way and
+/// refuses with the count it exceeded. [`Forbidden`](Self::Forbidden) is `InFlight` at
+/// every pool state, because it never reaches that call.
+/// `rpc::tests::a_forbidden_ceiling_is_refused_without_a_waiting_place` and
+/// `rpc::tests::a_zero_hold_still_spends_a_waiting_place` hold the pair, against one
+/// exhausted pool so that neither can drift from the other.
+///
+/// # Three acts, and each has its own door
+///
+/// A caller that wants never to be parked does not ask to attach, which is the
+/// *calling* side — see [`Limits::waiting`]. A service that will admit an attacher and
+/// hold it for no time sets [`UpTo(Duration::ZERO)`](Self::UpTo). A service that will
+/// not admit one sets [`Forbidden`](Self::Forbidden). Only the first was expressible
+/// before [`Limits::attach`] took this enum, and the second was standing in for the
+/// third.
 ///
 /// **A `bool` beside the duration, rejected**, and twice over: two fields that
 /// interact where one does the work, and a flag at a call site that names nothing.
@@ -1645,7 +1649,9 @@ pub enum Attaching {
     /// Admit the attacher, and hold it for at most this long.
     ///
     /// A ceiling on a number the peer chose, so the smaller of the two governs.
-    /// [`Limits::attach`] describes what both ends of this range do, zero included.
+    /// [`Attaching`]'s own doc describes what the zero end of this range does.
+    /// [`Limits::attach`] describes the top of it, where a value above any budget a peer
+    /// sends disables the cap.
     UpTo(Duration),
     /// Admit no attacher at all.
     ///
@@ -1751,8 +1757,9 @@ impl Ledger {
 
     /// Whether this service admits an attaching call, and its ceiling if it does.
     ///
-    /// The one bound read from outside the ledger, because the clamp is applied on
-    /// the accept path — `Idempotency::attach_budget` takes it there. A
+    /// The one bound read from outside the ledger, because the clamp is applied on the
+    /// accept path: `claim_key` matches this value, and only an
+    /// [`UpTo`](Attaching::UpTo)'s duration reaches `Idempotency::attach_budget`. A
     /// crate-private reader rather than a getter on [`Limits`], which deliberately
     /// offers none.
     ///

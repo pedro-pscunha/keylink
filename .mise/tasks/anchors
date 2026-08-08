@@ -1246,8 +1246,10 @@ for record in sorted(set(REDNESS) - row_ids):
 # hook answered `124 comment blocks mention break-once.sh` from the walk.
 #
 # 124 → the figure below, two commits later on the same branch, for `Attaching` and for
-# the panic-restart gap. **THREE new blocks, ONE retired, ONE new row**, and the three
-# do not line up — which is why the figure is measured and not derived:
+# the panic-restart gap. **THREE new blocks, ONE new row, and the net is +3.** An earlier
+# version of this note said "THREE new blocks, ONE retired, ONE new row", which reaches
+# 126 and not the figure below. The retirement is real and it subtracts nothing, and that
+# is the part an auditor cannot re-derive from the two ends alone:
 #
 #   added    `a_forbidden_ceiling_is_refused_without_a_waiting_place`, whose literal is
 #            the new row **M2**.
@@ -1255,19 +1257,23 @@ for record in sorted(set(REDNESS) - row_ids):
 #            replacement of its own, so it is a block without a row.
 #            `a_keyed_call_whose_turn_panicked_stays_interrupted_across_a_restart` in
 #            `tests/supervision.rs` — cites **R11's**, likewise.
-#   retired  `a_forbidden_ceiling_answers_none_for_every_request`, deleted with the seam
-#            it guarded: the operator's refusal moved OUT of
-#            `Idempotency::attach_budget` and into `claim_key`, so `attach_budget`'s
-#            `None` keeps one meaning and `a_bare_key_does_not_attach` keeps testing
-#            what its name says.
+#   retired  `a_forbidden_ceiling_answers_none_for_every_request`, **born and deleted
+#            INSIDE this range**: the commit that introduced `Attaching` added it, and the
+#            commit after that deleted it with the seam it guarded, when the operator's
+#            refusal moved OUT of `Idempotency::attach_budget` and into `claim_key` — so
+#            `attach_budget`'s `None` keeps one meaning and `a_bare_key_does_not_attach`
+#            keeps testing what its name says. **It was never in the 124 base**, so it is
+#            not a block this range took away from it, and nothing is subtracted.
 #   re-quoted A1 (the cap read became a `match` arm), A3 and A4 (the default became
 #            `Attaching::UpTo(MAX_ATTACH)`). Re-quoting moves no block.
 #
-# **Read off a run of this task at this tree, which agreed at 127.** An arithmetic would
-# have needed the retirement, the two shared literals and the three re-quotes to come out
-# right; and this branch's own earlier version of this note said "TWO new rows" for rows
-# that no longer exist and "NO new row" one edit after that. Both were written while the
-# tree was still moving, which is exactly what a carried figure is.
+# **Read off a run of this task at this tree, which agreed at 127.** The lesson this entry
+# earns is sharper than "measure, do not derive": a walk of the INTERMEDIATE commits is
+# what shows a retirement to be internal, and a diff of the two ends cannot, because a
+# block born and deleted between them is absent from both. This branch's own earlier
+# versions of this note said "TWO new rows" for rows that no longer exist, then "NO new
+# row" one edit after that, then an arithmetic landing one short. All three were written
+# while the tree was still moving, which is exactly what a carried figure is.
 RECORD_BLOCKS = 127
 
 # The one marker the tripwire counts, and the two phrasings records use INSTEAD of

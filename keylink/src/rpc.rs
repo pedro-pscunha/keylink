@@ -324,7 +324,7 @@ async fn claim_key(
     // `Limits::attach` at zero gets `Some(ZERO)` above, reaches this line, spends a
     // place, and expires at the timeout below. So a zero ceiling is refused
     // `TooManyRunning` rather than `InFlight` once the waiting pool is full, which is
-    // what `Limits::attach`'s own doc now says instead of "turns the feature off".
+    // what `Attaching`'s own doc says instead of "turns the feature off".
     let _waiting = match ledger.wait(peer) {
         Ok(waiting) => waiting,
         Err(refusal) => return Claimed::Refuse(refusal),
@@ -1038,7 +1038,7 @@ mod tests {
     /// before expiring — this test gets
     /// [`InFlight`](IdempotencyRefusal::InFlight) because the pool has a place free,
     /// and a zero ceiling meeting an exhausted pool is refused `TooManyRunning`
-    /// instead. `Limits::attach` carries that distinction; the guard deliberately
+    /// instead. [`Attaching`] carries that distinction; the guard deliberately
     /// covers one arm of it, and naming which arm is the point of this paragraph.
     /// [`Attaching::Forbidden`] is the setting that does turn it off, and
     /// `a_forbidden_ceiling_is_refused_without_a_waiting_place` holds that.
@@ -1183,7 +1183,7 @@ mod tests {
     /// hold still ASKS for a waiting place, so an exhausted pool turns it away with
     /// the count it exceeded.
     ///
-    /// `Limits::attach`'s own doc claims exactly this — *"`TooManyRunning` when the
+    /// [`Attaching`]'s own doc claims exactly this — *"`TooManyRunning` when the
     /// waiting pool was already full"* — and nothing asserted it until here.
     ///
     /// Made red by `scripts/break-once.sh` appending `.filter(|held| !held.is_zero())`
@@ -1437,9 +1437,25 @@ where
     /// it. A key is a wire concept, so that is consistent rather than a hole — but a
     /// layer is not a place to put an invariant the local path shares.
     ///
-    /// A keyed actor system takes the same layer, because its generated
-    /// `keyed_service` hands back an ordinary [`ServiceBuilder`]. Held by
-    /// `tests/protocol.rs::a_layer_can_require_an_idempotency_key`.
+    /// **A keyed actor system takes this layer with its impl header changed**, and the
+    /// change is not optional. The generated `keyed_service` hands back a
+    /// [`ServiceBuilder`]`<`[`Addressed`](crate::Addressed)`<Request>, Response>`, and
+    /// [`layer`](Self::layer) accepts a [`Middleware`] over that builder's own `Req` — so
+    /// the header becomes `Middleware<Addressed<till::Request>, Resp>`, and the form
+    /// written above does not satisfy it. An operator who copies the header unchanged
+    /// onto a keyed system gets a trait-bound error rather than a layer.
+    ///
+    /// **The body is unchanged.** [`Context::method`](crate::Context::method) answers the
+    /// actor's own method name on that path rather than a constant, which is what makes
+    /// the `cx.method()` test above mean the same thing there.
+    /// `tests/actors.rs`'s `PerMethod` mounts a `Middleware<Addressed<..>, ..>` on a
+    /// `keyed_service` and reads that name, so the keyed header shape is compiled
+    /// somewhere in this tree.
+    ///
+    /// The layer above is held on an ordinary service by
+    /// `tests/protocol.rs::a_layer_can_require_an_idempotency_key`. **No test mounts this
+    /// layer on a keyed system**, so the keyed header is stated here rather than
+    /// compiled with this body.
     #[must_use]
     pub fn keyable(mut self, keyable: Keyable) -> Self {
         self.keyable = keyable;
