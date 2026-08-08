@@ -42,9 +42,18 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 # `no_failure_prefix_is_a_prefix_of_another` spells out its four prefixes and
 # says a fifth has to be added by hand.
 #
-# **The honest limitation: a record added without an entry here is unchecked.**
-# That is the cost of the hand-maintained list, and it is the same cost that
-# test accepts for the same reason.
+# **The honest limitation, and it is larger than it sounds: this checks the
+# records REGISTERED below, not the records that exist.** A sweep of every
+# backticked code-shaped span inside a break record, repo-wide, finds them in the
+# hundreds. Most are watched output or replacement literals rather than search
+# anchors — which is exactly why no extractor can build this list — but the
+# consequence stands: a green here means *the registered anchors resolve*, and it
+# is not a statement about the health of every record in the tree.
+#
+# Registration is therefore **opt-in per record**, and the green line says
+# "registered" for that reason. When you write a record that quotes a search
+# literal, add it. Nothing will notice if you do not, which is the one hole this
+# task cannot close from the inside.
 import pathlib
 import subprocess
 import sys
@@ -141,4 +150,7 @@ if bad:
     )
     sys.exit(1)
 
-print(f"ok: {len(ANCHORS)} quoted break anchors each resolve exactly once")
+print(
+    f"ok: {len(ANCHORS)} REGISTERED break anchors resolve exactly once "
+    "(registration is per-record and opt-in - see this task's header)"
+)

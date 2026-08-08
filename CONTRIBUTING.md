@@ -134,7 +134,9 @@ Nothing has ever run in a browser.
   uniqueness depends on its neighbours, as a `pub use` list item's does. Describe the
   search edit in those two cases. **Quote the replacement either way**: the harness
   never searches it. Three records reached `main` unable to find their own anchors,
-  and none of them was red, which is why this is a gate.
+  and none of them was red, which is why this is a gate. **Registration is opt-in and
+  the gate says so**: it checks the records listed in that task, not every record in
+  the tree, and nothing will notice a record you do not add.
 - **A red `anchors` means the anchor moved. Follow it.** Re-quote it against the line
   as it now reads — that is the fix for a cross-file, line-local anchor, and the fix
   whenever a rebase moved the target. **Delete its entry only** in the two cases above,
