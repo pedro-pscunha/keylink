@@ -3681,3 +3681,26 @@ dispatch paths at once, because there is only one arm left for it to cover.
 
 Found by an adversarial review of Wave 1b, which read the table as the audit surface it
 claims to be and could not find four of its six rows.
+
+---
+
+## 16.15 Revision, 2026-08-07: §16.13's own literal has moved, by §16.13's own mechanism
+
+Appended rather than edited in place, per CONTRIBUTING.md, and for the reason §16.13
+was: it names a literal, and naming which value the pin became is its content, so
+removing the literal would delete the section rather than repair it.
+
+**The pinned literal is now `keylink/Probe/d75913b8a4742547`**, and
+`keylink/Inspect/0572763878b7fb9d` beside it. §16.13's
+`keylink/Probe/d3fe34471921164e` was true when written, exactly as the
+`keylink/Probe/aa77e29e5e1ccdc7` it corrected was true when *that* was written.
+
+The cause is not in this document and not in the keyed rewrite: `IdempotencyRefusal`
+gained a `NotKeyable` variant so a serving side can refuse an idempotency key on a
+method it does not key. `IdempotencyRefusal` reaches every service's hashed contract
+through `Outcome::Err(RemoteError)` → `RemoteError::Idempotency(..)`, the same route
+§16.13 traces for the `ActorSchemaMismatch` deletion. Full argument in
+`docs/rfc-08-serving-side-keys.md` §4.
+
+Nothing in §16.10 through §16.12 changes. Their claims were about the changes *they*
+describe, and none of those moved a hash.

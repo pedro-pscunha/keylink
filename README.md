@@ -276,6 +276,16 @@ answered from the record without entering the handler again.
 
 That is effectively-once for one `rpc`. Here is what it does not cover.
 
+**Limits 3 and 5 are now partly the serving side's choice rather than only
+keylink's**: `ServiceBuilder::keyable` decides which methods accept a key at all, so
+a key on any other is refused as `NotKeyable` instead of filling the ledger, and
+`ServiceBuilder::records` can decline to hold the reply at all — reaching limit 5's
+`Unrecordable` refusal by configuration rather than by the method's shape, which
+keeps at-most-once and gives up the answer on purpose so that a caller's payload is
+not held for the 600 s of limit 3. It narrows limit 4's window from `MAX_TOMBSTONES`
+plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
+`docs/rfc-08-serving-side-keys.md`.
+
 1. **There is no reliable `tell`.** A `tell` has no reply stream, so nothing can
    ack it, nothing can refuse it, and it does not accept a key — there is no reply
    to record and answer a repeat with. `with_idempotency` returns an

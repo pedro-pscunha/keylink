@@ -91,6 +91,16 @@
 //! Retention is bounded rather than forever. And **attach**, where a second
 //! caller waits for the running invocation instead of being turned away.
 //!
+//! **A serving side may now decline that first sentence, and this is where that is
+//! said.** [`Records::None`] records no reply, so every repeat under it is refused
+//! rather than replayed — the exact behaviour the paragraph above calls the wrong
+//! one. It is not a reversal of the reasoning. "Refusing hands it nothing it did
+//! not already have" is a claim about what is *good for the caller*, and it holds;
+//! what [`Records`] adds is that the reply is the *caller's data*, and holding it
+//! for [`RECORD_TTL`] is a cost the serving side may not be willing to pay on the
+//! caller's behalf. So the trade is stated rather than assumed: a service that
+//! declines it gives up the better answer knowingly, and says so on every repeat.
+//!
 //! Rejected: **durability**, and everything downstream of it — journaling,
 //! replay of the execution itself, restart from a known point.
 //!
@@ -240,20 +250,49 @@ pub enum IdempotencyRefusal {
     #[error("a call with this key was interrupted - whether it took effect is unknown")]
     Interrupted,
 
-    /// The recorded call answered with a payload beside its reply.
+    /// The call ran, and its reply is not something this ledger holds.
     ///
-    /// A body is streamed and never held, so recording one would contradict the
-    /// property that makes a 4 GiB transfer cost a bounded amount of memory. The
-    /// header alone would decode into a reply whose body never arrives.
-    #[error("the reply to this key carried a payload, which is not recorded")]
+    /// **Three causes, one variant, and they share the only thing a caller acts
+    /// on:** it ran, there is no reply, do not send the work again — read the
+    /// result out of your own domain. All three are permanent properties rather
+    /// than evictions, which is the axis RFC-05 §5 draws between this variant and
+    /// [`Forgotten`](Self::Forgotten).
+    ///
+    /// - **The reply carried a payload.** A body is streamed and never held, so
+    ///   recording one would contradict the property that makes a 4 GiB transfer
+    ///   cost a bounded amount of memory. The header alone would decode into a
+    ///   reply whose body never arrives.
+    /// - **The reply frame was larger than the per-record ceiling.** One reply over
+    ///   the whole byte budget cannot be evicted into fitting, so it is never
+    ///   stored.
+    /// - **The service holds no replies at all** — [`Records::None`]. A retention
+    ///   choice by the serving side, not a property of this method or this reply.
+    ///
+    /// The message names none of the three, deliberately. Which one applies is a
+    /// property of the *service and the method* rather than of the call, so it is
+    /// answerable from the service's own configuration and is not something to put
+    /// on a wire that every service shares. `Display` said "carried a payload"
+    /// until [`Records`] existed, and that sentence was about to start being false
+    /// on a service that had never declared a `recv` method.
+    #[error("a call with this key already ran, and this service does not hold its reply")]
     Unrecordable,
 
     /// This key ran, and its reply is no longer held.
     ///
-    /// The record aged past [`RECORD_TTL`] or was evicted under pressure. The
-    /// at-most-once promise still holds — that is what the tombstone is for —
-    /// and the answer is gone. Distinct from a vacant key on purpose: silently
-    /// running the work again is the one thing this module exists to prevent.
+    /// The record aged past [`RECORD_TTL`] or was evicted under pressure — the two
+    /// producers are `expire` and `evict`, and both are evictions. The at-most-once
+    /// promise still holds, which is what the tombstone is for, and the answer is
+    /// gone. Distinct from a vacant key on purpose: silently running the work again
+    /// is the one thing this module exists to prevent.
+    ///
+    /// **A reply that was never recorded is [`Unrecordable`](Self::Unrecordable),
+    /// not this.** RFC-05 §5 is explicit that the axis between the two variants is
+    /// *a permanent property* against *an eviction*, and that merging them "would
+    /// make the query lie about why". [`Records::None`] is a permanent property of
+    /// the service, so it settles there. An earlier version of this crate settled
+    /// it here and had to widen this sentence to *"or was never recorded"*, which
+    /// put a configured choice under a name that means pressure — the wrong side of
+    /// the line RFC-05 drew.
     #[error("a call with this key already ran, and its reply is no longer held")]
     Forgotten,
 
@@ -282,12 +321,284 @@ pub enum IdempotencyRefusal {
         /// The cap that was reached.
         limit: u32,
     },
+
+    /// This service does not accept an idempotency key on this method.
+    ///
+    /// A serving side decides which of its methods a key is worth recording for
+    /// — see [`Keyable`] — and this is what a key on any other method is answered
+    /// with.
+    ///
+    /// **Refused rather than ignored, and that is the whole of why this variant
+    /// exists.** A caller that wrote `with_idempotency` believes the call runs
+    /// at most once. Running it and recording nothing would hand that caller a
+    /// guarantee it does not have, silently, on the one path it cannot check —
+    /// and it would be discovered by a double booking rather than by an error.
+    /// Every other refusal in this enum is here for the same reason: the answer
+    /// a caller can act on beats the answer that looks like success.
+    ///
+    /// **No layer can produce this instead.** The key is claimed *before* the
+    /// [`Middleware`](crate::Middleware) chain runs — `serve_one` claims, then
+    /// calls `next` — so a layer never meets an unclaimed key and could only
+    /// refuse one already in the ledger. The decision has to live where the
+    /// claim is.
+    ///
+    /// `method` names the method in the `CamelCase` spelling
+    /// [`Rpc::method`](crate::Rpc::method) returns. Redundant to the caller,
+    /// which knows which call it made — one stream per call, so this refusal
+    /// arrives on that call's own stream — and carried anyway for the reason
+    /// [`RemoteError::NoSuchActor`](crate::RemoteError::NoSuchActor) carries the
+    /// id it was given: a log line read away from the call site has to say what
+    /// it is about. `String` rather than `&'static str`, because this crosses
+    /// the wire inside [`RemoteError`] and has to `Deserialize`.
+    #[error("this service does not accept an idempotency key on {method}")]
+    NotKeyable {
+        /// The method a key was attached to, `CamelCase` as `service!` wrote it.
+        method: String,
+    },
 }
 
 impl From<IdempotencyRefusal> for RemoteError {
     fn from(refusal: IdempotencyRefusal) -> Self {
         Self::Idempotency(refusal)
     }
+}
+
+/// Which methods of this service accept an idempotency key.
+///
+/// The **serving** side decides this, and until this type existed it could not.
+/// A peer attached a key to whatever it liked, and one pool of [`MAX_RECORDS`]
+/// entries served the whole service — so a method whose reply is worth nothing
+/// to record, a quote lookup asked a thousand times a second, evicted the
+/// records of the methods that needed them. The ledger has no way to tell a
+/// record it should keep from one it should never have taken. This is where that
+/// is said.
+///
+/// Set it with [`ServiceBuilder::keyable`](crate::ServiceBuilder::keyable).
+/// [`Any`](Self::Any) is what `ServiceBuilder::new` writes and what this crate did
+/// before the type existed.
+///
+/// **There is deliberately no `Default`, and this enum is exhaustive.** Both follow
+/// [`Allowlist`](crate::Allowlist), which is the nearest thing in the crate — a
+/// per-service policy a caller constructs and hands to a builder — and whose doc
+/// says *"There is deliberately no `Default`. Admitting everyone is a decision you
+/// make"*. `Any` is the permissive setting here for the same reason `anyone()` is
+/// there, so nobody should reach it by leaving a field out; the default lives in
+/// `ServiceBuilder::new`, where it is written once and is visible. And
+/// `CONTRIBUTING.md` reserves `#[non_exhaustive]` for error enums rather than for
+/// ones a caller constructs, which is what this is.
+///
+/// # Why this is not called `Keyed`
+///
+/// `Keyed` is the obvious name and it is taken. In this crate a **keyed** thing
+/// is one addressed by an [`ActorId`](crate::ActorId) —
+/// [`KeyedService`](crate::KeyedService), `KeyedClient`, `keyed_service`,
+/// `keyed_alpn`, `run_keyed` — and `keylink::Keyed` would sit two lines below
+/// `keylink::KeyedService` in the same export list meaning a different key
+/// entirely. `rpc.rs`'s `Claimed` was renamed *out of* the word for exactly this,
+/// and its doc comment records the decision; taking the word back for the
+/// idempotency side would undo a rename this crate already paid for.
+///
+/// **Keyable** is what the type actually decides: whether a key may be attached to a
+/// method.
+///
+/// It keeps the stem, and an earlier version of this comment rejected `Keying` *for*
+/// keeping the stem — which does not distinguish the winner from the loser and was
+/// simply a bad argument. The stem is not the problem and cannot be, since
+/// `IdempotencyKey` is the caller-side name. **What distinguishes them is grammar
+/// and referent.** `Keyed` is an adjective this crate has already bound to a
+/// different noun — a keyed *actor*, addressed by an [`ActorId`](crate::ActorId).
+/// `Keying` is a gerund: it names an activity and says nothing about what is being
+/// selected. `Keyable` is an adjective whose subject is a **method**, which is
+/// exactly what the variants select over — so `Only(&["Reserve"])` reads as *these
+/// methods are keyable*, and no sentence built from it can be read as being about an
+/// actor. `Idempotent` was the third candidate and reads as a property of the reply
+/// rather than of the method.
+///
+/// # Method names are `CamelCase`
+///
+/// These are the names `service!` writes into the generated `Request` enum,
+/// which is what [`Rpc::method`](crate::Rpc::method) returns. `rpc
+/// reserve_stock(..)` is `"ReserveStock"` here. Reach for the `snake_case`
+/// spelling — which is the first thing a reader does — and the policy accepts
+/// nothing, silently, because a name that matches no method simply never
+/// matches.
+///
+/// ```ignore
+/// keylink::service! {
+///     service Till;
+///     rpc reserve(sku: String, qty: u32) -> u64;
+///     rpc quote(sku: String) -> u64;
+/// }
+///
+/// // A key on `Reserve` is recorded. A key on `Quote` is refused with
+/// // `IdempotencyRefusal::NotKeyable`.
+/// till::service(handler, Allowlist::anyone())
+///     .keyable(Keyable::Only(&["Reserve"]))
+///     .build()
+/// ```
+///
+/// # A name matching no method is not a startup error, and it could be
+///
+/// Nothing checks these names against the service's own methods, so a typo is
+/// discovered on the first call rather than at `spawn`. Checking would need the
+/// method list *at the builder*, which means a `const METHODS` on
+/// [`Rpc`](crate::Rpc) that every generated service carries — a change to the
+/// macro, for a mistake whose refusal already names the method it did not match.
+/// Left undone deliberately, and recorded here rather than discovered.
+///
+/// # `&'static`, so the policy is code
+///
+/// A runtime-computed list is not representable, and that is the intent: which
+/// methods are worth recording is a property of the service's design, not of its
+/// data. A decision that has to change while the service runs is
+/// [`Admission`](crate::Admission)'s shape — a port with a live policy behind it
+/// — and nobody has asked for one here.
+#[derive(Debug, Clone)]
+pub enum Keyable {
+    /// Every method accepts one. What this crate did before this type existed,
+    /// and what `ServiceBuilder::new` writes.
+    Any,
+    /// These, and nothing else.
+    Only(&'static [&'static str]),
+    /// Everything except these.
+    ///
+    /// **A method added later is keyable by default here**, which is the mirror of
+    /// [`Only`](Self::Only)'s typo hazard and worse in kind: the failure is silent
+    /// and it is the exact problem this type exists to prevent, arriving through the
+    /// policy meant to prevent it. A new method's records begin evicting the ones
+    /// that matter and nothing says so. [`Only`](Self::Only) is the safer choice for
+    /// a service that expects to grow, because there the failure of omission is a
+    /// refusal that names the method.
+    Except(&'static [&'static str]),
+    /// No method accepts one, and no ledger is built.
+    None,
+}
+
+impl Keyable {
+    /// Whether a key on `method` is accepted rather than refused.
+    ///
+    /// `&'static str`, matching [`Rpc::method`](crate::Rpc::method), which is
+    /// where every real caller's argument comes from. A shorter lifetime would
+    /// mean `contains` could not be used against a `&'static [&'static str]` and
+    /// the loop would have to be spelled out — a borrow relaxed for nobody.
+    pub(crate) fn accepts(&self, method: &'static str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Only(named) => named.contains(&method),
+            Self::Except(named) => !named.contains(&method),
+            Self::None => false,
+        }
+    }
+
+    /// Whether this policy needs a ledger allocated for it at all.
+    ///
+    /// [`None`](Self::None) is the one variant that does not, and that is what
+    /// it is *for*: a service that keys nothing holds no map, no queues and no
+    /// counters, and a reader can see the allocation not happen.
+    ///
+    /// `Only(&[])` accepts nothing either and still gets one. Two spellings of
+    /// the same absence would be two things to keep in step, and what `Only(&[])`
+    /// builds is an empty `HashMap` that every call refuses before reaching. So
+    /// this is an implication rather than an equivalence — **no ledger means no
+    /// key is accepted, and the converse is not claimed** — and no refusal is
+    /// ever decided by the ledger's absence. [`accepts`](Self::accepts) decides
+    /// every refusal, including every one of `None`'s.
+    pub(crate) fn needs_a_ledger(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Whether this service holds a caller's reply bytes at all.
+///
+/// **The motive is retention, not memory**, and the memory version of this
+/// argument was written first and is wrong. See "What this is not for" below,
+/// because getting it the wrong way round is how the whole type gets justified on
+/// a saving it does not make.
+///
+/// Set it with [`ServiceBuilder::records`](crate::ServiceBuilder::records).
+/// [`Memory`](Self::Memory) is what `ServiceBuilder::new` writes and what this
+/// crate did before the type existed. **There is deliberately no `Default`**, for
+/// the reason [`Allowlist`](crate::Allowlist) has none: the value that keeps a
+/// caller's payloads in RAM for ten minutes is a decision somebody makes, not one
+/// they get by leaving a field out.
+///
+/// # What [`None`](Self::None) is for
+///
+/// A reply frame is a caller's data. Under [`Memory`](Self::Memory) it sits in this
+/// process's heap for up to [`RECORD_TTL`] — ten minutes — so that a retry can be
+/// answered with it. For a great many services that is exactly the trade the
+/// ledger exists to make. For a service handling data it would rather not hold, it
+/// is a ten-minute retention window nobody asked for, on bytes it was only ever
+/// asked to pass through once.
+///
+/// [`None`](Self::None) is at-most-once with no retention. The key still claims, so
+/// the work still runs once; the frame is never written into the ledger, so nothing
+/// survives the reply's own trip to the wire.
+///
+/// # What this is NOT for, and the number that says so
+///
+/// **Not saving memory.** [`MAX_RECORDED_BYTES`] does double duty and reading it as
+/// a per-key figure inverts the whole argument: `Guard::record` uses it as a
+/// **per-record ceiling** (`frame.len() > limits.bytes`) and `evict` uses the same
+/// value as the **total pool across every peer** (`inner.bytes > limits.bytes`). So
+/// the record pool is 1 MiB *in total*, and what [`None`](Self::None) saves is that
+/// one megabyte once per process, and it does not get that megabyte back for free:
+/// the same keys still occupy the tombstone pool, which [`MAX_TOMBSTONES`] bounds
+/// separately.
+///
+/// **No figure for the comparison, deliberately.** An earlier version said the saving
+/// was "roughly what its own tombstones cost", resting on [`MAX_TOMBSTONES`]'s own
+/// doc calling that pool *"on the order of a megabyte"* — a number in another
+/// comment, measured by nothing, that this comment cannot keep true. The sentence
+/// only has to establish that memory is **not** the motive, and the *direction* does
+/// that: what is saved is one bounded pool while another bounded pool keeps its
+/// entries.
+///
+/// A feature justified on that saving would not pay for itself. Justified on
+/// retention it pays immediately, because the thing it removes is not a quantity of
+/// bytes but a duration they are held for.
+///
+/// # What it costs, including the part that is not free
+///
+/// It costs the answer. Every repeat is [`IdempotencyRefusal::Unrecordable`] rather
+/// than the reply, and a caller reconciles against its own state — which is what
+/// `README.md`'s limit 5 already tells it to do for a method whose reply cannot be
+/// recorded.
+///
+/// **And it shortens the at-most-once window, which is not nothing.** Under
+/// [`Memory`](Self::Memory) a settled key occupies a slot in the record pool and
+/// *then* becomes a tombstone, so its total life is bounded by [`MAX_RECORDS`] plus
+/// [`MAX_TOMBSTONES`] of churn. Under [`None`](Self::None) it goes straight to the
+/// tombstone pool and forgoes the record pool's grace entirely — so the window is
+/// [`MAX_TOMBSTONES`] of churn instead of [`MAX_TOMBSTONES`] **plus**
+/// [`MAX_RECORDS`].
+///
+/// **The operands rather than the quotient, deliberately.** Both are `pub const` and
+/// either may move; a percentage written here would rot silently the moment one did,
+/// and the reader can divide. It lands on the one degradation `README.md`'s limit 4
+/// says a caller **cannot detect**, because past [`MAX_TOMBSTONES`] a key reads
+/// [`KeyState::Fresh`] and runs again. Stated rather than sold as free.
+///
+/// `records_none_shortens_the_at_most_once_window` holds the **direction** — that the
+/// window is strictly shorter — and not the ratio, because it sets its own
+/// [`MAX_RECORDS`]/[`MAX_TOMBSTONES`] to keep the test fast. The direction is the
+/// claim worth guarding, and it is what the phrase "does not affect the key state"
+/// that stood here first got wrong.
+///
+/// # Not `Copy`, on purpose
+///
+/// A tier below memory is the shape this would grow into, and it would hold a port
+/// — an `Arc<dyn ..>` — rather than a discriminant. `Copy` today would have to be
+/// withdrawn then, and withdrawing a trait impl is a breaking change no attribute
+/// covers.
+#[derive(Debug, Clone)]
+pub enum Records {
+    /// Memory, bounded by [`MAX_RECORDS`], [`MAX_RECORDED_BYTES`] and
+    /// [`RECORD_TTL`]. What this crate did before this type existed.
+    Memory,
+    /// Nowhere. The key still claims, so the work still runs at most once, and
+    /// every repeat is refused instead of answered.
+    None,
 }
 
 /// What the ledger knows about one key, for one peer.
@@ -306,7 +617,14 @@ impl From<IdempotencyRefusal> for RemoteError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, postcard_schema::Schema)]
 pub enum KeyState {
     /// No record. Either never used, or its tombstone was dropped past
-    /// [`MAX_TOMBSTONES`]. A call with this key would run.
+    /// [`MAX_TOMBSTONES`].
+    ///
+    /// A call with this key would run **if the service accepts a key on the
+    /// method** — see [`Keyable`]. On a method the service does not key, every call
+    /// is [`IdempotencyRefusal::NotKeyable`] and every key reads `Fresh` forever,
+    /// because nothing was ever recorded. That is a fact about the ledger rather
+    /// than a prediction about the call, and this variant only ever claimed the
+    /// former.
     Fresh,
     /// A call is in dispatch under this key now.
     Running,
@@ -314,8 +632,12 @@ pub enum KeyState {
     Done,
     /// Entered and no reply came out. Whether it took effect is unknown.
     Interrupted,
-    /// It ran, and its reply carried a payload, which is never recorded. A
-    /// permanent property of the method rather than an eviction.
+    /// It ran, and this ledger does not hold its reply: it carried a payload, or
+    /// it was over the per-record ceiling, or the service holds none
+    /// ([`Records::None`]). A permanent property of the method or of the service,
+    /// rather than an eviction — which is the whole of what distinguishes this from
+    /// [`Forgotten`](Self::Forgotten). See
+    /// [`IdempotencyRefusal::Unrecordable`] for the three causes.
     Unrecordable,
     /// It ran; the reply is no longer held. At-most-once still holds.
     Forgotten,
@@ -381,6 +703,28 @@ impl Idempotency {
     /// Only a *running* call is waited for. A key that already settled is
     /// answered at once, whether that answer is the reply, `Interrupted`,
     /// `Unrecordable` or `Forgotten`.
+    ///
+    /// # Attaching to a service that holds no replies
+    ///
+    /// On a [`Records::None`] service the wait always ends in
+    /// [`IdempotencyRefusal::Unrecordable`], because there is no reply to take.
+    /// **The wait is still the right behaviour and it is not refused early**, and
+    /// the reasoning is worth having, because refusing early looks like the obvious
+    /// optimisation.
+    ///
+    /// What the wait buys is a *definitive* answer: `Unrecordable` means the work
+    /// ran, there is no reply, reconcile against your own domain and stop.
+    /// Refusing the attach at once could only answer
+    /// [`InFlight`](IdempotencyRefusal::InFlight), whose documented meaning is *ask
+    /// again when it finishes* — so a caller told that immediately asks again, and
+    /// again, for as long as the handler runs. One bounded park becomes a re-dial
+    /// loop, which is more load on both sides and ends at the worse of the two
+    /// answers.
+    ///
+    /// The park is already priced. A waiter holds no claim, so
+    /// [`MAX_WAITING_PER_PEER`] and [`MAX_WAITING`] exist to bound exactly this,
+    /// and [`MAX_ATTACH`] caps how long any one of them lasts. Held by
+    /// `an_attacher_on_a_recordless_service_waits_and_is_told_it_ran`.
     #[must_use]
     pub fn attaching_for(key: IdempotencyKey, budget: Duration) -> Self {
         Self {
@@ -576,17 +920,22 @@ pub(crate) enum Claim {
 pub(crate) struct Ledger {
     inner: Mutex<Inner>,
     limits: Limits,
+    /// Where the replies recorded here go. Held by the ledger rather than
+    /// threaded down from `serve_one`, because `Guard::record` is the one place
+    /// that reads it and the guard already holds the ledger.
+    records: Records,
 }
 
 impl Ledger {
-    pub(crate) fn new() -> Arc<Self> {
-        Self::with_limits(Limits::default())
+    pub(crate) fn new(records: Records) -> Arc<Self> {
+        Self::with_limits(Limits::default(), records)
     }
 
-    fn with_limits(limits: Limits) -> Arc<Self> {
+    fn with_limits(limits: Limits, records: Records) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner::default()),
             limits,
+            records,
         })
     }
 
@@ -930,10 +1279,35 @@ impl Guard {
     /// a body that never arrives.
     pub(crate) fn record(mut self, frame: &Bytes, carries_body: bool) {
         self.settled = true;
-        let slot = if carries_body || frame.len() > self.ledger.limits.bytes {
-            Slot::Unrecordable
-        } else {
+        // Three causes, one slot, and that is the whole of Wave 2's wire cost:
+        // nothing. `Slot::Unrecordable` reads "the handler ran, and its reply is
+        // not something this ledger can hold", which is true word for word of a
+        // reply that carried a payload, of one over the per-record ceiling, and of
+        // a service configured to hold none.
+        //
+        // NOT `Slot::Forgotten`, which was the first attempt. RFC-05 §5 draws the
+        // axis this sits on — a permanent property versus an eviction — and says
+        // merging the two "would make the query lie about why". `Forgotten` has two
+        // producers, `expire` and `evict`, and both are evictions. A configured
+        // retention policy is a permanent property, so it belongs on this side of
+        // that line.
+        //
+        // Reusing this variant is also what keeps the refusal and the QUERY honest
+        // for free: `Slot::state` already maps it to `KeyState::Unrecordable`, so a
+        // caller that asks gets the same story a caller that retries gets. A new
+        // variant would have had to be minted twice, on two enums, to say what this
+        // one already says.
+        //
+        // The arm order that mattered under the old design does not exist any more.
+        // Both causes land here, so there is nothing to sequence and README limit 5
+        // is untouched.
+        let recordable = matches!(self.ledger.records, Records::Memory)
+            && !carries_body
+            && frame.len() <= self.ledger.limits.bytes;
+        let slot = if recordable {
             Slot::Done(frame.clone())
+        } else {
+            Slot::Unrecordable
         };
         self.ledger.settle(self.peer, &self.key, slot);
     }
@@ -1012,11 +1386,30 @@ mod tests {
         Bytes::from(vec![7u8; len])
     }
 
-    fn records(max: usize) -> Limits {
+    /// A ledger holding `max` records. Named `holding` rather than `records`,
+    /// which now means [`Records`] two hundred lines up.
+    fn holding(max: usize) -> Limits {
         Limits {
             records: max,
             ..Limits::default()
         }
+    }
+
+    /// The ordinary ledger every test below this line wants: memory-backed, with
+    /// the shipped bounds.
+    fn ledger() -> Arc<Ledger> {
+        Ledger::new(Records::Memory)
+    }
+
+    /// The same, with the bounds moved. One test door rather than two, so
+    /// `Records::Memory` is stated once for every test that is not about it.
+    fn bounded(limits: Limits) -> Arc<Ledger> {
+        Ledger::with_limits(limits, Records::Memory)
+    }
+
+    /// A ledger that claims keys and records no replies.
+    fn recordless() -> Arc<Ledger> {
+        Ledger::new(Records::None)
     }
 
     fn refusal(claim: Claim) -> IdempotencyRefusal {
@@ -1049,12 +1442,365 @@ mod tests {
         }
     }
 
+    /// [`Keyable`], which decides whether anything below this module runs at all.
+    ///
+    /// Exhaustive over the four variants here, in one place, so the wire test
+    /// `a_key_on_a_method_the_service_does_not_key_is_refused` only has to prove
+    /// the policy is *wired in* rather than that every variant is right. Same
+    /// split as `key_state_reports_every_state` beside
+    /// `a_key_state_query_crosses_the_wire`.
+    mod policy {
+        use super::*;
+
+        /// Both directions for every variant. One direction per variant would
+        /// pass for a policy that answered a constant, which is the failure this
+        /// exists to refuse: `Only` that accepted everything and `Except` that
+        /// refused everything are each half-green under a one-sided test.
+        ///
+        /// Made red by `scripts/break-once.sh` making `Keyable::accepts`' `Only`
+        /// arm answer `true` unconditionally — its `contains` call ORed with `true`.
+        /// Watched: `2 passed; 3 failed` of this module's five, the three being
+        /// `every_variant_accepts_and_refuses_what_it_says`,
+        /// `an_empty_only_accepts_nothing_and_still_needs_a_ledger` and
+        /// `a_snake_case_name_matches_nothing`. Three tests catching one edit is the
+        /// intended overlap: each states a different consequence of `Only` meaning
+        /// what it says. Over the wire the same edit reddens
+        /// `a_key_on_a_method_the_service_does_not_key_is_refused`,
+        /// `a_keyed_actor_service_applies_the_same_policy` and
+        /// `a_refused_key_never_reaches_the_ledger`.
+        ///
+        /// Made red a second way, on the other end of the sweep, by making the `Any`
+        /// arm answer `false`. Watched: `assertion failed:
+        /// Keyable::Any.accepts("Reserve")`, `3 passed; 2 failed`, the second being
+        /// `the_permissive_policy_keys_every_method`. Whole-lib it also reddens
+        /// `rpc::tests::an_attacher_over_the_cap_is_refused_before_it_parks` and
+        /// `rpc::tests::a_parked_attacher_keeps_its_place_for_the_whole_wait`, which
+        /// build their `Keys` from `Keyable::Any`.
+        #[test]
+        fn every_variant_accepts_and_refuses_what_it_says() {
+            assert!(Keyable::Any.accepts("Reserve"));
+            assert!(Keyable::Any.accepts("Quote"));
+
+            assert!(Keyable::Only(&["Reserve"]).accepts("Reserve"));
+            assert!(!Keyable::Only(&["Reserve"]).accepts("Quote"));
+
+            assert!(!Keyable::Except(&["Quote"]).accepts("Quote"));
+            assert!(Keyable::Except(&["Quote"]).accepts("Reserve"));
+        }
+
+        /// Split out from the sweep above because it is the variant with a
+        /// second consequence — no ledger — and the two halves of `None` belong
+        /// beside each other.
+        ///
+        /// Made red by `scripts/break-once.sh` making `Keyable::accepts`' `None` arm
+        /// answer `true`. Watched: `assertion failed:
+        /// !Keyable::None.accepts("Reserve")`, `4 passed; 1 failed` in this module.
+        /// No other test in this module notices, which is why this one exists — and
+        /// the claim stops at this module on purpose, because a count or a
+        /// "the only one" reaching further is a value this file does not control.
+        #[test]
+        fn keyed_none_accepts_no_method() {
+            assert!(!Keyable::None.accepts("Reserve"));
+            assert!(!Keyable::None.needs_a_ledger());
+        }
+
+        /// The empty list is the spelling `needs_a_ledger` deliberately does not
+        /// recognise, and this pins the asymmetry rather than leaving it in prose:
+        /// it accepts nothing and still builds a ledger, so "no ledger" is a
+        /// consequence of `None` and never the cause of a refusal.
+        ///
+        /// Red under the same `Self::Only(..) || true` break recorded on the sweep
+        /// above; watched there.
+        #[test]
+        fn an_empty_only_accepts_nothing_and_still_needs_a_ledger() {
+            assert!(!Keyable::Only(&[]).accepts("Reserve"));
+            assert!(Keyable::Only(&[]).needs_a_ledger());
+        }
+
+        /// `Any` is the behaviour that existed before the type did, which is the
+        /// half of invariant 8 this module can hold.
+        ///
+        /// There is no `Keyable::default()` to assert against, on purpose — `Any` is
+        /// the permissive setting and `Allowlist`'s doc makes the argument: *"There
+        /// is deliberately no `Default`. Admitting everyone is a decision you
+        /// make"*. That nobody gets `Any` by accident is the absence of the impl,
+        /// which the compiler holds; that a service naming no policy gets it is held
+        /// over a real connection by
+        /// `tests/idempotency.rs::the_defaults_reproduce_todays_behaviour`.
+        ///
+        /// Made red by `scripts/break-once.sh` making `Keyable::accepts`' `Any` arm
+        /// answer `false`. Watched: `assertion failed:
+        /// Keyable::Any.accepts("Reserve")`, `3 passed; 2 failed` in this module.
+        /// See the sweep above for what else that edit reaches.
+        #[test]
+        fn the_permissive_policy_keys_every_method() {
+            assert!(Keyable::Any.accepts("Reserve"));
+            assert!(Keyable::Any.accepts("Datasheet"));
+        }
+
+        /// `CamelCase`, because a reader reaches for the other spelling first and
+        /// the failure is silent — a `snake_case` name matches no method, so the
+        /// policy refuses every call and says nothing about why.
+        ///
+        /// Red under the same `Self::Only(..) || true` break recorded on the sweep
+        /// above; watched there. `assertion failed:
+        /// !Keyable::Only(&["reserve"]).accepts("Reserve")`.
+        #[test]
+        fn a_snake_case_name_matches_nothing() {
+            assert!(!Keyable::Only(&["reserve"]).accepts("Reserve"));
+        }
+    }
+
+    /// [`Records`], which decides what a settled key holds rather than whether it
+    /// settles.
+    ///
+    /// The line these tests draw: every one of them claims a key and every one of
+    /// them proves the claim still happened. `Records::None` is about the reply
+    /// bytes and nothing else, and a test that only checked the refusal would not
+    /// tell a reader whether the key was claimed at all.
+    mod records {
+        use super::*;
+
+        /// **The reply is not held, and the key is.** Both halves, because either
+        /// alone describes a different feature: holding neither is a ledger that
+        /// does nothing, and holding both is `Records::Memory`.
+        ///
+        /// Made red by `scripts/break-once.sh` forcing `Guard::record`'s
+        /// `recordable` flag to ignore the retention switch — its `matches!` on
+        /// `self.ledger.records` replaced by `true`. Watched:
+        /// `panicked at .., expected an idempotency refusal, got
+        /// Replay(b"\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07")`,
+        /// from this module's `refusal(..)` helper.
+        ///
+        /// That one edit also reddens
+        /// `a_retention_refusal_is_told_apart_from_an_eviction`,
+        /// `a_retention_settle_is_a_tombstone_not_a_record`,
+        /// `a_retention_settle_reports_the_same_state_it_refuses_with` and
+        /// `records_none_shortens_the_at_most_once_window`. Five tests for one edit
+        /// is the intended overlap — each states a different consequence of the
+        /// switch being honoured.
+        #[test]
+        fn records_none_settles_the_key_and_holds_no_reply() {
+            let ledger = recordless();
+            guard(ledger.claim(peer(A), key("k"))).record(&frame(16), false);
+
+            assert_eq!(
+                refusal(ledger.claim(peer(A), key("k"))),
+                IdempotencyRefusal::Unrecordable,
+                "the key must be spent, so the work cannot run again"
+            );
+            assert_eq!(
+                ledger.lock().bytes,
+                0,
+                "and not one byte of the reply may be held"
+            );
+        }
+
+        /// **`Unrecordable` and not `Forgotten`**, which is the axis RFC-05 §5 draws
+        /// and the one this settle sits on: a permanent property of the service, not
+        /// an eviction.
+        ///
+        /// Asserted beside a genuinely evicted key in the same test, because the
+        /// claim is that the two are *told apart*. A settle that answered
+        /// `Forgotten` would make this half green and the other half
+        /// indistinguishable from it.
+        ///
+        /// Made red by `scripts/break-once.sh` replacing
+        /// `Guard::record`'s settled slot from
+        /// `Slot::Unrecordable` to `Slot::Forgotten`. Watched: `assertion `left == right` failed: a configured
+        /// retention policy is not an eviction`, `left: Forgotten`,
+        /// `right: Unrecordable`.
+        #[test]
+        fn a_retention_refusal_is_told_apart_from_an_eviction() {
+            let ledger = Ledger::with_limits(holding(1), Records::None);
+            guard(ledger.claim(peer(A), key("kept"))).record(&frame(8), false);
+
+            assert_eq!(
+                refusal(ledger.claim(peer(A), key("kept"))),
+                IdempotencyRefusal::Unrecordable,
+                "a configured retention policy is not an eviction"
+            );
+
+            let evicting = Ledger::with_limits(holding(1), Records::Memory);
+            guard(evicting.claim(peer(A), key("old"))).record(&frame(8), false);
+            guard(evicting.claim(peer(A), key("new"))).record(&frame(8), false);
+            assert_eq!(
+                refusal(evicting.claim(peer(A), key("old"))),
+                IdempotencyRefusal::Forgotten,
+                "and an eviction still says so, or the two names have merged"
+            );
+        }
+
+        /// The counter side, and the one that says which pool the key landed in. A
+        /// retention settle is a **tombstone**, bounded by [`MAX_TOMBSTONES`] rather
+        /// than [`MAX_RECORDS`] — the right pool, because a tombstone is what keeps
+        /// the work from running twice and has to outlive the reply it never had.
+        ///
+        /// Made red by `scripts/break-once.sh` forcing `Guard::record`'s
+        /// `recordable` flag to ignore the retention switch, its `matches!` replaced
+        /// by `true`. Watched: `assertion `left == right` failed: a key with no reply
+        /// belongs in the tombstone pool, not the record pool`, `left: 1`,
+        /// `right: 0`. See `records_none_settles_the_key_and_holds_no_reply` for the
+        /// four other tests that edit reaches.
+        #[test]
+        fn a_retention_settle_is_a_tombstone_not_a_record() {
+            let ledger = recordless();
+            guard(ledger.claim(peer(A), key("k"))).record(&frame(16), false);
+
+            let inner = ledger.lock();
+            assert_eq!(
+                inner.held, 0,
+                "a key with no reply belongs in the tombstone pool, not the record pool"
+            );
+            assert_eq!(inner.spent, 1, "and it does belong in the tombstone pool");
+        }
+
+        /// **The cost this mode is not free of**, and the reason `Records`'s doc
+        /// carries a ratio rather than the words "does not affect the key state".
+        ///
+        /// Under `Records::Memory` a settled key occupies a record slot and *then*
+        /// becomes a tombstone, so two pools of churn have to pass before its
+        /// tombstone is dropped and the key reads `Fresh` again. Under
+        /// `Records::None` it enters the tombstone pool directly and forgoes the
+        /// record pool's grace, so the at-most-once window is shorter — and
+        /// `README.md`'s limit 4 is explicit that a key going `Fresh` again is the
+        /// one degradation a caller **cannot detect**.
+        ///
+        /// Two ledgers, one bound, one difference. With `records: 4` the memory
+        /// ledger's oldest key is still a tombstone after four more settles, because
+        /// four of the eight it saw are holding records; the recordless one has
+        /// spent all eight tombstones and dropped it.
+        ///
+        /// Made red by `scripts/break-once.sh` replacing
+        /// `Guard::record`'s `recordable` flag to
+        /// `false` — its `matches!` replaced by `false` — which makes both ledgers
+        /// recordless. Watched: `panicked at .., under Memory the oldest key must
+        /// still be remembered`. It is the FIRST assertion that fires, not the
+        /// second, and that is the right way round: with both ledgers recordless the
+        /// two arms agree, and the arm that has to notice is the one claiming the
+        /// longer window still exists.
+        ///
+        /// **That break is deliberately wide.** Forcing every ledger recordless
+        /// reddens thirteen tests, across `mod bounds`, `mod claim`, `mod state` and
+        /// `mod ttl`, because every replay assertion in the crate rests on a
+        /// recording ledger; in this module it also takes `memory_records_and_replays`
+        /// and `a_retention_refusal_is_told_apart_from_an_eviction`. Width is the
+        /// finding rather than a weakness — the switch is the only thing between
+        /// `Records::Memory` and a ledger that answers nothing.
+        #[test]
+        fn records_none_shortens_the_at_most_once_window() {
+            let bounds = Limits {
+                records: 4,
+                tombstones: 4,
+                ..Limits::default()
+            };
+            let settle_eight = |ledger: &Arc<Ledger>| {
+                for n in 0..8 {
+                    guard(ledger.claim(peer(A), key(&format!("k{n}")))).record(&frame(8), false);
+                }
+            };
+
+            let recording = Ledger::with_limits(bounds, Records::Memory);
+            settle_eight(&recording);
+            let recordless = Ledger::with_limits(bounds, Records::None);
+            settle_eight(&recordless);
+
+            assert!(
+                !matches!(recording.claim(peer(A), key("k0")), Claim::Fresh(_)),
+                "under Memory the oldest key must still be remembered"
+            );
+            assert!(
+                matches!(recordless.claim(peer(A), key("k0")), Claim::Fresh(_)),
+                "a record pool the key passes through first is what buys the longer window"
+            );
+        }
+
+        /// The state query agrees with the claim, for free: `Slot::state` maps this
+        /// slot to `KeyState::Unrecordable`, so a caller that asks instead of
+        /// retrying is told the same story.
+        ///
+        /// That is the argument against minting a variant for this: a new refusal
+        /// would have left `key_state` answering the old one until `KeyState` gained
+        /// a variant too — two names on two enums to say what this one says.
+        ///
+        /// Made red by `scripts/break-once.sh` replacing
+        /// `Guard::record`'s settled slot to
+        /// `Slot::Interrupted` —
+        /// the other spent state, and the tempting one, since nothing was recorded.
+        /// Watched: `assertion `left == right` failed`, `left: Interrupted`,
+        /// `right: Unrecordable`. It is the wrong answer: `Interrupted` means whether
+        /// the work took effect is unknown, and here it is known to have completed.
+        #[test]
+        fn a_retention_settle_reports_the_same_state_it_refuses_with() {
+            let ledger = recordless();
+            guard(ledger.claim(peer(A), key("k"))).record(&frame(16), false);
+
+            assert_eq!(ledger.key_state(peer(A), &key("k")), KeyState::Unrecordable);
+        }
+
+        /// `Records::None` must not touch the paths that decide whether the work
+        /// ran. A guard dropped without a reply is still `Interrupted`, and one
+        /// dropped with nothing dispatched is still claimable — the two halves of
+        /// RFC-05 §2, asked of a ledger that records no replies.
+        ///
+        /// Made red by `scripts/break-once.sh` replacing
+        /// `if self.progress.as_ref().map(Progress::reached) == Some(Reached::NotDispatched) {`
+        /// with `if false {`. Watched: `panicked at .., a key nothing ran under must
+        /// still be claimable`. It also reddens
+        /// `claim::a_guard_dropped_with_nothing_dispatched_leaves_the_key_claimable`,
+        /// which is the test that owns that rule; this one asks it of a ledger that
+        /// records no replies.
+        #[test]
+        fn records_none_changes_nothing_about_who_settles() {
+            let ledger = recordless();
+            drop(guard(ledger.claim(peer(A), key("entered"))));
+            assert_eq!(
+                refusal(ledger.claim(peer(A), key("entered"))),
+                IdempotencyRefusal::Interrupted,
+                "entered and unfinished is still unknown"
+            );
+
+            drop(guard(ledger.claim(peer(A), key("nothing"))).watching(Progress::new()));
+            assert!(
+                matches!(ledger.claim(peer(A), key("nothing")), Claim::Fresh(_)),
+                "a key nothing ran under must still be claimable"
+            );
+        }
+
+        /// `Memory` is the behaviour that existed before the type did, which is the
+        /// half of invariant 8 this module can hold.
+        ///
+        /// The other half — that a service naming no policy *gets* `Memory` — is not
+        /// assertable here, because there is no `Records::default()` to ask. That is
+        /// deliberate: the default lives in `ServiceBuilder::new` so nobody reaches a
+        /// ten-minute retention window by leaving a field out, the same argument
+        /// `Allowlist`'s doc makes about `anyone()`. It is held over a real
+        /// connection instead, by
+        /// `tests/idempotency.rs::the_defaults_reproduce_todays_behaviour`.
+        ///
+        /// Made red by `scripts/break-once.sh` replacing
+        /// `Guard::record`'s `recordable` flag to
+        /// `false`, its `matches!` replaced by `false`. Watched: `panicked at .., expected a replay, got
+        /// Refused(Idempotency(Unrecordable))`, from this module's `recorded(..)`
+        /// helper.
+        #[test]
+        fn memory_records_and_replays() {
+            let ledger = Ledger::new(Records::Memory);
+            guard(ledger.claim(peer(A), key("k"))).record(&frame(16), false);
+            assert_eq!(
+                recorded(ledger.claim(peer(A), key("k"))),
+                frame(16),
+                "`Memory` must replay, which is what this crate did before the type"
+            );
+        }
+    }
+
     mod claim {
         use super::*;
 
         #[test]
         fn an_unused_key_is_fresh() {
-            let ledger = Ledger::new();
+            let ledger = ledger();
             assert!(matches!(
                 ledger.claim(peer(A), key("first")),
                 Claim::Fresh(_)
@@ -1063,7 +1809,7 @@ mod tests {
 
         #[test]
         fn a_recorded_key_replays_the_same_bytes() {
-            let ledger = Ledger::new();
+            let ledger = ledger();
             guard(ledger.claim(peer(A), key("k"))).record(&frame(16), false);
 
             assert_eq!(recorded(ledger.claim(peer(A), key("k"))), frame(16));
@@ -1081,7 +1827,7 @@ mod tests {
         /// decode and re-encode, and this test is what would stop being true.
         #[test]
         fn a_replayed_reply_is_byte_identical() {
-            let ledger = Ledger::new();
+            let ledger = ledger();
             // Deliberately not a run of one repeated byte: a frame that is
             // uniform cannot show a re-encoding that reordered anything.
             let original = Bytes::from((0u8..=255).cycle().take(777).collect::<Vec<u8>>());
@@ -1097,7 +1843,7 @@ mod tests {
 
         #[test]
         fn a_different_key_is_fresh_even_after_one_is_recorded() {
-            let ledger = Ledger::new();
+            let ledger = ledger();
             guard(ledger.claim(peer(A), key("one"))).record(&frame(16), false);
 
             assert!(matches!(ledger.claim(peer(A), key("two")), Claim::Fresh(_)));
@@ -1108,7 +1854,7 @@ mod tests {
         /// ledger has become an information leak.
         #[test]
         fn two_peers_using_the_same_key_do_not_collide() {
-            let ledger = Ledger::new();
+            let ledger = ledger();
             guard(ledger.claim(peer(A), key("shared"))).record(&frame(16), false);
 
             assert!(
@@ -1119,7 +1865,7 @@ mod tests {
 
         #[test]
         fn a_second_claim_while_the_first_runs_is_refused_as_in_flight() {
-            let ledger = Ledger::new();
+            let ledger = ledger();
             let _running = guard(ledger.claim(peer(A), key("k")));
 
             assert_eq!(
@@ -1133,7 +1879,7 @@ mod tests {
         /// exists to prevent.
         #[test]
         fn a_guard_dropped_without_a_reply_leaves_the_key_interrupted() {
-            let ledger = Ledger::new();
+            let ledger = ledger();
             drop(guard(ledger.claim(peer(A), key("k"))));
 
             assert_eq!(
@@ -1147,7 +1893,7 @@ mod tests {
         /// first attempt rather than a permanent refusal.
         #[test]
         fn a_guard_dropped_with_nothing_dispatched_leaves_the_key_claimable() {
-            let ledger = Ledger::new();
+            let ledger = ledger();
             // A fresh marker says `NotDispatched`, which is what a layer that
             // refused without calling through leaves behind.
             drop(guard(ledger.claim(peer(A), key("k"))).watching(Progress::new()));
@@ -1162,7 +1908,7 @@ mod tests {
         /// this as vacant would let the work run twice.
         #[test]
         fn a_guard_dropped_after_dispatch_leaves_the_key_interrupted() {
-            let ledger = Ledger::new();
+            let ledger = ledger();
             let progress = Progress::new();
             progress.dispatched();
             drop(guard(ledger.claim(peer(A), key("k"))).watching(progress));
@@ -1175,7 +1921,7 @@ mod tests {
 
         #[test]
         fn a_reply_that_carries_a_body_is_not_replayed() {
-            let ledger = Ledger::new();
+            let ledger = ledger();
             guard(ledger.claim(peer(A), key("k"))).record(&frame(16), true);
 
             assert_eq!(
@@ -1188,7 +1934,7 @@ mod tests {
         /// fitting, so it must never be stored in the first place.
         #[test]
         fn a_reply_larger_than_the_byte_budget_is_not_replayed() {
-            let ledger = Ledger::with_limits(Limits {
+            let ledger = bounded(Limits {
                 bytes: 64,
                 ..Limits::default()
             });
@@ -1206,7 +1952,7 @@ mod tests {
 
         #[test]
         fn the_record_count_stays_inside_its_bound() {
-            let ledger = Ledger::with_limits(records(4));
+            let ledger = bounded(holding(4));
             for n in 0..64 {
                 guard(ledger.claim(peer(A), key(&format!("k{n}")))).record(&frame(8), false);
             }
@@ -1216,7 +1962,7 @@ mod tests {
 
         #[test]
         fn the_recorded_bytes_stay_inside_their_bound() {
-            let ledger = Ledger::with_limits(Limits {
+            let ledger = bounded(Limits {
                 bytes: 64,
                 ..Limits::default()
             });
@@ -1236,7 +1982,7 @@ mod tests {
         /// and fails this one.
         #[test]
         fn a_flooding_peer_cannot_evict_a_quiet_peers_record() {
-            let ledger = Ledger::with_limits(records(4));
+            let ledger = bounded(holding(4));
             guard(ledger.claim(peer(B), key("quiet"))).record(&frame(8), false);
             for n in 0..64 {
                 guard(ledger.claim(peer(A), key(&format!("k{n}")))).record(&frame(8), false);
@@ -1253,7 +1999,7 @@ mod tests {
         /// handler, which is the one thing the ledger must never do.
         #[test]
         fn a_running_claim_is_never_evicted() {
-            let ledger = Ledger::with_limits(records(1));
+            let ledger = bounded(holding(1));
             let _running = guard(ledger.claim(peer(A), key("running")));
             for n in 0..64 {
                 guard(ledger.claim(peer(A), key(&format!("k{n}")))).record(&frame(8), false);
@@ -1270,7 +2016,7 @@ mod tests {
         /// work ran a second time and nobody could tell.
         #[test]
         fn an_evicted_key_is_refused_not_rerun() {
-            let ledger = Ledger::with_limits(records(2));
+            let ledger = bounded(holding(2));
             guard(ledger.claim(peer(A), key("old"))).record(&frame(8), false);
             guard(ledger.claim(peer(A), key("new"))).record(&frame(8), false);
             guard(ledger.claim(peer(A), key("newest"))).record(&frame(8), false);
@@ -1286,7 +2032,7 @@ mod tests {
         /// is vacant again, and `KeyState::Fresh` is what says so.
         #[test]
         fn a_tombstone_is_dropped_once_its_own_bound_is_reached() {
-            let ledger = Ledger::with_limits(Limits {
+            let ledger = bounded(Limits {
                 records: 1,
                 tombstones: 2,
                 ..Limits::default()
@@ -1304,7 +2050,7 @@ mod tests {
 
         #[test]
         fn running_claims_are_bounded_per_peer() {
-            let ledger = Ledger::with_limits(Limits {
+            let ledger = bounded(Limits {
                 running_per_peer: 2,
                 ..Limits::default()
             });
@@ -1323,7 +2069,7 @@ mod tests {
 
         #[test]
         fn running_claims_are_bounded_in_total() {
-            let ledger = Ledger::with_limits(Limits {
+            let ledger = bounded(Limits {
                 running: 2,
                 ..Limits::default()
             });
@@ -1341,7 +2087,7 @@ mod tests {
         /// many tasks and stream pairs and meets neither cap.
         #[test]
         fn waiting_attachers_are_bounded_per_peer() {
-            let ledger = Ledger::with_limits(Limits {
+            let ledger = bounded(Limits {
                 waiting_per_peer: 2,
                 ..Limits::default()
             });
@@ -1360,7 +2106,7 @@ mod tests {
 
         #[test]
         fn waiting_attachers_are_bounded_in_total() {
-            let ledger = Ledger::with_limits(Limits {
+            let ledger = bounded(Limits {
                 waiting: 2,
                 ..Limits::default()
             });
@@ -1380,7 +2126,7 @@ mod tests {
         /// nobody waiting.
         #[test]
         fn a_dropped_waiter_gives_its_place_back() {
-            let ledger = Ledger::with_limits(Limits {
+            let ledger = bounded(Limits {
                 waiting_per_peer: 1,
                 ..Limits::default()
             });
@@ -1407,7 +2153,7 @@ mod tests {
         /// re-exports tokio's clock on native, so pausing tokio pauses this.
         #[tokio::test(start_paused = true)]
         async fn a_record_expires_after_its_ttl() {
-            let ledger = Ledger::with_limits(Limits {
+            let ledger = bounded(Limits {
                 ttl: Duration::from_secs(60),
                 ..Limits::default()
             });
@@ -1426,7 +2172,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn a_running_claim_does_not_expire() {
-            let ledger = Ledger::with_limits(Limits {
+            let ledger = bounded(Limits {
                 ttl: Duration::from_secs(60),
                 ..Limits::default()
             });
@@ -1447,7 +2193,7 @@ mod tests {
 
         #[test]
         fn key_state_reports_every_state() {
-            let ledger = Ledger::with_limits(records(1));
+            let ledger = bounded(holding(1));
             assert_eq!(ledger.key_state(peer(A), &key("never")), KeyState::Fresh);
 
             let running = guard(ledger.claim(peer(A), key("running")));
@@ -1477,7 +2223,7 @@ mod tests {
 
         #[test]
         fn key_state_is_peer_scoped() {
-            let ledger = Ledger::new();
+            let ledger = ledger();
             guard(ledger.claim(peer(A), key("mine"))).record(&frame(8), false);
 
             assert_eq!(ledger.key_state(peer(A), &key("mine")), KeyState::Done);
@@ -1560,7 +2306,7 @@ mod tests {
         /// tombstone pool both fire many times rather than never.
         #[test]
         fn the_counters_agree_with_the_maps_on_every_path() {
-            let ledger = Ledger::with_limits(Limits {
+            let ledger = bounded(Limits {
                 records: 3,
                 bytes: 64,
                 tombstones: 4,
@@ -1609,7 +2355,7 @@ mod tests {
         /// through `settle`, so it gets its own check.
         #[tokio::test(start_paused = true)]
         async fn the_counters_agree_after_records_expire() {
-            let ledger = Ledger::with_limits(Limits {
+            let ledger = bounded(Limits {
                 ttl: Duration::from_secs(60),
                 ..Limits::default()
             });
@@ -1633,7 +2379,7 @@ mod tests {
         /// one never had one.
         #[test]
         fn a_claim_the_global_cap_refuses_leaves_no_bucket_behind() {
-            let ledger = Ledger::with_limits(Limits {
+            let ledger = bounded(Limits {
                 running: 1,
                 ..Limits::default()
             });
@@ -1654,7 +2400,7 @@ mod tests {
         /// against the guards themselves here.
         #[test]
         fn the_waiting_count_follows_the_live_guards() {
-            let ledger = Ledger::new();
+            let ledger = ledger();
             let mut places = Vec::new();
             for _ in 0..4 {
                 places.push(ledger.wait(peer(A)).expect("free"));
@@ -1693,7 +2439,7 @@ mod tests {
         /// is answered from the first caller's record.
         #[tokio::test]
         async fn a_waiter_is_woken_when_the_slot_settles() {
-            let ledger = Ledger::new();
+            let ledger = ledger();
             let running = guard(ledger.claim(peer(A), key("k")));
 
             let Claim::Running(notify) = ledger.claim(peer(A), key("k")) else {
@@ -1716,7 +2462,7 @@ mod tests {
         /// the settle would sleep forever, so `enable()` is not decoration.
         #[tokio::test]
         async fn a_waiter_that_registers_late_still_sees_the_settled_slot() {
-            let ledger = Ledger::new();
+            let ledger = ledger();
             let running = guard(ledger.claim(peer(A), key("k")));
             let Claim::Running(notify) = ledger.claim(peer(A), key("k")) else {
                 panic!("expected a running slot");

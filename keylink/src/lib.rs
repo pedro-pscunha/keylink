@@ -301,9 +301,9 @@ pub mod inspect {
 }
 pub use error::{ConfigError, Error, Result, Transport};
 pub use idempotency::{
-    Idempotency, IdempotencyRefusal, KeyState, MAX_ATTACH, MAX_RECORDED_BYTES, MAX_RECORDS,
-    MAX_RUNNING, MAX_RUNNING_PER_PEER, MAX_TOMBSTONES, MAX_WAITING, MAX_WAITING_PER_PEER,
-    RECORD_TTL,
+    Idempotency, IdempotencyRefusal, KeyState, Keyable, Records, MAX_ATTACH, MAX_RECORDED_BYTES,
+    MAX_RECORDS, MAX_RUNNING, MAX_RUNNING_PER_PEER, MAX_TOMBSTONES, MAX_WAITING,
+    MAX_WAITING_PER_PEER, RECORD_TTL,
 };
 pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use local::{

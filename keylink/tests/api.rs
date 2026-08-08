@@ -18,6 +18,13 @@
 //! 3. **The keylink-level generics need a parameter**, and the one that used to
 //!    be rescued by a default in expression position — `DEFAULT_CAPACITY` — is
 //!    reached through the alias instead.
+//! 4. **The serving side's idempotency policy resolves from out here** —
+//!    `Keyable`, `Records`, `ServiceBuilder::keyable`, `ServiceBuilder::records`
+//!    and `IdempotencyRefusal::NotKeyable`.
+//!    Not part of the actor surface, and here for the reason in the paragraph
+//!    below: this is the only consumer-position file in the repo, and `rpc.rs`
+//!    deliberately reaches `Keyable` through `crate::idempotency` so that the root
+//!    re-export has exactly one guard rather than none.
 //!
 //! The pairing of the two positions is still the point rather than pedantry:
 //! `SystemBuilder::DEFAULT_CAPACITY` stopped compiling once while
@@ -38,8 +45,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink::{
-    mount, ActorId, Allowlist, Body, BodyReader, Caller, Ended, Eviction, KeyedService, MountError,
-    Origin, Reply,
+    mount, ActorId, Allowlist, Body, BodyReader, Caller, Ended, Eviction, Keyable, KeyedService,
+    MountError, Origin, Records, Reply,
 };
 
 keylink::service! {
@@ -132,6 +139,92 @@ async fn the_generated_module_supplies_the_rest_fully_applied() {
     let _ = depot::keyed_service(&system, Allowlist::anyone());
 
     assert!(system.is_empty());
+}
+
+/// **The serving side's idempotency policy, written from a consumer's position.**
+///
+/// This file's header scopes it to the actor surface, and these names are not part
+/// of that. They are here anyway for the reason the header gives: this is the
+/// only place in the repo that writes keylink's own names the way a downstream crate
+/// writes them, and a policy a caller cannot reach from outside is a policy that
+/// does not exist. `keyable` in particular is reached through a `ServiceBuilder` the
+/// *generated* module hands back, so the annotation pins that the builder method
+/// survives the erasure `service()` performs.
+///
+/// The pairing of the two positions is the same discipline as the test above.
+///
+/// Made red by `scripts/break-once.sh` replacing
+/// `Idempotency, IdempotencyRefusal, KeyState, Keyable, MAX_ATTACH` in
+/// `keylink/src/lib.rs` with the same line minus ` Keyable,`. Watched: this does not
+/// run, it does not compile —
+///
+/// ```text
+/// error[E0432]: unresolved import `keylink::Keyable`
+///   --> keylink/tests/api.rs   # at this file's own `use`
+/// error: could not compile `keylink` (test "api") due to 1 previous error
+/// ```
+///
+/// A compile error is the only red a compile-only test has.
+///
+/// **That break was watched twice, and the first run is the reason `rpc.rs` imports
+/// `Keyable` from `crate::idempotency`.** With `rpc.rs` reaching for
+/// `crate::Keyable`, the same edit failed inside the library's own import and it never
+/// compiled, so this test could not run and therefore guarded nothing about the
+/// re-export. Moving that one import is what turned a vacuous guard into this
+/// output. `tests/idempotency.rs` now names `keylink::Keyable` too and would fail
+/// the same way; this is the file whose purpose is the name.
+///
+/// The half that has no other guard anywhere is `ServiceBuilder::keyable` as a
+/// function item. Made red by `scripts/break-once.sh` replacing
+/// `pub fn keyable(mut self, keyable: Keyable) -> Self {` with
+/// `pub fn keyed(mut self, keyable: Keyable) -> Self {`. Watched:
+///
+/// ```text
+/// error[E0599]: no associated function or constant named `keyable` found for
+///   struct `ServiceBuilder<Req, Resp>` in the current scope
+///   --> keylink/tests/api.rs   # at the annotation below
+/// ```
+///
+/// The library itself still compiled under that edit — nothing in-crate calls the
+/// method — which is why this annotation is what holds the name.
+///
+/// `ServiceBuilder::records` is the same story and was watched the same way, by
+/// replacing `pub fn records(mut self, records: Records) -> Self {` with
+/// `pub fn recording(mut self, records: Records) -> Self {`: `error[E0599]: no
+/// associated function or constant named `records` found for struct
+/// `ServiceBuilder<Req, Resp>` in the current scope`, and `error: could not compile
+/// `keylink` (test "api") due to 1 previous error` — the library again untouched.
+#[tokio::test]
+async fn the_serving_side_key_policy_resolves_from_outside() {
+    // ── type position ────────────────────────────────────────────────────────
+    let _: Keyable = Keyable::Any;
+    let _: Option<Keyable> = None;
+    let _: Records = Records::Memory;
+    let _: Option<Records> = None;
+
+    // ── expression position ──────────────────────────────────────────────────
+    let _ = Keyable::Only(&["Count"]);
+    let _ = Keyable::Except(&["Note"]);
+    let _ = Keyable::None;
+    // The whole point of the export: a policy set on the builder a *generated*
+    // module returns. Annotated, because that is the assertion — the method has to
+    // be reachable on the erased-schema builder, not on some private type.
+    let _: fn(
+        keylink::ServiceBuilder<depot::Request, depot::Response>,
+        Keyable,
+    ) -> keylink::ServiceBuilder<depot::Request, depot::Response> =
+        keylink::ServiceBuilder::keyable;
+    let _ = Records::None;
+    let _: fn(
+        keylink::ServiceBuilder<depot::Request, depot::Response>,
+        Records,
+    ) -> keylink::ServiceBuilder<depot::Request, depot::Response> =
+        keylink::ServiceBuilder::records;
+    // And the refusal a caller has to be able to match on, since it is what a
+    // refused key arrives as.
+    let _ = keylink::IdempotencyRefusal::NotKeyable {
+        method: "Count".to_owned(),
+    };
 }
 
 /// The names only generated code is meant to write, written by hand once so
