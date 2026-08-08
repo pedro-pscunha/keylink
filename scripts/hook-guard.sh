@@ -314,6 +314,9 @@ cd "$repo"
 #         the chained hook receives the bytes git sent
 #         a deletion-only push in a SHA256 repository SKIPS the gate
 #         the sha256 deletion-only push says it skipped
+#         a push from a linked worktree of the OWNING checkout's HEAD never reaches the gate
+#         a push from a linked worktree of the OWNING checkout's HEAD is REFUSED
+#         the refusal names the worktree's HEAD and not the owning checkout's
 #
 #     `a deletion-only push RUNS the chained hook` does NOT move, and that is
 #     worth more than the list: the chain is still REACHED, it is only handed
@@ -343,6 +346,9 @@ cd "$repo"
 #         the refusal names the delivered sha
 #         the refusal names HEAD
 #         the refusal names the bypass
+#         a push from a linked worktree of the OWNING checkout's HEAD never reaches the gate
+#         a push from a linked worktree of the OWNING checkout's HEAD is REFUSED
+#         the refusal names the worktree's HEAD and not the owning checkout's
 #
 # H5. **Stop re-delivering stdin to the chain.** Replace
 #     `    redeliver | "$chain/pre-push" "$@"` with
@@ -394,6 +400,31 @@ cd "$repo"
 #         empty stdin still RUNS the chained hook
 #         the chained hook receives the bytes git sent
 #
+# H10. **Read HEAD from the checkout that owns the hooks directory.** Replace
+#     `    head_sha="$(git rev-parse HEAD)"` with
+#     `    head_sha="$(git --git-dir="$(git rev-parse --git-common-dir)" rev-parse HEAD)"`.
+#     Watched — and in BOTH directions at once, which is what makes this the most
+#     expensive defect the file can catch: the worktree's own push is wrongly
+#     REFUSED, and the owning checkout's sha is wrongly ACCEPTED:
+#
+#         a push from a linked worktree gates against the WORKTREE's own HEAD
+#         a push from a linked worktree is not refused
+#         a push from a linked worktree of the OWNING checkout's HEAD never reaches the gate
+#         a push from a linked worktree of the OWNING checkout's HEAD is REFUSED
+#         the refusal names the worktree's HEAD and not the owning checkout's
+#
+#     Every other row stays green, so a standalone repository cannot see this at
+#     all — scenario 10 is the only thing that can.
+#
+#     **The `--git-dir=` spelling is the measurement, not a stylistic choice, and
+#     the first attempt at this break FAILED TO REDDEN ANYTHING.** It used
+#     `git -C "$(git rev-parse --git-common-dir)/.."`, which looks like it reads
+#     the owning checkout and does not: git EXPORTS `GIT_DIR` into the hook
+#     pointing at the pushing worktree's own gitdir, and `GIT_DIR` overrides
+#     directory-based discovery, so `-C` anywhere still answers the worktree's
+#     HEAD. That is also why the hook is CORRECT as written. Only an explicit
+#     `--git-dir=` beats the exported variable.
+#
 # ── AND THE ROWS NO BREAK ABOVE REDDENS, NAMED RATHER THAN LEFT TO LOOK COVERED
 #
 # Two kinds, and neither is decoration:
@@ -406,9 +437,11 @@ cd "$repo"
 #     failure mode the nine breaks above cannot produce, because each one narrows
 #     the hook rather than widening it.
 #   * ANTI-VACUITY PRECONDITIONS on the measurement itself: `git delivered an
-#     update line to compare against` and `git delivered exactly one line, its LF
-#     included`. They are claims about what git did, not about the hook, and they
-#     are there because `cmp` of two empty files passes.
+#     update line to compare against`, `git delivered exactly one line, its LF
+#     included`, and `the linked worktree and its owning checkout sit at different
+#     commits`. They are claims about what git did, not about the hook. Two are
+#     there because `cmp` of two empty files passes; the third is there because
+#     scenario 10 asserts nothing at all if the two HEADs happen to agree.
 
 # The hook under test, alone in its own hooks directory. Part One's directory
 # holds a `pre-commit`, and a commit made while setting up a push scenario would
@@ -628,6 +661,49 @@ check no "a deletion-only push in a SHA256 repository SKIPS the gate"
 assert "the sha256 deletion-only push succeeds" test "$pushed_status" -eq 0
 assert "the sha256 deletion-only push says it skipped" \
     grep -q "SKIPPING the gate" "$pushlog"
+
+# ── 10. A LINKED WORKTREE, which is the shape this hook ships in and the one
+#       scenario whose absence would have been expensive.
+#
+#       This repository stores `core.hooksPath` as an ABSOLUTE path in
+#       `.git/config`, and linked worktrees SHARE that file. So every worktree
+#       runs ONE hook file, owned by one checkout, while sitting at its own HEAD
+#       — and a merge to the default branch puts the new hook in front of every
+#       worktree at once, with no per-worktree opt-in.
+#
+#       If the guard resolved HEAD from the checkout that owns the hooks
+#       directory rather than from the pushing worktree, it would refuse every
+#       push from every worktree simultaneously. **No scenario above can see
+#       that**, because they all run in standalone repositories where the two
+#       answers are the same commit. That is the same trap Part One's scenarios 5
+#       and 6 exist for, arriving through a different question.
+git config hooks.chain ""
+newrepo "$scratch/shared"
+echo one >one.txt
+git add one.txt
+git commit -q -m "one"
+git init -q --bare "$scratch/remote-shared"
+git remote add origin "$scratch/remote-shared"
+owner_head="$(git rev-parse HEAD)"
+git worktree add -q -b side "$scratch/shared-side" HEAD
+cd "$scratch/shared-side"
+echo two >two.txt
+git add two.txt
+git commit -q -m "two"
+side_head="$(git rev-parse HEAD)"
+assert "the linked worktree and its owning checkout sit at different commits" \
+    test "$owner_head" != "$side_head"
+fresh
+push origin side
+check yes "a push from a linked worktree gates against the WORKTREE's own HEAD"
+assert "a push from a linked worktree is not refused" test "$pushed_status" -eq 0
+fresh
+push origin "$owner_head:refs/heads/ownerhead"
+check no "a push from a linked worktree of the OWNING checkout's HEAD never reaches the gate"
+assert "a push from a linked worktree of the OWNING checkout's HEAD is REFUSED" \
+    test "$pushed_status" -ne 0
+assert "the refusal names the worktree's HEAD and not the owning checkout's" \
+    grep -qF "HEAD -> $side_head" "$pushlog"
 
 if [ "$fail" -ne 0 ]; then
     echo "── FAILED" >&2

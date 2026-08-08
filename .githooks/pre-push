@@ -173,6 +173,21 @@ fi
 # `git push --no-verify`. That is honest where a green gate would not be —
 # nothing built that tree in this run, and the refusal is the only part of the
 # system that knows.
+# ── WHOSE HEAD, when several worktrees share one copy of this hook ────────────
+#
+# `core.hooksPath` here is an ABSOLUTE path into one checkout, and linked
+# worktrees share `.git/config` — so every worktree runs this one file while
+# sitting at its own HEAD. Reading the wrong one would refuse every push from
+# every worktree at once.
+#
+# The plain `git rev-parse HEAD` below is right, and the reason is that git
+# EXPORTS `GIT_DIR` into the hook pointing at the PUSHING worktree's own gitdir
+# (`<owner>/.git/worktrees/<name>`). Measured from inside a hook in a linked
+# worktree: `GIT_DIR` is the worktree's, `--show-toplevel` is the worktree's, and
+# even `git -C <the owning checkout> rev-parse HEAD` still answers the WORKTREE's
+# HEAD, because `GIT_DIR` overrides directory-based discovery. Getting this wrong
+# takes an explicit `--git-dir=` override, which is why the guard for it in
+# `scripts/hook-guard.sh` is spelled that way.
 if [ -n "$delivering" ]; then
     head_sha="$(git rev-parse HEAD)"
     stale=""
