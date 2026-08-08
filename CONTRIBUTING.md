@@ -7,9 +7,56 @@
 mise run gate                # the whole gate
 ```
 
-**GitHub Actions is disabled. `mise run gate` is the only gate**, and the
-`pre-push` hook runs it — which makes `./scripts/install-hooks.sh` load-bearing
+**CI is off by decision, and `mise run gate` at `pre-push` is the gate.** The
+`pre-push` hook runs it, which makes `./scripts/install-hooks.sh` load-bearing
 rather than a convenience. Skip it and nothing checks your pushes.
+
+### CI is off by decision, and TWO independent things keep it off
+
+The decision is not a fallback and it is not an accident. Commit `afdbeb3` —
+"build: disable GitHub Actions, and move what only it ran into the gate" — did both
+halves at once, and moving what only CI ran into `gate` is what made switching it
+off safe. It stays off; the gate does this job.
+
+Two reasons rather than one, which is what stops this paragraph depending on either
+of them. Read back on 2026-08-08, and reproducible as written — `gh` resolves
+`{owner}/{repo}` from the local remote:
+
+1. **The repository setting is off.**
+   `gh api repos/{owner}/{repo}/actions/permissions` answers
+   `{"enabled":false,"sha_pinning_required":false}`. Read back rather than inferred
+   from a write's exit code.
+2. **`main` carries no workflow file.** `origin/main` has no `.github` directory,
+   so a pull request based on `main` would have nothing to start even with the
+   setting on.
+
+Either alone would hold. Both is the state, and writing both down is what lets a
+reader who finds one of them changed know that the other is still holding.
+
+**The residue, and it is inert.** Six unmerged REMOTE branches still carry
+`.github/workflows/ci.yml`, and five LOCAL gate branches carry it as well — eleven
+refs across the two namespaces, counted on 2026-08-08. Both namespaces are named
+because this sentence used to say "six unmerged branches" while counting only
+`refs/remotes/origin`, which reads as a count of the repository and is not one.
+
+Ten of those eleven share blob `77fda9a`, whose trigger is `push` to `master` plus a
+bare `pull_request:` — that second half is where CI runs used to come from, and as
+measured on 2026-08-08 the repository had recorded twenty runs, all on
+`pull_request`, seventeen of them red, the last at 13:05Z. Those figures are past
+tense with a date on purpose: nothing can join that set while the setting is off.
+**So those files are dead weight rather than a live trigger** — merging one starts
+nothing today. Delete them as their branches land, and know they are there before
+anybody considers the setting again.
+
+**The eleventh ref carries blob `0b01d7e`, and it is NOT the special case this
+paragraph used to claim.** The claim was that this copy is `push`-only against a
+`master` branch that does not exist, so it "could never fire at all". Measured
+rather than read — `diff <(git cat-file -p 77fda9a) <(git cat-file -p 0b01d7e)`
+reports exactly two differing lines, both `- run:` steps, and the two `on:` blocks
+are byte-identical. **All six remote copies carry the same bare `pull_request:`.**
+So that copy is inert for the one reason the other ten are, the setting being off,
+and for no reason of its own. No ref named `master` exists, which disarms the `push`
+half of all eleven and none of their `pull_request` halves.
 
 Two consequences worth knowing before you hit them:
 
@@ -19,6 +66,40 @@ Two consequences worth knowing before you hit them:
   than it claims is a false green.
 - **The gate runs on your machine, on your OS.** CI ran Linux. Nothing checks the
   other platform any more.
+
+**In a worktree, the hooks are your branch's own.** `./scripts/install-hooks.sh`
+writes `core.hooksPath` as the relative `.githooks`, and git resolves that against
+the working-tree root — so each worktree runs the hooks of the branch checked out
+in it, and a gate change arrives in a worktree when that worktree rebases. The
+script's header carries the measurement and argues the choice against the absolute
+value, which makes every worktree run one checkout's hooks instead. One hazard
+comes with it: a branch whose tree has no `.githooks/` runs **no hook at all**, and
+the push succeeds. To exercise a hook change without touching any configuration,
+run `mise run hook-guard`.
+
+The `pre-push` hook reads git's list of ref updates before it runs any of that,
+and it answers differently for two shapes of push. A push whose updates are ALL
+deletions skips the gate and prints that it did: a deletion carries no tree, so
+building one checks nothing about it. A push delivering an object that is not
+`HEAD` is **refused**, because the gate builds the working tree — a green result
+would be a statement about a tree the push does not carry.
+
+**That refusal is about the REFS a push carries, not about the command.** Measured
+on 2026-08-08 against the hook:
+
+| push | result |
+|---|---|
+| `git push --all` with every branch at `HEAD` | accepted, gate ran, both refs landed |
+| `git push --all` with one branch behind | refused |
+| a lightweight tag at `HEAD` | accepted, gate ran |
+| **any annotated tag, including one at `HEAD`** | refused |
+| an annotated tag at an older commit | refused |
+
+`git push --all` is refused as soon as any branch it carries is not at `HEAD`, and
+not before. The annotated tag is the case worth knowing before you hit it: git sends
+a tag's OWN object sha on the hook's stdin, so `git tag -a v1.0 && git push origin
+v1.0` at the tip is refused even though the tag points at `HEAD`. Push it with
+`--no-verify`.
 
 You need [`mise`](https://mise.jdx.dev) and rustup. Nothing else is a manual
 step: `rust-toolchain.toml` requests the `wasm32-unknown-unknown` target and the
@@ -32,7 +113,7 @@ it called those same tasks rather than restating them.
 
 | | runs | why |
 |---|---|---|
-| `mise run pre-commit` | fmt, clippy on the library | Seconds. A commit hook people bypass is not a gate. |
+| `mise run pre-commit` | framing, anchors, anchors-selftest, fmt-check, lint-fast | Seconds. A commit hook people bypass is not a gate. |
 | `mise run pre-push` | the whole gate | A push is rarer than a commit, and a red gate here costs one local run instead of a CI round trip. |
 
 There is no third row. `deny`, `msrv` and `wasm-guards` used to be CI's, and they
@@ -83,6 +164,14 @@ Legitimate:
   rustup component is not installed.
 - The push died in transport *after* the gate ran green on the same HEAD. That
   is a network failure, and running the gate again proves nothing.
+- You are pushing something the gate cannot check, and the `pre-push` hook has
+  refused it for that reason: a tag pointing at an older commit, or a branch
+  that is not the one checked out. Nothing built those trees in this run, and
+  the refusal is the only part of the system that knows.
+- **You are pushing an annotated tag, including one created at `HEAD`.** Git sends
+  the tag object's own sha, which is never `HEAD`, so the hook refuses it and no
+  remedy short of this flag applies. This is the most ordinary tag push there is,
+  and it is listed here so that hitting it is not read as a fault.
 
 Not legitimate:
 
@@ -91,7 +180,7 @@ Not legitimate:
 - The failure looks unrelated to your change. Find out why before you decide
   that.
 
-If you bypass, say so in the pull request, with which of the two reasons applied.
+If you bypass, say so in the pull request, and name which reason applied.
 
 ## The wire contract
 

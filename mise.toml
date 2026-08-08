@@ -1,10 +1,15 @@
 # keylink's gate, defined once — and now defined only here.
 #
-# **GitHub Actions is disabled and this file is the whole gate.** The workflow
-# used to call these same tasks, which is why nothing here had to change when it
-# went: there was never a second copy of the commands. What did change is that a
-# green `mise run gate` is no longer a prediction about a second run somewhere
-# else. It is the run. See README.md for what that costs.
+# **CI is off by decision, and this file is the whole gate.** `afdbeb3` deleted the
+# workflow from `main` and moved what only it ran here in the same commit, which is
+# what made that safe. Two independent things hold the state — the Actions setting
+# is off, and `main` carries no workflow file — and CONTRIBUTING.md holds that
+# measurement, so this file keeps no second copy of it.
+#
+# The workflow used to call these same tasks, which is why nothing here had to
+# change when it went: there was never a second copy of the commands. What did
+# change is that a green `mise run gate` is no longer a prediction about a second
+# run somewhere else. It is the run. See README.md for what that costs.
 #
 #   mise tasks           # every task
 #   mise run gate        # the whole gate
@@ -117,13 +122,13 @@ CARGO_INCREMENTAL = "0"
 # ── the whole gate ──────────────────────────────────────────────────────────
 
 [tasks.gate]
-description = "The whole gate. There is no other one — CI is disabled"
+description = "The whole gate. There is no other one — CI is off by decision"
 # A list of task references runs them ONE AT A TIME, in order. Bare `depends`
 # lets mise parallelize, and parallel cargo invocations contend for the same
 # target directory and the same memory.
 #
 # **This used to be "everything CI runs", and CI ran three things it did not.**
-# When the workflow was disabled, `wasm-guards`, `msrv` and `deny` were the
+# When the workflow was deleted, `wasm-guards`, `msrv` and `deny` were the
 # difference, so they moved here in the same change. Disabling a gate and
 # dropping what only it covered are two separate acts, and doing the first
 # without the second is how coverage disappears without anybody deciding to
@@ -141,6 +146,13 @@ run = [
     # failure class as itself — the defect that reached `main` once was a passing gate
     # printing the anchor-rot playbook, which no green/red check can see.
     { task = "anchors-selftest" },
+    # `mise.toml` defines `pre-commit` once and three other files restate it; this
+    # asserts they still agree. Text only, so it costs nothing and cannot recurse.
+    # In `gate` and deliberately NOT in `pre-commit`, unlike `anchors-selftest`
+    # above it: the commit hook's filter looks for Rust, and none of the four files
+    # this reads is Rust, so there it would fire only by coincidence. The task's own
+    # header argues that out.
+    { task = "task-lists" },
     { task = "fmt-check" },
     { task = "deny" },
     { task = "lint" },
@@ -177,17 +189,21 @@ description = "The heavy gate. A push is rarer than a commit"
 run = [{ task = "gate" }]
 
 [tasks.hook-guard]
-description = "The pre-commit hook gates the commit it is actually writing"
-# Deliberately NOT in `gate` or `pre-commit`. It drives `git commit` in a throwaway
-# repository four times, which is fast but is also the one thing a commit hook must
-# not do from inside itself — wiring it into `pre-commit` would have the hook run a
-# script that runs the hook.
+description = "Both hooks gate the thing they are actually about"
+# Deliberately in NEITHER `gate`, `pre-commit` nor `pre-push`. It drives
+# `git commit` and `git push` in throwaway repositories, which is fast and is also
+# the one thing a hook must not do from inside itself: wiring it into `pre-commit`
+# would have the commit hook run a script that commits, and wiring it into
+# `pre-push` would have the push hook run a script that pushes.
+#
+# It names what it drives and no longer counts it. The count that used to be here
+# said `four times`, which the script had already outgrown.
 #
 # It is here so that the guard is reachable the way every other check in this repo
 # is, rather than being a file somebody has to know about. Run it after touching
-# `.githooks/pre-commit`; the script's own header carries the two breaks that make
-# it red and the output each one produced.
-run = "./scripts/pre-commit-amend-guard.sh"
+# either hook; the script's own header carries the breaks that redden each part and
+# names the rows each one reddened.
+run = "./scripts/hook-guard.sh"
 
 # ── formatting ──────────────────────────────────────────────────────────────
 
@@ -489,7 +505,8 @@ run = "cargo package --workspace --exclude demo --no-verify --allow-dirty"
 
 [tasks.msrv]
 description = "Compile on the oldest Rust keylink claims to support"
-# **In `gate` since CI was disabled, and the cost it used to dodge is real.** It
+# **In `gate` since the workflow was deleted, and the cost it used to dodge is
+# real.** It
 # needs a second toolchain — a ~200 MB download the first time — which is why it
 # sat outside the gate while CI carried it. Nobody carries it now, and an MSRV
 # nobody compiles is a promise broken silently: `rust-version` changes what cargo
@@ -502,7 +519,7 @@ run = "cargo +1.91 check --workspace --all-targets --all-features"
 
 [tasks.deny]
 description = "Advisories and licences over the whole tree"
-# **In `gate` since CI was disabled**, for `msrv`'s reason. It fetches the
+# **In `gate` since the workflow was deleted**, for `msrv`'s reason. It fetches the
 # advisory database, so it needs the network on every push — which is what kept
 # it out while CI ran it.
 #

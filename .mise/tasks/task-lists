@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""Every copy of the `pre-commit` task list agrees with `mise.toml`.
+
+MISE description="Every copy of the pre-commit task list agrees with mise.toml"
+"""
+# `mise.toml` defines `pre-commit` once, and THREE other files restate it. Two of
+# them were wrong when this task was written, and the third had been wrong twice:
+#
+#   * `.githooks/pre-commit` INVOKES the tasks itself when `mise` is absent, so a
+#     missing line there is a commit gated by fewer checks than the hook claims.
+#     It has been one task short twice.
+#   * `CONTRIBUTING.md` and `scripts/install-hooks.sh` DESCRIBE the list. Both said
+#     "fmt, clippy on the library" while the list ran five tasks, so `framing`,
+#     `anchors` and `anchors-selftest` were invisible in both places a contributor
+#     looks first.
+#
+# `.githooks/pre-commit` predicted the recurrence in its own comment — "THIS LIST
+# IS HAND-MAINTAINED AND WILL DRIFT AGAIN ... nothing enforces that" — and that
+# sentence is the reason this file exists rather than a fourth repair of the
+# strings. A prediction of drift with no check behind it is a note, not a guard.
+#
+# ── WHY THIS IS A TASK AND NOT A ROW IN `mise run hook-guard` ─────────────────
+#
+# `hook-guard` is the harness for hook BEHAVIOUR, and it is deliberately in none
+# of `gate`, `pre-commit` or `pre-push`, because it commits and pushes. A drift
+# check that lived there would run only when somebody remembered to run it — and
+# "nothing enforces that" is the exact defect being closed. This check reads text
+# and executes nothing, so it has no recursion hazard and can sit in a list.
+#
+# ── AND IT IS IN `gate` ONLY, WHICH IS THE OPPOSITE OF `anchors-selftest` ──────
+#
+# It was in `pre-commit` too, following that precedent, and the placement was
+# WRONG for a reason specific to this check's subject. `.githooks/pre-commit`
+# reaches `mise run pre-commit` only when the staged diff touches `.rs`,
+# `Cargo.toml`, `Cargo.lock` or `rustfmt.toml`. The drift this task detects is
+# introduced by editing `mise.toml`, `.githooks/pre-commit`, `CONTRIBUTING.md` or
+# `scripts/install-hooks.sh` — **not one of which matches that filter.** So in
+# `pre-commit` it fired only when a Rust file happened to be staged in the same
+# commit: a coincidence with respect to its own defect, which is the definition of
+# a guard on paper.
+#
+# `anchors` and `anchors-selftest` earn that placement and this does not, and the
+# difference is principled rather than a preference: their subject is break records
+# inside `.rs` files, so a commit staging Rust is exactly when their subject
+# changes. The filter and their subject agree. Here they do not.
+#
+# `gate` runs on every push through `pre-push`, so that is where this is certain,
+# and one placement that fires beats two where one cannot.
+#
+# **The residue, stated because it is larger than this task and not this task's to
+# fix:** THREE of the five tasks in `pre-commit` — `framing`, `anchors`,
+# `anchors-selftest` — check prose and registry content rather than Rust, while the
+# filter deciding whether to run them tests for Rust. A commit touching only
+# documentation runs none of them. Every commit on the branch that added this file
+# was in exactly that position. Widening the filter would make every documentation
+# commit run clippy, which contradicts what this hook's header promises, so it is a
+# decision rather than a fix and it is left named here.
+#
+# ── WHAT IT CHECKS, AND THE TAUTOLOGY IT AVOIDS ───────────────────────────────
+#
+# The obvious version searches each file for each task NAME, and it is worthless
+# for the two prose copies: `CONTRIBUTING.md` mentions `framing`, `anchors` and
+# `fmt-check` in several unrelated paragraphs, so every name is present whatever
+# the copy says. That is `anchors`' own record-quote defect one file over — a
+# check satisfied by text that is not the text under test.
+#
+# So each copy is ANCHORED to the one region that is the copy, and each anchor is
+# required to occur EXACTLY ONCE. An anchor that moves gives count 0 and fails
+# loudly, which is the direction to be wrong in.
+#
+# Both directions, for all three copies: every task in the list must appear, AND
+# nothing may appear that is not in the list. One direction alone leaves a stale
+# leftover invisible — measured twice, once per copy shape, and both are recorded
+# in the breaks below.
+#
+# **How each shape gets its second direction differs, and the difference is where a
+# hole hid.** Copy 1 compares WHOLE LINES against the expected invocations, so an
+# extra line is extra in both directions by construction. Copies 2 and 3 CAPTURE the
+# one cell that is the list and compare it for equality — because the earlier
+# spelling searched for the list inside the matched line, and a substring search is
+# blind to a name added at either END of what it finds. T9 records that measurement
+# at all three positions.
+#
+# ── AND WHAT IT DOES NOT CHECK ────────────────────────────────────────────────
+#
+# `gate`, which is a different and longer list with its own copies in `README.md`.
+# Nothing here says a word about those. This closes the `pre-commit` list because
+# that is the list with three copies and a measured history of drifting.
+#
+# It also never RUNS the fallback. It compares text; whether the hook then behaves
+# is `mise run hook-guard`'s question.
+#
+# ── MADE RED, EVERY BREAK RUN AND WATCHED, EACH NAMING THE ROWS IT REDDENS ─────
+#
+# **None of these rows is registered in `.mise/tasks/anchors`, deliberately.** That
+# registry's record-quote check reads `///`, `//!` and `//` markers and has no `#`
+# arm, so it finds zero backticked spans in a shell file and would fail a row here
+# for not being quoted by a record that quotes it. Its population walk globs `*.rs`
+# only. `scripts/hook-guard.sh`'s header carries the measurement and the exposure
+# that follows from it.
+#
+# Perturbed on a COPY: the four files this task reads, plus `.mise/tasks/`, copied
+# into a `git init`-ed temp directory. The task resolves its root from the cwd
+# rather than from its own path, so the copy reads the copy, and the tree is never
+# written to.
+#
+# **A TRAP FOR WHOEVER REPLAYS THESE, MEASURED THE HARD WAY.** `python3` on this
+# developer's PATH is a mise SHIM, and a shim loads mise config from the cwd — so
+# an UNTRUSTED `mise.toml` in the temp directory makes the interpreter exit 1
+# before this file runs a single line. Five breaks were recorded as caught before
+# the control run was tried and came back red too.
+#
+# **`scripts/break-hook-record.sh` DOES all of that now, and it exists because the
+# sentence that used to close this paragraph was an instruction with nothing behind
+# it.** "Always run the unperturbed control first" was advice a replayer had to
+# remember, in a file recording what happens when they do not. The script copies the
+# tree, runs both checkers as a CONTROL, and refuses to report anything from a
+# perturbed run until that control is green:
+#
+#     scripts/break-hook-record.sh CONTRIBUTING.md from-literal.txt to-literal.txt
+#
+# It also fails a break that reddens NOTHING, which is the other direction a replay
+# lies in, and it aborts when the search literal is not unique. Its own first run
+# died on the mise-shim trap above — naming only the copy in
+# `MISE_TRUSTED_CONFIG_PATHS` untrusts the real repository — so it names both.
+#
+# **What it does NOT do is compare the printed rows against the rows a record
+# claims.** These records are prose and nothing parses them. So the row lists below
+# are still checked by a reader; only the control is mechanical. An unattended green
+# from that script means the break reddens something, never that this record is
+# honest.
+#
+# T1. **Drop an invocation.** In `.githooks/pre-commit`, delete the
+#     `.mise/tasks/framing` line. Watched:
+#
+#         FAIL the mise-absent fallback runs `framing`
+#
+#     **`framing` and not this task, and the swap is worth recording.** While
+#     `task-lists` was in the `pre-commit` list, this break deleted its invocation —
+#     and the literal could not be a single line, because the paragraph above naming
+#     the file that closes the drift had put a second copy of `.mise/tasks/task-lists`
+#     into the same hook as a backticked span. `break-once.sh` aborted with `the
+#     search literal occurs 2 times`: the same-file trap arriving through the comment
+#     documenting the fix for it. Moving the task to `gate` alone removed that
+#     invocation, so the break moved to a line whose path this file does not quote —
+#     `.mise/tasks/framing` counts 1, measured with `grep -cF` after this record was
+#     written. `.mise/tasks/anchors` counts 2 and would abort, which is T6's subject.
+#
+# T2. **Swap two invocations.** Exchange the `.mise/tasks/anchors` and
+#     `.mise/tasks/anchors-selftest` lines. Watched:
+#
+#         FAIL the fallback runs the tasks in mise.toml's order
+#
+# T3. **Leave a command behind.** Add `cargo test --doc` under
+#     `cargo fmt --all -- --check`. Watched:
+#
+#         FAIL the fallback runs NOTHING that is not in the list
+#
+# T4. **Drift an inlined command.** Change `cargo fmt --all -- --check` to
+#     `cargo fmt --all`. Watched — TWO rows, because a drifted line is both a
+#     missing invocation and an unexplained one, and the pair says so:
+#
+#         FAIL the mise-absent fallback runs `fmt-check`
+#         FAIL the fallback runs NOTHING that is not in the list
+#
+# T5. **Move the anchor.** Replace the `note: 'mise' is not installed` line with
+#     any other text. Watched:
+#
+#         FAIL the fallback block in .githooks/pre-commit is findable
+#
+# T6. **THE PREFIX COLLISION, and this break is why the checker was rewritten.**
+#     Delete ONLY the `.mise/tasks/anchors` line, leaving
+#     `.mise/tasks/anchors-selftest`. Watched:
+#
+#         FAIL the mise-absent fallback runs `anchors`
+#
+#     Under the first version of this file it printed `ok:` instead. `find` matched
+#     the selftest line, so a MISSING task read as present — the one direction this
+#     task exists to catch, in the task built to catch it. T2 was green for the same
+#     reason. Both went red once the comparison moved to whole lines.
+#
+# T7. **Drop a name from the prose.** Remove `framing, ` from `CONTRIBUTING.md`'s
+#     `mise run pre-commit` row. Watched:
+#
+#         FAIL CONTRIBUTING.md names the list exactly
+#
+# T8. **Drop a name from the installer.** Remove `anchors-selftest, ` from
+#     `scripts/install-hooks.sh`'s `pre-commit` line. Watched:
+#
+#         FAIL scripts/install-hooks.sh names the list exactly
+#
+# T9. **ADD a name that no longer runs**, which is the direction T7 and T8 cannot
+#     see. Put `task-lists, ` into `CONTRIBUTING.md`'s row — and **WHERE in the row
+#     is part of the break**, which is exactly what this record used to leave out.
+#     Measured at all three positions, control green first, and the same three
+#     against `scripts/install-hooks.sh`'s line:
+#
+#         added at the FRONT     FAIL CONTRIBUTING.md names the list exactly
+#         added in the MIDDLE    FAIL CONTRIBUTING.md names the list exactly
+#         added at the END       FAIL CONTRIBUTING.md names the list exactly
+#
+#     **This record was GREEN at both ends until the comparison below was fixed, and
+#     it did not say so.** While the check looked for the comma-joined list INSIDE
+#     the matched line, a name added at either end left that string intact and
+#     satisfied it: FRONT exit 0, MIDDLE exit 1, END exit 0, for both prose copies
+#     alike. Because the record named no position, replaying it at the middle
+#     confirmed a guard that held in one case out of three — and the failure message
+#     printed to the contributor claimed all three.
+#
+#     The original reason for the break stands unchanged. Taking `task-lists` out of
+#     the `pre-commit` list left both prose copies still naming it, and a per-name
+#     test was green in both, because every remaining task was still present. A prose
+#     copy advertising a check that does not run is the same false claim as one
+#     omitting a check that does. The fallback copy already had its reverse
+#     direction, so the hole was in the two copies a contributor reads first.
+#
+# T10. **Reorder the row.** Swap `fmt-check` and `lint-fast` in either prose copy.
+#      Watched, one row per copy:
+#
+#          FAIL CONTRIBUTING.md names the list exactly
+#          FAIL scripts/install-hooks.sh names the list exactly
+#
+#      Recorded because the comparison CLAIMS to pin the order, and until this was
+#      run nothing had made that claim fail.
+#
+# T11. **Move a prose anchor.** Change `| `mise run pre-commit` |` to
+#      `| `mise run precommit` |`, or the installer's `echo "  pre-commit  ` to
+#      `echo "  precommit  `. Watched, one row per copy, and it is a DIFFERENT row
+#      from T9's — the count goes to 0 and the checker says it is lost rather than
+#      quietly comparing nothing:
+#
+#          FAIL the pre-commit description in CONTRIBUTING.md is findable
+#          FAIL the pre-commit description in scripts/install-hooks.sh is findable
+import pathlib
+import re
+import subprocess
+import sys
+
+ROOT = pathlib.Path(
+    subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+)
+
+MANIFEST = ROOT / "mise.toml"
+manifest = MANIFEST.read_text()
+failures: list[str] = []
+
+
+def fail(what: str, *detail: str) -> None:
+    failures.append(what)
+    print(f"FAIL {what}", file=sys.stderr)
+    for line in detail:
+        print(f"       {line}", file=sys.stderr)
+    print(file=sys.stderr)
+
+
+def block(name: str) -> str:
+    """The body of `[tasks.<name>]`, up to the next table header."""
+    at = manifest.find(f"[tasks.{name}]")
+    if at < 0:
+        sys.exit(f"task-lists: mise.toml has no [tasks.{name}] - this checker is lost")
+    rest = manifest[at + 1 :]
+    end = rest.find("\n[")
+    return rest if end < 0 else rest[:end]
+
+
+# ── the source of truth ───────────────────────────────────────────────────────
+#
+# Parsed with `re` rather than `tomllib`, because the three scripts in this list
+# run standalone when `mise` is absent, and the python3 that is then on PATH is
+# whatever the machine ships. `tomllib` arrived in 3.11. `anchors` and
+# `anchors-selftest` are stdlib-only for the same reason.
+ORDER = re.findall(r'\{\s*task\s*=\s*"([^"]+)"\s*\}', block("pre-commit"))
+if not ORDER:
+    sys.exit("task-lists: could not read [tasks.pre-commit]'s run list from mise.toml")
+
+
+def invocation(task: str) -> str:
+    """What `.githooks/pre-commit` has to contain in order to run `task` itself.
+
+    A FILE task under `.mise/tasks/` is invoked by path. Anything else is a
+    `mise.toml` task, and the fallback has to inline its command — so the command
+    is read from the manifest rather than copied here, which is what makes a
+    DRIFTED inline command a failure and not just a missing one.
+    """
+    if (ROOT / ".mise" / "tasks" / task).exists():
+        return f".mise/tasks/{task}"
+    run = re.search(r'^run = "([^"]+)"$', block(task), re.M)
+    if run is None:
+        sys.exit(
+            f"task-lists: [tasks.{task}]'s `run` is not a single quoted command, so "
+            "this checker cannot say what the fallback must contain. Teach it, or "
+            "keep that task out of `pre-commit`."
+        )
+    return run.group(1)
+
+
+# ── copy 1: the hook INVOKES them ─────────────────────────────────────────────
+HOOK = ROOT / ".githooks" / "pre-commit"
+hook = HOOK.read_text()
+NOTE = "echo \"note: 'mise' is not installed - running the same checks directly\" >&2"
+if hook.count(NOTE) != 1:
+    fail(
+        "the fallback block in .githooks/pre-commit is findable",
+        f"looked for exactly one line reading: {NOTE}",
+        f"found {hook.count(NOTE)}. The anchor moved, or the fallback is gone.",
+    )
+else:
+    # ── WHOLE LINES, and a substring match here was a FALSE GREEN ──────────────
+    #
+    # The first version asked `fallback.find(want)`, and `.mise/tasks/anchors` is
+    # a PREFIX of `.mise/tasks/anchors-selftest`. So deleting the `anchors` line
+    # left `find` matching the selftest line, and the checker reported a task as
+    # invoked that the hook no longer ran — a missing task looking present, which
+    # is the one direction this file exists to catch. The order probe had the same
+    # hole and stayed green on a swap of exactly that pair.
+    #
+    # Measured, not reasoned: with the substring form, swapping those two lines
+    # passed. Comparing whole lines closes both at once, and it is the remedy
+    # `.mise/tasks/anchors` writes down for its own rot mode 4.
+    fallback = hook.split(NOTE, 1)[1]
+    expected = [invocation(task) for task in ORDER]
+    ran = [
+        line.strip()
+        for line in fallback.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    for task, want in zip(ORDER, expected):
+        if want not in ran:
+            fail(
+                f"the mise-absent fallback runs `{task}`",
+                f"`.githooks/pre-commit` has no line reading: {want}",
+                "mise.toml's `pre-commit` list is the authority. That hook runs the",
+                "checks itself when mise is missing, so a line missing here is a",
+                "commit gated by less than the hook says it gates.",
+            )
+    if all(want in ran for want in expected):
+        order = [ran.index(want) for want in expected]
+        if order != sorted(order):
+            fail(
+                "the fallback runs the tasks in mise.toml's order",
+                "every task is invoked, but not in the order the manifest lists them.",
+                "The order decides which failure a contributor sees first.",
+            )
+    # The other direction. A command left behind after a task is removed from the
+    # list runs on every commit while nothing claims it should.
+    for line in ran:
+        if line not in expected:
+            fail(
+                "the fallback runs NOTHING that is not in the list",
+                f"`.githooks/pre-commit` runs: {line}",
+                "which is not any task in mise.toml's `pre-commit` list. Either add",
+                "the task to the manifest or drop the line.",
+            )
+
+# ── copies 2 and 3: they DESCRIBE the list ────────────────────────────────────
+#
+# Each anchored to its single line, so an unrelated paragraph naming a task
+# cannot satisfy the check. The pattern CAPTURES the list, and the capture is the
+# whole point — see the comparison below.
+DESCRIBED = [
+    ("CONTRIBUTING.md", r"^\| `mise run pre-commit` \| ([^|]*)\|"),
+    ("scripts/install-hooks.sh", r'^echo "  pre-commit\s+([^"]*)"$'),
+]
+for relative, pattern in DESCRIBED:
+    text = (ROOT / relative).read_text()
+    found = list(re.finditer(pattern, text, re.M))
+    if len(found) != 1:
+        fail(
+            f"the pre-commit description in {relative} is findable",
+            f"expected exactly one line matching: {pattern}",
+            f"found {len(found)}. Re-anchor this row, or restore the line.",
+        )
+        continue
+    # Named distinctly, and not `line` or `expected`. Both of those are already
+    # bound by the fallback loop above, and a first version of this block relied on
+    # one of them — it read the CLIPPY COMMAND left over from that loop and reported
+    # a failure about CONTRIBUTING.md while never looking at the file. It failed
+    # closed, which is luck: a leaked value that happened to contain the list would
+    # have passed both prose rows without reading either file.
+    line = found[0].group(0)
+    described = found[0].group(1).strip()
+    # ── THE CELL IS CAPTURED AND COMPARED, because SEARCHING INSIDE THE LINE was
+    # ── one-directional at both ends of it. This is a measured repair, not a
+    # ── tidy-up.
+    #
+    # The version before this asked `wanted not in described`, where `described` was
+    # the WHOLE matched line. A substring test cannot see a name added at either END
+    # of the list, because the wanted string survives intact on both sides of it.
+    # Measured on a copy at all three positions, control green first, for both prose
+    # copies alike:
+    #
+    #     task-lists added at the FRONT    exit 0  GREEN   <- hole
+    #     added in the MIDDLE              exit 1  RED
+    #     added at the END                 exit 0  GREEN   <- hole
+    #
+    # So the reverse direction held only where an inserted name happened to split
+    # the comma-joined run. Capturing the cell and comparing it with `!=` closes
+    # both ends, and it is genuinely bidirectional: a missing task, an extra task
+    # anywhere in the row, and a reordering each change the cell.
+    #
+    # The earlier version's own argument was sound and its implementation was not,
+    # which is worth keeping apart. A name-by-name reverse test really cannot work:
+    # task names collide as substrings — `fmt` inside `fmt-check`, `lint` inside
+    # `lint-fast`, `anchors` inside `anchors-selftest` — and the surrounding prose
+    # names real tasks in passing, CONTRIBUTING.md's own row ending "is not a gate"
+    # while `gate` is a task. The comma-joined string is still the right thing to
+    # compare. It has to be compared against a CELL rather than looked for in a
+    # line.
+    #
+    # That is what the anchor patterns capture: the third column of the markdown row
+    # is prose and must stay out of the comparison, so the group stops at the next
+    # `|`, and the installer's group stops at the closing quote.
+    wanted = ", ".join(ORDER)
+    if described != wanted:
+        fail(
+            f"{relative} names the list exactly",
+            f"expected this row to name exactly: {wanted}",
+            f"it names:                          {described}",
+            f"the line reads: {line.strip()}",
+            "Compared as one string against the whole cell: it fails when a task is",
+            "missing, when one is named that no longer runs ANYWHERE in the row, and",
+            "when the order drifts. It is read before anybody runs the hook, so both",
+            "directions are a claim to a contributor about what does and does not",
+            "check their commit.",
+        )
+
+if failures:
+    print(f"{len(failures)} copy of the pre-commit list disagrees with mise.toml"
+          if len(failures) == 1
+          else f"{len(failures)} checks failed against mise.toml's pre-commit list",
+          file=sys.stderr)
+    sys.exit(1)
+print(f"ok: every copy of the pre-commit list agrees with mise.toml "
+      f"({', '.join(ORDER)})")

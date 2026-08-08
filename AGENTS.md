@@ -8,8 +8,15 @@ rule without its reason is a rule somebody edits away.
 
 ## The gate is the only gate
 
-**GitHub Actions is disabled.** The workflow file is deleted, not paused. There
-is no second checker.
+**GitHub Actions is disabled, and TWO independent things hold that.** The
+repository's Actions setting is off, and `main` carries no workflow file — deleted,
+not paused. Either alone would hold. Both is the state. There is no second checker.
+
+Both are named here rather than one, because this is the file an agent reads first
+and a single reason reads as the whole reason. `CONTRIBUTING.md` carries the
+measurement of each, with the date and the command that read it back, and it is the
+only place that does. Do not restate the figures here — go and read them before you
+argue anything about CI.
 
 `mise run pre-commit` and `mise run pre-push` are therefore the whole safety
 net. `deny`, `msrv` and `wasm-guards` used to run only in CI and now run in

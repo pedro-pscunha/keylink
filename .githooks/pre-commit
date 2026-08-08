@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fast gate. A commit hook that takes a minute is a commit hook people bypass,
-# so this runs formatting and a library-scoped clippy and nothing else. The
+# so this runs the fast subset `mise.toml` calls `pre-commit` and nothing else —
+# named there rather than listed here, because a list in a comment is a copy. The
 # expensive checks — every target, every feature end, every feature subset, the
 # tests, the docs, the browser target — belong to pre-push, which runs far less
 # often.
@@ -138,7 +139,45 @@ if [ -n "$amend_base" ]; then
 else
     linted="$(git diff --cached --name-only --diff-filter=ACMR)"
 fi
-if ! printf '%s\n' "$linted" | grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$'; then
+# ── A HERE-STRING AND NOT A PIPE, which is the difference between a gate and a
+# ── SILENT BYPASS. This was `printf '%s\n' "$linted" | grep -qE ...`.
+#
+# `grep -q` exits 0 at its FIRST match and closes the pipe. On a large staged list
+# `printf` is then killed by SIGPIPE and exits 141, `pipefail` makes the whole
+# pipeline non-zero, `!` inverts that to true, and the hook takes the `exit 0`
+# below — **skipping the gate on a commit that stages Rust**, with a zero exit
+# status and nothing printed. The failure runs the wrong way round: the larger the
+# commit, the likelier it is ungated, so a big refactor or a vendored import is
+# exactly what goes unchecked.
+#
+# MEASURED, control first, in throwaway repositories with a stub `mise` that
+# reports whether the gate was reached at all. `a.rs` sorts early, so the match
+# lands near the top while the rest of the list is still unwritten:
+#
+#     staged path list    with the pipe    with this here-string
+#     65,001 bytes        gate RAN         gate RAN
+#     65,566 bytes        gate SKIPPED     gate RAN
+#     226,026 bytes       gate SKIPPED     gate RAN
+#     2,825,026 bytes     gate SKIPPED     gate RAN
+#
+# **`git commit` exited 0 in every one of those runs**, which is why nobody would
+# ever have noticed. The flip brackets 65,536 bytes — one 64 KiB pipe buffer — so
+# it is a kernel constant rather than a figure of this repository's, and a machine
+# with a different capacity flips somewhere else. What is invariant is the shape:
+# a match near the START of a list bigger than one buffer kills the writer.
+#
+# **THE TRAP, MEASURED THE HARD WAY, for whoever replays this.** The first harness
+# asked `printf '%s' "$out" | grep -q 'GATE RAN'` of the commit's own output — and
+# git prints one `create mode` line per staged file, so that pipeline reproduced
+# the defect under test INSIDE the measurement and reported SKIP for both
+# spellings alike. The first set of figures written here came from it and was
+# wrong in the direction that flatters the fix. Redirect to a file and let grep
+# read the file: never measure a pipe bug through a pipe.
+#
+# `<<<` hands grep a seekable temp file, which has no writer to kill and no
+# pipeline for `pipefail` to judge. Byte-for-byte the same input: `<<<` appends
+# exactly one LF, which is what `printf '%s\n'` did.
+if ! grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$' <<<"$linted"; then
     exit 0
 fi
 
@@ -153,24 +192,53 @@ fi
 #
 # It said "the same two commands" while `pre-commit` already ran THREE tasks —
 # `framing` was never inlined — then `anchors` made it four and `anchors-selftest`
-# made it five. So, matching `mise.toml`'s `pre-commit` in its order:
-# `framing`, `anchors`, `anchors-selftest`, `fmt-check`, `lint-fast`.
+# five. **No enumeration of them is written in this comment any more: the lines
+# below ARE the list, in `mise.toml`'s order, and a second copy of it up here is
+# one more thing to go stale.**
 #
-# The first three are scripts, so they are invoked rather than reimplemented; a
-# second copy of their logic is a second thing to drift. All three read their own
-# root and run standalone without `mise` in the environment.
+# This sentence went on to say `task-lists` made it six, and that was left standing
+# after `task-lists` moved to `gate` alone — so ONE FILE stated the length of this
+# list twice, as five above and as six here. `task-lists` cannot catch it: the check
+# reads only the region below the `note: 'mise' is not installed` anchor, and both
+# sentences sit above it. That is the argument for naming no count at all.
 #
-# THIS LIST IS HAND-MAINTAINED AND WILL DRIFT AGAIN. `mise.toml` is the authority;
-# this is a copy, and it has now been one task short twice. Whoever adds a sixth
-# task to `pre-commit` has to add it here too, and nothing enforces that.
+# The script tasks are invoked rather than reimplemented; a second copy of their
+# logic is a second thing to drift. Each reads its own root and runs standalone
+# without `mise` in the environment.
+#
+# THIS LIST IS A COPY AND `mise.toml` IS THE AUTHORITY. It has been one task short
+# twice, and the sentence that used to close this paragraph — "nothing enforces
+# that" — is the reason `.mise/tasks/task-lists` exists. It reads the manifest's
+# `pre-commit` list and asserts that every task in it is invoked below, in the
+# manifest's order, with nothing extra beside it.
+#
+# **Where that bites is the PUSH and never the commit, and the reason is simpler
+# than the one this paragraph used to give.** `task-lists` is not in the
+# `pre-commit` list at all — `mise.toml` puts it in `gate` alone and says so — so it
+# does not run at a commit for the plain reason that a commit does not run it.
+#
+# The reason written here before was that the filter above only reaches the gate
+# when the commit stages Rust or a cargo manifest, `mise.toml` being neither. That
+# sentence described `task-lists` as running inside `pre-commit`, which it stopped
+# doing when it moved. **Both readings reach the same conclusion, which is exactly
+# why the wrong one survived** — and a contributor acting on it would widen the
+# filter and change nothing, because widening a list `task-lists` is not in cannot
+# add it. So a task added to the manifest and forgotten below survives the commit
+# that adds it, and fails `mise run gate` at the push.
+#
+# Worth naming for what it was: a copy of the `pre-commit` list's behaviour that
+# disagreed with the manifest, inside the hook whose drift this file's own guard
+# exists to stop. `task-lists` compares the INVOCATIONS below against the manifest
+# and reads none of this prose, so nothing but a reader was ever going to catch it.
 #
 # Not resolved the way `pre-push` resolves it, and the difference is deliberate.
 # That hook now REFUSES without `mise`, because it claims to be the whole gate and
-# GitHub Actions is disabled, so a subset there is a false green. This hook claims
-# the opposite: its header says it runs formatting and a library-scoped clippy and
-# NOTHING else, and that the expensive checks belong to `pre-push`. A hook that is
-# avowedly a subset cannot be made a false green by being a subset — it can only be
-# made one by covering less than the list it names, which is what this fixes.
+# CI is off by decision, so a subset there is a false green. This hook claims the
+# opposite: its header says it runs the fast subset and nothing else, and that the
+# expensive checks belong to `pre-push`. A
+# hook that is avowedly a subset cannot be made a false green by being a subset —
+# it can only be made one by covering less than the list it names, which is what
+# this fixes.
 echo "note: 'mise' is not installed - running the same checks directly" >&2
 .mise/tasks/framing
 .mise/tasks/anchors

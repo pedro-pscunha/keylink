@@ -1,17 +1,302 @@
 #!/usr/bin/env bash
-# The heavy gate — and since GitHub Actions was disabled, the ONLY gate.
+# The heavy gate — and THE gate, by decision. CI is off on purpose and stays off.
 #
-# Slow on purpose, and now load-bearing rather than an optimisation. It used to
-# run what CI would run, so a red result here saved a round trip. Nothing runs
-# after this any more: a bypass is not "CI will catch it", it is "nothing will".
+# Slow on purpose, and load-bearing rather than an optimisation. It used to run
+# what CI would run, so a red result here saved a round trip. Nothing runs after
+# this now: a bypass is not "CI will catch it", it is "nothing will". `afdbeb3`
+# switched the workflow off and moved what only it ran into `gate` in the same
+# commit, which is what made that safe.
+#
+# TWO independent things hold that, which is why the claim is not fragile: the
+# repository's Actions setting is off, and `main` carries no workflow file either.
+# CONTRIBUTING.md carries the measurement of both, once; this comment keeps no
+# second copy of it, and none of it is a reason to reach for CI instead of this
+# hook.
 #
 # Bypass with `git push --no-verify`. See CONTRIBUTING.md, and read the narrow
 # case it is for — it got narrower when the second gate went away.
+#
+# ── AND IT READS ITS STDIN, WHICH IS WHERE THE PUSH SAYS WHAT IT DELIVERS ─────
+#
+# Git writes one line per ref update on this hook's stdin:
+#
+#     <local-ref> SP <local-sha> SP <remote-ref> SP <remote-sha> LF
+#
+# and a DELETION arrives as `(delete)` with an all-zero local sha. This hook
+# ignored that input entirely, and two defects followed from the one omission.
+# Both were observed on 2026-08-08 rather than reasoned about:
+#
+#   * `git push origin --delete <branch>` ran the whole gate and then failed on
+#     a cargo lock. A deletion carries no tree, so there was nothing for any of
+#     those steps to be about — the gate was checking an unrelated working tree
+#     and reporting the answer as if it were about the push. No step count is
+#     quoted, because `mise.toml` owns that number and a copy of it here would
+#     be wrong the next time a task is added to `gate`.
+#   * A `git commit --amend` landing while the gate ran left the gate green for
+#     the amended tree while the ref update delivered the PRE-amend commit. Both
+#     halves reported success and nothing compared them.
+#
+# The second one is structural rather than a coincidence of timing. Git resolves
+# the refspec to a sha and writes that sha here, so by the time this hook starts
+# the commit being delivered is already decided — while `mise run pre-push`
+# builds the WORKING TREE, which is free to have moved since. The gate's subject
+# is a tree, the push's subject is a sha, and this hook is the only place the two
+# can be compared at all.
 set -euo pipefail
 
+# ── stdin, read ONCE, before anything else ───────────────────────────────────
+#
+# Nothing below can re-read it. Stdin is a pipe and a pipe does not seek, so the
+# capture happens here and every decision downstream reads the variable.
+#
+# Command substitution strips EVERY trailing newline, so `$updates` holds the
+# update lines without their final LF. The forward below puts exactly one back with
+# `<<<`, and that is byte-exact rather than approximately right: git terminates each
+# update with one LF and writes nothing after the last one. Verified by comparing
+# what git sent against what the chain received, in one repository, at 402 bytes and
+# at 116,698 bytes — sha256 equal in both.
+updates="$(cat)"
+
+# Chain to whatever hook was configured before this repo took over
+# `core.hooksPath` — a global secret scanner, most often. Setting a repo-local
+# hooks path silently REPLACES a global one, so without this the repo would
+# quietly disable a guard the developer set up for every repository they own.
+# `scripts/install-hooks.sh` records the previous path in `hooks.chain`.
+#
+# **The pipe is the crux, and it is not tidying up.** This line used to be
+# `"$chain/pre-push" "$@"`, which INHERITED stdin — correct only while nothing
+# upstream read it. The `cat` above reads it, so an unchanged forward would hand
+# the chained hook an immediate EOF: a scanner that reads ref updates would find
+# zero of them, check nothing, and exit 0. That is a false green in somebody
+# else's hook, caused from this file.
+#
+# Written for the case where a chained `pre-push` EXISTS, and deliberately not
+# for the directory as it stands today. `hooks.chain` is LOCAL config naming a
+# path outside this repository, so it can gain a `pre-push` between two pushes
+# without one line here changing — and a forward that is correct only today
+# breaks silently on the day it starts mattering.
+# ── A HERE-STRING AND NOT A PIPE, for the reason this file's own header gives ──
+#
+# This was `redeliver | "$chain/pre-push" "$@"`, with `redeliver` a function that
+# `printf`ed `$updates`. A pipe adds a failure path a here-string does not have: a
+# chained hook that exits WITHOUT draining its stdin closes the read end, the writer
+# takes SIGPIPE, and `pipefail` plus `set -e` abort this hook — **refusing the push**.
+#
+# MEASURED both ways, with a chained hook spelled `exit 0` and every branch at HEAD
+# so the guard below cannot be what refuses:
+#
+#     2 refs, 402 bytes         pipe: push SUCCEEDS   here-string: push SUCCEEDS
+#     401 refs, 116,698 bytes   pipe: REFUSED         here-string: push SUCCEEDS
+#
+# At 402 bytes the write fits in one pipe buffer and completes before the reader is
+# gone, so a small push cannot see this at all. It takes a payload past the buffer to
+# be deterministic — a few hundred refs, which `git push --mirror` reaches. **This
+# file's own standard is that a forward correct only today breaks silently on the day
+# it starts mattering, and that standard reaches this spelling.**
+#
+# What the refusal looked like, quoted rather than characterised — it is not silent,
+# it is worse than silent, because it reads as a bug in this file. The line number is
+# part of the quote and belongs to the OLD spelling, where 85 was the `printf`:
+#
+#     .githooks/pre-push: line 85: printf: write error: Broken pipe
+#     error: failed to push some refs to '<remote>'
+#
+# Nothing there names the gate, the chain, or a decision. A developer seeing it has
+# no way to tell a refusal from a crash.
+#
+# THE DIFFERENCE IN KIND, and it is why the fix is not a bigger buffer: bash backs a
+# here-string with a TEMP FILE, so the chained hook reads a seekable file rather than
+# a pipe. There is no writer left to kill, and no pipeline for `pipefail` to judge.
+#
+# Byte-exact by construction rather than by arithmetic. Command substitution stripped
+# every trailing newline from `$updates`, and `<<<` appends exactly one LF back —
+# the same single LF `printf '%s\n'` wrote, and the one git terminates its last
+# update with.
+#
+# Two arms rather than one, because `<<<""` writes a lone LF. Git never sends that,
+# and a reader splitting on newlines takes it as one malformed update — so the empty
+# case gets `/dev/null`, which is a genuinely empty stdin.
 chain="$(git config --get hooks.chain || true)"
 if [ -n "$chain" ] && [ -x "$chain/pre-push" ]; then
-    "$chain/pre-push" "$@"
+    if [ -n "$updates" ]; then
+        "$chain/pre-push" "$@" <<<"$updates"
+    else
+        "$chain/pre-push" "$@" </dev/null
+    fi
+fi
+
+# ── what this push actually delivers ─────────────────────────────────────────
+#
+# All zeros, whatever the hash length. A sha256 repository writes 64 of them, so
+# a hard-coded 40 would read every deletion there as an ordinary update and gate
+# a tree the push does not carry. Matched by SHAPE for that reason: no character
+# other than `0`, and not empty.
+is_deletion() {
+    case "$1" in
+        "" | *[!0]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+updates_read=0
+deletions=0
+delivering=""
+if [ -n "$updates" ]; then
+    while read -r local_ref local_sha _remote_ref _remote_sha; do
+        [ -n "$local_ref" ] || continue
+        updates_read=$((updates_read + 1))
+        if is_deletion "$local_sha"; then
+            deletions=$((deletions + 1))
+        else
+            delivering="$delivering$local_ref $local_sha"$'\n'
+        fi
+    done <<<"$updates"
+fi
+
+# ── a deletion has no tree, so the GATE is skipped — never the HOOK ──────────
+#
+# The chain forward above has already run, and that ordering is the design. A
+# protected-ref guard belongs in a hook rather than in a gate, and a hook that
+# returned early for deletions would make every such guard dead code on exactly
+# the push it exists to stop.
+#
+# EVERY update, not any. A push carrying one deletion beside one real update
+# still delivers a tree, and that tree wants the whole gate — which is what `-eq
+# "$updates_read"` says and what a `-gt 0` would not.
+#
+# **And `updates_read` must be above zero, which is the load-bearing half.**
+# Zero lines read means UNKNOWN, never "no updates". An empty read is precisely
+# what a bug in the capture above produces, so treating it as all-deletions
+# would skip the entire gate on it, silently, in the one direction this whole
+# change exists to remove. Unknown runs the gate and says why.
+#
+# Both arms announce themselves. A gate that quietly did not run is
+# indistinguishable, in the output, from a gate that passed.
+if [ "$updates_read" -gt 0 ] && [ "$deletions" -eq "$updates_read" ]; then
+    echo "pre-push: SKIPPING the gate — all $updates_read ref update(s) are deletions."
+    echo "pre-push: a deletion carries no tree, so building one checks nothing"
+    echo "pre-push: about it. Any chained hook has already run."
+    exit 0
+fi
+
+if [ "$updates_read" -eq 0 ]; then
+    echo "pre-push: no ref update arrived on stdin, so the gate RUNS." >&2
+    echo "pre-push: an empty read means unknown, and unknown is not a deletion." >&2
+fi
+
+# ── the gate vouches for the tree it builds, and that tree is HEAD's ─────────
+#
+# So a delivered sha that is not HEAD is the second defect from the header,
+# arriving as a fact this hook can see: whatever the gate is about to say, it
+# will be a statement about a commit other than the one the remote receives.
+# Refused before the gate runs, because running it would produce the false green
+# rather than avoid it.
+#
+# ── WHAT THIS REFUSES THAT NOBODY WOULD CALL WRONG — MEASURED, NOT LISTED ─────
+#
+# **The refusal is a property of the REFS a push carries and never of the command
+# that carried them.** This comment used to name commands, and that was wrong in
+# both directions. Every row below was run against this hook with a stub gate:
+#
+#     git push --all, every branch AT HEAD       ACCEPTED, gate ran, both refs landed
+#     git push --all, one branch NOT at HEAD     REFUSED
+#     a LIGHTWEIGHT tag at HEAD                  ACCEPTED, gate ran
+#     an ANNOTATED tag at HEAD                   REFUSED
+#     an annotated tag at an OLDER commit        REFUSED
+#
+# So `git push --all` is not refused as such. It is refused as soon as ANY branch it
+# carries is not at HEAD, and in a repository whose branches all sit at HEAD it goes
+# through the gate and lands. `git push <remote> <branch>` naming a sibling branch is
+# the same story: refused because that branch's tip is not HEAD, not because it was
+# named.
+#
+# **AN ANNOTATED TAG AT THE TIP IS REFUSED, AND THAT IS THE ONE NOBODY PREDICTS.**
+# `git tag -a v1.0 && git push origin v1.0` at the tip delivers neither an older
+# commit nor another branch, and it is still refused — because git writes the TAG
+# OBJECT's sha on this hook's stdin, not the sha of the commit the tag points at.
+# Measured, with a hook that only dumps what it was sent: HEAD was `f584d78`,
+# `refs/tags/ann` resolved to `ff12f9a`, and `refs/tags/ann^{commit}` resolved back
+# to `f584d78`. The sha compared below is therefore the tag object's, and it never
+# equals HEAD for ANY annotated tag. A lightweight tag at the tip sends the commit
+# sha itself and is accepted.
+#
+# Dereferencing with `^{commit}` would let the tip case through and is not done,
+# because it is a carve-out of exactly the kind the next paragraph rejects — and it
+# would not help the case this refusal exists for, a tag two commits back, which
+# still has to be refused. One rule that is easy to state beats two that are easy to
+# get wrong. CONTRIBUTING.md lists the annotated tag among the legitimate bypasses.
+#
+# Refused rather than carved out, because a carve-out has to claim something
+# this hook cannot check. `mise run pre-push` compiles and tests the working
+# tree; for a tag two commits back, or for a sibling branch, that tree is not
+# built in this run at all. Exempting them would mean a green gate that is true
+# of a tree and false of the push, which is the defect wearing a different hat.
+#
+# The carve-out that looks free is "the tag's target is already on the remote,
+# so some earlier push gated it". It needs the remote's answer about what it
+# holds, and it substitutes the remote's history for a check of a tree. A gate
+# that trusts a claim it cannot make is the thing this hook has just stopped
+# doing.
+#
+# What the refusal costs is one flag, and the message says so: a tag push takes
+# `git push --no-verify`. That is honest where a green gate would not be —
+# nothing built that tree in this run, and the refusal is the only part of the
+# system that knows.
+# ── WHOSE HEAD, when several worktrees share one copy of this hook ────────────
+#
+# `core.hooksPath` here is an ABSOLUTE path into one checkout, and linked
+# worktrees share `.git/config` — so every worktree runs this one file while
+# sitting at its own HEAD. Reading the wrong one would refuse every push from
+# every worktree at once.
+#
+# The plain `git rev-parse HEAD` below is right, and the reason is that git
+# EXPORTS `GIT_DIR` into the hook pointing at the PUSHING worktree's own gitdir
+# (`<owner>/.git/worktrees/<name>`). Measured from inside a hook in a linked
+# worktree: `GIT_DIR` is the worktree's, `--show-toplevel` is the worktree's, and
+# even `git -C <the owning checkout> rev-parse HEAD` still answers the WORKTREE's
+# HEAD, because `GIT_DIR` overrides directory-based discovery. Getting this wrong
+# takes an explicit `--git-dir=` override, which is why the guard for it in
+# `scripts/hook-guard.sh` is spelled that way.
+if [ -n "$delivering" ]; then
+    head_sha="$(git rev-parse HEAD)"
+    stale=""
+    while read -r ref sha; do
+        [ -n "$ref" ] || continue
+        if [ "$sha" != "$head_sha" ]; then
+            stale="$stale    $ref -> $sha"$'\n'
+        fi
+    done <<<"$delivering"
+    if [ -n "$stale" ]; then
+        # "an object" and not "a commit": for an annotated tag the sha below is the
+        # TAG OBJECT's, which is not a commit at all. The message named a commit and
+        # was therefore false in the one case a reader would bring it to.
+        echo "error: this push delivers an object that is not HEAD." >&2
+        echo >&2
+        printf '%s' "$stale" >&2
+        echo "    HEAD -> $head_sha" >&2
+        echo >&2
+        echo "  The gate builds and tests the WORKING TREE, and the working tree is" >&2
+        echo "  HEAD's. A green result would therefore be a statement about a commit" >&2
+        echo "  this push does not deliver, which is how a green gate and a delivered" >&2
+        echo "  ref came to disagree without either half reporting anything." >&2
+        echo >&2
+        echo "  For a BRANCH, the remedy is to deliver HEAD:" >&2
+        echo "          git push <remote> HEAD:<branch>" >&2
+        echo "          or check out the branch you mean and push that." >&2
+        echo >&2
+        echo "  For a TAG there is no such remedy, and the flag below is the answer." >&2
+        echo "  Git sends a tag's own object sha, so EVERY annotated tag lands here —" >&2
+        echo "  including one created at this very commit. A lightweight tag at HEAD" >&2
+        echo "  sends the commit sha and passes." >&2
+        echo >&2
+        echo "  'git push --all' lands here only when one of the branches it carries" >&2
+        echo "  is not at HEAD. The comment above this message in .githooks/pre-push" >&2
+        echo "  measures each of these cases." >&2
+        echo >&2
+        echo "  To push anyway, knowing nothing has checked what you are delivering:" >&2
+        echo "  git push --no-verify" >&2
+        exit 1
+    fi
 fi
 
 cd "$(git rev-parse --show-toplevel)"
@@ -33,9 +318,9 @@ fi
 # false green on a push is worse than a refused push: one of them tells you.
 echo "error: 'mise' is not installed, and it is the gate." >&2
 echo >&2
-echo "  GitHub Actions is disabled for this repository. \`mise run gate\` is the" >&2
-echo "  only thing that checks a push, so there is no weaker-but-still-useful" >&2
-echo "  subset to fall back to — whatever it skipped, nobody else would run." >&2
+echo "  CI is off by decision, so \`mise run gate\` is the whole check for this" >&2
+echo "  push. There is no weaker-but-still-useful subset to fall back to —" >&2
+echo "  whatever it skipped, nobody else would run." >&2
 echo >&2
 echo "  Install mise:  https://mise.jdx.dev" >&2
 echo "  Then:          ./scripts/install-hooks.sh && mise run gate" >&2
