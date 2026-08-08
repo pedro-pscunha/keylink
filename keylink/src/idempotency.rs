@@ -1723,10 +1723,12 @@ mod tests {
         /// would have left `key_state` answering the old one until `KeyState` gained
         /// a variant too — two names on two enums to say what this one says.
         ///
-        /// Made red by `scripts/break-once.sh` replacing
-        /// `Guard::record`'s settled slot to
-        /// `Slot::Interrupted` —
-        /// the other spent state, and the tempting one, since nothing was recorded.
+        /// Made red by `scripts/break-once.sh` settling `Guard::record`'s slot as
+        /// `Slot::Interrupted` — the other spent state, and the tempting one, since
+        /// nothing was recorded. Described rather than quoted because the record and
+        /// the line it breaks are in one file, where a quoted anchor is what
+        /// `break-once.sh` counts twice; the **replacement** is quoted, which is
+        /// always safe, since the harness never searches it.
         /// Watched: `assertion `left == right` failed`, `left: Interrupted`,
         /// `right: Unrecordable`. It is the wrong answer: `Interrupted` means whether
         /// the work took effect is unknown, and here it is known to have completed.
@@ -1743,10 +1745,19 @@ mod tests {
         /// dropped with nothing dispatched is still claimable — the two halves of
         /// RFC-05 §2, asked of a ledger that records no replies.
         ///
-        /// Made red by `scripts/break-once.sh` replacing
+        /// Made red by `scripts/break-once.sh` making `Guard::drop`'s
+        /// `Reached::NotDispatched` test unreachable. Search, **with its
+        /// indentation**, which is what keeps it unique against this quote:
         /// `if self.progress.as_ref().map(Progress::reached) == Some(Reached::NotDispatched) {`
-        /// with `if false {`. Watched: `panicked at .., a key nothing ran under must
-        /// still be claimable`. It also reddens
+        /// and replace with `if false {`, so every dropped guard settles rather than
+        /// releasing. The replacement is quoted too, which is always safe.
+        ///
+        /// This record and that condition are in one file, and that is not a reason to
+        /// describe rather than quote — measured at `7a147c0`, the indented form
+        /// counts **1** with this quote present while the bare form counts 2. The
+        /// indentation is the whole mechanism. Watched:
+        /// `panicked at .., a key nothing ran under must still be claimable`. It also
+        /// reddens
         /// `claim::a_guard_dropped_with_nothing_dispatched_leaves_the_key_claimable`,
         /// which is the test that owns that rule; this one asks it of a ledger that
         /// records no replies.

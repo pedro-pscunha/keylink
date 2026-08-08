@@ -1,0 +1,802 @@
+#!/usr/bin/env python3
+"""A break record that quotes an anchor must still be able to find it.
+
+MISE description="Every quoted break anchor resolves exactly once in its target"
+"""
+# This exists because three records on `main` quoted anchors that no longer
+# resolved, and **not one of them was red**. `scripts/break-once.sh` refuses to
+# run when its search literal is not exactly-once in the target, so a rotted
+# anchor makes the recorded run unreproducible — while the record goes on
+# reading like evidence. That is the failure this task turns into a gate.
+#
+# The rule it enforces is `break-once.sh`'s own precondition, nothing more:
+#
+#     grep -qF -- "$from" "$file"          # count 0 aborts before any backup
+#     assert text.count(old) == 1          # count 2 aborts, backup restored
+#
+# So the check is `count == 1`, and both failure modes are safe to hit by hand:
+# a 0 aborts at the grep before a backup exists, and a 2 aborts at the python
+# assert with the backup already restored by `trap EXIT`.
+#
+# ── four ways a quoted anchor rots, all four found across three branches ────
+#
+# 1. **Same file.** A record in the file it breaks can make its own anchor a
+#    second occurrence: count 2. NOT always, though - a `///` quote carries no
+#    indentation while the code does, so an INDENTED search literal stays unique
+#    and the record's copy is not a second occurrence. Same-file quoting works
+#    where indentation disambiguates, and fails at column 0 or on a fragment.
+#    Where it cannot work, describe the search edit - and still quote the
+#    REPLACEMENT, which is always safe because `break-once.sh` never searches it.
+# 2. **The formatter rewrapped it.** A record quoted a one-line expression;
+#    `rustfmt` split it across three when the function's signature widened.
+#    Count 0, cross-file, nothing anybody wrote by hand. The formatter owns the
+#    line breaks and the record does not.
+# 3. **A positional anchor.** A record anchored on a slice of `lib.rs`'s
+#    `pub use` list. A later wave inserted one more export into the middle of
+#    that slice: count 0. Cross-file and nothing rewrapped, so neither rule
+#    above reaches it. What moved was a sibling's presence in an ordered list.
+# 4. **A fragment, or a line whose text prefixes another.** The standard advice
+#    is "pass the line WITH its indentation", and for these it does not work:
+#    a `const` at column 0 has no indentation to add; a mid-line fragment like
+#    `pop_front()` is not disambiguated by indentation at all; and a line whose
+#    indented text is a PREFIX of another line still counts 2 unless the anchor
+#    carries the trailing NEWLINE, which no record thinks to mention. So an
+#    anchor must be a **whole line, including indentation, plus the newline when
+#    its text prefixes another line.** The abort reads as the harness failing
+#    when it is the record that is wrong.
+#
+# The question that reaches all four: **is the anchor's uniqueness a property of
+# the LINE, or of its NEIGHBOURS?** — with the sharpening mode 4 forces, that a
+# fragment is not a line at all.
+#
+# ── THE REMEDY THAT DISSOLVES "THE EDIT SITE SPANS SEVERAL LINES" ─────────────
+#
+# **`break-once.sh` searches ONE literal and replaces it with anything, so a
+# one-line search with a MULTI-LINE replacement is legal — and the replacement is
+# never searched, so it cannot affect uniqueness.**
+#
+# A multi-line edit therefore does NOT need a multi-line anchor. Every row anybody
+# has justified with "the edit site spans several lines" was reasoning about the
+# SITE when the harness only cares about the SEARCH LITERAL. Three of the five
+# conversions on this branch were unlocked by that sentence, and the reason it is
+# written here rather than in one row's comment is that its absence is what makes
+# the wrong conclusion re-derivable.
+#
+# So before describing a multi-line edit, ask which single line inside it is
+# unique. C14 is the worked example: `.iter()` alone counts 2 and is unusable,
+# while the `.filter_map(..)` line one below it counts 1 and anchors the same edit.
+#
+# ── AND A RECORD IS PART OF THE CORPUS IT DESCRIBES ───────────────────────────
+#
+# **Writing a record changes the thing the record measures.** The literal you quote
+# to document an anchor becomes a second occurrence of it, so the act of explaining
+# a break can be what stops the break working.
+#
+# The asymmetry is worth stating plainly, because it says which edits are risky:
+#
+#   * REMOVING a quote can only LOWER an occurrence count.
+#   * ADDING one can only RAISE it.
+#
+# **So a requote is the only edit that can turn a resolving anchor into an aborting
+# one**, and it does that in the file the author is looking at, while feeling
+# careful. Re-reading does not find it; the text looks right. **Count after the
+# edit, not after the batch.** And if a count comes back 2, the fix is not "add
+# more indentation" — it is that the quote is now byte-identical to something, and
+# which occurrence is which has to be seen before choosing.
+#
+# `break-once.sh` fails safe here: a wrong count aborts at its `grep` or its
+# `assert` before any backup is taken, so a bad requote costs a run and not a file.
+# But that signal arrives at REPLAY time. The count arrives at edit time.
+#
+# This is the same insight as the per-tree limitation below, from the other end: a
+# record is not an observer of the tree, it is part of it.
+#
+# ── why this list is written out by hand ────────────────────────────────────
+#
+# Deriving it would mean parsing prose for "replacing `X` with `Y` in `path`",
+# and a heuristic that misses a record checks nothing while reporting success.
+# So the list is explicit, exactly as `local.rs`'s
+# `no_failure_prefix_is_a_prefix_of_another` spells out its four prefixes and
+# says a fifth has to be added by hand.
+#
+# **The honest limitation, and it is larger than it sounds: this checks the
+# records REGISTERED below, not the records that exist.** A sweep of every
+# backticked code-shaped span inside a break record, repo-wide, finds them in the
+# hundreds. Most are watched output or replacement literals rather than search
+# anchors — which is exactly why no extractor can build this list — but the
+# consequence stands: a green here means *the registered anchors resolve*, and it
+# is not a statement about the health of every record in the tree.
+#
+# Registration is therefore **opt-in per record**, and the green line says
+# "registered" for that reason. When you write a record that quotes a search
+# literal, add it. Nothing will notice if you do not, which is the one hole this
+# task cannot close from the inside.
+#
+# **And it checks ANCHORS, never MESSAGES.** A record's watched output is a claim
+# about which assertion fires first, and that rots when an assertion is added
+# ABOVE the recorded one — the guard stays correct, the test still fails, and only
+# comparing the recorded sentence against a fresh run finds it. No count and no
+# resolution check can see that. `scripts/replay-fate-breaks.sh` is the tool for
+# it, on the set it covers; this task deliberately answers the narrower question
+# of whether the break can be STARTED at all.
+#
+# ── AND THE GUARANTEE IS PER-TREE. IT SAYS NOTHING ABOUT A MERGE ───────────────
+#
+# Every rot mode above is detectable from inside one checkout. **This one is not,
+# and no version of this task can be.**
+#
+# A row can be registered, resolving, replayable and TRUE at branch A's tip while
+# branch B rewrites the test the record describes. The literal still resolves at
+# exactly one occurrence, so this task stays GREEN on A, on B, and on the merge —
+# while the break it certifies no longer reddens anything. Resolution is all the
+# checker sees, and the claim died in a file this checkout never had.
+#
+# Observed, not hypothesised: `C10`'s anchor is a line another branch mutated in an
+# experiment and its record is a paragraph that branch rewrote. Its break stopped
+# reddening and this task never moved.
+#
+# **And the registry cannot even REPRESENT the part that goes wrong.** A row is
+# `(id, lives_in, target, literal)` — there is **no watched-message field**. So no
+# edit to any row can state the claim that died, and no edit to any row can repair
+# it. A reader who accepts this limitation and then goes looking for the row change
+# that expresses it will not find one, which is why the absence is written down here
+# rather than left to be discovered.
+#
+# So the repair belongs to **the branch that falsifies a row, in the same commit
+# that rewrites the file** — otherwise some checkout-able commit has a tree and a
+# registry that disagree, and there is no tree from which that is visible. The
+# generalisation is worth having: **any registry naming lines in files another
+# branch owns is valid at exactly one tree, and the merge is where it silently
+# stops being valid.** A green run here is a statement about THIS checkout and
+# never about a merge that has not happened.
+import pathlib
+import re
+import subprocess
+import sys
+
+ROOT = pathlib.Path(
+    subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+)
+
+# (record id, where the record lives, file the break edits, quoted SEARCH literal)
+#
+# Only records that QUOTE a search literal belong here. A record that describes its
+# edit has nothing to resolve and nothing to rot.
+#
+# **The three cases where describing is right are NOT the four rot modes above, and
+# an earlier version of this line pointed at "the three modes above" as though they
+# were the same list.** They are two different lists and they cross:
+#
+#   * SAME-FILE where indentation cannot separate the record's copy from the code's
+#     - rot mode 1, and a describing case only where nothing else separates them;
+#   * POSITIONAL - rot mode 3, where re-quoting buys only until the next sibling;
+#   * FORMATTER where the edit site spans more than one line - part of rot mode 2,
+#     and the only one of the three with no better anchor available.
+#
+# Mode 4, a fragment, is a rot mode and NOT a describing case: its remedy is to
+# widen to the whole line, which is what C12 does. Mode 2 is only a describing case
+# when the site has no single line - a one-line anchor inside a wrapped chain is
+# quotable, and C13 is quoted for that reason.
+#
+# **This is a count of ROWS, not of distinct anchors**, and the list holds both
+# shapes on purpose: R15 and R16 are two rows sharing one literal because two
+# records cite it, while C5 is one row for a literal two records also cite. The loop
+# below iterates rows, so `len(ANCHORS)` is rows, and the green line says so.
+ANCHORS = [
+    ("R15", "keylink/tests/idempotency.rs", "keylink/src/idempotency.rs",
+     "Self::Only(named) => named.contains(&method),"),
+    ("R16", "keylink/tests/idempotency.rs", "keylink/src/idempotency.rs",
+     "Self::Only(named) => named.contains(&method),"),
+    ("R17", "keylink/tests/idempotency.rs", "keylink/src/rpc.rs",
+     "return Claimed::None;"),
+    ("R18", "keylink/tests/idempotency.rs", "keylink/src/rpc.rs",
+     "Some(_) | None => KeyState::Fresh,"),
+    ("R20", "keylink/tests/idempotency.rs", "keylink/src/idempotency.rs",
+     "self.ledger.settle(self.peer, &self.key, slot);"),
+    ("R25", "keylink/tests/api.rs", "keylink/src/macros.rs",
+     "pub type SystemBuilder = $crate::SystemBuilder<Mail>;"),
+    ("R26b", "keylink/tests/api.rs", "keylink/src/rpc.rs",
+     "pub fn keyable(mut self, keyable: Keyable) -> Self {"),
+    ("R26c", "keylink/tests/api.rs", "keylink/src/rpc.rs",
+     "pub fn records(mut self, records: Records) -> Self {"),
+    ("R28", "keylink/tests/blobs.rs", "keylink/src/macros.rs",
+     "__keylink_granted_id!"),
+    # ── from PR #11 (`call-id`). Enumerated by that branch's own gate against
+    # `break-once.sh:28`, then re-measured here row by row rather than
+    # transcribed: for each, the code site was separated from the record's quote,
+    # the indentation read off the code, and the count taken at that exact form.
+    #
+    # SIX are SAME-FILE and legitimate, which is the narrowed rule in action: the
+    # record's quote sits unindented inside a `///` line while the code carries
+    # its indentation, so the indented literal is unique and the record's copy is
+    # not a second occurrence. Their bare forms count 2-3.
+    ("C1", "keylink/src/call.rs", "keylink/src/call.rs",
+     "        hasher.update(peer.as_bytes());"),
+    ("C2", "keylink/src/call.rs", "keylink/src/call.rs",
+     "        hasher.update(key.as_str().as_bytes());"),
+    ("C3", "keylink/src/call.rs", "keylink/src/call.rs",
+     "        let Some(call) = call else { return };"),
+    ("C4", "keylink/src/call.rs", "keylink/src/call.rs",
+     "        self.answers.get(&call?)"),
+    # Cited from TWO records and registered ONCE, which is the opposite choice from
+    # R15/R16 - two rows for one literal, also two records. Both are defensible and
+    # the list makes both, so neither is the convention; what the green line counts
+    # is ROWS, and that is stated where the count is printed.
+    ("C5", "keylink/src/call.rs", "keylink/src/call.rs",
+     "            Entry::Occupied(_) => return,"),
+    # A FRAGMENT: the line continues `.serialize(serializer)`. Registered as the
+    # record quotes it and declared below, rather than widened to the whole line -
+    # widening would make this row's literal something no record contains, which the
+    # record-quote check rejects. MEASURED, not reasoned: widening C6 gives
+    # `FAIL C6: this task's literal is NOT QUOTED by its own record`.
+    #
+    # That was NOT true while the check searched the whole file, and it was claimed
+    # anyway. A review measured it and found the check green on a widened literal,
+    # because `lives_in == target` here so the widened CODE line satisfied it. The
+    # claim only became true when the check was narrowed to comment spans. Recorded
+    # because the decision was right for a reason that did not hold at the time.
+    ("C6", "keylink/src/call.rs", "keylink/src/call.rs",
+     "        (self.bound, self.iter().collect::<Vec<_>>())"),
+    ("C7", "keylink/tests/persist.rs", "keylink/src/call.rs",
+     "        call.is_some_and(|call| self.answers.contains_key(&call))"),
+    # The one anchor whose record says the TRAILING NEWLINE is load bearing, and
+    # it is right: `        self.call` alone counts 2, the text prefixing
+    # `        self.call = call;`. Measured here, the INDENTATION is not what
+    # disambiguates - `self.call\n` is already unique - but the record's own
+    # stated form is kept, since bare-plus-newline would collide the moment
+    # another line ends in `self.call` at any indentation.
+    ("C8", "keylink/tests/persist.rs", "keylink/src/middleware.rs",
+     "        self.call\n"),
+    ("C9", "keylink/tests/persist.rs", "keylink/tests/persist.rs",
+     "        self.waiting.push((amount, call, deferred));"),
+    ("C10", "keylink/tests/persist.rs", "keylink/tests/persist.rs",
+     "    parked_over_the_wire(&other, &actor, 1).await;"),
+    # ── the two rows that were DESCRIBED and are now quoted. Their old ids were
+    # `C-D1` and `C-D2`; renamed because a `-D` suffix in this list would read as
+    # "described" and that is what they no longer are.
+    #
+    # C11 was described on the reasoning that a column-0 declaration has no
+    # indentation for the record's quote to lack, so quoting it would make the count
+    # 2. That much is true and MEASURED: with the record quoting it, the bare form
+    # counts 2. What the old reason got wrong is that it stopped there. The TRAILING
+    # NEWLINE disambiguates where indentation cannot, because the record's copy is
+    # closed by a backtick and the declaration's by a newline - so the newline form
+    # counts 1 and the anchor is quotable after all. This is the second row whose
+    # newline is load-bearing, C8 being the first, and the two reach it by different
+    # routes: C8's text PREFIXES another line, C11's is a same-file duplicate.
+    ("C11", "keylink/src/call.rs", "keylink/src/call.rs",
+     "const DIGEST_BYTES: usize = 16;\n"),
+    # C12 was described as a fragment - `self.order.pop_front()` is mid-line and
+    # indentation cannot disambiguate a fragment. Correct about the fragment and the
+    # wrong conclusion: mode 4's own remedy is to take the WHOLE LINE, which counts 1
+    # at its indentation while the record quotes it unindented. Registering the line
+    # is the remedy the file already prescribes; describing it was reaching past it.
+    ("C12", "keylink/src/call.rs", "keylink/src/call.rs",
+     "            if let Some(oldest) = self.order.pop_front() {"),
+    # C13 was described as a formatter case, and that is true of the anchor and beside
+    # the point for the decision. The reflow gives count 0, which this task reports
+    # LOUDLY and which sends a reader to re-quote the line. Describing survives the
+    # reflow and takes the row OUT of the gate, after which nothing checks that the
+    # description still locates the edit. So the choice is not fragile-vs-durable, it
+    # is loud-vs-silent, and the record now says so in those terms.
+    ("C13", "keylink/tests/persist.rs", "keylink/src/rpc.rs",
+     "                .map(|idem| CallId::of(peer, idem.key())),"),
+    # ── three more rows that were DESCRIBED, converted after MEASURING instead of
+    # re-reading. All three reasons were property-shaped and none survived a count.
+    #
+    # R11 and R19 both said "the record is in the file its break edits, so a quoted
+    # anchor is a second occurrence". True of the BARE form, which counts 2, and false
+    # of the indented one, which counts 1 - the same remedy five sibling rows were
+    # already using when these two were written.
+    ("R11", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
+     "        if self.progress.as_ref().map(Progress::reached) == Some(Reached::NotDispatched) {"),
+    ("R19", "keylink/tests/idempotency.rs", "keylink/tests/idempotency.rs",
+     "                .keyable(Keyable::Only(&[\"Reserve\"]))"),
+    # C14, formerly `C-D3`, said its edit site spans three lines so no anchor exists.
+    # True of the SITE and false of the ANCHOR: `break-once.sh` searches one literal
+    # and substitutes anything, so a one-line search with a MULTI-LINE replacement is
+    # legal. `.iter()` alone counts 2 and is unusable; the `.filter_map` line counts 1.
+    # That reason was written on this branch, one commit after the same hand corrected
+    # the identical shape in C11 and C12 - which is the argument for measuring rather
+    # than reasoning, made against its own author.
+    ("C14", "keylink/src/call.rs", "keylink/src/call.rs",
+     "            .filter_map(|call| self.answers.get(call).map(|answer| (*call, answer)))"),
+]
+
+# Records whose search edit is DESCRIBED, deliberately, and must stay that way.
+#
+# **What a row here MEANS, and it is narrower than it looks: this record once had a
+# quoted search literal, somebody removed it on purpose, and here is why.** It does
+# NOT mean "has no quoted literal" - most records in this repo have none and were
+# never converted, and they do not belong here.
+#
+# That distinction has to hold before the population ever gets classified in bulk.
+# A migration that swept every unquoted record into this list would make every row
+# assert a deliberateness nobody checked - which is this convention's own failure
+# mode arriving through the fix for it. If a standing category is wanted for records
+# **born** without a quote, it needs its own name and its own list; provenance may
+# not matter to a reader, but the deliberateness does.
+#
+# **This is documentation and NOT a check, and the reason is worth stating because
+# it looks checkable and is not.** The obvious assertion — "the retired literal no
+# longer appears in the record's file" — fails immediately: a record that explains
+# *why* it was converted quotes the retired literal to do so, and an explanatory
+# quote is textually identical to a search quote. Measured, not assumed: R26a's file
+# contains its retired anchor exactly once, and that once is the paragraph
+# documenting the rot mode. Any rule strong enough to catch a re-quote would flag
+# that paragraph, and any rule loose enough to permit it catches nothing.
+#
+# What the list is for, then: **distinguishing "deliberately described" from
+# "forgotten".** Without it a record absent from ANCHORS is ambiguous, and the
+# ambiguity favours the wrong reading — somebody re-quotes an anchor that was
+# converted on purpose, reinstating the rot the conversion removed, and the new
+# entry looks like coverage.
+# ── A ROW HERE MUST CARRY ITS MEASURED COUNT AND THE TREE IT WAS MEASURED AT ───
+#
+# **State the measurement that made quoting impossible, not the property that made
+# it look impossible.** Six rows were once here. FIVE of them gave a property, every
+# property was true, and not one of the five conclusions survived a count:
+#
+#   * "the record is in the file its break edits, so a quote is a second occurrence"
+#     - true of the BARE form, false of the indented one. Three rows, R11, R19, C11;
+#   * "a fragment cannot be disambiguated by indentation" - true, and mode 4's remedy
+#     is to stop quoting the fragment. C12;
+#   * "the site spans three lines, so no anchor exists" - true of the SITE, false of
+#     the ANCHOR, because a one-line search may have a multi-line replacement. C14;
+#   * "a reflow will rot this anchor" - true, and a reflow gives count 0, which is
+#     LOUD, so it argues for quoting. C13.
+#
+# The reason a reason rots here is that **a reason for NOT doing something is never
+# exercised.** A quoted anchor is re-checked on every commit; a description is read,
+# found plausible, and left. So this list accumulates arguments that were sound once,
+# each keeping a true-sounding first clause. A count with a tree can be falsified in
+# one command; a property has to be re-derived, and re-derivation is how a correct
+# row acquires a false reason.
+#
+# Where a remedy is genuinely UNAVAILABLE rather than merely unused, say so in those
+# words - a `const` at column 0 has no indentation to add. "No indentation needed"
+# invites exactly the re-derivation above.
+DESCRIBED = [
+    # The only row left, and the only one of the six whose reason was ever a
+    # measurement. Its retired anchor was a slice of `lib.rs`'s `pub use` list; a
+    # later wave inserted `Records,` inside that slice and the anchor went to count 0.
+    # Re-measured at `7a147c0`: the retired literal counts **0** in `keylink/src/lib.rs`
+    # and re-quoting buys only until the next export lands, which puts the chore on
+    # whoever adds one. This is the one mode where quoting is not worth it at all.
+    ("R26a", "keylink/tests/api.rs", "positional",
+     "a slice of lib.rs's `pub use` list - retired literal counts 0 at 7a147c0, and "
+     "re-quoting buys only until the next export lands"),
+]
+
+def flat(text: str) -> str:
+    """Whitespace-collapsed, so a literal wrapped across `///` lines still matches.
+
+    A record's quote is broken by the comment's own wrapping; the target's copy is
+    not. Comparing them raw finds nothing and reports a false failure - the same
+    trap a plain `grep -c` over a record hits.
+    """
+    return " ".join(text.split())
+
+
+cache: dict[str, str] = {}
+spancache: dict[str, set[str]] = {}
+bad = 0
+
+for record, lives_in, target, literal in ANCHORS:
+    if target not in cache:
+        cache[target] = (ROOT / target).read_text()
+    found = cache[target].count(literal)
+    if found == 1:
+        continue
+    bad += 1
+    same_file = lives_in == target
+    if found == 0:
+        reason = "IS GONE - `break-once.sh` aborts at its grep, before any backup"
+        # Three causes, and the contributor's mental model differs for each: an edit
+        # they made, a reflow nobody made, or a neighbour arriving in a list.
+        likely = (
+            "one of: (a) the line was edited; (b) the FORMATTER rewrapped it, which "
+            "nobody wrote and nothing else would report; (c) POSITIONAL insertion - "
+            "a sibling appeared inside an ordered construct the anchor spans, so the "
+            "construct still exists and looks untouched"
+        )
+    elif same_file:
+        reason = f"IS NOT UNIQUE ({found}x) - `break-once.sh` aborts on its count assert"
+        likely = (
+            "the record itself now quotes it - the same-file trap - unless the anchor "
+            "is a FRAGMENT or a whole line whose text prefixes another, neither of "
+            "which indentation can disambiguate"
+        )
+    else:
+        reason = f"IS NOT UNIQUE ({found}x) - `break-once.sh` aborts on its count assert"
+        # NOT the same-file trap, and saying so matters: for a cross-file row the
+        # record's quote lives in a different file and CANNOT contribute to this
+        # count. An earlier version named it anyway, one line above the two lines
+        # that refute it - and a contributor sent to look for a cause that cannot
+        # apply, finding nothing wrong, reaches for the deletion this task argues
+        # against. BOTH arms fire in practice - the list holds cross-file and
+        # same-file rows in comparable numbers - and which one you get is decided by
+        # the row, not by the list.
+        #
+        # No split is written here on purpose. The first version said "11 cross-file
+        # and 8 same-file" and was stale ONE COMMIT later, because six conversions in
+        # the same range moved five rows to same-file and one to cross-file. The
+        # conclusion is what this comment needs and the conclusion does not depend on
+        # the ratio; a count here is a value this file cannot keep true.
+        likely = (
+            "a second occurrence appeared in the TARGET - a new call site, a copied "
+            "line, or a doc comment there quoting it. It may also be a PREFIX "
+            "COLLISION: your anchor is a whole line whose text begins another line, "
+            "and it needs its trailing newline to be unique"
+        )
+    print(f"FAIL {record}: the anchor {reason}", file=sys.stderr)
+    print(f"       likely cause:    {likely}", file=sys.stderr)
+    print(f"       record lives in: {lives_in}", file=sys.stderr)
+    print(f"       break edits:     {target}", file=sys.stderr)
+    print(f"       anchor:          {literal}", file=sys.stderr)
+    print(file=sys.stderr)
+
+# ── is the anchor a WHOLE LINE? (mode 4, latent) ──────────────────────────────
+#
+# A fragment resolves fine until the day it does not, and then no remedy applies:
+# indentation cannot disambiguate a mid-line span, and "re-quote against the line
+# as it now reads" presumes there is a line. So a fragment anchor is a mode-4
+# failure waiting for a sibling, worth naming while it is still green.
+#
+# Declared rather than forbidden, because one row already is one. The assertion is
+# that the set does not GROW - the safe kind of count, no false-success state - so
+# a new fragment reddens while this one stays visibly grandfathered.
+FRAGMENT_ANCHORS = {
+    # `(self.bound, self.iter().collect::<Vec<_>>())` - the line continues with
+    # `.serialize(serializer)`. Count 1 today.
+    #
+    # Its own branch DESCRIBED a sibling fragment of exactly this shape,
+    # `self.order.pop_front()`, while quoting this one. That inconsistency is now
+    # resolved in the sibling's favour: it is C12 above, quoted as a WHOLE LINE,
+    # which is mode 4's own remedy. **So the remedy is available here too, and taking
+    # it means editing the record to quote the whole line - not widening this row,
+    # which the record-quote check correctly rejects on its own.** Left as the record
+    # quotes it, and declared, until somebody makes that record edit deliberately.
+    "C6",
+    # `$crate::__keylink_granted_id!(..)` sits inside a macro repetition, so the
+    # whole line would drag `)+` and a trailing comma into the anchor. Count is 1
+    # today. Left a fragment knowingly, and listed so the next one is not.
+    "R28",
+}
+
+fragments = set()
+for record, lives_in, target, literal in ANCHORS:
+    if target not in cache:
+        cache[target] = (ROOT / target).read_text()
+    body = cache[target]
+    at = body.find(literal)
+    if at < 0:
+        continue  # already reported above
+    # Whether the anchor SPANS a complete line, not whether it was quoted with its
+    # indentation. Records quote line content without leading whitespace as a matter
+    # of course, and that is fine: `break-once.sh` matches the substring either way.
+    # A first version of this check tested for a leading newline and flagged eight of
+    # nine rows - it was measuring quoting style, not the mode-4 hazard.
+    start = body.rfind("\n", 0, at) + 1
+    end = body.find("\n", at)
+    line = body[start:] if end < 0 else body[start:end]
+    if line.strip() != literal.strip():
+        fragments.add(record)
+
+for record in sorted(fragments - FRAGMENT_ANCHORS):
+    bad += 1
+    print(f"FAIL {record}: the anchor is a FRAGMENT, not a whole line", file=sys.stderr)
+    print("       It resolves today and has no remedy on the day it stops:",
+          file=sys.stderr)
+    print("       indentation cannot disambiguate a mid-line span. Take the whole",
+          file=sys.stderr)
+    print("       line including its indentation, or describe the edit instead.",
+          file=sys.stderr)
+    print(file=sys.stderr)
+for record in sorted(FRAGMENT_ANCHORS - fragments):
+    bad += 1
+    print(f"FAIL {record}: listed in FRAGMENT_ANCHORS but its anchor is a whole "
+          "line now - drop it from that set", file=sys.stderr)
+    print(file=sys.stderr)
+
+# ── and is it the literal the RECORD actually quotes? ─────────────────────────
+#
+# Without this the task is the very defect it exists to catch, one level up: it
+# hardcodes a COPY of a value that lives in a doc comment in another file, so a
+# rebase that correctly re-quotes a record and forgets this list leaves the gate
+# validating a string no record uses - green.
+#
+# `local.rs`'s `no_failure_prefix_is_a_prefix_of_another` is NOT the precedent for
+# a hand-written list of copies. Its own comment says it "names the consts rather
+# than the strings, so it cannot drift from the wire" - hand-written *references*
+# to one source of truth. A doc comment cannot be referenced from Python, so the
+# copy is unavoidable here; what was avoidable is leaving it unchecked.
+#
+# ── the haystack is BACKTICKED SPANS IN COMMENTS, and both narrowings were bugs
+#
+# A first version searched the whole of `lives_in`, and that made this check a
+# TAUTOLOGY for every same-file row: `lives_in == target`, so the CODE LINE
+# satisfies the search by itself and the record need not quote anything at all.
+# It was sound only while every row was cross-file. The rows registered from
+# `call-id` took same-file from 0 to 8 of 19, and the check went inert for those 8
+# without a single line of it changing - measured by re-quoting one record's
+# literal, leaving its code alone, and watching the task still print `ok:`.
+#
+# Restricting to COMMENT LINES fixes that. Restricting further to what the comment
+# BACKQUOTES, and demanding EQUALITY rather than containment, fixes a second hole
+# in the same expression: `flat` collapses `        self.call\n` to `self.call`,
+# which is a substring of the prose `self.call = call;`, `self.call.and(None)` and
+# `self.call.filter(..)` in that same record. Four DISTINCT spans CONTAIN it and
+# exactly one DISTINCT span EQUALS it, so equality is what distinguishes the record's
+# search quote from its own replacement literals.
+#
+# Distinct, because the haystack below is a `set`. By OCCURRENCE the same measurement
+# reads 6 and 2, since two records quote that anchor. Every other figure in this file
+# is an occurrence count, so the unit is named here rather than inferred - a
+# re-measurer who gets 6 and 2, disagrees, and re-derives is the failure the
+# DESCRIBED header warns about.
+#
+# **Not by comparing indentation, which cannot work here.** The obvious reading -
+# "compare the quoted form with its indentation" - reddens 9 of the 19 rows,
+# measured. Records quote UNINDENTED on purpose: that is the whole mechanism that
+# leaves the indented literal unique in the target (mode 1). Only C8's record
+# quotes its anchor with the indentation, and a rule derived from that one row
+# breaks the nine that follow the convention.
+#
+# Lines are joined BEFORE the spans are cut out, so a quote the comment wrapped
+# across two `///` lines is still one span.
+def quoted_spans(path: str) -> set[str]:
+    """Every backticked span inside a comment of `path`, whitespace-flattened."""
+    kept: list[str] = []
+    for line in (ROOT / path).read_text().splitlines():
+        stripped = line.strip()
+        for marker in ("///", "//!", "//"):
+            if stripped.startswith(marker):
+                kept.append(stripped[len(marker):])
+                break
+    return {flat(span) for span in re.findall(r"`([^`]*)`", " ".join(kept))}
+
+
+for record, lives_in, target, literal in ANCHORS:
+    if lives_in not in spancache:
+        spancache[lives_in] = quoted_spans(lives_in)
+    if flat(literal) in spancache[lives_in]:
+        continue
+    bad += 1
+    print(f"FAIL {record}: this task's literal is NOT QUOTED by its own record",
+          file=sys.stderr)
+    print(f"       record lives in: {lives_in}", file=sys.stderr)
+    print(f"       task's literal:  {literal}", file=sys.stderr)
+    print("       Looked for it as a `backticked` span inside a COMMENT of that",
+          file=sys.stderr)
+    print("       file, compared whole rather than as a substring - so neither the",
+          file=sys.stderr)
+    print("       code line nor a longer quote containing it will satisfy this.",
+          file=sys.stderr)
+    print("       The record was re-quoted and this list was not, or the row names",
+          file=sys.stderr)
+    print("       the wrong record. The RECORD is the source of truth; follow it.",
+          file=sys.stderr)
+    print(file=sys.stderr)
+
+# ── population tripwire ───────────────────────────────────────────────────────
+#
+# A count, deliberately, and the safe kind: it can only fail LOUDLY. There is no
+# state in which it passes while wrong, which is what separates it from the
+# whole-target pass/fail counts this convention retired. The rule is not "never
+# write a count" - it is "never write a count that can pass while wrong".
+#
+# What it buys: ADDING a break record forces a decision about registering it,
+# instead of this list silently falling further behind a growing population.
+#
+# ── THE METHOD, because this number now fails the build when it moves ─────────
+#
+# A reviewer measured 86 where this says 98. Both are right for their own
+# definitions, and neither is written down anywhere - so a contributor who trips
+# this, re-measures by a different reasonable definition and gets a third number
+# cannot tell which one the constant meant. It counts:
+#
+#   * both crates - `keylink/**/*.rs` AND `keylink-persist/**/*.rs`;
+#   * contiguous runs of `///`, `//!` OR plain `//` lines, joined into one block,
+#     so a `//` line adjacent to a `///` run merges into it;
+#   * blocks whose joined text contains the string `break-once.sh`.
+#
+# Change any of those three and the number changes. The loop below IS the
+# definition; this comment exists so the number can be reproduced without
+# reading it.
+#
+# ── AND IT IS BLIND TO ROUGHLY A THIRD OF THE POPULATION ──────────────────────
+#
+# One marker, and records use three. Measured 2026-08-08 (-03:00) by the same walk,
+# widened to `break-once.sh` OR "Made red" OR "Red under": **157 blocks match,
+# 102 carry `break-once.sh`, so 55 do not** - a record phrased "Made red by .."
+# without naming the harness does NOT move this count and the tripwire stays
+# green. Two are in this repo's own `keylink/src/idempotency.rs`.
+#
+# **The previous figures here said 144 / 98 / 46, and all three were stale for a
+# reason the paragraph could not see: the rebase moved the tree underneath them.**
+# They were measured before this branch rebased onto `call-id`, and the commit that
+# wrote them is itself one of the six described below whose declared constant no
+# longer matches its own tree. So the declared blind spot understated itself by
+# nine blocks - the direction that matters, since this paragraph exists to bound
+# what the tripwire cannot see.
+#
+# The date above carries its UTC offset because a bare date cannot be ordered
+# against another bare date from a different zone - and "which of these two figures
+# is older" is exactly the question a stale one makes somebody ask.
+#
+# Not widened, deliberately: the value here is LOUDNESS ON CHANGE, not
+# completeness, and widening would move the number again while leaving some
+# other phrasing outside. **So the limit is declared instead** - green here means
+# the `break-once.sh` population is unchanged, and it is not a statement about
+# every break record.
+#
+# The figure is a measurement rather than an assertion, and nothing checks it:
+# it moves whenever anybody adds a record, which is precisely the property that
+# disqualifies it from being a checked constant. Re-measure by widening MARKERS
+# in the loop below to the three strings.
+# ── the number, and what moved it last ────────────────────────────────────────
+#
+# 98 -> 102 when `call-id` merged (PR #11), which added four records mentioning
+# the harness. **The tripwire fired and this is the decision it forced**, recorded
+# rather than absorbed: those records carry quoted anchors that belong in ANCHORS
+# above, and they are NOT registered here yet. Registration is tracked as its own
+# task, because a candidate's SEARCH literal cannot be told from its watched output
+# or its replacement mechanically - the sweep over those files returns roughly
+# forty spans for ten anchors - so it needs the authoring branch's own list to
+# cross-check against, and one list read twice is not a cross-check.
+#
+# Bumping the number without registering them is the one move this comment exists
+# to make visible. Green here now means "the population is 102", not "102 records
+# are checked". The ratio is not written here on purpose - a copy of it would go
+# stale on the next row added. The success line COMPUTES it instead.
+#
+# ── A PROPERTY OF THIS CONSTANT THAT COSTS A BISECT, MEASURED ON THIS BRANCH ───
+#
+# **A constant measuring the WHOLE TREE is invalidated wholesale by a rebase, at
+# every commit still carrying the old value.** Six commits on this branch declare 98
+# while their own tree carries 102, so `mise run anchors` FAILS at each of them even
+# though the tip is green. The constant was written measuring the pre-rebase tree;
+# rebasing onto `call-id` moved the tree under all six at once, and only the commit
+# that corrected the value is green again.
+#
+# The consequence is narrow and worth knowing before somebody hits it: **a bisect
+# across a range containing such a rebase cannot use this gate**, because the
+# failures are an artefact of where the range sits and not of the commits. Run the
+# gate at the tip, or fix the constant at each step, or exclude this task from the
+# bisect script. Nothing here needs changing for that - the tip is correct, and the
+# alternative is a constant that measures less than the tree, which is the thing
+# this one exists to be.
+RECORD_BLOCKS = 102
+
+harness_blocks: list[str] = []
+for path in sorted(
+    list((ROOT / "keylink").rglob("*.rs")) + list((ROOT / "keylink-persist").rglob("*.rs"))
+):
+    run, found = [], []
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("///", "//!", "//")):
+            run.append(stripped)
+        else:
+            if run:
+                found.append(" ".join(run))
+            run = []
+    if run:
+        found.append(" ".join(run))
+    harness_blocks += [b for b in found if "break-once.sh" in b]
+blocks = len(harness_blocks)
+
+# ── coverage: an INTERSECTION, because the two populations are different units ──
+#
+# The first version of the line below printed `RECORD_BLOCKS - len(ANCHORS)`, which
+# **subtracts a row count from a block count**. It read as coverage, it was wrong,
+# and it was wrong in the FLATTERING direction - 77 unchecked where the true figure
+# is 89. Two reasons the subtraction cannot work:
+#
+#   * several rows can live in ONE block, so rows do not map onto blocks 1:1; and
+#   * a row's record need not be a harness block at all. Eight of them are not: their
+#     records say "Made red by .." without naming `break-once.sh`, which is exactly
+#     the population the paragraph above declares this tripwire blind to. Those rows
+#     cannot be "of those 102" in any sense.
+#
+# `882bd35` on this branch is the same defect one level up - **a gate cannot claim a
+# denominator it cannot compute.** So the numbers below are an intersection measured
+# both directions, and nothing is subtracted across units.
+registered = {flat(literal) for _, _, _, literal in ANCHORS}
+harness_spans = [
+    {flat(span) for span in re.findall(r"`([^`]*)`", block)} for block in harness_blocks
+]
+blocks_carrying = sum(1 for spans in harness_spans if spans & registered)
+quotable_anywhere = set().union(*harness_spans) if harness_spans else set()
+rows_unseen = [rid for rid, _, _, lit in ANCHORS if flat(lit) not in quotable_anywhere]
+
+if blocks != RECORD_BLOCKS:
+    bad += 1
+    print(f"FAIL population: {blocks} comment blocks mention break-once.sh, but "
+          f"RECORD_BLOCKS says {RECORD_BLOCKS}.", file=sys.stderr)
+    print("       A record was added or removed. Decide whether it needs a row",
+          file=sys.stderr)
+    print("       above - most will not, and that is fine - then update this",
+          file=sys.stderr)
+    print("       number. This exists so the decision is forced, not skipped.",
+          file=sys.stderr)
+    print(file=sys.stderr)
+
+if bad:
+    # The remedy belongs HERE and not only in RFC-08 §9.2, because a contributor
+    # meets the failure and not the convention. Without it the shortest path to
+    # green is to delete the entry — which removes the check while reporting
+    # success, the exact silent-success case this task exists to prevent.
+    print(
+        f"{bad} of {len(ANCHORS)} quoted break anchors no longer resolve, so those\n"
+        "records cannot be replayed and nothing else would have said so.\n"
+        "\n"
+        "THIS MEANS THE ANCHOR MOVED. FOLLOW IT.\n"
+        "\n"
+        "  Re-quote it against the line as it now reads. That is the fix for a\n"
+        "  cross-file, line-local anchor, which is most of this list, and it is\n"
+        "  the fix whenever a rebase or a refactor moved the target.\n"
+        "\n"
+        "Delete the entry ONLY in the three cases where quoting cannot work:\n"
+        "\n"
+        "  - the record lives in the file its break edits AND nothing separates\n"
+        "    its own quote from the code's - so the quote is a second occurrence.\n"
+        "    Check first that neither remedy applies: an INDENTED literal is\n"
+        "    unique against an unindented quote, and a TRAILING NEWLINE is unique\n"
+        "    against a quote closed by a backtick. Two rows here were described\n"
+        "    for this reason and both turned out to be quotable;\n"
+        "  - the anchor's uniqueness is a property of its NEIGHBOURS rather than\n"
+        "    of the line - a `pub use` list item, a slice of an ordered list -\n"
+        "    where re-quoting only buys until the next sibling lands; or\n"
+        "  - the edit site SPANS MORE THAN ONE LINE, because `rustfmt` wrapped it\n"
+        "    and the wrapping is not the author's to promise. This one is the\n"
+        "    third case and it was missing from this list while the registry was\n"
+        "    already using it. A one-line anchor merely sitting INSIDE a wrapped\n"
+        "    chain does not qualify: that rots to count 0, which is loud, and\n"
+        "    describing it instead removes the row from this gate entirely.\n"
+        "\n"
+        "  In those three - and ONLY those three - describe the search edit\n"
+        "  instead. Quote the REPLACEMENT either way: it is never searched.\n"
+        "\n"
+        "  AND REPLAY THE RECORD FROM ITS NEW DESCRIPTION BEFORE DROPPING THE ROW.\n"
+        "  A description is ungated: nothing checks that it locates the edit. The\n"
+        "  first three conversions made under this rule included one that sent a\n"
+        "  reader to a line where the guard passes, which reads as `this guard is\n"
+        "  vacuous` and is false. Quoting is the safe side BECAUSE of this gate.\n"
+        "\n"
+        "Deleting an entry is the shortest path to green and it is usually the\n"
+        "wrong one: it makes the record unchecked rather than correct. If you are\n"
+        "mid-rebase and reaching for it, that is the moment this paragraph is for.\n"
+        "RFC-08 §9.2 carries the full argument.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+print(
+    f"ok: {len(ANCHORS)} REGISTERED rows resolve to exactly one occurrence "
+    f"({len({literal for _, _, _, literal in ANCHORS})} distinct literals; "
+    "registration is per-record and opt-in - see this task's header)"
+)
+print(
+    f"    {len(DESCRIBED)} more {'is' if len(DESCRIBED) == 1 else 'are'} recorded as "
+    "deliberately DESCRIBED rather than quoted - documentation, not a check"
+)
+# Computed, never written down: the tripwire agreeing with the population says the
+# population has not MOVED, and says nothing about how much of it is registered.
+# Anybody reading the two lines above as coverage needs this third one - and it
+# reports each population in ITS OWN unit, because the first version of this line
+# subtracted rows from blocks and overstated coverage by twelve blocks.
+print(
+    f"    {blocks_carrying} of the {blocks} harness blocks carry a registered row, "
+    f"so {blocks - blocks_carrying} do not"
+)
+print(
+    f"    and {len(rows_unseen)} of the {len(ANCHORS)} rows sit in records this "
+    "tripwire cannot see at all - they never say `break-once.sh`"
+)

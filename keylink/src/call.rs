@@ -716,12 +716,16 @@ mod tests {
     /// tautology — it re-asserted the predicate `find` had just matched on, and
     /// then compared one call to itself.
     ///
-    /// - The **guard** is the width assertion. Made red by
-    ///   narrowing [`DIGEST_BYTES`] to one — described and not quoted, because this
-    ///   record lives in the file it breaks and a quoted anchor would make the count
-    ///   2. Replacement, quoted because it is never searched:
-    ///   `const DIGEST_BYTES: usize = 1;`. The pair that collides at one byte then
-    ///   collides at the real width too. Watched:
+    /// - The **guard** is the width assertion. Made red by narrowing
+    ///   [`DIGEST_BYTES`] to one: search
+    ///   `const DIGEST_BYTES: usize = 16;`
+    ///   — **with its trailing newline, which is what makes it unique** — and replace
+    ///   with `const DIGEST_BYTES: usize = 1;`. This record lives in the file it
+    ///   breaks and the declaration sits at **column 0**, so there is no indentation
+    ///   for this quote to lack and the bare form counts 2. What disambiguates
+    ///   instead is that the record's copy is closed by a **backtick** where the
+    ///   declaration's is closed by a **newline**. The pair that collides at one byte
+    ///   then collides at the real width too. Watched:
     ///   `at DIGEST_BYTES the same pair must be two calls / left: CallId(4a) right: CallId(4a)`.
     /// - The **demonstration** is the `Applied` half. It passes broken and
     ///   unbroken, because it is asserted at the narrowed width on purpose, and it
@@ -808,12 +812,14 @@ mod tests {
     /// retries are still plausible — are the ones kept.
     ///
     /// Made red by making [`Applied::insert`]'s eviction take from the **newest** end
-    /// of `order` rather than the oldest — described, not quoted: this record lives in
-    /// the file it breaks, and `pop_front()` alone is a mid-line fragment that no
-    /// amount of indentation makes unique. Replacement, quoted because it is never
-    /// searched: `pop_back()`. The set then forgets what just happened and remembers
-    /// what nobody will ask about again. Watched:
-    /// `the first call is the one displaced`.
+    /// of `order` rather than the oldest. Search the whole line —
+    /// `if let Some(oldest) = self.order.pop_front() {`
+    /// — and replace `pop_front()` in it with `pop_back()`. The fragment
+    /// `pop_front()` alone counts 2 and no amount of indentation makes it unique,
+    /// which is why the anchor is the LINE: at its own indentation the line counts 1,
+    /// and this quote sits unindented so it is not a second occurrence. The set then
+    /// forgets what just happened and remembers what nobody will ask about again.
+    /// Watched: `the first call is the one displaced`.
     #[test]
     fn the_oldest_call_is_the_one_forgotten() {
         let two = NonZeroUsize::new(2).expect("2 is not zero");
@@ -908,22 +914,33 @@ mod tests {
     ///
     /// Made red two ways:
     ///
-    /// - **reversing [`Applied::iter`]** — insert `.rev()` at the head of the chain
-    ///   that function returns, so the restored set forgets the wrong entry. The
-    ///   replacement, quoted because `break-once.sh` never searches it and so it
-    ///   cannot affect uniqueness: `.rev().collect::<Vec<_>>().into_iter()` between
-    ///   `.iter()` and `.filter_map(..)` — the `collect` being what keeps the
-    ///   closure's lifetime the same shape.
+    /// - **reversing [`Applied::iter`]** — so the restored set forgets the wrong
+    ///   entry. Search, with its indentation:
+    ///   `.filter_map(|call| self.answers.get(call).map(|answer| (*call, answer)))`
+    ///   and replace it with `.rev()`, `.collect::<Vec<_>>()`, `.into_iter()` and
+    ///   that same line, in that order — the `collect` being what keeps the closure's
+    ///   lifetime the same shape.
     ///
-    ///   Named rather than quoted, and **measured rather than assumed**: that chain
-    ///   is wrapped across three lines by `rustfmt` and not by anybody's choice, so
-    ///   a quoted anchor there rots the moment a neighbour grows. Renaming the
-    ///   `answers` field — an ordinary refactor that does not touch this function's
-    ///   text at all — was enough to rewrap it and make the old anchor
-    ///   unfindable, with nothing red to say so.
+    ///   **A one-line search with a multi-line replacement**, which is the shape this
+    ///   record was missing. `break-once.sh` searches ONE literal and substitutes
+    ///   anything, so the chain being wrapped across three lines bounds the ANCHOR
+    ///   and not the edit: measured at `7a147c0`, `.iter()` alone counts 2 and is
+    ///   unusable, while this `.filter_map` line counts **1**. The earlier reason —
+    ///   that the site spans three lines so no anchor exists — was true of the site
+    ///   and false of the anchor.
+    ///
+    ///   Renaming the `answers` field rewraps this chain, which is how the previous
+    ///   anchor here was lost. It also rewrites this line, so the anchor goes to
+    ///   count 0 and `mise run anchors` says so — loudly, which is the point of
+    ///   quoting it rather than describing it.
+    ///
+    ///   Watched: `a restored set must evict in the order it was written`.
     /// - dropping the bound from the encoding: `(self.bound, self.iter()` →
     ///   `(APPLIED_BOUND, self.iter()`, which is what a derived impl would have
     ///   done and which the `bound()` assertion catches.
+    ///
+    ///   Watched: `a round trip that lost the bound would silently widen it to
+    ///   APPLIED_BOUND and no assertion about entries would notice`.
     #[test]
     fn a_snapshot_of_what_was_applied_round_trips_with_its_bound() {
         let two = NonZeroUsize::new(2).expect("2 is not zero");

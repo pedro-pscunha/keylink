@@ -599,11 +599,13 @@ So, for a break record:
 - **Name the tests that go red**, which is also a fact about your break and is
   checkable by re-running it. Where a break is wide enough that naming every test is
   noise, say it is wide, say what makes it wide, and name the ones that matter.
-- **Do not claim to have named them all.** *"A, B and C go red"* stays true when
-  somebody adds test D; *"A, B and C are the only ones"* does not. Naming is an
-  existence claim and survives; exhaustiveness is a universal one over a set the
-  record does not own. Several records in this wave were written the second way and
-  corrected to the first.
+- **Do not claim to have named them all.** *"A, B and C go red" is an existence
+  claim and survives somebody adding test D. "A, B and C are the only ones" is a
+  universal over a set the record does not own, and does not.* Several records in
+  this wave were written the second way and corrected to the first — and one of them
+  then said *five* and listed *four*, omitting the very test it had just named as the
+  fifth. That is the same error one level down: a list presented as complete. The
+  count goes; the list stays.
 - **Module- and file-scoped claims stay**, because who adds a test *there* has to
   touch that file. The four counts in `mod policy` are of that kind, and so is
   `tests/idempotency.rs`'s "within this file, three tests and no more".
@@ -614,7 +616,7 @@ file's call sites — and a sentence pricing the retention saving against
 `MAX_TOMBSTONES`' own *"on the order of a megabyte"*, which is a figure in a third
 comment that nothing measures.
 
-### 9.2 And a break record must not quote its own anchor
+### 9.2 A quoted anchor rots three ways, and one of them is now a gate
 
 `break-once.sh` anchors on a literal that must be **unique in the file it edits**, so
 a record that quotes the line it breaks makes that file non-unique and the run aborts
@@ -639,10 +641,181 @@ over-wide reading of this rule left a reviewer hand-constructing working Rust to
 reproduce a record that could simply have shown it. Describe what you searched for;
 quote what you put in its place.
 
+#### The default is QUOTE, and this document had it backwards
+
+Everything above reads as though describing were the safe side. **It is the ungated
+side, and that is the opposite.**
+
+> Keep a quote wrongly → `mise run anchors` reddens: loud, cheap, one edit.
+> Describe wrongly → **nothing checks it at all**, and a description that does not
+> locate the edit is shippable.
+
+That asymmetry cashed out in the *first three conversions ever made under this rule*.
+One of them — `a_keyed_actor_service_applies_the_same_policy` — was converted to
+*"the `.keyable(..)` call in its fixture above"*. That test has **no fixture**; it
+builds inline, below the comment. What is above is a fixture four *other* tests use,
+whose `.keyable(..)` takes the policy as an argument. Editing the line the description
+sends you to gives `1 passed; 0 failed`.
+
+**A reader following it would have concluded the guard was vacuous, which is false —
+and that is worse than the rot it replaced.** A stale anchor aborts loudly at
+`break-once.sh`'s precondition. A misdirecting description reddens nothing and looks
+like a finding.
+
+So:
+
+> **Quote by default, because the gate covers you. Describe only where quoting
+> provably cannot work — and replay a converted record from its description alone,
+> before its entry leaves the list.**
+
+The replay is the part with teeth. Dropping an entry is four deleted lines; re-quoting
+means finding the new text. The incentive runs toward describing, so the conversion has
+to carry a cost that catches a description which does not locate the edit — and only a
+replay does.
+
+**And the axis is post-hoc, which is worth admitting.** Calling an anchor "line-local"
+means predicting no future edit reflows it, and `R26b`/`R26c` are function signatures —
+the same construct that rotted on `ledger_for`. So the axis decides where quoting is
+**impossible**, not where it is unnecessary. Where it is merely fragile, quote it and
+let the gate carry the fragility.
+
+#### The third mode: a positional anchor
+
+A mechanical sweep after this wave merged found a rot mode neither rule above
+reaches. `tests/api.rs` anchored on a slice of `lib.rs`'s `pub use idempotency::{..}`
+list. A later wave inserted one more export into the middle of that slice, taking the
+anchor to **count 0**. The record and its target are in different files, so the
+same-file rule permits the quote; nothing rewrapped, so the formatter rule says
+nothing. What moved was **a sibling's presence in an ordered list**.
+
+#### The fourth mode: a fragment, or a line that prefixes another
+
+Found on a sibling branch by the same sweep. Three anchors aborted for one reason: the
+quoted span was **not a whole line**, so the documented remedy — *pass the line with
+its indentation* — could not make it unique.
+
+- `DIGEST_BYTES: usize = 16` sits at **column 0**: there is no indentation to add.
+- `pop_front()` is **mid-line**: indentation is irrelevant to a fragment.
+- `self.call` with its indentation is a **prefix of both** candidate lines, so
+  following the remedy exactly still gives 2. It needs the **trailing newline**, which
+  no record anywhere mentions.
+
+So the rule gains a clause: **a quoted anchor must be a whole line, including its
+indentation, and for a line whose text prefixes another it must include the trailing
+newline.** The abort reads as the harness failing when it is the record that is wrong.
+
+#### The fifth mode, which no resolution check can see
+
+A record's watched message is a claim about **which assertion fires first**, so it
+rots when an assertion is added **above** the recorded one. Found on a sibling branch:
+a later commit inserted an on-disk check above where a value was read, so a different
+assertion now fires. Nothing broke, nothing was red, and the guard was always correct
+— **the record described a race it no longer wins.**
+
+All four rules above permit it. Not same-file, nothing rewrapped, no ordered list, a
+whole line. And `break-once.sh` reports failure either way, because the test still
+fails. **Only comparing the recorded sentence against a fresh run finds it**, which is
+what `scripts/replay-fate-breaks.sh` does on the set it covers.
+
+`mise run anchors` cannot see this and says so in its own header. It answers the
+narrower question of whether the break can be **started**. The check that finds mode
+five is a replay, and the standing rule that follows is: **every branch re-runs its own
+full record set during its rebase.** Seventeen break/test pairs measured at 69 seconds,
+so cost is not a reason to skip it — the reason not to re-run *another* branch's set is
+scope, never cost.
+
+#### A record that quotes no message at all is unverifiable, and that is a failure
+
+Three of four defects on that same branch were this shape: the record described the
+*effect* — *"the two ids become equal"* — and never said what was watched. There is
+nothing to compare a re-run against, so such a record can be shown neither stale nor
+current.
+
+**The design rule for any checker, including this one: "no message recorded" must be a
+FAILURE, not a pass.** A checker keyed on mismatch alone calls all three green, which
+is the silent-success case again — and it is the arm to write *first*, because these
+are the records nobody can audit.
+
+#### Never quote the value under test
+
+Cite the guard, not the value, reaches one step further than we had it. A record beside
+a digest test declined to quote the digest, because **quoting it makes the record rot on
+exactly the change the test exists to catch.** *"`left` and `right` the same `CallId`"*
+is the durable form. This is the same rule pointed at the guard's own subject.
+
+#### The question that reaches all four
+
+**Is the anchor's uniqueness a property of the line, or of its neighbours?** — with the
+sharpening mode 4 forces, that **a fragment is not a line at all**. A `pub use` list
+item's text is a property of its neighbours, and a `pub use` list is the most-added-to
+construct in a crate, so re-quoting buys only until the next export lands and would put
+that chore on whoever adds it. Describe those.
+
+#### `mise run anchors`, because reading does not find these
+
+Three records on `main` quoted anchors that no longer resolved and **not one was red**.
+Two of them had already been through a review that checked the evidence beside the
+anchor and not the anchor itself. So the check is a gate now, in `.mise/tasks/anchors`,
+first in `gate` after `framing` because it only reads files: for every record that
+quotes a search literal, that literal must occur **exactly once** in its stated
+target, which is `break-once.sh`'s own precondition and nothing more.
+
+Its list is written out by hand, and that is deliberate for the reason `local.rs`'s
+`no_failure_prefix_is_a_prefix_of_another` spells out its four prefixes by hand: a
+heuristic that parsed prose for *"replacing `X` with `Y`"* and missed a record would
+check nothing while reporting success. **The honest limitation is that a record added
+without an entry there is unchecked**, which is the cost of the hand-maintained list.
+
+It earned itself immediately. Applying the three known findings, this document's author
+fixed the wrong record in `idempotency.rs` — a neighbouring one whose search edit was
+already described — and the gate reddened on the one that was actually stale.
+
+#### The trade this makes, stated rather than left implicit
+
+**A described record is rot-proof and cannot be driven by a script.**
+`scripts/replay-fate-breaks.sh` replays a break and asserts the record's watched
+substring appears in the run, and to do that it needs a `from`/`to` pair — quoted text.
+Every record converted to prose therefore leaves the replayable set, and what stays
+checkable about it is the assertion substring, by a human.
+
+So it is decided per record, and the two axes are independent:
+
+- **Same-file records: describe *when quoting cannot be made unique*, which is not
+  always.** This said "always" and that was too strong. A sibling branch's same-file
+  anchors resolve, because the record's quote sits in a `///` comment **without**
+  indentation while the code carries it — so the indented search literal is unique and
+  the record's copy is not a second occurrence. Same-file quoting is legitimate **when
+  indentation disambiguates**.
+
+  **And the exclusion is sharper than "column 0 or a fragment", which are symptoms:
+  it fails exactly when the record's quote is BYTE-IDENTICAL to the code.** Those two
+  are simply the ways that happens — code at column 0 has no indentation for the quote
+  to lack, and a fragment has none to carry. State the property and the two cases fall
+  out of it; state the two cases and a third way of colliding goes unnoticed.
+
+  **A measured nuance that makes describing a stronger call rather than a forced one.**
+  For one such anchor — a `const` at column 0 — a unique form does survive: taken
+  *with its trailing newline* it is count 1, because the record's copy is followed by a
+  closing backtick rather than a newline. So "no unique form exists" is the weaker
+  argument and it is not quite true. The stronger one is that the surviving form's
+  uniqueness rests on **a closing backtick sitting between the literal and the line's
+  newline** — a dependency on the record's own punctuation, more fragile than the
+  indentation dependency it would replace, and one fenced code block away from
+  breaking. Describe it because the only quote that works is held up by a backtick,
+  not because no quote works.
+- **Positional anchors: describe.** The alternative is a gate that reddens for every
+  unrelated export and trains people to re-quote mechanically, which is worse than no
+  gate.
+- **Cross-file, line-local anchors: keep the quote.** The fragility is real and it is
+  now *caught* rather than silent, which is exactly what makes it affordable — a
+  quoted anchor is worth its fragility precisely because `mise run anchors` fails
+  loudly when it rots. That is the resolution of the tension: the gate is what buys
+  the quotes.
+
 And when auditing records, check that the **anchor still exists**, not only the
-evidence beside it. Both unreplayable records on this branch were found by re-running
-the break rather than by reading it, and one of them had already been reviewed for its
-counts while its anchor had been dead for some time.
+evidence beside it. Both unreplayable records found during this wave were found by
+re-running the break rather than by reading it, and one had already been reviewed for
+its counts while its anchor had been dead for some time.
 
 ---
 
