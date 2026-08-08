@@ -1622,6 +1622,7 @@ async fn a_peer_whose_feed_panicked_is_told_the_actor_is_gone() {
 /// `a retry must read Interrupted even though the work provably did not survive:
 /// Remote(Failed("panicked: the actor panicked: bad entry"))` — the retry RAN the turn a
 /// second time, which is the double-effect the argument on `supervise` is about.
+#[cfg(feature = "persist-file")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_keyed_call_whose_turn_panicked_stays_interrupted_across_a_restart() {
     let (_scratch, files) = store("keyed-restart").await;
