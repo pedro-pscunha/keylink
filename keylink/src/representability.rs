@@ -445,9 +445,15 @@ impl HasNoDefault for DynamicAdmission {}
 /// would pick which methods accept a key from a peer.
 ///
 /// [`Limits`](crate::Limits) is deliberately **not** on this list. It is the one
-/// ledger type that does have a `Default`, because eight of its nine bounds
-/// refuse with the exceeded number in the refusal, and its rustdoc argues the
-/// ninth.
+/// ledger type that does have a `Default`, because nine of its ten bounds refuse
+/// **visibly** when they are set wrong, and its rustdoc argues the tenth.
+///
+/// Said as *visibly* rather than *with the exceeded number in the refusal*, which
+/// is what this line claimed while `Limits` held nine bounds. Only the four
+/// running and waiting bounds carry the figure; the pool bounds and the ceilings
+/// answer `Forgotten` or `Unrecordable`, which name the outcome and not the
+/// number. `Limits`'s own rustdoc has always drawn that line, so this summary of
+/// it was overstating one clause.
 ///
 /// **This module is `#[cfg(test)]` (`lib.rs:230`), so every probe in it — this one
 /// included — reddens under `cargo test` or `cargo check --all-targets` and

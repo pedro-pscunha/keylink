@@ -1067,7 +1067,7 @@ where
             // This line IS the default, and it is the only place to look for it.
             //
             // `Limits` is the exception on this list, and it DOES have a `Default`:
-            // eight of its nine bounds refuse with the number in the refusal, so the
+            // nine of its ten bounds refuse visibly when they are set wrong, so the
             // safe configuration is the default one. Its own rustdoc argues that per
             // field, including the field that is not like the others.
             keyable: Keyable::Any,

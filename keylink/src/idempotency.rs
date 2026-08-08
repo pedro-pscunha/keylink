@@ -1099,9 +1099,15 @@ pub struct Limits {
 /// reason its own inline comment gives there: `NonZeroUsize::new` is total, and this
 /// crate denies `unwrap` in a `const` as everywhere else.
 ///
-/// So the eight `NonZeroUsize` fields cost no panic path, and the nine `pub const`
-/// bounds stay `usize` and public. Converting in a `const fn` rather than at each
-/// field is what keeps those two facts compatible.
+/// So the eight `NonZeroUsize` fields cost no panic path, and the eight `pub const`
+/// bounds they default from stay `usize` and public. Converting in a `const fn`
+/// rather than at each field is what keeps those two facts compatible.
+///
+/// **This said `nine` and the number was wrong, in the direction that made it look
+/// like a field count.** Measured with `rg -c 'pub const [A-Z_]+: usize'` on this
+/// module: **8**. Ten `pub const` bounds live here and two of them —
+/// [`RECORD_TTL`] and [`MAX_ATTACH`] — are [`Duration`]s that never meet this
+/// function, which is the whole reason the two figures are not the same figure.
 const fn nonzero(n: usize) -> NonZeroUsize {
     match NonZeroUsize::new(n) {
         Some(n) => n,
