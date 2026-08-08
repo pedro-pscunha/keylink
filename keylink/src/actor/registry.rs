@@ -200,9 +200,15 @@ impl Busy {
 /// generated code nothing: `mount(|inbox: Mailbox| ..)` is the same line it was,
 /// and `run_keyed` takes the cell off the mailbox it was already handed.
 ///
-/// The two are not folded into one allocation, and the reason is on [`Fate`]: a
-/// [`LocalActor`](crate::LocalActor) needs the fate and deliberately has no
-/// `Busy`.
+/// The two are not folded into one allocation, and the reason is that they are
+/// read by different halves of the crate. A
+/// [`LocalActor`](crate::LocalActor) carries both — the fate for a served
+/// dispatch, and its own busy cell for
+/// [`is_busy`](crate::LocalActor::is_busy) — but it carries them **on the
+/// handle**, because a singleton has no registry entry to hang either on. This
+/// sentence used to say a `LocalActor` "deliberately has no `Busy`"; that was
+/// true of the type in this file and stopped being true of the concept when the
+/// local twin shipped, so it says which is which now.
 #[doc(hidden)]
 pub struct Mailbox<M> {
     slots: mpsc::Receiver<Box<M>>,

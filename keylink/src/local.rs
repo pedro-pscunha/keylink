@@ -147,6 +147,7 @@ use std::fmt;
 use std::future::Future;
 use std::num::NonZeroU32;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -1310,13 +1311,29 @@ trait Inbox<A, M>: Send {
     ///
     /// Called by [`run_loop`] around **every** dispatch, for either input, which
     /// is the whole reason it is here rather than inside a receive: a feed item is
-    /// a turn and it never comes through a mailbox. `keylink::Busy` carries the
-    /// rest of that argument.
+    /// a turn and it never comes through a mailbox. `registry.rs`'s `Busy` carries
+    /// the rest of that argument.
     ///
-    /// Defaulted to nothing, because a [`LocalActor`] has nowhere to report it to.
-    /// Its caller holds a handle and can ask that; there is no registry entry
-    /// keeping a flag beside it, and inventing one would be a second lifecycle
-    /// fact about an actor whose reason for existing is that it has no registry.
+    /// Written by whoever has somewhere to put it: [`Keyed`] writes the registry
+    /// entry [`System::status`](crate::System::status) reads, [`Watched`] writes
+    /// the cell a [`LocalActor`] carries on its handle, and a bare
+    /// `mpsc::Receiver` keeps this default — three tests hand `supervise` one and
+    /// want no cell at all.
+    ///
+    /// # What the refusal that stood here weighed, and what it did not
+    ///
+    /// It read: *"a `LocalActor` has nowhere to report it to. Its caller holds a
+    /// handle and can ask that."* That is true of an **idle** actor and it is the
+    /// whole of the case it considered. It is false of a **wedged** one, which is
+    /// the actor [`is_busy`](LocalActor::is_busy) exists for: asking a wedged
+    /// actor queues a message behind the turn that wedged it, so the question
+    /// never returns. `is_running` is `!mail.is_closed()` and answers `true` for
+    /// both, which is why the two were indistinguishable before this cell.
+    ///
+    /// The refusal was not wrong about the cost. A cell on a handle is a
+    /// reporting surface a `LocalActor` did not have, and it is paid for in the
+    /// only way this crate accepts: [`Watched`] clears it on drop, so an unwind
+    /// and an [`abort`](LocalActor::abort) cannot leave it lying.
     fn mark_busy(&self, _running: bool) {}
 
     /// The loop knows why it is ending, and has dropped nothing yet: say what
@@ -1389,6 +1406,62 @@ impl<A: Send, M: Send> Inbox<A, M> for mpsc::Receiver<Message<A, M>> {
         // recursion with no diagnostic at all, which is a stack overflow rather
         // than a compile error.
         mpsc::Receiver::close(self);
+    }
+}
+
+/// A [`LocalActor`]'s mailbox, plus the cell its handle reads to answer
+/// [`is_busy`](LocalActor::is_busy).
+///
+/// A newtype for [`Keyed`]'s reason and one it does not have: `mpsc::Receiver` is
+/// a foreign type, so there is nowhere on it to put a cell. The bare impl above
+/// stays rather than moving here, because three tests hand [`supervise`] a raw
+/// receiver and want the empty default.
+///
+/// # The cell is cleared on drop, and that is the half the loop cannot do
+///
+/// [`run_loop`] clears it after every dispatch that **returns**. Two endings do
+/// not return: a turn whose unwind escapes the loop, and an
+/// [`abort`](LocalActor::abort), which cancels the task at its next await. Both
+/// end the task without reaching that line, and both drop this. Without the
+/// `Drop` the handle would answer "busy" for ever about an actor that is gone.
+///
+/// **A clear inside `supervise` would not reach either of them** — and it was
+/// tried. It is dead by construction: every [`Ended`] that `retryable` grants a
+/// restart to is a value `dispatch` **returned**, so the clear on the next line
+/// already ran. It is worse than dead, because `run_keyed_supervised` hands the
+/// same function a [`Keyed`], which would make `supervise` a second writer of the
+/// registry's flag — and `Busy`'s own invariant in `registry.rs` is that
+/// `run_loop` writes it and *nothing else does*.
+struct Watched<A, M> {
+    rx: mpsc::Receiver<Message<A, M>>,
+    busy: Arc<AtomicBool>,
+}
+
+impl<A: Send, M: Send> Inbox<A, M> for Watched<A, M> {
+    fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Message<A, M>>> {
+        self.rx.poll_recv(cx)
+    }
+
+    fn mark_busy(&self, running: bool) {
+        self.busy.store(running, Ordering::Relaxed);
+    }
+
+    fn close(&mut self) {
+        // Fully qualified for the bare impl's reason: an inherent `close` would
+        // win path resolution and an upstream rename would turn a delegation into
+        // silent recursion.
+        mpsc::Receiver::close(&mut self.rx);
+    }
+}
+
+/// See the type's own "cleared on drop" section. `Relaxed` matches every other
+/// write to this cell: the flag is a diagnostic and orders nothing.
+impl<A, M> Drop for Watched<A, M> {
+    fn drop(&mut self) {
+        self.busy.store(false, Ordering::Relaxed);
     }
 }
 
@@ -1967,19 +2040,29 @@ pub(crate) enum Standing {
 
 /// One actor's [`Standing`], shared between its own loop and whoever serves it.
 ///
-/// The shape [`Busy`](crate::Busy) already proved: a cell made where the actor is
-/// created, cloned into the mailbox so the loop can write it, and kept beside the
-/// registry entry so a dispatch can read it. It travels to a keyed actor through
+/// The shape `registry.rs`'s `Busy` already proved: a cell made where the actor
+/// is created, cloned into the mailbox so the loop can write it, and kept beside
+/// the registry entry so a dispatch can read it. `Busy` is `pub(crate)` in a
+/// private module and has no path from the crate root, so it is named here and
+/// not linked — the link that stood here, `crate::Busy`, resolved to nothing.
+/// It travels to a keyed actor through
 /// [`Mailbox`](crate::Mailbox) for the reason `Busy` does — widening
 /// [`mount`](crate::mount)'s closure would put the pairing in *generated* code,
 /// one expansion per `service!` in the world.
 ///
-/// **Separate from `Busy` and not folded into it**, though both are one word about
-/// one actor. `Busy` is the registry's, written per turn and read by
-/// [`System::status`](crate::System::status); a [`LocalActor`] has none on purpose
-/// — its documentation refuses one, since a handle's holder can ask the handle.
-/// This one a `LocalActor` does need, so folding the two would force a registry
-/// fact onto a path whose reason for existing is that it has no registry.
+/// **Separate from the busy cell and not folded into it**, though both are one
+/// word about one actor. `registry.rs`'s `Busy` is the registry's, written per
+/// turn and read by [`System::status`](crate::System::status); a [`LocalActor`]
+/// now carries its own, written through [`Watched`] and read by
+/// [`is_busy`](LocalActor::is_busy). They stay two cells because they answer two
+/// readers — a served dispatch reads this one, a handle's holder reads that one —
+/// and folding them would force a registry fact onto a path whose reason for
+/// existing is that it has no registry.
+///
+/// This paragraph said a `LocalActor` had no busy cell "on purpose", citing the
+/// refusal that used to stand on `Inbox::mark_busy`. That refusal weighed the
+/// idle actor and is rewritten there; a paragraph citing it had to move in the
+/// same commit, or the crate would document a capability it ships.
 ///
 /// # A `Mutex` and not an atomic
 ///
@@ -2552,6 +2635,17 @@ pub struct LocalActor<A, M> {
     /// singleton has no entry. See [`Standing`] for why it is not the channel
     /// above.
     fate: Fate,
+    /// Whether a turn is running right now, for [`is_busy`](Self::is_busy).
+    ///
+    /// The other end of this `Arc` lives in the [`Watched`] the loop is polling,
+    /// which is what lets a turn on the actor's own task be read from a caller's.
+    /// The keyed twin is `registry.rs`'s `Busy`, kept beside the registry entry;
+    /// a singleton has no entry, so the handle carries it — which is [`fate`]'s
+    /// arrangement and, unlike `fate`, this one is read by the handle's holder
+    /// rather than by a served dispatch.
+    ///
+    /// [`fate`]: Self::fate
+    busy: Arc<AtomicBool>,
     /// Held so a wedged actor can still be [aborted](Self::abort). Dropping a
     /// `JoinHandle` detaches the task on both targets — it does not cancel it —
     /// so this is the only handle on a turn that never returns.
@@ -2622,6 +2716,8 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
         let (ended, watching) = watch::channel(None);
         let fate = Fate::default();
         let held = fate.clone();
+        let busy = Arc::new(AtomicBool::new(false));
+        let watched = Arc::clone(&busy);
         let task = n0_future::task::spawn(async move {
             // Everything that happens to the state, its observers and its two
             // inputs — including the whole teardown order — is in `run_loop`,
@@ -2632,13 +2728,15 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
             // It happens after every drop `run_loop` makes, which is stronger
             // than before: `stop().await` returning now means the state itself is
             // gone, not merely that the observers' claims are.
-            let (reason, _verdict) = run_loop(state, hooks, feeds, inbox, &fate).await;
+            let (reason, _verdict) =
+                run_loop(state, hooks, feeds, Watched { rx: inbox, busy }, &fate).await;
             let _ = ended.send_replace(Some(reason));
         });
         Self {
             mail,
             ended: watching,
             fate: held,
+            busy: watched,
             task: Arc::new(task),
         }
     }
@@ -2709,6 +2807,8 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
         let (ended, watching) = watch::channel(None);
         let fate = Fate::default();
         let held = fate.clone();
+        let busy = Arc::new(AtomicBool::new(false));
+        let watched = Arc::clone(&busy);
         let task = n0_future::task::spawn(async move {
             // `supervise` owns the receiver and drops it on the way out, so the
             // mailbox is closed before the ending is published.
@@ -2721,13 +2821,17 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
             // state — and every `Deferred` parked in it — is dropped. What a
             // served dispatch reads is the `Fate` below, settled inside the loop
             // before that drop, and never the mailbox.
-            let reason = supervise(factory, limit, inbox, &fate).await;
+            // The `Watched` outlives every incarnation here, exactly as the
+            // receiver inside it does, so the cell is cleared once — when this
+            // task ends or is cancelled — rather than per incarnation.
+            let reason = supervise(factory, limit, Watched { rx: inbox, busy }, &fate).await;
             let _ = ended.send_replace(Some(reason));
         });
         Self {
             mail,
             ended: watching,
             fate: held,
+            busy: watched,
             task: Arc::new(task),
         }
     }
@@ -3111,6 +3215,58 @@ impl<A, M> LocalActor<A, M> {
         !self.mail.is_closed()
     }
 
+    /// Whether a turn is running **right now**.
+    ///
+    /// [`is_running`](Self::is_running) is `!mail.is_closed()`, so an actor
+    /// wedged inside a turn and an actor sitting idle both answer `true` to it.
+    /// This is the question that separates them, and it is the one you cannot ask
+    /// the actor itself: a message asking would queue behind the turn that
+    /// wedged it.
+    ///
+    /// A [`read`](Self::read) is **not** a turn and never sets this — it runs no
+    /// observers and cannot mutate, which is the same answer the keyed side
+    /// gives, enforced by the one loop rather than by two decisions.
+    ///
+    /// Advisory, like everything else about another task: a turn can start or end
+    /// between this answer and the next line. `false` from a live actor means "no
+    /// turn was running at the instant this loaded".
+    ///
+    /// **`false` after an [`abort`](Self::abort) or an escaping unwind**, because
+    /// [`Watched`] clears the cell on drop. The alternative — leaving it set,
+    /// which is what the loop alone would do — is a handle reporting "busy" for
+    /// ever about an actor that is gone.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Relaxed)
+    }
+
+    /// How many messages are waiting ahead of the one being handled.
+    ///
+    /// Zero or one at [`LOCAL_MAILBOX_DEPTH`], and never a number to compute a
+    /// queue-length alert from. What it is good for is the question it answers
+    /// exactly — **is this actor's mailbox full, and therefore will the next
+    /// caller block on the permit.** `ActorStatus::buffered` is the keyed twin and
+    /// carries the same warning.
+    ///
+    /// It reads the **sender**, so it is the one fact here that an
+    /// [`abort`](Self::abort) does not change.
+    ///
+    /// Paired with [`is_busy`](Self::is_busy) it separates three states rather
+    /// than two: idle, in a turn with the slot free, and in a turn with the next
+    /// caller already about to block.
+    #[must_use]
+    pub fn buffered(&self) -> u64 {
+        // `u64` and `try_from` for the keyed twin's reason: the widening cannot
+        // fail on any target keylink builds for, and a diagnostic must not be the
+        // thing that panics if one ever appears.
+        u64::try_from(
+            self.mail
+                .max_capacity()
+                .saturating_sub(self.mail.capacity()),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
     /// The one place a message enters the mailbox.
     ///
     /// It used to be the one place the box was put on, too. The box moved into
@@ -3125,12 +3281,18 @@ impl<A, M> LocalActor<A, M> {
 /// By hand, because `#[derive(Clone)]` would demand `A: Clone` — and `A` is the
 /// state, which is never cloned and usually cannot be. `M` is not cloned either:
 /// only the sender is.
+///
+/// **Every field here shares rather than copies**, and `busy` is the one where
+/// getting that wrong would be invisible: cloning the `bool` out of the `Arc`
+/// would give each handle a frozen snapshot, and a test that reads through the
+/// handle it spawned with would still pass.
 impl<A, M> Clone for LocalActor<A, M> {
     fn clone(&self) -> Self {
         Self {
             mail: self.mail.clone(),
             ended: self.ended.clone(),
             fate: self.fate.clone(),
+            busy: Arc::clone(&self.busy),
             task: self.task.clone(),
         }
     }
@@ -3140,6 +3302,8 @@ impl<A, M> fmt::Debug for LocalActor<A, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalActor")
             .field("running", &!self.mail.is_closed())
+            // The loaded value and never the `Arc`, which would print an address.
+            .field("busy", &self.busy.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -3523,6 +3687,20 @@ mod tests {
         Boom { origin: Origin, reply: Reply<usize> },
         /// Never return.
         Wedge { origin: Origin, reply: Reply<usize> },
+        /// Enter, say so, and wait to be let go.
+        ///
+        /// [`Wedge`](Self::Wedge) wedges but never says *when* it started, which is
+        /// why `abort_ends_an_actor_that_stop_could_not` sleeps 20 ms to let the
+        /// turn begin. A test about `is_busy` cannot borrow that: it would be
+        /// asserting on a flag whose window it guessed at. These two channels make
+        /// "the turn has started" and "the turn may finish" both observable, so
+        /// every assertion around them is ordered rather than raced.
+        Held {
+            origin: Origin,
+            entered: oneshot::Sender<()>,
+            release: oneshot::Receiver<()>,
+            reply: Reply<usize>,
+        },
         /// Park the reply in the state and answer nothing. The hand-written twin
         /// of what `#[defer]` generates, here for the reason every other variant
         /// is: this is where the loop lives, so a probe only the macro could build
@@ -3581,6 +3759,21 @@ mod tests {
                             })
                         },
                     )
+                    .await
+                }
+                Mail::Held {
+                    origin,
+                    entered,
+                    release,
+                    reply,
+                } => {
+                    turn(state, hooks, origin, "Held", reply, move |_from, _state| {
+                        Box::pin(async move {
+                            let _ = entered.send(());
+                            let _ = release.await;
+                            0usize
+                        })
+                    })
                     .await
                 }
                 Mail::Park { origin, reply } => {
@@ -3779,6 +3972,183 @@ mod tests {
 
         assert_eq!(spare.ask(add(1)).await, Err(MailboxClosed));
         assert_eq!(spare.notify(add(1)).await, Err(MailboxClosed));
+    }
+
+    /// Spawn an actor already inside a turn, and hand back the two ends that
+    /// order everything around it: a handle, and the sender that lets the turn go.
+    ///
+    /// Returns once the turn has **provably started** — `entered` resolving is the
+    /// happens-after edge, so no assertion below it is racing the dispatch.
+    async fn held() -> (
+        LocalActor<Counter, Mail>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<usize, MailboxClosed>>,
+    ) {
+        hold(LocalActor::spawn(Counter::default())).await
+    }
+
+    /// The same, for an actor the caller spawned — which is how the supervised
+    /// path gets the identical treatment without a second copy of this.
+    async fn hold(
+        actor: LocalActor<Counter, Mail>,
+    ) -> (
+        LocalActor<Counter, Mail>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<usize, MailboxClosed>>,
+    ) {
+        let (entered, started) = oneshot::channel();
+        let (release, releasing) = oneshot::channel();
+        let turning = {
+            let actor = actor.clone();
+            tokio::spawn(async move {
+                actor
+                    .ask(|origin, reply| Mail::Held {
+                        origin,
+                        entered,
+                        release: releasing,
+                        reply,
+                    })
+                    .await
+            })
+        };
+        started.await.expect("the turn started");
+        (actor, release, turning)
+    }
+
+    /// The two halves of `is_busy`, in one test and in this order, because
+    /// **neither half is a guard on its own**.
+    ///
+    /// The positive alone passes for an implementation that never clears the flag.
+    /// The negative alone passes for one that never sets it — an empty
+    /// `Watched::mark_busy`, an `Arc` never wrapped — and it is the half that reads
+    /// like the interesting one, so it is the trap.
+    ///
+    /// Ordered turn → read for the same reason: the recorded break is
+    /// `mark_busy(false)` → `mark_busy(true)` on the mail dispatch, which leaves
+    /// the flag set **after** a turn. A read performed by an actor that had never
+    /// run a turn would read `false` under that break and stay green.
+    ///
+    /// **Watched break, `Inbox::mark_busy`'s mail arm in `run_loop`,
+    /// `mark_busy(false)` → `mark_busy(true)`:**
+    /// `a_turn_reports_busy_and_a_read_does_not ... FAILED`, with
+    /// `a read is not a turn and must not report busy`.
+    #[tokio::test]
+    async fn a_turn_reports_busy_and_a_read_does_not() {
+        let (actor, release, turning) = held().await;
+
+        // Positive: observed from outside, ordered by `entered` rather than by a
+        // sleep. The turn is inside `Held`'s body right now.
+        assert!(actor.is_busy(), "a running turn must report busy");
+
+        release.send(()).expect("the turn is still waiting");
+        turning
+            .await
+            .expect("no panic")
+            .expect("the actor answered");
+
+        // Negative: observed from **inside** a read, which runs on the actor's own
+        // loop. Sampling from another task would be a timing test; this is ordered
+        // by construction. `is_busy` is an atomic load, not a message, so it
+        // cannot queue behind the read it runs inside.
+        let seen = {
+            let actor = actor.clone();
+            actor
+                .clone()
+                .read(move |_state| actor.is_busy())
+                .await
+                .expect("the actor is running")
+        };
+        assert!(!seen, "a read is not a turn and must not report busy");
+    }
+
+    /// The question `buffered` answers exactly: will the next caller block.
+    ///
+    /// **Watched break, `LocalActor::buffered`, `max_capacity()` →
+    /// `capacity()`:** `a_full_mailbox_is_visible_before_a_caller_blocks_on_it ...
+    /// FAILED`, with `left: 0, right: 1`.
+    #[tokio::test]
+    async fn a_full_mailbox_is_visible_before_a_caller_blocks_on_it() {
+        let (actor, release, turning) = held().await;
+
+        // The turn holds the loop, so nothing drains. An empty slot first.
+        assert_eq!(actor.buffered(), 0, "nothing is queued yet");
+
+        // `notify` returns when the message has a permit, so this is ordered.
+        actor.notify(add(1)).await.expect("the actor is running");
+        assert_eq!(
+            actor.buffered(),
+            1,
+            "the queued message is what the next caller would block behind"
+        );
+
+        release.send(()).expect("the turn is still waiting");
+        turning
+            .await
+            .expect("no panic")
+            .expect("the actor answered");
+    }
+
+    /// The supervised path wraps its receiver too — which is a **second** call
+    /// site and therefore a second thing to forget.
+    ///
+    /// This is the guard for that, and it exists because I proved it was missing:
+    /// with `spawn_supervised` passing its raw receiver, the whole lib suite —
+    /// including all three tests above — stayed green at 169. Every one of them
+    /// reaches the actor through `spawn_fed`, so `is_busy` would have answered
+    /// `false` for ever on every supervised actor and nothing would have said so.
+    ///
+    /// **Watched break, `spawn_supervised`, `Watched { rx: inbox, busy }` →
+    /// `inbox`:** `a_supervised_actor_reports_busy_through_its_handle ... FAILED`,
+    /// with `a supervised actor's handle must see its turn`.
+    #[tokio::test]
+    async fn a_supervised_actor_reports_busy_through_its_handle() {
+        let limit = Intensity::new(
+            NonZeroU32::new(2).expect("two is not zero"),
+            Duration::from_millis(20),
+        )
+        .expect("a budget whose backoff is not zero");
+        let supervised: LocalActor<Counter, Mail> = LocalActor::spawn_supervised(
+            || async { Ok((Counter::default(), Vec::new(), ())) },
+            limit,
+        );
+
+        let (actor, release, turning) = hold(supervised).await;
+        assert!(
+            actor.is_busy(),
+            "a supervised actor's handle must see its turn"
+        );
+
+        release.send(()).expect("the turn is still waiting");
+        turning
+            .await
+            .expect("no panic")
+            .expect("the actor answered");
+        assert!(!actor.is_busy(), "and must see it end");
+    }
+
+    /// An abort mid-turn leaves no `run_loop` to clear the flag, so `Watched`'s
+    /// `Drop` is the only thing that can — and without it a handle reports "busy"
+    /// for ever about an actor that is gone.
+    ///
+    /// `ended()` is the sync point rather than a sleep: it resolves when the task
+    /// is gone, which is after the drop that clears the cell.
+    ///
+    /// **Watched break, `impl Drop for Watched`, delete the `store`:**
+    /// `an_aborted_turn_does_not_leave_the_handle_reporting_busy ... FAILED`, with
+    /// `an aborted actor is gone, not busy`.
+    #[tokio::test]
+    async fn an_aborted_turn_does_not_leave_the_handle_reporting_busy() {
+        let (actor, _release, turning) = held().await;
+        assert!(actor.is_busy(), "the turn is running");
+
+        actor.abort();
+        assert!(
+            matches!(actor.ended().await, Ended::Vanished),
+            "an aborted actor vanishes"
+        );
+
+        assert!(!actor.is_busy(), "an aborted actor is gone, not busy");
+        let _ = turning.await;
     }
 
     /// A turn that never returns cannot be stopped, and can be aborted.

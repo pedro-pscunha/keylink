@@ -2041,6 +2041,27 @@ macro_rules! __keylink_service {
                     self.inner.is_running()
                 }
 
+                /// Whether a turn is running right now.
+                ///
+                /// [`is_running`](Self::is_running) answers `true` for an actor
+                /// wedged inside a turn and for one sitting idle. This separates
+                /// them, and it is the question you cannot ask the actor: a
+                /// message asking would queue behind the turn that wedged it.
+                #[must_use]
+                pub fn is_busy(&self) -> bool {
+                    self.inner.is_busy()
+                }
+
+                /// How many messages are waiting ahead of the one being handled.
+                ///
+                /// Zero or one at the local mailbox depth, and never a number to
+                /// compute a queue-length alert from. What it answers exactly is
+                /// whether the next caller will block on the permit.
+                #[must_use]
+                pub fn buffered(&self) -> u64 {
+                    self.inner.buffered()
+                }
+
                 /// Resolve when this actor ends, and say why.
                 ///
                 /// [`MailboxClosed`](keylink::MailboxClosed) says "gone", and it
