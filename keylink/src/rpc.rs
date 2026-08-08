@@ -40,10 +40,10 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::admission::settle;
 use crate::error::ConfigError;
 // `Keyable` through the module rather than through the crate root, unlike its
-// siblings below: the root re-export is a promise to a *consumer*, and
-// `tests/api.rs` is the only place that writes it from a consumer's position. An
-// in-crate `crate::Keyable` would make the library itself the thing that fails
-// when the re-export goes, which would leave that test proving nothing.
+// siblings below: the root re-export is a promise to a *consumer*, and it is
+// `tests/api.rs` that writes it from a consumer's position. An in-crate
+// `crate::Keyable` would make the library itself the thing that fails when the
+// re-export goes, which would leave that test proving nothing.
 use crate::idempotency::{Claim, Guard, Keyable, Ledger, Records};
 use crate::middleware::{wrap, Reached};
 use crate::wire::FrameReader;
@@ -111,8 +111,14 @@ impl<Req, Resp> Clone for RpcService<Req, Resp> {
 ///
 /// One value rather than a [`Keyable`] beside an `Option<Arc<Ledger>>`, because the
 /// two are read together on every keyed call and handing one on without the other
-/// is the mistake this makes unwritable. It also puts the invariant in one place
-/// instead of at each site that reads it.
+/// is the mistake this makes unwritable.
+///
+/// **The CLAIM path has one reader**, [`Keys::ledger_for`], and that is the
+/// load-bearing half: it is the only route to a ledger a key can be recorded in, so
+/// there is no site that can take the ledger while ignoring the policy.
+/// `answer_key_state` reads `ledger` directly and does not go through it, which is
+/// total rather than a hole — its parameter is `Option<&Ledger>` and both arms are
+/// answered — and it is why this says "the claim path" rather than "every site".
 #[derive(Debug, Clone)]
 struct Keys {
     /// Which methods accept a key. Consulted before the key is validated and
@@ -685,11 +691,15 @@ mod tests {
     /// probe reaches for the field instead. The behaviour half is
     /// `tests/idempotency.rs::a_key_on_a_method_the_service_does_not_key_is_refused`.
     ///
-    /// Made red by `scripts/break-once.sh` replacing the body of
-    /// `Keyable::needs_a_ledger` — `!matches!(self, Self::None)` — with `true`.
-    /// Watched: `panicked at .., `Keyable::None` must not allocate a ledger nothing
-    /// can ever write to`, `0 passed; 1 failed;
-    /// 138 filtered out`. No other test in the crate noticed the edit.
+    /// Made red by `scripts/break-once.sh` forcing `Keyable::needs_a_ledger` to
+    /// return `true` for every variant. Watched: `panicked at .., `Keyable::None`
+    /// must not allocate a ledger nothing can ever write to`.
+    ///
+    /// It also reddens `idempotency::tests::policy::keyed_none_accepts_no_method`.
+    /// **An earlier version of this record said "no other test in the crate noticed
+    /// the edit", which was false** — and the replacement names the reddened tests
+    /// rather than counting them or claiming to have found all of them. A name stays
+    /// true when somebody adds a test; "the only one" does not.
     #[test]
     fn keyed_none_builds_no_ledger() {
         assert!(
@@ -706,11 +716,19 @@ mod tests {
     /// method keyed?" and "where do its records go?", so no call site can take the
     /// ledger while ignoring the policy.
     ///
-    /// Made red by `scripts/break-once.sh` replacing
-    /// `self.ledger.as_ref().filter(|_| self.keyable.accepts(method))` with
-    /// `self.ledger.as_ref()` — the edit that would make the policy decorative
-    /// while every idempotency test that predates this wave stayed green. Watched:
-    /// `panicked at .., a refused method must not, or the policy decides nothing`, `0 passed; 1 failed; 138 filtered out`.
+    /// Made red by `scripts/break-once.sh` dropping the `.filter(..)` from
+    /// `Keys::ledger_for`, so it answers the ledger without consulting the policy —
+    /// the edit that makes the policy decorative while every idempotency test
+    /// predating this wave stays green. Watched: `panicked at .., a refused method
+    /// must not, or the policy decides nothing`.
+    ///
+    /// **Described rather than quoted, and that is not a style choice.** This record
+    /// used to quote the one-line form `self.ledger.as_ref().filter(..)`, which
+    /// `rustfmt` split across three lines when the signature took `&'static str` —
+    /// so `break-once.sh` could no longer find its anchor and the recorded run was
+    /// unreplayable. A quoted anchor in the file being broken fails twice over: it
+    /// makes the literal non-unique, and it rots when the formatter rewraps the
+    /// target.
     #[test]
     fn the_ledger_is_reachable_only_through_the_policy() {
         let keys = Keys::new(Keyable::Only(&["Reserve"]), Records::Memory);
@@ -936,7 +954,7 @@ where
     ///
     /// ```ignore
     /// till::service(handler, Allowlist::anyone())
-    ///     .keyed(Keyable::Only(&["Reserve"]))
+    ///     .keyable(Keyable::Only(&["Reserve"]))
     ///     .build()
     /// ```
     ///
@@ -955,13 +973,13 @@ where
         self
     }
 
-    /// Decide where the replies recorded under a key live.
+    /// Decide whether this service holds a caller's reply bytes at all.
     ///
-    /// [`Records::None`] is at-most-once without paying to store a reply: the key
-    /// still claims, so the work still runs once, and every repeat is
-    /// [`IdempotencyRefusal::Forgotten`](crate::IdempotencyRefusal::Forgotten)
-    /// rather than the reply. Reach for it when the caller can read the result out
-    /// of its own domain and only needed *"do not run this twice"*.
+    /// [`Records::None`] is at-most-once with no retention: the key still claims, so
+    /// the work still runs once, and every repeat is
+    /// [`IdempotencyRefusal::Unrecordable`](crate::IdempotencyRefusal::Unrecordable)
+    /// rather than the reply. Reach for it when the reply is data this service would
+    /// rather not keep, and the caller can read the result out of its own domain.
     ///
     /// ```ignore
     /// till::service(handler, Allowlist::anyone())
@@ -971,9 +989,18 @@ where
     /// ```
     ///
     /// The default is [`Records::Memory`], so a service that never calls this
-    /// behaves exactly as it did before the method existed. **No setting here can
-    /// weaken at-most-once** — the key state never leaves memory whatever this
-    /// says, and [`Records`] is only about the reply bytes.
+    /// behaves exactly as it did before the method existed.
+    ///
+    /// # It is not free, and [`Records`] is where the cost is written
+    ///
+    /// The key state never leaves memory whatever this says. **What
+    /// [`Records::None`] does shorten is the at-most-once *window*, by about a
+    /// ninth**, because a settled key skips the record pool and enters the tombstone
+    /// pool directly. That lands on the one degradation `README.md`'s limit 4 says a
+    /// caller cannot detect. [`Records`] carries the operands and the argument; read
+    /// it before choosing `None` for a privacy requirement, because the sentence
+    /// that used to sit here — *"no setting here can weaken at-most-once"* — was
+    /// false, and this is the doc a caller reads at the instant it types the call.
     #[must_use]
     pub fn records(mut self, records: Records) -> Self {
         self.records = records;

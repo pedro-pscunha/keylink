@@ -208,7 +208,9 @@ the line explicitly:
 > property of the method, the other is an eviction. Both mean "do not retry", and
 > merging them would make the query lie about why.
 
-`Forgotten` has exactly two producers, `expire` and `evict`, and both are evictions.
+`Forgotten` is produced by `expire` and by `evict`, and both are evictions —
+`Slot::Forgotten`'s own doc comment in `idempotency.rs` carries the current list,
+because that file owns it and this one does not.
 A configured retention policy is a permanent property. So it settles
 `Slot::Unrecordable`, whose own doc — *"the handler ran, and its reply is not
 something this ledger can hold"* — is true word for word of a service configured to
@@ -223,12 +225,24 @@ variant too — **two names on two enums to say what one existing name already s
 truthfully.** The wire was already breaking for `NotKeyable`, so the price was low;
 it was the benefit that was missing.
 
-What reuse costs, stated rather than glossed: three doc sites widened and one
-wire-visible `Display` string changed. `IdempotencyRefusal::Unrecordable` used to
-render *"the reply to this key carried a payload, which is not recorded"*, which was
-about to be false on a service that had never declared a `recv` method. It now names
-no cause at all, deliberately — which of the three applies is answerable from the
-service's own configuration and does not belong on a wire every service shares.
+What reuse costs, stated rather than glossed: several doc sites widened and one
+`Display` string changed. `IdempotencyRefusal::Unrecordable` used to render *"the
+reply to this key carried a payload, which is not recorded"*, which was about to be
+false on a service that had never declared a `recv` method. It now names no cause at
+all, deliberately — which of the three applies is answerable from the service's own
+configuration and does not belong in a message every service shares.
+
+**That string is NOT wire-visible, and an earlier version of this sentence called it
+that.** `IdempotencyRefusal` crosses the wire as a postcard variant index; the
+receiving peer renders `Display` from *its own* build, so the text never travels. The
+gate proved it by removal: with the new string in place, deleting only `NotKeyable`
+restored the old hash exactly — so Wave 2 on its own would have moved no pin.
+
+The real consequence is smaller and differently shaped: **two peers on different
+builds render different text for the same variant, and no handshake catches it.**
+Blast radius is small, because callers are told to match on variants rather than
+parse messages and `examples/reliable_call.rs` does, but it is the honest statement
+of what changing a `Display` impl costs.
 
 **The arm order the earlier design forced does not exist any more.** Under
 `Forgotten` the retention cause and the `carries_body` cause produced *different*
@@ -245,14 +259,21 @@ set of states is unaffected. The **retention window is not**.
 
 Under `Records::Memory` a settled key occupies a slot in the record pool and *then*
 becomes a tombstone. Under `Records::None` it enters the tombstone pool directly and
-forgoes the record pool's grace entirely: `8192 / (8192 + 1024)` — about **89% of
-the window**, so roughly an 11% cut. That lands on the one degradation README limit
-4 says a caller **cannot detect**, because past `MAX_TOMBSTONES` a key reads
-`KeyState::Fresh` and runs again.
+forgoes the record pool's grace entirely — so the window is `MAX_TOMBSTONES` of
+churn instead of `MAX_TOMBSTONES` **plus** `MAX_RECORDS`. That lands on the one
+degradation README limit 4 says a caller **cannot detect**, because past
+`MAX_TOMBSTONES` a key reads `KeyState::Fresh` and runs again.
 
-Small, and it is stated instead of sold as free. Held by
-`records_none_shortens_the_at_most_once_window`, which asserts it as a difference
-between two ledgers under one bound rather than as a number.
+**The operands and not the quotient**, per main's `5834881 docs(keylink): stop
+writing derived figures, because that one rotted twice`. This section carried
+`8192 / (8192 + 1024)` and "about 11%" before that rule reached this branch; both
+are correct today and both would have rotted silently the first time either constant
+moved, with nothing to catch it. The reader can divide.
+
+Stated instead of sold as free. `records_none_shortens_the_at_most_once_window` holds
+the **direction** — the window is strictly shorter — asserted as a difference between
+two ledgers under one bound. It does not hold the ratio, and cannot, because it sets
+its own bounds to stay fast; the direction is the claim worth guarding.
 
 ### 3.2.2 It opts out of a principle this module states
 
@@ -381,6 +402,13 @@ refusal that misdescribes itself sends the caller to fix the wrong thing, and th
 hash exists precisely so the honest version can be paid for once. This is the same
 judgement §3.1 makes in the other direction, and the two are consistent: reuse a
 variant when it stays true, mint one when it would have to lie.
+
+> **Marker, added on review.** *"`Unrecordable` says the reply carried a payload"* was
+> true when this section was written and §3.2 retired it **earlier in this same
+> document**: the retention setting settles `Unrecordable`, so its wording no longer
+> names a payload. Left standing rather than rewritten, per `5834881`'s precedent —
+> the conclusion is unaffected, because what rules `Unrecordable` out for `NotKeyable`
+> is that **nothing ran**, which never depended on the wording.
 
 **Carry the refusal as a `RemoteError::Failed` prefix.** Rejected. There are
 exactly four prefixes, they are load-bearing as a `starts_with` discriminator, and
@@ -527,10 +555,94 @@ dropping the re-export — failed inside the *library*, because `rpc.rs` importe
 reaches the type through `crate::idempotency`, which leaves the root re-export with
 exactly one guard.
 
-Break records in this wave carry the assertion message and the pass/fail counts and
-**not** `file:line:col`. Two of this repo's recorded defects are break records
-citing lines the tree no longer has, and a line number moves every time anybody
-edits a doc comment above it.
+### 9.1 What a break record carries, corrected twice
+
+This section first said: break records carry the assertion message **and the
+pass/fail counts**, and not `file:line:col`, because a line number moves every time
+anybody edits a doc comment above it. The premise was right and the remedy was wrong,
+and the merge gate measured it wrong **inside this same wave**.
+
+**Counts rot faster than line numbers, and for a sharper reason.** A line number rots
+per doc line edited *above* the citation. A whole-target count rots per **test added
+to the target** — by anybody, for any reason, including a test that has nothing to do
+with the break. Nine of the twelve counts recorded here were stale by the time the
+gate ran, and the one that proves the mechanism is this: a Wave 2 test added to
+`tests/idempotency.rs` silently falsified a Wave 1 record in the same file, which had
+correctly enumerated four reddened tests and was now five.
+
+It is the same rule this document already relies on twice, arriving a third time: **a
+record that embeds a value it does not control rots — silently, and while still
+reading like evidence.**
+
+#### The rule, and it is wider than counts
+
+The literal shape is not the defect. A second branch audited itself against the
+whole-target-count rule, found it carried none, then searched for the *class* and
+found two more instances — a rustdoc naming how many callers a function had, and a
+dated measurement of a number a tracked task exists to drive to zero. Neither is a
+count of tests. Both rot the same way.
+
+> **A record may only assert values the record's own file controls.** A module-scoped
+> count qualifies. A whole-target count does not. A caller count does not. And a dated
+> measurement qualifies only when the thing measured is not itself the subject of a
+> scheduled fix — otherwise the date licenses the staleness instead of preventing it.
+
+The operational test is one question: **who can move this value without touching this
+file?** If the answer is anybody, retire it. That is why a date is enough for
+`persist.rs`'s 7.6 ms — a physical measurement does not move when somebody edits code
+— and not enough for a figure something is *working* to change.
+
+So, for a break record:
+
+- **Drop whole-target counts.** They are not facts about your break.
+- **Keep the assertion message**, which is.
+- **Name the tests that go red**, which is also a fact about your break and is
+  checkable by re-running it. Where a break is wide enough that naming every test is
+  noise, say it is wide, say what makes it wide, and name the ones that matter.
+- **Do not claim to have named them all.** *"A, B and C go red"* stays true when
+  somebody adds test D; *"A, B and C are the only ones"* does not. Naming is an
+  existence claim and survives; exhaustiveness is a universal one over a set the
+  record does not own. Several records in this wave were written the second way and
+  corrected to the first.
+- **Module- and file-scoped claims stay**, because who adds a test *there* has to
+  touch that file. The four counts in `mod policy` are of that kind, and so is
+  `tests/idempotency.rs`'s "within this file, three tests and no more".
+
+Two more instances of the class were found on this branch by the same question and
+retired: an RFC asserting that `evict` has *"exactly one caller"* — a count of another
+file's call sites — and a sentence pricing the retention saving against
+`MAX_TOMBSTONES`' own *"on the order of a megabyte"*, which is a figure in a third
+comment that nothing measures.
+
+### 9.2 And a break record must not quote its own anchor
+
+`break-once.sh` anchors on a literal that must be **unique in the file it edits**, so
+a record that quotes the line it breaks makes that file non-unique and the run aborts
+with `expected exactly one occurrence, found N`. That fired repeatedly across this
+branch, and every time the harness was working.
+
+The rule is **"do not quote the literal when the record lives in the file being
+broken"** — not "never quote". A record in `tests/idempotency.rs` describing a break
+in `src/idempotency.rs` may quote freely: uniqueness in the target is untouched and
+the quote is the more precise record.
+
+A second failure mode makes describing the better default even across files. One
+record here quoted `self.ledger.as_ref().filter(..)` as a single line; `rustfmt` split
+it across three when the signature took `&'static str`, so the anchor stopped existing
+and the recorded run became unreplayable — with nothing red to say so. **Name the
+function and describe the edit; the formatter owns the line breaks and you do not.**
+
+Note also that it is only the **search** literal that is constrained. `break-once.sh`
+greps and counts `$from`; `$to` is never searched, so quoting the **replacement**
+verbatim cannot affect uniqueness anywhere and should be done — a sibling branch's
+over-wide reading of this rule left a reviewer hand-constructing working Rust to
+reproduce a record that could simply have shown it. Describe what you searched for;
+quote what you put in its place.
+
+And when auditing records, check that the **anchor still exists**, not only the
+evidence beside it. Both unreplayable records on this branch were found by re-running
+the break rather than by reading it, and one of them had already been reviewed for its
+counts while its anchor had been dead for some time.
 
 ---
 
@@ -553,7 +665,7 @@ edits a doc comment above it.
   per process because `MAX_RECORDED_BYTES` is a total and not a per-key figure. The
   motive is retention. §3.1.
 - It said the key state is *"not affected"* by `Records::None`. The set of states is
-  not; the at-most-once window is about 11% shorter. §3.2.1.
+  not; the at-most-once window is shorter by `MAX_RECORDS` of churn. §3.2.1.
 - It specified `Slot::Forgotten` for the retention settle, which puts a configured
   choice under a name that means pressure — the wrong side of the line RFC-05 §5
   draws. §3.2.
@@ -563,6 +675,8 @@ edits a doc comment above it.
 - It named `Service` as the struct holding the ledger. The ledger is on
   `RpcService`, and `Service` has type-erased it, so the brief's own goal — a reader
   seeing the allocation not happen — was unreachable where it asked for it. §2.3.
-- Its fact table said `evict` runs inside `claim`. `evict` has exactly one caller,
-  `settle`; `claim` and `key_state` call `expire`, which is a second and unmentioned
-  producer of `Forgotten`.
+- Its fact table said `evict` runs inside `claim`. It does not: `claim` and
+  `key_state` call `expire`, and `evict` is reached from `settle`. `expire` is also a
+  producer of `Forgotten` the table never mentions. Stated as which function calls
+  which rather than as a caller *count*, per §9.1 — a count of callers is a value
+  this document cannot keep true.

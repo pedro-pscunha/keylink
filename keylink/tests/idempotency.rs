@@ -287,8 +287,11 @@ async fn a_refused_key_leaves_the_handler_reachable() {
 /// shape a wiring mistake takes. Watched: `panicked at ..,
 /// `Slow` is not in this service's policy: 1`
 /// — the `expect_err` fires because the call went through and answered run 1.
-/// Across the whole file that one edit reddens three tests and no more:
-/// `24 passed; 3 failed`.
+/// Within this file that one edit reddens three tests and no more — this one,
+/// `a_refused_key_never_reaches_the_ledger` and
+/// `a_keyed_actor_service_applies_the_same_policy`. Scoped to this file on purpose:
+/// which tests exist here is something this file controls, and a claim reaching past
+/// it would not be.
 #[tokio::test]
 async fn a_key_on_a_method_the_service_does_not_key_is_refused() {
     let fixture = start_keyable(Keyable::Only(&["Reserve"])).await;
@@ -340,8 +343,9 @@ async fn a_key_on_a_method_the_service_does_not_key_is_refused() {
 /// assertion `left == right` failed: a key the ledger would refuse as malformed
 /// must be refused by the POLICY first, or the policy is not above the ledger`,
 /// `left: Malformed("config: invalid idempotency key: 129 bytes exceeds the 128
-/// byte cap")`, `right: NotKeyable { method: "Slow" }`, `0 passed; 1 failed;
-/// 26 filtered out`.
+/// byte cap")`, `right: NotKeyable { method: "Slow" }`. The other two tests that
+/// edit reddens are named on
+/// `a_key_on_a_method_the_service_does_not_key_is_refused`.
 ///
 /// The break this test would most like — swapping the two statements in `claim_key`
 /// — is a reordering rather than a substitution, so `break-once.sh` cannot express
@@ -399,11 +403,14 @@ async fn a_refused_key_never_reaches_the_ledger() {
 /// `return Claimed::None;` with
 /// `return Claimed::Refuse(IdempotencyRefusal::InFlight.into());` — the unkeyed
 /// early return, gone. Watched: `panicked at ..,
-/// a call with no key needs no policy: Remote(Idempotency(InFlight))`,
-/// `0 passed; 1 failed; 26 filtered out`.
+/// a call with no key needs no policy: Remote(Idempotency(InFlight))`.
 ///
-/// **That break reddens four tests, and the breadth is the finding rather than a
-/// weakness of this one.** Whole-file run: `23 passed; 4 failed` —
+/// **That break reddens FIVE tests, and the breadth is the finding rather than a
+/// weakness of this one.** An earlier version of this record said four and listed
+/// four; the fifth,
+/// `an_attacher_on_a_recordless_service_waits_and_is_told_it_ran`, was added to this
+/// same branch after the record was written — which is precisely why a record must
+/// name the tests it reddens rather than count them. The five are —
 /// `a_call_without_a_key_runs_every_time`, `a_refusal_is_recorded_and_replayed`,
 /// `a_second_caller_attaches_to_a_live_key` and this test. The unkeyed path is
 /// load-bearing under most of the file; what this test adds is the one service the
@@ -444,7 +451,7 @@ async fn an_unkeyed_call_is_unaffected_by_any_policy() {
 /// `Some(_) | None => KeyState::Interrupted,`. Watched: `panicked at ..,
 /// assertion `left == right` failed: no ledger
 /// means nothing was recorded, which is what `Fresh` reports`, `left: Interrupted`,
-/// `right: Fresh`, `2 passed; 1 failed; 24 filtered out` — the other two
+/// `right: Fresh`, and no other test in THIS FILE reddens — the other two
 /// `a_key_state_query_*` tests stay green, because they run on a service that has
 /// a ledger and never reach the arm.
 #[tokio::test]
@@ -473,7 +480,8 @@ async fn a_key_state_query_on_a_service_that_keys_nothing_is_fresh() {
 /// applied behaves *identically* to one configured `Keyable::Any`, so neutralising
 /// the policy here reproduces exactly the defect this test exists to catch.
 /// Watched: `panicked at .., `Slow` is not in
-/// this service's policy, actor or not: 1`, `0 passed; 1 failed; 26 filtered out`.
+/// this service's policy, actor or not: 1`. No other test in this file can redden,
+/// since the break is this test's own literal.
 ///
 /// Red a second way, from production code, under the
 /// `Self::Only(..) || true` break recorded on
@@ -1026,8 +1034,12 @@ async fn start_recordless() -> Fixture {
 /// `self.ledger.settle(self.peer, &self.key, slot);` with
 /// `let _ = slot;` followed by `self.ledger.release(self.peer, &self.key);` — the
 /// key given back instead of spent, which is the only shape at-most-once fails in.
-/// Watched: `panicked at .., the repeat is refused, not answered: 2`, `0 passed;
-/// 1 failed; 30 filtered out`. The `2` is the handler's counter: the repeat ran.
+/// Watched: `panicked at .., the repeat is refused, not answered: 2`. The `2` is the
+/// handler's counter: the repeat ran.
+///
+/// **That break is very wide** — giving a key back instead of spending it reddens
+/// fourteen of this file's tests, every one that asserts a repeat is not re-run.
+/// Width is the finding: `settle` is the single line at-most-once rests on.
 ///
 /// **What that break does NOT reach is this test's last assertion**, and it is worth
 /// saying which half is unguarded. The break trips the `expect_err` above it, so the
@@ -1077,7 +1089,7 @@ async fn records_none_still_runs_the_work_at_most_once() {
 }
 
 /// The half `Records::None` gives up, said out loud: the repeat gets
-/// `Forgotten` rather than the reply.
+/// `Unrecordable` rather than the reply.
 ///
 /// Asserted against the identical call on a **default** service, in the same test,
 /// because the claim is a difference. `Records::Memory` answers 1 twice;
@@ -1091,10 +1103,12 @@ async fn records_none_still_runs_the_work_at_most_once() {
 ///
 /// Made red by `scripts/break-once.sh` replacing
 /// `Guard::record`'s `recordable` flag to ignore the retention switch, its
-/// `matches!` on `self.ledger.records` replaced by `true`. Watched: `panicked at .., the repeat under
-/// `Records::None` is refused, not answered: 1`, `0 passed; 1 failed;
-/// 30 filtered out` — the `expect_err` fires because the repeat came back as the
-/// recorded reply.
+/// `matches!` on `self.ledger.records` replaced by `true`. Watched: `panicked at ..,
+/// the repeat under `Records::None` is refused, not answered: 1` — the `expect_err`
+/// fires because the repeat came back as the recorded reply. It reddens
+/// `records_none_still_runs_the_work_at_most_once`,
+/// `a_recv_method_is_refused_the_same_way_whatever_the_retention_policy` and
+/// `an_attacher_on_a_recordless_service_waits_and_is_told_it_ran` beside this one.
 #[tokio::test]
 async fn records_none_refuses_the_repeat_instead_of_answering_it() {
     let recording = start().await;
@@ -1153,10 +1167,15 @@ async fn records_none_refuses_the_repeat_instead_of_answering_it() {
 ///
 /// Made red by `scripts/break-once.sh` replacing
 /// `Guard::record`'s settled slot from
-/// `Slot::Unrecordable` to `Slot::Forgotten`, which is the old design restored. Watched: `panicked at ..,
-/// assertion `left == right` failed: a recv method's refusal must not depend on
-/// the service's retention policy`, `left: Forgotten`, `right: Unrecordable`,
-/// `0 passed; 1 failed; 31 filtered out`.
+/// `Slot::Unrecordable` to `Slot::Forgotten`, which is the old design restored.
+/// Watched: `panicked at .., assertion `left == right` failed: a recv method's
+/// refusal must not depend on the service's retention policy`, `left: Forgotten`,
+/// `right: Unrecordable`. It also reddens
+/// `a_reply_that_carries_a_payload_is_refused_on_repeat`,
+/// `records_none_refuses_the_repeat_instead_of_answering_it` and
+/// `an_attacher_on_a_recordless_service_waits_and_is_told_it_ran` — and that
+/// `a_reply_that_carries_a_payload_is_refused_on_repeat` is in the list is the point
+/// of this test: the two causes share one refusal.
 #[tokio::test]
 async fn a_recv_method_is_refused_the_same_way_whatever_the_retention_policy() {
     for fixture in [start().await, start_recordless().await] {
@@ -1184,9 +1203,9 @@ async fn a_recv_method_is_refused_the_same_way_whatever_the_retention_policy() {
 
 // ────────────────────────────────────────── the defaults, spelled and not
 
-/// **A service that names neither policy behaves as one that names both
-/// defaults.** That is the whole compatibility claim of both waves, and it is
-/// asserted as a comparison rather than as a re-run of
+/// **A service that names neither policy behaves as one that names both values
+/// out loud.** That is the whole compatibility claim of both waves — invariant 8 —
+/// and it is asserted as a comparison rather than as a re-run of
 /// `a_repeated_key_does_not_run_the_handler_twice`.
 ///
 /// `till` is built with no `.keyable()` and no `.records()` call. `depot` names
@@ -1194,15 +1213,40 @@ async fn a_recv_method_is_refused_the_same_way_whatever_the_retention_policy() {
 /// the record, and both must be `Done` when asked. Asserting only one of the two
 /// services would prove nothing the tests above this line do not.
 ///
-/// The unit half — that `Keyable::default()` IS `Any` and `Records::default()` IS
-/// `Memory` — is `idempotency::tests::policy::the_default_policy_keys_every_method`
-/// and `idempotency::tests::records::the_default_records_in_memory`. This is the
-/// half that says the two spellings meet over a real connection.
+/// **There is no unit half, and that is the point.** Neither `Keyable` nor `Records`
+/// has a `Default` impl — deliberately, per RFC-08 §3.2.5, because `Keyable::Any` is
+/// the permissive setting and `Records::Memory` holds a caller's payloads for ten
+/// minutes, and `Allowlist`'s doc makes the argument for not handing either to
+/// somebody who left a field out. So there is no `Keyable::default()` to assert
+/// against; the default is one spelled-out line of `ServiceBuilder::new`, and **this
+/// test is the only thing that holds it.** The nearest unit tests,
+/// `idempotency::tests::policy::the_permissive_policy_keys_every_method` and
+/// `idempotency::tests::records::memory_records_and_replays`, hold that those two
+/// *values* behave as they did before the types existed — not that a service gets
+/// them.
 ///
-/// Made red by `scripts/break-once.sh` replacing `keyable: Keyable::default(),` in
-/// `ServiceBuilder::new` with `keyable: Keyable::None,`. Watched: `panicked at ..,
-/// the unnamed default must record: Remote(Idempotency(NotKeyable { method:
-/// "Reserve" }))`, `0 passed; 1 failed; 28 filtered out`.
+/// Within this file, nothing else compares an unnamed default against the same
+/// values named explicitly, which is what makes this the guard rather than one of
+/// the twenty-six the break below reddens.
+///
+/// Made red by `scripts/break-once.sh` changing the `keyable` field in
+/// `ServiceBuilder::new` from `Keyable::Any` to `Keyable::None` — anchored on that
+/// field together with the `records` line below it, because `keyable: Keyable::Any,`
+/// on its own also appears in this crate's `any(..)` test helper and
+/// `break-once.sh` needs a unique anchor. Watched: `panicked at .., the unnamed
+/// default must record: Remote(Idempotency(NotKeyable { method: "Reserve" }))`.
+///
+/// **That break is very wide** — most of this file fails, since a default of
+/// `Keyable::None` means no service keys anything. Width is expected for a default:
+/// everything rests on it. The paragraph above says what makes *this* test the guard
+/// rather than one of the casualties.
+///
+/// An earlier version of this record was unreplayable and is worth naming as the
+/// defect it was: it quoted the anchor as `keyable: Keyable::default(),`, which has
+/// never been in this tree, and it claimed a unit half asserting
+/// `Keyable::default()` — an API RFC-08 §3.2.5 exists to refuse. It also named two
+/// tests, `the_default_policy_keys_every_method` and `the_default_records_in_memory`,
+/// that do not exist under those names.
 #[tokio::test]
 async fn the_defaults_reproduce_todays_behaviour() {
     let server = local_node().await;
@@ -1417,7 +1461,7 @@ async fn a_second_caller_attaches_to_a_live_key() {
 /// Made red by `scripts/break-once.sh` replacing `Guard::record`'s settled slot
 /// with `Slot::Done(frame.clone())` — a service that records after all, which is
 /// what an attacher would rather meet. Watched: `panicked at .., the attacher waits
-/// for the settle and is then refused: 1`, `0 passed; 1 failed; 31 filtered out`.
+/// for the settle and is then refused: 1`, and no other test in this file reddens.
 /// The `expect_err` is what fires, because the attacher is handed the replayed
 /// reply.
 ///

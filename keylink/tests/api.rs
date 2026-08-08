@@ -186,7 +186,7 @@ async fn the_generated_module_supplies_the_rest_fully_applied() {
 /// ```
 ///
 /// The library itself still compiled under that edit — nothing in-crate calls the
-/// method — which is what makes this annotation the only thing holding the name.
+/// method — which is why this annotation is what holds the name.
 ///
 /// `ServiceBuilder::records` is the same story and was watched the same way, by
 /// replacing `pub fn records(mut self, records: Records) -> Self {` with

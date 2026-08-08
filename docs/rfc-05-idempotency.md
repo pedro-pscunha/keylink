@@ -505,3 +505,33 @@ constructor, and neither fact stops a caller from cloning the `Context` *before*
 deliveries and sharing one marker. See `docs/rfc-07-the-turn-model.md` §1.6, where that
 claim has now been corrected twice. §11.5's conclusion — documented rather than defended,
 because every route to `Progress` is in-process — is what covers this one too.
+
+---
+
+## 13. Revision, 2026-08-07: §12's own literal has moved, by §12's own mechanism
+
+Appended rather than edited in place, per CONTRIBUTING.md — and §12 is the reason this
+is a new section rather than a correction to it. §12 exists because §6 and §11.2 named
+a literal that later moved; **§12 then named one itself**, and it has now moved the
+same way. Editing §12 would delete the record of which value the pin became, which is
+that section's entire content.
+
+**The literals are now `keylink/Probe/d75913b8a4742547` and
+`keylink/Inspect/0572763878b7fb9d`.** §12's `keylink/Probe/d3fe34471921164e` was true
+when written.
+
+The cause is again not in this document, and it is recorded in full in
+`docs/rfc-08-serving-side-keys.md` §4: `IdempotencyRefusal` — this module's own enum —
+gained a seventh variant, `NotKeyable`, so a serving side can refuse a key on a method
+it does not key. `IdempotencyRefusal` sits inside every service's hashed contract by
+the route §12 spells out for `RemoteError`, so the move is wire-visible for every
+service. It was appended after `TooManyRunning`, so no existing variant renumbers and
+an old peer is refused at the handshake rather than misdecoding.
+
+Two notes for a reader of this file. The move was **measured** rather than derived, and
+measured twice: the variant was first written `NotKeyed`, which gave
+`keylink/Probe/68a16a96e45f8da8`, so the hash is sensitive to a variant's *name* and
+not only to what it carries. And this is the first time **both** pins moved in one
+commit, which is the positive form of the evidence the two entries above give in the
+negative: a change to a type every contract shares must move both, and a change to one
+service's own types must move exactly one.

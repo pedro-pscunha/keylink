@@ -3844,3 +3844,35 @@ workers now. Under the fixed code both are deterministic, because the answer is
 settled before the window opens rather than raced against it — which is the
 difference between a guard and a coin toss, and is the argument for fixing the
 *ordering* rather than narrowing the *window*.
+||||||| parent of d67f662 (fix(idempotency): apply the merge gate — 4 Major, 8 Minor, and break records stop carrying counts)
+
+---
+
+## 13. Revision, 2026-08-07: the ALPN literal this document names throughout has moved
+
+A forward pointer, and **not one claim above is edited**. Sections throughout this
+document say `keylink/Probe/d3fe34471921164e` is *"unchanged and green"*, and §7 says
+it beside `keylink/Inspect/7bbd34fa83c9060c`. Deliberately not counted here: how many
+sites there are is a value this section does not control, which is the mistake §9.1 of
+`docs/rfc-08-serving-side-keys.md` exists to record. `rg` gives the current number. Every one of those claims is still true:
+the wave it describes did not move the pin.
+
+**The literals are now `keylink/Probe/d75913b8a4742547` and
+`keylink/Inspect/0572763878b7fb9d`.** Substituting them above would be worse than
+leaving them, because each sentence asserts that *its own* wave moved nothing, and
+writing today's value into it would make it assert something about a value that wave
+never saw. So this section exists purely so that a reader grepping the old literal
+finds out here instead of concluding the tree has drifted.
+
+The cause is in neither this document nor the waves it records: `IdempotencyRefusal`
+gained a `NotKeyable` variant, and it sits inside every service's hashed contract. See
+`docs/rfc-08-serving-side-keys.md` §4, and RFC-05 §13.
+
+The general form is worth keeping, because this will recur: **appending to a drift
+narrative does not find the citations elsewhere in the file.** After any pin move,
+`rg <old-literal>` across the repo, and every surviving hit must be either inside a
+history entry describing that transition or a deliberately-signposted forward pointer
+like this one. Better still, prose should cite the **guard** — here
+`tests/protocol.rs::the_contract_hash_has_not_moved` — rather than its value, and then
+there is nothing to sweep. Where the literal *is* the record, as in RFC-05 §12 and
+RFC-04 §16.13, it cannot be removed and a pointer is the only honest treatment.

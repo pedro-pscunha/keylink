@@ -398,11 +398,21 @@ impl From<IdempotencyRefusal> for RemoteError {
 /// and its doc comment records the decision; taking the word back for the
 /// idempotency side would undo a rename this crate already paid for.
 ///
-/// **Keyable** is what the type actually decides: whether a key may be attached
-/// to a method. `Keyable::Any`, `Keyable::None` — nothing here is ever said of an
-/// actor, so there is nothing to disambiguate. `Keying` and `Idempotent` were the
-/// other two candidates: the first keeps the stem a reader has to disambiguate,
-/// and the second reads as a property of the reply rather than of the method.
+/// **Keyable** is what the type actually decides: whether a key may be attached to a
+/// method.
+///
+/// It keeps the stem, and an earlier version of this comment rejected `Keying` *for*
+/// keeping the stem — which does not distinguish the winner from the loser and was
+/// simply a bad argument. The stem is not the problem and cannot be, since
+/// `IdempotencyKey` is the caller-side name. **What distinguishes them is grammar
+/// and referent.** `Keyed` is an adjective this crate has already bound to a
+/// different noun — a keyed *actor*, addressed by an [`ActorId`](crate::ActorId).
+/// `Keying` is a gerund: it names an activity and says nothing about what is being
+/// selected. `Keyable` is an adjective whose subject is a **method**, which is
+/// exactly what the variants select over — so `Only(&["Reserve"])` reads as *these
+/// methods are keyable*, and no sentence built from it can be read as being about an
+/// actor. `Idempotent` was the third candidate and reads as a property of the reply
+/// rather than of the method.
 ///
 /// # Method names are `CamelCase`
 ///
@@ -423,7 +433,7 @@ impl From<IdempotencyRefusal> for RemoteError {
 /// // A key on `Reserve` is recorded. A key on `Quote` is refused with
 /// // `IdempotencyRefusal::NotKeyable`.
 /// till::service(handler, Allowlist::anyone())
-///     .keyed(Keyable::Only(&["Reserve"]))
+///     .keyable(Keyable::Only(&["Reserve"]))
 ///     .build()
 /// ```
 ///
@@ -451,6 +461,14 @@ pub enum Keyable {
     /// These, and nothing else.
     Only(&'static [&'static str]),
     /// Everything except these.
+    ///
+    /// **A method added later is keyable by default here**, which is the mirror of
+    /// [`Only`](Self::Only)'s typo hazard and worse in kind: the failure is silent
+    /// and it is the exact problem this type exists to prevent, arriving through the
+    /// policy meant to prevent it. A new method's records begin evicting the ones
+    /// that matter and nothing says so. [`Only`](Self::Only) is the safer choice for
+    /// a service that expects to grow, because there the failure of omission is a
+    /// refusal that names the method.
     Except(&'static [&'static str]),
     /// No method accepts one, and no ledger is built.
     None,
@@ -524,8 +542,17 @@ impl Keyable {
 /// **per-record ceiling** (`frame.len() > limits.bytes`) and `evict` uses the same
 /// value as the **total pool across every peer** (`inner.bytes > limits.bytes`). So
 /// the record pool is 1 MiB *in total*, and what [`None`](Self::None) saves is that
-/// one megabyte once per process — roughly what its own tombstones cost, since
-/// [`MAX_TOMBSTONES`]'s doc puts that pool *"on the order of a megabyte"* too.
+/// one megabyte once per process, and it does not get that megabyte back for free:
+/// the same keys still occupy the tombstone pool, which [`MAX_TOMBSTONES`] bounds
+/// separately.
+///
+/// **No figure for the comparison, deliberately.** An earlier version said the saving
+/// was "roughly what its own tombstones cost", resting on [`MAX_TOMBSTONES`]'s own
+/// doc calling that pool *"on the order of a megabyte"* — a number in another
+/// comment, measured by nothing, that this comment cannot keep true. The sentence
+/// only has to establish that memory is **not** the motive, and the *direction* does
+/// that: what is saved is one bounded pool while another bounded pool keeps its
+/// entries.
 ///
 /// A feature justified on that saving would not pay for itself. Justified on
 /// retention it pays immediately, because the thing it removes is not a quantity of
@@ -538,19 +565,25 @@ impl Keyable {
 /// `README.md`'s limit 5 already tells it to do for a method whose reply cannot be
 /// recorded.
 ///
-/// **And it shortens the at-most-once window by about 11%, which is not nothing.**
-/// Under [`Memory`](Self::Memory) a settled key occupies a slot in the record pool
-/// and *then* becomes a tombstone, so its total life is bounded by [`MAX_RECORDS`]
-/// plus [`MAX_TOMBSTONES`] of churn. Under [`None`](Self::None) it goes straight to
-/// the tombstone pool and forgoes the record pool's grace entirely:
-/// 8192 / (8192 + 1024) — **about 89% of the window**, so roughly an 11% cut. It
-/// lands on the one degradation `README.md`'s limit 4 says a caller **cannot
-/// detect**, because past [`MAX_TOMBSTONES`] a key reads [`KeyState::Fresh`] and
-/// runs again. Small, and stated rather than sold as free.
+/// **And it shortens the at-most-once window, which is not nothing.** Under
+/// [`Memory`](Self::Memory) a settled key occupies a slot in the record pool and
+/// *then* becomes a tombstone, so its total life is bounded by [`MAX_RECORDS`] plus
+/// [`MAX_TOMBSTONES`] of churn. Under [`None`](Self::None) it goes straight to the
+/// tombstone pool and forgoes the record pool's grace entirely — so the window is
+/// [`MAX_TOMBSTONES`] of churn instead of [`MAX_TOMBSTONES`] **plus**
+/// [`MAX_RECORDS`].
 ///
-/// Held by `records_none_shortens_the_at_most_once_window`, which is also why the
-/// claim above is a measured ratio and not the phrase "does not affect the key
-/// state" that stood here first and was false.
+/// **The operands rather than the quotient, deliberately.** Both are `pub const` and
+/// either may move; a percentage written here would rot silently the moment one did,
+/// and the reader can divide. It lands on the one degradation `README.md`'s limit 4
+/// says a caller **cannot detect**, because past [`MAX_TOMBSTONES`] a key reads
+/// [`KeyState::Fresh`] and runs again. Stated rather than sold as free.
+///
+/// `records_none_shortens_the_at_most_once_window` holds the **direction** — that the
+/// window is strictly shorter — and not the ratio, because it sets its own
+/// [`MAX_RECORDS`]/[`MAX_TOMBSTONES`] to keep the test fast. The direction is the
+/// claim worth guarding, and it is what the phrase "does not affect the key state"
+/// that stood here first got wrong.
 ///
 /// # Not `Copy`, on purpose
 ///
@@ -1424,20 +1457,25 @@ mod tests {
         /// exists to refuse: `Only` that accepted everything and `Except` that
         /// refused everything are each half-green under a one-sided test.
         ///
-        /// Made red by `scripts/break-once.sh` replacing
-        /// `Self::Only(named) => named.contains(&method),` with the same line plus
-        /// `|| true`. Watched: `2 passed; 3 failed` of this module's five —
+        /// Made red by `scripts/break-once.sh` making `Keyable::accepts`' `Only`
+        /// arm answer `true` unconditionally — its `contains` call ORed with `true`.
+        /// Watched: `2 passed; 3 failed` of this module's five, the three being
         /// `every_variant_accepts_and_refuses_what_it_says`,
         /// `an_empty_only_accepts_nothing_and_still_needs_a_ledger` and
-        /// `a_snake_case_name_matches_nothing`. Three tests catching one edit is
-        /// the intended overlap: each states a different consequence of `Only`
-        /// meaning what it says.
+        /// `a_snake_case_name_matches_nothing`. Three tests catching one edit is the
+        /// intended overlap: each states a different consequence of `Only` meaning
+        /// what it says. Over the wire the same edit reddens
+        /// `a_key_on_a_method_the_service_does_not_key_is_refused`,
+        /// `a_keyed_actor_service_applies_the_same_policy` and
+        /// `a_refused_key_never_reaches_the_ledger`.
         ///
-        /// Made red a second way, on the other end of the sweep, by replacing
-        /// `Self::Any => true,` with `Self::Any => false,`. Watched: `assertion
-        /// failed: Keyable::Any.accepts("Reserve")`, `3 passed; 2 failed`,
-        /// the second being
-        /// `the_default_policy_keys_every_method`.
+        /// Made red a second way, on the other end of the sweep, by making the `Any`
+        /// arm answer `false`. Watched: `assertion failed:
+        /// Keyable::Any.accepts("Reserve")`, `3 passed; 2 failed`, the second being
+        /// `the_permissive_policy_keys_every_method`. Whole-lib it also reddens
+        /// `rpc::tests::an_attacher_over_the_cap_is_refused_before_it_parks` and
+        /// `rpc::tests::a_parked_attacher_keeps_its_place_for_the_whole_wait`, which
+        /// build their `Keys` from `Keyable::Any`.
         #[test]
         fn every_variant_accepts_and_refuses_what_it_says() {
             assert!(Keyable::Any.accepts("Reserve"));
@@ -1454,10 +1492,12 @@ mod tests {
         /// second consequence — no ledger — and the two halves of `None` belong
         /// beside each other.
         ///
-        /// Made red by `scripts/break-once.sh` replacing `Self::None => false,`
-        /// with `Self::None => true,`. Watched: `assertion failed:
-        /// !Keyable::None.accepts("Reserve")`, `4 passed; 1 failed`, and no other test in the crate noticed — which is
-        /// why this one exists.
+        /// Made red by `scripts/break-once.sh` making `Keyable::accepts`' `None` arm
+        /// answer `true`. Watched: `assertion failed:
+        /// !Keyable::None.accepts("Reserve")`, `4 passed; 1 failed` in this module.
+        /// No other test in this module notices, which is why this one exists — and
+        /// the claim stops at this module on purpose, because a count or a
+        /// "the only one" reaching further is a value this file does not control.
         #[test]
         fn keyed_none_accepts_no_method() {
             assert!(!Keyable::None.accepts("Reserve"));
@@ -1488,9 +1528,10 @@ mod tests {
         /// over a real connection by
         /// `tests/idempotency.rs::the_defaults_reproduce_todays_behaviour`.
         ///
-        /// Made red by `scripts/break-once.sh` replacing `Self::Any => true,` with
-        /// `Self::Any => false,`. Watched: `assertion failed:
-        /// Keyable::Any.accepts("Reserve")`, `3 passed; 2 failed`.
+        /// Made red by `scripts/break-once.sh` making `Keyable::accepts`' `Any` arm
+        /// answer `false`. Watched: `assertion failed:
+        /// Keyable::Any.accepts("Reserve")`, `3 passed; 2 failed` in this module.
+        /// See the sweep above for what else that edit reaches.
         #[test]
         fn the_permissive_policy_keys_every_method() {
             assert!(Keyable::Any.accepts("Reserve"));
@@ -1524,13 +1565,20 @@ mod tests {
         /// alone describes a different feature: holding neither is a ledger that
         /// does nothing, and holding both is `Records::Memory`.
         ///
-        /// Made red by `scripts/break-once.sh` replacing
-        /// `Guard::record`'s `recordable` flag to
-        /// ignore the retention switch — its `matches!` on `self.ledger.records`
-        /// replaced by `true`. Watched:
+        /// Made red by `scripts/break-once.sh` forcing `Guard::record`'s
+        /// `recordable` flag to ignore the retention switch — its `matches!` on
+        /// `self.ledger.records` replaced by `true`. Watched:
         /// `panicked at .., expected an idempotency refusal, got
         /// Replay(b"\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07")`,
         /// from this module's `refusal(..)` helper.
+        ///
+        /// That one edit also reddens
+        /// `a_retention_refusal_is_told_apart_from_an_eviction`,
+        /// `a_retention_settle_is_a_tombstone_not_a_record`,
+        /// `a_retention_settle_reports_the_same_state_it_refuses_with` and
+        /// `records_none_shortens_the_at_most_once_window`. Five tests for one edit
+        /// is the intended overlap — each states a different consequence of the
+        /// switch being honoured.
         #[test]
         fn records_none_settles_the_key_and_holds_no_reply() {
             let ledger = recordless();
@@ -1588,11 +1636,12 @@ mod tests {
         /// than [`MAX_RECORDS`] — the right pool, because a tombstone is what keeps
         /// the work from running twice and has to outlive the reply it never had.
         ///
-        /// Made red by `scripts/break-once.sh` replacing
-        /// `Guard::record`'s `recordable` flag to
-        /// ignore the retention switch, its `matches!` replaced by `true`. Watched: `assertion `left == right` failed: a key
-        /// with no reply belongs in the tombstone pool, not the record pool`,
-        /// `left: 1`, `right: 0`.
+        /// Made red by `scripts/break-once.sh` forcing `Guard::record`'s
+        /// `recordable` flag to ignore the retention switch, its `matches!` replaced
+        /// by `true`. Watched: `assertion `left == right` failed: a key with no reply
+        /// belongs in the tombstone pool, not the record pool`, `left: 1`,
+        /// `right: 0`. See `records_none_settles_the_key_and_holds_no_reply` for the
+        /// four other tests that edit reaches.
         #[test]
         fn a_retention_settle_is_a_tombstone_not_a_record() {
             let ledger = recordless();
@@ -1626,10 +1675,18 @@ mod tests {
         /// `Guard::record`'s `recordable` flag to
         /// `false` — its `matches!` replaced by `false` — which makes both ledgers
         /// recordless. Watched: `panicked at .., under Memory the oldest key must
-        /// still be remembered`, `0 passed; 1 failed; 145 filtered out`. It is the
-        /// FIRST assertion that fires, not the second, and that is the right way
-        /// round: with both ledgers recordless the two arms agree, and the arm that
-        /// has to notice is the one claiming the longer window still exists.
+        /// still be remembered`. It is the FIRST assertion that fires, not the
+        /// second, and that is the right way round: with both ledgers recordless the
+        /// two arms agree, and the arm that has to notice is the one claiming the
+        /// longer window still exists.
+        ///
+        /// **That break is deliberately wide.** Forcing every ledger recordless
+        /// reddens thirteen tests, across `mod bounds`, `mod claim`, `mod state` and
+        /// `mod ttl`, because every replay assertion in the crate rests on a
+        /// recording ledger; in this module it also takes `memory_records_and_replays`
+        /// and `a_retention_refusal_is_told_apart_from_an_eviction`. Width is the
+        /// finding rather than a weakness — the switch is the only thing between
+        /// `Records::Memory` and a ledger that answers nothing.
         #[test]
         fn records_none_shortens_the_at_most_once_window() {
             let bounds = Limits {
@@ -1689,7 +1746,10 @@ mod tests {
         /// Made red by `scripts/break-once.sh` replacing
         /// `if self.progress.as_ref().map(Progress::reached) == Some(Reached::NotDispatched) {`
         /// with `if false {`. Watched: `panicked at .., a key nothing ran under must
-        /// still be claimable`, `0 passed; 1 failed; 144 filtered out`.
+        /// still be claimable`. It also reddens
+        /// `claim::a_guard_dropped_with_nothing_dispatched_leaves_the_key_claimable`,
+        /// which is the test that owns that rule; this one asks it of a ledger that
+        /// records no replies.
         #[test]
         fn records_none_changes_nothing_about_who_settles() {
             let ledger = recordless();

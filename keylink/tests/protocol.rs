@@ -1052,11 +1052,18 @@ async fn a_service_serves_as_a_singleton_and_as_an_actor_system_on_one_node() {
 ///
 /// **The alternative was to reuse an existing variant, and it was rejected for
 /// being false.** `Malformed` says the key is empty or oversized; the key here is
-/// well formed and the *method* is what does not take one. `Unrecordable` says the
-/// reply carried a payload. `Forgotten` says it ran and the reply is gone —
-/// nothing ran. A refusal that misdescribes itself sends the caller to fix the
-/// wrong thing, and the hash exists precisely so that the honest version can be
-/// paid for once.
+/// well formed and the *method* is what does not take one. `Forgotten` says it ran
+/// and the reply is gone; `Unrecordable` says it ran and the reply is not something
+/// this ledger holds. **Nothing ran** — which is what rules both of them out, and it
+/// is the one fact that does not depend on how either is worded.
+///
+/// That last clause is deliberate. An earlier version of this paragraph rejected
+/// `Unrecordable` on the ground that it *"says the reply carried a payload"*, which
+/// was true when written and stopped being true later in this same branch: the
+/// retention setting settles `Unrecordable` too, so its wording no longer names a
+/// payload. The **conclusion** is untouched, because it never rested on the wording.
+/// A refusal that misdescribes itself sends the caller to fix the wrong thing, and
+/// the hash exists precisely so that the honest version can be paid for once.
 ///
 /// The other alternative was a fifth `RemoteError::Failed` prefix, which keeps the
 /// hash still. Rejected: the four prefixes are load-bearing as a `starts_with`
@@ -1308,9 +1315,17 @@ mod fed {
 /// Both ALPNs, keyed and singleton, for the reason the twin gives.
 ///
 /// The sensitivity this cannot prove itself is proved by the twin above, which was
-/// made red by changing an argument type. The pinned literal
-/// `keylink/Probe/d3fe34471921164e` in `the_contract_hash_has_not_moved` is the
-/// other half: it is unchanged by this wave.
+/// made red by changing an argument type. [`the_contract_hash_has_not_moved`] is the
+/// other half: **the feed wave did not move its pin**, whatever that pin's value is
+/// at the time you read this.
+///
+/// Named rather than quoted, on purpose. This sentence used to cite the literal, and
+/// the literal moved — so the citation pointed at a value that was no longer a pin,
+/// and a reader grepping for it found nothing. The claim here was never about the
+/// value: it is that *this* wave left that test alone, which is a fact about the test.
+/// Note also that "unchanged by this wave" means the **feed** wave and not the most
+/// recent one; a later wave did move that pin, deliberately, and its own narrative
+/// entry records why.
 #[test]
 fn adding_a_feed_to_a_service_does_not_move_the_contract_hash() {
     assert_eq!(
