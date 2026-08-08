@@ -40,6 +40,7 @@ description = "Everything CI runs, in CI's order. Cheapest failures first"
 # target directory and the same memory.
 run = [
     { task = "framing" },
+    { task = "anchors" },
     { task = "fmt-check" },
     { task = "lint" },
     { task = "features" },

@@ -126,6 +126,15 @@ Nothing has ever run in a browser.
 
 - A guard you have not watched fail is not a guard. Break it, see the red,
   restore it. A check that cannot fail looks exactly like a check that passes.
+- Record the break beside the guard, and **`mise run anchors` decides how.** If the
+  record quotes the literal `break-once.sh` searches for, that literal must resolve
+  exactly once in the file the break edits, and the record needs an entry in
+  `.mise/tasks/anchors` — without one it is unchecked. Quoting cannot work at all when
+  the record lives in the file being broken, and it rots by itself when the anchor's
+  uniqueness depends on its neighbours, as a `pub use` list item's does. Describe the
+  search edit in those two cases. **Quote the replacement either way**: the harness
+  never searches it. Three records reached `main` unable to find their own anchors,
+  and none of them was red, which is why this is a gate.
 - Do not assert on wall-clock time. Tests share a machine with a compiler and a
   test runner, and a load spike is not a bug in your code. Put the
   clock-dependent half in a unit test with `tokio::time::pause`, and leave the

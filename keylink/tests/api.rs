@@ -153,10 +153,9 @@ async fn the_generated_module_supplies_the_rest_fully_applied() {
 ///
 /// The pairing of the two positions is the same discipline as the test above.
 ///
-/// Made red by `scripts/break-once.sh` replacing
-/// `Idempotency, IdempotencyRefusal, KeyState, Keyable, MAX_ATTACH` in
-/// `keylink/src/lib.rs` with the same line minus ` Keyable,`. Watched: this does not
-/// run, it does not compile —
+/// Made red by `scripts/break-once.sh` dropping `Keyable` from the
+/// `pub use idempotency::{..}` list in `keylink/src/lib.rs`, leaving the rest of the
+/// list as it stands. Watched: this does not run, it does not compile —
 ///
 /// ```text
 /// error[E0432]: unresolved import `keylink::Keyable`
@@ -165,6 +164,25 @@ async fn the_generated_module_supplies_the_rest_fully_applied() {
 /// ```
 ///
 /// A compile error is the only red a compile-only test has.
+///
+/// **Described rather than quoted, and this record is where a third rot mode was
+/// found.** It used to anchor on the literal
+/// `Idempotency, IdempotencyRefusal, KeyState, Keyable, MAX_ATTACH`. A later wave
+/// inserted `Records,` between `Keyable,` and `MAX_ATTACH,`, so the anchor went to
+/// **count 0** and `break-once.sh` aborted with `is not in` — the recorded run could
+/// not be reproduced, and nothing was red.
+///
+/// It defeats both of the rules that were settled before it. The record and its
+/// target are in **different files**, so the same-file rule permits the quote. And
+/// nothing rewrapped, so the formatter rule does not reach it either. What moved was
+/// a **sibling's presence in an ordered list**.
+///
+/// The distinction that does reach it: **is the anchor's uniqueness a property of the
+/// line, or of its neighbours?** A `pub use` list item's text is a property of its
+/// neighbours, and a `pub use` list is the most-added-to construct in a crate — so
+/// re-quoting buys only until the next export lands, and it would put that chore on
+/// whoever adds it. `mise run anchors` is what catches the modes that *are* worth
+/// quoting; this is the mode where quoting is not worth it at all.
 ///
 /// **That break was watched twice, and the first run is the reason `rpc.rs` imports
 /// `Keyable` from `crate::idempotency`.** With `rpc.rs` reaching for

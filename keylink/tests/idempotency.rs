@@ -439,9 +439,15 @@ async fn a_refused_key_never_reaches_the_ledger() {
 /// four; the fifth,
 /// `an_attacher_on_a_recordless_service_waits_and_is_told_it_ran`, was added to this
 /// same branch after the record was written — which is precisely why a record must
-/// name the tests it reddens rather than count them. The five are —
+/// name the tests it reddens rather than count them.
+///
+/// **And the first version of this paragraph then said five and listed four**,
+/// omitting the very test it had just named as the fifth. The same error one level
+/// down: a list presented as complete. So the count goes and the list stays —
 /// `a_call_without_a_key_runs_every_time`, `a_refusal_is_recorded_and_replayed`,
-/// `a_second_caller_attaches_to_a_live_key` and this test. The unkeyed path is
+/// `a_second_caller_attaches_to_a_live_key`,
+/// `an_attacher_on_a_recordless_service_waits_and_is_told_it_ran`, and this test.
+/// The unkeyed path is
 /// load-bearing under most of the file; what this test adds is the one service the
 /// others never build, the one with no ledger at all, where a call reaching for a
 /// ledger would be reaching for `None`.
@@ -503,9 +509,11 @@ async fn a_key_state_query_on_a_service_that_keys_nothing_is_fresh() {
 /// real method name rather than a constant. That is the whole of why Wave 1 needed
 /// no change to `macros.rs`.
 ///
-/// Made red by `scripts/break-once.sh` replacing this test's own
-/// `.keyable(Keyable::Only(&["Reserve"]))` with `.keyable(Keyable::Any)`. That is
-/// the test-literal break on purpose: a keyed service to which the policy was never
+/// Made red by `scripts/break-once.sh` neutralising this test's own policy — the
+/// `.keyable(..)` call in its fixture above, set to `Keyable::Any`. Described rather
+/// than quoted because the anchor would be in this same file and `break-once.sh`
+/// would count it twice; the replacement, `Keyable::Any`, is quoted, which is always
+/// safe. That is the test-literal break on purpose: a keyed service to which the policy was never
 /// applied behaves *identically* to one configured `Keyable::Any`, so neutralising
 /// the policy here reproduces exactly the defect this test exists to catch.
 /// Watched: `panicked at .., `Slow` is not in

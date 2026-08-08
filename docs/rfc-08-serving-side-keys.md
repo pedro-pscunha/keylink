@@ -599,11 +599,13 @@ So, for a break record:
 - **Name the tests that go red**, which is also a fact about your break and is
   checkable by re-running it. Where a break is wide enough that naming every test is
   noise, say it is wide, say what makes it wide, and name the ones that matter.
-- **Do not claim to have named them all.** *"A, B and C go red"* stays true when
-  somebody adds test D; *"A, B and C are the only ones"* does not. Naming is an
-  existence claim and survives; exhaustiveness is a universal one over a set the
-  record does not own. Several records in this wave were written the second way and
-  corrected to the first.
+- **Do not claim to have named them all.** *"A, B and C go red" is an existence
+  claim and survives somebody adding test D. "A, B and C are the only ones" is a
+  universal over a set the record does not own, and does not.* Several records in
+  this wave were written the second way and corrected to the first — and one of them
+  then said *five* and listed *four*, omitting the very test it had just named as the
+  fifth. That is the same error one level down: a list presented as complete. The
+  count goes; the list stays.
 - **Module- and file-scoped claims stay**, because who adds a test *there* has to
   touch that file. The four counts in `mod policy` are of that kind, and so is
   `tests/idempotency.rs`'s "within this file, three tests and no more".
@@ -614,7 +616,7 @@ file's call sites — and a sentence pricing the retention saving against
 `MAX_TOMBSTONES`' own *"on the order of a megabyte"*, which is a figure in a third
 comment that nothing measures.
 
-### 9.2 And a break record must not quote its own anchor
+### 9.2 A quoted anchor rots three ways, and one of them is now a gate
 
 `break-once.sh` anchors on a literal that must be **unique in the file it edits**, so
 a record that quotes the line it breaks makes that file non-unique and the run aborts
@@ -639,10 +641,65 @@ over-wide reading of this rule left a reviewer hand-constructing working Rust to
 reproduce a record that could simply have shown it. Describe what you searched for;
 quote what you put in its place.
 
+#### The third mode: a positional anchor
+
+A mechanical sweep after this wave merged found a rot mode neither rule above
+reaches. `tests/api.rs` anchored on a slice of `lib.rs`'s `pub use idempotency::{..}`
+list. A later wave inserted one more export into the middle of that slice, taking the
+anchor to **count 0**. The record and its target are in different files, so the
+same-file rule permits the quote; nothing rewrapped, so the formatter rule says
+nothing. What moved was **a sibling's presence in an ordered list**.
+
+The question that reaches all three: **is the anchor's uniqueness a property of the
+line, or of its neighbours?** A `pub use` list item's text is a property of its
+neighbours, and a `pub use` list is the most-added-to construct in a crate — so
+re-quoting buys only until the next export lands, and it would put that chore on
+whoever adds it. Describe those.
+
+#### `mise run anchors`, because reading does not find these
+
+Three records on `main` quoted anchors that no longer resolved and **not one was red**.
+Two of them had already been through a review that checked the evidence beside the
+anchor and not the anchor itself. So the check is a gate now, in `.mise/tasks/anchors`,
+first in `gate` after `framing` because it only reads files: for every record that
+quotes a search literal, that literal must occur **exactly once** in its stated
+target, which is `break-once.sh`'s own precondition and nothing more.
+
+Its list is written out by hand, and that is deliberate for the reason `local.rs`'s
+`no_failure_prefix_is_a_prefix_of_another` spells out its four prefixes by hand: a
+heuristic that parsed prose for *"replacing `X` with `Y`"* and missed a record would
+check nothing while reporting success. **The honest limitation is that a record added
+without an entry there is unchecked**, which is the cost of the hand-maintained list.
+
+It earned itself immediately. Applying the three known findings, this document's author
+fixed the wrong record in `idempotency.rs` — a neighbouring one whose search edit was
+already described — and the gate reddened on the one that was actually stale.
+
+#### The trade this makes, stated rather than left implicit
+
+**A described record is rot-proof and cannot be driven by a script.**
+`scripts/replay-fate-breaks.sh` replays a break and asserts the record's watched
+substring appears in the run, and to do that it needs a `from`/`to` pair — quoted text.
+Every record converted to prose therefore leaves the replayable set, and what stays
+checkable about it is the assertion substring, by a human.
+
+So it is decided per record, and the two axes are independent:
+
+- **Same-file records: describe, always.** Quoting cannot work there at all, so
+  replayability was never on offer and rot-immunity is free.
+- **Positional anchors: describe.** The alternative is a gate that reddens for every
+  unrelated export and trains people to re-quote mechanically, which is worse than no
+  gate.
+- **Cross-file, line-local anchors: keep the quote.** The fragility is real and it is
+  now *caught* rather than silent, which is exactly what makes it affordable — a
+  quoted anchor is worth its fragility precisely because `mise run anchors` fails
+  loudly when it rots. That is the resolution of the tension: the gate is what buys
+  the quotes.
+
 And when auditing records, check that the **anchor still exists**, not only the
-evidence beside it. Both unreplayable records on this branch were found by re-running
-the break rather than by reading it, and one of them had already been reviewed for its
-counts while its anchor had been dead for some time.
+evidence beside it. Both unreplayable records found during this wave were found by
+re-running the break rather than by reading it, and one had already been reviewed for
+its counts while its anchor had been dead for some time.
 
 ---
 
