@@ -38,15 +38,26 @@ fi
 # not record whether a commit was verified, so "was `HEAD` already gated?" is not
 # a question this hook can ask — only "does the commit I am about to write touch
 # code the gate cares about?". Re-running is the answer that cannot be wrong in
-# the dangerous direction. It cost ~0.5 s on a warm tree, which an amend always
-# has, because the commit it is amending just built one.
+# the dangerous direction. It is cheap on a warm tree, which an amend always has,
+# because the commit it is amending just built one.
 #
-# THAT FIGURE WAS MEASURED AT A LIST LENGTH THAT NO LONGER EXISTS, so treat it as
-# an order of magnitude and not a number. It was taken when `mise run pre-commit`
-# was three tasks; `anchors` made it four. The two non-cargo tasks measure 0.20 s
-# (`framing`) and 0.08 s (`anchors`) on this machine, so the rounded claim
-# survives — but the end-to-end figure has not been re-measured, because
-# re-measuring it runs clippy. Re-measure before quoting it.
+# NO SECOND-COUNT IS QUOTED HERE ANY MORE, ON PURPOSE, and the reason is worth more
+# than the number was. This comment used to claim `~0.5 s`, measured when `mise run
+# pre-commit` was three tasks. It is five now, and the two additions are both
+# non-trivial Python, so the old figure had stopped being merely stale.
+#
+# The first attempt to replace it was withdrawn, which is the useful part: the same
+# three non-cargo tasks timed **0.04 s and 0.27 s for `framing`** across two
+# sessions minutes apart, and `anchors-selftest` ranged 0.21–0.44 s — a spread
+# driven by filesystem warmth, by whether `/usr/bin/time` forks a shell, and by
+# another compiler running in a sibling worktree. **The variance was larger than the
+# quantity being claimed**, so any single number written here is a coin flip
+# presented as evidence.
+#
+# So this comment states the shape and owns no figure: the hook is cheap on a warm
+# tree, and an amend always has one. A wall-clock figure needs a stated method and a
+# quiet machine, and it belongs wherever that measurement is recorded — not inline,
+# where it rots invisibly and is read as fact.
 #
 # There is NO signal for an amend in git's environment, and this was verified
 # rather than assumed: every `GIT_*` variable is byte-identical between an
@@ -141,14 +152,28 @@ fi
 # contributor without it is still gated rather than silently ungated.
 #
 # It said "the same two commands" while `pre-commit` already ran THREE tasks —
-# `framing` was never inlined — and then `anchors` made it four. Naming the list is
-# what keeps that honest, so: `framing`, `anchors`, `fmt-check`, `lint-fast`.
+# `framing` was never inlined — then `anchors` made it four and `anchors-selftest`
+# made it five. So, matching `mise.toml`'s `pre-commit` in its order:
+# `framing`, `anchors`, `anchors-selftest`, `fmt-check`, `lint-fast`.
 #
-# The first two are scripts, so they are invoked rather than reimplemented; a
-# second copy of their logic is a second thing to drift. Both read their own root
-# and run standalone without `mise` in the environment.
+# The first three are scripts, so they are invoked rather than reimplemented; a
+# second copy of their logic is a second thing to drift. All three read their own
+# root and run standalone without `mise` in the environment.
+#
+# THIS LIST IS HAND-MAINTAINED AND WILL DRIFT AGAIN. `mise.toml` is the authority;
+# this is a copy, and it has now been one task short twice. Whoever adds a sixth
+# task to `pre-commit` has to add it here too, and nothing enforces that.
+#
+# Not resolved the way `pre-push` resolves it, and the difference is deliberate.
+# That hook now REFUSES without `mise`, because it claims to be the whole gate and
+# GitHub Actions is disabled, so a subset there is a false green. This hook claims
+# the opposite: its header says it runs formatting and a library-scoped clippy and
+# NOTHING else, and that the expensive checks belong to `pre-push`. A hook that is
+# avowedly a subset cannot be made a false green by being a subset — it can only be
+# made one by covering less than the list it names, which is what this fixes.
 echo "note: 'mise' is not installed - running the same checks directly" >&2
 .mise/tasks/framing
 .mise/tasks/anchors
+.mise/tasks/anchors-selftest
 cargo fmt --all -- --check
 cargo clippy -p keylink --lib --all-features -- -D warnings

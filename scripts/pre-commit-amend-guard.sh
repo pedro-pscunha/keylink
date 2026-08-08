@@ -21,21 +21,31 @@
 # A guard that only proves "the gate ran" is satisfied by a hook that always runs
 # it, which would delete the fast path this hook exists to have. So the pair:
 #
+# EACH RECORD BELOW NAMES THE ROWS IT REDDENS AND COUNTS NOTHING, and that is a
+# repair rather than a style. Records 1 and 2 used to say "the other three" and "the
+# two negatives". Both were true at five `check` calls and both went stale the
+# moment `a8a7343` took it to eight — silently, because a break record is read and
+# found plausible rather than executed. **The footer one screen below had exactly
+# this defect and was fixed by deriving the number; the fix for prose is to name
+# the rows, because a row name survives a new scenario and a count cannot.**
+#
 # 1. **Revert the fix.** In `.githooks/pre-commit`, replace
 #
 #        amend_base="$(git rev-parse --verify --quiet HEAD~1 || git hash-object -t tree /dev/null)"
 #
-#    with `amend_base=""`. Watched — scenario 1 alone, and the other three stay
-#    green:
+#    with `amend_base=""`. Watched: it reddens the amend-of-an-ungated-Rust-commit
+#    row, and that row only —
 #
 #        FAIL an amend of an ungated Rust commit RE-RUNS the gate — the gate did NOT run
 #
 # 2. **Make it gate everything.** Replace the `if ! printf '%s\n' "$linted" |
-#    grep -qE ...; then` line with `if false; then`. Watched — the two negatives,
-#    while 1 and 2 stay green:
+#    grep -qE ...; then` line with `if false; then`. Watched: it reddens **every row
+#    that expects a skip** — the two ordinary negatives AND the reword, which is the
+#    one this record omitted while the reword scenario existed:
 #
 #        FAIL an ordinary commit staging no linted file skips the gate — the gate ran and should not have
 #        FAIL an amend of a commit with no linted file skips the gate — the gate ran and should not have
+#        FAIL a rebase -i reword of a Rust commit does NOT run the gate (a replay is not authoring) — the gate ran and should not have
 #
 # 3. **Break the rebase arm, either way.** In `.githooks/pre-commit`, either drop
 #    the guard from the detector by replacing
