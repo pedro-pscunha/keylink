@@ -69,17 +69,19 @@
 //! # A claim no probe here can reach, and why its stand-in is a test
 //!
 //! **A cycle of blocking sends.** An `ask` awaiting an actor whose handler awaits
-//! the first one back deadlocks, and nothing in this file can refuse it: both
-//! handles have the same type, and `macros.rs` already gives the reason — "no
-//! type can tell one actor's handle from another's". A cycle is a property of
-//! *which* handle a handler calls at run time, so there is no name to shadow and
-//! no impl to overlap.
+//! the first one back deadlocks, and nothing in this file can refuse it: a cycle
+//! is a property of *which* handle a handler calls at run time, so there is no
+//! name to shadow and no impl to overlap. `macros.rs` puts it as "no type can
+//! tell one actor's handle from another's" — true of a ring of one service, and
+//! a ring of two *different* services has two different `Handle` types that no
+//! probe could refuse either.
 //!
-//! It is also the one claim here with no `rg` stand-in, and that is the
-//! difference from the `unbounded_channel` note further down. That one is a
-//! token, so its absence is greppable; a cycle is built out of ordinary sends
-//! that are each correct alone, so no pattern matches the defect rather than the
-//! mechanism. A grep can only bound the search:
+//! The `unbounded_channel` note further down is the **only** claim in this file
+//! with an `rg` stand-in, and it earns one by being a token: its absence is
+//! greppable. Every other claim-no-probe-can-reach here stands on prose or on a
+//! named test, as §"A third half this file cannot reach" does. A cycle is built
+//! out of ordinary sends that are each correct alone, so no pattern matches the
+//! defect rather than the mechanism, and a grep can only bound the search:
 //! `rg -c 'self\.mail\.send' keylink/src/local.rs` reports `1` and exits 0,
 //! because every local mailbox message funnels through `LocalActor::send` — and
 //! that count says nothing about whether two trips through it form a loop, which

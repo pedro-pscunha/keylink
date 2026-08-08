@@ -2782,19 +2782,24 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     /// reserved. Use [`ask_catching`](Self::ask_catching) on a served path, and
     /// on any path put the bound inside the method rather than around the call.
     ///
-    /// # Nothing bounds the answer, and `abort` is the only recovery
+    /// # Nothing bounds the answer on **this** path, and `abort` is the only
+    /// recovery
     ///
-    /// A turn that never returns leaves this call waiting for ever. The two ways
-    /// that happens are documented where they are built — a self-call, on the
-    /// generated `Handle`, and a ring of two or more actors, in the same section
-    /// — and neither is detectable by a type.
+    /// A turn that never returns leaves this call waiting for ever. The two
+    /// **cycle** shapes are documented where they are built — a self-call, on the
+    /// generated `Handle`, and a ring of two or more actors, in the section below
+    /// that one — and neither is detectable by a type. A turn can also simply
+    /// await something that never fires, which is neither shape and is the
+    /// commonest of the three.
     ///
-    /// There is no backstop on this path. Both bounds the crate has are
-    /// [`Middleware`](crate::Middleware), so they reach a **served** dispatch and
-    /// not a local call; both bound the wait for a mailbox *permit* rather than
-    /// for the answer; and a local `ask` carries no [`Caller`](crate::Caller), so
-    /// it has no queueing budget to spend in the first place. So a local caller
-    /// behind a wedged turn gets no timeout and no refusal.
+    /// Both dispatch paths bound the wait for a mailbox *permit*, and neither
+    /// bounds the wait for the *answer*. The crate's answer-bound is
+    /// [`Timeout`](crate::Timeout) — and it is a
+    /// [`Middleware`](crate::Middleware), so it reaches a served dispatch and not
+    /// a local call. A local `ask` carries
+    /// [`Caller::Local`](crate::Caller::Local), which has no peer and therefore
+    /// no queueing budget to spend in the first place. So a local caller behind a
+    /// wedged turn gets no timeout and no refusal.
     ///
     /// Neither liveness seam reveals it either, which is the part worth knowing.
     /// [`is_running`](Self::is_running) reads the mailbox, and a wedged actor's
@@ -2802,15 +2807,15 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     /// resolves, because only the loop fills it and the loop is inside the turn.
     /// Asking `ended` *why* is the usual companion to a lost call, and it is the
     /// one thing that does not work for the one loss with no reason. Supervision
-    /// does not reach it: a supervised actor decides to restart when a turn
-    /// **ends**, and this turn does not end.
+    /// does not reach it: a supervised actor decides to restart when its **loop**
+    /// ends, and this loop does not end.
     ///
     /// [`abort`](Self::abort) is the recovery and it is the only one. It destroys
     /// the state — that is the price, and it is why it is a separate method — and
     /// it is also what makes `ended` resolve, as
     /// [`Ended::Vanished`](crate::Ended), since an aborted task filled nothing.
-    /// In a ring it frees the *other* actors and destroys only the one it names.
-    /// Guarded by `tests/cycles.rs`.
+    /// In a two-actor ring it frees the other actor and destroys only the one it
+    /// names. Guarded at N = 2 by `tests/cycles.rs`.
     ///
     /// # Panics
     ///

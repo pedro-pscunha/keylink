@@ -1774,13 +1774,15 @@ macro_rules! __keylink_service {
             /// shape a reader is most likely to build.
             ///
             /// It is **worse than the self-`tell` case above, not milder.** Both
-            /// sends succeed: each loop released its own permit when it took the
-            /// message it is running, so on an idle pair a permit is free at both
-            /// ends and nothing complains. What neither caller gets is an
-            /// *answer*, because the only task that could produce one is the task
-            /// waiting for it. So a ring needs no contention and hangs the first
-            /// time it runs — the load-dependence that makes the self-`tell` case
-            /// survive testing is absent, and the deadlock is unconditional.
+            /// sends succeed, and for two different reasons: the **opening** send
+            /// A→B lands because B is idle with an empty mailbox, and the
+            /// **closing** send B→A lands because A's loop released its own permit
+            /// when it took the message it is now running. So nothing complains at
+            /// either end. What neither caller gets is an *answer*, because the
+            /// only task that could produce one is the task waiting for it. A ring
+            /// therefore needs no contention and hangs the first time it runs — the
+            /// load-dependence that lets the self-`tell` case survive testing is
+            /// absent, and the deadlock is unconditional.
             ///
             /// Both actors are then stuck in **two different ways**, which is
             /// worth knowing when reading a stack: a further call to A blocks in

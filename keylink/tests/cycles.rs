@@ -14,9 +14,12 @@
 //! At N = 2 nothing is load-dependent. Both sends succeed on an idle pair, and both
 //! callers then block on an **answer** that only a loop can produce. So A → B → A
 //! hangs on the first attempt, every time, with no contention anywhere — a harder
-//! failure than the one the crate already warns about, and a quieter one, because
-//! `LOCAL_MAILBOX_DEPTH = 1` is exactly the depth at which the send does not
-//! complain.
+//! failure than the one the crate already warns about, and a quieter one. What
+//! `LOCAL_MAILBOX_DEPTH = 1` buys is not silence on the send — any depth ≥ 1 is
+//! silent for one queued message, and `mpsc::channel(0)` panics, so there is no
+//! depth that *would* complain. What 1 buys is that **exactly one** message fits:
+//! the ring closes quietly, and the very next caller blocks. Both halves are
+//! asserted below.
 //!
 //! The order of these tests is the argument:
 //!
@@ -178,6 +181,21 @@ const HANG: Duration = Duration::from_millis(750);
 const SETTLE: Duration = Duration::from_secs(5);
 
 /// Two wired actors, and the gate and counter of the first.
+///
+/// # The wiring is a strong reference cycle, and that is an exemption
+///
+/// Each `Peer` holds an `Arc<OnceLock<Handle>>` for its peer **and** for itself,
+/// so the `mpsc::Sender`s outlive every handle a test holds. These actors
+/// therefore cannot be ended by dropping handles — only `abort`, `stop` or
+/// runtime teardown ends them, and two tests below deliberately leave a live
+/// actor to teardown.
+///
+/// Named rather than left silent, because this file warns about leaked busy
+/// actors a few tests down and the exemption would otherwise read as an
+/// oversight. It is safe here for one reason: `#[tokio::test]` builds a runtime
+/// per test and drops it at the end, so nothing outlives the test that made it.
+/// A cycle wired this way in a **shared** runtime would leak both actors for the
+/// life of the process.
 fn ring_of_two() -> (
     ring::Handle<Peer>,
     ring::Handle<Peer>,
@@ -283,6 +301,14 @@ async fn a_running_turn_leaves_exactly_one_free_permit_behind_it() {
 /// `send`. B's permit is still free, so a further call to B is accepted and then
 /// blocks on the answer. One deadlock, two shapes, and the crate names neither.
 ///
+/// That asymmetry is **asserted and not merely stated**, with `tell` rather than
+/// `rpc`: a `tell` resolves when the send completes, so it separates a full
+/// mailbox from a busy loop. A ping cannot — it times out identically at both
+/// ends, which is why the two ping assertions claim only that a loop is not
+/// polling. The `tell`s therefore run **first**: a ping to B takes B's free permit
+/// on its way to timing out, so the permit assertions have to happen before any
+/// ping or they measure the pings instead.
+///
 /// Reddened by making the cycle not a cycle: `scripts/break-once.sh` on this
 /// file, loosening `hop`'s early return so it fires one hop sooner — the
 /// equality against zero becomes `<= 1` — which stops the chain before the second
@@ -294,8 +320,9 @@ async fn a_running_turn_leaves_exactly_one_free_permit_behind_it() {
 /// **Described rather than quoted, deliberately.** `break-once.sh` aborts unless
 /// its search literal occurs exactly once in the target file, and the target here
 /// is this file — so a record that spelled the literal out would appear beside the
-/// line it breaks and make its own break unrunnable. The records above break
-/// `src/`, where quoting costs nothing because the record lives elsewhere.
+/// line it breaks and make its own break unrunnable. The records that break `src/`
+/// still quote, because there the record lives in a different file from its target
+/// and quoting costs nothing.
 #[tokio::test]
 async fn a_two_actor_cycle_hangs_and_wedges_both_actors() {
     let (a, b, _gate, _entered) = ring_of_two();
@@ -309,9 +336,32 @@ async fn a_two_actor_cycle_hangs_and_wedges_both_actors() {
         n0_future::time::timeout(HANG, &mut hopping).await.is_err(),
         "A -> B -> A must hang"
     );
+    // The asymmetry, asserted with the one method that can see it: a `tell`
+    // resolves when the **send** completes rather than when the loop runs it, so it
+    // separates a full mailbox from a busy loop. A's one free permit was consumed
+    // by B's call, so this blocks in `send`; B's is still free, so the same call to
+    // B is accepted.
+    //
+    // **This has to come before the pings, and that is not a style choice.** A
+    // `ping` to B succeeds at the *send* — B's permit is free — and only then times
+    // out waiting for the answer, so it leaves B's mailbox full. Asserting the
+    // permits afterwards measures the pings instead of the deadlock: written that
+    // way round, `b.bump()` blocks and fails with
+    // "B's permit is still free, so the send completes: Elapsed(())".
+    assert!(
+        n0_future::time::timeout(HANG, a.bump()).await.is_err(),
+        "A's mailbox is full: B's call took the one permit A released"
+    );
+    n0_future::time::timeout(SETTLE, b.bump())
+        .await
+        .expect("B's permit is still free, so the send completes")
+        .expect("B is running, wedged but not gone");
+
+    // And neither loop is polling. That is all a ping can say — it times out at
+    // both ends, and cannot tell a full mailbox from a busy loop.
     assert!(
         n0_future::time::timeout(HANG, a.ping()).await.is_err(),
-        "A is inside the turn that is waiting on B, and its permit is spent"
+        "A is inside the turn that is waiting on B"
     );
     assert!(
         n0_future::time::timeout(HANG, b.ping()).await.is_err(),
@@ -382,6 +432,11 @@ async fn aborting_one_actor_of_a_cycle_frees_the_other_and_destroys_it() {
     // documentation now leans on: a wedged actor's `ended` never resolves,
     // because only its loop fills it. Aborting the task drops the sender, and
     // that is what makes this answer at all.
+    //
+    // **The timeout is the whole of the finding.** The variant is near-tautological
+    // — `ended`'s dropped-sender arm can only be `Vanished`, and the `Floor` writes
+    // `Fate` rather than this watch — so the `matches!` below is a change-detector
+    // for that arm and not evidence about `abort`.
     let ended = n0_future::time::timeout(SETTLE, a.ended())
         .await
         .expect("aborting is what makes a wedged actor's `ended` resolve");
@@ -396,9 +451,12 @@ async fn aborting_one_actor_of_a_cycle_frees_the_other_and_destroys_it() {
 /// A read from inside a turn is the same deadlock, through the public read seam.
 ///
 /// `Handle::with_state` is `LocalActor::read`, and `read` takes a mailbox permit
-/// like any other message. On an idle actor the send therefore **succeeds** — it
-/// takes the one free permit the running turn left — and then waits for an answer
-/// that only the loop can produce. The permit is what the crate's self-`tell`
+/// like any other message. On an idle actor the send therefore succeeds — it takes
+/// the one free permit the running turn left — and then waits for an answer that
+/// only the loop can produce. **That step is inherited, not asserted here:** the
+/// single timeout below cannot separate a send that completed from one still
+/// blocked, and what establishes the free permit is the first test in this file.
+/// The permit is what the crate's self-`tell`
 /// paragraph is about; here it is not the binding constraint, and the hang is
 /// unconditional rather than load-dependent.
 ///
