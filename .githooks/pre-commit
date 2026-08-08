@@ -176,9 +176,9 @@ fi
 #
 # Not resolved the way `pre-push` resolves it, and the difference is deliberate.
 # That hook now REFUSES without `mise`, because it claims to be the whole gate and
-# nothing else checks a push from a branch cut off `main`, so a subset there is a
-# false green. This hook claims the opposite: its header says it runs the fast
-# subset and nothing else, and that the expensive checks belong to `pre-push`. A
+# CI is off by decision, so a subset there is a false green. This hook claims the
+# opposite: its header says it runs the fast subset and nothing else, and that the
+# expensive checks belong to `pre-push`. A
 # hook that is avowedly a subset cannot be made a false green by being a subset —
 # it can only be made one by covering less than the list it names, which is what
 # this fixes.
@@ -186,6 +186,5 @@ echo "note: 'mise' is not installed - running the same checks directly" >&2
 .mise/tasks/framing
 .mise/tasks/anchors
 .mise/tasks/anchors-selftest
-.mise/tasks/task-lists
 cargo fmt --all -- --check
 cargo clippy -p keylink --lib --all-features -- -D warnings

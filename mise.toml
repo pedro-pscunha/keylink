@@ -1,9 +1,10 @@
 # keylink's gate, defined once — and now defined only here.
 #
-# **The CI workflow was DELETED from `main`, so this file is the whole gate for any
-# branch cut from it.** Not because Actions is disabled — it is enabled, measured,
-# and CONTRIBUTING.md holds the evidence rather than this file holding a second
-# copy of it.
+# **CI is off by decision, and this file is the whole gate.** `afdbeb3` deleted the
+# workflow from `main` and moved what only it ran here in the same commit, which is
+# what made that safe. What MAINTAINS the state is `main`'s content rather than the
+# Actions setting, which still reads enabled — CONTRIBUTING.md holds that
+# measurement and names what would reverse it, so this file keeps no second copy.
 #
 # The workflow used to call these same tasks, which is why nothing here had to
 # change when it went: there was never a second copy of the commands. What did
@@ -121,7 +122,7 @@ CARGO_INCREMENTAL = "0"
 # ── the whole gate ──────────────────────────────────────────────────────────
 
 [tasks.gate]
-description = "The whole gate. There is no other one for a branch cut off main"
+description = "The whole gate. There is no other one — CI is off by decision"
 # A list of task references runs them ONE AT A TIME, in order. Bare `depends`
 # lets mise parallelize, and parallel cargo invocations contend for the same
 # target directory and the same memory.
@@ -147,6 +148,10 @@ run = [
     { task = "anchors-selftest" },
     # `mise.toml` defines `pre-commit` once and three other files restate it; this
     # asserts they still agree. Text only, so it costs nothing and cannot recurse.
+    # In `gate` and deliberately NOT in `pre-commit`, unlike `anchors-selftest`
+    # above it: the commit hook's filter looks for Rust, and none of the four files
+    # this reads is Rust, so there it would fire only by coincidence. The task's own
+    # header argues that out.
     { task = "task-lists" },
     { task = "fmt-check" },
     { task = "deny" },
@@ -175,7 +180,6 @@ run = [
     { task = "framing" },
     { task = "anchors" },
     { task = "anchors-selftest" },
-    { task = "task-lists" },
     { task = "fmt-check" },
     { task = "lint-fast" },
 ]

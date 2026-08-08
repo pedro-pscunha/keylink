@@ -25,10 +25,36 @@ MISE description="Every copy of the pre-commit task list agrees with mise.toml"
 # of `gate`, `pre-commit` or `pre-push`, because it commits and pushes. A drift
 # check that lived there would run only when somebody remembered to run it — and
 # "nothing enforces that" is the exact defect being closed. This check reads text
-# and executes nothing, so it has no recursion hazard and can sit in the lists
-# themselves. It is in BOTH `gate` and `pre-commit`, following
-# `anchors-selftest`: a guard that does not run where the thing it guards runs is
+# and executes nothing, so it has no recursion hazard and can sit in a list.
+#
+# ── AND IT IS IN `gate` ONLY, WHICH IS THE OPPOSITE OF `anchors-selftest` ──────
+#
+# It was in `pre-commit` too, following that precedent, and the placement was
+# WRONG for a reason specific to this check's subject. `.githooks/pre-commit`
+# reaches `mise run pre-commit` only when the staged diff touches `.rs`,
+# `Cargo.toml`, `Cargo.lock` or `rustfmt.toml`. The drift this task detects is
+# introduced by editing `mise.toml`, `.githooks/pre-commit`, `CONTRIBUTING.md` or
+# `scripts/install-hooks.sh` — **not one of which matches that filter.** So in
+# `pre-commit` it fired only when a Rust file happened to be staged in the same
+# commit: a coincidence with respect to its own defect, which is the definition of
 # a guard on paper.
+#
+# `anchors` and `anchors-selftest` earn that placement and this does not, and the
+# difference is principled rather than a preference: their subject is break records
+# inside `.rs` files, so a commit staging Rust is exactly when their subject
+# changes. The filter and their subject agree. Here they do not.
+#
+# `gate` runs on every push through `pre-push`, so that is where this is certain,
+# and one placement that fires beats two where one cannot.
+#
+# **The residue, stated because it is larger than this task and not this task's to
+# fix:** THREE of the five tasks in `pre-commit` — `framing`, `anchors`,
+# `anchors-selftest` — check prose and registry content rather than Rust, while the
+# filter deciding whether to run them tests for Rust. A commit touching only
+# documentation runs none of them. Every commit on the branch that added this file
+# was in exactly that position. Widening the filter would make every documentation
+# commit run clippy, which contradicts what this hook's header promises, so it is a
+# decision rather than a fix and it is left named here.
 #
 # ── WHAT IT CHECKS, AND THE TAUTOLOGY IT AVOIDS ───────────────────────────────
 #
@@ -42,9 +68,10 @@ MISE description="Every copy of the pre-commit task list agrees with mise.toml"
 # required to occur EXACTLY ONCE. An anchor that moves gives count 0 and fails
 # loudly, which is the direction to be wrong in.
 #
-# Both directions, for the invoking copy: every task in the list must be invoked,
-# AND every command in the fallback must be a task in the list. One direction
-# alone leaves a stale leftover invisible.
+# Both directions, for all three copies: every task in the list must appear, AND
+# nothing may appear that is not in the list. One direction alone leaves a stale
+# leftover invisible — measured twice, once per copy shape, and both are recorded
+# in the breaks below.
 #
 # ── AND WHAT IT DOES NOT CHECK ────────────────────────────────────────────────
 #
@@ -70,20 +97,21 @@ MISE description="Every copy of the pre-commit task list agrees with mise.toml"
 # `MISE_TRUSTED_CONFIG_PATHS=<the copy>`, and always run the unperturbed control
 # first: an exit code means nothing until you have seen it be 0.
 #
-# T1. **Drop an invocation.** In `.githooks/pre-commit`, replace the two adjacent
-#     lines invoking `anchors-selftest` and then this task with the first of them
-#     alone. Watched:
+# T1. **Drop an invocation.** In `.githooks/pre-commit`, delete the
+#     `.mise/tasks/framing` line. Watched:
 #
-#         FAIL the mise-absent fallback runs `task-lists`
+#         FAIL the mise-absent fallback runs `framing`
 #
-#     **The pair is the search literal because the single line is NOT unique, and
-#     this record's own subject made it so.** The first version of this break
-#     searched for the bare invocation path, and the paragraph above — the one
-#     naming the file that closes the drift — put a second copy of that path into
-#     the same hook, as a backticked span. `break-once.sh` aborted with `the search
-#     literal occurs 2 times`, which is `.mise/tasks/anchors`' documented same-file
-#     trap arriving through the comment that documents the fix for it. Two adjacent
-#     whole lines are unique where one is not.
+#     **`framing` and not this task, and the swap is worth recording.** While
+#     `task-lists` was in the `pre-commit` list, this break deleted its invocation —
+#     and the literal could not be a single line, because the paragraph above naming
+#     the file that closes the drift had put a second copy of `.mise/tasks/task-lists`
+#     into the same hook as a backticked span. `break-once.sh` aborted with `the
+#     search literal occurs 2 times`: the same-file trap arriving through the comment
+#     documenting the fix for it. Moving the task to `gate` alone removed that
+#     invocation, so the break moved to a line whose path this file does not quote —
+#     `.mise/tasks/framing` counts 1, measured with `grep -cF` after this record was
+#     written. `.mise/tasks/anchors` counts 2 and would abort, which is T6's subject.
 #
 # T2. **Swap two invocations.** Exchange the `.mise/tasks/anchors` and
 #     `.mise/tasks/anchors-selftest` lines. Watched:
@@ -121,12 +149,25 @@ MISE description="Every copy of the pre-commit task list agrees with mise.toml"
 # T7. **Drop a name from the prose.** Remove `framing, ` from `CONTRIBUTING.md`'s
 #     `mise run pre-commit` row. Watched:
 #
-#         FAIL CONTRIBUTING.md names every task in the list
+#         FAIL CONTRIBUTING.md names the list exactly
 #
-# T8. **Drop a name from the installer.** Remove `task-lists, ` from
+# T8. **Drop a name from the installer.** Remove `anchors-selftest, ` from
 #     `scripts/install-hooks.sh`'s `pre-commit` line. Watched:
 #
-#         FAIL scripts/install-hooks.sh names every task in the list
+#         FAIL scripts/install-hooks.sh names the list exactly
+#
+# T9. **ADD a name that no longer runs**, which is the direction T7 and T8 cannot
+#     see. Put `task-lists, ` back into `CONTRIBUTING.md`'s row. Watched:
+#
+#         FAIL CONTRIBUTING.md names the list exactly
+#
+#     **This break was written because the one-directional version passed it.**
+#     Taking `task-lists` out of the `pre-commit` list left both prose copies still
+#     naming it, and the per-name test was green in both: every remaining task was
+#     still present. A prose copy advertising a check that does not run is the same
+#     false claim as one omitting a check that does, and only a whole-string
+#     comparison sees both. The fallback copy already had its reverse direction, so
+#     the hole was in the two copies a contributor actually reads.
 import pathlib
 import re
 import subprocess
@@ -271,15 +312,37 @@ for relative, pattern in DESCRIBED:
             f"found {len(found)}. Re-anchor this row, or restore the line.",
         )
         continue
-    line = found[0]
-    missing = [task for task in ORDER if task not in line]
-    if missing:
+    # Named distinctly, and not `line` or `expected`. Both of those are already
+    # bound by the fallback loop above, and a first version of this block relied on
+    # one of them — it read the CLIPPY COMMAND left over from that loop and reported
+    # a failure about CONTRIBUTING.md while never looking at the file. It failed
+    # closed, which is luck: a leaked value that happened to contain the list would
+    # have passed both prose rows without reading either file.
+    described = found[0]
+    # ── THE WHOLE LIST AS ONE STRING, which is what makes this BOTH directions ──
+    #
+    # The first version asked, per task, whether the line contained its name. That
+    # is one-directional and it was measured failing: removing `task-lists` from the
+    # manifest left both prose copies still naming it, both green, because every
+    # remaining task was still present. A prose copy advertising a check that does
+    # not run is the same false claim as one omitting a check that does.
+    #
+    # A name-by-name version of the reverse test cannot work either. Task names
+    # collide as substrings — `fmt` inside `fmt-check`, `lint` inside `lint-fast`,
+    # `anchors` inside `anchors-selftest` — and the surrounding prose names real
+    # tasks in passing: CONTRIBUTING.md's own row ends "is not a gate", and `gate`
+    # is a task. Requiring the exact comma-joined string sidesteps both, and pins
+    # the ORDER as a free consequence.
+    wanted = ", ".join(ORDER)
+    if wanted not in described:
         fail(
-            f"{relative} names every task in the list",
-            f"the line does not name: {', '.join(missing)}",
-            f"the line reads: {line.strip()}",
-            "It is read before anybody runs the hook, so a task it omits is a check",
-            "a contributor does not know runs.",
+            f"{relative} names the list exactly",
+            f"expected this line to contain: {wanted}",
+            f"the line reads: {described.strip()}",
+            "Written as one string on purpose: it fails when a task is missing, when",
+            "one is named that no longer runs, and when the order drifts. It is read",
+            "before anybody runs the hook, so both directions are a claim to a",
+            "contributor about what does and does not check their commit.",
         )
 
 if failures:
