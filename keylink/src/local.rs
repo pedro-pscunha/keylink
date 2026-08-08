@@ -97,11 +97,11 @@
 //! then dropped unrun, because `Ok` there means "queued" and nothing else.
 //!
 //! It is also why [`ended`](LocalActor::ended) exists rather than a second error
-//! variant. An [`Observer`](crate::Observer) that refuses a turn ends the actor,
+//! variant. An [`Observer`] that refuses a turn ends the actor,
 //! and the caller of that turn is told [`MailboxClosed`] like any other — which
 //! is true, and which does not say *why*. `MailboxClosed` means "gone" and must
 //! not be stretched to mean "gave up on durability", so the second question is
-//! asked separately and answered by [`Ended`](crate::Ended).
+//! asked separately and answered by [`Ended`].
 //!
 //! The method names and success types match the remote client for `rpc` and
 //! `tell`. They do not for the other three: `blob` hands back a
@@ -1541,8 +1541,8 @@ struct Keyed<M>(crate::Mailbox<M>);
 
 /// [`Message::Read`] and [`Message::Stop`] are unreachable on this path: a keyed
 /// actor is read through a method and stopped by
-/// [`System::stop`](crate::System::stop) dropping the registry's sender, which
-/// arrives here as `None`. The loop's arms for them are written to be *correct*
+/// [`System::shutdown`](crate::System::shutdown) dropping the registry's sender,
+/// which arrives here as `None`. The loop's arms for them are written to be *correct*
 /// rather than to panic, which is the choice `Mail`'s `send` and `recv` variants
 /// already make one layer out.
 impl<A: Send, M: Send> Inbox<A, M> for Keyed<M> {

@@ -2294,7 +2294,8 @@ macro_rules! __keylink_service {
                 }
 
                 /// Send one message to one actor. Called by [`ActorRef`], which
-                /// is the only thing that should build an [`Addressed`].
+                /// is the only thing that should build an
+                /// [`Addressed`](keylink::Addressed).
                 async fn send_to(
                     &self,
                     actor: &$crate::ActorId,

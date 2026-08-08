@@ -737,7 +737,7 @@ impl<M> Registry<M> {
     /// Find the actor, spawning it if the system was given a factory.
     ///
     /// `self: &Arc<Self>` because a lazy spawn reaches [`Registry::entry`], and
-    /// the task that starts there holds a [`Weak`](std::sync::Weak) back to this
+    /// the task that starts there holds a [`Weak`] back to this
     /// registry so it can reap its own entry. There is no other reason.
     fn route(self: &Arc<Self>, id: &ActorId) -> std::result::Result<Route<M>, RouteError>
     where
@@ -807,7 +807,7 @@ impl<M> Registry<M> {
     /// One row per live actor. [`System::status`] is the door and carries what
     /// every field does and does not claim; this is the body, here because
     /// [`System::weak_status`] needs it reachable from a
-    /// [`Weak`](std::sync::Weak) that has no `System` around it.
+    /// [`Weak`] that has no `System` around it.
     fn status(&self) -> Vec<ActorStatus> {
         let now = self.now();
         self.read()
@@ -873,7 +873,7 @@ impl<M> Registry<M> {
     ///
     /// The loop resolves to an [`Ended`] — see [`Loop`] — and the wrapper hands
     /// it to [`Registry::reap`], which is the only site that can unmount an
-    /// actor **nobody asked to unmount**. A [`Weak`](std::sync::Weak) and not an
+    /// actor **nobody asked to unmount**. A [`Weak`] and not an
     /// `Arc`, and not for tidiness: the registry owns the [`Entry`], the entry
     /// owns the `JoinHandle`, and a strong reference here would close that ring.
     /// A program that dropped every [`System`] clone would keep the registry —
@@ -1179,8 +1179,8 @@ pub struct ActorStatus {
     /// that is parked on I/O is a turn that is running.
     ///
     /// `false` for an actor whose loop was written by hand around
-    /// [`mount`](crate::mount) rather than by `service!` — see
-    /// [`Mailbox`](crate::Mailbox). Every actor a service declares runs the
+    /// [`mount`] rather than by `service!` — see
+    /// [`Mailbox`]. Every actor a service declares runs the
     /// generated loop.
     pub busy: bool,
     /// Messages sitting in the mailbox.
@@ -1885,7 +1885,7 @@ impl<M> SystemBuilder<M> {
     /// against a budget, so one block of slots, 256 bytes per actor, is unmissable
     /// at that size. It is measured and not asserted from the tokio source because
     /// this crate has been wrong about this allocator's shape before — the table on
-    /// [`Mailbox`](crate::Mailbox) carried three wrong figures under a sentence
+    /// [`Mailbox`] carried three wrong figures under a sentence
     /// claiming they were measured.
     ///
     /// **This line said ten thousand, and that is the file's other constant.**

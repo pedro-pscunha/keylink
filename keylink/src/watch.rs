@@ -19,7 +19,8 @@
 //!
 //! # This is notification, not supervision
 //!
-//! keylink now has supervision — [`LocalActor::spawn_supervised`], RFC-07 §9 —
+//! keylink now has supervision —
+//! [`LocalActor::spawn_supervised`](crate::LocalActor::spawn_supervised), RFC-07 §9 —
 //! and this is still not it. RFC-04 §8 rejected supervision outright and has
 //! since been superseded, but the half of its argument that applies here never
 //! depended on that refusal: restarting a *remote* actor means nothing without

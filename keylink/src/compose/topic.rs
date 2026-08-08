@@ -74,7 +74,7 @@
 //!
 //! One `tokio::sync::mpsc` channel of capacity one per subscriber, and one clone
 //! of the item per subscriber per publish. A large item wants an
-//! [`Arc`](std::sync::Arc) around it; the clone is the caller's to make cheap,
+//! [`Arc`] around it; the clone is the caller's to make cheap,
 //! because a topic that boxed for you would allocate for the callers whose items
 //! are already two words.
 //!

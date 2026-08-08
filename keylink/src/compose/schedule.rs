@@ -67,7 +67,7 @@
 //! # A dropped [`Scheduled`] cancels
 //!
 //! The opposite of [`LocalActor`](crate::LocalActor), deliberately. Dropping a
-//! [`JoinHandle`](n0_future::task::JoinHandle) *detaches* on both targets, so a
+//! [`JoinHandle`] *detaches* on both targets, so a
 //! repeating task whose handle was lost would run forever, hold whatever it
 //! captured — a `Handle` clone, which keeps an actor alive — and be unreachable.
 //! An actor is a thing you addressed and can address again; a schedule is not, so
