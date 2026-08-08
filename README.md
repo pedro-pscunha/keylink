@@ -270,7 +270,10 @@ recipe rather than a feature:
    for a QUIC stream to be held for a year. So a caller with a 90-second handler
    cannot wait it out — at the default it is refused at 30 s with the work still
    running, which is `InFlight` and still the truth. Ask again, or ask
-   `key_state`.
+   `key_state`. A service that will not **admit** an attacher at all passes
+   `Attaching::Forbidden` to `Limits::attach`, which answers `InFlight` at once and
+   spends no waiting place — distinct from `Attaching::UpTo(Duration::ZERO)`, which
+   admits the attacher and holds it for no time.
 
 `examples/reliable_call.rs` is that recipe, compiled by the gate and run over two
 nodes. `tests/reliable.rs::a_retried_call_across_a_reconnect_runs_exactly_once` is

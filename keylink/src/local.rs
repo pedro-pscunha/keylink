@@ -2434,6 +2434,64 @@ impl<A: Send, M: Send, I: Inbox<A, M>> Inbox<A, M> for Lent<'_, I> {
 /// before the next factory call. That is what bounds the re-acquire window to
 /// `backoff + claim latency` and stops the process racing itself for its own
 /// claim.
+///
+/// # A restart rolls the state back and does not roll the key back, and that is a gap
+///
+/// Written here because this is the only frame that knows an incarnation was
+/// replaced. The ledger never learns of a restart — it is per service and it
+/// **survives** one intact — so `idempotency.rs` cannot state this, and the refusal a
+/// caller receives cannot either.
+///
+/// The chain, and every link is needed. A keyed call reaches a turn, the turn is
+/// marked dispatched, the turn panics. A panic **alone** stops here and costs one
+/// message: `tests/actors.rs::a_panicking_message_costs_one_message_and_not_the_actor`
+/// holds that, and nothing restarts. What produces a restart is an
+/// [`Observer`] refusing the faulted turn — the shape a
+/// [`Persist`](crate::Persist) adapter always has, since it will not write a
+/// half-applied state — which `observed_turn` folds into [`Ended::Panicked`], which
+/// [`retryable`] grants. The next incarnation starts from the last committed state, as
+/// `tests/supervision.rs::an_actor_restarts_from_its_last_committed_state` asserts.
+///
+/// So the turn's effect on the state is gone, and the key still reads
+/// [`Interrupted`](crate::IdempotencyRefusal::Interrupted) — *it ran, and whether it
+/// took effect is unknown* — for the ledger's whole retention. The caller can neither
+/// retry under that key nor learn which of the two happened.
+///
+/// **It is left open, and the reason is not that a test would have to change.** The
+/// rollback is of keylink's **state**, not of the **world**. A turn that charged a card
+/// over HTTP and then panicked leaves the card charged; this loop restores an in-memory
+/// struct and reaches none of that. Releasing the key would let a retry charge it
+/// twice, which is the double-effect the ledger exists to prevent. Promoting *the state
+/// did not survive* into *the work did not happen* is a claim only the caller can make,
+/// because only the caller knows what its handler touched.
+///
+/// **Nothing guarded the combination until this branch.** `tests/actors.rs` still mounts
+/// no supervisor, and no test named an idempotency key on a supervised actor before
+/// `tests/supervision.rs::a_keyed_call_whose_turn_panicked_stays_interrupted_across_a_restart`,
+/// which was added with this paragraph. **What it pins is the answer a caller gets, not
+/// that the answer is right** — the paragraphs above are what argue that, and no test can
+/// stand in for them: the claim they make is about the world the handler touched, which
+/// the suite cannot reach.
+///
+/// **Releasing the key instead is not a one-guard change.** Make `Guard::drop`'s
+/// `Reached::NotDispatched` test always take the releasing arm, and the guard above
+/// reddens together with these in `idempotency.rs`:
+/// `claim::a_guard_dropped_after_dispatch_leaves_the_key_interrupted`,
+/// `claim::a_guard_dropped_without_a_reply_leaves_the_key_interrupted`,
+/// `records::records_none_changes_nothing_about_who_settles` and
+/// `state::key_state_reports_every_state`. So *leave it open* is a decision measured
+/// against named guards rather than a preference between two readings.
+///
+/// **Under that release the double effect is observed rather than argued.** The guard
+/// above then fails carrying a `Failed("panicked: ..")`, and a `Failed` whose text is a
+/// panic message can only be produced by ENTERING the handler — so the retry ran the turn
+/// a second time on an actor whose first attempt had already panicked. That is the
+/// double-effect the paragraph above says the ledger exists to prevent, seen rather than
+/// predicted.
+///
+/// **Measured whole-lib by this branch's merge gate, and not re-run here.** Nothing in
+/// this repository replays a recorded break, so the list above names one run rather than
+/// a standing check.
 async fn supervise<A, M, F, Fut, N, I>(
     mut factory: N,
     limit: Intensity,
@@ -3510,8 +3568,15 @@ pub(crate) fn rendered<Resp>(
 /// The three answers are three different next moves for the caller, which is the
 /// only reason to tell them apart:
 ///
-/// - [`Standing::Restarting`] — **retry.** The incarnation that owed the answer
-///   is gone and another is coming; the string carries the ending that caused it.
+/// - [`Standing::Restarting`] — **retry, unless you sent a key.** The incarnation
+///   that owed the answer is gone and another is coming; the string carries the
+///   ending that caused it. A call that carried an
+///   [`IdempotencyKey`](crate::IdempotencyKey) is the exception, and it is the caller
+///   most likely to act on the word *retry*: a message that reached a mailbox was
+///   marked `enqueued`, which `Progress::reached` reports as dispatched, so its key
+///   settled [`Interrupted`](crate::IdempotencyRefusal::Interrupted) and **a retry
+///   under the same key is refused**. Reconcile and use a different key. `supervise`
+///   carries why that is the honest answer rather than a defect.
 /// - [`Standing::Running`] — **do not retry blindly, and do not give up on the
 ///   actor.** It is there, and this one reply was lost.
 /// - [`Standing::Gone`] — **stop asking.**

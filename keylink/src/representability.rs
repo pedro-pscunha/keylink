@@ -1092,6 +1092,12 @@ fn no_mailbox_can_be_asked_to_be_unbounded(builder: beta::SystemBuilder) -> beta
 /// arrived outside this probe's reach by the same language fact. A third duration
 /// would too, which is why the sentence names the property and not the field count.
 ///
+/// **`attach` takes an [`Attaching`](crate::Attaching) now and is still an
+/// exception**, because zero lives inside [`Attaching::UpTo`](crate::Attaching::UpTo)
+/// rather than being removed from the range. What the enum removed is a second
+/// *meaning* on that zero, which is a different property from the one this probe
+/// asserts — so a reader meeting the new signature does not gain a bound here.
+///
 /// Reddened by widening one setter — `Limits::pool_records`'s parameter changed from
 /// `NonZeroUsize` to `usize`, which is the real defect rather than an edit to the
 /// annotation below. Watched, via `cargo check -p keylink --all-targets`:

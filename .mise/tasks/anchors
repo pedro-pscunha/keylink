@@ -483,8 +483,19 @@ ANCHORS = [
     #
     # A1 is SAME-FILE and indented, the narrowed rule in action: the record's quote
     # sits unindented inside a `///` line while the code carries four spaces.
+    # Re-quoted on `limit-docs`: the cap read became a `match` arm, because
+    # `Attaching::Forbidden` needed a line of its OWN that a harness can replace, and a
+    # `let ... else` spreads a refusal over three lines. So the ceiling break moved from
+    # the clamp line to this arm, and `M2` below is the other arm.
+    #
+    # **The break set moved with it, measured rather than assumed**: this replacement
+    # reddens `an_attach_ceiling_below_the_peers_request_governs` AND
+    # `an_attach_ceiling_of_zero_refuses_the_attacher_at_once`, and leaves the two
+    # `a_peer_*_the_attach_ceiling_*` guards green because both configure
+    # `Limits::default()`, whose cap IS `MAX_ATTACH` — so substituting the constant is a
+    # no-op for them. The record on the first guard says so.
     ("A1", "keylink/src/rpc.rs", "keylink/src/rpc.rs",
-     "    let Some(budget) = idem.attach_budget(ledger.attach_cap()) else {"),
+     "        Attaching::UpTo(cap) => cap,"),
     # A2 and A2b are ONE literal cited by THREE records - two accept-path guards in
     # `rpc.rs` and the arithmetic guard in `idempotency.rs` - registered as two rows,
     # one per `lives_in`, because the record-quote check is per file and a single row
@@ -504,10 +515,14 @@ ANCHORS = [
     # one edit to the shipped default reddens a struct-level guard in
     # `idempotency.rs` and an accept-path guard in `rpc.rs`, and only the pair says
     # the default reaches the wire path rather than only the struct.
+    # Re-quoted on `limit-docs`: the field took an `Attaching`, so the default became
+    # `Attaching::UpTo(MAX_ATTACH)` and both rows rotted at once. This gate reported it,
+    # which is the case it exists for — the two records' own prose was updated in the
+    # same edit and nothing else would have compared them.
     ("A3", "keylink/src/rpc.rs", "keylink/src/idempotency.rs",
-     "            attach: MAX_ATTACH,"),
+     "            attach: Attaching::UpTo(MAX_ATTACH),"),
     ("A4", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
-     "            attach: MAX_ATTACH,"),
+     "            attach: Attaching::UpTo(MAX_ATTACH),"),
     # A5 holds the TOP of the pool bounds' range, which their rustdoc argued only at
     # the zero end. The first line of a two-line `while` condition, and a whole line
     # in its own right - the `||` under it belongs to `rustfmt`, so a reflow gives
@@ -526,6 +541,23 @@ ANCHORS = [
     # `src/`.
     ("N1", "keylink/tests/mailbox_latency.rs", "keylink/src/actor/registry.rs",
      "        let (mail, slots) = mpsc::channel(self.mailbox_depth);"),
+    # ── `limit-docs` ─────────────────────────────────────────────────────────
+    #
+    # M1 is SAME-FILE and INDENTED, the narrowed rule again: the record's quote sits
+    # unindented inside a `///` line while the code carries twelve spaces. Its guard
+    # holds the `cx.method()` test that keeps a required-key layer from refusing every
+    # method the service's `Keyable` policy leaves out.
+    ("M1", "keylink/tests/protocol.rs", "keylink/tests/protocol.rs",
+     "            if cx.method() == \"Ping\" && cx.call().is_none() {"),
+    # M2 is A1's sibling arm: the OPERATOR's refusal, `Attaching::Forbidden`, on the one
+    # line that says this service admits no attacher. Collapsing it into a zero hold
+    # reddens `a_forbidden_ceiling_is_refused_without_a_waiting_place` alone — measured
+    # whole-lib, one run — while `a_zero_hold_still_spends_a_waiting_place` stays green
+    # off A2's literal. That disjointness is the whole point of the pair.
+    #
+    # SAME-FILE and indented, so the record's unindented copy is not a second occurrence.
+    ("M2", "keylink/src/rpc.rs", "keylink/src/rpc.rs",
+     "        Attaching::Forbidden => return Claimed::Refuse(IdempotencyRefusal::InFlight.into()),"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -1207,7 +1239,42 @@ for record in sorted(set(REDNESS) - row_ids):
 # spends paragraphs on: 122 + 1 would have been right here and is not a method, and
 # two commits on one branch each needing their own measurement is the whole reason
 # a carried value goes stale.
-RECORD_BLOCKS = 123
+#
+# 123 → 124 on `limit-docs`, off `080fec7`, for the required-key layer: ONE block,
+# `a_layer_can_require_an_idempotency_key`, registered as M1. **Read off a FAILURE,
+# the same way the line above was**: the tripwire was left at 123 and the pre-commit
+# hook answered `124 comment blocks mention break-once.sh` from the walk.
+#
+# 124 → the figure below, two commits later on the same branch, for `Attaching` and for
+# the panic-restart gap. **THREE new blocks, ONE new row, and the net is +3.** An earlier
+# version of this note said "THREE new blocks, ONE retired, ONE new row", which reaches
+# 126 and not the figure below. The retirement is real and it subtracts nothing, and that
+# is the part an auditor cannot re-derive from the two ends alone:
+#
+#   added    `a_forbidden_ceiling_is_refused_without_a_waiting_place`, whose literal is
+#            the new row **M2**.
+#            `a_zero_hold_still_spends_a_waiting_place` — cites **A2's** literal with a
+#            replacement of its own, so it is a block without a row.
+#            `a_keyed_call_whose_turn_panicked_stays_interrupted_across_a_restart` in
+#            `tests/supervision.rs` — cites **R11's**, likewise.
+#   retired  `a_forbidden_ceiling_answers_none_for_every_request`, **born and deleted
+#            INSIDE this range**: the commit that introduced `Attaching` added it, and the
+#            commit after that deleted it with the seam it guarded, when the operator's
+#            refusal moved OUT of `Idempotency::attach_budget` and into `claim_key` — so
+#            `attach_budget`'s `None` keeps one meaning and `a_bare_key_does_not_attach`
+#            keeps testing what its name says. **It was never in the 124 base**, so it is
+#            not a block this range took away from it, and nothing is subtracted.
+#   re-quoted A1 (the cap read became a `match` arm), A3 and A4 (the default became
+#            `Attaching::UpTo(MAX_ATTACH)`). Re-quoting moves no block.
+#
+# **Read off a run of this task at this tree, which agreed at 127.** The lesson this entry
+# earns is sharper than "measure, do not derive": a walk of the INTERMEDIATE commits is
+# what shows a retirement to be internal, and a diff of the two ends cannot, because a
+# block born and deleted between them is absent from both. This branch's own earlier
+# versions of this note said "TWO new rows" for rows that no longer exist, then "NO new
+# row" one edit after that, then an arithmetic landing one short. All three were written
+# while the tree was still moving, which is exactly what a carried figure is.
+RECORD_BLOCKS = 127
 
 # The one marker the tripwire counts, and the two phrasings records use INSTEAD of
 # naming the harness. Both are read by the same walk, so the blind spot below is a

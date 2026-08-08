@@ -12,7 +12,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use keylink::{
-    Allowlist, Body, BodyReader, Context as KeylinkContext, Error, Node, Server as KeylinkServer,
+    Allowlist, Body, BodyReader, Context as KeylinkContext, Error, IdempotencyKey, Keyable, Node,
+    Server as KeylinkServer,
 };
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
@@ -618,6 +619,99 @@ async fn a_layer_can_refuse_one_method_and_pass_the_rest() {
 
     // A refused call must not poison the connection.
     assert_eq!(client.ping().await.unwrap(), "pong");
+}
+
+/// Refuses a call that carried no idempotency key, to prove a layer closes the
+/// half [`keylink::ServiceBuilder::keyable`] cannot: that policy decides which
+/// methods *accept* a key and never which ones demand one.
+///
+/// The `cx.method()` test is in step with the service's own `Keyable` policy, and
+/// it is load bearing rather than tidy. On a method outside that policy
+/// `cx.call()` can never answer `Some` — a keyed call is refused `NotKeyable`
+/// before the chain is entered and an unkeyed one arrives as `None` — so a layer
+/// without the test refuses every call to every other method.
+struct RequireKey;
+
+impl<Resp: Send + 'static> keylink::Middleware<probe::Request, Resp> for RequireKey {
+    fn handle(
+        &self,
+        cx: keylink::Context,
+        req: probe::Request,
+        body: BodyReader,
+        next: keylink::Next<probe::Request, Resp>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (keylink::Outcome<Resp>, Body)> + Send>>
+    {
+        Box::pin(async move {
+            if cx.method() == "Ping" && cx.call().is_none() {
+                return (
+                    keylink::Outcome::Err(keylink::RemoteError::Unauthorized(
+                        "Ping needs an idempotency key".into(),
+                    )),
+                    Body::empty(),
+                );
+            }
+            next(cx, req, body).await
+        })
+    }
+}
+
+/// The layer above, over a real connection, on all three cases that matter:
+/// the guarded method without a key, the guarded method with one, and a method
+/// the policy leaves out.
+///
+/// Made red by `scripts/break-once.sh` replacing
+/// `if cx.method() == "Ping" && cx.call().is_none() {` with
+/// `if cx.call().is_none() {`, which is the shorter layer the caveat is about.
+/// The search literal carries its twelve spaces of indentation, so this record's
+/// unindented copy is not a second occurrence of it. Watched, under `cargo test`,
+/// this test alone reddening:
+/// `a method outside the policy: Remote(Unauthorized("Ping needs an idempotency
+/// key"))`.
+#[tokio::test]
+async fn a_layer_can_require_an_idempotency_key() {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let _running = keylink::Server::builder(&server)
+        .service(
+            probe::service(Server::default(), Allowlist::anyone())
+                .keyable(Keyable::Only(&["Ping"]))
+                .layer(RequireKey)
+                .build(),
+        )
+        .spawn()
+        .expect("serves");
+
+    let client = probe::Client::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("dials");
+
+    // The guarded method with no key: the layer sees the absence and refuses.
+    let err = client
+        .ping()
+        .await
+        .expect_err("the layer refuses a call carrying no key");
+    assert!(
+        matches!(err, Error::Remote(keylink::RemoteError::Unauthorized(_))),
+        "expected a typed refusal, got {err:?}"
+    );
+
+    // The same method with a key reaches the handler, so the layer refuses an
+    // absence rather than the method.
+    let key = IdempotencyKey::new("ping-1").expect("a valid key");
+    assert_eq!(
+        client.with_idempotency(key).ping().await.unwrap(),
+        "pong",
+        "a call carrying a key must reach the handler"
+    );
+
+    // A method the policy leaves out passes unkeyed, which is what the
+    // `cx.method()` test buys: `cx.call()` is permanently `None` here, so a layer
+    // reading the absence alone would refuse this one forever.
+    assert_eq!(
+        client.slow(1).await.expect("a method outside the policy"),
+        1,
+        "expected a method outside the policy to pass unkeyed"
+    );
 }
 
 #[tokio::test]

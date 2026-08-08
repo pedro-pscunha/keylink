@@ -44,7 +44,7 @@ use crate::error::ConfigError;
 // `tests/api.rs` that writes it from a consumer's position. An in-crate
 // `crate::Keyable` would make the library itself the thing that fails when the
 // re-export goes, which would leave that test proving nothing.
-use crate::idempotency::{Claim, Guard, Keyable, Ledger, Limits, Records};
+use crate::idempotency::{Attaching, Claim, Guard, Keyable, Ledger, Limits, Records};
 use crate::middleware::{wrap, Reached};
 use crate::wire::FrameReader;
 use crate::{
@@ -293,7 +293,27 @@ async fn claim_key(
     // `Limits::attach`, and this is the one place that holds the peer's request and
     // the ledger at the same time. `ledger` came from the `ledger_for` above and is
     // used again below, so reading the cap here repeats no lookup.
-    let Some(budget) = idem.attach_budget(ledger.attach_cap()) else {
+    //
+    // TWO refusals, one wire answer, and they are separate lines on purpose. This one
+    // is the OPERATOR's: `Attaching::Forbidden` means this service admits no attacher.
+    // The next is the CALLER's: it did not ask to be held. Both answer `InFlight` and
+    // both return before `ledger.wait`, so neither spends a waiting place.
+    //
+    // Folding this into `attach_budget`'s `None` would give the same wire answer and
+    // cost a guard: `a_bare_key_does_not_attach` asserts that `None` means *the caller
+    // did not ask*, and a second producer makes it pass for two reasons at once while
+    // its name still claims one. `Attaching::Forbidden`'s own doc carries the rest.
+    //
+    // A `match` and not a `let ... else`, so that each act is ONE line a break harness
+    // can replace: reintroducing the constant on the first arm and collapsing the
+    // second into a zero hold are the two edits `an_attach_ceiling_below_the_peers_request_governs`
+    // and `a_forbidden_ceiling_is_refused_without_a_waiting_place` record. A `let-else`
+    // spreads the refusal over three lines and neither break fits on one of them.
+    let cap = match ledger.attach_cap() {
+        Attaching::UpTo(cap) => cap,
+        Attaching::Forbidden => return Claimed::Refuse(IdempotencyRefusal::InFlight.into()),
+    };
+    let Some(budget) = idem.attach_budget(cap) else {
         return Claimed::Refuse(IdempotencyRefusal::InFlight.into());
     };
     // Taken before anything parks, and held to the end of this function so it
@@ -304,7 +324,7 @@ async fn claim_key(
     // `Limits::attach` at zero gets `Some(ZERO)` above, reaches this line, spends a
     // place, and expires at the timeout below. So a zero ceiling is refused
     // `TooManyRunning` rather than `InFlight` once the waiting pool is full, which is
-    // what `Limits::attach`'s own doc now says instead of "turns the feature off".
+    // what `Attaching`'s own doc says instead of "turns the feature off".
     let _waiting = match ledger.wait(peer) {
         Ok(waiting) => waiting,
         Err(refusal) => return Claimed::Refuse(refusal),
@@ -928,21 +948,34 @@ mod tests {
     /// that ignored its own setting would look right — and a service that set one
     /// second holds it for one.
     ///
-    /// Made red by `scripts/break-once.sh` replacing
-    /// `let Some(budget) = idem.attach_budget(ledger.attach_cap()) else {` with
-    /// `let Some(budget) = idem.attach_budget(crate::MAX_ATTACH) else {`, which is
-    /// the hard-coded ceiling this change removed, reintroduced at the one call
-    /// site. Fully qualified in the replacement because `rpc.rs` does not import
-    /// the constant. The search literal carries its four spaces of indentation, so
-    /// this record's unindented copy is not a second occurrence of it. Watched,
-    /// under `cargo test`:
+    /// Made red by `scripts/break-once.sh` replacing `Attaching::UpTo(cap) => cap,`
+    /// with `Attaching::UpTo(_) => crate::MAX_ATTACH,`, which is the hard-coded ceiling
+    /// this bound removed, reintroduced at the one call site. Fully qualified in the
+    /// replacement because `rpc.rs` does not import the constant. The search literal
+    /// carries its eight spaces of indentation, so this record's unindented copy is not
+    /// a second occurrence of it. Watched, under `cargo test`:
     /// `assertion `left == right` failed: the ceiling must be this service's
     /// Limits::attach`, `left: 30s`, `right: 1s`.
+    ///
+    /// **The line this quotes moved twice, and the break set moved with it.** It was
+    /// `let Some(budget) = idem.attach_budget(ledger.attach_cap()) else {` when the cap
+    /// was read and clamped on one line; the read is its own `match` arm now, because
+    /// [`Attaching::Forbidden`] needed a line of its own that a harness could replace.
+    ///
+    /// **MEASURED at this tree, whole-lib, one run: TWO guards red.** This one and
+    /// `an_attach_ceiling_of_zero_refuses_the_attacher_at_once`.
+    /// `a_peer_over_the_attach_ceiling_is_held_for_the_default` and
+    /// `a_peer_under_the_attach_ceiling_keeps_its_own_budget` stay **green**, and the
+    /// reason is not that they are weak: both configure `Limits::default()`, whose cap
+    /// **is** [`MAX_ATTACH`], so this replacement is a no-op for them. A break that
+    /// substitutes the default is invisible to every guard that uses the default —
+    /// which is why the guard that sets one second is the one that carries this
+    /// property.
     #[tokio::test(start_paused = true)]
     async fn an_attach_ceiling_below_the_peers_request_governs() {
         assert_eq!(
             held_for(
-                Limits::default().attach(Duration::from_secs(1)),
+                Limits::default().attach(Attaching::UpTo(Duration::from_secs(1))),
                 Duration::from_secs(30),
             )
             .await,
@@ -957,8 +990,9 @@ mod tests {
     /// literal here rots in the one direction nothing catches: lower the constant
     /// and a hard-coded 30 would assert a ceiling the ledger no longer has.
     ///
-    /// Made red by `scripts/break-once.sh` replacing `attach: MAX_ATTACH,` in
-    /// `impl Default for Limits` with `attach: Duration::from_secs(1),` — the same
+    /// Made red by `scripts/break-once.sh` replacing
+    /// `attach: Attaching::UpTo(MAX_ATTACH),` in `impl Default for Limits` with
+    /// `attach: Attaching::UpTo(Duration::from_secs(1)),` — the same
     /// edit `idempotency.rs`'s `the_default_attach_ceiling_is_max_attach` records,
     /// and this is the guard that says the default reaches the accept path rather
     /// than only the struct. Watched, under `cargo test`:
@@ -996,16 +1030,18 @@ mod tests {
         );
     }
 
-    /// Zero is representable on this bound — [`Duration`] has no `NonZero` — so
-    /// what it does is asserted rather than argued.
+    /// Zero is representable inside [`Attaching::UpTo`] — [`Duration`] has no
+    /// `NonZero` — so what it does is asserted rather than argued.
     ///
     /// **What it measures is the hold, which is zero, and NOT that attaching is
     /// turned off.** The attacher still spends a waiting place and re-claims once
     /// before expiring — this test gets
     /// [`InFlight`](IdempotencyRefusal::InFlight) because the pool has a place free,
     /// and a zero ceiling meeting an exhausted pool is refused `TooManyRunning`
-    /// instead. `Limits::attach` carries that distinction; the guard deliberately
+    /// instead. [`Attaching`] carries that distinction; the guard deliberately
     /// covers one arm of it, and naming which arm is the point of this paragraph.
+    /// [`Attaching::Forbidden`] is the setting that does turn it off, and
+    /// `a_forbidden_ceiling_is_refused_without_a_waiting_place` holds that.
     ///
     /// `representability.rs`'s `no_ledger_bound_can_be_asked_to_be_zero` names this
     /// test as one of its two stated exceptions, `ttl`'s being the other.
@@ -1021,12 +1057,156 @@ mod tests {
     async fn an_attach_ceiling_of_zero_refuses_the_attacher_at_once() {
         assert_eq!(
             held_for(
-                Limits::default().attach(Duration::ZERO),
+                Limits::default().attach(Attaching::UpTo(Duration::ZERO)),
                 Duration::from_secs(30)
             )
             .await,
             Duration::ZERO,
             "a zero ceiling must refuse without waiting"
+        );
+    }
+
+    /// Fill every waiting place this peer has, then attach, and answer the refusal.
+    ///
+    /// **The exhausted pool is what makes the two settings tell each other apart**,
+    /// and it is the only observation available: [`Limits`] offers no getters and the
+    /// ledger publishes no waiter count. A setting that needs a place cannot get one
+    /// here and is refused [`TooManyRunning`](IdempotencyRefusal::TooManyRunning) by
+    /// `Ledger::wait`; a setting that needs none never reaches that call and is
+    /// refused [`InFlight`](IdempotencyRefusal::InFlight). So the refusal *names*
+    /// which side of `ledger.wait` the call was turned away on.
+    ///
+    /// One fixture for all three, following `actors.rs`'s `gated_behind`: settings that
+    /// owe a caller different things in the same scenario have to be compared through
+    /// one fixture, or the scenario drifts between them.
+    ///
+    /// `asked` is what the CALLER sent, and it is an [`Option`] because that is the
+    /// shape of the wire field under test — `Idempotency::attach_for_millis` is
+    /// `Option<u64>`, and `None` there *is* "did not ask". It is not an invented flag.
+    ///
+    /// `start_paused` for `held_for`'s reason — a setting that DOES park must reach
+    /// its answer without a wall-clock wait.
+    async fn refused_with_no_places(
+        attaching: Attaching,
+        asked: Option<Duration>,
+    ) -> IdempotencyRefusal {
+        let ledger = Ledger::new(Limits::default().attach(attaching), Records::Memory);
+        let peer = EndpointId::from_str(A).expect("a valid endpoint id");
+        let key = IdempotencyKey::new("k").expect("a valid key");
+
+        let Claim::Fresh(_running) = ledger.claim(peer, key.clone()) else {
+            panic!("the first claim must be fresh");
+        };
+        let places: Vec<_> = (0..MAX_WAITING_PER_PEER)
+            .map(|_| ledger.wait(peer).expect("a free place"))
+            .collect();
+
+        let idem = match asked {
+            Some(budget) => Idempotency::attaching_for(key, budget),
+            None => key.into(),
+        };
+        let keyed = claim_key(&any(&ledger), "Probe", peer, Some(idem)).await;
+
+        // Exhaustive, with no catch-all, for the reason
+        // `an_attacher_over_the_cap_is_refused_before_it_parks` gives: the arm that
+        // hides a regression is the one nobody thought to name.
+        let refused = match keyed {
+            Claimed::Refuse(RemoteError::Idempotency(refusal)) => refusal,
+            Claimed::Refuse(other) => panic!("expected an idempotency refusal, got {other:?}"),
+            Claimed::None => panic!("expected a refusal, got no key at all"),
+            Claimed::Run(_) => panic!("expected a refusal, got the key"),
+            Claimed::Replay(_) => panic!("expected a refusal, got a replay"),
+        };
+        drop(places);
+        refused
+    }
+
+    /// **The property [`Attaching::Forbidden`] exists for**: the operator refuses to
+    /// ADMIT an attacher, not merely to hold one.
+    ///
+    /// The pool has no place left, and the answer is
+    /// [`InFlight`](IdempotencyRefusal::InFlight) rather than
+    /// [`TooManyRunning`](IdempotencyRefusal::TooManyRunning) — which can only happen
+    /// if `Ledger::wait` was never reached. That is the assertion: no waiting place is
+    /// spent, so nothing parks and nothing re-claims.
+    ///
+    /// Paired with `a_zero_hold_still_spends_a_waiting_place`, which is the same
+    /// scenario at the setting this one is not.
+    ///
+    /// Made red by `scripts/break-once.sh` replacing
+    /// `Attaching::Forbidden => return Claimed::Refuse(IdempotencyRefusal::InFlight.into()),`
+    /// with `Attaching::Forbidden => std::time::Duration::ZERO,`, which is
+    /// [`Attaching::Forbidden`] collapsing into the zero hold it is not. Fully qualified
+    /// in the replacement because `rpc.rs` does not import `Duration` — the unqualified
+    /// form was tried and is `E0433`. The search literal carries its eight spaces of
+    /// indentation, so this record's unindented copy is not a second occurrence.
+    ///
+    /// **MEASURED at this tree, whole-lib, one run: ONE guard red, this one.**
+    /// `a_zero_hold_still_spends_a_waiting_place` stays green, which is what says the
+    /// pair is not one test twice. Watched, under `cargo test`:
+    /// `assertion `left == right` failed: a forbidden setting must be refused before a
+    /// place is asked for`, `left: TooManyRunning { limit: 128 }`, `right: InFlight`.
+    #[tokio::test(start_paused = true)]
+    async fn a_forbidden_ceiling_is_refused_without_a_waiting_place() {
+        assert_eq!(
+            refused_with_no_places(Attaching::Forbidden, Some(Duration::from_secs(30))).await,
+            IdempotencyRefusal::InFlight,
+            "a forbidden setting must be refused before a place is asked for"
+        );
+    }
+
+    /// **The collapse, pinned rather than described.** A caller that never asked to
+    /// attach reaches the SAME refusal, through the line below the operator's one —
+    /// so an unexhausted pool is not what distinguishes them and nothing on the wire
+    /// does either.
+    ///
+    /// The ceiling here is the default, so the only thing turning this call away is
+    /// that it did not ask. Read against
+    /// `a_forbidden_ceiling_is_refused_without_a_waiting_place`, which sends the same
+    /// key with a budget and gets the same answer, the pair is what makes
+    /// [`Attaching::Forbidden`]'s documented collapse a checked fact.
+    ///
+    /// No break is recorded, and the reason is that it has none worth having: this is
+    /// `a_bare_key_does_not_attach`'s property observed one layer out, and that guard
+    /// carries the break. What this adds is the accept path, which the other cannot
+    /// see.
+    #[tokio::test(start_paused = true)]
+    async fn a_caller_that_did_not_ask_is_refused_the_same_way() {
+        assert_eq!(
+            refused_with_no_places(Attaching::UpTo(MAX_ATTACH), None).await,
+            IdempotencyRefusal::InFlight,
+            "a caller that did not ask must be refused before a place is asked for too"
+        );
+    }
+
+    /// The other half, and the whole reason zero is not spelled `Forbidden`: a zero
+    /// hold still ASKS for a waiting place, so an exhausted pool turns it away with
+    /// the count it exceeded.
+    ///
+    /// [`Attaching`]'s own doc claims exactly this — *"`TooManyRunning` when the
+    /// waiting pool was already full"* — and nothing asserted it until here.
+    ///
+    /// Made red by `scripts/break-once.sh` appending `.filter(|held| !held.is_zero())`
+    /// to `.map(|millis| Duration::from_millis(millis).min(cap))` in
+    /// `keylink/src/idempotency.rs`, which is a zero hold collapsing into
+    /// [`Attaching::Forbidden`] — the inverse of the break above, and the reason these
+    /// two are a pair rather than one test twice. That is A2's registered literal with
+    /// a replacement of its own, so it adds no row. **MEASURED at this tree, whole-lib,
+    /// one run: ONE guard red, this one.** Watched, under `cargo test`:
+    /// `assertion `left == right` failed: a zero hold must still spend a waiting
+    /// place`, `left: InFlight`, `right: TooManyRunning { limit: 128 }`.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_hold_still_spends_a_waiting_place() {
+        assert_eq!(
+            refused_with_no_places(
+                Attaching::UpTo(Duration::ZERO),
+                Some(Duration::from_secs(30))
+            )
+            .await,
+            IdempotencyRefusal::TooManyRunning {
+                limit: u32::try_from(MAX_WAITING_PER_PEER).expect("a cap that fits"),
+            },
+            "a zero hold must still spend a waiting place"
         );
     }
 }
@@ -1169,8 +1349,112 @@ where
     /// refused rather than ignored, because a caller that attached a key believes
     /// it is protected.
     ///
-    /// This is not something a [`Middleware`] could do instead: the key is claimed
-    /// before the layer chain runs, so a layer never sees an unclaimed one.
+    /// This is not something a [`Middleware`] could do instead, and the act it
+    /// cannot do is **refusing a key that is present**: the key is claimed before
+    /// the layer chain runs, so a layer never sees an unclaimed one. Reading that a
+    /// key is **absent** is a different act, and the section below is a layer doing
+    /// it.
+    ///
+    /// # A layer requires a key where this policy permits one
+    ///
+    /// This decides which methods *accept* a key, and it cannot demand one. A
+    /// [`Middleware`] can: [`Context::call`](crate::Context::call) answers `None`
+    /// for a call that carried no key, and it answers before any layer runs —
+    /// `claim_key` builds the value from the request that arrived, and `serve_one`
+    /// enters the chain after it. So the absence is already correct when a layer
+    /// reads it, and [`RemoteError::Unauthorized`] is what refuses
+    /// it — **a reuse rather than a fit, and the difference is worth knowing before
+    /// you copy this.** No variant is named for *this method requires a key*, and
+    /// minting one is not cheap: [`RemoteError`] sits inside every service's hashed
+    /// contract, so `reply.rs` records that adding a variant is
+    /// wire-visible for every service, singletons included. `Unauthorized`'s own
+    /// documented meaning is *the peer is known, but not for this method*, which is
+    /// about the peer's standing rather than about a missing key. It is still the right
+    /// choice over [`Failed`](crate::RemoteError::Failed): a peer can `matches!` on it,
+    /// while a `Failed` is prose, and `reply.rs` states that *"a `Failed` whose text
+    /// came from a caller's own `Middleware` is outside any guard here and always will
+    /// be"* — so a `Failed` string here is one nothing protects.
+    ///
+    /// ```ignore
+    /// struct RequireKey;
+    ///
+    /// impl<Resp: Send + 'static> Middleware<till::Request, Resp> for RequireKey {
+    ///     fn handle(
+    ///         &self,
+    ///         cx: Context,
+    ///         req: till::Request,
+    ///         body: BodyReader,
+    ///         next: Next<till::Request, Resp>,
+    ///     ) -> BoxFut<(Outcome<Resp>, Body)> {
+    ///         Box::pin(async move {
+    ///             // In step with `Keyable::Only(&["Reserve"])` above, and that is
+    ///             // the whole of the caveat below.
+    ///             if cx.method() == "Reserve" && cx.call().is_none() {
+    ///                 return (
+    ///                     Outcome::Err(RemoteError::Unauthorized(
+    ///                         "Reserve needs an idempotency key".into(),
+    ///                     )),
+    ///                     Body::empty(),
+    ///                 );
+    ///             }
+    ///             next(cx, req, body).await
+    ///         })
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// **The method test is what makes a shorter layer wrong.** On a method
+    /// outside this policy a keyed call is refused
+    /// [`NotKeyable`](crate::IdempotencyRefusal::NotKeyable) *before* the chain is
+    /// entered and an unkeyed one arrives with `None`, so `cx.call()` can never
+    /// answer `Some` there — [`Context::call`](crate::Context::call) states that and
+    /// gives the construction. A layer that drops the `cx.method()` test therefore
+    /// refuses **every** call on every method this policy leaves out.
+    ///
+    /// **A `tell` breaks such a layer two ways, and the `cx.method()` test is what
+    /// saves it.** `serve_one_tell` never calls `with_call`, so `cx.call()` is
+    /// `None` for *every* `tell` whatever the caller sent — and it discards the layer
+    /// chain's outcome, so a refusal there reaches nobody. A `tell` cannot carry a key
+    /// at all, which [`Context::call`](crate::Context::call) says on its own; the
+    /// consequence for this layer is that a `tell` method must never be in the list it
+    /// tests.
+    ///
+    /// **Under [`Keyable::None`] such a layer refuses everything**, by the same
+    /// construction as a method outside the list: no ledger is built at all, so no call
+    /// can arrive with a key. `rpc::tests::the_ledger_is_reachable_only_through_the_policy`
+    /// and `Keys::new`'s own guard hold that no ledger exists there.
+    ///
+    /// **What such a layer polices is the key's presence, and nothing further about
+    /// the ledger.** [`Limits::attach`](crate::Limits::attach) records the ordering
+    /// this rests on: `serve_one` finishes `claim_key` — the park, and the re-claim
+    /// after it — *before* it calls the chain, so no layer can bound how long an
+    /// attaching call was held.
+    ///
+    /// **Served paths only.** `middleware::wrap` is `pub(crate)` and reached from
+    /// [`build`](Self::build) alone, so a call made through a local
+    /// [`Handle`](crate::LocalActor) meets no layer and this guard does not exist for
+    /// it. A key is a wire concept, so that is consistent rather than a hole — but a
+    /// layer is not a place to put an invariant the local path shares.
+    ///
+    /// **A keyed actor system takes this layer with its impl header changed**, and the
+    /// change is not optional. The generated `keyed_service` hands back a
+    /// [`ServiceBuilder`]`<`[`Addressed`](crate::Addressed)`<Request>, Response>`, and
+    /// [`layer`](Self::layer) accepts a [`Middleware`] over that builder's own `Req` — so
+    /// the header becomes `Middleware<Addressed<till::Request>, Resp>`, and the form
+    /// written above does not satisfy it. An operator who copies the header unchanged
+    /// onto a keyed system gets a trait-bound error rather than a layer.
+    ///
+    /// **The body is unchanged.** [`Context::method`](crate::Context::method) answers the
+    /// actor's own method name on that path rather than a constant, which is what makes
+    /// the `cx.method()` test above mean the same thing there.
+    /// `tests/actors.rs`'s `PerMethod` mounts a `Middleware<Addressed<..>, ..>` on a
+    /// `keyed_service` and reads that name, so the keyed header shape is compiled
+    /// somewhere in this tree.
+    ///
+    /// The layer above is held on an ordinary service by
+    /// `tests/protocol.rs::a_layer_can_require_an_idempotency_key`. **No test mounts this
+    /// layer on a keyed system**, so the keyed header is stated here rather than
+    /// compiled with this body.
     #[must_use]
     pub fn keyable(mut self, keyable: Keyable) -> Self {
         self.keyable = keyable;
