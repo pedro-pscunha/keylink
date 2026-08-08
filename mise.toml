@@ -293,13 +293,23 @@ description = "rustdoc as a gate, not as decoration"
 #    replaced said the opposite — it listed "every break record in a unit-test
 #    module" among what the flag would buy. It buys none of them.
 #
-#    THE DECISIVE EVIDENCE IS A POSITIVE CONTROL, in one run. A
-#    `[`NoSuchItemAnywhereInThisCrate`]` added inside `authz.rs`'s `mod tests`
-#    produced NO diagnostic, while a second broken link on a method in the SAME
-#    FILE produced `error: unresolved link to `PositiveControlNoSuchItem`` and
-#    exit 101. Two things at once: rustdoc ran, and the silence was specific to
-#    the test module. Without the control, silence and "rustdoc never ran" are the
-#    same output.
+#    THE DECISIVE EVIDENCE IS A THREE-ARM CONTROL, in one run, and the third arm
+#    came from the merge-gate reviewer rather than from this branch. Three broken
+#    links in `authz.rs`, one rustdoc pass, 2 errors:
+#
+#      PubItemNoSuchItem                on a `pub` method        REPORTED
+#      NonCfgPrivateModuleNoSuchItem    private mod, no cfg      REPORTED
+#      InsideCfgTestModNoSuchItem       inside `#[cfg(test)] mod`  silent
+#
+#    **The middle arm is what makes this isolation rather than correlation.** The
+#    first version of this control had two arms — the cfg one against a `pub`
+#    method — which differ in TWO ways: the cfg, and being public with a
+#    re-exported path. The reviewer added a private module in the same file,
+#    identical in privacy and nesting and differing only by having no
+#    `#[cfg(test)]`. It is REPORTED, so privacy and nesting are ruled out and the
+#    cfg is the isolated variable. Reproduced here before being written down.
+#
+#    Without any control at all, silence and "rustdoc never ran" are one output.
 #
 #    Corroborating, and NOT decisive on its own: rustdoc emits no page for such a
 #    module. `target/doc/keylink/authz/` holds `enum.Allowlist.html`,
@@ -310,11 +320,18 @@ description = "rustdoc as a gate, not as decoration"
 #    written somewhere this search did not look. It agrees with the control rather
 #    than standing in for it.
 #
-#    THE MECHANISM IS THE UNVERIFIED PART, and it is named rather than dropped so
-#    the next reader has somewhere to start: `cargo doc` is believed not to set
-#    `--cfg test`, which would strip the module before rustdoc sees it. Nothing
-#    here measured that. Treat it as the likely explanation of the control's
-#    result, never as the finding.
+#    THE MECHANISM IS NOW HALF OBSERVED, and the boundary is worth being exact
+#    about. `cargo doc -v` prints every rustdoc invocation, and all three carry
+#    ONLY `feature="…"` cfgs — no bare `test` cfg and no `--test` flag. So "cargo
+#    passes no test cfg" is a measurement, not a belief.
+#
+#    A grep returning nothing is not a finding on its own, so the pattern was fed
+#    a synthetic line carrying `--cfg 'test'` and `--test` first: it matched 2. The
+#    same pattern against the real `-v` log matches 0.
+#
+#    **What stays unverified is the step from "no test cfg" to "the item is gone
+#    before rustdoc documents it".** That is language semantics rather than
+#    anything this task can measure, and it is the only part still inferred.
 #
 #    `lib.rs`'s own reasoning beside `extern crate self as keylink` reaches the
 #    same conclusion from the other direction: `representability.rs` expands
@@ -383,20 +400,33 @@ description = "rustdoc as a gate, not as decoration"
 # `break-once.sh` flips to redden a TEST, and this is a claim about rustdoc, so it
 # is described here instead — the third option that task's own header allows.
 #
-# One invocation and not two, and selecting `demo` here is CHEAPER than leaving it
-# out — which is the opposite of what it looks like, so it is measured rather than
-# argued. `lint` and `test` both build the whole workspace, so the resolution that
-# INCLUDES `demo` is the one the gate has already materialised by the time this
-# step runs. A `-p keylink -p keylink-persist` selection is the odd one out: its
-# narrower package set resolves features differently, so rustdoc redoes both
-# crates at a resolution nothing else uses.
+# One invocation and not two. Selecting `demo` costs one extra rustdoc unit and
+# saves a dependency rebuild, and the reason is which FEATURE RESOLUTION each
+# selection asks for: `lint` and `test` both build the whole workspace, so the
+# resolution that INCLUDES `demo` is the one already materialised when this step
+# runs. A `-p keylink -p keylink-persist` selection is the odd one out — its
+# narrower package set resolves features differently, so it needs dependency
+# artifacts nothing else in the gate builds.
 #
-# MEASURED in the gate's own order, after
-# `cargo check --workspace --all-features --all-targets`:
+# MEASURED with a cleaned doc dir and the workspace check restored BEFORE EACH
+# form, run in both orders. Two columns, and they point opposite ways:
 #
-#   this line, with `-p demo`      1 unit documented, 0 Checking lines
-#   the same line without it       2 units documented, 0 Checking lines
-#   `--workspace` check afterwards 0 units either way — neither invalidates `lint`
+#                             Documenting   Checking (first use)
+#   this line, with `-p demo`      3              0
+#   the same line without it       2             12
+#   `--workspace` afterwards       0              0   — neither invalidates `lint`
+#
+# **An earlier version of this table said 1 in the Documenting column, and that
+# number was the ONLY thing in it supporting the word "cheaper".** It came from a
+# procedure that ran the workspace check once at the start rather than before each
+# form, on a doc dir this form had already populated, so it counted `demo` alone.
+# From a clean doc dir it is 3, in either order. The real Documenting comparison,
+# 3 against 2, mildly OPPOSES the conclusion; the `Checking` column carries it.
+#
+# The 12 is ONE observation, not a stable figure: reproducing it needs the
+# two-crate resolution's dependency artifacts absent, and `cargo clean --doc` does
+# not arrange that. What is stable across every ordering is 3 against 2 documented
+# and 0 against non-zero compiled.
 #
 # In package terms `demo` adds exactly TWO that `-p keylink --all-features` does
 # not already compile, `anyhow` and `demo` itself, derived by comparing
