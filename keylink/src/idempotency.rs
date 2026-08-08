@@ -1116,12 +1116,18 @@ impl Limits {
     /// ledger stores exactly the bytes the wire wrote. So headroom for one reply's
     /// payload is the figure set minus four.
     ///
-    /// **There IS a hard floor, and it is not the useful one.** Every frame carries
-    /// that four-byte prefix, so `frame.len()` is never below four and **any value
-    /// under four refuses every reply** — arithmetic from the prefix width, not a
-    /// measurement of the ledger. This line previously said *"zero would leave only
-    /// a zero-length frame recordable"*, which named a frame size that cannot exist
-    /// and a value `NonZeroUsize` already forbids.
+    /// **There IS a hard floor, and it is not the useful one.** A frame is the
+    /// four-byte prefix plus a postcard-encoded envelope, and that envelope is never
+    /// empty — it carries two option tags before the message — so `frame.len()` is
+    /// always **greater** than four. **Any value of four or below therefore refuses
+    /// every reply**, which is arithmetic from the prefix width rather than a
+    /// measurement of the ledger.
+    ///
+    /// Stated as *four or below* rather than *under four*, which was the first
+    /// wording here and left the boundary out: at exactly four nothing records
+    /// either, because no frame is that small. This line before that said *"zero
+    /// would leave only a zero-length frame recordable"* — a frame size that cannot
+    /// exist, at a value `NonZeroUsize` already forbids.
     ///
     /// **Above four there is no floor this method can state**, and that is what
     /// separates it from the one bound in this workspace that has one.
@@ -1153,6 +1159,13 @@ impl Limits {
     /// `Ledger::settle` runs in the same lock. It never reads
     /// [`Unrecordable`](IdempotencyRefusal::Unrecordable), because that state and
     /// `Done` are exclusive for one key.
+    ///
+    /// **A `const` assertion forbids that relation between the two default
+    /// constants, and it does not constrain this setter.** It fires at build time on
+    /// [`MAX_RECORDED_FRAME`] against [`MAX_RECORDED_BYTES`], because a *shipped*
+    /// default in that relation would report an eviction for a reply that was never
+    /// storable. A caller who chooses it deliberately gets the behaviour described
+    /// above, which is why it is documented rather than rejected.
     #[must_use]
     pub fn pool_bytes(mut self, bytes: NonZeroUsize) -> Self {
         self.pool_bytes = bytes;
@@ -1194,10 +1207,23 @@ impl Limits {
     ///
     /// Defaults to [`MAX_RUNNING`]. Zero would refuse every keyed call.
     ///
-    /// Reaches the wire inside
+    /// # What a value above `u32::MAX` does, and it is the opposite of refusing
+    ///
+    /// The exceeded figure reaches the wire inside
     /// [`TooManyRunning`](IdempotencyRefusal::TooManyRunning), whose `limit` is a
-    /// `u32`. A value above [`u32::MAX`] still refuses, and the refusal names
-    /// 4294967295 rather than the value set.
+    /// `u32`, so `over` clamps anything larger to 4294967295 rather than truncating
+    /// it to a small wrong number.
+    ///
+    /// **But that clamp is only ever observed when a refusal fires, and a refusal
+    /// fires only when the counter reaches the bound.** So a value above
+    /// [`u32::MAX`] does not refuse — it makes the bound **unreachable**, because
+    /// nothing refuses until more than 4294967295 keyed calls are in dispatch at
+    /// once. Setting a bound that large disables it; it does not make it loud.
+    ///
+    /// The same reasoning covers [`running_per_peer`](Self::running_per_peer),
+    /// [`waiting`](Self::waiting) and
+    /// [`waiting_per_peer`](Self::waiting_per_peer), which is why it is written once
+    /// here rather than four times.
     #[must_use]
     pub fn running(mut self, running: NonZeroUsize) -> Self {
         self.running = running;
@@ -1210,8 +1236,9 @@ impl Limits {
     /// [`running`](Self::running), so it governs first. Zero would refuse every
     /// keyed call from every peer.
     ///
-    /// Reaches the wire as a `u32`, so a value above [`u32::MAX`] refuses while
-    /// naming 4294967295.
+    /// A value above [`u32::MAX`] **disables** this bound rather than refusing
+    /// loudly — see [`running`](Self::running) for why the `u32` clamp is never
+    /// observed at such a value.
     #[must_use]
     pub fn running_per_peer(mut self, running: NonZeroUsize) -> Self {
         self.running_per_peer = running;
@@ -1231,8 +1258,9 @@ impl Limits {
     /// it is on the *calling* side: not asking to attach is answered
     /// [`InFlight`](IdempotencyRefusal::InFlight), which is the right refusal.
     ///
-    /// Reaches the wire as a `u32`, so a value above [`u32::MAX`] refuses while
-    /// naming 4294967295.
+    /// A value above [`u32::MAX`] **disables** this bound rather than refusing
+    /// loudly — see [`running`](Self::running) for why the `u32` clamp is never
+    /// observed at such a value.
     #[must_use]
     pub fn waiting(mut self, waiting: NonZeroUsize) -> Self {
         self.waiting = waiting;
@@ -1242,12 +1270,20 @@ impl Limits {
     /// Attaching calls one peer may have parked at once.
     ///
     /// Defaults to [`MAX_WAITING_PER_PEER`]. **Checked first**, before
-    /// [`waiting`](Self::waiting), so this one alone governs whatever `waiting`
-    /// holds for a single peer. Zero would refuse every attaching call, with the
+    /// [`waiting`](Self::waiting) — but checked first is not the same as governing,
+    /// and this doc used to say it *alone* governed whatever `waiting` held. It does
+    /// not. If it passes, `waiting` is still checked, so **whichever of the two is
+    /// smaller binds**: at the defaults 128 is below 1024 so this one binds for one
+    /// peer, and set `waiting` below this and `waiting` binds even for a single
+    /// peer. Being checked first only decides which refusal a caller sees when both
+    /// are exceeded.
+    ///
+    /// Zero would refuse every attaching call, with the
     /// same misnamed refusal described on [`waiting`](Self::waiting).
     ///
-    /// Reaches the wire as a `u32`, so a value above [`u32::MAX`] refuses while
-    /// naming 4294967295.
+    /// A value above [`u32::MAX`] **disables** this bound rather than refusing
+    /// loudly — see [`running`](Self::running) for why the `u32` clamp is never
+    /// observed at such a value.
     #[must_use]
     pub fn waiting_per_peer(mut self, waiting: NonZeroUsize) -> Self {
         self.waiting_per_peer = waiting;
