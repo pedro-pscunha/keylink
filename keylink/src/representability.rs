@@ -1093,7 +1093,7 @@ fn no_mailbox_can_be_asked_to_be_unbounded(builder: beta::SystemBuilder) -> beta
 /// would too, which is why the sentence names the property and not the field count.
 ///
 /// **`attach` takes an [`Attaching`](crate::Attaching) now and is still an
-/// exception**, because zero lives inside [`Attaching::For`](crate::Attaching::For)
+/// exception**, because zero lives inside [`Attaching::UpTo`](crate::Attaching::UpTo)
 /// rather than being removed from the range. What the enum removed is a second
 /// *meaning* on that zero, which is a different property from the one this probe
 /// asserts — so a reader meeting the new signature does not gain a bound here.

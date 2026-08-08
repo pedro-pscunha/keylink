@@ -320,12 +320,29 @@ the handler again. `keylink-persist` is deliberately not the answer — it says 
 itself: *"No history. One state, one current value. A journal is a different port
 with different operations."* The ledger is journal-shaped.
 
-**A live wart, recorded rather than fixed.** A `NoSuchActor` refusal from an
-actor system's `deliver` settles the key, so a retry after the actor is mounted
-replays `NoSuchActor` forever. It is the same shape as §2 — a refusal recorded
-for a call that never ran — one layer down, where the payload is opaque to
-keylink by design and the progress marker therefore cannot reach. Fixing it means
-the keyed actor system growing an idea of dispatch it does not have yet.
+**A wart this recorded as live, and the tree has since closed it.** The claim was
+that a `NoSuchActor` refusal from an actor system's `deliver` settles the key, so a
+retry after the actor is mounted replays `NoSuchActor` forever — the same shape as
+§2, one layer down, "where the payload is opaque to keylink by design and the
+progress marker therefore cannot reach".
+
+Both halves are now false. `deliver_to_actor` takes the `NoSuchActor` exit at its
+`let route = system.route(&actor)?;`, and the first progress mark on that path —
+`progress.enqueued()` — is far below it and after the send. So the `?` returns with
+**nothing marked**, `Progress::reached` reports an unmarked marker as
+`Reached::NotDispatched`, and `Drop for Guard` **releases** on exactly that value. A
+retry after the actor is mounted is a first attempt. The stated cause went too: the
+payload is typed on that path now and the marker does reach it.
+
+**Nothing names this case, so the closure rests on a path reading.** No test in
+`keylink/tests/` asserts on a key or a key state after a `NoSuchActor`, and the
+release is a consequence of two independent facts — where the `?` sits and what an
+unmarked marker means — rather than of a line written for it. The guards that hold
+those two facts separately are
+`idempotency::tests::a_guard_dropped_with_nothing_dispatched_leaves_the_key_claimable`
+for the release and
+`actors.rs::a_keyed_call_whose_turn_panicked_settles_the_key_interrupted` for the
+other arm. A guard for the composition is worth adding and is not added here.
 
 ---
 

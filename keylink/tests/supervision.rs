@@ -1590,3 +1590,119 @@ async fn a_peer_whose_feed_panicked_is_told_the_actor_is_gone() {
          {lost:?}"
     );
 }
+
+/// **The gap `local.rs`'s `supervise` documents, pinned as behaviour.** A keyed call
+/// whose turn panics on a supervised DURABLE actor is refused
+/// `IdempotencyRefusal::Interrupted` on every retry, even though the restart rolled the
+/// state back and the entry the turn appended is provably gone.
+///
+/// Both halves are asserted, because either alone reads as a different story: the
+/// entries after the restart show the state rolled back, and the retry under the same
+/// key shows the ledger did not. The ledger is per service and survives the restart
+/// intact, which is what makes the two disagree.
+///
+/// **Written because nothing else combined them.** `supervision.rs` named no
+/// idempotency key and `actors.rs` mounts no supervisor, so this behaviour was
+/// reachable and unasserted. It pins what a caller GETS. Whether that answer is right
+/// is argued on `supervise`, and the argument does not rest on this test.
+///
+/// `Ruin` and not `Bad`, for the reason the service declaration gives: a peer's `rpc`
+/// receives the fault as `Failed("panicked: ..")` rather than as an unwind in this test.
+/// `RefuseFaults` stands in for `Persist`'s own refusal of a panicked turn — the saver
+/// beside it is the real thing, so the snapshot the next incarnation reads is genuine.
+///
+/// Real time and a real file store, and nothing here asserts a duration.
+///
+/// Made red by `scripts/break-once.sh` replacing
+/// `if self.progress.as_ref().map(Progress::reached) == Some(Reached::NotDispatched) {`
+/// with `if true {` in `keylink/src/idempotency.rs`, which releases every key a guard
+/// drops — the BROAD close this gap deliberately does not take. That is R11's
+/// registered literal with a replacement of its own, so it adds no row; the search form
+/// carries its eight spaces of indentation. Watched, under `cargo test`:
+/// `a retry must read Interrupted even though the work provably did not survive:
+/// Remote(Failed("panicked: the actor panicked: bad entry"))` — the retry RAN the turn a
+/// second time, which is the double-effect the argument on `supervise` is about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_keyed_call_whose_turn_panicked_stays_interrupted_across_a_restart() {
+    let (_scratch, files) = store("keyed-restart").await;
+    let id = StateId::new("ledgers/keyed-01").expect("valid");
+    let server_node = local_node().await;
+    let client_node = local_node().await;
+
+    let ledger = ledger::supervised(
+        move || {
+            let files = files.clone();
+            let id = id.clone();
+            async move {
+                let (restored, saver) = Persist::<Ledger, _>::open(&files, &id)
+                    .await?
+                    .start_from(Ledger::default);
+                let observers: Vec<Box<dyn Observer<Ledger>>> =
+                    vec![Box::new(saver), Box::new(RefuseFaults { fatal: false })];
+                Ok((restored, observers, ()))
+            }
+        },
+        limit(2, Duration::from_millis(50)),
+    );
+    let _server = Server::builder(&server_node)
+        .service(ledger.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("one service, one ALPN");
+
+    let peer: keylink::Peer<ledger::Client> =
+        keylink::Peer::new(&client_node, server_node.endpoint().addr());
+    let client = peer.connect().await.expect("the dial");
+
+    // One committed turn, so "rolled back to the last commit" has something behind it.
+    assert_eq!(client.post(1).await.expect("the first turn"), 1);
+
+    let key = keylink::IdempotencyKey::new("ruin-1").expect("a valid key");
+    let faulted = client
+        .with_idempotency(key.clone())
+        .ruin(9)
+        .await
+        .expect_err("the turn panics");
+    assert!(
+        matches!(&faulted, keylink::Error::Remote(RemoteError::Failed(why)) if why.contains("bad entry")),
+        "a peer must be told the turn panicked: {faulted:?}"
+    );
+
+    // The next incarnation, asked rather than assumed: it answers only once the
+    // supervisor has built it, and the answer is the state the snapshot holds.
+    let mut entries = Vec::new();
+    for _ in 0..1_000 {
+        if let Ok(seen) = client.entries().await {
+            if !seen.is_empty() {
+                entries = seen;
+                break;
+            }
+        }
+        n0_future::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        entries,
+        vec![1],
+        "the restart must drop the panicked turn's entry, or this test is not about a rollback"
+    );
+
+    // And the half that is the gap: the ledger did not roll back with it.
+    let retried = client
+        .with_idempotency(key)
+        .ruin(9)
+        .await
+        .expect_err("the key settled, so the retry is refused rather than run");
+    assert!(
+        matches!(
+            &retried,
+            keylink::Error::Remote(RemoteError::Idempotency(
+                keylink::IdempotencyRefusal::Interrupted
+            ))
+        ),
+        "a retry must read Interrupted even though the work provably did not survive: {retried:?}"
+    );
+    assert_eq!(
+        client.entries().await.expect("the actor answers"),
+        vec![1],
+        "and the refused retry must not have run the turn again"
+    );
+}

@@ -272,7 +272,7 @@ recipe rather than a feature:
    running, which is `InFlight` and still the truth. Ask again, or ask
    `key_state`. A service that will not hold an attacher at all sets
    `Limits::attach(Attaching::Forbidden)`, which answers `InFlight` at once and
-   spends no waiting place — distinct from `Attaching::For(Duration::ZERO)`, which
+   spends no waiting place — distinct from `Attaching::UpTo(Duration::ZERO)`, which
    admits the attacher and holds it for no time.
 
 `examples/reliable_call.rs` is that recipe, compiled by the gate and run over two
