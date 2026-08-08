@@ -93,6 +93,33 @@ ANCHORS = [
      "__keylink_granted_id!"),
 ]
 
+# Records whose search edit is DESCRIBED, deliberately, and must stay that way.
+#
+# **This is documentation and NOT a check, and the reason is worth stating because
+# it looks checkable and is not.** The obvious assertion — "the retired literal no
+# longer appears in the record's file" — fails immediately: a record that explains
+# *why* it was converted quotes the retired literal to do so, and an explanatory
+# quote is textually identical to a search quote. Measured, not assumed: R26a's file
+# contains its retired anchor exactly once, and that once is the paragraph
+# documenting the rot mode. Any rule strong enough to catch a re-quote would flag
+# that paragraph, and any rule loose enough to permit it catches nothing.
+#
+# What the list is for, then: **distinguishing "deliberately described" from
+# "forgotten".** Without it a record absent from ANCHORS is ambiguous, and the
+# ambiguity favours the wrong reading — somebody re-quotes an anchor that was
+# converted on purpose, reinstating the rot the conversion removed, and the new
+# entry looks like coverage.
+DESCRIBED = [
+    ("R11", "keylink/src/idempotency.rs", "same-file",
+     "Guard::drop's NotDispatched condition - the record's own quote was the "
+     "second occurrence"),
+    ("R19", "keylink/tests/idempotency.rs", "same-file",
+     "the keyed-actor test's own .keyable(..) call, for the same reason"),
+    ("R26a", "keylink/tests/api.rs", "positional",
+     "a slice of lib.rs's `pub use` list - re-quoting buys only until the next "
+     "export lands"),
+]
+
 cache: dict[str, str] = {}
 bad = 0
 
@@ -153,4 +180,8 @@ if bad:
 print(
     f"ok: {len(ANCHORS)} REGISTERED break anchors resolve exactly once "
     "(registration is per-record and opt-in - see this task's header)"
+)
+print(
+    f"    {len(DESCRIBED)} more are recorded as deliberately DESCRIBED rather than "
+    "quoted - documentation, not a check"
 )
