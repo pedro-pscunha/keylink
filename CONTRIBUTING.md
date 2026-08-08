@@ -4,18 +4,31 @@
 
 ```sh
 ./scripts/install-hooks.sh   # once per clone
-mise run gate                # everything CI runs
+mise run gate                # the whole gate
 ```
+
+**GitHub Actions is disabled. `mise run gate` is the only gate**, and the
+`pre-push` hook runs it — which makes `./scripts/install-hooks.sh` load-bearing
+rather than a convenience. Skip it and nothing checks your pushes.
+
+Two consequences worth knowing before you hit them:
+
+- **`mise` is now required, not recommended.** The `pre-push` hook used to fall
+  back to a weaker set of checks when mise was missing, on the grounds that CI
+  ran the rest. It refuses now, because a gate that passes while covering less
+  than it claims is a false green.
+- **The gate runs on your machine, on your OS.** CI ran Linux. Nothing checks the
+  other platform any more.
 
 You need [`mise`](https://mise.jdx.dev) and rustup. Nothing else is a manual
 step: `rust-toolchain.toml` requests the `wasm32-unknown-unknown` target and the
 `llvm-tools` component, and rustup installs both on first use. `mise.toml` pins
-`cargo-deny`. A cold clone should reach a green gate without reading a list of
-setup commands, because a setup command in a README is a step somebody skips.
+`cargo-deny`, and `msrv` pulls Rust 1.91 on its first run — a one-time download
+that used to be CI's to pay.
 
-The gate is defined once, in `mise.toml` and `.mise/tasks/`. CI calls those same
-tasks, so a green `mise run gate` locally means a green run. There is no second
-copy of the commands to drift.
+The gate is defined once, in `mise.toml` and `.mise/tasks/`. That was already
+true while CI existed, which is why removing the workflow changed no command:
+it called those same tasks rather than restating them.
 
 | | runs | why |
 |---|---|---|

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# The heavy gate: everything CI runs, before it costs a CI minute.
+# The heavy gate — and since GitHub Actions was disabled, the ONLY gate.
 #
-# Slow on purpose. A push is rare compared to a commit, and finding a red gate
-# here costs one local run rather than a round trip through CI and a fixup
-# commit on a branch someone is already reading.
+# Slow on purpose, and now load-bearing rather than an optimisation. It used to
+# run what CI would run, so a red result here saved a round trip. Nothing runs
+# after this any more: a bypass is not "CI will catch it", it is "nothing will".
 #
-# Bypass with `git push --no-verify`. See CONTRIBUTING.md.
+# Bypass with `git push --no-verify`. See CONTRIBUTING.md, and read the narrow
+# case it is for — it got narrower when the second gate went away.
 set -euo pipefail
 
 chain="$(git config --get hooks.chain || true)"
@@ -19,17 +20,25 @@ if command -v mise >/dev/null 2>&1; then
     exec mise run pre-push
 fi
 
-# Not the same gate: the browser-target build needs `llvm-ar` derived from the
-# host triple, and duplicating that here would be a second copy to drift from
-# .mise/tasks/wasm. So this path is honestly weaker, and says so — CI still
-# runs the full one.
-echo "note: 'mise' is not installed - running the checks directly," >&2
-echo "      WITHOUT the browser target. Install mise to gate it locally." >&2
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo clippy -p keylink --lib --no-default-features -- -D warnings
-for f in "" blocking fs env blocking,fs blocking,env fs,env blocking,fs,env; do
-    cargo check -p keylink --lib --no-default-features --features "$f"
-done
-cargo test --workspace
-RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features -p keylink
+# **This path used to run a weaker gate and say so, on the grounds that "CI still
+# runs the full one". That sentence is why it now refuses instead.**
+#
+# The weaker version skipped the browser target, because building it needs
+# `llvm-ar` derived from the host triple and duplicating that here would be a
+# second copy to drift from .mise/tasks/wasm. It also skipped `wasm-guards`,
+# `msrv`, `deny`, `framing`, `examples` and `package`. That was a fair trade
+# while something else ran them. Nothing else runs them now.
+#
+# A gate that passes while covering less than it claims is a false green, and a
+# false green on a push is worse than a refused push: one of them tells you.
+echo "error: 'mise' is not installed, and it is the gate." >&2
+echo >&2
+echo "  GitHub Actions is disabled for this repository. \`mise run gate\` is the" >&2
+echo "  only thing that checks a push, so there is no weaker-but-still-useful" >&2
+echo "  subset to fall back to — whatever it skipped, nobody else would run." >&2
+echo >&2
+echo "  Install mise:  https://mise.jdx.dev" >&2
+echo "  Then:          ./scripts/install-hooks.sh && mise run gate" >&2
+echo >&2
+echo "  To push anyway, knowing nothing has checked it: git push --no-verify" >&2
+exit 1

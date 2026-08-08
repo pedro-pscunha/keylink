@@ -1,10 +1,13 @@
-# keylink's gate, defined once.
+# keylink's gate, defined once — and now defined only here.
 #
-# CI runs these same tasks, so a green `mise run gate` locally means a green run
-# there — there is no second copy of the commands to drift from this one.
+# **GitHub Actions is disabled and this file is the whole gate.** The workflow
+# used to call these same tasks, which is why nothing here had to change when it
+# went: there was never a second copy of the commands. What did change is that a
+# green `mise run gate` is no longer a prediction about a second run somewhere
+# else. It is the run. See README.md for what that costs.
 #
 #   mise tasks           # every task
-#   mise run gate        # everything CI runs
+#   mise run gate        # the whole gate
 #   mise run pre-commit  # the fast subset the commit hook runs
 #   mise run pre-push    # the heavy subset the push hook runs
 #
@@ -34,21 +37,35 @@
 # ── the whole gate ──────────────────────────────────────────────────────────
 
 [tasks.gate]
-description = "Everything CI runs, in CI's order. Cheapest failures first"
+description = "The whole gate. There is no other one — CI is disabled"
 # A list of task references runs them ONE AT A TIME, in order. Bare `depends`
 # lets mise parallelize, and parallel cargo invocations contend for the same
 # target directory and the same memory.
+#
+# **This used to be "everything CI runs", and CI ran three things it did not.**
+# When the workflow was disabled, `wasm-guards`, `msrv` and `deny` were the
+# difference, so they moved here in the same change. Disabling a gate and
+# dropping what only it covered are two separate acts, and doing the first
+# without the second is how coverage disappears without anybody deciding to
+# drop it.
+#
+# Cheapest failures first, with one deliberate exception: `deny` needs no
+# compile at all and sits early, so a fresh advisory fails in seconds rather
+# than after the test suite.
 run = [
     { task = "framing" },
     { task = "fmt-check" },
+    { task = "deny" },
     { task = "lint" },
     { task = "features" },
     { task = "test" },
     { task = "examples" },
     { task = "docs" },
     { task = "wasm" },
+    { task = "wasm-guards" },
     { task = "wasm-web" },
     { task = "package" },
+    { task = "msrv" },
 ]
 
 # ── what the hooks run ──────────────────────────────────────────────────────
@@ -191,17 +208,23 @@ run = "cargo package --workspace --exclude demo --no-verify --allow-dirty"
 
 [tasks.msrv]
 description = "Compile on the oldest Rust keylink claims to support"
-# Not in `gate` and not in a hook: it needs a second toolchain, which is a
-# ~200 MB download a contributor should not pay for on every push. CI runs it.
+# **In `gate` since CI was disabled, and the cost it used to dodge is real.** It
+# needs a second toolchain — a ~200 MB download the first time — which is why it
+# sat outside the gate while CI carried it. Nobody carries it now, and an MSRV
+# nobody compiles is a promise broken silently: `rust-version` changes what cargo
+# tells a user on an old compiler, so a wrong one sends them to the wrong place.
 #
-# An MSRV nobody compiles is a promise broken silently — `rust-version` changes
-# what cargo tells a user on an old compiler, so a wrong one sends them to the
-# wrong place.
+# Paying it once per clone beat dropping the guarantee. If that trade stops being
+# worth it, take this out of `gate` **and** say who runs it instead — not one
+# without the other.
 run = "cargo +1.91 check --workspace --all-targets --all-features"
 
 [tasks.deny]
 description = "Advisories and licences over the whole tree"
-# Not in `gate` and not in a hook: it fetches the advisory database, so it needs
-# the network. CI runs it. Run it by hand when you change a dependency — see
-# CONTRIBUTING.md.
+# **In `gate` since CI was disabled**, for `msrv`'s reason. It fetches the
+# advisory database, so it needs the network on every push — which is what kept
+# it out while CI ran it.
+#
+# It is placed early in `gate`, ahead of anything that compiles: it is the one
+# check whose result can change without the tree changing, and it costs seconds.
 run = "cargo deny check"
