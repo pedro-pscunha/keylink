@@ -1607,6 +1607,13 @@ impl Limits {
 /// the feature off": wrong on that path, and the sentence this type exists to make
 /// unwritable.
 ///
+/// **A zero ceiling is still an admission, and that is why it reaches that path at
+/// all.** Clamping the peer's request against this ceiling leaves it with a budget of
+/// zero rather than with no budget, and a caller holding a budget is one the accept path
+/// admits. So it goes on to ask for a waiting place, and it is the *expiry* that turns it
+/// away. [`Forbidden`](Self::Forbidden) is refused before any budget is read, so it never
+/// asks.
+///
 /// So a second meaning stacked on the same zero would be a value whose act a
 /// reader has to look up. A variant is the act, in the word the operator typed.
 ///
