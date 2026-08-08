@@ -1362,12 +1362,11 @@ where
     /// for a call that carried no key, and it answers before any layer runs —
     /// `claim_key` builds the value from the request that arrived, and `serve_one`
     /// enters the chain after it. So the absence is already correct when a layer
-    /// reads it, and
-    /// [`RemoteError::Unauthorized`](crate::RemoteError::Unauthorized) is what refuses
+    /// reads it, and [`RemoteError::Unauthorized`] is what refuses
     /// it — **a reuse rather than a fit, and the difference is worth knowing before
     /// you copy this.** No variant is named for *this method requires a key*, and
-    /// minting one is not cheap: [`RemoteError`](crate::RemoteError) sits inside every
-    /// service's hashed contract, so `reply.rs` records that adding a variant is
+    /// minting one is not cheap: [`RemoteError`] sits inside every service's hashed
+    /// contract, so `reply.rs` records that adding a variant is
     /// wire-visible for every service, singletons included. `Unauthorized`'s own
     /// documented meaning is *the peer is known, but not for this method*, which is
     /// about the peer's standing rather than about a missing key. It is still the right

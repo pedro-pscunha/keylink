@@ -1525,6 +1525,13 @@ impl Limits {
     /// otherwise read and before `Ledger::wait`, so nothing parks and no
     /// [`waiting`](Self::waiting) place is spent.
     ///
+    /// **That line sits there for a reason, and not merely because it moved there.**
+    /// Routing this refusal through `Idempotency::attach_budget`'s `None` would answer the
+    /// same thing on the wire and cost a guard: `a_bare_key_does_not_attach` asserts that
+    /// `None` means *the caller did not ask*, and a second producer makes it pass for two
+    /// reasons at once while its name still claims one. That method's own doc carries the
+    /// argument in full.
+    ///
     /// **[`Attaching`] carries the argument for both acts, and this setter deliberately
     /// does not repeat it**: which refusal each one produces, what a zero hold still
     /// spends, and why zero is not spelled [`Forbidden`](Attaching::Forbidden). That

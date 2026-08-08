@@ -2446,7 +2446,7 @@ impl<A: Send, M: Send, I: Inbox<A, M>> Inbox<A, M> for Lent<'_, I> {
 /// marked dispatched, the turn panics. A panic **alone** stops here and costs one
 /// message: `tests/actors.rs::a_panicking_message_costs_one_message_and_not_the_actor`
 /// holds that, and nothing restarts. What produces a restart is an
-/// [`Observer`](crate::Observer) refusing the faulted turn — the shape a
+/// [`Observer`] refusing the faulted turn — the shape a
 /// [`Persist`](crate::Persist) adapter always has, since it will not write a
 /// half-applied state — which `observed_turn` folds into [`Ended::Panicked`], which
 /// [`retryable`] grants. The next incarnation starts from the last committed state, as
@@ -2472,6 +2472,26 @@ impl<A: Send, M: Send, I: Inbox<A, M>> Inbox<A, M> for Lent<'_, I> {
 /// that the answer is right** — the paragraphs above are what argue that, and no test can
 /// stand in for them: the claim they make is about the world the handler touched, which
 /// the suite cannot reach.
+///
+/// **Releasing the key instead is not a one-guard change.** Make `Guard::drop`'s
+/// `Reached::NotDispatched` test always take the releasing arm, and the guard above
+/// reddens together with these in `idempotency.rs`:
+/// `claim::a_guard_dropped_after_dispatch_leaves_the_key_interrupted`,
+/// `claim::a_guard_dropped_without_a_reply_leaves_the_key_interrupted`,
+/// `records::records_none_changes_nothing_about_who_settles` and
+/// `state::key_state_reports_every_state`. So *leave it open* is a decision measured
+/// against named guards rather than a preference between two readings.
+///
+/// **Under that release the double effect is observed rather than argued.** The guard
+/// above then fails carrying a `Failed("panicked: ..")`, and a `Failed` whose text is a
+/// panic message can only be produced by ENTERING the handler — so the retry ran the turn
+/// a second time on an actor whose first attempt had already panicked. That is the
+/// double-effect the paragraph above says the ledger exists to prevent, seen rather than
+/// predicted.
+///
+/// **Measured whole-lib by this branch's merge gate, and not re-run here.** Nothing in
+/// this repository replays a recorded break, so the list above names one run rather than
+/// a standing check.
 async fn supervise<A, M, F, Fut, N, I>(
     mut factory: N,
     limit: Intensity,
