@@ -526,6 +526,14 @@ ANCHORS = [
     # `src/`.
     ("N1", "keylink/tests/mailbox_latency.rs", "keylink/src/actor/registry.rs",
      "        let (mail, slots) = mpsc::channel(self.mailbox_depth);"),
+    # ── `limit-docs` ─────────────────────────────────────────────────────────
+    #
+    # M1 is SAME-FILE and INDENTED, the narrowed rule again: the record's quote sits
+    # unindented inside a `///` line while the code carries twelve spaces. Its guard
+    # holds the `cx.method()` test that keeps a required-key layer from refusing every
+    # method the service's `Keyable` policy leaves out.
+    ("M1", "keylink/tests/protocol.rs", "keylink/tests/protocol.rs",
+     "            if cx.method() == \"Ping\" && cx.call().is_none() {"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -1207,7 +1215,12 @@ for record in sorted(set(REDNESS) - row_ids):
 # spends paragraphs on: 122 + 1 would have been right here and is not a method, and
 # two commits on one branch each needing their own measurement is the whole reason
 # a carried value goes stale.
-RECORD_BLOCKS = 123
+#
+# 123 → the figure below on `limit-docs`, off `080fec7`, for the required-key layer:
+# ONE block, `a_layer_can_require_an_idempotency_key`, registered as M1. **Read off a
+# FAILURE, the same way the line above was**: the tripwire was left at 123 and the
+# pre-commit hook answered `124 comment blocks mention break-once.sh` from the walk.
+RECORD_BLOCKS = 124
 
 # The one marker the tripwire counts, and the two phrasings records use INSTEAD of
 # naming the harness. Both are read by the same walk, so the blind spot below is a

@@ -1169,8 +1169,67 @@ where
     /// refused rather than ignored, because a caller that attached a key believes
     /// it is protected.
     ///
-    /// This is not something a [`Middleware`] could do instead: the key is claimed
-    /// before the layer chain runs, so a layer never sees an unclaimed one.
+    /// This is not something a [`Middleware`] could do instead, and the act it
+    /// cannot do is **refusing a key that is present**: the key is claimed before
+    /// the layer chain runs, so a layer never sees an unclaimed one. Reading that a
+    /// key is **absent** is a different act, and the section below is a layer doing
+    /// it.
+    ///
+    /// # A layer requires a key where this policy permits one
+    ///
+    /// This decides which methods *accept* a key, and it cannot demand one. A
+    /// [`Middleware`] can: [`Context::call`](crate::Context::call) answers `None`
+    /// for a call that carried no key, and it answers before any layer runs —
+    /// `claim_key` builds the value from the request that arrived, and `serve_one`
+    /// enters the chain after it. So the absence is already correct when a layer
+    /// reads it, and [`RemoteError::Unauthorized`](crate::RemoteError::Unauthorized)
+    /// is what refuses it:
+    ///
+    /// ```ignore
+    /// struct RequireKey;
+    ///
+    /// impl<Resp: Send + 'static> Middleware<till::Request, Resp> for RequireKey {
+    ///     fn handle(
+    ///         &self,
+    ///         cx: Context,
+    ///         req: till::Request,
+    ///         body: BodyReader,
+    ///         next: Next<till::Request, Resp>,
+    ///     ) -> BoxFut<(Outcome<Resp>, Body)> {
+    ///         Box::pin(async move {
+    ///             // In step with `Keyable::Only(&["Reserve"])` above, and that is
+    ///             // the whole of the caveat below.
+    ///             if cx.method() == "Reserve" && cx.call().is_none() {
+    ///                 return (
+    ///                     Outcome::Err(RemoteError::Unauthorized(
+    ///                         "Reserve needs an idempotency key".into(),
+    ///                     )),
+    ///                     Body::empty(),
+    ///                 );
+    ///             }
+    ///             next(cx, req, body).await
+    ///         })
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// **The method test is what makes a shorter layer wrong.** On a method
+    /// outside this policy a keyed call is refused
+    /// [`NotKeyable`](crate::IdempotencyRefusal::NotKeyable) *before* the chain is
+    /// entered and an unkeyed one arrives with `None`, so `cx.call()` can never
+    /// answer `Some` there — [`Context::call`](crate::Context::call) states that and
+    /// gives the construction. A layer that drops the `cx.method()` test therefore
+    /// refuses **every** call on every method this policy leaves out.
+    ///
+    /// **What such a layer polices is the key's presence, and nothing further about
+    /// the ledger.** [`Limits::attach`](crate::Limits::attach) records the ordering
+    /// this rests on: `serve_one` finishes `claim_key` — the park, and the re-claim
+    /// after it — *before* it calls the chain, so no layer can bound how long an
+    /// attaching call was held.
+    ///
+    /// A keyed actor system takes the same layer, because its generated
+    /// `keyed_service` hands back an ordinary [`ServiceBuilder`]. Held by
+    /// `tests/protocol.rs::a_layer_can_require_an_idempotency_key`.
     #[must_use]
     pub fn keyable(mut self, keyable: Keyable) -> Self {
         self.keyable = keyable;
