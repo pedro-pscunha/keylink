@@ -2,9 +2,9 @@
 #
 # **CI is off by decision, and this file is the whole gate.** `afdbeb3` deleted the
 # workflow from `main` and moved what only it ran here in the same commit, which is
-# what made that safe. What MAINTAINS the state is `main`'s content rather than the
-# Actions setting, which still reads enabled — CONTRIBUTING.md holds that
-# measurement and names what would reverse it, so this file keeps no second copy.
+# what made that safe. Two independent things hold the state — the Actions setting
+# is off, and `main` carries no workflow file — and CONTRIBUTING.md holds that
+# measurement, so this file keeps no second copy of it.
 #
 # The workflow used to call these same tasks, which is why nothing here had to
 # change when it went: there was never a second copy of the commands. What did

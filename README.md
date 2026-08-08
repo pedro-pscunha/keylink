@@ -506,10 +506,10 @@ mise run gate                # the whole gate. There is no other one
 ```
 
 **CI is off by decision, and `mise run gate` is the gate.** The workflow was
-removed rather than left switched off, because a workflow nobody runs still looks
-like coverage. What keeps it off is that `main` carries no workflow file: the
-Actions setting itself still reads enabled, and CONTRIBUTING.md measures that and
-names what would put a workflow back. The `pre-push` hook runs `gate`, so the check happens
+deleted from `main` rather than left sitting there switched off, because a workflow
+nobody runs still looks like coverage — and the repository's Actions setting is off
+as well, so two independent things hold it. CONTRIBUTING.md measures both. The
+`pre-push` hook runs `gate`, so the check happens
 before a push instead of after one — and `./scripts/install-hooks.sh` is what
 makes that true for a clone, which is why it is the first line above.
 

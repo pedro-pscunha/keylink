@@ -11,40 +11,38 @@ mise run gate                # the whole gate
 `pre-push` hook runs it, which makes `./scripts/install-hooks.sh` load-bearing
 rather than a convenience. Skip it and nothing checks your pushes.
 
-### What keeps CI off, and what would turn it back on
+### CI is off by decision, and TWO independent things keep it off
 
 The decision is not a fallback and it is not an accident. Commit `afdbeb3` —
 "build: disable GitHub Actions, and move what only it ran into the gate" — did both
 halves at once, and moving what only CI ran into `gate` is what made switching it
 off safe. It stays off; the gate does this job.
 
-**What MAINTAINS that is `main`'s CONTENT.** `origin/main` carries no `.github`
-directory, so a pull request based on `main` starts no workflow. That is the
-load-bearing fact, and it is written down here because it is also the thing that
-could change.
+Two reasons rather than one, which is what stops this paragraph depending on either
+of them. Read back on 2026-08-08, and reproducible as written — `gh` resolves
+`{owner}/{repo}` from the local remote:
 
-So this section is a maintenance note rather than an argument. Measured on
-2026-08-08, reproducible as written — `gh` resolves `{owner}/{repo}` from the local
-remote:
+1. **The repository setting is off.**
+   `gh api repos/{owner}/{repo}/actions/permissions` answers
+   `{"enabled":false,"sha_pinning_required":false}`. Read back rather than inferred
+   from a write's exit code.
+2. **`main` carries no workflow file.** `origin/main` has no `.github` directory,
+   so a pull request based on `main` would have nothing to start even with the
+   setting on.
 
-- The Actions **setting** still reads
-  `{"enabled":true,"allowed_actions":"all","sha_pinning_required":false}`
-  (`gh api repos/{owner}/{repo}/actions/permissions`). The "off" is held by what
-  `main` carries, not by that switch.
-- **Six unmerged branches still carry `.github/workflows/ci.yml`.** Five share one
-  blob whose trigger is `push` to `master` plus a bare `pull_request:`, and that
-  second half DOES fire: every workflow run in this repository's history came from
-  it, and most were red. **Merging one of those five puts the file on `main` and
-  re-enables CI on every pull request, red** — a `pull_request` run is built from
-  the merge of base and head, so it would fire even for a pull request that adds
-  nothing. The sixth copy is `push`-only against a `master` branch that does not
-  exist, so it can never fire.
-- Of every run in that history, all fired on `pull_request` and none on `push`,
-  which is the same fact from the other side.
+Either alone would hold. Both is the state, and writing both down is what lets a
+reader who finds one of them changed know that the other is still holding.
 
-None of that argues for turning CI back on. It is what a reader needs in order to
-keep it off: if a workflow file reaches `main`, the state above has changed, and
-this paragraph is the thing that says so.
+**The residue, and it is inert.** Six unmerged branches still carry
+`.github/workflows/ci.yml`. Five share blob `77fda9a`, whose trigger is `push` to
+`master` plus a bare `pull_request:` — that second half is where CI runs used to
+come from, and as measured on 2026-08-08 the repository had recorded twenty runs,
+all on `pull_request`, seventeen of them red, the last at 13:05Z. Those figures are
+past tense with a date on purpose: nothing can join that set while the setting is
+off. **So those files are dead weight rather than a live trigger** — merging one
+starts nothing today. Delete them as their branches land, and know they are there
+before anybody considers the setting again. The sixth copy is `push`-only against a
+`master` branch that does not exist, so it could never fire at all.
 
 Two consequences worth knowing before you hit them:
 

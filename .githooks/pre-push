@@ -7,11 +7,11 @@
 # switched the workflow off and moved what only it ran into `gate` in the same
 # commit, which is what made that safe.
 #
-# **What MAINTAINS that is `main` carrying no workflow file, not the Actions
-# setting — which still reads enabled.** So the state is a property of the tree,
-# and a workflow file reaching `main` would change it. CONTRIBUTING.md carries the
-# measurement and names what would do it; this comment keeps no second copy, and
-# none of it is a reason to reach for CI instead of this hook.
+# TWO independent things hold that, which is why the claim is not fragile: the
+# repository's Actions setting is off, and `main` carries no workflow file either.
+# CONTRIBUTING.md carries the measurement of both, once; this comment keeps no
+# second copy of it, and none of it is a reason to reach for CI instead of this
+# hook.
 #
 # Bypass with `git push --no-verify`. See CONTRIBUTING.md, and read the narrow
 # case it is for — it got narrower when the second gate went away.
