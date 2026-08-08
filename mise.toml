@@ -290,15 +290,30 @@ description = "rustdoc as a gate, not as decoration"
 # ── THREE KNOWN HOLES IN THIS GATE. All three measured, none closed here.
 #
 # 1. A `#[cfg(test)] mod` is NOT reached, flag or no flag, and the comment this
-#    replaced said the opposite. `cargo doc` does not set `--cfg test`, so the
-#    module is stripped before rustdoc sees it and every break record in a
-#    unit-test module is unchecked prose. MEASURED, with both controls in one
-#    run: a `[`NoSuchItemAnywhereInThisCrate`]` added to a doc comment inside
-#    `authz.rs`'s `mod tests` produced NO error, while a second broken link on a
-#    method in the same file produced `error: unresolved link to
-#    `PositiveControlNoSuchItem`` and exit 101 — so rustdoc had run, and the
-#    silence was the cfg and not a stale cache. A negative result with no
-#    positive control beside it would have been worth nothing.
+#    replaced said the opposite — it listed "every break record in a unit-test
+#    module" among what the flag would buy. It buys none of them.
+#
+#    THE MECHANISM IS NOT ASSERTED HERE, because it was not measured. What was
+#    measured is two things, and they are enough:
+#
+#      - rustdoc emits no page for such a module. After a full
+#        `--document-private-items` run, `target/doc/keylink/authz/` holds
+#        `enum.Allowlist.html`, `struct.AdmittedPeer.html`,
+#        `struct.ProvenPeer.html`, `index.html` and `sidebar-items.js`, and
+#        `find target/doc/keylink -name '*tests*'` is empty. An item with no page
+#        has no rendered doc comment to resolve links in.
+#      - a broken link inside one produces nothing, WITH a control proving
+#        rustdoc ran. `[`NoSuchItemAnywhereInThisCrate`]` inside `authz.rs`'s
+#        `mod tests` gave no error, while a second broken link on a method in the
+#        same file gave `error: unresolved link to `PositiveControlNoSuchItem``
+#        and exit 101, in the SAME run. Without that control the silence would
+#        have been indistinguishable from rustdoc never running.
+#
+#    `lib.rs`'s own reasoning beside `extern crate self as keylink` reaches the
+#    same conclusion from the other direction: `representability.rs` expands
+#    `service!` and never hit the link failures, "because rustdoc does not render
+#    test-only code". Two independent statements, one measured and one reasoned,
+#    and the replaced comment contradicted both.
 #
 # 2. `tests/*.rs` is unreachable EITHER WAY. cargo builds integration tests as
 #    separate crates and never hands them to rustdoc, so a broken intra-doc link
@@ -328,8 +343,25 @@ description = "rustdoc as a gate, not as decoration"
 #    standing remedy is the convention `macros.rs` already follows everywhere:
 #    inside the macro body, write `keylink::Foo`, never `crate::Foo`.
 #
-# `demo` is documented anyway, for a different and smaller reason that a
-# measurement did support: its OWN prose. `main.rs`'s header had
+# `demo` is documented anyway, and the reason is bigger than the one it replaced.
+# **It TRIPLES the number of `service!` expansions rustdoc checks, from one to
+# three.** Derived, not counted by hand — a generated service module is the
+# directory holding a `trait.Actor.html`, and after this task runs there are
+# exactly three:
+#
+#   target/doc/keylink/console/inspect      `Inspect`, the only one before this
+#   target/doc/demo/inventory               \  the two `-p demo` adds
+#   target/doc/demo/dock                    /
+#
+# `representability.rs` expands the macro too and is NOT among them, which is
+# `lib.rs`'s "rustdoc does not render test-only code" showing up as an absence.
+#
+# It also widens which METHOD KINDS are checked at all. `Inspect` declares `rpc`,
+# `#[defer] rpc` and `feed`; `demo` adds `recv` and `send`. Neither declares `tell`
+# or `blob`, so those two kinds stay unchecked either way — stated because a
+# reader counting three expansions could otherwise assume the macro is covered.
+#
+# And its OWN prose, which is where this started. `main.rs`'s header had
 # `cargo run -p demo -- connect <endpoint-id>` in a 3-space indent, which is a
 # paragraph and not a code block, so rustdoc read `<endpoint-id>` as an HTML tag.
 # The line dates from 5939216 — `git log -1 -L4,4:demo/src/main.rs`, which is the
@@ -344,12 +376,29 @@ description = "rustdoc as a gate, not as decoration"
 # `break-once.sh` flips to redden a TEST, and this is a claim about rustdoc, so it
 # is described here instead — the third option that task's own header allows.
 #
-# One invocation and not two, so the feature graph is resolved once. It costs
-# TWO packages that `-p keylink --all-features` does not already compile —
-# `anyhow` and `demo` itself — derived by comparing
-# `cargo tree -p demo --prefix none --no-dedupe` with the same for keylink at
-# `--all-features`, not timed. `mise run test` already compiles `demo` through
-# `--workspace`, so what is new to the gate is the rustdoc pass and not the crate.
+# One invocation and not two, and selecting `demo` here is CHEAPER than leaving it
+# out — which is the opposite of what it looks like, so it is measured rather than
+# argued. `lint` and `test` both build the whole workspace, so the resolution that
+# INCLUDES `demo` is the one the gate has already materialised by the time this
+# step runs. A `-p keylink -p keylink-persist` selection is the odd one out: its
+# narrower package set resolves features differently, so rustdoc redoes both
+# crates at a resolution nothing else uses.
+#
+# MEASURED in the gate's own order, after
+# `cargo check --workspace --all-features --all-targets`:
+#
+#   this line, with `-p demo`      1 unit documented, 0 Checking lines
+#   the same line without it       2 units documented, 0 Checking lines
+#   `--workspace` check afterwards 0 units either way — neither invalidates `lint`
+#
+# In package terms `demo` adds exactly TWO that `-p keylink --all-features` does
+# not already compile, `anyhow` and `demo` itself, derived by comparing
+# `cargo tree -p demo --prefix none --no-dedupe` with the same for keylink.
+#
+# **The cold-tree cost is NOT established, for either form.** A separate
+# `cargo doc -p demo` invocation on a tree that has never built demo's doc profile
+# was measured elsewhere at 31 `Checking` lines. That is a real number about a
+# different command, and it is why this is one invocation and not two.
 #
 # `--all-features` reaches `demo`'s `swap-variants` here, which is the feature
 # that reorders two variants to prove the ALPN refuses the handshake. It changes
