@@ -293,21 +293,28 @@ description = "rustdoc as a gate, not as decoration"
 #    replaced said the opposite — it listed "every break record in a unit-test
 #    module" among what the flag would buy. It buys none of them.
 #
-#    THE MECHANISM IS NOT ASSERTED HERE, because it was not measured. What was
-#    measured is two things, and they are enough:
+#    THE DECISIVE EVIDENCE IS A POSITIVE CONTROL, in one run. A
+#    `[`NoSuchItemAnywhereInThisCrate`]` added inside `authz.rs`'s `mod tests`
+#    produced NO diagnostic, while a second broken link on a method in the SAME
+#    FILE produced `error: unresolved link to `PositiveControlNoSuchItem`` and
+#    exit 101. Two things at once: rustdoc ran, and the silence was specific to
+#    the test module. Without the control, silence and "rustdoc never ran" are the
+#    same output.
 #
-#      - rustdoc emits no page for such a module. After a full
-#        `--document-private-items` run, `target/doc/keylink/authz/` holds
-#        `enum.Allowlist.html`, `struct.AdmittedPeer.html`,
-#        `struct.ProvenPeer.html`, `index.html` and `sidebar-items.js`, and
-#        `find target/doc/keylink -name '*tests*'` is empty. An item with no page
-#        has no rendered doc comment to resolve links in.
-#      - a broken link inside one produces nothing, WITH a control proving
-#        rustdoc ran. `[`NoSuchItemAnywhereInThisCrate`]` inside `authz.rs`'s
-#        `mod tests` gave no error, while a second broken link on a method in the
-#        same file gave `error: unresolved link to `PositiveControlNoSuchItem``
-#        and exit 101, in the SAME run. Without that control the silence would
-#        have been indistinguishable from rustdoc never running.
+#    Corroborating, and NOT decisive on its own: rustdoc emits no page for such a
+#    module. `target/doc/keylink/authz/` holds `enum.Allowlist.html`,
+#    `struct.AdmittedPeer.html`, `struct.ProvenPeer.html`, `index.html` and
+#    `sidebar-items.js`, and `find target/doc/keylink -iname '*tests*'` returns
+#    nothing. Weaker because an absent page has several explanations besides this
+#    one — an item with no public path, a naming scheme nobody predicted, output
+#    written somewhere this search did not look. It agrees with the control rather
+#    than standing in for it.
+#
+#    THE MECHANISM IS THE UNVERIFIED PART, and it is named rather than dropped so
+#    the next reader has somewhere to start: `cargo doc` is believed not to set
+#    `--cfg test`, which would strip the module before rustdoc sees it. Nothing
+#    here measured that. Treat it as the likely explanation of the control's
+#    result, never as the finding.
 #
 #    `lib.rs`'s own reasoning beside `extern crate self as keylink` reaches the
 #    same conclusion from the other direction: `representability.rs` expands
