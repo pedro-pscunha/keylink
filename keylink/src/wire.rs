@@ -30,7 +30,16 @@ use crate::{Error, Result};
 pub const MAX_HEADER: u32 = 1 << 20;
 
 /// Bytes of length prefix ahead of every header frame.
-const PREFIX: usize = size_of::<u32>();
+///
+/// `pub(crate)` for [`MAX_RECORDED_FRAME`](crate::MAX_RECORDED_FRAME), which bounds a
+/// whole frame and so has to add this to [`MAX_HEADER`].
+///
+/// **`pub(crate)` rather than `pub`, and the distinction is not cosmetic.** This
+/// module is private and `lib.rs` selects what escapes it, so a `pub` here could not
+/// reach outside the crate anyway — it would just read as public API to the next
+/// person, which is false. `pub(crate)` states the visibility the module gate
+/// already enforces.
+pub(crate) const PREFIX: usize = size_of::<u32>();
 
 /// Upper bound on a single transport read. Not a frame cap — the transport
 /// hands back whatever it has, and this only stops one read from returning an

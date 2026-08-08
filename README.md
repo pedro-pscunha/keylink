@@ -389,7 +389,8 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
    happen twice.
 3. **A record answers for 600 s.** That is `RECORD_TTL`, alongside volume bounds
    of `MAX_RECORDS` — 1024 entries — and `MAX_RECORDED_BYTES` — 1 MiB of held
-   reply. Past any of them the reply is dropped and the retry is *refused* as
+   reply **in total, across every peer**, not per key. Past any of them the reply
+   is dropped and the retry is *refused* as
    `Forgotten`:
    at-most-once still holds, and the answer does not. Read the result out of your
    own domain; do not re-run the work.
@@ -420,10 +421,25 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
 5. **A reply that carries a payload is never recorded.** A `recv` method answers
    with a body beside its reply, and a body is streamed rather than held, so the
    repeat is refused as `Unrecordable` instead of being answered with a header
-   whose payload never arrives. So is any reply frame over `MAX_RECORDED_BYTES` —
-   a permanent property of the method, not an eviction. A `blob` reply is not
+   whose payload never arrives — a permanent property of the method, not an
+   eviction. A `blob` reply is not
    affected: its bytes move on iroh-blobs and the reply itself is just a header
    carrying an address, so it records and replays like any other.
+
+   **So is any reply frame over `MAX_RECORDED_FRAME` — 1 MiB plus four bytes,
+   1048580 — and by default that refuses nothing.** This line used to name
+   `MAX_RECORDED_BYTES` and print no figure, and it was false twice over. The
+   ledger's ceiling is a *frame* bound, and the wire already refuses a larger
+   header frame before the ledger sees it: `MAX_HEADER` is 1 MiB, 1048576, and
+   `encode_header` errors above it. The four bytes are the length prefix, which
+   `MAX_HEADER` does not count and the ledger does — so a ceiling of exactly
+   `MAX_HEADER` would have refused four frame sizes that the wire was willing to
+   carry, on a boundary nobody chose.
+
+   The number is worth setting **lower** than the default, and
+   `Limits::frame_bytes` is how: one large reply that fits the pool can evict many
+   small ones. There is no floor to quote, because the smallest useful value is the
+   encoding of one service's own response type.
 6. **`Interrupted` is permanent, and it is the answer that needs a decision.** A
    call whose handler was entered and produced no reply — a dead connection, a
    shutdown, a layer that stopped waiting after dispatch — settles the key as

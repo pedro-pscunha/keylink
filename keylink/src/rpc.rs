@@ -44,7 +44,7 @@ use crate::error::ConfigError;
 // `tests/api.rs` that writes it from a consumer's position. An in-crate
 // `crate::Keyable` would make the library itself the thing that fails when the
 // re-export goes, which would leave that test proving nothing.
-use crate::idempotency::{Claim, Guard, Keyable, Ledger, Records};
+use crate::idempotency::{Claim, Guard, Keyable, Ledger, Limits, Records};
 use crate::middleware::{wrap, Reached};
 use crate::wire::FrameReader;
 use crate::{
@@ -141,8 +141,15 @@ impl Keys {
     /// The one place the two are decided together, which is what lets
     /// `keyed_none_builds_no_ledger` probe the absence directly rather than
     /// reaching through an erased handler for it.
-    fn new(keyable: Keyable, records: Records) -> Self {
-        let ledger = keyable.needs_a_ledger().then(|| Ledger::new(records));
+    ///
+    /// It is also the one place that **discards** a configured [`Limits`]: under
+    /// [`Keyable::None`] there is no ledger to hold it. A doc line on
+    /// [`ServiceBuilder::limits`] says so, because both methods appear in the
+    /// crate's own examples in one chain.
+    fn new(keyable: Keyable, records: Records, limits: Limits) -> Self {
+        let ledger = keyable
+            .needs_a_ledger()
+            .then(|| Ledger::new(limits, records));
         Self { keyable, ledger }
     }
 
@@ -716,11 +723,15 @@ mod tests {
     #[test]
     fn keyed_none_builds_no_ledger() {
         assert!(
-            Keys::new(Keyable::None, Records::Memory).ledger.is_none(),
+            Keys::new(Keyable::None, Records::Memory, Limits::default())
+                .ledger
+                .is_none(),
             "`Keyable::None` must not allocate a ledger nothing can ever write to"
         );
         assert!(
-            Keys::new(Keyable::Any, Records::Memory).ledger.is_some(),
+            Keys::new(Keyable::Any, Records::Memory, Limits::default())
+                .ledger
+                .is_some(),
             "and every other policy must have one, or no key works at all"
         );
     }
@@ -744,7 +755,11 @@ mod tests {
     /// target.
     #[test]
     fn the_ledger_is_reachable_only_through_the_policy() {
-        let keys = Keys::new(Keyable::Only(&["Reserve"]), Records::Memory);
+        let keys = Keys::new(
+            Keyable::Only(&["Reserve"]),
+            Records::Memory,
+            Limits::default(),
+        );
         assert!(
             keys.ledger_for("Reserve").is_some(),
             "an accepted method must reach the ledger"
@@ -765,7 +780,7 @@ mod tests {
     /// the test fails on the variant rather than hanging.
     #[tokio::test(start_paused = true)]
     async fn an_attacher_over_the_cap_is_refused_before_it_parks() {
-        let ledger = Ledger::new(Records::Memory);
+        let ledger = Ledger::new(Limits::default(), Records::Memory);
         let peer = EndpointId::from_str(A).expect("a valid endpoint id");
         let key = IdempotencyKey::new("k").expect("a valid key");
 
@@ -815,7 +830,7 @@ mod tests {
     /// concurrency bound usually gets wrong.
     #[tokio::test(start_paused = true)]
     async fn a_parked_attacher_keeps_its_place_for_the_whole_wait() {
-        let ledger = Ledger::new(Records::Memory);
+        let ledger = Ledger::new(Limits::default(), Records::Memory);
         let peer = EndpointId::from_str(A).expect("a valid endpoint id");
         let key = IdempotencyKey::new("k").expect("a valid key");
 
@@ -870,6 +885,10 @@ pub struct ServiceBuilder<Req, Resp> {
     /// Where the replies of the accepted ones live. [`Records::Memory`] by
     /// default, for the same reason.
     records: Records,
+    /// Every bound the ledger enforces. [`Limits::default`] unless
+    /// [`ServiceBuilder::limits`] replaced it, and discarded under
+    /// [`Keyable::None`], which builds no ledger to hold it.
+    limits: Limits,
 }
 
 impl<Req, Resp> ServiceBuilder<Req, Resp>
@@ -892,8 +911,14 @@ where
             // holds a caller's bytes for ten minutes, so both are decisions somebody
             // makes — `Allowlist`'s doc makes the same argument about `anyone()`.
             // This line IS the default, and it is the only place to look for it.
+            //
+            // `Limits` is the exception on this list, and it DOES have a `Default`:
+            // eight of its nine bounds refuse with the number in the refusal, so the
+            // safe configuration is the default one. Its own rustdoc argues that per
+            // field, including the field that is not like the others.
             keyable: Keyable::Any,
             records: Records::Memory,
+            limits: Limits::default(),
         }
     }
 
@@ -1020,6 +1045,40 @@ where
         self
     }
 
+    /// Replace the bounds this service's idempotency ledger enforces.
+    ///
+    /// The default is [`Limits::default`], so a service that never calls this
+    /// behaves exactly as it did before the method existed. [`Limits`] carries the
+    /// argument for each bound and what setting it to its smallest value would do.
+    ///
+    /// ```ignore
+    /// till::service(handler, Allowlist::anyone())
+    ///     .limits(Limits::default().pool_records(thousands))
+    ///     .build()
+    /// ```
+    ///
+    /// # Two ways to call this and have it bound nothing
+    ///
+    /// Both compile, and both read as configured:
+    ///
+    /// - **`.keyable(Keyable::None)`** builds **no ledger at all**
+    ///   (`Keys::new` is where that is decided), so the whole value is
+    ///   discarded. Nothing warns, because a service with no keys has no bounds to
+    ///   set.
+    /// - **`.records(Records::None)`** holds no reply, so
+    ///   [`pool_records`](Limits::pool_records),
+    ///   [`frame_bytes`](Limits::frame_bytes) and
+    ///   [`pool_bytes`](Limits::pool_bytes) bound nothing. The running, waiting and
+    ///   tombstone bounds still apply.
+    ///
+    /// These are worth naming here rather than only on [`Limits`], because both
+    /// methods and this one appear in this crate's own examples in a single chain.
+    #[must_use]
+    pub fn limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
+    }
+
     /// Freeze the chain and erase the schema.
     pub fn build(self) -> Service {
         let mut chain = self.base;
@@ -1032,7 +1091,7 @@ where
                 next: chain,
                 admission: self.admission,
                 blobs: self.blobs.clone(),
-                keys: Keys::new(self.keyable, self.records),
+                keys: Keys::new(self.keyable, self.records, self.limits),
                 _p: PhantomData,
             }),
             blobs: self.blobs,

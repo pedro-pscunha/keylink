@@ -392,6 +392,22 @@ ANCHORS = [
     # side - not to move the code.
     ("D8", "keylink/tests/blocking_work.rs", "keylink/tests/blocking_work.rs",
      "        offloaded(work).await"),
+    # ── from the ledger-limits PR. Both were measured with `grep -cF` AFTER the
+    # record was written, which is the order that matters: adding a quote can only
+    # RAISE a count, so measuring first reports a 1 that the record itself then
+    # breaks.
+    #
+    # L1 is cross-file, so the record's own quote lives in another file and cannot
+    # contribute to the count. Unindented, like every other cross-file row here.
+    ("L1", "keylink/tests/idempotency.rs", "keylink/src/rpc.rs",
+     "keys: Keys::new(self.keyable, self.records, self.limits),"),
+    # L2 is SAME-file, and indented for exactly the reason the failure text gives:
+    # the code line carries four spaces and the record quotes it with none, so the
+    # indented literal counts 1. A `.tombstones(..)` fragment was the first choice
+    # and is unusable - indentation cannot disambiguate a fragment, because the
+    # fragment does not begin its line.
+    ("L2", "keylink/tests/idempotency.rs", "keylink/tests/idempotency.rs",
+     "    let tight = start_limited(Limits::default().pool_records(nz(1)).tombstones(nz(1))).await;"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -812,7 +828,17 @@ for record, lives_in, target, literal in ANCHORS:
 # `155e868` and `111` against `2cc0c1d`, so a value carried across a rebase would
 # have been wrong twice. The arithmetic agreeing twice is what makes it a trap:
 # it looks like a derivation and it is a coincidence of two disjoint edits.
-RECORD_BLOCKS = 111
+#
+# 111 → 113 on `ledger-limits`, rebased onto `fbb7e43`: two new harness blocks in
+# `keylink/tests/idempotency.rs`, the builder-wiring guard and the tombstone-churn
+# guard, both REGISTERED above as L1 and L2.
+#
+# **FIFTH tree, and read off a run again rather than carried.** The value has now
+# been 102, 104, 106, 110, 111 and 113 depending on which tree measured it, and a
+# figure carried across a rebase has been wrong on three of them. This one was
+# measured by resolving the rebase conflict, running the loop, and taking what it
+# printed — `113` — not by adding two to `111`.
+RECORD_BLOCKS = 113
 
 harness_blocks: list[str] = []
 for path in sorted(
