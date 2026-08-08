@@ -252,7 +252,10 @@ async fn inside_a_turn(entered: &AtomicUsize) {
 /// apart.
 ///
 /// Made red by `scripts/break-once.sh`, replacing `local.rs`'s
-/// `const LOCAL_MAILBOX_DEPTH: usize = 1;` with `= 2;`. Watched: the second
+/// `const LOCAL_MAILBOX_DEPTH: usize = 1;` with the whole line
+/// `const LOCAL_MAILBOX_DEPTH: usize = 2;` — spelled out because `= 2;` alone, which
+/// is what this record used to say, substitutes for the *entire* searched line and
+/// leaves a syntax error. Watched: the second
 /// `bump` then completes too and the test fails at
 /// "a second message must not fit: LOCAL_MAILBOX_DEPTH is 1". That is the right
 /// red — it is the depth, and not the loop's release of the permit, that this
