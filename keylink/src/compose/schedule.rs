@@ -33,8 +33,7 @@
 //! [`Duration`] is re-exported through `n0_future::time` and is
 //! `std::time::Duration` on every target. A `Duration` is not a clock.
 //!
-//! # Backpressure: a run in progress is never re-entered, and a missed tick is
-//! never queued
+//! # Backpressure: a run in progress is never re-entered, and a missed tick is never queued
 //!
 //! [`every`] sleeps, runs, and sleeps again. So the period is a floor on the
 //! **gap between runs**, not a rate: a run that takes longer than the period

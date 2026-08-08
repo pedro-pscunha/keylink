@@ -269,8 +269,7 @@ impl<T: Clone> Topic<T> {
     /// [`Overflow::DropSubscriber`] never awaits — it completes without yielding,
     /// which is worth knowing for a caller that publishes from inside a turn.
     ///
-    /// # An actor must not publish to a topic it subscribes to, under
-    /// [`Overflow::BlockPublisher`]
+    /// # An actor must not publish to a topic it subscribes to, under [`Overflow::BlockPublisher`]
     ///
     /// It is [`Handle`](crate::LocalActor)'s self-call deadlock in a second
     /// costume: the actor is inside a turn, so it is not polling its own feed, so

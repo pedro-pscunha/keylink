@@ -93,8 +93,7 @@ keylink::service! {
     /// panics that escape a turn's guard — a factory's and a feed's — need an
     /// actor that has **both** a feed and a parked reply, and `Desk` has no feed.
     ///
-    /// # This moved `Ticker`'s ALPN, and the reason is the `rpc` rather than the
-    /// `#[defer]`
+    /// # This moved `Ticker`'s ALPN, and the reason is the `rpc` rather than the `#[defer]`
     ///
     /// Worth stating where it was done rather than only in a report. The attribute
     /// is free — `protocol.rs` holds

@@ -2390,8 +2390,7 @@ impl<A: Send, M: Send, I: Inbox<A, M>> Inbox<A, M> for Lent<'_, I> {
     /// that would never answer again. A hook that has to hand a value back cannot
     /// have an arm that quietly says nothing.
     ///
-    /// # The same arm closes the mailbox, and that is a second consequence rather
-    /// than a second decision
+    /// # The same arm closes the mailbox, and that is a second consequence rather than a second decision
     ///
     /// A restart keeps the mailbox open with no re-queue, which is the whole
     /// structural idea of [`Lent`]. A give-up must not: [`supervise`] owns the

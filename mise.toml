@@ -345,7 +345,16 @@ description = "rustdoc as a gate, not as decoration"
 # that reorders two variants to prove the ALPN refuses the handshake. It changes
 # which variants the generated docs list and nothing else; no rustdoc check in
 # this repository depends on their order.
-run = "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --all-features -p keylink -p keylink-persist -p demo"
+#
+# `headings` runs first and is not a seventeenth gate step — it is inside this
+# one, because it checks the same artifact and takes no compile. It is the only
+# check in this repository that reaches hole 2: it reads tracked FILES, so the
+# heading it found in `keylink/tests/supervision.rs` is a site rustdoc never
+# sees. Cheapest first, as everywhere else in this gate.
+run = [
+    { task = "headings" },
+    "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --all-features -p keylink -p keylink-persist -p demo",
+]
 
 # ── shipping ────────────────────────────────────────────────────────────────
 

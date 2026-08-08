@@ -691,8 +691,7 @@ impl<M> Registry<M> {
     /// [`Registry::entry`] spawns, with the [`Ended`] the loop returned — which
     /// is the *true* reason rather than [`drain`]'s synthesis from a join.
     ///
-    /// # It reports only if the entry was still ours, and that is the whole
-    /// interlock
+    /// # It reports only if the entry was still ours, and that is the whole interlock
     ///
     /// [`System::shutdown`], [`System::abort`] and [`Registry::sweep`] all take
     /// the entry out **before** they await the task, and each reports its own
