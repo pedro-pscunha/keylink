@@ -159,8 +159,15 @@ ANCHORS = [
      "            Entry::Occupied(_) => return,"),
     # A FRAGMENT: the line continues `.serialize(serializer)`. Registered as the
     # record quotes it and declared below, rather than widened to the whole line -
-    # widening would make this row's literal something no record contains, which
-    # the record-quote check would then reject, correctly.
+    # widening would make this row's literal something no record contains, which the
+    # record-quote check rejects. MEASURED, not reasoned: widening C6 gives
+    # `FAIL C6: this task's literal is NOT QUOTED by its own record`.
+    #
+    # That was NOT true while the check searched the whole file, and it was claimed
+    # anyway. A review measured it and found the check green on a widened literal,
+    # because `lives_in == target` here so the widened CODE line satisfied it. The
+    # claim only became true when the check was narrowed to comment spans. Recorded
+    # because the decision was right for a reason that did not hold at the time.
     ("C6", "keylink/src/call.rs", "keylink/src/call.rs",
      "        (self.bound, self.iter().collect::<Vec<_>>())"),
     ("C7", "keylink/tests/persist.rs", "keylink/src/call.rs",
@@ -339,10 +346,15 @@ for record, lives_in, target, literal in ANCHORS:
 # a new fragment reddens while this one stays visibly grandfathered.
 FRAGMENT_ANCHORS = {
     # `(self.bound, self.iter().collect::<Vec<_>>())` - the line continues with
-    # `.serialize(serializer)`. Count 1 today. Its own branch described a sibling
-    # fragment (`self.order.pop_front()`) for exactly this shape and quoted this
-    # one: an inconsistency in that classification rather than a defect, since
-    # both resolve now and both are latent.
+    # `.serialize(serializer)`. Count 1 today.
+    #
+    # Its own branch DESCRIBED a sibling fragment of exactly this shape,
+    # `self.order.pop_front()`, while quoting this one. That inconsistency is now
+    # resolved in the sibling's favour: it is C12 above, quoted as a WHOLE LINE,
+    # which is mode 4's own remedy. **So the remedy is available here too, and taking
+    # it means editing the record to quote the whole line - not widening this row,
+    # which the record-quote check correctly rejects on its own.** Left as the record
+    # quotes it, and declared, until somebody makes that record edit deliberately.
     "C6",
     # `$crate::__keylink_granted_id!(..)` sits inside a macro repetition, so the
     # whole line would drag `)+` and a trailing comma into the anchor. Count is 1
