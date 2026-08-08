@@ -157,6 +157,28 @@ ANCHORS = [
      "        self.waiting.push((amount, call, deferred));"),
     ("C10", "keylink/tests/persist.rs", "keylink/tests/persist.rs",
      "    parked_over_the_wire(&other, &actor, 1).await;"),
+    # ── the two rows that were DESCRIBED and are now quoted. Their old ids were
+    # `C-D1` and `C-D2`; renamed because a `-D` suffix in this list would read as
+    # "described" and that is what they no longer are.
+    #
+    # C11 was described on the reasoning that a column-0 declaration has no
+    # indentation for the record's quote to lack, so quoting it would make the count
+    # 2. That much is true and MEASURED: with the record quoting it, the bare form
+    # counts 2. What the old reason got wrong is that it stopped there. The TRAILING
+    # NEWLINE disambiguates where indentation cannot, because the record's copy is
+    # closed by a backtick and the declaration's by a newline - so the newline form
+    # counts 1 and the anchor is quotable after all. This is the second row whose
+    # newline is load-bearing, C8 being the first, and the two reach it by different
+    # routes: C8's text PREFIXES another line, C11's is a same-file duplicate.
+    ("C11", "keylink/src/call.rs", "keylink/src/call.rs",
+     "const DIGEST_BYTES: usize = 16;\n"),
+    # C12 was described as a fragment - `self.order.pop_front()` is mid-line and
+    # indentation cannot disambiguate a fragment. Correct about the fragment and the
+    # wrong conclusion: mode 4's own remedy is to take the WHOLE LINE, which counts 1
+    # at its indentation while the record quotes it unindented. Registering the line
+    # is the remedy the file already prescribes; describing it was reaching past it.
+    ("C12", "keylink/src/call.rs", "keylink/src/call.rs",
+     "            if let Some(oldest) = self.order.pop_front() {"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -193,17 +215,15 @@ DESCRIBED = [
      "second occurrence"),
     ("R19", "keylink/tests/idempotency.rs", "same-file",
      "the keyed-actor test's own .keyable(..) call, for the same reason"),
-    # ── from PR #11 (`call-id`), converted after MEASURING the reason rather than
-    # predicting it. None carries a quoted search literal; each quotes only its
-    # replacement.
-    ("C-D1", "keylink/src/call.rs", "column 0",
-     "const DIGEST_BYTES at column 0. A unique form DOES survive, taken with its "
-     "trailing newline, because the record's copy is followed by a closing "
-     "backtick - so described because that uniqueness rests on the record's own "
-     "punctuation, more fragile than the indentation it would replace"),
-    ("C-D2", "keylink/src/call.rs", "fragment",
-     "self.order.pop_front() is mid-line, and indentation cannot disambiguate a "
-     "fragment"),
+    # ── from PR #11 (`call-id`). Four were converted here; TWO of the four reasons
+    # did not survive re-measurement and those rows are now quoted, as C11 and C12
+    # above. Both errors ran the same way: a real obstacle was identified and the
+    # remedy for it was not tried. Column 0 does defeat indentation - and the
+    # trailing newline still works. A fragment cannot be disambiguated by
+    # indentation - and mode 4's remedy is to stop quoting the fragment.
+    #
+    # The two that remain are both FORMATTER cases, and neither has a remedy of that
+    # kind: the reflow is not something a better choice of anchor avoids.
     ("C-D3", "keylink/src/call.rs", "formatter",
      "Applied::iter's chain - rustfmt reflow measured rather than predicted"),
     ("C-D4", "keylink/tests/persist.rs", "formatter",

@@ -716,12 +716,16 @@ mod tests {
     /// tautology — it re-asserted the predicate `find` had just matched on, and
     /// then compared one call to itself.
     ///
-    /// - The **guard** is the width assertion. Made red by
-    ///   narrowing [`DIGEST_BYTES`] to one — described and not quoted, because this
-    ///   record lives in the file it breaks and a quoted anchor would make the count
-    ///   2. Replacement, quoted because it is never searched:
-    ///   `const DIGEST_BYTES: usize = 1;`. The pair that collides at one byte then
-    ///   collides at the real width too. Watched:
+    /// - The **guard** is the width assertion. Made red by narrowing
+    ///   [`DIGEST_BYTES`] to one: search
+    ///   `const DIGEST_BYTES: usize = 16;`
+    ///   — **with its trailing newline, which is what makes it unique** — and replace
+    ///   with `const DIGEST_BYTES: usize = 1;`. This record lives in the file it
+    ///   breaks and the declaration sits at **column 0**, so there is no indentation
+    ///   for this quote to lack and the bare form counts 2. What disambiguates
+    ///   instead is that the record's copy is closed by a **backtick** where the
+    ///   declaration's is closed by a **newline**. The pair that collides at one byte
+    ///   then collides at the real width too. Watched:
     ///   `at DIGEST_BYTES the same pair must be two calls / left: CallId(4a) right: CallId(4a)`.
     /// - The **demonstration** is the `Applied` half. It passes broken and
     ///   unbroken, because it is asserted at the narrowed width on purpose, and it
@@ -808,12 +812,14 @@ mod tests {
     /// retries are still plausible — are the ones kept.
     ///
     /// Made red by making [`Applied::insert`]'s eviction take from the **newest** end
-    /// of `order` rather than the oldest — described, not quoted: this record lives in
-    /// the file it breaks, and `pop_front()` alone is a mid-line fragment that no
-    /// amount of indentation makes unique. Replacement, quoted because it is never
-    /// searched: `pop_back()`. The set then forgets what just happened and remembers
-    /// what nobody will ask about again. Watched:
-    /// `the first call is the one displaced`.
+    /// of `order` rather than the oldest. Search the whole line —
+    /// `if let Some(oldest) = self.order.pop_front() {`
+    /// — and replace `pop_front()` in it with `pop_back()`. The fragment
+    /// `pop_front()` alone counts 2 and no amount of indentation makes it unique,
+    /// which is why the anchor is the LINE: at its own indentation the line counts 1,
+    /// and this quote sits unindented so it is not a second occurrence. The set then
+    /// forgets what just happened and remembers what nobody will ask about again.
+    /// Watched: `the first call is the one displaced`.
     #[test]
     fn the_oldest_call_is_the_one_forgotten() {
         let two = NonZeroUsize::new(2).expect("2 is not zero");
