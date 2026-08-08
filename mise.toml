@@ -264,35 +264,31 @@ description = "rustdoc as a gate, not as decoration"
 # `keylink-persist` declares `missing_docs` too and was not listed here, so its
 # own gate was decoration until this line named it.
 #
-# ── TWO KNOWN HOLES IN THIS GATE. Both measured, neither closed here.
+# `--document-private-items` is what makes that true of more than the public
+# surface. WITHOUT it, rustdoc resolves no intra-doc link in a private item at
+# all — not the item and not its doc comment — which in this crate is every
+# private module's header and most of the prose a maintainer reads. The flag was
+# off while 49 errors stood behind it, and the commit before this one is the pass
+# that cleared them: 7 links that resolved to nothing, and 42 reports of
+# `rustdoc::redundant_explicit_links` over 24 lines. The lint is not allowed. An
+# allow would hide the next instance, and that class is the first thing a reader
+# meets on the day somebody writes `[`X`](X)` again.
 #
-# 1. WITHOUT `--document-private-items`, rustdoc does not resolve intra-doc links
-#    in private items at all — not the item, not its doc comment, not a
-#    `#[cfg(test)] mod` inside it. That is most of the prose in this crate: every
-#    private module's header and every break record in a unit-test module.
+# Do not carry a number out of this comment. What the flag covers is the claim;
+# what it costs is one `cargo doc` invocation, the same one, with one more flag.
 #
-#    Turning it on is NOT free, which is why it is not on.
+# ── THREE KNOWN HOLES IN THIS GATE. All three measured, none closed here.
 #
-#    A SNAPSHOT AND NOT A STANDING COUNT — the numbers below were measured on
-#    2026-08-07 (-03:00) and are being actively fixed, so expect them to fall. The
-#    offset is there so this snapshot can be ordered against another one. Do not read
-#    a smaller count as this comment being wrong; re-measure with
-#    `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items
-#    --all-features -p keylink -p keylink-persist` and turn the flag on for good
-#    when it reaches zero. What does not go stale is the shape: private items are
-#    unchecked today, and that is the reason to finish the job.
-#
-#    As measured: **48 errors across 12 files** — 40 `redundant explicit link
-#    target`, which are mechanical, and **8 genuinely unresolved links that no
-#    gate in this repo had ever seen**:
-#      console.rs   `Allowlist`, `Self::follow`, `Self::on_events` (x2)
-#      local.rs     `crate::System::stop`, `crate::Busy`
-#      macros.rs    `Addressed`
-#      watch.rs     `LocalActor::spawn_supervised`
-#    Flipping the flag without fixing those 48 lands a red gate on the default
-#    branch, so it wants its own pass across files several branches own. The 8
-#    above are real broken links in shipped documentation and are worth fixing
-#    on their own merits.
+# 1. A `#[cfg(test)] mod` is NOT reached, flag or no flag, and the comment this
+#    replaced said the opposite. `cargo doc` does not set `--cfg test`, so the
+#    module is stripped before rustdoc sees it and every break record in a
+#    unit-test module is unchecked prose. MEASURED, with both controls in one
+#    run: a `[`NoSuchItemAnywhereInThisCrate`]` added to a doc comment inside
+#    `authz.rs`'s `mod tests` produced NO error, while a second broken link on a
+#    method in the same file produced `error: unresolved link to
+#    `PositiveControlNoSuchItem`` and exit 101 — so rustdoc had run, and the
+#    silence was the cfg and not a stale cache. A negative result with no
+#    positive control beside it would have been worth nothing.
 #
 # 2. `tests/*.rs` is unreachable EITHER WAY. cargo builds integration tests as
 #    separate crates and never hands them to rustdoc, so a broken intra-doc link
@@ -303,7 +299,53 @@ description = "rustdoc as a gate, not as decoration"
 #    link the crate graph — so the standing remedy is to grep for the old name
 #    after any rename that touches a documented item. Stated rather than worked
 #    around, because a workaround nobody maintains is worse than a known hole.
-run = "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features -p keylink -p keylink-persist"
+#
+# 3. A link inside the `service!` body is linted for KEYLINK and for nobody
+#    else, so `crate::` where `keylink::` was meant is undetectable. The macro
+#    body IS expanded and IS linted here — the `Addressed` link this task's
+#    predecessor left broken was reported at `macros.rs`, from an expansion, and
+#    only under `--document-private-items`. What no rustdoc run reaches is the
+#    same link expanded in a crate that is NOT keylink, where `crate::` means
+#    that crate.
+#
+#    MEASURED, and it refuted the plan that put `demo` here: `send_to`'s
+#    `[`Addressed`](keylink::Addressed)` was rewritten to `crate::Addressed`.
+#    keylink stayed green, correctly — `crate::` is keylink there. `demo`, which
+#    expands the same macro and imports no `Addressed`, ALSO stayed green, at
+#    exit 0. rustdoc does not lint an intra-doc link whose doc comment came from
+#    another crate's macro, which is reasonable of it — a downstream crate cannot
+#    fix an upstream macro — and it means no gate step can be bought here. The
+#    standing remedy is the convention `macros.rs` already follows everywhere:
+#    inside the macro body, write `keylink::Foo`, never `crate::Foo`.
+#
+# `demo` is documented anyway, for a different and smaller reason that a
+# measurement did support: its OWN prose. `main.rs`'s header had
+# `cargo run -p demo -- connect <endpoint-id>` in a 3-space indent, which is a
+# paragraph and not a code block, so rustdoc read `<endpoint-id>` as an HTML tag.
+# The line dates from 5939216 — `git log -1 -L4,4:demo/src/main.rs`, which is the
+# line's own commit and not the file's last touch — so it had been broken for as
+# long as it had existed, with nothing in the repository able to say so. It is a
+# fenced block now.
+#
+# WATCHED, on the exact line this task runs: putting the 3-space indent back gave
+# exit 101, `error: unclosed HTML tag 'endpoint-id'` at `demo/src/main.rs:4:36`,
+# and `error: could not document 'demo'` — two error lines, one diagnostic. Not
+# registered in `.mise/tasks/anchors`: a row there is a source line
+# `break-once.sh` flips to redden a TEST, and this is a claim about rustdoc, so it
+# is described here instead — the third option that task's own header allows.
+#
+# One invocation and not two, so the feature graph is resolved once. It costs
+# TWO packages that `-p keylink --all-features` does not already compile —
+# `anyhow` and `demo` itself — derived by comparing
+# `cargo tree -p demo --prefix none --no-dedupe` with the same for keylink at
+# `--all-features`, not timed. `mise run test` already compiles `demo` through
+# `--workspace`, so what is new to the gate is the rustdoc pass and not the crate.
+#
+# `--all-features` reaches `demo`'s `swap-variants` here, which is the feature
+# that reorders two variants to prove the ALPN refuses the handshake. It changes
+# which variants the generated docs list and nothing else; no rustdoc check in
+# this repository depends on their order.
+run = "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --all-features -p keylink -p keylink-persist -p demo"
 
 # ── shipping ────────────────────────────────────────────────────────────────
 
