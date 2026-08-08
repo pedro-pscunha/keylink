@@ -293,6 +293,41 @@ for record, lives_in, target, literal in ANCHORS:
 #
 # What it buys: ADDING a break record forces a decision about registering it,
 # instead of this list silently falling further behind a growing population.
+#
+# ── THE METHOD, because this number now fails the build when it moves ─────────
+#
+# A reviewer measured 86 where this says 98. Both are right for their own
+# definitions, and neither is written down anywhere - so a contributor who trips
+# this, re-measures by a different reasonable definition and gets a third number
+# cannot tell which one the constant meant. It counts:
+#
+#   * both crates - `keylink/**/*.rs` AND `keylink-persist/**/*.rs`;
+#   * contiguous runs of `///`, `//!` OR plain `//` lines, joined into one block,
+#     so a `//` line adjacent to a `///` run merges into it;
+#   * blocks whose joined text contains the string `break-once.sh`.
+#
+# Change any of those three and the number changes. The loop below IS the
+# definition; this comment exists so the number can be reproduced without
+# reading it.
+#
+# ── AND IT IS BLIND TO ROUGHLY A THIRD OF THE POPULATION ──────────────────────
+#
+# One marker, and records use three. Measured on 2026-08-08 by the same walk,
+# widened to `break-once.sh` OR "Made red" OR "Red under": **144 blocks match,
+# 98 carry `break-once.sh`, so 46 do not** - a record phrased "Made red by .."
+# without naming the harness does NOT move this count and the tripwire stays
+# green. Two are in this repo's own `keylink/src/idempotency.rs`.
+#
+# Not widened, deliberately: the value here is LOUDNESS ON CHANGE, not
+# completeness, and widening would move the number again while leaving some
+# other phrasing outside. **So the limit is declared instead** - green here means
+# the `break-once.sh` population is unchanged, and it is not a statement about
+# every break record.
+#
+# The figure is a measurement rather than an assertion, and nothing checks it:
+# it moves whenever anybody adds a record, which is precisely the property that
+# disqualifies it from being a checked constant. Re-measure by widening MARKERS
+# in the loop below to the three strings.
 RECORD_BLOCKS = 98
 
 blocks = 0
