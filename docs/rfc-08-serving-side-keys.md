@@ -792,6 +792,17 @@ So it is decided per record, and the two axes are independent:
   are simply the ways that happens — code at column 0 has no indentation for the quote
   to lack, and a fragment has none to carry. State the property and the two cases fall
   out of it; state the two cases and a third way of colliding goes unnoticed.
+
+  **A measured nuance that makes describing a stronger call rather than a forced one.**
+  For one such anchor — a `const` at column 0 — a unique form does survive: taken
+  *with its trailing newline* it is count 1, because the record's copy is followed by a
+  closing backtick rather than a newline. So "no unique form exists" is the weaker
+  argument and it is not quite true. The stronger one is that the surviving form's
+  uniqueness rests on **a closing backtick sitting between the literal and the line's
+  newline** — a dependency on the record's own punctuation, more fragile than the
+  indentation dependency it would replace, and one fenced code block away from
+  breaking. Describe it because the only quote that works is held up by a backtick,
+  not because no quote works.
 - **Positional anchors: describe.** The alternative is a gate that reddens for every
   unrelated export and trains people to re-quote mechanically, which is worse than no
   gate.
