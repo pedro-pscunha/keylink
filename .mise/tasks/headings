@@ -9,8 +9,9 @@ wrap at, and the remainder reads as the section's opening line.
 
 **Nothing else in this repository can see it.** It is valid markdown, so
 `-D warnings` has nothing to warn about: `mise run docs` renders the truncated
-heading and exits 0. It is not a link, so `--document-private-items` does not
-reach it either. And one of the six this check was written against lives in
+heading and exits 0. `--document-private-items` does not help — it documents more
+items, and rustdoc has no lint saying a heading is short. And one of the six this
+check was written against lives in
 `keylink/tests/supervision.rs`, which `mise run docs` NEVER hands to rustdoc —
 so for that site a grep is not a cheap substitute for the real instrument, it is
 the only instrument there is.

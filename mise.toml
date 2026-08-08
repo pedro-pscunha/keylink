@@ -357,10 +357,17 @@ description = "rustdoc as a gate, not as decoration"
 # this repository depends on their order.
 #
 # `headings` runs first and is not a seventeenth gate step — it is inside this
-# one, because it checks the same artifact and takes no compile. It is the only
-# check in this repository that reaches hole 2: it reads tracked FILES, so the
-# heading it found in `keylink/tests/supervision.rs` is a site rustdoc never
-# sees. Cheapest first, as everywhere else in this gate.
+# one, because it checks the same artifact and takes no compile. It reads tracked
+# FILES rather than rustdoc's output, so it sees inside `keylink/tests/`, where
+# one of the six headings it was written against lived.
+#
+# **That does not close hole 2, and saying it did would be the same trade this
+# comment keeps refusing.** Hole 2 is about intra-doc LINKS, and a broken one in
+# `keylink/tests/` is still invisible to everything here. What `headings` shows is
+# narrower and still worth having: for one defect class, reading the file is the
+# whole instrument, so the hole does not apply to it.
+#
+# Cheapest first, as everywhere else in this gate.
 run = [
     { task = "headings" },
     "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --all-features -p keylink -p keylink-persist -p demo",
