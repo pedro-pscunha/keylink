@@ -20,6 +20,14 @@ Two consequences worth knowing before you hit them:
 - **The gate runs on your machine, on your OS.** CI ran Linux. Nothing checks the
   other platform any more.
 
+The `pre-push` hook reads git's list of ref updates before it runs any of that,
+and it answers differently for two shapes of push. A push whose updates are ALL
+deletions skips the gate and prints that it did: a deletion carries no tree, so
+building one checks nothing about it. A push delivering a commit that is not
+`HEAD` is **refused**, because the gate builds the working tree — a green result
+would be a statement about a tree the push does not carry. A tag pointing at an
+older commit lands there, and so does `git push --all`.
+
 You need [`mise`](https://mise.jdx.dev) and rustup. Nothing else is a manual
 step: `rust-toolchain.toml` requests the `wasm32-unknown-unknown` target and the
 `llvm-tools` component, and rustup installs both on first use. `mise.toml` pins
@@ -83,6 +91,10 @@ Legitimate:
   rustup component is not installed.
 - The push died in transport *after* the gate ran green on the same HEAD. That
   is a network failure, and running the gate again proves nothing.
+- You are pushing something the gate cannot check, and the `pre-push` hook has
+  refused it for that reason: a tag pointing at an older commit, or a branch
+  that is not the one checked out. Nothing built those trees in this run, and
+  the refusal is the only part of the system that knows.
 
 Not legitimate:
 
@@ -91,7 +103,7 @@ Not legitimate:
 - The failure looks unrelated to your change. Find out why before you decide
   that.
 
-If you bypass, say so in the pull request, with which of the two reasons applied.
+If you bypass, say so in the pull request, and name which reason applied.
 
 ## The wire contract
 
