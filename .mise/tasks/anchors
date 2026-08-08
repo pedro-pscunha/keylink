@@ -11,12 +11,30 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 #
 # The rule it enforces is `break-once.sh`'s own precondition, nothing more:
 #
-#     grep -qF -- "$from" "$file"          # count 0 aborts before any backup
-#     assert text.count(old) == 1          # count 2 aborts, backup restored
+#     text.count(from) == 1        # ANY other count aborts, before any backup
 #
-# So the check is `count == 1`, and both failure modes are safe to hit by hand:
-# a 0 aborts at the grep before a backup exists, and a 2 aborts at the python
-# assert with the backup already restored by `trap EXIT`.
+# So the check is `count == 1`, and every failure mode is safe to hit by hand: the
+# count runs before the backup is taken, so there is nothing written to restore.
+#
+# ── THAT PARAGRAPH USED TO DESCRIBE TWO STEPS, AND IT HAD THEM BACKWARDS ───────
+#
+# It read `grep -qF -- "$from" "$file"  # count 0 aborts before any backup` over
+# `assert text.count(old) == 1  # count 2 aborts, backup restored`, and leaned on
+# the split. **For a multi-line literal the grep was the weaker check, not the
+# earlier one.** POSIX gives `grep -F` a pattern LIST separated by newlines, so a
+# multi-line literal matches when ANY ONE of its lines does, and a literal ending
+# in a newline hands grep an EMPTY pattern that matches every file unconditionally.
+#
+# Measured against the two-step form, with the literal passed as argv exactly as
+# the script passes it: a file holding `alpha` and not `beta` passed the grep, took
+# the backup, and failed at the assert with `found 0` and **exit 1** — where this
+# paragraph promised a count-0 abort at the grep and exit 2. And **C8's and C11's
+# literals both END in a newline**, so for those two rows the grep matched a file
+# containing none of their text: the precondition was not weaker there, it was
+# inert. Not a rare shape either — 21 of `scripts/replay-fate-breaks.sh`'s 23 breaks
+# pass a multi-line search literal, counted by letting bash parse its own arguments.
+#
+# The two steps are now one count over the whole literal, before the backup.
 #
 # ── four ways a quoted anchor rots, all four found across three branches ────
 #
@@ -116,9 +134,11 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 # about which assertion fires first, and that rots when an assertion is added
 # ABOVE the recorded one — the guard stays correct, the test still fails, and only
 # comparing the recorded sentence against a fresh run finds it. No count and no
-# resolution check can see that. `scripts/replay-fate-breaks.sh` is the tool for
-# it, on the set it covers; this task deliberately answers the narrower question
-# of whether the break can be STARTED at all.
+# resolution check can see that. Two tools answer it, each on its own set:
+# `scripts/replay-fate-breaks.sh` on the breaks it hard-codes, and
+# `mise run replay-anchors` on the rows `REDNESS` below carries. This task
+# deliberately answers the narrower question of whether the break can be STARTED
+# at all — and it is the only one of the three that any gate runs.
 #
 # ── AND THE GUARANTEE IS PER-TREE. IT SAYS NOTHING ABOUT A MERGE ───────────────
 #
@@ -135,12 +155,18 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 # experiment and its record is a paragraph that branch rewrote. Its break stopped
 # reddening and this task never moved.
 #
-# **And the registry cannot even REPRESENT the part that goes wrong.** A row is
+# **And an `ANCHORS` row cannot even REPRESENT the part that goes wrong.** A row is
 # `(id, lives_in, target, literal)` — there is **no watched-message field**. So no
 # edit to any row can state the claim that died, and no edit to any row can repair
 # it. A reader who accepts this limitation and then goes looking for the row change
 # that expresses it will not find one, which is why the absence is written down here
 # rather than left to be discovered.
+#
+# `REDNESS` below is where a row's claim CAN now be written down — a replacement and
+# the sentence its break printed, for the rows somebody replayed. **That does not
+# lift this limitation.** This task still never runs a test, so a `REDNESS` entry is
+# checked only by `mise run replay-anchors`, which no gate runs, and only for the
+# rows carrying one. The claim moved from unrepresentable to falsifiable by hand.
 #
 # So the repair belongs to **the branch that falsifies a row, in the same commit
 # that rewrites the file** — otherwise some checkout-able commit has a tree and a
@@ -430,14 +456,24 @@ ANCHORS = [
     #
     # Indented, so the code line cannot collide with the record's unindented quote.
     #
-    # The record's quote sits ALONE ON ONE LINE, and that is not cosmetic. The first
-    # draft wrapped it across two `///` lines, and this task reads spans two different
-    # ways: `quoted_spans` strips the comment marker before matching, while the
-    # `harness_blocks` splitter keeps it. So the wrapped quote flattened to
-    # `inner.spent = /// inner.spent.saturating_sub(1);` for the second reader and this
-    # row showed as carried by NOBODY while `rows_unseen` was happy. **A quote that
-    # wraps is invisible to the carrying figure.** Measured, not reasoned: the row
-    # reported `carried by NOBODY` until the quote went onto one line.
+    # The record's quote sits alone on one line, and that USED to be load-bearing.
+    # This task read backticked spans two ways - the record-quote check stripped the
+    # comment marker before matching, the population walk kept it - so this quote,
+    # wrapped across two `///` lines as its first draft had it, flattened to
+    # `inner.spent = /// inner.spent.saturating_sub(1);` for the walk and matched no
+    # registered literal. `comment_blocks` is now the ONLY reader and strips the
+    # marker for both, so wrapping this quote is cosmetic. Measured, not reasoned:
+    # wrapped under the unified reader, `blocks_carrying` and `rows_unseen` both hold
+    # still; wrapped under the two-reader code at `080fec7`, they move.
+    #
+    # **What was recorded here was an observation of ONE TREE and it read as a
+    # property of the defect.** It said the row "reported `carried by NOBODY` while
+    # `rows_unseen` was happy" - and that pairing needs a SECOND harness block quoting
+    # the same literal, because `rows_unseen` searches every harness block rather than
+    # this one. Re-measured at `080fec7` under the two-reader code, with this quote
+    # wrapped: `blocks_carrying` 36 → 35 **and** `rows_unseen` 8 → 9, together.
+    # Exactly one harness block quotes this literal on that tree and it carries no
+    # other registered row, which is the tree fact the old sentence was about.
     ("L5", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
      "            inner.spent = inner.spent.saturating_sub(1);"),
     # ── from `ledger-attach`, which added `Limits::attach` and moved the attach
@@ -545,6 +581,93 @@ DESCRIBED = [
      "re-quoting buys only until the next export lands"),
 ]
 
+# ── WHAT A ROW'S BREAK PRODUCES, FOR THE ROWS SOMEBODY REPLAYED ────────────────
+#
+# This task says a break can be STARTED. It cannot say the break still REDDENS, and
+# no resolution check can: an anchor resolving is a property of one line, while
+# reddening is a property of a test living somewhere else. So the second half of
+# every record - what the run printed - rested on ONE watched run by the record's
+# own author, permanently, with nothing able to re-check it. `mise run replay-anchors`
+# is what re-checks the rows below.
+#
+# The bias that makes a re-check worth its cost, measured rather than supposed: on
+# 2026-08-08 both records a reviewer challenged were wrong in the SAME direction,
+# claiming MORE redness than exists. The mechanism is that an author holds the guards
+# they WROTE in mind while the neighbouring guard's SHAPE is not in that picture - a
+# guard asserting a ceiling cannot detect a defect that moves the value the other
+# way, because emptying the pool satisfies the ceiling.
+#
+# ── THE DESIGN DECISION, AND THE TWO CHEAPER PATHS IT REJECTS ─────────────────
+#
+# An `ANCHORS` row cannot express a replay: it carries the search literal and
+# nothing else, so a replayer reading that list alone knows where to cut and neither
+# what to write nor what to expect. Three ways out.
+#
+#   * PARSE the replacement and the watched sentence out of the record's prose.
+#     Rejected, and MEASURED rather than argued: the "Watched:" sentences in this
+#     tree are comma-joined prose - `left: 5, right: 0` - while the panic
+#     `assert_eq!` prints puts `left:` and `right:` on their own lines. A parser fed
+#     the record's own words would assert a string no run can contain, so it fails
+#     on CORRECT records. And the general objection this file already carries: a
+#     heuristic that misses a record checks nothing while reporting success.
+#   * A GENERIC destructive substitution - blank the line, invert the comparison.
+#     Rejected: a generic edit can redden a DIFFERENT test than the record names,
+#     which is exactly the defect being hunted. A replay red for the wrong reason
+#     reads as evidence and is not.
+#   * STATE the replacement and the watched output per row. The honest path, priced
+#     per row, because a value is only worth having if somebody OBSERVED it.
+#
+# **So this is an opt-in list and NOT a fifth and sixth field on `ANCHORS`.** A
+# field forces a value for every row, and rows nobody replayed would carry values
+# nobody watched - forty-six claims of precisely the kind this file exists to catch.
+#
+# **The objection this list therefore accepts is that it SAMPLES.** It does not say
+# the registry replays; it says these rows do. The success summary prints the ratio
+# for that reason, so the sample cannot read as the whole.
+#
+# What the sample IS: rows whose guard is a `#[test]` in the `keylink` library, so
+# one test binary serves all of them, AND whose record states its replacement as a
+# literal rather than describing it. What it is NOT: no R, C, D or P row is here,
+# and neither are L1 and L2, whose guards live in `keylink/tests/idempotency.rs`.
+# Those rows are resolution-checked and unreplayed - the state every row was in.
+#
+# `watched` is a substring of the RUN's output, not of the record's prose, for the
+# parsing reason above. Every entry was run and watched at `080fec7`; where the
+# record's sentence and the run disagreed, the run won and the record was corrected.
+#
+# id -> (replacement, watched substring, test filter, extra runner arguments)
+REDNESS = {
+    "L3": ("        self.frame_bytes = bytes;",
+           "held 1024 bytes over a 64 byte budget",
+           "the_recorded_bytes_stay_inside_their_bound", ["-p", "keylink", "--lib"]),
+    "L4": ("        self.pool_bytes = bytes;",
+           "left: Forgotten",
+           "a_reply_over_the_frame_ceiling_is_not_replayed", ["-p", "keylink", "--lib"]),
+    "L5": ("            inner.spent = inner.spent.saturating_sub(0);",
+           "after n=9: spent",
+           "the_counters_agree_with_the_maps_on_every_path", ["-p", "keylink", "--lib"]),
+    "A1": ("    let Some(budget) = idem.attach_budget(crate::MAX_ATTACH) else {",
+           "the ceiling must be this service's Limits::attach",
+           "an_attach_ceiling_below_the_peers_request_governs", ["-p", "keylink", "--lib"]),
+    "A2": ("            .map(|_| cap)",
+           "a request under the ceiling must be kept",
+           "a_peer_under_the_attach_ceiling_keeps_its_own_budget",
+           ["-p", "keylink", "--lib"]),
+    "A2b": ("            .map(|millis| Duration::from_millis(millis))",
+            "left: Some(3600s)",
+            "a_budget_is_capped_at_the_cap_it_is_given", ["-p", "keylink", "--lib"]),
+    "A3": ("            attach: Duration::from_secs(1),",
+           "a request over the ceiling must be held for the ceiling",
+           "a_peer_over_the_attach_ceiling_is_held_for_the_default",
+           ["-p", "keylink", "--lib"]),
+    "A4": ("            attach: Duration::from_secs(1),",
+           "the default ceiling must be the constant the README prints",
+           "the_default_attach_ceiling_is_max_attach", ["-p", "keylink", "--lib"]),
+    "A5": ("        while inner.held > 0",
+           "a bound nothing can reach must evict nothing",
+           "a_maximal_pool_evicts_nothing", ["-p", "keylink", "--lib"]),
+}
+
 def flat(text: str) -> str:
     """Whitespace-collapsed, so a literal wrapped across `///` lines still matches.
 
@@ -555,15 +678,79 @@ def flat(text: str) -> str:
     return " ".join(text.split())
 
 
+# What counts as a comment line, in ONE place. Every reader below goes through
+# `comment_blocks`, so this tuple is the only definition of the three markers in
+# this file - `anchors-selftest` asserts that there is exactly one of it, because a
+# second copy is how the two readers it replaced came to disagree.
+MARKERS = ("///", "//!", "//")
+
+
+def comment_blocks(text: str) -> list[str]:
+    """Contiguous runs of comment lines, marker stripped, each joined into one string.
+
+    ONE reader, and the unification is the whole point of this function. There were
+    TWO: the record-quote check stripped the marker before matching, while the
+    population walk kept the whole stripped line. So a quote the comment wrapped
+    across two `///` lines flattened to `inner.spent = /// inner.spent...` for the
+    second reader and to the clean literal for the first, and the wrapped form
+    matched no registered literal at all.
+
+    **LATENT, not firing, so this is PREVENTIVE and corrected no miscount.**
+    Measured on the tree this landed on: `blocks_carrying` computes to the same
+    figure with the marker stripped and with it kept, because no registered literal
+    was quoted only in wrapped form. What the readers did disagree about is the
+    hazard surface, measured 2026-08-08 (-03:00) over the blocks naming the
+    harness: with the marker kept, 99 of 1629 backticked spans carried an embedded
+    `///` or `//!`; with it stripped, 3 did, and those three are spans whose own
+    text is about a marker. That pair of figures bounds nothing and is not a
+    constant - it says the disagreement had a surface, and a re-measurer on a later
+    tree should expect two different numbers.
+
+    Runs stop at a line that is not a comment, which was the readers' SECOND
+    difference and was also inert: joining a whole file's comment lines and joining
+    each run separately gave identical span sets in every `lives_in` file, because
+    no comment block in them holds an odd number of backticks. Per-run is the one
+    kept, and not by coin toss. A block is the most text a comment author has in
+    front of them, so an unclosed backtick can only pair with another inside the
+    same block; whole-file joining lets one in a doc comment pair with one thirty
+    functions later and invent a span that no comment contains.
+    """
+    out: list[str] = []
+    run: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(MARKERS):
+            for marker in MARKERS:
+                if stripped.startswith(marker):
+                    run.append(stripped[len(marker):])
+                    break
+        else:
+            if run:
+                out.append(" ".join(run))
+            run = []
+    if run:
+        out.append(" ".join(run))
+    return out
+
+
+def spans(text: str) -> set[str]:
+    """Every backticked span in `text`, whitespace-flattened."""
+    return {flat(span) for span in re.findall(r"`([^`]*)`", text)}
+
+
 cache: dict[str, str] = {}
 spancache: dict[str, set[str]] = {}
 
 # TWO counters, and the split is the whole of a defect this task shipped with.
 #
-# `bad` decides the exit code and is raised by all five checks below: anchor
+# `bad` decides the exit code and is raised by EVERY check below - anchor
 # resolution, an undeclared fragment, an over-declared fragment, the record-quote
-# check, and the population tripwire. `unresolved` is raised by **resolution
-# alone**.
+# check, a row in `ANCHORS` and `DESCRIBED` at once, a `REDNESS` entry naming no
+# row, and the population tripwire. `unresolved` is raised by **resolution alone**.
+#
+# Named rather than counted, and this paragraph is why: it said "all five checks"
+# while a sixth and a seventh were being added in the same session, and a count
+# rots the moment anybody adds one.
 #
 # They were one counter, and the anchor-rot playbook at the bottom was printed on
 # it — so the population tripwire, which fires for **every branch that adds a
@@ -746,24 +933,28 @@ for record in sorted(FRAGMENT_ANCHORS - fragments):
 # DESCRIBED header warns about.
 #
 # **Not by comparing indentation, which cannot work here.** The obvious reading -
-# "compare the quoted form with its indentation" - reddens 9 of the 19 rows,
-# measured. Records quote UNINDENTED on purpose: that is the whole mechanism that
-# leaves the indented literal unique in the target (mode 1). Only C8's record
-# quotes its anchor with the indentation, and a rule derived from that one row
-# breaks the nine that follow the convention.
+# "the record's span must equal the literal including its leading whitespace" -
+# reddens most of this list. Records quote UNINDENTED on purpose: that is the whole
+# mechanism leaving the indented literal unique in the target (mode 1), so a rule
+# built on the exceptions breaks the convention.
+#
+# **Both figures this paragraph used to carry went stale, and one of them changed
+# sides.** It said the rule "reddens 9 of the 19 rows" and that "only C8's record
+# quotes its anchor with the indentation". Re-measured at `080fec7`, over the rows
+# whose REGISTERED literal carries indentation, comparing each record's flat-matching
+# span: **C8, C13, P1 and P2** keep the whitespace, and thirty rows drop it. C8 is
+# still one of the four and is no longer alone - `call-id` and `parked-drain` each
+# added one - so a rule derived from "that one row" would now be derived from four.
+# The conclusion did not move, which is the trap: a paragraph whose numbers are stale
+# and whose point is sound reads as already checked.
 #
 # Lines are joined BEFORE the spans are cut out, so a quote the comment wrapped
-# across two `///` lines is still one span.
+# across two `///` lines is still one span - and `comment_blocks` is what joins
+# them, the same reader the population walk goes through. This check owning a
+# private reader is exactly how the two came to disagree.
 def quoted_spans(path: str) -> set[str]:
     """Every backticked span inside a comment of `path`, whitespace-flattened."""
-    kept: list[str] = []
-    for line in (ROOT / path).read_text().splitlines():
-        stripped = line.strip()
-        for marker in ("///", "//!", "//"):
-            if stripped.startswith(marker):
-                kept.append(stripped[len(marker):])
-                break
-    return {flat(span) for span in re.findall(r"`([^`]*)`", " ".join(kept))}
+    return set().union(*(spans(b) for b in comment_blocks((ROOT / path).read_text())))
 
 
 for record, lives_in, target, literal in ANCHORS:
@@ -786,6 +977,56 @@ for record, lives_in, target, literal in ANCHORS:
           file=sys.stderr)
     print("       the wrong record. The RECORD is the source of truth; follow it.",
           file=sys.stderr)
+    print(file=sys.stderr)
+
+# ── a re-quoted record must LEAVE `DESCRIBED` ─────────────────────────────────
+#
+# The one thing about that list which is checkable, and its own header says why it
+# is worth checking: without the list, a record absent from `ANCHORS` is ambiguous,
+# and the ambiguity favours the wrong reading - somebody re-quotes an anchor that
+# was converted on purpose, the new row LOOKS like coverage, and the stale entry
+# goes on asserting that quoting was measured to be impossible.
+#
+# **This is NOT the check that header rules out.** That one - "the retired literal
+# no longer appears in the record's file" - cannot work, because a record explaining
+# why it was converted quotes the retired literal to do so, and an explanatory quote
+# is textually identical to a search quote. This check reads no file at all: it
+# compares two lists of ids, so the objection does not reach it.
+#
+# What it cannot do is notice a record re-quoted and registered NOWHERE. Nothing in
+# this file can - registration is opt-in per record, which the header states.
+row_ids = {record for record, _, _, _ in ANCHORS}
+for record in sorted(row_ids & {record for record, _, _, _ in DESCRIBED}):
+    bad += 1
+    print(f"FAIL {record}: registered in ANCHORS and listed in DESCRIBED at once",
+          file=sys.stderr)
+    print("       Those two rows say opposite things about one record: that its",
+          file=sys.stderr)
+    print("       search literal is quoted and checked, and that quoting it was",
+          file=sys.stderr)
+    print("       MEASURED to be impossible. If the record quotes an anchor now,",
+          file=sys.stderr)
+    print("       the ANCHORS row is the live one - drop the DESCRIBED entry.",
+          file=sys.stderr)
+    print(file=sys.stderr)
+
+# ── a REDNESS entry must name a row that exists ───────────────────────────────
+#
+# `mise run replay-anchors` takes the target and the search literal from `ANCHORS`
+# and everything else from `REDNESS`, so an entry naming no row is a replay that
+# cannot run. Without this it would be found by running the replayer, which no gate
+# does - so the entry would sit there reading like coverage.
+#
+# The reverse is NOT checked, deliberately: a row with no `REDNESS` entry is the
+# normal case. That list samples, and its header says which rows it leaves out.
+for record in sorted(set(REDNESS) - row_ids):
+    bad += 1
+    print(f"FAIL {record}: has a REDNESS entry and no ANCHORS row", file=sys.stderr)
+    print("       The replayer reads the file and the search literal from ANCHORS,",
+          file=sys.stderr)
+    print("       so this entry has nothing to cut. Either the row was dropped and",
+          file=sys.stderr)
+    print("       this entry outlived it, or the id is misspelled.", file=sys.stderr)
     print(file=sys.stderr)
 
 # ── population tripwire ───────────────────────────────────────────────────────
@@ -814,49 +1055,52 @@ for record, lives_in, target, literal in ANCHORS:
 # definition; this comment exists so the number can be reproduced without
 # reading it.
 #
-# ── AND IT IS BLIND TO ROUGHLY A THIRD OF THE POPULATION ──────────────────────
+# ── AND IT IS BLIND TO PART OF THE POPULATION, DERIVED ON EVERY RUN ───────────
 #
-# One marker, and records use three. Measured 2026-08-08 (-03:00) by the same walk,
-# widened to `break-once.sh` OR "Made red" OR "Red under": **158 blocks match,
-# 103 carry `break-once.sh`, so 55 do not** - a record phrased "Made red by .."
-# without naming the harness does NOT move this count and the tripwire stays
-# green. Two are in this repo's own `keylink/src/idempotency.rs`.
+# One marker, and records use three. A record phrased "Made red by .." without
+# naming the harness does not move this constant at all, and the tripwire stays
+# green. **The size of that blind spot is now COMPUTED by the walk below and
+# PRINTED by the success summary** - `HARNESS` plus `UNNAMED` is the widened
+# definition, and the blind figure is the difference between the widened population
+# and the counted one, both measured by one loop on one tree.
 #
-# **The blind figure did not move, and that is a coincidence rather than a result.**
-# `parked-drain` added one record block that names the harness, so the widened count
-# and the carrying count each rose by one and their difference happened to stay at
-# 55. All three were re-derived from the tree here, because a subtraction whose two
-# inputs both moved is exactly the shape that leaves a stale figure looking current.
+# ── it was three hand-written figures, and they went stale three times ────────
 #
-# **And the 157 / 102 / 55 this replaces went stale inside one commit, past the one
-# mitigation this convention relies on.** The date above was ALREADY 2026-08-08 when
-# it was wrong: `parked-drain` moved `RECORD_BLOCKS` thirty lines below, and no
-# reader could have told from the date that the snapshot predated that. A same-day
-# figure is unfalsifiable by date alone, so the date is a tiebreaker between
-# snapshots and never evidence that one is current.
+# Always in the same direction, and that is why the derivation is worth the lines:
+# this paragraph exists to BOUND what the tripwire cannot see, so understating the
+# bound is the one error that matters here.
 #
-# **The previous figures here said 144 / 98 / 46, and all three were stale for a
-# reason the paragraph could not see: the rebase moved the tree underneath them.**
-# They were measured before this branch rebased onto `call-id`, and the commit that
-# wrote them is itself one of the six described below whose declared constant no
-# longer matches its own tree. So the declared blind spot understated itself by
-# nine blocks - the direction that matters, since this paragraph exists to bound
-# what the tripwire cannot see.
+#   * `144 / 98 / 46` was written before its branch rebased onto `call-id`. The
+#     rebase moved the tree under it, and the declared blind spot was nine blocks
+#     short of the tree it was read against.
+#   * `157 / 102 / 55` went stale INSIDE ONE COMMIT, past the one mitigation this
+#     convention had. Its date was ALREADY 2026-08-08 when it went wrong, so no
+#     reader could order the snapshot against the commit that broke it: a same-day
+#     figure is unfalsifiable by date alone. A date is a tiebreaker between two
+#     snapshots and never evidence that either is current.
+#   * `158 / 103 / 55` was the last hand-written triple, and it carried a paragraph
+#     arguing that its blind figure had held steady. Re-measured 2026-08-08 (-03:00)
+#     by that same walk and those same three markers: **180 match, 123 carry, 57
+#     blind.** All three had moved, and the difference had moved with them - which
+#     is the shape a subtraction hides, because two inputs moving together leave the
+#     result looking derived.
 #
-# The date above carries its UTC offset because a bare date cannot be ordered
-# against another bare date from a different zone - and "which of these two figures
-# is older" is exactly the question a stale one makes somebody ask.
+# The dates carry a UTC offset because a bare date cannot be ordered against
+# another bare date from a different zone, and "which of these two figures is
+# older" is exactly the question a stale one makes somebody ask.
 #
-# Not widened, deliberately: the value here is LOUDNESS ON CHANGE, not
-# completeness, and widening would move the number again while leaving some
-# other phrasing outside. **So the limit is declared instead** - green here means
-# the `break-once.sh` population is unchanged, and it is not a statement about
-# every break record.
+# **So the fix is not a fourth triple.** A figure describing the whole tree cannot
+# be kept true by care, by a date, or by a warning paragraph - a sibling branch or a
+# rebase moves the tree under it, and it then reads as current. `RECORD_BLOCKS` is
+# the shape that survives that: it FAILS LOUDLY the moment it disagrees with its own
+# tree. A figure that only informs has no such state, so it is derived instead of
+# declared.
 #
-# The figure is a measurement rather than an assertion, and nothing checks it:
-# it moves whenever anybody adds a record, which is precisely the property that
-# disqualifies it from being a checked constant. Re-measure by widening MARKERS
-# in the loop below to the three strings.
+# The tripwire itself is NOT widened, deliberately: the value it has is LOUDNESS ON
+# CHANGE rather than completeness, and widening it would move the constant again
+# while still leaving some other phrasing outside. Green here means the
+# `break-once.sh` population is unchanged, and it is not a statement about every
+# break record.
 # ── the number, and what moved it last ────────────────────────────────────────
 #
 # 98 -> 102 when `call-id` merged (PR #11), which added four records mentioning
@@ -937,44 +1181,43 @@ for record, lives_in, target, literal in ANCHORS:
 # a carried value goes stale.
 RECORD_BLOCKS = 123
 
-harness_blocks: list[str] = []
+# The one marker the tripwire counts, and the two phrasings records use INSTEAD of
+# naming the harness. Both are read by the same walk, so the blind spot below is a
+# subtraction between two figures measured by one loop on one tree - never a
+# constant, and never two snapshots taken at different times.
+HARNESS = "break-once.sh"
+UNNAMED = ("Made red", "Red under")
+
+all_blocks: list[str] = []
 for path in sorted(
     list((ROOT / "keylink").rglob("*.rs")) + list((ROOT / "keylink-persist").rglob("*.rs"))
 ):
-    run, found = [], []
-    for line in path.read_text().splitlines():
-        stripped = line.strip()
-        if stripped.startswith(("///", "//!", "//")):
-            run.append(stripped)
-        else:
-            if run:
-                found.append(" ".join(run))
-            run = []
-    if run:
-        found.append(" ".join(run))
-    harness_blocks += [b for b in found if "break-once.sh" in b]
+    all_blocks += comment_blocks(path.read_text())
+harness_blocks = [b for b in all_blocks if HARNESS in b]
+marked_blocks = [b for b in all_blocks if HARNESS in b or any(p in b for p in UNNAMED)]
 blocks = len(harness_blocks)
+blind = len(marked_blocks) - blocks
 
 # ── coverage: an INTERSECTION, because the two populations are different units ──
 #
 # The first version of the line below printed `RECORD_BLOCKS - len(ANCHORS)`, which
-# **subtracts a row count from a block count**. It read as coverage, it was wrong,
-# and it was wrong in the FLATTERING direction - 77 unchecked where the true figure
-# is 89. Two reasons the subtraction cannot work:
+# **subtracts a row count from a block count**. It read as coverage and it was wrong
+# in the FLATTERING direction - 77 unchecked against a true figure of 89 on the tree
+# that carried it. Two reasons the subtraction cannot work:
 #
 #   * several rows can live in ONE block, so rows do not map onto blocks 1:1; and
-#   * a row's record need not be a harness block at all. Eight of them are not: their
-#     records say "Made red by .." without naming `break-once.sh`, which is exactly
-#     the population the paragraph above declares this tripwire blind to. Those rows
-#     cannot be "of those 102" in any sense.
+#   * a row's record need not be a harness block at all. `rows_unseen` is the rows that
+#     are not, and the summary PRINTS it rather than this comment naming it: their
+#     records say "Made red by .." without naming `break-once.sh`, the population this
+#     tripwire is declared blind to above. Those rows cannot be "of the counted
+#     population" in any sense. The figure sat here as "Eight of them are not" beside a
+#     population of "102" - both stale, in a sentence that read as current.
 #
 # `882bd35` on this branch is the same defect one level up - **a gate cannot claim a
 # denominator it cannot compute.** So the numbers below are an intersection measured
 # both directions, and nothing is subtracted across units.
 registered = {flat(literal) for _, _, _, literal in ANCHORS}
-harness_spans = [
-    {flat(span) for span in re.findall(r"`([^`]*)`", block)} for block in harness_blocks
-]
+harness_spans = [spans(block) for block in harness_blocks]
 blocks_carrying = sum(1 for spans in harness_spans if spans & registered)
 quotable_anywhere = set().union(*harness_spans) if harness_spans else set()
 rows_unseen = [rid for rid, _, _, lit in ANCHORS if flat(lit) not in quotable_anywhere]
@@ -1078,9 +1321,9 @@ if unresolved:
         file=sys.stderr,
     )
 
-# Separate from the block above, and after it, so that a failure in any of the five
-# checks still fails the gate while only resolution prints the playbook. Folding this
-# back into `if unresolved:` would make the other four checks report and then exit 0.
+# Separate from the block above, and after it, so that a failure in ANY check still
+# fails the gate while only resolution prints the playbook. Folding this back into
+# `if unresolved:` would make every other check report and then exit 0.
 if bad:
     sys.exit(1)
 
@@ -1106,3 +1349,37 @@ print(
     f"    and {len(rows_unseen)} of the {len(ANCHORS)} rows sit in records this "
     "tripwire cannot see at all - they never say `break-once.sh`"
 )
+# ── the blind spot, DERIVED, because three hand-written triples went stale ─────
+#
+# `HARNESS` plus `UNNAMED` is the widened definition, and both figures come off ONE
+# walk over ONE tree - so this cannot become a snapshot of a tree that has moved,
+# which is what happened to each of the three triples the header lists.
+print(
+    f"    widened to \"{UNNAMED[0]}\" and \"{UNNAMED[1]}\" the walk finds "
+    f"{len(marked_blocks)} record blocks, so {blind} name no harness and the "
+    "tripwire above is blind to them"
+)
+print(
+    f"    {len(REDNESS)} of the {len(ANCHORS)} rows carry a WATCHED REPLAY - "
+    "`mise run replay-anchors` runs those, and no gate runs it; every other row "
+    "is resolution-checked and unreplayed"
+)
+# ── the three states, and ROWS and BLOCKS are NOT interchangeable ──────────────
+#
+# **A row cannot be unclassified, because being a row IS the classification**: it is
+# in `ANCHORS`, so its anchor is checked, or in `DESCRIBED`, so somebody measured
+# that quoting it was impossible. Only a BLOCK can be unclassified. That is why the
+# row column has no third entry, and why the block column has no `DESCRIBED` one - a
+# `DESCRIBED` row's fourth field is prose rather than a literal, so there is no span
+# to match and its block figure does not exist. A dash, where a zero would lie.
+#
+# The unclassified figure is PRINTED and never swept. Relabelling those blocks as
+# deliberately described would make every row assert a deliberateness nobody
+# checked - this convention's own failure mode arriving through the fix for it, which
+# `DESCRIBED`'s header argues at length. Large and visible is the intended state.
+print("    by state, and the two columns are different units:")
+print("                     rows  blocks")
+print(f"      CHECKED        {len(ANCHORS):5d} {blocks_carrying:7d}")
+print(f"      DESCRIBED      {len(DESCRIBED):5d} {'-':>7}   (prose, no literal to match)")
+print(f"      UNCLASSIFIED   {'-':>5} {len(marked_blocks) - blocks_carrying:7d}   "
+      f"({blocks - blocks_carrying} this walk sees, {blind} it does not)")

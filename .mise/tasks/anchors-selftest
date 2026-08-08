@@ -3,7 +3,7 @@
 
 MISE description="The anchors gate reports each failure class as itself, not as anchor rot"
 """
-# This exists because the gate had ONE counter for five checks and printed the
+# This exists because the gate had ONE counter for every check and printed the
 # anchor-rot playbook on all of them. The population tripwire fires for every
 # branch that adds a record block — the normal case — so the normal case produced
 # `N of M quoted break anchors no longer resolve` plus thirty lines headed
@@ -26,6 +26,7 @@ MISE description="The anchors gate reports each failure class as itself, not as 
 # The copy still resolves the repo correctly: the task computes ROOT from
 # `git rev-parse --show-toplevel`, which answers from the cwd and not from the
 # script's own path. So a copy in /tmp reads the same tree the original would.
+import ast
 import pathlib
 import re
 import subprocess
@@ -183,6 +184,172 @@ else:
         "a rotted anchor names the row",
         f"FAIL {rid}" in out,
         f"expected `FAIL {rid}` in the output",
+    )
+
+# ── probe 3: a row in ANCHORS and DESCRIBED at once ────────────────────────────
+#
+# The two lists say opposite things about one record, so an id in both is a defect
+# the gate must name. Perturbed by splicing over the id's own character range rather
+# than by `str.replace`, because an id is a short string that occurs in prose too.
+described = re.search(r'^DESCRIBED = \[\n(?:.*\n)*?    \("([^"]+)",', source, re.M)
+if described is None or row is None:
+    check("a DESCRIBED row is findable", False, "could not locate a row to perturb")
+else:
+    at, to = described.span(1)
+    code, out = run(source[:at] + rid + source[to:])
+    check("a row in ANCHORS and DESCRIBED at once fails the gate", code == 1,
+          f"exit {code}, expected 1")
+    check(
+        "a row in both lists is named",
+        f"FAIL {rid}" in out and "DESCRIBED at once" in out,
+        f"expected `FAIL {rid}` and `DESCRIBED at once` in the output",
+    )
+    check(
+        "a row in both lists does NOT print the anchor-rot playbook",
+        PLAYBOOK not in out,
+        "no anchor moved: the playbook's remedy is re-quoting, and this failure is "
+        "two lists disagreeing about one record",
+    )
+
+# ── probe 4: a REDNESS entry naming no row ─────────────────────────────────────
+#
+# `replay-anchors` reads the file and the search literal from `ANCHORS`, so an entry
+# whose id is not a row is a replay that cannot run — and nothing would say so,
+# because no gate runs the replayer.
+redness = re.search(r'^REDNESS = \{\n    "([^"]+)":', source, re.M)
+if redness is None:
+    check("a REDNESS entry is findable", False, "no `REDNESS = {` with a first key")
+else:
+    at, to = redness.span(1)
+    code, out = run(source[:at] + "ZZ99" + source[to:])
+    check("a REDNESS entry naming no row fails the gate", code == 1,
+          f"exit {code}, expected 1")
+    check(
+        "a REDNESS entry naming no row is named",
+        "FAIL ZZ99" in out and "no ANCHORS row" in out,
+        "expected `FAIL ZZ99` and `no ANCHORS row` in the output",
+    )
+    check(
+        "a REDNESS entry naming no row does NOT print the anchor-rot playbook",
+        PLAYBOOK not in out,
+        "no anchor moved: this is a replay entry pointing at nothing",
+    )
+
+# ── the summary's figures must be DERIVED, and its states must be printed ──────
+#
+# Three hand-written figures declared the tripwire's blind spot and all three went
+# stale, always understating it. They are computed now, so what is worth asserting is
+# that the arithmetic in the output is the SAME RUN's arithmetic: a literal spliced
+# back in over any one of them stops agreeing with the other two. That is what this
+# can catch and the limit of it — three figures off one walk are not independent
+# measurements, so agreement is consistency and not proof.
+code, out = run(source)
+widened = re.search(r"the walk finds (\d+) record blocks, so (\d+) name no harness", out)
+counted = re.search(r"of the (\d+) harness blocks carry a registered row", out)
+seen = re.search(r"\((\d+) this walk sees, (\d+) it does not\)", out)
+check(
+    "the summary states the widened population and the blind count",
+    widened is not None and counted is not None and seen is not None,
+    f"expected the widened line, the harness-block line and the state table:\n{out}",
+)
+if widened and counted and seen:
+    check(
+        "the blind count is that run's own subtraction",
+        int(widened.group(2)) == int(widened.group(1)) - int(counted.group(1)),
+        f"{widened.group(1)} widened - {counted.group(1)} counted != "
+        f"{widened.group(2)} blind: one of the three is not from this walk",
+    )
+    check(
+        "the unclassified blocks are the seen and the unseen added up",
+        int(seen.group(2)) == int(widened.group(2)),
+        f"the state table says {seen.group(2)} blocks this walk does not see while "
+        f"the widened line says {widened.group(2)}",
+    )
+check(
+    "the summary prints the replay coverage, so the sample cannot read as the whole",
+    "carry a WATCHED REPLAY" in out,
+    "REDNESS samples the registry; a run that does not print the ratio lets a "
+    "reviewer read a partial replay as a whole-registry one",
+)
+check(
+    "the summary prints the unclassified population rather than hiding it",
+    "UNCLASSIFIED" in out,
+    "the three-state classification exists to make the unclassified blocks visible; "
+    "a summary without them is the sweep this convention refuses",
+)
+
+# ── the READER, on synthetic input, because the hazard is LATENT in this tree ───
+#
+# No registered literal is quoted only in wrapped form, so no perturbation of the
+# TREE can redden a check for the wrapped-quote defect — a probe that ran the whole
+# task would pass with either reader. The reader is therefore exercised directly, on
+# text written here for the purpose.
+#
+# `ast` lifts the functions out of the task and executes those alone, so this neither
+# runs the gate nor touches the tree.
+READER = ("flat", "comment_blocks", "spans")
+reader: dict = {"re": re}
+lifted = [
+    node
+    for node in ast.parse(source).body
+    if (isinstance(node, ast.FunctionDef) and node.name in READER)
+    or (isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "MARKERS")
+]
+exec(compile(ast.Module(body=lifted, type_ignores=[]), str(TASK), "exec"), reader)
+check(
+    "the task's comment reader is liftable by name",
+    {"MARKERS", "flat", "comment_blocks", "spans"} <= set(reader),
+    "expected `MARKERS`, `flat`, `comment_blocks` and `spans` at the task's top "
+    "level; the cases below read the reader by those names",
+)
+markers = [
+    node
+    for node in ast.walk(ast.parse(source))
+    if isinstance(node, ast.Tuple)
+    and [getattr(e, "value", None) for e in node.elts] == ["///", "//!", "//"]
+]
+check(
+    "the comment marker is written down exactly once",
+    len(markers) == 1,
+    f"found {len(markers)} copies of the marker tuple. Two readers with two copies "
+    "is how the record-quote check and the population walk came to disagree, and "
+    "the disagreement was invisible because both were green",
+)
+if {"comment_blocks", "spans"} <= set(reader):
+    WRAPPED = (
+        "impl Ledger {\n"
+        "    /// Made red by `scripts/break-once.sh` replacing `inner.spent =\n"
+        "    /// inner.spent.saturating_sub(1);` with `saturating_sub(0)`.\n"
+        "    fn evict(&mut self) {}\n"
+        "}\n"
+    )
+    blocks = reader["comment_blocks"](WRAPPED)
+    wrapped_spans = set().union(*(reader["spans"](b) for b in blocks))
+    check(
+        "a quote wrapped across two comment lines is one clean span",
+        "inner.spent = inner.spent.saturating_sub(1);" in wrapped_spans,
+        f"the wrapped quote did not come back as one span: {sorted(wrapped_spans)}",
+    )
+    check(
+        "no span carries the comment marker the reader stripped",
+        not any("///" in span or "//!" in span for span in wrapped_spans),
+        f"a span still holds its marker: {sorted(wrapped_spans)}. A registered "
+        "literal can never match that, and the row reads as quoted by nobody",
+    )
+    SPLIT = (
+        "    /// one `alpha\n"
+        "    fn code() {}\n"
+        "    /// two beta` gamma\n"
+    )
+    split_blocks = reader["comment_blocks"](SPLIT)
+    check(
+        "a comment block ends at a line of code",
+        len(split_blocks) == 2
+        and not set().union(*(reader["spans"](b) for b in split_blocks)),
+        f"expected two blocks and no span; got {len(split_blocks)} blocks and "
+        f"{sorted(set().union(*(reader['spans'](b) for b in split_blocks)))}. Joining "
+        "a whole file's comment lines lets an unclosed backtick pair with one in "
+        "another function and invent a span no comment contains",
     )
 
 print()
