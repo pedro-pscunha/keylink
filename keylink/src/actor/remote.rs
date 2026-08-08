@@ -434,6 +434,12 @@ pub async fn deliver_to_actor<S: KeyedService>(
         .map_err(|err| RemoteError::Failed(err.to_string()))?;
 
     let route = system.route(&actor)?;
+    // Cloned out so the wait at the bottom can read the verdict without the
+    // sender still sitting beside it. `Fate` is a handle to one
+    // `Arc<Mutex<Standing>>`, and the registry itself clones it out of the entry
+    // to build every `Route`, so this reads the same cell the actor's own loop
+    // settles. See the `drop(route)` below for what the separation is for.
+    let fate = route.fate.clone();
 
     // Read before `cx` moves into the `Origin`, which is the only reason these
     // are bindings rather than expressions at their use sites.
@@ -465,6 +471,24 @@ pub async fn deliver_to_actor<S: KeyedService>(
         })?,
     };
     sent.map_err(|_| no_such_actor(&actor))?;
+    // **This clone dies here, and a keyed actor's graceful stop is what that
+    // buys.** `drain` ends an actor's loop by dropping the registry's sender, and
+    // says the task lives while any other sender does so that "a message already
+    // in flight" can finish. A `#[defer]` reply parked in user state is not a
+    // message in flight: the message was delivered and the turn ran to
+    // completion. So a clone held across the wait below kept the loop open for
+    // nothing — `shutdown` spent its whole budget and then aborted the actor it
+    // was asked to drain, and the peer was told the same thing a budget later.
+    // `Registry::sweep` reaches the same `drain`, so an **eviction** did it too,
+    // with nobody having called anything: a parked reply does not touch
+    // `last_seen`, so the actor expired on schedule and was destroyed instead of
+    // drained.
+    //
+    // Not any earlier: the send future borrows `route.mail`, so this is the first
+    // line where the clone is provably spent rather than still owed a permit.
+    // `answer` and `fate` outlive it, which is the whole reason `fate` was cloned
+    // out above.
+    drop(route);
     // Below every refusal above it, so no refusal here can be mistaken for a
     // message that queued. Above the wait, because the wait is exactly what a
     // caller gives up on.
@@ -482,15 +506,15 @@ pub async fn deliver_to_actor<S: KeyedService>(
     // `#[must_use]` asks for — told the peer *no actor is mounted as X* about an
     // actor that answers the next call on this same connection.
     //
-    // The cell `route` handed back is settled by that actor's own loop before it
-    // drops anything, so this read happens-after the verdict for the drop that
+    // The cell the route handed back is settled by that actor's own loop before
+    // it drops anything, so this read happens-after the verdict for the drop that
     // woke it. What it cannot close is the *late* direction, and
     // `deliver_to_local` states it in full: an actor that moved on between the
     // death and this read is described as it is now rather than as it was.
     answer
         .await
         .map(|answered| rendered(answered, budget.map_or(0, Queueing::millis)))
-        .map_err(|_| lost(route.fate.standing(), actor.as_str()))
+        .map_err(|_| lost(fate.standing(), actor.as_str()))
 }
 
 #[cfg(test)]
