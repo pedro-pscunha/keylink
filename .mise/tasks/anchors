@@ -306,6 +306,17 @@ ANCHORS = [
     # than reasoning, made against its own author.
     ("C14", "keylink/src/call.rs", "keylink/src/call.rs",
      "            .filter_map(|call| self.answers.get(call).map(|answer| (*call, answer)))"),
+    # `parked-drain`. Both rows are the SAME literal, deliberately: one edit reddens
+    # two guards, one on the drain's timing and one on what the peer is told, and
+    # neither shape sees both halves. Measured in all three forms rather than
+    # reasoned - bare, indented, and indented-plus-newline all count 1 in the target,
+    # so the indentation does no work here. The indented form is registered anyway,
+    # for C8's reason: the bare form collides the moment any line anywhere ends in
+    # `drop(route);`.
+    ("P1", "keylink/tests/defer.rs", "keylink/src/actor/remote.rs",
+     "    drop(route);"),
+    ("P2", "keylink/tests/defer.rs", "keylink/src/actor/remote.rs",
+     "    drop(route);"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -672,7 +683,7 @@ for record, lives_in, target, literal in ANCHORS:
 # bisect script. Nothing here needs changing for that - the tip is correct, and the
 # alternative is a constant that measures less than the tree, which is the thing
 # this one exists to be.
-RECORD_BLOCKS = 102
+RECORD_BLOCKS = 103
 
 harness_blocks: list[str] = []
 for path in sorted(
