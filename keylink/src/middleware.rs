@@ -306,6 +306,26 @@ impl Context {
     /// `None` when it did not, and `None` for every `tell`, which cannot carry a
     /// key at all. Never a peer's key in the clear: see [`CallId`].
     ///
+    /// # `None` for a method this service does not key, and that is a footgun
+    ///
+    /// [`Keyable`](crate::Keyable) decides which methods accept a key at all. On a
+    /// method outside that policy a keyed call is refused
+    /// [`NotKeyable`](crate::IdempotencyRefusal::NotKeyable) **before the chain is
+    /// entered**, and an unkeyed one arrives here as `None` — so this accessor can
+    /// never answer `Some` there, by construction rather than by chance.
+    ///
+    /// Which means an [`Applied`](crate::Applied) sitting in a handler whose method
+    /// the service has not made keyable **never fires, and nothing says so**. That
+    /// is the same silent at-least-once the type exists to prevent, reached through
+    /// a serving-side setting instead of through a caller forgetting
+    /// `with_idempotency`. If you deduplicate in a handler, put its method in the
+    /// policy.
+    ///
+    /// The refusal itself is held by
+    /// `tests/idempotency.rs::a_key_on_a_method_the_service_does_not_key_is_refused`.
+    /// What is added here is only where that leaves this accessor, which is a
+    /// consequence of `claim_key` returning before `next` and needs no second test.
+    ///
     /// This is what makes `README.md`'s third limit — *"read the result out of
     /// your own domain; do not re-run the work"* — something a handler can act on.
     /// [`Applied`](crate::Applied) is where to put it. The ledger stops a

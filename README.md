@@ -319,6 +319,12 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
    self.applied.insert(call, self.balance);
    ```
 
+   **The method has to be one your service keys.** `Keyable` decides that, and on a
+   method outside the policy a keyed call is refused `NotKeyable` before the handler
+   runs — so `cx.call()` is `None` there always, and an `Applied` in that handler
+   never fires and never says so. Deduplicating in a handler means putting its
+   method in the policy.
+
    Insert in the turn that **applies**, as above, and never in a turn that merely
    hears about the work: the two together are one snapshot and one `fsync`, and that
    is the whole reason the set lives in your state rather than in keylink's. A
