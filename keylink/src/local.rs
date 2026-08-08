@@ -577,6 +577,27 @@ enum Settled<T> {
 /// wait ends with [`TurnLost::Gone`], which is exactly what happens by itself when
 /// an actor ends with replies parked in its state.
 ///
+/// # This is how a handler calls another actor — but parking is only half of it
+///
+/// A handler that awaits another actor whose handler calls back deadlocks, and
+/// the generated `Handle` documents why. This type is the way out, and the way
+/// out is precise: **returning from the turn** is what breaks the cycle, because
+/// the loop goes back to polling and can take the peer's message and run it.
+/// [`later`](Reply::later) is what makes returning possible while a caller is
+/// still owed an answer — so park the reply, hand the outbound call to a spawned
+/// task, and return.
+///
+/// Parking on its own fixes nothing. A handler that calls `later` and then awaits
+/// the peer *without returning* hangs exactly as before: the turn has not ended,
+/// so the loop is not polling, so the park bought nothing.
+/// `tests/cycles.rs` is a pair of twins that differ in the `tokio::spawn` alone
+/// and disagree, which is what makes that a mechanism rather than a suggestion.
+///
+/// And the mechanism is **not** about the mailbox permit. The permit is free in
+/// the hanging case too — a running turn released its own when it took the message
+/// it is running — so a cycle-breaker that only freed a permit would break
+/// nothing. What was missing was a loop that would *run* the message.
+///
 /// # What a parked reply resolves to when a LATER turn faults
 ///
 /// **Nothing. It stays parked.** Wave 2a gave `Answered` a `Faulted` state, and
