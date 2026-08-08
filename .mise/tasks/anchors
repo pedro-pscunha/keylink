@@ -93,9 +93,28 @@ ROOT = pathlib.Path(
 
 # (record id, where the record lives, file the break edits, quoted SEARCH literal)
 #
-# Only records that QUOTE a search literal belong here. A record that describes
-# its edit has nothing to resolve and nothing to rot — see the three modes above
-# for when describing is the right call.
+# Only records that QUOTE a search literal belong here. A record that describes its
+# edit has nothing to resolve and nothing to rot.
+#
+# **The three cases where describing is right are NOT the four rot modes above, and
+# an earlier version of this line pointed at "the three modes above" as though they
+# were the same list.** They are two different lists and they cross:
+#
+#   * SAME-FILE where indentation cannot separate the record's copy from the code's
+#     - rot mode 1, and a describing case only where nothing else separates them;
+#   * POSITIONAL - rot mode 3, where re-quoting buys only until the next sibling;
+#   * FORMATTER where the edit site spans more than one line - part of rot mode 2,
+#     and the only one of the three with no better anchor available.
+#
+# Mode 4, a fragment, is a rot mode and NOT a describing case: its remedy is to
+# widen to the whole line, which is what C12 does. Mode 2 is only a describing case
+# when the site has no single line - a one-line anchor inside a wrapped chain is
+# quotable, and C13 is quoted for that reason.
+#
+# **This is a count of ROWS, not of distinct anchors**, and the list holds both
+# shapes on purpose: R15 and R16 are two rows sharing one literal because two
+# records cite it, while C5 is one row for a literal two records also cite. The loop
+# below iterates rows, so `len(ANCHORS)` is rows, and the green line says so.
 ANCHORS = [
     ("R15", "keylink/tests/idempotency.rs", "keylink/src/idempotency.rs",
      "Self::Only(named) => named.contains(&method),"),
@@ -132,9 +151,10 @@ ANCHORS = [
      "        let Some(call) = call else { return };"),
     ("C4", "keylink/src/call.rs", "keylink/src/call.rs",
      "        self.answers.get(&call?)"),
-    # Cited from TWO records, which is why the unit here is the distinct ANCHOR
-    # rather than the record site - a site count is legitimately larger and both
-    # are defensible.
+    # Cited from TWO records and registered ONCE, which is the opposite choice from
+    # R15/R16 - two rows for one literal, also two records. Both are defensible and
+    # the list makes both, so neither is the convention; what the green line counts
+    # is ROWS, and that is stated where the count is printed.
     ("C5", "keylink/src/call.rs", "keylink/src/call.rs",
      "            Entry::Occupied(_) => return,"),
     # A FRAGMENT: the line continues `.serialize(serializer)`. Registered as the
@@ -467,11 +487,23 @@ for record, lives_in, target, literal in ANCHORS:
 #
 # ── AND IT IS BLIND TO ROUGHLY A THIRD OF THE POPULATION ──────────────────────
 #
-# One marker, and records use three. Measured on 2026-08-08 by the same walk,
-# widened to `break-once.sh` OR "Made red" OR "Red under": **144 blocks match,
-# 98 carry `break-once.sh`, so 46 do not** - a record phrased "Made red by .."
+# One marker, and records use three. Measured 2026-08-08 (-03:00) by the same walk,
+# widened to `break-once.sh` OR "Made red" OR "Red under": **157 blocks match,
+# 102 carry `break-once.sh`, so 55 do not** - a record phrased "Made red by .."
 # without naming the harness does NOT move this count and the tripwire stays
 # green. Two are in this repo's own `keylink/src/idempotency.rs`.
+#
+# **The previous figures here said 144 / 98 / 46, and all three were stale for a
+# reason the paragraph could not see: the rebase moved the tree underneath them.**
+# They were measured before this branch rebased onto `call-id`, and the commit that
+# wrote them is itself one of the six described below whose declared constant no
+# longer matches its own tree. So the declared blind spot understated itself by
+# nine blocks - the direction that matters, since this paragraph exists to bound
+# what the tripwire cannot see.
+#
+# The date above carries its UTC offset because a bare date cannot be ordered
+# against another bare date from a different zone - and "which of these two figures
+# is older" is exactly the question a stale one makes somebody ask.
 #
 # Not widened, deliberately: the value here is LOUDNESS ON CHANGE, not
 # completeness, and widening would move the number again while leaving some
@@ -496,7 +528,25 @@ for record, lives_in, target, literal in ANCHORS:
 #
 # Bumping the number without registering them is the one move this comment exists
 # to make visible. Green here now means "the population is 102", not "102 records
-# are checked".
+# are checked". The ratio is not written here on purpose - a copy of it would go
+# stale on the next row added. The success line COMPUTES it instead.
+#
+# ── A PROPERTY OF THIS CONSTANT THAT COSTS A BISECT, MEASURED ON THIS BRANCH ───
+#
+# **A constant measuring the WHOLE TREE is invalidated wholesale by a rebase, at
+# every commit still carrying the old value.** Six commits on this branch declare 98
+# while their own tree carries 102, so `mise run anchors` FAILS at each of them even
+# though the tip is green. The constant was written measuring the pre-rebase tree;
+# rebasing onto `call-id` moved the tree under all six at once, and only the commit
+# that corrected the value is green again.
+#
+# The consequence is narrow and worth knowing before somebody hits it: **a bisect
+# across a range containing such a rebase cannot use this gate**, because the
+# failures are an artefact of where the range sits and not of the commits. Run the
+# gate at the tip, or fix the constant at each step, or exclude this task from the
+# bisect script. Nothing here needs changing for that - the tip is correct, and the
+# alternative is a constant that measures less than the tree, which is the thing
+# this one exists to be.
 RECORD_BLOCKS = 102
 
 blocks = 0
@@ -543,16 +593,26 @@ if bad:
         "  cross-file, line-local anchor, which is most of this list, and it is\n"
         "  the fix whenever a rebase or a refactor moved the target.\n"
         "\n"
-        "Delete the entry ONLY in the two cases where quoting cannot work:\n"
+        "Delete the entry ONLY in the three cases where quoting cannot work:\n"
         "\n"
-        "  - the record lives in the file its break edits, so its own quote is\n"
-        "    the second occurrence; or\n"
+        "  - the record lives in the file its break edits AND nothing separates\n"
+        "    its own quote from the code's - so the quote is a second occurrence.\n"
+        "    Check first that neither remedy applies: an INDENTED literal is\n"
+        "    unique against an unindented quote, and a TRAILING NEWLINE is unique\n"
+        "    against a quote closed by a backtick. Two rows here were described\n"
+        "    for this reason and both turned out to be quotable;\n"
         "  - the anchor's uniqueness is a property of its NEIGHBOURS rather than\n"
         "    of the line - a `pub use` list item, a slice of an ordered list -\n"
-        "    where re-quoting only buys until the next sibling lands.\n"
+        "    where re-quoting only buys until the next sibling lands; or\n"
+        "  - the edit site SPANS MORE THAN ONE LINE, because `rustfmt` wrapped it\n"
+        "    and the wrapping is not the author's to promise. This one is the\n"
+        "    third case and it was missing from this list while the registry was\n"
+        "    already using it. A one-line anchor merely sitting INSIDE a wrapped\n"
+        "    chain does not qualify: that rots to count 0, which is loud, and\n"
+        "    describing it instead removes the row from this gate entirely.\n"
         "\n"
-        "  In both - and ONLY in those two - describe the search edit instead.\n"
-        "  Quote the REPLACEMENT either way: `break-once.sh` never searches it.\n"
+        "  In those three - and ONLY those three - describe the search edit\n"
+        "  instead. Quote the REPLACEMENT either way: it is never searched.\n"
         "\n"
         "  AND REPLAY THE RECORD FROM ITS NEW DESCRIPTION BEFORE DROPPING THE ROW.\n"
         "  A description is ungated: nothing checks that it locates the edit. The\n"
@@ -569,10 +629,18 @@ if bad:
     sys.exit(1)
 
 print(
-    f"ok: {len(ANCHORS)} REGISTERED break anchors resolve exactly once "
-    "(registration is per-record and opt-in - see this task's header)"
+    f"ok: {len(ANCHORS)} REGISTERED rows resolve to exactly one occurrence "
+    f"({len({literal for _, _, _, literal in ANCHORS})} distinct literals; "
+    "registration is per-record and opt-in - see this task's header)"
 )
 print(
     f"    {len(DESCRIBED)} more are recorded as deliberately DESCRIBED rather than "
     "quoted - documentation, not a check"
+)
+# Computed, never written down: the tripwire agreeing with the population says the
+# population has not MOVED, and says nothing about how much of it is registered.
+# Anybody reading the two lines above as coverage needs this third one.
+print(
+    f"    the tripwire agrees at {RECORD_BLOCKS} blocks; {len(ANCHORS)} of those "
+    f"{RECORD_BLOCKS} carry a row, so {RECORD_BLOCKS - len(ANCHORS)} are unchecked"
 )

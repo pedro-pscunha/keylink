@@ -137,7 +137,8 @@ description = "rustdoc as a gate, not as decoration"
 #    Turning it on is NOT free, which is why it is not on.
 #
 #    A SNAPSHOT AND NOT A STANDING COUNT — the numbers below were measured on
-#    2026-08-07 and are being actively fixed, so expect them to fall. Do not read
+#    2026-08-07 (-03:00) and are being actively fixed, so expect them to fall. The
+#    offset is there so this snapshot can be ordered against another one. Do not read
 #    a smaller count as this comment being wrong; re-measure with
 #    `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items
 #    --all-features -p keylink -p keylink-persist` and turn the flag on for good
