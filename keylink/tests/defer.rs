@@ -819,25 +819,53 @@ async fn an_aborted_keyed_actor_tells_a_peer_no_such_actor() {
     );
 }
 
-/// And the third door out of a registry: a `shutdown` whose budget expires.
+/// And the third door out of a registry: a `shutdown` that **drains** an actor
+/// holding a parked remote reply.
 ///
-/// A peer waiting on a parked reply holds a clone of the actor's mailbox sender
-/// for as long as it waits, so the loop never sees its senders go and the drain
-/// always runs out its budget — the actor is destroyed rather than drained. That
-/// is `drain`'s abort, a different line from `System::abort` above, and it needs
-/// the same settle for the same reason.
+/// **This test asserted the opposite until `deliver_to_actor` stopped holding a
+/// mailbox sender across the wait.** Its rustdoc read *"a peer waiting on a parked
+/// reply holds a clone of the actor's mailbox sender for as long as it waits, so
+/// the loop never sees its senders go and the drain always runs out its budget"*,
+/// and it asserted `Some(Ended::Vanished)` against fifty milliseconds. True of the
+/// tree and false of the design: `drain` drops the registry's sender and leaves
+/// the task alive *"while any other sender does"* so that a message **already in
+/// flight** can finish, and a parked `#[defer]` reply is not one — it was
+/// delivered, and its turn ran to completion. A keyed actor holding one could not
+/// be stopped gracefully at all. `deliver_to_actor` drops its `Route` the moment
+/// the send lands now, and this is the door that proves it.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs` on
-/// `Mailbox`'s `Drop`, `self.fate.settle(Standing::Gone);` →
-/// `self.fate.settle(Standing::Running);` — the floor, for the twin above's
-/// reason: on an *unsupervised* keyed actor it drops before the state and is what
-/// answers, so breaking `drain`'s own settle leaves this green. `drain`'s line is
-/// held by
-/// `registry::tests::an_expired_shutdown_budget_settles_the_served_answer_before_the_abort`.
-/// Watched: `an actor destroyed by an expired budget is gone:
-/// Remote(Failed("dropped: the actor is serving and this reply was never answered"))`.
+/// **The elapsed time is asserted and not only the variant**, because a `Stopped`
+/// that cost the whole budget is the same defect wearing a bigger number: fifty
+/// milliseconds reached `Vanished`, and thirty seconds would have reached
+/// `Stopped` after hanging for thirty seconds.
+///
+/// The bound is a sixth of the budget, and the number under it was **measured**
+/// rather than chosen: six consecutive runs spent between **213 µs and 513 µs** of
+/// the thirty seconds, on an M5 Max MacBook Pro, macOS 27.0, 2026-08-07, with a
+/// debug build. Re-run it with:
+///
+/// ```sh
+/// cargo test -p keylink --test defer \
+///   a_keyed_actor_holding_a_parked_reply_drains_inside_its_budget -- --nocapture
+/// ```
+///
+/// Five seconds is therefore about ten thousand times the slowest of those, which
+/// is the headroom a loaded box gets. Load can only make a real drain slower —
+/// never faster, and never instant, which is the direction the defect went.
+///
+/// The expired-budget door did not disappear with the premise, and is no longer
+/// held here. `actors::a_shutdown_whose_budget_expires_destroys_the_actor` drives
+/// a hand-written loop that genuinely never returns, and
+/// `registry::tests::an_expired_shutdown_budget_settles_the_served_answer_before_the_abort`
+/// holds `drain`'s own settle. What this test added over its aborted twin above is
+/// the **peer's** answer, and that is still what its second half asserts.
+///
+/// Made red by `scripts/break-once.sh keylink/src/actor/remote.rs`, `    drop(route);`
+/// → `    let _held = route;` — the defect restored, since the clone then lives to
+/// the end of the function again. Watched: `a keyed actor holding a parked remote
+/// reply must drain: got Some(Vanished)`.
 #[tokio::test]
-async fn a_keyed_actor_destroyed_by_an_expired_budget_tells_a_peer_no_such_actor() {
+async fn a_keyed_actor_holding_a_parked_reply_drains_inside_its_budget() {
     let nodes = [local_node().await, local_node().await];
     let (system, client, _server) = keyed(&nodes).await;
 
@@ -846,22 +874,100 @@ async fn a_keyed_actor_destroyed_by_an_expired_budget_tells_a_peer_no_such_actor
         tokio::spawn(async move { orders::at(&client, book_id()).place(3).await })
     };
     keyed_parked(&client, 1).await;
+
+    // Deliberately far more than the drain needs, which is the whole instrument:
+    // the defect spent every budget it was given, so a small one hid inside the
+    // noise of a loaded box and a large one cannot.
+    let budget = Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    let ended = system.shutdown(&book_id(), budget).await;
+    let spent = started.elapsed();
+
     assert!(
-        matches!(
-            system.shutdown(&book_id(), Duration::from_millis(50)).await,
-            Some(Ended::Vanished)
-        ),
-        "the waiting peer holds a sender, so nothing drains and the budget runs out"
+        matches!(ended, Some(Ended::Stopped)),
+        "a keyed actor holding a parked remote reply must drain: got {ended:?}"
+    );
+    // Captured by the harness unless `--nocapture`, so the gate pays nothing for
+    // it and the number in the documentation above stays re-runnable rather than
+    // remembered.
+    println!("── drained in {spent:?} of a {budget:?} budget");
+    assert!(
+        spent < budget / 6,
+        "a Stopped that cost its whole budget is the sender clone still being held: \
+         {spent:?} of {budget:?}"
     );
 
     let lost = n0_future::time::timeout(Duration::from_secs(10), placing)
         .await
-        .expect("a peer must not hang on a reply its actor was killed holding")
+        .expect("a peer must not hang on a reply its actor drained holding")
         .expect("the caller is not itself panicking")
-        .expect_err("the state was destroyed holding it");
+        .expect_err("the state was dropped holding it");
     assert!(
         matches!(&lost, keylink::Error::Remote(RemoteError::NoSuchActor { id }) if id == "obra/4471"),
-        "an actor destroyed by an expired budget is gone: {lost:?}"
+        "a drained actor is gone, and its parked caller is told so: {lost:?}"
+    );
+}
+
+/// The same drain read from the peer's end, with a [`keylink::Timeout`] in front
+/// of it — which is what makes *not* `TimedOut` an assertion rather than a hope.
+///
+/// Without a layer both trees end at `NoSuchActor` and the broken one is merely a
+/// budget late, so the sibling above has to read a clock to tell them apart. A
+/// `Timeout` turns that delay into a **different answer**: the layer drops the
+/// wait at two seconds and renders [`RemoteError::TimedOut`], so the peer is told
+/// its call expired when what happened is that its actor was stopped and the
+/// honest answer was there to be given.
+///
+/// It is also why the sibling above must **not** have a layer. Dropping the wait
+/// drops `deliver_to_actor`'s frame and the sender clone inside it, so on the
+/// broken tree the drain finishes *because the peer gave up* — two seconds in
+/// rather than thirty — and an elapsed assertion passes. One defect, two shapes,
+/// and neither shape sees both halves of it.
+///
+/// Made red by the same edit the sibling records, `scripts/break-once.sh
+/// keylink/src/actor/remote.rs`, `    drop(route);` → `    let _held = route;`.
+/// Watched: `a drained actor must answer for itself, and a TimedOut means the peer
+/// waited out the layer instead: Remote(TimedOut { millis: 2000 })`.
+#[tokio::test]
+async fn a_peer_whose_parked_reply_is_drained_is_not_told_its_call_timed_out() {
+    let nodes = [local_node().await, local_node().await];
+    // Built inline rather than through `keyed`, because the layer is the subject.
+    let system: orders::System = orders::System::builder(Eviction::Never).build();
+    system
+        .mount(book_id(), orders::spawn(Book::default()))
+        .expect("the id is free");
+    let _server = Server::builder(&nodes[0])
+        .service(
+            orders::keyed_service(&system, Allowlist::anyone())
+                .layer(keylink::Timeout::after(Duration::from_secs(2)))
+                .build(),
+        )
+        .spawn()
+        .expect("one service, one ALPN");
+    let client = orders::KeyedClient::connect(&nodes[1], nodes[0].endpoint().addr())
+        .await
+        .expect("the client dials the actor system");
+
+    let placing = {
+        let client = client.clone();
+        tokio::spawn(async move { orders::at(&client, book_id()).place(3).await })
+    };
+    keyed_parked(&client, 1).await;
+    let ended = system.shutdown(&book_id(), Duration::from_secs(30)).await;
+    assert!(
+        matches!(ended, Some(Ended::Stopped)),
+        "the drain is the sibling's claim, and this test rests on it: got {ended:?}"
+    );
+
+    let lost = n0_future::time::timeout(Duration::from_secs(10), placing)
+        .await
+        .expect("a peer must not hang on a reply its actor drained holding")
+        .expect("the caller is not itself panicking")
+        .expect_err("the state was dropped holding it");
+    assert!(
+        matches!(&lost, keylink::Error::Remote(RemoteError::NoSuchActor { id }) if id == "obra/4471"),
+        "a drained actor must answer for itself, and a TimedOut means the peer \
+         waited out the layer instead: {lost:?}"
     );
 }
 

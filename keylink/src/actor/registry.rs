@@ -1068,6 +1068,17 @@ async fn drain<M>(entry: Entry<M>, budget: Duration) -> Ended {
     // Dropping the registry's sender is what ends the loop. The task lives while
     // any other sender does, which is what lets a message already in flight
     // finish rather than be cancelled.
+    //
+    // Which makes this a constraint on every dispatch, and one was breaking it: a
+    // caller that keeps its [`Route`] alive across the wait for the *answer* holds
+    // this open for as long as it waits, and a parked `#[defer]` reply never
+    // answers. `deliver_to_actor` did exactly that — for no reason of its own,
+    // only because the `map_err` at the bottom read the other field — so a keyed
+    // actor holding one could not be stopped gracefully at all: every budget was
+    // spent in full and the actor was aborted. It clones the [`Fate`] out and
+    // drops the sender the moment the send lands now, and
+    // `defer::a_keyed_actor_holding_a_parked_reply_drains_inside_its_budget` is
+    // what says so.
     drop(mail);
     let mut task = std::pin::pin!(AbortOnDropHandle::new(task));
     match n0_future::time::timeout(budget, &mut task).await {
