@@ -244,8 +244,11 @@ to construct an actor at all.
 `--no-default-features`. The `web` feature adds `Body::from_web_file` and
 `Body::from_web_stream`, so a `<input type=file>` streams up the same way a path
 does on a server. `blocking`, `fs` and `env` refuse the target by
-`compile_error!` — each needs an OS facility a browser does not have. Nothing
-has ever run in a tab; see Status.
+`compile_error!` — each needs an OS facility a browser does not have.
+`mise run wasm-browser` loads the module into headless Chrome and runs the ALPN
+derivation, a `postcard` round trip of the reply type, and both `web`
+constructors there. A page cannot open a UDP socket, so no connection runs in a
+tab and none is claimed; see Status.
 
 ## Reliable delivery, and its seven limits
 
@@ -541,9 +544,13 @@ argument for fixing the sharp things now.
 
 Known gaps, in rough priority order:
 
-- **Never run in a browser.** The crate compiles and links for
-  `wasm32-unknown-unknown` and `mise run gate` gates that, but no `.wasm` has
-  been loaded in a tab. Threaded wasm is refused outright: the local mailbox holds a thread-affine
+- **No connection has ever run in a browser.** `mise run wasm-browser` loads the
+  module into headless Chrome and runs four tests there — the schema hash, a
+  `postcard` round trip of `WireResponse`, and both `web` body constructors — so
+  the module is no longer merely linked. What is untested in a tab is everything
+  that needs a socket: no `Node`, no `Server`, no `Client`, no actor turn. A page
+  cannot open a UDP socket, so QUIC is out of reach whatever keylink does.
+  Threaded wasm is refused outright: the local mailbox holds a thread-affine
   task handle behind a `Send + Sync` type.
 - **A running actor turn cannot be bounded from outside.** `Timeout` drops the
   wait for the reply, not the turn, so it sheds no load once a turn has started.

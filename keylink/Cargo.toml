@@ -150,7 +150,27 @@ tokio = { version = "1", default-features = false, features = [
 # The browser's body sources. Scoped to the browser target so that `web` on a
 # native build is inert rather than a resolution failure.
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
-wasm-streams = { version = "0.6", optional = true }
+# **`0.5` and not `0.6`, and the reason is a link error nobody could see.**
+#
+# `wasm-streams` exports its glue with `#[wasm_bindgen]`, so its symbols are
+# named per crate and not per version — `__wbg_intounderlyingbytesource_free`
+# and nineteen more. `reqwest`, which iroh-relay pulls in on this target, asks
+# for `0.5`; cargo will not unify that with `0.6`, so a `web` build carried both
+# and `rust-lld` refused the module with TWENTY `duplicate symbol` errors — a
+# count measured with `grep -o 'duplicate symbol: [^ ]*' | sort -u | wc -l`, not
+# eyeballed from the tail of the log. **No wasm consumer of this crate could
+# link.**
+#
+# `mise run wasm-web` was green throughout, and correctly so: it builds a
+# LIBRARY, and an rlib is not linked. The collision needs a wasm binary to
+# appear, which is what `mise run wasm-browser` produces and why that task found
+# this on its first run.
+#
+# The downgrade costs nothing here. `from_raw` and `try_into_async_read` have
+# the same signatures in both, down to the error type, and `src/body.rs` calls
+# nothing else. Move back to `0.6` when reqwest does — and then keep
+# `wasm-browser` in the gate, because it is the only check that would notice.
+wasm-streams = { version = "0.5", optional = true }
 web-sys = { version = "0.3", optional = true, features = [
     "Blob",
     "File",
@@ -160,7 +180,17 @@ tokio-util = { version = "0.7", optional = true, default-features = false, featu
     "compat",
 ] }
 
-[dev-dependencies]
+# **Scoped by target for the reason the runtime dependencies above are, and it
+# is not decoration.** Cargo builds `[dev-dependencies]` for whatever target a
+# test target is built for, so an unscoped table put `tokio/full` and iroh's
+# relay stack on `wasm32-unknown-unknown` the moment anything ran
+# `cargo test --target wasm32-unknown-unknown`. Measured: it stopped at
+# `error: This wasm target is unsupported by mio. If using Tokio, disable the
+# net feature.` before one line of keylink was compiled.
+#
+# Nothing on a native build changes. Everything under `keylink/tests/` except
+# `browser.rs` needs both of these and gets both of them.
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 # `test-utils` ships iroh's relay and its pkarr/DNS server as libraries, so
 # `keylink/tests/relay.rs` can run both in-process. Without it every test in this
@@ -173,6 +203,26 @@ tokio = { version = "1", features = ["full"] }
 # the relay without a container, and `mise run deny` is what keeps the new
 # crates honest.
 iroh = { workspace = true, features = ["test-utils"] }
+
+# What `keylink/tests/browser.rs` needs, and nothing else in this repository has
+# a use for. Scoped so that a native `cargo test` neither resolves nor builds
+# them, and so that `--all-features` on a native host cannot drag a browser
+# harness into the graph.
+#
+# `wasm-bindgen-test` is version-coupled to the `wasm-bindgen-test-runner`
+# binary `mise.toml` pins: the runner refuses a module built against a different
+# `wasm-bindgen`, by version, in its own words. Bumping one without the other is
+# a red `mise run wasm-browser`, which is the right way round.
+#
+# `js-sys` and `web-sys` are here to BUILD the inputs — a `File` out of a string,
+# a default `ReadableStream` — not to test them. `web-sys`'s features are the
+# same three `keylink`'s own `web` feature turns on, because they are the three
+# the constructors under test take and return.
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-test = "0.3"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Blob", "File", "ReadableStream"] }
 
 [lints]
 workspace = true

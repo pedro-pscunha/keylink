@@ -165,8 +165,38 @@ CI's until the workflow was deleted, and it moved into `gate` in the same
 change. A `compile_error!` nobody triggers is a
 comment.
 
-What is claimed: the crate compiles and links for `wasm32-unknown-unknown`.
-Nothing has ever run in a browser.
+`mise run wasm-browser` is the fourth task and the only one that loads a module.
+It builds `keylink/tests/browser.rs` for the target, and
+`wasm-bindgen-test-runner` serves it to headless Chrome over a loopback port and
+calls each test inside the page. Both tools are pinned in `mise.toml`; the
+chromedriver pin tracks the **installed Chrome's major version**, not keylink,
+so a Chrome that auto-updates past it reddens the task until the pin follows.
+
+**What now runs in a browser**, all four assertions under `--no-default-features
+--features web`:
+
+- `derive_alpn` — the schema hash is computed, is stable across two calls, and
+  still moves when a field is added.
+- `postcard` encode and decode of `WireResponse<u32>`, in both the `Ok` and the
+  `Err(RemoteError)` arm.
+- `Body::from_web_file` — a real `File` becomes a body that declares its length.
+- `Body::from_web_stream` — a `ReadableStream` with no BYOB reader is refused as
+  `Error::NotAByteStream` rather than thrown out of.
+
+The task found a defect on its first run, which is the shape of what the three
+build tasks cannot see: keylink asked for `wasm-streams 0.6` while reqwest, which
+iroh-relay pulls in on this target, asks for `0.5`. Both export the same
+`#[wasm_bindgen]` symbols, so `rust-lld` refused the module with twenty
+`duplicate symbol` errors — **no consumer of the `web` feature could link a wasm
+binary.** `mise run wasm-web` was green throughout and was not wrong: it builds a
+library, and an rlib is never linked.
+
+**What still does not run in a browser.** No `Node`, no `Server`, no `Client`, no
+connection, no actor turn. A page cannot open a UDP socket, so QUIC is out of
+reach whatever keylink does, and no test here tries. Nothing from
+`keylink-persist` runs either — the version frame and the migration chain compile
+for this target and are executed only on a native host. `keylink/tests/browser.rs`
+carries the same list beside the tests.
 
 ## Tests
 
