@@ -590,6 +590,34 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Applied<T> {
 /// code and once in the record — and the harness aborts on a match that is not
 /// unique, which is the correct behaviour and the reason this paragraph exists
 /// rather than a softer literal.
+///
+/// # Which records quote their anchor, and which describe it
+///
+/// Quoting an anchor is the more precise record and it has one failure mode:
+/// **`rustfmt` owns where a line breaks, and a record does not.** An anchor inside
+/// a formatter-wrapped chain stops existing when a neighbour grows, and the run
+/// then aborts rather than going red — which reads as green to anybody checking
+/// counts instead of anchors.
+///
+/// So the split here is measured, not by taste. Every anchor in this module was
+/// re-checked under two plausible edits — a nearby signature gaining an argument,
+/// and the `answers` field being renamed — with `cargo fmt` run after each:
+///
+/// - **A quoted anchor is a single short statement or arm on one line.** Those are
+///   the ones the formatter has no reason to reflow, and none of them moved.
+/// - **[`Applied::iter`]'s chain is the one that rotted**, from the field rename
+///   alone — a change that does not touch that function's text at all. Its record
+///   describes the edit instead, and says so at the site.
+///
+/// A record that quotes an anchor spanning more than one line is therefore already
+/// wrong, whatever the formatter has done to it so far: the break it depends on was
+/// never the author's to promise. That is the test to apply to a new one, and it
+/// needs no inventory here — an inventory would be one more value this file does
+/// not control.
+///
+/// The replacement half is never at risk and is always quoted verbatim:
+/// `break-once.sh` greps and counts the search literal only, so what a record says
+/// to substitute cannot affect uniqueness in any file.
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
@@ -856,10 +884,19 @@ mod tests {
     ///
     /// Made red two ways:
     ///
-    /// - reversing [`Applied::iter`] — `self.order\n.iter()` →
-    ///   `self.order\n.iter()\n.rev()\n.collect::<Vec<_>>()\n.into_iter()`, the
-    ///   `collect` being what keeps the closure's lifetime the same shape — when the
-    ///   restored set forgets the wrong entry.
+    /// - **reversing [`Applied::iter`]** — insert `.rev()` at the head of the chain
+    ///   that function returns, so the restored set forgets the wrong entry. The
+    ///   replacement, quoted because `break-once.sh` never searches it and so it
+    ///   cannot affect uniqueness: `.rev().collect::<Vec<_>>().into_iter()` between
+    ///   `.iter()` and `.filter_map(..)` — the `collect` being what keeps the
+    ///   closure's lifetime the same shape.
+    ///
+    ///   Named rather than quoted, and **measured rather than assumed**: that chain
+    ///   is wrapped across three lines by `rustfmt` and not by anybody's choice, so
+    ///   a quoted anchor there rots the moment a neighbour grows. Renaming the
+    ///   `answers` field — an ordinary refactor that does not touch this function's
+    ///   text at all — was enough to rewrap it and make the old anchor
+    ///   unfindable, with nothing red to say so.
     /// - dropping the bound from the encoding: `(self.bound, self.iter()` →
     ///   `(APPLIED_BOUND, self.iter()`, which is what a derived impl would have
     ///   done and which the `bound()` assertion catches.

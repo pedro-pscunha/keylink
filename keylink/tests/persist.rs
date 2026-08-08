@@ -1300,11 +1300,18 @@ impl Serving {
 ///
 /// Made red at both ends, because two facts have to hold at once:
 ///
-/// - `scripts/break-once.sh keylink/src/rpc.rs` on
-///   `.map(|idem| CallId::of(peer, idem.key())),` →
+/// - in `keylink/src/rpc.rs`, inside `serve_one`: make the `.map` that
+///   `.with_call(..)` wraps hash a **constant** key instead of the caller's, so
+///   every one of a peer's calls shares one id. The replacement, quoted because
+///   `break-once.sh` never searches it:
 ///   `.map(|idem| { let _ = idem; CallId::of(peer, &IdempotencyKey::new("x").expect("valid")) }),`
-///   — every one of a peer's calls then shares one id. Watched:
-///   `left: 50 right: 57`, on the second-key assertion.
+///   Watched: `left: 50 right: 57`, on the second-key assertion.
+///
+///   Described rather than quoted, and **measured**: that `.map` sits inside a
+///   five-line chain `rustfmt` owns the wrapping of. Giving `CallId::of` a third
+///   argument — the likeliest future edit there — reflows the chain and the old
+///   one-line anchor stops existing, which `break-once.sh` reports as an abort and
+///   a careless reader reports as green.
 /// - `scripts/break-once.sh keylink/src/middleware.rs` on `pub fn call`'s body
 ///   `self.call` → `self.call.and(None)` — nothing is ever recognised. Watched:
 ///   `the retry is answered with the FIRST run's balance, out of the state`,
