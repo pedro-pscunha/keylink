@@ -707,10 +707,13 @@ def comment_blocks(text: str) -> list[str]:
     figure with the marker stripped and with it kept, because no registered literal
     was quoted only in wrapped form. What the readers did disagree about is the
     hazard surface, measured 2026-08-08 (-03:00) over the blocks naming the
-    harness: with the marker kept, 99 of 1629 backticked spans carried an embedded
+    harness: with the marker kept, 99 of 1630 backticked spans carried an embedded
     `///` or `//!`; with it stripped, 3 did, and all three of those ARE the marker,
-    quoted as `///` by a comment discussing one. That pair of figures bounds nothing
-    and is not a constant - it says the disagreement had a surface, and a
+    quoted as `///` by a comment discussing one. The denominator read 1629 first, and
+    re-measuring it found the reason: **1629 at `96cf374`, 1630 on this branch**,
+    whose own edit to `keylink/src/idempotency.rs` adds one span. So it went stale
+    inside the branch that wrote it, while 99 held on both trees. That pair bounds
+    nothing and is not a constant: it says the disagreement had a surface, and a
     re-measurer on a later tree will get two different numbers.
 
     Runs stop at a line that is not a comment, which was the readers' SECOND
@@ -950,8 +953,11 @@ for record in sorted(FRAGMENT_ANCHORS - fragments):
 # quotes its anchor with the indentation". Re-measured at `080fec7`, over the rows
 # whose REGISTERED literal carries indentation, comparing each record's flat-matching
 # span: **C8, C13, P1 and P2** keep the whitespace, and thirty rows drop it. C8 is
-# still one of the four and is no longer alone - `call-id` and `parked-drain` each
-# added one - so a rule derived from "that one row" would now be derived from four.
+# still one of the four and is no longer alone, so a rule derived from "that one row"
+# would now be derived from four. **`P1` and `P2` are the registry's ONLY `P` rows and
+# BOTH of them keep the whitespace** - `parked-drain` did not contribute one of these
+# four, it contributed every row it owns, which is the fact a per-branch count of one
+# hid.
 # The conclusion did not move, which is the trap: a paragraph whose numbers are stale
 # and whose point is sound reads as already checked.
 #
@@ -1087,10 +1093,13 @@ for record in sorted(set(REDNESS) - row_ids):
 #     snapshots and never evidence that either is current.
 #   * `158 / 103 / 55` was the last hand-written triple, and it carried a paragraph
 #     arguing that its blind figure had held steady. Re-measured 2026-08-08 (-03:00)
-#     by that same walk and those same three markers: **180 match, 123 carry, 57
-#     blind.** All three had moved, and the difference had moved with them - which
-#     is the shape a subtraction hides, because two inputs moving together leave the
-#     result looking derived.
+#     by that same walk and those same three markers, **all three had moved, and the
+#     difference had moved with them** - which is the shape a subtraction hides,
+#     because two inputs moving together leave the result looking derived. The
+#     replacement values are deliberately absent from this list: writing them here
+#     would be the fourth triple that the paragraph below refuses, above the sentence
+#     refusing it, and any branch adding a record block moves two of the three while
+#     this comment cannot. The success summary prints all three off one walk.
 #
 # The dates carry a UTC offset because a bare date cannot be ordered against
 # another bare date from a different zone, and "which of these two figures is
@@ -1218,7 +1227,16 @@ blind = len(marked_blocks) - blocks
 #     records say "Made red by .." without naming `break-once.sh`, the population this
 #     tripwire is declared blind to above. Those rows cannot be "of the counted
 #     population" in any sense. The figure sat here as "Eight of them are not" beside a
-#     population of "102" - both stale, in a sentence that read as current.
+#     population of "102", and exactly ONE of those two rotted. The population is
+#     whatever `RECORD_BLOCKS` now says, which the tripwire keeps true and which is no
+#     longer 102. The ROW figure never rotted: `rows_unseen` measures **8 at
+#     `e06b7bd`, the commit that wrote that sentence, and 8 at `96cf374`**, and the
+#     computed line below prints today's. So "Eight" was accurate then and is accurate
+#     now, and it moved onto that line for the reason every figure here does - not
+#     because it was wrong, but because nothing would say so once it became wrong.
+#     Calling both stale would invert this branch's own finding: the records it
+#     corrects claimed MORE redness than they had, and a correction claiming more
+#     staleness than there was errs in the direction that flatters the correction.
 #
 # `882bd35` on this branch is the same defect one level up - **a gate cannot claim a
 # denominator it cannot compute.** So the numbers below are an intersection measured

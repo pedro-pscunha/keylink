@@ -87,6 +87,18 @@ ANCHORS = registry("ANCHORS")
 REDNESS = registry("REDNESS")
 rows = {record: (target, literal) for record, _, target, literal in ANCHORS}
 
+# A `REDNESS` id with no `ANCHORS` row, refused HERE and not as a bare `KeyError` at
+# the lookup below. `mise run anchors` fails on the same state and names the same two
+# fixes, and the wording follows it deliberately: this is the one task written for
+# somebody who did not write the registry, so a traceback with no remedy is the worst
+# place to spend their attention. A drifted `REPLAY_REGISTRY` reaches this too.
+orphans = sorted(set(REDNESS) - set(rows))
+if orphans:
+    sys.exit(f"REDNESS entries with no ANCHORS row: {', '.join(orphans)}. This task "
+             "reads the file and the search literal from ANCHORS, so those entries "
+             "have nothing to cut. Either the row was dropped and the entry outlived "
+             "it, or the id is misspelled.")
+
 wanted = sys.argv[1:]
 unknown = sorted(set(wanted) - set(REDNESS))
 if unknown:
@@ -117,11 +129,14 @@ for record in plan:
         capture_output=True, text=True, cwd=ROOT,
     )
     out = done.stdout + done.stderr
-    # The same three lines `replay-fate-breaks.sh` echoes: whether the harness
-    # aborted, and what the runner exited with. Never the whole test log, which the
-    # harness already keeps in the file whose path it prints.
+    # The three lines `replay-fate-breaks.sh` echoes - whether the harness aborted,
+    # and what the runner exited with - plus the log PATH, which that script does not
+    # echo and which the failure arm below sends the reader to. Without it the remedy
+    # named a file whose name appeared nowhere. Never the whole test log: the harness
+    # keeps that in the file this line names.
     for line in out.splitlines():
-        if "ABORT" in line or "expected exactly one" in line or line.startswith("── exit="):
+        if ("ABORT" in line or "expected exactly one" in line
+                or line.startswith("── exit=") or line.startswith("── log:")):
             print(f"     {line}")
     if watched in out:
         print(f"     ✓ still red at: {watched}")
@@ -130,9 +145,11 @@ for record in plan:
     print("     ✗ the recorded sentence is NOT in this run. Expected to find:")
     print(f"         {watched}")
     print("       A break that went green, one whose anchor aborted, and one red at a")
-    print("       DIFFERENT assertion all land here. Read the log the harness printed")
-    print("       above, then fix whichever of the two is wrong - the record or the")
-    print("       guard. Do NOT relax the expected sentence to match the run without")
+    print("       DIFFERENT assertion all land here. Read the log at the `── log:`")
+    print("       path above - an ABORT line and no log path means the harness refused")
+    print("       before it ran anything, and the ABORT says why. Then fix whichever of")
+    print("       the two is wrong - the record or the guard.")
+    print("       Do NOT relax the expected sentence to match the run without")
     print("       reading why it changed: a break red at another assertion is a")
     print("       record describing coverage it no longer has.")
 

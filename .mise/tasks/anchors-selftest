@@ -240,30 +240,68 @@ else:
 # Three hand-written figures declared the tripwire's blind spot and all three went
 # stale, always understating it. They are computed now, so what is worth asserting is
 # that the arithmetic in the output is the SAME RUN's arithmetic: a literal spliced
-# back in over any one of them stops agreeing with the other two. That is what this
-# can catch and the limit of it — three figures off one walk are not independent
+# back in over any one of the figures below stops agreeing with the others. That is
+# what this can catch and the limit of it — figures off one walk are not independent
 # measurements, so agreement is consistency and not proof.
+#
+# **A CASE NAME IS NOT A CHECK, and this one was named for an addition it never did.**
+# "the unclassified blocks are the seen and the unseen added up" compared the blind
+# count with ITSELF across two output lines: it never read the UNCLASSIFIED total and
+# never added anything. Measured by splicing `999` over one printed expression at a
+# time and running this file against the copy: the UNCLASSIFIED total, the `this walk
+# sees` figure and `blocks_carrying` in the harness-block line were all GREEN, and only
+# the widened line's `{blind}` went red. So every column of the state table this
+# convention exists to print was unread, including its own total.
+#
+# Each figure in the summary is now read by a case, and each splice named above reddens
+# the case whose name describes it. Re-measured after the fix: those three go red, the
+# two second copies of a figure - the state table's `it does not` column and the
+# harness-block line's `so N do not` tail - go red as well, and the CHECKED row's row
+# column reddens against the resolution line.
 code, out = run(source)
 widened = re.search(r"the walk finds (\d+) record blocks, so (\d+) name no harness", out)
-counted = re.search(r"of the (\d+) harness blocks carry a registered row", out)
-seen = re.search(r"\((\d+) this walk sees, (\d+) it does not\)", out)
-check(
-    "the summary states the widened population and the blind count",
-    widened is not None and counted is not None and seen is not None,
-    f"expected the widened line, the harness-block line and the state table:\n{out}",
+counted = re.search(
+    r"(\d+) of the (\d+) harness blocks carry a registered row, so (\d+) do not", out
 )
-if widened and counted and seen:
+checked = re.search(r"CHECKED\s+(\d+)\s+(\d+)", out)
+resolved = re.search(r"ok: (\d+) REGISTERED rows resolve", out)
+unclassified = re.search(
+    r"UNCLASSIFIED\s+-\s+(\d+)\s+\((\d+) this walk sees, (\d+) it does not\)", out
+)
+check(
+    "the summary states the widened population, the blind count and the state table",
+    None not in (widened, counted, checked, unclassified, resolved),
+    f"expected the resolution line, the widened line, the harness-block line and the "
+    f"CHECKED and UNCLASSIFIED rows of the state table:\n{out}",
+)
+if widened and counted and checked and unclassified and resolved:
     check(
         "the blind count is that run's own subtraction",
-        int(widened.group(2)) == int(widened.group(1)) - int(counted.group(1)),
-        f"{widened.group(1)} widened - {counted.group(1)} counted != "
+        int(widened.group(2)) == int(widened.group(1)) - int(counted.group(2)),
+        f"{widened.group(1)} widened - {counted.group(2)} counted != "
         f"{widened.group(2)} blind: one of the three is not from this walk",
     )
     check(
         "the unclassified blocks are the seen and the unseen added up",
-        int(seen.group(2)) == int(widened.group(2)),
-        f"the state table says {seen.group(2)} blocks this walk does not see while "
-        f"the widened line says {widened.group(2)}",
+        int(unclassified.group(1))
+        == int(unclassified.group(2)) + int(unclassified.group(3)),
+        f"the state table's UNCLASSIFIED total is {unclassified.group(1)} while its "
+        f"own two parts are {unclassified.group(2)} seen and "
+        f"{unclassified.group(3)} unseen",
+    )
+    check(
+        "the CHECKED row and the harness-block line agree on the carrying figure",
+        int(checked.group(2)) == int(counted.group(1))
+        and int(counted.group(2)) - int(counted.group(1)) == int(counted.group(3)),
+        f"the CHECKED row says {checked.group(2)} carrying blocks while the "
+        f"harness-block line says {counted.group(1)} of {counted.group(2)}, "
+        f"{counted.group(3)} not carrying",
+    )
+    check(
+        "the CHECKED row's row column is the resolution line's own count",
+        int(checked.group(1)) == int(resolved.group(1)),
+        f"the CHECKED row says {checked.group(1)} rows while the resolution line "
+        f"says {resolved.group(1)}",
     )
 check(
     "the summary prints the replay coverage, so the sample cannot read as the whole",
