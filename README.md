@@ -261,12 +261,13 @@ recipe rather than a feature:
 3. **Ask to attach.** `Idempotency::attaching_for(key, budget)` waits for a call
    already in flight under the key instead of being refused with `InFlight` —
    the difference between a retry that helps and a retry that races. **The
-   budget is capped at `MAX_ATTACH`, 30 s**, and the cap is the serving side's,
-   not yours: the budget arrives from the network and a peer asking to be held
-   for a year is asking for a QUIC stream to be held for a year. So a caller
-   with a 90-second handler cannot wait it out — it is refused at 30 s with the
-   work still running, which is `InFlight` and still the truth. Ask again, or
-   ask `key_state`.
+   budget is capped by the served `Limits::attach`, which defaults to
+   `MAX_ATTACH`, 30 s**, and the cap is the serving side's, not yours: the budget
+   arrives from the network and a peer asking to be held for a year is asking
+   for a QUIC stream to be held for a year. So a caller with a 90-second handler
+   cannot wait it out — at the default it is refused at 30 s with the work still
+   running, which is `InFlight` and still the truth. Ask again, or ask
+   `key_state`.
 
 `examples/reliable_call.rs` is that recipe, compiled by the gate and run over two
 nodes. `tests/reliable.rs::a_retried_call_across_a_reconnect_runs_exactly_once` is

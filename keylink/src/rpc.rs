@@ -289,7 +289,11 @@ async fn claim_key(
         Claim::Running(notify) => notify,
         settled => return resolve(settled),
     };
-    let Some(budget) = idem.attach_budget() else {
+    // `ledger.attach_cap()` and not `MAX_ATTACH`: the ceiling is this service's
+    // `Limits::attach`, and this is the one place that holds the peer's request and
+    // the ledger at the same time. `ledger` came from the `ledger_for` above and is
+    // used again below, so reading the cap here repeats no lookup.
+    let Some(budget) = idem.attach_budget(ledger.attach_cap()) else {
         return Claimed::Refuse(IdempotencyRefusal::InFlight.into());
     };
     // Taken before anything parks, and held to the end of this function so it
@@ -682,7 +686,7 @@ mod tests {
 
     // `Future` and `Poll` arrive through the glob; `poll_fn` does not.
     use super::*;
-    use crate::idempotency::MAX_WAITING_PER_PEER;
+    use crate::idempotency::{MAX_ATTACH, MAX_WAITING_PER_PEER};
 
     /// A valid endpoint id, reused from `idempotency.rs` for the same reason.
     const A: &str = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0";
@@ -862,6 +866,156 @@ mod tests {
             "a parked attacher must still be holding its place, or the cap bounds nothing"
         );
         drop(places);
+    }
+
+    /// Park an attacher against a claim that never settles, and answer **how long
+    /// the accept path held it**.
+    ///
+    /// The figure is read off tokio's PAUSED clock, so it is the budget
+    /// `claim_key` chose and not a wall-clock measurement: under `start_paused`
+    /// the runtime advances to the pending timer once the attach is the only thing
+    /// left to run, so the elapsed time is exactly the deadline. An upper bound on
+    /// the wall clock is the flake `CONTRIBUTING.md` forbids; this cannot see the
+    /// wall at all.
+    ///
+    /// The refusal is asserted here rather than at each caller. Nothing settles the
+    /// claim, so an expired budget is the only honest outcome, and returning a
+    /// duration for a `Run` or a `Replay` would let one of those read as a wait.
+    async fn held_for(limits: Limits, asked: Duration) -> Duration {
+        let ledger = Ledger::new(limits, Records::Memory);
+        let peer = EndpointId::from_str(A).expect("a valid endpoint id");
+        let key = IdempotencyKey::new("k").expect("a valid key");
+
+        let Claim::Fresh(_running) = ledger.claim(peer, key.clone()) else {
+            panic!("the first claim must be fresh");
+        };
+
+        let started = tokio::time::Instant::now();
+        let keyed = claim_key(
+            &any(&ledger),
+            "Probe",
+            peer,
+            Some(Idempotency::attaching_for(key, asked)),
+        )
+        .await;
+        let held = started.elapsed();
+
+        // Exhaustive, with no catch-all, for the reason
+        // `an_attacher_over_the_cap_is_refused_before_it_parks` gives: the arm that
+        // hides a regression is the one nobody thought to name.
+        match keyed {
+            Claimed::Refuse(RemoteError::Idempotency(IdempotencyRefusal::InFlight)) => held,
+            Claimed::Refuse(RemoteError::Idempotency(other)) => {
+                panic!("expected an expired budget to answer InFlight, got {other:?}")
+            }
+            Claimed::Refuse(other) => panic!("expected an idempotency refusal, got {other:?}"),
+            Claimed::None => panic!("expected a refusal, got no key at all"),
+            Claimed::Run(_) => panic!("expected a refusal, got the key"),
+            Claimed::Replay(_) => panic!("expected a refusal, got a replay"),
+        }
+    }
+
+    /// **The property the whole of `Limits::attach` exists for**: the ceiling a
+    /// peer's budget meets is the one this service configured, not the constant.
+    ///
+    /// A peer asks for thirty seconds — the default ceiling exactly, so a service
+    /// that ignored its own setting would look right — and a service that set one
+    /// second holds it for one.
+    ///
+    /// Made red by `scripts/break-once.sh` replacing
+    /// `let Some(budget) = idem.attach_budget(ledger.attach_cap()) else {` with
+    /// `let Some(budget) = idem.attach_budget(crate::MAX_ATTACH) else {`, which is
+    /// the hard-coded ceiling this change removed, reintroduced at the one call
+    /// site. Fully qualified in the replacement because `rpc.rs` does not import
+    /// the constant. The search literal carries its four spaces of indentation, so
+    /// this record's unindented copy is not a second occurrence of it. Watched,
+    /// under `cargo test`:
+    /// `assertion `left == right` failed: the ceiling must be this service's
+    /// Limits::attach`, `left: 30s`, `right: 1s`.
+    #[tokio::test(start_paused = true)]
+    async fn an_attach_ceiling_below_the_peers_request_governs() {
+        assert_eq!(
+            held_for(
+                Limits::default().attach(Duration::from_secs(1)),
+                Duration::from_secs(30),
+            )
+            .await,
+            Duration::from_secs(1),
+            "the ceiling must be this service's Limits::attach"
+        );
+    }
+
+    /// The default ceiling still caps, so moving the clamp did not drop it.
+    ///
+    /// Derived from [`MAX_ATTACH`] rather than written as thirty seconds, because a
+    /// literal here rots in the one direction nothing catches: lower the constant
+    /// and a hard-coded 30 would assert a ceiling the ledger no longer has.
+    ///
+    /// Made red by `scripts/break-once.sh` replacing `attach: MAX_ATTACH,` in
+    /// `impl Default for Limits` with `attach: Duration::from_secs(1),` — the same
+    /// edit `idempotency.rs`'s `the_default_attach_ceiling_is_max_attach` records,
+    /// and this is the guard that says the default reaches the accept path rather
+    /// than only the struct. Watched, under `cargo test`:
+    /// `assertion `left == right` failed: a request over the ceiling must be held
+    /// for the ceiling`, `left: 1s`, `right: 30s`.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_over_the_attach_ceiling_is_held_for_the_default() {
+        assert_eq!(
+            held_for(Limits::default(), Duration::from_secs(3600)).await,
+            MAX_ATTACH,
+            "a request over the ceiling must be held for the ceiling"
+        );
+    }
+
+    /// The clamp is a `min` and not an assignment, so a modest request is not
+    /// rounded **up** to the service's ceiling.
+    ///
+    /// This is the guard the other two cannot be: both of those pass when the
+    /// ceiling replaces the request outright, because in both the ceiling is the
+    /// smaller number.
+    ///
+    /// Made red by `scripts/break-once.sh` replacing
+    /// `.map(|millis| Duration::from_millis(millis).min(cap))` with
+    /// `.map(|_| cap)` in `keylink/src/idempotency.rs`, which is the ceiling
+    /// swallowing the request. Watched, under `cargo test`:
+    /// `assertion `left == right` failed: a request under the ceiling must be kept`,
+    /// `left: 30s`, `right: 1s`.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_under_the_attach_ceiling_keeps_its_own_budget() {
+        assert_eq!(
+            held_for(Limits::default(), Duration::from_secs(1)).await,
+            Duration::from_secs(1),
+            "a request under the ceiling must be kept"
+        );
+    }
+
+    /// Zero is representable on this bound — [`Duration`] has no `NonZero` — so
+    /// what it does is asserted rather than argued.
+    ///
+    /// It turns attaching off for this service: the answer is the
+    /// [`InFlight`](IdempotencyRefusal::InFlight) a caller who never asked to
+    /// attach already gets, and it arrives without the task waiting for anything.
+    /// `representability.rs`'s `no_ledger_bound_can_be_asked_to_be_zero` names this
+    /// test as one of its two stated exceptions, `ttl`'s being the other.
+    ///
+    /// Made red by `scripts/break-once.sh` replacing
+    /// `.map(|millis| Duration::from_millis(millis).min(cap))` with
+    /// `.map(|millis| Duration::from_millis(millis))` in
+    /// `keylink/src/idempotency.rs` — the cap going away rather than moving.
+    /// Watched, under `cargo test`:
+    /// `assertion `left == right` failed: a zero ceiling must refuse without
+    /// waiting`, `left: 30s`, `right: 0ns`.
+    #[tokio::test(start_paused = true)]
+    async fn an_attach_ceiling_of_zero_refuses_the_attacher_at_once() {
+        assert_eq!(
+            held_for(
+                Limits::default().attach(Duration::ZERO),
+                Duration::from_secs(30)
+            )
+            .await,
+            Duration::ZERO,
+            "a zero ceiling must refuse without waiting"
+        );
     }
 }
 

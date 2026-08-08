@@ -440,6 +440,38 @@ ANCHORS = [
     # reported `carried by NOBODY` until the quote went onto one line.
     ("L5", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
      "            inner.spent = inner.spent.saturating_sub(1);"),
+    # ── from `ledger-attach`, which added `Limits::attach` and moved the attach
+    # clamp from `Idempotency::attach_budget` to the accept path. SIX rows over FOUR
+    # distinct literals, and every count below was taken with `grep -cF` AFTER the
+    # record was written, in that order: adding a quote can only RAISE a count.
+    #
+    # A1 is SAME-FILE and indented, the narrowed rule in action: the record's quote
+    # sits unindented inside a `///` line while the code carries four spaces.
+    ("A1", "keylink/src/rpc.rs", "keylink/src/rpc.rs",
+     "    let Some(budget) = idem.attach_budget(ledger.attach_cap()) else {"),
+    # A2 and A2b are ONE literal cited by THREE records - two accept-path guards in
+    # `rpc.rs` and the arithmetic guard in `idempotency.rs` - registered as two rows,
+    # one per `lives_in`, because the record-quote check is per file and a single row
+    # would leave the other file's quote unchecked. C5 made the opposite choice for a
+    # literal two records cite; neither is the convention, and the reason to split
+    # here is that the two records live in DIFFERENT files, which C5's do not.
+    #
+    # **MEASURED at 2 in the bare form and 1 indented**, which is the same-file trap
+    # arriving through A2b: `.map(|millis| Duration::from_millis(millis).min(cap))`
+    # unindented matches the code line as a substring AND the record's own quote. The
+    # twelve-space form separates them.
+    ("A2", "keylink/src/rpc.rs", "keylink/src/idempotency.rs",
+     "            .map(|millis| Duration::from_millis(millis).min(cap))"),
+    ("A2b", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
+     "            .map(|millis| Duration::from_millis(millis).min(cap))"),
+    # A3 and A4 are also one literal and two `lives_in` files, for the same reason:
+    # one edit to the shipped default reddens a struct-level guard in
+    # `idempotency.rs` and an accept-path guard in `rpc.rs`, and only the pair says
+    # the default reaches the wire path rather than only the struct.
+    ("A3", "keylink/src/rpc.rs", "keylink/src/idempotency.rs",
+     "            attach: MAX_ATTACH,"),
+    ("A4", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
+     "            attach: MAX_ATTACH,"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -880,7 +912,17 @@ for record, lives_in, target, literal in ANCHORS:
 # been right, which is exactly what makes adding it a trap — `parked-drain` added two
 # rows, gained two carrying blocks, and saw its population rise by ONE, so its
 # unchecked figure FELL.
-RECORD_BLOCKS = 116
+#
+# 116 → the figure below on `ledger-attach`, off `e09e942`, for `Limits::attach`. SIX
+# new harness blocks: four accept-path guards in `rpc.rs` and two in
+# `idempotency.rs`. Read off a run at THIS tree, not carried and not computed — the
+# branch adds one more record in a later commit and this constant is a property of
+# one tree, so the value here is the one this commit's tree produces.
+#
+# FIVE rows above and SIX blocks, which is not one-per-row:
+# `an_attach_ceiling_of_zero_refuses_the_attacher_at_once` shares A2's literal with a
+# different replacement, so it adds a block without adding a row.
+RECORD_BLOCKS = 122
 
 harness_blocks: list[str] = []
 for path in sorted(

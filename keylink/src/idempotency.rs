@@ -255,11 +255,14 @@ pub const MAX_TOMBSTONES: usize = 8192;
 /// `wasm32-unknown-unknown`.
 pub const RECORD_TTL: Duration = Duration::from_secs(600);
 
-/// The longest an attaching call is held waiting for one already in flight.
+/// The longest an attaching call is held waiting for one already in flight,
+/// **unless the serving side sets [`Limits::attach`]**, whose default this is.
 ///
-/// A caller names its own budget in [`Idempotency::attaching_for`]; this caps
-/// it, because the budget arrives from the network and a peer that asks to be
-/// held for a year is asking us to hold a QUIC stream for a year.
+/// A caller names its own budget in [`Idempotency::attaching_for`] and the
+/// serving side caps it, because the budget arrives from the network and a peer
+/// that asks to be held for a year is asking us to hold a QUIC stream for a
+/// year. That the ceiling is the *serving* side's is why it is configurable:
+/// the cost being bounded is the server's task and its stream pair.
 pub const MAX_ATTACH: Duration = Duration::from_secs(30);
 
 /// Calls with keys one peer may have in dispatch at once.
@@ -284,6 +287,8 @@ pub const MAX_RUNNING: usize = 4096;
 /// A parked attacher holds no claim, so neither running cap can see it or the
 /// QUIC stream pair it is holding open: one claimed key plus 40 connections of
 /// 100 streams each parks 4000 tasks for [`MAX_ATTACH`] and meets no bound.
+/// **This bound and [`Limits::attach`] are the two factors of that product**, and
+/// both are the serving side's to set — the count here, the duration there.
 /// Same number as [`MAX_RUNNING_PER_PEER`], because that is also the legitimate
 /// ceiling — a [`Peer`](crate::Peer) re-issue produces at most one attacher per
 /// running claim, and running claims are capped there.
@@ -778,21 +783,33 @@ impl Idempotency {
     /// Wait up to `budget` for a call already in flight under this key, then
     /// answer with whatever it settled as.
     ///
-    /// Capped server-side by [`MAX_ATTACH`], which is 30 seconds. A budget that
-    /// runs out is [`IdempotencyRefusal::InFlight`] — the same answer a
-    /// non-attaching call gets, and still the truth.
+    /// Capped server-side by [`Limits::attach`], which defaults to
+    /// [`MAX_ATTACH`], 30 seconds. A budget that runs out is
+    /// [`IdempotencyRefusal::InFlight`] — the same answer a non-attaching call
+    /// gets, and still the truth.
     ///
     /// **The cap is not yours to raise, and asking for more is not an error
     /// here.** The budget is written on the envelope and read by the peer, so a
     /// number refused on this side would stop nobody: a hand-rolled peer sends
     /// whatever it likes, and the serving side caps it because holding a QUIC
     /// stream open is its cost to pay, not the caller's. So `attaching_for(key,
-    /// Duration::from_secs(120))` is accepted and waits 30 seconds.
+    /// Duration::from_secs(120))` is accepted and waits for whatever the service
+    /// it is calling allows — 30 seconds at the default.
     ///
-    /// A handler that routinely runs longer than [`MAX_ATTACH`] cannot be waited
-    /// out. Ask again — a second attach re-parks for another budget — or stop
-    /// waiting and ask [`key_state`](crate::RpcClient::key_state), which reports
-    /// without running anything.
+    /// **The side that pays now holds the knob, and [`Limits::attach`] is it.**
+    /// That clause above names the serving side as the party whose stream and
+    /// whose task are spent, and until that setter existed it was also the party
+    /// with no way to spend less: the ceiling was a crate constant. Naming the
+    /// cost and the control in one paragraph is the point — the argument for
+    /// refusing the *caller* a raise is the same argument for giving the
+    /// *service* a setting.
+    ///
+    /// A handler that routinely runs longer than the served ceiling cannot be
+    /// waited out. Ask again — a second attach re-parks for another budget — or
+    /// stop waiting and ask [`key_state`](crate::RpcClient::key_state), which
+    /// reports without running anything. **A caller cannot read that ceiling**:
+    /// it is not on the wire, and the refusal is the same
+    /// [`InFlight`](IdempotencyRefusal::InFlight) at any value.
     ///
     /// Only a *running* call is waited for. A key that already settled is
     /// answered at once, whether that answer is the reply, `Interrupted`,
@@ -817,7 +834,7 @@ impl Idempotency {
     ///
     /// The park is already priced. A waiter holds no claim, so
     /// [`MAX_WAITING_PER_PEER`] and [`MAX_WAITING`] exist to bound exactly this,
-    /// and [`MAX_ATTACH`] caps how long any one of them lasts. Held by
+    /// and [`Limits::attach`] caps how long any one of them lasts. Held by
     /// `an_attacher_on_a_recordless_service_waits_and_is_told_it_ran`.
     #[must_use]
     pub fn attaching_for(key: IdempotencyKey, budget: Duration) -> Self {
@@ -833,15 +850,32 @@ impl Idempotency {
         &self.key
     }
 
-    /// How long the caller asked to be held, already capped at [`MAX_ATTACH`].
+    /// How long the caller asked to be held, capped at `cap`.
     ///
     /// Capped here rather than at the constructor, because the value that
     /// matters is the one that arrived from the network and never met a
     /// constructor.
+    ///
+    /// **`cap` is a parameter rather than [`MAX_ATTACH`], and the reason is that
+    /// the ceiling belongs to the service being called.** It is
+    /// [`Limits::attach`], read off the ledger by the serving side's `claim_key`,
+    /// which is the one place that holds both this value and the ledger. This
+    /// type is built on the *calling* side and holds no ledger, so a constant was
+    /// the only ceiling it could name on its own — and that is what made
+    /// [`MAX_ATTACH`] the one ledger bound no operator could set.
+    ///
+    /// Taking the cap as an argument rather than returning the raw request is
+    /// deliberate: an uncapped accessor returns a number a **peer** chose, and
+    /// nothing in a signature would then say that its one caller must clamp it.
+    /// The wrong use is unrepresentable instead.
+    ///
+    /// `None` means the caller did not ask to attach at all. That is refused
+    /// [`IdempotencyRefusal::InFlight`] rather than capped, so `cap` never
+    /// applies to it.
     #[must_use]
-    pub fn attach_budget(&self) -> Option<Duration> {
+    pub fn attach_budget(&self, cap: Duration) -> Option<Duration> {
         self.attach_for_millis
-            .map(|millis| Duration::from_millis(millis).min(MAX_ATTACH))
+            .map(|millis| Duration::from_millis(millis).min(cap))
     }
 }
 
@@ -971,17 +1005,25 @@ struct Inner {
 /// ```
 ///
 /// The name says `ledger`, not `keylink`: [`MAX_HEADER`](crate::MAX_HEADER),
-/// [`MAX_KEY_LEN`](crate::MAX_KEY_LEN), [`MAX_ATTACH`],
+/// [`MAX_KEY_LEN`](crate::MAX_KEY_LEN),
 /// [`SystemBuilder::capacity`](crate::SystemBuilder::capacity) and
 /// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth) are all
-/// keylink bounds and none of them is in here. [`MAX_ATTACH`] is the one that is
-/// genuinely the *ledger's* and still absent: it is capped in
-/// [`Idempotency::attach_budget`], which holds no ledger, because the value that
-/// matters arrived from the network and never met a constructor.
+/// keylink bounds and none of them is in here.
+///
+/// **[`MAX_ATTACH`] was on that list, as the one bound "genuinely the ledger's
+/// and still absent", and the reason given for its absence was wrong.** It said
+/// the cap is applied in [`Idempotency::attach_budget`], "which holds no
+/// ledger" — true of the method and false of its only caller. The serving side's
+/// `claim_key` binds the ledger before it reads the budget, so it holds this
+/// value at the instant it applies the cap, and it now passes it in. The ceiling
+/// is [`attach`](Self::attach), applied where the ledger is in scope. That the
+/// number arrives from the network is the *reason* the serving side owns the
+/// ceiling rather than a reason it cannot name one: what a peer sends is a
+/// request, and only a ceiling somebody configured makes it bounded.
 ///
 /// # Why this type has a `Default` when `Records` and `Keyable` do not
 ///
-/// Because eight of its nine fields are tuning decisions whose wrong value is
+/// Because nine of its ten fields are tuning decisions whose wrong value is
 /// **visible in a refusal** — every one of them refuses through
 /// [`IdempotencyRefusal`]. Slower or fatter, and both visible and recoverable.
 /// Only the four running and waiting bounds put the exceeded figure *in* the
@@ -1005,13 +1047,13 @@ struct Inner {
 /// [`Retention`](crate::Retention),
 /// [`Eviction`](crate::Eviction) and [`Allowlist`](crate::Allowlist), which have
 /// no `Default` at all: each of those is *one* decision, so it can be judged
-/// whole, and the wrong answer is a policy a caller never chose. `Limits` is nine
+/// whole, and the wrong answer is a policy a caller never chose. `Limits` is ten
 /// decisions in one value, and "this type is a tuning decision" is not a
 /// well-formed sentence about it.
 /// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth)'s rustdoc
 /// draws the same line between a bound and a policy — it is **one knob**, not a bag
 /// of them, so it is the precedent for the *distinction* rather than for defaulting
-/// nine numbers at once. Nothing in this crate had a precedent for that.
+/// ten numbers at once. Nothing in this crate had a precedent for that.
 ///
 /// # Not `Copy`, and no getters
 ///
@@ -1048,6 +1090,7 @@ pub struct Limits {
     waiting: NonZeroUsize,
     waiting_per_peer: NonZeroUsize,
     ttl: Duration,
+    attach: Duration,
 }
 
 /// Every bound constant in this module is a non-zero literal, so the `None` arm is
@@ -1078,6 +1121,7 @@ impl Default for Limits {
             waiting: nonzero(MAX_WAITING),
             waiting_per_peer: nonzero(MAX_WAITING_PER_PEER),
             ttl: RECORD_TTL,
+            attach: MAX_ATTACH,
         }
     }
 }
@@ -1310,6 +1354,56 @@ impl Limits {
         self.ttl = ttl;
         self
     }
+
+    /// The longest an attaching call is held waiting for a call already in flight
+    /// under its key.
+    ///
+    /// Defaults to [`MAX_ATTACH`], 30 seconds. A [`Duration`] rather than a
+    /// non-zero type for [`ttl`](Self::ttl)'s reason: the language offers no
+    /// `NonZero` for one, so these two are the fields that can be set to zero.
+    ///
+    /// **This is a ceiling on a number a peer chose, and the smaller of the two
+    /// governs.** A caller names its own budget in
+    /// [`Idempotency::attaching_for`]; lowering this can only shorten a wait and
+    /// never lengthen one, so a peer asking for one second is held for one second
+    /// whatever this says.
+    ///
+    /// It is the second factor of the exhaustion [`MAX_WAITING_PER_PEER`] prices:
+    /// a parked attacher holds a task and a QUIC stream pair that neither running
+    /// cap can see, and the cost of a flood is *waiters × duration*. Before this
+    /// setter existed a caller could set the count and not the duration, so it
+    /// controlled one factor of a product.
+    ///
+    /// Zero refuses every attaching call
+    /// [`InFlight`](IdempotencyRefusal::InFlight), which is the answer a caller
+    /// who never asked to attach already gets — so it turns the feature off for
+    /// this service rather than producing a refusal nobody can read.
+    ///
+    /// # No layer can stand in for this, and the ordering is why
+    ///
+    /// `serve_one` finishes `claim_key` — the whole park, and the re-claim after
+    /// it — **before** it calls the layer chain. So a
+    /// [`Timeout`](crate::Timeout) or [`QueueTimeout`](crate::QueueTimeout) layer
+    /// starts its clock once this wait is already over, and neither can bound it.
+    /// This setter is the only thing that bounds its **duration** —
+    /// [`waiting`](Self::waiting) and
+    /// [`waiting_per_peer`](Self::waiting_per_peer) bound how many such waits run
+    /// at once, which is the other factor and not this one.
+    ///
+    /// # There is a top of the range, and it does not raise the ceiling
+    ///
+    /// **A value larger than any budget a peer sends disables the cap**, and past
+    /// that point the wait is bounded by the *peer's* number alone.
+    /// [`Idempotency::attaching_for`] carries whole milliseconds in a `u64` and
+    /// saturates, so the largest request is [`u64::MAX`] of them — about 584
+    /// million years. Set this near that and a peer holds a stream for as long as
+    /// it likes. The bound is disabled by a large value rather than made loud, the
+    /// same shape [`running`](Self::running) describes for its `u32`.
+    #[must_use]
+    pub fn attach(mut self, attach: Duration) -> Self {
+        self.attach = attach;
+        self
+    }
 }
 
 impl fmt::Debug for Limits {
@@ -1379,6 +1473,16 @@ impl Ledger {
             limits,
             records,
         })
+    }
+
+    /// This service's ceiling on an attaching call's budget.
+    ///
+    /// The one bound read from outside the ledger, because the clamp is applied on
+    /// the accept path — [`Idempotency::attach_budget`] takes it there. A
+    /// crate-private reader rather than a getter on [`Limits`], which deliberately
+    /// offers none.
+    pub(crate) fn attach_cap(&self) -> Duration {
+        self.limits.attach
     }
 
     /// Take the key, or say what already holds it.
@@ -1854,7 +1958,7 @@ mod tests {
     /// Built through the **setter**, not a struct literal, and so is every
     /// `Limits` in this module. `mod tests` is a child of the defining module, so
     /// a literal would still compile after the fields went private — and it would
-    /// leave all nine setters unexercised, which makes `pool_bytes` writing
+    /// leave all ten setters unexercised, which makes `pool_bytes` writing
     /// `frame_bytes` a defect the whole suite stays green through.
     fn holding(max: usize) -> Limits {
         Limits::default().pool_records(nz(max))
@@ -3121,17 +3225,79 @@ mod tests {
             drop(notify);
         }
 
+        /// The arithmetic of the cap, and only that. **This test cannot see which
+        /// cap the accept path passes in**, which is the half that matters and is
+        /// held by `an_attach_ceiling_below_the_peers_request_governs` in
+        /// `rpc.rs` — a ledger is what the argument comes from, and this type
+        /// holds none.
+        ///
+        /// Both directions are asserted here because the `min` is what makes the
+        /// smaller of the two govern: an assignment would satisfy the first
+        /// assertion and fail the third.
+        ///
+        /// Made red by `scripts/break-once.sh` replacing
+        /// `.map(|millis| Duration::from_millis(millis).min(cap))` with
+        /// `.map(|millis| Duration::from_millis(millis))`, which is the cap going
+        /// away rather than moving. Watched, under `cargo test`:
+        /// `assertion `left == right` failed`, `left: Some(3600s)`,
+        /// `right: Some(30s)`. That edit also reddens two guards on the accept path
+        /// in `rpc.rs`, and `.map(|_| cap)` — the cap swallowing a smaller request
+        /// — reddens this test's third assertion and one of those two.
         #[test]
-        fn a_budget_is_capped_at_max_attach() {
-            let idem = Idempotency::attaching_for(key("k"), Duration::from_secs(3600));
-            assert_eq!(idem.attach_budget(), Some(MAX_ATTACH));
+        fn a_budget_is_capped_at_the_cap_it_is_given() {
+            let over = Idempotency::attaching_for(key("k"), Duration::from_secs(3600));
+            assert_eq!(over.attach_budget(MAX_ATTACH), Some(MAX_ATTACH));
+            assert_eq!(
+                over.attach_budget(Duration::from_secs(1)),
+                Some(Duration::from_secs(1)),
+                "the ceiling is the argument, never the constant"
+            );
+
+            let under = Idempotency::attaching_for(key("k"), Duration::from_secs(1));
+            assert_eq!(
+                under.attach_budget(MAX_ATTACH),
+                Some(Duration::from_secs(1)),
+                "and a request under the ceiling is kept, not raised to it"
+            );
         }
 
+        /// Any cap, because `None` never meets one: a caller who did not ask to
+        /// attach is refused rather than capped.
         #[test]
         fn a_bare_key_does_not_attach() {
             let idem: Idempotency = key("k").into();
-            assert_eq!(idem.attach_budget(), None);
+            assert_eq!(idem.attach_budget(MAX_ATTACH), None);
+            assert_eq!(idem.attach_budget(Duration::ZERO), None);
             assert_eq!(idem.key(), &key("k"));
+        }
+
+        /// The default ceiling is the constant, not a second copy of thirty
+        /// seconds. [`MAX_ATTACH`]'s own value is pinned against the README by
+        /// `tests/reliable.rs::the_limits_the_readme_names_are_the_ones_the_ledger_uses`,
+        /// so the two together are what stop the shipped ceiling drifting from the
+        /// number a reader plans around.
+        ///
+        /// Reads the private field, because [`Limits`] offers no getters and
+        /// `mod tests` is a child of the module that defines it. Going through
+        /// [`Limits::attach`] instead would assert the setter and not the default.
+        ///
+        /// Made red by `scripts/break-once.sh` replacing
+        /// `attach: MAX_ATTACH,` in `impl Default for Limits` with
+        /// `attach: Duration::from_secs(1),`. The search literal carries that
+        /// line's twelve spaces of indentation, so this record's unindented copy of
+        /// it is not a second occurrence — the same-file remedy rot mode 1
+        /// prescribes. Watched, under `cargo test`:
+        /// `assertion `left == right` failed: the default ceiling must be the
+        /// constant the README prints`, `left: 1s`, `right: 30s`. The same edit
+        /// reddens `rpc.rs`'s
+        /// `a_peer_over_the_attach_ceiling_is_held_for_the_default`.
+        #[test]
+        fn the_default_attach_ceiling_is_max_attach() {
+            assert_eq!(
+                Limits::default().attach,
+                MAX_ATTACH,
+                "the default ceiling must be the constant the README prints"
+            );
         }
     }
 }
