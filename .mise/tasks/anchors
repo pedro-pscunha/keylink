@@ -49,6 +49,48 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 # the LINE, or of its NEIGHBOURS?** — with the sharpening mode 4 forces, that a
 # fragment is not a line at all.
 #
+# ── THE REMEDY THAT DISSOLVES "THE EDIT SITE SPANS SEVERAL LINES" ─────────────
+#
+# **`break-once.sh` searches ONE literal and replaces it with anything, so a
+# one-line search with a MULTI-LINE replacement is legal — and the replacement is
+# never searched, so it cannot affect uniqueness.**
+#
+# A multi-line edit therefore does NOT need a multi-line anchor. Every row anybody
+# has justified with "the edit site spans several lines" was reasoning about the
+# SITE when the harness only cares about the SEARCH LITERAL. Three of the five
+# conversions on this branch were unlocked by that sentence, and the reason it is
+# written here rather than in one row's comment is that its absence is what makes
+# the wrong conclusion re-derivable.
+#
+# So before describing a multi-line edit, ask which single line inside it is
+# unique. C14 is the worked example: `.iter()` alone counts 2 and is unusable,
+# while the `.filter_map(..)` line one below it counts 1 and anchors the same edit.
+#
+# ── AND A RECORD IS PART OF THE CORPUS IT DESCRIBES ───────────────────────────
+#
+# **Writing a record changes the thing the record measures.** The literal you quote
+# to document an anchor becomes a second occurrence of it, so the act of explaining
+# a break can be what stops the break working.
+#
+# The asymmetry is worth stating plainly, because it says which edits are risky:
+#
+#   * REMOVING a quote can only LOWER an occurrence count.
+#   * ADDING one can only RAISE it.
+#
+# **So a requote is the only edit that can turn a resolving anchor into an aborting
+# one**, and it does that in the file the author is looking at, while feeling
+# careful. Re-reading does not find it; the text looks right. **Count after the
+# edit, not after the batch.** And if a count comes back 2, the fix is not "add
+# more indentation" — it is that the quote is now byte-identical to something, and
+# which occurrence is which has to be seen before choosing.
+#
+# `break-once.sh` fails safe here: a wrong count aborts at its `grep` or its
+# `assert` before any backup is taken, so a bad requote costs a run and not a file.
+# But that signal arrives at REPLAY time. The count arrives at edit time.
+#
+# This is the same insight as the per-tree limitation below, from the other end: a
+# record is not an observer of the tree, it is part of it.
+#
 # ── why this list is written out by hand ────────────────────────────────────
 #
 # Deriving it would mean parsing prose for "replacing `X` with `Y` in `path`",
