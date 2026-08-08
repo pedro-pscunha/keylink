@@ -14,8 +14,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink::{
-    ActorId, Allowlist, Applied, Caller, Context, Deferred, Ended, Eviction, IdempotencyKey,
-    KeyState, Observer, Persist, Replied, Reply, Server, Stop, TurnFut, TurnInfo,
+    ActorId, Allowlist, Applied, CallId, Caller, Context, Deferred, Ended, Eviction,
+    IdempotencyKey, KeyState, Observer, Persist, Replied, Reply, Server, Stop, TurnFut, TurnInfo,
 };
 use std::time::Duration;
 
@@ -1086,6 +1086,54 @@ fn micros(elapsed: std::time::Duration, turns: u32) -> f64 {
     elapsed.as_secs_f64() * 1_000_000.0 / f64::from(turns)
 }
 
+/// **What an `Applied` set costs the turn it rides on**, which is not a memory
+/// question.
+///
+/// `Persist::after_turn` calls `Snapshot::of(state)` on **every completed turn**,
+/// unconditionally — so a `Durable::snapshot` that encodes an `Applied` re-encodes
+/// the whole set once per turn whether it changed or not. That is linear in entries
+/// held, and `APPLIED_BOUND`'s documentation used to price the set only as bytes of
+/// memory, which is the half that does not matter on a fast adapter.
+///
+/// A measurement, in the shape `the_per_turn_store_cost` established: it prints and
+/// asserts nothing. The ids are synthesised through [`keylink::CallId::from_bytes`]
+/// rather than derived from real keys, because what is being timed is postcard over
+/// sixteen bytes and a `u64` and the provenance of the bytes cannot matter.
+///
+/// Reproduce with
+/// `cargo test -p keylink --release --test persist -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, not an assertion: run with --ignored --nocapture"]
+fn the_per_turn_cost_of_the_applied_set() {
+    use n0_future::time::Instant;
+    use std::num::NonZeroUsize;
+
+    const ENCODES: u32 = 500;
+
+    println!("── `Till::snapshot` by entries held — the WHOLE set, every turn");
+    for entries in [0usize, 64, 1024, 4096, 16384, 65536] {
+        let bound = NonZeroUsize::new(entries.max(1)).expect("max(1) is not zero");
+        let mut till = Till {
+            balance: 1,
+            runs: 1,
+            applied: Applied::bounded(bound),
+        };
+        for n in 0..entries {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            till.applied.insert(Some(CallId::from_bytes(id)), n as u64);
+        }
+
+        let bytes = till.snapshot().len();
+        let started = Instant::now();
+        for _ in 0..ENCODES {
+            let _ = till.snapshot();
+        }
+        let each = micros(started.elapsed(), ENCODES);
+        println!("   {entries:>6} entries : {bytes:>8} bytes, {each:>9.1} µs/turn");
+    }
+}
+
 // ───────────────────────────────── the restart the ledger cannot cross
 //
 // The other half of the pair `src/idempotency.rs` names: a durable state and a
@@ -1103,7 +1151,7 @@ keylink::service! {
     rpc Credit(amount: u64) -> u64;
     /// The balance now.
     rpc Balance() -> u64;
-    /// How many times [`Credit`] actually did the work. This is the assertion —
+    /// How many times `credit` actually did the work. This is the assertion —
     /// "it did not run twice" and not "the ledger refused it".
     rpc Runs() -> u64;
 }
@@ -1601,10 +1649,13 @@ impl Booking {
 ///
 /// 1. a **keyed** `withdraw` parks. Its turn reports its own id.
 /// 2. an **unkeyed** `approve` releases it. Its turn reports `-` — even though the
-///    reply it released belongs to a keyed call. That is the negative and it is
-///    the sharp half.
+///    reply it released belongs to a keyed call. The negative, and the **weaker**
+///    of the two: an accessor that always answered `None` would satisfy it.
 /// 3. a **keyed** `withdraw`, then a **keyed** `approve`. The approving turn
-///    reports ITS key and not the parked withdrawal's. That is the positive.
+///    reports ITS key and not the parked withdrawal's. **This is the sharp one** —
+///    `seen[2] != seen[3]`, where both turns are keyed and nothing that answers a
+///    constant can pass. Weaken that assertion and the decision is unguarded, so it
+///    is the line to defend.
 /// 4. a restart, and the retry of the second withdrawal's key. The ledger is
 ///    empty so the handler is entered; the `Applied<()>` the parking turn wrote
 ///    came back with the state, so nothing is parked twice.

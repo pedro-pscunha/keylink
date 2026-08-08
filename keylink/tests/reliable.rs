@@ -286,9 +286,16 @@ async fn a_retried_call_across_a_reconnect_runs_exactly_once() {
 /// cannot see is a bound they cannot plan around.
 /// `APPLIED_BOUND` joined this list with limit 2's rewrite, and it is the one
 /// entry here that is not the ledger's: it bounds a set that lives in the
-/// caller's own state. It belongs anyway, by this test's own rule — the README
-/// prints the number, and the README's argument for it is a comparison against
-/// `MAX_ATTACH`, which is pinned two lines up.
+/// caller's own state. It belongs anyway, by the only rule this test has — the
+/// README prints the number, at limit 2, as `4096 calls`.
+///
+/// It used to say the README argued for it "by a comparison against `MAX_ATTACH`,
+/// which is pinned two lines up". That comparison was deleted as **wrong** in the
+/// same fix pass that wrote this clause: `MAX_ATTACH` bounds a wait on a call in
+/// flight on a live process and never the window a post-restart retry crosses, and
+/// `APPLIED_BOUND`'s own docs now say so. The clause outlived the claim it rested
+/// on, which is the failure this whole test exists to catch, arriving in the test's
+/// own prose.
 #[test]
 fn the_limits_the_readme_names_are_the_ones_the_ledger_uses() {
     assert_eq!(RECORD_TTL, Duration::from_secs(600));

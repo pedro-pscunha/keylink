@@ -125,10 +125,13 @@ const DIGEST_BYTES: usize = 16;
 ///
 /// **That number belongs to that adapter.** `Persist`'s header invites *"an adapter
 /// whose `store` does not sync"* and measures the same turn with no observer at
-/// **18 µs**. An actor storing at anything like that rate does thousands of turns a
-/// second, and 4096 entries is then well under a second, not 31. So: measure your
-/// own adapter's turn rate and divide. If you have no measurement, the count is
-/// still the guarantee and the seconds are not.
+/// **12.8 µs** in release. An actor storing at anything like that rate does tens of
+/// thousands of turns a second, and 4096 entries is then well under a second, not
+/// 31. So: measure your own adapter's turn rate and divide. If you have no
+/// measurement, the count is still the guarantee and the seconds are not.
+///
+/// And read the cost section below before choosing a bigger bound for that adapter,
+/// because on a turn that cheap the set is no longer free.
 ///
 /// The comparison this used to draw against [`MAX_ATTACH`](crate::MAX_ATTACH) is
 /// gone, and it was wrong rather than merely loose: `MAX_ATTACH` bounds how long
@@ -158,11 +161,43 @@ const DIGEST_BYTES: usize = 16;
 /// makes the post-restart burst the worst window for reasons of arrival *rate*, not
 /// because retries eat their own records.
 ///
-/// # Cost, which is a consequence and not the argument
+/// # Cost — and it is CPU per turn, not just memory
 ///
-/// 4096 ids is 64 KiB, plus one `T` each and a `HashMap`'s overhead. Raise it with
-/// [`Applied::bounded`] if your callers back off for longer than your actor takes to
-/// fill it; there is no reason to lower it.
+/// The memory is the easy half: 4096 ids is 64 KiB, plus one `T` each and a
+/// `HashMap`'s overhead.
+///
+/// **The half that bites is that the whole set re-encodes on every turn.**
+/// `Persist::after_turn` calls `Snapshot::of(state)` for every `Completed` turn
+/// unconditionally, so a `Durable::snapshot` carrying an `Applied` pays for every
+/// entry it holds whether that turn touched one or not. Linear in entries, measured
+/// through `Till::snapshot` in
+/// `tests/persist.rs::the_per_turn_cost_of_the_applied_set`:
+///
+/// | entries | snapshot bytes | µs/turn |
+/// |---|---|---|
+/// | 64 | 1,092 | 2.1 |
+/// | 1,024 | 18,310 | 26.6 |
+/// | **4,096** | **73,606** | **91.7** |
+/// | 16,384 | 294,792 | 329.6 |
+/// | 65,536 | 1,228,680 | 1,507.7 |
+///
+/// Release profile, Apple M5 Max (`Mac17,6`), macOS 27.0 build 26A5378n,
+/// 2026-08-07 — the same machine and day as `Persist`'s own table, so the two are
+/// comparable.
+///
+/// **Read that against your turn, not against a byte budget.** Beside a 7.6 ms
+/// `fsync` turn, 91.7 µs is 1.2% and invisible. Beside the fast adapter this very
+/// section invites — 14.0 µs for an unobserved turn on the same run — it is **6.5×
+/// the entire turn**, and the set is then the dominant cost of the thing it is
+/// riding on. The turn rate a caller is told to measure two paragraphs up is
+/// therefore **partly a function of the bound they are choosing**, which is
+/// circular, and the way out is to measure at the bound you intend to run.
+///
+/// So: raise it with [`Applied::bounded`] if your callers back off for longer than
+/// your actor takes to fill it — and **lower it if your turns are cheap**, because
+/// on a non-syncing adapter a bound of 65,536 puts 1.5 ms of encoding on a turn that
+/// was doing 14 µs of work. The previous version of this paragraph said there was no
+/// reason to lower it. There is.
 pub const APPLIED_BOUND: NonZeroUsize = match NonZeroUsize::new(4096) {
     Some(bound) => bound,
     // Unreachable: 4096 is not zero. The arm exists because `NonZeroUsize::new`
@@ -180,7 +215,7 @@ pub const APPLIED_BOUND: NonZeroUsize = match NonZeroUsize::new(4096) {
 /// # Opaque on purpose
 ///
 /// The obvious alternative is to hand the handler back what the accept path
-/// already has: the [`EndpointId`](crate::EndpointId) and the key. That exports
+/// already has: the [`EndpointId`] and the key. That exports
 /// the ledger's peer-scoping rule to every caller who wants to dedupe, and
 /// `idempotency.rs` calls that scoping *"the whole security
 /// property"* — one peer's key must never be able to name another's. Folding the
@@ -365,8 +400,6 @@ impl std::fmt::Debug for CallId {
 /// [`iter`](Self::iter) is still there for a snapshot that wants the pairs itself;
 /// it reports oldest-first, so replaying it through [`insert`](Self::insert) into an
 /// `Applied` **of the same bound** rebuilds the same eviction order.
-///
-/// [`Snapshot`]: keylink_persist::versioned::Snapshot
 ///
 /// # What an unkeyed call gets
 ///

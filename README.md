@@ -337,8 +337,15 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
    "4096 other pieces of keyed work may land between yours and its retry". Turning
    that into a duration needs *your* adapter's turn rate: over `keylink-persist`'s
    file store a turn is ~7.6 ms, so ~130/s and roughly 31 seconds — but the same turn
-   with no `fsync` behind it is 18 µs, where 4096 entries is well under a second.
+   with no `fsync` behind it is ~13 µs, where 4096 entries is well under a second.
    Measure and divide, and treat the count as the guarantee.
+
+   **And the set is a term in that turn rate, so measure at the bound you mean to
+   run.** `Persist` re-encodes the whole state every completed turn, so an `Applied`
+   costs its entries on every turn whether one changed or not — 4096 entries is
+   ~92 µs, which is 1.2% of an `fsync` turn and **6.5× a non-syncing one**. Raise the
+   bound for slow callers; lower it for cheap turns. `APPLIED_BOUND`'s rustdoc has the
+   measured table.
 
    The busiest window is the one right after the restart, which *concentrates*
    arrivals — every peer's backoff fires at once. What drains the set, though, is
