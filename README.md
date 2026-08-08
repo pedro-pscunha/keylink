@@ -276,9 +276,11 @@ answered from the record without entering the handler again.
 
 That is effectively-once for one `rpc`. Here is what it does not cover.
 
-**Limits 3 and 5 are now partly the serving side's choice rather than only
+**Limits 2, 3 and 5 are now partly the serving side's choice rather than only
 keylink's**: `ServiceBuilder::keyable` decides which methods accept a key at all, so
-a key on any other is refused as `NotKeyable` instead of filling the ledger, and
+a key on any other is refused as `NotKeyable` instead of filling the ledger — which
+also **voids limit 2's remedy on every method outside the policy**, because
+`cx.call()` is then `None` and an `Applied` there never fires. And
 `ServiceBuilder::records` can decline to hold the reply at all — reaching limit 5's
 `Unrecordable` refusal by configuration rather than by the method's shape, which
 keeps at-most-once and gives up the answer on purpose so that a caller's payload is

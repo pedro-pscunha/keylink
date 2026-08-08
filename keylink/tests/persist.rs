@@ -1312,8 +1312,11 @@ impl Serving {
 ///   argument — the likeliest future edit there — reflows the chain and the old
 ///   one-line anchor stops existing, which `break-once.sh` reports as an abort and
 ///   a careless reader reports as green.
-/// - `scripts/break-once.sh keylink/src/middleware.rs` on `pub fn call`'s body
-///   `self.call` → `self.call.and(None)` — nothing is ever recognised. Watched:
+/// - in `keylink/src/middleware.rs`, make `Context::call`'s body answer nothing —
+///   described rather than quoted, because `        self.call` is a **prefix** of
+///   `        self.call = call;` in `with_call`, so it counts 2 even with its
+///   indentation and the usual remedy does not reach it. Replacement, quoted
+///   because it is never searched: `self.call.and(None)`. Watched:
 ///   `the retry is answered with the FIRST run's balance, out of the state`,
 ///   `left: 100 right: 50`.
 #[tokio::test]
@@ -1695,7 +1698,9 @@ impl Booking {
 ///
 /// On `keylink/src/middleware.rs`'s `pub fn call` body:
 ///
-/// - `self.call` → `self.call.and(None)`, so no turn is named at all. Watched:
+/// - answer nothing from `Context::call`'s body — described, for the prefix reason
+///   the restart test's record spells out. Replacement: `self.call.and(None)`. So no
+///   turn is named at all. Watched:
 ///   `and recorded the call it applied, on the same snapshot as the debit`,
 ///   `left: 0 right: 1`.
 ///
@@ -1711,8 +1716,9 @@ impl Booking {
 ///   assertion fires first**, so it rots when an assertion is added *above* the
 ///   recorded one — a value the record does not control. `break-once.sh`'s exit
 ///   code cannot see it, because the test still fails.
-/// - `self.call` → `self.call.filter(|_| self.method() != "Approve")`, so the
-///   releasing turn loses its own name. Watched:
+/// - make that same body drop the id for one method only. Replacement:
+///   `self.call.filter(|_| self.method() != "Approve")`. The releasing turn then
+///   loses its own name. Watched:
 ///   `and the keyed approval carried its own`, `left: "-" right: "-"`.
 ///
 /// On the record's placement, which is step 1's guard — in this file,
