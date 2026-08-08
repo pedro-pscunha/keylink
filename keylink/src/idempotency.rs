@@ -3227,8 +3227,11 @@ mod tests {
         /// buckets, so **every** `assert_agrees` in the loop fails rather than one.
         ///
         /// Made red by dropping `evict`'s tombstone decrement, so the counter stays
-        /// high while the buckets drain. The anchor, on one line because a quote that
-        /// wraps across `///` lines is not seen as a span by every reader of this file:
+        /// high while the buckets drain. The anchor is on one line, which was once
+        /// load-bearing and is now only tidy: `.mise/tasks/anchors` read backticked
+        /// spans two ways, and the reader that walked this file for record blocks kept
+        /// the comment marker, so a wrapped quote reached it with a `///` inside it.
+        /// One reader now, and it strips the marker — wrapping this is cosmetic:
         ///
         /// `inner.spent = inner.spent.saturating_sub(1);`
         ///

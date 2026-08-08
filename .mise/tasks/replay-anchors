@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""A registered break must still print the sentence its record says it printed.
+
+MISE description="Replay each REDNESS row's break and check it reddens its own guard"
+"""
+# `mise run anchors` says a break can be STARTED: the search literal resolves to
+# exactly one occurrence, so `scripts/break-once.sh` will not abort. It says nothing
+# about whether the break still REDDENS, and no resolution check can — an anchor
+# resolving is a property of one line, while reddening is a property of a test that
+# lives somewhere else, often in another file.
+#
+# That gap is not theoretical. `C10`'s anchor kept resolving while another branch
+# rewrote the test its record described, so the break stopped reddening and the gate
+# never moved. And the bias runs one way: on 2026-08-08 both records a reviewer
+# challenged claimed MORE redness than exists, because an author holds the guards
+# they WROTE in mind while the neighbouring guard's shape is not in that picture.
+#
+# ── WHY THIS READS THE REGISTRY INSTEAD OF HARD-CODING ITS OWN BREAKS ──────────
+#
+# `scripts/replay-fate-breaks.sh` hard-codes twenty-three breaks, and that is the
+# defect this one avoids: its literals are invisible to `mise run anchors`, so they
+# rot exactly the way the records did — silently, until somebody runs the script.
+# Reading `ANCHORS` means the gate keeps every literal here resolving, on every
+# commit, and this task only has to supply the half a gate cannot check.
+#
+# The registry is PARSED, not imported. Importing would run the gate as a side
+# effect, and `ast.literal_eval` on the assignment's value is exact where a regex
+# over the source would be a guess — a file that exists because of unchecked guesses
+# does not get to make one.
+#
+# ── IT ASSERTS ON THE SENTENCE AND NEVER ON THE EXIT CODE ──────────────────────
+#
+# `break-once.sh` always exits 0 and reports the runner's status as text, and the
+# argument for keeping it that way is `replay-fate-breaks.sh`'s: a break that goes
+# GREEN prints `exit=0`, an aborted anchor prints no `exit=` line at all, and a break
+# red at a DIFFERENT assertion prints a different sentence. Asserting on the recorded
+# sentence puts all three in the failure arm. An exit code cannot tell them apart —
+# `exit=101` is identical for a break that reddens the right guard and one that
+# reddens the wrong one, and the wrong one reads as evidence.
+#
+# ── AND IT IS IN NO GATE, WHICH IS A CORRECTNESS CLAIM AND NOT A SPEED ONE ─────
+#
+# It edits the tree. `break-once.sh` restores a backup on EXIT, so a run racing an
+# uncommitted edit restores OVER it — which is why this refuses a dirty worktree, and
+# why it could not be a `pre-commit` citizen even if it were instant: that hook fires
+# while a developer's working tree is live. It also runs one `cargo test` per row.
+#
+# So the honest place for it is by hand: at a merge gate, or by whoever rewrites a
+# guard a record describes. Reviewer-run rather than author-run is the point — the
+# author already ran it once, and that run is the thing being re-checked.
+#
+#     mise run replay-anchors            # every row in REDNESS
+#     mise run replay-anchors L5 A5      # named rows only
+#
+#     REPLAY_REGISTRY=/tmp/drifted mise run replay-anchors L5    # this task, tested
+import ast
+import os
+import pathlib
+import subprocess
+import sys
+
+ROOT = pathlib.Path(
+    subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+)
+# Overridable so THAT THIS TASK IS ITSELF TESTABLE: point it at a copy of the
+# registry carrying a deliberately wrong sentence and the failure arm below must
+# fire. Without the override the only way to reach that arm is to COMMIT a wrong
+# value, and the tree must be clean before this will run at all — so the arm would
+# stay unexercised, which for a checker is the same as absent.
+TASK = pathlib.Path(os.environ.get("REPLAY_REGISTRY", ROOT / ".mise" / "tasks" / "anchors"))
+
+
+def registry(name: str):
+    """One top-level list or dict from the anchors task, parsed and not executed."""
+    for node in ast.parse(TASK.read_text()).body:
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == name:
+            return ast.literal_eval(node.value)
+    sys.exit(f"{TASK} has no top-level `{name}` to read")
+
+
+ANCHORS = registry("ANCHORS")
+REDNESS = registry("REDNESS")
+rows = {record: (target, literal) for record, _, target, literal in ANCHORS}
+
+# A `REDNESS` id with no `ANCHORS` row, refused HERE and not as a bare `KeyError` at
+# the lookup below. `mise run anchors` fails on the same state and names the same two
+# fixes, and the wording follows it deliberately: this is the one task written for
+# somebody who did not write the registry, so a traceback with no remedy is the worst
+# place to spend their attention. A drifted `REPLAY_REGISTRY` reaches this too.
+orphans = sorted(set(REDNESS) - set(rows))
+if orphans:
+    sys.exit(f"REDNESS entries with no ANCHORS row: {', '.join(orphans)}. This task "
+             "reads the file and the search literal from ANCHORS, so those entries "
+             "have nothing to cut. Either the row was dropped and the entry outlived "
+             "it, or the id is misspelled.")
+
+wanted = sys.argv[1:]
+unknown = sorted(set(wanted) - set(REDNESS))
+if unknown:
+    sys.exit(f"no REDNESS entry for: {', '.join(unknown)}")
+plan = [record for record in REDNESS if not wanted or record in wanted]
+
+# Refused rather than worked around. `break-once.sh`'s `trap restore EXIT` copies a
+# backup back over the file it edited, so anything uncommitted in that file is lost —
+# and it is lost silently, since the restore is the harness working as designed.
+dirty = subprocess.run(
+    ["git", "status", "--porcelain"], capture_output=True, text=True, check=True, cwd=ROOT
+).stdout
+if dirty.strip():
+    print("refusing to run against a dirty tree: break-once.sh restores a backup on",
+          file=sys.stderr)
+    print("EXIT, which would overwrite whatever is uncommitted here.", file=sys.stderr)
+    print(dirty, file=sys.stderr, end="")
+    sys.exit(2)
+
+failed: list[str] = []
+for record in plan:
+    replacement, watched, test_filter, extra = REDNESS[record]
+    target, literal = rows[record]
+    print(f"════ {record}  {test_filter}")
+    done = subprocess.run(
+        [str(ROOT / "scripts" / "break-once.sh"), target, literal, replacement,
+         test_filter, *extra],
+        capture_output=True, text=True, cwd=ROOT,
+    )
+    out = done.stdout + done.stderr
+    # The three lines `replay-fate-breaks.sh` echoes - whether the harness aborted,
+    # and what the runner exited with - plus the log PATH, which that script does not
+    # echo and which the failure arm below sends the reader to. Without it the remedy
+    # named a file whose name appeared nowhere. Never the whole test log: the harness
+    # keeps that in the file this line names.
+    for line in out.splitlines():
+        if ("ABORT" in line or "expected exactly one" in line
+                or line.startswith("── exit=") or line.startswith("── log:")):
+            print(f"     {line}")
+    if watched in out:
+        print(f"     ✓ still red at: {watched}")
+        continue
+    failed.append(record)
+    print("     ✗ the recorded sentence is NOT in this run. Expected to find:")
+    print(f"         {watched}")
+    print("       A break that went green, one whose anchor aborted, and one red at a")
+    print("       DIFFERENT assertion all land here. Read the log at the `── log:`")
+    print("       path above - an ABORT line and no log path means the harness refused")
+    print("       before it ran anything, and the ABORT says why. Then fix whichever of")
+    print("       the two is wrong - the record or the guard.")
+    print("       Do NOT relax the expected sentence to match the run without")
+    print("       reading why it changed: a break red at another assertion is a")
+    print("       record describing coverage it no longer has.")
+
+print()
+if failed:
+    print(f"{len(failed)} of {len(plan)} replayed breaks did not print their recorded "
+          f"sentence: {', '.join(failed)}", file=sys.stderr)
+    sys.exit(1)
+print(f"ok: {len(plan)} of the {len(REDNESS)} REDNESS rows replayed and each printed "
+      "its recorded sentence")
+print(f"    REDNESS covers {len(REDNESS)} of the {len(ANCHORS)} registered rows - "
+      "`mise run anchors` prints that ratio, and the rest are unreplayed")
