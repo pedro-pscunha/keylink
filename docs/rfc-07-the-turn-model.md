@@ -1974,10 +1974,28 @@ handle — and a wedged one cannot be asked, because the question queues behind 
 A bare `mpsc::Receiver` still takes the default, and the supervision tests that hand
 `supervise` one are why it stays.
 
-Red-tested per arm, separately, because they are separately load-bearing: clearing the
-flag on the mail arm fails the two mailbox tests, `a_turn_reports_busy_and_a_read_does_not`
-on the local side, and leaves the feed test green; clearing it on the feed arm fails only
-`busy_is_true_during_a_feed_turn`.
+Red-tested per arm, separately, because they are separately load-bearing. Breaking the
+**mail** arm reddens seven tests across **two cargo targets**, and leaves
+`busy_is_true_during_a_feed_turn` green. Breaking the **feed** arm reddens only that one.
+
+`cargo test -p keylink --lib` — three, all added with `LocalActor::is_busy`:
+
+- `a_turn_reports_busy_and_a_read_does_not`
+- `a_supervised_actor_reports_busy_through_its_handle`
+- `an_aborted_turn_does_not_leave_the_handle_reporting_busy`
+
+`cargo test -p keylink --test actors` — four:
+
+- `busy_is_true_during_a_turn_and_false_between_turns`
+- `busy_stays_true_across_an_await_inside_a_turn`
+- `a_saturated_mailbox_at_depth_does_not_starve_a_feed`
+- `different_actors_run_concurrently_while_one_actor_stays_serial`
+
+**This list stood at three names for one wave and it was measured wrong.** It said "the two
+mailbox tests" plus one of the three local ones, which is what happens when the author who
+watched a break adds the test *they* watched to a list somebody else wrote. The two targets
+are the reason it survived: a reader running `--lib` sees three reds and not one of them is
+a mailbox test.
 
 **One honest limit, stated on `Mailbox` rather than left to be discovered.** `mount` is
 `#[doc(hidden)] pub`, so a loop can be written by hand — the tests in `registry.rs` and

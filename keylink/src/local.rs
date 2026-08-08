@@ -1427,12 +1427,13 @@ impl<A: Send, M: Send> Inbox<A, M> for mpsc::Receiver<Message<A, M>> {
 /// `Drop` the handle would answer "busy" for ever about an actor that is gone.
 ///
 /// **A clear inside `supervise` would not reach either of them** — and it was
-/// tried. It is dead, by the two arms `retryable` grants a restart to and not by
-/// one rule over both. `Ended::Panicked` and a non-fatal `Ended::Observer` are
-/// values `dispatch` **returned**, so the clear on the next line already ran.
-/// `Ended::Feed` is built on the `Taken::Fed(Fed::Ended { .. })` arm, which runs
-/// no dispatch at all, so the flag was never set. Either way the supervisor
-/// would be storing `false` over `false`.
+/// tried. It is dead, and by two cases rather than by one rule over all three
+/// endings `retryable` restarts. `Ended::Panicked` and a non-fatal
+/// `Ended::Observer` are values `dispatch` **returned**, so the clear on the next
+/// line already ran. `Ended::Feed` is built on the `Taken::Fed(Fed::Ended { .. })`
+/// arm, which runs no dispatch, so the flag is not set at that point — earlier
+/// mail turns may well have set and cleared it. Either way the supervisor would
+/// be storing `false` over `false`.
 ///
 /// It is worse than dead, because `run_keyed_supervised` hands the same function
 /// a [`Keyed`], which would make `supervise` a second writer of the registry's
@@ -3239,10 +3240,12 @@ impl<A, M> LocalActor<A, M> {
     ///
     /// # After an abort, and the caveat is the one `abort` already carries
     ///
-    /// The cell is cleared when the actor's mailbox is dropped, so an escaping
-    /// unwind and a cancelled task both end with this `false` rather than stuck
-    /// at `true` — a handle reporting "busy" for ever about an actor that is gone
-    /// is what the loop alone would leave behind.
+    /// The cell is cleared when the **loop's** end of the mailbox is dropped — the
+    /// receiving end, not the sender this handle holds, and the two part company
+    /// on a supervised actor whose receiver outlives every incarnation. So an
+    /// escaping unwind and a cancelled task both end with this `false` rather than
+    /// stuck at `true`, which is what the loop alone would leave behind: a handle
+    /// reporting "busy" for ever about an actor that is gone.
     ///
     /// **But [`abort`](Self::abort) is asynchronous**, exactly as its own
     /// documentation and [`is_running`](Self::is_running)'s say: it cancels the
