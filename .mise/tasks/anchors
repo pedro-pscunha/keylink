@@ -114,6 +114,48 @@ ANCHORS = [
      "pub fn records(mut self, records: Records) -> Self {"),
     ("R28", "keylink/tests/blobs.rs", "keylink/src/macros.rs",
      "__keylink_granted_id!"),
+    # ── from PR #11 (`call-id`). Enumerated by that branch's own gate against
+    # `break-once.sh:28`, then re-measured here row by row rather than
+    # transcribed: for each, the code site was separated from the record's quote,
+    # the indentation read off the code, and the count taken at that exact form.
+    #
+    # SIX are SAME-FILE and legitimate, which is the narrowed rule in action: the
+    # record's quote sits unindented inside a `///` line while the code carries
+    # its indentation, so the indented literal is unique and the record's copy is
+    # not a second occurrence. Their bare forms count 2-3.
+    ("C1", "keylink/src/call.rs", "keylink/src/call.rs",
+     "        hasher.update(peer.as_bytes());"),
+    ("C2", "keylink/src/call.rs", "keylink/src/call.rs",
+     "        hasher.update(key.as_str().as_bytes());"),
+    ("C3", "keylink/src/call.rs", "keylink/src/call.rs",
+     "        let Some(call) = call else { return };"),
+    ("C4", "keylink/src/call.rs", "keylink/src/call.rs",
+     "        self.answers.get(&call?)"),
+    # Cited from TWO records, which is why the unit here is the distinct ANCHOR
+    # rather than the record site - a site count is legitimately larger and both
+    # are defensible.
+    ("C5", "keylink/src/call.rs", "keylink/src/call.rs",
+     "            Entry::Occupied(_) => return,"),
+    # A FRAGMENT: the line continues `.serialize(serializer)`. Registered as the
+    # record quotes it and declared below, rather than widened to the whole line -
+    # widening would make this row's literal something no record contains, which
+    # the record-quote check would then reject, correctly.
+    ("C6", "keylink/src/call.rs", "keylink/src/call.rs",
+     "        (self.bound, self.iter().collect::<Vec<_>>())"),
+    ("C7", "keylink/tests/persist.rs", "keylink/src/call.rs",
+     "        call.is_some_and(|call| self.answers.contains_key(&call))"),
+    # The one anchor whose record says the TRAILING NEWLINE is load bearing, and
+    # it is right: `        self.call` alone counts 2, the text prefixing
+    # `        self.call = call;`. Measured here, the INDENTATION is not what
+    # disambiguates - `self.call\n` is already unique - but the record's own
+    # stated form is kept, since bare-plus-newline would collide the moment
+    # another line ends in `self.call` at any indentation.
+    ("C8", "keylink/tests/persist.rs", "keylink/src/middleware.rs",
+     "        self.call\n"),
+    ("C9", "keylink/tests/persist.rs", "keylink/tests/persist.rs",
+     "        self.waiting.push((amount, call, deferred));"),
+    ("C10", "keylink/tests/persist.rs", "keylink/tests/persist.rs",
+     "    parked_over_the_wire(&other, &actor, 1).await;"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -150,6 +192,21 @@ DESCRIBED = [
      "second occurrence"),
     ("R19", "keylink/tests/idempotency.rs", "same-file",
      "the keyed-actor test's own .keyable(..) call, for the same reason"),
+    # ── from PR #11 (`call-id`), converted after MEASURING the reason rather than
+    # predicting it. None carries a quoted search literal; each quotes only its
+    # replacement.
+    ("C-D1", "keylink/src/call.rs", "column 0",
+     "const DIGEST_BYTES at column 0. A unique form DOES survive, taken with its "
+     "trailing newline, because the record's copy is followed by a closing "
+     "backtick - so described because that uniqueness rests on the record's own "
+     "punctuation, more fragile than the indentation it would replace"),
+    ("C-D2", "keylink/src/call.rs", "fragment",
+     "self.order.pop_front() is mid-line, and indentation cannot disambiguate a "
+     "fragment"),
+    ("C-D3", "keylink/src/call.rs", "formatter",
+     "Applied::iter's chain - rustfmt reflow measured rather than predicted"),
+    ("C-D4", "keylink/tests/persist.rs", "formatter",
+     "rpc.rs's .map - same, measured"),
     ("R26a", "keylink/tests/api.rs", "positional",
      "a slice of lib.rs's `pub use` list - re-quoting buys only until the next "
      "export lands"),
@@ -227,6 +284,12 @@ for record, lives_in, target, literal in ANCHORS:
 # that the set does not GROW - the safe kind of count, no false-success state - so
 # a new fragment reddens while this one stays visibly grandfathered.
 FRAGMENT_ANCHORS = {
+    # `(self.bound, self.iter().collect::<Vec<_>>())` - the line continues with
+    # `.serialize(serializer)`. Count 1 today. Its own branch described a sibling
+    # fragment (`self.order.pop_front()`) for exactly this shape and quoted this
+    # one: an inconsistency in that classification rather than a defect, since
+    # both resolve now and both are latent.
+    "C6",
     # `$crate::__keylink_granted_id!(..)` sits inside a macro repetition, so the
     # whole line would drag `)+` and a trailing comma into the anchor. Count is 1
     # today. Left a fragment knowingly, and listed so the next one is not.
