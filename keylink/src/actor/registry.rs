@@ -1838,11 +1838,77 @@ impl<M> SystemBuilder<M> {
     ///
     /// # What the number means — and this doc names no recommended one
     ///
-    /// Depth is **the boundary between backpressure the caller feels and
-    /// backpressure the actor absorbs.** At one, every caller waits for the actor
-    /// it is addressing, so a caller that measures its own latency has measured
-    /// the actor's. At `N`, the first `N` callers hand their message over and go on
-    /// as if the actor were fast; the `N + 1`th feels the whole queue at once.
+    /// **A deeper mailbox drains the whole queue faster. It does not move
+    /// backpressure off the caller, and this paragraph used to say it did.** Every
+    /// keyed call *through a generated client* waits for the actor it is addressing,
+    /// at every depth, and that is a property of the client surface rather than of
+    /// the timings below: `__keylink_actor_client_method!` in
+    /// `keylink/src/macros.rs` generates **no** method for a `tell` on a keyed
+    /// `ActorRef`, and its own comment gives the reason — four keyed refusals are
+    /// decided after the bytes reach the wire and are reported on the reply. So a
+    /// caller holding a generated keyed client awaits a reply or it does not call,
+    /// and a message the mailbox has *accepted* still leaves its caller waiting.
+    /// `keylink/tests/mailbox_latency.rs` asserts exactly that, at three slots with
+    /// four callers.
+    ///
+    /// **A hand-rolled peer is outside that bound, and the same macro arm says so in
+    /// its own comment**: "a keyed `tell` really would work — `RpcClient::tell` writes
+    /// a `WireRequest::Call` on a unidirectional stream and `serve_one_tell` walks the
+    /// same dispatch a call does". That is
+    /// [`RpcClient::tell`](crate::RpcClient::tell), generic over any `Serialize`
+    /// request. What is absent is the generated *method*, not the wire path. So a peer
+    /// that dials a service's `keyed_alpn()` and writes an `Addressed` request by hand
+    /// reaches this mailbox without awaiting anything, and the sender on the mailbox
+    /// is the serving task rather than the peer — the peer returned when the bytes
+    /// went out.
+    ///
+    /// **That does not bring the deleted sentence back. It takes the caller out of the
+    /// picture altogether.** Such a peer returns at every depth and never feels this
+    /// queue at all, so the staircase the deleted prose described — the first `N`
+    /// callers going on and the `N + 1`th feeling the whole queue — is unreachable on
+    /// that path too, and for a blunter reason. The sentence was wrong for both kinds
+    /// of caller, for two different reasons. Finding the `tell` is a reason to read
+    /// this paragraph, not to restore that one.
+    ///
+    /// What depth buys is the hop **between** turns. At one slot every turn but the
+    /// first waits for a parked sender to be woken and rescheduled before the loop
+    /// can receive; at `N` the next `N` messages are already in the channel. That
+    /// takes work off the critical path of every queued caller, the last one
+    /// included — so the gain arrives as the whole burst finishing sooner, not as
+    /// `N` callers escaping the queue.
+    ///
+    /// | 32 concurrent callers, one actor | depth 1 | depth 32 | runs |
+    /// |---|---|---|---|
+    /// | drain, per queued turn, the release included | 18.8 – 20.5 µs | 1.3 – 1.9 µs | 4 |
+    /// | slowest caller's own wait | 717 – 779 µs | 165 – 234 µs | 4 |
+    /// | fastest caller's own wait | 378 – 453 µs | 155 – 222 µs | 4 |
+    /// | that spread, within one run | 1.7 – 1.9× | 1.03 – 1.07× | 4 |
+    /// | control: one call at a time | 151 – 168 µs/call | 137 – 410 µs/call | 4 |
+    ///
+    /// Apple M5 Max (`Mac17,6`), macOS 27.0.0 `arm64`, release profile, 2026-08-08
+    /// (-03:00), at a load average between 13.95 and 18.69 with two sibling
+    /// compilers running. `keylink/tests/mailbox_latency.rs`'s `#[ignore]`d
+    /// measurement produced these and prints its own load average and sccache hit
+    /// rate beside them, because a figure taken on that machine is not evidence
+    /// without them.
+    ///
+    /// **Read the ratios, not the absolutes**, and the control row is what says why:
+    /// it must not depend on depth, and across four runs it did not, apart from one
+    /// 410 µs reading under load against a 137 – 168 µs band. Every figure includes
+    /// a QUIC stream setup, a postcard encode and a round trip, because
+    /// `Registry::route` is `pub(super)` and a test reaches a keyed mailbox only
+    /// through a served client. What survives that noise is the shape: the drain is
+    /// 10.8 to 15 times apart within a run, and the burst's own spread narrows from
+    /// 70 – 90% at one slot to 3 – 7% at 32. A burst of 32 into 32 slots arrives
+    /// almost together, which is what a staircase of `N` fast callers and one slow
+    /// one does not look like.
+    ///
+    /// The debug profile agrees in direction over four more runs, at 6.8 to 9.8
+    /// times for the same drain ratio. That rules out one thing and states nothing
+    /// else: the gap is not an artifact of the optimization level. It does not
+    /// separate a task wakeup from a permit acquisition, or from any other per-turn
+    /// constant a debug build inflates. What the gap *is* comes from the mechanism
+    /// paragraph above, which argues it from the code.
     ///
     /// Nothing here recommends a value, deliberately. A number in a doc gets
     /// copied into services it was never measured against; the trade above is the
@@ -1873,11 +1939,17 @@ impl<M> SystemBuilder<M> {
     /// `tokio::sync::mpsc` allocates its first block of 32 slots eagerly, so an
     /// idle mailbox costs the same at depth 1 as at depth 32 — and, measured,
     /// the same at 1,024, because further blocks are allocated when messages
-    /// actually arrive rather than when capacity is declared. Below 32 the knob
-    /// buys latency for **free** and its whole cost is semantic: what the caller
-    /// stops feeling.
+    /// actually arrive rather than when capacity is declared. So below 32 the knob's
+    /// **memory** cost is zero.
     ///
-    /// `tests/actor_memory.rs`'s depth phase is that measurement, printing the
+    /// **Two measurements, in two files, and this heading covers one of them.** This
+    /// sentence used to read "below 32 the knob buys latency for free" and cite the
+    /// paragraph below for all of it — but that test measures BYTES, so the word
+    /// "latency" was sourced by nothing. The bytes are here; the microseconds are in
+    /// `keylink/tests/mailbox_latency.rs` and are tabled under "What the number
+    /// means" above. Neither citation covers the other.
+    ///
+    /// `tests/actor_memory.rs`'s depth phase is that BYTE measurement, printing the
     /// per-actor cost at each depth. It runs at that file's `ACTORS_PER_DEPTH` —
     /// **two thousand** idle actors per depth — and that constant's own doc argues
     /// the count: phase 5 compares three systems against each other rather than

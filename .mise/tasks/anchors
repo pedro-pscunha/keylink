@@ -514,6 +514,18 @@ ANCHORS = [
     # count 0, which is loud and is what this gate is for.
     ("A5", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
      "        while inner.held > self.limits.pool_records.get()"),
+    # ── from `mailbox-latency`, which turned `SystemBuilder::mailbox_depth`'s latency
+    # prose into a number. ONE row, cross-file, and the anchor is the one line the
+    # knob consists of: every keyed mailbox is built from it, so substituting
+    # `DEFAULT_MAILBOX_DEPTH` for `self.mailbox_depth` there disables the whole
+    # builder method without touching the builder method.
+    #
+    # Counted with `grep -cF` at 96cf374 AFTER the record was written, in that order:
+    # **1** in the indented form and **1** bare. Cross-file, so the same-file trap the
+    # `A` rows document cannot arise — the record is in `tests/` and the code is in
+    # `src/`.
+    ("N1", "keylink/tests/mailbox_latency.rs", "keylink/src/actor/registry.rs",
+     "        let (mail, slots) = mpsc::channel(self.mailbox_depth);"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
