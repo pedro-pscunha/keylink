@@ -286,8 +286,12 @@ also **voids limit 2's remedy on every method outside the policy**, because
 `Unrecordable` refusal by configuration rather than by the method's shape, which
 keeps at-most-once and gives up the answer on purpose so that a caller's payload is
 not held for the 600 s of limit 3. It narrows limit 4's window from `MAX_TOMBSTONES`
-plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
-`docs/rfc-08-serving-side-keys.md`.
+plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. And `ServiceBuilder::limits`
+replaces the numbers themselves: every constant limits 3, 4 and 5 print is a default
+rather than a fixed value, which is how a service bounds its own memory instead of
+only its exposure. **The margin limit 4 names is the one to keep** — it is a property
+of the default, so narrowing it takes on the degradation that limit says a caller
+cannot detect. See `docs/rfc-08-serving-side-keys.md`.
 
 1. **There is no reliable `tell`.** A `tell` has no reply stream, so nothing can
    ack it, nothing can refuse it, and it does not accept a key — there is no reply

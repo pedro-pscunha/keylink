@@ -1069,6 +1069,51 @@ struct Inner {
 /// a derived one would publish every private field name as the readback nobody
 /// decided to offer.
 ///
+/// # Three shapes this type is not
+///
+/// Issue #3's precedent, applied to issue #13: an argument for refusing a shape
+/// belongs where somebody meets the shape, and that is here rather than in the
+/// issue that raised it.
+///
+/// **Public fields behind `#[non_exhaustive]`, rejected.** The pitch is a struct
+/// literal that names two bounds and takes the rest from `..Default::default()`,
+/// with the attribute keeping a tenth field non-breaking. **The two are mutually
+/// exclusive.** A `#[non_exhaustive]` struct cannot be built by literal from
+/// another crate at all — functional update included — so
+/// `Limits { pool_records: n, ..Default::default() }` does not compile outside
+/// `keylink`, and the syntax the design was wanted for is exactly the syntax the
+/// attribute removes. Drop the attribute and the field list is frozen for good
+/// instead.
+///
+/// **And the property the attribute was wanted for is already here without it.**
+/// The fields are private, so no dependent crate can write a struct literal for
+/// this type at all, and `Default` plus setters is the only construction route
+/// there is. A tenth private field with a tenth setter is therefore purely
+/// additive — which is what [`attach`](Self::attach) was, and it is why that
+/// addition is no more breaking after this crate is published than before. The
+/// attribute would buy nothing that privacy has not already bought.
+///
+/// **A constructor taking every bound at once, rejected.**
+/// `Limits::new(1024, 1048576, 8192, ..)` compiles with any two of its `usize`
+/// arguments transposed and [`Limits::default().pool_records(n)`](Self::pool_records)
+/// cannot, because the name is at the call site rather than in the position.
+/// [`attach`](Self::attach) is the second argument, arriving as evidence: it took
+/// this type from nine bounds to ten, which is one more positional parameter for
+/// every existing caller of such a constructor and no change at all for a caller of
+/// the setters.
+///
+/// **A setter returning `Result`, rejected.** The shape follows `Files::limit` in
+/// `keylink-persist`, whose own doc gives the reason a builder documents its floor
+/// rather than refusing at it: *"clamping upward is a silent fallback, and panicking
+/// on a configuration value is a crash where a refused store already says the same
+/// thing at the same volume. So the floor is a documented number."* Here the
+/// equivalent of that refused store is an [`IdempotencyRefusal`], and it arrives at
+/// the moment the bound binds, naming the bound. A `Result` at configuration time
+/// would report the same fact earlier and less specifically, and only for the bounds
+/// whose bad values are namable — which is not the set that matters, since
+/// [`tombstones`](Self::tombstones) is the field whose wrong value nothing reports
+/// at all.
+///
 /// # Two ways to configure this and have it bound nothing
 ///
 /// Both compile and both read as configured:

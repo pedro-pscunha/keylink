@@ -738,6 +738,24 @@ macro_rules! __keylink_service {
             /// For several services on one endpoint, build each with
             /// [`service`] and register them on a single
             /// [`Server`](keylink::Server): one router must own every ALPN.
+            ///
+            /// **It also decides three serving-side policies and takes no argument
+            /// for any of them.** It calls `build()` itself, so a caller never holds
+            /// the [`ServiceBuilder`](keylink::ServiceBuilder) and cannot reach
+            /// [`limits`](keylink::ServiceBuilder::limits),
+            /// [`records`](keylink::ServiceBuilder::records) or
+            /// [`keyable`](keylink::ServiceBuilder::keyable). What it picks is
+            /// `Keyable::Any`, so every method accepts an idempotency key;
+            /// `Records::Memory`, so replies are held in memory; and
+            /// [`Limits::default`](keylink::Limits::default) for the ledger's bounds.
+            /// To change any of the three, take the `service` plus
+            /// [`Server::builder`](keylink::Server::builder) route above — named
+            /// there for a different reason, and a reader wanting different bounds
+            /// has none to look for it.
+            ///
+            /// **Not a `Limits` parameter, deliberately.** Issue #13 refused a long
+            /// parameter list for that type, and a fourth way to build a service
+            /// costs more than a default a caller can read here.
             pub fn serve<H: Handler>(
                 node: &$crate::Node,
                 handler: H,
@@ -1993,6 +2011,20 @@ macro_rules! __keylink_service {
                 /// For several services on one endpoint, build each with
                 /// [`Self::service`] and register them on a single
                 /// [`Server`](keylink::Server): one router must own every ALPN.
+                ///
+                /// **It also decides three serving-side policies and takes no
+                /// argument for any of them**, exactly as the concurrent
+                /// [`serve`] does and for the same reason: it calls `build()`
+                /// itself, so a caller never holds the
+                /// [`ServiceBuilder`](keylink::ServiceBuilder) and cannot reach
+                /// [`limits`](keylink::ServiceBuilder::limits),
+                /// [`records`](keylink::ServiceBuilder::records) or
+                /// [`keyable`](keylink::ServiceBuilder::keyable). It picks
+                /// `Keyable::Any`, `Records::Memory` and
+                /// [`Limits::default`](keylink::Limits::default). To change any of
+                /// them, go through [`Self::service`] and
+                /// [`Server::builder`](keylink::Server::builder) — the route the
+                /// paragraph above names for a different reason.
                 ///
                 /// # The server holds the actor, and holds it past `shutdown`
                 ///
