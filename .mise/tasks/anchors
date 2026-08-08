@@ -161,28 +161,90 @@ for record, lives_in, target, literal in ANCHORS:
     if found == 1:
         continue
     bad += 1
+    same_file = lives_in == target
     if found == 0:
         reason = "IS GONE - `break-once.sh` aborts at its grep, before any backup"
-        likely = "the line was edited, or the formatter rewrapped it"
+        # Three causes, and the contributor's mental model differs for each: an edit
+        # they made, a reflow nobody made, or a neighbour arriving in a list.
+        likely = (
+            "one of: (a) the line was edited; (b) the FORMATTER rewrapped it, which "
+            "nobody wrote and nothing else would report; (c) POSITIONAL insertion - "
+            "a sibling appeared inside an ordered construct the anchor spans, so the "
+            "construct still exists and looks untouched"
+        )
+    elif same_file:
+        reason = f"IS NOT UNIQUE ({found}x) - `break-once.sh` aborts on its count assert"
+        likely = (
+            "the record itself now quotes it - the same-file trap - unless the anchor "
+            "is a FRAGMENT or a whole line whose text prefixes another, neither of "
+            "which indentation can disambiguate"
+        )
     else:
         reason = f"IS NOT UNIQUE ({found}x) - `break-once.sh` aborts on its count assert"
-        # At least three causes, and an earlier version of this line named only the
-        # first. It was wrong for three real failures at once on a sibling branch:
-        # two same-file FRAGMENTS and one cross-file PREFIX collision. A tool that
-        # prints the right paragraph for the wrong failure is this whole convention
-        # one level up, so it enumerates instead of guessing.
+        # NOT the same-file trap, and saying so matters: for a cross-file row the
+        # record's quote lives in a different file and CANNOT contribute to this
+        # count. An earlier version named it anyway, one line above the two lines
+        # that refute it - and a contributor sent to look for a cause that cannot
+        # apply, finding nothing wrong, reaches for the deletion this task argues
+        # against. Every registered row is cross-file, and the convention keeps it
+        # that way, so this is the arm that fires.
         likely = (
-            "one of: (a) the record itself now quotes it - the same-file trap; "
-            "(b) the anchor is a FRAGMENT, not a whole line, and no amount of "
-            "indentation makes a fragment unique; (c) the anchor is a whole line "
-            "whose text PREFIXES another line, which needs the trailing newline "
-            "too. Check which before editing - the remedy differs"
+            "a second occurrence appeared in the TARGET - a new call site, a copied "
+            "line, or a doc comment there quoting it. It may also be a PREFIX "
+            "COLLISION: your anchor is a whole line whose text begins another line, "
+            "and it needs its trailing newline to be unique"
         )
     print(f"FAIL {record}: the anchor {reason}", file=sys.stderr)
     print(f"       likely cause:    {likely}", file=sys.stderr)
     print(f"       record lives in: {lives_in}", file=sys.stderr)
     print(f"       break edits:     {target}", file=sys.stderr)
     print(f"       anchor:          {literal}", file=sys.stderr)
+    print(file=sys.stderr)
+
+# ── is the anchor a WHOLE LINE? (mode 4, latent) ──────────────────────────────
+#
+# A fragment resolves fine until the day it does not, and then no remedy applies:
+# indentation cannot disambiguate a mid-line span, and "re-quote against the line
+# as it now reads" presumes there is a line. So a fragment anchor is a mode-4
+# failure waiting for a sibling, worth naming while it is still green.
+#
+# Declared rather than forbidden, because one row already is one. The assertion is
+# that the set does not GROW - the safe kind of count, no false-success state - so
+# a new fragment reddens while this one stays visibly grandfathered.
+FRAGMENT_ANCHORS = {
+    # `$crate::__keylink_granted_id!(..)` sits inside a macro repetition, so the
+    # whole line would drag `)+` and a trailing comma into the anchor. Count is 1
+    # today. Left a fragment knowingly, and listed so the next one is not.
+    "R28",
+}
+
+fragments = set()
+for record, lives_in, target, literal in ANCHORS:
+    if target not in cache:
+        cache[target] = (ROOT / target).read_text()
+    body = cache[target]
+    at = body.find(literal)
+    if at < 0:
+        continue  # already reported above
+    starts = at == 0 or body[at - 1] == "\n"
+    ends = at + len(literal) >= len(body) or body[at + len(literal)] == "\n"
+    if not (starts and ends):
+        fragments.add(record)
+
+for record in sorted(fragments - FRAGMENT_ANCHORS):
+    bad += 1
+    print(f"FAIL {record}: the anchor is a FRAGMENT, not a whole line", file=sys.stderr)
+    print("       It resolves today and has no remedy on the day it stops:",
+          file=sys.stderr)
+    print("       indentation cannot disambiguate a mid-line span. Take the whole",
+          file=sys.stderr)
+    print("       line including its indentation, or describe the edit instead.",
+          file=sys.stderr)
+    print(file=sys.stderr)
+for record in sorted(FRAGMENT_ANCHORS - fragments):
+    bad += 1
+    print(f"FAIL {record}: listed in FRAGMENT_ANCHORS but its anchor is a whole "
+          "line now - drop it from that set", file=sys.stderr)
     print(file=sys.stderr)
 
 # ── and is it the literal the RECORD actually quotes? ─────────────────────────
