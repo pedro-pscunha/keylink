@@ -340,6 +340,41 @@ pub enum IdempotencyRefusal {
     /// stopped waiting part way through. Whether the work took effect is
     /// unknown, and no record can make it known. Decide out of band, then use a
     /// different key.
+    ///
+    /// # A panicked turn whose actor restarted lands here, and its mutation is gone
+    ///
+    /// A panicking turn is a dispatched turn, so the marker `Drop for Guard`
+    /// reads settles the key here. Where the actor is
+    /// [supervised](crate::LocalActor::spawn_supervised) **and** an
+    /// [`Observer`](crate::Observer) vetoes the fault — which the
+    /// [`Persist`](crate::Persist) adapter does, because *"a half-applied state
+    /// written to the disk is worse than the turn being lost"* — the incarnation
+    /// ends and `local.rs`'s `retryable` grants a restart whose *"state goes back
+    /// to its last commit"*. So this crate discarded the mutation and still
+    /// answers **unknown** rather than **nothing happened**: its own observer
+    /// chain held the fact, and the refusal a caller receives declines to use it.
+    /// Where no observer vetoes the fault nothing restarts, because
+    /// `observed_turn` returns no ending for a fault nobody refused — the actor
+    /// carries on holding whatever the turn mutated, which is what
+    /// `tests/actors.rs::a_keyed_call_whose_turn_panicked_settles_the_key_interrupted`
+    /// pins, and there this refusal is the plain truth.
+    ///
+    /// **It stays open on purpose, and the reason is not that a test would have to
+    /// change.** The state is not the only place a turn leaves a mark. A handler
+    /// that mutated `&mut self` can have charged a card, written a row or called a
+    /// peer in the same body, and a state restored from its last commit restores
+    /// none of that. What the restart discarded is the effect on the state this
+    /// crate holds; what a retry would repeat is the effect on everything the
+    /// handler touched, and that set is the caller's to know rather than this
+    /// crate's. Promoting *the state did not survive* into *the work did not
+    /// happen* would answer a question only the caller can answer, so the
+    /// ambiguity is named instead and
+    /// [`key_state`](crate::RpcClient::key_state) asks about it without running
+    /// anything. The guard that holds the current answer is
+    /// `tests/singleton.rs::a_refused_turn_does_not_settle_its_key_as_the_refusal`:
+    /// it vetoes a turn whose mutation, in that test's own words, *"lived in
+    /// memory and never reached a store"*, and demands this refusal on the retry
+    /// anyway.
     #[error("a call with this key was interrupted - whether it took effect is unknown")]
     Interrupted,
 
