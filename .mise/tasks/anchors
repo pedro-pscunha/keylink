@@ -226,9 +226,15 @@ for record, lives_in, target, literal in ANCHORS:
     at = body.find(literal)
     if at < 0:
         continue  # already reported above
-    starts = at == 0 or body[at - 1] == "\n"
-    ends = at + len(literal) >= len(body) or body[at + len(literal)] == "\n"
-    if not (starts and ends):
+    # Whether the anchor SPANS a complete line, not whether it was quoted with its
+    # indentation. Records quote line content without leading whitespace as a matter
+    # of course, and that is fine: `break-once.sh` matches the substring either way.
+    # A first version of this check tested for a leading newline and flagged eight of
+    # nine rows - it was measuring quoting style, not the mode-4 hazard.
+    start = body.rfind("\n", 0, at) + 1
+    end = body.find("\n", at)
+    line = body[start:] if end < 0 else body[start:end]
+    if line.strip() != literal.strip():
         fragments.add(record)
 
 for record in sorted(fragments - FRAGMENT_ANCHORS):
