@@ -34,3 +34,20 @@ pastey = "0.2"
 all = { level = "deny", priority = -1 }
 expect_used = "deny"
 unwrap_used = "deny"
+
+# ── the dev profile ─────────────────────────────────────────────────────────
+
+[profile.dev]
+# Full debuginfo is what the gate was paying for, and nothing in the gate reads
+# it. `line-tables-only` keeps what a panic backtrace actually uses — file and
+# line — and drops the type and variable descriptions a debugger wants. Run
+# `CARGO_PROFILE_DEV_DEBUG=2 cargo test …` for the session where you attach LLDB.
+#
+# It cuts bytes written and it cuts link time, which is the one part of a Rust
+# build that no cache can skip: sccache caches compilation, never linking.
+#
+# `split-debuginfo` is deliberately NOT set here. macOS already defaults to
+# `unpacked` — verified by the absence of any `.dSYM` bundle in `target/debug` —
+# so writing it down would be a line that changes nothing and still has to be
+# maintained.
+debug = "line-tables-only"

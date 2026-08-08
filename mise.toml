@@ -34,6 +34,52 @@
 # everywhere, including on a CI image that does not ship ripgrep.
 "aqua:BurntSushi/ripgrep" = "14.1.1"
 
+# The shared compilation cache. Pinned for the same reason as the two above: a
+# cache that is present on one machine and absent on another produces two
+# different build times and one confused bug report.
+"aqua:mozilla/sccache" = "0.17.0"
+
+# Test runner. `cargo test` runs test BINARIES one after another; this runs them
+# as parallel processes. Measured here: 34 binaries, 73.4s serial.
+#
+# `ubi:` and not `aqua:` — there is no aqua registry entry for nextest. Two
+# things this line has to spell out, both of which fail as a 404 or an empty
+# archive if you drop them: releases are tagged `cargo-nextest-<version>` rather
+# than the bare version, and the binary inside the archive is `cargo-nextest`
+# while the repository is `nextest`.
+"ubi:nextest-rs/nextest[exe=cargo-nextest]" = "cargo-nextest-0.9.143"
+
+# ── the build environment ───────────────────────────────────────────────────
+
+[env]
+# **Why a cache and not a shared target directory.**
+#
+# Ten agents on ten worktrees is the working pattern here, and cargo offers no
+# safe way for them to share build output. Sharing one `CARGO_TARGET_DIR` takes
+# cargo's per-directory lock, which serializes every worktree, AND races: one
+# build overwrites an `.rmeta` another rustc is still reading. rust-lang/cargo
+# issue 16804 documents both, and states there is no third option in cargo.
+#
+# `keylink/tests/drift.rs` makes it worse than that — it runs `cargo build`
+# inside a test, so a shared lock would deadlock it against any other worktree's
+# gate.
+#
+# So each worktree keeps its OWN target directory, which is what makes the
+# agents independent, and the sharing happens one layer down in sccache.
+# Registry dependencies compile from the same path in every worktree, so they
+# hit the cache across worktrees; only this workspace's own crates miss.
+RUSTC_WRAPPER = "sccache"
+
+# Not a preference — sccache cannot cache an incremental build, so leaving this
+# on silently disables the cache. It is also the disk lever: measured across 13
+# worktrees, `target/debug/incremental` was 107 GiB, 45% of ALL build bytes,
+# while duplicated dependency artifacts were only about 29 GiB. Incremental
+# state is per-worktree and no cache can ever deduplicate it.
+#
+# The cost is a slower single-worktree edit loop. Override it per shell with
+# `CARGO_INCREMENTAL=1` when you are iterating by hand rather than gating.
+CARGO_INCREMENTAL = "0"
+
 # ── the whole gate ──────────────────────────────────────────────────────────
 
 [tasks.gate]
@@ -121,8 +167,23 @@ run = [
 # ── tests ───────────────────────────────────────────────────────────────────
 
 [tasks.test]
-description = "The whole workspace"
-run = "cargo test --workspace"
+description = "The whole workspace, binaries in parallel, then the doctests"
+# `cargo test` runs test BINARIES one after another. Measured on this workspace:
+# 34 binaries, 73.4s of execution, of which one binary was 30.2s and the rest of
+# the machine sat idle. nextest runs them as parallel processes.
+#
+# **The second line is not redundant. nextest NEVER runs doctests.**
+# `cargo test --workspace` was running 22 of them at default features, and
+# `features` runs doctests only at the no-default and `file` ends — a different
+# set. Delete the `--doc` line and the `Versioned` doctest hole reopens, which
+# is the hole `.mise/tasks/features` was extended to close in the first place.
+#
+# `--no-fail-fast` on the doctest line so a doctest failure still reports every
+# other doctest, matching what nextest does for the binaries above it.
+run = [
+    "cargo nextest run --workspace",
+    "cargo test --workspace --doc --no-fail-fast",
+]
 
 [tasks.examples]
 description = "Every example RUNS. Building one asserts nothing"

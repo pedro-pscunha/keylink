@@ -10,7 +10,7 @@ use std::sync::Arc;
 use keylink::{Allowlist, Context, Node, Peer};
 
 mod common;
-use common::local_node;
+use common::{local_node, local_node_with_idle_timeout};
 
 keylink::service! {
     service Meter;
@@ -166,7 +166,11 @@ async fn a_disconnected_peer_dials_again_on_the_next_call() {
 /// that can react to it.
 #[tokio::test]
 async fn a_peer_gives_up_rather_than_retrying_forever() {
-    let caller = local_node().await;
+    // The dial below cannot succeed — the server is closed — so what is being
+    // waited out is QUIC's idle timeout, and its 30s default made this one test
+    // the slowest thing in the suite by an order of magnitude. A 2s ceiling
+    // changes how long the failure takes to arrive, never whether it arrives.
+    let caller = local_node_with_idle_timeout(std::time::Duration::from_secs(2)).await;
     let addr = {
         let doomed = local_node().await;
         let addr = doomed.endpoint().addr();
@@ -187,8 +191,14 @@ async fn a_peer_gives_up_rather_than_retrying_forever() {
     // One-sided on purpose: load can only make this slower, so a pass under a
     // generous ceiling still means "bounded" rather than "forever". A retry
     // loop would blow through it by orders of magnitude.
+    //
+    // 30s and not the old 120s. The caller above now gives up on an idle
+    // connection after 2s and the handle re-dials once, so the honest cost is a
+    // few seconds and the ceiling is still an order of magnitude above it.
+    // It is a ceiling, never a measurement — do not tighten it toward the
+    // observed time, because that turns a machine under load into a red gate.
     assert!(
-        elapsed < std::time::Duration::from_secs(120),
+        elapsed < std::time::Duration::from_secs(30),
         "gave up in {elapsed:?}, which is bounded"
     );
 }
