@@ -2715,6 +2715,31 @@ mod tests {
         ///   which was 36 + 31 + 26 and counted the frame the ceiling now refuses —
         ///   a sum this test can no longer reach.
         /// - `tombstones(4)` fires `evict`'s tombstone loop.
+        ///
+        /// # This guard has NO one-literal break, and that is a finding rather than a gap
+        ///
+        /// **Raising `pool_bytes` does not redden it.** What is asserted here is that
+        /// the counters agree with the maps; removing a *trigger* reduces what the
+        /// test covers without making any counter disagree with any map. So the
+        /// obvious break is a **silent coverage reduction** — which is precisely the
+        /// failure the four clauses above exist to prevent, so proposing it as this
+        /// guard's break would be that failure wearing the shape of its own remedy.
+        ///
+        /// The honest consequence: **the four bounds are a reviewable statement, not a
+        /// reddenable one.** No one-literal substitution expresses "this number no
+        /// longer fires the loop it was chosen for", because the loop not firing is
+        /// invisible from the assertions. A break was NOT invented to fill the slot.
+        ///
+        /// What a bad pool-versus-frame mapping *does* redden, and where to look if
+        /// one is suspected:
+        ///
+        /// - `the_recorded_bytes_stay_inside_their_bound` — asserts the pool sum, so
+        ///   `pool_bytes` writing `frame_bytes` fails it.
+        /// - `a_reply_over_the_frame_ceiling_is_not_replayed` — asserts the ceiling's
+        ///   refusal, so `frame_bytes` writing `pool_bytes` fails it.
+        ///
+        /// Between them those two hold the mapping. This test holds the arithmetic,
+        /// and its four clauses are what a reviewer checks by reading.
         #[test]
         fn the_counters_agree_with_the_maps_on_every_path() {
             let ledger = bounded(
