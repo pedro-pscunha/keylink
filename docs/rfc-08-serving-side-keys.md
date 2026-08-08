@@ -641,6 +641,44 @@ over-wide reading of this rule left a reviewer hand-constructing working Rust to
 reproduce a record that could simply have shown it. Describe what you searched for;
 quote what you put in its place.
 
+#### The default is QUOTE, and this document had it backwards
+
+Everything above reads as though describing were the safe side. **It is the ungated
+side, and that is the opposite.**
+
+> Keep a quote wrongly → `mise run anchors` reddens: loud, cheap, one edit.
+> Describe wrongly → **nothing checks it at all**, and a description that does not
+> locate the edit is shippable.
+
+That asymmetry cashed out in the *first three conversions ever made under this rule*.
+One of them — `a_keyed_actor_service_applies_the_same_policy` — was converted to
+*"the `.keyable(..)` call in its fixture above"*. That test has **no fixture**; it
+builds inline, below the comment. What is above is a fixture four *other* tests use,
+whose `.keyable(..)` takes the policy as an argument. Editing the line the description
+sends you to gives `1 passed; 0 failed`.
+
+**A reader following it would have concluded the guard was vacuous, which is false —
+and that is worse than the rot it replaced.** A stale anchor aborts loudly at
+`break-once.sh`'s precondition. A misdirecting description reddens nothing and looks
+like a finding.
+
+So:
+
+> **Quote by default, because the gate covers you. Describe only where quoting
+> provably cannot work — and replay a converted record from its description alone,
+> before its entry leaves the list.**
+
+The replay is the part with teeth. Dropping an entry is four deleted lines; re-quoting
+means finding the new text. The incentive runs toward describing, so the conversion has
+to carry a cost that catches a description which does not locate the edit — and only a
+replay does.
+
+**And the axis is post-hoc, which is worth admitting.** Calling an anchor "line-local"
+means predicting no future edit reflows it, and `R26b`/`R26c` are function signatures —
+the same construct that rotted on `ledger_for`. So the axis decides where quoting is
+**impossible**, not where it is unnecessary. Where it is merely fragile, quote it and
+let the gate carry the fragility.
+
 #### The third mode: a positional anchor
 
 A mechanical sweep after this wave merged found a rot mode neither rule above
@@ -650,11 +688,29 @@ anchor to **count 0**. The record and its target are in different files, so the
 same-file rule permits the quote; nothing rewrapped, so the formatter rule says
 nothing. What moved was **a sibling's presence in an ordered list**.
 
-The question that reaches all three: **is the anchor's uniqueness a property of the
-line, or of its neighbours?** A `pub use` list item's text is a property of its
-neighbours, and a `pub use` list is the most-added-to construct in a crate — so
-re-quoting buys only until the next export lands, and it would put that chore on
-whoever adds it. Describe those.
+#### The fourth mode: a fragment, or a line that prefixes another
+
+Found on a sibling branch by the same sweep. Three anchors aborted for one reason: the
+quoted span was **not a whole line**, so the documented remedy — *pass the line with
+its indentation* — could not make it unique.
+
+- `DIGEST_BYTES: usize = 16` sits at **column 0**: there is no indentation to add.
+- `pop_front()` is **mid-line**: indentation is irrelevant to a fragment.
+- `self.call` with its indentation is a **prefix of both** candidate lines, so
+  following the remedy exactly still gives 2. It needs the **trailing newline**, which
+  no record anywhere mentions.
+
+So the rule gains a clause: **a quoted anchor must be a whole line, including its
+indentation, and for a line whose text prefixes another it must include the trailing
+newline.** The abort reads as the harness failing when it is the record that is wrong.
+
+#### The question that reaches all four
+
+**Is the anchor's uniqueness a property of the line, or of its neighbours?** — with the
+sharpening mode 4 forces, that **a fragment is not a line at all**. A `pub use` list
+item's text is a property of its neighbours, and a `pub use` list is the most-added-to
+construct in a crate, so re-quoting buys only until the next export lands and would put
+that chore on whoever adds it. Describe those.
 
 #### `mise run anchors`, because reading does not find these
 

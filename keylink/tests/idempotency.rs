@@ -434,8 +434,8 @@ async fn a_refused_key_never_reaches_the_ledger() {
 /// early return, gone. Watched: `panicked at ..,
 /// a call with no key needs no policy: Remote(Idempotency(InFlight))`.
 ///
-/// **That break reddens FIVE tests, and the breadth is the finding rather than a
-/// weakness of this one.** An earlier version of this record said four and listed
+/// **That break is wide, and the breadth is the finding rather than a weakness of
+/// this one.** An earlier version of this record said four and listed
 /// four; the fifth,
 /// `an_attacher_on_a_recordless_service_waits_and_is_told_it_ran`, was added to this
 /// same branch after the record was written — which is precisely why a record must
@@ -443,7 +443,8 @@ async fn a_refused_key_never_reaches_the_ledger() {
 ///
 /// **And the first version of this paragraph then said five and listed four**,
 /// omitting the very test it had just named as the fifth. The same error one level
-/// down: a list presented as complete. So the count goes and the list stays —
+/// down: a list presented as complete. So this record names them and counts
+/// nothing —
 /// `a_call_without_a_key_runs_every_time`, `a_refusal_is_recorded_and_replayed`,
 /// `a_second_caller_attaches_to_a_live_key`,
 /// `an_attacher_on_a_recordless_service_waits_and_is_told_it_ran`, and this test.

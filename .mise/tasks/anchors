@@ -31,8 +31,20 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 # 3. **A positional anchor.** A record anchored on a slice of `lib.rs`'s
 #    `pub use` list. A later wave inserted one more export into the middle of
 #    that slice: count 0. Cross-file and nothing rewrapped, so neither rule
-#    above reaches it. The question that does: **is the anchor's uniqueness a
-#    property of the line, or of its neighbours?**
+#    above reaches it. What moved was a sibling's presence in an ordered list.
+# 4. **A fragment, or a line whose text prefixes another.** The standard advice
+#    is "pass the line WITH its indentation", and for these it does not work:
+#    a `const` at column 0 has no indentation to add; a mid-line fragment like
+#    `pop_front()` is not disambiguated by indentation at all; and a line whose
+#    indented text is a PREFIX of another line still counts 2 unless the anchor
+#    carries the trailing NEWLINE, which no record thinks to mention. So an
+#    anchor must be a **whole line, including indentation, plus the newline when
+#    its text prefixes another line.** The abort reads as the harness failing
+#    when it is the record that is wrong.
+#
+# The question that reaches all four: **is the anchor's uniqueness a property of
+# the LINE, or of its NEIGHBOURS?** — with the sharpening mode 4 forces, that a
+# fragment is not a line at all.
 #
 # ── why this list is written out by hand ────────────────────────────────────
 #
@@ -54,6 +66,14 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 # "registered" for that reason. When you write a record that quotes a search
 # literal, add it. Nothing will notice if you do not, which is the one hole this
 # task cannot close from the inside.
+#
+# **And it checks ANCHORS, never MESSAGES.** A record's watched output is a claim
+# about which assertion fires first, and that rots when an assertion is added
+# ABOVE the recorded one — the guard stays correct, the test still fails, and only
+# comparing the recorded sentence against a fresh run finds it. No count and no
+# resolution check can see that. `scripts/replay-fate-breaks.sh` is the tool for
+# it, on the set it covers; this task deliberately answers the narrower question
+# of whether the break can be STARTED at all.
 import pathlib
 import subprocess
 import sys
@@ -120,7 +140,18 @@ DESCRIBED = [
      "export lands"),
 ]
 
+def flat(text: str) -> str:
+    """Whitespace-collapsed, so a literal wrapped across `///` lines still matches.
+
+    A record's quote is broken by the comment's own wrapping; the target's copy is
+    not. Comparing them raw finds nothing and reports a false failure - the same
+    trap a plain `grep -c` over a record hits.
+    """
+    return " ".join(text.split())
+
+
 cache: dict[str, str] = {}
+flatcache: dict[str, str] = {}
 bad = 0
 
 for record, lives_in, target, literal in ANCHORS:
@@ -135,12 +166,91 @@ for record, lives_in, target, literal in ANCHORS:
         likely = "the line was edited, or the formatter rewrapped it"
     else:
         reason = f"IS NOT UNIQUE ({found}x) - `break-once.sh` aborts on its count assert"
-        likely = "often the record itself now quotes it: the same-file trap"
+        # At least three causes, and an earlier version of this line named only the
+        # first. It was wrong for three real failures at once on a sibling branch:
+        # two same-file FRAGMENTS and one cross-file PREFIX collision. A tool that
+        # prints the right paragraph for the wrong failure is this whole convention
+        # one level up, so it enumerates instead of guessing.
+        likely = (
+            "one of: (a) the record itself now quotes it - the same-file trap; "
+            "(b) the anchor is a FRAGMENT, not a whole line, and no amount of "
+            "indentation makes a fragment unique; (c) the anchor is a whole line "
+            "whose text PREFIXES another line, which needs the trailing newline "
+            "too. Check which before editing - the remedy differs"
+        )
     print(f"FAIL {record}: the anchor {reason}", file=sys.stderr)
     print(f"       likely cause:    {likely}", file=sys.stderr)
     print(f"       record lives in: {lives_in}", file=sys.stderr)
     print(f"       break edits:     {target}", file=sys.stderr)
     print(f"       anchor:          {literal}", file=sys.stderr)
+    print(file=sys.stderr)
+
+# ── and is it the literal the RECORD actually quotes? ─────────────────────────
+#
+# Without this the task is the very defect it exists to catch, one level up: it
+# hardcodes a COPY of a value that lives in a doc comment in another file, so a
+# rebase that correctly re-quotes a record and forgets this list leaves the gate
+# validating a string no record uses - green.
+#
+# `local.rs`'s `no_failure_prefix_is_a_prefix_of_another` is NOT the precedent for
+# a hand-written list of copies. Its own comment says it "names the consts rather
+# than the strings, so it cannot drift from the wire" - hand-written *references*
+# to one source of truth. A doc comment cannot be referenced from Python, so the
+# copy is unavoidable here; what was avoidable is leaving it unchecked.
+for record, lives_in, target, literal in ANCHORS:
+    if lives_in not in flatcache:
+        flatcache[lives_in] = flat((ROOT / lives_in).read_text())
+    if flat(literal) in flatcache[lives_in]:
+        continue
+    bad += 1
+    print(f"FAIL {record}: this task's literal is NOT QUOTED by its own record",
+          file=sys.stderr)
+    print(f"       record lives in: {lives_in}", file=sys.stderr)
+    print(f"       task's literal:  {literal}", file=sys.stderr)
+    print("       The record was re-quoted and this list was not, or the row names",
+          file=sys.stderr)
+    print("       the wrong record. The RECORD is the source of truth; follow it.",
+          file=sys.stderr)
+    print(file=sys.stderr)
+
+# ── population tripwire ───────────────────────────────────────────────────────
+#
+# A count, deliberately, and the safe kind: it can only fail LOUDLY. There is no
+# state in which it passes while wrong, which is what separates it from the
+# whole-target pass/fail counts this convention retired. The rule is not "never
+# write a count" - it is "never write a count that can pass while wrong".
+#
+# What it buys: ADDING a break record forces a decision about registering it,
+# instead of this list silently falling further behind a growing population.
+RECORD_BLOCKS = 98
+
+blocks = 0
+for path in sorted(
+    list((ROOT / "keylink").rglob("*.rs")) + list((ROOT / "keylink-persist").rglob("*.rs"))
+):
+    run, found = [], []
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("///", "//!", "//")):
+            run.append(stripped)
+        else:
+            if run:
+                found.append(" ".join(run))
+            run = []
+    if run:
+        found.append(" ".join(run))
+    blocks += sum(1 for b in found if "break-once.sh" in b)
+
+if blocks != RECORD_BLOCKS:
+    bad += 1
+    print(f"FAIL population: {blocks} comment blocks mention break-once.sh, but "
+          f"RECORD_BLOCKS says {RECORD_BLOCKS}.", file=sys.stderr)
+    print("       A record was added or removed. Decide whether it needs a row",
+          file=sys.stderr)
+    print("       above - most will not, and that is fine - then update this",
+          file=sys.stderr)
+    print("       number. This exists so the decision is forced, not skipped.",
+          file=sys.stderr)
     print(file=sys.stderr)
 
 if bad:
@@ -166,8 +276,14 @@ if bad:
         "    of the line - a `pub use` list item, a slice of an ordered list -\n"
         "    where re-quoting only buys until the next sibling lands.\n"
         "\n"
-        "  In both, describe the search edit in the record instead. Quote the\n"
-        "  REPLACEMENT either way: `break-once.sh` never searches it.\n"
+        "  In both - and ONLY in those two - describe the search edit instead.\n"
+        "  Quote the REPLACEMENT either way: `break-once.sh` never searches it.\n"
+        "\n"
+        "  AND REPLAY THE RECORD FROM ITS NEW DESCRIPTION BEFORE DROPPING THE ROW.\n"
+        "  A description is ungated: nothing checks that it locates the edit. The\n"
+        "  first three conversions made under this rule included one that sent a\n"
+        "  reader to a line where the guard passes, which reads as `this guard is\n"
+        "  vacuous` and is false. Quoting is the safe side BECAUSE of this gate.\n"
         "\n"
         "Deleting an entry is the shortest path to green and it is usually the\n"
         "wrong one: it makes the record unchecked rather than correct. If you are\n"
