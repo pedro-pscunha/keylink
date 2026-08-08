@@ -111,6 +111,39 @@
 //! kinds out of five, and a compile error that needs a decision for the rest —
 //! which is the honest version of what §5.3 promised.
 //!
+//! # Blocking work in a handler, and which thread pays for it
+//!
+//! A turn is the unit of serialization, so a handler that spends 400 ms holds its
+//! actor for 400 ms **however it spends them**. That much is the actor model
+//! working. What the handler chooses is who *else* pays.
+//!
+//! `tokio::task::spawn_blocking(..).await` moves the work to the blocking pool and
+//! yields: the turn is occupied, and the runtime's worker thread is free. Blocking
+//! the thread **synchronously** occupies both — the turn *and* a worker — so
+//! unrelated tasks on that runtime stall. With `W` workers it takes `W` concurrent
+//! synchronous blocks to stop the runtime outright and fewer to degrade it; on a
+//! current-thread runtime one is enough to stop everything. `blocking::Node` runs a
+//! multi-threaded runtime on purpose, so a program built on it degrades rather than
+//! stops — the rule is the same and the blast radius is not.
+//!
+//! **Nothing reports this.** No error is produced, no lint fires, and the actor is
+//! correct from its own point of view; the damage lands on tasks that have nothing
+//! to do with it. That is the profile of a defect that ships, which is the reason
+//! this paragraph exists at all.
+//!
+//! `keylink-persist/src/file.rs` is the worked example, on both of its blocking
+//! calls — a lock-file open, and a write plus `sync_all` plus rename — and it is the
+//! reference for what belongs in the pool: bounded work that returns. For work that
+//! never returns, a parked actor loop or a blocking `recv` of your own, the pool is
+//! the wrong tool and a dedicated `std::thread` is the right one, because a pool
+//! slot never given back is a slot every other caller waits for.
+//!
+//! `spawn_blocking` does **not** make one actor concurrent: the next call still
+//! waits for this turn to return. That is the turn doing its job rather than a cost
+//! of the pool, and it is the belief worth checking, because moving work off the
+//! worker feels like parallelism and is not. Both halves are guarded in
+//! `tests/blocking_work.rs`.
+//!
 //! # A panic reaches the caller of an `ask`
 //!
 //! If the handler panics, the panic is caught so the **actor survives**, and
