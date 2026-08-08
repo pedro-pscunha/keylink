@@ -78,6 +78,7 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 # it, on the set it covers; this task deliberately answers the narrower question
 # of whether the break can be STARTED at all.
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -223,7 +224,7 @@ def flat(text: str) -> str:
 
 
 cache: dict[str, str] = {}
-flatcache: dict[str, str] = {}
+spancache: dict[str, set[str]] = {}
 bad = 0
 
 for record, lives_in, target, literal in ANCHORS:
@@ -258,8 +259,8 @@ for record, lives_in, target, literal in ANCHORS:
         # count. An earlier version named it anyway, one line above the two lines
         # that refute it - and a contributor sent to look for a cause that cannot
         # apply, finding nothing wrong, reaches for the deletion this task argues
-        # against. Every registered row is cross-file, and the convention keeps it
-        # that way, so this is the arm that fires.
+        # against. The split is 11 cross-file and 8 same-file, so BOTH arms fire in
+        # practice and which one you get is decided by the row, not by the list.
         likely = (
             "a second occurrence appeared in the TARGET - a new call site, a copied "
             "line, or a doc comment there quoting it. It may also be a PREFIX "
@@ -343,16 +344,62 @@ for record in sorted(FRAGMENT_ANCHORS - fragments):
 # than the strings, so it cannot drift from the wire" - hand-written *references*
 # to one source of truth. A doc comment cannot be referenced from Python, so the
 # copy is unavoidable here; what was avoidable is leaving it unchecked.
+#
+# ── the haystack is BACKTICKED SPANS IN COMMENTS, and both narrowings were bugs
+#
+# A first version searched the whole of `lives_in`, and that made this check a
+# TAUTOLOGY for every same-file row: `lives_in == target`, so the CODE LINE
+# satisfies the search by itself and the record need not quote anything at all.
+# It was sound only while every row was cross-file. The rows registered from
+# `call-id` took same-file from 0 to 8 of 19, and the check went inert for those 8
+# without a single line of it changing - measured by re-quoting one record's
+# literal, leaving its code alone, and watching the task still print `ok:`.
+#
+# Restricting to COMMENT LINES fixes that. Restricting further to what the comment
+# BACKQUOTES, and demanding EQUALITY rather than containment, fixes a second hole
+# in the same expression: `flat` collapses `        self.call\n` to `self.call`,
+# which is a substring of the prose `self.call = call;`, `self.call.and(None)` and
+# `self.call.filter(..)` in that same record. Four spans CONTAIN it and exactly one
+# EQUALS it, so equality is what distinguishes the record's search quote from its
+# own replacement literals.
+#
+# **Not by comparing indentation, which cannot work here.** The obvious reading -
+# "compare the quoted form with its indentation" - reddens 9 of the 19 rows,
+# measured. Records quote UNINDENTED on purpose: that is the whole mechanism that
+# leaves the indented literal unique in the target (mode 1). Only C8's record
+# quotes its anchor with the indentation, and a rule derived from that one row
+# breaks the nine that follow the convention.
+#
+# Lines are joined BEFORE the spans are cut out, so a quote the comment wrapped
+# across two `///` lines is still one span.
+def quoted_spans(path: str) -> set[str]:
+    """Every backticked span inside a comment of `path`, whitespace-flattened."""
+    kept: list[str] = []
+    for line in (ROOT / path).read_text().splitlines():
+        stripped = line.strip()
+        for marker in ("///", "//!", "//"):
+            if stripped.startswith(marker):
+                kept.append(stripped[len(marker):])
+                break
+    return {flat(span) for span in re.findall(r"`([^`]*)`", " ".join(kept))}
+
+
 for record, lives_in, target, literal in ANCHORS:
-    if lives_in not in flatcache:
-        flatcache[lives_in] = flat((ROOT / lives_in).read_text())
-    if flat(literal) in flatcache[lives_in]:
+    if lives_in not in spancache:
+        spancache[lives_in] = quoted_spans(lives_in)
+    if flat(literal) in spancache[lives_in]:
         continue
     bad += 1
     print(f"FAIL {record}: this task's literal is NOT QUOTED by its own record",
           file=sys.stderr)
     print(f"       record lives in: {lives_in}", file=sys.stderr)
     print(f"       task's literal:  {literal}", file=sys.stderr)
+    print("       Looked for it as a `backticked` span inside a COMMENT of that",
+          file=sys.stderr)
+    print("       file, compared whole rather than as a substring - so neither the",
+          file=sys.stderr)
+    print("       code line nor a longer quote containing it will satisfy this.",
+          file=sys.stderr)
     print("       The record was re-quoted and this list was not, or the row names",
           file=sys.stderr)
     print("       the wrong record. The RECORD is the source of truth; follow it.",
