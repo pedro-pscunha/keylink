@@ -1313,10 +1313,12 @@ impl Serving {
 ///   one-line anchor stops existing, which `break-once.sh` reports as an abort and
 ///   a careless reader reports as green.
 /// - in `keylink/src/middleware.rs`, make `Context::call`'s body answer nothing —
-///   described rather than quoted, because `        self.call` is a **prefix** of
-///   `        self.call = call;` in `with_call`, so it counts 2 even with its
-///   indentation and the usual remedy does not reach it. Replacement, quoted
-///   because it is never searched: `self.call.and(None)`. Watched:
+///   search for `        self.call` **with its indentation AND its trailing
+///   newline** — the newline is load-bearing and no other record in this repo
+///   mentions one: without it the text is a prefix of `        self.call = call;`
+///   in `with_call` and counts 2, so the documented "pass the line with its
+///   indentation" remedy is not enough here. Replacement, quoted because it is
+///   never searched: `self.call.and(None)`. Watched:
 ///   `the retry is answered with the FIRST run's balance, out of the state`,
 ///   `left: 100 right: 50`.
 #[tokio::test]
@@ -1698,9 +1700,9 @@ impl Booking {
 ///
 /// On `keylink/src/middleware.rs`'s `pub fn call` body:
 ///
-/// - answer nothing from `Context::call`'s body — described, for the prefix reason
-///   the restart test's record spells out. Replacement: `self.call.and(None)`. So no
-///   turn is named at all. Watched:
+/// - `        self.call` **plus its trailing newline** → `self.call.and(None)`, per
+///   the newline note in the restart test's record. So no turn is named at all.
+///   Watched:
 ///   `and recorded the call it applied, on the same snapshot as the debit`,
 ///   `left: 0 right: 1`.
 ///
@@ -1716,9 +1718,8 @@ impl Booking {
 ///   assertion fires first**, so it rots when an assertion is added *above* the
 ///   recorded one — a value the record does not control. `break-once.sh`'s exit
 ///   code cannot see it, because the test still fails.
-/// - make that same body drop the id for one method only. Replacement:
-///   `self.call.filter(|_| self.method() != "Approve")`. The releasing turn then
-///   loses its own name. Watched:
+/// - the same anchor → `self.call.filter(|_| self.method() != "Approve")`, so the
+///   releasing turn loses its own name. Watched:
 ///   `and the keyed approval carried its own`, `left: "-" right: "-"`.
 ///
 /// On the record's placement, which is step 1's guard — in this file,

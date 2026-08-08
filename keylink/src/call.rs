@@ -187,11 +187,25 @@ const DIGEST_BYTES: usize = 16;
 ///
 /// **Read that against your turn, not against a byte budget.** Beside a 7.6 ms
 /// `fsync` turn, 91.7 µs is 1.2% and invisible. Beside the fast adapter this very
-/// section invites — 14.0 µs for an unobserved turn on the same run — it is **6.5×
-/// the entire turn**, and the set is then the dominant cost of the thing it is
-/// riding on. The turn rate a caller is told to measure two paragraphs up is
-/// therefore **partly a function of the bound they are choosing**, which is
-/// circular, and the way out is to measure at the bound you intend to run.
+/// section invites it is **6.5× the entire turn**, and the set is then the dominant
+/// cost of the thing it is riding on.
+///
+/// That ratio divides by **14.0 µs, not by the 12.8 µs tabled in
+/// [`Persist`](crate::Persist)** — two figures for one quantity, so which one and
+/// why. 14.0 µs is what `the_per_turn_store_cost` printed for its unobserved turn
+/// **on the same `--ignored` run that produced the 91.7 µs above**, and a ratio
+/// wants both halves from one run: same machine state, same thermal state, same
+/// build. Against the tabled 12.8 µs the same 91.7 µs is 7.2×, and if you are
+/// checking the arithmetic against `persist.rs`'s table that is the number you
+/// will get. Both are right about different runs; neither is wrong.
+///
+/// The µs vary 6–11% run to run while the byte counts reproduce exactly, which is
+/// the ordinary shape of a timing measurement and the reason the ratio is stated to
+/// one figure rather than two.
+///
+/// The turn rate a caller is told to measure two paragraphs up is therefore
+/// **partly a function of the bound they are choosing**, which is circular, and the
+/// way out is to measure at the bound you intend to run.
 ///
 /// So: raise it with [`Applied::bounded`] if your callers back off for longer than
 /// your actor takes to fill it — and **lower it if your turns are cheap**, because

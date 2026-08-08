@@ -351,7 +351,8 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
    **And the set is a term in that turn rate, so measure at the bound you mean to
    run.** `Persist` re-encodes the whole state every completed turn, so an `Applied`
    costs its entries on every turn whether one changed or not — 4096 entries is
-   ~92 µs, which is 1.2% of an `fsync` turn and **6.5× a non-syncing one**. Raise the
+   ~92 µs, which is 1.2% of an `fsync` turn and **6.5× a non-syncing one** — that
+   ratio and its denominator are sourced in `APPLIED_BOUND`'s rustdoc. Raise the
    bound for slow callers; lower it for cheap turns. `APPLIED_BOUND`'s rustdoc has the
    measured table.
 
