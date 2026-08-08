@@ -1600,11 +1600,22 @@ async fn attaching_to_a_settled_key_does_not_wait() {
         .expect("replays");
 
     assert_eq!(replayed, first);
-    // A generous bound: the assertion is "it did not wait out 30 seconds", and
-    // load can only make a real network call slower, never faster.
+    // The assertion is "it did not wait out the attach window", and the only
+    // honest ceiling is one a loaded machine cannot cross by accident.
+    //
+    // This used to read a bare `5s`, under a comment arguing that "load can only
+    // make a real network call slower, never faster" — which is the argument
+    // AGAINST an upper bound, not for one. CONTRIBUTING.md forbids that shape.
+    //
+    // **Derived from `MAX_ATTACH`, never written as its own number.** A literal
+    // here rots in a direction nothing catches: drop `MAX_ATTACH` below the
+    // literal and `elapsed` can no longer reach it, so this test passes forever
+    // while asserting nothing. Half the window keeps both edges — a settled
+    // replay answers in milliseconds, and a regression waits the whole window.
+    let ceiling = keylink::MAX_ATTACH / 2;
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "a settled key must be answered without waiting: took {:?}",
+        started.elapsed() < ceiling,
+        "a settled key must be answered without waiting: took {:?}, ceiling {ceiling:?}",
         started.elapsed()
     );
 }

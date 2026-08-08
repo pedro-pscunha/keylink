@@ -34,12 +34,26 @@ it called those same tasks rather than restating them.
 |---|---|---|
 | `mise run pre-commit` | fmt, clippy on the library | Seconds. A commit hook people bypass is not a gate. |
 | `mise run pre-push` | the whole gate | A push is rarer than a commit, and a red gate here costs one local run instead of a CI round trip. |
-| CI | the same tasks, plus `mise run deny` and `mise run msrv` | `deny` fetches the advisory database and `msrv` needs a second toolchain, so both live in CI rather than in a hook. |
+
+There is no third row. `deny`, `msrv` and `wasm-guards` used to be CI's, and they
+moved into `gate` when the workflow was deleted — so `mise run pre-push` is now
+the whole of it. Nothing else checks this repository.
 
 `mise run gate` runs its steps **one at a time**, cheapest first. That is why the
 task lists sub-tasks rather than using bare `depends`: mise parallelizes
 dependencies, and two concurrent cargo invocations contend for one target
 directory and one machine's memory.
+
+The tests inside `mise run test` are the exception, and only because they do not
+share that directory the same way: `cargo nextest run` executes test binaries as
+parallel PROCESSES, which is where most of the gate's time used to go. One file
+needs protecting from that — see `.config/nextest.toml`.
+
+`mise.toml` pins `sccache` and sets `RUSTC_WRAPPER`, so a cargo command run under
+mise compiles through a shared cache. `mise install` fetches it; there is still
+no manual setup step. It also sets `CARGO_INCREMENTAL=0`, because sccache cannot
+cache an incremental build — export `CARGO_INCREMENTAL=1` in a shell where you
+are iterating by hand rather than gating.
 
 Run `mise run deny` by hand whenever you change a dependency. It is the one check no
 hook runs, which is exactly why it was broken for three commits without anybody

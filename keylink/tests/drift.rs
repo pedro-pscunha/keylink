@@ -107,6 +107,13 @@ fn build_demo(name: &str, features: &[&str]) -> PathBuf {
 /// Swapped is built first so the tree is left in its default feature state, and
 /// `OnceLock` keeps two test threads from running two cargo processes at each
 /// other.
+///
+/// **The `OnceLock` is only half the guard now.** It spans threads, and the gate
+/// runs this file under nextest, which gives every test its own PROCESS. The
+/// other half lives in `.config/nextest.toml`, as a `max-threads = 1` test group
+/// filtered to `binary(drift)`. Delete that group and these two tests build and
+/// copy at each other again — see the comment there for what that actually
+/// costs. Neither half is sufficient alone.
 fn binaries() -> &'static (PathBuf, PathBuf) {
     static BINARIES: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
     BINARIES.get_or_init(|| {

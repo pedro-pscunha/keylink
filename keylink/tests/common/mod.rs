@@ -37,7 +37,7 @@
 
 use std::time::Duration;
 
-use iroh::endpoint::presets;
+use iroh::endpoint::{presets, IdleTimeout, QuicTransportConfig};
 use iroh::Endpoint;
 use keylink::Node;
 use tokio::sync::{mpsc, watch};
@@ -49,6 +49,36 @@ use tokio::sync::{mpsc, watch};
 pub async fn local_node() -> Node {
     Node::from_endpoint(
         Endpoint::bind(presets::Minimal)
+            .await
+            .expect("a local endpoint binds"),
+    )
+}
+
+/// A node that stops waiting on an unanswered dial after `idle`.
+///
+/// QUIC's default idle timeout is 30 seconds, so a dial to an endpoint that is
+/// simply gone costs the full 30s before it can fail. One test does exactly
+/// that, and it was the slowest thing in the whole suite by an order of
+/// magnitude — 30.2s against 3.4s for the next binary.
+///
+/// This shortens the ceiling, never the conclusion. The dial being waited on
+/// cannot succeed, so a smaller budget can only make the same failure arrive
+/// sooner. iroh does the same thing in its own suite for the same reason.
+///
+/// Use it only where the wait is a timeout you are not measuring. A test that
+/// asserts something *completed* must not borrow this — load would turn a
+/// passing run red.
+pub async fn local_node_with_idle_timeout(idle: Duration) -> Node {
+    let transport = QuicTransportConfig::builder()
+        .max_idle_timeout(Some(
+            IdleTimeout::try_from(idle).expect("a test-sized idle timeout fits"),
+        ))
+        .build();
+
+    Node::from_endpoint(
+        Endpoint::builder(presets::Minimal)
+            .transport_config(transport)
+            .bind()
             .await
             .expect("a local endpoint binds"),
     )

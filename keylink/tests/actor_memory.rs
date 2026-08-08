@@ -3,9 +3,14 @@
 //! One test in its own binary, because the measurement is a process-wide
 //! allocation counter and a second test running beside it would be noise. That
 //! is also why the four measurements below are **phases of one test** rather than
-//! four tests: cargo runs the tests in a binary on parallel threads, and `LIVE` is
-//! process-wide, so a second `#[test]` would measure this one's allocations as
-//! well as its own.
+//! four tests: `LIVE` is process-wide, so two `#[test]`s sharing a process
+//! measure each other.
+//!
+//! That reason used to read "cargo runs the tests in a binary on parallel
+//! threads". The gate runs nextest now, which gives every test its own process,
+//! so that sentence stopped being true while the conclusion stayed correct.
+//! Keep the phases: the shape must not depend on which runner is in use, and a
+//! plain `cargo test` still shares one process across a binary's tests.
 //!
 //! The numbers this prints are the answer to "can one service hold ten thousand
 //! live actors": the framework's own cost per actor, with an empty state, so a
