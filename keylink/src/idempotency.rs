@@ -1116,9 +1116,16 @@ impl Limits {
     /// ledger stores exactly the bytes the wire wrote. So headroom for one reply's
     /// payload is the figure set minus four.
     ///
-    /// Zero would leave only a zero-length frame recordable. **There is no floor to
-    /// state, and this does not follow the one bound in this workspace that has
-    /// one.** `keylink_persist`'s file limit states its floor as a named constant,
+    /// **There IS a hard floor, and it is not the useful one.** Every frame carries
+    /// that four-byte prefix, so `frame.len()` is never below four and **any value
+    /// under four refuses every reply** — arithmetic from the prefix width, not a
+    /// measurement of the ledger. This line previously said *"zero would leave only
+    /// a zero-length frame recordable"*, which named a frame size that cannot exist
+    /// and a value `NonZeroUsize` already forbids.
+    ///
+    /// **Above four there is no floor this method can state**, and that is what
+    /// separates it from the one bound in this workspace that has one.
+    /// `keylink_persist`'s file limit states its floor as a named constant,
     /// so a caller can read the threshold and stay above it. The smallest useful
     /// value here is the postcard encoding of one service's own response type: it
     /// differs per service and has no name anywhere. So **any non-zero value can
