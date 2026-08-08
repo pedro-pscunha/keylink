@@ -20,8 +20,52 @@ if [ -n "$chain" ] && [ -x "$chain/pre-commit" ]; then
     "$chain/pre-commit" "$@"
 fi
 
-# Nothing staged that we lint? Then there is nothing for this hook to say.
-if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$'; then
+# Which commit is the one being built ON? An ordinary commit extends `HEAD`, so
+# comparing the index against `HEAD` describes it exactly. An `--amend` REPLACES
+# `HEAD`, so the commit it produces is built on `HEAD`'s parent — and comparing
+# against `HEAD` then describes the wrong thing.
+#
+# That is the defect this exists for, and it is narrower than "amends are not
+# gated". An amend that only reworded a message diffs empty against `HEAD` and
+# skips, which is harmless when `HEAD` itself was gated. What it cannot do is
+# **repair a commit that was never gated** — one made with `--no-verify`, or by
+# this very early exit under an older version of this hook. That amend looks to
+# the developer like a second chance and is not one: the gate does not run, and
+# nothing says so.
+#
+# Consequence worth stating, because it is a real cost and not an oversight: a
+# message-only amend of a Rust-touching commit now DOES re-run the gate. Git does
+# not record whether a commit was verified, so "was `HEAD` already gated?" is not
+# a question this hook can ask — only "does the commit I am about to write touch
+# code the gate cares about?". Re-running is the answer that cannot be wrong in
+# the dangerous direction. It costs ~0.5 s on a warm tree, which an amend always
+# has, because the commit it is amending just built one.
+#
+# There is NO signal for an amend in git's environment, and this was verified
+# rather than assumed: every `GIT_*` variable is byte-identical between an
+# ordinary commit and an amend, and `ORIG_HEAD` is unset for both — `commit
+# --amend` does not write it. The parent process is the only thing that knows,
+# and the hook's parent IS `git commit`.
+#
+# The check over-fires on `git commit -m '... --amend ...'`, because the message
+# is in that command line too. That costs one extra gate run and no correctness,
+# which is the direction to be wrong in.
+amend_base=""
+if ps -o args= -p "$PPID" 2>/dev/null | grep -qw -- '--amend'; then
+    # The empty tree when amending a root commit, so there is one code path here
+    # rather than a special case that only fires on a repository's first commit.
+    amend_base="$(git rev-parse --verify --quiet HEAD~1 || git hash-object -t tree /dev/null)"
+fi
+
+# Nothing in the resulting commit that we lint? Then there is nothing for this
+# hook to say. Two spellings rather than an array, because `set -u` plus an empty
+# `"${a[@]}"` is an error on the bash 3.2 that macOS still ships as /bin/bash.
+if [ -n "$amend_base" ]; then
+    linted="$(git diff --cached --name-only --diff-filter=ACMR "$amend_base")"
+else
+    linted="$(git diff --cached --name-only --diff-filter=ACMR)"
+fi
+if ! printf '%s\n' "$linted" | grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$'; then
     exit 0
 fi
 
