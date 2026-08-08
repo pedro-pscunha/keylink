@@ -1689,22 +1689,55 @@ impl Booking {
 /// work, never the replayed answer an ordinary `rpc` gets, because the parking turn
 /// produced no answer to record.
 ///
-/// It is stated rather than asserted, and here is the observation behind that
-/// choice, because it is not a small one. **A keyed actor with a remote `#[defer]`
-/// reply still parked in its state does not drain.** Skipping only the approval in
-/// step 5 — `parked_over_the_wire(&other, &actor, 1).await;` followed immediately
-/// by `booking.stop(&actor).await; return;` — produced, watched:
-/// `the actor was mounted and must drain: got Some(Vanished)`, after the whole
-/// 5-second budget. So the shutdown path with a parked remote reply is its own
-/// subject with its own owner, and this test approves before it stops rather than
-/// smuggling that in.
+/// It is stated rather than asserted, and **the reason changed under this test.**
+///
+/// This paragraph used to read *"a keyed actor with a remote `#[defer]` reply still
+/// parked in its state does not drain"*, and it had watched evidence: skipping only
+/// the approval in step 5 — `parked_over_the_wire(&other, &actor, 1).await;`
+/// followed immediately by `booking.stop(&actor).await; return;` — produced `the
+/// actor was mounted and must drain: got Some(Vanished)`, after the whole 5-second
+/// budget. That was true of the tree and it was a **defect**, not a property:
+/// `deliver_to_actor` held a per-call clone of the actor's mailbox sender across
+/// its wait for the answer, so the loop never saw its channel close and no budget
+/// could ever be enough. `parked-drain` drops that clone once the send has landed.
+///
+/// **Re-run against this tree, the same edit passes**, watched: `test
+/// a_deferred_reply_is_named_by_the_turn_that_releases_it ... ok`, in 0.23 s — M5
+/// Max MacBook Pro, macOS 27.0, 2026-08-08, debug build, through
+/// `scripts/break-once.sh` so the mutation was restored from outside the tree. The
+/// `return` means nothing after the stop runs, so what the pass proves is exactly
+/// the drain and nothing else — `Booking::stop`'s `Some(Ended::Stopped)` arm was
+/// reached, and 0.23 s against a 5-second budget is the other half of it.
+///
+/// So the obstacle is gone, and what keeps the claim unasserted **here** is now a
+/// subject boundary rather than a defect. What a drain does to a parked caller
+/// belongs to `defer.rs`, and it is asserted there:
+/// `defer::a_keyed_actor_holding_a_parked_reply_drains_inside_its_budget` reads the
+/// caller's answer, and
+/// `defer::a_peer_whose_parked_reply_is_drained_is_not_told_its_call_timed_out`
+/// reads it through a `Timeout` layer. The claim this paragraph declined to make
+/// exists now, one file over, in the file whose subject it is.
+///
+/// **And step 5 still approves before it stops for its own reason, not to avoid
+/// anything.** Its assertion is that the stranger's withdrawal was *applied* —
+/// `strangers.await` is `15` — and only the approval releases the parked reply that
+/// carries that answer. Drop it and step 5 stops making its own claim. That is what
+/// the ordering was always load-bearing for; the drain defect merely made a second,
+/// weaker argument for it available.
+///
+/// **One consequence for the list below, and it is about the EDIT rather than the
+/// line.** `booking.stop(&actor).await; return;` is history: it reddens nothing on
+/// this tree, and it never guarded anything even when it did redden — it exposed a
+/// bug, which is a different thing wearing the same shape. Do not read it as a break.
+/// The *line* it was appended to is a different matter: it carries a real break now,
+/// the fifth in the list below, and that repair is written up there.
 ///
 /// Every break literal here is quoted without its leading indentation. Pass it to
 /// `scripts/break-once.sh` **with** the indentation — this doc comment is
 /// otherwise a second occurrence of the same text and the harness aborts on a
 /// match that is not unique, which is what it is for.
 ///
-/// Made red four ways.
+/// Made red five ways.
 ///
 /// On `keylink/src/middleware.rs`'s `pub fn call` body:
 ///
@@ -1745,6 +1778,29 @@ impl Booking {
 /// recognised and parks. Watched:
 /// `an unrecognised retry parks and never answers; this must not park: Elapsed(())`
 /// — a named failure where, without the `timeout`, the suite would simply hang.
+///
+/// And on step 5's synchronisation — in this file,
+/// `parked_over_the_wire(&other, &actor, 1).await;` →
+/// `parked_over_the_wire(&other, &actor, 2).await;`, a count step 5 never
+/// reaches, so the helper's own bounded loop gives up rather than racing. Watched:
+/// `2 withdrawals never parked`. What it pins is what the line is for: step 5
+/// observes exactly one parked reply before it approves.
+///
+/// **That break is new, and it exists because the one this line used to carry
+/// stopped reddening.** The line is quoted in the section above to describe a
+/// *defect observation*, and `anchor-rot` registered that quote as a break anchor
+/// at `fb02257` — correct at the tip that registered it, and false the moment this
+/// branch fixed the drain. Nothing went red in between, and nothing could have: the
+/// literal resolved to exactly one occurrence the whole time, and **an anchor check
+/// sees resolution, never whether the edit still reddens.**
+///
+/// That is a rot mode no single tree can detect. It needs two branches — one that
+/// registers a row which resolves, replays and is true at its own tip, and one that
+/// rewrites the file the row's record describes — and every checkout of either, plus
+/// the merge, reports green. It is repaired here rather than where it was
+/// registered, because the branch that falsifies a record is the branch that owns
+/// it, and in the same commit that rewrote the file, so no commit anybody can check
+/// out has the tree and the registry disagreeing.
 ///
 /// # The leak itself has no break, and that is the argument
 ///
