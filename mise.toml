@@ -137,6 +137,19 @@ run = [
 description = "The heavy gate. A push is rarer than a commit"
 run = [{ task = "gate" }]
 
+[tasks.hook-guard]
+description = "The pre-commit hook gates the commit it is actually writing"
+# Deliberately NOT in `gate` or `pre-commit`. It drives `git commit` in a throwaway
+# repository four times, which is fast but is also the one thing a commit hook must
+# not do from inside itself — wiring it into `pre-commit` would have the hook run a
+# script that runs the hook.
+#
+# It is here so that the guard is reachable the way every other check in this repo
+# is, rather than being a file somebody has to know about. Run it after touching
+# `.githooks/pre-commit`; the script's own header carries the two breaks that make
+# it red and the output each one produced.
+run = "./scripts/pre-commit-amend-guard.sh"
+
 # ── formatting ──────────────────────────────────────────────────────────────
 
 [tasks.fmt]
