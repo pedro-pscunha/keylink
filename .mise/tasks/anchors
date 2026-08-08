@@ -94,25 +94,49 @@ for record, lives_in, target, literal in ANCHORS:
     if found == 1:
         continue
     bad += 1
-    reason = (
-        "not in the file at all - `break-once.sh` aborts at its grep"
-        if found == 0
-        else f"found {found} times - `break-once.sh` aborts on its count assert"
-    )
-    print(f"FAIL {record}: anchor {reason}", file=sys.stderr)
+    if found == 0:
+        reason = "IS GONE - `break-once.sh` aborts at its grep, before any backup"
+        likely = "the line was edited, or the formatter rewrapped it"
+    else:
+        reason = f"IS NOT UNIQUE ({found}x) - `break-once.sh` aborts on its count assert"
+        likely = "often the record itself now quotes it: the same-file trap"
+    print(f"FAIL {record}: the anchor {reason}", file=sys.stderr)
+    print(f"       likely cause:    {likely}", file=sys.stderr)
     print(f"       record lives in: {lives_in}", file=sys.stderr)
     print(f"       break edits:     {target}", file=sys.stderr)
     print(f"       anchor:          {literal}", file=sys.stderr)
     print(file=sys.stderr)
 
 if bad:
+    # The remedy belongs HERE and not only in RFC-08 §9.2, because a contributor
+    # meets the failure and not the convention. Without it the shortest path to
+    # green is to delete the entry — which removes the check while reporting
+    # success, the exact silent-success case this task exists to prevent.
     print(
-        f"{bad} of {len(ANCHORS)} quoted break anchors no longer resolve.\n"
-        "A record whose anchor does not resolve cannot be replayed, and nothing\n"
-        "else will say so. Either re-quote it against the current line, or - if\n"
-        "the anchor is in the record's own file, or its uniqueness depends on its\n"
-        "neighbours - describe the search edit and drop its entry from this task.\n"
-        "Keep the replacement quoted either way.",
+        f"{bad} of {len(ANCHORS)} quoted break anchors no longer resolve, so those\n"
+        "records cannot be replayed and nothing else would have said so.\n"
+        "\n"
+        "THIS MEANS THE ANCHOR MOVED. FOLLOW IT.\n"
+        "\n"
+        "  Re-quote it against the line as it now reads. That is the fix for a\n"
+        "  cross-file, line-local anchor, which is most of this list, and it is\n"
+        "  the fix whenever a rebase or a refactor moved the target.\n"
+        "\n"
+        "Delete the entry ONLY in the two cases where quoting cannot work:\n"
+        "\n"
+        "  - the record lives in the file its break edits, so its own quote is\n"
+        "    the second occurrence; or\n"
+        "  - the anchor's uniqueness is a property of its NEIGHBOURS rather than\n"
+        "    of the line - a `pub use` list item, a slice of an ordered list -\n"
+        "    where re-quoting only buys until the next sibling lands.\n"
+        "\n"
+        "  In both, describe the search edit in the record instead. Quote the\n"
+        "  REPLACEMENT either way: `break-once.sh` never searches it.\n"
+        "\n"
+        "Deleting an entry is the shortest path to green and it is usually the\n"
+        "wrong one: it makes the record unchecked rather than correct. If you are\n"
+        "mid-rebase and reaching for it, that is the moment this paragraph is for.\n"
+        "RFC-08 §9.2 carries the full argument.",
         file=sys.stderr,
     )
     sys.exit(1)
