@@ -1145,6 +1145,24 @@ impl Limits {
     /// [`Unrecordable`](IdempotencyRefusal::Unrecordable): that is a permanent
     /// property of the service, and this would be an eviction that already
     /// happened.
+    ///
+    /// # What a maximal value does, and it is the opposite of bounding
+    ///
+    /// `Ledger::evict` drops records *while* the held count is over this number, so
+    /// at [`NonZeroUsize::MAX`] that condition is unreachable and the loop body
+    /// never runs: **the record pool evicts nothing, and what bounds it is
+    /// [`ttl`](Self::ttl) alone.** Every settled reply is held until it expires, and
+    /// the memory that costs is whatever the traffic was.
+    ///
+    /// Nothing refuses, which is what makes this end of the range quieter than the
+    /// other one. Zero is loud — every retry reads
+    /// [`Forgotten`](IdempotencyRefusal::Forgotten) — while an unreachable bound
+    /// produces no refusal at all, because an eviction that does not happen has
+    /// nothing to report.
+    ///
+    /// [`pool_bytes`](Self::pool_bytes) is the other half of that same `while`
+    /// condition and goes unreachable the same way, so a pool bounded by neither
+    /// needs both set high. Held by `a_maximal_pool_evicts_nothing`.
     #[must_use]
     pub fn pool_records(mut self, records: NonZeroUsize) -> Self {
         self.pool_records = records;
@@ -1216,6 +1234,11 @@ impl Limits {
     /// default in that relation would report an eviction for a reply that was never
     /// storable. A caller who chooses it deliberately gets the behaviour described
     /// above, which is why it is documented rather than rejected.
+    ///
+    /// At [`NonZeroUsize::MAX`] this bound is **unreachable**, so the byte half of
+    /// `Ledger::evict`'s condition never fires — see
+    /// [`pool_records`](Self::pool_records), where the argument is written once for
+    /// both halves. A pool that evicts nothing is bounded by [`ttl`](Self::ttl).
     #[must_use]
     pub fn pool_bytes(mut self, bytes: NonZeroUsize) -> Self {
         self.pool_bytes = bytes;
@@ -2623,6 +2646,56 @@ mod tests {
                 ledger.lock().bytes <= 64,
                 "held {} bytes over a 64 byte budget",
                 ledger.lock().bytes
+            );
+        }
+
+        /// The **top** of the range for both pool bounds, which their rustdoc argued
+        /// only at the zero end.
+        ///
+        /// At [`NonZeroUsize::MAX`] neither half of `Ledger::evict`'s `while`
+        /// condition can be satisfied, so its body never runs: nothing is evicted and
+        /// no record is downgraded to a tombstone. What bounds the pool then is `ttl`
+        /// alone. This is the quiet end of the range — a bound set to zero refuses
+        /// every retry loudly, and a bound nothing can reach reports nothing at all,
+        /// because an eviction that does not happen has nothing to say.
+        ///
+        /// Sixty-four records of sixteen bytes, the same shape as the two guards
+        /// above, so the three differ in their bounds and in nothing else.
+        ///
+        /// Made red by `scripts/break-once.sh` replacing
+        /// `while inner.held > self.limits.pool_records.get()` with
+        /// `while inner.held > 0`, so eviction runs unconditionally. The literal
+        /// carries its eight spaces of indentation and this record's copy has none.
+        /// Watched, under `cargo test`:
+        /// `assertion `left == right` failed: a bound nothing can reach must evict
+        /// nothing`, `left: 0`, `right: 64`. The same edit reddens both guards above,
+        /// which is expected of an unconditional evict and is why this record names
+        /// the assertion rather than a count of failures.
+        #[test]
+        fn a_maximal_pool_evicts_nothing() {
+            let ledger = bounded(
+                Limits::default()
+                    .pool_records(NonZeroUsize::MAX)
+                    .pool_bytes(NonZeroUsize::MAX),
+            );
+            for n in 0..64 {
+                guard(ledger.claim(peer(A), key(&format!("k{n}")))).record(&frame(16), false);
+            }
+
+            assert_eq!(
+                ledger.lock().held,
+                64,
+                "a bound nothing can reach must evict nothing"
+            );
+            assert_eq!(
+                ledger.lock().spent,
+                0,
+                "and must leave no tombstone behind, because nothing was dropped"
+            );
+            assert_eq!(
+                ledger.lock().bytes,
+                64 * 16,
+                "with every recorded byte still held"
             );
         }
 

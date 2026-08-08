@@ -472,6 +472,12 @@ ANCHORS = [
      "            attach: MAX_ATTACH,"),
     ("A4", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
      "            attach: MAX_ATTACH,"),
+    # A5 holds the TOP of the pool bounds' range, which their rustdoc argued only at
+    # the zero end. The first line of a two-line `while` condition, and a whole line
+    # in its own right - the `||` under it belongs to `rustfmt`, so a reflow gives
+    # count 0, which is loud and is what this gate is for.
+    ("A5", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
+     "        while inner.held > self.limits.pool_records.get()"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -913,16 +919,23 @@ for record, lives_in, target, literal in ANCHORS:
 # rows, gained two carrying blocks, and saw its population rise by ONE, so its
 # unchecked figure FELL.
 #
-# 116 → the figure below on `ledger-attach`, off `e09e942`, for `Limits::attach`. SIX
-# new harness blocks: four accept-path guards in `rpc.rs` and two in
-# `idempotency.rs`. Read off a run at THIS tree, not carried and not computed — the
-# branch adds one more record in a later commit and this constant is a property of
-# one tree, so the value here is the one this commit's tree produces.
-#
-# FIVE rows above and SIX blocks, which is not one-per-row:
+# 116 → 122 on `ledger-attach`, off `e09e942`, for `Limits::attach`: SIX new harness
+# blocks, four accept-path guards in `rpc.rs` and two in `idempotency.rs`. FIVE rows
+# and SIX blocks, which is not one-per-row —
 # `an_attach_ceiling_of_zero_refuses_the_attacher_at_once` shares A2's literal with a
 # different replacement, so it adds a block without adding a row.
-RECORD_BLOCKS = 122
+#
+# 122 → the figure below, one commit later, for the pool bounds' maximal end: ONE
+# block, `a_maximal_pool_evicts_nothing`, registered as A5.
+#
+# **Both figures were read off a run at their own commit's tree, and the second one
+# was read off a FAILURE on purpose** — the tripwire was left at 122 and asked, so
+# the number came back as `123 comment blocks mention break-once.sh` from the walk
+# rather than from adding one to the previous line. That is the difference this file
+# spends paragraphs on: 122 + 1 would have been right here and is not a method, and
+# two commits on one branch each needing their own measurement is the whole reason
+# a carried value goes stale.
+RECORD_BLOCKS = 123
 
 harness_blocks: list[str] = []
 for path in sorted(
