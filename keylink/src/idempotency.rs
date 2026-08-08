@@ -2434,9 +2434,15 @@ mod tests {
             assert_eq!(ledger.lock().held, 4);
         }
 
-        /// `pool_bytes`, not `frame_bytes`: sixteen frames of 16 bytes are each far
-        /// inside the ceiling, and what is asserted is the sum they are allowed to
-        /// reach together.
+        /// `pool_bytes`, not `frame_bytes`: **sixty-four** frames of 16 bytes are each
+        /// far inside the ceiling, and what is asserted is the sum they are allowed to
+        /// reach together — four of them, once eviction has run.
+        ///
+        /// This line first said *"sixteen frames"*, against a `for n in 0..64` loop it
+        /// sits three lines above. Nothing was red, because 16 and 64 both exceed a
+        /// 64-byte budget, and the doc line was **new in this PR** so the figure was
+        /// never checked against the code beside it. It became load-bearing the moment
+        /// another guard's record started sending readers here.
         ///
         /// **This is the other of the two guards that hold the setter-to-field
         /// mapping.** Made red by `scripts/break-once.sh` swapping
@@ -2857,10 +2863,18 @@ mod tests {
         /// **The four bounds are a reviewable statement; a reviewer checks them by
         /// reading.**
         ///
-        /// **That does not make the guard unreddenable, and an earlier version of this
-        /// paragraph claimed it did.** The generalisation from *bound* literals to
-        /// *every* literal is what fails: `scripts/break-once.sh` takes a file path,
-        /// so any production line in this file is a legal target.
+        /// **So what has no one-literal break is the CHOICE OF BOUND VALUES, and not
+        /// the counter invariant, which is strongly guarded.** An earlier version of
+        /// this section was headed *"this guard has NO one-literal break"*, which drops
+        /// that scope — and a reader who stopped at the heading would conclude the
+        /// invariant was unguarded and follow a redirection to two **mapping** guards
+        /// that answer a different question.
+        ///
+        /// The generalisation from *bound* literals to *every* literal is what failed:
+        /// `scripts/break-once.sh` takes a file path, so any production line in this
+        /// file is a legal target. Several redden this — `inner.spent += 1` to `+= 2`
+        /// is another — because each makes a counter disagree with the sum over
+        /// buckets, so **every** `assert_agrees` in the loop fails rather than one.
         ///
         /// Made red by dropping `evict`'s tombstone decrement, so the counter stays
         /// high while the buckets drain. The anchor, on one line because a quote that
