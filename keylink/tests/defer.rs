@@ -864,6 +864,20 @@ async fn an_aborted_keyed_actor_tells_a_peer_no_such_actor() {
 /// → `    let _held = route;` — the defect restored, since the clone then lives to
 /// the end of the function again. Watched: `a keyed actor holding a parked remote
 /// reply must drain: got Some(Vanished)`.
+///
+/// **That break reddens the VARIANT assertion, and the elapsed bound below it is
+/// never evaluated on the broken tree.** Nothing releases the clone under the edit,
+/// so the drain burns the whole budget, `shutdown` answers `Vanished`, and the first
+/// `assert!` fires before `spent` is ever compared. So the two assertions are not
+/// both exercised by one replay, and a replayer who sees red has watched one of
+/// them.
+///
+/// The elapsed bound guards a **different shape**: a drain that finishes, but
+/// slowly. No one-literal edit here produces that — the defect is a hang, not a
+/// slowdown, and a hang is caught by the variant. The bound is what stops the same
+/// defect returning behind a *larger* budget, where `Stopped` would be the answer
+/// and the wall time the only tell. It is unwatched, and it is carried on the
+/// measured 213–513 µs above rather than on a break.
 #[tokio::test]
 async fn a_keyed_actor_holding_a_parked_reply_drains_inside_its_budget() {
     let nodes = [local_node().await, local_node().await];

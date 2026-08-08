@@ -313,6 +313,13 @@ ANCHORS = [
     # so the indentation does no work here. The indented form is registered anyway,
     # for C8's reason: the bare form collides the moment any line anywhere ends in
     # `drop(route);`.
+    #
+    # **What DOES make it unique is the semicolon, and that is a one-character
+    # dependency worth stating.** `drop(route)` without it counts 2, because
+    # `remote.rs`'s own comment above the statement points a reader at "the
+    # `drop(route)` below". So the prose that explains the fix is the second
+    # occurrence - the same-file trap, arriving from the target's side rather than
+    # the record's. Drop the semicolon when re-quoting and the harness aborts.
     ("P1", "keylink/tests/defer.rs", "keylink/src/actor/remote.rs",
      "    drop(route);"),
     ("P2", "keylink/tests/defer.rs", "keylink/src/actor/remote.rs",
@@ -624,10 +631,23 @@ for record, lives_in, target, literal in ANCHORS:
 # ── AND IT IS BLIND TO ROUGHLY A THIRD OF THE POPULATION ──────────────────────
 #
 # One marker, and records use three. Measured 2026-08-08 (-03:00) by the same walk,
-# widened to `break-once.sh` OR "Made red" OR "Red under": **157 blocks match,
-# 102 carry `break-once.sh`, so 55 do not** - a record phrased "Made red by .."
+# widened to `break-once.sh` OR "Made red" OR "Red under": **158 blocks match,
+# 103 carry `break-once.sh`, so 55 do not** - a record phrased "Made red by .."
 # without naming the harness does NOT move this count and the tripwire stays
 # green. Two are in this repo's own `keylink/src/idempotency.rs`.
+#
+# **The blind figure did not move, and that is a coincidence rather than a result.**
+# `parked-drain` added one record block that names the harness, so the widened count
+# and the carrying count each rose by one and their difference happened to stay at
+# 55. All three were re-derived from the tree here, because a subtraction whose two
+# inputs both moved is exactly the shape that leaves a stale figure looking current.
+#
+# **And the 157 / 102 / 55 this replaces went stale inside one commit, past the one
+# mitigation this convention relies on.** The date above was ALREADY 2026-08-08 when
+# it was wrong: `parked-drain` moved `RECORD_BLOCKS` thirty lines below, and no
+# reader could have told from the date that the snapshot predated that. A same-day
+# figure is unfalsifiable by date alone, so the date is a tiebreaker between
+# snapshots and never evidence that one is current.
 #
 # **The previous figures here said 144 / 98 / 46, and all three were stale for a
 # reason the paragraph could not see: the rebase moved the tree underneath them.**
