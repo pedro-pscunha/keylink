@@ -128,10 +128,19 @@ description = "rustdoc as a gate, not as decoration"
 #    `#[cfg(test)] mod` inside it. That is most of the prose in this crate: every
 #    private module's header and every break record in a unit-test module.
 #
-#    Turning it on is NOT free, which is why it is not on. Measured on
-#    2026-08-07: `--document-private-items` produces **48 errors across 12
-#    files** — 40 `redundant explicit link target`, which are mechanical, and
-#    **8 genuinely unresolved links that no gate in this repo has ever seen**:
+#    Turning it on is NOT free, which is why it is not on.
+#
+#    A SNAPSHOT AND NOT A STANDING COUNT — the numbers below were measured on
+#    2026-08-07 and are being actively fixed, so expect them to fall. Do not read
+#    a smaller count as this comment being wrong; re-measure with
+#    `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items
+#    --all-features -p keylink -p keylink-persist` and turn the flag on for good
+#    when it reaches zero. What does not go stale is the shape: private items are
+#    unchecked today, and that is the reason to finish the job.
+#
+#    As measured: **48 errors across 12 files** — 40 `redundant explicit link
+#    target`, which are mechanical, and **8 genuinely unresolved links that no
+#    gate in this repo had ever seen**:
 #      console.rs   `Allowlist`, `Self::follow`, `Self::on_events` (x2)
 #      local.rs     `crate::System::stop`, `crate::Busy`
 #      macros.rs    `Addressed`

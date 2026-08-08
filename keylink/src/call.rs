@@ -520,10 +520,14 @@ impl<T> Applied<T> {
 
     /// The bound this one was built with.
     ///
-    /// Its one caller in this crate is
-    /// `a_snapshot_of_what_was_applied_round_trips_with_its_bound`, which is not an
-    /// accident: the type's docs promise that a round trip restores the bound, and
-    /// an accessor is what makes that promise assertable rather than decorative.
+    /// It exists so that the round trip's promise is **assertable** rather than
+    /// decorative: this type's `Serialize` claims to carry the bound, and
+    /// `a_snapshot_of_what_was_applied_round_trips_with_its_bound` is what holds it
+    /// to that. Without an accessor the claim could only be checked behaviourally,
+    /// by observing an eviction, which is the weaker of the two readings.
+    ///
+    /// A caller who serialises an `Applied` and wants to know what bound came back
+    /// has the same need, which is why this is `pub` rather than `pub(crate)`.
     #[must_use]
     pub fn bound(&self) -> NonZeroUsize {
         self.bound
