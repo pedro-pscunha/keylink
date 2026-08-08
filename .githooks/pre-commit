@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fast gate. A commit hook that takes a minute is a commit hook people bypass,
-# so this runs formatting and a library-scoped clippy and nothing else. The
+# so this runs the fast subset `mise.toml` calls `pre-commit` and nothing else —
+# named there rather than listed here, because a list in a comment is a copy. The
 # expensive checks — every target, every feature end, every feature subset, the
 # tests, the docs, the browser target — belong to pre-push, which runs far less
 # often.
@@ -152,28 +153,39 @@ fi
 # contributor without it is still gated rather than silently ungated.
 #
 # It said "the same two commands" while `pre-commit` already ran THREE tasks —
-# `framing` was never inlined — then `anchors` made it four and `anchors-selftest`
-# made it five. So, matching `mise.toml`'s `pre-commit` in its order:
-# `framing`, `anchors`, `anchors-selftest`, `fmt-check`, `lint-fast`.
+# `framing` was never inlined — then `anchors` made it four, `anchors-selftest`
+# five and `task-lists` six. **No enumeration of them is written in this comment
+# any more: the lines below ARE the list, in `mise.toml`'s order, and a second copy
+# of it up here is one more thing to go stale.**
 #
-# The first three are scripts, so they are invoked rather than reimplemented; a
-# second copy of their logic is a second thing to drift. All three read their own
-# root and run standalone without `mise` in the environment.
+# The script tasks are invoked rather than reimplemented; a second copy of their
+# logic is a second thing to drift. Each reads its own root and runs standalone
+# without `mise` in the environment.
 #
-# THIS LIST IS HAND-MAINTAINED AND WILL DRIFT AGAIN. `mise.toml` is the authority;
-# this is a copy, and it has now been one task short twice. Whoever adds a sixth
-# task to `pre-commit` has to add it here too, and nothing enforces that.
+# THIS LIST IS A COPY AND `mise.toml` IS THE AUTHORITY. It has been one task short
+# twice, and the sentence that used to close this paragraph — "nothing enforces
+# that" — is the reason `.mise/tasks/task-lists` exists. It reads the manifest's
+# `pre-commit` list and asserts that every task in it is invoked below, in the
+# manifest's order, with nothing extra beside it.
+#
+# **Where that bites is the PUSH, and not necessarily the commit.** `task-lists`
+# runs inside `pre-commit`, and the filter above only reaches the gate when the
+# commit stages Rust or a cargo manifest — `mise.toml` is neither. So a task added
+# to the manifest and forgotten here survives the commit that adds it, and fails
+# `mise run gate` at the push.
 #
 # Not resolved the way `pre-push` resolves it, and the difference is deliberate.
 # That hook now REFUSES without `mise`, because it claims to be the whole gate and
-# GitHub Actions is disabled, so a subset there is a false green. This hook claims
-# the opposite: its header says it runs formatting and a library-scoped clippy and
-# NOTHING else, and that the expensive checks belong to `pre-push`. A hook that is
-# avowedly a subset cannot be made a false green by being a subset — it can only be
-# made one by covering less than the list it names, which is what this fixes.
+# nothing else checks a push from a branch cut off `main`, so a subset there is a
+# false green. This hook claims the opposite: its header says it runs the fast
+# subset and nothing else, and that the expensive checks belong to `pre-push`. A
+# hook that is avowedly a subset cannot be made a false green by being a subset —
+# it can only be made one by covering less than the list it names, which is what
+# this fixes.
 echo "note: 'mise' is not installed - running the same checks directly" >&2
 .mise/tasks/framing
 .mise/tasks/anchors
 .mise/tasks/anchors-selftest
+.mise/tasks/task-lists
 cargo fmt --all -- --check
 cargo clippy -p keylink --lib --all-features -- -D warnings

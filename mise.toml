@@ -1,10 +1,14 @@
 # keylink's gate, defined once — and now defined only here.
 #
-# **GitHub Actions is disabled and this file is the whole gate.** The workflow
-# used to call these same tasks, which is why nothing here had to change when it
-# went: there was never a second copy of the commands. What did change is that a
-# green `mise run gate` is no longer a prediction about a second run somewhere
-# else. It is the run. See README.md for what that costs.
+# **The CI workflow was DELETED from `main`, so this file is the whole gate for any
+# branch cut from it.** Not because Actions is disabled — it is enabled, measured,
+# and CONTRIBUTING.md holds the evidence rather than this file holding a second
+# copy of it.
+#
+# The workflow used to call these same tasks, which is why nothing here had to
+# change when it went: there was never a second copy of the commands. What did
+# change is that a green `mise run gate` is no longer a prediction about a second
+# run somewhere else. It is the run. See README.md for what that costs.
 #
 #   mise tasks           # every task
 #   mise run gate        # the whole gate
@@ -117,13 +121,13 @@ CARGO_INCREMENTAL = "0"
 # ── the whole gate ──────────────────────────────────────────────────────────
 
 [tasks.gate]
-description = "The whole gate. There is no other one — CI is disabled"
+description = "The whole gate. There is no other one for a branch cut off main"
 # A list of task references runs them ONE AT A TIME, in order. Bare `depends`
 # lets mise parallelize, and parallel cargo invocations contend for the same
 # target directory and the same memory.
 #
 # **This used to be "everything CI runs", and CI ran three things it did not.**
-# When the workflow was disabled, `wasm-guards`, `msrv` and `deny` were the
+# When the workflow was deleted, `wasm-guards`, `msrv` and `deny` were the
 # difference, so they moved here in the same change. Disabling a gate and
 # dropping what only it covered are two separate acts, and doing the first
 # without the second is how coverage disappears without anybody deciding to
@@ -141,6 +145,9 @@ run = [
     # failure class as itself — the defect that reached `main` once was a passing gate
     # printing the anchor-rot playbook, which no green/red check can see.
     { task = "anchors-selftest" },
+    # `mise.toml` defines `pre-commit` once and three other files restate it; this
+    # asserts they still agree. Text only, so it costs nothing and cannot recurse.
+    { task = "task-lists" },
     { task = "fmt-check" },
     { task = "deny" },
     { task = "lint" },
@@ -168,6 +175,7 @@ run = [
     { task = "framing" },
     { task = "anchors" },
     { task = "anchors-selftest" },
+    { task = "task-lists" },
     { task = "fmt-check" },
     { task = "lint-fast" },
 ]
@@ -493,7 +501,8 @@ run = "cargo package --workspace --exclude demo --no-verify --allow-dirty"
 
 [tasks.msrv]
 description = "Compile on the oldest Rust keylink claims to support"
-# **In `gate` since CI was disabled, and the cost it used to dodge is real.** It
+# **In `gate` since the workflow was deleted, and the cost it used to dodge is
+# real.** It
 # needs a second toolchain — a ~200 MB download the first time — which is why it
 # sat outside the gate while CI carried it. Nobody carries it now, and an MSRV
 # nobody compiles is a promise broken silently: `rust-version` changes what cargo
@@ -506,7 +515,7 @@ run = "cargo +1.91 check --workspace --all-targets --all-features"
 
 [tasks.deny]
 description = "Advisories and licences over the whole tree"
-# **In `gate` since CI was disabled**, for `msrv`'s reason. It fetches the
+# **In `gate` since the workflow was deleted**, for `msrv`'s reason. It fetches the
 # advisory database, so it needs the network on every push — which is what kept
 # it out while CI ran it.
 #

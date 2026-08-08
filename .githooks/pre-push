@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
-# The heavy gate — and since GitHub Actions was disabled, the ONLY gate.
+# The heavy gate — and the only thing that checks a push from a branch cut off
+# `main`.
 #
 # Slow on purpose, and now load-bearing rather than an optimisation. It used to
 # run what CI would run, so a red result here saved a round trip. Nothing runs
-# after this any more: a bypass is not "CI will catch it", it is "nothing will".
+# after this for such a branch: a bypass is not "CI will catch it", it is
+# "nothing will".
+#
+# **THAT IS NOT BECAUSE ACTIONS IS DISABLED, AND THIS FILE SAID IT WAS.** Measured
+# on 2026-08-08: `gh api repos/{owner}/{repo}/actions/permissions` answers
+# `{"enabled":true,"allowed_actions":"all"}`, and CI has been producing failing
+# runs. What happened is narrower — the workflow FILE was deleted from `main`, so
+# a branch cut from `main` inherits none and nothing fires for it. It holds by
+# what `main` carries rather than by a setting, and it stops holding if the file
+# comes back. CONTRIBUTING.md carries the whole measurement, once; this comment
+# does not keep a second copy of it.
 #
 # Bypass with `git push --no-verify`. See CONTRIBUTING.md, and read the narrow
 # case it is for — it got narrower when the second gate went away.
@@ -240,9 +251,9 @@ fi
 # false green on a push is worse than a refused push: one of them tells you.
 echo "error: 'mise' is not installed, and it is the gate." >&2
 echo >&2
-echo "  GitHub Actions is disabled for this repository. \`mise run gate\` is the" >&2
-echo "  only thing that checks a push, so there is no weaker-but-still-useful" >&2
-echo "  subset to fall back to — whatever it skipped, nobody else would run." >&2
+echo "  A branch cut off \`main\` inherits no CI workflow, so nothing runs for this" >&2
+echo "  push but \`mise run gate\`. There is no weaker-but-still-useful subset to" >&2
+echo "  fall back to — whatever it skipped, nobody else would run." >&2
 echo >&2
 echo "  Install mise:  https://mise.jdx.dev" >&2
 echo "  Then:          ./scripts/install-hooks.sh && mise run gate" >&2

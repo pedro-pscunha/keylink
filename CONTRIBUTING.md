@@ -7,9 +7,37 @@
 mise run gate                # the whole gate
 ```
 
-**GitHub Actions is disabled. `mise run gate` is the only gate**, and the
-`pre-push` hook runs it — which makes `./scripts/install-hooks.sh` load-bearing
-rather than a convenience. Skip it and nothing checks your pushes.
+**`mise run gate` is the only thing that checks a push from a branch cut off
+`main`**, and the `pre-push` hook runs it — which makes
+`./scripts/install-hooks.sh` load-bearing rather than a convenience. Skip it and
+nothing checks your pushes.
+
+### It is not because Actions is disabled, and this file said it was
+
+That sentence used to read "GitHub Actions is disabled". It is the stated reason
+the push hook refuses without `mise`, so it was measured on 2026-08-08 rather than
+repeated. Every command below is reproducible as written — `gh` resolves
+`{owner}/{repo}` from the local remote:
+
+- `gh api repos/{owner}/{repo}/actions/permissions` answers
+  `{"enabled":true,"allowed_actions":"all","sha_pinning_required":false}`.
+  Actions is **on**.
+- Of every workflow run in the repository's history, **all** fired on
+  `pull_request` and **none** on `push`.
+- What actually happened is narrower: commit `afdbeb3` **deleted**
+  `.github/workflows/ci.yml` from `main`. `origin/main` carries no `.github` at
+  all, while several live remote branches still carry that file — which is where
+  those runs came from, and most of them failed.
+- The file's trigger is `push` to `master` plus a bare `pull_request`. The default
+  branch is `main` and no `master` ref exists, so the `push` half could not have
+  fired, and the run history agrees that it never did.
+
+So the operational claim survives and its reason does not. A branch cut from
+`main` inherits no workflow, so neither its pushes nor its pull request produce a
+CI run, and this hook is the only check. **That holds because of what `main`
+happens to carry, and it stops the moment any branch merges that workflow back
+into `main`** — a `pull_request` run is built from the merge of base and head, so
+it would then fire for every pull request, including one that adds nothing.
 
 Two consequences worth knowing before you hit them:
 
@@ -40,7 +68,7 @@ it called those same tasks rather than restating them.
 
 | | runs | why |
 |---|---|---|
-| `mise run pre-commit` | fmt, clippy on the library | Seconds. A commit hook people bypass is not a gate. |
+| `mise run pre-commit` | framing, anchors, anchors-selftest, task-lists, fmt-check, lint-fast | Seconds. A commit hook people bypass is not a gate. |
 | `mise run pre-push` | the whole gate | A push is rarer than a commit, and a red gate here costs one local run instead of a CI round trip. |
 
 There is no third row. `deny`, `msrv` and `wasm-guards` used to be CI's, and they

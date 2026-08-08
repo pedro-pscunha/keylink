@@ -31,7 +31,7 @@ chmod +x .githooks/*
 
 echo "installed: .githooks/pre-commit, .githooks/pre-push"
 echo
-echo "  pre-commit  cargo fmt --check, clippy on the library     (seconds)"
+echo "  pre-commit  framing, anchors, anchors-selftest, task-lists, fmt-check, lint-fast"
 echo "  pre-push    the full gate: every target, both feature ends,"
 echo "              every feature subset, the tests, the docs,"
 echo "              and the browser target"
