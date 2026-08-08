@@ -1696,7 +1696,21 @@ impl Booking {
 /// On `keylink/src/middleware.rs`'s `pub fn call` body:
 ///
 /// - `self.call` → `self.call.and(None)`, so no turn is named at all. Watched:
-///   `the first withdrawal's turn carried its own key`, `left: "-" right: "-"`.
+///   `and recorded the call it applied, on the same snapshot as the debit`,
+///   `left: 0 right: 1`.
+///
+///   **This record moved, and the cause was a later commit on this same branch.**
+///   It read `the first withdrawal's turn carried its own key`, `left: "-"
+///   right: "-"` — the `seen[0]` assertion — until the on-disk check after step 1's
+///   approval was inserted *earlier in the script* than `seen` is read. With no
+///   call ever named, nothing is recorded, so that check now fires first. The
+///   guard was never wrong and nothing was red; only the record was stale, and it
+///   was found by re-running rather than by reading.
+///
+///   Worth naming as a shape: a record's message is a claim about **which
+///   assertion fires first**, so it rots when an assertion is added *above* the
+///   recorded one — a value the record does not control. `break-once.sh`'s exit
+///   code cannot see it, because the test still fails.
 /// - `self.call` → `self.call.filter(|_| self.method() != "Approve")`, so the
 ///   releasing turn loses its own name. Watched:
 ///   `and the keyed approval carried its own`, `left: "-" right: "-"`.

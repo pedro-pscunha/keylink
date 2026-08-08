@@ -655,8 +655,9 @@ mod tests {
     /// rule is what `CallId` folds in so that no caller has to re-implement it.
     ///
     /// Made red by taking the peer out of the digest — replace
-    /// `hasher.update(peer.as_bytes());` with `let _ = peer;` and the two ids
-    /// become equal.
+    /// `hasher.update(peer.as_bytes());` with `let _ = peer;`. Watched:
+    /// `the same key from two peers must be two calls`, with `left` and `right`
+    /// the same `CallId`.
     #[test]
     fn one_peers_key_cannot_name_another_peers_call() {
         let shared = key("reserve-4471");
@@ -674,7 +675,8 @@ mod tests {
     /// always answers one way satisfies half a suite.
     ///
     /// Made red by replacing `hasher.update(key.as_str().as_bytes());` with
-    /// `let _ = key;`.
+    /// `let _ = key;`. Watched: `two keys from one peer must be two calls`, with
+    /// `left` and `right` the same `CallId`.
     #[test]
     fn two_keys_from_one_peer_are_two_calls() {
         assert_ne!(
@@ -789,7 +791,8 @@ mod tests {
     /// retries are still plausible — are the ones kept.
     ///
     /// Made red by `pop_front()` → `pop_back()`: the set then forgets what just
-    /// happened and remembers what nobody will ask about again.
+    /// happened and remembers what nobody will ask about again. Watched:
+    /// `the first call is the one displaced`.
     #[test]
     fn the_oldest_call_is_the_one_forgotten() {
         let two = NonZeroUsize::new(2).expect("2 is not zero");
