@@ -179,6 +179,17 @@ ANCHORS = [
     # is the remedy the file already prescribes; describing it was reaching past it.
     ("C12", "keylink/src/call.rs", "keylink/src/call.rs",
      "            if let Some(oldest) = self.order.pop_front() {"),
+    # C13 was described as a formatter case, and that is true of the anchor and beside
+    # the point for the decision. The reflow gives count 0, which this task reports
+    # LOUDLY and which sends a reader to re-quote the line. Describing survives the
+    # reflow and takes the row OUT of the gate, after which nothing checks that the
+    # description still locates the edit. So the choice is not fragile-vs-durable, it
+    # is loud-vs-silent, and the record now says so in those terms.
+    #
+    # Its sibling `C-D3` stays described for a reason this one does not share: that
+    # edit site already spans more than one line, so there is no single line to quote.
+    ("C13", "keylink/tests/persist.rs", "keylink/src/rpc.rs",
+     "                .map(|idem| CallId::of(peer, idem.key())),"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -215,19 +226,21 @@ DESCRIBED = [
      "second occurrence"),
     ("R19", "keylink/tests/idempotency.rs", "same-file",
      "the keyed-actor test's own .keyable(..) call, for the same reason"),
-    # ── from PR #11 (`call-id`). Four were converted here; TWO of the four reasons
-    # did not survive re-measurement and those rows are now quoted, as C11 and C12
-    # above. Both errors ran the same way: a real obstacle was identified and the
-    # remedy for it was not tried. Column 0 does defeat indentation - and the
-    # trailing newline still works. A fragment cannot be disambiguated by
-    # indentation - and mode 4's remedy is to stop quoting the fragment.
+    # ── from PR #11 (`call-id`). Four were converted here and THREE did not survive
+    # re-measurement; they are now quoted as C11, C12 and C13 above. Two of the three
+    # failed the same way - a real obstacle identified and its remedy never tried.
+    # Column 0 does defeat indentation, and the trailing newline still works. A
+    # fragment cannot be disambiguated by indentation, and mode 4's remedy is to stop
+    # quoting the fragment. The third was a sound reason applied to the wrong
+    # question: durability, where the question is loudness.
     #
-    # The two that remain are both FORMATTER cases, and neither has a remedy of that
-    # kind: the reflow is not something a better choice of anchor avoids.
+    # ONE remains, and it is the only one of the four with no remedy of that kind: the
+    # edit site already spans more than one line, so there is no single line to quote
+    # and a reflow is not something a better anchor avoids.
     ("C-D3", "keylink/src/call.rs", "formatter",
-     "Applied::iter's chain - rustfmt reflow measured rather than predicted"),
-    ("C-D4", "keylink/tests/persist.rs", "formatter",
-     "rpc.rs's .map - same, measured"),
+     "Applied::iter's chain is wrapped across three lines by rustfmt, so the edit "
+     "has no single line to anchor on - measured, by renaming the answers field "
+     "and watching the old anchor stop existing"),
     ("R26a", "keylink/tests/api.rs", "positional",
      "a slice of lib.rs's `pub use` list - re-quoting buys only until the next "
      "export lands"),

@@ -927,9 +927,14 @@ mod tests {
     ///   `answers` field — an ordinary refactor that does not touch this function's
     ///   text at all — was enough to rewrap it and make the old anchor
     ///   unfindable, with nothing red to say so.
+    ///
+    ///   Watched: `a restored set must evict in the order it was written`.
     /// - dropping the bound from the encoding: `(self.bound, self.iter()` →
     ///   `(APPLIED_BOUND, self.iter()`, which is what a derived impl would have
     ///   done and which the `bound()` assertion catches.
+    ///
+    ///   Watched: `a round trip that lost the bound would silently widen it to
+    ///   APPLIED_BOUND and no assertion about entries would notice`.
     #[test]
     fn a_snapshot_of_what_was_applied_round_trips_with_its_bound() {
         let two = NonZeroUsize::new(2).expect("2 is not zero");

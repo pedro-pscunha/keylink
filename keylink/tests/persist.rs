@@ -1302,16 +1302,24 @@ impl Serving {
 ///
 /// - in `keylink/src/rpc.rs`, inside `serve_one`: make the `.map` that
 ///   `.with_call(..)` wraps hash a **constant** key instead of the caller's, so
-///   every one of a peer's calls shares one id. The replacement, quoted because
-///   `break-once.sh` never searches it:
+///   every one of a peer's calls shares one id. Search
+///   `                .map(|idem| CallId::of(peer, idem.key())),`
+///   and replace it — the replacement quoted because `break-once.sh` never searches
+///   it — with
 ///   `.map(|idem| { let _ = idem; CallId::of(peer, &IdempotencyKey::new("x").expect("valid")) }),`
-///   Watched: `left: 50 right: 57`, on the second-key assertion.
+///   Watched: `a different key from the same peer must be applied, not recognised`,
+///   `left: 50`, `right: 57`. The sentence is recorded beside the values because the
+///   values alone cannot tell this assertion from a new one added above it.
 ///
-///   Described rather than quoted, and **measured**: that `.map` sits inside a
-///   five-line chain `rustfmt` owns the wrapping of. Giving `CallId::of` a third
-///   argument — the likeliest future edit there — reflows the chain and the old
-///   one-line anchor stops existing, which `break-once.sh` reports as an abort and
-///   a careless reader reports as green.
+///   **Quoted rather than described, and the reason is which failure shape you get,
+///   not how durable the anchor is.** That `.map` sits inside a five-line chain
+///   `rustfmt` owns the wrapping of; giving `CallId::of` a third argument — the
+///   likeliest future edit there — reflows it and the one-line anchor stops
+///   existing. That is **count 0, which `mise run anchors` reports loudly** and
+///   sends the reader to re-quote it. Describing it survives the reflow and
+///   **removes the row from the gate**, after which nothing checks that the
+///   description still locates the edit. A loud failure that gets followed beats a
+///   silent survival nobody verifies.
 /// - in `keylink/src/middleware.rs`, make `Context::call`'s body answer nothing —
 ///   search for `        self.call` **with its indentation AND its trailing
 ///   newline** — the newline is load-bearing and no other record in this repo
