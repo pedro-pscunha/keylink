@@ -1396,6 +1396,72 @@ async fn a_second_caller_attaches_to_a_live_key() {
     );
 }
 
+/// **An attacher on a service that holds no replies waits, and is then told the
+/// work ran.** The wait is not futile and it is deliberately not refused early.
+///
+/// Refusing at once could only answer `InFlight`, documented as *ask again when it
+/// finishes*, so the caller would ask again for as long as the handler runs — one
+/// bounded park traded for a re-dial loop, ending at the worse of the two answers.
+/// What the wait buys is `Unrecordable`: it ran, there is no reply, reconcile and
+/// stop. `Idempotency::attaching_for`'s doc carries the argument.
+///
+/// The budget here is five seconds against a 400 ms handler, so the assertion is
+/// that the attacher was answered by the *settle* rather than by its own timeout —
+/// a timeout would answer `InFlight` and fail on the variant rather than hang.
+///
+/// The counter is the second half: the handler ran **twice**, once for the original
+/// and once for the third keyless call. Three would mean the attacher's own call
+/// entered the handler after being refused, which is the failure a refusal-shaped
+/// answer could otherwise hide.
+///
+/// Made red by `scripts/break-once.sh` replacing `Guard::record`'s settled slot
+/// with `Slot::Done(frame.clone())` — a service that records after all, which is
+/// what an attacher would rather meet. Watched: `panicked at .., the attacher waits
+/// for the settle and is then refused: 1`, `0 passed; 1 failed; 31 filtered out`.
+/// The `expect_err` is what fires, because the attacher is handed the replayed
+/// reply.
+///
+/// The half that break does not reach is `InFlight` versus `Unrecordable` — a
+/// budget that expired instead of being woken. That is
+/// `an_attach_that_outlives_its_budget_returns`'s claim, below, and the variant
+/// assertion here is what would notice the two paths being confused.
+#[tokio::test]
+async fn an_attacher_on_a_recordless_service_waits_and_is_told_it_ran() {
+    let fixture = start_recordless().await;
+    let client = fixture.client;
+
+    let slow = {
+        let scoped = client.with_idempotency(key("k"));
+        tokio::spawn(async move { scoped.slow(400).await })
+    };
+    // Long enough that the claim is taken and the handler is inside its sleep.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let refused = client
+        .with_idempotency(keylink::Idempotency::attaching_for(
+            key("k"),
+            Duration::from_secs(5),
+        ))
+        .slow(0)
+        .await
+        .expect_err("the attacher waits for the settle and is then refused");
+
+    slow.await
+        .expect("no panic")
+        .expect("the first call answers");
+    assert_eq!(
+        refusal(&refused),
+        IdempotencyRefusal::Unrecordable,
+        "the wait must end at the settle, not at its own budget: `InFlight` here \
+         would mean the attacher timed out instead of being woken"
+    );
+    assert_eq!(
+        client.slow(0).await.expect("runs"),
+        2,
+        "the handler ran twice - the original and this one - not three times"
+    );
+}
+
 /// Attaching is bounded. When the budget runs out the answer is `InFlight`,
 /// which is what a non-attaching caller gets and is still the truth: a call
 /// under this key is in dispatch now.

@@ -670,6 +670,28 @@ impl Idempotency {
     /// Only a *running* call is waited for. A key that already settled is
     /// answered at once, whether that answer is the reply, `Interrupted`,
     /// `Unrecordable` or `Forgotten`.
+    ///
+    /// # Attaching to a service that holds no replies
+    ///
+    /// On a [`Records::None`] service the wait always ends in
+    /// [`IdempotencyRefusal::Unrecordable`], because there is no reply to take.
+    /// **The wait is still the right behaviour and it is not refused early**, and
+    /// the reasoning is worth having, because refusing early looks like the obvious
+    /// optimisation.
+    ///
+    /// What the wait buys is a *definitive* answer: `Unrecordable` means the work
+    /// ran, there is no reply, reconcile against your own domain and stop.
+    /// Refusing the attach at once could only answer
+    /// [`InFlight`](IdempotencyRefusal::InFlight), whose documented meaning is *ask
+    /// again when it finishes* — so a caller told that immediately asks again, and
+    /// again, for as long as the handler runs. One bounded park becomes a re-dial
+    /// loop, which is more load on both sides and ends at the worse of the two
+    /// answers.
+    ///
+    /// The park is already priced. A waiter holds no claim, so
+    /// [`MAX_WAITING_PER_PEER`] and [`MAX_WAITING`] exist to bound exactly this,
+    /// and [`MAX_ATTACH`] caps how long any one of them lasts. Held by
+    /// `an_attacher_on_a_recordless_service_waits_and_is_told_it_ran`.
     #[must_use]
     pub fn attaching_for(key: IdempotencyKey, budget: Duration) -> Self {
         Self {

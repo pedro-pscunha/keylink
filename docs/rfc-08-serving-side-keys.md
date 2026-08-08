@@ -269,7 +269,29 @@ be willing to pay on the caller's behalf. The module doc now carries that paragr
 because a design principle a later feature opts out of has to say so where the
 principle is stated rather than in a release note.
 
-### 3.2.3 A retention settle is a tombstone
+### 3.2.3 Attach still waits, and refusing early was rejected
+
+An attacher on a `Records::None` service parks, the handler completes, and its
+re-claim is refused `Unrecordable`. That looks like pure cost — a QUIC stream held
+for up to `MAX_ATTACH` to be told no — and refusing at the policy check instead was
+proposed on exactly that reading. **Rejected.**
+
+The wait buys a *definitive* answer. `Unrecordable` means the work ran, there is no
+reply, reconcile and stop. Refusing at once could only answer `InFlight`, whose
+documented meaning is *ask again when it finishes* — so a caller told that asks
+again, and again, for as long as the handler runs. One bounded park becomes a
+re-dial loop: more load on both sides, ending at the worse of the two answers. The
+"optimisation" inverts.
+
+And the park is already priced. A waiter holds no claim, which is precisely why
+`MAX_WAITING_PER_PEER` and `MAX_WAITING` exist — RFC-05 §11.2 is the section that
+added them — and `MAX_ATTACH` caps any one of them at thirty seconds. There is no
+unbounded cost here to remove.
+
+Documented on `Idempotency::attaching_for`, where a caller meets it, and held by
+`an_attacher_on_a_recordless_service_waits_and_is_told_it_ran`.
+
+### 3.2.4 A retention settle is a tombstone
 
 `settle` routes on `matches!(slot, Slot::Done(_))`, so `Unrecordable` lands in
 `Bucket::spent` and is bounded by `MAX_TOMBSTONES` rather than `MAX_RECORDS`. The
@@ -278,7 +300,7 @@ the reply it never had. `Slot::held_bytes` needed no edit because `Unrecordable`
 already holds zero — checked against the match rather than assumed, and
 `records_none_settles_the_key_and_holds_no_reply` asserts `inner.bytes == 0`.
 
-### 3.2.4 No `Default`, and the selectors are exhaustive
+### 3.2.5 No `Default`, and the selectors are exhaustive
 
 `Keyable` and `Records` both had `#[derive(Default)]` and `#[non_exhaustive]` at
 first. Both are wrong on the crate's own rules, and `Allowlist` is the precedent —
