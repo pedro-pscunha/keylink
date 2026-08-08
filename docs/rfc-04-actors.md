@@ -3704,3 +3704,47 @@ through `Outcome::Err(RemoteError)` → `RemoteError::Idempotency(..)`, the same
 
 Nothing in §16.10 through §16.12 changes. Their claims were about the changes *they*
 describe, and none of those moved a hash.
+
+## 16.16 Revision, 2026-08-08: the latency measurement §6.2 asked for exists, and it refutes §6.2
+
+Appended rather than edited into §6.2 and §13.2, per CONTRIBUTING.md: "Do not edit an
+RFC so that it matches new code. Append to it." §6.2 asking for a number it did not
+have is the record, and a repaired §6.2 would delete it.
+
+**§6.2's condition is met.** It said `.mailbox(n)` "can go on the builder later if
+somebody produces a latency measurement that justifies a number". The knob shipped as
+`SystemBuilder::mailbox_depth` without one. The measurement is now
+`what_a_deeper_mailbox_buys_the_caller` in `keylink/tests/mailbox_latency.rs` — an
+`#[ignore]`d run that prints and asserts nothing — and its numbers are tabled in
+`mailbox_depth`'s own rustdoc with the machine, the day and the load average beside
+them. §13.2 item 6 can be read as answered by the same pointer.
+
+**And the number contradicts the sentence the condition was attached to.** §6.2 argued
+a larger buffer "adds latency". Measured over 32 concurrent callers on one keyed actor,
+release profile: depth 32 against depth 1 drained a loaded queue 10.8 to 15 times
+faster, and the slowest caller's own wait fell from 717 – 779 µs to 165 – 234 µs. A
+deeper mailbox removes a parked-sender wakeup from between every pair of turns, and
+that is work on the critical path of every queued caller. So the direction is the
+opposite of §6.2's.
+
+§6.2's *other* clause stands, and it is the half worth keeping: a deeper mailbox does
+hide how far behind the actor is, by moving messages out of the transport into a queue
+nobody could read. `ActorStatus::buffered` is the partial answer built since — partial
+because it reports what the channel holds and never the senders parked behind it.
+
+**A third claim, in `mailbox_depth`'s own rustdoc rather than in this document, was
+also wrong and is now corrected.** It said that at depth `N` the first `N` callers
+"hand their message over and go on as if the actor were fast" while "the `N + 1`th
+feels the whole queue at once". No keyed caller can do either: the generated keyed
+client has no `tell` at all — `__keylink_actor_client_method!` emits nothing for one,
+deliberately, because four keyed refusals are only knowable from a reply — so every
+keyed caller awaits the actor at every depth. The guard is
+`a_mailbox_holds_exactly_its_depth_and_releases_no_caller_early`, which holds three
+messages in a three-slot mailbox and asserts that none of the four callers has been
+answered.
+
+**§15.10 item 3 is NOT answered by any of this.** That item is about capacity 1 on the
+**local** path, and nothing above touches it: `LOCAL_MAILBOX_DEPTH` is private, has no
+knob by decision, and the argument in `keylink/src/local.rs` for keeping it at one is a
+self-call hazard rather than a latency trade. A number measured through two QUIC
+endpoints says nothing about a mailbox both ends of which are in one process.
