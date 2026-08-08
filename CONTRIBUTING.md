@@ -115,6 +115,23 @@ Every `pub` item is a compatibility promise. Before you add one:
 `mise run docs` runs rustdoc with `-D warnings`, which turns `#![warn(missing_docs)]`
 into a gate and fails on a broken intra-doc link in the same pass.
 
+**Publishing a previously-private type? Run `mise run docs` before you believe the
+change compiles.** Making a type `pub` promotes its **whole** rustdoc to public
+documentation, so every intra-doc link in it that pointed at a private neighbour —
+legal while the module was private — becomes an error at once. You did not edit
+those links; publishing one item revoked their legality. Name the private item in
+backticks instead of linking it.
+
+A related convention, which the tree follows without stating why: `keylink_persist`
+is optional, and **only the `#[cfg(feature = "persist")]` module links to it**.
+Always-compiled files that mention it — `call.rs`, `observe.rs` — use backticks.
+Follow that rather than adding a link from a module that compiles without the
+feature.
+
+**`cargo check`, `cargo clippy --all-targets`, the whole test suite and
+`mise run anchors` all pass with those errors in the tree.** `mise run docs` is the
+only gate that sees them, so a green suite is not evidence here.
+
 ## The browser target
 
 `mise run wasm` **builds**, never checks. `cargo check` stops before the linker
