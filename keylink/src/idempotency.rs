@@ -1103,10 +1103,14 @@ impl Limits {
 
     /// The largest single reply frame the ledger will record, prefix included.
     ///
-    /// Defaults to [`MAX_RECORDED_FRAME`], which **cannot refuse anything**,
-    /// because the wire caps a header frame lower. Lower it to stop one large reply
-    /// from evicting many small ones. A reply above it is answered normally, and
-    /// the retry is refused [`Unrecordable`](IdempotencyRefusal::Unrecordable).
+    /// Defaults to [`MAX_RECORDED_FRAME`], which equals the wire's **payload** cap.
+    /// A frame is that payload plus the four-byte length prefix, so the default
+    /// **refuses the four largest frames the wire can carry**. That is the truthful
+    /// answer while the pool is [`MAX_RECORDED_BYTES`] — the argument lives in
+    /// [`MAX_RECORDED_FRAME`]'s own four-bytes paragraph, and it changes when the
+    /// pool rises. Lower it to stop one large reply from evicting many small ones. A
+    /// reply above it is answered normally, and the retry is refused
+    /// [`Unrecordable`](IdempotencyRefusal::Unrecordable).
     ///
     /// **The number counts the whole frame, length prefix included**, because the
     /// ledger stores exactly the bytes the wire wrote. So headroom for one reply's
