@@ -56,7 +56,12 @@ run = [
 
 [tasks.pre-commit]
 description = "Fast enough that nobody is tempted to bypass it. Seconds, warm"
-run = [{ task = "framing" }, { task = "fmt-check" }, { task = "lint-fast" }]
+run = [
+    { task = "framing" },
+    { task = "anchors" },
+    { task = "fmt-check" },
+    { task = "lint-fast" },
+]
 
 [tasks.pre-push]
 description = "The heavy gate. A push is rarer than a commit"
