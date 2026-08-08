@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+#MISE description="keylink RUNS in a browser. The three tasks above it only prove it compiles"
+#
+# `wasm`, `wasm-web` and `wasm-guards` are three statements about a compiler.
+# None of them loads a module. `CONTRIBUTING.md` said so in as many words —
+# "nothing has ever run in a browser" — while README.md described browser
+# support, and both sentences were true about different things.
+#
+# This task closes that gap the only way it can be closed: it builds the test
+# binary for `wasm32-unknown-unknown`, hands it to `wasm-bindgen-test-runner`,
+# and the runner serves it to headless Chrome over a loopback port and calls
+# each `#[wasm_bindgen_test]` inside the page. A module that links and then
+# traps on instantiation is red here and green in all three tasks above.
+#
+# **It found a defect on its first run, which is the argument for it existing.**
+# keylink asked for `wasm-streams 0.6` while reqwest — which iroh-relay pulls in
+# on this target — asks for `0.5`. Both export the same `#[wasm_bindgen]` glue
+# symbols, so `rust-lld` refused the module with twenty `duplicate symbol` errors
+# and NO consumer of the `web` feature could link a wasm binary. `wasm-web` was
+# green the whole time and was not wrong: it builds a library, and an rlib is
+# never linked. See `keylink/Cargo.toml`.
+#
+# # `--features web`, and no `--all-features` ever
+#
+# Same rule as `wasm-web`: `blocking`, `fs` and `env` refuse this target by
+# `compile_error!` on purpose, and `wasm-guards` is what proves they still do.
+#
+# # `--test browser` and not the whole test directory
+#
+# Everything else under `keylink/tests/` drives a `Node` over QUIC, and a
+# browser cannot open a UDP socket. Naming the one target keeps that a stated
+# boundary rather than twenty-six compile failures. `keylink/Cargo.toml` scopes
+# the dev-dependencies to match, which is what stops `tokio/full` reaching mio
+# on this target.
+set -euo pipefail
+
+ar="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-ar"
+if [ ! -x "$ar" ]; then
+    echo "llvm-ar not found at $ar" >&2
+    echo "rust-toolchain.toml requests it; try: rustup component add llvm-tools" >&2
+    exit 1
+fi
+
+# Both come from `[tools]` in mise.toml. Resolved here, and named in the failure,
+# because a gate that says `No such file or directory` teaches nobody which of
+# its four moving parts is missing.
+runner="$(command -v wasm-bindgen-test-runner || true)"
+if [ -z "$runner" ]; then
+    echo "wasm-bindgen-test-runner is not on PATH" >&2
+    echo "mise.toml pins it under [tools]; try: mise install" >&2
+    exit 1
+fi
+
+driver="$(command -v chromedriver || true)"
+if [ -z "$driver" ]; then
+    echo "chromedriver is not on PATH" >&2
+    echo "mise.toml pins it under [tools]; try: mise install" >&2
+    exit 1
+fi
+
+# The runner is reached as cargo's target runner rather than through a
+# `.cargo/config.toml`, so that setting it cannot leak into `wasm`, `wasm-web`
+# or anything else in this repository that names the same target.
+export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$runner"
+# Read by the runner. It also searches PATH, so this is belt and braces — but it
+# is the half that pins WHICH driver, and the pin is what makes the browser the
+# same one on every machine.
+export CHROMEDRIVER="$driver"
+
+# Headless is the runner's default. Set NO_HEADLESS=1 in your shell to watch the
+# page instead, which is the only way to see a JS exception's stack.
+
+log="$(mktemp -t keylink-wasm-browser)"
+trap 'rm -f "$log"' EXIT
+
+AR_wasm32_unknown_unknown="$ar" \
+    cargo test --target wasm32-unknown-unknown -p keylink \
+        --no-default-features --features web --test browser 2>&1 | tee "$log"
+
+# **The one thing a green exit code here does not prove.**
+#
+# `wasm_bindgen_test_configure!(run_in_browser)` is a line in a test file, and
+# without it the runner falls back to Node — which is installed on most machines
+# that build Rust, so every assertion in `browser.rs` would pass, in seconds,
+# outside any browser engine. That is a gate that cannot fail at the exact thing
+# it is named after, and deleting one line of a test file is all it takes.
+#
+# So the browser is asserted, from the runner's own announcement. Not a test
+# count: adding a test must not redden this, and `browser.rs` is expected to
+# grow.
+if ! grep -qF 'headless tests in Chrome' "$log"; then
+    echo >&2
+    echo "── the tests passed, but NOT in a browser." >&2
+    echo >&2
+    echo "The runner announces the engine it used, and it did not announce" >&2
+    echo "Chrome. The usual cause is a missing wasm_bindgen_test_configure!" >&2
+    echo "(run_in_browser) in keylink/tests/browser.rs, which sends the whole" >&2
+    echo "file to Node instead — where every assertion in it still passes." >&2
+    exit 1
+fi

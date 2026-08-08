@@ -49,6 +49,40 @@
 # while the repository is `nextest`.
 "ubi:nextest-rs/nextest[exe=cargo-nextest]" = "cargo-nextest-0.9.143"
 
+# The harness `mise run wasm-browser` runs keylink's wasm module under. It is
+# the `wasm-bindgen-test-runner` binary out of the wasm-bindgen release archive;
+# `exe=` picks it, because that archive also carries `wasm-bindgen` itself and
+# `wasm2es6js`, which nothing here uses.
+#
+# **The version is not a preference, it is Cargo.lock.** The runner refuses a
+# module built against a different `wasm-bindgen` and says so by version, so
+# this number and the `wasm-bindgen` line in `Cargo.lock` move together. If a
+# `cargo update` bumps that crate, `wasm-browser` goes red until this follows —
+# which is the right way round, and cheaper than the alternative of finding out
+# in a browser console.
+#
+# `github:` and not `ubi:`, unlike the line above: mise now warns that the `ubi`
+# backend is deprecated and removed in 2027.1. Same resolver, current spelling.
+"github:wasm-bindgen/wasm-bindgen[exe=wasm-bindgen-test-runner]" = "0.2.127"
+
+# The WebDriver the runner drives Chrome through. Pinned so that the gate runs
+# in a browser that is the same one everywhere, and so a machine without a
+# driver fails at the tool layer with a name rather than inside a test.
+#
+# **This pin is coupled to the installed Chrome, not to keylink.** chromedriver
+# refuses a browser whose MAJOR version differs from its own, so a Chrome that
+# auto-updates past 151 reddens `wasm-browser` with
+# `This version of ChromeDriver only supports Chrome version 151`. The fix is to
+# move this number to the new Chrome, not to bypass the task. Chrome for Testing
+# would remove the coupling by downloading its own browser — about 150 MB per
+# machine — and that trade was refused: a real browser already on the machine is
+# the one worth testing against.
+#
+# `asdf:` because there is no aqua entry and chromedriver has no GitHub release
+# to point `github:` at. The plugin fetches from Chrome for Testing's own
+# endpoint, once, at install time. Nothing downloads at test time.
+"asdf:mise-plugins/mise-chromedriver" = "151.0.7922.76"
+
 # ── the build environment ───────────────────────────────────────────────────
 
 [env]
@@ -117,6 +151,11 @@ run = [
     { task = "wasm" },
     { task = "wasm-guards" },
     { task = "wasm-web" },
+    # Last of the four, because it is the only one that needs a browser and the
+    # three above it narrow the failure: a red `wasm` is a link problem, a red
+    # `wasm-web` is the `web` feature, and a red `wasm-browser` after two greens
+    # is keylink not working where it says it works.
+    { task = "wasm-browser" },
     { task = "package" },
     { task = "msrv" },
 ]
