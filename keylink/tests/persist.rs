@@ -1732,6 +1732,17 @@ impl Booking {
 /// The *line* it was appended to is a different matter: it carries a real break now,
 /// the fifth in the list below, and that repair is written up there.
 ///
+/// **And a near-identical edit behaves completely differently: dropping only the
+/// approval.** That leaves the parked caller unreleased, so `strangers.await` blocks
+/// with nothing to answer it until `booking.stop` at the end of the test — it
+/// **hangs** rather than reddens, and a hang gives a replayer no message at all.
+///
+/// The retired edit does *not* hang, and the whole difference is one token: its
+/// `return` skips `strangers.await` altogether, so the test finishes without ever
+/// observing the stranger's answer. **That is why the retired edit passes and this
+/// one wedges** — two edits a line apart, on the same statement, telling a reader
+/// nothing and telling them nothing in two different ways. Both are named here
+/// because the plausible one is the one that hangs.
 /// Every break literal here is quoted without its leading indentation. Pass it to
 /// `scripts/break-once.sh` **with** the indentation — this doc comment is
 /// otherwise a second occurrence of the same text and the harness aborts on a
@@ -1785,6 +1796,13 @@ impl Booking {
 /// reaches, so the helper's own bounded loop gives up rather than racing. Watched:
 /// `2 withdrawals never parked`. What it pins is what the line is for: step 5
 /// observes exactly one parked reply before it approves.
+///
+/// **The smaller-looking edit is the one to try first and the one not to use:
+/// `want` → `0`.** The helper compares `== want`, so zero is already true on its
+/// first poll and it returns before anything has parked — the approval then races
+/// the park. That is a flaky test rather than a red one, and a break that sometimes
+/// passes is worse than no break, because it teaches a replayer to distrust the
+/// harness instead of the record.
 ///
 /// **That break is new, and it exists because the one this line used to carry
 /// stopped reddening.** The line is quoted in the section above to describe a
