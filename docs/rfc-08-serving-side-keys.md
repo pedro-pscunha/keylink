@@ -528,6 +528,25 @@ service's memory ceiling and changes what `evict` does under load, so it wants i
 own commit with a measured argument per constant rather than riding on a policy
 change. It is the one piece of the analysis above that is still owed.
 
+**Since then, the first half has landed and the second is still owed.** The split
+is done: `MAX_RECORDED_BYTES` is now the total pool alone, and `MAX_RECORDED_FRAME`
+is the per-frame ceiling. So every present-tense sentence above that says the
+constant *does double duty* describes the tree this section was written against and
+not the tree now — including the one in §3.1, which is left exactly as it stands
+because that section preserves a retracted argument on purpose and the double duty
+is what makes the retraction instructive.
+
+The ceiling did **not** stay at 1 MiB as this section predicted, and the four bytes
+are the reason. `MAX_HEADER` bounds the postcard payload while the ledger stores the
+whole frame, prefix included, so a ceiling of exactly 1 MiB would refuse four frame
+sizes the wire was willing to carry. The truthful never-rejects value is
+`MAX_HEADER + 4`.
+
+**Still owed: the pool's value.** Raising it partly revives the memory argument
+§3.1 retracted — at a larger pool, what `Records::None` saves is no longer *"roughly
+what its own tombstones cost"*. That tension is flagged here rather than resolved,
+because resolving it is the value-move commit's work.
+
 ---
 
 ## 9. What is guarded, and the two claims that are not

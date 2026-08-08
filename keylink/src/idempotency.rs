@@ -122,6 +122,8 @@
 //! [`Notified::enable`]: tokio::sync::futures::Notified::enable
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -140,13 +142,96 @@ use crate::{IdempotencyKey, RemoteError};
 /// it, small enough that the ledger is a rounding error beside one connection.
 pub const MAX_RECORDS: usize = 1024;
 
-/// Recorded reply bytes the ledger holds before it starts evicting.
+/// Recorded reply bytes the ledger holds **in total, across every peer**, before
+/// it starts evicting.
 ///
-/// A record is a reply frame, which is capped at [`MAX_HEADER`](crate::MAX_HEADER)
-/// — a megabyte each. Counting entries alone would therefore bound the ledger at
-/// a gigabyte, so the bytes are counted too, and a reply that cannot fit here on
-/// its own is never recorded.
+/// A record is a reply frame, which the ledger caps at [`MAX_RECORDED_FRAME`] — a
+/// megabyte each. Counting entries alone would therefore bound the ledger at a
+/// gigabyte, so the bytes are counted too.
+///
+/// The cap named here is the **ledger's**, not the wire's. They hold the same value
+/// today and are not the same bound: [`MAX_HEADER`](crate::MAX_HEADER) bounds a
+/// header frame's payload on the way out, and this pool bounds what is kept
+/// afterwards.
+///
+/// This is the pool and nothing else. What one reply may cost on its own is
+/// [`MAX_RECORDED_FRAME`], a separate number. Until the two were split this name
+/// carried both duties, and its own doc read as a per-key figure to anyone who
+/// came to it from [`MAX_RECORDS`].
 pub const MAX_RECORDED_BYTES: usize = 1 << 20;
+
+/// The largest reply frame the ledger will record, length prefix included.
+///
+/// [`MAX_RECORDED_BYTES`] bounds the pool; this bounds one entry in it. A reply
+/// over this is answered normally and then refused on the retry as
+/// [`IdempotencyRefusal::Unrecordable`] — a permanent property of the reply, which
+/// is what makes it different from eviction.
+///
+/// **This must never exceed [`MAX_RECORDED_BYTES`], and the ceiling equalling the
+/// wire's cap is what keeps it inside.** A frame larger than the whole pool cannot
+/// be held no matter what else the ledger is doing, so refusing it is a permanent
+/// property and [`IdempotencyRefusal::Unrecordable`] is the truthful answer. Admit
+/// it instead and `evict` downgrades it in the same lock, which reports an
+/// **eviction** for something that was never storable — the merge RFC-05 §5 says
+/// *"would make the query lie about why"*.
+/// `the_limits_the_readme_names_are_the_ones_the_ledger_uses` asserts the relation,
+/// because nothing else related the two numbers and their first values inverted it.
+///
+/// **The four bytes, which are a real fact about the wire and not this number.**
+/// [`MAX_HEADER`](crate::MAX_HEADER) bounds the **postcard payload**:
+/// `encode_header` computes `buf.len() - PREFIX` and checks that. It then returns
+/// the whole buffer, so the ledger stores `payload + PREFIX`. A maximal payload is
+/// therefore a **1048580-byte frame**, four bytes over the 1 MiB pool — so at
+/// today's pool those four sizes are permanently unrecordable, and this ceiling
+/// says so by stopping at the payload cap. Setting it to `MAX_HEADER + PREFIX`
+/// would admit exactly those four and answer `Forgotten`.
+///
+/// **When the pool rises the answer changes**, which is why RFC-08 §8 holds the two
+/// together: an 8 MiB pool can hold a maximal frame, refusing it becomes wrong, and
+/// `MAX_HEADER + PREFIX` becomes the truthful never-rejects ceiling. **The split is
+/// sound only once the pool can hold one maximal frame.**
+///
+/// A service lowers it with
+/// [`Limits::frame_bytes`](crate::Limits::frame_bytes) to stop one large reply
+/// from evicting many small ones. There is no floor to state: the smallest useful
+/// value is the postcard encoding of that service's own response type, which
+/// differs per service and has no name here. So any non-zero value can still
+/// refuse every reply of some response type.
+pub const MAX_RECORDED_FRAME: usize = crate::wire::MAX_HEADER as usize;
+
+/// The invariant that relates the two byte bounds, enforced at **compile time**.
+///
+/// A ceiling above the pool admits a frame that cannot be stored, so `Guard::record`
+/// writes `Done`, `evict` downgrades it in the same lock, and the retry is told
+/// `Forgotten` — an eviction — for a reply that was never storable. RFC-05 §5
+/// refuses that merge: it *"would make the query lie about why"*.
+///
+/// **A `const` block rather than an assertion in a test, and clippy is the reason
+/// the stronger form got used.** The first version of this guard was
+/// `assert!(MAX_RECORDED_FRAME <= MAX_RECORDED_BYTES)` inside
+/// `the_limits_the_readme_names_are_the_ones_the_ledger_uses`, and
+/// `clippy::assertions_on_constants` rejected it: *"this assertion has a constant
+/// value"*. That lint is right, and the remedy is not to silence it — both operands
+/// are `const`, so the relation can be checked when the crate is built instead of
+/// when a test is run. **The violation is now unbuildable rather than merely
+/// caught**, and no test can be skipped past it.
+///
+/// The message is a plain literal because a `const` panic cannot format arguments,
+/// so the two values are named rather than printed.
+///
+/// Made red by raising [`MAX_RECORDED_FRAME`] to `crate::wire::MAX_HEADER as usize +
+/// crate::wire::PREFIX`. Watched, on `cargo check -p keylink`, and the whole message
+/// comes through rather than a truncation: `error[E0080]: evaluation panicked:
+/// MAX_RECORDED_FRAME exceeds MAX_RECORDED_BYTES: a frame ceiling above the whole
+/// pool admits a reply that cannot be stored, so evict answers Forgotten for
+/// something permanently unrecordable`, pointing at the `const _: () = assert!(`
+/// line below.
+const _: () = assert!(
+    MAX_RECORDED_FRAME <= MAX_RECORDED_BYTES,
+    "MAX_RECORDED_FRAME exceeds MAX_RECORDED_BYTES: a frame ceiling above the whole \
+     pool admits a reply that cannot be stored, so evict answers Forgotten for \
+     something permanently unrecordable"
+);
 
 /// Tombstones the ledger holds before it starts dropping them.
 ///
@@ -537,14 +622,21 @@ impl Keyable {
 ///
 /// # What this is NOT for, and the number that says so
 ///
-/// **Not saving memory.** [`MAX_RECORDED_BYTES`] does double duty and reading it as
-/// a per-key figure inverts the whole argument: `Guard::record` uses it as a
-/// **per-record ceiling** (`frame.len() > limits.bytes`) and `evict` uses the same
-/// value as the **total pool across every peer** (`inner.bytes > limits.bytes`). So
-/// the record pool is 1 MiB *in total*, and what [`None`](Self::None) saves is that
+/// **Not saving memory.** Reading [`MAX_RECORDED_BYTES`] as a per-key figure
+/// inverts the whole argument: it is the **total pool across every peer**, which is
+/// the bound `evict` reads. What one reply may cost on its own is a different
+/// number, [`MAX_RECORDED_FRAME`], read in `Guard::record`. So the record pool is
+/// 1 MiB *in total*, and what [`None`](Self::None) saves is that
 /// one megabyte once per process, and it does not get that megabyte back for free:
 /// the same keys still occupy the tombstone pool, which [`MAX_TOMBSTONES`] bounds
 /// separately.
+///
+/// **This paragraph used to make that point from a defect, and the defect is
+/// gone.** It read *"[`MAX_RECORDED_BYTES`] does double duty"* and quoted the two
+/// comparisons to prove that one value was serving as both bounds. That was true of
+/// the tree it was written against. The two bounds are now two constants, so the
+/// premise no longer exists — but the conclusion never depended on the conflation,
+/// only on the pool being a pool. It is restated above without it.
 ///
 /// **No figure for the comparison, deliberately.** An earlier version said the saving
 /// was "roughly what its own tombstones cost", resting on [`MAX_TOMBSTONES`]'s own
@@ -594,7 +686,9 @@ impl Keyable {
 #[derive(Debug, Clone)]
 pub enum Records {
     /// Memory, bounded by [`MAX_RECORDS`], [`MAX_RECORDED_BYTES`] and
-    /// [`RECORD_TTL`]. What this crate did before this type existed.
+    /// [`RECORD_TTL`] — the three that evict — and by [`MAX_RECORDED_FRAME`], which
+    /// refuses one reply rather than evicting any. What this crate did before this
+    /// type existed.
     Memory,
     /// Nowhere. The key still claims, so the work still runs at most once, and
     /// every repeat is refused instead of answered.
@@ -856,31 +950,377 @@ struct Inner {
     waiting: usize,
 }
 
-/// Every bound the ledger enforces, in one value so a test can move them.
-#[derive(Debug, Clone, Copy)]
-struct Limits {
-    records: usize,
-    bytes: usize,
-    tombstones: usize,
-    running: usize,
-    running_per_peer: usize,
-    waiting: usize,
-    waiting_per_peer: usize,
+/// Every bound the **idempotency ledger** enforces, in one value.
+///
+/// Set it with [`ServiceBuilder::limits`](crate::ServiceBuilder::limits). Each
+/// method consumes and returns the value, so a departure from the default is one
+/// chain:
+///
+/// ```
+/// use std::num::NonZeroUsize;
+/// use keylink::Limits;
+///
+/// // The const-friendly conversion this crate uses everywhere a bound is written,
+/// // because `NonZeroUsize::new` is total and `unwrap` is denied in a `const`.
+/// const SMALL: NonZeroUsize = match NonZeroUsize::new(64) {
+///     Some(n) => n,
+///     None => NonZeroUsize::MIN,
+/// };
+///
+/// let limits = Limits::default().pool_records(SMALL).frame_bytes(SMALL);
+/// ```
+///
+/// The name says `ledger`, not `keylink`: [`MAX_HEADER`](crate::MAX_HEADER),
+/// [`MAX_KEY_LEN`](crate::MAX_KEY_LEN), [`MAX_ATTACH`],
+/// [`SystemBuilder::capacity`](crate::SystemBuilder::capacity) and
+/// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth) are all
+/// keylink bounds and none of them is in here. [`MAX_ATTACH`] is the one that is
+/// genuinely the *ledger's* and still absent: it is capped in
+/// [`Idempotency::attach_budget`], which holds no ledger, because the value that
+/// matters arrived from the network and never met a constructor.
+///
+/// # Why this type has a `Default` when `Records` and `Keyable` do not
+///
+/// Because eight of its nine fields are tuning decisions whose wrong value is
+/// **visible in a refusal** — every one of them refuses through
+/// [`IdempotencyRefusal`]. Slower or fatter, and both visible and recoverable.
+/// Only the four running and waiting bounds put the exceeded figure *in* the
+/// refusal, via [`TooManyRunning`](IdempotencyRefusal::TooManyRunning); the pool
+/// bounds and the ceiling answer
+/// [`Forgotten`](IdempotencyRefusal::Forgotten) or
+/// [`Unrecordable`](IdempotencyRefusal::Unrecordable), which name the outcome and
+/// not the number.
+///
+/// **[`tombstones`](Self::tombstones) is the exception, and it is why this
+/// paragraph is written per field rather than about the type.** Past it a key
+/// reads `Claim::Fresh` and the work runs a second time, which README
+/// limit 4 names as the one degradation a caller **cannot detect** — `Fresh` is
+/// what "never used" looks like too. So the safety of this `Default` is not that
+/// every field is harmless. It is that the default `tombstones` is **eight times**
+/// the default [`pool_records`](Self::pool_records), and **that margin is the
+/// whole of the safety**. A caller who narrows the margin takes on a failure the
+/// crate cannot report.
+///
+/// That is also what separates this type from
+/// [`Retention`](crate::Retention),
+/// [`Eviction`](crate::Eviction) and [`Allowlist`](crate::Allowlist), which have
+/// no `Default` at all: each of those is *one* decision, so it can be judged
+/// whole, and the wrong answer is a policy a caller never chose. `Limits` is nine
+/// decisions in one value, and "this type is a tuning decision" is not a
+/// well-formed sentence about it.
+/// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth)'s rustdoc
+/// draws the same line between a bound and a policy — it is **one knob**, not a bag
+/// of them, so it is the precedent for the *distinction* rather than for defaulting
+/// nine numbers at once. Nothing in this crate had a precedent for that.
+///
+/// # Not `Copy`, and no getters
+///
+/// For the reason [`Records`] is not `Copy`: a later field could hold a port
+/// behind an `Arc`, and withdrawing a trait impl is a breaking change no attribute
+/// covers. A `Limits` is built once per service, so `Copy` buys nothing
+/// measurable. Adding `Copy` later is not breaking; removing it is.
+///
+/// The fields are private and there are no getters, so a configured `Limits`
+/// cannot be read back. That is deliberate for now — adding a getter later is not
+/// breaking — and the operator-facing need is already met on the wire, because the
+/// refusal carries the number. [`Debug`] is hand-written for the same reason:
+/// a derived one would publish every private field name as the readback nobody
+/// decided to offer.
+///
+/// # Two ways to configure this and have it bound nothing
+///
+/// Both compile and both read as configured:
+///
+/// - Under [`Keyable::None`] **no ledger is built at all**, so a `Limits` handed
+///   to the builder is discarded whole.
+/// - Under [`Records::None`] nothing is held, so
+///   [`pool_records`](Self::pool_records), [`frame_bytes`](Self::frame_bytes) and
+///   [`pool_bytes`](Self::pool_bytes) bound nothing. The running, waiting and
+///   tombstone bounds still apply.
+#[derive(Clone)]
+pub struct Limits {
+    pool_records: NonZeroUsize,
+    frame_bytes: NonZeroUsize,
+    pool_bytes: NonZeroUsize,
+    tombstones: NonZeroUsize,
+    running: NonZeroUsize,
+    running_per_peer: NonZeroUsize,
+    waiting: NonZeroUsize,
+    waiting_per_peer: NonZeroUsize,
     ttl: Duration,
+}
+
+/// Every bound constant in this module is a non-zero literal, so the `None` arm is
+/// unreachable. It returns `MIN` rather than panicking, which is the shape
+/// [`APPLIED_BOUND`](crate::APPLIED_BOUND) already uses at `call.rs:215` and for the
+/// reason its own inline comment gives there: `NonZeroUsize::new` is total, and this
+/// crate denies `unwrap` in a `const` as everywhere else.
+///
+/// So the eight `NonZeroUsize` fields cost no panic path, and the nine `pub const`
+/// bounds stay `usize` and public. Converting in a `const fn` rather than at each
+/// field is what keeps those two facts compatible.
+const fn nonzero(n: usize) -> NonZeroUsize {
+    match NonZeroUsize::new(n) {
+        Some(n) => n,
+        None => NonZeroUsize::MIN,
+    }
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            records: MAX_RECORDS,
-            bytes: MAX_RECORDED_BYTES,
-            tombstones: MAX_TOMBSTONES,
-            running: MAX_RUNNING,
-            running_per_peer: MAX_RUNNING_PER_PEER,
-            waiting: MAX_WAITING,
-            waiting_per_peer: MAX_WAITING_PER_PEER,
+            pool_records: nonzero(MAX_RECORDS),
+            frame_bytes: nonzero(MAX_RECORDED_FRAME),
+            pool_bytes: nonzero(MAX_RECORDED_BYTES),
+            tombstones: nonzero(MAX_TOMBSTONES),
+            running: nonzero(MAX_RUNNING),
+            running_per_peer: nonzero(MAX_RUNNING_PER_PEER),
+            waiting: nonzero(MAX_WAITING),
+            waiting_per_peer: nonzero(MAX_WAITING_PER_PEER),
             ttl: RECORD_TTL,
         }
+    }
+}
+
+impl Limits {
+    /// Settled records held before `Ledger::evict` starts dropping the oldest.
+    ///
+    /// Defaults to [`MAX_RECORDS`]. One of the two pool bounds, counted across
+    /// every peer; the other is [`pool_bytes`](Self::pool_bytes), and **whichever
+    /// binds first governs**.
+    ///
+    /// Zero would hold nothing, so every retry would read
+    /// [`Forgotten`](IdempotencyRefusal::Forgotten) — at-most-once intact, the
+    /// answer gone. Not [`Records::None`]'s
+    /// [`Unrecordable`](IdempotencyRefusal::Unrecordable): that is a permanent
+    /// property of the service, and this would be an eviction that already
+    /// happened.
+    #[must_use]
+    pub fn pool_records(mut self, records: NonZeroUsize) -> Self {
+        self.pool_records = records;
+        self
+    }
+
+    /// The largest single reply frame the ledger will record, prefix included.
+    ///
+    /// Defaults to [`MAX_RECORDED_FRAME`], which equals the wire's **payload** cap.
+    /// A frame is that payload plus the four-byte length prefix, so the default
+    /// **refuses the four largest frames the wire can carry**. That is the truthful
+    /// answer while the pool is [`MAX_RECORDED_BYTES`] — the argument lives in
+    /// [`MAX_RECORDED_FRAME`]'s own four-bytes paragraph, and it changes when the
+    /// pool rises. Lower it to stop one large reply from evicting many small ones. A
+    /// reply above it is answered normally, and the retry is refused
+    /// [`Unrecordable`](IdempotencyRefusal::Unrecordable).
+    ///
+    /// **The number counts the whole frame, length prefix included**, because the
+    /// ledger stores exactly the bytes the wire wrote. So headroom for one reply's
+    /// payload is the figure set minus four.
+    ///
+    /// **There IS a hard floor, and it is not the useful one.** A frame is the
+    /// four-byte prefix plus a postcard-encoded envelope, and that envelope is never
+    /// empty — it carries two option tags before the message — so `frame.len()` is
+    /// always **greater** than four. **Any value of four or below therefore refuses
+    /// every reply**, which is arithmetic from the prefix width rather than a
+    /// measurement of the ledger.
+    ///
+    /// Stated as *four or below* rather than *under four*, which was the first
+    /// wording here and left the boundary out: at exactly four nothing records
+    /// either, because no frame is that small. This line before that said *"zero
+    /// would leave only a zero-length frame recordable"* — a frame size that cannot
+    /// exist, at a value `NonZeroUsize` already forbids.
+    ///
+    /// **Above four there is no floor this method can state**, and that is what
+    /// separates it from the one bound in this workspace that has one.
+    /// `keylink_persist`'s file limit states its floor as a named constant,
+    /// so a caller can read the threshold and stay above it. The smallest useful
+    /// value here is the postcard encoding of one service's own response type: it
+    /// differs per service and has no name anywhere. So **any non-zero value can
+    /// still refuse every reply of some response type**, and this method cannot say
+    /// which value that is.
+    #[must_use]
+    pub fn frame_bytes(mut self, bytes: NonZeroUsize) -> Self {
+        self.frame_bytes = bytes;
+        self
+    }
+
+    /// Recorded reply bytes held in total, across every peer, before
+    /// `Ledger::evict` starts dropping the oldest.
+    ///
+    /// Defaults to [`MAX_RECORDED_BYTES`]. The other pool bound beside
+    /// [`pool_records`](Self::pool_records).
+    ///
+    /// Zero would evict the whole pool on every settle, so every retry would read
+    /// [`Forgotten`](IdempotencyRefusal::Forgotten).
+    ///
+    /// Setting this **below** [`frame_bytes`](Self::frame_bytes) is legal and it
+    /// is not the refusal a reader expects: a reply under the frame ceiling and
+    /// over the pool is recorded `Done` and then immediately downgraded to
+    /// [`Forgotten`](IdempotencyRefusal::Forgotten) by the `evict` that
+    /// `Ledger::settle` runs in the same lock. It never reads
+    /// [`Unrecordable`](IdempotencyRefusal::Unrecordable), because that state and
+    /// `Done` are exclusive for one key.
+    ///
+    /// **A `const` assertion forbids that relation between the two default
+    /// constants, and it does not constrain this setter.** It fires at build time on
+    /// [`MAX_RECORDED_FRAME`] against [`MAX_RECORDED_BYTES`], because a *shipped*
+    /// default in that relation would report an eviction for a reply that was never
+    /// storable. A caller who chooses it deliberately gets the behaviour described
+    /// above, which is why it is documented rather than rejected.
+    #[must_use]
+    pub fn pool_bytes(mut self, bytes: NonZeroUsize) -> Self {
+        self.pool_bytes = bytes;
+        self
+    }
+
+    /// Tombstones held **in total, across every peer**, before the oldest are
+    /// dropped.
+    ///
+    /// Not per peer — `Inner.spent` is one count for the whole ledger, and `evict`
+    /// compares that single number against this bound. The same shape as
+    /// [`pool_bytes`](Self::pool_bytes), and worth stating precisely **here of all
+    /// places**: this is the one bound whose wrong value the caller cannot detect,
+    /// so a reader who budgets it per peer under-provisions it by however many peers
+    /// the service has.
+    ///
+    /// Defaults to [`MAX_TOMBSTONES`]. **This is the one bound on this type that
+    /// is a correctness control rather than a tuning decision, and
+    /// `NonZeroUsize` is not enough to make it safe.**
+    ///
+    /// A tombstone is what keeps an evicted key from being silently re-executed.
+    /// Drop one and its key reads `Claim::Fresh` again, the work runs a
+    /// second time, and README limit 4 names that as the one degradation a caller
+    /// **cannot detect** — `Fresh` is what "never used" looks like too. So a small
+    /// value loses at-most-once *undetectably*, and no refusal reports it.
+    ///
+    /// The bound that matters is not zero, it is the **margin over
+    /// [`pool_records`](Self::pool_records)**: a tombstone must outlive the reply
+    /// it replaced by a wide margin, and the default margin is eight times. Narrow
+    /// it and a key can settle, lose its record to the record pool, then lose its
+    /// tombstone to churn, all inside one retry window.
+    #[must_use]
+    pub fn tombstones(mut self, tombstones: NonZeroUsize) -> Self {
+        self.tombstones = tombstones;
+        self
+    }
+
+    /// Keyed calls the whole ledger may have in dispatch at once.
+    ///
+    /// Defaults to [`MAX_RUNNING`]. Zero would refuse every keyed call.
+    ///
+    /// # What a value above `u32::MAX` does, and it is the opposite of refusing
+    ///
+    /// The exceeded figure reaches the wire inside
+    /// [`TooManyRunning`](IdempotencyRefusal::TooManyRunning), whose `limit` is a
+    /// `u32`, so `over` clamps anything larger to 4294967295 rather than truncating
+    /// it to a small wrong number.
+    ///
+    /// **But that clamp is only ever observed when a refusal fires, and a refusal
+    /// fires only when the counter reaches the bound.** So a value above
+    /// [`u32::MAX`] does not refuse — it makes the bound **unreachable**, because
+    /// nothing refuses until more than 4294967295 keyed calls are in dispatch at
+    /// once. Setting a bound that large disables it; it does not make it loud.
+    ///
+    /// The same reasoning covers [`running_per_peer`](Self::running_per_peer),
+    /// [`waiting`](Self::waiting) and
+    /// [`waiting_per_peer`](Self::waiting_per_peer), which is why it is written once
+    /// here rather than four times.
+    #[must_use]
+    pub fn running(mut self, running: NonZeroUsize) -> Self {
+        self.running = running;
+        self
+    }
+
+    /// Keyed calls one peer may have in dispatch at once.
+    ///
+    /// Defaults to [`MAX_RUNNING_PER_PEER`]. Checked before
+    /// [`running`](Self::running), so it governs first. Zero would refuse every
+    /// keyed call from every peer.
+    ///
+    /// A value above [`u32::MAX`] **disables** this bound rather than refusing
+    /// loudly — see [`running`](Self::running) for why the `u32` clamp is never
+    /// observed at such a value.
+    #[must_use]
+    pub fn running_per_peer(mut self, running: NonZeroUsize) -> Self {
+        self.running_per_peer = running;
+        self
+    }
+
+    /// Attaching calls the whole ledger may have parked at once.
+    ///
+    /// Defaults to [`MAX_WAITING`]. Zero would refuse every attaching call
+    /// [`TooManyRunning { limit: 0 }`](IdempotencyRefusal::TooManyRunning), which
+    /// names a capacity, names the *running* count rather than the waiter count,
+    /// and names it zero — wrong quantity and wrong cause at once. `NonZeroUsize`
+    /// keeps the value out of that range without minting a refusal variant, which
+    /// would move both ALPN pins.
+    ///
+    /// A caller that does not want to be parked at all already has the switch, and
+    /// it is on the *calling* side: not asking to attach is answered
+    /// [`InFlight`](IdempotencyRefusal::InFlight), which is the right refusal.
+    ///
+    /// A value above [`u32::MAX`] **disables** this bound rather than refusing
+    /// loudly — see [`running`](Self::running) for why the `u32` clamp is never
+    /// observed at such a value.
+    #[must_use]
+    pub fn waiting(mut self, waiting: NonZeroUsize) -> Self {
+        self.waiting = waiting;
+        self
+    }
+
+    /// Attaching calls one peer may have parked at once.
+    ///
+    /// Defaults to [`MAX_WAITING_PER_PEER`]. **Checked first**, before
+    /// [`waiting`](Self::waiting) — but checked first is not the same as governing,
+    /// and this doc used to say it *alone* governed whatever `waiting` held. It does
+    /// not. If it passes, `waiting` is still checked, so **whichever of the two is
+    /// smaller binds**: at the defaults 128 is below 1024 so this one binds for one
+    /// peer, and set `waiting` below this and `waiting` binds even for a single
+    /// peer. Being checked first only decides which refusal a caller sees when both
+    /// are exceeded.
+    ///
+    /// Zero would refuse every attaching call, with the
+    /// same misnamed refusal described on [`waiting`](Self::waiting).
+    ///
+    /// A value above [`u32::MAX`] **disables** this bound rather than refusing
+    /// loudly — see [`running`](Self::running) for why the `u32` clamp is never
+    /// observed at such a value.
+    #[must_use]
+    pub fn waiting_per_peer(mut self, waiting: NonZeroUsize) -> Self {
+        self.waiting_per_peer = waiting;
+        self
+    }
+
+    /// How long a settled record answers with its reply before it becomes a
+    /// tombstone.
+    ///
+    /// Defaults to [`RECORD_TTL`]. A [`Duration`] rather than a non-zero type,
+    /// because the language offers no `NonZero` for one — the only field on this
+    /// type that can be set to zero.
+    ///
+    /// Zero makes every record [`Forgotten`](IdempotencyRefusal::Forgotten) at the
+    /// next claim: at-most-once holds and no answer survives.
+    ///
+    /// **There is no floor to document, and that is a fact about the crate rather
+    /// than an omission.** Any value above zero stores something. What decides
+    /// whether a value is useful is the caller's own retry interval — a `ttl`
+    /// below it behaves exactly like zero — and the crate cannot know that
+    /// interval. That is precisely why it is not a floor.
+    #[must_use]
+    pub fn ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+}
+
+impl fmt::Debug for Limits {
+    /// Hand-written, and the field list is deliberately absent.
+    ///
+    /// A derived `Debug` on a public struct with private fields publishes every
+    /// private field name and value, which would make it the readback that
+    /// [`Limits`] deliberately does not offer. Same reason
+    /// [`ServiceBuilder`](crate::ServiceBuilder) hand-writes its own.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Limits").finish_non_exhaustive()
     }
 }
 
@@ -927,11 +1367,13 @@ pub(crate) struct Ledger {
 }
 
 impl Ledger {
-    pub(crate) fn new(records: Records) -> Arc<Self> {
-        Self::with_limits(Limits::default(), records)
-    }
-
-    fn with_limits(limits: Limits, records: Records) -> Arc<Self> {
+    /// One constructor, taking the limits.
+    ///
+    /// There used to be a `new(records)` default shim over a
+    /// `with_limits(limits, records)`. Once the builder always holds a [`Limits`]
+    /// the shim had no caller, so it is gone rather than kept for symmetry — a
+    /// deleted shim stays deleted.
+    pub(crate) fn new(limits: Limits, records: Records) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner::default()),
             limits,
@@ -965,11 +1407,11 @@ impl Ledger {
             if let Some(entry) = bucket.slots.get(&key) {
                 return entry.slot.replay();
             }
-            if bucket.running >= self.limits.running_per_peer {
+            if bucket.running >= self.limits.running_per_peer.get() {
                 return refused_over(self.limits.running_per_peer);
             }
         }
-        if total >= self.limits.running {
+        if total >= self.limits.running.get() {
             return refused_over(self.limits.running);
         }
         {
@@ -1010,10 +1452,10 @@ impl Ledger {
     pub(crate) fn wait(self: &Arc<Self>, peer: EndpointId) -> Result<Waiting, RemoteError> {
         let mut guard = self.lock();
         let inner = &mut *guard;
-        if inner.waiters.get(&peer).copied().unwrap_or(0) >= self.limits.waiting_per_peer {
+        if inner.waiters.get(&peer).copied().unwrap_or(0) >= self.limits.waiting_per_peer.get() {
             return Err(over(self.limits.waiting_per_peer));
         }
-        if inner.waiting >= self.limits.waiting {
+        if inner.waiting >= self.limits.waiting.get() {
             return Err(over(self.limits.waiting));
         }
         *inner.waiters.entry(peer).or_default() += 1;
@@ -1172,7 +1614,9 @@ impl Ledger {
     /// is also why the two pools are counted separately — a tombstone that still
     /// counted as a record would make this loop unable to reach its own bound.
     fn evict(&self, inner: &mut Inner) {
-        while inner.held > self.limits.records || inner.bytes > self.limits.bytes {
+        while inner.held > self.limits.pool_records.get()
+            || inner.bytes > self.limits.pool_bytes.get()
+        {
             let Some(peer) = largest(inner, |bucket| bucket.held.len()) else {
                 return;
             };
@@ -1196,7 +1640,7 @@ impl Ledger {
             inner.spent += 1;
         }
 
-        while inner.spent > self.limits.tombstones {
+        while inner.spent > self.limits.tombstones.get() {
             let Some(peer) = largest(inner, |bucket| bucket.spent.len()) else {
                 return;
             };
@@ -1228,15 +1672,22 @@ fn largest(inner: &Inner, size: impl Fn(&Bucket) -> usize) -> Option<EndpointId>
 }
 
 /// One refusal, built in one place, so every cap reports the same way.
-fn over(limit: usize) -> RemoteError {
+/// `NonZeroUsize` because every caller passes a [`Limits`] field, and taking the
+/// field's own type keeps a plain count from arriving here by mistake.
+///
+/// The `u32` clamp used to be unreachable: every limit was a `pub const` of at
+/// most 4096. [`Limits`]'s setters make it live, so the four methods whose value
+/// reaches this refusal say in their own rustdoc that a value above [`u32::MAX`]
+/// is named as 4294967295.
+fn over(limit: NonZeroUsize) -> RemoteError {
     IdempotencyRefusal::TooManyRunning {
-        limit: u32::try_from(limit).unwrap_or(u32::MAX),
+        limit: u32::try_from(limit.get()).unwrap_or(u32::MAX),
     }
     .into()
 }
 
 /// The same refusal, on the path that answers a claim rather than a wait.
-fn refused_over(limit: usize) -> Claim {
+fn refused_over(limit: NonZeroUsize) -> Claim {
     Claim::Refused(over(limit))
 }
 
@@ -1282,8 +1733,14 @@ impl Guard {
         // Three causes, one slot, and that is the whole of Wave 2's wire cost:
         // nothing. `Slot::Unrecordable` reads "the handler ran, and its reply is
         // not something this ledger can hold", which is true word for word of a
-        // reply that carried a payload, of one over the per-record ceiling, and of
+        // reply that carried a payload, of one over the frame ceiling, and of
         // a service configured to hold none.
+        //
+        // The frame ceiling is the one this reads, and it is NOT the pool. A reply
+        // under the ceiling and over the pool is recordable here and evicted a
+        // moment later, so it reads Forgotten rather than Unrecordable. Before the
+        // two bounds were split they were one number, which made the difference
+        // invisible.
         //
         // NOT `Slot::Forgotten`, which was the first attempt. RFC-05 §5 draws the
         // axis this sits on — a permanent property versus an eviction — and says
@@ -1303,7 +1760,7 @@ impl Guard {
         // is untouched.
         let recordable = matches!(self.ledger.records, Records::Memory)
             && !carries_body
-            && frame.len() <= self.ledger.limits.bytes;
+            && frame.len() <= self.ledger.limits.frame_bytes.get();
         let slot = if recordable {
             Slot::Done(frame.clone())
         } else {
@@ -1386,30 +1843,38 @@ mod tests {
         Bytes::from(vec![7u8; len])
     }
 
+    /// Every bound a test sets is a non-zero literal written three lines away.
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("no test sets a bound to zero")
+    }
+
     /// A ledger holding `max` records. Named `holding` rather than `records`,
     /// which now means [`Records`] two hundred lines up.
+    ///
+    /// Built through the **setter**, not a struct literal, and so is every
+    /// `Limits` in this module. `mod tests` is a child of the defining module, so
+    /// a literal would still compile after the fields went private — and it would
+    /// leave all nine setters unexercised, which makes `pool_bytes` writing
+    /// `frame_bytes` a defect the whole suite stays green through.
     fn holding(max: usize) -> Limits {
-        Limits {
-            records: max,
-            ..Limits::default()
-        }
+        Limits::default().pool_records(nz(max))
     }
 
     /// The ordinary ledger every test below this line wants: memory-backed, with
     /// the shipped bounds.
     fn ledger() -> Arc<Ledger> {
-        Ledger::new(Records::Memory)
+        Ledger::new(Limits::default(), Records::Memory)
     }
 
     /// The same, with the bounds moved. One test door rather than two, so
     /// `Records::Memory` is stated once for every test that is not about it.
     fn bounded(limits: Limits) -> Arc<Ledger> {
-        Ledger::with_limits(limits, Records::Memory)
+        Ledger::new(limits, Records::Memory)
     }
 
     /// A ledger that claims keys and records no replies.
     fn recordless() -> Arc<Ledger> {
-        Ledger::new(Records::None)
+        Ledger::new(Limits::default(), Records::None)
     }
 
     fn refusal(claim: Claim) -> IdempotencyRefusal {
@@ -1612,7 +2077,7 @@ mod tests {
         /// `right: Unrecordable`.
         #[test]
         fn a_retention_refusal_is_told_apart_from_an_eviction() {
-            let ledger = Ledger::with_limits(holding(1), Records::None);
+            let ledger = Ledger::new(holding(1), Records::None);
             guard(ledger.claim(peer(A), key("kept"))).record(&frame(8), false);
 
             assert_eq!(
@@ -1621,7 +2086,7 @@ mod tests {
                 "a configured retention policy is not an eviction"
             );
 
-            let evicting = Ledger::with_limits(holding(1), Records::Memory);
+            let evicting = Ledger::new(holding(1), Records::Memory);
             guard(evicting.claim(peer(A), key("old"))).record(&frame(8), false);
             guard(evicting.claim(peer(A), key("new"))).record(&frame(8), false);
             assert_eq!(
@@ -1689,20 +2154,18 @@ mod tests {
         /// `Records::Memory` and a ledger that answers nothing.
         #[test]
         fn records_none_shortens_the_at_most_once_window() {
-            let bounds = Limits {
-                records: 4,
-                tombstones: 4,
-                ..Limits::default()
-            };
+            let bounds = Limits::default().pool_records(nz(4)).tombstones(nz(4));
             let settle_eight = |ledger: &Arc<Ledger>| {
                 for n in 0..8 {
                     guard(ledger.claim(peer(A), key(&format!("k{n}")))).record(&frame(8), false);
                 }
             };
 
-            let recording = Ledger::with_limits(bounds, Records::Memory);
+            // Cloned rather than copied: `Limits` is deliberately not `Copy`, so a
+            // later field can hold a port behind an `Arc`.
+            let recording = Ledger::new(bounds.clone(), Records::Memory);
             settle_eight(&recording);
-            let recordless = Ledger::with_limits(bounds, Records::None);
+            let recordless = Ledger::new(bounds, Records::None);
             settle_eight(&recordless);
 
             assert!(
@@ -1796,7 +2259,7 @@ mod tests {
         /// helper.
         #[test]
         fn memory_records_and_replays() {
-            let ledger = Ledger::new(Records::Memory);
+            let ledger = Ledger::new(Limits::default(), Records::Memory);
             guard(ledger.claim(peer(A), key("k"))).record(&frame(16), false);
             assert_eq!(
                 recorded(ledger.claim(peer(A), key("k"))),
@@ -1941,19 +2404,66 @@ mod tests {
             );
         }
 
-        /// One reply larger than the whole byte budget cannot be evicted into
-        /// fitting, so it must never be stored in the first place.
+        /// A reply over the frame ceiling is refused on the retry, and the pool has
+        /// nothing to do with it.
+        ///
+        /// **The old rationale here was true only while the two bounds were one
+        /// number.** It read *"One reply larger than the whole byte budget cannot
+        /// be evicted into fitting, so it must never be stored in the first
+        /// place"*, which justifies a per-response check by appealing to the pool.
+        /// Once the two split, a reply over the ceiling and under the pool can fit,
+        /// so the appeal no longer reaches the conclusion. The ceiling stands on
+        /// its own ground instead: it is a permanent property of the reply, and
+        /// [`Slot::Unrecordable`] is the state that says so.
+        ///
+        /// The test is also renamed, because *"the byte budget"* stopped being one
+        /// thing. `pool_bytes` is left at its default here on purpose — nothing
+        /// about this assertion involves it.
+        ///
+        /// **This is one of the two guards that hold the setter-to-field mapping**,
+        /// which is the defect class a public `Limits` introduces: a setter writing
+        /// the wrong field, with the suite green. Made red by
+        /// `scripts/break-once.sh` swapping `Limits::frame_bytes`'s body to write the
+        /// other field — anchored on `self.frame_bytes = bytes;` indented, which is
+        /// unique against this unindented quote. Watched: `panicked at .., assertion
+        /// `left == right` failed, left: Forgotten, right: Unrecordable`.
+        ///
+        /// `Forgotten` is the *right* half of the finding: under the swap the ceiling
+        /// keeps its default so the 65-byte frame is recordable, settles `Done`, and
+        /// then `evict` sees 65 over a 64-byte pool and downgrades it. So the swap
+        /// does not merely fail — it produces exactly the refusal that
+        /// `a_reply_under_the_ceiling_and_over_the_pool_is_forgotten_not_unrecordable`
+        /// exists to distinguish, which is why the two bounds need separate guards
+        /// rather than one.
         #[test]
-        fn a_reply_larger_than_the_byte_budget_is_not_replayed() {
-            let ledger = bounded(Limits {
-                bytes: 64,
-                ..Limits::default()
-            });
+        fn a_reply_over_the_frame_ceiling_is_not_replayed() {
+            let ledger = bounded(Limits::default().frame_bytes(nz(64)));
             guard(ledger.claim(peer(A), key("k"))).record(&frame(65), false);
 
             assert_eq!(
                 refusal(ledger.claim(peer(A), key("k"))),
                 IdempotencyRefusal::Unrecordable
+            );
+        }
+
+        /// The refusal a reply under the ceiling and over the pool gets, which is
+        /// **not** the one above.
+        ///
+        /// This is the hazard the split creates, so it is the split's to guard.
+        /// `Guard::record` writes `Done` or `Unrecordable`; `evict` downgrades
+        /// `Done` to `Forgotten`. Those states are exclusive for one key, so a
+        /// reply in this window goes `Done` and then `Forgotten` and never touches
+        /// `Unrecordable`. No timing is needed: `settle` calls `evict` in the same
+        /// lock, so the eviction has already happened when `record` returns.
+        #[test]
+        fn a_reply_under_the_ceiling_and_over_the_pool_is_forgotten_not_unrecordable() {
+            let ledger = bounded(Limits::default().frame_bytes(nz(64)).pool_bytes(nz(8)));
+            guard(ledger.claim(peer(A), key("k"))).record(&frame(32), false);
+
+            assert_eq!(
+                refusal(ledger.claim(peer(A), key("k"))),
+                IdempotencyRefusal::Forgotten,
+                "a frame inside the ceiling is recorded, then evicted by the pool"
             );
         }
     }
@@ -1971,12 +2481,30 @@ mod tests {
             assert_eq!(ledger.lock().held, 4);
         }
 
+        /// `pool_bytes`, not `frame_bytes`: **sixty-four** frames of 16 bytes are each
+        /// far inside the ceiling, and what is asserted is the sum they are allowed to
+        /// reach together — four of them, once eviction has run.
+        ///
+        /// This line first said *"sixteen frames"*, against a `for n in 0..64` loop it
+        /// sits three lines above. Nothing was red, because 16 and 64 both exceed a
+        /// 64-byte budget, and the doc line was **new in this PR** so the figure was
+        /// never checked against the code beside it. It became load-bearing the moment
+        /// another guard's record started sending readers here.
+        ///
+        /// **This is the other of the two guards that hold the setter-to-field
+        /// mapping.** Made red by `scripts/break-once.sh` swapping
+        /// `Limits::pool_bytes`'s body to write the other field — anchored on
+        /// `self.pool_bytes = bytes;` indented, unique against this unindented quote.
+        /// Watched: `panicked at .., held 1024 bytes over a 64 byte budget`.
+        ///
+        /// The 1024 is the finding rather than an arbitrary number: under the swap
+        /// the pool keeps its 1 MiB default, every 16-byte frame is far under the
+        /// ceiling the value landed on, and `pool_records` at 1024 never binds — so
+        /// all sixty-four frames are held and nothing evicts. A swap here is
+        /// **not** a smaller bound; it is no bound at all.
         #[test]
         fn the_recorded_bytes_stay_inside_their_bound() {
-            let ledger = bounded(Limits {
-                bytes: 64,
-                ..Limits::default()
-            });
+            let ledger = bounded(Limits::default().pool_bytes(nz(64)));
             for n in 0..64 {
                 guard(ledger.claim(peer(A), key(&format!("k{n}")))).record(&frame(16), false);
             }
@@ -1985,6 +2513,43 @@ mod tests {
                 ledger.lock().bytes <= 64,
                 "held {} bytes over a 64 byte budget",
                 ledger.lock().bytes
+            );
+        }
+
+        /// The four-byte fact, pinned as a **fact about the wire** rather than as the
+        /// ceiling's value — which is the distinction this branch got wrong once.
+        ///
+        /// `MAX_HEADER` bounds the postcard payload, and the ledger stores the whole
+        /// frame, so a maximal payload arrives as `MAX_HEADER + PREFIX` bytes. That
+        /// sum **exceeds the pool**, which is why the ceiling stops at the payload
+        /// cap: those four sizes can never be held, so refusing them is permanent
+        /// rather than an eviction.
+        ///
+        /// This lives in `src` rather than beside the pin in `tests/reliable.rs`
+        /// because `PREFIX` is `pub(crate)` and an integration test is a separate
+        /// crate. That visibility is what this assertion consumes — the constant's
+        /// value no longer names `PREFIX`, and a widened visibility with no reader
+        /// would be exactly the dead `pub` `CONTRIBUTING.md` argues against.
+        ///
+        /// Made red by raising the ceiling to include the prefix: change
+        /// `MAX_RECORDED_FRAME`'s value from `crate::wire::MAX_HEADER as usize` to
+        /// that plus `crate::wire::PREFIX`. Watched: `panicked at .., a maximal frame
+        /// exceeds the pool, so the ceiling must stop at the payload cap: ceiling
+        /// 1048580, maximal frame 1048584, pool 1048576`.
+        #[test]
+        fn a_maximal_frame_exceeds_the_pool_which_is_why_the_ceiling_omits_the_prefix() {
+            let maximal_frame = crate::wire::MAX_HEADER as usize + crate::wire::PREFIX;
+
+            assert!(
+                maximal_frame > MAX_RECORDED_BYTES,
+                "a maximal frame exceeds the pool, so the ceiling must stop at the \
+                 payload cap: ceiling {MAX_RECORDED_FRAME}, maximal frame \
+                 {maximal_frame}, pool {MAX_RECORDED_BYTES}"
+            );
+            assert_eq!(
+                MAX_RECORDED_FRAME,
+                crate::wire::MAX_HEADER as usize,
+                "so the ceiling is the payload cap, and the prefix is not added to it"
             );
         }
 
@@ -2043,11 +2608,7 @@ mod tests {
         /// is vacant again, and `KeyState::Fresh` is what says so.
         #[test]
         fn a_tombstone_is_dropped_once_its_own_bound_is_reached() {
-            let ledger = bounded(Limits {
-                records: 1,
-                tombstones: 2,
-                ..Limits::default()
-            });
+            let ledger = bounded(Limits::default().pool_records(nz(1)).tombstones(nz(2)));
             for n in 0..8 {
                 guard(ledger.claim(peer(A), key(&format!("k{n}")))).record(&frame(8), false);
             }
@@ -2061,10 +2622,7 @@ mod tests {
 
         #[test]
         fn running_claims_are_bounded_per_peer() {
-            let ledger = bounded(Limits {
-                running_per_peer: 2,
-                ..Limits::default()
-            });
+            let ledger = bounded(Limits::default().running_per_peer(nz(2)));
             let _one = guard(ledger.claim(peer(A), key("a")));
             let _two = guard(ledger.claim(peer(A), key("b")));
 
@@ -2080,10 +2638,7 @@ mod tests {
 
         #[test]
         fn running_claims_are_bounded_in_total() {
-            let ledger = bounded(Limits {
-                running: 2,
-                ..Limits::default()
-            });
+            let ledger = bounded(Limits::default().running(nz(2)));
             let _one = guard(ledger.claim(peer(A), key("a")));
             let _two = guard(ledger.claim(peer(B), key("b")));
 
@@ -2098,10 +2653,7 @@ mod tests {
         /// many tasks and stream pairs and meets neither cap.
         #[test]
         fn waiting_attachers_are_bounded_per_peer() {
-            let ledger = bounded(Limits {
-                waiting_per_peer: 2,
-                ..Limits::default()
-            });
+            let ledger = bounded(Limits::default().waiting_per_peer(nz(2)));
             let _one = ledger.wait(peer(A)).expect("the first place is free");
             let _two = ledger.wait(peer(A)).expect("and so is the second");
 
@@ -2117,10 +2669,7 @@ mod tests {
 
         #[test]
         fn waiting_attachers_are_bounded_in_total() {
-            let ledger = bounded(Limits {
-                waiting: 2,
-                ..Limits::default()
-            });
+            let ledger = bounded(Limits::default().waiting(nz(2)));
             let _one = ledger.wait(peer(A)).expect("free");
             let _two = ledger.wait(peer(B)).expect("free");
 
@@ -2137,10 +2686,7 @@ mod tests {
         /// nobody waiting.
         #[test]
         fn a_dropped_waiter_gives_its_place_back() {
-            let ledger = bounded(Limits {
-                waiting_per_peer: 1,
-                ..Limits::default()
-            });
+            let ledger = bounded(Limits::default().waiting_per_peer(nz(1)));
             let first = ledger.wait(peer(A)).expect("free");
             assert_eq!(
                 waited(ledger.wait(peer(A))),
@@ -2164,10 +2710,7 @@ mod tests {
         /// re-exports tokio's clock on native, so pausing tokio pauses this.
         #[tokio::test(start_paused = true)]
         async fn a_record_expires_after_its_ttl() {
-            let ledger = bounded(Limits {
-                ttl: Duration::from_secs(60),
-                ..Limits::default()
-            });
+            let ledger = bounded(Limits::default().ttl(Duration::from_secs(60)));
             guard(ledger.claim(peer(A), key("k"))).record(&frame(8), false);
             assert_eq!(recorded(ledger.claim(peer(A), key("k"))), frame(8));
 
@@ -2181,12 +2724,29 @@ mod tests {
             assert_eq!(ledger.lock().bytes, 0, "the reply's bytes must be freed");
         }
 
+        /// `ttl` is the one field on [`Limits`] that **can** be set to zero, because
+        /// the language offers no `NonZero` for a [`Duration`]. So what zero does is
+        /// asserted rather than claimed unrepresentable.
+        ///
+        /// No clock advance: the point is that the record is already expired when it
+        /// is written. This is also why `ttl` has no floor to document — a value
+        /// below the caller's own retry interval behaves exactly like this one, and
+        /// the crate cannot know that interval.
+        #[tokio::test(start_paused = true)]
+        async fn a_ttl_of_zero_forgets_every_record_at_the_next_claim() {
+            let ledger = bounded(Limits::default().ttl(Duration::ZERO));
+            guard(ledger.claim(peer(A), key("k"))).record(&frame(8), false);
+
+            assert_eq!(
+                refusal(ledger.claim(peer(A), key("k"))),
+                IdempotencyRefusal::Forgotten,
+                "at-most-once holds and no answer survives"
+            );
+        }
+
         #[tokio::test(start_paused = true)]
         async fn a_running_claim_does_not_expire() {
-            let ledger = bounded(Limits {
-                ttl: Duration::from_secs(60),
-                ..Limits::default()
-            });
+            let ledger = bounded(Limits::default().ttl(Duration::from_secs(60)));
             let _running = guard(ledger.claim(peer(A), key("k")));
 
             tokio::time::advance(Duration::from_secs(600)).await;
@@ -2315,14 +2875,93 @@ mod tests {
 
         /// Every settled path, mixed, against tight bounds so eviction and the
         /// tombstone pool both fire many times rather than never.
+        ///
+        /// **Four bounds, one clause each, because this test's coverage is a
+        /// function of which trigger each number fires.** It used to set one
+        /// `bytes: 64` that did both duties. Mapping that to `frame_bytes` alone
+        /// would have retired byte-driven eviction **while the test stayed green** —
+        /// `pool_records` at 3 keeps `evict`'s first loop running, so nothing goes
+        /// red and the doc paragraph above stays literally true.
+        ///
+        /// The recorded frames are 1, 6, 11, 16, 21, 26, 31 and 36 bytes — the
+        /// `n % 5 == 0` arm below, at `frame(n + 1)`. Every number is chosen against
+        /// that series:
+        ///
+        /// - `pool_records(3)` fires `evict`'s record loop, because eight frames are
+        ///   recorded.
+        /// - `frame_bytes(32)` fires `Guard::record`'s size refusal: **36 is the only
+        ///   one of the eight over it**, so the `Unrecordable` arm is reached on a
+        ///   size cause without swallowing the rest.
+        /// - `pool_bytes(64)` fires `evict`'s byte loop. The seven frames that pass
+        ///   the ceiling are 1 to 31, and the three largest of those are
+        ///   21 + 26 + 31 = **78**, over 64. The old figure written here was 93,
+        ///   which was 36 + 31 + 26 and counted the frame the ceiling now refuses —
+        ///   a sum this test can no longer reach.
+        /// - `tombstones(4)` fires `evict`'s tombstone loop.
+        ///
+        /// # The bounds are not the break target, and the difference matters
+        ///
+        /// **Raising `pool_bytes` does not redden this.** What is asserted is that the
+        /// counters agree with the maps; removing a *trigger* reduces what the test
+        /// covers without making any counter disagree with any map. So an edit to one
+        /// of the four bounds is a **silent coverage reduction** — precisely the
+        /// failure the four clauses exist to prevent, which is why proposing it as
+        /// this guard's break would be that failure wearing the shape of its remedy.
+        /// **The four bounds are a reviewable statement; a reviewer checks them by
+        /// reading.**
+        ///
+        /// **So what has no one-literal break is the CHOICE OF BOUND VALUES, and not
+        /// the counter invariant, which is strongly guarded.** An earlier version of
+        /// this section was headed *"this guard has NO one-literal break"*, which drops
+        /// that scope — and a reader who stopped at the heading would conclude the
+        /// invariant was unguarded and follow a redirection to two **mapping** guards
+        /// that answer a different question.
+        ///
+        /// The generalisation from *bound* literals to *every* literal is what failed:
+        /// `scripts/break-once.sh` takes a file path, so any production line in this
+        /// file is a legal target. Several redden this — `inner.spent += 1` to `+= 2`
+        /// is another — because each makes a counter disagree with the sum over
+        /// buckets, so **every** `assert_agrees` in the loop fails rather than one.
+        ///
+        /// Made red by dropping `evict`'s tombstone decrement, so the counter stays
+        /// high while the buckets drain. The anchor, on one line because a quote that
+        /// wraps across `///` lines is not seen as a span by every reader of this file:
+        ///
+        /// `inner.spent = inner.spent.saturating_sub(1);`
+        ///
+        /// replaced by the same line with `saturating_sub(0)`. Watched: `panicked at
+        /// .., assertion `left == right` failed: after n=9: spent, left: 5, right: 0`.
+        ///
+        /// The `after n=9` is the guard working as designed: `assert_agrees` runs
+        /// inside the loop, so it names the iteration at which the counter and the map
+        /// parted rather than reporting a final total.
+        ///
+        /// What a bad pool-versus-frame mapping *does* redden — **both measured, both
+        /// carrying their own break record, neither claimed from reasoning**:
+        ///
+        /// - `the_recorded_bytes_stay_inside_their_bound` — asserts the pool sum.
+        ///   Swapping `pool_bytes`'s body gives `held 1024 bytes over a 64 byte
+        ///   budget`.
+        /// - `a_reply_over_the_frame_ceiling_is_not_replayed` — asserts the ceiling's
+        ///   refusal. Swapping `frame_bytes`'s body gives `left: Forgotten, right:
+        ///   Unrecordable`.
+        ///
+        /// Between them those two hold the mapping. This test holds the arithmetic.
+        ///
+        /// **The first version of this paragraph asserted both of those without
+        /// running either**, which is the same substitution of a property for a
+        /// measurement that this section objects to — written into the commit whose
+        /// subject is that distinction. Both are now replays, and so is this guard's
+        /// own break.
         #[test]
         fn the_counters_agree_with_the_maps_on_every_path() {
-            let ledger = bounded(Limits {
-                records: 3,
-                bytes: 64,
-                tombstones: 4,
-                ..Limits::default()
-            });
+            let ledger = bounded(
+                Limits::default()
+                    .pool_records(nz(3))
+                    .pool_bytes(nz(64))
+                    .frame_bytes(nz(32))
+                    .tombstones(nz(4)),
+            );
             assert_agrees(&ledger, "empty");
 
             // Held across the whole loop, so every probe below runs with a live
@@ -2366,10 +3005,7 @@ mod tests {
         /// through `settle`, so it gets its own check.
         #[tokio::test(start_paused = true)]
         async fn the_counters_agree_after_records_expire() {
-            let ledger = bounded(Limits {
-                ttl: Duration::from_secs(60),
-                ..Limits::default()
-            });
+            let ledger = bounded(Limits::default().ttl(Duration::from_secs(60)));
             for n in 0..10u8 {
                 guard(ledger.claim(peer(A), key(&format!("k{n}")))).record(&frame(8), false);
             }
@@ -2390,10 +3026,7 @@ mod tests {
         /// one never had one.
         #[test]
         fn a_claim_the_global_cap_refuses_leaves_no_bucket_behind() {
-            let ledger = bounded(Limits {
-                running: 1,
-                ..Limits::default()
-            });
+            let ledger = bounded(Limits::default().running(nz(1)));
             let _running = guard(ledger.claim(peer(A), key("a")));
 
             assert_eq!(

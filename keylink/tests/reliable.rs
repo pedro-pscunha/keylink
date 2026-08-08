@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use keylink::{
     Admission, Admittance, AdmittedPeer, Allowlist, Context, Departure, IdempotencyKey, KeyState,
-    Peer, ProvenPeer, Revocation, Server as KeylinkServer, APPLIED_BOUND, MAX_ATTACH,
-    MAX_RECORDED_BYTES, MAX_RECORDS, MAX_TOMBSTONES, RECORD_TTL,
+    Peer, ProvenPeer, Revocation, Server as KeylinkServer, APPLIED_BOUND, MAX_ATTACH, MAX_HEADER,
+    MAX_RECORDED_BYTES, MAX_RECORDED_FRAME, MAX_RECORDS, MAX_TOMBSTONES, RECORD_TTL,
 };
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
@@ -296,6 +296,38 @@ async fn a_retried_call_across_a_reconnect_runs_exactly_once() {
 /// `APPLIED_BOUND`'s own docs now say so. The clause outlived the claim it rested
 /// on, which is the failure this whole test exists to catch, arriving in the test's
 /// own prose.
+///
+/// `MAX_RECORDED_FRAME` and `MAX_HEADER` joined with the split of the byte bound
+/// into a pool and a per-frame ceiling, and they joined **only because limit 5 now
+/// prints their numbers**, which is this test's one rule. Before the split, limit 5
+/// named `MAX_RECORDED_BYTES` and printed no figure at all — the same defect this
+/// test records against its own history two paragraphs up, and fixed the same way,
+/// on the README's side.
+///
+/// `MAX_RECORDED_FRAME` is not an independent number: it equals `MAX_HEADER`. Both
+/// are pinned anyway, because a reader of limit 5 needs the wire's cap **and** the
+/// ledger's ceiling to see that the second refuses nothing the first already passed.
+///
+/// # This pin cannot see the relation between the two byte bounds, and a `const` block in `src` does
+///
+/// `MAX_RECORDED_FRAME` bounds one frame; `MAX_RECORDED_BYTES` bounds the pool that
+/// holds it. **A ceiling above the pool admits a frame that cannot be stored**, and
+/// this branch shipped exactly that for one review cycle: the ceiling was
+/// `MAX_HEADER + PREFIX`, four bytes over the pool, so frame sizes 1048577 to
+/// 1048580 moved from `Unrecordable` on `main` to `Forgotten` — an eviction reported
+/// for a reply that was never storable.
+///
+/// **Every check here passed while that was true, and the reason is structural: the
+/// assertions above are per-constant.** Each names one number against one README
+/// figure. Two numbers can agree with their own pins and be wrong about each other,
+/// and this test cannot express that no matter how many rows it grows.
+///
+/// The invariant therefore lives with the constants, as a `const _: () = assert!(..)`
+/// beside `MAX_RECORDED_FRAME` in `keylink/src/idempotency.rs`, so the violation is
+/// **unbuildable** rather than caught by a test somebody can filter out. That form was
+/// not the first choice — an `assert!` here was, and
+/// `clippy::assertions_on_constants` rejected it as *"this assertion has a constant
+/// value"*. The lint was right, and following it produced the stronger guard.
 #[test]
 fn the_limits_the_readme_names_are_the_ones_the_ledger_uses() {
     assert_eq!(RECORD_TTL, Duration::from_secs(600));
@@ -304,4 +336,6 @@ fn the_limits_the_readme_names_are_the_ones_the_ledger_uses() {
     assert_eq!(MAX_RECORDED_BYTES, 1 << 20);
     assert_eq!(MAX_ATTACH, Duration::from_secs(30));
     assert_eq!(APPLIED_BOUND.get(), 4096);
+    assert_eq!(MAX_HEADER, 1 << 20);
+    assert_eq!(MAX_RECORDED_FRAME, 1 << 20);
 }

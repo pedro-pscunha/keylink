@@ -6,12 +6,13 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use keylink::{
     ActorId, Allowlist, Body, BodyReader, Caller, Context, Error, Eviction, IdempotencyKey,
-    IdempotencyRefusal, Keyable, Middleware, Next, Node, Outcome, Records, RemoteError,
+    IdempotencyRefusal, Keyable, Limits, Middleware, Next, Node, Outcome, Records, RemoteError,
     Server as KeylinkServer,
 };
 use postcard_schema::Schema;
@@ -124,6 +125,36 @@ async fn start_keyable(keyable: Keyable) -> Fixture {
         _server: running,
         _nodes: vec![server, client_node],
     }
+}
+
+/// The same `till`, served under bounds of the test's choosing.
+///
+/// A fresh node pair per call, for the reason `start_keyable` gives: the limits are
+/// fixed at `build()`.
+async fn start_limited(limits: Limits) -> Fixture {
+    let server = local_node().await;
+    let client_node = local_node().await;
+    let running = KeylinkServer::builder(&server)
+        .service(
+            till::service(Till::default(), Allowlist::anyone())
+                .limits(limits)
+                .build(),
+        )
+        .spawn()
+        .expect("one service, no duplicate ALPN");
+    let client = till::Client::connect(&client_node, server.endpoint().addr())
+        .await
+        .expect("the client dials the server");
+
+    Fixture {
+        client,
+        _server: running,
+        _nodes: vec![server, client_node],
+    }
+}
+
+fn nz(n: usize) -> NonZeroUsize {
+    NonZeroUsize::new(n).expect("no test sets a bound to zero")
 }
 
 fn key(text: &str) -> IdempotencyKey {
@@ -1345,6 +1376,155 @@ async fn the_defaults_reproduce_todays_behaviour() {
         unnamed.key_state(key("k")).await.expect("asks"),
         keylink::KeyState::Done,
         "and the ledger must agree with the replay"
+    );
+}
+
+/// **`ServiceBuilder::limits` reaches the ledger.** There is no unit half, and that
+/// is the point.
+///
+/// Every other guard on this feature is a unit test inside `src/idempotency.rs`,
+/// reaching the bounds through `Ledger::new`. Those prove the ledger's arithmetic
+/// and say **nothing** about whether the builder's value arrives. The whole of
+/// `ServiceBuilder::limits` can be silently disconnected — a `limits` field
+/// assigned in the method and never read in `build` — with all of them green.
+/// `the_defaults_reproduce_todays_behaviour` above is the same shape for
+/// `records`, and its record makes the same argument.
+///
+/// `frame_bytes(1)` is chosen because **the default cannot produce this refusal at
+/// all.** `MAX_RECORDED_FRAME` is `MAX_HEADER + 4`, deliberately above every frame
+/// the wire will pass, so a `Reserve` reply is recordable on any default service.
+/// At a ceiling of one byte the reply is over it, settles `Unrecordable`, and the
+/// retry is refused. A green here therefore cannot be produced by a discarded
+/// `Limits`.
+///
+/// Made red by `scripts/break-once.sh` deleting the `limits` assignment in
+/// `ServiceBuilder::build` — that is, changing
+/// `keys: Keys::new(self.keyable, self.records, self.limits),` to pass
+/// `Limits::default()` in its place. Watched: `panicked at .., a one-byte frame
+/// ceiling must refuse the repeat: 1`. The `1` is the recorded reply coming back:
+/// with the configured value discarded, the default ceiling records it and the
+/// repeat is answered instead of refused.
+///
+/// **The break is narrow, and that is the point.** It reddens this test and nothing
+/// else in the file, because this is the only one that asserts a refusal the default
+/// cannot produce. Every other guard on this feature reaches the bounds through
+/// `Ledger::new` and stays green.
+#[tokio::test]
+async fn a_frame_ceiling_set_on_the_builder_reaches_the_ledger() {
+    let limited = start_limited(Limits::default().frame_bytes(nz(1))).await;
+
+    limited
+        .client
+        .with_idempotency(key("k"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("the first call runs and is answered");
+
+    let refused = limited
+        .client
+        .with_idempotency(key("k"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect_err("a one-byte frame ceiling must refuse the repeat");
+
+    assert_eq!(
+        refusal(&refused),
+        IdempotencyRefusal::Unrecordable,
+        "over the ceiling is a permanent property of the reply, not an eviction"
+    );
+
+    let generous = start_limited(Limits::default()).await;
+    let first = generous
+        .client
+        .with_idempotency(key("k"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("the default ceiling records");
+    assert_eq!(
+        generous
+            .client
+            .with_idempotency(key("k"))
+            .reserve("ADU-014".to_string(), 2)
+            .await
+            .expect("and replays"),
+        first,
+        "the contrast: the shipped ceiling refuses nothing, so this is the value arriving"
+    );
+}
+
+/// **A narrow `tombstones` loses at-most-once, and no refusal reports it.**
+///
+/// This is the one bound on `Limits` whose wrong value the caller cannot detect,
+/// so it is the one that needs a guard showing the work running twice rather than
+/// a guard showing a refusal. `tombstones(1)` drops the first tombstone as soon as
+/// a second key settles for that peer, the key reads `Fresh` again, and the handler
+/// is entered a second time. `README.md` limit 4 names exactly this as the
+/// degradation a caller cannot see, *because `Fresh` is what "never used" looks
+/// like too*.
+///
+/// `pool_records(1)` is here to make the record go first: a key has to lose its
+/// record before its tombstone is what answers. The churn then evicts the
+/// tombstone.
+///
+/// The **run count in the second reply** is the whole assertion. `Till::reserve`
+/// returns the number of times it has been entered, so the reply is the evidence and
+/// nothing reaches inside the serving side. Four, not two: the two churn keys are
+/// entries 2 and 3.
+///
+/// Made red by `scripts/break-once.sh` raising the tombstone bound above the churn.
+/// Anchored on the whole builder line rather than on a `.tombstones(..)` fragment,
+/// because the record and the edit are in the SAME file: an indented whole line is
+/// unique against this unindented quote, while a fragment is not disambiguated by
+/// indentation at all.
+///
+/// Anchor: `let tight = start_limited(Limits::default().pool_records(nz(1)).tombstones(nz(1))).await;`
+/// Replacement: the same line with `.tombstones(nz(64))`.
+/// Watched: `panicked at .., a vacant key is Fresh, so the call is dispatched rather
+/// than refused: Remote(Idempotency(Forgotten))`.
+///
+/// **The red fires on the `expect` above the assertion, not on the run count**, and
+/// it is worth saying which half that leaves unguarded. At a bound of 64 the
+/// tombstone survives the churn, so the retry is refused `Forgotten` and the
+/// counter check never runs. That is the correct behaviour being restored — a
+/// surviving tombstone is exactly what should refuse — so the break proves the
+/// tombstone is what answers here, and the `ran == 4` assertion below is what
+/// distinguishes *the work ran again* from *the key was merely vacant*. Nothing
+/// available to `break-once.sh` reddens that second half: it would need a service
+/// that reports `Fresh` without dispatching, which is not a substitution.
+#[tokio::test]
+async fn a_tombstone_bound_below_the_churn_runs_the_work_twice() {
+    let tight = start_limited(Limits::default().pool_records(nz(1)).tombstones(nz(1))).await;
+
+    let first = tight
+        .client
+        .with_idempotency(key("k"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("the first call runs");
+    assert_eq!(first, 1, "the handler has been entered once");
+
+    // Two further keys settle for the same peer. The first pushes `k` out of the
+    // record pool; the second pushes `k`'s tombstone out of the tombstone pool.
+    for other in ["a", "b"] {
+        tight
+            .client
+            .with_idempotency(key(other))
+            .reserve("ADU-014".to_string(), 2)
+            .await
+            .expect("churn settles");
+    }
+
+    let again = tight
+        .client
+        .with_idempotency(key("k"))
+        .reserve("ADU-014".to_string(), 2)
+        .await
+        .expect("a vacant key is Fresh, so the call is dispatched rather than refused");
+
+    assert_eq!(
+        again, 4,
+        "a dropped tombstone must let the work run again: the handler counts every \
+         entry, and the two churn keys are entries 2 and 3"
     );
 }
 

@@ -389,7 +389,8 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
    happen twice.
 3. **A record answers for 600 s.** That is `RECORD_TTL`, alongside volume bounds
    of `MAX_RECORDS` — 1024 entries — and `MAX_RECORDED_BYTES` — 1 MiB of held
-   reply. Past any of them the reply is dropped and the retry is *refused* as
+   reply **in total, across every peer**, not per key. Past any of them the reply
+   is dropped and the retry is *refused* as
    `Forgotten`:
    at-most-once still holds, and the answer does not. Read the result out of your
    own domain; do not re-run the work.
@@ -420,10 +421,29 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
 5. **A reply that carries a payload is never recorded.** A `recv` method answers
    with a body beside its reply, and a body is streamed rather than held, so the
    repeat is refused as `Unrecordable` instead of being answered with a header
-   whose payload never arrives. So is any reply frame over `MAX_RECORDED_BYTES` —
-   a permanent property of the method, not an eviction. A `blob` reply is not
+   whose payload never arrives — a permanent property of the method, not an
+   eviction. A `blob` reply is not
    affected: its bytes move on iroh-blobs and the reply itself is just a header
    carrying an address, so it records and replays like any other.
+
+   **So is any reply frame over `MAX_RECORDED_FRAME` — 1 MiB, 1048576.** This line
+   used to name `MAX_RECORDED_BYTES` and print no figure, which was wrong twice:
+   the ledger's ceiling is a bound on **one frame**, and the pool is a separate
+   number that happens to share its value today.
+
+   The ceiling equals `MAX_HEADER`, the wire's own cap, and that is not a
+   coincidence. `MAX_HEADER` bounds the postcard *payload*, while the ledger stores
+   the whole frame including its four-byte length prefix — so a maximal payload
+   arrives as 1048580 bytes, which **exceeds the 1 MiB pool on its own**. A reply
+   that cannot fit the pool under any conditions is permanently unrecordable, so
+   `Unrecordable` is the right answer for it and the ceiling stops at the payload
+   cap to say so. Raise the pool and that changes: a bigger pool can hold a maximal
+   frame, and then the ceiling gains the four bytes.
+
+   The number is worth setting **lower** than the default, and
+   `Limits::frame_bytes` is how: one large reply that fits the pool can evict many
+   small ones. There is no floor to quote, because the smallest useful value is the
+   encoding of one service's own response type.
 6. **`Interrupted` is permanent, and it is the answer that needs a decision.** A
    call whose handler was entered and produced no reply — a dead connection, a
    shutdown, a layer that stopped waiting after dispatch — settles the key as

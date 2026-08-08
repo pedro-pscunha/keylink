@@ -100,8 +100,8 @@ use std::ops::DerefMut;
 use crate::compose::{Overflow, Topic};
 use crate::{
     ActorId, ActorStatus, Admission, Admittance, AdmittedPeer, Allowlist, BlobId, Caller,
-    DynamicAdmission, Ended, Eviction, FinishFut, IdempotencyKey, Intensity, LocalActor,
-    MailboxClosed, MountError, Observer, Origin, ProvenPeer, Retention, TurnFut, TurnInfo,
+    DynamicAdmission, Ended, Eviction, FinishFut, IdempotencyKey, Intensity, Keyable, LocalActor,
+    MailboxClosed, MountError, Observer, Origin, ProvenPeer, Records, Retention, TurnFut, TurnInfo,
     TurnOutcome,
 };
 
@@ -433,6 +433,43 @@ impl<T> HasNoDefault for Topic<T> {}
 /// would mean "a policy you did not name", and the only policy nobody named is
 /// the one that admits everyone.
 impl HasNoDefault for DynamicAdmission {}
+/// The eighth and ninth are the ledger's two service policies, and until this
+/// line they were the only types in the crate that **claimed** the property in
+/// prose and had nothing checking it. [`Records`]'s rustdoc says *"There is
+/// deliberately no `Default`"* and [`Keyable`]'s says the same; a
+/// `#[derive(Default)]` on either is one attribute, it compiles, and the
+/// paragraph goes false with nothing red.
+///
+/// The values are why. A defaulted [`Records`] would keep a caller's payloads in
+/// RAM for ten minutes because a field was left out, and a defaulted [`Keyable`]
+/// would pick which methods accept a key from a peer.
+///
+/// [`Limits`](crate::Limits) is deliberately **not** on this list. It is the one
+/// ledger type that does have a `Default`, because eight of its nine bounds
+/// refuse with the exceeded number in the refusal, and its rustdoc argues the
+/// ninth.
+///
+/// **This module is `#[cfg(test)]` (`lib.rs:230`), so every probe in it — this one
+/// included — reddens under `cargo test` or `cargo check --all-targets` and
+/// **never** under a plain `cargo check`.** Worth stating, because a coherence
+/// conflict looks like something the compiler enforces everywhere and this one is
+/// enforced in one command.
+///
+/// Reddened by adding `#[derive(Default)]` to `Records` with `#[default]` on
+/// `Memory` — both, because the derive alone is `error[E0665]` and stops short of
+/// this probe. Watched, via `cargo check -p keylink --all-targets`:
+/// `error[E0119]: conflicting implementations of trait `HasNoDefault` for type `idempotency::Records``
+/// on the `impl HasNoDefault for Records {}` line below, naming
+/// `impl<T: Default> HasNoDefault for T {}` as the `first implementation here`.
+///
+/// **No line number, deliberately.** The first version of this record cited `:426`,
+/// which was the line when the record was two paragraphs shorter — the record's own
+/// growth pushed the code down to `:439`, so a reader following the citation landed
+/// inside this comment. Same discipline as an anchor literal: a coordinate measured
+/// before the prose that displaces it is stale on arrival, and the item's name does
+/// not move.
+impl HasNoDefault for Records {}
+impl HasNoDefault for Keyable {}
 
 // ─────────────────────────────────── `Admission` has no permissive blanket impl
 
@@ -1018,6 +1055,66 @@ fn no_mailbox_can_be_asked_to_be_unbounded(builder: beta::SystemBuilder) -> beta
     let depth: fn(beta::SystemBuilder, NonZeroUsize) -> beta::SystemBuilder =
         beta::SystemBuilder::mailbox_depth;
     depth(builder, NonZeroUsize::MIN)
+}
+
+// ───────────────────────────────── no ledger bound can be asked to be zero
+
+/// The claim: **eight of [`Limits`](crate::Limits)'s nine setters cannot be handed
+/// a zero**, so every "what zero would do" sentence in that type's rustdoc
+/// describes a value a caller cannot type.
+///
+/// The natural guard is a `compile_fail` doctest, and it is the wrong tool twice
+/// over. Rustdoc does not check the error code, so a fence written for `E0308`
+/// stays green when the code fails to compile for a typo instead — a
+/// `compile_fail` that never compiled for the reason it names is a guard that
+/// cannot be reddened, which is the trap this whole module exists to avoid.
+///
+/// A coercion has no such slack. Widening one of these annotations to `usize` is
+/// `E0308` at this line and nothing suppresses it. That is also the whole break for
+/// this probe: change one `NonZeroUsize` below to `usize`, or change one setter's
+/// parameter, and the file stops compiling.
+///
+/// `ttl` is absent on purpose and is the stated exception: the language offers no
+/// `NonZero` for a [`Duration`](std::time::Duration), so zero is representable
+/// there and its rustdoc says what it does rather than claiming it cannot happen.
+/// `a_ttl_of_zero_forgets_every_record_at_the_next_claim` asserts what it does
+/// instead, because that is the one field this probe cannot speak for.
+///
+/// Reddened by widening one setter — `Limits::pool_records`'s parameter changed from
+/// `NonZeroUsize` to `usize`, which is the real defect rather than an edit to the
+/// annotation below. Watched, via `cargo check -p keylink --all-targets`:
+/// `error[E0308]: mismatched types` on the `crate::Limits::pool_records;` line in
+/// the body below — no line number, for the reason the `HasNoDefault` record above
+/// gives: this comment's own growth moves that line, and a citation measured before
+/// the prose that displaces it is stale on arrival —
+/// `expected fn pointer, found fn item`, with
+/// `note: expected fn pointer `fn(idempotency::Limits, NonZero<usize>) -> idempotency::Limits``
+/// against
+/// `found fn item `fn(idempotency::Limits, usize) -> idempotency::Limits {idempotency::Limits::pool_records}``.
+/// No error code is suppressible here, which is the whole reason this is a coercion
+/// and not a `compile_fail` fence.
+fn no_ledger_bound_can_be_asked_to_be_zero(limits: crate::Limits) -> crate::Limits {
+    let pool_records: fn(crate::Limits, NonZeroUsize) -> crate::Limits =
+        crate::Limits::pool_records;
+    let frame_bytes: fn(crate::Limits, NonZeroUsize) -> crate::Limits = crate::Limits::frame_bytes;
+    let pool_bytes: fn(crate::Limits, NonZeroUsize) -> crate::Limits = crate::Limits::pool_bytes;
+    let tombstones: fn(crate::Limits, NonZeroUsize) -> crate::Limits = crate::Limits::tombstones;
+    let running: fn(crate::Limits, NonZeroUsize) -> crate::Limits = crate::Limits::running;
+    let running_per_peer: fn(crate::Limits, NonZeroUsize) -> crate::Limits =
+        crate::Limits::running_per_peer;
+    let waiting: fn(crate::Limits, NonZeroUsize) -> crate::Limits = crate::Limits::waiting;
+    let waiting_per_peer: fn(crate::Limits, NonZeroUsize) -> crate::Limits =
+        crate::Limits::waiting_per_peer;
+
+    let one = NonZeroUsize::MIN;
+    let limits = pool_records(limits, one);
+    let limits = frame_bytes(limits, one);
+    let limits = pool_bytes(limits, one);
+    let limits = tombstones(limits, one);
+    let limits = running(limits, one);
+    let limits = running_per_peer(limits, one);
+    let limits = waiting(limits, one);
+    waiting_per_peer(limits, one)
 }
 
 // ────────────────────────────── a status reports only what a registry can read
