@@ -120,6 +120,45 @@ description = "rustdoc as a gate, not as decoration"
 #
 # `keylink-persist` declares `missing_docs` too and was not listed here, so its
 # own gate was decoration until this line named it.
+#
+# ── TWO KNOWN HOLES IN THIS GATE. Both measured, neither closed here.
+#
+# 1. WITHOUT `--document-private-items`, rustdoc does not resolve intra-doc links
+#    in private items at all — not the item, not its doc comment, not a
+#    `#[cfg(test)] mod` inside it. That is most of the prose in this crate: every
+#    private module's header and every break record in a unit-test module.
+#
+#    Turning it on is NOT free, which is why it is not on.
+#
+#    A SNAPSHOT AND NOT A STANDING COUNT — the numbers below were measured on
+#    2026-08-07 and are being actively fixed, so expect them to fall. Do not read
+#    a smaller count as this comment being wrong; re-measure with
+#    `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items
+#    --all-features -p keylink -p keylink-persist` and turn the flag on for good
+#    when it reaches zero. What does not go stale is the shape: private items are
+#    unchecked today, and that is the reason to finish the job.
+#
+#    As measured: **48 errors across 12 files** — 40 `redundant explicit link
+#    target`, which are mechanical, and **8 genuinely unresolved links that no
+#    gate in this repo had ever seen**:
+#      console.rs   `Allowlist`, `Self::follow`, `Self::on_events` (x2)
+#      local.rs     `crate::System::stop`, `crate::Busy`
+#      macros.rs    `Addressed`
+#      watch.rs     `LocalActor::spawn_supervised`
+#    Flipping the flag without fixing those 48 lands a red gate on the default
+#    branch, so it wants its own pass across files several branches own. The 8
+#    above are real broken links in shipped documentation and are worth fixing
+#    on their own merits.
+#
+# 2. `tests/*.rs` is unreachable EITHER WAY. cargo builds integration tests as
+#    separate crates and never hands them to rustdoc, so a broken intra-doc link
+#    in `keylink/tests/` is invisible to every gate here. It happened: an
+#    `APPLIED_CAPACITY` -> `APPLIED_BOUND` rename left a dangling
+#    `[`APPLIED_CAPACITY`]` in `tests/persist.rs` and this task stayed green.
+#    There is no cheap fix — `cargo rustdoc -p keylink --test persist` cannot
+#    link the crate graph — so the standing remedy is to grep for the old name
+#    after any rename that touches a documented item. Stated rather than worked
+#    around, because a workaround nobody maintains is worse than a known hole.
 run = "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features -p keylink -p keylink-persist"
 
 # ── shipping ────────────────────────────────────────────────────────────────

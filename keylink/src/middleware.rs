@@ -18,7 +18,7 @@ use std::time::Duration;
 use iroh::EndpointId;
 use n0_future::time::Instant;
 
-use crate::{ActorId, Body, BodyReader, Outcome, RemoteError};
+use crate::{ActorId, Body, BodyReader, CallId, Outcome, RemoteError};
 
 pub(crate) type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -215,6 +215,7 @@ pub struct Context {
     actor: Option<ActorId>,
     progress: Progress,
     queueing: Option<Queueing>,
+    call: Option<CallId>,
 }
 
 impl Context {
@@ -226,6 +227,7 @@ impl Context {
             actor: None,
             progress: Progress::new(),
             queueing: None,
+            call: None,
         }
     }
 
@@ -260,6 +262,13 @@ impl Context {
         self
     }
 
+    /// Name this call, when it arrived carrying an idempotency key. Called by the
+    /// accept loop, from the one place both halves of the digest exist.
+    pub(crate) fn with_call(mut self, call: Option<CallId>) -> Self {
+        self.call = call;
+        self
+    }
+
     /// The proven public key of the calling peer.
     pub fn peer(&self) -> EndpointId {
         self.peer
@@ -289,6 +298,64 @@ impl Context {
     /// in which case no actor can match it and the call is refused.
     pub fn actor(&self) -> Option<&ActorId> {
         self.actor.as_ref()
+    }
+
+    /// The name of this call, when the caller put an
+    /// [`IdempotencyKey`](crate::IdempotencyKey) on it.
+    ///
+    /// `None` when it did not, and `None` for every `tell`, which cannot carry a
+    /// key at all. Never a peer's key in the clear: see [`CallId`].
+    ///
+    /// # `None` for a method this service does not key, and that is a footgun
+    ///
+    /// [`Keyable`](crate::Keyable) decides which methods accept a key at all. On a
+    /// method outside that policy a keyed call is refused
+    /// [`NotKeyable`](crate::IdempotencyRefusal::NotKeyable) **before the chain is
+    /// entered**, and an unkeyed one arrives here as `None` — so this accessor can
+    /// never answer `Some` there, by construction rather than by chance.
+    ///
+    /// Which means an [`Applied`](crate::Applied) sitting in a handler whose method
+    /// the service has not made keyable **never fires, and nothing says so**. That
+    /// is the same silent at-least-once the type exists to prevent, reached through
+    /// a serving-side setting instead of through a caller forgetting
+    /// `with_idempotency`. If you deduplicate in a handler, put its method in the
+    /// policy.
+    ///
+    /// The refusal itself is held by
+    /// `tests/idempotency.rs::a_key_on_a_method_the_service_does_not_key_is_refused`.
+    /// What is added here is only where that leaves this accessor, which is a
+    /// consequence of `claim_key` returning before `next` and needs no second test.
+    ///
+    /// This is what makes `README.md`'s third limit — *"read the result out of
+    /// your own domain; do not re-run the work"* — something a handler can act on.
+    /// [`Applied`](crate::Applied) is where to put it. The ledger stops a
+    /// duplicate for as long as the process lives; **this is for the restart it
+    /// cannot cross**, where the state came back and the ledger did not.
+    ///
+    /// # A `#[defer]` reply released in a later turn does not carry this one
+    ///
+    /// `parking.rs` puts it plainly: a [`Deferred`](crate::Deferred) *"is parked in
+    /// turn 1 and sent in turn 5"*. During turn 5 this accessor answers **turn
+    /// 5's** call — `approve`'s key, or `None` if `approve` carried none — and not
+    /// the parked `withdraw`'s. That is the only answer that can be right: turn 5
+    /// is a call of its own, with its own caller and its own key, and a
+    /// [`Deferred`](crate::Deferred) reached from a spawned task is not inside any
+    /// turn at all.
+    ///
+    /// So a handler that wants to dedupe a `#[defer]` method records `cx.call()`
+    /// **in the turn that parks**, which is the turn that has it. What it records
+    /// there cannot be an answer, because that turn produced none — so `#[defer]`
+    /// gets `Applied<()>` and at-most-once, never the replayed answer an ordinary
+    /// `rpc` gets. Across a restart it gets less still: a parked reply channel is
+    /// not `Durable` and cannot be, so the restart drops it and the original
+    /// caller is never answered by anybody.
+    ///
+    /// Reachable from a [`Middleware`], which is a hole this documents rather than
+    /// one it closes — the same shape as [`progress`](Self::progress), and much
+    /// less interesting: a layer can already read the whole request.
+    #[must_use]
+    pub fn call(&self) -> Option<CallId> {
+        self.call
     }
 }
 

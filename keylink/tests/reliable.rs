@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use keylink::{
     Admission, Admittance, AdmittedPeer, Allowlist, Context, Departure, IdempotencyKey, KeyState,
-    Peer, ProvenPeer, Revocation, Server as KeylinkServer, MAX_ATTACH, MAX_RECORDED_BYTES,
-    MAX_RECORDS, MAX_TOMBSTONES, RECORD_TTL,
+    Peer, ProvenPeer, Revocation, Server as KeylinkServer, APPLIED_BOUND, MAX_ATTACH,
+    MAX_RECORDED_BYTES, MAX_RECORDS, MAX_TOMBSTONES, RECORD_TTL,
 };
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
@@ -284,6 +284,18 @@ async fn a_retried_call_across_a_reconnect_runs_exactly_once() {
 /// nothing. Both were fixed on the README's side — the numbers are printed
 /// there now — rather than by dropping the assertions, because a bound a reader
 /// cannot see is a bound they cannot plan around.
+/// `APPLIED_BOUND` joined this list with limit 2's rewrite, and it is the one
+/// entry here that is not the ledger's: it bounds a set that lives in the
+/// caller's own state. It belongs anyway, by the only rule this test has — the
+/// README prints the number, at limit 2, as `4096 calls`.
+///
+/// It used to say the README argued for it "by a comparison against `MAX_ATTACH`,
+/// which is pinned two lines up". That comparison was deleted as **wrong** in the
+/// same fix pass that wrote this clause: `MAX_ATTACH` bounds a wait on a call in
+/// flight on a live process and never the window a post-restart retry crosses, and
+/// `APPLIED_BOUND`'s own docs now say so. The clause outlived the claim it rested
+/// on, which is the failure this whole test exists to catch, arriving in the test's
+/// own prose.
 #[test]
 fn the_limits_the_readme_names_are_the_ones_the_ledger_uses() {
     assert_eq!(RECORD_TTL, Duration::from_secs(600));
@@ -291,4 +303,5 @@ fn the_limits_the_readme_names_are_the_ones_the_ledger_uses() {
     assert_eq!(MAX_RECORDS, 1024);
     assert_eq!(MAX_RECORDED_BYTES, 1 << 20);
     assert_eq!(MAX_ATTACH, Duration::from_secs(30));
+    assert_eq!(APPLIED_BOUND.get(), 4096);
 }

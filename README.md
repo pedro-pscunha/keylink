@@ -276,9 +276,11 @@ answered from the record without entering the handler again.
 
 That is effectively-once for one `rpc`. Here is what it does not cover.
 
-**Limits 3 and 5 are now partly the serving side's choice rather than only
+**Limits 2, 3 and 5 are now partly the serving side's choice rather than only
 keylink's**: `ServiceBuilder::keyable` decides which methods accept a key at all, so
-a key on any other is refused as `NotKeyable` instead of filling the ledger, and
+a key on any other is refused as `NotKeyable` instead of filling the ledger — which
+also **voids limit 2's remedy on every method outside the policy**, because
+`cx.call()` is then `None` and an `Applied` there never fires. And
 `ServiceBuilder::records` can decline to hold the reply at all — reaching limit 5's
 `Unrecordable` refusal by configuration rather than by the method's shape, which
 keeps at-most-once and gives up the answer on purpose so that a caller's payload is
@@ -292,11 +294,12 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
    `IdempotentClient`, which has no `tell` method, so this limit is one the
    compiler enforces rather than one you have to remember. Work that has to
    arrive is an `rpc`.
-2. **The ledger is memory.** It dies with the process, and a restarted service
-   runs a retried call again. `keylink-persist` makes an actor's *state* durable
-   and does nothing for the ledger. keylink has no journal and this is not one.
+2. **The ledger is memory, so across a restart the guarantee is yours to keep.**
+   The ledger dies with the process. `keylink-persist` makes an actor's *state*
+   durable and does nothing for the ledger; keylink has no journal and this is not
+   one.
 
-   **Durable state makes this sharper, not milder.** While nothing survived a
+   **Durable state makes that sharper, not milder.** While nothing survived a
    restart, re-running a retried call was *correct* — a fresh process had a fresh
    state. It is not correct any more. A process that fsyncs turn *n*, records the
    reply in the in-memory ledger, and dies before the frame reaches the peer will,
@@ -304,23 +307,116 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
    run *n* again. The state is durable and the record that would have suppressed
    the repeat is not.
 
-   So **effectively-once is a property of one process's lifetime, not of a key.**
-   Across a restart the guarantee is at-least-once, and a handler that is not
-   idempotent against its own committed state will double-apply. This is the real
-   distance to a journalled system, and it is one sentence rather than a caveat
-   you can tune away.
+   So **effectively-once is a property of one process's lifetime, not of a key** —
+   for as long as the only thing that knows about the key is the ledger.
+   `cx.call()` is what changes that. It hands the handler a `CallId` — the calling
+   peer folded into a hash of its key, opaque so that no caller has to re-implement
+   the ledger's peer-scoping rule — and `Applied<T>` is a bounded set to keep them
+   in. Put one in your own state, and the dedupe is three lines:
+
+   ```rust,ignore
+   let call = cx.peer().and_then(Context::call);
+   if let Some(&balance) = self.applied.get(call) { return balance; }
+   self.balance += amount;
+   self.applied.insert(call, self.balance);
+   ```
+
+   **The method has to be one your service keys.** `Keyable` decides that, and on a
+   method outside the policy a keyed call is refused `NotKeyable` before the handler
+   runs — so `cx.call()` is `None` there always, and an `Applied` in that handler
+   never fires and never says so. Deduplicating in a handler means putting its
+   method in the policy.
+
+   Insert in the turn that **applies**, as above, and never in a turn that merely
+   hears about the work: the two together are one snapshot and one `fsync`, and that
+   is the whole reason the set lives in your state rather than in keylink's. A
+   `#[defer]` method's parking turn is the trap — park the `CallId` beside the
+   `Deferred` and let the releasing turn record it, or a restart in between leaves a
+   record with no work behind it. `Applied<()>` is the valueless form for exactly
+   that shape, where there is no answer to replay.
+
+   `Applied` derives `Serialize`/`Deserialize` and no `Schema`, so it cannot reach an
+   ALPN and `postcard::to_allocvec(self)` keeps compiling when you add the field.
+   Take that encoder rather than writing your own: a hand-rolled snapshot that omits
+   the field compiles, passes every test, and starts empty after every restart, which
+   is the silent at-least-once this whole mechanism exists to prevent.
+
+   **`APPLIED_BOUND` is 4096 calls — and the unit is calls, not seconds.** It means
+   "4096 other pieces of keyed work may land between yours and its retry". Turning
+   that into a duration needs *your* adapter's turn rate: over `keylink-persist`'s
+   file store a turn is ~7.6 ms, so ~130/s and roughly 31 seconds — but the same turn
+   with no `fsync` behind it is ~13 µs, where 4096 entries is well under a second.
+   Measure and divide, and treat the count as the guarantee.
+
+   **And the set is a term in that turn rate, so measure at the bound you mean to
+   run.** `Persist` re-encodes the whole state every completed turn, so an `Applied`
+   costs its entries on every turn whether one changed or not — 4096 entries is
+   ~92 µs, which is 1.2% of an `fsync` turn and **6.5× a non-syncing one** — that
+   ratio and its denominator are sourced in `APPLIED_BOUND`'s rustdoc. Raise the
+   bound for slow callers; lower it for cheap turns. `APPLIED_BOUND`'s rustdoc has the
+   measured table.
+
+   The busiest window is the one right after the restart, which *concentrates*
+   arrivals — every peer's backoff fires at once. What drains the set, though, is
+   only **first-time** keyed work: a recognised retry returns before it touches the
+   eviction order, so a herd of pure retries costs no places at all. A reconnecting
+   client supplies both, and it is the new work that spends the bound.
+
+   **What this does not buy, in full.** The duplicate still *enters the handler*
+   and still costs a turn — about 7.6 ms of `fsync` on a state it did not change —
+   because only a durable ledger could refuse it before dispatch, and that one is
+   structural: the record lives in your state, so reaching it means dispatching to
+   your state. And the dedupe is yours to write, because the correct version knows
+   what your answer is and whether replaying it beats refusing.
+
+   Separately, and *as the tree stands today*: `key_state(key)` answers `Fresh`
+   after a restart, because the ledger it reads is memory. A peer therefore learns
+   nothing about a key your domain is about to dedupe. That is a property of the
+   ledger being volatile rather than a limit of the query — a durable record store
+   would answer it again, with nothing here changing — so read it as the current
+   state and not as a closed door.
+
+   **It also rests on the calling peer keeping its identity.** The peer is in the
+   hash, so a client that reconnects on a fresh keypair is a different caller, is
+   not recognised, and runs the work again — silently, and indistinguishably from a
+   first call, which is the degradation limit 4 below names as the one a caller
+   cannot detect. A long-lived `SecretKey` on the calling side is the precondition,
+   not a deployment preference.
+
+   `tests/persist.rs::a_retried_call_across_a_restart_is_applied_once` is the
+   proof, over two real nodes and the real file store: the process dies, the
+   restarted ledger answers `Fresh`, the retry is dispatched, and the work does not
+   happen twice.
 3. **A record answers for 600 s.** That is `RECORD_TTL`, alongside volume bounds
    of `MAX_RECORDS` — 1024 entries — and `MAX_RECORDED_BYTES` — 1 MiB of held
    reply. Past any of them the reply is dropped and the retry is *refused* as
    `Forgotten`:
    at-most-once still holds, and the answer does not. Read the result out of your
    own domain; do not re-run the work.
+
+   **`cx.call()` is no help here, and it is worth saying so.** A `Forgotten` repeat
+   is refused *before* dispatch, so there is no turn, no `Context`, and nothing for
+   a handler to recognise — the advice above is the caller's to act on, in its own
+   domain, and limit 2's remedy is the serving side's. The two limits look adjacent
+   and are not.
 4. **Past `MAX_TOMBSTONES` — 8192, eight times the record bound — a key is
-   `Fresh` again and the retry runs.** This is the one edge where the guarantee
-   degrades: effectively-once, to at-most-once, to at-least-once. It is also the
-   one state a caller cannot detect, because `Fresh` is what "never used" looks
-   like too. The wide margin over the record bound is what makes it unlikely
+   `Fresh` again and the retry runs.** This is the one edge where the *ledger's*
+   guarantee degrades: effectively-once, to at-most-once, to at-least-once. It is
+   also the one state a caller cannot detect, because `Fresh` is what "never used"
+   looks like too. The wide margin over the record bound is what makes it unlikely
    rather than impossible.
+
+   **The real bound, beside it.** The margin is over *this ledger's* traffic, so
+   what it protects is the window between a call and its retry on one live process
+   — and a restart resets it to nothing, which is limit 2. Two bounds, then, and
+   they are different quantities: `MAX_TOMBSTONES` is how many other keys may pass
+   before this one is vacant again, and `APPLIED_BOUND` is how many other keys
+   may pass before your own state forgets it. The second is the one that survives a
+   restart, and it is the one you can raise.
+
+   Undetectable degradation has two doors, and this is the second: a caller on a
+   fresh keypair also gets `Fresh` from `Applied`, for the same reason and with the
+   same silence.
 5. **A reply that carries a payload is never recorded.** A `recv` method answers
    with a body beside its reply, and a body is streamed rather than held, so the
    repeat is refused as `Unrecordable` instead of being answered with a header

@@ -310,6 +310,35 @@ async fn a_key_on_a_method_the_service_does_not_key_is_refused() {
         "the refusal must name the method it refused"
     );
 
+    // **And it refused BEFORE dispatch.** Read the way this file's header says to:
+    // the reply IS the evidence. `Slow`'s counter has never been touched, so the
+    // first call that gets through must answer run 1.
+    //
+    // Not redundant with the refusal above, and the reason is the whole point of the
+    // line: **moving the refusal to after the handler would leave that assertion
+    // green.** The caller receives its `NotKeyable` either way, so a reorder is
+    // invisible from the reply — and only the counter can see it. That ordering is
+    // what `Context::call`'s rustdoc rests on when it says the accessor can never
+    // answer `Some` on a method outside the policy; a handler that ran with a key in
+    // hand would falsify it silently.
+    //
+    // **It has no one-literal break, and this is the honest shape of that.** Every
+    // edit that lets the call through — `keys.ledger_for(method)` gaining an
+    // `.or(keys.ledger_for("Reserve"))`, say — reddens the `expect_err` above FIRST,
+    // watched: ``panicked at .., `Slow` is not in this service's policy: 1``. So the
+    // available break does not isolate this assertion. What it guards is a
+    // structural reorder of `serve_one`, which is not a one-literal edit and which
+    // nothing else here would notice.
+    assert_eq!(
+        fixture
+            .client
+            .slow(0)
+            .await
+            .expect("`Slow` unkeyed is fine"),
+        1,
+        "the refused keyed call must not have entered the handler",
+    );
+
     assert!(
         fixture
             .client
