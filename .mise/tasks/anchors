@@ -440,6 +440,44 @@ ANCHORS = [
     # reported `carried by NOBODY` until the quote went onto one line.
     ("L5", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
      "            inner.spent = inner.spent.saturating_sub(1);"),
+    # ── from `ledger-attach`, which added `Limits::attach` and moved the attach
+    # clamp from `Idempotency::attach_budget` to the accept path. SIX rows over FOUR
+    # distinct literals, and every count below was taken with `grep -cF` AFTER the
+    # record was written, in that order: adding a quote can only RAISE a count.
+    #
+    # A1 is SAME-FILE and indented, the narrowed rule in action: the record's quote
+    # sits unindented inside a `///` line while the code carries four spaces.
+    ("A1", "keylink/src/rpc.rs", "keylink/src/rpc.rs",
+     "    let Some(budget) = idem.attach_budget(ledger.attach_cap()) else {"),
+    # A2 and A2b are ONE literal cited by THREE records - two accept-path guards in
+    # `rpc.rs` and the arithmetic guard in `idempotency.rs` - registered as two rows,
+    # one per `lives_in`, because the record-quote check is per file and a single row
+    # would leave the other file's quote unchecked. C5 made the opposite choice for a
+    # literal two records cite; neither is the convention, and the reason to split
+    # here is that the two records live in DIFFERENT files, which C5's do not.
+    #
+    # **MEASURED at 2 in the bare form and 1 indented**, which is the same-file trap
+    # arriving through A2b: `.map(|millis| Duration::from_millis(millis).min(cap))`
+    # unindented matches the code line as a substring AND the record's own quote. The
+    # twelve-space form separates them.
+    ("A2", "keylink/src/rpc.rs", "keylink/src/idempotency.rs",
+     "            .map(|millis| Duration::from_millis(millis).min(cap))"),
+    ("A2b", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
+     "            .map(|millis| Duration::from_millis(millis).min(cap))"),
+    # A3 and A4 are also one literal and two `lives_in` files, for the same reason:
+    # one edit to the shipped default reddens a struct-level guard in
+    # `idempotency.rs` and an accept-path guard in `rpc.rs`, and only the pair says
+    # the default reaches the wire path rather than only the struct.
+    ("A3", "keylink/src/rpc.rs", "keylink/src/idempotency.rs",
+     "            attach: MAX_ATTACH,"),
+    ("A4", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
+     "            attach: MAX_ATTACH,"),
+    # A5 holds the TOP of the pool bounds' range, which their rustdoc argued only at
+    # the zero end. The first line of a two-line `while` condition, and a whole line
+    # in its own right - the `||` under it belongs to `rustfmt`, so a reflow gives
+    # count 0, which is loud and is what this gate is for.
+    ("A5", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
+     "        while inner.held > self.limits.pool_records.get()"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -880,7 +918,24 @@ for record, lives_in, target, literal in ANCHORS:
 # been right, which is exactly what makes adding it a trap — `parked-drain` added two
 # rows, gained two carrying blocks, and saw its population rise by ONE, so its
 # unchecked figure FELL.
-RECORD_BLOCKS = 116
+#
+# 116 → 122 on `ledger-attach`, off `e09e942`, for `Limits::attach`: SIX new harness
+# blocks, four accept-path guards in `rpc.rs` and two in `idempotency.rs`. FIVE rows
+# and SIX blocks, which is not one-per-row —
+# `an_attach_ceiling_of_zero_refuses_the_attacher_at_once` shares A2's literal with a
+# different replacement, so it adds a block without adding a row.
+#
+# 122 → the figure below, one commit later, for the pool bounds' maximal end: ONE
+# block, `a_maximal_pool_evicts_nothing`, registered as A5.
+#
+# **Both figures were read off a run at their own commit's tree, and the second one
+# was read off a FAILURE on purpose** — the tripwire was left at 122 and asked, so
+# the number came back as `123 comment blocks mention break-once.sh` from the walk
+# rather than from adding one to the previous line. That is the difference this file
+# spends paragraphs on: 122 + 1 would have been right here and is not a method, and
+# two commits on one branch each needing their own measurement is the whole reason
+# a carried value goes stale.
+RECORD_BLOCKS = 123
 
 harness_blocks: list[str] = []
 for path in sorted(

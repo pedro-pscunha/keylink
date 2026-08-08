@@ -738,6 +738,29 @@ macro_rules! __keylink_service {
             /// For several services on one endpoint, build each with
             /// [`service`] and register them on a single
             /// [`Server`](keylink::Server): one router must own every ALPN.
+            ///
+            /// **It also decides three serving-side policies and takes no argument
+            /// for any of them.** It calls `build()` itself, so a caller never holds
+            /// the [`ServiceBuilder`](keylink::ServiceBuilder) and cannot reach
+            /// [`limits`](keylink::ServiceBuilder::limits),
+            /// [`records`](keylink::ServiceBuilder::records) or
+            /// [`keyable`](keylink::ServiceBuilder::keyable). What it picks is
+            /// `Keyable::Any`, so every method accepts an idempotency key;
+            /// `Records::Memory`, so replies are held in memory; and
+            /// [`Limits::default`](keylink::Limits::default) for the ledger's bounds.
+            /// To change any of the three, take the `service` plus
+            /// [`Server::builder`](keylink::Server::builder) route above — named
+            /// there for a different reason, and a reader wanting different bounds
+            /// has none to look for it.
+            ///
+            /// **Not a `Limits` parameter, deliberately, and the reason is this
+            /// function's own signature.** Issue #13 lists "adding a parameter to
+            /// `serve`" as one of three surfaces that are genuinely breaking once
+            /// this crate is published — which is why it asked for a documentation
+            /// fix here rather than a signature change. A fourth way to build a
+            /// service also costs more than a default a caller can read, but that
+            /// argument is about a `Limits` *constructor* and not about this
+            /// parameter.
             pub fn serve<H: Handler>(
                 node: &$crate::Node,
                 handler: H,
@@ -1993,6 +2016,26 @@ macro_rules! __keylink_service {
                 /// For several services on one endpoint, build each with
                 /// [`Self::service`] and register them on a single
                 /// [`Server`](keylink::Server): one router must own every ALPN.
+                ///
+                /// **It also decides three serving-side policies and takes no
+                /// argument for any of them**, exactly as the concurrent
+                /// [`serve`] does and for the same reason: it calls `build()`
+                /// itself, so a caller never holds the
+                /// [`ServiceBuilder`](keylink::ServiceBuilder) and cannot reach
+                /// [`limits`](keylink::ServiceBuilder::limits),
+                /// [`records`](keylink::ServiceBuilder::records) or
+                /// [`keyable`](keylink::ServiceBuilder::keyable). It picks
+                /// `Keyable::Any`, `Records::Memory` and
+                /// [`Limits::default`](keylink::Limits::default). To change any of
+                /// them, go through [`Self::service`] and
+                /// [`Server::builder`](keylink::Server::builder) — the route the
+                /// paragraph above names for a different reason.
+                ///
+                /// **No `Limits` parameter here either, and for the reason
+                /// [`serve`] gives**: issue #13 lists adding a parameter to these
+                /// front doors as one of three surfaces that genuinely break once
+                /// this crate is published, so it asked for a documented default
+                /// rather than a wider signature.
                 ///
                 /// # The server holds the actor, and holds it past `shutdown`
                 ///

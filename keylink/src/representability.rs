@@ -445,9 +445,15 @@ impl HasNoDefault for DynamicAdmission {}
 /// would pick which methods accept a key from a peer.
 ///
 /// [`Limits`](crate::Limits) is deliberately **not** on this list. It is the one
-/// ledger type that does have a `Default`, because eight of its nine bounds
-/// refuse with the exceeded number in the refusal, and its rustdoc argues the
-/// ninth.
+/// ledger type that does have a `Default`, because nine of its ten bounds refuse
+/// **visibly** when they are set wrong, and its rustdoc argues the tenth.
+///
+/// Said as *visibly* rather than *with the exceeded number in the refusal*, which
+/// is what this line claimed while `Limits` held nine bounds. Only the four
+/// running and waiting bounds carry the figure; the pool bounds and the ceilings
+/// answer `Forgotten` or `Unrecordable`, which name the outcome and not the
+/// number. `Limits`'s own rustdoc has always drawn that line, so this summary of
+/// it was overstating one clause.
 ///
 /// **This module is `#[cfg(test)]` (`lib.rs:230`), so every probe in it — this one
 /// included — reddens under `cargo test` or `cargo check --all-targets` and
@@ -1059,7 +1065,7 @@ fn no_mailbox_can_be_asked_to_be_unbounded(builder: beta::SystemBuilder) -> beta
 
 // ───────────────────────────────── no ledger bound can be asked to be zero
 
-/// The claim: **eight of [`Limits`](crate::Limits)'s nine setters cannot be handed
+/// The claim: **eight of [`Limits`](crate::Limits)'s ten setters cannot be handed
 /// a zero**, so every "what zero would do" sentence in that type's rustdoc
 /// describes a value a caller cannot type.
 ///
@@ -1074,11 +1080,17 @@ fn no_mailbox_can_be_asked_to_be_unbounded(builder: beta::SystemBuilder) -> beta
 /// this probe: change one `NonZeroUsize` below to `usize`, or change one setter's
 /// parameter, and the file stops compiling.
 ///
-/// `ttl` is absent on purpose and is the stated exception: the language offers no
-/// `NonZero` for a [`Duration`](std::time::Duration), so zero is representable
-/// there and its rustdoc says what it does rather than claiming it cannot happen.
-/// `a_ttl_of_zero_forgets_every_record_at_the_next_claim` asserts what it does
-/// instead, because that is the one field this probe cannot speak for.
+/// `ttl` and `attach` are absent on purpose and are the stated exceptions: the
+/// language offers no `NonZero` for a [`Duration`](std::time::Duration), so zero is
+/// representable on both and each rustdoc says what it does rather than claiming it
+/// cannot happen. `a_ttl_of_zero_forgets_every_record_at_the_next_claim` and
+/// `an_attach_ceiling_of_zero_refuses_the_attacher_at_once` assert what they do
+/// instead, because those are the two fields this probe cannot speak for.
+///
+/// **The exceptions are a list because the type grew one**, and the pairing is not a
+/// coincidence: `attach` joined as a `Duration` for `ttl`'s stated reason, so it
+/// arrived outside this probe's reach by the same language fact. A third duration
+/// would too, which is why the sentence names the property and not the field count.
 ///
 /// Reddened by widening one setter — `Limits::pool_records`'s parameter changed from
 /// `NonZeroUsize` to `usize`, which is the real defect rather than an edit to the

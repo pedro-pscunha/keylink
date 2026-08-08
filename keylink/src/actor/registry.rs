@@ -1878,11 +1878,20 @@ impl<M> SystemBuilder<M> {
     /// buys latency for **free** and its whole cost is semantic: what the caller
     /// stops feeling.
     ///
-    /// `tests/actor_memory.rs`'s depth phase is that measurement, at ten thousand
-    /// idle actors, printing the per-actor cost at each depth. It is measured and
-    /// not asserted from the tokio source because this crate has been wrong about
-    /// this allocator's shape before — the table on [`Mailbox`](crate::Mailbox)
-    /// carried three wrong figures under a sentence claiming they were measured.
+    /// `tests/actor_memory.rs`'s depth phase is that measurement, printing the
+    /// per-actor cost at each depth. It runs at that file's `ACTORS_PER_DEPTH` —
+    /// **two thousand** idle actors per depth — and that constant's own doc argues
+    /// the count: phase 5 compares three systems against each other rather than
+    /// against a budget, so one block of slots, 256 bytes per actor, is unmissable
+    /// at that size. It is measured and not asserted from the tokio source because
+    /// this crate has been wrong about this allocator's shape before — the table on
+    /// [`Mailbox`](crate::Mailbox) carried three wrong figures under a sentence
+    /// claiming they were measured.
+    ///
+    /// **This line said ten thousand, and that is the file's other constant.**
+    /// `ACTORS` is 10,000 and drives phases 1 to 4; the depth phase is phase 5 and
+    /// never touches it. A wrong figure in a doc pointing at a test reads as
+    /// sourced, which is how this one propagated: issue #13 quoted it from here.
     ///
     /// What is **not** measured, and follows from the same block size: past 32
     /// queued messages a real queue does allocate again. The trade in the heading

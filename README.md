@@ -261,12 +261,13 @@ recipe rather than a feature:
 3. **Ask to attach.** `Idempotency::attaching_for(key, budget)` waits for a call
    already in flight under the key instead of being refused with `InFlight` —
    the difference between a retry that helps and a retry that races. **The
-   budget is capped at `MAX_ATTACH`, 30 s**, and the cap is the serving side's,
-   not yours: the budget arrives from the network and a peer asking to be held
-   for a year is asking for a QUIC stream to be held for a year. So a caller
-   with a 90-second handler cannot wait it out — it is refused at 30 s with the
-   work still running, which is `InFlight` and still the truth. Ask again, or
-   ask `key_state`.
+   budget is capped by the served `Limits::attach`, which defaults to
+   `MAX_ATTACH`, 30 s**, and the cap is the serving side's, not yours: the budget
+   arrives from the network and a peer asking to be held for a year is asking
+   for a QUIC stream to be held for a year. So a caller with a 90-second handler
+   cannot wait it out — at the default it is refused at 30 s with the work still
+   running, which is `InFlight` and still the truth. Ask again, or ask
+   `key_state`.
 
 `examples/reliable_call.rs` is that recipe, compiled by the gate and run over two
 nodes. `tests/reliable.rs::a_retried_call_across_a_reconnect_runs_exactly_once` is
@@ -285,8 +286,15 @@ also **voids limit 2's remedy on every method outside the policy**, because
 `Unrecordable` refusal by configuration rather than by the method's shape, which
 keeps at-most-once and gives up the answer on purpose so that a caller's payload is
 not held for the 600 s of limit 3. It narrows limit 4's window from `MAX_TOMBSTONES`
-plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
-`docs/rfc-08-serving-side-keys.md`.
+plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. And `ServiceBuilder::limits`
+replaces the numbers themselves: `RECORD_TTL`, `MAX_RECORDS`, `MAX_RECORDED_BYTES`,
+`MAX_RECORDED_FRAME` and `MAX_TOMBSTONES` are the **defaults** of `Limits` fields
+rather than fixed values, which is how a service bounds its own memory instead of only
+its exposure. Not every constant these limits print: `MAX_HEADER` is the wire's own cap
+and `APPLIED_BOUND` bounds a set in the caller's state, and neither is a `Limits`
+field. **The margin limit 4 names is the one to keep** — it is a property of the
+default, so narrowing it takes on the degradation that limit says a caller cannot
+detect. See `docs/rfc-08-serving-side-keys.md`.
 
 1. **There is no reliable `tell`.** A `tell` has no reply stream, so nothing can
    ack it, nothing can refuse it, and it does not accept a key — there is no reply
