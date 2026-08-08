@@ -914,19 +914,25 @@ mod tests {
     ///
     /// Made red two ways:
     ///
-    /// - **reversing [`Applied::iter`]** — insert `.rev()` at the head of the chain
-    ///   that function returns, so the restored set forgets the wrong entry. The
-    ///   replacement, quoted because `break-once.sh` never searches it and so it
-    ///   cannot affect uniqueness: `.rev().collect::<Vec<_>>().into_iter()` between
-    ///   `.iter()` and `.filter_map(..)` — the `collect` being what keeps the
-    ///   closure's lifetime the same shape.
+    /// - **reversing [`Applied::iter`]** — so the restored set forgets the wrong
+    ///   entry. Search, with its indentation:
+    ///   `.filter_map(|call| self.answers.get(call).map(|answer| (*call, answer)))`
+    ///   and replace it with `.rev()`, `.collect::<Vec<_>>()`, `.into_iter()` and
+    ///   that same line, in that order — the `collect` being what keeps the closure's
+    ///   lifetime the same shape.
     ///
-    ///   Named rather than quoted, and **measured rather than assumed**: that chain
-    ///   is wrapped across three lines by `rustfmt` and not by anybody's choice, so
-    ///   a quoted anchor there rots the moment a neighbour grows. Renaming the
-    ///   `answers` field — an ordinary refactor that does not touch this function's
-    ///   text at all — was enough to rewrap it and make the old anchor
-    ///   unfindable, with nothing red to say so.
+    ///   **A one-line search with a multi-line replacement**, which is the shape this
+    ///   record was missing. `break-once.sh` searches ONE literal and substitutes
+    ///   anything, so the chain being wrapped across three lines bounds the ANCHOR
+    ///   and not the edit: measured at `7a147c0`, `.iter()` alone counts 2 and is
+    ///   unusable, while this `.filter_map` line counts **1**. The earlier reason —
+    ///   that the site spans three lines so no anchor exists — was true of the site
+    ///   and false of the anchor.
+    ///
+    ///   Renaming the `answers` field rewraps this chain, which is how the previous
+    ///   anchor here was lost. It also rewrites this line, so the anchor goes to
+    ///   count 0 and `mise run anchors` says so — loudly, which is the point of
+    ///   quoting it rather than describing it.
     ///
     ///   Watched: `a restored set must evict in the order it was written`.
     /// - dropping the bound from the encoding: `(self.bound, self.iter()` →

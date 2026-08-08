@@ -1746,11 +1746,16 @@ mod tests {
         /// RFC-05 §2, asked of a ledger that records no replies.
         ///
         /// Made red by `scripts/break-once.sh` making `Guard::drop`'s
-        /// `Reached::NotDispatched` test unreachable — its `if` condition replaced by
-        /// `if false {`, so every dropped guard settles rather than releasing.
-        /// Described rather than quoted because that condition and this record are in
-        /// one file, where a quoted anchor is the second occurrence `break-once.sh`
-        /// refuses; the replacement is quoted, which is always safe. Watched:
+        /// `Reached::NotDispatched` test unreachable. Search, **with its
+        /// indentation**, which is what keeps it unique against this quote:
+        /// `if self.progress.as_ref().map(Progress::reached) == Some(Reached::NotDispatched) {`
+        /// and replace with `if false {`, so every dropped guard settles rather than
+        /// releasing. The replacement is quoted too, which is always safe.
+        ///
+        /// This record and that condition are in one file, and that is not a reason to
+        /// describe rather than quote — measured at `7a147c0`, the indented form
+        /// counts **1** with this quote present while the bare form counts 2. The
+        /// indentation is the whole mechanism. Watched:
         /// `panicked at .., a key nothing ran under must still be claimable`. It also
         /// reddens
         /// `claim::a_guard_dropped_with_nothing_dispatched_leaves_the_key_claimable`,

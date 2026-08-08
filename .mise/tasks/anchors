@@ -77,6 +77,29 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 # resolution check can see that. `scripts/replay-fate-breaks.sh` is the tool for
 # it, on the set it covers; this task deliberately answers the narrower question
 # of whether the break can be STARTED at all.
+#
+# ── AND THE GUARANTEE IS PER-TREE. IT SAYS NOTHING ABOUT A MERGE ───────────────
+#
+# Every rot mode above is detectable from inside one checkout. **This one is not,
+# and no version of this task can be.**
+#
+# A row can be registered, resolving, replayable and TRUE at branch A's tip while
+# branch B rewrites the test the record describes. The literal still resolves at
+# exactly one occurrence, so this task stays GREEN on A, on B, and on the merge —
+# while the break it certifies no longer reddens anything. Resolution is all the
+# checker sees, and the claim died in a file this checkout never had.
+#
+# Observed, not hypothesised: `C10`'s anchor is a line another branch mutated in an
+# experiment and its record is a paragraph that branch rewrote. Its break stopped
+# reddening and this task never moved.
+#
+# So the repair belongs to **the branch that falsifies a row, in the same commit
+# that rewrites the file** — otherwise some checkout-able commit has a tree and a
+# registry that disagree, and there is no tree from which that is visible. The
+# generalisation is worth having: **any registry naming lines in files another
+# branch owns is valid at exactly one tree, and the merge is where it silently
+# stops being valid.** A green run here is a statement about THIS checkout and
+# never about a merge that has not happened.
 import pathlib
 import re
 import subprocess
@@ -212,11 +235,28 @@ ANCHORS = [
     # reflow and takes the row OUT of the gate, after which nothing checks that the
     # description still locates the edit. So the choice is not fragile-vs-durable, it
     # is loud-vs-silent, and the record now says so in those terms.
-    #
-    # Its sibling `C-D3` stays described for a reason this one does not share: that
-    # edit site already spans more than one line, so there is no single line to quote.
     ("C13", "keylink/tests/persist.rs", "keylink/src/rpc.rs",
      "                .map(|idem| CallId::of(peer, idem.key())),"),
+    # ── three more rows that were DESCRIBED, converted after MEASURING instead of
+    # re-reading. All three reasons were property-shaped and none survived a count.
+    #
+    # R11 and R19 both said "the record is in the file its break edits, so a quoted
+    # anchor is a second occurrence". True of the BARE form, which counts 2, and false
+    # of the indented one, which counts 1 - the same remedy five sibling rows were
+    # already using when these two were written.
+    ("R11", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
+     "        if self.progress.as_ref().map(Progress::reached) == Some(Reached::NotDispatched) {"),
+    ("R19", "keylink/tests/idempotency.rs", "keylink/tests/idempotency.rs",
+     "                .keyable(Keyable::Only(&[\"Reserve\"]))"),
+    # C14, formerly `C-D3`, said its edit site spans three lines so no anchor exists.
+    # True of the SITE and false of the ANCHOR: `break-once.sh` searches one literal
+    # and substitutes anything, so a one-line search with a MULTI-LINE replacement is
+    # legal. `.iter()` alone counts 2 and is unusable; the `.filter_map` line counts 1.
+    # That reason was written on this branch, one commit after the same hand corrected
+    # the identical shape in C11 and C12 - which is the argument for measuring rather
+    # than reasoning, made against its own author.
+    ("C14", "keylink/src/call.rs", "keylink/src/call.rs",
+     "            .filter_map(|call| self.answers.get(call).map(|answer| (*call, answer)))"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -247,30 +287,41 @@ ANCHORS = [
 # ambiguity favours the wrong reading — somebody re-quotes an anchor that was
 # converted on purpose, reinstating the rot the conversion removed, and the new
 # entry looks like coverage.
+# ── A ROW HERE MUST CARRY ITS MEASURED COUNT AND THE TREE IT WAS MEASURED AT ───
+#
+# **State the measurement that made quoting impossible, not the property that made
+# it look impossible.** Six rows were once here. FIVE of them gave a property, every
+# property was true, and not one of the five conclusions survived a count:
+#
+#   * "the record is in the file its break edits, so a quote is a second occurrence"
+#     - true of the BARE form, false of the indented one. Three rows, R11, R19, C11;
+#   * "a fragment cannot be disambiguated by indentation" - true, and mode 4's remedy
+#     is to stop quoting the fragment. C12;
+#   * "the site spans three lines, so no anchor exists" - true of the SITE, false of
+#     the ANCHOR, because a one-line search may have a multi-line replacement. C14;
+#   * "a reflow will rot this anchor" - true, and a reflow gives count 0, which is
+#     LOUD, so it argues for quoting. C13.
+#
+# The reason a reason rots here is that **a reason for NOT doing something is never
+# exercised.** A quoted anchor is re-checked on every commit; a description is read,
+# found plausible, and left. So this list accumulates arguments that were sound once,
+# each keeping a true-sounding first clause. A count with a tree can be falsified in
+# one command; a property has to be re-derived, and re-derivation is how a correct
+# row acquires a false reason.
+#
+# Where a remedy is genuinely UNAVAILABLE rather than merely unused, say so in those
+# words - a `const` at column 0 has no indentation to add. "No indentation needed"
+# invites exactly the re-derivation above.
 DESCRIBED = [
-    ("R11", "keylink/src/idempotency.rs", "same-file",
-     "Guard::drop's NotDispatched condition - the record's own quote was the "
-     "second occurrence"),
-    ("R19", "keylink/tests/idempotency.rs", "same-file",
-     "the keyed-actor test's own .keyable(..) call, for the same reason"),
-    # ── from PR #11 (`call-id`). Four were converted here and THREE did not survive
-    # re-measurement; they are now quoted as C11, C12 and C13 above. Two of the three
-    # failed the same way - a real obstacle identified and its remedy never tried.
-    # Column 0 does defeat indentation, and the trailing newline still works. A
-    # fragment cannot be disambiguated by indentation, and mode 4's remedy is to stop
-    # quoting the fragment. The third was a sound reason applied to the wrong
-    # question: durability, where the question is loudness.
-    #
-    # ONE remains, and it is the only one of the four with no remedy of that kind: the
-    # edit site already spans more than one line, so there is no single line to quote
-    # and a reflow is not something a better anchor avoids.
-    ("C-D3", "keylink/src/call.rs", "formatter",
-     "Applied::iter's chain is wrapped across three lines by rustfmt, so the edit "
-     "has no single line to anchor on - measured, by renaming the answers field "
-     "and watching the old anchor stop existing"),
+    # The only row left, and the only one of the six whose reason was ever a
+    # measurement. Its retired anchor was a slice of `lib.rs`'s `pub use` list; a
+    # later wave inserted `Records,` inside that slice and the anchor went to count 0.
+    # Re-measured at `7a147c0`: the retired literal counts **0** in `keylink/src/lib.rs`
+    # and re-quoting buys only until the next export lands, which puts the chore on
+    # whoever adds one. This is the one mode where quoting is not worth it at all.
     ("R26a", "keylink/tests/api.rs", "positional",
-     "a slice of lib.rs's `pub use` list - re-quoting buys only until the next "
-     "export lands"),
+     "a slice of lib.rs's `pub use` list - retired literal counts 0 at 7a147c0, and "
+     "re-quoting buys only until the next export lands"),
 ]
 
 def flat(text: str) -> str:
@@ -646,8 +697,8 @@ print(
     "registration is per-record and opt-in - see this task's header)"
 )
 print(
-    f"    {len(DESCRIBED)} more are recorded as deliberately DESCRIBED rather than "
-    "quoted - documentation, not a check"
+    f"    {len(DESCRIBED)} more {'is' if len(DESCRIBED) == 1 else 'are'} recorded as "
+    "deliberately DESCRIBED rather than quoted - documentation, not a check"
 )
 # Computed, never written down: the tripwire agreeing with the population says the
 # population has not MOVED, and says nothing about how much of it is registered.

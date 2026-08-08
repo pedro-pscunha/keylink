@@ -510,11 +510,14 @@ async fn a_key_state_query_on_a_service_that_keys_nothing_is_fresh() {
 /// real method name rather than a constant. That is the whole of why Wave 1 needed
 /// no change to `macros.rs`.
 ///
-/// Made red by `scripts/break-once.sh` neutralising this test's own policy — the
-/// `.keyable(..)` call in its fixture above, set to `Keyable::Any`. Described rather
-/// than quoted because the anchor would be in this same file and `break-once.sh`
-/// would count it twice; the replacement, `Keyable::Any`, is quoted, which is always
-/// safe. That is the test-literal break on purpose: a keyed service to which the policy was never
+/// Made red by `scripts/break-once.sh` neutralising this test's own policy. Search,
+/// **with its indentation**, which is what keeps it unique against this quote:
+/// `.keyable(Keyable::Only(&["Reserve"]))`
+/// and replace with `.keyable(Keyable::Any)`.
+///
+/// The anchor is in this same file, and that is not a reason to describe rather than
+/// quote — measured at `7a147c0`, the indented form counts **1** with this quote
+/// present while the bare form counts 2. That is the test-literal break on purpose: a keyed service to which the policy was never
 /// applied behaves *identically* to one configured `Keyable::Any`, so neutralising
 /// the policy here reproduces exactly the defect this test exists to catch.
 /// Watched: `panicked at .., `Slow` is not in
