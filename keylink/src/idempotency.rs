@@ -145,9 +145,14 @@ pub const MAX_RECORDS: usize = 1024;
 /// Recorded reply bytes the ledger holds **in total, across every peer**, before
 /// it starts evicting.
 ///
-/// A record is a reply frame, which is capped at [`MAX_HEADER`](crate::MAX_HEADER)
-/// — a megabyte each. Counting entries alone would therefore bound the ledger at
-/// a gigabyte, so the bytes are counted too.
+/// A record is a reply frame, which the ledger caps at [`MAX_RECORDED_FRAME`] — a
+/// megabyte each. Counting entries alone would therefore bound the ledger at a
+/// gigabyte, so the bytes are counted too.
+///
+/// The cap named here is the **ledger's**, not the wire's. They hold the same value
+/// today and are not the same bound: [`MAX_HEADER`](crate::MAX_HEADER) bounds a
+/// header frame's payload on the way out, and this pool bounds what is kept
+/// afterwards.
 ///
 /// This is the pool and nothing else. What one reply may cost on its own is
 /// [`MAX_RECORDED_FRAME`], a separate number. Until the two were split this name
@@ -155,27 +160,36 @@ pub const MAX_RECORDS: usize = 1024;
 /// came to it from [`MAX_RECORDS`].
 pub const MAX_RECORDED_BYTES: usize = 1 << 20;
 
-/// The largest reply frame the ledger will record, prefix included.
+/// The largest reply frame the ledger will record, length prefix included.
 ///
 /// [`MAX_RECORDED_BYTES`] bounds the pool; this bounds one entry in it. A reply
 /// over this is answered normally and then refused on the retry as
-/// [`IdempotencyRefusal::Unrecordable`] — a permanent property of the method,
-/// which is what makes it different from eviction.
+/// [`IdempotencyRefusal::Unrecordable`] — a permanent property of the reply, which
+/// is what makes it different from eviction.
 ///
-/// **The default cannot refuse anything, and that is deliberate.** The wire
-/// already caps a header frame at [`MAX_HEADER`](crate::MAX_HEADER) and errors
-/// above it, so no larger frame ever reaches the ledger to be recorded. The
-/// default is therefore that cap **plus the four-byte length prefix**, because
-/// `MAX_HEADER` bounds the postcard payload while the ledger stores the whole
-/// buffer, prefix and all. Set the default to `MAX_HEADER` itself and the four
-/// frames whose payloads are 1048573 to 1048576 bytes are refused by a bound
-/// nobody chose.
+/// **This must never exceed [`MAX_RECORDED_BYTES`], and the ceiling equalling the
+/// wire's cap is what keeps it inside.** A frame larger than the whole pool cannot
+/// be held no matter what else the ledger is doing, so refusing it is a permanent
+/// property and [`IdempotencyRefusal::Unrecordable`] is the truthful answer. Admit
+/// it instead and `evict` downgrades it in the same lock, which reports an
+/// **eviction** for something that was never storable — the merge RFC-05 §5 says
+/// *"would make the query lie about why"*.
+/// `the_limits_the_readme_names_are_the_ones_the_ledger_uses` asserts the relation,
+/// because nothing else related the two numbers and their first values inverted it.
 ///
-/// **What the number counts.** It counts the whole frame, `PREFIX` included — the
-/// ledger stores exactly the bytes the wire wrote, and those carry a four-byte
-/// length prefix ahead of the postcard payload. So headroom for one reply's payload
-/// is `frame_bytes - PREFIX`, four bytes less than the figure set. `PREFIX` is
-/// named rather than linked because it is crate-internal.
+/// **The four bytes, which are a real fact about the wire and not this number.**
+/// [`MAX_HEADER`](crate::MAX_HEADER) bounds the **postcard payload**:
+/// `encode_header` computes `buf.len() - PREFIX` and checks that. It then returns
+/// the whole buffer, so the ledger stores `payload + PREFIX`. A maximal payload is
+/// therefore a **1048580-byte frame**, four bytes over the 1 MiB pool — so at
+/// today's pool those four sizes are permanently unrecordable, and this ceiling
+/// says so by stopping at the payload cap. Setting it to `MAX_HEADER + PREFIX`
+/// would admit exactly those four and answer `Forgotten`.
+///
+/// **When the pool rises the answer changes**, which is why RFC-08 §8 holds the two
+/// together: an 8 MiB pool can hold a maximal frame, refusing it becomes wrong, and
+/// `MAX_HEADER + PREFIX` becomes the truthful never-rejects ceiling. **The split is
+/// sound only once the pool can hold one maximal frame.**
 ///
 /// A service lowers it with
 /// [`Limits::frame_bytes`](crate::Limits::frame_bytes) to stop one large reply
@@ -183,7 +197,41 @@ pub const MAX_RECORDED_BYTES: usize = 1 << 20;
 /// value is the postcard encoding of that service's own response type, which
 /// differs per service and has no name here. So any non-zero value can still
 /// refuse every reply of some response type.
-pub const MAX_RECORDED_FRAME: usize = crate::wire::MAX_HEADER as usize + crate::wire::PREFIX;
+pub const MAX_RECORDED_FRAME: usize = crate::wire::MAX_HEADER as usize;
+
+/// The invariant that relates the two byte bounds, enforced at **compile time**.
+///
+/// A ceiling above the pool admits a frame that cannot be stored, so `Guard::record`
+/// writes `Done`, `evict` downgrades it in the same lock, and the retry is told
+/// `Forgotten` — an eviction — for a reply that was never storable. RFC-05 §5
+/// refuses that merge: it *"would make the query lie about why"*.
+///
+/// **A `const` block rather than an assertion in a test, and clippy is the reason
+/// the stronger form got used.** The first version of this guard was
+/// `assert!(MAX_RECORDED_FRAME <= MAX_RECORDED_BYTES)` inside
+/// `the_limits_the_readme_names_are_the_ones_the_ledger_uses`, and
+/// `clippy::assertions_on_constants` rejected it: *"this assertion has a constant
+/// value"*. That lint is right, and the remedy is not to silence it — both operands
+/// are `const`, so the relation can be checked when the crate is built instead of
+/// when a test is run. **The violation is now unbuildable rather than merely
+/// caught**, and no test can be skipped past it.
+///
+/// The message is a plain literal because a `const` panic cannot format arguments,
+/// so the two values are named rather than printed.
+///
+/// Made red by raising [`MAX_RECORDED_FRAME`] to `crate::wire::MAX_HEADER as usize +
+/// crate::wire::PREFIX`. Watched, on `cargo check -p keylink`, and the whole message
+/// comes through rather than a truncation: `error[E0080]: evaluation panicked:
+/// MAX_RECORDED_FRAME exceeds MAX_RECORDED_BYTES: a frame ceiling above the whole
+/// pool admits a reply that cannot be stored, so evict answers Forgotten for
+/// something permanently unrecordable`, pointing at the `const _: () = assert!(`
+/// line below.
+const _: () = assert!(
+    MAX_RECORDED_FRAME <= MAX_RECORDED_BYTES,
+    "MAX_RECORDED_FRAME exceeds MAX_RECORDED_BYTES: a frame ceiling above the whole \
+     pool admits a reply that cannot be stored, so evict answers Forgotten for \
+     something permanently unrecordable"
+);
 
 /// Tombstones the ledger holds before it starts dropping them.
 ///
@@ -923,18 +971,25 @@ struct Inner {
 /// ```
 ///
 /// The name says `ledger`, not `keylink`: [`MAX_HEADER`](crate::MAX_HEADER),
-/// [`MAX_KEY_LEN`](crate::MAX_KEY_LEN),
+/// [`MAX_KEY_LEN`](crate::MAX_KEY_LEN), [`MAX_ATTACH`],
 /// [`SystemBuilder::capacity`](crate::SystemBuilder::capacity) and
 /// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth) are all
-/// keylink bounds and none of them is in here.
+/// keylink bounds and none of them is in here. [`MAX_ATTACH`] is the one that is
+/// genuinely the *ledger's* and still absent: it is capped in
+/// [`Idempotency::attach_budget`], which holds no ledger, because the value that
+/// matters arrived from the network and never met a constructor.
 ///
 /// # Why this type has a `Default` when `Records` and `Keyable` do not
 ///
 /// Because eight of its nine fields are tuning decisions whose wrong value is
-/// **visible in a refusal that names the number** — every one of them refuses
-/// through [`IdempotencyRefusal`], and
-/// [`TooManyRunning`](IdempotencyRefusal::TooManyRunning) carries the limit it
-/// exceeded. Slower or fatter, and both visible and recoverable.
+/// **visible in a refusal** — every one of them refuses through
+/// [`IdempotencyRefusal`]. Slower or fatter, and both visible and recoverable.
+/// Only the four running and waiting bounds put the exceeded figure *in* the
+/// refusal, via [`TooManyRunning`](IdempotencyRefusal::TooManyRunning); the pool
+/// bounds and the ceiling answer
+/// [`Forgotten`](IdempotencyRefusal::Forgotten) or
+/// [`Unrecordable`](IdempotencyRefusal::Unrecordable), which name the outcome and
+/// not the number.
 ///
 /// **[`tombstones`](Self::tombstones) is the exception, and it is why this
 /// paragraph is written per field rather than about the type.** Past it a key
@@ -952,9 +1007,11 @@ struct Inner {
 /// no `Default` at all: each of those is *one* decision, so it can be judged
 /// whole, and the wrong answer is a policy a caller never chose. `Limits` is nine
 /// decisions in one value, and "this type is a tuning decision" is not a
-/// well-formed sentence about it. The precedent for defaulting a bag of bounds is
-/// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth), whose
-/// rustdoc draws the same line.
+/// well-formed sentence about it.
+/// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth)'s rustdoc
+/// draws the same line between a bound and a policy — it is **one knob**, not a bag
+/// of them, so it is the precedent for the *distinction* rather than for defaulting
+/// nine numbers at once. Nothing in this crate had a precedent for that.
 ///
 /// # Not `Copy`, and no getters
 ///
@@ -1091,7 +1148,15 @@ impl Limits {
         self
     }
 
-    /// Tombstones held per peer before the oldest are dropped.
+    /// Tombstones held **in total, across every peer**, before the oldest are
+    /// dropped.
+    ///
+    /// Not per peer — `Inner.spent` is one count for the whole ledger, and `evict`
+    /// compares that single number against this bound. The same shape as
+    /// [`pool_bytes`](Self::pool_bytes), and worth stating precisely **here of all
+    /// places**: this is the one bound whose wrong value the caller cannot detect,
+    /// so a reader who budgets it per peer under-provisions it by however many peers
+    /// the service has.
     ///
     /// Defaults to [`MAX_TOMBSTONES`]. **This is the one bound on this type that
     /// is a correctness control rather than a tuning decision, and
@@ -2398,6 +2463,43 @@ mod tests {
             );
         }
 
+        /// The four-byte fact, pinned as a **fact about the wire** rather than as the
+        /// ceiling's value — which is the distinction this branch got wrong once.
+        ///
+        /// `MAX_HEADER` bounds the postcard payload, and the ledger stores the whole
+        /// frame, so a maximal payload arrives as `MAX_HEADER + PREFIX` bytes. That
+        /// sum **exceeds the pool**, which is why the ceiling stops at the payload
+        /// cap: those four sizes can never be held, so refusing them is permanent
+        /// rather than an eviction.
+        ///
+        /// This lives in `src` rather than beside the pin in `tests/reliable.rs`
+        /// because `PREFIX` is `pub(crate)` and an integration test is a separate
+        /// crate. That visibility is what this assertion consumes — the constant's
+        /// value no longer names `PREFIX`, and a widened visibility with no reader
+        /// would be exactly the dead `pub` `CONTRIBUTING.md` argues against.
+        ///
+        /// Made red by raising the ceiling to include the prefix: change
+        /// `MAX_RECORDED_FRAME`'s value from `crate::wire::MAX_HEADER as usize` to
+        /// that plus `crate::wire::PREFIX`. Watched: `panicked at .., a maximal frame
+        /// exceeds the pool, so the ceiling must stop at the payload cap: ceiling
+        /// 1048580, maximal frame 1048584, pool 1048576`.
+        #[test]
+        fn a_maximal_frame_exceeds_the_pool_which_is_why_the_ceiling_omits_the_prefix() {
+            let maximal_frame = crate::wire::MAX_HEADER as usize + crate::wire::PREFIX;
+
+            assert!(
+                maximal_frame > MAX_RECORDED_BYTES,
+                "a maximal frame exceeds the pool, so the ceiling must stop at the \
+                 payload cap: ceiling {MAX_RECORDED_FRAME}, maximal frame \
+                 {maximal_frame}, pool {MAX_RECORDED_BYTES}"
+            );
+            assert_eq!(
+                MAX_RECORDED_FRAME,
+                crate::wire::MAX_HEADER as usize,
+                "so the ceiling is the payload cap, and the prefix is not added to it"
+            );
+        }
+
         /// A peer that floods the ledger must evict itself, never a quiet peer.
         /// A global oldest-first policy passes every other test in this module
         /// and fails this one.
@@ -2744,19 +2846,34 @@ mod tests {
         ///   a sum this test can no longer reach.
         /// - `tombstones(4)` fires `evict`'s tombstone loop.
         ///
-        /// # This guard has NO one-literal break, and that is a finding rather than a gap
+        /// # The bounds are not the break target, and the difference matters
         ///
-        /// **Raising `pool_bytes` does not redden it.** What is asserted here is that
-        /// the counters agree with the maps; removing a *trigger* reduces what the
-        /// test covers without making any counter disagree with any map. So the
-        /// obvious break is a **silent coverage reduction** — which is precisely the
-        /// failure the four clauses above exist to prevent, so proposing it as this
-        /// guard's break would be that failure wearing the shape of its own remedy.
+        /// **Raising `pool_bytes` does not redden this.** What is asserted is that the
+        /// counters agree with the maps; removing a *trigger* reduces what the test
+        /// covers without making any counter disagree with any map. So an edit to one
+        /// of the four bounds is a **silent coverage reduction** — precisely the
+        /// failure the four clauses exist to prevent, which is why proposing it as
+        /// this guard's break would be that failure wearing the shape of its remedy.
+        /// **The four bounds are a reviewable statement; a reviewer checks them by
+        /// reading.**
         ///
-        /// The honest consequence: **the four bounds are a reviewable statement, not a
-        /// reddenable one.** No one-literal substitution expresses "this number no
-        /// longer fires the loop it was chosen for", because the loop not firing is
-        /// invisible from the assertions. A break was NOT invented to fill the slot.
+        /// **That does not make the guard unreddenable, and an earlier version of this
+        /// paragraph claimed it did.** The generalisation from *bound* literals to
+        /// *every* literal is what fails: `scripts/break-once.sh` takes a file path,
+        /// so any production line in this file is a legal target.
+        ///
+        /// Made red by dropping `evict`'s tombstone decrement, so the counter stays
+        /// high while the buckets drain. The anchor, on one line because a quote that
+        /// wraps across `///` lines is not seen as a span by every reader of this file:
+        ///
+        /// `inner.spent = inner.spent.saturating_sub(1);`
+        ///
+        /// replaced by the same line with `saturating_sub(0)`. Watched: `panicked at
+        /// .., assertion `left == right` failed: after n=9: spent, left: 5, right: 0`.
+        ///
+        /// The `after n=9` is the guard working as designed: `assert_agrees` runs
+        /// inside the loop, so it names the iteration at which the counter and the map
+        /// parted rather than reporting a final total.
         ///
         /// What a bad pool-versus-frame mapping *does* redden — **both measured, both
         /// carrying their own break record, neither claimed from reasoning**:
@@ -2768,13 +2885,13 @@ mod tests {
         ///   refusal. Swapping `frame_bytes`'s body gives `left: Forgotten, right:
         ///   Unrecordable`.
         ///
-        /// Between them those two hold the mapping. This test holds the arithmetic,
-        /// and its four clauses are what a reviewer checks by reading.
+        /// Between them those two hold the mapping. This test holds the arithmetic.
         ///
         /// **The first version of this paragraph asserted both of those without
         /// running either**, which is the same substitution of a property for a
-        /// measurement that the section heading above objects to — written into the
-        /// commit whose subject is that distinction. Both are now replays.
+        /// measurement that this section objects to — written into the commit whose
+        /// subject is that distinction. Both are now replays, and so is this guard's
+        /// own break.
         #[test]
         fn the_counters_agree_with_the_maps_on_every_path() {
             let ledger = bounded(

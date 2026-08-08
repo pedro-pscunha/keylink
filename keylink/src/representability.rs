@@ -459,8 +459,15 @@ impl HasNoDefault for DynamicAdmission {}
 /// `Memory` — both, because the derive alone is `error[E0665]` and stops short of
 /// this probe. Watched, via `cargo check -p keylink --all-targets`:
 /// `error[E0119]: conflicting implementations of trait `HasNoDefault` for type `idempotency::Records``
-/// at `keylink/src/representability.rs:426:1`, naming
+/// on the `impl HasNoDefault for Records {}` line below, naming
 /// `impl<T: Default> HasNoDefault for T {}` as the `first implementation here`.
+///
+/// **No line number, deliberately.** The first version of this record cited `:426`,
+/// which was the line when the record was two paragraphs shorter — the record's own
+/// growth pushed the code down to `:439`, so a reader following the citation landed
+/// inside this comment. Same discipline as an anchor literal: a coordinate measured
+/// before the prose that displaces it is stale on arrival, and the item's name does
+/// not move.
 impl HasNoDefault for Records {}
 impl HasNoDefault for Keyable {}
 
@@ -1076,7 +1083,10 @@ fn no_mailbox_can_be_asked_to_be_unbounded(builder: beta::SystemBuilder) -> beta
 /// Reddened by widening one setter — `Limits::pool_records`'s parameter changed from
 /// `NonZeroUsize` to `usize`, which is the real defect rather than an edit to the
 /// annotation below. Watched, via `cargo check -p keylink --all-targets`:
-/// `error[E0308]: mismatched types` at `keylink/src/representability.rs:1037:9`,
+/// `error[E0308]: mismatched types` on the `crate::Limits::pool_records;` line in
+/// the body below — no line number, for the reason the `HasNoDefault` record above
+/// gives: this comment's own growth moves that line, and a citation measured before
+/// the prose that displaces it is stale on arrival —
 /// `expected fn pointer, found fn item`, with
 /// `note: expected fn pointer `fn(idempotency::Limits, NonZero<usize>) -> idempotency::Limits``
 /// against

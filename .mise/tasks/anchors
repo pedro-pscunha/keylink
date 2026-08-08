@@ -422,6 +422,24 @@ ANCHORS = [
      "        self.pool_bytes = bytes;"),
     ("L4", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
      "        self.frame_bytes = bytes;"),
+    # ── L5 exists because a "this guard cannot be reddened" claim was wrong. The
+    # counters guard's four BOUNDS are indeed the wrong break target — editing one
+    # reduces coverage without making any counter disagree with any map — but
+    # `break-once.sh` takes a FILE, so any production line in it is a legal target.
+    # Dropping `evict`'s tombstone decrement reddens it.
+    #
+    # Indented, so the code line cannot collide with the record's unindented quote.
+    #
+    # The record's quote sits ALONE ON ONE LINE, and that is not cosmetic. The first
+    # draft wrapped it across two `///` lines, and this task reads spans two different
+    # ways: `quoted_spans` strips the comment marker before matching, while the
+    # `harness_blocks` splitter keeps it. So the wrapped quote flattened to
+    # `inner.spent = /// inner.spent.saturating_sub(1);` for the second reader and this
+    # row showed as carried by NOBODY while `rows_unseen` was happy. **A quote that
+    # wraps is invisible to the carrying figure.** Measured, not reasoned: the row
+    # reported `carried by NOBODY` until the quote went onto one line.
+    ("L5", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
+     "            inner.spent = inner.spent.saturating_sub(1);"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -836,23 +854,33 @@ for record, lives_in, target, literal in ANCHORS:
 # 103 → 111 on the deadlock-audit branch: eight new harness blocks, seven in
 # `tests/cycles.rs` and one in `tests/blocking_work.rs`.
 #
-# **Re-measured from this tree by running the loop below and reading what it
-# counted.** That it equals `103 + 8` is a RESULT, not the method — and this
-# constant has now been measured three times on three trees, `110` against
-# `155e868` and `111` against `2cc0c1d`, so a value carried across a rebase would
-# have been wrong twice. The arithmetic agreeing twice is what makes it a trap:
-# it looks like a derivation and it is a coincidence of two disjoint edits.
+# 111 → the figure below on `ledger-limits`, rebased onto `fbb7e43`. Five records,
+# all REGISTERED above:
 #
-# 111 → 113 on `ledger-limits`, rebased onto `fbb7e43`: two new harness blocks in
-# `keylink/tests/idempotency.rs`, the builder-wiring guard and the tombstone-churn
-# guard, both REGISTERED above as L1 and L2.
+#   L1, L2  `keylink/tests/idempotency.rs` — the builder-wiring guard and the
+#           tombstone-churn guard.
+#   L3, L4  `keylink/src/idempotency.rs` — the two that hold the setter-to-field
+#           mapping. Added one commit after L1 and L2, because the paragraph naming
+#           them had asserted their redness without running either.
+#   L5      `keylink/src/idempotency.rs` — the counters guard, whose record used to
+#           claim it had NO one-literal break. Added at the merge gate's finding.
 #
-# **FIFTH tree, and read off a run again rather than carried.** The value has now
-# been 102, 104, 106, 110, 111 and 113 depending on which tree measured it, and a
-# figure carried across a rebase has been wrong on three of them. This one was
-# measured by resolving each rebase conflict, running the loop, and taking what it
-# printed — `113` — not by adding two to `111`.
-RECORD_BLOCKS = 115
+# **FIVE records and FOUR new blocks, so this is not one-per-row.** L5's record
+# replaced a paragraph that already existed and did not name the harness, so a block
+# became a harness block without a new comment appearing; and the compile-time
+# invariant beside `MAX_RECORDED_FRAME` landed in the same commit without moving this
+# number at all, because its record names `cargo check` rather than this harness.
+#
+# **SIXTH tree to measure this constant, and read off a run at every step.** It has
+# been 102, 104, 106, 107, 110, 111, 113, 115 and 116 depending on the tree, and a
+# value carried across a rebase has been wrong on three of them. The rebase alone
+# moved it three times — 113, then 115, then 116 — each read off a run after
+# resolving that commit's conflict. The prose above deliberately does not repeat the
+# final figure, so the assignment is its only home. Twice the arithmetic would also have
+# been right, which is exactly what makes adding it a trap — `parked-drain` added two
+# rows, gained two carrying blocks, and saw its population rise by ONE, so its
+# unchecked figure FELL.
+RECORD_BLOCKS = 116
 
 harness_blocks: list[str] = []
 for path in sorted(

@@ -426,15 +426,19 @@ plus `MAX_RECORDS` of churn to `MAX_TOMBSTONES` alone. See
    affected: its bytes move on iroh-blobs and the reply itself is just a header
    carrying an address, so it records and replays like any other.
 
-   **So is any reply frame over `MAX_RECORDED_FRAME` — 1 MiB plus four bytes,
-   1048580 — and by default that refuses nothing.** This line used to name
-   `MAX_RECORDED_BYTES` and print no figure, and it was false twice over. The
-   ledger's ceiling is a *frame* bound, and the wire already refuses a larger
-   header frame before the ledger sees it: `MAX_HEADER` is 1 MiB, 1048576, and
-   `encode_header` errors above it. The four bytes are the length prefix, which
-   `MAX_HEADER` does not count and the ledger does — so a ceiling of exactly
-   `MAX_HEADER` would have refused four frame sizes that the wire was willing to
-   carry, on a boundary nobody chose.
+   **So is any reply frame over `MAX_RECORDED_FRAME` — 1 MiB, 1048576.** This line
+   used to name `MAX_RECORDED_BYTES` and print no figure, which was wrong twice:
+   the ledger's ceiling is a bound on **one frame**, and the pool is a separate
+   number that happens to share its value today.
+
+   The ceiling equals `MAX_HEADER`, the wire's own cap, and that is not a
+   coincidence. `MAX_HEADER` bounds the postcard *payload*, while the ledger stores
+   the whole frame including its four-byte length prefix — so a maximal payload
+   arrives as 1048580 bytes, which **exceeds the 1 MiB pool on its own**. A reply
+   that cannot fit the pool under any conditions is permanently unrecordable, so
+   `Unrecordable` is the right answer for it and the ceiling stops at the payload
+   cap to say so. Raise the pool and that changes: a bigger pool can hold a maximal
+   frame, and then the ceiling gains the four bytes.
 
    The number is worth setting **lower** than the default, and
    `Limits::frame_bytes` is how: one large reply that fits the pool can evict many
