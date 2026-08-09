@@ -512,8 +512,10 @@ pub enum Ended {
     /// to know whether this actor stopped because somebody asked it to or
     /// because it could not be kept alive.
     ///
-    /// The mailbox closes when this is published, so every later call reports
-    /// [`Undelivered`](crate::Undelivered) and a peer is told
+    /// The mailbox closes when this is published, so every later call reports it
+    /// — [`Undelivered::Gone`](crate::Undelivered::Gone) to a door that wanted a
+    /// value, [`NotQueued::Closed`](crate::NotQueued::Closed) to one that wanted
+    /// only to be queued — and a peer is told
     /// [`RemoteError::NoSuchActor`](crate::RemoteError::NoSuchActor).
     GaveUp {
         /// How many incarnations were spent before giving up.
@@ -637,7 +639,9 @@ pub enum TurnLost {
     /// one's mirror of it: the actor is not merely still running, it is running
     /// the turn this call was made from.
     /// [`Undelivered::Reentrant`](crate::Undelivered::Reentrant) is the same fact
-    /// at the doors that carry one error instead of four.
+    /// at the doors that ask for a value and carry one error instead of four, and
+    /// [`NotQueued::Reentrant`](crate::NotQueued::Reentrant) at the doors that ask
+    /// only to be queued and carry two.
     #[error("this call was made from inside the target actor's own turn: it would deadlock")]
     Reentrant,
 }

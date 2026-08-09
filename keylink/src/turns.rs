@@ -251,8 +251,9 @@ use crate::{
 /// that varies; it is the choice that maximises the chance of the block.
 ///
 /// The remaining hazard is closed by a mechanism rather than by a number: a
-/// re-entrant call is refused with [`Undelivered::Reentrant`] at any depth. See
-/// [`LocalActor::send`].
+/// re-entrant call is refused at any depth, with [`Undelivered::Reentrant`] or
+/// its twin [`NotQueued::Reentrant`] according to which of the two questions the
+/// door asked. See [`LocalActor::send`].
 ///
 /// # A default where it used to be a value, and the name says which
 ///
@@ -1604,7 +1605,9 @@ enum Message<A, M> {
     /// cannot mutate, so storing after it is waste.
     Read(Read<A>),
     /// Ends the loop, which drops the receiver, which is what makes every other
-    /// handle report [`Undelivered`] from then on.
+    /// handle report a closed mailbox from then on — [`Undelivered::Gone`] to a
+    /// door that wanted a value, [`NotQueued::Closed`] to one that wanted only to
+    /// be queued.
     Stop,
 }
 
@@ -3103,6 +3106,91 @@ pub enum Undelivered {
     Reentrant,
 }
 
+/// A message that never entered the mailbox, and which of the two ways.
+///
+/// The error of the doors that ask *did this get queued* — [`LocalActor::notify`]
+/// and [`LocalActor::stop`], plus the private `send` they both go through.
+/// [`Undelivered`] is the error of the doors that ask *did I get a value*:
+/// [`ask`](LocalActor::ask) and [`read`](LocalActor::read).
+///
+/// # Two types because the two questions have different answers, not different styles
+///
+/// Everything `Undelivered` names beyond these two states is a verdict on a turn
+/// that already exists, and it arrives on a **reply channel**. These doors have
+/// none to hear it on: `stop` sends a request that is not a turn, and `notify`
+/// drops the receiving half before it sends. So one shared type would put on a
+/// public `stop` every state a lost reply can be in, and a caller matching it
+/// would be writing arms for states `stop` cannot produce.
+///
+/// # Two variants because `send` fails two ways, not because two is tidy
+///
+/// `send` is the one place a message enters the mailbox, and its body has three
+/// `Err` sites over two causes: the re-entrancy check, which fires before a permit
+/// is touched, and the channel, which is either closed or is not. Nothing that
+/// happens after the message is queued can reach here at all.
+///
+/// # Exhaustive, and deliberately not `#[non_exhaustive]`
+///
+/// [`Undelivered`]'s own argument — a caller matches this, and a wildcard arm is
+/// the collapse the split exists to prevent. It is stronger here: a third variant
+/// would need a third way for a send to fail, and there is no fourth `Err` site to
+/// grow one from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum NotQueued {
+    /// The loop's end of the mailbox is dropped, so there is nobody left to take
+    /// the message.
+    ///
+    /// `Closed` and not `Gone`, because this names the one thing the send
+    /// observed. [`Undelivered::Gone`] hedges — its own doc spends a section
+    /// saying the actor is *usually* gone, because two of the states it folds in
+    /// arrive through a lost reply channel and leave the actor alive. A closed
+    /// mailbox has no such hedge: the receiver is dropped or it is not, and it is
+    /// dropped only when the loop is finished with it.
+    ///
+    /// A **restart does not reach here.** The receiver outlives every incarnation
+    /// of a supervised actor — the same fact [`is_busy`](LocalActor::is_busy)
+    /// records, from the other side — so this is the supervision itself ending,
+    /// not one life of it.
+    #[error("the actor is no longer running")]
+    Closed,
+    /// The call was made from inside the target actor's own turn, and would have
+    /// deadlocked.
+    ///
+    /// [`Undelivered::Reentrant`] is the same fact through the other pair of
+    /// doors, and carries the same message: the actor is **still running** — it is
+    /// running the turn this call was made from.
+    ///
+    /// The two doors that answer this are refused under **different halves** of
+    /// the rule, and the private `Refuse` parameter is what says which.
+    /// [`stop`](LocalActor::stop) waits for an ending only the blocked turn can
+    /// reach, so a free mailbox slot does not save it and it is refused at any
+    /// depth. [`notify`](LocalActor::notify) waits for a permit and nothing else,
+    /// so a self-`tell` into a free slot runs after the turn returns and is
+    /// allowed; it is refused only when the mailbox is **full**.
+    #[error("this call was made from inside the target actor's own turn: it would deadlock")]
+    Reentrant,
+}
+
+/// The one direction that is total, and the reason [`read`](LocalActor::read) can
+/// keep its `?`.
+///
+/// A send that failed produces one of two states, and `Undelivered` has a name for
+/// each: a closed mailbox is one of the ways it means [`Gone`](Undelivered::Gone),
+/// and a refusal is the same refusal.
+///
+/// **The reverse impl does not exist and must not be written.** `Undelivered`
+/// answers a question that includes the turn's own verdict, so mapping it back
+/// would have to decide what a lost reply means to a door that never had one —
+/// which is the collapse this split removed.
+impl From<NotQueued> for Undelivered {
+    fn from(not_queued: NotQueued) -> Self {
+        match not_queued {
+            NotQueued::Closed => Self::Gone,
+            NotQueued::Reentrant => Self::Reentrant,
+        }
+    }
+}
+
 /// Which half of the re-entrancy rule a send is under.
 ///
 /// [`LocalActor::send`] **cannot work this out from its argument**, and that is
@@ -3250,8 +3338,13 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
     /// It lets a caller get further ahead of the actor, which is the whole of it.
     /// It is **not** a bound on memory — a parked sender holds its message alive
     /// whatever this is — and it does **not** make a self-call safe: a re-entrant
-    /// call is refused by identity rather than by the permit, so
-    /// [`Undelivered::Reentrant`] is the answer at every depth.
+    /// call is refused by identity rather than by the permit, so a `Reentrant` is
+    /// the answer at every depth: [`Undelivered::Reentrant`] from an
+    /// [`ask`](Self::ask) or a [`read`](Self::read), [`NotQueued::Reentrant`] from
+    /// a [`stop`](Self::stop). [`notify`](Self::notify) is the one door the permit
+    /// still decides — it answers [`NotQueued::Reentrant`] only when the mailbox
+    /// is **full** — so depth changes how often that fires, never whether the
+    /// hazard is closed.
     /// `DEFAULT_LOCAL_MAILBOX_DEPTH` carries the measurement, and it is private
     /// because the two doors above are the whole of the public surface for it.
     ///
@@ -3633,9 +3726,9 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
             Refuse::Always,
         )
         .await
-        .map_err(|undelivered| match undelivered {
-            Undelivered::Gone => TurnLost::Gone,
-            Undelivered::Reentrant => TurnLost::Reentrant,
+        .map_err(|not_queued| match not_queued {
+            NotQueued::Closed => TurnLost::Gone,
+            NotQueued::Reentrant => TurnLost::Reentrant,
         })?;
         // `RecvError` is a unit type: there is exactly one way to lose the
         // channel, so this is total rather than blanket.
@@ -3668,16 +3761,18 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     /// this on itself would block even though it never waits for a reply — and
     /// why it is the one call refused only when the mailbox is **full**. Into a
     /// free slot a self-`tell` is legitimate and runs after the turn returns; into
-    /// a full one it answers [`Undelivered::Reentrant`], which replaces an
+    /// a full one it answers [`NotQueued::Reentrant`], which replaces an
     /// intermittent hang with an intermittent error a caller can see.
     ///
     /// # Errors
     ///
-    /// [`Undelivered`] when the actor is gone.
-    pub async fn notify<T>(
-        &self,
-        mail: impl FnOnce(Origin, Reply<T>) -> M,
-    ) -> Result<(), Undelivered>
+    /// [`NotQueued`] and not [`Undelivered`], because this door asks only whether
+    /// the message was queued. Both of its states are reachable here:
+    /// [`NotQueued::Closed`] when the actor is gone, and [`NotQueued::Reentrant`]
+    /// under the full-mailbox half of the rule above. Nothing that happens to the
+    /// turn afterwards is reported, and the paragraph above says why — the
+    /// receiving half of the channel that would carry it is dropped here.
+    pub async fn notify<T>(&self, mail: impl FnOnce(Origin, Reply<T>) -> M) -> Result<(), NotQueued>
     where
         T: Send + 'static,
     {
@@ -3803,7 +3898,7 @@ impl<A, M> LocalActor<A, M> {
     /// **An actor must not call this on itself**, and it no longer can: it takes
     /// a mailbox permit like any message and then waits for a loop that cannot
     /// exit while it is inside this turn, so it is refused with
-    /// [`Undelivered::Reentrant`] before the permit is touched.
+    /// [`NotQueued::Reentrant`] before the permit is touched.
     ///
     /// Waits for the receiver to be dropped, which is the loop ending — not for
     /// the state's own `Drop` to have run. A state that flushes in `Drop` needs
@@ -3831,19 +3926,24 @@ impl<A, M> LocalActor<A, M> {
     ///
     /// # Errors
     ///
-    /// [`Undelivered::Reentrant`] when called from inside the actor's own turn —
+    /// [`NotQueued::Reentrant`], and it is the **only** error this can return —
     /// the case the paragraph above says must not happen, reported instead of
     /// hanging. It returns **before** waiting, so a refused `stop` costs nothing
     /// and the actor is untouched.
     ///
-    /// It returns `Ok` for an actor that is already gone. Stopping a stopped
-    /// actor is what the caller asked for, and this method is documented as
-    /// idempotent; the send's own `Gone` is swallowed here for that reason and
-    /// not for want of a channel.
-    pub async fn stop(&self) -> Result<(), Undelivered> {
+    /// [`NotQueued::Closed`] is the other state a send can end in and it never
+    /// leaves this method: it returns `Ok` for an actor that is already gone.
+    /// Stopping a stopped actor is what the caller asked for, and this method is
+    /// documented as idempotent; the send's own `Closed` is swallowed here for
+    /// that reason and not for want of a channel.
+    ///
+    /// So the error is [`NotQueued`] rather than [`Undelivered`] twice over: this
+    /// door asks only whether the request was queued, and it discards half of even
+    /// that.
+    pub async fn stop(&self) -> Result<(), NotQueued> {
         match self.send(Message::Stop, Refuse::Always).await {
-            Ok(()) | Err(Undelivered::Gone) => {}
-            Err(refused @ Undelivered::Reentrant) => return Err(refused),
+            Ok(()) | Err(NotQueued::Closed) => {}
+            Err(refused @ NotQueued::Reentrant) => return Err(refused),
         }
         // The END channel, not `mail.closed()`. The loop fills it after it has
         // dropped the observers and the mailbox, so returning from here means
@@ -3902,8 +4002,8 @@ impl<A, M> LocalActor<A, M> {
     /// Whether the actor is still handling messages.
     ///
     /// Advisory: it can stop between this answer and the next call, which is why
-    /// every call reports [`Undelivered`] on its own rather than asking a
-    /// caller to check first.
+    /// every call reports the loss on its own — [`Undelivered`] or
+    /// [`NotQueued`], by door — rather than asking a caller to check first.
     #[must_use]
     pub fn is_running(&self) -> bool {
         !self.mail.is_closed()
@@ -4002,21 +4102,19 @@ impl<A, M> LocalActor<A, M> {
     /// other sender can *free* a permit, only spend one. So the load is not a
     /// check-then-act race against the actor: what it reads cannot change while
     /// the caller is inside the turn that would have to change it.
-    async fn send(&self, message: Message<A, M>, refuse: Refuse) -> Result<(), Undelivered> {
+    async fn send(&self, message: Message<A, M>, refuse: Refuse) -> Result<(), NotQueued> {
         // The `Arc` this handle already carries, read as an identity. Built
         // before the thread-local is touched so the common off-turn path is one
         // clone and one match arm on a unit discriminant.
         let me = Actor(Arc::clone(&self.busy));
         if current().holds(&me) {
             match refuse {
-                Refuse::Always => return Err(Undelivered::Reentrant),
-                Refuse::WhenFull if self.mail.capacity() == 0 => {
-                    return Err(Undelivered::Reentrant)
-                }
+                Refuse::Always => return Err(NotQueued::Reentrant),
+                Refuse::WhenFull if self.mail.capacity() == 0 => return Err(NotQueued::Reentrant),
                 Refuse::WhenFull => {}
             }
         }
-        self.mail.send(message).await.map_err(|_| Undelivered::Gone)
+        self.mail.send(message).await.map_err(|_| NotQueued::Closed)
     }
 }
 
@@ -4290,14 +4388,19 @@ where
     };
     match sent {
         Ok(()) => {}
-        Err(Undelivered::Gone) => return gone(),
+        Err(NotQueued::Closed) => return gone(),
         // NOT `NoSuchActor`, which says "there is nothing here, stop asking":
         // a refused re-entrant call leaves the actor running. `Failed` with the
         // error's own text and **no prefix**, because the four prefixes are the
         // discriminator between causes a peer acts on differently and this one is
         // unreachable from a peer — see the send above. A fifth prefix would be a
         // wire-visible discriminator invented for a case nothing can produce.
-        Err(refused @ Undelivered::Reentrant) => {
+        //
+        // The text is `NotQueued::Reentrant`'s and it is byte-identical to
+        // `Undelivered::Reentrant`'s, which this arm read before the two questions
+        // were split: the same fact through a different door is the same sentence,
+        // and a wire string must not move because a local type did.
+        Err(refused @ NotQueued::Reentrant) => {
             return (
                 Outcome::Err(RemoteError::Failed(refused.to_string())),
                 Body::empty(),
@@ -4752,7 +4855,9 @@ mod tests {
             .expect("a stop from outside the actor's own turn is never refused");
 
         assert_eq!(spare.ask(add(1)).await, Err(Undelivered::Gone));
-        assert_eq!(spare.notify(add(1)).await, Err(Undelivered::Gone));
+        // The same closed mailbox through the other question, so the other type:
+        // an `ask` lost a reply channel too and a `notify` never had one.
+        assert_eq!(spare.notify(add(1)).await, Err(NotQueued::Closed));
     }
 
     /// Spawn an actor already inside a turn, and hand back the two ends that

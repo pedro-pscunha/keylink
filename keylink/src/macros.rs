@@ -1669,9 +1669,14 @@ macro_rules! __keylink_service {
             /// and that is the whole of what it buys. It is **not** a bound on
             /// memory, and it does **not** make a self-call safe: a call made
             /// from inside the target actor's own turn is refused by identity
-            /// rather than by the permit, so it answers
-            /// [`Undelivered::Reentrant`](keylink::Undelivered::Reentrant) at
-            /// every depth.
+            /// rather than by the permit, so it answers a `Reentrant` at every
+            /// depth:
+            /// [`Undelivered::Reentrant`](keylink::Undelivered::Reentrant) from
+            /// an `rpc`, a `blob` or a [`with_state`](Handle::with_state),
+            /// [`NotQueued::Reentrant`](keylink::NotQueued::Reentrant) from a
+            /// [`stop`](Handle::stop). A `tell` is the one door the permit still
+            /// decides — refused only when the mailbox is **full** — so depth
+            /// changes how often that fires, never whether the hazard is closed.
             ///
             /// # CAUTION: a deeper mailbox raises the shutdown budget owed
             ///
@@ -1794,9 +1799,16 @@ macro_rules! __keylink_service {
             /// Its methods are the ones written in `service!`, with the same
             /// names, the same argument order and the same success types as
             /// [`Client`]'s. The error type is the difference, and it is the
-            /// whole difference: a local call fails one way, so it fails with
-            /// [`Undelivered`](keylink::Undelivered) and never with
-            /// [`Error`](keylink::Error).
+            /// whole difference: a local call cannot fail the ways a remote one
+            /// can, so it never fails with [`Error`](keylink::Error).
+            ///
+            /// **Two local error types, and they are the two questions a door
+            /// asks.** An `rpc` or a `blob` asks *did I get a value* and answers
+            /// [`Undelivered`](keylink::Undelivered). A `tell` or
+            /// [`stop`](Self::stop) asks *did this get queued*, has no reply
+            /// channel, and answers [`NotQueued`](keylink::NotQueued) — two
+            /// states rather than every state a lost reply can be in. One type
+            /// for both would advertise on `stop` what `stop` cannot produce.
             ///
             /// That is deliberate and permanent. RFC-04 §5.5: a handle that is
             /// one type in both places must either claim failures the local
@@ -1840,9 +1852,12 @@ macro_rules! __keylink_service {
             /// A handler that awaits **any** method on a handle to its own actor
             /// would deadlock. Since item M it does not: the message carries the
             /// chain of turns it was sent from, so a send to an actor already on
-            /// that chain answers
-            /// [`Undelivered::Reentrant`](keylink::Undelivered::Reentrant)
-            /// instead of being queued. The four cases and their mechanisms are
+            /// that chain answers a `Reentrant` instead of being queued —
+            /// [`Undelivered::Reentrant`](keylink::Undelivered::Reentrant) from
+            /// an `rpc`,
+            /// [`NotQueued::Reentrant`](keylink::NotQueued::Reentrant) from a
+            /// `tell` or a [`stop`](Self::stop), which is the same fact through
+            /// the door that only queues. The four cases and their mechanisms are
             /// unchanged and worth knowing, because what each one *would* have
             /// done is what decides whether it is refused:
             ///
@@ -2244,17 +2259,25 @@ macro_rules! __keylink_service {
                 }
 
                 /// Stop after the messages already queued, then wait for the
-                /// actor to end. Every other handle reports
-                /// [`Undelivered::Gone`](keylink::Undelivered::Gone) from then
-                /// on.
+                /// actor to end. Every other handle reports a closed mailbox
+                /// from then on — an `rpc` as
+                /// [`Undelivered::Gone`](keylink::Undelivered::Gone), a `tell`
+                /// as [`NotQueued::Closed`](keylink::NotQueued::Closed).
                 ///
                 /// # Errors
                 ///
-                /// [`Undelivered::Reentrant`](keylink::Undelivered::Reentrant)
-                /// when called from inside the actor's own turn. An actor that
+                /// [`NotQueued::Reentrant`](keylink::NotQueued::Reentrant),
+                /// and it is the only error this returns: called from inside
+                /// the actor's own turn, where it would otherwise wait for an
+                /// ending only this turn can reach.
+                ///
+                /// [`NotQueued`](keylink::NotQueued) and not
+                /// [`Undelivered`](keylink::Undelivered) because a `stop` asks
+                /// only whether the request was queued — it has no reply
+                /// channel, so no verdict on a turn can reach it. An actor that
                 /// is already gone is `Ok`, because stopping a stopped actor is
                 /// what the caller asked for.
-                pub async fn stop(&self) -> ::core::result::Result<(), $crate::Undelivered> {
+                pub async fn stop(&self) -> ::core::result::Result<(), $crate::NotQueued> {
                     self.inner.stop().await
                 }
 
@@ -3801,9 +3824,19 @@ macro_rules! __keylink_local_method {
         ///
         /// # Errors
         ///
-        /// [`Undelivered`](keylink::Undelivered) when the actor is gone.
+        /// [`NotQueued`](keylink::NotQueued), which is the whole of what a
+        /// `tell` can report and the reason it is not
+        /// [`Undelivered`](keylink::Undelivered): the sentence above — no reply
+        /// channel — is exactly the sentence that says no verdict on the turn
+        /// can arrive here.
+        ///
+        /// [`NotQueued::Closed`](keylink::NotQueued::Closed) when the actor is
+        /// gone, and
+        /// [`NotQueued::Reentrant`](keylink::NotQueued::Reentrant) for a
+        /// self-`tell` into a **full** mailbox — into a free slot it is queued
+        /// and runs after the current turn returns.
         pub async fn $name(&self $(, $arg: $ty )*)
-            -> ::core::result::Result<(), $crate::Undelivered> {
+            -> ::core::result::Result<(), $crate::NotQueued> {
             self.inner
                 .notify(move |__from, __reply| Mail::$variant {
                     origin: __from,

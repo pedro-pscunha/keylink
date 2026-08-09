@@ -162,7 +162,9 @@ const BOTH_TELLS_LANDED: u64 = 2;
 /// `tell`, which deletes the pattern the rule promises to keep.
 const FIRST_TELL_REFUSED: u64 = 3;
 
-/// Neither shape — a `Gone`, which would mean the actor died mid-turn.
+/// Neither shape — a `NotQueued::Closed`, which would mean the actor died
+/// mid-turn. It is the whole of what the wildcard arm below can still reach: a
+/// `tell` answers two states, and the other one is matched by name twice.
 const TELL_SURPRISE: u64 = 4;
 
 impl ring::Actor for Peer {
@@ -192,9 +194,9 @@ impl ring::Actor for Peer {
         let first = me.bump().await;
         let second = me.bump().await;
         match (first, second) {
-            (Ok(()), Err(keylink::Undelivered::Reentrant)) => TELL_THEN_REFUSED,
+            (Ok(()), Err(keylink::NotQueued::Reentrant)) => TELL_THEN_REFUSED,
             (Ok(()), Ok(())) => BOTH_TELLS_LANDED,
-            (Err(keylink::Undelivered::Reentrant), _) => FIRST_TELL_REFUSED,
+            (Err(keylink::NotQueued::Reentrant), _) => FIRST_TELL_REFUSED,
             _ => TELL_SURPRISE,
         }
     }
@@ -202,8 +204,8 @@ impl ring::Actor for Peer {
     async fn self_stop(&mut self, _cx: Caller<'_>) -> u64 {
         let me = self.me.get().expect("wired").clone();
         match me.stop().await {
-            Err(keylink::Undelivered::Reentrant) => REFUSED,
-            Err(keylink::Undelivered::Gone) => GONE,
+            Err(keylink::NotQueued::Reentrant) => REFUSED,
+            Err(keylink::NotQueued::Closed) => GONE,
             // Unreachable while the check holds, and it is what a hang would
             // become if the check were removed — this handler would never get
             // here at all, and the test's timeout is what would say so.
@@ -878,9 +880,10 @@ async fn a_deeper_mailbox_takes_one_more_message_behind_a_running_turn() {
 ///   "the first self-tell takes the permit the loop released: 3", the code for
 ///   [`FIRST_TELL_REFUSED`].
 /// - and replacing `send`'s
-///   `                Refuse::WhenFull if self.mail.capacity() == 0 => {` with
-///   `                Refuse::WhenFull if false => {`. Watched: "a self-tell into
-///   a full mailbox must be refused, not block: Elapsed(())", after 5.00s.
+///   `                Refuse::WhenFull if self.mail.capacity() == 0 => return Err(NotQueued::Reentrant),`
+///   with `                Refuse::WhenFull if false => return Err(NotQueued::Reentrant),`.
+///   Watched: "a self-tell into a full mailbox must be refused, not block:
+///   Elapsed(())", after 5.00s.
 ///
 /// **The second red is a TIMEOUT and not [`BOTH_TELLS_LANDED`]**, which is what
 /// this record predicted before it was run. The prediction was wrong about the

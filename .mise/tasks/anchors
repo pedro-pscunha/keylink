@@ -1025,7 +1025,7 @@ ANCHORS = [
     ("D10", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "            Refuse::WhenFull,"),
     ("D11", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
-     "                Refuse::WhenFull if self.mail.capacity() == 0 => {"),
+     "                Refuse::WhenFull if self.mail.capacity() == 0 => return Err(NotQueued::Reentrant),"),
     ("D12", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "        match self.send(Message::Stop, Refuse::Always).await {"),
     # D13 is the `Lent` forward, and it is the one row here whose absence would be
