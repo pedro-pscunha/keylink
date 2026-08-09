@@ -291,14 +291,115 @@ Never compute it. Add a transition entry in the existing format. `anchors` runs 
 Revision 1 listed five. One could not go red, one duplicated four existing tests,
 and none covered the two new supervised cases.
 
-| guard | what it pins |
+**Four new tests, not six.** Two of the six are changes to existing tests — the
+same finding that removed the original guard 2, applied twice more.
+
+| guard | shape | what it pins |
+|---|---|---|
+| `a_live_actor_that_drops_a_deferred_is_told_dropped_and_not_gone` | **new**, `defer.rs` | the finding on the local path — **and asserts the next call succeeds in the same test** |
+| ~~`a_handler_that_panics_before_consuming_its_reply_reads_dropped`~~ | **dropped** | `defer.rs:332` is the same fixture, the same call and the same two assertions. The worklist already tightens it to the variant |
+| `a_local_caller_can_tell_restarting_from_gone` | **new**, `supervision.rs` | `Restarting` through a local `ask` |
+| `a_local_caller_is_told_refused_when_a_non_fatal_observer_refuses` | **new**, `observe.rs` | the fourth defect |
+| `a_local_caller_and_a_peer_agree_about_an_abandoned_deferred` | **extends** `defer.rs:561` | one actor, one cause, two doors, two answers that agree |
+| `every_turn_lost_except_faulted_has_one_undelivered_twin_with_the_same_words` | **new** | the two-type relationship, mechanical instead of editorial |
+
+**Guard 1's second assertion is mechanical, not stylistic.** If `Fate` were left
+`Running` for an actor that is in fact gone, `assert_eq!(err, Dropped)` passes
+with its meaning **inverted** — the mirror of the defect being fixed. Only "the
+next call is answered" refuses that, and a gone actor cannot satisfy it. That is
+why the two assertions must share one test.
+
+**Guard 5's name was describing an impossible setup.** No test can hold *one
+dropped reply seen from both sides*: a reply has exactly one destination, so the
+peer's abandoned reply and the local caller's are two replies. A name for a setup
+nobody can build invites an implementer to approximate it and call the
+approximation done. The achievable claim — and the one worth having — is *one
+actor, one cause, two doors, two answers that agree*. Its record is **re-watched
+in place**, not added, because that test already carries one and the new half
+changes what fails first.
+
+**Guard 4 needs no new fixture.** `Recording::refusing` (`observe.rs:100-106`)
+refuses a **completed** turn with `Stop::new` — non-fatal, which is exactly what
+`retryable()` sends to a restart. The two refusing observers in `supervision.rs`
+do not fit: both refuse only a *panicked* turn, whose caller gets the `Panic`
+instead. And `service!` generates `supervised` unconditionally
+(`macros.rs:1743`), so `observe.rs`'s own `ledger` module already has it. Its
+redness is proved rather than inferred: `observe.rs:493` asserts **today** that
+this exact call answers `Undelivered::Gone`.
+
+**Guard 3 carries `multi_thread` deliberately.** `supervision.rs:1094-1096`
+records that the suite's single `multi_thread` test was the mechanical reason
+nothing caught the original regression. It must also assert the **parked** reply
+rather than a fresh call, or round 2 passes on the closed mailbox instead of the
+`Standing` read.
+
+### The twin guard's third mechanism does not exist
+
+`display-strings.md` §4 claimed a fixed-size array indexed past its end fires
+`unconditional_panic`, so the array could not lag the enum. **That fires on a
+*constant* index only.** The guard as drafted writes `covered[slot(&mine)]`,
+which is a **runtime** index: it panics if reached and compiles fine. The
+mechanism holds for an expression the guard does not contain, and nothing forces
+a later author to keep the literal style.
+
+Mechanisms 1 and 2 — `E0004` on both exhaustive matches — are real and are the
+whole of what is real. Nothing in stable Rust tracks a variant set except an
+exhaustive match; `std::mem::variant_count` is nightly.
+
+**Measured, because "it is a deny-by-default lint" turned out to hide a second
+gap.** `unconditional_panic` is a **MIR pass**, so `cargo check` never reaches
+it — and every compile-shaped step in this gate is `check` or `clippy`. A `check`
+gate is blind to it. What actually catches the literal form under `check` is
+`clippy::out_of_bounds_indexing`, which **is** ours (`all = { level = "deny" }`).
+The rustc lint is rustc's default and no repo decision, so it is one upstream
+change away from not being ours at all.
+
+| command | literal `EVERY[2]` |
 |---|---|
-| `a_live_actor_that_drops_a_deferred_is_told_dropped_and_not_gone` | the finding, on the local path — **and asserts the next call succeeds in the same test**, because liveness alone discriminates nothing |
-| `a_handler_that_panics_before_consuming_its_reply_reads_dropped` | the cause that never was a `Deferred`. Fixture ready: `Book::boom`, `defer.rs:112-114` |
-| `a_local_caller_can_tell_restarting_from_gone` | `Restarting` through a local `ask`. Mirror `tests/supervision.rs:1107` |
-| `a_local_caller_is_told_refused_when_a_non_fatal_observer_refuses` | the fourth defect. `retryable()` makes it restart, and no local-door test reaches it today |
-| `a_local_caller_and_a_peer_agree_about_one_dropped_reply` | the property `lost` exists for, extended to the third path. Must assert the local **variant** and the peer **prefix** — both `Err` passes for the wrong reason |
-| `every_turn_lost_except_faulted_has_one_undelivered_twin_with_the_same_words` | the two-type relationship, mechanical instead of editorial: same variants, same `Display` |
+| `cargo check --all-targets` | **nothing**, exit 0 |
+| `cargo clippy --all-targets -- -D warnings` | error, `clippy::out_of_bounds_indexing` |
+| `cargo build --all-targets` | error, `unconditional_panic` |
+
+A `const _: () = assert!(EVERY.len() == N);` fails harder and earlier —
+`E0080` const-eval, which no `#[allow]` reaches and `check` does catch. **It still
+does not make the claim true**, for a reason unrelated to its strength: it pins
+the array against a hand-written `N`, and a seventh variant with a bumped literal
+passes. That moves the lag from the array to the number, which is a failure this
+project has recorded before. If it is written at all, it is documented as pinning
+the array against a literal — never as the third mechanism.
+
+The runtime form is silent under `check`, `clippy` **and** `build`, and the reason
+is stronger than "not a constant": the lint needs a *syntactically* constant index
+expression. A `fn slot_folded() -> usize { 2 }` — one inlining from a literal —
+is still silent under a full build. `covered[slot(&mine)]` is not near the edge of
+that mechanism; it is outside it.
+
+**Asserting each slot is written exactly once** (rather than at least once) is
+kept: it is free, it runs in the gate, and it catches two variants folded onto one
+slot. It does **not** close the case where the sample list lags — that was
+measured too, not assumed.
+
+### A design not built, measured rather than argued
+
+**Declaring both enums through a `macro_rules!` that emits the variant list from
+the same source does close it**, and it was built and proved before being
+refused. Per-variant rustdoc and `#[error(..)]` pass through
+`$(#[$inner:meta])*` and compile clean. The control that makes the derivation
+live rather than incidental: adding a third variant to the invocation and
+touching nothing else gives
+
+```
+error[E0080]: evaluation panicked: assertion failed: SampleErr::EVERY.len() == 2
+```
+
+The array grows on its own, because there is one place to add a variant.
+
+**Refused on price, not on doubt.** It would put `Undelivered` and `TurnLost`
+inside macro braces — `Undelivered`'s doc alone is ~70 lines of argument, and this
+crate gates rustdoc as a build step. Paying the readability of the two
+most-documented types in the file to close a hole a sentence can name is the wrong
+trade. The mechanism is proven and the decision is reversible; that is why it is
+written down here instead of being rediscovered.
 
 **The control is not written.** Four tests already pin it — `turns.rs:4690`,
 `4746`, `5009`, `singleton.rs:211`. Name them; a fifth is duplication.
