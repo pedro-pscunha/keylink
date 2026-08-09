@@ -162,6 +162,106 @@
 //!     move || async move { child.stop() },
 //! ));
 //! ```
+//!
+//! # Rebuilding the whole set is the caller's loop, and here it is
+//!
+//! Refusing every restart verdict leaves one sentence with nothing to say it:
+//! *"if any of these dies for good, rebuild the subsystem"*. It is expressible
+//! with what is already here, so it is written out rather than left to be
+//! re-derived from the refusal above. Hold the group behind a factory that
+//! builds the **whole** set, await [`ended`](Group::ended), decide on the
+//! [`GroupEnded`], and rebuild by calling the factory again.
+//!
+//! ```ignore
+//! // The factory spawns the set, watches it, and publishes the handles. A
+//! // rebuild redoes all three, which is why all three are in one place.
+//! fn build(
+//!     reserves: &Names<reserve::Handle<Reserve>>,
+//!     charges: &Names<charge::Handle<Charge>>,
+//! ) -> keylink::Result<Group> {
+//!     let (reserve, charge) = (spawn_reserve(), spawn_charge());
+//!     let (reserve_id, charge_id) = (ActorId::new("reserve")?, ActorId::new("charge")?);
+//!
+//!     let group = Group::new(|_who, why| match why {
+//!         Ended::Stopped => Verdict::Forget,
+//!         _ => Verdict::StopAll,
+//!     });
+//!     let _ = group.add(reserve_id.clone(), membership!(reserve));
+//!     let _ = group.add(charge_id.clone(), membership!(charge));
+//!
+//!     // `membership!` clones, so the handles are still ours to publish — and
+//!     // publishing them is the half of a rebuild no verdict could have done.
+//!     let _ = reserves.register(reserve_id, reserve.clone(), reserve.ended());
+//!     let _ = charges.register(charge_id, charge.clone(), charge.ended());
+//!     Ok(group)
+//! }
+//!
+//! loop {
+//!     let group = build(&reserves, &charges)?;
+//!     match group.ended().await {
+//!         // The one ending this loop is for.
+//!         GroupEnded::Member { .. } => continue,
+//!         // `Stopped` is this caller asking. `Dropped` left the members
+//!         // running. A policy that panicked panics again on the way back.
+//!         _ => break,
+//!     }
+//! }
+//! ```
+//!
+//! **The rebuild cannot race the teardown, and that is what makes the shape
+//! safe.** [`Verdict::StopAll`] retires every member and *then* settles the
+//! value [`ended`](Group::ended) reads, so the answer a caller receives is
+//! already the far side of teardown. The same locked step that takes the members
+//! off the books marks the group closed, so a stray [`add`](Group::add) on the
+//! old group hands its [`Retire`] straight back rather than filing a member into
+//! a group that watches nothing.
+//!
+//! What that teardown *is* stays what [`Membership::new`] says and no more:
+//! every member's `retire` ran to completion, which for a
+//! [`membership!`](crate::membership) member is
+//! [`abort`](crate::LocalActor::abort) called on each. An actor wedged in a turn
+//! that never reaches an await point is not interrupted by `abort` —
+//! [`ended`](crate::LocalActor::ended) says so — so what the next `build` is
+//! promised is that nothing of the old set is watched or reachable through the
+//! group, not that every old task has already exited.
+//!
+//! [`GroupEnded::Dropped`] is why that match rebuilds on one arm and breaks on
+//! the rest: it is the ending with **no** teardown behind it, so its members are
+//! still running and a rebuild on it doubles the set.
+//!
+//! **Why this is a recipe and not a verdict.** Two reasons, and neither needs
+//! the other. A group-level rebuild produces new actors with new mailboxes —
+//! `spawn_supervised` builds a fresh `mpsc::channel`, which is the third reason
+//! the section above refuses a `Restart` — so every handle a caller held across
+//! it is dead. The factory is where the new ones are published, and the group's
+//! task is where they cannot be: a verdict runs inside that task, which knows
+//! its members' names and nothing about who holds a handle to them. Separately,
+//! issue #3 and RFC-07 §9.8 refuse the sibling-restart strategies on grounds
+//! that are not this one at all — the dead-pid problem they exist to repair does
+//! not exist here.
+//!
+//! **What the caller carries that a verdict would have hidden.** Two things:
+//!
+//! - **Republishing.** [`Names`](super::Names) is the crate's answer, and it
+//!   composes one registry per handle type rather than one for the group: it is
+//!   generic over a single `H`, and a group is heterogeneous — this module's
+//!   opening argument, arriving at the caller.
+//!   [`register`](super::Names::register) replaces under the same name and hands
+//!   back the handle it displaced, so a rebuild reaches every reader that asks
+//!   the registry by name, and reaches none that cached a handle.
+//! - **A budget.** Nothing bounds how often this loop rebuilds.
+//!   [`Intensity`](crate::Intensity) bounds one actor's incarnations inside its
+//!   own supervision loop and cannot be spent here — its `max` and the backoff
+//!   it implies are private to `local.rs`, and `compose` is a sibling module. A
+//!   `Verdict::Restart` was to have carried that bound and could not get it. So
+//!   the trade is stated rather than sold: this buys control over what a rebuild
+//!   republishes and pays a restart budget for it, and a caller who wants one
+//!   counts in its own loop.
+//!
+//! **Escalation is a different thing, and it is the section above.** A group
+//! held as a member of another group makes the parent *decide*, and deciding is
+//! not rebuilding: nothing in that shape rebuilds anything, and nothing here
+//! escalates.
 
 use std::fmt;
 use std::future::Future;
