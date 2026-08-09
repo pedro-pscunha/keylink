@@ -510,7 +510,7 @@ pub enum Ended {
     /// The only ending a [supervised](crate::LocalActor::spawn_supervised) actor
     /// can reach that an unsupervised one cannot, and the reason the whole enum
     /// is worth having: "gone" is already
-    /// [`Undelivered`](crate::Undelivered)'s answer, and an operator needs
+    /// [`Undelivered::Gone`](crate::Undelivered::Gone)'s answer, and an operator needs
     /// to know whether this actor stopped because somebody asked it to or
     /// because it could not be kept alive.
     ///
@@ -563,9 +563,18 @@ impl fmt::Display for Ended {
 
 /// Why a turn produced no value.
 ///
-/// Replaces [`Undelivered`](crate::Undelivered) on the catching paths,
-/// because "the actor is gone" and "this turn was refused" ask a caller for
-/// different things and the served path has to tell a peer which it was.
+/// Replaces [`Undelivered`](crate::Undelivered) on the catching paths. The two
+/// name the same losses and differ by **one variant and one payload**: this one
+/// has [`Faulted`](Self::Faulted), which an [`ask`](crate::LocalActor::ask)
+/// resumes into its caller instead of reporting, and its
+/// [`Restarting`](Self::Restarting) carries the [`Ended`] that caused the restart
+/// where the other carries the bare fact.
+///
+/// Both differences cost `Copy` and `Eq` — a [`Panic`] and an [`Arc`] are neither
+/// — which is what the other type keeps and this one spends. So the choice is
+/// made by the **door**, not by two vocabularies: a catching path has to hand a
+/// peer the reason, and a resuming one has already handed the caller the panic
+/// itself. The two axes below are the same two on both types.
 ///
 /// # Three answers and not two, and why the third carries a payload
 ///
@@ -582,7 +591,7 @@ impl fmt::Display for Ended {
 /// type that dropped it would make the crate's whole panic policy
 /// unimplementable on top of the catching path.
 ///
-/// # Four now, because the fourth was being reported as [`Gone`](Self::Gone)
+/// # `Expired` is an answer of its own, because it was being reported as [`Gone`](Self::Gone)
 ///
 /// `Answered` has had a fourth state — "the queueing budget expired while this
 /// message waited, and nothing ran" — since before this enum existed, and
@@ -698,9 +707,11 @@ pub enum TurnLost {
     /// one's mirror of it: the actor is not merely still running, it is running
     /// the turn this call was made from.
     /// [`Undelivered::Reentrant`](crate::Undelivered::Reentrant) is the same fact
-    /// at the doors that ask for a value and carry one error instead of four, and
-    /// [`NotQueued::Reentrant`](crate::NotQueued::Reentrant) at the doors that ask
-    /// only to be queued and carry two.
+    /// at the doors that ask for a value and resume a fault rather than report it,
+    /// and [`NotQueued::Reentrant`](crate::NotQueued::Reentrant) at the doors that
+    /// ask only to be queued and so have no reply channel to hear a verdict on.
+    /// Three enums, one fact, because a caller matches the answer of the door it
+    /// used.
     #[error("this call was made from inside the target actor's own turn: it would deadlock")]
     Reentrant,
 }

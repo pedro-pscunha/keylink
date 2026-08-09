@@ -988,6 +988,102 @@ The *at most once* half is `representability.rs`'s coherence probe: `Reply`,
   own `n0_future::time::timeout` is the answer today; a per-method budget on a
   deferred reply would be a new mechanism and belongs with whichever wave wants one.
 
+### 4.11 REVISED, 2026-08-09: the caller is told which, and only the panic is still lost
+
+§4.8 priced `#[defer]` at one cost and the price had two halves. One is paid off.
+The other is unchanged, and was re-checked rather than assumed.
+
+**The name first, once, for the whole document.** `MailboxClosed` no longer
+exists. It is `Undelivered`, renamed while the mailbox depth became a knob, and
+this document names the old type eight times outside this section — in §3.1,
+§4.8, §6.7, §6.10, §8.7, §10.6, §12.10 and §14.3, one of them inside §4.8's own
+sentence. Six are prose naming the type and are read as `Undelivered` from here
+on. The other two, in §6.7 and §6.10, are **quoted output from break records**:
+they are transcripts of runs that happened, the runs printed that word, and they
+stay as they are. Sections rather than line numbers, because appending to this
+document moves every line below the append — the eight were first written down as
+line numbers and six of them rotted before this paragraph was finished. Nothing
+above this section is edited.
+
+**What is paid off: the caller can now tell this from a dead actor.** §4.8's cost
+was that a caller is told `Gone`. It now reads `Undelivered::Dropped`, whose text
+is *the actor is serving and this reply was never answered* — the same sentence a
+peer reads behind the `"dropped: "` prefix, from a rendering that reads the same
+fact about the same actor. The distinction §4.8 gave up is closed, and it was
+closed for a reason larger than this section: `Gone` was answering four
+conditions, and three of the four left the actor alive.
+
+`defer::a_local_caller_and_a_peer_agree_about_an_abandoned_deferred` holds the two
+doors together, and what it can hold is narrower than "both sides see it" sounds:
+**a reply has exactly one destination**, so a peer's abandoned reply and a local
+caller's are two replies and never one seen twice. The claim is *one actor, one
+cause, two doors, two answers that agree*.
+
+**What is still refused: the panic itself does not reach the caller.** §4.8
+priced that at *"a return channel and a `Drop` impl on the reply of every
+method"*, and the price stands. Neither of the two mechanisms built since is that
+channel, and both are close enough to be worth ruling out by name:
+
+- **The chain** carries actor identities from caller into turn, cloned into each
+  message for a membership test. It says who is calling. It cannot say where an
+  answer goes, and it flows the wrong way to carry one back.
+- **`Fate`** is a cell about the *actor*, read after the channel has died. It
+  carries no payload and names no reply, which is why it can make the caller's
+  sentence true and cannot hand it a `Panic`.
+
+`Reply` and `Deferred` still have no `Drop` impl, which is the whole of what §4.8
+asked for and did not build. The cost is the same cost.
+
+**The guard §4.8 cites now asserts the variant.**
+`a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_actor`
+asserted `is_err()` and nothing more, so it stayed green whichever variant
+arrived and this section's citation proved only that *something* went wrong. It
+now asserts `Dropped`. The second assertion beside it — that the actor answers
+the next call — is what makes "and not the actor" a measured half rather than a
+restatement.
+
+**What this does not close**, so it is not rediscovered as a defect: the read can
+still be late. A restart whose next incarnation has already published `Running`
+reads as *dropped* rather than *restarting*, and the generation counter that
+would close it is refused in the other direction — queued turns survive a
+restart, so a bumped generation answers *restarting* about an actor that is
+running. §12.4 carries both directions and the design that would close them. The
+local path inherits that window exactly; it adds none of its own.
+
+**And that is the answer to the one residual this wave's review filed.** A parked
+local caller woken by a dropped channel reads the cell some scheduler-dependent
+time later, and a supervisor walking `Restarting` → `factory().await` →
+`settle(Running)` can get there first, so the caller reads `Running` and is told
+*dropped* where *restarting* was settled for it. It is §12.4's window and not a
+second one — the same cell, read after the same death, under the same
+happens-before — and the ordinary restart path is not exempt from it, because the
+ordinary restart path is the one §12.4 describes. The local door renders that
+window; it does not widen it.
+
+**A row in §12.8 was edited in place, and it is put back.** The break-record row
+for `defer::a_live_actor_does_not_tell_a_peer_no_such_actor` was rewritten to
+carry the test's new name and a second break that did not exist when §12 was
+written. CONTRIBUTING.md's rule for RFCs is why it is reverted rather than kept:
+the value of a record is that it shows what was believed at the time, and a row
+that acquires a later wave's break stops being a record of its own. Both facts
+belong here instead.
+
+- **The rename.** That test is
+  `defer::a_local_caller_and_a_peer_agree_about_an_abandoned_deferred` now. The
+  old name is half of what it holds, and it named a setup that cannot be built —
+  see the destination argument above, which is the reason the extension took a new
+  claim rather than a wider version of the old one.
+  `scripts/replay-fate-breaks.sh` follows the new name, because it has to run;
+  §12.8's row records the name the run was made under.
+- **The second break.** §12.8 records one break, on `lost`'s `Standing::Running`
+  arm, and that is the whole of what §12 built: the local door read no `Standing`
+  then. It does now, so the test carries a second — `answered`'s
+  `Standing::Running => TurnLost::Dropped,` → `… TurnLost::Gone,` — and either
+  break alone leaves the other half green, which is the measurement that makes the
+  pairing worth asserting rather than a restatement. Quote that literal with its
+  **twelve spaces** of indentation; the bare form resolves twice in `turns.rs` and
+  aborts the harness.
+
 ---
 
 ## 5. Wave 3 — feeds: an actor's second input, and one loop at last
@@ -3586,7 +3682,7 @@ two lines now, and `scripts/replay-fate-breaks.sh` runs the whole set.
 | `registry::abort_settles_the_served_answer_before_it_destroys_the_actor` | `System::abort`'s settle → `Standing::Running` |
 | `registry::an_expired_shutdown_budget_settles_the_served_answer_before_the_abort` | `drain`'s settle → `Standing::Running` |
 | `remote::no_other_served_failure_begins_with_one_of_the_four` | `RouteError::AtCapacity`'s `Display` gains a `"dropped: "` prefix |
-| `defer::a_local_caller_and_a_peer_agree_about_an_abandoned_deferred` | `lost`'s `Standing::Running` arm → `NoSuchActor`, and `answered`'s `Standing::Running` arm → `TurnLost::Gone` — one break per door |
+| `defer::a_live_actor_does_not_tell_a_peer_no_such_actor` | `lost`'s `Standing::Running` arm → `NoSuchActor` |
 | `defer::a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer` | the same arm → `Failed("panicked: bad")` |
 | `defer::a_stopped_actor_still_tells_a_peer_no_such_actor` | the default `Inbox::ending` → `Standing::Running` |
 | `defer::an_aborted_actor_tells_a_peer_no_such_actor` | `LocalActor::abort`'s settle → `Standing::Running` |

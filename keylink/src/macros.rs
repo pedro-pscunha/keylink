@@ -2240,8 +2240,16 @@ macro_rules! __keylink_service {
                 ///
                 /// # Errors
                 ///
-                /// [`Undelivered`](keylink::Undelivered) when the actor is
-                /// gone.
+                /// Two of [`Undelivered`](keylink::Undelivered)'s variants,
+                /// because this is
+                /// [`LocalActor::read`](keylink::LocalActor::read) and a read
+                /// runs no observers and carries no queueing budget:
+                /// [`Reentrant`](keylink::Undelivered::Reentrant) when the call
+                /// came from inside this actor's own turn, and
+                /// [`Gone`](keylink::Undelivered::Gone) when the actor is gone.
+                /// That method's own documentation carries the argument for why
+                /// a dead read channel is `Gone` and never `Dropped` or
+                /// `Restarting`.
                 pub async fn with_state<T, F>(
                     &self,
                     read: F,
@@ -3797,11 +3805,22 @@ macro_rules! __keylink_local_method {
         ///
         /// [`Undelivered`](keylink::Undelivered), one variant per way the call
         /// lost its value: [`Gone`](keylink::Undelivered::Gone) when the actor
-        /// is gone, [`Refused`](keylink::Undelivered::Refused) when an
+        /// is gone, [`Dropped`](keylink::Undelivered::Dropped) when a live actor
+        /// threw this reply away without answering it,
+        /// [`Restarting`](keylink::Undelivered::Restarting) when the incarnation
+        /// that owed the answer died and a supervisor is starting another,
+        /// [`Refused`](keylink::Undelivered::Refused) when an
         /// [`Observer`](keylink::Observer) refused the turn that ran — the actor
-        /// is alive, and a supervised one may be restarting — and
-        /// [`Reentrant`](keylink::Undelivered::Reentrant) when the call was made
-        /// from inside this actor's own turn.
+        /// is alive, and a supervised one may be restarting —
+        /// [`Expired`](keylink::Undelivered::Expired) when a queueing budget ran
+        /// out before the turn started, which a local origin cannot do today,
+        /// and [`Reentrant`](keylink::Undelivered::Reentrant) when the call was
+        /// made from inside this actor's own turn.
+        ///
+        /// "One variant per way" is a promise of completeness, so it is the
+        /// whole enum: a fault is the one loss missing, and it is missing
+        /// because this method resumes the panic in the caller rather than
+        /// reporting it.
         ///
         /// # Panics
         ///

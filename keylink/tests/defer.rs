@@ -161,11 +161,21 @@ async fn parked(book: &orders::Handle<Book>, want: u64) {
 /// released it.
 ///
 /// Made red by `scripts/break-once.sh`, replacing `Deferred::send`'s
-/// `self.0.answer(Answered::Ran(value));` with `drop((self, value));` — a park that
-/// takes the channel away and never gives it back. Watched: this fails at the
-/// answer, "the actor is running: Undelivered", which is what a caller sees when
-/// the channel dies unanswered. It prints rather than hangs because the wait is
-/// bounded by the sender being dropped, not by a timeout.
+/// `Verdict::Committed => reply.answer(Answered::Ran(value)),` with
+/// `Verdict::Committed => drop((reply, value)),` — a park that takes the channel
+/// away and never gives it back. Watched: this fails at the answer,
+/// `the actor is running: Dropped`, which is what a caller sees when a **live**
+/// actor lets the channel die unanswered. It prints rather than hangs because the
+/// wait is bounded by the sender being dropped, not by a timeout.
+///
+/// **Both halves of that were re-measured on 2026-08-09 rather than carried, and
+/// both had moved.** The literal read `self.0.answer(Answered::Ran(value));`, which
+/// is not in the tree: `send` binds the reply and parks a callback, so the answer
+/// sits on a `Verdict` arm and the old quote could not be applied at all. And the
+/// watched word read `Undelivered` — the panic is `expect`'s, so it prints the
+/// error's `Debug`, which was the type's name while it was a unit struct and is the
+/// variant's name now. Control first, 5 of 5 green; then 2 failed under the break,
+/// this test and its sibling below.
 #[tokio::test]
 async fn a_parked_reply_is_answered_from_a_later_turn() {
     let book = orders::actor(Book::default());
@@ -192,8 +202,8 @@ async fn a_parked_reply_is_answered_from_a_later_turn() {
 ///
 /// **Reddened, but not on its distinguishing claim, and that is worth saying.** The
 /// break is the one its sibling above uses — `Deferred::send`'s
-/// `self.0.answer(Answered::Ran(value));` replaced by `drop((self, value));` —
-/// watched here as "running: Undelivered" at the first order. That fails both
+/// `Verdict::Committed` arm, answering replaced by a drop — watched here as
+/// `running: Dropped` at the first order, in the same run. That fails both
 /// tests, so it proves the parked channel is load-bearing and proves nothing about
 /// *two* of them. No one-literal edit isolates the plural: a `Reply` is built per
 /// call by generated code and `later` consumes it, so "the deferred reply per actor"
@@ -594,9 +604,14 @@ async fn a_deferred_sent_from_another_task_is_not_gated_by_the_turn_that_spawned
 /// unanswered was reported to the peer as though the service had never been mounted.
 /// The test went red either way — the finding was about what an operator reads.
 /// **Fixed:** `deliver_to_local` now splits the dead-channel arm three ways, and the
-/// same break watched under it prints `Remote(Failed("dropped: the reply was taken
-/// out of the turn and never answered"))`. `a_local_caller_and_a_peer_agree_about_an_abandoned_deferred`
-/// reaches the same rendering through the public API with nothing broken at all.
+/// same break watched under it printed `Remote(Failed("dropped: the reply was taken
+/// out of the turn and never answered"))`. **That is a transcript and not the
+/// current text.** `lost`'s `Standing::Running` arm has been rewritten since — its
+/// own comment records that the sentence was wrong twice, both times by naming a
+/// cause — so the prefix is what survives from that run and the words after it are
+/// read off `lost`. `a_local_caller_and_a_peer_agree_about_an_abandoned_deferred`
+/// reaches the same rendering through the public API with nothing broken at all,
+/// and it matches on the **prefix** for exactly this reason.
 #[tokio::test]
 async fn a_peer_gets_an_answer_parked_past_its_own_turn() {
     let node = local_node().await;

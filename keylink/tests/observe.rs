@@ -9,11 +9,11 @@
 //!
 //! What is pinned here is §2.6, the table that says who gets an answer:
 //!
-//! | the turn  | an observer | the caller of a local call gets                |
-//! |-----------|-------------|------------------------------------------------|
-//! | completed | accepted    | the value                                      |
-//! | panicked  | refused     | the panic, resumed — and the actor then ends   |
-//! | completed | refused     | `Undelivered`, with the turn not committed   |
+//! | the turn  | an observer | the caller of a local call gets                     |
+//! |-----------|-------------|-----------------------------------------------------|
+//! | completed | accepted    | the value                                           |
+//! | panicked  | refused     | the panic, resumed — and the actor then ends        |
+//! | completed | refused     | `Undelivered::Refused { name }`, turn not committed |
 //!
 //! Three rows and three tests, because they are three different promises and an
 //! implementation that collapses any two of them still passes a test written for
