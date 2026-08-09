@@ -1288,6 +1288,39 @@ ANCHORS = [
      "done < <(git worktree list --porcelain | sed -n 's/^worktree //p')"),
     ("I3", "scripts/hook-guard.sh", "scripts/install-hooks.sh",
      'git config core.hooksPath .githooks'),
+    # ── THE TWO ROWS FOR THE GATE MARKER, and registering them is the branch's own
+    # thesis applied to itself. Each hook's `exec mise run …` line names WHICH gate it
+    # runs, and one word on it downgraded the gate to a subset - a false green that no
+    # assertion caught, because nothing in `scripts/hook-guard.sh` had ever read the
+    # marker's CONTENT, only whether it was non-empty. Two assertions now read it, one
+    # per hook.
+    #
+    # **Leaving these two literals unregistered would put the new guards in exactly the
+    # state they were written to escape**: an edit to either hook would silently rot the
+    # record that describes its guard, and every gate would stay green. So they are rows.
+    #
+    # Re-derived here rather than transcribed, because a row is where a carried figure
+    # becomes permanent. Measured at `fec4704` through the lifted reader and `str.count`:
+    # each counts **1** in its target, each is quoted by EQUALITY in `lives_in`, and each
+    # is a whole line.
+    #
+    # **Both are CROSS-FILE**, so rot mode 1's same-file trap cannot reach them. **And
+    # neither contains nor is contained by any other registered literal** - checked
+    # against all 70 by substring in both directions, which is the containment coupling
+    # `H11` forced into that mode and the reason it is checked here rather than assumed.
+    #
+    # **Their indentation is NOT load-bearing**, unlike `H6`/`H7`: the bare form of each
+    # counts 1 as well. They keep it to match the file's convention, and a reader tidying
+    # it would get a still-green gate rather than an abort - the opposite hazard, worth
+    # naming because the two live four rows apart.
+    #
+    # `5` keeps its record's own number instead of a letter, the decision already recorded
+    # for records 1, 3a, 3b and 4: a reader who sees `FAIL 5` should find record 5 without
+    # a translation step.
+    ("H13", "scripts/hook-guard.sh", ".githooks/pre-push",
+     '    exec mise run pre-push'),
+    ("5", "scripts/hook-guard.sh", ".githooks/pre-commit",
+     '    exec mise run pre-commit'),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
