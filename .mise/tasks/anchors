@@ -1498,8 +1498,20 @@ ANCHORS = [
     # Re-derived at `8fc1443`, after both shell files were committed - **registering
     # against a file still being edited is the C6 hazard, where a row is pinned to bytes
     # that move under it.** Count **1** in `scripts/install-hooks.sh`, quoted by EQUALITY
-    # in the carrier, a whole line, and neither containing nor contained by any of the
-    # other 72 literals.
+    # in the carrier, a whole line, and neither containing nor contained by any other
+    # registered literal.
+    #
+    # **That last clause used to carry a number - "the other 72 literals" - and it was
+    # wrong in two ways at once.** The date rescues the `Count **1**` measurement and does
+    # NOT rescue this one: containment is a property of the WHOLE registry, so it changes
+    # whenever anybody adds a row, on a commit that need not touch this row or this file.
+    # The `compose-group` merge falsified it by adding twenty-three.
+    #
+    # And it was mis-nouned from the start. At `8fc1443` the registry held **72 rows over
+    # 64 distinct literals**, so 72 counted ROWS while the noun said literals - the figure
+    # was never a literal count at any tree. The number is dropped rather than refreshed,
+    # because a refreshed one rots on the next row anybody registers. What matters is the
+    # property, and the resolution check above re-derives it every run.
     #
     # **Its indentation is NOT load-bearing** - the bare form also counts 1. So it patterns
     # with `H13` and `5` above rather than with `H6`/`H7`, and that answer was measured
@@ -1743,11 +1755,19 @@ MARKERS = ("///", "//!", "//")
 # the one check in this file that fails loudly on a population change would stay green
 # while the haystack every record is matched against had grown.
 #
-# **That 127 is NOT `RECORD_BLOCKS`, which is 132**, and an earlier version of this
-# paragraph named the constant. The two differ because the walk now covers shell files as
-# well - the 127 here is the `.rs` half alone, held fixed to isolate the marker set as the
-# only variable. Naming the constant made the sentence read as false the moment the walk
-# widened, while the measurement behind it never moved.
+# **That 127 is NOT `RECORD_BLOCKS`**, and an earlier version of this paragraph named the
+# constant. The two differ because the walk now covers shell files as well - the 127 here
+# is the `.rs` half alone, held fixed to isolate the marker set as the only variable.
+# Naming the constant made the sentence read as false the moment the walk widened, while
+# the measurement behind it never moved.
+#
+# **This paragraph then did it a SECOND time and had to be corrected again.** The version
+# before this one read "which is 132" - it removed the constant from the argument and
+# left the constant's VALUE in the same sentence, which is the identical defect wearing
+# the fix. It was true when written and the `compose-group` merge falsified it, exactly as
+# the widening falsified the first version. The value is gone now rather than updated:
+# updating it would only schedule the third correction. The live figure is printed by
+# every run of this task, and that is where a reader should get it.
 #
 # The mechanism, on the smallest sample that shows it - one `///` doc comment between
 # `#![allow(dead_code)]` and two attributes. Under `MARKERS` the reader returns one
@@ -2581,7 +2601,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # 103 → 111 on the deadlock-audit branch: eight new harness blocks, seven in
 # `tests/cycles.rs` and one in `tests/blocking_work.rs`.
 #
-# 111 → the figure below on `ledger-limits`, rebased onto `fbb7e43`. Five records,
+# 111 → 116 on `ledger-limits`, rebased onto `fbb7e43`. Five records,
 # all REGISTERED above:
 #
 #   L1, L2  `keylink/tests/idempotency.rs` — the builder-wiring guard and the
@@ -2614,7 +2634,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # `an_attach_ceiling_of_zero_refuses_the_attacher_at_once` shares A2's literal with a
 # different replacement, so it adds a block without adding a row.
 #
-# 122 → the figure below, one commit later, for the pool bounds' maximal end: ONE
+# 122 → 123, one commit later, for the pool bounds' maximal end: ONE
 # block, `a_maximal_pool_evicts_nothing`, registered as A5.
 #
 # **Both figures were read off a run at their own commit's tree, and the second one
@@ -2630,10 +2650,10 @@ for record in sorted(set(REDNESS) - row_ids):
 # the same way the line above was**: the tripwire was left at 123 and the pre-commit
 # hook answered `124 comment blocks mention break-once.sh` from the walk.
 #
-# 124 → the figure below, two commits later on the same branch, for `Attaching` and for
+# 124 → 127, two commits later on the same branch, for `Attaching` and for
 # the panic-restart gap. **THREE new blocks, ONE new row, and the net is +3.** An earlier
 # version of this note said "THREE new blocks, ONE retired, ONE new row", which reaches
-# 126 and not the figure below. The retirement is real and it subtracts nothing, and that
+# 126 and not 127. The retirement is real and it subtracts nothing, and that
 # is the part an auditor cannot re-derive from the two ends alone:
 #
 #   added    `a_forbidden_ceiling_is_refused_without_a_waiting_place`, whose literal is
@@ -2799,7 +2819,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # What is NOT claimed: that 132 is a count of break records. It is a count of blocks
 # naming the harness, three of which are the harness itself.
 #
-# 149 and 132 → the figure below, at the merge of `compose-group` into `main`. **The
+# 149 and 132 → 154, at the merge of `compose-group` into `main`. **The
 # two entries above are the only pair in this file that do not chain**, and that is
 # the entry: they are siblings, not steps. Both start at 127, neither could see the
 # other, and the merged tree carries BOTH causes — twenty-two new record blocks on
