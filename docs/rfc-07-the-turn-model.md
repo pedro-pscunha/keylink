@@ -4401,3 +4401,62 @@ failure this crate keeps having is the opposite one: names and numbers that asse
 more than the tree can support — §15.1 immediately above is an instance. Buying a
 rename here would spend an edit on the safe direction of an error whose expensive
 direction is what the file is about.
+
+---
+
+## 16. Revision, 2026-08-09: §9.9's "fifteen tests" was exact, and nothing in the sentence says when
+
+§9.9 opens *"Fifteen tests in `keylink/tests/supervision.rs`, every one of them
+watched to fail under a break."* Measured, both ends:
+
+```
+git show 75155e3:keylink/tests/supervision.rs | rg -c '^#\[(tokio::)?test'   # 15
+rg -c '^#\[(tokio::)?test' keylink/tests/supervision.rs                      # 20
+```
+
+`75155e3` (2026-08-07) is the commit that wrote the sentence. **It was exact when
+written.** The file holds twenty today, and §9.9 is not edited, because fifteen is
+what Wave 9 recorded of its own work and the five since are not claims Wave 9 made.
+
+**The defect is that a reader cannot tell those two apart.** A count that was true
+when written and is never re-derived reads exactly like a count that is current,
+and this sentence gives a reader nothing to distinguish them with. Somebody who
+counts today and finds twenty has three readings available — the record rotted,
+the record was always wrong, or the tree moved — and the sentence does not say
+which. That is the whole cost, and it is paid by the reader rather than by the
+author.
+
+`.mise/tasks/anchors:357` solves the same problem in one clause: *"EVERY FIGURE
+BELOW WAS RE-RUN AND RE-TRANSCRIBED AT `82b8366`"*. A reader who disagrees with a
+figure under that umbrella knows at once which side is the measurement and which
+is the record. No section of this file carries such a marker.
+
+**So: §9.9's fifteen is pinned, here, to `75155e3`.** Anyone counting
+`keylink/tests/supervision.rs` and finding a different number has found later work
+and not rot.
+
+### 16.1 The general form, stated once, because this is not the first
+
+Three sections of this file now correct the same shape. §13: a pin moved, and the
+sentences naming its value went stale without one of them being wrong about its
+own wave. §15.1: `Undelivered` and `TurnLost` stopped having the same number of
+variants, and a sentence saying "either enum" outlived it. §16: a test file grew
+past a count taken of it. Different subjects, one failure — **a figure about the
+tree, written into a record, is a measurement of the moment it was taken, and
+nothing in the sentence says so.**
+
+It has two halves and both are cheap:
+
+- **Writing one.** Say what it was measured at. *"Fifteen tests, at `75155e3`"*
+  costs two words and cannot rot afterwards, because it stops claiming anything
+  about today. Better still, cite the guard rather than the count — that is §13's
+  own advice, and it needs no maintenance at all.
+- **Finding one.** Append, as this section does. The figure stays where it is,
+  because it is what the wave believed and that is the value of the record. The
+  appended section says what is true now, and why both are right.
+
+`CONTRIBUTING.md`'s `## RFCs` section now carries the first half as a rule, so the
+next author meets it while writing the figure rather than after a reader trips on
+it. It carries no licence for the second half beyond what the append-only rule
+already gives, which is deliberate: correcting a figure is still an append, and
+this section is one.

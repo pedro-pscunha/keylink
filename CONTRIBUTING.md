@@ -342,3 +342,17 @@ and the carve-out is about pointing. What a record *asserts* — a count, a watc
 message, the verdict a break produced — is still appended, never edited in. And
 nothing here permits editing an RFC so that it matches new code: that is the rule
 above, and this carve-out does not reach it.
+
+**Write a figure with the commit it was measured at.** A count of anything in the
+tree — tests in a file, variants in an enum, rows in a registry — is a measurement
+of the moment it was taken, and an RFC keeps it for ever. *"Fifteen tests, at
+`75155e3`"* costs two words and cannot rot, because it stops claiming anything
+about today; the bare form reads as current for as long as the file exists, and a
+reader who counts and disagrees cannot tell whether the record went stale or the
+tree moved. `.mise/tasks/anchors` does this with an explicit pin over a block of
+figures. RFCs have no such mechanism, so the sentence has to carry it. Better
+still, cite the guard rather than the count, and there is nothing to pin.
+
+This is a rule for writing a **new** figure. A bare one already in a file is
+corrected the way everything else is — by appending, never by editing the number
+in place. RFC-07 §13, §15.1 and §16 are three worked examples.
