@@ -13,12 +13,16 @@
 //! | [`after`] / [`every`] | a delayed run and a repeating one, on a cancellable handle |
 //! | [`Names`] | name → local actor, unregistered when the actor ends |
 //! | [`Group`] | a set of actors that end together, or one the rest carry on without |
+//! | [`Endings`] | ending → future, for a keyed actor no handle can be asked |
 //!
-//! Five types and two functions for the five in the table. The **sixth** pattern
-//! has no row, and that is the finding rather than an oversight: handle
-//! ergonomics turned out to be a table rather than a type — all of it already
-//! exists under keylink's own names, and the last section here is the mapping and
-//! the argument for not adding an alias.
+//! Six types and two functions for the six rows. Five of the rows are the first
+//! five patterns; [`Endings`] is a sixth **row** and not a sixth pattern — it is
+//! the keyed half of [`Names`] and [`Group`], both of which want an ending future
+//! and could not get one out of a keyed actor. The sixth **pattern** has no row,
+//! and that is the finding rather than an oversight: handle ergonomics turned out
+//! to be a table rather than a type — all of it already exists under keylink's own
+//! names, and the last section here is the mapping and the argument for not adding
+//! an alias.
 //!
 //! # Every one of these states its backpressure, because that is what was missing from the versions this is modelled on
 //!
@@ -42,6 +46,7 @@
 //! | [`Names`] | nothing waits | it is a map and a lock. No channel, no queue; bounded by the number of live names |
 //! | [`Group`] | a member slow to die delays the group's next **decision** | one decision at a time, in one task. Endings are futures rather than queue entries, so N members are at most N pending endings and a death allocates nothing |
 //! | [`add`](Group::add) while the policy is running | its ending waits in a staging list until the next wake — the member itself is filed at once, and a teardown before that wake retires it | the number of `add` calls in flight, drained to empty on that wake. A staging list, not a queue that grows against a slow consumer |
+//! | [`Endings`] | nothing waits | a map, a lock, and one `oneshot` per waiter. No channel is ever full, so [`ended`](crate::Lifecycle::ended) cannot block a mount; bounded by the number of **live** [`watch`](Endings::watch) futures, and dropping one takes its waiter back out |
 //!
 //! **There is no third option that hides.** A pattern here either applies
 //! backpressure to whoever is producing, or ends the consumer and says so.
@@ -103,11 +108,13 @@
 //! | `stop_gracefully` | [`Handle::stop`] — ordered, drains what was already queued, then waits | Wave 1, and it waits on the `ended` channel rather than `mail.closed()` since Wave 2 |
 //! | `wait_for_shutdown` | [`Handle::ended`] — and it answers *why*, which a `wait_for_shutdown` returning `()` cannot | Wave 2 |
 //!
-//! What is genuinely absent is on the **keyed** path, and it is not this
-//! module's to fix: a keyed actor reached through [`System`](crate::System) has
-//! no per-actor `ended()` for a caller to await. [`Names`] therefore takes the
-//! ending future as an argument rather than asking a handle for one, which is
-//! what lets it hold a keyed wrapper the day that channel exists.
+//! What was genuinely absent is on the **keyed** path, and this module is where
+//! it is fixed: a keyed actor reached through [`System`](crate::System) has no
+//! per-actor `ended()` for a caller to await, so [`Endings`] writes that channel
+//! once. [`Names`] and [`Group`] both take the ending future as an argument
+//! rather than asking a handle for one, which is what lets either hold a keyed
+//! member now that the channel exists — the argument they already had is the
+//! change they did not need.
 //!
 //! [`Handle`]: crate::LocalActor
 //! [`Handle::is_running`]: crate::LocalActor::is_running
@@ -116,12 +123,14 @@
 //! [`n0_future`]: n0_future
 
 mod group;
+mod keyed;
 mod names;
 mod pool;
 mod schedule;
 mod topic;
 
 pub use group::{Group, GroupEnded, Membership, Retire, Verdict};
+pub use keyed::Endings;
 pub use names::Names;
 pub use pool::{Member, Pool};
 pub use schedule::{after, every, Scheduled};

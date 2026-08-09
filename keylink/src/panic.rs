@@ -17,7 +17,8 @@
 use std::fmt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::task::Poll;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 /// A panic that was caught instead of killing an actor.
 ///
@@ -153,16 +154,82 @@ pub(crate) fn message_of(payload: &(dyn std::any::Any + Send)) -> String {
 /// `rg '\$crate::guarded' keylink/src/macros.rs` finds nothing, and neither do
 /// `tests/`, `demo/` or the README. A `pub` nothing outside needs is a
 /// compatibility promise made by accident.
-pub(crate) async fn guarded<F: Future>(fut: F) -> std::result::Result<F::Output, Panic> {
-    let mut fut = Box::pin(fut);
-    std::future::poll_fn(move |cx| {
+///
+/// A plain `fn` returning [`Guarded`] rather than an `async fn`, so that the
+/// future it hands back has a name a caller can write down. [`Guarded`] says
+/// which caller needs that and what the alternative cost.
+pub(crate) fn guarded<F: Future>(fut: F) -> Guarded<F> {
+    Guarded { fut: Box::pin(fut) }
+}
+
+/// The future [`guarded`] returns: one panic-catching poll around a boxed future.
+///
+/// # Named rather than opaque, so a collection of them can be annotated
+///
+/// This was an `async fn`, whose return type no caller can spell. That costs
+/// nothing until something has to *name* it, and one caller does.
+/// `compose::Group`'s `retire_all` pushes every guarded ending into a
+/// `FuturesUnordered`, and the item type of that set is inferred from the single
+/// `retiring.push(guarded(fut))` line and from nothing else. So the set's type
+/// is held up by the very line a guard has to replace. The break behind
+/// `tests/compose.rs`'s `no_members_retirement_waits_on_another` swaps that push
+/// for an `await`, which leaves the set with no inference source at all: the
+/// edit fails to compile with `E0282` instead of reddening the test, and a guard
+/// that cannot be expressed measures nothing.
+///
+/// A name fixes it at the collection rather than at the push:
+/// `FuturesUnordered<Guarded<Retiring>>` gives the set its item type up front,
+/// and the push line is then free to be replaced by anything.
+///
+/// **The refused alternative was to annotate the set with the opaque type.** It
+/// cannot be named, so the only annotation available is
+/// `FuturesUnordered<Pin<Box<dyn Future<Output = Result<(), Panic>> + Send>>>`,
+/// which needs a `Box::pin` at the push site. Three breaks in `tests/compose.rs`
+/// anchor on that push line verbatim, and a literal that no longer occurs aborts
+/// `scripts/break-once.sh` — so rewriting it re-quotes all three. One of them is
+/// then no longer expressible either: the break that pushes the caller's future
+/// *unguarded* pushes a `Retiring`, whose output is `()`, into a set that now
+/// demands `Result<(), Panic>`. It stops compiling rather than failing an
+/// assertion, which says nothing about teardown. One struct here moves no anchor
+/// and disarms no break.
+///
+/// # Boxed, and that is what keeps it free of `unsafe`
+///
+/// The field is a `Pin<Box<F>>` and not an `F`. Polling an `F` in place needs a
+/// pin projection, and a hand-written projection needs `unsafe`, which
+/// `lib.rs`'s `#![deny(unsafe_code)]` lifts exactly once, by name, for something
+/// else. The box carries the pinning instead, and makes `Guarded<F>` [`Unpin`]
+/// for every `F`, so [`Pin::get_mut`] is enough to reach the field —
+/// [`Watch`](crate::Watch) is polled the same way for the same reason.
+///
+/// It is the allocation the `async fn` body already made. What moved is when:
+/// the box is built when [`guarded`] is called rather than at the first poll.
+/// Nothing runs in between — the inner future is not polled either way — so no
+/// caller can observe the difference.
+#[must_use = "a guarded future does nothing unless you `.await` or poll it"]
+pub(crate) struct Guarded<F> {
+    /// The caller's future, owned and pinned. Kept across a caught panic rather
+    /// than dropped, because a `Panic` is reported as `Ready` and a future is
+    /// not polled after that.
+    fut: Pin<Box<F>>,
+}
+
+impl<F: Future> Future for Guarded<F> {
+    type Output = std::result::Result<F::Output, Panic>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let fut = &mut self.get_mut().fut;
         match std::panic::catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
+            // Pending is passed through and the future is kept, not abandoned:
+            // a guard around a future must not change how many times it is
+            // polled. `compose::Group` holds these in a set that polls each of
+            // them to completion, and an ending dropped at its first `Pending`
+            // would report a member as retired that never was.
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
             Err(panic) => Poll::Ready(Err(Panic::caught(panic))),
         }
-    })
-    .await
+    }
 }
 
 /// Run one **synchronous** step, turning a panic into a value instead of a dead

@@ -1308,7 +1308,50 @@ for record in sorted(set(REDNESS) - row_ids):
 # `Watched: TO BE MEASURED`. Registering them now would pin a literal against a
 # failure nobody has watched, which is the defect this whole task exists to catch.
 # The rows land with the commit that replaces those thirteen lines with real output.
-RECORD_BLOCKS = 141
+#
+# 141 → the figure below, same branch, for `compose::Endings` and the keyed side.
+# Read off a FAILURE like every figure above it.
+#
+# The accounting, measured on this tree and not subtracted between two ends:
+#
+#   +6  `keylink/tests/compose.rs`, 25 → 31. Four keyed-side tests, one block each,
+#       plus two records restored — see the paragraph below. The compose target
+#       goes 29 tests to 33.
+#   +1  `keylink/src/panic.rs`, 0 → 1. `guarded` became a named future so that
+#       `retire_all` can annotate its `FuturesUnordered`, and the block records
+#       that three anchors quote that function and a rewrite re-quotes all three.
+#
+# **This entry first said 146, +4 and +1, and every one of those was measured.**
+# `mise run anchors` was run by hand, answered 146, and the accounting was written
+# to match. The pre-commit hook then answered 148 and refused the commit. Nothing
+# was miscounted: a second agent held the pen, and the failing run and the commit
+# were two measurements of two different trees. **So "read the number off a failing
+# run" is necessary and is not sufficient.** It protects against computing a figure.
+# It does not protect against the tree moving between the read and the use, and
+# that window is invisible — a stale number and a fresh one are the same digits on
+# the page. What closes it is holding still: one writer, and the count taken in the
+# same commit that consumes it.
+#
+# The two restored blocks are the reason the figure moved twice. That agent had
+# replaced two `Made red by ...` records with descriptive prose. The prose is
+# better and is kept. Deleting the records is not, and they are back above it: a
+# record names the substitution that reddens the test, and a deleted record is a
+# guard this walk stops counting — the population falls, the constant agrees, and
+# the check passes over a claim nobody can replay. **A block count falling is the
+# quiet direction, and nothing here would have said so.**
+#
+# **The thirteen above is now TWENTY, and the sentence above is left as it was
+# written.** It was accurate for the transition it describes; editing it to match a
+# later tree would turn a record into a running total, which is the one thing this
+# file keeps saying a record must not become.
+#
+# **Still no row, and for the reason the entry above gives, now on more evidence.**
+# The agent that wrote all seven of the new and rewritten records reported plainly
+# that it ran `break-once.sh` zero times: it verified each literal resolves exactly
+# once and verified two replacements COMPILE, which is neither the same thing as a
+# red test nor claimed to be. Twenty `Watched: TO BE MEASURED` lines is the honest
+# state. The rows land with the commit that replaces them with real output.
+RECORD_BLOCKS = 148
 
 # The one marker the tripwire counts, and the two phrasings records use INSTEAD of
 # naming the harness. Both are read by the same walk, so the blind spot below is a

@@ -100,13 +100,18 @@
 //! a time in one task. That is a caller error with a symptom, not an
 //! impossibility.
 //!
-//! # Keyed actors cannot be members, and that is a stated limit
+//! # Keyed actors are members, through [`Endings`](super::Endings)
 //!
 //! A [`Membership`] needs the member's ending, and **a keyed actor has no
 //! `ended()` to ask for** — the same gap [`Names`](super::Names) names one type
 //! over. [`Membership::new`] therefore takes the ending as an argument rather
-//! than asking a handle for one, so it needs no change the day the keyed side
-//! grows a per-actor ending channel. Today a group watches local actors.
+//! than asking a handle for one, so it needed no change when the keyed side
+//! grew a per-actor ending channel — and that is the whole of why the argument
+//! is an argument. [`Endings`](super::Endings) is that channel:
+//! [`watch`](super::Endings::watch) hands back the future this constructor
+//! already takes, and [`System::abort`](crate::System::abort) is the retiring.
+//! `keyed.rs` states the one thing the shape costs, which is that a `watch`
+//! filed after its actor ended reaches nobody.
 //!
 //! # Cost
 //!
@@ -273,7 +278,7 @@ use std::task::Poll;
 use n0_future::{FuturesUnordered, Stream, StreamExt};
 use tokio::sync::{watch, Notify};
 
-use crate::panic::{catching, guarded, message_of};
+use crate::panic::{catching, guarded, message_of, Guarded};
 use crate::{ActorId, Ended};
 
 /// One member's ending, boxed so that one group can hold members of different
@@ -358,7 +363,30 @@ pub enum GroupEnded {
         message: String,
     },
     /// [`Group::stop`] was called.
-    Stopped,
+    Stopped {
+        /// How many members' `retire` panicked and were discarded.
+        ///
+        /// Both halves count: the closure that panicked before it ever built a
+        /// future, and the future that panicked on a poll.
+        /// [`Membership::new`] prices them as one thing — a panicking `retire`
+        /// costs one member and not the group — and this is where a caller
+        /// hears how many members that was.
+        ///
+        /// **On this variant rather than on a variant of its own, because the
+        /// group is already ending.** A new [`GroupEnded`] would exist to stop
+        /// something, and there is no group left to stop: every member is
+        /// retired and the answer is settled. What a caller deserves here is to
+        /// know, not to be stopped.
+        ///
+        /// **The other three endings drop it, and that is the residual.**
+        /// [`Member`](Self::Member), [`PolicyPanicked`](Self::PolicyPanicked)
+        /// and [`EndingPanicked`](Self::EndingPanicked) each name a member and
+        /// a reason of their own, and a second number beside those is one a
+        /// caller reads past on the way to the thing that ended the group.
+        /// `stop` is the one ending that otherwise says nothing at all about
+        /// the teardown it just ran, which is why the count is here.
+        retire_panics: usize,
+    },
     /// Every [`Group`] was dropped, so nothing decides any more.
     ///
     /// The members are still running. This is the group's answer to whoever was
@@ -853,8 +881,11 @@ async fn conduct(
             stop_requested.then(|| closing(&shared))
         };
         if let Some(members) = teardown {
-            retire_all(members).await;
-            break GroupEnded::Stopped;
+            // The one ending that carries the count. The three below name a
+            // member and a reason instead, and `GroupEnded::Stopped` says why
+            // the number rides on this one alone.
+            let retire_panics = retire_all(members).await;
+            break GroupEnded::Stopped { retire_panics };
         }
 
         let mut waiting = std::pin::pin!(wake.notified());
@@ -995,12 +1026,24 @@ fn closing(shared: &Shared) -> Vec<Retire> {
 /// [`GroupEnded::Dropped`] while the caller still holds a live [`Group`]. A
 /// wrong answer, not a missing one. One bad member costs one member.
 ///
-/// A panic here is **discarded**, because there is nobody to tell: teardown has
-/// no reply channel and the group's own ending is already decided. That is
-/// `schedule.rs`'s position for the same shape of problem, and it is the one
-/// place in this module where something is dropped without a signal.
-async fn retire_all(members: Vec<Retire>) {
-    let mut retiring = FuturesUnordered::new();
+/// **A panic here is counted, and the count is what comes back.** It cannot be
+/// reported as a *reason*: teardown has no reply channel, and no [`Ended`] means
+/// "the retire panicked". So the number of them is returned instead, and
+/// [`GroupEnded::Stopped`] carries it. This used to be discarded on the floor —
+/// one member vanishing out of a teardown with no report anywhere, in a module
+/// whose own backpressure section says there is no third option that hides.
+async fn retire_all(members: Vec<Retire>) -> usize {
+    // Annotated rather than inferred, and the annotation is a guard's
+    // precondition rather than a habit. Without it the set's item type came from
+    // the single `push` below and from nothing else — so the break behind
+    // `tests/compose.rs`'s `no_members_retirement_waits_on_another`, which
+    // replaces that push with an `await`, left the set with no inference source
+    // at all. It failed to compile instead of reddening the test, which is the
+    // failure shaped most like success. Measured twice, on two spellings of that
+    // break: `E0308` first, then `E0282`. `conduct` annotates its own
+    // `FuturesUnordered<Stamped>` for no reason but style; this one is load-bearing.
+    let mut retiring: FuturesUnordered<Guarded<Retiring>> = FuturesUnordered::new();
+    let mut panicked = 0_usize;
     for member in members {
         // `catching` covers the closure, which runs HERE rather than at the
         // first poll, and `guarded` covers the future it returns. Two calls
@@ -1009,10 +1052,20 @@ async fn retire_all(members: Vec<Retire>) {
         // returning a future, is exactly what makes them two.
         match catching(member.end) {
             Ok(fut) => retiring.push(guarded(fut)),
-            Err(_discarded) => {}
+            // Counted and not discarded. The closure never produced a future, so
+            // there is no retirement of this member's left to wait for.
+            Err(_panicked) => panicked += 1,
         }
     }
-    while retiring.next().await.is_some() {}
+    // The other half of the same number: a closure that did produce a future,
+    // and a future that panicked on a poll. Both halves are `retire`, and
+    // `Membership::new` prices them as one thing, so they are one count.
+    while let Some(retired) = retiring.next().await {
+        if retired.is_err() {
+            panicked += 1;
+        }
+    }
+    panicked
 }
 
 /// Build a [`Membership`] from a handle, naming it once.

@@ -28,6 +28,12 @@
 //! | a member asleep in a backoff is retired without waiting it out | `a_member_asleep_in_backoff_is_retired_without_waiting_out_its_backoff` |
 //! | an ending that panics ends the group and names the member it was awaiting | `an_ending_that_panics_ends_the_group_as_ending_panicked` |
 //! | a panicking `retire` costs its own member and not the teardown | `a_panicking_retire_costs_its_own_member_and_not_the_teardown` |
+//! | a keyed actor's own ending reaches a `watch` future, carrying the reason its loop returned | `a_keyed_actors_own_ending_reaches_a_watch_future_with_its_reason` |
+//! | every waiter filed under one name is answered, and not just one of them | `two_watchers_on_one_name_are_both_answered` |
+//! | two `Lifecycle`s on one `System` both fire, so watching does not cost the console | `two_lifecycles_on_one_system_both_fire` |
+//! | an abandoned `watch` unfiles its own waiter and not a later one under that name | `an_abandoned_watch_unfiles_its_own_waiter_and_not_a_later_one` |
+//! | a `watch` outliving its `Endings` resolves `Vanished` instead of waiting for ever | `a_watch_outliving_its_endings_resolves_vanished_rather_than_hanging` |
+//! | a keyed actor is a `Group` member: it ends, the policy is asked, the siblings are retired | `a_keyed_actor_is_a_group_member_end_to_end` |
 //!
 //! # Two ways time is kept out of the assertions, and they are different ways
 //!
@@ -87,10 +93,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use keylink::compose::{
-    after, every, Fanout, Group, GroupEnded, Membership, Names, Overflow, Pool, Subscription,
-    Topic, Verdict,
+    after, every, Endings, Fanout, Group, GroupEnded, Membership, Names, Overflow, Pool,
+    Subscription, Topic, Verdict,
 };
-use keylink::{ActorId, Caller, Ended, Intensity, Observer, Stop, TurnFut, TurnInfo};
+use keylink::{
+    ActorId, Caller, Ended, Eviction, Intensity, Lifecycle, Observer, Stop, TurnFut, TurnInfo,
+};
 use n0_future::time::Duration;
 use n0_future::StreamExt;
 use tokio::sync::{mpsc, oneshot};
@@ -1317,13 +1325,25 @@ async fn stop_all_ends_the_group_and_names_the_member_that_caused_it() {
 /// retirement stops every later member from being retired at all.
 /// Watched: TO BE MEASURED.
 ///
+/// **This break was not expressible until `retire_all`'s set was annotated, and
+/// that annotation exists for this break and no other reason.** The item type
+/// used to come from the single `retiring.push(guarded(fut))` line and from
+/// nothing else — the very line this replaces — so the edit left the
+/// `FuturesUnordered` with no inference source and the crate stopped compiling
+/// instead of the test going red. Measured twice, on two spellings: `E0308`
+/// first, then `E0282`. `FuturesUnordered<Guarded<Retiring>>` gives the set its
+/// type up front, which is what frees this line to be replaced by anything, and
+/// `panic.rs`'s `Guarded` is a named type rather than an `async fn` so that
+/// there is something to write there at all. The replacement above was verified
+/// to compile against the annotated set: no `E0282`, no `E0308`, no warning.
+///
 /// **The serial spelling must discard the result, and the first version of this
 /// record did not.** `Ok(fut) => guarded(fut).await,` does not compile: `guarded`
-/// yields `Result<(), Panic>` and the sibling `Err(_discarded) => {}` arm yields
-/// `()`, so the match arms disagree. Run as written it exits 101 on E0308 and
-/// tests nothing — and a non-zero exit from `break-once.sh` reads as a caught
-/// defect, so that failure is the one shaped most like success. The `let _ =`
-/// is what makes the arm `()`.
+/// yields `Result<(), Panic>` and the sibling `Err(_panicked) => panicked += 1,`
+/// arm yields `()`, so the match arms disagree. Run as written it exits 101 on
+/// E0308 and tests nothing — and a non-zero exit from `break-once.sh` reads as a
+/// caught defect, so that failure is the one shaped most like success. The
+/// `let _ =` is what makes the arm `()`.
 ///
 /// **Read the anchor line before running it.** The defect is fixed — await the
 /// retire future where it is built instead of pushing it — but the line it lives
@@ -1392,8 +1412,11 @@ async fn no_members_retirement_waits_on_another() {
     // Released, the teardown finishes and the group answers.
     let _ = release.send(());
     assert!(
-        matches!(bounded(group.ended()).await, GroupEnded::Stopped),
-        "`stop` ends the group as `Stopped`"
+        matches!(
+            bounded(group.ended()).await,
+            GroupEnded::Stopped { retire_panics: 0 }
+        ),
+        "`stop` ends the group as `Stopped`, and no member's `retire` panicked"
     );
 }
 
@@ -1824,7 +1847,10 @@ async fn a_member_asleep_in_backoff_is_retired_without_waiting_out_its_backoff()
 
     group.stop();
     assert!(
-        matches!(bounded(group.ended()).await, GroupEnded::Stopped),
+        matches!(
+            bounded(group.ended()).await,
+            GroupEnded::Stopped { retire_panics: 0 }
+        ),
         "the teardown completes while a member is asleep in its backoff"
     );
     assert!(
@@ -1946,48 +1972,56 @@ async fn an_ending_that_panics_ends_the_group_as_ending_panicked() {
 }
 
 /// Two breaks, one per half, because the two guards are two pieces of caller code
-/// at two moments. Both with `scripts/break-once.sh keylink/src/compose/group.rs`.
+/// at two moments — and they are now in two different files, which is the change
+/// worth reading before running either.
 ///
-/// **The closure half.** Replace `retire_all`'s
+/// **The closure half.** `scripts/break-once.sh keylink/src/compose/group.rs`,
+/// replacing `retire_all`'s `        match catching(member.end) {` with
+/// `        match Ok::<Retiring, crate::Panic>((member.end)()) {` — the closure
+/// called uncaught, which is a spelling this function genuinely had, so it is
+/// the regression rather than an invention. The `Ok::<_, _>` device is the one
+/// `a_policy_that_panics_ends_the_group_rather_than_orphaning_it` uses on the
+/// policy, and for the same reason: it removes the catch while leaving both
+/// match arms typed. Verified to compile, with one `unused import: catching`
+/// warning and nothing else — a warning under `cargo test`, so read the test
+/// result and not the exit of the build. Watched: TO BE MEASURED.
 ///
-/// ```text
-///         match catching(member.end) {
-///             Ok(fut) => retiring.push(guarded(fut)),
-///             Err(_discarded) => {}
-///         }
-/// ```
+/// **The future half moved to `keylink/src/panic.rs`, and the reason is the
+/// annotation on the set.** It used to read: replace
+/// `Ok(fut) => retiring.push(guarded(fut)),` with
+/// `Ok(fut) => retiring.push(fut),`, which worked only while the
+/// `FuturesUnordered`'s item type was inferred from that one push. It is
+/// annotated now — `FuturesUnordered<Guarded<Retiring>>`, which is what makes
+/// break 5 expressible at all — so pushing a bare `Retiring` is `E0308` and
+/// tests nothing. A break that stops compiling is the failure shaped most like
+/// success.
 ///
-/// with `retiring.push(guarded((member.end)()));` — which is a spelling this
-/// function genuinely had, so it is the regression rather than an invention.
-/// Watched: TO BE MEASURED.
-///
-/// **The future half.** Replace `Ok(fut) => retiring.push(guarded(fut)),` with
-/// `Ok(fut) => retiring.push(fut),` — the guard dropped and the caller's future
-/// pushed raw, so its panic unwinds the conductor mid-teardown. Watched: TO BE
+/// So the guard is broken where it lives: `scripts/break-once.sh
+/// keylink/src/panic.rs`, replacing
+/// `            Err(panic) => Poll::Ready(Err(Panic::caught(panic))),` with
+/// `            Err(panic) => std::panic::resume_unwind(panic),` — the catch
+/// re-throwing, so the retire future's panic unwinds the conductor mid-teardown
+/// and `Group::ended` answers `Dropped` on a dropped sender. Watched: TO BE
 /// MEASURED.
 ///
-/// It needs no type gymnastics, and that is worth one sentence because the first
-/// candidate written here did. `fut` is a `Retiring`, which is already
-/// `Pin<Box<dyn Future<Output = ()> + Send>>`, and this is the set's **only**
-/// push — so the `FuturesUnordered` simply infers that item type instead of
-/// `guarded`'s opaque one. `guarded` then goes unused, which is a warning and
-/// not an error under `cargo test`.
-///
-/// **That literal is the same one break 5 anchors on, with a different
-/// replacement.** Two breaks, one line, two claims: serialising the loop is one
-/// defect and unguarding the future is another. Run them separately.
+/// **That break is wider than the one it replaces, and the width is the price.**
+/// `guarded` is also what wraps a caller's ending future in `Group::add` and a
+/// turn in `local.rs`, so this reddens `panic.rs`'s own
+/// `guarded_turns_a_panic_into_a_value` and anything else that leans on the
+/// catch. Run it against this test's filter and read that one result; a
+/// whole-suite run under it says nothing about this guard in particular.
 ///
 /// **What each count says, because one of them alone says nothing.** `entered`
 /// is 2 because both bad members were reached: the closure ran, and the future
-/// was polled. `retired` is 2 because both healthy members completed. The second
-/// count is the claim — *one bad member costs one member* — and it is worth
-/// nothing without the first, since a teardown that skipped all four would also
-/// leave `retired` at 2 relative to nothing. What neither count can say is that
-/// the bad members were *discarded rather than retired anyway*, and nothing needs
-/// to: a closure that panicked never produced a future, so there was never a
-/// retirement of theirs to complete. The silence of that `Err(_discarded) => {}`
-/// arm is what this pins — it costs the member, it does not cost the teardown,
-/// and it does not change `GroupEnded`.
+/// was polled. `retired` is 2 because both healthy members completed. `retired`
+/// is the *one bad member costs one member* claim and it is worth nothing
+/// without `entered`, since a teardown that skipped all four would also leave
+/// `retired` at 2 relative to nothing. **`retire_panics` is what neither of them
+/// could say**: that the two bad members were discarded rather than retired
+/// anyway, and how many of them there were. It was `Err(_discarded) => {}` and a
+/// dropped `Result` until now — a member vanishing out of a teardown with no
+/// report anywhere — so the third assertion below is the one that turns this
+/// from a silence into a number.
 ///
 /// **Why this test exists at all.** `tests/zz_scratch_panic.rs` covered both
 /// halves and was deleted as scratch on 2026-08-08. `tests/compose.rs` is now the
@@ -2032,10 +2066,18 @@ async fn a_panicking_retire_costs_its_own_member_and_not_the_teardown() {
     assert_eq!(group.names().len(), 4, "four members, two of them bad");
 
     group.stop();
-    assert!(
-        matches!(bounded(group.ended()).await, GroupEnded::Stopped),
-        "a panicking retire does not change WHY the group ended"
-    );
+    match bounded(group.ended()).await {
+        // The variant is the old claim — a panicking retire does not change WHY
+        // the group ended — and the count is the new one. Both on one match, so
+        // that neither can be read without the other.
+        GroupEnded::Stopped { retire_panics } => assert_eq!(
+            retire_panics, 2,
+            "the two panics are counted rather than discarded, one per half: the \
+             closure that panicked before it built a future, and the future that \
+             panicked on a poll"
+        ),
+        other => panic!("a panicking retire does not change WHY the group ended, got {other:?}"),
+    }
     assert_eq!(
         entered.load(Ordering::SeqCst),
         2,
@@ -2046,5 +2088,409 @@ async fn a_panicking_retire_costs_its_own_member_and_not_the_teardown() {
         2,
         "both healthy members were retired: one bad member costs one member, \
          and the one issued after the panics is not orphaned by them"
+    );
+}
+
+// ────────────────────────────────────────────────────────────── the keyed side
+
+/// The one [`Ended`] no teardown path can synthesise, which is what makes a
+/// waiter carrying it evidence about the **loop** rather than about the
+/// teardown.
+///
+/// `compose::keyed`'s own four-path table is the argument:
+/// [`System::abort`](keylink::System::abort) reports [`Ended::Vanished`] and
+/// [`System::shutdown`](keylink::System::shutdown) reports [`Ended::Stopped`],
+/// and neither one asks the loop anything. So a `GaveUp` that arrives at a
+/// waiter came from the loop and from nowhere else.
+fn gave_up(after: u32) -> Ended {
+    let error: Box<dyn std::error::Error + Send + Sync> = "this member cannot serve at all".into();
+    Ended::GaveUp {
+        after,
+        error: Arc::from(error),
+    }
+}
+
+/// A keyed actor whose loop ends when the test says so, with the [`Ended`] the
+/// test chose.
+///
+/// Hand-written through [`keylink::mount`] and not `worker::spawn_supervised`,
+/// because these claims are about the reason the loop returned. A supervised
+/// member's reason is its supervisor's, and making one end at all needs a turn
+/// — which needs a served client, since a keyed mailbox is reachable over a QUIC
+/// stream or not at all. Nothing below needs a message, so nothing below binds a
+/// node.
+fn ending_when(told: oneshot::Receiver<Ended>) -> worker::Mounted {
+    keylink::mount(move |_inbox: worker::Mailbox| async move {
+        // A dropped sender is a test that went away before it said anything.
+        // `Vanished` is what an interrupted loop means, and it fails the
+        // assertions below rather than hanging them.
+        told.await.unwrap_or(Ended::Vanished)
+    })
+}
+
+/// A second [`Lifecycle`], standing for the console an [`Endings`] must not
+/// displace.
+struct Watched {
+    /// Every id this sink was told about, in the order it was told.
+    seen: Arc<Mutex<Vec<ActorId>>>,
+}
+
+impl Lifecycle for Watched {
+    fn mounted(&self, _id: &ActorId) {}
+
+    fn ended(&self, id: &ActorId, _why: &Ended) {
+        self.seen.lock().expect("not poisoned").push(id.clone());
+    }
+}
+
+/// Made red by `scripts/break-once.sh keylink/src/compose/keyed.rs`, replacing
+/// `Lifecycle::ended`'s `            let _ = waiter.tell.send(why.clone());`
+/// with `            let _ = waiter.tell.send(Ended::Vanished);` — a waiter
+/// answered with a reason the registry never gave it, which is exactly the
+/// *synthesised* half of that module's four-path table arriving on the one path
+/// that has a true reason. Watched: TO BE MEASURED.
+///
+/// `Vanished` is the replacement and not some other constant, because it is what
+/// [`System::abort`](keylink::System::abort) reports: a waiter that answered the
+/// teardown's reason instead of the loop's would look exactly like this.
+#[tokio::test]
+async fn a_keyed_actors_own_ending_reaches_a_watch_future_with_its_reason() {
+    let endings = Endings::new();
+    let system = worker::System::builder(Eviction::Never)
+        .lifecycle(endings.clone())
+        .build();
+    let id = ActorId::new("ledger/7").expect("a name");
+
+    // Before the mount, and that order is the module's miss-window rather than a
+    // style: an ending reported before its waiter is filed reaches nobody, and
+    // that waiter then waits for the life of the system.
+    let mut watching = Box::pin(endings.watch(&id));
+
+    let (ends, told) = oneshot::channel();
+    system
+        .mount(id.clone(), ending_when(told))
+        .expect("the system mounts it");
+
+    // Nothing has ended, so nothing can have been reported. Boxed rather than
+    // moved so that this one poll does not consume the future the assertion
+    // below awaits — and `stop_all_ends_the_group_and_names_the_member_that_caused_it`
+    // holds the control proving a `poll_once` here CAN be `Some`.
+    spun().await;
+    assert!(
+        n0_future::future::poll_once(&mut watching).await.is_none(),
+        "a mounted actor that has not ended reports nothing"
+    );
+
+    ends.send(gave_up(3))
+        .expect("the loop is waiting for its ending");
+
+    let why = bounded(watching).await;
+    assert!(
+        matches!(why, Ended::GaveUp { after: 3, .. }),
+        "the waiter carries the reason the loop returned, fields and all: {why:?}"
+    );
+}
+
+/// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs`, replacing
+/// `SystemBuilder::lifecycle`'s `        self.lifecycle.push(Arc::new(lifecycle));`
+/// with `        self.lifecycle = vec![Arc::new(lifecycle)];` — the single slot
+/// that method's own doc records as the defect it replaced, where a second
+/// `.lifecycle(..)` displaced the first with no error, no warning and no
+/// returned value. Watched: TO BE MEASURED.
+///
+/// **The install order is chosen so that the break reddens by assertion rather
+/// than by timeout**, which is the same choice `NO_PROGRESS` records having got
+/// wrong once. With the recorder installed first and [`Endings`] second, a
+/// single slot keeps [`Endings`]: the watch still resolves and the recorder is
+/// empty, so this fails at [`settles`] in well under a second. Installed the
+/// other way round the watch would never resolve and this would sit at the bound
+/// instead.
+#[tokio::test]
+async fn two_lifecycles_on_one_system_both_fire() {
+    let endings = Endings::new();
+    let seen: Arc<Mutex<Vec<ActorId>>> = Arc::new(Mutex::new(Vec::new()));
+    let system = worker::System::builder(Eviction::Never)
+        .lifecycle(Watched {
+            seen: Arc::clone(&seen),
+        })
+        .lifecycle(endings.clone())
+        .build();
+    let id = ActorId::new("ledger/7").expect("a name");
+    let watching = endings.watch(&id);
+
+    let (ends, told) = oneshot::channel();
+    system
+        .mount(id.clone(), ending_when(told))
+        .expect("the system mounts it");
+    ends.send(Ended::Stopped)
+        .expect("the loop is waiting for its ending");
+
+    assert!(
+        matches!(bounded(watching).await, Ended::Stopped),
+        "the `Endings` installed second is told"
+    );
+
+    // THIS is the decision, and it is about the sink that was installed FIRST: a
+    // program that adds `.lifecycle(endings)` to a builder that already had
+    // `.lifecycle(events)` must not lose its console to do it.
+    assert!(
+        settles(|| !seen.lock().expect("not poisoned").is_empty()).await,
+        "the sink installed first is told too: a second `.lifecycle(..)` adds, it does not displace"
+    );
+    assert_eq!(
+        seen.lock().expect("not poisoned").clone(),
+        vec![id],
+        "and about that actor, once"
+    );
+}
+
+/// Made red by `scripts/break-once.sh keylink/src/compose/keyed.rs`, replacing
+/// `Lifecycle::ended`'s `        for waiter in waiters {` with
+/// `        for waiter in waiters.into_iter().take(1) {` — a fan-out that reaches
+/// the first waiter and stops, which is the shape
+/// `a_publisher_fans_out_to_three_subscribers_each_on_its_own_feed` breaks on the
+/// topic. Watched: TO BE MEASURED.
+///
+/// Every waiter under one name is answered, which is what the `Vec` in that map
+/// is for. One waiter per name would answer whichever `watch` came last and lose
+/// the other with no error anywhere.
+///
+/// **`poll_once` and not an `await`, and that is about the arrangement.** The
+/// sends happen inside [`Lifecycle::ended`], which is called here by hand, so
+/// both answers are in their channels the moment it returns. One poll each is
+/// therefore the whole of what this needs, and a fan-out that stopped early
+/// fails it in 0.00s rather than at the [`NO_PROGRESS`] bound.
+/// `a_watch_outliving_its_endings_resolves_vanished_rather_than_hanging` holds
+/// the control proving a `poll_once` in this file CAN be `None`.
+///
+/// The sibling claim — *and never twice* — is not here, and the module doc is
+/// why: `ended` takes the entry out before it sends, so a second report under
+/// the same name finds nothing to answer. That is the miss-window, which
+/// `an_abandoned_watch_unfiles_its_own_waiter_and_not_a_later_one` reads from
+/// the map's side.
+#[tokio::test]
+async fn two_watchers_on_one_name_are_both_answered() {
+    let endings = Endings::new();
+    let id = ActorId::new("ledger/7").expect("a name");
+
+    // Two waiters, one name, neither abandoned. A map of one waiter per name
+    // would answer whichever `watch` came last and lose the other silently.
+    let mut first = Box::pin(endings.watch(&id));
+    let mut second = Box::pin(endings.watch(&id));
+
+    endings.ended(&id, &gave_up(2));
+
+    for (which, waiter) in [("first", &mut first), ("second", &mut second)] {
+        let why = n0_future::future::poll_once(waiter).await;
+        assert!(
+            matches!(why, Some(Ended::GaveUp { after: 2, .. })),
+            "the {which} waiter filed under one name is answered, and owns its own \
+             copy of the reason rather than a share of one: {why:?}"
+        );
+    }
+}
+
+/// Two breaks, one per half, because the two halves are two claims. Both with
+/// `scripts/break-once.sh keylink/src/compose/keyed.rs`.
+///
+/// **Not a later one.** Replace `Watch`'s
+/// `            under.get_mut().retain(|waiter| waiter.slot != slot);` with
+/// `            under.get_mut().clear();` — the whole entry emptied on one
+/// abandonment, which is the defect the comment on that very line names: a live
+/// caller left waiting on a future nothing can resolve any more. Watched: TO BE
+/// MEASURED, and expect it **by timeout** at the [`NO_PROGRESS`] bound rather
+/// than by assertion. Unfiling the wrong waiter produces no wrong value; it
+/// produces no value.
+///
+/// **Its own.** Replace `                under.remove();` with
+/// `                let _ = &under;` — the emptied key left in the map, so the
+/// map grows with names watched *once* rather than with names watched *now*,
+/// which is the bound the type claims. Watched: TO BE MEASURED. It reddens the
+/// last assertion by value, not by timeout.
+///
+/// No [`System`](keylink::System) here at all. [`Endings`] is a [`Lifecycle`],
+/// so the report is made by hand, and a registry between the two would add
+/// scheduling to a test about a map.
+#[tokio::test]
+async fn an_abandoned_watch_unfiles_its_own_waiter_and_not_a_later_one() {
+    let endings = Endings::new();
+    let id = ActorId::new("ledger/7").expect("a name");
+
+    // Two waiters under one name, filed in that order, and the FIRST is
+    // abandoned. Taking the whole entry would unwatch the second one silently.
+    let abandoned = endings.watch(&id);
+    let kept = endings.watch(&id);
+    drop(abandoned);
+
+    endings.ended(
+        &id,
+        &Ended::Panicked {
+            message: "the turn refused".to_string(),
+        },
+    );
+
+    let why = bounded(kept).await;
+    assert!(
+        matches!(&why, Ended::Panicked { message } if message == "the turn refused"),
+        "the waiter filed after the abandoned one is still filed, and carries the true reason: {why:?}"
+    );
+
+    // The other half, and it is a different claim: a waiter abandoned and never
+    // reported takes its own key back out. The report above already emptied the
+    // map, so this watches and drops a second time to say so.
+    assert!(
+        format!("{endings:?}").contains("watching: 0"),
+        "a reported name leaves no key behind: {endings:?}"
+    );
+    drop(endings.watch(&id));
+    assert!(
+        format!("{endings:?}").contains("watching: 0"),
+        "and neither does an abandoned one: {endings:?}"
+    );
+}
+
+/// Made red by `scripts/break-once.sh keylink/src/compose/keyed.rs`, replacing
+/// `Watch::poll`'s `            Poll::Ready(Err(_)) => Ended::Vanished,` with
+/// `            Poll::Ready(Err(_)) => Ended::Stopped,` — the whole system going
+/// away reported as a clean stop, which is the one thing a caller has to be able
+/// to tell it from. Watched: TO BE MEASURED, by value.
+///
+/// **That covers the value half only, and the liveness half needs its own
+/// substitution.** The same arm as
+/// `            Poll::Ready(Err(_)) => return Poll::Pending,` reddens at the
+/// [`NO_PROGRESS`] bound rather than by assertion, so run it second and expect
+/// the minute. Watched: TO BE MEASURED.
+///
+/// A waiter that nothing can ever report to is answered rather than left
+/// waiting, and it is answered with the one reason that says *the whole thing
+/// went away* rather than *this actor stopped*.
+///
+/// Two claims on one arm, and they fail differently: a wrong [`Ended`] here is a
+/// caller who cannot tell a dead system from a clean stop, and no [`Ended`] at
+/// all is the hang [`Endings`]' own documentation says it refuses — *an
+/// `Endings` that was built, watched and never installed would otherwise hang
+/// its callers with no signal at all*. The first fails this by value, the second
+/// at the [`NO_PROGRESS`] bound.
+///
+/// Built, watched and never installed is exactly that sentence's case, so no
+/// [`System`](keylink::System) is bound here: the map going away with its last
+/// clone is the whole of what happens, and the [`Endings`] the system would have
+/// held is the clone that is missing.
+#[tokio::test]
+async fn a_watch_outliving_its_endings_resolves_vanished_rather_than_hanging() {
+    let endings = Endings::new();
+    let id = ActorId::new("ledger/7").expect("a name");
+    let mut watching = Box::pin(endings.watch(&id));
+
+    // Every chance to resolve early, and it must not: an `Endings` that is still
+    // alive and has reported nothing owes this waiter nothing yet.
+    spun().await;
+    assert!(
+        n0_future::future::poll_once(&mut watching).await.is_none(),
+        "a live `Endings` that reported nothing answers nothing"
+    );
+
+    // The last clone. The future holds a `Weak` rather than keeping the map
+    // alive, which is what makes this case reachable at all.
+    drop(endings);
+    let why = bounded(watching).await;
+    assert!(
+        matches!(why, Ended::Vanished),
+        "a waiter nothing can ever report to is answered rather than left waiting: {why:?}"
+    );
+}
+
+/// **The same literal as
+/// `a_keyed_actors_own_ending_reaches_a_watch_future_with_its_reason`, and a
+/// different claim.** `scripts/break-once.sh keylink/src/compose/keyed.rs`,
+/// replacing `            let _ = waiter.tell.send(why.clone());` with
+/// `            let _ = waiter.tell.send(Ended::Vanished);`. There the claim is
+/// that a *waiter* is handed the loop's reason. Here it is that the reason
+/// survives the two hops a group adds — through the hand-written [`Membership`]
+/// below, into the policy's argument, and out as [`GroupEnded::Member`].
+/// Watched: TO BE MEASURED.
+///
+/// The file already runs one literal for two guards on the policy's reason, and
+/// records why they are not one claim; this is that arrangement on the keyed
+/// side. `Vanished` is the replacement because it is what
+/// [`System::abort`](keylink::System::abort) reports and `abort` is what this
+/// member's `retire` calls — a group reading the teardown's reason instead of
+/// the loop's would be indistinguishable from a correct one under any other
+/// value.
+#[tokio::test]
+async fn a_keyed_actor_is_a_group_member_end_to_end() {
+    let endings = Endings::new();
+    let system = worker::System::builder(Eviction::Never)
+        .lifecycle(endings.clone())
+        .build();
+    let id = ActorId::new("ledger/7").expect("a name");
+    let (asked, policy) = recording(Verdict::StopAll);
+    let group = Group::new(policy);
+
+    let watching = endings.watch(&id);
+    let (ends, told) = oneshot::channel();
+    system
+        .mount(id.clone(), ending_when(told))
+        .expect("the system mounts it");
+
+    // The two values a `Membership` wants, both from the keyed side and neither
+    // from a handle: the ending from `Endings::watch`, the retiring from
+    // `System::abort`. `abort` and not `shutdown`, for the reason
+    // `Membership::new` gives about a member sitting in a backoff.
+    let retiring = system.clone();
+    let retired = id.clone();
+    assert!(
+        group
+            .add(
+                id.clone(),
+                Membership::new(watching, move || async move {
+                    retiring.abort(&retired).await;
+                }),
+            )
+            .is_none(),
+        "nothing was displaced"
+    );
+
+    // A local sibling, so that `StopAll` has a member to retire that the policy
+    // was never asked about — the half a `GroupEnded` cannot carry. Heterogeneous
+    // on purpose: one keyed member and one local one in the same group is the
+    // thing this module is not generic over a handle type in order to allow.
+    let sibling = worker::actor(Worker { me: 2 });
+    assert!(group
+        .add(
+            ActorId::new("sibling").expect("a name"),
+            keylink::membership!(sibling),
+        )
+        .is_none());
+
+    ends.send(gave_up(1))
+        .expect("the loop is waiting for its ending");
+
+    match bounded(group.ended()).await {
+        GroupEnded::Member { member, reason } => {
+            assert_eq!(member, id, "the group names the keyed member that ended");
+            assert!(
+                matches!(reason, Ended::GaveUp { after: 1, .. }),
+                "and carries the reason its loop returned rather than one a teardown \
+                 would have synthesised: {reason:?}"
+            );
+        }
+        other => panic!("a keyed member ending must end the group as `Member`, got {other:?}"),
+    }
+
+    // **What the POLICY was handed, which is a different question from what the
+    // caller was told above.** `a_fatal_refusal_reaches_the_policy_without_a_restart`
+    // records the guard that was green under exactly this gap.
+    let seen = decisions(&asked);
+    assert_eq!(seen.len(), 1, "the policy was asked once");
+    assert_eq!(seen[0].0, id, "about the keyed member");
+    assert!(
+        matches!(seen[0].1, Ended::GaveUp { after: 1, .. }),
+        "and handed the keyed loop's own reason: {:?}",
+        seen[0].1
+    );
+    assert!(
+        settles(|| !sibling.is_running()).await,
+        "and the sibling nobody asked about is retired, not left serving"
     );
 }
