@@ -1070,7 +1070,9 @@ fn refusing(fatal: bool, recovered_after: Duration) -> (worker::Handle<Worker>, 
 /// `policy(&reported.name, &Ended::Stopped)` — a policy told a reason the group
 /// invented instead of the one the member ended with, which is the shape of every
 /// supervisor that reports its own teardown for somebody else's fault.
-/// Watched: TO BE MEASURED.
+/// Watched: it fails at the policy's own argument, "with the reason it ended
+/// for: Stopped", where the member ended `Vanished`. Exit 101, by value, in
+/// 0.01s.
 #[tokio::test]
 async fn a_member_that_ends_for_good_reaches_the_policy_once() {
     let (asked, policy) = recording(Verdict::Forget);
@@ -1114,7 +1116,11 @@ async fn a_member_that_ends_for_good_reaches_the_policy_once() {
 /// `scripts/break-once.sh keylink/src/local.rs`, replacing `supervise`'s
 /// `if !restarting {` with `if true {` — an outer loop that publishes every
 /// incarnation's ending instead of only its last, which is the mistake this
-/// module's structural claim rests on not being made. Watched: TO BE MEASURED.
+/// module's structural claim rests on not being made. Watched: it fails before
+/// the policy is ever consulted, at "the next incarnation answers:
+/// MailboxClosed" — the outer loop published the first incarnation's ending, so
+/// the handle is dead and there is no second incarnation to answer. Exit 101, by
+/// value, in 0.00s.
 ///
 /// That break destroys the restart rather than leaking it, so what it proves is
 /// that the restart below is real and observed. The other half — *the policy is
@@ -1184,7 +1190,10 @@ async fn a_members_own_restart_never_reaches_the_policy() {
 /// Made red by the same break as `a_member_that_ends_for_good_reaches_the_policy_once`:
 /// `scripts/break-once.sh keylink/src/compose/group.rs`, replacing
 /// `policy(&reported.name, &reason)` with
-/// `policy(&reported.name, &Ended::Stopped)`. Watched: TO BE MEASURED.
+/// `policy(&reported.name, &Ended::Stopped)`. Watched: it fails at `seen[0].1`,
+/// "and handed the supervisor's own reason rather than one the group invented:
+/// Stopped", where the supervisor produced `GaveUp { after: 0 }`. Exit 101, by
+/// value, in 0.00s — and that line is the one the paragraph below is about.
 ///
 /// One break, two guards, and they are not the same claim: there the reason is
 /// `Vanished` and here it is `GaveUp { after: 0 }`, which is a reason **only a
@@ -1260,7 +1269,17 @@ async fn a_fatal_refusal_reaches_the_policy_without_a_restart() {
 /// with `retire_all(Vec::new()).await;` on the second line — a group that ends
 /// itself and leaves every sibling running, which is the outcome this whole
 /// module exists to prevent and the one a `GroupEnded` alone cannot tell you
-/// about. Watched: TO BE MEASURED.
+/// about. Watched: the `GroupEnded::Member` arm above still passes, and what
+/// fails is the sibling assertion — "every other member is retired, not left
+/// serving". So the red lands exactly where the record says the claim lives, and
+/// a guard reading only the `GroupEnded` would have stayed green. Exit 101, by
+/// value, in 0.00s.
+///
+/// **Pass the WHOLE fence.** The second line alone,
+/// `retire_all(closing(&shared)).await;`, occurs three times in `group.rs`. The
+/// literal is unique only because the `Ok(Verdict::StopAll) => {` line above it
+/// is part of it. Shortened, `break-once.sh` aborts on a count of 3 before it
+/// takes a backup — safe, and a wasted run.
 #[tokio::test]
 async fn stop_all_ends_the_group_and_names_the_member_that_caused_it() {
     let (asked, policy) = recording(Verdict::StopAll);
@@ -1323,7 +1342,9 @@ async fn stop_all_ends_the_group_and_names_the_member_that_caused_it() {
 /// function's own doc comment refuses, and the one every hand-written teardown
 /// reaches for first. Awaited inside the build loop, a member wedged in its
 /// retirement stops every later member from being retired at all.
-/// Watched: TO BE MEASURED.
+/// Watched: "a member's retirement does not wait on the one retired before it".
+/// Exit 101, by value, in 0.00s — and it COMPILES, with no `E0282` and no
+/// `E0308`, which is the whole of what the annotation bought.
 ///
 /// **This break was not expressible until `retire_all`'s set was annotated, and
 /// that annotation exists for this break and no other reason.** The item type
@@ -1423,7 +1444,8 @@ async fn no_members_retirement_waits_on_another() {
 /// Made red by `scripts/break-once.sh keylink/src/compose/group.rs`, replacing the
 /// conductor's `held.members.remove(at);` with `let _ = at;` — a member decided
 /// about and left on the books, which is the leak that makes `names()` a list of
-/// actors the group is no longer watching. Watched: TO BE MEASURED.
+/// actors the group is no longer watching. Watched: "`Forget` takes the member
+/// off the books and leaves the rest". Exit 101, by value, in 0.01s.
 #[tokio::test]
 async fn forget_removes_the_member_and_leaves_the_others_serving() {
     let (asked, policy) = recording(Verdict::Forget);
@@ -1465,7 +1487,8 @@ async fn forget_removes_the_member_and_leaves_the_others_serving() {
 /// `entry.name == reported.name && entry.generation == reported.generation` with
 /// `entry.name == reported.name` — the generation stamp dropped, so the displaced
 /// member's still-pending ending is decided on under a name its replacement now
-/// owns. Watched: TO BE MEASURED.
+/// owns. Watched: "a displaced member's ending is discarded on its stamp, never
+/// decided on". Exit 101, by value, in 0.01s.
 ///
 /// The same race `names.rs` documents and the same fix, watched here from the
 /// side that matters for a group: not a wrong eviction but a wrong **decision**,
@@ -1531,7 +1554,9 @@ async fn a_displaced_members_ending_does_not_reach_the_policy_as_its_replacement
 /// Made red by `scripts/break-once.sh keylink/src/compose/group.rs`, replacing
 /// `held.staged.drain(..)` with `held.staged.drain(..).skip(1)` — a drain that
 /// takes every staged member off the list and watches all but the first, which is
-/// the off-by-one a hand-written index loop makes. Watched: TO BE MEASURED.
+/// the off-by-one a hand-written index loop makes. Watched: "one wake drains
+/// every staged add: the three filed while the policy ran are all watched".
+/// Exit 101, by value, in 0.01s.
 ///
 /// **`steady` is in this test for that break and not for the claim.** The break
 /// loses whichever member is first in a drain, and on a current-thread runtime the
@@ -1626,7 +1651,9 @@ async fn adds_made_while_the_policy_runs_are_all_watched() {
 /// `match Ok::<Verdict, Box<dyn std::any::Any + Send>>(policy(&reported.name, &reason)) {`
 /// — the panic uncaught, so the conductor dies with it and every member is left
 /// running and unwatched, which is the group-actor problem this module refuses,
-/// reached from the other side. Watched: TO BE MEASURED.
+/// reached from the other side. Watched: "a panicking policy must end the group,
+/// got Dropped". Exit 101, by assertion and in 0.00s, which is what the
+/// paragraph below predicts rather than what the record first claimed.
 ///
 /// **This break reddens by assertion and not by timeout**, and the record said
 /// the opposite until the break was run. A conductor that unwinds takes its
@@ -1683,7 +1710,10 @@ async fn a_policy_that_panics_ends_the_group_rather_than_orphaning_it() {
 /// with `fn drop(&mut self) {}` — the one wake a dropped group has. Without it a
 /// group with two healthy members and no holder is noticed only when some member
 /// happens to end, so nothing answers whoever is awaiting [`Group::ended`].
-/// Watched: TO BE MEASURED.
+/// Watched: at the [`NO_PROGRESS`] bound, exactly as the paragraph below
+/// predicts — [`bounded`] panics with "this must resolve rather than run for
+/// ever: Elapsed(())" after 60.00s inside the test and 62.9s of wall time.
+/// Exit 101. One of only two of the twenty-two that reach the bound.
 ///
 /// **That break was GREEN, in 0.00s, until the body below was changed to park
 /// the conductor first.** The wake matters only to a conductor already waiting at
@@ -1812,7 +1842,10 @@ async fn members_are_reported_in_the_order_they_were_added() {
 /// `Membership::new`'s doc argues against, and the argument is exactly this test:
 /// `stop` puts a message in the mailbox, and a supervised actor polls its inbox
 /// only inside the run loop, never across a backoff sleep.
-/// Watched: TO BE MEASURED.
+/// Watched: at the [`NO_PROGRESS`] bound — "this must resolve rather than run
+/// for ever: Elapsed(())" after 60.01s inside the test and 62.93s of wall time.
+/// Exit 101. The teardown was waiting out a backoff of sixty bounds, which is
+/// the defect stated as a duration rather than a value.
 ///
 /// **No upper bound on wall-clock time is asserted.** The claim is that the
 /// teardown *completes*, which load can only strengthen. The member's backoff is
@@ -1914,7 +1947,9 @@ fn counting(retired: &Arc<AtomicUsize>) -> Membership {
 /// unguarded, so its unwind takes the conductor with it. Every member is then
 /// running and unwatched, and every awaiter of [`Group::ended`] is told `Dropped`
 /// while the caller still holds a live `Group` — a wrong answer rather than a
-/// missing one. Watched: TO BE MEASURED.
+/// missing one. Watched: "a panicking ending must end the group as
+/// `EndingPanicked`, got Dropped". Exit 101, by assertion and in 0.00s, which is
+/// what the paragraph below predicts.
 ///
 /// **This break reddens by assertion and not by timeout**, and the record said
 /// the opposite until the break was run. A conductor that unwinds takes its
@@ -1984,7 +2019,8 @@ async fn an_ending_that_panics_ends_the_group_as_ending_panicked() {
 /// policy, and for the same reason: it removes the catch while leaving both
 /// match arms typed. Verified to compile, with one `unused import: catching`
 /// warning and nothing else — a warning under `cargo test`, so read the test
-/// result and not the exit of the build. Watched: TO BE MEASURED.
+/// result and not the exit of the build. Watched: "a panicking retire does not
+/// change WHY the group ended, got Dropped". Exit 101, by value, in 0.00s.
 ///
 /// **The future half moved to `keylink/src/panic.rs`, and the reason is the
 /// annotation on the set.** It used to read: replace
@@ -2001,8 +2037,17 @@ async fn an_ending_that_panics_ends_the_group_as_ending_panicked() {
 /// `            Err(panic) => Poll::Ready(Err(Panic::caught(panic))),` with
 /// `            Err(panic) => std::panic::resume_unwind(panic),` — the catch
 /// re-throwing, so the retire future's panic unwinds the conductor mid-teardown
-/// and `Group::ended` answers `Dropped` on a dropped sender. Watched: TO BE
-/// MEASURED.
+/// and `Group::ended` answers `Dropped` on a dropped sender. Watched: "a
+/// panicking retire does not change WHY the group ended, got Dropped". Exit 101,
+/// by value, in 0.00s.
+///
+/// **The two halves print the SAME sentence, so the log cannot tell you which
+/// one you ran.** Both make the conductor unwind, and both therefore leave
+/// [`Group::ended`] answering `Dropped` at the identical assertion. Each run's
+/// stdout also carries the *caught* member panic — "the retire closure refuses"
+/// — because the panic hook prints before `catch_unwind` swallows it, so that
+/// line is present under both and is not the failure. Run one substitution at a
+/// time and label its log; there is no way to separate them afterwards.
 ///
 /// **That break is wider than the one it replaces, and the width is the price.**
 /// `guarded` is also what wraps a caller's ending future in `Group::add` and a
@@ -2148,7 +2193,15 @@ impl Lifecycle for Watched {
 /// with `            let _ = waiter.tell.send(Ended::Vanished);` — a waiter
 /// answered with a reason the registry never gave it, which is exactly the
 /// *synthesised* half of that module's four-path table arriving on the one path
-/// that has a true reason. Watched: TO BE MEASURED.
+/// that has a true reason. Watched: "the waiter carries the reason the loop
+/// returned, fields and all: Vanished", where the loop returned
+/// `GaveUp { after: 3 }`. Exit 101, by value, in 0.01s.
+///
+/// **This substitution reddens five tests, so run it under one filter.** It is
+/// the only anchor in this file that does: every guard reaching an ending
+/// through `send` fails under it. `a_watch_outliving_its_endings_resolves_vanished_rather_than_hanging`
+/// is the exception and stays green, because it reaches `Vanished` through the
+/// dropped-sender arm and never through `send` at all.
 ///
 /// `Vanished` is the replacement and not some other constant, because it is what
 /// [`System::abort`](keylink::System::abort) reports: a waiter that answered the
@@ -2196,7 +2249,9 @@ async fn a_keyed_actors_own_ending_reaches_a_watch_future_with_its_reason() {
 /// with `        self.lifecycle = vec![Arc::new(lifecycle)];` — the single slot
 /// that method's own doc records as the defect it replaced, where a second
 /// `.lifecycle(..)` displaced the first with no error, no warning and no
-/// returned value. Watched: TO BE MEASURED.
+/// returned value. Watched: "the sink installed first is told too: a second
+/// `.lifecycle(..)` adds, it does not displace". Exit 101, by value, in 0.00s —
+/// the SECOND assertion, which is what the install order was chosen to buy.
 ///
 /// **The install order is chosen so that the break reddens by assertion rather
 /// than by timeout**, which is the same choice `NO_PROGRESS` records having got
@@ -2249,7 +2304,11 @@ async fn two_lifecycles_on_one_system_both_fire() {
 /// `        for waiter in waiters.into_iter().take(1) {` — a fan-out that reaches
 /// the first waiter and stops, which is the shape
 /// `a_publisher_fans_out_to_three_subscribers_each_on_its_own_feed` breaks on the
-/// topic. Watched: TO BE MEASURED.
+/// topic. Watched: "the second waiter filed under one name is answered, and owns
+/// its own copy of the reason rather than a share of one: Some(Vanished)".
+/// Exit 101, by value, in 0.00s — the waiter `take(1)` skipped has its sender
+/// dropped rather than left hanging, so it answers `Vanished` instead of the
+/// reason that was reported.
 ///
 /// Every waiter under one name is answered, which is what the `Vec` in that map
 /// is for. One waiter per name would answer whichever `watch` came last and lose
@@ -2297,16 +2356,31 @@ async fn two_watchers_on_one_name_are_both_answered() {
 /// `            under.get_mut().retain(|waiter| waiter.slot != slot);` with
 /// `            under.get_mut().clear();` — the whole entry emptied on one
 /// abandonment, which is the defect the comment on that very line names: a live
-/// caller left waiting on a future nothing can resolve any more. Watched: TO BE
-/// MEASURED, and expect it **by timeout** at the [`NO_PROGRESS`] bound rather
-/// than by assertion. Unfiling the wrong waiter produces no wrong value; it
-/// produces no value.
+/// caller left waiting on a future nothing can resolve any more. Watched: "the
+/// waiter filed after the abandoned one is still filed, and carries the true
+/// reason: Vanished". Exit 101, **by value**, in 0.00s.
+///
+/// **This record predicted the bound and the prediction was wrong.** It said to
+/// expect a timeout, on the reasoning that *unfiling the wrong waiter produces
+/// no wrong value, it produces no value*. That sentence stops one step early.
+/// `clear()` drops every [`Waiter`] in the vector, the kept one included;
+/// dropping a `Waiter` drops its `oneshot::Sender`; and `Watch::poll` maps a
+/// dropped sender to [`Ended::Vanished`] rather than to `Pending`. So it does
+/// produce a wrong value, and the guard reddens in no time at all. The error was
+/// reasoning about the map without following the `Drop` out of it — the same
+/// shape as trusting a mechanism you have not opened.
 ///
 /// **Its own.** Replace `                under.remove();` with
 /// `                let _ = &under;` — the emptied key left in the map, so the
 /// map grows with names watched *once* rather than with names watched *now*,
-/// which is the bound the type claims. Watched: TO BE MEASURED. It reddens the
-/// last assertion by value, not by timeout.
+/// which is the bound the type claims. Watched: "and neither does an abandoned
+/// one: Endings { watching: 1 }". Exit 101, by value, in 0.00s.
+///
+/// **The FIRST `watching: 0` assertion has no break and is a control, not a
+/// guard.** It passes under both of the substitutions above, measured. It is not
+/// vacuous — a non-zero count cannot satisfy it, because `Debug` prints one
+/// field — but nothing in this file can redden it, so read it as the statement
+/// that the report emptied the map and read the second one as the guard.
 ///
 /// No [`System`](keylink::System) here at all. [`Endings`] is a [`Lifecycle`],
 /// so the report is made by hand, and a registry between the two would add
@@ -2353,13 +2427,27 @@ async fn an_abandoned_watch_unfiles_its_own_waiter_and_not_a_later_one() {
 /// `Watch::poll`'s `            Poll::Ready(Err(_)) => Ended::Vanished,` with
 /// `            Poll::Ready(Err(_)) => Ended::Stopped,` — the whole system going
 /// away reported as a clean stop, which is the one thing a caller has to be able
-/// to tell it from. Watched: TO BE MEASURED, by value.
+/// to tell it from. Watched: "a waiter nothing can ever report to is answered
+/// rather than left waiting: Stopped". Exit 101, by value, in 0.00s.
 ///
 /// **That covers the value half only, and the liveness half needs its own
 /// substitution.** The same arm as
-/// `            Poll::Ready(Err(_)) => return Poll::Pending,` reddens at the
-/// [`NO_PROGRESS`] bound rather than by assertion, so run it second and expect
-/// the minute. Watched: TO BE MEASURED.
+/// `            Poll::Ready(Err(_)) => return Poll::Pending,` was expected to
+/// redden at the [`NO_PROGRESS`] bound rather than by assertion, so the record
+/// said to run it second and expect the minute. Watched: it reddens in 0.00s and
+/// **not** at the bound, and not at any assertion in this file. Exit 101, with
+/// the test panicking inside tokio at `oneshot.rs:1291`, "called after
+/// complete".
+///
+/// **So this substitution does not model the liveness claim, and that is the
+/// finding rather than the result.** Returning `Pending` after the receiver has
+/// already answered `Err` leaves the completed [`oneshot::Receiver`] to be
+/// polled a second time, which tokio refuses by panicking. The guard goes red,
+/// but for a broken receiver contract rather than for the hang the claim is
+/// about — a break that fails for its own reason. Expressing the liveness half
+/// faithfully means never resolving the receiver at all, and this arm, which
+/// runs only *after* the receiver has resolved, cannot say that. Treat the
+/// liveness half as **unbroken** until an anchor that can express it exists.
 ///
 /// A waiter that nothing can ever report to is answered rather than left
 /// waiting, and it is answered with the one reason that says *the whole thing
@@ -2408,7 +2496,12 @@ async fn a_watch_outliving_its_endings_resolves_vanished_rather_than_hanging() {
 /// that a *waiter* is handed the loop's reason. Here it is that the reason
 /// survives the two hops a group adds — through the hand-written [`Membership`]
 /// below, into the policy's argument, and out as [`GroupEnded::Member`].
-/// Watched: TO BE MEASURED.
+/// Watched: "and carries the reason its loop returned rather than one a teardown
+/// would have synthesised: Vanished", where the loop returned
+/// `GaveUp { after: 1 }`. Exit 101, by value, in 0.00s. That is
+/// [`GroupEnded::Member`]'s own field failing, two hops further along than where
+/// the sibling guard fails on the same substitution, which is what makes the two
+/// records two claims.
 ///
 /// The file already runs one literal for two guards on the policy's reason, and
 /// records why they are not one claim; this is that arrangement on the keyed
