@@ -872,3 +872,25 @@ its counts while its anchor had been dead for some time.
   producer of `Forgotten` the table never mentions. Stated as which function calls
   which rather than as a caller *count*, per §9.1 — a count of callers is a value
   this document cannot keep true.
+
+---
+
+## Appendix, 2026-08-09: §9.2's "four prefixes" has moved to five
+
+Appended, and **§9.2 is not edited.** The sentence cites
+`no_failure_prefix_is_a_prefix_of_another` to explain why the anchors registry is
+written out by hand, and says that guard *"spells out its four prefixes by
+hand"*. The identifier is unchanged, so `CONTRIBUTING.md`'s carve-out does not
+apply: what moved is a count, and a count is a claim.
+
+**The fifth is `RemoteError::OBSERVER_PANICKED`**, and the current list is
+whatever `turns::tests::no_failure_prefix_is_a_prefix_of_another` spells out —
+cited rather than counted, per §9.1. The
+argument §9.2 borrows it for is untouched and is if anything stronger: the fifth
+prefix had to be added to that list by hand, and it is the first one sharing a
+word with an existing prefix — `"observer panicked: "` against `"panicked: "` and
+`"observer refused: "` — so the by-hand list is what says the three do not
+collide, rather than the eye.
+
+Cite the guard rather than the number it currently spells, which is the form §9.1
+already prefers for callers.

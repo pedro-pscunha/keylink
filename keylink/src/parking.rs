@@ -2,7 +2,7 @@
 //!
 //! # The window this closes
 //!
-//! [`Deferred::send`](crate::Deferred) used to write to the reply channel from
+//! [`Deferred::send`](crate::Deferred::send) used to write to the reply channel from
 //! inside the running handler. Its own documentation said so — *"nothing is owed
 //! to the turn running now: the value crosses the channel directly, and this
 //! turn's observers neither see it nor gate it"* — and that sentence is the whole
@@ -99,7 +99,7 @@ pub(crate) type Parked = Box<dyn FnOnce(Verdict) + Send>;
 
 /// What the observer chain decided about the turn that parked an answer.
 ///
-/// The same three cases `turn` folds into an `Answered` for the turn's own
+/// The same four cases `turn` folds into an `Answered` for the turn's own
 /// caller, read from the same pair of facts in the same place — so a parked
 /// caller and the turn's own caller cannot be told two different things about one
 /// turn.
@@ -119,6 +119,22 @@ pub(crate) enum Verdict {
     /// and was not committed" is exactly what happened to the work behind this
     /// answer.
     Refused {
+        /// [`Observer::name`](crate::Observer::name).
+        name: &'static str,
+    },
+    /// An observer **panicked** watching it. The turn ran and was not committed
+    /// for the same reason [`Refused`](Self::Refused) states, so the parked caller
+    /// is told
+    /// [`TurnLost::ObserverPanicked`](crate::TurnLost::ObserverPanicked) naming
+    /// the same observer the turn's own caller is told about.
+    ///
+    /// **Withholding is right here and the word *refused* was not.** A veto means
+    /// *do not commit*; a crash means nobody knows whether the observer committed,
+    /// which RFC-06 §5.1 argues is the worse of the two. So this arm and
+    /// [`Refused`](Self::Refused) do the same thing to the value and owe the
+    /// caller different sentences, which is why they are two arms and not one with
+    /// a flag.
+    ObserverPanicked {
         /// [`Observer::name`](crate::Observer::name).
         name: &'static str,
     },

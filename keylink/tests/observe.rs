@@ -422,23 +422,41 @@ async fn an_observer_runs_before_the_caller_is_answered() {
     );
 }
 
-/// A panicking observer is not a surviving observer: it ends the actor, and
-/// `ended` names it.
+/// A panicking observer is not a surviving observer: it ends the actor, `ended`
+/// names it, and the caller is told it **panicked** rather than refused.
 ///
 /// The chain runs inside the same guard as the handler, and that placement is
-/// what this pins. Outside it, an observer that unwound would escape a detached
-/// task and be swallowed — the actor would go on serving turns with a durability
-/// adapter that has stopped working, and nobody would ever be told.
+/// what the `ended` half pins. Outside it, an observer that unwound would escape a
+/// detached task and be swallowed — the actor would go on serving turns with a
+/// durability adapter that has stopped working, and nobody would ever be told.
+///
+/// **The caller's half is here because it was wrong**, and this test asserted the
+/// wrong answer under a comment that named the fold out loud: a panicking observer
+/// was folded into the refusal path, so `ask` said *the exploding observer refused
+/// this turn* about an observer that decided nothing. The value is still withheld
+/// — that half was right, and RFC-06 §5.1 gives the reason — so what changed is
+/// the sentence and not the outcome.
+///
+/// The sentence is asserted as text and not only as a variant. The variant says
+/// which fact; the text is what a caller prints, and it is the half that was
+/// false.
+///
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `turn`'s fold.
+/// Search
+/// `(Ok(_), Some(Withheld::Panicked { name })) => Answered::ObserverPanicked { name },`
+/// and give the panicked arm the refusal's answer instead:
+/// `(Ok(_), Some(Withheld::Panicked { name })) => Answered::Refused { name },`.
+/// Watched: `left: Refused { name: "exploding" }`,
+/// `right: ObserverPanicked { name: "exploding" }`.
 #[tokio::test]
 async fn a_panicking_observer_ends_the_actor_and_is_named() {
     let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(Exploding)]);
 
-    // The caller is told which observer, and by the same name `ended` reports
-    // below: a panicking observer is folded into the refusal path — `Panic` is
-    // not an `Error`, so `observed_turn` renders it and keeps the name.
+    let lost = ledger.post(1).await.expect_err("the observer panicked");
+    assert_eq!(lost, Undelivered::ObserverPanicked { name: "exploding" });
     assert_eq!(
-        ledger.post(1).await,
-        Err(Undelivered::Refused { name: "exploding" })
+        lost.to_string(),
+        "the exploding observer panicked during this turn: it ran and was not committed",
     );
 
     match ledger.ended().await {
@@ -768,6 +786,13 @@ async fn observers_run_in_order_and_the_first_refusal_stops_the_rest() {
 /// fallen over. The `Ended::Observer` arm was dead for every panic of this
 /// shape, and `a_panicking_observer_ends_the_actor_and_is_named` above could not
 /// see it, because that one panics inside the future.
+///
+/// Made red by the **same** one-line edit as
+/// `a_panicking_observer_ends_the_actor_and_is_named` above — that record quotes
+/// it — run again under this test's own filter, because two `catch_unwind` sites
+/// write one slot and only a second filter says this one reaches it. Watched:
+/// `left: Err(Refused { name: "early" })`,
+/// `right: Err(ObserverPanicked { name: "early" })`.
 struct ExplodesBeforeItYields;
 
 impl Observer<Ledger> for ExplodesBeforeItYields {
@@ -784,9 +809,13 @@ impl Observer<Ledger> for ExplodesBeforeItYields {
 async fn an_observer_that_panics_before_it_yields_is_still_named() {
     let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(ExplodesBeforeItYields)]);
 
+    // The **synchronous** half reaches the same answer as the half that yields.
+    // Two `catch_unwind` sites write one slot, and a caller must not be able to
+    // tell which of them fired: that would be a distinction about where an
+    // observer's code sits, reported as a distinction about the turn.
     assert_eq!(
         ledger.post(1).await,
-        Err(Undelivered::Refused { name: "early" })
+        Err(Undelivered::ObserverPanicked { name: "early" })
     );
 
     match ledger.ended().await {

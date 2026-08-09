@@ -3741,7 +3741,7 @@ two lines now, and `scripts/replay-fate-breaks.sh` runs the whole set.
 | `local::a_supervisor_that_refuses_a_restart_answers_gone_rather_than_running` | the refusal arm answers `Standing::Running` |
 | `registry::abort_settles_the_served_answer_before_it_destroys_the_actor` | `System::abort`'s settle → `Standing::Running` |
 | `registry::an_expired_shutdown_budget_settles_the_served_answer_before_the_abort` | `drain`'s settle → `Standing::Running` |
-| `remote::no_other_served_failure_begins_with_one_of_the_four` | `RouteError::AtCapacity`'s `Display` gains a `"dropped: "` prefix |
+| `remote::no_other_served_failure_begins_with_one_of_the_five` | `RouteError::AtCapacity`'s `Display` gains a `"dropped: "` prefix |
 | `defer::a_local_caller_and_a_peer_agree_about_an_abandoned_deferred` | `lost`'s `Standing::Running` arm → `NoSuchActor` |
 | `defer::a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer` | the same arm → `Failed("panicked: bad")` |
 | `defer::a_stopped_actor_still_tells_a_peer_no_such_actor` | the default `Inbox::ending` → `Standing::Running` |
@@ -3751,7 +3751,7 @@ two lines now, and `scripts/replay-fate-breaks.sh` runs the whole set.
 | `supervision::a_peer_whose_factory_panicked_is_told_the_actor_is_gone` | `supervise`'s per-iteration floor disarmed before the factory call |
 | `supervision::a_peer_whose_feed_panicked_is_told_the_actor_is_gone` | `run_loop`'s floor disarmed before the loop |
 | `local::the_gone_answer_is_not_a_failed_and_carries_no_prefix` | `lost`'s `Gone` arm becomes a `Failed` |
-| `reply::the_four_prefixes_are_the_text_a_peer_matches_on` | `DROPPED` → `"lost: "` |
+| `reply::the_five_prefixes_are_the_text_a_peer_matches_on` | `DROPPED` → `"lost: "` |
 | `local::a_supervisor_between_incarnations_is_gone_when_it_is_destroyed` | `supervise`'s floor disarmed at its declaration |
 | `local::a_transient_factory_failure_does_not_overwrite_a_pending_restart` | the floor moved back inside the loop body |
 | `local::a_state_that_panics_on_drop_mid_restart_is_gone_not_restarting` | the third disarm around `run_loop`, applied verbatim |
@@ -3872,7 +3872,7 @@ name and a claim nothing checked.
   `no_failure_prefix_is_a_prefix_of_another` compares the four against each other
   and would stay green while a `RouteError` variant beginning `"dropped: "` made
   every peer's `starts_with` ambiguous. The claim is narrowed to *every prefix
-  `rendered` and `lost` build*, and `no_other_served_failure_begins_with_one_of_the_four`
+  `rendered` and `lost` build*, and `no_other_served_failure_begins_with_one_of_the_five`
   renders the other three and checks them. What no guard can cover is a `Failed`
   whose text came from a caller's own `Middleware`, which is exactly why naming
   the constants is the other half of the fix.
@@ -4031,7 +4031,6 @@ workers now. Under the fixed code both are deterministic, because the answer is
 settled before the window opens rather than raced against it — which is the
 difference between a guard and a coin toss, and is the argument for fixing the
 *ordering* rather than narrowing the *window*.
-||||||| parent of d67f662 (fix(idempotency): apply the merge gate — 4 Major, 8 Minor, and break records stop carrying counts)
 
 ---
 
@@ -4460,3 +4459,139 @@ next author meets it while writing the figure rather than after a reader trips o
 it. It carries no licence for the second half beyond what the append-only rule
 already gives, which is deliberate: correcting a figure is still an append, and
 this section is one.
+## 17. Revision, 2026-08-09: §4.11's twin guard gains a seventh slot, and its watched array with it
+
+Appended, and **§4.11 is not edited** — the same discipline §15 states, for the
+same bullet, and §15.1 is the section half of this one continues.
+
+`CONTRIBUTING.md`'s carve-out reaches the two table rows in §"`scripts/replay-fate-breaks.sh`
+runs all twenty-three" and one prose pointer, and nothing else here. Those three
+name tests that were **renamed** —
+`remote::no_other_served_failure_begins_with_one_of_the_four` and
+`reply::the_four_prefixes_are_the_text_a_peer_matches_on`, both `_five` now,
+because both embedded a count in the name and the fifth served prefix landed. A
+replay row whose filter names a test that no longer exists selects **zero tests**
+and reports success, so those are pointers that must stay runnable. Everything
+below is a claim and is appended.
+
+### 17.1 Each enum gained one variant, so §15.1's one-variant gap is preserved
+
+§15.1 measured, on `d2f5e6e`, that `TurnLost` had seven variants and
+`Undelivered` six — and concluded that §4.11's *"a seventh variant in either enum
+is `E0004`"* held for one enum and not two.
+
+`ObserverPanicked` landed on **each** of them, so that a caller whose turn met an
+observer that panicked is no longer told the observer refused. Counted at the
+tip: `TurnLost` has **eight** — `Gone`, `Dropped`, `Restarting`, `Refused`,
+`ObserverPanicked`, `Faulted`, `Expired`, `Reentrant` — and `Undelivered` has
+**seven**, that list without `Faulted`.
+
+**So the asymmetry §15.1 found is not closed; it is preserved exactly.** One
+variant on each side leaves the gap where it was, and the gap has a name:
+`Faulted` is the one `TurnLost` state `ask` resumes rather than maps, which is
+the whole reason `twin` returns `Option`. The guard below says so in its own
+arithmetic — `lost` holds eight entries against `EVERY: [Undelivered; 7]`, and
+the body asserts `without_a_twin == 1`. A reader who took the two enums for the
+same width would not expect `twin` to answer `None` at all.
+
+§15.1's figures were exact at the commit it names and are not edited. What that
+section says numberlessly is the part that survives every such move: *"two
+exhaustive matches, and both are `error[E0004]` the moment either enum grows"*.
+Read §4.11's bullet that way; the number in it was never the mechanism.
+
+**What the compiler actually reported, which is not what a first draft of this
+section claimed.** It said `slot` and `twin` were the only two `E0004`s inside
+`keylink/src`. **No `E0004` fired in `keylink/src` at all**, because every arm
+there was written before the first compile. The only two the compiler reported
+were in `keylink/tests/cycles.rs`, at its two `SURPRISE` folds. That draft
+asserted a measurement nobody took, in a section whose subject is a figure
+carried instead of re-derived — so it is corrected here rather than quietly.
+
+The exhaustive sites that had to gain an arm, listed because *that* is checkable
+where a count of compiler errors is not: `LocalActor::ask` over `TurnLost` — the
+only one in production code, and the stronger form of the argument — plus
+`Answered::map` and `ask_catching`'s and `rendered`'s matches over `Answered`,
+`Deferred::send` over `Verdict`, and `slot` and `twin` in `mod tests`. `EVERY`
+and the `lost` sample grew by hand, which §4.11's own residual paragraph predicts
+and which no compiler forces.
+
+### 17.2 The watched array is a break record's output and cannot be corrected in place
+
+§4.11's second break watches:
+
+> `every variant is written exactly once, and this one was written 2 times:
+> [2, 1, 1, 1, 0, 1] at slot 0`
+
+That is what the run printed, and it stays. §15.1 states the rule it falls under:
+*"where the value **is** the record — as it is in a break record's watched output
+— it cannot be removed and an appended correction is the only honest treatment"*.
+
+Re-run at `fdcf412`, with the same break re-expressed against the moved arm —
+`slot`'s `Undelivered::Expired` points at `5` now, not `4` — the run prints:
+
+> `every variant is written exactly once, and this one was written 2 times:
+> [2, 1, 1, 1, 1, 0, 1] at slot 0`
+
+Read off the failing run and not computed. Two things moved and only one of them
+is the seventh slot: the **emptied** slot went 4 → 5 with `Expired`, while the
+**reported** slot stayed 0, because the loop still reaches the doubled slot
+first. A correction that had only lengthened the array would have been wrong in
+the half that record already exists to warn about — §4.11 records that this break
+was mispredicted once before, in exactly that field.
+
+`keylink/src/turns.rs`'s own copy of the record was re-run and rewritten there,
+because a break record beside its test is a live instruction rather than a
+historical claim. This file keeps both readings, which is the difference between
+the two homes.
+
+### 17.3 §"the four prefixes" is a count and is not edited
+
+Two sentences in the §9 bullet beginning *"keylink builds a `Failed` from at
+least three other places"* say `no_failure_prefix_is_a_prefix_of_another`
+*"compares the four against each other"* and describe the guard set as four. The
+identifier is unchanged, so nothing is renamed and the carve-out does not apply.
+
+**The fifth is `RemoteError::OBSERVER_PANICKED`**, and the set is whatever
+`no_failure_prefix_is_a_prefix_of_another` spells out — cite the guard, not the
+total. It is the first prefix in that set to share a word with another one, which is the whole
+reason the by-hand list is the guard rather than the eye.
+
+### 17.4 One sentence in that bullet now reads "five renders three", and that is the honest state
+
+**Read this before trying to parse §9's line 3875.** After the rename above it
+reads:
+
+> The claim is narrowed to *every prefix `rendered` and `lost` build*, and
+> `no_other_served_failure_begins_with_one_of_the_five` renders the other three
+> and checks them.
+
+Five renders three, and **both halves are correct in their own register.** The
+identifier was carried forward under the carve-out, because a pointer that names
+a test which no longer exists is a dead pointer — this branch measured what that
+costs, and the answer is a replay stanza selecting **zero tests** while reporting
+success. The figure was not carried forward, because a count is what a row
+asserts. So the sentence is deliberately half-current and half-historical, and
+this section is what tells a reader which half is which.
+
+**What a reader who counts finds, and it depends on the unit.** Measured on
+`keylink/src/actor/remote.rs`'s `others` array at `fdcf412`: **five rendered
+values, from four places.** The values are the registry's capacity refusal, an
+oversized `ActorId`'s validation failure, `FollowRefused::Ahead`,
+`FollowRefused::Crowded`, and `Undelivered::Reentrant`. The two `FollowRefused`
+arms are one place, which is the whole of the gap between four and five — and a
+correction that had written one number without naming its unit would have been
+wrong against the other.
+
+**The "three" is not a slip and predates this branch.** The same bullet opens
+*"at least three other places"* and then lists exactly three. Both figures were
+written when three were known. The fourth — `deliver_to_local`'s re-entrancy arm
+— was found later, and `remote.rs`'s own doc records the finding in the register
+this file cannot: *"The fourth is built in `turns.rs`, and being the exception is
+why this list missed it"*, beside the line that renders it. So the bullet is
+internally coherent as a record of its own wave, and editing one number inside it
+would leave the sentence above it claiming three as well.
+
+Cite `no_other_served_failure_begins_with_one_of_the_five` and read the array,
+which is the form §15.1 prefers and the only one that cannot rot: the guard
+renders every case it knows about, and the assertion is against the bytes rather
+than against a total.

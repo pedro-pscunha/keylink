@@ -1200,3 +1200,77 @@ The claim the section was making still holds — a new workspace member is picke
 `--workspace` and must pass the MSRV check on day one. Only the coordinates are wrong.
 
 This is the failure a line-number citation invites. Cite the task name, not the line.
+
+---
+
+## Appendix, 2026-08-09: §2.6's fold specifies a defect, and §6's prefix count has moved
+
+Appended, and **§2.6, §6 and §9 are not edited.** §2.6's pseudo-code is the
+strongest thing in this file: it is the design, executed, and it is where the
+defect below came from. Rewriting it would delete the evidence that the crate
+built what this RFC asked for.
+
+`CONTRIBUTING.md`'s carve-out was checked first and reaches none of this. It
+permits renaming an identifier a break record names. Nothing here is a rename.
+
+### The `refused` slot is one slot for two questions
+
+§2.6's loop writes one variable from both arms:
+
+> ```rust
+> Ok(Err(stop)) => { refused = Some((name, stop.into())); break; }
+> Err(panic)   => { refused = Some((name, panic.to_string().into())); break; }
+> ```
+
+So *the observer vetoed* and *the observer fell over* arrive as one value, and
+the caller-side fold reads only the name out of it — the error, which holds the
+panic message, goes to the `Ended` instead. A caller whose turn met a panicking
+observer was told **"the {name} observer refused this turn"**. It refused
+nothing.
+
+**The commit decision the fold makes is correct and this appendix does not touch
+it.** §2.6 is right that the value is withheld, and §5.1 gives the stronger half
+of the reason: after a torn observer the memory and the disk have diverged and
+nobody has read back which. Withholding on a crash is conservative for a
+*different* reason than withholding on a veto, not for a weaker one.
+
+The defect is granularity. *Do we commit?* needs two answers, and the fold gives
+it two. *What do we tell the caller?* needs three — accepted, vetoed, crashed —
+and the coarser reading won because one slot answered both.
+
+### What the tree carries now
+
+The loop carries a two-armed `Withheld` — `Vetoed { name, fatal }` and
+`Panicked { name }` — instead of a `(name, error, bool)` tuple, and `Verdict`,
+`Answered`, `TurnLost` and `Undelivered` each gained one variant. `Stop::is_fatal`
+moved onto the arm that has one, so a panicking observer no longer spells *no
+claim was made* the same way a deliberate `Stop::new` spells *another
+incarnation can help*. Withholding is unchanged and `fatal: false` on a panic is
+unchanged; §3 of the root-cause note argues both, and neither was in scope.
+
+The guard is `observe::a_panicking_observer_ends_the_actor_and_is_named`, which
+asserted the wrong answer under a comment naming the fold out loud. Cite the
+guard rather than a count of the sites, which is a value this document does not
+own.
+
+### §6's "Three prefixes now" was true when written
+
+§6's overturned bullet reads *"Three prefixes now, none a prefix of another"*.
+That was exact, and the list is longer now. The list itself is spelled out by
+hand in `turns::tests::no_failure_prefix_is_a_prefix_of_another` — cite that
+rather than a total, which is the form this file recommends one section earlier
+and the only one that cannot rot. The addition is why this appendix exists rather
+than a §6 edit: `observer panicked: ` was added because a peer has
+no `ended()` to fall back on, so the `Failed` string is the whole of what it
+learns and it read the refusal's word.
+
+The bullet's *rule* is untouched and was met again — a prefix and not a
+`RemoteError` variant, so no ALPN moved. The count is what rotted, and a count is
+a claim.
+
+§9's *"Both wire prefixes. One test pins `observer refused: {name}` **and**
+`panicked: {msg}`"* is likewise still true of that test. A second test,
+`singleton::an_observer_that_panicked_reaches_a_peer_under_its_own_prefix`, pins
+the third and asserts it against **both** neighbours rather than only its own
+text — `observer refused: `, which this case was folded into, and `panicked: `,
+which shares the verb and means the handler.

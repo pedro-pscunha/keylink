@@ -1028,6 +1028,104 @@ async fn both_halves_of_a_lost_turn_carry_their_own_prefix() {
     server.shutdown().await.expect("stops");
 }
 
+/// The name the panicking observer answers to, and therefore the exact text a
+/// peer reads after `observer panicked: `.
+const PANICKER: &str = "panics-on-completed-turns";
+
+/// Panics on every turn that **completed**, and passes every turn that panicked.
+///
+/// The same shape as [`RefusesWhatCompleted`] and for the same reason, one arm
+/// apart: it panics where that one returns [`Stop`]. Keeping the two structurally
+/// identical is what makes the assertion below about the **fold** rather than
+/// about two unrelated fixtures.
+struct PanicsOnWhatCompleted;
+
+impl Observer<Ledger> for PanicsOnWhatCompleted {
+    fn name(&self) -> &'static str {
+        PANICKER
+    }
+
+    fn after_turn<'a>(&'a mut self, _state: &'a Ledger, turn: TurnInfo<'a>) -> TurnFut<'a> {
+        Box::pin(async move {
+            match turn.outcome {
+                TurnOutcome::Completed => panic!("the observer fell over"),
+                TurnOutcome::Panicked { .. } => Ok(()),
+            }
+        })
+    }
+}
+
+/// An observer that **panicked** reaches a peer under its own prefix, and not
+/// under the refusal's.
+///
+/// **A peer is the worst-informed audience for this fact and it had the same
+/// false word.** A local caller can await [`ended`](keylink::LocalActor::ended)
+/// and read the panic message out of `Ended::Observer`; a peer has no such second
+/// future, so the `Failed` string is the whole of what it learns. It read
+/// `observer refused: {name}` about an observer that decided nothing.
+///
+/// # Three texts, pinned against each other rather than one at a time
+///
+/// The prefix is the only discriminator a peer has — `RemoteError::Failed`
+/// carries a `String` because a variant would move the ALPN — so a prefix that
+/// cannot be told from its neighbours discriminates nothing. Two neighbours
+/// matter here and both are asserted: `observer refused: `, which this case was
+/// folded into, and `panicked: `, which is the **handler** exploding and shares
+/// the verb. Asserting only the new text would stay green if it were a prefix of
+/// either.
+///
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `rendered`'s new
+/// arm. Search
+/// `Outcome::Err(RemoteError::Failed(format!("{OBSERVER_PANICKED}{name}"))),`
+/// and send it back out under the refusal's prefix instead:
+/// `Outcome::Err(RemoteError::Failed(format!("{REFUSED}{name}"))),`. Watched:
+/// `left: "observer refused: panics-on-completed-turns"`,
+/// `right: "observer panicked: panics-on-completed-turns"`.
+#[tokio::test]
+async fn an_observer_that_panicked_reaches_a_peer_under_its_own_prefix() {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let actor = ledger::actor_with(Ledger::default(), vec![Box::new(PanicsOnWhatCompleted)]);
+    let server = Server::builder(&node)
+        .service(actor.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("serves");
+    let client = ledger::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+
+    let crashed = client
+        .post(1, 0)
+        .await
+        .expect_err("the observer panicked on the completed turn");
+    assert!(
+        !matches!(
+            crashed,
+            keylink::Error::Remote(RemoteError::NoSuchActor { .. })
+        ),
+        "the actor was there and the turn ran, so telling a peer to stop asking is a different \
+         fact; got {crashed:?}"
+    );
+    // Exact, because every byte is chosen here: the format string in the dispatch
+    // and `PANICKER`, with nothing in between.
+    assert_eq!(
+        failed_reason(&crashed),
+        format!("observer panicked: {PANICKER}"),
+        "an observer that fell over must reach a peer under its own prefix, naming it"
+    );
+    assert!(
+        !failed_reason(&crashed).starts_with(RemoteError::REFUSED),
+        "and it must not read as a refusal: nothing decided anything"
+    );
+    assert!(
+        !failed_reason(&crashed).starts_with(RemoteError::PANICKED),
+        "nor as a handler fault, which is the other thing a peer acts on differently"
+    );
+
+    client.close().await.expect("closes");
+    server.shutdown().await.expect("stops");
+}
+
 // ───────────────────────────────────────── what `stop()` has done by the time
 // ───────────────────────────────────────── it returns
 

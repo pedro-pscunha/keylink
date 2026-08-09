@@ -1699,6 +1699,32 @@ ANCHORS = [
     # apart and disagree.
     ("I4", "scripts/hook-guard.sh", "scripts/install-hooks.sh",
      '    if [ "$worktrees" -gt 1 ]; then'),
+    # ── `O`, from `observer-crashed`: a panicking observer is not a refusal ─────
+    #
+    # **Registered because one of these four was DEAD and nothing said so.** `O3`'s
+    # record first quoted the release arm's BODY, off a three-line block. Uniqueness
+    # was measured at 1 - and then `cargo fmt` collapsed the block onto the single
+    # line registered below, taking the count to 0. It was dead at the branch's first
+    # commit, dead at every commit after it, and dead at the SHA a merge gate
+    # reviewed, because this gate checks REGISTERED rows and the row did not exist.
+    #
+    # That is mode 2 in this file's header - the formatter rewrapped it - arriving
+    # for the second time in one day, after `D11` in `#41`. Two instances, one cause,
+    # so `scripts/break-once.sh`'s own header now carries the rule: **`cargo fmt`
+    # owns the line breaks, so an anchor over a multi-line block is counted AFTER
+    # formatting.**
+    #
+    # `O3` and `O4` are same-file rows and their records quote UNINDENTED for mode
+    # 1's reason. `O4`'s bare line occurs twice in `turns.rs`, so its record says out
+    # loud to pass the indentation; the registered literal carries it.
+    ("O1", "keylink/tests/observe.rs", "keylink/src/turns.rs",
+     "        (Ok(_), Some(Withheld::Panicked { name })) => Answered::ObserverPanicked { name },\n"),
+    ("O2", "keylink/tests/singleton.rs", "keylink/src/turns.rs",
+     '            Outcome::Err(RemoteError::Failed(format!("{OBSERVER_PANICKED}{name}"))),\n'),
+    ("O3", "keylink/src/turns.rs", "keylink/src/turns.rs",
+     "            Verdict::ObserverPanicked { name } => reply.answer(Answered::ObserverPanicked { name }),\n"),
+    ("O4", "keylink/src/turns.rs", "keylink/src/turns.rs",
+     "            Ok(()) | Err(NotQueued::Closed) => {}\n"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -3183,7 +3209,34 @@ for record in sorted(set(REDNESS) - row_ids):
 # break-once.sh, but RECORD_BLOCKS says 171` — and NOT computed as 171 + 2. The
 # arithmetic happens to agree here, and the entries above say why that is worth
 # nothing: an agreeing subtraction reads as a derivation and is a coincidence.
-RECORD_BLOCKS = 173
+# 173 → 177, on `observer-crashed`, measured AFTER rebasing onto `99c7bec` and not
+# before. FOUR blocks, and a fifth record that is deliberately not one of them.
+#
+# The four: `tests/observe.rs`'s `a_panicking_observer_ends_the_actor_and_is_named`,
+# `tests/singleton.rs`'s `an_observer_that_panicked_reaches_a_peer_under_its_own_prefix`,
+# and `turns.rs`'s own `a_released_reply_reads_the_panic_with_the_turn_that_released_it`
+# and `a_second_stop_returns_ok_rather_than_the_send_s_own_closed`.
+#
+# **The fifth record names no harness on purpose**, so it lands in `UNNAMED` and
+# outside this population: `tests/observe.rs`'s `ExplodesBeforeItYields` says "the
+# same one-line edit as <sibling> above" rather than quoting the literal a second
+# time, because a literal's count is a property of the literal and not of the row.
+# Five records, four blocks. A `+5` typed off the diff would have been wrong by
+# one, which is the 169-run class this ledger already names once.
+#
+# **This branch measured the constant THREE times and only the third counts.** It
+# read 174 on `d2f5e6e`, then 175 after a fourth record landed, and both were dead
+# the moment `harness-exactly-one` merged — that branch moved the same constant to
+# 173 for reasons having nothing to do with this one. Neither figure was carried
+# across the rebase. The tree was rebased, the constant left at 173, and the task
+# asked: `FAIL population: 177 comment blocks mention break-once.sh, but
+# RECORD_BLOCKS says 173`.
+#
+# **173 + 4 = 177, and the agreement is worth nothing**, for the reason the 154 and
+# 171 entries above both give. It is worth recording only because the two branches
+# that fed it moved the number for unrelated causes, so the arithmetic agreeing is
+# a coincidence over a merge rather than over one wave.
+RECORD_BLOCKS = 177
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

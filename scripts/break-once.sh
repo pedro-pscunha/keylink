@@ -50,6 +50,15 @@ shift 4
 # first passed — and having two invited the reading that they check different
 # things. Now every count that is not 1 aborts before a backup exists.
 #
+# **`cargo fmt` OWNS THE LINE BREAKS, so count an anchor AFTER formatting.** An
+# anchor quoted off a multi-line block can be unique when you measure it and gone
+# when the formatter collapses that block onto one line — the count goes 1 → 0 and
+# nothing says so, because `mise run anchors` checks only REGISTERED rows. Twice in
+# one day: `D11` in `#41`, when a shorter type name let a block collapse, and `O3`
+# on `observer-crashed`, which was dead at its own first commit and stayed dead
+# through a merge gate. `.mise/tasks/anchors` calls this rot mode 2. The remedy is
+# sequencing and nothing cleverer: format first, then count.
+#
 # **A READ FAILURE PRINTS THE SAME ONE-LINE ABORT, and `set -e` is not what
 # reports it.** The first `python3` version let a missing target raise, so the
 # assignment failed and `set -e` killed the script: a `FileNotFoundError`

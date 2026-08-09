@@ -737,7 +737,7 @@ mod tests {
     }
 
     /// **Every other `RemoteError::Failed` keylink itself builds on a served
-    /// path, and none of them begins like one of the four prefixes.**
+    /// path, and none of them begins like one of the five prefixes.**
     ///
     /// `turns.rs`'s const block claimed those four were *every* prefix a `Failed`
     /// carries on the served path. It was false in at least four places. Three are
@@ -752,7 +752,7 @@ mod tests {
     /// prose said it was covered. Each is a whole **sentence**
     /// rather than a prefix, which is exactly why nothing has ever collided and
     /// why nothing would have noticed if something had:
-    /// `no_failure_prefix_is_a_prefix_of_another` checks the four against each
+    /// `no_failure_prefix_is_a_prefix_of_another` checks the five against each
     /// other and would stay green while a `RouteError` variant whose `Display`
     /// began `"dropped: "` made every peer's `starts_with` ambiguous.
     ///
@@ -769,11 +769,11 @@ mod tests {
     /// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs`, giving
     /// `RouteError::AtCapacity`'s `#[error(..)]` the text `"dropped: the actor
     /// system is at its capacity of {capacity} live actors"`. Watched:
-    /// `a served Failed that is not one of the four must not begin like one:
+    /// `a served Failed that is not one of the five must not begin like one:
     /// "dropped: " starts "dropped: the actor system is at its capacity of 10
     /// live actors"`.
     #[test]
-    fn no_other_served_failure_begins_with_one_of_the_four() {
+    fn no_other_served_failure_begins_with_one_of_the_five() {
         let oversized: ActorId = postcard::from_bytes(
             &postcard::to_stdvec(&"x".repeat(crate::MAX_KEY_LEN + 1)).expect("encodes"),
         )
@@ -800,12 +800,13 @@ mod tests {
             for prefix in [
                 RemoteError::PANICKED,
                 RemoteError::REFUSED,
+                RemoteError::OBSERVER_PANICKED,
                 RemoteError::RESTARTING,
                 RemoteError::DROPPED,
             ] {
                 assert!(
                     !text.starts_with(prefix),
-                    "a served Failed that is not one of the four must not begin \
+                    "a served Failed that is not one of the five must not begin \
                      like one: {prefix:?} starts {text:?}",
                 );
             }

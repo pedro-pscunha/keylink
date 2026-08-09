@@ -125,10 +125,15 @@ pub enum RemoteError {
 ///
 /// # The property, and exactly what it is a property OF
 ///
-/// **No one of these four is a prefix of another**, in either direction, so a
+/// **No one of these five is a prefix of another**, in either direction, so a
 /// peer matching with `starts_with` is never ambiguous.
-/// `turns::tests::no_failure_prefix_is_a_prefix_of_another` holds it, and a fifth
+/// `turns::tests::no_failure_prefix_is_a_prefix_of_another` holds it, and a sixth
 /// has to be added to that list by hand.
+///
+/// [`OBSERVER_PANICKED`](Self::OBSERVER_PANICKED) is the fifth and it is the one
+/// worth checking a new prefix against: it neither begins with nor is begun by
+/// [`PANICKED`](Self::PANICKED), which shares its verb, and the guard is what says
+/// so rather than the eye.
 ///
 /// The claim used to read *"every prefix a `RemoteError::Failed` carries on the
 /// served path"*, and that was false. keylink builds a `Failed` from at least
@@ -154,6 +159,26 @@ impl RemoteError {
     /// could not write, most often — so the actor is ending for a reason worth
     /// telling the peer apart from a fault. Followed by the observer's name.
     pub const REFUSED: &'static str = "observer refused: ";
+
+    /// An observer **panicked** watching the turn, which ran and was not
+    /// committed.
+    ///
+    /// Distinct from [`REFUSED`](Self::REFUSED) because a veto is a decision an
+    /// author wrote down and a panic is the absence of one, and distinct from
+    /// [`PANICKED`](Self::PANICKED) because that one is the **handler**: your
+    /// message exploded, and the actor kept its state. Followed by the observer's
+    /// name.
+    ///
+    /// **A prefix and not a fifth [`RemoteError`] variant.** A variant sits inside
+    /// the hashed contract and would move every service's ALPN; a prefix is
+    /// content inside `Failed(String)` and moves nothing. RFC-06 §6 refuses the
+    /// variant route on exactly this ground.
+    ///
+    /// A peer has no [`ended`](crate::LocalActor::ended) to fall back on, so this
+    /// prefix is the whole of what it learns. Before it existed, a peer read
+    /// [`REFUSED`](Self::REFUSED) for both — the worst-informed audience, given
+    /// the same false word.
+    pub const OBSERVER_PANICKED: &'static str = "observer panicked: ";
 
     /// The incarnation that owed you an answer is gone, and another is coming.
     ///
@@ -282,7 +307,7 @@ mod tests {
         assert!(refused.is_err());
     }
 
-    /// **The four prefixes are bytes on a wire, so their values are pinned like
+    /// **The five prefixes are bytes on a wire, so their values are pinned like
     /// bytes on a wire.**
     ///
     /// They are public now, which is what makes this necessary rather than
@@ -292,7 +317,7 @@ mod tests {
     /// actually matches on. This does, in the register `tests/protocol.rs` uses
     /// for an ALPN: a literal that must not move quietly.
     ///
-    /// It does **not** claim the four may never change. It claims a change is a
+    /// It does **not** claim the five may never change. It claims a change is a
     /// deliberate act with a compatibility argument attached, exactly like a
     /// hash pin — and unlike an ALPN, moving one of these refuses nothing at the
     /// handshake, so an old peer meets it as a `Failed` it silently stops
@@ -304,9 +329,10 @@ mod tests {
     /// `pub const DROPPED: &'static str = "lost: ";`. Watched: `left: "lost: "`,
     /// `right: "dropped: "`.
     #[test]
-    fn the_four_prefixes_are_the_text_a_peer_matches_on() {
+    fn the_five_prefixes_are_the_text_a_peer_matches_on() {
         assert_eq!(RemoteError::PANICKED, "panicked: ");
         assert_eq!(RemoteError::REFUSED, "observer refused: ");
+        assert_eq!(RemoteError::OBSERVER_PANICKED, "observer panicked: ");
         assert_eq!(RemoteError::RESTARTING, "restarting: ");
         assert_eq!(RemoteError::DROPPED, "dropped: ");
     }

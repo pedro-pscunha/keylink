@@ -200,7 +200,7 @@ impl ring::Actor for Peer {
     async fn self_read(&mut self, _cx: Caller<'_>) -> u64 {
         let me = self.me.get().expect("wired").clone();
         // A read runs no observers, starts no turn, and parks no reply, so the
-        // four arms below it are unreachable through this door several times
+        // five states below it are unreachable through this door several times
         // over — named rather than wildcarded, because a wildcard here would also
         // swallow whatever the next state turned out to be.
         match me.with_state(|state: &Peer| state.bumps).await {
@@ -209,6 +209,7 @@ impl ring::Actor for Peer {
             Err(keylink::Undelivered::Gone) => GONE,
             Err(
                 keylink::Undelivered::Refused { .. }
+                | keylink::Undelivered::ObserverPanicked { .. }
                 | keylink::Undelivered::Expired
                 | keylink::Undelivered::Dropped
                 | keylink::Undelivered::Restarting,
@@ -292,6 +293,7 @@ fn answered(hop: Result<u64, keylink::Undelivered>) -> u64 {
         Err(keylink::Undelivered::Gone) => GONE,
         Err(
             keylink::Undelivered::Refused { .. }
+            | keylink::Undelivered::ObserverPanicked { .. }
             | keylink::Undelivered::Expired
             | keylink::Undelivered::Dropped
             | keylink::Undelivered::Restarting,

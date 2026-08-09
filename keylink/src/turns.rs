@@ -566,7 +566,7 @@ impl<T> Reply<T> {
 /// `Reply` drops it inside the unwinding future, so the caller is told `Dropped`
 /// rather than being handed the panic the way [`LocalActor::ask`] hands one on
 /// every other kind. The actor still survives, the observer chain still reads
-/// [`TurnOutcome::Panicked`](crate::TurnOutcome), and the panic hook already ran
+/// [`TurnOutcome::Panicked`], and the panic hook already ran
 /// at the fault — which is the trade [`notify`](LocalActor::notify) documents for
 /// a `tell`, arriving here for a structural reason instead of a policy one. The
 /// surviving actor is what the answer names: `Dropped` is the same sentence for
@@ -764,6 +764,7 @@ impl<T> Deferred<T> {
         crate::parking::park(Box::new(move |verdict| match verdict {
             Verdict::Committed => reply.answer(Answered::Ran(value)),
             Verdict::Refused { name } => reply.answer(Answered::Refused { name }),
+            Verdict::ObserverPanicked { name } => reply.answer(Answered::ObserverPanicked { name }),
             // Dropped, not answered. `Answered::Faulted` needs the `Panic`
             // itself, there is one, and it is the turn's own caller's — see
             // `Verdict::Faulted`.
@@ -780,12 +781,12 @@ impl<T> fmt::Debug for Deferred<T> {
 
 /// What the loop puts on the reply channel.
 ///
-/// Four states rather than two, because "the budget expired while it queued",
-/// "an observer refused the turn that ran" and "the turn ran and exploded" are
-/// three different facts and a caller that has to unwrap layers to tell them
-/// apart will get it wrong.
+/// Five states rather than two, because "the budget expired while it queued",
+/// "an observer refused the turn that ran", "an observer panicked while watching
+/// it" and "the turn ran and exploded" are four different facts and a caller that
+/// has to unwrap layers to tell them apart will get it wrong.
 ///
-/// A **dropped** sender is not a fifth state here and cannot be: this type is what
+/// A **dropped** sender is not a sixth state here and cannot be: this type is what
 /// the loop *sends*, and nothing is sent in that case. It is answered from the
 /// actor's own standing instead — three more `TurnLost` variants, none of which
 /// belong on this enum. See [`LocalActor::answered`].
@@ -815,6 +816,17 @@ pub(crate) enum Answered<T> {
         /// [`Observer::name`].
         name: &'static str,
     },
+    /// An observer **panicked** watching a completed turn. It ran and was not
+    /// committed.
+    ///
+    /// A separate state from [`Refused`](Self::Refused) for the reason
+    /// [`Faulted`](Self::Faulted) is separate from `Ran`: the two withhold the
+    /// value for the same reason and mean opposite things about the observer. A
+    /// veto is a decision an author wrote down; a panic is the absence of one.
+    ObserverPanicked {
+        /// [`Observer::name`].
+        name: &'static str,
+    },
 }
 
 impl<T> Answered<T> {
@@ -830,8 +842,44 @@ impl<T> Answered<T> {
             Self::Faulted(panic) => Answered::Faulted(panic),
             Self::Expired => Answered::Expired,
             Self::Refused { name } => Answered::Refused { name },
+            Self::ObserverPanicked { name } => Answered::ObserverPanicked { name },
         }
     }
+}
+
+/// What an observer did to a turn that **completed**, in the two shapes the
+/// caller is owed different sentences for.
+///
+/// The third element of the slot [`observed_turn`] folds used to be
+/// [`Stop::is_fatal`](crate::Stop::is_fatal) — a `bool` beside the name — and a
+/// panic has
+/// no such claim to put in it. Writing `false` there spelled *the author said
+/// another incarnation can help* for an author who said nothing at all, and it
+/// spelled it the same way a deliberate [`Stop::new`](crate::Stop::new) does, so
+/// no reader could tell the crate was guessing. The flag now rides on the arm
+/// that has one.
+///
+/// [`Copy`], because the same value is read twice six lines apart: once to build
+/// the [`Verdict`] a parked caller is released with, once to build the answer the
+/// turn's own caller reads.
+#[derive(Clone, Copy)]
+enum Withheld {
+    /// [`Observer::after_turn`] returned `Err`. The flag is
+    /// [`Stop::is_fatal`](crate::Stop::is_fatal).
+    Vetoed {
+        /// [`Observer::name`].
+        name: &'static str,
+        /// Whether the observer said another incarnation cannot help.
+        fatal: bool,
+    },
+    /// [`Observer::after_turn`] panicked, in either of its two halves.
+    ///
+    /// No flag, because there is no claim to carry — [`Ended::Observer`]'s own
+    /// `fatal` field says so where a caller meets it.
+    Panicked {
+        /// [`Observer::name`].
+        name: &'static str,
+    },
 }
 
 /// One turn and its observers — RFC-06 §2.6 in one place, so the two catching
@@ -871,7 +919,7 @@ async fn observed_turn<A, T, F>(
     hooks: &mut [Box<dyn Observer<A>>],
     method: &'static str,
     turn: F,
-) -> (Result<T, Panic>, Option<&'static str>, Option<Ended>)
+) -> (Result<T, Panic>, Option<Withheld>, Option<Ended>)
 where
     A: 'static,
     // `Send` on `T` and not on `A`. The handler's value is held across the
@@ -911,9 +959,11 @@ where
         method,
     };
 
-    // The third element is [`Stop::is_fatal`], carried out because it is the one
-    // thing about a refusal a supervisor reads and nothing else does.
-    let mut refused: Option<(&'static str, Arc<dyn Error + Send + Sync>, bool)> = None;
+    // Two things, because the two audiences need different granularity: the
+    // [`Withheld`] is what the caller is told, and the `Arc` is what the [`Ended`]
+    // carries. `Withheld::Vetoed` holds [`Stop::is_fatal`] as well, because that is
+    // the one thing about a refusal a supervisor reads and nothing else does.
+    let mut withheld: Option<(Withheld, Arc<dyn Error + Send + Sync>)> = None;
     for observer in hooks.iter_mut() {
         let name = observer.name();
         // TWO catches, because `after_turn` has two halves that can panic and
@@ -952,19 +1002,22 @@ where
             Ok(Ok(())) => {}
             Ok(Err(stop)) => {
                 let (reason, fatal) = stop.into_parts();
-                refused = Some((name, Arc::from(reason), fatal));
+                withheld = Some((Withheld::Vetoed { name, fatal }, Arc::from(reason)));
                 break;
             }
             // `Panic` implements `Display` and not `Error`, and is not `Sync`,
             // so it cannot fill an `Arc<dyn Error + Send + Sync>` directly.
             // `to_string()` is what `RemoteError::Failed` already does with one.
             //
-            // Never fatal: an observer that panicked made no claim about whether
-            // another incarnation would fare better, and answering one for it
-            // would be a claim nobody made.
+            // A DIFFERENT arm and not the same one with a `false` in it. Both
+            // withhold the value, for the two reasons RFC-06 §2.6 and §5.1 give
+            // — a veto says *do not commit*, a crash says *nobody knows whether
+            // it committed* — and the fold below is right to withhold on either.
+            // What the caller is told is a third question, and it was answered
+            // with the second for as long as one slot carried both.
             Err(panic) => {
                 let reason: Box<dyn Error + Send + Sync> = panic.to_string().into();
-                refused = Some((name, Arc::from(reason), false));
+                withheld = Some((Withheld::Panicked { name }, Arc::from(reason)));
                 break;
             }
         }
@@ -979,20 +1032,21 @@ where
     // caller and the turn's own caller cannot be told two different things about
     // one turn. A fault outranks a refusal here for the reason it does there: the
     // ending names the fault, and there is nothing committed either way.
-    let verdict = match (&panicked, &refused) {
+    let verdict = match (&panicked, &withheld) {
         (Some(_), _) => Verdict::Faulted,
-        (None, Some((name, _, _))) => Verdict::Refused { name },
+        (None, Some((Withheld::Vetoed { name, .. }, _))) => Verdict::Refused { name },
+        (None, Some((Withheld::Panicked { name }, _))) => Verdict::ObserverPanicked { name },
         (None, None) => Verdict::Committed,
     };
     for release in parked {
         release(verdict);
     }
 
-    match (refused, panicked) {
+    match (withheld, panicked) {
         // Completed and accepted, or faulted and accepted — which is an observer
         // that read `TurnOutcome::Panicked` and chose to continue.
         (None, _) => (answer, None, None),
-        // Panicked and refused: the fault is still the handler's outcome and the
+        // Panicked and withheld: the fault is still the handler's outcome and the
         // actor ends naming the fault rather than the observer. A durability
         // adapter refuses a panicked turn, so reporting the adapter here would
         // point an operator at the wrong code.
@@ -1000,17 +1054,27 @@ where
         // The refusal's `fatal` flag is dropped with the rest of it, and
         // `Stop::fatal`'s own documentation says so: this ending names the fault,
         // and a fault is the kind of thing another incarnation might not repeat.
-        (Some((name, _, _)), Some(message)) => {
-            (answer, Some(name), Some(Ended::Panicked { message }))
-        }
-        // Completed and refused: the turn ran and was not committed, so whoever
+        (Some((who, _)), Some(message)) => (answer, Some(who), Some(Ended::Panicked { message })),
+        // Completed and withheld: the turn ran and was not committed, so whoever
         // holds the reply owes the caller a refusal rather than an uncommitted
-        // value.
-        (Some((name, error, fatal)), None) => (
-            answer,
-            Some(name),
-            Some(Ended::Observer { name, error, fatal }),
-        ),
+        // value. Which of the two sentences they are owed is `who`, and it is the
+        // same `who` the parked callers were released with above.
+        (Some((who, error)), None) => {
+            let end = match who {
+                Withheld::Vetoed { name, fatal } => Ended::Observer { name, error, fatal },
+                // Never fatal: an observer that panicked made no claim about
+                // whether another incarnation would fare better, and answering one
+                // for it would be a claim nobody made. It is written here, on the
+                // one line that needs a flag, rather than into the slot the caller
+                // also reads.
+                Withheld::Panicked { name } => Ended::Observer {
+                    name,
+                    error,
+                    fatal: false,
+                },
+            };
+            (answer, Some(who), Some(end))
+        }
     }
 }
 
@@ -1080,7 +1144,7 @@ where
 {
     let reply = began(&origin, reply)?;
 
-    let (ran, refused, end) =
+    let (ran, withheld, end) =
         observed_turn(state, hooks, method, move |state| turn(origin, state)).await;
     // The one place the handler's outcome and the observers' verdict become a
     // discriminant. A fault is answered even when an observer then refused —
@@ -1088,9 +1152,15 @@ where
     // never applied to it, and withholding would reverse what this module's header
     // promises about a panicking call. A turn that *completed* and was refused is
     // withheld, because a caller must not be handed an uncommitted value.
-    reply.answer(match (ran, refused) {
+    //
+    // Withholding is the same on both `Withheld` arms and the sentence is not. The
+    // decision needs two answers and the report needs three, and one slot carrying
+    // both is what told a caller *the {name} observer refused this turn* about an
+    // observer that fell over.
+    reply.answer(match (ran, withheld) {
         (Ok(value), None) => Answered::Ran(value),
-        (Ok(_), Some(name)) => Answered::Refused { name },
+        (Ok(_), Some(Withheld::Vetoed { name, .. })) => Answered::Refused { name },
+        (Ok(_), Some(Withheld::Panicked { name })) => Answered::ObserverPanicked { name },
         (Err(panic), _) => Answered::Faulted(panic),
     });
     end
@@ -1125,7 +1195,7 @@ where
 ///   inside the unwinding future, so there is nothing left to answer with and the
 ///   caller's wait ends [`TurnLost::Dropped`] — which names the actor that
 ///   survives, so the caller is not told to stop calling one that is serving. The
-///   observers saw [`TurnOutcome::Panicked`](crate::TurnOutcome), and the panic
+///   observers saw [`TurnOutcome::Panicked`](crate::TurnOutcome::Panicked), and the panic
 ///   hook ran at the fault. This is the one thing `#[defer]` costs against every
 ///   other kind, and [`Replied`] says so where a reader meets the type.
 #[doc(hidden)]
@@ -1151,14 +1221,15 @@ where
 {
     let reply = began(&origin, reply)?;
 
-    let (ran, refused, end) = observed_turn(state, hooks, method, move |state| {
+    let (ran, withheld, end) = observed_turn(state, hooks, method, move |state| {
         turn(origin, state, reply)
     })
     .await;
     match ran {
-        Ok(Replied(Settled::Now(reply, value))) => reply.answer(match refused {
+        Ok(Replied(Settled::Now(reply, value))) => reply.answer(match withheld {
             None => Answered::Ran(value),
-            Some(name) => Answered::Refused { name },
+            Some(Withheld::Vetoed { name, .. }) => Answered::Refused { name },
+            Some(Withheld::Panicked { name }) => Answered::ObserverPanicked { name },
         }),
         Ok(Replied(Settled::Later)) => {}
         // The `Panic` is dropped rather than reported, because the channel it
@@ -1251,7 +1322,7 @@ where
     A: 'static,
     F: for<'b> FnOnce(&'b mut A) -> Pin<Box<dyn Future<Output = ()> + Send + 'b>> + Send,
 {
-    let (ran, _refused, end) = observed_turn(state, hooks, feed, turn).await;
+    let (ran, _withheld, end) = observed_turn(state, hooks, feed, turn).await;
 
     // There is no reply channel to carry a fault and no caller to resume it into,
     // so the ending is the only report a feed's panic can have.
@@ -3160,6 +3231,34 @@ pub enum Undelivered {
         /// [`Observer::name`].
         name: &'static str,
     },
+    /// An [`Observer`] **panicked** watching this turn. It **ran** and was not
+    /// committed, and the actor is **not** gone.
+    ///
+    /// A separate variant from [`Refused`](Self::Refused), and the separation is
+    /// the whole of it: this arm was that one until it had a variant of its own,
+    /// so a caller whose observer fell over was told *the {name} observer refused
+    /// this turn* about an observer that made no decision at all. Both withhold
+    /// the value, and RFC-06 §2.6 and §5.1 give two different reasons for that —
+    /// a veto means *do not commit*, a crash means nobody read back whether it
+    /// committed. Only the verb differed, and only the verb was wrong.
+    ///
+    /// **What a supervisor does next is the same as for a non-fatal refusal**, and
+    /// that is deliberate rather than an omission: a panicking observer made no
+    /// claim about whether another incarnation would fare better, so
+    /// [`Ended::Observer`] carries `fatal: false` and the
+    /// incarnation is restarted. The field's own documentation carries the
+    /// argument.
+    ///
+    /// The panic's message does not reach here. It reaches
+    /// [`ended`](LocalActor::ended), as
+    /// [`Ended::Observer`]'s `error` — this type is `Copy`
+    /// and `Eq` and an `Arc` is neither, which is the same trade
+    /// [`Restarting`](Self::Restarting) makes.
+    #[error("the {name} observer panicked during this turn: it ran and was not committed")]
+    ObserverPanicked {
+        /// [`Observer::name`].
+        name: &'static str,
+    },
     /// A [`QueueTimeout`](crate::QueueTimeout) budget expired while the message
     /// waited. It **never started**, so the actor is untouched and still running.
     ///
@@ -3780,7 +3879,7 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     /// [`abort`](Self::abort) is the recovery and it is the only one. It destroys
     /// the state — that is the price, and it is why it is a separate method — and
     /// it is also what makes `ended` resolve, as
-    /// [`Ended::Vanished`](crate::Ended), since an aborted task filled nothing.
+    /// [`Ended::Vanished`], since an aborted task filled nothing.
     /// In a two-actor ring it frees the other actor and destroys only the one it
     /// names. Guarded at N = 2 by `tests/cycles.rs`.
     ///
@@ -3813,6 +3912,7 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
             // where a caller meets it.
             Err(TurnLost::Restarting(_reason)) => Err(Undelivered::Restarting),
             Err(TurnLost::Refused { name }) => Err(Undelivered::Refused { name }),
+            Err(TurnLost::ObserverPanicked { name }) => Err(Undelivered::ObserverPanicked { name }),
             Err(TurnLost::Expired) => Err(Undelivered::Expired),
             Err(TurnLost::Reentrant) => Err(Undelivered::Reentrant),
         }
@@ -3849,6 +3949,7 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
             Answered::Ran(value) => Ok(value),
             Answered::Faulted(panic) => Err(TurnLost::Faulted(panic)),
             Answered::Refused { name } => Err(TurnLost::Refused { name }),
+            Answered::ObserverPanicked { name } => Err(TurnLost::ObserverPanicked { name }),
             // Unreachable from here today — a local `Origin` carries no
             // `Queueing`, so there is no budget to expire — and answered with the
             // variant that means what happened anyway.
@@ -4161,6 +4262,13 @@ impl<A, M> LocalActor<A, M> {
     /// So the error is [`NotQueued`] rather than [`Undelivered`] twice over: this
     /// door asks only whether the request was queued, and it discards half of even
     /// that.
+    ///
+    /// **Both halves are held by a test rather than by the paragraph above.**
+    /// `cycles::a_self_stop_is_refused_rather_than_wedging_the_actor` produces the
+    /// refusal, and `a_second_stop_returns_ok_rather_than_the_send_s_own_closed`
+    /// in this file's `mod tests` holds the swallow — which was the argued half
+    /// and the unasserted one, because nothing in the workspace read this method's
+    /// `Ok`.
     pub async fn stop(&self) -> Result<(), NotQueued> {
         match self.send(Message::Stop, Refuse::Always).await {
             Ok(()) | Err(NotQueued::Closed) => {}
@@ -4379,7 +4487,7 @@ impl<A, M> fmt::Debug for LocalActor<A, M> {
 
 // ─────────────────────────────────────────── what a peer is told about a turn
 
-// The four prefixes a `RemoteError::Failed` carries out of `rendered` and
+// The five prefixes a `RemoteError::Failed` carries out of `rendered` and
 // `lost`. They live on `RemoteError` itself now, in `reply.rs`, because a peer
 // has to match on them and could not name them: this block held them as private
 // `const`s for four waves while every caller hard-coded the literal.
@@ -4392,6 +4500,7 @@ impl<A, M> fmt::Debug for LocalActor<A, M> {
 use crate::RemoteError as Failure;
 const PANICKED: &str = Failure::PANICKED;
 const REFUSED: &str = Failure::REFUSED;
+const OBSERVER_PANICKED: &str = Failure::OBSERVER_PANICKED;
 const RESTARTING: &str = Failure::RESTARTING;
 const DROPPED: &str = Failure::DROPPED;
 
@@ -4412,15 +4521,18 @@ const DROPPED: &str = Failure::DROPPED;
 ///
 /// There are two more now — [`RESTARTING`] and [`DROPPED`], both built in
 /// [`deliver_to_local`] on the arm that answers a reply channel that died
-/// without sending. The four are declared together above, with the one property
-/// they share and the test that holds it: none of them is a prefix of another,
+/// without sending, and a fifth — [`OBSERVER_PANICKED`] — for the observer that
+/// fell over rather than deciding anything, which this function rendered as
+/// [`REFUSED`] until it had a prefix of its own. The five are declared together
+/// above, with the one property they share and the test that holds it: none of
+/// them is a prefix of another,
 /// and none is a [`RemoteError`] variant, so the contract hash does not move for
 /// any of them.
 ///
 /// The stutter is still there and is deliberately not fixed here:
 /// `Panic::caught` builds its message as `the actor panicked: {payload}`, and
 /// that same string is what [`Ended::Panicked`] and
-/// [`TurnOutcome::Panicked`](crate::TurnOutcome) carry. Removing one of the two
+/// [`TurnOutcome::Panicked`] carry. Removing one of the two
 /// prefixes is a decision about `panic.rs`'s vocabulary, and it belongs where
 /// `Panic` is rather than inside a dispatch.
 pub(crate) fn rendered<Resp>(
@@ -4440,6 +4552,14 @@ pub(crate) fn rendered<Resp>(
         // reason the peer should be able to read.
         Answered::Refused { name } => (
             Outcome::Err(RemoteError::Failed(format!("{REFUSED}{name}"))),
+            Body::empty(),
+        ),
+        // A fifth prefix, because a peer has no `ended()` and this is the whole of
+        // what it learns. It read `{REFUSED}{name}` until this arm existed, which
+        // made the worst-informed audience the one told the observer had decided
+        // something. The prefix moves no ALPN — see `RemoteError`'s const block.
+        Answered::ObserverPanicked { name } => (
+            Outcome::Err(RemoteError::Failed(format!("{OBSERVER_PANICKED}{name}"))),
             Body::empty(),
         ),
         // Queued and never started. The value the other bound produces for the
@@ -4620,10 +4740,16 @@ where
         Err(NotQueued::Closed) => return gone(),
         // NOT `NoSuchActor`, which says "there is nothing here, stop asking":
         // a refused re-entrant call leaves the actor running. `Failed` with the
-        // error's own text and **no prefix**, because the four prefixes are the
+        // error's own text and **no prefix**, because the prefixes are the
         // discriminator between causes a peer acts on differently and this one is
-        // unreachable from a peer — see the send above. A fifth prefix would be a
-        // wire-visible discriminator invented for a case nothing can produce.
+        // unreachable from a peer — see the send above. A prefix for THIS arm would
+        // be a wire-visible discriminator invented for a case nothing can produce.
+        //
+        // That argument is about this arm and does not generalise, which is worth
+        // saying now that the set has grown: `observer panicked: ` was added as a
+        // fifth, and it is producible — `tests/observe.rs` produces one locally and
+        // `rendered` is the arm that ships it. The premise here is *nothing can
+        // produce it*, and that premise is false everywhere except this arm.
         //
         // **The wire sentence belongs to `Undelivered`, so the conversion is
         // explicit.** A bare `refused.to_string()` renders whichever type `send`
@@ -4636,9 +4762,9 @@ where
         // both are true, and neither weakens the other.
         //
         // **No test covers this path, and the guard this line used to cite is not
-        // one.** `remote::no_other_served_failure_begins_with_one_of_the_four` builds
-        // `Undelivered::Reentrant.to_string()` by hand and asserts the four
-        // prefixes against that string. It never calls this function and never
+        // one.** `remote::no_other_served_failure_begins_with_one_of_the_five` builds
+        // `Undelivered::Reentrant.to_string()` by hand and asserts every prefix
+        // against that string. It never calls this function and never
         // reads which type renders here, so reverting this line to
         // `refused.to_string()` leaves it green. Nothing else calls
         // `deliver_to_local` and reads its refusal bytes either. A guard would have
@@ -4705,7 +4831,7 @@ mod tests {
 
     use super::*;
 
-    /// The one property the four served-path prefixes share.
+    /// The one property the five served-path prefixes share.
     ///
     /// A peer reads `RemoteError::Failed`'s text to tell "your message exploded"
     /// from "the actor is restarting" from "this reply was dropped", because the
@@ -4714,15 +4840,20 @@ mod tests {
     /// `starts_with` ambiguous and the discriminator stops discriminating.
     ///
     /// Written into four rustdocs before it was written into a test. The list is
-    /// spelled out here, so **a fifth prefix has to be added to it by hand**; it
+    /// spelled out here, so **a sixth prefix has to be added to it by hand**; it
     /// names the consts rather than the strings, so it cannot drift from the wire.
+    ///
+    /// [`OBSERVER_PANICKED`] is the fifth and the first one whose text shares a
+    /// word with an existing prefix, which is what makes the by-hand step worth
+    /// stating twice: `"observer panicked: "` neither begins with nor is begun by
+    /// `"panicked: "` or `"observer refused: "`, and this loop is what says so.
     ///
     /// Made red by `scripts/break-once.sh keylink/src/turns.rs`, giving [`DROPPED`]
     /// the value `"panicked: dropped: "`. Watched:
     /// `"panicked: " is a prefix of "panicked: dropped: "`.
     #[test]
     fn no_failure_prefix_is_a_prefix_of_another() {
-        let all = [PANICKED, REFUSED, RESTARTING, DROPPED];
+        let all = [PANICKED, REFUSED, OBSERVER_PANICKED, RESTARTING, DROPPED];
         for (i, outer) in all.iter().enumerate() {
             for (j, inner) in all.iter().enumerate() {
                 assert!(
@@ -4739,7 +4870,7 @@ mod tests {
     /// **Renamed, because the old name promised a property nothing here checks.**
     /// It was `the_four_are_only_what_rendered_and_lost_build` — a set equality,
     /// against a body that asserts one arm. The set half lives in
-    /// `remote::no_other_served_failure_begins_with_one_of_the_four`, which
+    /// `remote::no_other_served_failure_begins_with_one_of_the_five`, which
     /// renders the other producers; this one holds the smaller fact that makes
     /// the count come out: three answers, two prefixes.
     ///
@@ -4774,11 +4905,12 @@ mod tests {
 
     /// One [`Undelivered`] per [`TurnLost`] that is not a fault, sampled once so
     /// the coverage assertion below has something to index.
-    const EVERY: [Undelivered; 6] = [
+    const EVERY: [Undelivered; 7] = [
         Undelivered::Gone,
         Undelivered::Dropped,
         Undelivered::Restarting,
         Undelivered::Refused { name: "observer" },
+        Undelivered::ObserverPanicked { name: "observer" },
         Undelivered::Expired,
         Undelivered::Reentrant,
     ];
@@ -4793,8 +4925,9 @@ mod tests {
             Undelivered::Dropped => 1,
             Undelivered::Restarting => 2,
             Undelivered::Refused { .. } => 3,
-            Undelivered::Expired => 4,
-            Undelivered::Reentrant => 5,
+            Undelivered::ObserverPanicked { .. } => 4,
+            Undelivered::Expired => 5,
+            Undelivered::Reentrant => 6,
         }
     }
 
@@ -4808,6 +4941,7 @@ mod tests {
             TurnLost::Dropped => Some(Undelivered::Dropped),
             TurnLost::Restarting(_) => Some(Undelivered::Restarting),
             TurnLost::Refused { name } => Some(Undelivered::Refused { name }),
+            TurnLost::ObserverPanicked { name } => Some(Undelivered::ObserverPanicked { name }),
             TurnLost::Expired => Some(Undelivered::Expired),
             TurnLost::Reentrant => Some(Undelivered::Reentrant),
             TurnLost::Faulted(_) => None,
@@ -4840,7 +4974,7 @@ mod tests {
     /// `error[E0004]` on **production** code rather than on a test's own match.
     ///
     /// The property is injectivity and not the exactly-once above, because two
-    /// states are being checked against a six-slot space: each `NotQueued` state
+    /// states are being checked against a seven-slot space: each `NotQueued` state
     /// widens to a distinct `Undelivered`, and the two assertions are two-sided on
     /// purpose — `<= 1` alone is satisfied by a walk that ran zero times, so the
     /// count of written slots is asserted against the sample's own length.
@@ -4850,6 +4984,18 @@ mod tests {
     /// against and what §4.11 of RFC-07 records, and a name that asserts less than
     /// the body is not the failure mode this file is about.
     ///
+    /// **RFC-07 §15.2 is the full ruling and this is its pointer.** It records
+    /// what this sentence compresses: `NotQueued` reaches the guard through
+    /// `From<NotQueued> for Undelivered` rather than through [`twin`], so it is
+    /// held as a **widening** and not as a twin — which is why the name saying
+    /// *twin* is an under-claim rather than a wrong claim. It also measured what
+    /// the rename would have cost and refused it anyway, on the ground that this
+    /// crate's expensive failure is the opposite direction: names and numbers that
+    /// assert more than the tree can support. **The name stays.**
+    ///
+    /// That ruling is about the name and not the count, so it is unmoved by the
+    /// seventh variant this guard now walks.
+    ///
     /// # Rust has no reflection over variants, so this cannot enumerate them
     ///
     /// What it has instead is two exhaustive matches, and both are `error[E0004]`
@@ -4858,7 +5004,9 @@ mod tests {
     /// say what its twin is, which is the whole of the enforcement.
     ///
     /// **A third mechanism was claimed for this guard in design and it does not
-    /// exist.** The claim was that a seventh arm would write `EVERY[6]`, and that
+    /// exist.** The claim was that one arm past the array would write `EVERY[6]`
+    /// against a six-slot array — `EVERY[7]` now, and the number is not the
+    /// point — and that
     /// a constant index past the end of a sized array fires rustc's deny-by-default
     /// `unconditional_panic`. That lint reads a **syntactically constant** index,
     /// and this guard indexes with `slot(&mine)` — a value computed at run time —
@@ -4884,10 +5032,10 @@ mod tests {
     /// strengthening buys.
     ///
     /// It buys nothing against the enums as they stand today, which is worth
-    /// saying rather than leaving for a reader to discover: six twins over six
+    /// saying rather than leaving for a reader to discover: seven twins over seven
     /// slots means any fold also leaves a hole, so the two readings agree on every
     /// break reachable now. The second break below is the measurement — it
-    /// produces `[2, 1, 1, 1, 0, 1]`, a doubled slot **and** an empty one, so it
+    /// produces `[2, 1, 1, 1, 1, 0, 1]`, a doubled slot **and** an empty one, so it
     /// reddens under either reading and does not separate them.
     ///
     /// # Every assertion is against a way this could hold for nothing
@@ -4915,14 +5063,20 @@ mod tests {
     ///   given. Watched: `one fact must read as one sentence: Dropped and
     ///   Dropped`, with `left` and `right` printing the two sentences one
     ///   character apart.
-    /// - point [`slot`]'s `Undelivered::Expired` arm at `0` instead of `4`.
+    /// - point [`slot`]'s `Undelivered::Expired` arm at `0` instead of `5`.
     ///   Watched: `every variant is written exactly once, and this one was written
-    ///   2 times: [2, 1, 1, 1, 0, 1] at slot 0`, `left: 2`, `right: 1`. **This
+    ///   2 times: [2, 1, 1, 1, 1, 0, 1] at slot 0`, `left: 2`, `right: 1`. **This
     ///   record predicted slot 4 and "written 0 times", and the run said slot 0
     ///   and 2**: the loop walks the slots in order, so the doubled one is reached
     ///   before the emptied one. The prediction named the arm that was edited
     ///   rather than the arm that fires, which is the sentence a reader would
     ///   otherwise search the log for and not find.
+    ///
+    ///   Re-run when [`ObserverPanicked`](Undelivered::ObserverPanicked) took slot
+    ///   4 and pushed `Expired` to 5. Both halves of the record moved and neither
+    ///   was computed: the arm's own number is read off the source, and the array
+    ///   is read off the failing run — a seventh slot appears in it, and the
+    ///   *emptied* slot moved from 4 to 5 while the reported one stayed 0.
     /// - point `From<NotQueued> for Undelivered`'s `Closed` arm at
     ///   `Self::Reentrant`. Its arm line is unique in this file where **neither
     ///   `#[error]` attribute is** — both of `NotQueued`'s texts are byte-identical
@@ -4950,6 +5104,7 @@ mod tests {
             TurnLost::Dropped,
             TurnLost::Restarting(Arc::new(Ended::Stopped)),
             TurnLost::Refused { name: "observer" },
+            TurnLost::ObserverPanicked { name: "observer" },
             TurnLost::Expired,
             TurnLost::Reentrant,
             TurnLost::Faulted(catching(|| panic!("twin")).expect_err("it panicked")),
@@ -5355,6 +5510,72 @@ mod tests {
         assert_eq!(spare.notify(add(1)).await, Err(NotQueued::Closed));
     }
 
+    /// `stop`'s error type is one variant wider than `stop` can produce, and the
+    /// half that makes it so was argued and not asserted.
+    ///
+    /// [`stop`](LocalActor::stop)'s `# Errors` block says
+    /// [`NotQueued::Reentrant`] is the **only** error it can return, and that
+    /// [`NotQueued::Closed`] "never leaves this method". The first half has a
+    /// guard — `cycles::a_self_stop_is_refused_rather_than_wedging_the_actor`
+    /// produces the refusal. The second had none: **the one send `stop` makes can
+    /// return `Closed`**, and only the `Ok(()) | Err(NotQueued::Closed) => {}` arm
+    /// keeps it inside. Nothing anywhere read `stop`'s `Ok`, so that arm could
+    /// have been narrowed to `Ok(())` and every test in the workspace would have
+    /// stayed green while a caller that stopped an actor twice got an error the
+    /// documentation says is unreachable.
+    ///
+    /// The line above it is asserted too, and it is the reason `wait_for` is not
+    /// `changed()`: the second `stop` must **return**. A fresh receiver marks the
+    /// current value as seen, so `changed()` on an already-ended actor waits for a
+    /// second ending that never comes. The timeout is what separates "returned an
+    /// error" from "hung", and only a two-sided check can tell those apart —
+    /// `expect_err` on a hang is a test that never finishes.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `stop`'s first
+    /// arm. **Pass the arm WITH its twelve spaces of indentation** — the bare line
+    /// `Ok(()) | Err(NotQueued::Closed) => {}` occurs twice in this file and the
+    /// harness aborts at `found 2` before taking a backup, so this fails safe
+    /// rather than quietly breaking the wrong arm. Replace it with a pair that lets
+    /// the send's own refusal out:
+    ///
+    /// ```text
+    /// Ok(()) => {}
+    /// Err(closed @ NotQueued::Closed) => return Err(closed),
+    /// ```
+    ///
+    /// Quoted unindented, because this record lives in the file its break edits.
+    /// Watched: `stopping a stopped actor is what the caller asked for, so its own
+    /// Closed must not escape: Err(Closed)`, `left: Err(Closed)`, `right: Ok(())`.
+    ///
+    /// **The obvious break is not a break, and it was run first.** Deleting the
+    /// `| Err(NotQueued::Closed)` alternative alone leaves the match
+    /// non-exhaustive, so the harness exits **101 on `error[E0004]`** — a red that
+    /// reddens the same way a caught defect does, on a run where the test never
+    /// executed. The second arm is what makes the edit compile and therefore what
+    /// makes the assertion the thing being measured. This is written down because
+    /// the exhaustiveness that makes the mistake easy is the same property the
+    /// guard above [`twin`] rests on.
+    #[tokio::test]
+    async fn a_second_stop_returns_ok_rather_than_the_send_s_own_closed() {
+        // Annotated, because this test never sends a message and `M` is otherwise
+        // ambiguous: `Infallible` also implements `Turn<Counter>`.
+        let actor: LocalActor<Counter, Mail> = LocalActor::spawn(Counter::default());
+        actor
+            .stop()
+            .await
+            .expect("a stop from outside the actor's own turn is never refused");
+
+        let again = n0_future::time::timeout(Duration::from_secs(5), actor.stop())
+            .await
+            .expect("stop is documented as idempotent, so a second one must return");
+        assert_eq!(
+            again,
+            Ok(()),
+            "stopping a stopped actor is what the caller asked for, so its own \
+             Closed must not escape: {again:?}",
+        );
+    }
+
     /// Spawn an actor already inside a turn, and hand back the two ends that
     /// order everything around it: a handle, and the sender that lets the turn go.
     ///
@@ -5739,6 +5960,120 @@ mod tests {
         assert!(
             matches!(lost, Err(TurnLost::Refused { name: "vetoing" })),
             "a released reply crossed a refused turn: {lost:?}"
+        );
+    }
+
+    /// [`Vetoing`], one arm apart: it panics where that one returns a [`Stop`].
+    ///
+    /// Structurally identical on purpose, so the test below differs from the one
+    /// above in the observer's **behaviour** and in nothing else.
+    struct FallingOver {
+        method: &'static str,
+    }
+
+    impl Observer<Counter> for FallingOver {
+        fn name(&self) -> &'static str {
+            "falling-over"
+        }
+
+        fn after_turn<'a>(
+            &'a mut self,
+            _state: &'a Counter,
+            turn: TurnInfo<'a>,
+        ) -> crate::TurnFut<'a> {
+            let fall = turn.method == self.method;
+            Box::pin(async move {
+                match fall {
+                    true => panic!("the observer fell over"),
+                    false => Ok(()),
+                }
+            })
+        }
+    }
+
+    /// A **parked** caller is told the observer panicked, in the same words the
+    /// turn's own caller is told.
+    ///
+    /// The value is withheld exactly as it is above, and that half is not what
+    /// this adds: `Verdict::ObserverPanicked` and `Verdict::Refused` do the same
+    /// thing to a parked answer. What it adds is that the two are told **apart**,
+    /// on the release path, which is a separate route from the fold the turn's own
+    /// caller reads — `parking.rs` releases six lines earlier, from the same pair
+    /// of facts, and the two must not disagree about one turn.
+    ///
+    /// A `Deferred` caller had no other door to this fact. It reads no `Ended`, so
+    /// the sentence was the whole of what it got, and it was the refusal's.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on
+    /// [`Deferred::send`]'s release arm. Search
+    /// `Verdict::ObserverPanicked { name } => reply.answer(Answered::ObserverPanicked { name }),`
+    /// and give it the refusal's answer instead:
+    /// `Verdict::ObserverPanicked { name } => reply.answer(Answered::Refused { name }),`.
+    /// Both quotes are unindented and the code is not, which is what keeps the
+    /// anchor unique in its own file.
+    ///
+    /// **This record's first anchor was dead on arrival, and the reason is worth
+    /// more than the fix.** It quoted the arm's *body* off a three-line block —
+    /// uniqueness measured, count 1 — and then `cargo fmt` collapsed the block to
+    /// the single line above, taking the count to 0. The check had been run
+    /// **before** the formatter, which owns the line breaks and is not the
+    /// author's to promise. `.mise/tasks/anchors` names that rot mode; nothing
+    /// caught this instance, because the gate checked only **registered** rows and
+    /// this record was not one. It is registered now, as `O3`.
+    ///
+    /// **The sequencing is the lesson and it is not obvious**, so it is written
+    /// here rather than left to be inferred: format first, then count. Every anchor
+    /// this branch adds was re-measured **after** `cargo fmt` once this was found,
+    /// and all five resolve to exactly one. `scripts/break-once.sh`'s own header
+    /// carries the rule, because that is where an author meets the harness.
+    ///
+    /// Watched: `a parked caller must read the same words as the turn's own:
+    /// Err(Refused { name: "falling-over" })`. **The assertion above it stayed
+    /// green under that break**, which is the measurement that makes this test
+    /// worth having: the release path and the caller-side fold are two routes to
+    /// one fact, and breaking one leaves the other saying the right thing.
+    #[tokio::test]
+    async fn a_released_reply_reads_the_panic_with_the_turn_that_released_it() {
+        let actor: LocalActor<Counter, Mail> = LocalActor::spawn_observed(
+            Counter::default(),
+            vec![Box::new(FallingOver { method: "Release" })],
+        );
+
+        let parked = {
+            let actor = actor.clone();
+            tokio::spawn(async move {
+                actor
+                    .ask_catching(|origin, reply| Mail::Park { origin, reply })
+                    .await
+            })
+        };
+        until_parked(&actor).await;
+
+        let releasing = actor
+            .ask_catching(|origin, reply| Mail::Release { origin, reply })
+            .await;
+        assert!(
+            matches!(
+                releasing,
+                Err(TurnLost::ObserverPanicked {
+                    name: "falling-over"
+                })
+            ),
+            "the releasing turn's own caller reads the panic: got {releasing:?}"
+        );
+
+        let lost = n0_future::time::timeout(Duration::from_secs(5), parked)
+            .await
+            .expect("a released reply must not hang its caller")
+            .expect("the caller is not itself panicking");
+        assert!(
+            matches!(
+                lost,
+                Err(TurnLost::ObserverPanicked {
+                    name: "falling-over"
+                })
+            ),
+            "a parked caller must read the same words as the turn's own: {lost:?}"
         );
     }
 
