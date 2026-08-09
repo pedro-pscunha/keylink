@@ -1168,11 +1168,16 @@ async fn a_service_serves_as_a_singleton_and_as_an_actor_system_on_one_node() {
 /// A refusal that misdescribes itself sends the caller to fix the wrong thing, and
 /// the hash exists precisely so that the honest version can be paid for once.
 ///
-/// The other alternative was a fifth `RemoteError::Failed` prefix, which keeps the
-/// hash still. Rejected: the four prefixes are load-bearing as a `starts_with`
+/// The other alternative was another `RemoteError::Failed` prefix, which keeps the
+/// hash still. Rejected: the prefixes are load-bearing as a `starts_with`
 /// discriminator, a guard asserts none is a prefix of another, and adding
 /// wire-format vocabulary to dodge a wire-format change trades a checked break for
 /// an unchecked one.
+///
+/// **A prefix was added later and this rejection is not overturned by it.**
+/// `RemoteError::OBSERVER_PANICKED` names a cause a peer acts on differently and
+/// could not otherwise learn; it was not bought to avoid a hash move. The
+/// rejection above is about the second use, and it stands.
 ///
 /// Appended rather than inserted, so no existing variant is renumbered. That is
 /// belt and braces here — the hash moves either way and the handshake refuses the

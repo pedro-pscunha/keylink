@@ -4031,7 +4031,6 @@ workers now. Under the fixed code both are deterministic, because the answer is
 settled before the window opens rather than raced against it — which is the
 difference between a guard and a coin toss, and is the argument for fixing the
 *ordering* rather than narrowing the *window*.
-||||||| parent of d67f662 (fix(idempotency): apply the merge gate — 4 Major, 8 Minor, and break records stop carrying counts)
 
 ---
 
@@ -4475,25 +4474,46 @@ replay row whose filter names a test that no longer exists selects **zero tests*
 and reports success, so those are pointers that must stay runnable. Everything
 below is a claim and is appended.
 
-### 17.1 Both enums have seven variants now, so §15.1's asymmetry has closed
+### 17.1 Each enum gained one variant, so §15.1's one-variant gap is preserved
 
 §15.1 measured, on `d2f5e6e`, that `TurnLost` had seven variants and
 `Undelivered` six — and concluded that §4.11's *"a seventh variant in either enum
 is `E0004`"* held for one enum and not two.
 
-At `43fa7c1` both have **seven**: `ObserverPanicked` landed on each, so that a
-caller whose turn met an observer that panicked is no longer told the observer
-refused. §15.1's figures were exact at the commit it names and are not edited.
-What that section says numberlessly is the part that survives every such move,
-and it is worth repeating rather than recounting: *"two exhaustive matches, and
-both are `error[E0004]` the moment either enum grows"*. Read §4.11's bullet that
-way; the number in it was never the mechanism.
+`ObserverPanicked` landed on **each** of them, so that a caller whose turn met an
+observer that panicked is no longer told the observer refused. Counted at the
+tip: `TurnLost` has **eight** — `Gone`, `Dropped`, `Restarting`, `Refused`,
+`ObserverPanicked`, `Faulted`, `Expired`, `Reentrant` — and `Undelivered` has
+**seven**, that list without `Faulted`.
 
-The addition was measured against that claim, which is the only reason it is
-worth an entry. `slot` and `twin` were the **only** two `E0004`s inside
-`keylink/src` — the mechanism fired exactly where §15.1 says it does. `EVERY` and
-the `lost` sample grew by hand, which §4.11's own residual paragraph predicts and
-which no compiler forces.
+**So the asymmetry §15.1 found is not closed; it is preserved exactly.** One
+variant on each side leaves the gap where it was, and the gap has a name:
+`Faulted` is the one `TurnLost` state `ask` resumes rather than maps, which is
+the whole reason `twin` returns `Option`. The guard below says so in its own
+arithmetic — `lost` holds eight entries against `EVERY: [Undelivered; 7]`, and
+the body asserts `without_a_twin == 1`. A reader who took the two enums for the
+same width would not expect `twin` to answer `None` at all.
+
+§15.1's figures were exact at the commit it names and are not edited. What that
+section says numberlessly is the part that survives every such move: *"two
+exhaustive matches, and both are `error[E0004]` the moment either enum grows"*.
+Read §4.11's bullet that way; the number in it was never the mechanism.
+
+**What the compiler actually reported, which is not what a first draft of this
+section claimed.** It said `slot` and `twin` were the only two `E0004`s inside
+`keylink/src`. **No `E0004` fired in `keylink/src` at all**, because every arm
+there was written before the first compile. The only two the compiler reported
+were in `keylink/tests/cycles.rs`, at its two `SURPRISE` folds. That draft
+asserted a measurement nobody took, in a section whose subject is a figure
+carried instead of re-derived — so it is corrected here rather than quietly.
+
+The exhaustive sites that had to gain an arm, listed because *that* is checkable
+where a count of compiler errors is not: `LocalActor::ask` over `TurnLost` — the
+only one in production code, and the stronger form of the argument — plus
+`Answered::map` and `ask_catching`'s and `rendered`'s matches over `Answered`,
+`Deferred::send` over `Verdict`, and `slot` and `twin` in `mod tests`. `EVERY`
+and the `lost` sample grew by hand, which §4.11's own residual paragraph predicts
+and which no compiler forces.
 
 ### 17.2 The watched array is a break record's output and cannot be corrected in place
 
@@ -4506,7 +4526,7 @@ That is what the run printed, and it stays. §15.1 states the rule it falls unde
 *"where the value **is** the record — as it is in a break record's watched output
 — it cannot be removed and an appended correction is the only honest treatment"*.
 
-Re-run at `43fa7c1`, with the same break re-expressed against the moved arm —
+Re-run at `fdcf412`, with the same break re-expressed against the moved arm —
 `slot`'s `Undelivered::Expired` points at `5` now, not `4` — the run prints:
 
 > `every variant is written exactly once, and this one was written 2 times:
@@ -4531,8 +4551,9 @@ least three other places"* say `no_failure_prefix_is_a_prefix_of_another`
 *"compares the four against each other"* and describe the guard set as four. The
 identifier is unchanged, so nothing is renamed and the carve-out does not apply.
 
-**Five at `43fa7c1`.** The fifth is `RemoteError::OBSERVER_PANICKED`, and it is
-the first prefix in that set to share a word with another one, which is the whole
+**The fifth is `RemoteError::OBSERVER_PANICKED`**, and the set is whatever
+`no_failure_prefix_is_a_prefix_of_another` spells out — cite the guard, not the
+total. It is the first prefix in that set to share a word with another one, which is the whole
 reason the by-hand list is the guard rather than the eye.
 
 ### 17.4 One sentence in that bullet now reads "five renders three", and that is the honest state
@@ -4553,7 +4574,7 @@ asserts. So the sentence is deliberately half-current and half-historical, and
 this section is what tells a reader which half is which.
 
 **What a reader who counts finds, and it depends on the unit.** Measured on
-`keylink/src/actor/remote.rs`'s `others` array at `43fa7c1`: **five rendered
+`keylink/src/actor/remote.rs`'s `others` array at `fdcf412`: **five rendered
 values, from four places.** The values are the registry's capacity refusal, an
 oversized `ActorId`'s validation failure, `FollowRefused::Ahead`,
 `FollowRefused::Crowded`, and `Undelivered::Reentrant`. The two `FollowRefused`

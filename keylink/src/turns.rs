@@ -1322,7 +1322,7 @@ where
     A: 'static,
     F: for<'b> FnOnce(&'b mut A) -> Pin<Box<dyn Future<Output = ()> + Send + 'b>> + Send,
 {
-    let (ran, _refused, end) = observed_turn(state, hooks, feed, turn).await;
+    let (ran, _withheld, end) = observed_turn(state, hooks, feed, turn).await;
 
     // There is no reply channel to carry a fault and no caller to resume it into,
     // so the ending is the only report a feed's panic can have.
@@ -4740,10 +4740,16 @@ where
         Err(NotQueued::Closed) => return gone(),
         // NOT `NoSuchActor`, which says "there is nothing here, stop asking":
         // a refused re-entrant call leaves the actor running. `Failed` with the
-        // error's own text and **no prefix**, because the four prefixes are the
+        // error's own text and **no prefix**, because the prefixes are the
         // discriminator between causes a peer acts on differently and this one is
-        // unreachable from a peer — see the send above. A fifth prefix would be a
-        // wire-visible discriminator invented for a case nothing can produce.
+        // unreachable from a peer — see the send above. A prefix for THIS arm would
+        // be a wire-visible discriminator invented for a case nothing can produce.
+        //
+        // That argument is about this arm and does not generalise, which is worth
+        // saying now that the set has grown: `observer panicked: ` was added as a
+        // fifth, and it is producible — `tests/observe.rs` produces one locally and
+        // `rendered` is the arm that ships it. The premise here is *nothing can
+        // produce it*, and that premise is false everywhere except this arm.
         //
         // **The wire sentence belongs to `Undelivered`, so the conversion is
         // explicit.** A bare `refused.to_string()` renders whichever type `send`
@@ -4756,9 +4762,9 @@ where
         // both are true, and neither weakens the other.
         //
         // **No test covers this path, and the guard this line used to cite is not
-        // one.** `remote::no_other_served_failure_begins_with_one_of_the_four` builds
-        // `Undelivered::Reentrant.to_string()` by hand and asserts the four
-        // prefixes against that string. It never calls this function and never
+        // one.** `remote::no_other_served_failure_begins_with_one_of_the_five` builds
+        // `Undelivered::Reentrant.to_string()` by hand and asserts every prefix
+        // against that string. It never calls this function and never
         // reads which type renders here, so reverting this line to
         // `refused.to_string()` leaves it green. Nothing else calls
         // `deliver_to_local` and reads its refusal bytes either. A guard would have
@@ -4864,7 +4870,7 @@ mod tests {
     /// **Renamed, because the old name promised a property nothing here checks.**
     /// It was `the_four_are_only_what_rendered_and_lost_build` — a set equality,
     /// against a body that asserts one arm. The set half lives in
-    /// `remote::no_other_served_failure_begins_with_one_of_the_four`, which
+    /// `remote::no_other_served_failure_begins_with_one_of_the_five`, which
     /// renders the other producers; this one holds the smaller fact that makes
     /// the count come out: three answers, two prefixes.
     ///
@@ -5526,7 +5532,11 @@ mod tests {
     /// `expect_err` on a hang is a test that never finishes.
     ///
     /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `stop`'s first
-    /// arm, replacing it with a pair that lets the send's own refusal out:
+    /// arm. **Pass the arm WITH its twelve spaces of indentation** — the bare line
+    /// `Ok(()) | Err(NotQueued::Closed) => {}` occurs twice in this file and the
+    /// harness aborts at `found 2` before taking a backup, so this fails safe
+    /// rather than quietly breaking the wrong arm. Replace it with a pair that lets
+    /// the send's own refusal out:
     ///
     /// ```text
     /// Ok(()) => {}
@@ -5996,8 +6006,18 @@ mod tests {
     ///
     /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on
     /// [`Deferred::send`]'s release arm, giving it the refusal's answer:
-    /// `reply.answer(Answered::Refused { name })`. The quote is unindented and the
-    /// code is not, which is what keeps the anchor unique in its own file.
+    /// `Verdict::ObserverPanicked { name } => reply.answer(Answered::Refused { name }),`.
+    /// The quote is unindented and the code is not, which is what keeps the anchor
+    /// unique in its own file.
+    ///
+    /// **This record's first anchor was dead on arrival, and the reason is worth
+    /// more than the fix.** It quoted the arm's *body* off a three-line block —
+    /// uniqueness measured, count 1 — and then `cargo fmt` collapsed the block to
+    /// the single line above, taking the count to 0. The check had been run
+    /// **before** the formatter, which owns the line breaks and is not the
+    /// author's to promise. `.mise/tasks/anchors` names that rot mode; nothing
+    /// caught this instance, because the gate checks **registered** rows and this
+    /// record is not one. Verify an anchor after `cargo fmt`, never before.
     ///
     /// Watched: `a parked caller must read the same words as the turn's own:
     /// Err(Refused { name: "falling-over" })`. **The assertion above it stayed

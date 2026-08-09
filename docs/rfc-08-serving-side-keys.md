@@ -883,7 +883,9 @@ written out by hand, and says that guard *"spells out its four prefixes by
 hand"*. The identifier is unchanged, so `CONTRIBUTING.md`'s carve-out does not
 apply: what moved is a count, and a count is a claim.
 
-**Five at `43fa7c1`**, the fifth being `RemoteError::OBSERVER_PANICKED`. The
+**The fifth is `RemoteError::OBSERVER_PANICKED`**, and the current list is
+whatever `turns::tests::no_failure_prefix_is_a_prefix_of_another` spells out —
+cited rather than counted, per §9.1. The
 argument §9.2 borrows it for is untouched and is if anything stronger: the fifth
 prefix had to be added to that list by hand, and it is the first one sharing a
 word with an existing prefix — `"observer panicked: "` against `"panicked: "` and

@@ -1256,8 +1256,11 @@ own.
 ### §6's "Three prefixes now" was true when written
 
 §6's overturned bullet reads *"Three prefixes now, none a prefix of another"*.
-That was exact. It is **five at `43fa7c1`**, and the fifth is why this appendix
-exists rather than a §6 edit: `observer panicked: ` was added because a peer has
+That was exact, and the list is longer now. The list itself is spelled out by
+hand in `turns::tests::no_failure_prefix_is_a_prefix_of_another` — cite that
+rather than a total, which is the form this file recommends one section earlier
+and the only one that cannot rot. The addition is why this appendix exists rather
+than a §6 edit: `observer panicked: ` was added because a peer has
 no `ended()` to fall back on, so the `Failed` string is the whole of what it
 learns and it read the refusal's word.
 
