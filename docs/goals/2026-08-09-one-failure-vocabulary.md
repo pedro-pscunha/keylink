@@ -275,3 +275,59 @@ paths attempted, the evidence and the blocker — do not ask mid-run.
 ## Deliverable
 
 Worktree, PR to `main` with the session id in the body, all checks green.
+
+---
+
+## Corrections, appended 2026-08-09 after five read-only passes at `929d201`
+
+Five claims above are wrong against the tree. They are corrected here rather
+than edited in place, because a goal that quietly repairs itself teaches nobody
+which of its claims were measured and which were assumed.
+
+1. **"only two live sites exist" (success criteria) is FALSE.** Two `starts_with`
+   sites live *inside the guards being deleted*; **twelve more live in tests** —
+   `defer.rs:718,920,1199`, `supervision.rs:1155,1166,1380,1503,1514`,
+   `actors.rs:735`, `singleton.rs:992,1117,1121`. Nine of those hard-code the
+   literal text (`"panicked: "`), three use the const. Deleting the consts is a
+   compile error at three sites and a **silent assertion rewrite** at nine.
+   That is the largest single piece of work item 5 hides.
+
+2. **Two guards are in files this goal does not name.**
+   `no_other_served_failure_begins_with_one_of_the_five` is at
+   **`actor/remote.rs:776`**, not `reply.rs`. The twin guard is at
+   **`turns.rs:5101`**, not `observe.rs` — which has no test module at all.
+
+3. **Item 11's "9 references across 2 files" was scoped to `keylink/src/`.**
+   Repo-wide it is **13 lines across 4 files**, of which **7 are code across 3
+   files**. The omitted three are `tests/inspect.rs:23,390,470`, and two of them
+   **construct** `EndReason` variants. The conclusion (the move is cheap)
+   survives; the figure did not.
+
+4. **`console.rs:398-404` is the tail of the argument; the rule is `:384-393`.**
+   And the rule cuts against this goal's own public interface: it says error
+   enums are `#[non_exhaustive]` **and** enums a caller matches exhaustively are
+   not. A public `Withheld` is both at once. **The plan must rule on this, not
+   inherit `#[non_exhaustive]` from the sketch above.**
+
+5. **Item 8 is not confined to the failure vocabulary.** The two causes — no
+   factory configured (`registry.rs:778`) and a factory that refused
+   (`registry.rs:813`) — converge into one identical value **at the `return`**,
+   and `Factory` is `Arc<dyn Fn(&ActorId) -> Option<Mounted<M>>>`
+   (`registry.rs:533`): its refusal channel is `None`, with no room for a
+   reason. Distinguishing them changes the `Factory` signature and every
+   caller's closure. **Item 8 is descoped from this goal and moves to goal 3**,
+   where the registry surface is already being opened.
+
+Two further facts, measured rather than corrected:
+
+- **The hashed contract's rules.** Type names and module paths are NOT hashed;
+  variant names and struct field names ARE
+  (`postcard-schema-0.2.5/src/key/hash.rs:193-204`, plus an empirical probe). So
+  item 11's `EndReason` move is **wire-free**, item 6's type rename is
+  **wire-free**, and item 7's *field* rename moves the **Inspect** pin. The
+  scary-looking rename is free and the trivial-looking one is a redeploy.
+- **`RemoteError` is in every service's hashed graph** (`macros.rs:553-561` →
+  `reply.rs:245,247` → `reply.rs:211,215`), so item 4 moves **both** pins
+  together and cannot be isolated to one service. The second pin is
+  `the_inspect_contract_hash_has_not_moved` at `protocol.rs:1304`, which
+  `CONTRIBUTING.md:197-210` never mentions.
