@@ -635,11 +635,13 @@ impl<M> fmt::Debug for Route<M> {
 struct Registry<M> {
     entries: RwLock<HashMap<ActorId, Entry<M>>>,
     factory: Option<Factory<M>>,
-    /// Where mounts and endings are reported, when anybody asked. `None` is the
-    /// default and costs one `Option` check per mount and per teardown — never
-    /// per message, because routing to a live actor is not a lifecycle event.
-    /// See [`Lifecycle`].
-    lifecycle: Option<Arc<dyn Lifecycle>>,
+    /// Where mounts and endings are reported, in the order they were installed.
+    /// Empty is the default and costs one length check per mount and per
+    /// teardown — never per message, because routing to a live actor is not a
+    /// lifecycle event. `Vec::new` does not allocate, so a system nobody watches
+    /// carries a pointer and two words and asks the allocator for nothing. See
+    /// [`Lifecycle`].
+    lifecycle: Vec<Arc<dyn Lifecycle>>,
     capacity: usize,
     /// How many messages may wait ahead of the one being handled, for every
     /// actor in this system. [`SystemBuilder::mailbox_depth`] is where it means
@@ -670,14 +672,21 @@ impl<M> Registry<M> {
 
     /// The two report sites, so that "is anybody listening" is asked in one
     /// place rather than at each of the five call sites.
+    ///
+    /// One report goes to every installed [`Lifecycle`], in install order, on the
+    /// reporting task. They run one after another because both trait methods are
+    /// synchronous and neither may block — see [`Lifecycle`] — so the whole fan is
+    /// as long as the slowest member and the trait already forbids that being
+    /// long. Nothing is spawned per report: a task per ending would make the
+    /// order a race and would let a diagnostic outlive the thing it describes.
     fn report_mounted(&self, id: &ActorId) {
-        if let Some(watching) = &self.lifecycle {
+        for watching in &self.lifecycle {
             watching.mounted(id);
         }
     }
 
     fn report_ended(&self, id: &ActorId, why: &Ended) {
-        if let Some(watching) = &self.lifecycle {
+        for watching in &self.lifecycle {
             watching.ended(id, why);
         }
     }
@@ -719,8 +728,15 @@ impl<M> Registry<M> {
     /// the write guard is released, so the key has to be copied out from under
     /// it — and a registry with no [`Lifecycle`] must not pay for a `String`
     /// clone on its mount path to produce a value nothing reads.
+    ///
+    /// **The list did not change that, and this line is where it would have.**
+    /// The predicate used to be "the `Option` is `Some`" and is now "the list is
+    /// not empty" — one non-empty check either way, and **one** clone for any
+    /// number of listeners rather than one per listener, because
+    /// [`report_mounted`](Self::report_mounted) hands the same `&ActorId` to each.
+    /// Zero listeners still allocate nothing on the mount path.
     fn announcing(&self, id: &ActorId) -> Option<ActorId> {
-        self.lifecycle.as_ref().map(|_| id.clone())
+        (!self.lifecycle.is_empty()).then(|| id.clone())
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<ActorId, Entry<M>>> {
@@ -1251,6 +1267,17 @@ pub struct ActorStatus {
 /// guard before it reports, so an implementation may call back into the same
 /// system — [`System::status`], [`System::len`] — without deadlocking.
 ///
+/// # A system holds as many of these as were installed
+///
+/// [`SystemBuilder::lifecycle`] appends. Every implementation installed on a
+/// system sees every mount and every ending, in the order the calls were made,
+/// on the one task that mounted or tore down. One implementation that panics
+/// takes down that task and the ones after it in the list never hear about that
+/// event, which is the same blast radius a single panicking implementation
+/// always had — this trait catches nothing, and adding a `catch_unwind` here
+/// would be inventing a failure policy for caller code the registry cannot
+/// name.
+///
 /// [`Events`]: crate::Events
 /// [`NodeStatus::lost`]: crate::NodeStatus
 pub trait Lifecycle: Send + Sync + 'static {
@@ -1362,7 +1389,7 @@ impl<M> System<M> {
             mailbox_depth: DEFAULT_MAILBOX_DEPTH,
             eviction,
             factory: None,
-            lifecycle: None,
+            lifecycle: Vec::new(),
         }
     }
 
@@ -1753,7 +1780,10 @@ pub struct SystemBuilder<M> {
     mailbox_depth: usize,
     eviction: Eviction,
     factory: Option<Factory<M>>,
-    lifecycle: Option<Arc<dyn Lifecycle>>,
+    /// Every sink [`SystemBuilder::lifecycle`] was given, in call order. A `Vec`
+    /// and not an `Option`, because that method appends — see it for why one
+    /// slot was wrong.
+    lifecycle: Vec<Arc<dyn Lifecycle>>,
 }
 
 /// The cap, as the generic half spells it. [`SystemBuilder::DEFAULT_CAPACITY`]
@@ -1822,9 +1852,40 @@ impl<M> SystemBuilder<M> {
     ///
     /// Read [`Lifecycle`] before implementing one: both methods are synchronous
     /// and must not block, because a mount and an eviction wait for them.
+    ///
+    /// # Additive, and the single slot it replaced was a trap
+    ///
+    /// **Calling this twice installs both.** It used to overwrite, and that is
+    /// the defect rather than a simplification worth keeping: the sink is the
+    /// crate's own console on one side and a library type on the other, so the
+    /// two calls are written by two different people. A program with
+    /// `.lifecycle(events)` for [`Inspector`](crate::Inspector) that later adds
+    /// `.lifecycle(endings)` for `compose::Endings` lost its console silently —
+    /// no error, no warning, no method returning what it displaced. The failure
+    /// surfaced as a console that had stopped showing mounts, a long way from
+    /// the builder line that caused it.
+    ///
+    /// The alternative was to keep one slot and return the displaced sink, which
+    /// is `compose::Names::register`'s answer to the same shape. It is right
+    /// there and wrong here: a name is *one* actor, so displacing is what
+    /// registering a second one means, while a report is a broadcast and two
+    /// watchers of one system are not in competition. Nothing about a mount is
+    /// consumed by being reported.
+    ///
+    /// **Both `compose::` names above are backticks on purpose, not links
+    /// waiting to be written.** `compose` is built on top of this module, so an
+    /// intra-doc link from here would point the seam at the layer above it —
+    /// the cost the module header names at the top of this file. Do not "fix"
+    /// them.
+    ///
+    /// **Order is install order and it is observable**, because the reports run
+    /// one after another on the reporting task. Do not build on it: it says
+    /// which of two consoles prints first and nothing about which of two
+    /// implementations *sees* an actor, since neither can change what the other
+    /// is told.
     #[must_use]
     pub fn lifecycle(mut self, lifecycle: impl Lifecycle) -> Self {
-        self.lifecycle = Some(Arc::new(lifecycle));
+        self.lifecycle.push(Arc::new(lifecycle));
         self
     }
 
@@ -2047,7 +2108,10 @@ impl<M> fmt::Debug for SystemBuilder<M> {
             .field("mailbox_depth", &self.mailbox_depth)
             .field("eviction", &self.eviction)
             .field("lazy_spawn", &self.factory.is_some())
-            .field("lifecycle", &self.lifecycle.is_some())
+            // A count and not a bool, because "installed one" and "installed
+            // three" are now different states and a bool would report them the
+            // same.
+            .field("lifecycle", &self.lifecycle.len())
             .finish()
     }
 }

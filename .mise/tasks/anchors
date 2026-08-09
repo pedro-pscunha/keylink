@@ -1135,6 +1135,153 @@ ANCHORS = [
     # SAME-FILE and indented, so the record's unindented copy is not a second occurrence.
     ("M2", "keylink/src/rpc.rs", "keylink/src/rpc.rs",
      "        Attaching::Forbidden => return Claimed::Refuse(IdempotencyRefusal::InFlight.into()),"),
+    # ── `compose::Group` and `compose::Endings` ──────────────────────────────
+    #
+    # Twenty-two substitutions were run in the paired gate worktree before any row
+    # below was written. Every one reddened its own named test, every one printed
+    # `── exit=101`, and every one reported `34 filtered out` of 35, so no filter
+    # caught a neighbour. Controls green before and after; the second control is the
+    # only evidence that all twenty-two restores completed.
+    #
+    # **G1, G2 and G8 share ONE literal, because they share one physical LINE.**
+    # G1 and G2 were proposed against `policy(&reported.name, &reason)`, which is a
+    # fragment of G8's line and occurs nowhere else. Registering it would have
+    # declared a new mode-4 fragment, and `FRAGMENT_ANCHORS` above is a NON-GROWTH
+    # assertion — adding to it converts a working check into a silent pass. So all
+    # three quote the whole line. Three records, one literal, three rows.
+    ("G1", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.name, &reason))) {"),
+    ("G2", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.name, &reason))) {"),
+    ("G8", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.name, &reason))) {"),
+    # G3 is DELIBERATELY WEAKER than the break it guards, and that is the whole
+    # entry. Its record fences two lines and substitutes the second, because that
+    # second line - `retire_all(closing(&shared)).await;` - occurs THREE times in
+    # `group.rs` and is unique only under the arm above it. A row carries one
+    # literal, and a two-line literal is a fragment by the check at :933.
+    #
+    # So the row is a rot tripwire on the **arm**, not on what the arm does.
+    # Rename `Verdict::StopAll`, delete the arm, restructure the `match`, or
+    # re-indent it, and this reddens. Change the arm's BODY and it does not —
+    # including this record's own substitution, which edits the line below and
+    # leaves the header untouched. That is the cost of a one-literal row where the
+    # break needs a two-line fence, and it is taken knowingly.
+    #
+    # An earlier version of this entry claimed the row also reddens if you "move
+    # the teardown out of that arm". **That was false for the record's own break**
+    # and the merge gate caught it. Weaker-and-registered still beats
+    # unregistered-with-a-reason: an unregistered record rots in silence. What it
+    # does not beat is a row whose entry overstates what it catches.
+    ("G3", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "            Ok(Verdict::StopAll) => {"),
+    ("G4", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "            Ok(fut) => retiring.push(guarded(fut)),"),
+    # G5 was re-quoted after the `EndingPanicked` fix, and BOTH halves had rotted.
+    # The fix made that line the block's value, so it lost its semicolon and the
+    # registered literal counted 0 — loud, an `ABORT` at the grep before any
+    # backup. The SUBSTITUTION had rotted too, and that half was quiet: the old
+    # `let _ = at;` yields `()`, so the break became `error[E0609]: no field
+    # `retire` on type `()`` and still printed `── exit=101`. **A rotted anchor and
+    # a rotted substitution are two failures and only the first is loud.** Third
+    # time on this branch that a dead break reported the same exit as a caught one.
+    #
+    # The whole line is required and the fragment is not unique: bare
+    # `held.members.remove(at)` occurs TWICE in `group.rs` — the conductor's, and
+    # `Group::remove`'s `let removed = held.members.remove(at).retire;`. Only the
+    # twelve-space whole line resolves once.
+    #
+    # **Leaving the decided member on the books stopped being expressible in one
+    # line**, structurally: the block must now yield an owned `Entry`, and the only
+    # way to obtain one is to take it out, because `Entry` holds a boxed `FnOnce`
+    # and is not `Clone`. So the break takes the WRONG member instead. The
+    # observable the test reads is unchanged — the decided member is left filed and
+    # `names()` returns it — so the claim survives and only the mechanism moved.
+    # The extra removal is a side effect the test does not read.
+    ("G5", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "            held.members.remove(at)"),
+    ("G6", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "                entry.name == reported.name && entry.generation == reported.generation"),
+    # G7 was proposed as `held.staged.drain(..)` and is registered as its enclosing
+    # line. The bare call is a fragment; the `for` header is the line.
+    ("G7", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "                for staged in held.staged.drain(..) {"),
+    # G9 guards the dropped-group ending, whose break empties a three-line
+    # `Shared::drop` body. This is the inner line of that fence, whole and unique.
+    ("G9", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "        self.wake.notify_one();"),
+    # G10's break swaps `abort` for `stop`. It reddens at the NO_PROGRESS bound at
+    # 60.00s rather than by assertion, because `supervise` polls its inbox only
+    # inside `run_loop` and never across either sleep, so a `stop`-based teardown of
+    # a member in backoff cannot return until that backoff elapses. Measured.
+    ("G10", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "            handle.abort();"),
+    ("G11", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "            let reason = guarded(ended).await.map_err(|panicked| panicked.bare());"),
+    # G12's other half is G14, one record reaching across two files. Both print the
+    # SAME failure sentence, so nothing in the output says which was applied - the
+    # record says to run one at a time and label the log.
+    ("G12", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "        match catching(member.end) {"),
+    ("G13", "keylink/tests/compose.rs", "keylink/src/local.rs",
+     "if !restarting {"),
+    ("G14", "keylink/tests/compose.rs", "keylink/src/panic.rs",
+     "            Err(panic) => Poll::Ready(Err(Panic::caught(panic))),"),
+    # G15 guards a bug the merge gate found: the reported member's `Entry` was
+    # removed and DROPPED, so on `EndingPanicked` the group retired every healthy
+    # member and left running the one member it could no longer hear — with the
+    # only `Retire` anybody had for it gone.
+    #
+    # Its substitution is `drop(taken);`, which is the code as it stood before the
+    # guard existed. So this is a regression in the literal sense: the break
+    # restores the defect rather than inventing one, which is the strongest shape
+    # a record can have and is worth saying where it is rare.
+    ("G15", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "                leaving.push(taken.retire);"),
+    # ── the keyed side ───────────────────────────────────────────────────────
+    #
+    # K1 and K2 share a literal for the R15/R16 reason: two records, two rows. K1
+    # claims a waiter is handed the loop's reason; K2 claims that reason survives the
+    # two hops a `Group` adds. **That substitution reddens FIVE tests**, so a
+    # whole-target run under it says nothing about any single guard.
+    ("K1", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
+     "            let _ = waiter.tell.send(why.clone());"),
+    ("K2", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
+     "            let _ = waiter.tell.send(why.clone());"),
+    # K3 and K3b are the two DIRECTIONS of one claim, both measured. `= vec![..]`
+    # keeps only the last and fails by value in 0.00s; `if is_empty() { push }` keeps
+    # only the first and fails at the bound in 60.00s. A single-slot list fails either
+    # way, and which way says which slot survived. A list that stays permanently EMPTY
+    # is still indistinguishable from keep-first, and the test now reads both
+    # observables into locals before asserting either so the message names the
+    # direction rather than leaving it to which assertion fired.
+    ("K3", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
+     "        self.lifecycle.push(Arc::new(lifecycle));"),
+    ("K3b", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
+     "        self.lifecycle.push(Arc::new(lifecycle));"),
+    ("K4", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
+     "        for waiter in waiters {"),
+    # K5's local is `mine` and its FIELD is `generation`, which is not a slip. Spelled
+    # `waiter.generation != generation` the line runs to 101 characters and rustfmt
+    # breaks it into three - turning a one-line anchor into a fence, which is the
+    # shape G3 above is already paying for. The field carries the shared vocabulary
+    # `names.rs` uses and the local absorbs the width.
+    ("K5", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
+     "            under.get_mut().retain(|waiter| waiter.generation != mine);"),
+    ("K6", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
+     "                under.remove();"),
+    # K7 is the VALUE half only, and its liveness half is registered NOWHERE on
+    # purpose. That substitution does go red, and it goes red for the wrong reason:
+    # returning `Pending` from an arm that only runs after the receiver has already
+    # answered polls a completed `oneshot::Receiver` twice, and tokio refuses it at
+    # `oneshot.rs:1291` with `called after complete`. The claim is that a waiter
+    # nobody can report to is ANSWERED rather than left waiting, and a
+    # receiver-contract panic does not test that. A faithful break would have to leave
+    # the receiver unpolled, which an arm downstream of its resolution cannot do.
+    # **A guard that is red for the wrong reason keeps passing once its claim stops
+    # being true, so it is worth less than no guard.**
+    ("K7", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
+     "            Poll::Ready(Err(_)) => Ended::Vanished,"),
     # ── THE FIRST SHELL ROWS, and the reason this file grew a `#` marker at all.
     # `lives_in` is `scripts/hook-guard.sh` for all twelve and `target` is
     # `.githooks/pre-push`, so every one is CROSS-FILE.
@@ -2447,7 +2594,114 @@ for record in sorted(set(REDNESS) - row_ids):
 # row" one edit after that, then an arithmetic landing one short. All three were written
 # while the tree was still moving, which is exactly what a carried figure is.
 #
-# 127 → the figure below, and this one moved for a reason NO previous entry had: the
+# **The three entries below say `127 → 141 → 148 → 149` and the one after them says
+# `127 → 132`, and both are frozen at what they measured.** They were written on two
+# branches that each started from 127 and neither could see the other. Each said "the
+# figure below" when the figure below was its own; after the merge that phrase pointed
+# at a number neither entry had measured, so each now names its own. Freezing a record
+# at what it measured is the opposite of turning it into a running total — the running
+# total is what "the figure below" silently became.
+#
+# 127 → 141, on `compose-group`, for `compose::Group`. **FOURTEEN new
+# blocks, all in `keylink/tests/compose.rs`, and NO new row yet.** Read off a FAILURE,
+# the way every figure above it was: the constant was left at 127 and the pre-commit
+# hook answered `141 comment blocks mention break-once.sh` from the walk.
+#
+# The accounting, because the delta is not the number of new tests and an auditor
+# cannot re-derive it from the two ends. The file went from 15 tests to 29, and from
+# 11 blocks to 25; the rest of the tree is unchanged at 116, and 116 + 25 = 141.
+# Fourteen blocks against twelve reddenable claims, because:
+#
+#   THIRTEEN carry a `Watched:` line. Several name a break that is honest about
+#            covering only half of what the test asserts, which is a block each and
+#            a row each once measured. One test carries TWO, because a panicking
+#            retire closure and a panicking retire future are two defects.
+#   ONE      carries no `Watched:` line at all: `members_are_reported_in_the_order_they_were_added`,
+#            whose defect is `Vec` → `HashMap` — a field type, an insert and a read.
+#            `break-once.sh` substitutes ONE literal, so it cannot express a
+#            restructure, and the block exists to say so rather than to claim a
+#            guard. That is exactly the case `rfc-07-the-turn-model.md:2280-2285`
+#            set the precedent for with `two_clones_of_a_pool_share_one_rotation`.
+#
+# **This entry named the wrong test for that block on its first writing**, and said
+# the `A -> B -> A` claim instead. Both are un-breakable and only one of them is the
+# block: the cycle claim lives in a `compile_fail` doctest in `group.rs`, which
+# mentions the harness nowhere and therefore contributes NO block at all. The count
+# was right and the noun was wrong, which is the failure this file's own notes keep
+# warning about — it was found by walking the blocks, not by re-reading the number.
+#
+# **No row is added here, and that is deliberate rather than an omission.** A row
+# claims a literal resolves exactly once and that the record quotes it. Both are
+# true only after the break has been RUN, and these thirteen still read
+# `Watched: TO BE MEASURED`. Registering them now would pin a literal against a
+# failure nobody has watched, which is the defect this whole task exists to catch.
+# The rows land with the commit that replaces those thirteen lines with real output.
+#
+# 141 → 148, same branch, for `compose::Endings` and the keyed side.
+# Read off a FAILURE like every figure above it.
+#
+# The accounting, measured on this tree and not subtracted between two ends:
+#
+#   +6  `keylink/tests/compose.rs`, 25 → 31. Four keyed-side tests, one block each,
+#       plus two records restored — see the paragraph below. The compose target
+#       goes 29 tests to 33.
+#   +1  `keylink/src/panic.rs`, 0 → 1. `guarded` became a named future so that
+#       `retire_all` can annotate its `FuturesUnordered`, and the block records
+#       that three anchors quote that function and a rewrite re-quotes all three.
+#
+# **This entry first said 146, +4 and +1, and every one of those was measured.**
+# `mise run anchors` was run by hand, answered 146, and the accounting was written
+# to match. The pre-commit hook then answered 148 and refused the commit. Nothing
+# was miscounted: a second agent held the pen, and the failing run and the commit
+# were two measurements of two different trees. **So "read the number off a failing
+# run" is necessary and is not sufficient.** It protects against computing a figure.
+# It does not protect against the tree moving between the read and the use, and
+# that window is invisible — a stale number and a fresh one are the same digits on
+# the page. What closes it is holding still: one writer, and the count taken in the
+# same commit that consumes it.
+#
+# The two restored blocks are the reason the figure moved twice. That agent had
+# replaced two `Made red by ...` records with descriptive prose. The prose is
+# better and is kept. Deleting the records is not, and they are back above it: a
+# record names the substitution that reddens the test, and a deleted record is a
+# guard this walk stops counting — the population falls, the constant agrees, and
+# the check passes over a claim nobody can replay. **A block count falling is the
+# quiet direction, and nothing here would have said so.**
+#
+# **The thirteen above is now TWENTY, and the sentence above is left as it was
+# written.** It was accurate for the transition it describes; editing it to match a
+# later tree would turn a record into a running total, which is the one thing this
+# file keeps saying a record must not become.
+#
+# **Still no row, and for the reason the entry above gives, now on more evidence.**
+# The agent that wrote all seven of the new and rewritten records reported plainly
+# that it ran `break-once.sh` zero times: it verified each literal resolves exactly
+# once and verified two replacements COMPILE, which is neither the same thing as a
+# red test nor claimed to be. Twenty `Watched: TO BE MEASURED` lines is the honest
+# state. The rows land with the commit that replaces them with real output.
+#
+# 148 → 149, same branch, for the merge gate's two Major findings.
+# Read off a FAILURE: the constant was left at 148 and `mise run anchors` answered
+# `149 comment blocks`. ONE new block, in `keylink/tests/compose.rs`, 31 → 32:
+# `an_ending_that_panics_retires_the_member_it_could_not_hear`, which guards the
+# bug the gate found — the reported member's `Entry` was removed and DROPPED, so
+# `EndingPanicked` retired every healthy member and left running the one member
+# the group could no longer hear, with the only `Retire` anybody had for it gone.
+#
+# The second fix adds no block on purpose.
+# `a_stop_the_conductor_has_not_seen_is_lost_when_the_last_group_drops` is a
+# regression pin with no substitution, so its record never names the harness and
+# this walk cannot see it. That is the honest state and not an omission: a `stop`
+# raised on state the drop destroys has a one-line documented remedy and no
+# one-line break.
+#
+# **This bump was taken twice.** The first reading was 149 too, and it was
+# discarded rather than used, because a record was still being re-quoted and a
+# count carried across somebody else's edit is the defect this file's own notes
+# keep naming. The number came back the same. That is a coincidence worth nothing
+# and the re-reading is worth the turn it cost.
+#
+# 127 → 132, and this one moved for a reason NO previous entry had: the
 # WALK widened rather than the tree gaining a record. `scripts/*.sh` and `.githooks/*`
 # joined the population, contributing FIVE harness blocks — two in
 # `scripts/hook-guard.sh`, one each in `break-hook-record.sh`, `break-once.sh` and
@@ -2478,7 +2732,26 @@ for record in sorted(set(REDNESS) - row_ids):
 #
 # What is NOT claimed: that 132 is a count of break records. It is a count of blocks
 # naming the harness, three of which are the harness itself.
-RECORD_BLOCKS = 132
+#
+# 149 and 132 → the figure below, at the merge of `compose-group` into `main`. **The
+# two entries above are the only pair in this file that do not chain**, and that is
+# the entry: they are siblings, not steps. Both start at 127, neither could see the
+# other, and the merged tree carries BOTH causes — twenty-two new record blocks on
+# this branch, and a walk that widened to read `scripts/*.sh` and `.githooks/*`.
+#
+# **149 + 5 = 154 is arithmetic, and arithmetic is not a method here.** It assumes the
+# widened walk finds exactly the five blocks it found on `main` and not one more in
+# the files this branch added — and this branch added no shell file, so the assumption
+# looks safe, which is precisely when it is worth not making. The constant was left at
+# 149 and the task asked: it answered `154 comment blocks mention break-once.sh`.
+#
+# **The measurement agreed with the arithmetic, and that is evidence of nothing.** It
+# is the same shape as the 149 bump above, which was read twice and came back the same
+# — a subtraction that lands on the measured figure reads as a derivation, and the
+# next person to skip the run gets the wrong number on a tree where the two diverge.
+# The agreement is recorded because hiding it would make the run look load-bearing in
+# a way this one was not, and the run is kept because the NEXT one will be.
+RECORD_BLOCKS = 154
 
 # The one marker the tripwire counts, and the two phrasings records use INSTEAD of
 # naming the harness. Both are read by the same walk, so the blind spot below is a

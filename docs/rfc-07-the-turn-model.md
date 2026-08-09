@@ -3907,3 +3907,237 @@ like this one. Better still, prose should cite the **guard** — here
 `tests/protocol.rs::the_contract_hash_has_not_moved` — rather than its value, and then
 there is nothing to sweep. Where the literal *is* the record, as in RFC-05 §12 and
 RFC-04 §16.13, it cannot be removed and a pointer is the only honest treatment.
+
+---
+
+## 14. `compose::Group` — §9.8's caveat, built as fate sharing rather than as a strategy
+
+Appended rather than edited, per `CONTRIBUTING.md:322`. Not one claim in §8 or §9
+is touched: what they say is what was believed when those waves landed, and this
+section is what building the caveat found afterwards. Read together, the pair is
+the record.
+
+**Numbered 14 rather than 9.11, deliberately.** The next unused §9 subsection
+number *is* 9.11 — §9.10 is the last one — but this file's habit for later work
+that overturns an earlier section is a new top-level section that answers it by
+name, not a subsection slotted back into the middle. §11 does exactly that to
+§10.8, and §12.7 corrects §9.10 from inside §12 rather than from inside §9.
+Appending means appending.
+
+### 14.1 What shipped
+
+`keylink::compose::Group`, in `keylink/src/compose/group.rs`. It is a **plain
+struct and not an actor**: an `Arc` of shared state and one spawned task. No
+mailbox, no `service!`, no ALPN, no turn, and nothing on the wire.
+
+- **The policy is caller-written and synchronous.** `Group::new` takes
+  `impl FnMut(&ActorId, &Ended) -> Verdict + Send + 'static`. It returns a
+  verdict rather than a future, and it runs on the group's own task.
+- **Exactly two verdicts**, and there is no third. `Verdict::Forget` carries on
+  without that member; `Verdict::StopAll` retires every other member and ends the
+  group. §14.5 is the argument for the ones that are not there.
+- **One conductor task decides everything.** `conduct` waits on two inputs with
+  no `select!` — `tokio`'s `macros` feature is off for `wasm32-unknown-unknown` —
+  so it is the hand-written `poll_fn` the actor loop already uses.
+- **A member is two values, not a handle.** `Membership::new` takes the actor's
+  own ending and a closure that ends it. The motivating pair, `Reserve` and
+  `Charge`, are different services with different handle types, so there is no
+  one `H` to be generic over. That is why this is not `Pool<H>`'s shape.
+- **Teardown is reverse insertion order, issued concurrently.** `closing` drains
+  the member `Vec` `.rev()`; `retire_all` builds every retire future before
+  polling any.
+
+Cited by item name rather than by line, on purpose: these are the durable
+anchors, and a line number in a file that is still growing is a citation that
+rots. `local.rs`, `blocking.rs` and `names.rs` are unchanged by this work, so
+those keep their lines.
+
+**The policy is asked once per member, and no filter here decides which endings
+are final.** A supervised actor's incarnations run inside one task and only that
+task's exit publishes an ending at all — §9.2's third property, and
+`a_restart_is_not_an_ending` is that sentence as a test. So every ending a group
+is handed already is a final one, and a member's own restarts are structurally
+unable to reach the policy.
+
+### 14.2 §9.8's caveat, answered — it named three wanted things, and this is all three
+
+§9.8's caveat (lines 2690-2695 of this file) is the authority this feature exists
+under. It says the dead-pid argument *"defeats sibling-restart strategies and
+does not touch **ordered shutdown, escalation, or lifecycle grouping**. Those are
+judged wanted."*
+
+| the caveat's word | what delivers it |
+|---|---|
+| **lifecycle grouping** | the type. A `Group` is a set of actors held as one thing, with `add`, `remove` and `names` over it |
+| **ordered shutdown** | `closing` drains the member `Vec` in `.rev()`, so retirement is *issued* newest-first. Members live in a `Vec` and not a map precisely so that there is an order to reverse |
+| **escalation** | a group held as a member of another group. `StopAll` ends the child; the parent watches the child's ending and decides in turn |
+
+**Escalation is a composition rather than a variant, and its mapping is lossy
+rather than free.** `Group::ended` yields a `GroupEnded` and `Membership::new`
+wants an `Ended`. There is no total mapping and `Ended` has no variant meaning
+"a group ended", so the caller writes the lossy one it wants. The module doc
+carries that example rather than claiming nesting is free.
+
+The caveat's own closing sentence is the line the whole design divides on: *"a
+group that shuts down in an order is a statement about several actors, and
+supervision as built is a statement about one."* It divides on **what the thing
+does** — restart versus grouping — and not on which module it lives in. That is
+why this half was buildable while the restart half was not.
+
+### 14.3 §8.7's "Supervise anything" row is now false, and this is what replaced it
+
+Lines 2270-2278 of this file say, of Wave 7:
+
+> **Supervise anything.** … `compose` still holds no supervision mechanism of its
+> own, and that is the design rather than an omission.
+
+**The last clause is now false.** `compose` holds one. The row's two halves were
+always different claims and only one of them fell:
+
+- **Still true, untouched.** `Pool` restarts nothing, `pick` keeps handing back a
+  stopped actor's handle and the call answers `MailboxClosed`, `Names`
+  unregisters on ending and does not re-spawn, and a member built with the
+  generated `supervised()` restarts *itself* with nothing in `compose` knowing.
+- **Now false.** That `compose` holds no supervision mechanism of its own.
+  `Group` is one. It restarts nothing — that is still the member's own job — but
+  noticing that a member ended and acting on it across a set is a supervision
+  mechanism, and calling it composition would be a word doing work the code is
+  not doing.
+
+The same sentence sat in `keylink/src/compose/pool.rs`'s "Not a supervisor"
+bullet and is corrected **in place** there, in the commit that lands the module.
+The asymmetry is the house rule and not an inconsistency: an RFC records what was
+believed and is appended to; a doc comment is what a user reads as currently true
+and is corrected.
+
+### 14.4 §8's count, against the unit it names
+
+§8's opening (lines 2060-2062) says `keylink::compose` is *"one `pub mod` with
+four types and two functions in it"*, under a first line calling them *"five
+patterns"*.
+
+**Name the unit or the correction is worthless.** That sentence counts **headline
+types, one per pattern**, and by that unit it is now **five types and two
+functions** over **six patterns**. By the unit of public exports it is a
+different number and neither corrects the other: `compose` re-exported eight
+types and two functions, and now re-exports thirteen and two, because `Group`
+brought five public names — `Group`, `GroupEnded`, `Membership`, `Retire` and
+`Verdict`.
+
+`Retire` is the one a reader would not have predicted from the design, and §14.7
+is where it came from.
+
+### 14.5 Every restart verdict refused, and the sharpest reason is a visibility one
+
+Three were proposed. All three are gone.
+
+**`RestartAll` (`one_for_all`) and `RestartAfter` (`rest_for_one`)** fall to
+§9.8's own line — the dead-pid argument defeats sibling-*restart* strategies —
+and §9.2 (lines 2513-2519) is that argument in full. Two further reasons, neither
+of which is that line: rebuilding every member from its own commit point is
+**not** a consistent cut, because members commit independently and nothing
+coordinates them; and `RestartAfter`'s ordering is a *startup dependency*, which
+a group would be inferring from insertion order — a different fact wearing the
+same shape.
+
+**A single-member `Verdict::Restart`** is the one that had to be argued rather
+than cited. It survived the first draft. Three independent facts killed it.
+
+1. **It could not be bounded, and the reason is module visibility rather than
+   design.** The draft bounded group restarts with an `Intensity`. `Intensity`'s
+   entire public surface is `pub fn new` — `keylink/src/local.rs:2009`, and it is
+   the only `pub` item in that `impl` block. `backoff` is private
+   (`local.rs:2028`) and `Budget` is a private struct (`local.rs:2274`).
+   `compose` is a sibling module, so it cannot spend an `Intensity` at all. The
+   promise *"nothing in `local.rs` changes"* and the promise *"group restarts are
+   bounded by an `Intensity`"* could not both hold, and the draft made both.
+2. **It re-creates the stale reference this crate does not have.**
+   `spawn_supervised` builds a fresh `mpsc::channel` (`local.rs:2918` and
+   `local.rs:2924`), so a group-driven rebuild produces a new mailbox and every
+   handle a caller holds is dead. Issue #3's dead-pid argument is about a problem
+   keylink *avoids*; a group restart would import it.
+3. **It bought one shape and cost seven.** Given §14.6's limit, the only safe
+   shape was a local member republished through `Names` — a call site that writes
+   the same `ActorId` twice and calls `ended()` twice on one actor. It paid for an
+   `Intensity` argument, a re-entrant `FnMut` factory that can panic on the
+   group's own task, a precondition no type catches, an `OutOfRestarts` ending,
+   and a policy blind to the budget it spends.
+
+**Dropping it cost nothing that §9.8 asked for.** Escalation is delivered without
+it (§14.2), and dropping it makes **adoption the only mode**: `add` takes a
+`Membership` built from an actor that is already running, so there is no factory
+anywhere in the surface.
+
+### 14.6 The limit: a keyed actor cannot be a member, and it is stated rather than discovered
+
+`Membership` needs the member's ending, and **a keyed actor has no `ended()` to
+ask for**. `keylink/src/compose/names.rs:129` says so one type over, and §5.7
+(line 1235) has listed it as missing since Wave 3: *"Give a keyed actor an
+`ended()` channel. It is the one thing `spawn_wired` does not deliver."* §9.10
+records it as still Wave 9's.
+
+So `Group` watches **local actors only**, today. What closes it costs nothing
+here: `Membership::new` takes the ending **as an argument** rather than asking a
+handle for one, so it needs no change the day §5.7's gap lands. A constructor
+that took a handle would have needed one, and an earlier draft had exactly that
+constructor.
+
+### 14.7 Two claims narrowed under review, which is the part of this record worth keeping
+
+Both were written as impossibilities. Both are weaker than that. Recorded because
+a false impossibility is the kind of claim somebody later builds on.
+
+**"`A → B → A` is unwritable" was false.** A synchronous policy cannot *await*,
+which is what the draft meant, but nothing stops it from **blocking**: a
+`std::sync::Mutex` an actor holds across an await needs no dependency at all, and
+a blocking executor entry point is already in this tree's dependency graph —
+`block_on` reaches `n0_future::future` through its glob re-export of
+`futures_lite::future` (`n0-future-0.3.2/src/lib.rs:79`, and
+`futures-lite-2.6.1/src/future.rs:52-53`, where it is `pub` under
+`#[cfg(feature = "std")]` rather than unconditional, which the draft also had
+wrong).
+
+What survives a hostile reader is narrower, and it is what the module claims:
+
+> **No cycle can be built out of keylink calls.** The policy has no await point,
+> and a group is never *told* anything — it only observes endings. There is no
+> call from a member into a group for a cycle to close through …
+
+The sentence continues in the module, and it is the rest of the answer: keylink's
+own synchronous API cannot open one either. `blocking::Runtime::run`
+calls `guard()?` and answers `Error::BlockingInAsync`
+(`keylink/src/blocking.rs:77-80`), and a *local* handle has no blocking method at
+all. The residual is stated rather than denied: caller code that blocks inside
+the policy stalls the group, because the group takes one decision at a time in
+one task. **A caller error with a symptom, not an impossibility.**
+
+**"`abort()` + `ended()` solves the teardown race" proves less than it sounds
+like.** It proves the member's **task is gone**, via the dropped-sender path
+(`local.rs:3265`). It does **not** prove that the member's observers released
+what they held, and the tree already says so on `stop`'s own documentation
+(`local.rs:3282-3284`): *"Waits for the receiver to be dropped, which is the loop
+ending — not for the state's own `Drop` to have run. A state that flushes in
+`Drop` needs its own signal."* So a durable adapter's file claim can still be
+open at the moment a group reports that it ended. `Retire::retire` carries that
+limit at the door a caller actually calls, rather than leaving it one type away.
+
+The recommendation to build a `Membership` with `abort` rather than `stop` has
+evidence and not taste: `stop` puts a message in the mailbox, and `supervise`
+polls the inbox only inside the run loop and never across a backoff sleep — so a
+`stop`-based teardown of a member sitting in backoff cannot return until that
+backoff elapses.
+
+### 14.8 No criteria-and-breaks table here, and the absence is deliberate
+
+§9.9 and §12.8 are this file's habit: a criterion is recorded beside the break
+that was **watched** to redden it. At the time this section was written
+`keylink/tests/compose.rs` contains no `Group` test and no break has been run.
+A table here would be a claim about work that has not happened, which is the one
+thing §9.9 exists to prevent. It is owed, and it belongs to the commit that lands
+the tests.
+
+One thing is already known about it and is cheaper to say now than to discover
+twice: `scripts/break-once.sh` substitutes one literal, so a claim whose defect
+is a *restructure* cannot be reddened by it at all. §8.7's own note about
+`two_clones_of_a_pool_share_one_rotation` (lines 2279-2284) is both the precedent
+and the treatment — say so here, rather than count it as a proven guard.
