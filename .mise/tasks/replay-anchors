@@ -208,7 +208,7 @@ MISE description="Replay each REDNESS row's break and check it reddens its own g
 #     exit 1. The probe's own `sleep` still died, so the process-group half of that
 #     call is not what this perturbation proves.
 #
-# ── AND IT IS IN NO GATE, WHICH IS A CORRECTNESS CLAIM AND NOT A SPEED ONE ─────
+# ── AND THE REPLAY IS IN NO GATE, A CORRECTNESS CLAIM AND NOT A SPEED ONE ──────
 #
 # The REPLAY edits the tree. `break-once.sh` restores a backup on EXIT, so a run
 # racing an uncommitted edit restores OVER it — which is why this refuses a dirty
@@ -220,13 +220,22 @@ MISE description="Replay each REDNESS row's break and check it reddens its own g
 # guard a record describes. Reviewer-run rather than author-run is the point — the
 # author already ran it once, and that run is the thing being re-checked.
 #
-# `--selftest` is a different animal, and the heading above does not cover it: it
-# edits nothing, runs no cargo, and writes only inside the system temp directory, so
-# it is gate-safe on the same terms as `anchors-selftest`. It is not registered in a
-# gate only because `mise.toml` is a different file from this one. Whoever registers
-# it should say in the same breath that it checks the CLASSIFIER and never a record —
-# and should know that it cannot finish faster than the two seconds its kill probe
-# waits, which is a floor read off the constant and not a timing measurement.
+# `--selftest` is a different animal, and the heading above says REPLAY for that
+# reason: it edits nothing, runs no cargo, and writes only inside the system temp
+# directory, so it is gate-safe on the same terms as `anchors-selftest`. **And it IS
+# registered**, in `mise.toml`'s `gate` list, after that list's text-only checks and
+# placed by its own cheapest-first rule. Deliberately NOT in `pre-commit`: that
+# hook's filter tests for Rust and this file is not Rust, so there it would fire only
+# by coincidence. The entry passes `args = ["--selftest"]` rather than a flag inside
+# the task name, so nothing depends on how a wrapper parses a flag.
+#
+# What it checks is the CLASSIFIER and never a record. It cannot finish faster than
+# the two seconds its kill probe waits, which is a floor read off the constant and
+# not a timing measurement.
+#
+# The heading said "IT IS IN NO GATE" until one of its arms became a gate step. A
+# heading that covers less than its words claim is the trap this file spends
+# paragraphs on elsewhere, so the subject is now named in the heading itself.
 #
 #     mise run replay-anchors            # every row in REDNESS
 #     mise run replay-anchors L5 A5      # named rows only
