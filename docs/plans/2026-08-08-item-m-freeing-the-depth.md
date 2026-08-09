@@ -57,11 +57,47 @@ actor on the current call chain. **That is wrong, and it catches only `tell`.**
 
 ## 3. Identity, chain, propagation, check
 
-**Identity.** Local actors have none: `LocalActor` holds `mail`, `ended`, `fate`,
-`busy`, `task` and nothing else. Add a private `ActorId(NonZeroU64)` minted from
-a `static AtomicU64` with `fetch_add(.., Relaxed)` — `Relaxed` because the
-counter orders nothing, matching `Watched::mark_busy`. `NonZeroU64` so that
-`Option<ActorId>` stays 8 bytes. Cost per turn: zero.
+**Identity costs zero new fields, and it is the `Arc` and not its address.**
+`LocalActor` holds `mail`, `ended`, `fate`, `busy`, `task` and nothing else.
+`spawn_fed` makes one `Arc<AtomicBool>` at `local.rs:2837`, clones it at `:2838`,
+and hands one to `run_loop` inside `Watched`; `Clone` shares it at `:3466`. So
+that `Arc` already identifies the actor, uniquely and across every clone.
+
+**A first version of this used `Arc::as_ptr` as a `usize`, and that is a false
+positive waiting to happen.** The argument for it was: the chain only holds
+actors whose turns are on the stack, and such an actor's loop is alive, so the
+allocation cannot be freed. **That is true of the innermost identity and false of
+the ancestors**, which travel in the message and name actors that were alive when
+it was sent. The reachable sequence: A calls B; A is aborted and every handle
+dropped, freeing the allocation; C spawns onto the same address; B calls C, and C
+is refused as if it were A. A live, unrelated actor is refused — worse than a
+missed detection, because it breaks a working program with a named error.
+
+Address reuse here is the default rather than a corner: a probe allocating an
+`Arc<AtomicBool>`, recording the pointer, dropping and reallocating hit the same
+address **1000 times out of 1000**. (The reachability of the abort inside the
+window was reasoned, not measured. It does not change the decision, because the
+fix is free.)
+
+**So `Chain` holds `Arc<AtomicBool>` clones and compares with `Arc::ptr_eq`.** A
+strong reference keeps the allocation alive for exactly the window the chain uses
+it, so the address cannot be reused inside it. An `Arc` is a non-null pointer, so
+the entry is the same 8 bytes a `usize` costs and `Chain` keeps its niche. One
+atomic increment per chain entry, paid only on the nested path.
+
+Two guards, both required. **A private newtype from the start** —
+`struct Actor(Arc<AtomicBool>)`, private to `local.rs`, never public and never
+`#[doc(hidden)] pub`; `local.rs:294-297` is the scar this avoids. And **chain
+membership and nothing else**, written where the type is defined: it is not a
+handle, not a key, and must never enter a map that outlives a turn.
+
+**Reaching it from `run_loop`**, which is generic over `I: Inbox<A, M>` where
+`Keyed` and the bare receiver have no busy cell: add
+`fn identity(&self) -> Option<Actor> { None }` to the private `Inbox` trait.
+`Watched` returns its `busy`; the bare receiver keeps the default, which the
+supervision tests want; a keyed residual is stated rather than hidden. This is
+`Inbox::mark_busy`'s idiom verbatim (`local.rs:1364-1373`, "Written by whoever
+has somewhere to put it").
 
 **The chain is a `thread_local!`, not a task-local**, and the reason binds:
 `tokio::task_local!` sits behind tokio's `rt` feature, which this crate enables
