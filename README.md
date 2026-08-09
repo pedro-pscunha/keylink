@@ -175,7 +175,7 @@ ledger.post(1).await?;             // the observer ran before this returned
 
 match ledger.ended().await {
     Ended::Stopped              => {}
-    Ended::Observer { name, .. } => error!("{name} gave up; the turn was not committed"),
+    Ended::Observer { name, .. } => error!("{name} ended it; the turn was not committed"),
     _ => {}
 }
 ```
@@ -187,6 +187,13 @@ lookup, and `ended()` adds that observer's own error — `Undelivered::Gone` mea
 reaches a peer as `Failed("observer refused: ..")`
 rather than `NoSuchActor`, which would say "there is nothing here, stop asking"
 about a turn that ran.
+
+**An observer that panics is a third answer and not that one.** The value is
+withheld either way — a veto says "do not commit", a crash says nobody read back
+whether it committed — but the caller is told
+`Undelivered::ObserverPanicked { name }`, and a peer reads
+`Failed("observer panicked: ..")`. Reporting a crash as a refusal named a decision
+nobody made.
 
 The actor owns its observers, so nothing is shared and no `Sync` bound appears
 anywhere. `after_turn` returns a boxed future rather than being an `async fn`,

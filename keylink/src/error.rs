@@ -51,11 +51,22 @@ pub enum Error {
     #[error("peer closed the connection")]
     Closed,
 
-    /// The serving side refused the call.
+    /// The serving side answered with a [`RemoteError`](crate::RemoteError)
+    /// instead of a value.
     ///
-    /// The handler, or a layer above it, said no. Distinct from a transport
-    /// failure: the call arrived, was understood, and was declined.
-    #[error("remote refused: {0}")]
+    /// Distinct from a transport failure: the call arrived and was understood.
+    /// What happened next is whatever the inner error says, and this layer does
+    /// **not** narrow it — the arm in `rpc.rs` that builds this wraps every
+    /// `RemoteError`, including [`Failed`](crate::RemoteError::Failed) carrying
+    /// the `"panicked: "` prefix and [`TimedOut`](crate::RemoteError::TimedOut).
+    ///
+    /// **It read *"remote refused: {0}"*, over a doc that said the call "was
+    /// declined".** Neither is true of a handler that exploded or of a deadline
+    /// that expired, so a client whose remote handler panicked read
+    /// *remote refused: panicked: ..* about a call nobody declined. The word
+    /// belongs to [`RemoteError::REFUSED`](crate::RemoteError::REFUSED) and its
+    /// siblings, one layer in, which say which of them happened.
+    #[error("remote error: {0}")]
     Remote(#[from] crate::RemoteError),
 
     /// The peer speaks a different schema.

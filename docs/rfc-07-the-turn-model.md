@@ -1127,14 +1127,18 @@ records.
   makes this the supervised case rather than a rename of the test above it.
 - `turns::every_turn_lost_except_faulted_has_one_undelivered_twin_with_the_same_words`
   — one fact reads as one sentence whichever door a caller came through. Two
-  exhaustive matches, so a seventh variant in either enum is `E0004`. Broken twice,
+  exhaustive matches, so one more variant in either enum is `E0004`. Broken twice,
   because one break exercises the equality and the other the coverage: changing one
   character of `Undelivered::Dropped`'s `#[error]` text watches `one fact must read
   as one sentence: Dropped and Dropped`; pointing `slot`'s `Undelivered::Expired`
   arm at `0` watches `every variant is written exactly once, and this one was
-  written 2 times: [2, 1, 1, 1, 0, 1] at slot 0`. **That second record predicted
+  written 2 times: [2, 1, 1, 1, 1, 0, 1] at slot 0`. **That second record predicted
   slot 4 and "written 0 times" and the run said slot 0 and 2** — the loop walks the
   slots in order, so the doubled slot is reached before the emptied one.
+
+  Both enums grew a seventh variant, `ObserverPanicked`, and the `E0004` above is
+  what named every site. The array in that second watched sentence is seven long
+  now and was read off the re-run, never edited to fit.
 
   Its residual is named where it lives and is narrower than it first reads. `EVERY`
   and `lost` are two hand-written sample arrays, and `E0004` forces an author into
@@ -3741,7 +3745,7 @@ two lines now, and `scripts/replay-fate-breaks.sh` runs the whole set.
 | `local::a_supervisor_that_refuses_a_restart_answers_gone_rather_than_running` | the refusal arm answers `Standing::Running` |
 | `registry::abort_settles_the_served_answer_before_it_destroys_the_actor` | `System::abort`'s settle → `Standing::Running` |
 | `registry::an_expired_shutdown_budget_settles_the_served_answer_before_the_abort` | `drain`'s settle → `Standing::Running` |
-| `remote::no_other_served_failure_begins_with_one_of_the_four` | `RouteError::AtCapacity`'s `Display` gains a `"dropped: "` prefix |
+| `remote::no_other_served_failure_begins_with_one_of_the_five` | `RouteError::AtCapacity`'s `Display` gains a `"dropped: "` prefix |
 | `defer::a_local_caller_and_a_peer_agree_about_an_abandoned_deferred` | `lost`'s `Standing::Running` arm → `NoSuchActor` |
 | `defer::a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer` | the same arm → `Failed("panicked: bad")` |
 | `defer::a_stopped_actor_still_tells_a_peer_no_such_actor` | the default `Inbox::ending` → `Standing::Running` |
@@ -3751,7 +3755,7 @@ two lines now, and `scripts/replay-fate-breaks.sh` runs the whole set.
 | `supervision::a_peer_whose_factory_panicked_is_told_the_actor_is_gone` | `supervise`'s per-iteration floor disarmed before the factory call |
 | `supervision::a_peer_whose_feed_panicked_is_told_the_actor_is_gone` | `run_loop`'s floor disarmed before the loop |
 | `local::the_gone_answer_is_not_a_failed_and_carries_no_prefix` | `lost`'s `Gone` arm becomes a `Failed` |
-| `reply::the_four_prefixes_are_the_text_a_peer_matches_on` | `DROPPED` → `"lost: "` |
+| `reply::the_five_prefixes_are_the_text_a_peer_matches_on` | `DROPPED` → `"lost: "` |
 | `local::a_supervisor_between_incarnations_is_gone_when_it_is_destroyed` | `supervise`'s floor disarmed at its declaration |
 | `local::a_transient_factory_failure_does_not_overwrite_a_pending_restart` | the floor moved back inside the loop body |
 | `local::a_state_that_panics_on_drop_mid_restart_is_gone_not_restarting` | the third disarm around `run_loop`, applied verbatim |
@@ -3869,10 +3873,10 @@ name and a claim nothing checked.
   *sentence*: the registry's capacity refusal, an `ActorId` a peer sent that fails
   validation, and a console follow refusal. None collides, and nothing would have
   noticed if one did —
-  `no_failure_prefix_is_a_prefix_of_another` compares the four against each other
+  `no_failure_prefix_is_a_prefix_of_another` compares the five against each other
   and would stay green while a `RouteError` variant beginning `"dropped: "` made
   every peer's `starts_with` ambiguous. The claim is narrowed to *every prefix
-  `rendered` and `lost` build*, and `no_other_served_failure_begins_with_one_of_the_four`
+  `rendered` and `lost` build*, and `no_other_served_failure_begins_with_one_of_the_five`
   renders the other three and checks them. What no guard can cover is a `Failed`
   whose text came from a caller's own `Middleware`, which is exactly why naming
   the constants is the other half of the fix.

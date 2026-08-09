@@ -356,6 +356,22 @@ Three cases, and revision 1 got one of them backwards.
 | **panicked** | refused | **the panic, resumed** — then the actor ends |
 | completed | refused | `MailboxClosed`, and the turn is not committed |
 
+**The `refused` slot above is one slot for two questions, and that is a defect this
+RFC shipped.** Both arms of the loop write it, so *the observer vetoed* and *the
+observer fell over* arrive as one value — and the caller-side fold reads only the
+name out of it, so the panic message never leaves. The **commit** decision needs
+two answers and the fold is right to give it two: §5.1 argues that a crash is the
+worse of the two, because after a torn observer nobody has read back whether it
+committed. The **report** needs three — accepted, vetoed, crashed — and it got the
+second for the third.
+
+Corrected in the tree, and the shape of the correction is the point: the loop
+carries a two-armed `Withheld` instead of a `(name, error, bool)` tuple, and
+`Verdict`, `Answered`, `TurnLost` and `Undelivered` each grew one variant.
+Withholding did not change. `Stop::is_fatal` moved onto the arm that has one, so a
+panicking observer no longer spells *no claim was made* the same way a deliberate
+`Stop::new` spells *another incarnation can help*.
+
 Row 2 is the correction. Revision 1 dropped the reply whenever an observer returned
 `Err`, and `Saver` returns `Err` on a panicked turn. So a panicking `ask` against a
 durable actor would have returned `MailboxClosed`, which reverses the property
@@ -630,9 +646,15 @@ Overturned:
 - ~~No new `RemoteError` variant, because that moves the wire contract.~~ **The rule survives;
   the reason it was listed does not.** Wave 9 needed to tell a peer that an actor is restarting
   rather than gone, and did it *without* a new variant — a `"restarting: "` prefix inside
-  `Failed`, matching Wave 1b's `"panicked: "` discipline. Three prefixes now, none a prefix of
-  another. So no variant was added, the ALPN did not move, and the constraint was met by
+  `Failed`, matching Wave 1b's `"panicked: "` discipline. **Five prefixes now**, none a prefix
+  of another. So no variant was added, the ALPN did not move, and the constraint was met by
   design rather than by refusing the feature.
+
+  The fifth is `"observer panicked: "`, and it is the one this rule was tested against
+  hardest: §2.6 folded a panicking observer into the refusal, so a peer read
+  `observer refused: {name}` about an observer that decided nothing — the audience with no
+  `ended()` to fall back on, given the false word. A `RemoteError` variant would have said it
+  cleanly and moved every service's ALPN. The prefix says it and moves nothing.
 
 ---
 
@@ -774,6 +796,12 @@ passes in the other, so run it 25 times rather than once.
 **Both wire prefixes.** One test pins `observer refused: {name}` **and**
 `panicked: {msg}`. Made red by removing either prefix: a handler that panics with the
 refusal's exact text then produces an identical `Failed`.
+
+A third prefix and a second test joined them later:
+`singleton::an_observer_that_panicked_reaches_a_peer_under_its_own_prefix` pins
+`observer panicked: {name}`, and it asserts against **both** neighbours rather than only
+its own text — `observer refused: `, which this case was folded into, and `panicked: `,
+which shares the verb and means the handler.
 
 **A read runs no observers.** `with_state` increments no counter. Made red by routing
 `with_state` through `ask`.

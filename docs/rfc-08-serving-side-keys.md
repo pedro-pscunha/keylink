@@ -780,7 +780,7 @@ quotes a search literal, that literal must occur **exactly once** in its stated
 target, which is `break-once.sh`'s own precondition and nothing more.
 
 Its list is written out by hand, and that is deliberate for the reason `local.rs`'s
-`no_failure_prefix_is_a_prefix_of_another` spells out its four prefixes by hand: a
+`no_failure_prefix_is_a_prefix_of_another` spells out its five prefixes by hand: a
 heuristic that parsed prose for *"replacing `X` with `Y`"* and missed a record would
 check nothing while reporting success. **The honest limitation is that a record added
 without an entry there is unchecked**, which is the cost of the hand-maintained list.

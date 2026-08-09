@@ -550,8 +550,16 @@ impl fmt::Display for Ended {
             Self::Stopped => f.write_str("the actor was stopped"),
             Self::Vanished => f.write_str("the actor's task was cancelled"),
             Self::Panicked { message } => write!(f, "a turn panicked: {message}"),
+            // **Not "gave up", which was false for half of this variant's
+            // producers.** The variant's own doc has always said `Err`, *or
+            // panicked*, and an observer that panicked did not give anything up —
+            // it fell over. This is the sentence an operator reads in a log, and
+            // `turns.rs` puts it behind `"restarting: "` on the served path, so it
+            // is also the sentence a peer reads about a restart. One verb has to be
+            // true of both producers: they both ended the incarnation, and neither
+            // of them let the turn commit.
             Self::Observer { name, error, .. } => {
-                write!(f, "the {name} observer gave up: {error}")
+                write!(f, "the {name} observer ended this incarnation: {error}")
             }
             Self::Feed { name } => write!(f, "the {name} feed ended"),
             Self::GaveUp { after, error } => {
@@ -677,6 +685,24 @@ pub enum TurnLost {
     /// An observer refused this turn. It **ran** and was not committed.
     #[error("the {name} observer refused this turn: it ran and was not committed")]
     Refused {
+        /// [`Observer::name`].
+        name: &'static str,
+    },
+    /// An observer **panicked** watching this turn. It **ran** and was not
+    /// committed.
+    ///
+    /// [`Undelivered::ObserverPanicked`](crate::Undelivered::ObserverPanicked) is
+    /// the same fact at the door that resumes a fault rather than reporting it,
+    /// and carries the argument for the split from [`Refused`](Self::Refused): the
+    /// two withhold the value for two different reasons and only one of them is a
+    /// decision anybody made.
+    ///
+    /// The panic's own message is on [`Ended::Observer`], as its `error`. This
+    /// variant carries the name for [`Refused`](Self::Refused)'s reason —
+    /// [`ended`](crate::LocalActor::ended) resolves when the **actor** ends, and a
+    /// panicking observer ends one incarnation.
+    #[error("the {name} observer panicked during this turn: it ran and was not committed")]
+    ObserverPanicked {
         /// [`Observer::name`].
         name: &'static str,
     },
