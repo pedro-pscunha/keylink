@@ -18,6 +18,7 @@
 //! | a member's own restart never reaches the policy | `a_members_own_restart_never_reaches_the_policy` |
 //! | a refusal the author marked fatal reaches the policy without a restart | `a_fatal_refusal_reaches_the_policy_without_a_restart` |
 //! | `StopAll` ends every sibling and names the member that caused it | `stop_all_ends_the_group_and_names_the_member_that_caused_it` |
+//! | an `add` to a group that has already ended is a refusal and not a displacement, and the caller can tell | `an_add_after_the_group_ended_is_refused_rather_than_a_displacement` |
 //! | no member's retirement waits on another's to complete | `no_members_retirement_waits_on_another` |
 //! | `Forget` removes the member and leaves the others serving | `forget_removes_the_member_and_leaves_the_others_serving` |
 //! | a displaced member's ending does not reach the policy as its replacement | `a_displaced_members_ending_does_not_reach_the_policy_as_its_replacement` |
@@ -31,6 +32,8 @@
 //! | a keyed actor's own ending reaches a `watch` future, carrying the reason its loop returned | `a_keyed_actors_own_ending_reaches_a_watch_future_with_its_reason` |
 //! | every waiter filed under one name is answered, and not just one of them | `two_watchers_on_one_name_are_both_answered` |
 //! | two `Lifecycle`s on one `System` both fire, so watching does not cost the console | `two_lifecycles_on_one_system_both_fire` |
+//! | a sink that panics on a mount costs its own report, not the mount and not the sink behind it | `a_panicking_lifecycle_sink_does_not_unwind_into_the_mount_it_reports` |
+//! | a sink that panics on an ending does not leave the `Endings` behind it waiting for ever | `a_panicking_lifecycle_sink_does_not_deprive_the_next_of_an_ending` |
 //! | an abandoned `watch` unfiles its own waiter and not a later one under that name | `an_abandoned_watch_unfiles_its_own_waiter_and_not_a_later_one` |
 //! | a `watch` outliving its `Endings` resolves `Vanished` instead of waiting for ever | `a_watch_outliving_its_endings_resolves_vanished_rather_than_hanging` |
 //! | a keyed actor is a `Group` member: it ends, the policy is asked, the siblings are retired | `a_keyed_actor_is_a_group_member_end_to_end` |
@@ -93,7 +96,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use keylink::compose::{
-    after, every, Endings, Fanout, Group, GroupEnded, Membership, Names, Overflow, Pool,
+    after, every, Added, Endings, Fanout, Group, GroupEnded, Membership, Names, Overflow, Pool,
     Subscription, Topic, Verdict,
 };
 use keylink::{
@@ -1066,8 +1069,8 @@ fn refusing(fatal: bool, recovered_after: Duration) -> (worker::Handle<Worker>, 
 }
 
 /// Made red by `scripts/break-once.sh keylink/src/compose/group.rs`, replacing
-/// `policy(&reported.name, &reason)` with
-/// `policy(&reported.name, &Ended::Stopped)` — a policy told a reason the group
+/// `policy(&reported.stamp.name, &reason)` with
+/// `policy(&reported.stamp.name, &Ended::Stopped)` — a policy told a reason the group
 /// invented instead of the one the member ended with, which is the shape of every
 /// supervisor that reports its own teardown for somebody else's fault.
 /// Watched: it fails at the policy's own argument, "with the reason it ended
@@ -1083,7 +1086,7 @@ async fn a_member_that_ends_for_good_reaches_the_policy_once() {
     assert!(
         group
             .add(ledger.clone(), keylink::membership!(actor))
-            .is_none(),
+            .is_filed(),
         "nothing was displaced"
     );
     assert_eq!(group.names(), vec![ledger.clone()], "and it is watched");
@@ -1141,7 +1144,7 @@ async fn a_members_own_restart_never_reaches_the_policy() {
     assert!(
         group
             .add(name.clone(), keylink::membership!(member))
-            .is_none(),
+            .is_filed(),
         "nothing was displaced"
     );
 
@@ -1189,8 +1192,8 @@ async fn a_members_own_restart_never_reaches_the_policy() {
 
 /// Made red by the same break as `a_member_that_ends_for_good_reaches_the_policy_once`:
 /// `scripts/break-once.sh keylink/src/compose/group.rs`, replacing
-/// `policy(&reported.name, &reason)` with
-/// `policy(&reported.name, &Ended::Stopped)`. Watched: it fails at `seen[0].1`,
+/// `policy(&reported.stamp.name, &reason)` with
+/// `policy(&reported.stamp.name, &Ended::Stopped)`. Watched: it fails at `seen[0].1`,
 /// "and handed the supervisor's own reason rather than one the group invented:
 /// Stopped", where the supervisor produced `GaveUp { after: 0 }`. Exit 101, by
 /// value, in 0.00s — and that line is the one the paragraph below is about.
@@ -1220,7 +1223,7 @@ async fn a_fatal_refusal_reaches_the_policy_without_a_restart() {
     assert!(
         group
             .add(name.clone(), keylink::membership!(member))
-            .is_none(),
+            .is_filed(),
         "nothing was displaced"
     );
     assert!(
@@ -1263,11 +1266,11 @@ async fn a_fatal_refusal_reaches_the_policy_without_a_restart() {
 ///
 /// ```text
 ///             Ok(Verdict::StopAll) => {
-///                 retire_all(closing(&shared)).await;
+///                 let _ = retire_all(closing(&shared)).await;
 /// ```
 ///
-/// with `retire_all(Vec::new()).await;` on the second line — a group that ends
-/// itself and leaves every sibling running, which is the outcome this whole
+/// with `let _ = retire_all(Vec::new()).await;` on the second line — a group
+/// that ends itself and leaves every sibling running, which is the outcome this
 /// module exists to prevent and the one a `GroupEnded` alone cannot tell you
 /// about. Watched: the `GroupEnded::Member` arm above still passes, and what
 /// fails is the sibling assertion — "every other member is retired, not left
@@ -1276,10 +1279,17 @@ async fn a_fatal_refusal_reaches_the_policy_without_a_restart() {
 /// value, in 0.00s.
 ///
 /// **Pass the WHOLE fence.** The second line alone,
-/// `retire_all(closing(&shared)).await;`, occurs three times in `group.rs`. The
-/// literal is unique only because the `Ok(Verdict::StopAll) => {` line above it
-/// is part of it. Shortened, `break-once.sh` aborts on a count of 3 before it
+/// `let _ = retire_all(closing(&shared)).await;`, occurs twice in `group.rs`.
+/// The literal is unique only because the `Ok(Verdict::StopAll) => {` line above
+/// it is part of it. Shortened, `break-once.sh` aborts on a count of 2 before it
 /// takes a backup — safe, and a wasted run.
+///
+/// **Both lines of the fence grew a `let _ =` when `retire_all` became
+/// `#[must_use]`, and only the second one matters here.** The registered anchor
+/// is the arm header, which did not move, so `mise run anchors` stayed green
+/// across that change while the substitution above rotted underneath it. The
+/// fence was re-quoted and the break re-run rather than reasoned about — a
+/// rotted substitution reports the same `exit 101` as a caught defect.
 #[tokio::test]
 async fn stop_all_ends_the_group_and_names_the_member_that_caused_it() {
     let (asked, policy) = recording(Verdict::StopAll);
@@ -1291,10 +1301,10 @@ async fn stop_all_ends_the_group_and_names_the_member_that_caused_it() {
 
     assert!(group
         .add(first.clone(), keylink::membership!(reserve))
-        .is_none());
+        .is_filed());
     assert!(group
         .add(second.clone(), keylink::membership!(charge))
-        .is_none());
+        .is_filed());
 
     reserve.abort();
     match bounded(group.ended()).await {
@@ -1336,6 +1346,96 @@ async fn stop_all_ends_the_group_and_names_the_member_that_caused_it() {
     );
 }
 
+/// The rebuild recipe's own doubling window: the group closes **between** two
+/// `add` calls, and the second member comes back unfiled.
+///
+/// `build()` at the top of `group.rs` spawns the whole set and then adds it one
+/// member at a time. A member that ends inside that window makes the policy
+/// answer `StopAll`, and the group is closed before the next `add` reaches it.
+/// That `add` files nothing and hands the caller its own member straight back.
+///
+/// **What this guards is that the answer SAYS SO**, which is the whole of what
+/// changed here. Both halves of the old `Option<Retire>` were `Some`: a
+/// displacement — the group is watching, here is the one it replaced — and a
+/// refusal — the group is watching nothing, here is your member. A caller that
+/// read the second as the first dropped the only `Retire` in existence for a
+/// live actor, and the loop, which rebuilds on `GroupEnded::Member`, then built
+/// a second set beside it. The module warned about that doubling for
+/// `GroupEnded::Dropped` only; this path is `Member`.
+///
+/// Made red by `scripts/break-once.sh keylink/src/compose/group.rs`, replacing
+/// `add`'s `            return Added::Refused(retire);` with
+/// `            return Added::Displaced(retire);` — one word, and it restores
+/// the conflation rather than inventing a defect: `Displaced` is what the old
+/// `Option` said on both paths. Watched: the `other =>` arm below fires with
+/// "an `add` to a group that has ended is a refusal and not a displacement, got
+/// Displaced(Retire { .. })". Exit 101, by value, in 0.00s.
+///
+/// **Run against the whole target as well as under the filter, and the only
+/// test that moves is this one.** Said as a name rather than as a count,
+/// because a pass/fail figure here would rot on the next test added to
+/// `compose.rs` and nothing would say so. No other guard adds to a closed
+/// group, so no other guard can see this break at all.
+#[tokio::test]
+async fn an_add_after_the_group_ended_is_refused_rather_than_a_displacement() {
+    let (asked, policy) = recording(Verdict::StopAll);
+    let group = Group::new(policy);
+    let reserve = worker::actor(Worker { me: 1 });
+    let reserve_id = ActorId::new("reserve").expect("a name");
+
+    assert!(group
+        .add(reserve_id.clone(), keylink::membership!(reserve))
+        .is_filed());
+
+    // The window is CONSTRUCTED and not raced for: the group is driven all the
+    // way to its ending first, so "between two `add` calls" is a state this test
+    // holds rather than one it hopes to catch.
+    reserve.abort();
+    assert!(
+        matches!(bounded(group.ended()).await, GroupEnded::Member { .. }),
+        "the first member ending for good ends the group"
+    );
+
+    // The second half of `build()`, arriving at a group that has already closed.
+    let charge = worker::actor(Worker { me: 2 });
+    let charge_id = ActorId::new("charge").expect("a name");
+    let handed_back = match group.add(charge_id, keylink::membership!(charge)) {
+        Added::Refused(retire) => retire,
+        // THIS is the decision. `Displaced` here tells the caller the group is
+        // watching `charge`, and the recipe's `let _ =` would then drop the only
+        // means anybody has of ending it.
+        other => panic!(
+            "an `add` to a group that has ended is a refusal and not a \
+             displacement, got {other:?}"
+        ),
+    };
+    assert!(
+        group.names().is_empty(),
+        "the member was not filed: the group watches nothing"
+    );
+    assert_eq!(
+        decisions(&asked).len(),
+        1,
+        "and nothing about it ever reaches the policy"
+    );
+
+    // Handing it back is not ending it, which is why dropping the value is the
+    // defect rather than the tidy-up.
+    assert!(
+        charge.is_running(),
+        "the refused member runs on until its caller retires it"
+    );
+    handed_back.retire().await;
+    // `settles` and not a bare assertion, because `Retire::retire` resolves when
+    // the closure's future does — for a `membership!` member, when `abort` has
+    // been ISSUED. The spin is waiting for the runtime to drop the task, which
+    // that method does not promise and this test therefore does not assume.
+    assert!(
+        settles(|| !charge.is_running()).await,
+        "and retiring what came back is what ends it"
+    );
+}
+
 /// Made red by `scripts/break-once.sh keylink/src/compose/group.rs`, replacing
 /// `retire_all`'s `Ok(fut) => retiring.push(guarded(fut)),` with
 /// `Ok(fut) => { let _ = guarded(fut).await; }` — the serial spelling that
@@ -1360,7 +1460,7 @@ async fn stop_all_ends_the_group_and_names_the_member_that_caused_it() {
 ///
 /// **The serial spelling must discard the result, and the first version of this
 /// record did not.** `Ok(fut) => guarded(fut).await,` does not compile: `guarded`
-/// yields `Result<(), Panic>` and the sibling `Err(_panicked) => panicked += 1,`
+/// yields `Result<(), Panic>` and the sibling `Err(_lost) => panicked += 1,`
 /// arm yields `()`, so the match arms disagree. Run as written it exits 101 on
 /// E0308 and tests nothing — and a non-zero exit from `break-once.sh` reads as a
 /// caught defect, so that failure is the one shaped most like success. The
@@ -1418,10 +1518,10 @@ async fn no_members_retirement_waits_on_another() {
     // ever is the one added LAST and therefore retired FIRST.
     assert!(group
         .add(ActorId::new("quick").expect("a name"), quick)
-        .is_none());
+        .is_filed());
     assert!(group
         .add(ActorId::new("stuck").expect("a name"), stuck)
-        .is_none());
+        .is_filed());
 
     group.stop();
 
@@ -1510,10 +1610,10 @@ async fn forget_removes_the_member_and_leaves_the_others_serving() {
 
     assert!(group
         .add(leaving.clone(), keylink::membership!(gone))
-        .is_none());
+        .is_filed());
     assert!(group
         .add(staying.clone(), keylink::membership!(kept))
-        .is_none());
+        .is_filed());
 
     gone.abort();
     assert!(
@@ -1537,11 +1637,19 @@ async fn forget_removes_the_member_and_leaves_the_others_serving() {
 
 /// Made red by `scripts/break-once.sh keylink/src/compose/group.rs`, replacing the
 /// conductor's
-/// `entry.name == reported.name && entry.generation == reported.generation` with
-/// `entry.name == reported.name` — the generation stamp dropped, so the displaced
-/// member's still-pending ending is decided on under a name its replacement now
-/// owns. Watched: "a displaced member's ending is discarded on its stamp, never
+/// `                .position(|entry| entry.stamp == reported.stamp);` with
+/// `                .position(|entry| entry.stamp.name == reported.stamp.name);`
+/// — the generation half of the stamp dropped, so the displaced member's
+/// still-pending ending is decided on under a name its replacement now owns.
+/// Watched: "a displaced member's ending is discarded on its stamp, never
 /// decided on". Exit 101, by value, in 0.01s.
+///
+/// **Re-quoted when `Stamp` was extracted, and the break was re-run rather than
+/// re-reasoned.** Both halves moved: the anchor was the two-field comparison and
+/// is now the `position` line that replaced it, and the substitution was
+/// `entry.name == reported.name` and is now the same defect spelled through the
+/// stamp. A rotted anchor is loud and a rotted substitution is not, so the
+/// second half is the one this note exists for.
 ///
 /// The same race `names.rs` documents and the same fix, watched here from the
 /// side that matters for a group: not a wrong eviction but a wrong **decision**,
@@ -1556,10 +1664,13 @@ async fn a_displaced_members_ending_does_not_reach_the_policy_as_its_replacement
 
     assert!(group
         .add(ledger.clone(), keylink::membership!(first))
-        .is_none());
-    let displaced = group
-        .add(ledger.clone(), keylink::membership!(second))
-        .expect("the first membership comes back");
+        .is_filed());
+    let displaced = match group.add(ledger.clone(), keylink::membership!(second)) {
+        Added::Displaced(retire) => retire,
+        other => {
+            panic!("a taken name displaces, and the first membership comes back, got {other:?}")
+        }
+    };
 
     // The first actor ends, with its ending still filed under the SAME name.
     first.abort();
@@ -1669,12 +1780,12 @@ async fn adds_made_while_the_policy_runs_are_all_watched() {
             ActorId::new("steady").expect("a name"),
             Membership::new(std::future::pending(), || async {}),
         )
-        .is_none());
+        .is_filed());
     let opener = ActorId::new("opener").expect("a name");
     let first = worker::actor(Worker { me: 9 });
     assert!(group
         .add(opener.clone(), keylink::membership!(first))
-        .is_none());
+        .is_filed());
 
     first.abort();
     assert!(
@@ -1707,9 +1818,9 @@ async fn adds_made_while_the_policy_runs_are_all_watched() {
 }
 
 /// Made red by `scripts/break-once.sh keylink/src/compose/group.rs`, replacing
-/// `match catch_unwind(AssertUnwindSafe(|| policy(&reported.name, &reason))) {`
+/// `match catch_unwind(AssertUnwindSafe(|| policy(&reported.stamp.name, &reason))) {`
 /// with
-/// `match Ok::<Verdict, Box<dyn std::any::Any + Send>>(policy(&reported.name, &reason)) {`
+/// `match Ok::<Verdict, Box<dyn std::any::Any + Send>>(policy(&reported.stamp.name, &reason)) {`
 /// — the panic uncaught, so the conductor dies with it and every member is left
 /// running and unwatched, which is the group-actor problem this module refuses,
 /// reached from the other side. Watched: "a panicking policy must end the group,
@@ -1731,13 +1842,13 @@ async fn a_policy_that_panics_ends_the_group_rather_than_orphaning_it() {
 
     assert!(group
         .add(doomed.clone(), keylink::membership!(first))
-        .is_none());
+        .is_filed());
     assert!(group
         .add(
             ActorId::new("sibling").expect("a name"),
             keylink::membership!(sibling)
         )
-        .is_none());
+        .is_filed());
 
     first.abort();
     match bounded(group.ended()).await {
@@ -1811,7 +1922,7 @@ async fn a_dropped_group_ends_as_dropped_and_leaves_its_members_running() {
 
     assert!(group
         .add(name.clone(), keylink::membership!(member))
-        .is_none());
+        .is_filed());
 
     // **The conductor must be PARKED on the wake for this to test the wake.**
     // Nothing observable says "parked", so it is constructed: a second member
@@ -1827,7 +1938,7 @@ async fn a_dropped_group_ends_as_dropped_and_leaves_its_members_running() {
             ActorId::new("waker").expect("a name"),
             keylink::membership!(waker),
         )
-        .is_none());
+        .is_filed());
     waker.abort();
     assert!(
         settles(|| !decisions(&asked).is_empty()).await,
@@ -1891,7 +2002,7 @@ async fn a_dropped_group_ends_as_dropped_and_leaves_its_members_running() {
 /// nothing else, which is what makes the first half a statement about `stop`.
 ///
 /// **No fix, and the reason is that the obvious one does not work.** Moving
-/// `stopping` into an [`Arc`] the conductor holds strongly does not help,
+/// the phase into an [`Arc`] the conductor holds strongly does not help,
 /// because the members list dies with `Shared` too — and holding *that* strongly
 /// would keep the state alive for ever and stop `Dropped` firing at all, which
 /// is the answer `a_dropped_group_ends_as_dropped_and_leaves_its_members_running`
@@ -1908,7 +2019,7 @@ async fn a_stop_the_conductor_has_not_seen_is_lost_when_the_last_group_drops() {
 
     assert!(group
         .add(name.clone(), keylink::membership!(member))
-        .is_none());
+        .is_filed());
 
     // Taken while the group is still held, so something is left to answer.
     let waiting = group.ended();
@@ -1947,7 +2058,7 @@ async fn a_stop_the_conductor_has_not_seen_is_lost_when_the_last_group_drops() {
             ActorId::new("observed").expect("a name"),
             keylink::membership!(second),
         )
-        .is_none());
+        .is_filed());
 
     observed.stop();
     // The one difference. The conductor gets a turn, reads the flag, and tears
@@ -1988,7 +2099,7 @@ async fn members_are_reported_in_the_order_they_were_added() {
         });
         assert!(group
             .add(name.clone(), keylink::membership!(actor))
-            .is_none());
+            .is_filed());
         actors.push(actor);
     }
     assert_eq!(
@@ -2000,9 +2111,12 @@ async fn members_are_reported_in_the_order_they_were_added() {
     // A replacement keeps the displaced member's POSITION: re-registering a
     // rebuilt actor is not a statement that it should now be torn down first.
     let replacement = worker::actor(Worker { me: 9 });
-    let displaced = group
-        .add(names[0].clone(), keylink::membership!(replacement))
-        .expect("the first membership comes back");
+    let displaced = match group.add(names[0].clone(), keylink::membership!(replacement)) {
+        Added::Displaced(retire) => retire,
+        other => {
+            panic!("a taken name displaces, and the first membership comes back, got {other:?}")
+        }
+    };
     assert_eq!(
         group.names(),
         names,
@@ -2036,7 +2150,7 @@ async fn a_member_asleep_in_backoff_is_retired_without_waiting_out_its_backoff()
 
     assert!(group
         .add(name.clone(), keylink::membership!(member))
-        .is_none());
+        .is_filed());
     assert!(
         member.whoami().await.is_err(),
         "the first turn is refused, which ends the incarnation"
@@ -2145,13 +2259,13 @@ async fn an_ending_that_panics_ends_the_group_as_ending_panicked() {
             doomed.clone(),
             Membership::new(panicking_ending(), || async {}),
         )
-        .is_none());
+        .is_filed());
     assert!(group
         .add(
             ActorId::new("sibling").expect("a name"),
             keylink::membership!(sibling),
         )
-        .is_none());
+        .is_filed());
 
     match bounded(group.ended()).await {
         GroupEnded::EndingPanicked { member, message } => {
@@ -2223,13 +2337,13 @@ async fn an_ending_that_panics_retires_the_member_it_could_not_hear() {
                 unheard.abort();
             })
         })
-        .is_none());
+        .is_filed());
     assert!(group
         .add(
             ActorId::new("sibling").expect("a name"),
             keylink::membership!(sibling),
         )
-        .is_none());
+        .is_filed());
 
     match bounded(group.ended()).await {
         GroupEnded::EndingPanicked { member, .. } => {
@@ -2338,25 +2452,25 @@ async fn a_panicking_retire_costs_its_own_member_and_not_the_teardown() {
             ActorId::new("retired-last").expect("a name"),
             counting(&retired)
         )
-        .is_none());
+        .is_filed());
     assert!(group
         .add(
             ActorId::new("bad-future").expect("a name"),
             future_panics(&entered),
         )
-        .is_none());
+        .is_filed());
     assert!(group
         .add(
             ActorId::new("bad-closure").expect("a name"),
             closure_panics(&entered),
         )
-        .is_none());
+        .is_filed());
     assert!(group
         .add(
             ActorId::new("retired-first").expect("a name"),
             counting(&retired),
         )
-        .is_none());
+        .is_filed());
     assert_eq!(group.names().len(), 4, "four members, two of them bad");
 
     group.stop();
@@ -2570,6 +2684,149 @@ async fn two_lifecycles_on_one_system_both_fire() {
         seen.lock().expect("not poisoned").clone(),
         vec![id],
         "and about that actor, once"
+    );
+}
+
+/// A [`Lifecycle`] that records MOUNTS, which [`Watched`] deliberately does not.
+///
+/// Its sibling guard asserts an exact list of endings, and putting mounts in
+/// that list would be a second sequence to keep in step for no gain.
+struct Mounts {
+    seen: Arc<Mutex<Vec<ActorId>>>,
+}
+
+impl Lifecycle for Mounts {
+    fn mounted(&self, id: &ActorId) {
+        self.seen.lock().expect("not poisoned").push(id.clone());
+    }
+
+    fn ended(&self, _id: &ActorId, _why: &Ended) {}
+}
+
+/// A [`Lifecycle`] a caller wrote and got wrong, on the mount.
+///
+/// Two types and not one with a flag, because the two report sites fail
+/// differently and each guard installs exactly the one it is about: an unwind
+/// out of `mounted` reaches the caller of [`System::mount`], and an unwind out
+/// of `ended` reaches a spawned teardown where nobody is waiting at all.
+struct BrokenOnMount;
+
+impl Lifecycle for BrokenOnMount {
+    fn mounted(&self, _id: &ActorId) {
+        panic!("the console sink is broken on a mount");
+    }
+
+    fn ended(&self, _id: &ActorId, _why: &Ended) {}
+}
+
+/// The sibling of [`BrokenOnMount`], for the other report site.
+struct BrokenOnEnding;
+
+impl Lifecycle for BrokenOnEnding {
+    fn mounted(&self, _id: &ActorId) {}
+
+    fn ended(&self, _id: &ActorId, _why: &Ended) {
+        panic!("the console sink is broken on an ending");
+    }
+}
+
+/// A sink that panics does not take the mount down with it, and the sink behind
+/// it is still told.
+///
+/// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs`, replacing
+/// `report_mounted`'s
+/// `            let _ = crate::panic::catching(|| watching.mounted(id));` with
+/// `            watching.mounted(id);` — which is the line as it stood before
+/// the catch, so the break restores the defect rather than inventing one.
+/// Watched: the panic escapes `system.mount(..)` and kills the test with "the
+/// console sink is broken on a mount", before either assertion below is read.
+/// Exit 101, by panic through the caller, in 0.00s.
+///
+/// **Red BY PANIC and not by value, and that is the symptom rather than a
+/// weakness of the guard.** The claim is that an unwind does not cross this
+/// boundary, so the failure mode is the unwind arriving — there is no value for
+/// it to arrive as. What the assertions below add is the other half: catching
+/// must not become swallowing, so the sink installed after the bad one is read
+/// rather than assumed.
+#[tokio::test]
+async fn a_panicking_lifecycle_sink_does_not_unwind_into_the_mount_it_reports() {
+    let seen: Arc<Mutex<Vec<ActorId>>> = Arc::new(Mutex::new(Vec::new()));
+    let system = worker::System::builder(Eviction::Never)
+        .lifecycle(BrokenOnMount)
+        .lifecycle(Mounts {
+            seen: Arc::clone(&seen),
+        })
+        .build();
+    let id = ActorId::new("ledger/7").expect("a name");
+
+    let (_ends, told) = oneshot::channel();
+    // THIS is the first decision, and it is the whole of the red: the caller of
+    // `mount` did not write the sink and does not die for it.
+    system
+        .mount(id.clone(), ending_when(told))
+        .expect("a mount is not refused by a sink that panicked while hearing about it");
+
+    // And the second: one bad sink costs ONE report. A catch that swallowed the
+    // rest of the fan would pass the assertion above and fail this one.
+    assert_eq!(
+        seen.lock().expect("not poisoned").clone(),
+        vec![id],
+        "the sink installed after the broken one is still told about the mount"
+    );
+}
+
+/// The same claim at the other report site, where the loss is silent and is not
+/// a diagnostic.
+///
+/// A missed `ended` on a `compose::Endings` leaves every waiter it holds pending
+/// for the life of the system. A [`Group`] watching a keyed member is then never
+/// decided on and its `ended()` never resolves, while the group reports nothing
+/// wrong — there is no console line for a report that was never made.
+///
+/// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs`, replacing
+/// `report_ended`'s
+/// `            let _ = crate::panic::catching(|| watching.ended(id, why));` with
+/// `            watching.ended(id, why);` — again the line as it stood before the
+/// catch. Watched: "the `Endings` installed after the broken sink is still
+/// answered: None". Exit 101, by value, at the [`NO_PROGRESS`] bound after
+/// 60.00s.
+///
+/// **Under that break the sink's own panic prints and never reaches this test**,
+/// which is the "silent" in the paragraph above, measured rather than argued:
+/// the run shows both panics, the sink's from the teardown task nobody joins and
+/// this test's own assertion sixty seconds later. Its sibling above shows the
+/// opposite — the same defect at the other site kills the caller outright.
+///
+/// **The bound is the point and not an inconvenience.** This defect has no
+/// symptom of its own: nothing is reported, nothing errors, and the waiter
+/// simply never resolves. `timeout` is what turns "never" into a named failure
+/// instead of a hung suite — the device
+/// `a_watch_outliving_its_endings_resolves_vanished_rather_than_hanging` uses
+/// for the same reason.
+#[tokio::test]
+async fn a_panicking_lifecycle_sink_does_not_deprive_the_next_of_an_ending() {
+    let endings = Endings::new();
+    let system = worker::System::builder(Eviction::Never)
+        .lifecycle(BrokenOnEnding)
+        .lifecycle(endings.clone())
+        .build();
+    let id = ActorId::new("ledger/7").expect("a name");
+    let watching = endings.watch(&id);
+
+    let (ends, told) = oneshot::channel();
+    system
+        .mount(id.clone(), ending_when(told))
+        .expect("the system mounts it");
+    ends.send(Ended::Stopped)
+        .expect("the loop is waiting for its ending");
+
+    // `timeout` rather than `bounded`, because `bounded` panics on expiry and
+    // the answer has to reach the assertion to be named there.
+    let told_endings = n0_future::time::timeout(NO_PROGRESS, watching).await.ok();
+    assert!(
+        matches!(told_endings, Some(Ended::Stopped)),
+        "the `Endings` installed after the broken sink is still answered: \
+         {told_endings:?}"
     );
 }
 
@@ -2827,7 +3084,7 @@ async fn a_keyed_actor_is_a_group_member_end_to_end() {
                     retiring.abort(&retired).await;
                 }),
             )
-            .is_none(),
+            .is_filed(),
         "nothing was displaced"
     );
 
@@ -2841,7 +3098,7 @@ async fn a_keyed_actor_is_a_group_member_end_to_end() {
             ActorId::new("sibling").expect("a name"),
             keylink::membership!(sibling),
         )
-        .is_none());
+        .is_filed());
 
     ends.send(gave_up(1))
         .expect("the loop is waiting for its ending");

@@ -4027,6 +4027,28 @@ brought five public names — `Group`, `GroupEnded`, `Membership`, `Retire` and
 `Retire` is the one a reader would not have predicted from the design, and §14.7
 is where it came from.
 
+**Appended 2026-08-09 — both counts above have moved, and only one of the moves
+is this note's own change.** Nothing above is edited; this is what is true now.
+
+`Group` brought **six** public names and not five. `Added` joined `Group`,
+`GroupEnded`, `Membership`, `Retire` and `Verdict` in `47decc9`, when
+`Group::add` stopped answering `Option<Retire>` — where a displacement and a
+refusal were both `Some` — and started answering a three-variant enum. §14.7's
+reason for singling `Retire` out is untouched by it: `Added` is a name a reader
+*would* predict from a method that can do three things.
+
+The export count moved **twice**, and the earlier move is not this branch's.
+"Thirteen and two" was measured true at `7a48207`, the commit that wrote this
+section. `e801cca` then added `compose::Endings`, taking it to fourteen, and
+`Added` takes it to **fifteen types and two functions** — counted from
+`keylink/src/compose/mod.rs` on 2026-08-09, not derived from the sentence above.
+
+The headline-type count in the same paragraph — "five types and two functions"
+over six patterns — has **not** moved. `Added` is not a pattern and not a
+headline type; it is part of `Group`'s door. Two counts of one module moving
+independently is exactly what naming the unit was for, so this note names its
+unit too.
+
 ### 14.5 Every restart verdict refused, and the sharpest reason is a visibility one
 
 Three were proposed. All three are gone.
