@@ -315,8 +315,14 @@ Traceback (most recent call last):
 FileNotFoundError: [Errno 2] No such file or directory: '.../clone/keylink/src/local.rs'
 ```
 
-**Not one check printed.** `anchors` runs in `pre-commit`, so a commit that moves
-the file without repointing rows D1, D2 and D3 cannot be created.
+**The failure is loud and it is not silent — `mise` prints the traceback above.**
+State the cost precisely: the raise happens *inside the resolution loop*, so one
+missing file suppresses every remaining row's check. With 49 rows registered, one
+vanished target costs **48 absent answers**, not one wrong answer. A gate that
+answers nothing is the defect, and it is why Task 2 exists.
+
+`anchors` runs in `pre-commit`, so a commit that moves the file without
+repointing rows D1, D2 and D3 cannot be created.
 
 ### Trap 2 — `scripts/replay-fate-breaks.sh` hardcodes the path 16 times
 
@@ -379,8 +385,9 @@ Twelve more live in tests: `supervision.rs` 4, `defer.rs` 5, `feeds.rs` 1,
 Each one is an instruction a human runs. After the rename, every one of them
 names a file that does not exist.
 
-`cycles.rs:254` spells it `` `local.rs` `` with no directory. The substitution in
-Task 3 catches both spellings.
+`cycles.rs:254` spells it `` `local.rs` `` with no directory, where the other 18
+write the full `keylink/src/local.rs`. The `local\.rs` rule in Task 3 Step 3
+catches both.
 
 ## 6. Success criteria — two replaced, all with baselines
 
@@ -442,9 +449,10 @@ Per file, the 89:
 | `keylink/src/lib.rs` | 5 | `keylink/tests/feeds.rs` | 2 |
 | `keylink/src/representability.rs` | 4 | `keylink/tests/singleton.rs` | 2 |
 
-The remaining six carry one line each: `macros.rs`, `idempotency.rs`,
+The remaining seven carry one line each: `macros.rs`, `idempotency.rs`,
 `compose/mod.rs`, `compose/topic.rs`, `tests/cycles.rs`, `tests/observe.rs`,
-`tests/actor_memory.rs`.
+`tests/actor_memory.rs`. The sixteen above plus these seven sum to 89 over 23
+files, which is the sweep's own output.
 
 **The directive's "under 30 changed lines" is low by a factor of three.** It
 inherited Wave 0's count of four compile sites, three anchors rows, 16 script
@@ -519,7 +527,10 @@ echo "--- anchors D rows ---";     rg -n '"keylink/src/local.rs"' .mise/tasks/an
 echo "--- replay script ---";      rg -c 'local\.rs' scripts/replay-fate-breaks.sh
 echo "--- dispatch site ---";      rg -n '\(\*turn\)\.run\(' keylink/src
 echo "--- run_loop decls ---";     rg -c '^async fn run_loop' keylink/src/local.rs
-echo "--- total sweep ---";        rg -c 'local\.rs|crate::local|mod local|super::local' --glob '!target' . | awk -F: '{s+=$2} END{print s}'
+echo "--- module paths ---";       rg -n '\blocal::' keylink
+echo "--- THE EDIT (expect 89 over 23 files) ---"
+rg -c 'local\.rs|crate::local|\blocal::|\bmod local\b' keylink scripts .mise README.md CONTRIBUTING.md | sort
+rg -c 'local\.rs|crate::local|\blocal::|\bmod local\b' keylink scripts .mise README.md CONTRIBUTING.md | awk -F: '{s+=$2; n++} END{print "TOTAL:",s,"over",n,"files"}'
 ```
 
 Write every answer into the report. If a number differs from §3, the tree moved.
@@ -559,6 +570,13 @@ is what makes the §6 criterion *"no line changes anything but a name"* checkabl
 **Files:**
 - Modify: `.mise/tasks/anchors` (three read sites plus one helper)
 - Modify: `.mise/tasks/anchors-selftest` (two new checks)
+
+**CAUTION: `FRAGMENT_ANCHORS` is not an escape hatch and this plan does not use
+it.** `.mise/tasks/anchors:896-898` declares that set as a **non-growth**
+assertion: a new fragment must redden while the two grandfathered entries stay
+visible. Nothing in this plan registers a fragment, widens a row, or adds an
+`ANCHORS` row. If a later step is tempted to, the remedy the file itself names is
+to quote a whole line instead.
 
 - [ ] **Step 1: Write the failing check first**
 
@@ -656,7 +674,7 @@ for record, lives_in, target, literal in ANCHORS:
     found = cache[target].count(literal)
 ```
 
-At the second cache read, inside the fragment loop:
+At the second cache read, the one in the whole-line check near line 918:
 
 ```python
 for record, lives_in, target, literal in ANCHORS:
@@ -755,15 +773,30 @@ git status --short
 
 Expected: one line, `R  keylink/src/local.rs -> keylink/src/turns.rs`.
 
-- [ ] **Step 2: Repoint the module path in code**
+- [ ] **Step 2: Repoint every module path, in one rule**
+
+One rule covers all five, because `\blocal::` matches `crate::local::`,
+`pub use local::` and a bare `local::tests::` alike:
 
 ```bash
 cd /Users/pedrocunha/repos/keylink.actor-simplifications
-rg -l 'crate::local::' keylink/src | xargs perl -pi -e 's/crate::local::/crate::turns::/g'
-rg -n 'crate::turns::' keylink/src
+rg -l '\blocal::' keylink | xargs perl -pi -e 's/\blocal::/turns::/g'
+rg -n '\bturns::' keylink
 ```
 
-Expected: exactly two lines, in `actor/remote.rs` and `actor/registry.rs`.
+Expected: exactly five lines.
+
+```
+keylink/src/actor/remote.rs:60    use crate::turns::{lost, rendered, Reply};
+keylink/src/actor/registry.rs:67  use crate::turns::{Fate, Standing};
+keylink/src/lib.rs:316            pub use turns::{
+keylink/src/reply.rs:130          /// `turns::tests::no_failure_prefix_is_a_prefix_of_another` holds it, and a fifth
+keylink/tests/supervision.rs:1306 /// `turns::tests::an_ending_incarnation_settles_its_verdict_and_its_mailbox_before_its_state`,
+```
+
+The last two are the spelling every regex in this repository missed until the
+directive cited them by line. They are prose, they compile either way, and they
+name a module path that would otherwise not exist.
 
 - [ ] **Step 3: Repoint every path spelling outside `docs/`**
 
@@ -813,12 +846,15 @@ is one of this rename's reasons.
 
 ```bash
 cd /Users/pedrocunha/repos/keylink.actor-simplifications
-rg -n 'local\.rs|crate::local|\bmod local\b|pub use local::' keylink scripts .mise README.md CONTRIBUTING.md
+rg -n 'local\.rs|crate::local|\blocal::|\bmod local\b' keylink scripts .mise README.md CONTRIBUTING.md
 echo "exit=$?"
 ```
 
 Expected: no output, exit 1. **`rg` exits 1 when it matches nothing, so exit 1 is
-the pass here.**
+the pass here.** Baseline before the rename: 89 lines across 23 files.
+
+**Name `.mise` explicitly.** A sweep rooted at `.` skips hidden directories and
+reports a clean tree while five `anchors` lines still carry the old path.
 
 - [ ] **Step 7: Format, then compile**
 
@@ -841,8 +877,8 @@ git diff --cached --shortstat --find-renames=100%
 git diff --cached --stat --find-renames=100% | tail -5
 ```
 
-Expected: 23 files changed, 86 to 96 insertions, 86 to 96 deletions, and the
-rename shown as `keylink/src/{local.rs => turns.rs}`.
+Expected: 23 files changed, **90 to 96** insertions, 90 to 96 deletions, and the
+rename shown as `keylink/src/{local.rs => turns.rs}`. The prediction is 93.
 
 If the number falls outside the band, stop. Find the cause. Do not widen the
 band.
@@ -1014,6 +1050,13 @@ paraphrase a result.
 5. **Wave 0's brief said the `pub use` block re-exports 15 names. It is 17,**
    measured in this run. Nothing depends on the difference, because none of the
    names changes.
+6. **Two of the directive's D success criteria are refused on measurement.** §0
+   carries the evidence for both. If the lead reinstates either, D cannot pass
+   its own gate: "under 30 changed lines" against a measured 89-line edit, and a
+   whole-tree sweep against a criterion whose own line matches it.
+7. **Task 2 writes `.mise/tasks/anchors`, and the directive's line 95 says "One
+   writer per file".** Confirm no other item is editing that file before Task 2
+   starts. If one is, run Task 3 alone and file Task 2 separately.
 
 ## What would make this plan wrong
 

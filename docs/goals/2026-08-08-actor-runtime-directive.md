@@ -90,8 +90,11 @@ The error type is neither `crate::Error` nor `RemoteError`.
 argument that does not cover it.** This is one item, not two, and pricing it once
 is the whole point.
 
-`registry.rs:893` creates every keyed mailbox at the system's configured depth,
-and `registry.rs:2009` already exposes `SystemBuilder::mailbox_depth`. But
+`actor/registry.rs:893` creates every keyed mailbox at the system's configured
+depth, and `actor/registry.rs:2008-2010` already exposes
+`SystemBuilder::mailbox_depth(NonZeroUsize)`. **The file is
+`keylink/src/actor/registry.rs`; `keylink/src/registry.rs` does not exist**, and
+a reader following the shorter path gets an empty result. But
 `local.rs:251` fixes `LOCAL_MAILBOX_DEPTH = 1`, deliberately not a knob, and
 `local.rs:239` gives the reason: a deeper mailbox on an actor addressable from
 its own turn "turns a documented always-deadlock into an intermittent one. An
@@ -104,13 +107,67 @@ local `Handle` pushes into, so a singleton served to peers inherits depth 1. Pee
 traffic is another process. It cannot self-call, so the hazard pinning the
 constant cannot arise on the wire.
 
-**Split by INGRESS, never by local-versus-keyed.** The handle inbox keeps depth 1
-and keeps its argument. The wire inbox gets the knob. `run_loop` already takes
-two inputs through the private `Inbox` trait, so a third is the move Wave 3
-already made. State two things where a caller meets them: raising the wire depth
-raises the shutdown budget owed by up to N turns and nothing checks that, and
-`unbounded` stays permanently refused with `representability.rs` holding the
-probe.
+**Split by INGRESS, never by local-versus-keyed.**
+
+**CORRECTION, and an earlier draft of this file had it wrong: `run_loop` does NOT
+take two inputs through `Inbox`.** It takes **one** through `Inbox` and a second
+through a different trait, `Feeds<A>` (`local.rs:1265`). There is no "third
+`Inbox` arm" move to repeat, and an executor sent looking for one will change
+`run_loop`, which must not change.
+
+The conclusion survives and gets cheaper. `Inbox` has four methods and only two
+are required — `poll_next` (`local.rs:1359`) and `close` (`local.rs:1445`);
+`mark_busy` and `ending` have defaults. **A composite `Inbox` impl hides two
+receivers behind one `poll_next`, and `run_loop`, `next` and `Taken` do not
+change at all.** Four obligations, each with a reason: `poll_next` returns
+`Ready(None)` only when both receivers are drained AND closed, because
+`run_loop:1783-1785` reads one `None` as "every sender is gone"; `close` closes
+both, because `Lent`'s give-up arm needs every `Sender::is_closed()` true at
+once; `mark_busy` forwards, because `Watched` holds the cell `is_busy` reads; and
+the composite owns a **second** alternation flag, because `run_loop`'s
+`mail_first` divides mailbox against feeds, not handle against wire. Flip that
+flag when an item is RETURNED, never on a poll, or the choice depends on spurious
+wakeups.
+
+**THE HANDLE DEPTH IS NOT EXEMPT.** An earlier draft of this file left the handle
+pinned at 1 and gave the knob only to the wire. That is refused. Every path gets
+a configurable depth with a minimum of 1, the handle included. The reason the
+constant existed is real and it is not a reason to keep it: **depth is not the
+cause of the self-call deadlock. A blocking send issued from inside the target
+actor's own turn is.** Depth only decides whether that failure is deterministic
+or intermittent, and keeping it deterministic is settling for a reliable hang.
+Make the send fail fast and loud — a named error, never an await — and no depth
+can hang. See the design item below.
+
+**Ordering across the two doors IS claimed, and the bill is small.**
+`tests/singleton.rs:558-559` says "One mailbox, two doors. A local call and a
+remote call to the same actor are serialized against each other", pinned by
+`local_and_remote_messages_share_one_mailbox`. No RFC claims it. That test
+survives — its 20 ms sleep puts the remote message inside its turn before the
+local call exists, and turns stay serial at `run_loop:1772` under any split. What
+does not survive is `entries_behind_a_held_turn`, which names FIFO as its method
+twice (`singleton.rs:759-761`, `806-807`) and reads a remote message through a
+local call. Resequence it onto a fact. Total: one doc sentence, one narrowed
+claim, one helper.
+
+**Two things break silently and neither is obvious.** `stop()` sends
+`Message::Stop` on `self.mail` (`local.rs:3305-3306`) and `run_loop:1782` breaks
+at once, so `Stop` stops sitting behind messages sent before it — the rule is
+close the other receiver, drain what is buffered, then break, and *not* holding
+`Stop` back while items exist, which never terminates under load. And
+`buffered()` (`local.rs:3428-3439`) reads one sender, so it under-reports; for
+the keyed path that is a documented floor, here it would simply be wrong.
+
+**The shutdown budget arithmetic changes shape.** `registry.rs:1971-1982` says
+raising depth raises the budget owed by up to N turns and nothing can check it,
+because the budget is a `Duration` and the queue is a count. With two ingresses
+the worst case is `W + 2` turns, not `N + 1`, because a split adds a second queue
+rather than widening one. State that at the knob.
+
+`unbounded` stays permanently refused, with `representability.rs:1056-1062`
+holding two probes. **A second depth knob needs its own twin probe**, watched
+failing, because `representability.rs:1062` pins only the existing parameter and
+a new `usize` door would be unpinned.
 
 **M blocks A.** `at_local` gives a keyed actor a local caller, and a keyed system
 can already be built with `mailbox_depth(32)`. Together those are exactly the
@@ -130,19 +187,78 @@ the task. Dropping it answers `Gone`, which a `Handle` renders as
 or aborted task produces exactly that lie. `#[must_use]` catches an accidental
 drop and not a panic. `detach` spawns through `n0_future::task::spawn` so it
 works in a browser, wraps in `panic::guarded`, and answers `Answered::Faulted` on
-`Err`. Nothing holds a bare `Deferred`, so nothing can drop one. `later()` stays,
-for park-in-state-answer-from-a-later-turn, which is a different thing. No new
-types.
+`Err`. `later()` stays, for park-in-state-answer-from-a-later-turn, which is a
+different thing. No new types.
+
+**"Nothing holds a bare `Deferred`, so nothing can drop one" is a claim this file
+made and cannot support.** `later()` is public at `local.rs:444` and returns one.
+The true claim is narrower: `detach` removes the *need* to hold one, so the
+spawned-task path — the shape a service author actually writes for IO — can no
+longer drop one. It reduces the exposure; it does not close it.
+
+Three things `detach` needs that its sketch omits. It needs `T: Send + 'static`,
+because `Reply<T>` crosses into the task, and `Deferred::send` already carries
+that exact pair at `local.rs:702-705`. **It cannot route through
+`Deferred::send`**: `park` takes `FnOnce(Verdict)` (`parking.rs:98`), `Verdict`
+carries no `Panic`, and the `Verdict::Faulted` arm *drops* at `local.rs:713` — so
+`detach` calls the private `Reply::answer` (`local.rs:485`) directly, which is
+legal because it lives in the same module. Record that as a choice, or the next
+author tries the parked route and finds it closed. And it breaks a bound `later()`
+holds: a detached task outlives `stop()` and `abort()` and still answers its
+caller. That can be right, because keylink owns the task, but it is new and needs
+a sentence.
+
+**`Guarded<F>` changes nothing here.** The spawned task is an `async move` block
+whose type stays anonymous, so nothing becomes nameable; awaiting an opaque
+future never needed a name. `Guarded` exists so `retire_all` can annotate a
+`FuturesUnordered`, which `detach` has no equivalent of. Land it against
+whichever form is on `main`; the call site is `guarded(work).await` either way.
 
 **F — re-price RFC-07 §4.8 against the tree that now has the return channel.**
 §4.8 refuses fixing a `#[defer]` handler that panics before consuming its
 `Reply`, at a price of "a return channel and a `Drop` impl on the reply of every
 method". `#[defer]` landed first and `parking.rs` landed after, so the return
-channel that price assumed did not exist now does. Verdict required — BUILD NOW,
-BUILD LATER or REFUSE — against three named costs: neither `Reply` nor `Deferred`
-has a `Drop` today, adding one to `Deferred` breaks `Deferred::send`'s
-`let reply = self.0;` with `E0509`, and `Reply` is dropped on non-unwinding paths
-so a `thread::panicking()` guard must not misfire.
+channel that price assumed did not exist now does. **Verdict: BUILD LATER, after
+E.**
+
+**The `E0509` cost this file named was priced against the wrong type, and an
+executor following it would have recorded REFUSE against a cost that is not
+real.** Four probes compiled at rustc 1.97.1 settle it. `Drop` on `Deferred` plus
+`let reply = self.0;` is indeed `E0509` — but §4.8 prices a `Drop` on **the
+reply**, which is `Reply`, not `Deferred`, and with `Drop` on `Reply` alone
+`Deferred::send` compiles clean, because moving a field out of a non-`Drop`
+struct stays legal when the field's type implements `Drop`. The site that
+actually breaks is `Reply::answer` at `local.rs:489`, and it is worse in kind,
+because `answer` is on **every** reply path rather than the deferred one. And it
+is avoidable entirely: `to: Option<Answerer<T>>` with `.take()` in both compiles
+clean with no `unsafe`, at the price of one `Option` and a `None` arm that cannot
+use `unwrap`.
+
+**Two findings this file omitted are the ones that actually decide it.**
+`Verdict` is `#[derive(Clone, Copy)]` at `parking.rs:106` and is passed by value
+to every parked answer at `local.rs:926-928`; a `Panic` is neither `Copy` nor
+cloneable, which `parking.rs:132-133` states, so the resumption cannot travel
+through `Verdict` at all. And a `Drop for Reply<T>` **cannot tell the turn's own
+reply from a `Deferred`'s inner one**, because `Deferred<T>` is `Deferred(Reply<T>)`
+at `local.rs:665` — a turn that drops a parked `Deferred` resolves `Gone` today
+and is tested, and a naive `Drop` would answer it `Faulted` with a panic
+belonging to a different caller, which is exactly what `parking.rs:128-138`
+refuses. Avoiding that needs a second discriminating field on `Reply<T>`, set by
+`began` at `local.rs:1115-1126`.
+
+The `thread::panicking()` trap holds and reinforces this: `Deferred::send`'s
+`Verdict::Faulted => drop(reply)` at `local.rs:713` runs in the release loop
+**after** `guarded` caught the panic, so `thread::panicking()` is false at the one
+site whose whole meaning is "dropped because a turn faulted". Arm from the turn's
+guard, never from the thread.
+
+Full price: six sites, all on `Reply`, which is the universal reply path — §4.8
+was right about that word. Against one failure mode that already has a documented
+answer and a passing test at `tests/defer.rs:330`. **So: build E first, then
+re-read §4.8 against what is left. Correct §4.8's text regardless**, because its
+stated price is measurably wrong about the return channel, and name the
+`thread::panicking()` trap there so the next author does not write the guard that
+misses `local.rs:713`.
 
 **A correction, recorded so it is not re-fixed.** "Answering from a later turn is
 gated, answering from a task is not" is NOT a defect. Both are correct: an answer
@@ -166,24 +282,109 @@ inside the goal whose item C takes seven doors down to four, and M and E remove
 most of the motivation. For, narrowly and really: a future that is never polled
 never sends, so nothing else in the crate expresses queue-now-collect-later. If
 ever built, `Pending<T>` is a keylink newtype and never a
-`tokio::sync::oneshot::Receiver` — `local.rs:382` records that leak and records
-the newtype as its fix.
+`tokio::sync::oneshot::Receiver`. **The record is at `local.rs:294-297`, not
+`local.rs:382`** — 382 is `pub struct Reply<T> {`, the item that doc block
+documents. It says `Answer<Resp>` was a transparent `oneshot::Sender<..>`, so
+tokio's channel type sat in keylink's public API behind a `#[doc(hidden)]` name,
+and a newtype cost one field and bought the promise back. **It names the
+Sender, and `Pending<T>` would wrap a Receiver** — the principle carries
+unchanged, because it is about tokio's channel type in a public signature, but
+say so, or an author who greps for the receiver concludes the record does not
+exist.
 
-**The docs correction, which rides with M.** A served singleton is not a third
-kind of actor. There are two kinds, local and keyed. `Handle::service` is a
-method call on a handle you already hold, and reach over the network is an
-add-on to a local actor rather than a species of one. The documentation reads as
-a taxonomy with a served row beside `local` and `keyed`, which is what made a
-careful reader list it as one. Correct the worst sites, and flag any place the
-CODE teaches the wrong model — a name or a module layout does that as
-effectively as a table.
+And record the open question that actually stops a re-derivation: `Pending<T>`
+must resolve to four states, not two. `Answered` carries `Ran`, `Faulted`,
+`Expired` and `Refused`. A `Pending<T>` resolving to `Result<T, MailboxClosed>`
+re-collapses exactly what `ask_catching` exists to keep apart. So its await is
+either `ask`-shaped, which resumes the panic, or `ask_catching`-shaped, which
+returns `TurnLost`. That is a decision, not a mapping. Without it written down
+the next author writes `Result<T, MailboxClosed>` and the conflation returns.
+
+**The docs correction, which rides with M — and the misleading word is not the
+one I named.** "Served singleton" appears in exactly one file in this tree: this
+document, where the correction is written. The device that actually misleads is
+the bare noun **`singleton`**, used **91 times across 22 files** as a countable
+thing sitting beside "keyed". A reader who meets "the singleton" and "the keyed
+system" as two columns reads two species, and then has to put `local` somewhere.
+That is how a served actor becomes a row.
+
+The ground truth, read from the code rather than from the correction's wording.
+`Handle::service` **creates nothing**: it takes `&self`, clones the handle's
+inner `LocalActor`, and returns the *same* `ServiceBuilder` type the free
+`service` returns, on the *same* ALPN — which is why registering both is
+`DuplicateAlpn`. It spawns no task and allocates no channel. A served actor has
+**no mailbox of its own**: `deliver_to_local` pushes `Mail::Served`, one variant
+of the same generated `Mail` enum, into the same `LocalActor` channel the
+handle's own methods push into. **No type represents a served singleton.** There
+is nothing for a taxonomy row to name.
+
+The contrast is what proves it. A keyed actor *is* a second kind and the tree
+says so: its own `keyed_alpn()`, its own hashed contract over
+`Addressed<Request>`, its own registry. A served local actor has none of those.
+And serving is symmetric across both kinds — `keyed_service` is the same move
+over a `System` that already exists. **The kind is decided by `actor()` against
+`spawn()`. Serving is a registration over whichever you built.**
+
+Correct the coining site first, because every later use inherits it:
+`rfc-04-actors.md:61` reads "Capabilities A to E are the **singleton actor**".
+Then the §14.8 table whose heading row is `| The keyed system | The singleton |`
+— a heading is what a reader scans. Then the three public-rustdoc sites, which
+render in every downstream crate.
+
+**Do not attempt the full rename in this pass.** Two vocabularies side by side
+make a reader ask which is current, and a half-done rename is worse than none.
+Correct the coining site, the table and the public rustdoc; leave the adjectival
+uses; and if the whole sweep is wanted later it must include the test *names*
+that carry the word.
+
+Scope it by the right number. **91 is occurrences of the noun, not sites**, and
+only about 39 of them use it as a countable thing — the rest are adjectival on a
+path, a contract or an ALPN, and this pass deliberately leaves those. Calling it
+a "91-site rename" tells a future author to expect 91 edits from an instruction
+that asks for roughly 40.
+
+**And one grammar split that must not be swept.** The phrase "served as a `<X>`"
+makes the *service* the subject and `<X>` a costume, which is the becoming model.
+Four of its eleven occurrences are defects, where the costume named is a kind
+that does not exist. The other seven — `macros.rs:49`, `:648`, `:3350`,
+`README.md:495`, `:498`, `rfc-04-actors.md:2423` and their neighbours — say
+"served **as an actor**" inside the `send`-refusal argument, where the contrast
+really is about the serving side, a mailbox against an `Arc` behind a concurrent
+handler, and the compiler enforces it at `ServableAsActor::<A>::CHECK`. Those
+words are correct. The sentence to copy is already in the tree at
+`tests/singleton.rs:3-6`: "The local `Handle` is the base case; serving it is an
+addition on top that changes nothing on the wire."
+
+**Four sentences item M makes false, which only M's commit can carry.**
+`macros.rs:1767-1772` argues a self-`tell` deadlocks because "a served actor
+always has other senders" competing for the handle's single permit — M removes
+that competition, so the warning survives and its stated reason does not.
+`local.rs:233-241` writes the depth split as local-against-keyed when the real
+axis is handle-against-wire, and its own premise already covers a served local
+actor; that rewrite is scheduled under A above and M reaches it first.
+`macros.rs:1903-1904` says "messages from both sides share the one mailbox",
+which becomes flatly false. And `compose/mod.rs:52-59` names exactly two depth
+constants and says every number in that module is chosen against them; M adds a
+third, so the list becomes incomplete rather than wrong.
+
+**Two places the CODE teaches it, which no prose fix reaches.**
+`deliver_to_local` says "local" and means "served, and not keyed", while its twin
+`deliver_to_actor` says "actor" and means "keyed" — together they encode a
+singleton-against-keyed split rather than a local-against-keyed one. And
+`keylink/tests/singleton.rs` is named after the kind that does not exist, while
+its own header teaches the correct model. Both are separate decisions. Item D
+renames the file and moves no exported name, so `deliver_to_local` survives it
+untouched.
 
 ## Order
 
-**D → M → C → B → A, then E and F.** D is about 91 line edits and no behavior
-change, so it carries no scheduling risk. M comes before A because A is what
-creates the hazard M closes. The docs correction rides with M, because M is the
-commit that changes the served ingress.
+**D → M → C → B → A, then E, then F.** D is a rename with no behavior change, so
+it carries no scheduling risk; its predicted size lives with the D criteria below
+and is not restated here, because a figure restated in two places rots in one of
+them. M comes before A because A is what creates the hazard M closes. The docs
+correction rides with M, since M is the commit that changes the served ingress
+and falsifies four sentences about it. F comes after E on measurement, not on
+taste — see F.
 
 ## Traps, all measured
 
@@ -205,25 +406,43 @@ commit that changes the served ingress.
       one line** — the old header's first line. That is the criterion that
       actually enforces "no behavior change", and it is the one to keep if only
       one survives.
-- [ ] D: `rg -n 'local\.rs|crate::local|\bmod local\b|pub use local::' keylink
-      scripts .mise README.md CONTRIBUTING.md` returns zero. **The earlier sweep
-      `crate::local|src/local\.rs` misses `mod local;` and `pub use local::{`** —
-      verified, and both are compile-critical.
+- [ ] D: `rg -n 'local\.rs|crate::local|\blocal::|\bmod local\b' keylink scripts
+      .mise README.md CONTRIBUTING.md` returns zero. Baseline **89**.
+
+**The sweep this replaces was wrong twice over, and the second way is the
+instructive one.** `rg -n 'crate::local|src/local\.rs' .` does not return zero
+today; it returns **84**, of which 44 sit under `docs/` — RFCs and older goals
+that `CONTRIBUTING.md:322` forbids editing to match new code. So it demanded an
+edit the house rules refuse.
+
+**And it is unsatisfiable by construction: the line stating the criterion
+contains the pattern it searches for.** A whole-tree sweep matches the document
+that states it, and the plan written to satisfy it matched 24 more times. A check
+whose own statement is a hit can never go green. Root the sweep at the
+directories it can be true of, never at `.`.
+
+Two misses the old pattern also had, both compile-critical and both found by
+reading rather than by grepping: `reply.rs:130` and `tests/supervision.rs:1306`
+spell it as a bare `local::tests::…`, which matches neither `crate::local` nor
+`local\.rs`. `\blocal::` catches them and folds every module-path site into one
+substitution, `s/\blocal::/turns::/g`. A sweep rooted at `.` also skips hidden
+directories, so it saw none of the five `.mise/tasks/anchors` lines — name
+`.mise` explicitly.
 - [ ] D: `rg -n '\(\*turn\)\.run\(' keylink/src` returns exactly 1. Baseline 1,
       at `local.rs:1674`. `rg -c '^async fn run_loop'` returns 1, baseline 1.
       `ls keylink/src/*.rs | wc -l` returns 27, baseline 27.
 - [ ] D: `RECORD_BLOCKS` absent from the rename commit's diff, and `docs/`
       absent from its file list.
 
-**The "under 30 changed lines" estimate was low by 3x and is replaced.** Measured:
-**91 insertions, 91 deletions across 23 files plus one rename**, in a band of
-86-96 because `cargo fmt` re-sorts `use` groups. The earlier inventory counted 4
-compile sites, 3 anchors rows, 16 script arguments and 2 prose lines. The real
-inventory is 182 matching lines across 30 files: 4 compile-critical, **19
-break-record paths rather than 7** — the other 12 live in `supervision.rs`,
-`defer.rs`, `feeds.rs`, `persist.rs` and `cycles.rs`, not in `local.rs` — 16
-replay-script arguments, 43 prose lines inside code, and 101 in `docs/**` which
-are left alone per `CONTRIBUTING.md:322`.
+**The "under 30 changed lines" estimate was low by 3x and is replaced.**
+Measured: **89 name-carrying lines across 23 files outside `docs/`** — 4
+compile-critical, **19 break-record paths rather than 7** (the other 12 live in
+`supervision.rs`, `defer.rs`, `feeds.rs`, `persist.rs` and `cycles.rs`, not in
+`local.rs`), 16 replay-script arguments, 45 prose lines inside code, and 5 in
+`.mise/tasks/anchors`. Predicted diff **93 changed lines, band 90-96**: the 89
+names, the header's first line, and 3 for the `pub use` block if `cargo fmt`
+moves it as a unit. Everything under `docs/` is left alone per
+`CONTRIBUTING.md:322`.
 - [ ] C: `rg 'actor_with|actor_wired|spawn_wired' keylink/src` returns zero, and
       **`mise run docs` is green** — a deleted door named only in a rustdoc
       example is a doc break and not a compile error.
