@@ -38,7 +38,11 @@
 # this defect and was fixed by deriving the number; the fix for prose is to name
 # the rows, because a row name survives a new scenario and a count cannot.**
 #
-# 1. **Revert the fix.** In `.githooks/pre-commit`, replace
+# 1. **Revert the fix.** The literal this record searches, carried inline as a
+#    backticked span:
+#    `amend_base="$(git rev-parse --verify --quiet HEAD~1 || git hash-object -t tree /dev/null)"`
+#
+#    In `.githooks/pre-commit`, replace that line
 #
 #        amend_base="$(git rev-parse --verify --quiet HEAD~1 || git hash-object -t tree /dev/null)"
 #
@@ -56,8 +60,23 @@
 #        FAIL an amend of a commit with no linted file skips the gate — the gate ran and should not have
 #        FAIL a rebase -i reword of a Rust commit does NOT run the gate (a replay is not authoring) — the gate ran and should not have
 #
-# 3. **Break the rebase arm, either way.** In `.githooks/pre-commit`, either drop
-#    the guard from the detector by replacing
+#    **THIS RECORD HAS NO REGISTRABLE LITERAL, and that is stated rather than left to
+#    be discovered.** Its citation ELIDES the middle of the line with an ellipsis, so
+#    there is no literal to register, and inventing one would register a line this
+#    record does not quote. Record 4 quotes that SAME line in full, so its anchor already
+#    covers the rot this record would be watching for. A record that declares itself
+#    covered elsewhere costs a reader nothing; one that looks registrable and is not
+#    costs them a measurement.
+#
+# 3. **Break the rebase arm, either way.** TWO substitutions, so TWO literals and TWO
+#    rows — 3a and 3b. **The split is by REPLACEMENT, never by citation**: a row
+#    carries one literal, and two breaks that happen to redden the same row are still
+#    two breaks. Both carried inline as backticked spans:
+#
+#    3a `if [ "$rebasing" = no ] && ps -o args= -p "$PPID" 2>/dev/null | grep -qw -- '--amend'; then`
+#    3b `if [ -d "$(git rev-parse --git-path rebase-merge)" ] ||`
+#
+#    In `.githooks/pre-commit`, either drop the guard from the detector by replacing
 #
 #        if [ "$rebasing" = no ] && ps -o args= -p "$PPID" 2>/dev/null | grep -qw -- '--amend'; then
 #
@@ -76,8 +95,13 @@
 #    the guard would certify a hook that is dead in every worktree this repo is
 #    developed in.
 #
-# 4. **Restore the pipe, which is the shape `main` carries right now.** In
-#    `.githooks/pre-commit`, replace
+# 4. **Restore the pipe, which is the shape `main` carries right now.** The literal
+#    this record searches, carried inline as a backticked span — and it is the same
+#    line record 2 cites with an elision, which is why that record has no row of its
+#    own and points here:
+#    `if ! grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$' <<<"$linted"; then`
+#
+#    In `.githooks/pre-commit`, replace that line
 #
 #        if ! grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$' <<<"$linted"; then
 #
@@ -126,20 +150,33 @@
 # on purpose: it said "up to ten", and H12 quoting a line no other record quotes is all
 # it took to make it wrong — the same rot the row lists below avoid by naming rows.
 #
-# **THE RULE FOR A RECORD AUTHOR HERE, so the next one does not have to discover it:**
-# a literal that is registered, or may be, carries an INLINE backticked span somewhere
-# in its record — whatever else that record does to present it. The record-quote check
-# compares backticked spans by EQUALITY, so an INDENTED DISPLAY BLOCK is invisible to
-# it: a record showing its literal that way gets accused of not quoting a literal it
-# quotes plainly, and every remedy the failure prints is then wrong. Keep the display
-# block where it reads better and put the inline span beside it. A long literal may
-# WRAP across comment lines, because the reader joins a block's lines before it cuts
-# spans out — H11's is wrapped for exactly that reason.
+# **THE RULE FOR EVERY RECORD IN THIS FILE, stated as a property rather than as a list,
+# because the next author's record is not in anybody's list:** a literal that is
+# registered, or may be, carries an INLINE backticked span somewhere in its record —
+# whatever else that record does to present it. The record-quote check compares
+# backticked spans by EQUALITY, so an INDENTED DISPLAY BLOCK is invisible to it: a
+# record showing its literal that way gets accused of not quoting a literal it quotes
+# plainly, and every remedy the failure prints is then wrong. Keep the display block
+# where it reads better and put the inline span beside it. A long literal may WRAP
+# across comment lines, because the reader joins a block's lines before it cuts spans
+# out — H11's is wrapped for exactly that reason.
+#
+# Two consequences that are not about backticks at all:
+#
+#   * A record naming TWO substitutions needs TWO spans and registers as TWO rows,
+#     because a row carries one literal. **The split is by REPLACEMENT, never by
+#     citation** — record 3 is the one here, and its rows are 3a and 3b.
+#   * A record whose citation ELIDES part of the line has NO literal to register, and
+#     manufacturing one would register a line the record does not quote. Record 2 is
+#     that case; it says so where a reader meets it, and names the record whose anchor
+#     covers the same line.
 #
 # Measured with the shipped reader lifted out of `.mise/tasks/anchors` rather than
-# reasoned about: H1 and H4 already carried theirs inline and matched; H11 and H12
-# displayed theirs and matched NOTHING, not even by containment, until this rule was
-# applied to both. Teaching `quoted_spans` a `#` marker and widening the walk would
+# reasoned about, over EVERY record in this file: records 1, 3a, 3b, 4, H11 and H12
+# displayed their literal and matched NOTHING, not even by containment, until this rule
+# was applied to each; H1, H4 and the other H rows already matched inline, as did I1,
+# I2 and I3. Record 2 is the only record here that cannot comply, for the reason above.
+# Teaching `quoted_spans` a `#` marker and widening the walk would
 # close it, in the task that owns those two functions rather than here.
 # `scripts/break-hook-record.sh` is the partial answer available today — a replay
 # aborts when a quoted literal is missing or no longer unique, which is the same
@@ -535,7 +572,10 @@ echo "       (the staged path list measured $wide_bytes bytes)"
 # H8. **Hard-code forty zeros.** Replace
 #     `        "" | *[!0]*) return 1 ;;` with a first arm matching a 40-character
 #     zero sha and a `*) return 1 ;;` arm under it. A sha1 repository is
-#     unaffected, which is the point. Watched:
+#     unaffected, which is the point. **The REPLACEMENT here is described rather than
+#     quoted, which is legal — `break-once.sh` never searches a replacement — but it
+#     means a registered row for H8 guards the SEARCH literal only, and nothing checks
+#     that the described replacement still says what it says.** Watched:
 #
 #         the sha256 deletion-only push succeeds
 #         the sha256 deletion-only push says it skipped
