@@ -923,13 +923,22 @@ async fn unregistering_frees_the_name_without_waiting_for_an_ending() {
 
 /// A liveness bound, never a measurement.
 ///
-/// Three guards below name a defect whose only symptom is that an ending never
-/// comes: a conductor that died with the policy, a dropped group nothing woke,
-/// and a member that cannot be retired until its backoff elapses. Unbounded,
-/// each of those **hangs** the suite, and `tests/supervision.rs` records what
-/// that costs — a hang is not a failure a harness can read, and its own red-test
-/// run "sat for minutes reporting nothing". That file uses this same constant
-/// for this same reason.
+/// Two guards below name a defect whose only symptom is that an ending never
+/// comes: a dropped group nothing woke, and a member that cannot be retired
+/// until its backoff elapses. Unbounded, both **hang** the suite, and
+/// `tests/supervision.rs` records what that costs — a hang is not a failure a
+/// harness can read, and its own red-test run "sat for minutes reporting
+/// nothing". That file uses this same constant for this same reason.
+///
+/// **This said three, and the third was wrong.** A conductor that dies inside
+/// caller code — a panicking policy, a panicking ending — does not hang anybody,
+/// because it takes its `watch::Sender` with it, and [`Group::ended`] answers
+/// `Dropped` on a dropped sender rather than waiting on one. So those two redden
+/// by assertion, in 0.00s, on a `GroupEnded` that is the wrong variant rather
+/// than a missing one. Measured, after the breaks were run: only the backoff
+/// guard actually reached this bound, at 60.01s. The mistake was reasoning from
+/// *"the conductor is gone, so nothing will answer"* without reading the arm
+/// that answers precisely when nothing will.
 ///
 /// It is not a ceiling on how long the work may take. Nothing here asserts a
 /// duration, and the one test whose defect is *lateness* rather than a hang —
@@ -1174,6 +1183,16 @@ async fn a_members_own_restart_never_reaches_the_policy() {
 /// supervisor produces**. A group that handed the policy a reason of its own
 /// would erase the difference between an actor somebody aborted and one that
 /// refused to serve at all.
+///
+/// **This guard was GREEN under that break until the assertion at the end was
+/// added, and the reason is worth keeping.** It asserted `GroupEnded::Member`'s
+/// `reason` and a decision *count*, and never the `Ended` the policy was handed.
+/// The conductor builds that `GroupEnded` from its own local, so the whole
+/// assertion block sat on a path the break does not touch — while the record
+/// above claimed a policy argument. Its sibling reddens on the identical literal
+/// only because it reads `seen[0].1`. **A record naming what the policy is told
+/// needs an assertion on what the policy was told**, and "the caller was told the
+/// right thing" is a different claim wearing the same words.
 #[tokio::test]
 async fn a_fatal_refusal_reaches_the_policy_without_a_restart() {
     let (asked, policy) = recording(Verdict::StopAll);
@@ -1207,7 +1226,20 @@ async fn a_fatal_refusal_reaches_the_policy_without_a_restart() {
         1,
         "built once, and never rebuilt: a fatal refusal is not retried"
     );
-    assert_eq!(decisions(&asked).len(), 1, "and the policy was asked once");
+
+    // **What the POLICY was handed, which is a different question from what the
+    // caller was told above.** `GroupEnded::Member` is built by the conductor
+    // from its own local, so reading only that leaves the policy's argument
+    // unchecked — and this guard was green under exactly that break until it
+    // was run.
+    let seen = decisions(&asked);
+    assert_eq!(seen.len(), 1, "the policy was asked once");
+    assert_eq!(seen[0].0, name, "about that member");
+    assert!(
+        matches!(seen[0].1, Ended::GaveUp { after: 0, .. }),
+        "and handed the supervisor's own reason rather than one the group invented: {:?}",
+        seen[0].1
+    );
 }
 
 /// Made red by `scripts/break-once.sh keylink/src/compose/group.rs`, replacing
@@ -1279,12 +1311,21 @@ async fn stop_all_ends_the_group_and_names_the_member_that_caused_it() {
 
 /// Made red by `scripts/break-once.sh keylink/src/compose/group.rs`, replacing
 /// `retire_all`'s `Ok(fut) => retiring.push(guarded(fut)),` with
-/// `Ok(fut) => guarded(fut).await,` — the serial spelling that function's own doc
-/// comment refuses, and the one every hand-written teardown reaches for first.
-/// Awaited inside the build loop, a member wedged in its retirement stops every
-/// later member from being retired at all. Watched: TO BE MEASURED.
+/// `Ok(fut) => { let _ = guarded(fut).await; }` — the serial spelling that
+/// function's own doc comment refuses, and the one every hand-written teardown
+/// reaches for first. Awaited inside the build loop, a member wedged in its
+/// retirement stops every later member from being retired at all.
+/// Watched: TO BE MEASURED.
 ///
-/// **Read that line before running the break.** The defect is fixed — await the
+/// **The serial spelling must discard the result, and the first version of this
+/// record did not.** `Ok(fut) => guarded(fut).await,` does not compile: `guarded`
+/// yields `Result<(), Panic>` and the sibling `Err(_discarded) => {}` arm yields
+/// `()`, so the match arms disagree. Run as written it exits 101 on E0308 and
+/// tests nothing — and a non-zero exit from `break-once.sh` reads as a caught
+/// defect, so that failure is the one shaped most like success. The `let _ =`
+/// is what makes the arm `()`.
+///
+/// **Read the anchor line before running it.** The defect is fixed — await the
 /// retire future where it is built instead of pushing it — but the line it lives
 /// on took three spellings while this test was being written, as `retire_all`
 /// gained and lost its panic guards. A literal that no longer occurs aborts
@@ -1564,8 +1605,12 @@ async fn adds_made_while_the_policy_runs_are_all_watched() {
 /// running and unwatched, which is the group-actor problem this module refuses,
 /// reached from the other side. Watched: TO BE MEASURED.
 ///
-/// That defect's whole symptom is an ending that never comes, so the wait is
-/// [`bounded`]: unbounded it would hang rather than fail.
+/// **This break reddens by assertion and not by timeout**, and the record said
+/// the opposite until the break was run. A conductor that unwinds takes its
+/// `watch::Sender` with it, and [`Group::ended`] answers `GroupEnded::Dropped`
+/// on a dropped sender — so the `match` below fails on the wrong variant, in
+/// 0.00s. The [`bounded`] wrapper is cheap insurance here rather than the thing
+/// that produces the red.
 #[tokio::test]
 async fn a_policy_that_panics_ends_the_group_rather_than_orphaning_it() {
     let group = Group::new(|_who, _why| panic!("the policy refuses to decide"));
@@ -1617,6 +1662,17 @@ async fn a_policy_that_panics_ends_the_group_rather_than_orphaning_it() {
 /// happens to end, so nothing answers whoever is awaiting [`Group::ended`].
 /// Watched: TO BE MEASURED.
 ///
+/// **That break was GREEN, in 0.00s, until the body below was changed to park
+/// the conductor first.** The wake matters only to a conductor already waiting at
+/// `wake.notified()`, and the original test reached `drop` before the conductor's
+/// first poll ever ran — so that poll found the state gone on its own `upgrade`
+/// and answered `Dropped` down a path with no wake in it. The test named a
+/// mechanism it could not reach. Parking it is what puts the wake under test, and
+/// the `waker` member exists for that and for nothing else. Expect this break to
+/// redden **by timeout** now, at the [`NO_PROGRESS`] bound, because a parked
+/// conductor that is never woken holds its `watch::Sender` open — unlike the
+/// panicking-conductor breaks, which drop theirs and redden by assertion.
+///
 /// That reddens *"answers its waiters instead of hanging"*. The other half —
 /// *"and leaves its members running"* — has **no break**, for
 /// `a_topic_with_nobody_listening_drops_the_item_rather_than_keeping_it`'s reason:
@@ -1627,7 +1683,7 @@ async fn a_policy_that_panics_ends_the_group_rather_than_orphaning_it() {
 /// `conduct`'s signature, which is a compile failure rather than a red test.
 #[tokio::test]
 async fn a_dropped_group_ends_as_dropped_and_leaves_its_members_running() {
-    let (_asked, policy) = recording(Verdict::StopAll);
+    let (asked, policy) = recording(Verdict::Forget);
     let group = Group::new(policy);
     let name = ActorId::new("member").expect("a name");
     let member = worker::actor(Worker { me: 5 });
@@ -1635,6 +1691,28 @@ async fn a_dropped_group_ends_as_dropped_and_leaves_its_members_running() {
     assert!(group
         .add(name.clone(), keylink::membership!(member))
         .is_none());
+
+    // **The conductor must be PARKED on the wake for this to test the wake.**
+    // Nothing observable says "parked", so it is constructed: a second member
+    // ends, the policy is asked about it, and the conductor loops back to its
+    // wait. Without this the whole test runs before the conductor's first poll,
+    // and that poll then finds the state already gone on its own `upgrade` —
+    // which answers `Dropped` with no wake involved at all. That is not a
+    // hypothetical: this guard was GREEN with `Shared::drop`'s body deleted
+    // until this block was added.
+    let waker = worker::actor(Worker { me: 6 });
+    assert!(group
+        .add(
+            ActorId::new("waker").expect("a name"),
+            keylink::membership!(waker),
+        )
+        .is_none());
+    waker.abort();
+    assert!(
+        settles(|| !decisions(&asked).is_empty()).await,
+        "the conductor has run a whole iteration, so it is back at its wait"
+    );
+
     let held = group.clone();
     // Taken while the group is still held, and it must still be answered.
     let waiting = group.ended();
@@ -1812,8 +1890,12 @@ fn counting(retired: &Arc<AtomicUsize>) -> Membership {
 /// while the caller still holds a live `Group` — a wrong answer rather than a
 /// missing one. Watched: TO BE MEASURED.
 ///
-/// That defect's whole symptom is an ending that never comes, so the wait is
-/// [`bounded`]: unbounded it would hang rather than fail.
+/// **This break reddens by assertion and not by timeout**, and the record said
+/// the opposite until the break was run. A conductor that unwinds takes its
+/// `watch::Sender` with it, and [`Group::ended`] answers `GroupEnded::Dropped`
+/// on a dropped sender — so the `match` below fails on the wrong variant, in
+/// 0.00s. The [`bounded`] wrapper is cheap insurance here rather than the thing
+/// that produces the red.
 #[tokio::test]
 async fn an_ending_that_panics_ends_the_group_as_ending_panicked() {
     let (asked, policy) = recording(Verdict::Forget);
