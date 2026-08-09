@@ -1352,8 +1352,14 @@ MARKERS = ("///", "//!", "//")
 # So the over-approximation costs one junk span today and moves no figure. The MECHANISM
 # stays: a heredoc holding a shell script whose `#` comment quotes a real code line could
 # equal a registered literal, and then it would inflate `blocks_carrying` - overstating
-# coverage, the one direction every figure here is written to avoid. What is measured is
-# this tree, and `pick` is not that shape.
+# coverage, the one direction every figure here is written to avoid. `pick` is not that
+# shape.
+#
+# **The commit is named and the currency is NOT claimed, deliberately.** `97b29b7` is an
+# immutable handle on the content that was counted, so the figures stay checkable
+# forever. Whether that is still the last commit to touch either file is a fact about
+# some later tree, and a sentence asserting it would rot on the next edit while reading
+# as though somebody had just looked. Re-run the scan rather than trusting the date.
 HASH_MARKERS = ("#",)
 
 # Suffixes whose files are hash-commented. A suffix-less file is placed by its own
