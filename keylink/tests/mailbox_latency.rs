@@ -287,9 +287,17 @@ async fn until_buffered(system: &queue::System, messages: u64) {
 ///   shallow one;
 /// - `the_mailbox_depth_is_the_systems_and_defaults_to_one`, in that same section and
 ///   named after the knob itself — fails `left: 1, right: 4` on the first
-///   `max_capacity()` reading of its `depth(4)` system;
+///   `max_capacity()` reading of its `depth(4)` system. **Both of those numbers are
+///   borrowed from `registry.rs`, and they are recorded anyway.** The 4 is that test's
+///   own `depth(4)` and the 1 is `DEFAULT_MAILBOX_DEPTH`, so moving either literal
+///   makes this line false while the guard stays correct, the anchor still resolves and
+///   `mise run anchors` stays green. They stay because that assertion carries no
+///   message at all, so the two integers are the only tokens a replay has to match on —
+///   and a message added now would put a sentence in this record that nobody has
+///   watched fail;
 /// - `a_saturated_mailbox_at_depth_does_not_starve_a_feed` in `tests/actors.rs` —
-///   panics after its own 30 second budget;
+///   panics after its own 30 second budget, and that number is `actors.rs`'s own
+///   `until_buffered` rather than this file's same-named helper;
 /// - `buffered_is_exact_at_depth_and_counts_no_parked_sender`, also in that section —
 ///   **HANGS. It never reports at all.** Its actor holds every turn, so nothing ever
 ///   frees a permit: at one slot the second of its three `mail.send(..).await`s parks
@@ -304,6 +312,19 @@ async fn until_buffered(system: &queue::System, messages: u64) {
 /// depths 1, 32 and 1,024 each printed **1738 bytes** on the honest tree and **1738
 /// bytes** under the break, and the test passed both times. Not one figure moved. That
 /// guard is about the allocator's block size and is no evidence about the knob.
+///
+/// **That 1738 is a reading, not a property, and the difference decides what falsifies
+/// this paragraph.** It is a `println!` in `actor_memory.rs`'s phase 5 that no assertion
+/// gates — the assertion beside it compares the three depths to within one pointer and
+/// names no magnitude — and it comes from a process-wide allocation counter on one
+/// machine. The number is in no source file, so unlike the two integers above it cannot
+/// be rotted by an edit; it rots by being read on another host. **What the paragraph
+/// rests on is the two readings being EQUAL, never their value.** A machine printing
+/// some other number leaves the point standing, and three depths disagreeing with each
+/// other is what would retract it. The honest-tree half was re-measured on 2026-08-08
+/// with `cargo nextest run -p keylink --no-capture` under an `-E` filter naming that
+/// test, and printed 1738 at each of the three depths again. The under-break half is
+/// still one author's single run and has not been repeated.
 ///
 /// Nothing outside those six call sites was run, and this is not a claim about the
 /// whole suite.
@@ -442,7 +463,13 @@ async fn a_mailbox_holds_exactly_its_depth_and_releases_no_caller_early() {
 /// send — so the answer is a function of the queue and not of how far the run got.
 /// The two depths are 1 and 32, which is the range
 /// [`keylink::SystemBuilder::mailbox_depth`] claims is free of any memory trade,
-/// because `tokio::sync::mpsc` allocates its first block of 32 slots eagerly.
+/// because `tokio::sync::mpsc` allocates its first block of 32 slots eagerly. **That
+/// block size is `tokio`'s and not this repository's**, so it moves on a version bump
+/// with nothing here changing — the external-owner case `rpc.rs`'s module doc states in
+/// full, and the reason this sentence names the crate that sets it.
+/// `ten_thousand_idle_actors_fit_in_the_budget` in `tests/actor_memory.rs` measures the
+/// consequence rather than the block size: an empty mailbox costs the same at all three
+/// of its depths.
 ///
 /// # What is measured, and it is three quantities
 ///

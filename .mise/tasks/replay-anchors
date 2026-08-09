@@ -11,9 +11,19 @@ MISE description="Replay each REDNESS row's break and check it reddens its own g
 #
 # That gap is not theoretical. `C10`'s anchor kept resolving while another branch
 # rewrote the test its record described, so the break stopped reddening and the gate
-# never moved. And the bias runs one way: on 2026-08-08 both records a reviewer
-# challenged claimed MORE redness than exists, because an author holds the guards
-# they WROTE in mind while the neighbouring guard's shape is not in that picture.
+# never moved. And the bias does NOT run one way: on 2026-08-08 both records a
+# reviewer challenged claimed MORE redness than exists, because an author holds the
+# guards they WROTE in mind while the neighbouring guard's shape is not in that
+# picture — and on the same day the registry's `N1` row went the other way. As
+# challenged it named THREE affected guards, and five are affected. Its record, in
+# the file its `ANCHORS` row names, names all five now and marks the hang. Both
+# directions occur, so nothing here may assume a record over-claims. An over-claiming
+# record wastes a reader's time; an under-claiming one makes a stalled run read as a
+# broken harness — which is this whole file's failure mode, one layer down.
+#
+# (`N1` here is the registry row id. `keylink/src/local.rs` uses the same two
+# characters for an unrelated finding about incarnations, so the substitution is
+# spelled out below rather than left to the id.)
 #
 # ── WHY THIS READS THE REGISTRY INSTEAD OF HARD-CODING ITS OWN BREAKS ──────────
 #
@@ -38,26 +48,218 @@ MISE description="Replay each REDNESS row's break and check it reddens its own g
 # `exit=101` is identical for a break that reddens the right guard and one that
 # reddens the wrong one, and the wrong one reads as evidence.
 #
-# ── AND IT IS IN NO GATE, WHICH IS A CORRECTNESS CLAIM AND NOT A SPEED ONE ─────
+# One arm below now READS that line, and the paragraph above still holds. The
+# declared `unaffected` arm requires the recorded sentence AND `exit=0`, because a
+# `test … ok` line does not say that no SIBLING test under the same filter reddened —
+# and if one did, the break WAS observed and `unaffected` is the wrong cell. That is
+# an extra requirement inside one arm. It is never a substitute for the sentence, and
+# no arm passes on an exit code alone.
 #
-# It edits the tree. `break-once.sh` restores a backup on EXIT, so a run racing an
-# uncommitted edit restores OVER it — which is why this refuses a dirty worktree, and
-# why it could not be a `pre-commit` citizen even if it were instant: that hook fires
-# while a developer's working tree is live. It also runs one `cargo test` per row.
+# ── THE TWO MODES A PASS/FAIL CELL CANNOT HOLD ─────────────────────────────────
+#
+# Both were MEASURED on 2026-08-08 by applying the registry's `N1` break —
+# `Registry::entry`'s `mpsc::channel(self.mailbox_depth)` replaced by
+# `DEFAULT_MAILBOX_DEPTH` — and running every `mailbox_depth` call site by name.
+# Neither is a pass, and neither is a failure of the kind the arm above describes.
+#
+#   * A HANG. `buffered_is_exact_at_depth_and_counts_no_parked_sender` never
+#     reported at all. Its actor consumes nothing, so at one slot the second of
+#     three `mail.send(..).await`s parks forever — BEFORE the assertion that would
+#     have caught the wrong count. It was killed by hand at 120 s. There is no
+#     in-test timeout, and `.config/nextest.toml` sets `slow-timeout` with no
+#     `terminate-after`, so nextest prints `SLOW` and then waits with you.
+#
+#     **A hang is the break being OBSERVED, not the harness being broken.** A guard
+#     that stops reporting under a substitution felt that substitution. Scoring it
+#     as an error hides a working break. So a row is killed on a wall clock and the
+#     kill is scored as evidence — and the summary says the row's recorded SENTENCE
+#     went unchecked, because it did.
+#
+#   * A GUARD THE BREAK REACHES AND DOES NOT MOVE.
+#     `ten_thousand_idle_actors_fit_in_the_budget` sets three depths and PASSES
+#     under `N1` with byte-identical output: 1738 bytes at depths 1, 32 and 1,024 on
+#     the honest tree, and 1738 under the break. Its assertions demand that the
+#     three depths cost the SAME bytes, so flattening all three to one slot
+#     satisfies them. A one-sided assertion cannot see a break that removes the
+#     variable it compares across. The guard is correct and the break does not touch
+#     what it measures, so scoring it as a missing expected failure is a FALSE
+#     ALARM — and a false alarm in a checker is what gets the checker switched off.
+#
+# ── WHY ONE OF THE TWO IS DECLARED IN THE ROW AND THE OTHER IS INFERRED ────────
+#
+# An `unaffected` cell with no declared reason is indistinguishable from ROT, and rot
+# is the whole thing this task exists to find. A guard rewritten until the break no
+# longer reaches it goes GREEN. A guard the break honestly cannot move also goes
+# GREEN. Nothing in the output separates them, so `unaffected` is not a verdict this
+# task can infer — a row DECLARES it, in an optional fifth element carrying the
+# reason, and the reason is printed on every run where it is used.
+#
+# Three things keep that declaration from becoming a place a dead guard can hide:
+#
+#   * An UNDECLARED green still fails, in the same arm and with the same words as
+#     before. The fifth element is the only way into the `unaffected` cell.
+#   * A declared row still records a SENTENCE, and it is still asserted. For a
+#     declared row that sentence comes from a watched GREEN run and says the guard
+#     RAN — `cargo test` with a filter that matches NOTHING also exits 0, so
+#     `exit=0` alone would let a deleted test read as unaffected. Declaring
+#     `unaffected` therefore still costs a watched run and a line pasted out of it.
+#   * A declared row that HANGS fails. The declaration says the break does not reach
+#     what this guard measures, and a hang says it does.
+#
+# A hang needs no declaration, and that asymmetry is the argument rather than a
+# convenience: rot goes GREEN, it does not hang. A hang is positive evidence that
+# the substitution changed what the guard's own code does, so no dead guard can
+# reach that cell.
+#
+# ── HOW THE KILL IS DELIVERED, WHICH IS MEASURED AND NOT A DETAIL ──────────────
+#
+# `subprocess.run(timeout=…)` cannot be used for this, and it is worth naming why,
+# because it is the obvious thing to reach for and it does the two worst things at
+# once. Measured 2026-08-08 against a scratch shell shaped like `break-once.sh` — a
+# `trap restore EXIT`, then a foreground `sleep | tee` — under the bash that
+# `/usr/bin/env bash` resolves to on this machine, GNU bash 3.2.57(1)-release:
+#
+#   * `subprocess.run(capture_output=True, timeout=1)`: the trap did NOT run, and
+#     three processes survived, reparented to PID 1. So it leaves the BREAK IN THE
+#     FILE and orphans the runner — and `AGENTS.md` records that orphan as an
+#     incident of its own: it fires its `trap EXIT` later and copies a stale backup
+#     over whatever the file holds by then.
+#   * SIGKILL to the process GROUP: the trap did not run either. Nothing survived,
+#     and the file stayed broken.
+#   * SIGTERM to the shell PID alone: the trap RAN, and two processes survived.
+#   * SIGTERM to the process GROUP: the trap ran, and nothing survived.
+#
+# So the order is SIGTERM to the group, then a bounded wait, then SIGKILL to the
+# group only if it is still there. `start_new_session=True` is what makes the group
+# knowable: the child becomes its own group leader, so the group id IS its pid, and
+# nothing has to call `getpgid` after the child is reaped — that call raises
+# `ProcessLookupError` once it is gone, which was measured while writing this.
+#
+# **And the tree is re-checked after every row.** A restore that did not happen is
+# silent, and the next row would then cut a second literal into an already-broken
+# file — or, for the last row, leave the break in the tree with the task reporting
+# success. The check can only run because the tree was refused if dirty at the start.
+#
+# ── WHY THE TIMEOUT IS GENEROUS, AND WHY A MISSING START LINE FAILS ────────────
+#
+# A kill that lands during COMPILATION is not a hang. Scoring one as a hang would be
+# this task reporting a break it never ran — a false PASS, which is the failure this
+# whole file exists to prevent. Two things keep it out.
+#
+# The default is 600 s per row, which has to clear a COLD build rather than the 120 s
+# at which the measured hang was killed by hand. `REPLAY_TIMEOUT` moves it. A genuine
+# hang therefore costs the full timeout, which is the right price for a REPLAY that is
+# run by hand.
+#
+# **Only the replay path reads this timeout**, and the sentence above said "a task that
+# is run by hand and never in a gate" until `--selftest` became a gate step. That arm
+# passes its own two seconds at its one `run_watched` call, so registering it put no
+# 600 s wait into anybody's push. This is the third sentence in this file to be
+# narrowed for the same reason, after the heading below and its closing paragraph: a
+# claim about the whole file was true only of one of its two arms.
+#
+# And the `hang` arm requires a line saying the runner got PAST its build. `running `
+# is libtest's and `Finished ` is cargo's, and both were read off the one measured
+# `break-once.sh` log these fixtures are shaped on. `Starting ` is nextest's and is
+# NOT confirmed here — `BREAK_RUNNER` can select nextest, and no nextest log was in
+# hand. The set is CONSERVATIVE BY DIRECTION: a marker it does not know costs a false
+# FAILURE whose message names its own remedy, and it can never buy a false pass. For
+# a checker that is the direction to be wrong in.
+#
+# ── THE CLASSIFIER IS A PURE FUNCTION, AND `--selftest` IS WHAT THAT BUYS ──────
+#
+# The scoring used to be inline, where the only way to exercise an arm was to run a
+# break: a cargo run per arm, a clean worktree, and an edit to the tree. `outcome()`
+# takes the harness's output text plus one flag and returns a verdict, so every arm
+# is reachable from a string.
+#
+#     python3 .mise/tasks/replay-anchors --selftest   # edits nothing, runs no cargo
+#
+# Prefer that spelling over `mise run replay-anchors --selftest`: if a wrapper ever
+# swallowed the flag, the task would fall through to a full replay, and a replay
+# edits the tree. The dirty-tree refusal is the second guard against that, not the
+# first.
+#
+# The synthetic transcripts are SHAPED on a real run, and the recorded sentence is
+# spliced into them out of `REDNESS` rather than pasted. A pasted sentence would keep
+# agreeing with itself after the registry moved, which is the rot this task hunts,
+# reproduced inside its own self-test.
+#
+# **Watched, with the CONTROL first, because a red arm proves nothing until the green
+# one is green.** Each line is one perturbation of a COPY of this file — never of the
+# tree — and what that copy then printed:
+#
+#   * `outcome`'s `unaffected` arm with its `if not saw` test deleted, so a
+#     declaration stops costing a watched line: `FAIL a declared row whose pass
+#     sentence is absent fails` / `verdict unaffected: `unaffected` must still cost a
+#     watched line`, exit 1.
+#   * `outcome`'s `hang` arm with its `started(out)` test deleted, so a kill during a
+#     build reads as a hang: `FAIL a kill before the runner started is NOT a hang` /
+#     `verdict hang: a build that outran the timeout would read as evidence`, exit 1.
+#   * `outcome`'s undeclared-green arm made to return `unaffected`: exit 1 on THREE
+#     probes, not one - `FAIL an UNDECLARED green fails`, `FAIL a red at a DIFFERENT
+#     sentence fails` and `FAIL an aborted anchor fails`, each `verdict unaffected`.
+#     That is the arm's whole job in one line: a green break, a break red at another
+#     assertion, and a break that never ran all arrive there, and the third was not
+#     predicted when this record was written.
+#
+# The fifth element was also read out of a DRIFTED COPY of the registry through
+# `REPLAY_REGISTRY`, and not only out of a synthetic tuple: a five-element `A5` was
+# accepted and a six-element one printed the shape refusal. So the declaration is
+# known to survive `ast.literal_eval` in a real row. `mise run anchors` reads
+# `REDNESS` for its KEYS and its LENGTH and never unpacks a row, so the fifth element
+# is invisible to that gate — checked line by line, because a row nobody can commit
+# would make every arm above decoration.
+#   * `run_watched`'s SIGTERM replaced by SIGKILL, so the restore trap is skipped:
+#     `FAIL the killed shell ran its restore trap` / `the trap left '<no file>'`,
+#     exit 1. The probe's own `sleep` still died, so the process-group half of that
+#     call is not what this perturbation proves.
+#
+# ── AND THE REPLAY IS IN NO GATE, A CORRECTNESS CLAIM AND NOT A SPEED ONE ──────
+#
+# The REPLAY edits the tree. `break-once.sh` restores a backup on EXIT, so a run
+# racing an uncommitted edit restores OVER it — which is why this refuses a dirty
+# worktree, and why it could not be a `pre-commit` citizen even if it were instant:
+# that hook fires while a developer's working tree is live. It also runs one
+# `cargo test` per row.
 #
 # So the honest place for it is by hand: at a merge gate, or by whoever rewrites a
 # guard a record describes. Reviewer-run rather than author-run is the point — the
 # author already ran it once, and that run is the thing being re-checked.
 #
+# `--selftest` is a different animal, and the heading above says REPLAY for that
+# reason: it edits nothing, runs no cargo, and writes only under the system temp
+# directory — a scratch directory and one output sink, and it removes both — so it is
+# gate-safe on the same terms as `anchors-selftest`. **And it IS registered**, in
+# `mise.toml`'s `gate` list, LAST among the steps there that need no compile and
+# immediately above the first step that does. It sat higher, above `fmt-check`, until
+# a reviewer timed the two: that list orders cheapest failures first, and this step
+# cannot beat a step with no two-second floor. Deliberately NOT in `pre-commit`: that
+# hook's filter tests for Rust and this file is not Rust, so there it would fire only
+# by coincidence. The entry passes `args = ["--selftest"]` rather than a flag inside
+# the task name, so nothing depends on how a wrapper parses a flag.
+#
+# What it checks is the CLASSIFIER and never a record. It cannot finish faster than
+# the two seconds its kill probe waits, which is a floor read off the constant and
+# not a timing measurement.
+#
+# The heading said "IT IS IN NO GATE" until one of its arms became a gate step. A
+# heading that covers less than its words claim is the trap this file spends
+# paragraphs on elsewhere, so the subject is now named in the heading itself.
+#
 #     mise run replay-anchors            # every row in REDNESS
 #     mise run replay-anchors L5 A5      # named rows only
 #
 #     REPLAY_REGISTRY=/tmp/drifted mise run replay-anchors L5    # this task, tested
+#     REPLAY_TIMEOUT=1200 mise run replay-anchors                # a slower machine
 import ast
 import os
 import pathlib
+import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 
 ROOT = pathlib.Path(
     subprocess.run(
@@ -73,6 +275,16 @@ ROOT = pathlib.Path(
 # value, and the tree must be clean before this will run at all — so the arm would
 # stay unexercised, which for a checker is the same as absent.
 TASK = pathlib.Path(os.environ.get("REPLAY_REGISTRY", ROOT / ".mise" / "tasks" / "anchors"))
+
+try:
+    SECONDS = int(os.environ.get("REPLAY_TIMEOUT", "600"))
+except ValueError:
+    sys.exit("REPLAY_TIMEOUT must be a whole number of seconds")
+# Between the SIGTERM that lets `trap restore EXIT` run and the SIGKILL that does
+# not. The measured trap took milliseconds; this is slack, and not a measurement.
+GRACE = 10
+# Read off the measured log, and conservative by direction — see the heading above.
+STARTED = ("running ", "Finished ", "Starting ")
 
 
 def registry(name: str):
@@ -99,11 +311,314 @@ if orphans:
              "have nothing to cut. Either the row was dropped and the entry outlived "
              "it, or the id is misspelled.")
 
-wanted = sys.argv[1:]
+
+def exit_status(out: str) -> int | None:
+    """What `break-once.sh` said the runner exited with, or None if it never got there.
+
+    None is the aborted anchor and the killed run at once, and both belong in the
+    failure arm for the same reason: no assertion was reached.
+    """
+    for line in out.splitlines():
+        if line.startswith("── exit="):
+            return int(line[len("── exit="):].split()[0])
+    return None
+
+
+def started(out: str) -> bool:
+    """Did the runner get past its BUILD? The timeout heading says why that matters."""
+    return any(line.strip().startswith(STARTED) for line in out.splitlines())
+
+
+def outcome(watched: str, unaffected: str | None, out: str,
+            killed: bool) -> tuple[str, str]:
+    """Score one replayed break. Pure, so `--selftest` can reach every arm.
+
+    Reads only `break-once.sh`'s output text and whether the wall clock killed it.
+    Returns one of `red`, `hang`, `unaffected` or `fail`, and the reason to print.
+    """
+    saw = watched in out
+    if unaffected:
+        if killed:
+            return "fail", ("this row DECLARES the guard unaffected, and the run had to "
+                            "be killed — a break that hangs a guard is one it felt")
+        if not saw:
+            return "fail", ("the sentence this row records as its evidence that the "
+                            "guard RAN is absent, so `unaffected` rests on nothing")
+        status = exit_status(out)
+        if status != 0:
+            return "fail", (f"the row declares the guard unaffected and the run exited "
+                            f"{status}: something under this filter caught the break")
+        return "unaffected", unaffected
+    if saw:
+        return "red", watched
+    if killed:
+        if started(out):
+            return "hang", "killed with the runner already past its build"
+        return "fail", ("killed before the runner reached a test, so this is a BUILD "
+                        "that outran REPLAY_TIMEOUT rather than a hang — or a runner "
+                        "whose start line this task does not know")
+    return "fail", "the recorded sentence is NOT in this run"
+
+
+def declaration(record: str, row: tuple) -> str | None:
+    """A row's optional fifth element: why this break cannot move the guard it names."""
+    if len(row) == 4:
+        return None
+    if len(row) != 5 or not isinstance(row[4], str) or not row[4].strip():
+        sys.exit(f"REDNESS row {record} has {len(row)} elements. A row is "
+                 "(replacement, watched substring, test filter, extra runner args) and "
+                 "may carry a FIFTH: a non-empty string saying why this break reaches "
+                 "this guard and cannot move it. Nothing else is a row.")
+    return row[4].strip()
+
+
+def run_watched(argv: list[str], seconds: int) -> tuple[str, bool]:
+    """Run argv under a wall-clock kill. Returns its merged output and whether it died.
+
+    Output goes to a FILE rather than a pipe, because this function is the reader and
+    the killer at once and a file needs no drain. The kill ORDER is measured — see the
+    heading above; the short of it is that SIGKILL skips `break-once.sh`'s restore and
+    a PID-only signal orphans the runner.
+    """
+    # `mkstemp` hands back an OPEN descriptor and a path, and this needs only the path:
+    # the `with` below opens its own. Taking `[1]` and dropping the fd leaked one
+    # descriptor per call, held until the process exited — one for a self-test and one
+    # per row for a replay, so no run reached a limit and nothing would have reported
+    # it either.
+    fd, name = tempfile.mkstemp(prefix="replay-anchors-")
+    os.close(fd)
+    sink = pathlib.Path(name)
+    try:
+        with sink.open("w") as handle:
+            done = subprocess.Popen(argv, stdout=handle, stderr=subprocess.STDOUT,
+                                    cwd=ROOT, start_new_session=True)
+        group = done.pid  # `start_new_session` makes the child its own group leader
+        killed = False
+        try:
+            done.wait(timeout=seconds)
+        except subprocess.TimeoutExpired:
+            killed = True
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(group, sig)
+                except ProcessLookupError:
+                    break
+                try:
+                    done.wait(timeout=GRACE)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        return sink.read_text(errors="replace"), killed
+    finally:
+        sink.unlink(missing_ok=True)
+
+
+def restored(record: str, killed: bool) -> None:
+    """Refuse to run another break on a tree the last restore did not put back."""
+    dirt = subprocess.run(["git", "status", "--porcelain"], capture_output=True,
+                          text=True, check=True, cwd=ROOT).stdout
+    if not dirt.strip():
+        return
+    print(f"\nSTOPPING after {record}: the tree was clean when this started, and it is "
+          "not now.", file=sys.stderr)
+    if killed:
+        print("That row was killed on the wall clock, so the prime suspect is "
+              "break-once.sh's `trap restore EXIT`, and the break may still be IN the "
+              "file below. Restore it from git before running anything else.",
+              file=sys.stderr)
+    else:
+        print("Either a restore failed, or something else wrote to this tree while the "
+              "replay ran. Read the paths below before restoring anything: a checkout "
+              "here would also discard whatever else is uncommitted.", file=sys.stderr)
+    print(dirt, file=sys.stderr, end="")
+    sys.exit(2)
+
+
+def selftest() -> int:
+    """Feed `outcome()` synthetic runs, and `run_watched()` a sleeping shell.
+
+    Every case here is a guard, and the header above records what each one printed
+    when it was watched failing. Nothing in this function reads or writes the
+    repository — the kill probe works inside a scratch directory under the system
+    temp, which is also why it is the one arm a dirty worktree does not block.
+    """
+    failures: list[str] = []
+
+    def check(name: str, condition: bool, detail: str) -> None:
+        if condition:
+            print(f"ok: {name}")
+        else:
+            failures.append(name)
+            print(f"FAIL {name}", file=sys.stderr)
+            print(f"     {detail}", file=sys.stderr)
+
+    # Shaped on the `break-once.sh` log measured 2026-08-08, with the sentence and the
+    # filter spliced in from REDNESS so no fixture can agree with a registry that
+    # moved. `build=False` is the run killed while cargo was still compiling.
+    def transcript(body: str, status: int | None, build: bool = True) -> str:
+        head = "── broken: <target>\n── runner: cargo test\n"
+        head += "   Compiling keylink v0.1.0 (<root>/keylink)\n"
+        if build:
+            head += ("    Finished `test` profile [unoptimized + debuginfo] in 2.55s\n"
+                     "     Running unittests src/lib.rs (target/debug/deps/keylink-<h>)\n\n")
+        tail = "" if status is None else (
+            f"── exit={status} (non-zero means the test caught it)\n── log: <path>\n")
+        return head + body + tail
+
+    record = next(iter(REDNESS))
+    sentence, test_filter = REDNESS[record][1], REDNESS[record][2]
+    print(f"── the sentence and the filter come from REDNESS[{record!r}], read now")
+
+    red = transcript(f"running 1 test\ntest {test_filter} ... FAILED\n\n"
+                     f"thread '{test_filter}' panicked at <file>:<line>:\n{sentence}\n",
+                     101)
+    ok = transcript(f"running 1 test\ntest {test_filter} ... ok\n\n"
+                    "test result: ok. 1 passed; 0 failed; 178 filtered out\n", 0)
+    passed = f"test {test_filter} ... ok"
+
+    # ── the control, and every probe under it is void until this one is green ─────
+    verdict, why = outcome(sentence, None, red, killed=False)
+    check("CONTROL a red at the recorded sentence scores red",
+          (verdict, why) == ("red", sentence),
+          f"verdict {verdict}, why: {why}. Every probe below is void until this "
+          "passes: they share this fixture builder and this registry read.")
+
+    # ── the distinction this task was written for: red, but somewhere else ────────
+    elsewhere = transcript(f"running 1 test\ntest {test_filter} ... FAILED\n\n"
+                           "assertion `left == right` failed: something else entirely\n",
+                           101)
+    check("the wrong-sentence fixture does not contain the recorded sentence",
+          sentence not in elsewhere,
+          "the fixture carries the sentence it exists to lack, so the probe under it "
+          "would pass for the wrong reason")
+    verdict, _ = outcome(sentence, None, elsewhere, killed=False)
+    check("a red at a DIFFERENT sentence fails", verdict == "fail", f"verdict {verdict}")
+
+    # ── an aborted anchor: no `exit=` line anywhere in the run ────────────────────
+    aborted = ("BREAK HARNESS ABORT: expected exactly one occurrence, found 0 in "
+               "<target>: '<literal>'\n")
+    check("an aborted anchor has no exit status to read", exit_status(aborted) is None,
+          f"exit_status read {exit_status(aborted)} out of a run that never printed one")
+    verdict, _ = outcome(sentence, None, aborted, killed=False)
+    check("an aborted anchor fails", verdict == "fail", f"verdict {verdict}")
+
+    # ── green and undeclared: `unaffected` must not be reachable by default ───────
+    check("the green fixture reports exit=0", exit_status(ok) == 0,
+          f"exit_status read {exit_status(ok)}, so the probes under it are void")
+    verdict, _ = outcome(sentence, None, ok, killed=False)
+    check("an UNDECLARED green fails", verdict == "fail", f"verdict {verdict}")
+
+    # ── green and declared: the third outcome, and what it still costs ────────────
+    reason = "the depths are compared against each other"
+    verdict, why = outcome(passed, reason, ok, killed=False)
+    check("a green DECLARED unaffected passes, carrying its reason",
+          (verdict, why) == ("unaffected", reason), f"verdict {verdict}, why: {why}")
+    verdict, _ = outcome(sentence, reason, ok, killed=False)
+    check("a declared row whose pass sentence is absent fails", verdict == "fail",
+          f"verdict {verdict}: `unaffected` must still cost a watched line")
+    sibling = transcript(f"running 2 tests\ntest {test_filter} ... ok\n"
+                         "test a_sibling_under_the_same_filter ... FAILED\n", 101)
+    verdict, _ = outcome(passed, reason, sibling, killed=False)
+    check("a declared row is refused when a sibling reddened", verdict == "fail",
+          f"verdict {verdict}: exit={exit_status(sibling)} says the break was observed")
+    verdict, _ = outcome(passed, reason, transcript("running 1 test\n", None), killed=True)
+    check("a declared row that HANGS fails", verdict == "fail", f"verdict {verdict}")
+
+    # ── the hang, and the build that must never be mistaken for one ───────────────
+    hung = transcript("running 1 test\n", None)
+    check("the hang fixture has no exit status", exit_status(hung) is None,
+          "a killed run cannot have printed one, so this fixture is wrong")
+    verdict, _ = outcome(sentence, None, hung, killed=True)
+    check("a timeout with the runner past its build is scored as break OBSERVED",
+          verdict == "hang", f"verdict {verdict}")
+    building = transcript("", None, build=False)
+    check("the building fixture shows no start line", not started(building),
+          "the fixture already looks like a started run, so the probe under it is void")
+    verdict, _ = outcome(sentence, None, building, killed=True)
+    check("a kill before the runner started is NOT a hang", verdict == "fail",
+          f"verdict {verdict}: a build that outran the timeout would read as evidence")
+
+    # ── the row shape, refused where no cargo run has been spent yet ──────────────
+    check("a four-element row declares nothing",
+          declaration("X", ("a", "b", "c", [])) is None,
+          "an ordinary row grew a declaration out of nowhere")
+    for bad in (("a", "b", "c", [], "why", "extra"), ("a", "b", "c", [], ""),
+                ("a", "b", "c", [], True)):
+        try:
+            declaration("X", bad)
+            check(f"a malformed row is refused: {bad!r}", False, "it was accepted")
+        except SystemExit as refusal:
+            check(f"a malformed row is refused: {bad!r}",
+                  "Nothing else is a row" in str(refusal),
+                  f"refused with the wrong message: {refusal}")
+
+    # ── the kill itself, against a sleeping shell shaped like break-once.sh ───────
+    #
+    # The arms above are strings, and a string cannot show that the signal reached the
+    # runner or that the restore ran. This one drives `run_watched` for real. The pid
+    # file is what makes the GROUP half checkable: the shell's child has to be gone
+    # too, not just the shell, and a PID-only signal leaves it running.
+    scratch = pathlib.Path(tempfile.mkdtemp(prefix="replay-anchors-selftest-"))
+    marker, pidfile = scratch / "trap-ran", scratch / "child-pid"
+    probe = scratch / "sleeping-break.sh"
+    try:
+        probe.write_text("#!/usr/bin/env bash\nset -euo pipefail\n"
+                         f'restore() {{ echo RESTORED >> "{marker}"; }}\n'
+                         "trap restore EXIT\n"
+                         'echo "── broken: <nothing at all>"\n'
+                         f'sleep 120 & echo "$!" > "{pidfile}"\n'
+                         "wait\n")
+        probe.chmod(0o755)
+        out, killed = run_watched([str(probe)], 2)
+        check("the wall-clock kill fires", killed,
+              f"run_watched returned killed={killed} for a shell that sleeps 120 s")
+        check("the killed run's partial output is kept", "── broken:" in out,
+              f"the sink held {out!r}, so a hang would be scored with nothing to read")
+        trap = marker.read_text().strip() if marker.exists() else "<no file>"
+        check("the killed shell ran its restore trap", trap == "RESTORED",
+              f"the trap left {trap!r}: a break killed this way would stay in the file")
+        child = int(pidfile.read_text().strip()) if pidfile.exists() else 0
+        try:
+            os.kill(child, 0)
+            alive = True
+        except (ProcessLookupError, PermissionError):
+            alive = False
+        check("the signal reached the shell's child, not only the shell", not alive,
+              f"pid {child} is still running, so a killed row would leave the runner "
+              "behind")
+    finally:
+        # Removed, and NOT kept the way `break-once.sh` keeps its log. That log is the
+        # evidence a reader's conclusion rests on; this directory holds a sleeping
+        # shell and a pid, and every failure detail above already prints what it read
+        # out of them, so removing it destroys no evidence. Twenty-seven of these had
+        # accumulated under one TMPDIR before this line existed, one per run — and
+        # since `--selftest` became a gate step that is one per push, per worktree.
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    print()
+    if failures:
+        print(f"{len(failures)} of the classifier's guards failed: "
+              f"{', '.join(failures)}", file=sys.stderr)
+        return 1
+    print("ok: every arm scored as recorded — red, a red at the wrong sentence, an "
+          "aborted anchor, an undeclared green, a declared one, both sides of the "
+          "timeout, the row shape, and the kill itself")
+    return 0
+
+
+argv = sys.argv[1:]
+if any(arg.lstrip("-") == "selftest" for arg in argv):
+    if len(argv) != 1:
+        sys.exit("--selftest takes no row names: it replays nothing and reads no rows")
+    sys.exit(selftest())
+
+wanted = argv
 unknown = sorted(set(wanted) - set(REDNESS))
 if unknown:
     sys.exit(f"no REDNESS entry for: {', '.join(unknown)}")
 plan = [record for record in REDNESS if not wanted or record in wanted]
+# Every row's shape, checked before the first cargo run rather than after the eighth.
+declared = {record: declaration(record, REDNESS[record]) for record in plan}
 
 # Refused rather than worked around. `break-once.sh`'s `trap restore EXIT` copies a
 # backup back over the file it edited, so anything uncommitted in that file is lost —
@@ -119,16 +634,16 @@ if dirty.strip():
     sys.exit(2)
 
 failed: list[str] = []
+scored: dict[str, list[str]] = {"red": [], "hang": [], "unaffected": []}
 for record in plan:
-    replacement, watched, test_filter, extra = REDNESS[record]
+    replacement, watched, test_filter, extra = REDNESS[record][:4]
     target, literal = rows[record]
     print(f"════ {record}  {test_filter}")
-    done = subprocess.run(
+    out, killed = run_watched(
         [str(ROOT / "scripts" / "break-once.sh"), target, literal, replacement,
          test_filter, *extra],
-        capture_output=True, text=True, cwd=ROOT,
+        SECONDS,
     )
-    out = done.stdout + done.stderr
     # The three lines `replay-fate-breaks.sh` echoes - whether the harness aborted,
     # and what the runner exited with - plus the log PATH, which that script does not
     # echo and which the failure arm below sends the reader to. Without it the remedy
@@ -138,27 +653,81 @@ for record in plan:
         if ("ABORT" in line or "expected exactly one" in line
                 or line.startswith("── exit=") or line.startswith("── log:")):
             print(f"     {line}")
-    if watched in out:
-        print(f"     ✓ still red at: {watched}")
+    if killed:
+        # What was SENT, not what ended it: SIGTERM goes first so the restore runs,
+        # and a row that outlived the grace was ended by SIGKILL with no restore. The
+        # check below is what tells those two apart, so this line does not guess.
+        print(f"     ── killed after {SECONDS}s (REPLAY_TIMEOUT): SIGTERM to the "
+              "process group, then SIGKILL if it outlived the grace")
+    # Before the verdict, because a verdict on a tree the harness left broken is not
+    # worth reading, and the next row would cut into that broken file.
+    restored(record, killed)
+
+    verdict, why = outcome(watched, declared[record], out, killed)
+    if verdict == "red":
+        print(f"     ✓ still red at: {why}")
+        if killed:
+            print("       AND it had to be killed, so something after that sentence "
+                  "does not finish under this break.")
+        scored["red"].append(record)
         continue
+    if verdict == "hang":
+        print(f"     ✓ the break was OBSERVED: {why}")
+        print("       No assertion reported, so the recorded sentence is UNCHECKED for")
+        print("       this row - a hang says the guard felt the break, and not where it")
+        print("       would have failed. break-once.sh names its log after the test")
+        print("       filter under $TMPDIR (its `log=$(mktemp -t ...)` line); the kill")
+        print("       landed before it could echo that path.")
+        scored["hang"].append(record)
+        continue
+    if verdict == "unaffected":
+        print(f"     ✓ reached and unaffected, as this row declares: {why}")
+        print("       The recorded sentence proves the guard RAN. Nothing here says a")
+        print("       break can redden it, and nothing in this task ever will.")
+        scored["unaffected"].append(record)
+        continue
+
     failed.append(record)
-    print("     ✗ the recorded sentence is NOT in this run. Expected to find:")
-    print(f"         {watched}")
-    print("       A break that went green, one whose anchor aborted, and one red at a")
-    print("       DIFFERENT assertion all land here. Read the log at the `── log:`")
-    print("       path above - an ABORT line and no log path means the harness refused")
-    print("       before it ran anything, and the ABORT says why. Then fix whichever of")
-    print("       the two is wrong - the record or the guard.")
-    print("       Do NOT relax the expected sentence to match the run without")
-    print("       reading why it changed: a break red at another assertion is a")
-    print("       record describing coverage it no longer has.")
+    print(f"     ✗ {why}")
+    if declared[record]:
+        print("       This row DECLARES the guard unaffected, for this reason:")
+        print(f"         {declared[record]}")
+        print("       Either that reason stopped being true, or the line it records as")
+        print("       evidence that the guard runs has moved. Do not delete the")
+        print("       declaration to make this green.")
+    else:
+        print("       Expected to find:")
+        print(f"         {watched}")
+        print("       A break that went green, one whose anchor aborted, one that no")
+        print("       longer compiles, and one red at a DIFFERENT assertion all land")
+        print("       here. Read the log at the `── log:` path above - an ABORT line")
+        print("       and no log path means the harness refused before it ran anything,")
+        print("       and the ABORT says why. Then fix whichever of the two is wrong -")
+        print("       the record or the guard.")
+        print("       Do NOT relax the expected sentence to match the run without")
+        print("       reading why it changed: a break red at another assertion is a")
+        print("       record describing coverage it no longer has.")
+        if exit_status(out) == 0:
+            print("       This run went GREEN. If the break genuinely cannot move this")
+            print("       guard, that is the third outcome and it is DECLARED: add a")
+            print("       fifth element to the row saying why, and record a line from")
+            print("       the green run as the `watched` sentence so the row still")
+            print("       proves the guard RAN. An undeclared green stays a failure.")
 
 print()
 if failed:
-    print(f"{len(failed)} of {len(plan)} replayed breaks did not print their recorded "
-          f"sentence: {', '.join(failed)}", file=sys.stderr)
+    print(f"{len(failed)} of {len(plan)} replayed breaks were not the outcome their row "
+          f"records: {', '.join(failed)}", file=sys.stderr)
     sys.exit(1)
-print(f"ok: {len(plan)} of the {len(REDNESS)} REDNESS rows replayed and each printed "
-      "its recorded sentence")
+print(f"ok: {len(plan)} of the {len(REDNESS)} REDNESS rows replayed - "
+      f"{len(scored['red'])} printed the recorded sentence, "
+      f"{len(scored['hang'])} were scored on a wall-clock kill, "
+      f"{len(scored['unaffected'])} are declared unaffected and passed")
+if scored["hang"]:
+    print(f"    the recorded sentence is UNCHECKED for {', '.join(scored['hang'])}: a "
+          "kill says the break was observed, and not where the guard fails")
+if scored["unaffected"]:
+    print(f"    {', '.join(scored['unaffected'])} assert that the guard RAN and assert "
+          "nothing about redness - a declared reason is all that holds them")
 print(f"    REDNESS covers {len(REDNESS)} of the {len(ANCHORS)} registered rows - "
       "`mise run anchors` prints that ratio, and the rest are unreplayed")

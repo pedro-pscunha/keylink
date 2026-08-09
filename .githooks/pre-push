@@ -165,10 +165,25 @@ fi
 # "$updates_read"` says and what a `-gt 0` would not.
 #
 # **And `updates_read` must be above zero, which is the load-bearing half.**
-# Zero lines read means UNKNOWN, never "no updates". An empty read is precisely
-# what a bug in the capture above produces, so treating it as all-deletions
-# would skip the entire gate on it, silently, in the one direction this whole
-# change exists to remove. Unknown runs the gate and says why.
+# Zero lines read means UNKNOWN, never "no updates", so treating it as
+# all-deletions would skip the entire gate on it — silently, in the one direction
+# this whole change exists to remove. Unknown runs the gate and says why.
+#
+# **THE ORDINARY PRODUCER OF AN EMPTY READ IS AN UP-TO-DATE PUSH, and this comment
+# used to say a capture bug was the only one.** Measured 2026-08-08 against a
+# dumping hook, in a repository whose branch was already on the remote: `git push
+# origin work`, a bare `git push`, `git push --all origin`, `git push origin
+# HEAD:refs/heads/work` and `git push --force origin work` each ran this hook with
+# ZERO bytes and zero lines on stdin, while git printed `Everything up-to-date`.
+# Git writes an update line per ref it will UPDATE, and an up-to-date push updates
+# none — so the empty read is common, not pathological.
+#
+# The safe direction is kept anyway: unknown still runs the gate. What that costs
+# is a full gate on a push that delivers nothing, which is a real cost and is
+# stated here rather than discovered. What it buys is that a capture bug — the rare
+# producer — cannot skip the gate silently. The message says "nothing to push"
+# first, because that is what a developer seeing it has almost certainly done, and
+# the previous wording read as an internal fault when nothing was wrong.
 #
 # Both arms announce themselves. A gate that quietly did not run is
 # indistinguishable, in the output, from a gate that passed.
@@ -180,7 +195,9 @@ if [ "$updates_read" -gt 0 ] && [ "$deletions" -eq "$updates_read" ]; then
 fi
 
 if [ "$updates_read" -eq 0 ]; then
-    echo "pre-push: no ref update arrived on stdin, so the gate RUNS." >&2
+    echo "pre-push: no ref update arrived on stdin — most likely NOTHING TO PUSH." >&2
+    echo "pre-push: an up-to-date push sends no update line, and git will say" >&2
+    echo "pre-push: 'Everything up-to-date' below. The gate RUNS anyway, because" >&2
     echo "pre-push: an empty read means unknown, and unknown is not a deletion." >&2
 fi
 
@@ -203,12 +220,35 @@ fi
 #     a LIGHTWEIGHT tag at HEAD                  ACCEPTED, gate ran
 #     an ANNOTATED tag at HEAD                   REFUSED
 #     an annotated tag at an OLDER commit        REFUSED
+#     git push --force after a rewrite           ACCEPTED, gate ran, the new tip landed
+#     git push --force after --amend             ACCEPTED, gate ran
+#     git push --force-with-lease                ACCEPTED, gate ran
+#     git push --force of an OLDER commit        REFUSED
 #
 # So `git push --all` is not refused as such. It is refused as soon as ANY branch it
 # carries is not at HEAD, and in a repository whose branches all sit at HEAD it goes
 # through the gate and lands. `git push <remote> <branch>` naming a sibling branch is
 # the same story: refused because that branch's tip is not HEAD, not because it was
 # named.
+#
+# **AND `--force` IS NOT A CASE AT ALL, WHICH IS WHAT THE THREE ACCEPTING ROWS ABOVE
+# ARE FOR.** A rewind is a claim about the tip the REMOTE holds, and git puts that tip
+# in the FOURTH field of each update line — which the loop that classifies the updates
+# reads into `_remote_sha` and then never looks at again. The underscore is the
+# convention saying so, and no line of code below that read mentions it.
+#
+# Measured with a hook that only dumps what it was sent, both halves in one run. On a
+# forced update over a branch the remote already held: one update line, and its fourth
+# field was that branch's old sha. On a push CREATING a ref: all zeros there instead,
+# for a new branch and for a new annotated tag alike. So the fourth field is the one
+# place a rewind is visible at all, and reading it is what a hook would have to do to
+# tell the two apart. That is also why the break which consults it reddens the force
+# rows and no others — `scripts/hook-guard.sh`'s H12, replayed.
+#
+# So a history rewrite, a `git commit --amend` and a `--force-with-lease` all arrive
+# here in the ordinary shape, each delivering HEAD, and the gate ran for each. A forced
+# REWIND to an older commit is refused for the one reason everything else here is:
+# what it delivers is not HEAD. Scenario 13 of `scripts/hook-guard.sh` pins all four.
 #
 # **AN ANNOTATED TAG AT THE TIP IS REFUSED, AND THAT IS THE ONE NOBODY PREDICTS.**
 # `git tag -a v1.0 && git push origin v1.0` at the tip delivers neither an older
