@@ -679,15 +679,25 @@ impl<M> Registry<M> {
     /// as long as the slowest member and the trait already forbids that being
     /// long. Nothing is spawned per report: a task per ending would make the
     /// order a race and would let a diagnostic outlive the thing it describes.
+    ///
+    /// **Each call is caught, so one bad sink costs one report.** That is
+    /// `keyed.rs`'s "one bad report should cost one report" arriving at the
+    /// fan-out that feeds it, and it became necessary when this field became a
+    /// list: with one sink a panic deprived that sink and unwound into whoever
+    /// was reporting, and with several it deprived every sink installed after it
+    /// as well. [`Lifecycle`] carries the whole argument, including why the
+    /// unwind was a failure policy too. Nothing is reported about the catch:
+    /// there is no channel here to report it on, and the panic hook has already
+    /// printed at the fault.
     fn report_mounted(&self, id: &ActorId) {
         for watching in &self.lifecycle {
-            watching.mounted(id);
+            let _ = crate::panic::catching(|| watching.mounted(id));
         }
     }
 
     fn report_ended(&self, id: &ActorId, why: &Ended) {
         for watching in &self.lifecycle {
-            watching.ended(id, why);
+            let _ = crate::panic::catching(|| watching.ended(id, why));
         }
     }
 
@@ -1271,12 +1281,30 @@ pub struct ActorStatus {
 ///
 /// [`SystemBuilder::lifecycle`] appends. Every implementation installed on a
 /// system sees every mount and every ending, in the order the calls were made,
-/// on the one task that mounted or tore down. One implementation that panics
-/// takes down that task and the ones after it in the list never hear about that
-/// event, which is the same blast radius a single panicking implementation
-/// always had — this trait catches nothing, and adding a `catch_unwind` here
-/// would be inventing a failure policy for caller code the registry cannot
-/// name.
+/// on the one task that mounted or tore down.
+///
+/// # One that panics costs its own report and nothing else
+///
+/// The registry catches each call. **The list is what made that necessary.**
+/// With a single sink a panic deprived that sink and unwound into whoever was
+/// reporting; with several it deprived every sink installed *after* it too, and
+/// one of those can be `compose::Endings` — whose missed `ended` leaves every
+/// waiter it holds pending for the life of the system, so a `Group` watching a
+/// keyed member is never decided on and its `ended()` never resolves. A lost
+/// console line and a wedged group are not the same loss, and only one of them
+/// is visible.
+///
+/// **This doc used to argue the other way**, on the grounds that a
+/// `catch_unwind` here would be inventing a failure policy for caller code the
+/// registry cannot name. What that missed is that unwinding is a policy too, and
+/// nobody chose it: the caller it reaches is `System::mount`, `System::shutdown`,
+/// `System::abort` or the sweeper's own task, none of which asked to die for a
+/// diagnostic. Everywhere else this crate does name the policy and it is always
+/// the same one — a panicking turn, observer, group policy or `retire` each
+/// costs one thing and not the run.
+///
+/// The panic is still loud where it happened. Nothing here installs a panic
+/// hook, so `std`'s default one prints at the fault before the unwind is caught.
 ///
 /// [`Events`]: crate::Events
 /// [`NodeStatus::lost`]: crate::NodeStatus

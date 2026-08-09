@@ -32,6 +32,8 @@
 //! | a keyed actor's own ending reaches a `watch` future, carrying the reason its loop returned | `a_keyed_actors_own_ending_reaches_a_watch_future_with_its_reason` |
 //! | every waiter filed under one name is answered, and not just one of them | `two_watchers_on_one_name_are_both_answered` |
 //! | two `Lifecycle`s on one `System` both fire, so watching does not cost the console | `two_lifecycles_on_one_system_both_fire` |
+//! | a sink that panics on a mount costs its own report, not the mount and not the sink behind it | `a_panicking_lifecycle_sink_does_not_unwind_into_the_mount_it_reports` |
+//! | a sink that panics on an ending does not leave the `Endings` behind it waiting for ever | `a_panicking_lifecycle_sink_does_not_deprive_the_next_of_an_ending` |
 //! | an abandoned `watch` unfiles its own waiter and not a later one under that name | `an_abandoned_watch_unfiles_its_own_waiter_and_not_a_later_one` |
 //! | a `watch` outliving its `Endings` resolves `Vanished` instead of waiting for ever | `a_watch_outliving_its_endings_resolves_vanished_rather_than_hanging` |
 //! | a keyed actor is a `Group` member: it ends, the policy is asked, the siblings are retired | `a_keyed_actor_is_a_group_member_end_to_end` |
@@ -2667,6 +2669,149 @@ async fn two_lifecycles_on_one_system_both_fire() {
         seen.lock().expect("not poisoned").clone(),
         vec![id],
         "and about that actor, once"
+    );
+}
+
+/// A [`Lifecycle`] that records MOUNTS, which [`Watched`] deliberately does not.
+///
+/// Its sibling guard asserts an exact list of endings, and putting mounts in
+/// that list would be a second sequence to keep in step for no gain.
+struct Mounts {
+    seen: Arc<Mutex<Vec<ActorId>>>,
+}
+
+impl Lifecycle for Mounts {
+    fn mounted(&self, id: &ActorId) {
+        self.seen.lock().expect("not poisoned").push(id.clone());
+    }
+
+    fn ended(&self, _id: &ActorId, _why: &Ended) {}
+}
+
+/// A [`Lifecycle`] a caller wrote and got wrong, on the mount.
+///
+/// Two types and not one with a flag, because the two report sites fail
+/// differently and each guard installs exactly the one it is about: an unwind
+/// out of `mounted` reaches the caller of [`System::mount`], and an unwind out
+/// of `ended` reaches a spawned teardown where nobody is waiting at all.
+struct BrokenOnMount;
+
+impl Lifecycle for BrokenOnMount {
+    fn mounted(&self, _id: &ActorId) {
+        panic!("the console sink is broken on a mount");
+    }
+
+    fn ended(&self, _id: &ActorId, _why: &Ended) {}
+}
+
+/// The sibling of [`BrokenOnMount`], for the other report site.
+struct BrokenOnEnding;
+
+impl Lifecycle for BrokenOnEnding {
+    fn mounted(&self, _id: &ActorId) {}
+
+    fn ended(&self, _id: &ActorId, _why: &Ended) {
+        panic!("the console sink is broken on an ending");
+    }
+}
+
+/// A sink that panics does not take the mount down with it, and the sink behind
+/// it is still told.
+///
+/// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs`, replacing
+/// `report_mounted`'s
+/// `            let _ = crate::panic::catching(|| watching.mounted(id));` with
+/// `            watching.mounted(id);` — which is the line as it stood before
+/// the catch, so the break restores the defect rather than inventing one.
+/// Watched: the panic escapes `system.mount(..)` and kills the test with "the
+/// console sink is broken on a mount", before either assertion below is read.
+/// Exit 101, by panic through the caller, in 0.00s.
+///
+/// **Red BY PANIC and not by value, and that is the symptom rather than a
+/// weakness of the guard.** The claim is that an unwind does not cross this
+/// boundary, so the failure mode is the unwind arriving — there is no value for
+/// it to arrive as. What the assertions below add is the other half: catching
+/// must not become swallowing, so the sink installed after the bad one is read
+/// rather than assumed.
+#[tokio::test]
+async fn a_panicking_lifecycle_sink_does_not_unwind_into_the_mount_it_reports() {
+    let seen: Arc<Mutex<Vec<ActorId>>> = Arc::new(Mutex::new(Vec::new()));
+    let system = worker::System::builder(Eviction::Never)
+        .lifecycle(BrokenOnMount)
+        .lifecycle(Mounts {
+            seen: Arc::clone(&seen),
+        })
+        .build();
+    let id = ActorId::new("ledger/7").expect("a name");
+
+    let (_ends, told) = oneshot::channel();
+    // THIS is the first decision, and it is the whole of the red: the caller of
+    // `mount` did not write the sink and does not die for it.
+    system
+        .mount(id.clone(), ending_when(told))
+        .expect("a mount is not refused by a sink that panicked while hearing about it");
+
+    // And the second: one bad sink costs ONE report. A catch that swallowed the
+    // rest of the fan would pass the assertion above and fail this one.
+    assert_eq!(
+        seen.lock().expect("not poisoned").clone(),
+        vec![id],
+        "the sink installed after the broken one is still told about the mount"
+    );
+}
+
+/// The same claim at the other report site, where the loss is silent and is not
+/// a diagnostic.
+///
+/// A missed `ended` on a `compose::Endings` leaves every waiter it holds pending
+/// for the life of the system. A [`Group`] watching a keyed member is then never
+/// decided on and its `ended()` never resolves, while the group reports nothing
+/// wrong — there is no console line for a report that was never made.
+///
+/// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs`, replacing
+/// `report_ended`'s
+/// `            let _ = crate::panic::catching(|| watching.ended(id, why));` with
+/// `            watching.ended(id, why);` — again the line as it stood before the
+/// catch. Watched: "the `Endings` installed after the broken sink is still
+/// answered: None". Exit 101, by value, at the [`NO_PROGRESS`] bound after
+/// 60.00s.
+///
+/// **Under that break the sink's own panic prints and never reaches this test**,
+/// which is the "silent" in the paragraph above, measured rather than argued:
+/// the run shows both panics, the sink's from the teardown task nobody joins and
+/// this test's own assertion sixty seconds later. Its sibling above shows the
+/// opposite — the same defect at the other site kills the caller outright.
+///
+/// **The bound is the point and not an inconvenience.** This defect has no
+/// symptom of its own: nothing is reported, nothing errors, and the waiter
+/// simply never resolves. `timeout` is what turns "never" into a named failure
+/// instead of a hung suite — the device
+/// `a_watch_outliving_its_endings_resolves_vanished_rather_than_hanging` uses
+/// for the same reason.
+#[tokio::test]
+async fn a_panicking_lifecycle_sink_does_not_deprive_the_next_of_an_ending() {
+    let endings = Endings::new();
+    let system = worker::System::builder(Eviction::Never)
+        .lifecycle(BrokenOnEnding)
+        .lifecycle(endings.clone())
+        .build();
+    let id = ActorId::new("ledger/7").expect("a name");
+    let watching = endings.watch(&id);
+
+    let (ends, told) = oneshot::channel();
+    system
+        .mount(id.clone(), ending_when(told))
+        .expect("the system mounts it");
+    ends.send(Ended::Stopped)
+        .expect("the loop is waiting for its ending");
+
+    // `timeout` rather than `bounded`, because `bounded` panics on expiry and
+    // the answer has to reach the assertion to be named there.
+    let told_endings = n0_future::time::timeout(NO_PROGRESS, watching).await.ok();
+    assert!(
+        matches!(told_endings, Some(Ended::Stopped)),
+        "the `Endings` installed after the broken sink is still answered: \
+         {told_endings:?}"
     );
 }
 

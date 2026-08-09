@@ -1272,6 +1272,21 @@ ANCHORS = [
      "        self.lifecycle.push(Arc::new(lifecycle));"),
     ("K3b", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
      "        self.lifecycle.push(Arc::new(lifecycle));"),
+    # L1 and L2 are the two REPORT SITES of one claim, and they are two rows
+    # because the same defect fails differently at each. Both substitutions
+    # restore the line as it stood before the catch, so both are regressions in
+    # the literal sense rather than invented defects.
+    #
+    # L1 kills the CALLER: the unwind crosses `System::mount` and the test dies at
+    # the sink's own `panic!` in 0.00s, before either assertion is read. L2 kills
+    # nobody visible: the unwind dies in a teardown task no one joins, the waiter
+    # is never answered, and the red arrives by value at the `NO_PROGRESS` bound
+    # after 60.00s. **The pair is the evidence that this is not one symptom** —
+    # a reader who saw only L1 would price the defect as a loud crash.
+    ("L1", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
+     "            let _ = crate::panic::catching(|| watching.mounted(id));"),
+    ("L2", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
+     "            let _ = crate::panic::catching(|| watching.ended(id, why));"),
     ("K4", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
      "        for waiter in waiters {"),
     # K5's local is `mine` and its FIELD is `generation`, which is not a slip. Spelled
@@ -2764,7 +2779,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # next person to skip the run gets the wrong number on a tree where the two diverge.
 # The agreement is recorded because hiding it would make the run look load-bearing in
 # a way this one was not, and the run is kept because the NEXT one will be.
-RECORD_BLOCKS = 155
+RECORD_BLOCKS = 157
 
 # The one marker the tripwire counts, and the two phrasings records use INSTEAD of
 # naming the harness. Both are read by the same walk, so the blind spot below is a
