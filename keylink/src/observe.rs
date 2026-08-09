@@ -398,7 +398,7 @@ impl fmt::Display for Stop {
 
 /// Why an actor is no longer running.
 ///
-/// [`MailboxClosed`](crate::MailboxClosed) says "gone", and it must not be
+/// [`Undelivered`](crate::Undelivered) says "gone", and it must not be
 /// stretched to say "gave up on durability". This is the second question, asked
 /// separately.
 ///
@@ -508,12 +508,12 @@ pub enum Ended {
     /// The only ending a [supervised](crate::LocalActor::spawn_supervised) actor
     /// can reach that an unsupervised one cannot, and the reason the whole enum
     /// is worth having: "gone" is already
-    /// [`MailboxClosed`](crate::MailboxClosed)'s answer, and an operator needs
+    /// [`Undelivered`](crate::Undelivered)'s answer, and an operator needs
     /// to know whether this actor stopped because somebody asked it to or
     /// because it could not be kept alive.
     ///
     /// The mailbox closes when this is published, so every later call reports
-    /// [`MailboxClosed`](crate::MailboxClosed) and a peer is told
+    /// [`Undelivered`](crate::Undelivered) and a peer is told
     /// [`RemoteError::NoSuchActor`](crate::RemoteError::NoSuchActor).
     GaveUp {
         /// How many incarnations were spent before giving up.
@@ -559,7 +559,7 @@ impl fmt::Display for Ended {
 
 /// Why a turn produced no value.
 ///
-/// Replaces [`MailboxClosed`](crate::MailboxClosed) on the catching paths,
+/// Replaces [`Undelivered`](crate::Undelivered) on the catching paths,
 /// because "the actor is gone" and "this turn was refused" ask a caller for
 /// different things and the served path has to tell a peer which it was.
 ///
@@ -630,4 +630,14 @@ pub enum TurnLost {
     /// the wrong answer rather than a harmless one.
     #[error("the queueing budget expired before this turn started: nothing ran")]
     Expired,
+    /// The call was made from inside the target actor's own turn, and would have
+    /// deadlocked. **Nothing was queued**, so the actor is untouched.
+    ///
+    /// Distinct from [`Gone`](Self::Gone) for that enum's stated reason and this
+    /// one's mirror of it: the actor is not merely still running, it is running
+    /// the turn this call was made from.
+    /// [`Undelivered::Reentrant`](crate::Undelivered::Reentrant) is the same fact
+    /// at the doors that carry one error instead of four.
+    #[error("this call was made from inside the target actor's own turn: it would deadlock")]
+    Reentrant,
 }

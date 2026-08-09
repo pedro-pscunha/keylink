@@ -922,12 +922,21 @@ ANCHORS = [
     # enumerates, and a fresh letter cannot collide with them by arithmetic - the
     # same reason `call-id` took `C`.
     #
-    # EIGHT rows and EIGHT distinct literals: no two share one, and no literal
-    # appears against two targets. Checked as `(target, literal)` pairs, because
-    # this list's headline counts ROWS and two existing rows share a literal - so
-    # the numbers coinciding here is a measurement and not an assumption.
+    # FIFTEEN rows and FIFTEEN distinct literals: no two share one, and no
+    # literal appears against two targets. Checked as `(target, literal)` pairs,
+    # because this list's headline counts ROWS and two existing rows share a
+    # literal - so the numbers coinciding here is a measurement and not an
+    # assumption.
     #
-    # THREE are same-file (D6, D7, D8) and legitimate under the narrowed rule: the
+    # It was EIGHT until item M, which added D9 through D15 for the re-entrancy
+    # refusal and the depth knob. D10 and D11 break the SAME function on two
+    # different lines with two different replacements and two different watched
+    # sentences, which is the shape D3's note says one row cannot represent - so
+    # they are two rows from the start rather than one split later.
+    #
+    # TWO are same-file (D6, D8) and legitimate under the narrowed rule — it was
+    # three until item M moved D7's break into `src/`, and the note on that row says
+    # why. The
     # record's quote sits unindented inside a `///` line while the code carries its
     # indentation, so the indented literal is unique and the record's copy is not a
     # second occurrence. Their bare forms count 2. All three were DESCRIBED first,
@@ -936,8 +945,14 @@ ANCHORS = [
     # says nothing about the indented one. Third instance of that shape in this
     # registry, and the general form is worth the line: state the measurement that
     # made quoting impossible, never the property that made it look impossible.
+    # RE-QUOTED BY ITEM M, which made the constant a default and gave it a type. It
+    # read `const LOCAL_MAILBOX_DEPTH: usize = 1;`. The record's substitution moved
+    # with it and is no longer `= 2;`: `NonZeroUsize::new(2)` is an `Option`, and the
+    # workspace denies `unwrap_used` in `keylink/src`, so the replacement is a `match`.
+    # A break that fails to COMPILE still exits 101 and reads as a caught defect, which
+    # is the silent rot this registry exists to make loud.
     ("D1", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
-     "const LOCAL_MAILBOX_DEPTH: usize = 1;"),
+     "const DEFAULT_LOCAL_MAILBOX_DEPTH: NonZeroUsize = NonZeroUsize::MIN;"),
     ("D2", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "        self.task.abort();"),
     # A whole line at twelve spaces, inside `Deferred::send`'s parking callback. Its
@@ -967,12 +982,16 @@ ANCHORS = [
      "            Overflow::BlockPublisher => self.publish_blocking(item).await,"),
     ("D6", "keylink/tests/cycles.rs", "keylink/tests/cycles.rs",
      "        if hops == 0 {"),
-    # The FIRST line of a three-line chain, and a whole line in its own right, which
-    # is what makes it quotable. The `.await` and `.unwrap_or` under it belong to
-    # `rustfmt`; if it reflows this goes to count 0, which is loud and is what this
-    # gate is for.
-    ("D7", "keylink/tests/cycles.rs", "keylink/tests/cycles.rs",
-     "        me.with_state(|state: &Peer| state.bumps)"),
+    # MOVED BY ITEM M, target file and all. It read
+    # `        me.with_state(|state: &Peer| state.bumps)` against `cycles.rs` itself -
+    # the first line of a three-line chain - and a read from inside a turn is a
+    # REFUSAL now rather than a hang, so that record's break no longer isolates
+    # anything: the crate refuses the read before it reaches the mailbox, whatever the
+    # test's own chain looks like. The break that isolates the new claim is in `src/`,
+    # on the one line that gives a local actor an identity to be found on a chain, so
+    # this row is no longer same-file and the count above moved from three to two.
+    ("D7", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
+     "        Some(Actor(Arc::clone(&self.busy)))"),
     # Written inline as `tokio::task::spawn_blocking(work).await.expect(..)` first,
     # and `cargo fmt` split it across three lines - so the code was restructured to
     # put the call behind a short wrapper whose call site the formatter leaves alone.
@@ -989,6 +1008,47 @@ ANCHORS = [
     # side - not to move the code.
     ("D8", "keylink/tests/blocking_work.rs", "keylink/tests/blocking_work.rs",
      "        offloaded(work).await"),
+    # ── item M, the re-entrancy refusal and the depth knob. All six cross-file, so
+    # each record's own quote lives in `cycles.rs` and cannot contribute to the
+    # count in the target.
+    #
+    # D9 is the RING half. Its record also states the measured pairing that makes it
+    # worth having: under this break `a_read_from_inside_a_turn_is_refused` stays
+    # GREEN, so a chain that can hold only one actor passes the self-call guard and
+    # fails this one.
+    ("D9", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
+     "            Self::Deep(deep) => deep.iter().any(|each| each.is(who)),"),
+    # D10 and D11 break `LocalActor::send`'s two halves, one row each. D10 makes a
+    # `tell` refuse ALWAYS and D11 makes the refuse-when-full arm unreachable, and
+    # they redden the same test with two different sentences - one an assertion on
+    # the outcome code, one a timeout.
+    ("D10", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
+     "            Refuse::WhenFull,"),
+    ("D11", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
+     "                Refuse::WhenFull if self.mail.capacity() == 0 => {"),
+    ("D12", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
+     "        match self.send(Message::Stop, Refuse::Always).await {"),
+    # D13 is the `Lent` forward, and it is the one row here whose absence would be
+    # SILENT: a delegating wrapper that forgets to forward `identity` turns the
+    # check off for every supervised actor with no test failing. Measured: under
+    # this break the supervised guard reddens and the unsupervised one stays green.
+    ("D13", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
+     "        self.inbox.identity()"),
+    # D14 is TWO LINES, and the second line alone is not an anchor: `spawn_deep` and
+    # `spawn_supervised_deep` open with the identical `mpsc::channel` line, so the
+    # bare form aborts the harness at "found 2". Measured, not predicted. The
+    # comment line above it is what makes the unsupervised door unique, and a
+    # `rustfmt` reflow that separates the two sends this to count 0 - loud, which is
+    # what this gate is for.
+    ("D14", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
+     "        // closure it used to carry made one by accident.\n"
+     "        let (mail, inbox) = mpsc::channel::<Message<A, M>>(depth.get());"),
+    # D15 covers the `Chain::with` arm that grows an ALREADY-DEEP chain, which a
+    # two-actor ring cannot reach: its closing edge is sent from a chain of exactly
+    # two, built by the `One -> Deep` arm. So D9 and D15 are not the same guard at
+    # two sizes - each reddens a test the other leaves green, measured both ways.
+    ("D15", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
+     "                grown.extend(outer.iter().cloned());"),
     # ── from the ledger-limits PR. Both were measured with `grep -cF` AFTER the
     # record was written, which is the order that matters: adding a quote can only
     # RAISE a count, so measuring first reports a 1 that the record itself then
@@ -2902,7 +2962,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # next person to skip the run gets the wrong number on a tree where the two diverge.
 # The agreement is recorded because hiding it would make the run look load-bearing in
 # a way this one was not, and the run is kept because the NEXT one will be.
-RECORD_BLOCKS = 158
+RECORD_BLOCKS = 165
 
 # The one marker the tripwire counts, and the two phrasings records use INSTEAD of
 # naming the harness. Both are read by the same walk, so the blind spot below is a

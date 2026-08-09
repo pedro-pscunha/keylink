@@ -163,7 +163,7 @@ async fn parked(book: &orders::Handle<Book>, want: u64) {
 /// Made red by `scripts/break-once.sh`, replacing `Deferred::send`'s
 /// `self.0.answer(Answered::Ran(value));` with `drop((self, value));` — a park that
 /// takes the channel away and never gives it back. Watched: this fails at the
-/// answer, "the actor is running: MailboxClosed", which is what a caller sees when
+/// answer, "the actor is running: Undelivered", which is what a caller sees when
 /// the channel dies unanswered. It prints rather than hangs because the wait is
 /// bounded by the sender being dropped, not by a timeout.
 #[tokio::test]
@@ -193,7 +193,7 @@ async fn a_parked_reply_is_answered_from_a_later_turn() {
 /// **Reddened, but not on its distinguishing claim, and that is worth saying.** The
 /// break is the one its sibling above uses — `Deferred::send`'s
 /// `self.0.answer(Answered::Ran(value));` replaced by `drop((self, value));` —
-/// watched here as "running: MailboxClosed" at the first order. That fails both
+/// watched here as "running: Undelivered" at the first order. That fails both
 /// tests, so it proves the parked channel is load-bearing and proves nothing about
 /// *two* of them. No one-literal edit isolates the plural: a `Reply` is built per
 /// call by generated code and `later` consumes it, so "the deferred reply per actor"
@@ -287,7 +287,7 @@ async fn an_answer_given_inside_a_deferred_turn_is_withheld_when_an_observer_ref
 /// The channel is in the state, the state is owned by the loop's task, and the loop
 /// exiting drops both — so the caller's wait ends because the sender is gone. Inside
 /// keylink that is `TurnLost::Gone`; through a generated `Handle` it is
-/// `MailboxClosed`, which is the same fact under this path's one error type.
+/// `Undelivered`, which is the same fact under this path's one error type.
 ///
 /// **The timeout is the assertion.** A hang is not a failure to a test harness, so
 /// the wait is bounded and the bound is what goes red. `turns.rs`'s own unit test
@@ -307,7 +307,9 @@ async fn a_parked_reply_whose_actor_ends_is_answered_rather_than_hanging() {
     };
     parked(&book, 1).await;
 
-    book.stop().await;
+    book.stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
 
     let answer = n0_future::time::timeout(Duration::from_secs(5), placing)
         .await
@@ -455,7 +457,7 @@ async fn an_answer_sent_inside_a_turn_that_then_panics_does_not_cross() {
 /// Made red by `scripts/break-once.sh keylink/src/parking.rs` on `park`'s
 /// `if let Some(answer) = carried {` → `if let Some(answer) = Option::<Parked>::None {`,
 /// which drops an off-turn answer instead of giving it. Watched: `a send from
-/// another task must not be gated by the turn that spawned it: MailboxClosed`.
+/// another task must not be gated by the turn that spawned it: Undelivered`.
 #[tokio::test]
 async fn a_deferred_sent_from_another_task_is_not_gated_by_the_turn_that_spawned_it() {
     let book = orders::actor(Book::default());
@@ -624,7 +626,9 @@ async fn a_stopped_actor_still_tells_a_peer_no_such_actor() {
 
     let placing = tokio::spawn(async move { client.place(3).await });
     parked(&book, 1).await;
-    book.stop().await;
+    book.stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
 
     let lost = n0_future::time::timeout(Duration::from_secs(10), placing)
         .await
@@ -988,7 +992,7 @@ async fn a_peer_whose_parked_reply_is_drained_is_not_told_its_call_timed_out() {
 /// **The other half of the `dropped: ` arm, which had no served test at all.**
 ///
 /// `a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_actor`
-/// is a **local** call: it asserts `is_err()` on a `MailboxClosed` and never
+/// is a **local** call: it asserts `is_err()` on a `Undelivered` and never
 /// reaches `deliver_to_local`, so nothing anywhere asserted what a *peer* reads
 /// for this. The arm's own comment concedes the case — "a handler that panics
 /// after taking `reply.later()` arrives here too" — and the sentence it rendered

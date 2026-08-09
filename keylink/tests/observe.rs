@@ -13,7 +13,7 @@
 //! |-----------|-------------|------------------------------------------------|
 //! | completed | accepted    | the value                                      |
 //! | panicked  | refused     | the panic, resumed — and the actor then ends   |
-//! | completed | refused     | `MailboxClosed`, with the turn not committed   |
+//! | completed | refused     | `Undelivered`, with the turn not committed   |
 //!
 //! Three rows and three tests, because they are three different promises and an
 //! implementation that collapses any two of them still passes a test written for
@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keylink::{
-    Caller, Ended, FinishFut, MailboxClosed, Observer, Stop, TurnFut, TurnInfo, TurnOutcome,
+    Caller, Ended, FinishFut, Observer, Stop, TurnFut, TurnInfo, TurnOutcome, Undelivered,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -431,7 +431,7 @@ async fn an_observer_runs_before_the_caller_is_answered() {
 async fn a_panicking_observer_ends_the_actor_and_is_named() {
     let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(Exploding)]);
 
-    assert_eq!(ledger.post(1).await, Err(MailboxClosed));
+    assert_eq!(ledger.post(1).await, Err(Undelivered::Gone));
 
     match ledger.ended().await {
         Ended::Observer { name, error, .. } => {
@@ -451,7 +451,7 @@ async fn a_panicking_observer_ends_the_actor_and_is_named() {
 ///
 /// Both halves are load-bearing. Withholding the reply here would reverse what
 /// `turns.rs` promises about a panicking call, and the caller would be told
-/// `MailboxClosed` — "the actor is gone" — about a message that in fact ran and
+/// `Undelivered` — "the actor is gone" — about a message that in fact ran and
 /// exploded. And reporting the refusing observer instead of the panic would
 /// point an operator at the durability adapter for a fault in a `service!`
 /// method, which is why the two variants are not one.
@@ -480,7 +480,7 @@ async fn a_panicked_turn_reaches_its_caller_and_then_ends_the_actor() {
 /// The turn ran and was not committed, so handing back the value would publish a
 /// state no restart can reproduce — the exact fault the port exists to prevent,
 /// arrived at through the reply instead of through the store. A local caller
-/// fails one way, so it is told `MailboxClosed`, and `ended` is the only place
+/// fails one way, so it is told `Undelivered`, and `ended` is the only place
 /// the reason survives.
 #[tokio::test]
 async fn a_refused_turn_answers_its_caller_with_nothing() {
@@ -490,7 +490,7 @@ async fn a_refused_turn_answers_its_caller_with_nothing() {
         vec![Box::new(Recording::refusing("saver", &ran))],
     );
 
-    assert_eq!(ledger.post(1).await, Err(MailboxClosed));
+    assert_eq!(ledger.post(1).await, Err(Undelivered::Gone));
     assert_eq!(
         *ran.lock().unwrap(),
         ["saver"],
@@ -586,7 +586,7 @@ async fn a_read_runs_no_observers() {
 #[tokio::test]
 async fn an_observer_can_give_up_with_a_message_or_with_an_error() {
     let with_message = ledger::actor_with(Ledger::default(), vec![Box::new(GivesUp::WithMessage)]);
-    assert_eq!(with_message.post(1).await, Err(MailboxClosed));
+    assert_eq!(with_message.post(1).await, Err(Undelivered::Gone));
     match with_message.ended().await {
         Ended::Observer { name, error, .. } => {
             assert_eq!(name, "message");
@@ -596,7 +596,7 @@ async fn an_observer_can_give_up_with_a_message_or_with_an_error() {
     }
 
     let with_error = ledger::actor_with(Ledger::default(), vec![Box::new(GivesUp::WithError)]);
-    assert_eq!(with_error.post(1).await, Err(MailboxClosed));
+    assert_eq!(with_error.post(1).await, Err(Undelivered::Gone));
     match with_error.ended().await {
         Ended::Observer { name, error, .. } => {
             assert_eq!(name, "error");
@@ -628,7 +628,7 @@ async fn observers_run_in_order_and_the_first_refusal_stops_the_rest() {
         ],
     );
 
-    assert_eq!(ledger.post(1).await, Err(MailboxClosed));
+    assert_eq!(ledger.post(1).await, Err(Undelivered::Gone));
     assert_eq!(
         *ran.lock().unwrap(),
         ["first", "second"],
@@ -672,7 +672,7 @@ impl Observer<Ledger> for ExplodesBeforeItYields {
 async fn an_observer_that_panics_before_it_yields_is_still_named() {
     let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(ExplodesBeforeItYields)]);
 
-    assert_eq!(ledger.post(1).await, Err(MailboxClosed));
+    assert_eq!(ledger.post(1).await, Err(Undelivered::Gone));
 
     match ledger.ended().await {
         Ended::Observer { name, error, .. } => {
@@ -792,7 +792,10 @@ async fn finish_runs_once_after_the_last_turn_and_before_stop_returns() {
         ending.lock().unwrap()
     );
 
-    ledger.stop().await;
+    ledger
+        .stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
 
     // Read the instant `stop` returns, with nothing awaited in between: a
     // `finish` that ran after the end was published would not be here yet.
@@ -825,7 +828,7 @@ async fn finish_receives_the_same_ending_the_actor_reports() {
         ],
     );
 
-    assert_eq!(ledger.post(1).await, Err(MailboxClosed));
+    assert_eq!(ledger.post(1).await, Err(Undelivered::Gone));
 
     let reported = ledger.ended().await;
     match &reported {
@@ -890,7 +893,10 @@ async fn finish_runs_on_every_observer_even_when_an_earlier_one_panics() {
     );
 
     assert_eq!(ledger.post(1).await.expect("running"), 1);
-    ledger.stop().await;
+    ledger
+        .stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
 
     // `early` never reaches its log, because it panics before the future that
     // writes it exists. `late` does, and then panics. `last` is the assertion:
@@ -955,7 +961,10 @@ async fn finish_runs_on_stop_and_not_on_abort() {
         vec![Box::new(Finishing::new("saver", &ran, &stopped_log))],
     );
     assert_eq!(stopped.post(1).await.expect("running"), 1);
-    stopped.stop().await;
+    stopped
+        .stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
     assert_eq!(
         *stopped_log.lock().unwrap(),
         ["saver:1:Stopped"],

@@ -176,7 +176,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //  `Deferred` answered from a task you spawned yourself, which is answering
     //  with something no turn produced, and the volatile idempotency ledger a
     //  retrying peer is matched against (RFC-07 §6.8).
-    ledger.stop().await;
+    ledger.stop().await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
     Ok(())
 }

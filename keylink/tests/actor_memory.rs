@@ -371,7 +371,39 @@ const BUDGET_PER_LOCAL_ACTOR: isize = LOCAL_MEASURED + LOCAL_SLACK;
 /// Moving this is the deliberate act. A wave that grows an idle actor edits a
 /// number that says *what it costs*, next to a slack that says *what an allocator
 /// may differ by* — rather than a single ceiling where the two are indistinguishable.
-const LOCAL_MEASURED: isize = 2_029;
+///
+/// # It was 2,029, and item M's re-entrancy chain is what moved it
+///
+/// **The price, stated once so it can be rejected without being re-derived:
+/// re-entrancy detection costs 280 bytes per idle actor on the LOCAL path, and
+/// nothing on the keyed one.** That is the whole of what this raise buys. A later
+/// wave that decides the refusal is not worth 280 bytes per actor has the figure
+/// here and does not have to reconstruct where it came from — and the way to spend
+/// it back is to delete the mechanism, not to widen [`LOCAL_SLACK`].
+///
+/// Every local message now carries the chain of turns it was sent from, so
+/// `Message::Mail` grew by a `Chain` — and this is the one place in the crate
+/// where that is multiplied: `tokio::sync::mpsc` allocates its first block of 32
+/// slots eagerly, so a type in the slot is paid for 32 times by every idle actor
+/// whether or not anything is ever queued. The keyed path is untouched, because a
+/// keyed mailbox carries no chain: `BUDGET_PER_ACTOR` is still 2,048 against a
+/// measurement of 1,722, unmoved.
+///
+/// **The change was made cheaper before the number was moved**, which is this
+/// file's own precedent from the `Fate` wave. `Chain::Deep` held an `Arc<[Actor]>`
+/// first: a slice `Arc` is a **fat** pointer, so the enum was 24 bytes and the
+/// measurement was **2,565**. A thin `Arc<Vec<Actor>>` makes it 16 and the
+/// measurement **2,309** — 256 bytes bought back, exactly the 32 slots times the 8
+/// bytes of length that came out of the slot. The remaining 280 bytes are the
+/// chain itself, and they buy the refusal of a deterministic deadlock.
+///
+/// The 8-byte form exists and is refused: a linked list allocates a node for
+/// **every** top-level turn, which trades cold bytes for hot-path work. `turns.rs`
+/// carries that argument beside the type.
+///
+/// [`LOCAL_SLACK`] is untouched at 275, and that is the point of the split — this
+/// wave argues with the cost and not with the headroom.
+const LOCAL_MEASURED: isize = 2_309;
 
 /// How far another allocator may land from [`LOCAL_MEASURED`].
 ///

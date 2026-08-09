@@ -272,7 +272,10 @@ async fn a_state_survives_the_process_that_built_it() {
         for entry in [1, 2, 3] {
             ledger.post(entry).await.expect("running");
         }
-        ledger.stop().await;
+        ledger
+            .stop()
+            .await
+            .expect("a stop from outside the actor's own turn is never refused");
     }
 
     // ── run two: as far as the store can tell, a new process
@@ -286,7 +289,10 @@ async fn a_state_survives_the_process_that_built_it() {
 
         let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
         ledger.post(4).await.expect("running");
-        ledger.stop().await;
+        ledger
+            .stop()
+            .await
+            .expect("a stop from outside the actor's own turn is never refused");
     }
 
     // ── run three, which stores nothing, so what it reads is run two's write
@@ -346,7 +352,10 @@ async fn an_answered_call_is_a_stored_call_and_its_bytes_are_framed() {
         vec![0x2A]
     );
 
-    ledger.stop().await;
+    ledger
+        .stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
 }
 
 // ─────────────────────────────────────────────── what is deliberately not stored
@@ -458,7 +467,7 @@ async fn a_refusal_before_persist_prevents_the_store() {
 /// # Over two real nodes, because the promise is a peer's
 ///
 /// A local caller cannot see this: the generated handle collapses
-/// `Answered::Refused` into `MailboxClosed` — *"the actor is no longer
+/// `Answered::Refused` into `Undelivered` — *"the actor is no longer
 /// running"* — and `ended()` is the only local route to the reason. A **peer**
 /// is told `observer refused: persist`, produced by `turns.rs` under a comment
 /// reading *"The turn ran and was not committed"*, and that sentence is the
@@ -544,7 +553,10 @@ async fn the_claim_is_free_the_instant_stop_returns() {
 
     let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
     ledger.post(1).await.expect("running");
-    ledger.stop().await;
+    ledger
+        .stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
 
     // The very next thing, on the same task.
     files
@@ -796,7 +808,7 @@ async fn waiting_for(vault: &teller::Handle<Vault>, want: u64) {
 /// own doc said that if `Deferred::send` were ever made to wait for the observer
 /// chain the test would go red, and that the redness was the notice. It was made
 /// to wait, it went red — `the parked caller was answered from inside the
-/// handler: MailboxClosed` — and this is that notice, honoured rather than
+/// handler: Undelivered` — and this is that notice, honoured rather than
 /// deleted.
 ///
 /// What changed is `parking.rs`: a value handed to [`Deferred::send`] during a
@@ -816,7 +828,7 @@ async fn waiting_for(vault: &teller::Handle<Vault>, want: u64) {
 /// refusal rather than a receipt, and the balance on the disk is still 100, so
 /// there is no receipt anywhere for a debit that is not stored.
 ///
-/// A `Handle` folds every loss into `MailboxClosed`, so the precise
+/// A `Handle` folds every loss into `Undelivered`, so the precise
 /// `TurnLost::Refused { name: "persist" }` underneath is asserted in
 /// `turns.rs::a_released_reply_is_refused_with_the_turn_that_released_it`, where
 /// the variant is visible.
@@ -896,7 +908,7 @@ async fn a_deferred_reply_whose_turn_was_not_stored_is_refused() {
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `Deferred::send`'s
 /// `Verdict::Committed => reply.answer(Answered::Ran(value)),` →
 /// `Verdict::Committed => drop(value),`. Watched: `the receipt reaches its
-/// caller when the turn commits: MailboxClosed`.
+/// caller when the turn commits: Undelivered`.
 #[tokio::test]
 async fn a_deferred_reply_that_is_answered_is_a_stored_reply() {
     let store = Flaky::new();
@@ -931,7 +943,10 @@ async fn a_deferred_reply_that_is_answered_is_a_stored_reply() {
         "the caller holds a receipt, so the debit is on the disk"
     );
 
-    vault.stop().await;
+    vault
+        .stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
 }
 
 // ───────────────────────────────────────────────── the bound that is NOT there
@@ -1024,7 +1039,10 @@ async fn a_state_that_is_not_sync_is_still_persisted() {
         let counter = counting::actor_with(state, vec![Box::new(saver)]);
         assert_eq!(counter.hit().await.expect("running"), 1);
         assert_eq!(counter.hit().await.expect("running"), 2);
-        counter.stop().await;
+        counter
+            .stop()
+            .await
+            .expect("a stop from outside the actor's own turn is never refused");
     }
 
     let opened = Persist::<Counter, _>::open(&files, &id)
@@ -1071,7 +1089,9 @@ async fn the_per_turn_store_cost() {
         bare.hit().await.expect("running");
     }
     let without = started.elapsed();
-    bare.stop().await;
+    bare.stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
 
     let (state, saver) = Persist::open(&files, &id)
         .await
@@ -1083,7 +1103,10 @@ async fn the_per_turn_store_cost() {
         stored.hit().await.expect("running");
     }
     let with = started.elapsed();
-    stored.stop().await;
+    stored
+        .stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
 
     println!("── per-turn cost over {TURNS} turns of an 8-byte state");
     println!("   no observer : {:>8.1} µs/turn", micros(without, TURNS));

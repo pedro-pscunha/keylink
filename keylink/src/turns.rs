@@ -84,7 +84,7 @@
 //! # Two types, two error types, on purpose
 //!
 //! A local call **reports** one failure: the actor is gone. That is why
-//! [`MailboxClosed`] is a unit struct and why it is not [`Error`](crate::Error).
+//! [`Undelivered`] is a unit struct and why it is not [`Error`](crate::Error).
 //! RFC-04 §5.2 and §5.5 reject a handle that is the same type locally and
 //! remotely, because such a handle must either claim failures the local case
 //! cannot have, or hide failures the remote case does.
@@ -98,8 +98,8 @@
 //!
 //! It is also why [`ended`](LocalActor::ended) exists rather than a second error
 //! variant. An [`Observer`] that refuses a turn ends the actor,
-//! and the caller of that turn is told [`MailboxClosed`] like any other — which
-//! is true, and which does not say *why*. `MailboxClosed` means "gone" and must
+//! and the caller of that turn is told [`Undelivered`] like any other — which
+//! is true, and which does not say *why*. `Undelivered` means "gone" and must
 //! not be stretched to mean "gave up on durability", so the second question is
 //! asked separately and answered by [`Ended`].
 //!
@@ -151,7 +151,7 @@
 //! function call would deliver it.
 //!
 //! Both halves matter. Catching keeps one bad message from costing every later
-//! one. Resuming keeps [`MailboxClosed`] honest: it means the actor is gone, and
+//! one. Resuming keeps [`Undelivered`] honest: it means the actor is gone, and
 //! never "the actor is fine and your message exploded".
 //!
 //! Two structural exceptions. [`notify`](LocalActor::notify) has no channel to
@@ -170,15 +170,16 @@
 //! `guarded`, including the closure that produces the turn's future. What is
 //! left is a user `Drop` — on the state when the actor ends, or on a reply value
 //! dropped here because the caller went away. Either kills the loop, and every
-//! handle then reports [`MailboxClosed`]: the same lie the panic policy exists
+//! handle then reports [`Undelivered`]: the same lie the panic policy exists
 //! to remove, through a narrower door. And `panic = "abort"` defeats all of it.
 //!
 //! [`Handle`]: crate::LocalActor
 
+use std::cell::Cell;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -219,36 +220,65 @@ use crate::{
 /// does buy is that a caller cannot get further ahead of the actor than one
 /// message, so a caller that measures its own latency sees the actor's.
 ///
-/// Raising it would let callers run ahead without feeling it, and would make a
-/// self-`tell` succeed more often — which is worse, not better, because
-/// [`Handle`](crate::LocalActor) documents self-calls as a deadlock and the
-/// difference between "usually" and "always" is what makes a deadlock a
-/// production incident instead of a test failure.
+/// That reason survives on its own, and it is now the **only** one holding this
+/// value at 1. Two others stood here and neither survived being measured.
 ///
-/// # A constant where the keyed one is a knob, and the name says which
+/// # The deleted argument, and the measurement that deleted it
 ///
-/// `DEFAULT_MAILBOX_DEPTH` in `registry.rs` is a default and this is a value:
-/// nothing overrides it, and the paragraphs below are why.
-///
-/// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth) makes the
-/// registry's depth a builder method. This one stays fixed, and the asymmetry is
-/// the paragraph above rather than an oversight: on this path, depth has the
-/// "matching hazard" the keyed one lacks. A keyed actor is addressed from another
-/// task — a QUIC stream's — so a deeper mailbox trades latency for a longer queue
-/// and nothing else. A `LocalActor` is addressed from *whatever task holds the
-/// handle*, including its own turn, and there a deeper mailbox turns a documented
+/// This paragraph read: a `LocalActor` is addressed from whatever task holds the
+/// handle, including its own turn, so *"a deeper mailbox turns a documented
 /// always-deadlock into an intermittent one. An intermittent deadlock is not a
-/// slower program; it is a different program in production than in the tests.
+/// slower program; it is a different program in production than in the tests."*
 ///
-/// The other half of the argument above stands too, and it is now measurable
-/// elsewhere: the parked-sender list has no length anybody can read on **either**
-/// path. What the keyed path gained is
-/// [`ActorStatus::buffered`](crate::ActorStatus::buffered), which reports what
-/// the channel holds and says in its own documentation that it is a floor.
+/// Tested directly. Control first, required green: `cargo nextest run --test
+/// cycles`, 8 of 8 passing. Then `scripts/break-once.sh` raising the depth to
+/// **32** — thirty-two and not two, so that "the mailbox happens to be full" is
+/// unreachable in those tests. Result: 6 passed, 2 failed, and **every deadlock
+/// guard still fired at depth 32**. The two failures are the only assertions that
+/// are *about* depth-1 permit arithmetic, and the second of them settles it:
+/// assertions run in order, and it panicked at the "A's mailbox is full" line
+/// which sits *after* the ring assertion — so the ring still hung at depth 32,
+/// with no contention anywhere. Reproduced independently on a separate worktree,
+/// same two test names, same two panic lines.
 ///
-/// If a case for a local knob ever arrives, it needs to answer the self-call
-/// hazard first, and the answer is not a bigger number.
-const LOCAL_MAILBOX_DEPTH: usize = 1;
+/// The hazard is on the **answer**, not on the permit. `macros.rs` names four
+/// self-call cases; three of them send into the free slot and then wait forever
+/// on an answer only the blocked turn could produce, so depth moves where the
+/// hang happens and nothing else. And the one load-dependent case runs the other
+/// way: a self-`tell` is *already* intermittent at depth 1, because it succeeds
+/// only if nobody else took the permit first, so a deeper mailbox makes that
+/// block **less** often. Depth 1 is not the deterministic choice for the one case
+/// that varies; it is the choice that maximises the chance of the block.
+///
+/// The remaining hazard is closed by a mechanism rather than by a number: a
+/// re-entrant call is refused with [`Undelivered::Reentrant`] at any depth. See
+/// [`LocalActor::send`].
+///
+/// # A default where it used to be a value, and the name says which
+///
+/// `DEFAULT_MAILBOX_DEPTH` in `registry.rs` is a default and this is now one too,
+/// with [`LocalActor::spawn_deep`] and [`LocalActor::spawn_supervised_deep`] as
+/// the doors that override it. [`NonZeroUsize`] rather than `usize`, matching
+/// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth) exactly:
+/// `mpsc::channel(0)` panics, and `representability.rs` pins both signatures so a
+/// widening to `usize` — or to an `Option` whose `None` meant unbounded — is
+/// `E0308` rather than a review comment.
+///
+/// **The default stays 1, and moving it costs more than it buys.** Measured at
+/// depth 2 across the suite: exactly **two** tests fail, both the permit
+/// arithmetic in `tests/cycles.rs`, and `--test defer --test persist` runs 31 and
+/// passes 31 — the `parked()` helper is a 500-iteration retry loop, so it is the
+/// loop and not the permit that makes those suites deterministic. So the cost of
+/// moving it is two test edits and four doc comments going stale unchecked, and
+/// the benefit is nothing the knob does not already give.
+///
+/// # CAUTION: raising this raises the shutdown budget owed
+///
+/// `registry.rs`'s warning carries to this door verbatim: a deeper mailbox holds
+/// more turns that a shutdown must still drain, by up to N turns, and **nothing
+/// can check that for you**. Under-draining is a defect rather than a slow
+/// shutdown.
+const DEFAULT_LOCAL_MAILBOX_DEPTH: NonZeroUsize = NonZeroUsize::MIN;
 
 /// The observers an actor lends to one turn.
 ///
@@ -1305,6 +1335,226 @@ impl<A: Send> Turn<A> for std::convert::Infallible {
     }
 }
 
+/// One actor, for **chain membership and nothing else**.
+///
+/// Not a handle, not a key, and it must never enter a map that outlives a turn.
+/// Written here rather than left to a reader, because the type is a pointer that
+/// happens to identify something and every other use of it would be a lie: it
+/// cannot be sent to, cannot be compared across processes, and names an actor
+/// only for as long as somebody holds this clone.
+///
+/// # It costs no field, because the cell already exists
+///
+/// [`LocalActor`] holds `mail`, `ended`, `fate`, `busy` and `task`.
+/// [`spawn_fed`](LocalActor::spawn_fed) makes one `Arc<AtomicBool>` and clones
+/// it — one end to the handle, one into the [`Watched`] the loop polls — and
+/// `Clone` shares it. So that allocation already identifies the actor, uniquely
+/// and across every clone, and this newtype is a second name for it rather than
+/// a sixth field.
+///
+/// # A private newtype from the start, and an `Arc` rather than its address
+///
+/// Private, never public and never `#[doc(hidden)] pub`: the `Answer<Resp>`
+/// alias documented two hundred lines above is the scar that argument comes
+/// from, where a transparent alias put tokio's channel type into keylink's
+/// public API through a hidden name.
+///
+/// The first version of this compared `Arc::as_ptr as usize`, and that is a
+/// **false positive waiting to happen**. The argument for it was that the chain
+/// only holds actors whose turns are on the stack, so the allocation cannot be
+/// freed — which is true of the innermost entry and false of the ancestors,
+/// which travel in the message and name actors that were alive when it was sent.
+/// The reachable sequence: A calls B; A is aborted and every handle dropped,
+/// freeing the allocation; C spawns onto the same address; B calls C, and C is
+/// refused as if it were A. That breaks a working program with a named error,
+/// which is worse than missing a detection. Address reuse is the default and not
+/// a corner — a probe allocating an `Arc<AtomicBool>`, recording the pointer,
+/// dropping and reallocating hit the same address 1000 times out of 1000.
+///
+/// A strong reference keeps the allocation alive for exactly the window the
+/// chain uses it, so the address cannot be reused inside it. An `Arc` is a
+/// non-null pointer, so an entry costs the 8 bytes a `usize` would and [`Chain`]
+/// keeps its niche. The price is one atomic increment per entry, paid only on
+/// the nested path.
+#[derive(Clone)]
+struct Actor(Arc<AtomicBool>);
+
+impl Actor {
+    /// The same actor, by allocation and never by address.
+    fn is(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// The actors whose turns are on the stack behind the turn being polled.
+///
+/// Three variants, and the reason is allocation rather than tidiness. Every
+/// top-level turn installs `One`, which allocates nothing. `Deep` allocates
+/// once, only for a turn reached from inside another turn, and an `Arc` clones
+/// without allocating — which matters because every send made during a turn
+/// clones the chain into its message.
+///
+/// # `Arc<Vec<..>>` and not `Arc<[..]>`, and the reason is the mailbox
+///
+/// A slice `Arc` is a **fat** pointer, so `Chain` came out at 24 bytes, and this
+/// type sits in every [`Message::Mail`] — and `tokio::sync::mpsc` allocates its
+/// first block of 32 slots eagerly, so those bytes are multiplied by 32 on every
+/// idle actor whether or not anything is ever queued. Measured on the local path
+/// in `tests/actor_memory.rs`: the fat form cost **536 bytes per idle actor**
+/// (2,029 -> 2,565) and the thin one costs **280** (2,029 -> 2,309).
+///
+/// The double indirection is paid only when a deep chain is walked, which happens
+/// on the nested path alone; the fat pointer was paid by every actor in the
+/// process. A linked list would be 8 bytes and cheaper still, and it is refused
+/// for the reason `One` exists: it allocates a node for **every** top-level turn,
+/// which trades cold bytes for work on the hot path.
+#[derive(Clone, Default)]
+enum Chain {
+    /// Nothing is on the stack: this thread is between turns, or on a task that
+    /// never ran one — a connection's, or a caller's.
+    #[default]
+    Empty,
+    /// One turn, the common case.
+    One(Actor),
+    /// A turn reached from inside another turn, outermost first.
+    Deep(Arc<Vec<Actor>>),
+}
+
+impl Chain {
+    /// This chain with one more actor on the end, or unchanged when the actor
+    /// running the next turn has no identity to add.
+    ///
+    /// `None` is a keyed actor or a bare receiver: [`Inbox::identity`] carries
+    /// what that means. The inherited chain still **passes through** such a turn
+    /// rather than being reset, which costs nothing and is the honest shape — a
+    /// hop that cannot be detected must not also erase the hops that can.
+    fn with(self, running: Option<Actor>) -> Self {
+        let Some(running) = running else {
+            return self;
+        };
+        match self {
+            Self::Empty => Self::One(running),
+            Self::One(outer) => Self::Deep(Arc::new(vec![outer, running])),
+            Self::Deep(outer) => {
+                let mut grown = Vec::with_capacity(outer.len() + 1);
+                grown.extend(outer.iter().cloned());
+                grown.push(running);
+                Self::Deep(Arc::new(grown))
+            }
+        }
+    }
+
+    /// Whether this actor's turn is one of the ones on the stack.
+    fn holds(&self, who: &Actor) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::One(one) => one.is(who),
+            Self::Deep(deep) => deep.iter().any(|each| each.is(who)),
+        }
+    }
+}
+
+thread_local! {
+    /// The chain of the turn being polled on this thread, or [`Chain::Empty`]
+    /// between polls.
+    ///
+    /// Exchanged in and out by [`Chained::poll`], so it is set for exactly as
+    /// long as a turn's dispatch is on the stack. `parking.rs`'s `PARKING` is the
+    /// template, down to the `Drop` guard, and its header carries the whole
+    /// argument for a thread-local: `tokio::task_local!` lives behind tokio's
+    /// `rt` feature, which keylink enables on no target, and the save/restore
+    /// below is what that macro does anyway. It follows a task across worker
+    /// threads for the same reason — the exchange happens on whichever thread is
+    /// **polling**, not on whichever thread started the turn.
+    static CHAIN: Cell<Chain> = const { Cell::new(Chain::Empty) };
+}
+
+/// Swap this chain with whatever the current thread is holding. Its own inverse.
+fn exchange(held: &mut Chain) {
+    let taken = std::mem::take(held);
+    *held = CHAIN.with(|slot| slot.replace(taken));
+}
+
+/// The chain of the turn this send is being made from, or [`Chain::Empty`].
+///
+/// `try_with` and not `with`, for `parking::park`'s reason: a thread whose locals
+/// have already been destroyed is not running a turn, which is the `Empty` case
+/// exactly, and raising a panic inside somebody else's destructor is not an
+/// improvement on sending.
+fn current() -> Chain {
+    CHAIN
+        .try_with(|slot| {
+            let held = slot.take();
+            let seen = held.clone();
+            slot.set(held);
+            seen
+        })
+        .unwrap_or_default()
+}
+
+/// A turn's dispatch, with the chain the messages it sends will carry.
+///
+/// Built by [`run_loop`] around [`dispatch`] and nothing else, so "during the
+/// turn" means the handler's body, everything it awaits inline, and the observer
+/// chain the arm runs — every send that can reach a mailbox from inside the turn.
+struct Chained<F> {
+    /// The chain, except while this future is being polled — during a poll it is
+    /// on the thread and this holds whatever was displaced there, normally
+    /// [`Chain::Empty`].
+    chain: Chain,
+    /// The dispatch.
+    inner: F,
+}
+
+/// `Unpin` on the inner future rather than a projection, for `Parking`'s reason:
+/// the one thing this ever wraps is the `Pin<Box<dyn Future>>` [`dispatch`]
+/// returns, which is `Unpin`, and requiring it costs a bound instead of `unsafe`.
+impl<F: Future + Unpin> Future for Chained<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let Self { chain, inner } = self.get_mut();
+        exchange(chain);
+        // Per **poll** and not per turn, and a guard rather than a line after the
+        // poll. A turn's future moves between worker threads, so the install has
+        // to happen wherever it is being polled; and the poll can unwind, which
+        // would otherwise leave one turn's chain visible to the next thing polled
+        // on this thread — an unrelated actor refused for being on a chain it was
+        // never on.
+        //
+        // **The unwind path is REACHABLE and is NOT tested, and that is said here
+        // rather than left to be inferred.** It is not reachable by the two
+        // obvious routes: [`turn`] catches the handler with `guarded` and each
+        // observer with a `catch_unwind` plus a `guarded`, so neither reaches this
+        // frame. What is left is a panic in the generated arm outside `turn`, in
+        // the plumbing between those guards, or in a `Drop` run as the dispatch
+        // future unwinds — and this crate already treats that as a real ending:
+        // [`Watched`]'s own `Drop` exists for "a turn whose unwind escapes the
+        // loop". No test in this tree drives it, and no break has been watched
+        // against this line.
+        //
+        // The guard matters *because* the unwind is fatal to the task and not to
+        // the thread: the worker goes on to poll other actors, and a chain left
+        // behind would refuse one of them by name. `parking.rs` makes the same
+        // trade at the same place, for the same reason.
+        let _restore = Restore(chain);
+        Pin::new(inner).poll(cx)
+    }
+}
+
+/// Puts the chain back where it came from, on the way out of a poll — including
+/// the way out of a panicking one.
+struct Restore<'a>(&'a mut Chain);
+
+impl Drop for Restore<'_> {
+    fn drop(&mut self) {
+        exchange(self.0);
+    }
+}
+
 /// The one message whose work is a caller's closure rather than a declared
 /// method: [`LocalActor::read`].
 ///
@@ -1331,12 +1581,30 @@ enum Message<A, M> {
     /// It also removes an allocation rather than adding one: the channel used to
     /// carry `Box<Message<A, M>>` — one box for the message, none for the mail — and
     /// now carries the enum directly, which is pointer-sized whatever `M` is.
-    Mail(Box<M>),
+    ///
+    /// # The chain rides here, and it could not ride on `Origin`
+    ///
+    /// A thread-local cannot cross a task, so what an actor is called *from* has
+    /// to travel in the message. The first design put it on [`Origin`], and that
+    /// version cannot work: an `Origin` is consumed INTO the opaque `M` before a
+    /// `Message` exists — every send builds its payload through a closure typed
+    /// `impl FnOnce(Origin, Reply<T>) -> M` — so [`run_loop`] never sees one, and
+    /// [`Turn::run`] takes no `Origin` and offers no accessor.
+    ///
+    /// The consequence was not a matter of taste. `run_loop` could have installed
+    /// `Chain::One(self)` from a new parameter, but never `Chain::Deep`, because
+    /// the ancestors would be sealed inside `M` — so the check would have caught
+    /// a self-call and **silently missed `A → B → A`**, which is the
+    /// deterministic hazard the whole item exists to close.
+    ///
+    /// This enum is private to this module, so carrying it here costs no public
+    /// API, no generated line, and raises no ALPN question at all.
+    Mail(Box<M>, Chain),
     /// [`LocalActor::read`]. Runs no observers, by design: a read takes `&A` and
     /// cannot mutate, so storing after it is waste.
     Read(Read<A>),
     /// Ends the loop, which drops the receiver, which is what makes every other
-    /// handle report [`MailboxClosed`] from then on.
+    /// handle report [`Undelivered`] from then on.
     Stop,
 }
 
@@ -1389,6 +1657,34 @@ trait Inbox<A, M>: Send {
     /// only way this crate accepts: [`Watched`] clears it on drop, so an unwind
     /// and an [`abort`](LocalActor::abort) cannot leave it lying.
     fn mark_busy(&self, _running: bool) {}
+
+    /// Which actor this loop is, for [`Chain`] membership — or `None` for one
+    /// that cannot be named.
+    ///
+    /// [`mark_busy`](Self::mark_busy)'s idiom, for the same reason: written by
+    /// whoever has somewhere to put it. [`Watched`] hands back the cell a
+    /// [`LocalActor`] already carries on its handle, so the check costs no field
+    /// on that type; a bare `mpsc::Receiver` and a [`Keyed`] mailbox have no such
+    /// cell and keep this default.
+    ///
+    /// # `Lent` must override it, and a `None` default is why that is a risk
+    ///
+    /// [`Lent`] is a **delegating wrapper**, and it is the inbox the production
+    /// supervised path uses: `spawn_supervised` builds a real `Watched` with a
+    /// real cell, and `supervise` then wraps it in a `Lent` and calls
+    /// [`run_loop`]. Without the forward below, every supervised local actor
+    /// would lose this check silently, with no test failing — which is what a
+    /// `None` default buys and costs at the same time.
+    ///
+    /// # What a keyed actor's `None` means, stated rather than hidden
+    ///
+    /// A keyed mailbox carries no chain — [`Keyed::poll_next`] maps a bare `M`
+    /// into [`Message::Mail`] with [`Chain::Empty`] — so a ring closed through a
+    /// keyed or served hop is not caught. That is one of the residuals this wave
+    /// names rather than one it missed.
+    fn identity(&self) -> Option<Actor> {
+        None
+    }
 
     /// The loop knows why it is ending, and has dropped nothing yet: say what
     /// that means for a reply channel that is about to die.
@@ -1510,6 +1806,12 @@ impl<A: Send, M: Send> Inbox<A, M> for Watched<A, M> {
         self.busy.store(running, Ordering::Relaxed);
     }
 
+    /// The same cell, read as an identity instead of as a flag. See [`Actor`] for
+    /// why one allocation can carry both without either meaning the other.
+    fn identity(&self) -> Option<Actor> {
+        Some(Actor(Arc::clone(&self.busy)))
+    }
+
     fn close(&mut self) {
         // Fully qualified for the bare impl's reason: an inherent `close` would
         // win path resolution and an upstream rename would turn a delegation into
@@ -1550,7 +1852,9 @@ impl<A: Send, M: Send> Inbox<A, M> for Keyed<M> {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Message<A, M>>> {
-        self.0.poll_recv(cx).map(|mail| mail.map(Message::Mail))
+        self.0
+            .poll_recv(cx)
+            .map(|mail| mail.map(|mail| Message::Mail(mail, Chain::Empty)))
     }
 
     /// The mailbox is what the registry kept a handle on, so it is the way back to
@@ -1763,13 +2067,20 @@ where
         mail_first = !mail_first;
 
         match taken {
-            Taken::Mail(Some(Message::Mail(mail))) => {
+            Taken::Mail(Some(Message::Mail(mail, chain))) => {
                 // The two lines around this await are the whole of
                 // `ActorStatus::busy`, and they are here — in the one loop, at the
                 // one dispatch — rather than inside the receive, so that a feed
                 // turn and a mailbox turn cannot disagree about what a turn is.
                 inbox.mark_busy(true);
-                let ended = dispatch(mail, &mut state, &mut hooks).await;
+                // The chain the sender was on, plus this actor. Everything sent
+                // from inside the dispatch below carries it, which is what lets
+                // `LocalActor::send` refuse a ring rather than only a self-call.
+                let chained = Chained {
+                    chain: chain.with(inbox.identity()),
+                    inner: dispatch(mail, &mut state, &mut hooks),
+                };
+                let ended = chained.await;
                 inbox.mark_busy(false);
                 if let Some(end) = ended {
                     reason = end;
@@ -1785,7 +2096,15 @@ where
             Taken::Mail(None) => break,
             Taken::Fed(Fed::Item(item)) => {
                 inbox.mark_busy(true);
-                let ended = dispatch(item, &mut state, &mut hooks).await;
+                // A feed item arrives from a stream and not from a sender, so it
+                // starts a fresh chain holding this actor alone. A ring closed
+                // through a feed is one of the residuals, and it is this line:
+                // nothing upstream of the stream is named here.
+                let chained = Chained {
+                    chain: Chain::Empty.with(inbox.identity()),
+                    inner: dispatch(item, &mut state, &mut hooks),
+                };
+                let ended = chained.await;
                 inbox.mark_busy(false);
                 if let Some(end) = ended {
                     reason = end;
@@ -2373,6 +2692,14 @@ impl<A: Send, M: Send, I: Inbox<A, M>> Inbox<A, M> for Lent<'_, I> {
         self.inbox.mark_busy(running);
     }
 
+    /// Forwarded, exactly as `mark_busy` above is, and it is the one line that
+    /// keeps the re-entrancy check alive on the production supervised path. See
+    /// [`Inbox::identity`] for what forgetting it would have cost and why nothing
+    /// would have complained.
+    fn identity(&self) -> Option<Actor> {
+        self.inbox.identity()
+    }
+
     /// Decide — **before** the state is dropped.
     ///
     /// The decision is made here and nowhere else, and it is *published* by
@@ -2703,15 +3030,69 @@ where
     supervise(factory, limit, Keyed(inbox), &fate).await
 }
 
-/// The actor is gone. The only way a local call fails.
+/// A local call that never entered the mailbox, and why.
 ///
 /// Not [`Error`](crate::Error), and deliberately not convertible into one:
 /// `Error::Transport`, `Error::SchemaMismatch` and `Error::Closed` have no local
 /// counterpart, and a caller must not be able to `?` a local failure into a
 /// remote error type and lose which one it was. RFC-04 §5.3.
+///
+/// # It replaced a unit struct called `Undelivered`, and the name was the fault
+///
+/// That type's own first line read *"The actor is gone. The only way a local call
+/// fails."* The second sentence stopped being true when a re-entrant call became
+/// refusable, and the first is the reason the type could not simply grow: a
+/// refused re-entrant call leaves the actor **alive**, so reporting it as closed
+/// would be the same lie `ask_catching`'s `Expired` arm names — a live actor
+/// reported as gone through a public API, silently.
+///
+/// # Exhaustive, and deliberately not `#[non_exhaustive]`
+///
+/// [`Ended`] and [`TurnLost`] carry that argument: a caller matches this, and a
+/// wildcard arm is the collapse the split exists to prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("the actor is no longer running")]
-pub struct MailboxClosed;
+pub enum Undelivered {
+    /// The actor is gone: it stopped, was aborted, or its loop ended.
+    #[error("the actor is no longer running")]
+    Gone,
+    /// The call was made from inside the target actor's own turn, and would have
+    /// deadlocked.
+    ///
+    /// The actor is **still running** — it is running the turn this call was made
+    /// from. Call the method on `&mut self` instead; it is the same code without
+    /// the round trip. If the work must happen after the current turn, spawn a
+    /// task that holds a handle, which is not the actor and can wait for a permit
+    /// safely.
+    ///
+    /// A `tell` is refused only when the mailbox is **full**, because a self-tell
+    /// into a free slot runs after the turn returns and is legitimate. Every
+    /// other local call waits for an answer only the blocked turn could produce,
+    /// so a free slot does not save it and it is refused at any depth.
+    #[error("this call was made from inside the target actor's own turn: it would deadlock")]
+    Reentrant,
+}
+
+/// Which half of the re-entrancy rule a send is under.
+///
+/// [`LocalActor::send`] **cannot work this out from its argument**, and that is
+/// why it is a parameter rather than a match. Compare the two callers that
+/// disagree: `answered` and `notify` build byte-identical `Message::Mail` values
+/// — `notify` differs only by dropping the receiving half of the reply channel
+/// first and by not awaiting — so the same message arrives from the half that
+/// refuses always and the half that refuses only under load.
+///
+/// A private enum rather than a `bool`, so the caller cannot forget to say which
+/// half it is and cannot say it the wrong way round without reading as nonsense.
+#[derive(Clone, Copy)]
+enum Refuse {
+    /// The caller waits for an answer only the blocked turn could produce:
+    /// `ask`, `ask_catching`, `read`, `stop`, and a served dispatch. A free
+    /// mailbox slot does not save any of them, so the chain alone decides.
+    Always,
+    /// A `tell`. It waits for a permit and nothing else, so it is refused only
+    /// when there is no permit to be had.
+    WhenFull,
+}
 
 /// One value, owned by one task, addressed by `&mut self`.
 ///
@@ -2819,6 +3200,57 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
     /// Panics when called outside a tokio runtime, like every other spawn.
     #[must_use]
     pub fn spawn_fed<F: Feeds<A>>(state: A, hooks: Vec<Box<dyn Observer<A>>>, feeds: F) -> Self {
+        Self::spawn_deep(state, hooks, feeds, DEFAULT_LOCAL_MAILBOX_DEPTH)
+    }
+
+    /// [`spawn_fed`](Self::spawn_fed)'s triple, plus the mailbox depth.
+    ///
+    /// The general door, and the only reason the three above are not it: a depth
+    /// nobody chose is what `DEFAULT_LOCAL_MAILBOX_DEPTH` is for, and requiring
+    /// the argument would make every caller name a number it does not care about.
+    ///
+    /// [`NonZeroUsize`] because `mpsc::channel(0)` panics.
+    /// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth) is
+    /// the keyed twin and takes the same type for the same reason.
+    ///
+    /// # What a deeper mailbox does and does not buy
+    ///
+    /// It lets a caller get further ahead of the actor, which is the whole of it.
+    /// It is **not** a bound on memory — a parked sender holds its message alive
+    /// whatever this is — and it does **not** make a self-call safe: a re-entrant
+    /// call is refused by identity rather than by the permit, so
+    /// [`Undelivered::Reentrant`] is the answer at every depth.
+    /// `DEFAULT_LOCAL_MAILBOX_DEPTH` carries the measurement, and it is private
+    /// because the two doors above are the whole of the public surface for it.
+    ///
+    /// # What was measured, and the ring it does not cover
+    ///
+    /// "No depth converts a deterministic deadlock into an intermittent one" was
+    /// measured at depth 32 on **local** rings, where every hop is a `LocalActor`
+    /// and the chain reaches every edge. A ring closed through a **keyed or served
+    /// hop** is not caught by the chain — a keyed mailbox carries none — and its
+    /// behaviour above depth 1 is **unmeasured**. Nothing ships changed, because
+    /// the default stays 1 and that is the depth every existing guard runs at; but
+    /// a caller raising this in a system with keyed hops is outside what was
+    /// tested, and should treat the resulting hang or non-hang as unknown rather
+    /// than as covered by the paragraph above.
+    ///
+    /// # CAUTION: a deeper mailbox raises the shutdown budget owed
+    ///
+    /// A shutdown must still drain what is queued, so raising this raises the
+    /// time [`stop`](Self::stop) can take, by up to N turns. Nothing can check
+    /// that for you, and under-draining is a defect rather than a slow shutdown.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a tokio runtime, like every other spawn.
+    #[must_use]
+    pub fn spawn_deep<F: Feeds<A>>(
+        state: A,
+        hooks: Vec<Box<dyn Observer<A>>>,
+        feeds: F,
+        depth: NonZeroUsize,
+    ) -> Self {
         // The channel carries the enum directly and `Message::Mail` carries the
         // box: the same one allocation, in the place that keeps an unboxed `M` out
         // of this task's future. `tokio::sync::mpsc`
@@ -2830,7 +3262,7 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
         // message. `Mailbox` in `registry.rs` boxes for the same reason and
         // carries the measured table; this end had no box at all, because the
         // closure it used to carry made one by accident.
-        let (mail, inbox) = mpsc::channel::<Message<A, M>>(LOCAL_MAILBOX_DEPTH);
+        let (mail, inbox) = mpsc::channel::<Message<A, M>>(depth.get());
         let (ended, watching) = watch::channel(None);
         let fate = Fate::default();
         let held = fate.clone();
@@ -2921,7 +3353,37 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
         Fut: Future<Output = Result<Incarnation<A, F>, Stop>> + Send,
         F: Feeds<A>,
     {
-        let (mail, inbox) = mpsc::channel::<Message<A, M>>(LOCAL_MAILBOX_DEPTH);
+        Self::spawn_supervised_deep(factory, limit, DEFAULT_LOCAL_MAILBOX_DEPTH)
+    }
+
+    /// [`spawn_supervised`](Self::spawn_supervised), plus the mailbox depth.
+    ///
+    /// The supervised twin of [`spawn_deep`](Self::spawn_deep), and it exists
+    /// because the mailbox is created in exactly two places on this path — here
+    /// and there — so a knob that reaches every local actor is two signatures and
+    /// cannot be one. The mailbox belongs to the **actor** rather than to an
+    /// incarnation, so this depth is set once and survives every restart.
+    ///
+    /// # CAUTION: a deeper mailbox raises the shutdown budget owed
+    ///
+    /// [`spawn_deep`](Self::spawn_deep) carries the whole warning, and under
+    /// supervision it is the same warning with more turns behind it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a tokio runtime, like every other spawn.
+    #[must_use]
+    pub fn spawn_supervised_deep<N, Fut, F>(
+        factory: N,
+        limit: Intensity,
+        depth: NonZeroUsize,
+    ) -> Self
+    where
+        N: FnMut() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Incarnation<A, F>, Stop>> + Send,
+        F: Feeds<A>,
+    {
+        let (mail, inbox) = mpsc::channel::<Message<A, M>>(depth.get());
         let (ended, watching) = watch::channel(None);
         let fate = Fate::default();
         let held = fate.clone();
@@ -2974,7 +3436,7 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     ///
     /// # Errors
     ///
-    /// [`MailboxClosed`] when the actor is gone, before or during the turn.
+    /// [`Undelivered`] when the actor is gone, before or during the turn.
     ///
     /// # The turn runs even if you stop waiting
     ///
@@ -2988,8 +3450,10 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     /// A turn that never returns leaves this call waiting for ever. The two
     /// **cycle** shapes are documented where they are built — a self-call, on the
     /// generated `Handle`, and a ring of two or more actors, in the section below
-    /// that one — and neither is detectable by a type. A turn can also simply
-    /// await something that never fires, which is neither shape.
+    /// that one — and neither is detectable by a type, which is why both are
+    /// **refused at runtime** with [`Undelivered::Reentrant`] rather than left to
+    /// hang. A turn can also simply await something that never fires, which is
+    /// neither shape and which nothing here reaches.
     ///
     /// With a [`QueueTimeout`](crate::QueueTimeout) installed, both dispatch paths
     /// bound the wait for a mailbox *permit*, and neither
@@ -3022,11 +3486,11 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     /// With whatever the handler panicked with, after the actor has survived it.
     /// Use [`ask_catching`](Self::ask_catching) where an unwind must not escape
     /// — a connection's task, for one.
-    pub async fn ask<T>(&self, mail: impl FnOnce(Origin, Reply<T>) -> M) -> Result<T, MailboxClosed>
+    pub async fn ask<T>(&self, mail: impl FnOnce(Origin, Reply<T>) -> M) -> Result<T, Undelivered>
     where
         T: Send + 'static,
     {
-        // Every loss collapses to `MailboxClosed` here, on purpose: a local
+        // Every loss collapses to `Undelivered` here, on purpose: a local
         // caller learns WHY from [`ended`](Self::ended), and widening this
         // error would make every existing call site match on a case it has
         // nothing to do about. A **fault** is the exception, because it is not
@@ -3035,15 +3499,20 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
         match self.ask_catching(mail).await {
             Ok(value) => Ok(value),
             Err(TurnLost::Faulted(panic)) => panic.resume(),
-            // `Refused` ends the actor, so `MailboxClosed` is true of it by the
+            // `Refused` ends the actor, so `Undelivered` is true of it by the
             // time a caller reads it. `Expired` does NOT — and it cannot be
             // reported precisely here, because this method has one error type by
             // design. It is unreachable from a local origin today; if a later wave
             // gives one a budget, this is the call that has to widen or the call
             // sites have to move to `ask_catching`, and that is a decision rather
             // than a mapping. Named here so it is a decision somebody makes.
+            // Nothing was queued and the actor is still running, so this is the
+            // one loss that is NOT a `Gone`. It has its own variant for the
+            // reason the arm above collapses three into one: `Gone` tells a
+            // caller to stop calling, and this caller's actor is alive.
+            Err(TurnLost::Reentrant) => Err(Undelivered::Reentrant),
             Err(TurnLost::Gone | TurnLost::Refused { .. } | TurnLost::Expired) => {
-                Err(MailboxClosed)
+                Err(Undelivered::Gone)
             }
         }
     }
@@ -3125,9 +3594,17 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
         T: Send + 'static,
     {
         let (reply, answer) = Reply::channel();
-        self.send(Message::Mail(Box::new(mail(Origin::local(), reply))))
-            .await
-            .map_err(|_| TurnLost::Gone)?;
+        // `Refuse::Always`: both public asks land here, and both wait for an
+        // answer only the blocked turn could produce.
+        self.send(
+            Message::Mail(Box::new(mail(Origin::local(), reply)), current()),
+            Refuse::Always,
+        )
+        .await
+        .map_err(|undelivered| match undelivered {
+            Undelivered::Gone => TurnLost::Gone,
+            Undelivered::Reentrant => TurnLost::Reentrant,
+        })?;
         // `RecvError` is a unit type: there is exactly one way to lose the
         // channel, so this is total rather than blanket.
         answer.await.map_err(|_gone| TurnLost::Gone)
@@ -3156,22 +3633,32 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     /// consequence of one dropped receiver rather than of a fact nobody had.
     ///
     /// **It still waits for a mailbox permit**, which is why an actor calling
-    /// this on itself can deadlock even though it never waits for a reply.
+    /// this on itself would block even though it never waits for a reply — and
+    /// why it is the one call refused only when the mailbox is **full**. Into a
+    /// free slot a self-`tell` is legitimate and runs after the turn returns; into
+    /// a full one it answers [`Undelivered::Reentrant`], which replaces an
+    /// intermittent hang with an intermittent error a caller can see.
     ///
     /// # Errors
     ///
-    /// [`MailboxClosed`] when the actor is gone.
+    /// [`Undelivered`] when the actor is gone.
     pub async fn notify<T>(
         &self,
         mail: impl FnOnce(Origin, Reply<T>) -> M,
-    ) -> Result<(), MailboxClosed>
+    ) -> Result<(), Undelivered>
     where
         T: Send + 'static,
     {
         let (reply, answer) = Reply::channel();
         drop(answer);
-        self.send(Message::Mail(Box::new(mail(Origin::local(), reply))))
-            .await
+        // `Refuse::WhenFull`, and this is the one caller that is not
+        // `Refuse::Always`. A self-`tell` into a free slot runs after the turn
+        // returns and is a working pattern; refusing it would delete one.
+        self.send(
+            Message::Mail(Box::new(mail(Origin::local(), reply)), current()),
+            Refuse::WhenFull,
+        )
+        .await
     }
 }
 
@@ -3208,27 +3695,33 @@ impl<A, M> LocalActor<A, M> {
     ///
     /// # Errors
     ///
-    /// [`MailboxClosed`] when the actor is gone.
+    /// [`Undelivered`] when the actor is gone.
     ///
     /// [`Handle::with_state`]: crate::LocalActor
-    pub async fn read<T, F>(&self, read: F) -> Result<T, MailboxClosed>
+    pub async fn read<T, F>(&self, read: F) -> Result<T, Undelivered>
     where
         T: Send + 'static,
         F: FnOnce(&A) -> T + Send + 'static,
     {
         let (reply, answer) = oneshot::channel();
-        self.send(Message::Read(Box::new(Box::new(move |state| {
-            // Caught synchronously rather than through `guarded`, and that is
-            // not a shortcut: `guarded` takes a future, an async block holding
-            // `&A` is `Send` only when `A: Sync`, and requiring `A: Sync` here
-            // would put it on every actor in the crate for a closure that cannot
-            // await in the first place.
-            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(state)))
-                .map_err(Panic::caught);
-            let _ = reply.send(caught);
-        }))))
+        self.send(
+            Message::Read(Box::new(Box::new(move |state| {
+                // Caught synchronously rather than through `guarded`, and that is
+                // not a shortcut: `guarded` takes a future, an async block holding
+                // `&A` is `Send` only when `A: Sync`, and requiring `A: Sync` here
+                // would put it on every actor in the crate for a closure that cannot
+                // await in the first place.
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(state)))
+                    .map_err(Panic::caught);
+                let _ = reply.send(caught);
+            }))),
+            // A read is a message too: it takes the free permit and then waits
+            // for the loop to run the closure, so the one method that never
+            // touches `&mut self` deadlocks exactly like an `ask`.
+            Refuse::Always,
+        )
         .await?;
-        match answer.await.map_err(|_| MailboxClosed)? {
+        match answer.await.map_err(|_| Undelivered::Gone)? {
             Ok(value) => Ok(value),
             Err(panic) => panic.resume(),
         }
@@ -3271,13 +3764,14 @@ impl<A, M> LocalActor<A, M> {
     ///
     /// Ordered: everything sent before this is handled and answered. Anything
     /// queued behind it is dropped unrun when the loop drops the receiver — an
-    /// [`ask`](Self::ask) waiting on one is told [`MailboxClosed`], and a
+    /// [`ask`](Self::ask) waiting on one is told [`Undelivered`], and a
     /// [`notify`](Self::notify) is told nothing, because it was already told
     /// `Ok`.
     ///
-    /// **An actor must not call this on itself.** It takes a mailbox permit like
-    /// any message and then waits for a loop that cannot exit while it is inside
-    /// this turn.
+    /// **An actor must not call this on itself**, and it no longer can: it takes
+    /// a mailbox permit like any message and then waits for a loop that cannot
+    /// exit while it is inside this turn, so it is refused with
+    /// [`Undelivered::Reentrant`] before the permit is touched.
     ///
     /// Waits for the receiver to be dropped, which is the loop ending — not for
     /// the state's own `Drop` to have run. A state that flushes in `Drop` needs
@@ -3302,8 +3796,23 @@ impl<A, M> LocalActor<A, M> {
     /// [`Self::abort`] is still reachable through it — which is exactly what a
     /// caller who ran out of patience wants next, and exactly what a timed-out
     /// registry `stop` had taken away.
-    pub async fn stop(&self) {
-        let _ = self.send(Message::Stop).await;
+    ///
+    /// # Errors
+    ///
+    /// [`Undelivered::Reentrant`] when called from inside the actor's own turn —
+    /// the case the paragraph above says must not happen, reported instead of
+    /// hanging. It returns **before** waiting, so a refused `stop` costs nothing
+    /// and the actor is untouched.
+    ///
+    /// It returns `Ok` for an actor that is already gone. Stopping a stopped
+    /// actor is what the caller asked for, and this method is documented as
+    /// idempotent; the send's own `Gone` is swallowed here for that reason and
+    /// not for want of a channel.
+    pub async fn stop(&self) -> Result<(), Undelivered> {
+        match self.send(Message::Stop, Refuse::Always).await {
+            Ok(()) | Err(Undelivered::Gone) => {}
+            Err(refused @ Undelivered::Reentrant) => return Err(refused),
+        }
         // The END channel, not `mail.closed()`. The loop fills it after it has
         // dropped the observers and the mailbox, so returning from here means
         // whatever an observer held — a file claim, for the first adapter — is
@@ -3315,6 +3824,7 @@ impl<A, M> LocalActor<A, M> {
         // is an aborted task, which is ended too, so the error is ignored.
         let mut watching = self.ended.clone();
         let _ = watching.wait_for(Option::is_some).await;
+        Ok(())
     }
 
     /// Cancel the actor where it stands.
@@ -3328,7 +3838,7 @@ impl<A, M> LocalActor<A, M> {
     /// reaches an await point is not interrupted and this returns having done
     /// nothing; and until the runtime drops the task,
     /// [`is_running`](Self::is_running) still says `true`. Callers waiting on a
-    /// dropped turn do get [`MailboxClosed`]: dropping the receiver drains the
+    /// dropped turn do get [`Undelivered`]: dropping the receiver drains the
     /// buffer, and each queued turn owns its reply channel.
     ///
     /// # What a peer whose reply this destroys is told, and where that comes from
@@ -3360,7 +3870,7 @@ impl<A, M> LocalActor<A, M> {
     /// Whether the actor is still handling messages.
     ///
     /// Advisory: it can stop between this answer and the next call, which is why
-    /// every call reports [`MailboxClosed`] on its own rather than asking a
+    /// every call reports [`Undelivered`] on its own rather than asking a
     /// caller to check first.
     #[must_use]
     pub fn is_running(&self) -> bool {
@@ -3444,8 +3954,37 @@ impl<A, M> LocalActor<A, M> {
     /// [`Message::Mail`], where it stays until [`dispatch`] takes it off — because a
     /// box that the loop unwraps buys nothing, and that is what
     /// `tests/actor_memory.rs` measured.
-    async fn send(&self, message: Message<A, M>) -> Result<(), MailboxClosed> {
-        self.mail.send(message).await.map_err(|_| MailboxClosed)
+    ///
+    /// # The re-entrancy check is here because this is that one place
+    ///
+    /// Five non-test callers reach it — `answered` (serving both asks), `notify`,
+    /// `read`, `stop` and [`deliver_to_local`] — and there is no sixth door. Which
+    /// half of the rule applies is [`Refuse`]'s parameter, because the message
+    /// alone cannot say.
+    ///
+    /// # `capacity() == 0` is exact here, and racy anywhere else
+    ///
+    /// A permit is freed by exactly one event: this actor's loop taking the next
+    /// message. Reaching this branch means the actor's turn is on the calling
+    /// stack, so its loop cannot take anything until this call returns — and no
+    /// other sender can *free* a permit, only spend one. So the load is not a
+    /// check-then-act race against the actor: what it reads cannot change while
+    /// the caller is inside the turn that would have to change it.
+    async fn send(&self, message: Message<A, M>, refuse: Refuse) -> Result<(), Undelivered> {
+        // The `Arc` this handle already carries, read as an identity. Built
+        // before the thread-local is touched so the common off-turn path is one
+        // clone and one match arm on a unit discriminant.
+        let me = Actor(Arc::clone(&self.busy));
+        if current().holds(&me) {
+            match refuse {
+                Refuse::Always => return Err(Undelivered::Reentrant),
+                Refuse::WhenFull if self.mail.capacity() == 0 => {
+                    return Err(Undelivered::Reentrant)
+                }
+                Refuse::WhenFull => {}
+            }
+        }
+        self.mail.send(message).await.map_err(|_| Undelivered::Gone)
     }
 }
 
@@ -3675,7 +4214,17 @@ where
     let millis = budget.map_or(0, Queueing::millis);
 
     let (reply, answer) = Reply::channel();
-    let queueing = actor.send(Message::Mail(Box::new(mail(Origin::peer(cx), reply))));
+    // `Refuse::Always`, and `current()` rather than `Chain::Empty`. A peer's
+    // request arrives on a connection's task, which has run no turn, so both read
+    // empty today and the refusal below is unreachable. They are written as the
+    // general case anyway: the day a local door delivers a served call **inline**
+    // on the caller's task, this line is already right, and the alternative — a
+    // third `Refuse` variant meaning "cannot be re-entrant" — would be a hole
+    // that door falls into silently.
+    let queueing = actor.send(
+        Message::Mail(Box::new(mail(Origin::peer(cx), reply)), current()),
+        Refuse::Always,
+    );
     let sent = match budget {
         None => queueing.await,
         Some(budget) => {
@@ -3707,8 +4256,21 @@ where
             Body::empty(),
         )
     };
-    if sent.is_err() {
-        return gone();
+    match sent {
+        Ok(()) => {}
+        Err(Undelivered::Gone) => return gone(),
+        // NOT `NoSuchActor`, which says "there is nothing here, stop asking":
+        // a refused re-entrant call leaves the actor running. `Failed` with the
+        // error's own text and **no prefix**, because the four prefixes are the
+        // discriminator between causes a peer acts on differently and this one is
+        // unreachable from a peer — see the send above. A fifth prefix would be a
+        // wire-visible discriminator invented for a case nothing can produce.
+        Err(refused @ Undelivered::Reentrant) => {
+            return (
+                Outcome::Err(RemoteError::Failed(refused.to_string())),
+                Body::empty(),
+            )
+        }
     }
     progress.enqueued();
 
@@ -4097,7 +4659,10 @@ mod tests {
         // Route one: the mailbox refuses the send.
         let stopped = LocalActor::spawn(Counter::default());
         let spare = stopped.clone();
-        stopped.stop().await;
+        stopped
+            .stop()
+            .await
+            .expect("a stop from outside the actor's own turn is never refused");
         let lost = spare
             .ask_catching(add(1))
             .await
@@ -4138,7 +4703,10 @@ mod tests {
     async fn stop_drains_what_was_sent_before_it() {
         let actor = LocalActor::spawn(Counter::default());
         assert_eq!(actor.ask(add(1)).await.expect("running"), 1);
-        actor.stop().await;
+        actor
+            .stop()
+            .await
+            .expect("a stop from outside the actor's own turn is never refused");
         assert!(!actor.is_running());
     }
 
@@ -4146,10 +4714,13 @@ mod tests {
     async fn a_handle_to_a_stopped_actor_reports_a_closed_mailbox() {
         let actor = LocalActor::spawn(Counter::default());
         let spare = actor.clone();
-        actor.stop().await;
+        actor
+            .stop()
+            .await
+            .expect("a stop from outside the actor's own turn is never refused");
 
-        assert_eq!(spare.ask(add(1)).await, Err(MailboxClosed));
-        assert_eq!(spare.notify(add(1)).await, Err(MailboxClosed));
+        assert_eq!(spare.ask(add(1)).await, Err(Undelivered::Gone));
+        assert_eq!(spare.notify(add(1)).await, Err(Undelivered::Gone));
     }
 
     /// Spawn an actor already inside a turn, and hand back the two ends that
@@ -4160,7 +4731,7 @@ mod tests {
     async fn held() -> (
         LocalActor<Counter, Mail>,
         oneshot::Sender<()>,
-        tokio::task::JoinHandle<Result<usize, MailboxClosed>>,
+        tokio::task::JoinHandle<Result<usize, Undelivered>>,
     ) {
         hold(LocalActor::spawn(Counter::default())).await
     }
@@ -4172,7 +4743,7 @@ mod tests {
     ) -> (
         LocalActor<Counter, Mail>,
         oneshot::Sender<()>,
-        tokio::task::JoinHandle<Result<usize, MailboxClosed>>,
+        tokio::task::JoinHandle<Result<usize, Undelivered>>,
     ) {
         let (entered, started) = oneshot::channel();
         let (release, releasing) = oneshot::channel();
@@ -4353,7 +4924,7 @@ mod tests {
 
         assert_eq!(
             wedged.await.expect("the caller is not itself aborted"),
-            Err(MailboxClosed),
+            Err(Undelivered::Gone),
             "an aborted turn reports the actor as gone"
         );
     }
@@ -4398,7 +4969,7 @@ mod tests {
     /// And the answer when nobody ever answers: **`TurnLost::Gone`, not a hang.**
     ///
     /// Here rather than only in `tests/defer.rs` because this is where the variant
-    /// is visible — a generated `Handle` folds every loss into `MailboxClosed`, so
+    /// is visible — a generated `Handle` folds every loss into `Undelivered`, so
     /// the criterion's own words can only be asserted from inside the crate.
     ///
     /// The timeout is the assertion. A hang is not a failure to a harness.
@@ -4415,7 +4986,10 @@ mod tests {
             })
         };
         // Ordered behind the park, so the park has run by the time this returns.
-        actor.stop().await;
+        actor
+            .stop()
+            .await
+            .expect("a stop from outside the actor's own turn is never refused");
 
         let lost = n0_future::time::timeout(Duration::from_secs(5), parked)
             .await
@@ -4487,7 +5061,7 @@ mod tests {
     /// then refused left it holding an answer for state that was never stored.
     ///
     /// Here rather than only in `tests/persist.rs` because
-    /// [`ask`](LocalActor::ask) collapses every loss to `MailboxClosed`: **the
+    /// [`ask`](LocalActor::ask) collapses every loss to `Undelivered`: **the
     /// difference between "refused" and "gone" is only visible from inside the
     /// crate**, and the difference is the whole finding — a caller told `Gone`
     /// stops calling, and a caller told `Refused` knows the turn ran and was not
@@ -4795,7 +5369,7 @@ mod tests {
         // incarnation took it, so the two cannot land in one incarnation — and
         // both are queued long before the give-up closes anything.
         for _ in 0..2 {
-            mail.send(Message::Mail(Box::new(Fatal)))
+            mail.send(Message::Mail(Box::new(Fatal), Chain::Empty))
                 .await
                 .expect("an incarnation is there to take it");
         }
@@ -4929,7 +5503,7 @@ mod tests {
         let open = Arc::new(tokio::sync::Notify::new());
         let (fate, mail, running) = between_incarnations(&calls, Arc::clone(&open), false);
 
-        mail.send(Message::Mail(Box::new(Fatal)))
+        mail.send(Message::Mail(Box::new(Fatal), Chain::Empty))
             .await
             .expect("the first incarnation takes it");
         // Parked inside the second factory call: restart granted, no `run_loop`.
@@ -4978,7 +5552,7 @@ mod tests {
         let open = Arc::new(tokio::sync::Notify::new());
         let (fate, mail, running) = between_incarnations(&calls, Arc::clone(&open), true);
 
-        mail.send(Message::Mail(Box::new(Fatal)))
+        mail.send(Message::Mail(Box::new(Fatal), Chain::Empty))
             .await
             .expect("the first incarnation takes it");
         // The second factory call fails transiently and `continue`s; the third
@@ -5085,7 +5659,7 @@ mod tests {
             })
         };
 
-        mail.send(Message::Mail(Box::new(Fatal)))
+        mail.send(Message::Mail(Box::new(Fatal), Chain::Empty))
             .await
             .expect("the first incarnation takes it");
         // The incarnation ends with a restart granted, and then its state panics

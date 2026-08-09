@@ -203,9 +203,12 @@ async fn a_panicking_local_call_costs_one_message_and_reaches_its_caller() {
 async fn a_handle_to_a_stopped_actor_reports_a_closed_mailbox() {
     let ledger = ledger::actor(Ledger::default());
     let spare = ledger.clone();
-    ledger.stop().await;
+    ledger
+        .stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
 
-    assert_eq!(spare.post(1, 0).await, Err(keylink::MailboxClosed));
+    assert_eq!(spare.post(1, 0).await, Err(keylink::Undelivered::Gone));
     assert!(!spare.is_running());
 }
 
@@ -1114,7 +1117,10 @@ async fn stop_returns_only_once_the_mailbox_is_closed() {
              observed path"
         );
 
-        actor.stop().await;
+        actor
+            .stop()
+            .await
+            .expect("a stop from outside the actor's own turn is never refused");
 
         assert!(
             !actor.is_running(),

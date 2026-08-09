@@ -216,7 +216,7 @@ impl<H: Clone> Names<H> {
     ///
     /// Advisory in the same way [`is_running`](crate::LocalActor::is_running) is:
     /// the actor can end between this answer and the call made on it, and the
-    /// call then reports [`MailboxClosed`](crate::MailboxClosed) on its own. A
+    /// call then reports [`Undelivered`](crate::Undelivered) on its own. A
     /// registry that promised liveness would have to hold the lock across the
     /// caller's turn.
     #[must_use]
