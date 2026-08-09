@@ -53,6 +53,27 @@ run() {
     local out
     out="$(./scripts/break-once.sh "$@" 2>&1)" || true
     echo "$out" | rg "ABORT|expected exactly one|exit=" || true
+    # THE FILTER MUST SELECT SOMETHING, and this is checked BEFORE the recorded
+    # sentence, because a filter that matches nothing fails the check below for a
+    # reason that has nothing to do with the tree.
+    #
+    # `cargo test` with a filter naming no test prints `0 passed` and exits **0**.
+    # That reached the arm below as "the break was not reproduced" — the same report
+    # a genuinely rotted anchor gives, from the opposite cause, and the remedy for
+    # one is useless for the other. Break 16 sat in that state: it named a test that
+    # existed nowhere, so it could never redden and was never able to say so.
+    #
+    # The `0 passed; 0 failed` pair is the discriminator. A caught break is
+    # `0 passed; 1 failed`; a break that went green is `1 passed; 0 failed`. Only a
+    # filter that selected nothing gives zero of both.
+    if echo "$out" | rg -q '0 passed; 0 failed'; then
+        echo "  ✗ BROKEN STANZA: the filter selected NO test, so this break cannot"
+        echo "    redden and never could. This is not a tree change — fix the stanza."
+        echo "    The test name here does not exist, or the target cannot reach it"
+        echo "    (a \`#[cfg(test)]\` test inside \`src\` needs --lib, never --test)."
+        failed=$((failed + 1))
+        return
+    fi
     if ! echo "$out" | rg -qF -- "$expected"; then
         echo "  ✗ the recorded output is NOT in this run. Expected to find:"
         echo "      $expected"
@@ -66,7 +87,7 @@ run "1 keyed live drop" \
 'a live keyed actor must not be reported as absent: Remote(NoSuchActor { id: "obra/4471" })' \
 keylink/src/actor/remote.rs \
 '        .map(|answered| rendered(answered, budget.map_or(0, Queueing::millis)))
-        .map_err(|_| lost(route.fate.standing(), actor.as_str()))' \
+        .map_err(|_| lost(fate.standing(), actor.as_str()))' \
 '        .map(|answered| rendered(answered, budget.map_or(0, Queueing::millis)))
         .map_err(|_| no_such_actor(&actor))' \
   a_live_keyed_actor_does_not_tell_a_peer_no_such_actor -p keylink --test defer
@@ -209,16 +230,30 @@ keylink/src/actor/registry.rs \
     }' \
   an_aborted_keyed_actor_tells_a_peer_no_such_actor -p keylink --test defer
 
-run "16 Mailbox floor running (expired budget)" \
-'an actor destroyed by an expired budget is gone: Remote(Failed("dropped: the actor is serving and this reply was never answered"))' \
+# 16 named a test that DOES NOT EXIST, so it could never redden and exited 0 for it.
+# `cargo test` with a filter matching nothing prints `0 passed; N filtered out` and
+# exits 0, which this script read as "the break was not reproduced" - the same
+# outcome a genuinely rotted anchor gives, from the opposite cause. Audited: 22 of
+# the 23 names here resolve to a real `fn`, and this was the only one that did not.
+#
+# It was wrong four ways at once, and each hid the next. The ANCHOR took
+# `Mailbox::drop` at `registry.rs:247`, while the record it replays
+# (`registry.rs:3315-3318`) is about **`drain`'s** line at `:1125` - `registry.rs`
+# has three distinct `Standing::Gone` settle sites and this took the wrong one. The
+# TARGET was `--test defer`, which cannot reach a `#[cfg(test)]` unit test in `src`
+# at all. The TEST NAME existed nowhere in the tree. And the EXPECTED sentence was
+# not the one the assertion prints.
+#
+# Re-derived from the record rather than patched, and watched: the corrected break
+# reddens BY VALUE at `registry.rs:3339` with the recorded sentence, off a control
+# that runs `1 passed` rather than `0 filtered out`. Requiring the control to RUN is
+# the check that would have caught the original.
+run "16 expired shutdown budget settles before the abort" \
+'an actor destroyed by an expired budget is gone before it is destroyed: [Running]' \
 keylink/src/actor/registry.rs \
-'    fn drop(&mut self) {
-        self.fate.settle(Standing::Gone);
-    }' \
-'    fn drop(&mut self) {
-        self.fate.settle(Standing::Running);
-    }' \
-  a_keyed_actor_destroyed_by_an_expired_budget_tells_a_peer_no_such_actor -p keylink --test defer
+'            fate.settle(Standing::Gone);' \
+'            fate.settle(Standing::Running);' \
+  an_expired_shutdown_budget_settles_the_served_answer_before_the_abort -p keylink --lib
 
 run "17 the DROPPED prefix moves" \
 'left: "lost: "' \
