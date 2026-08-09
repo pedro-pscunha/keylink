@@ -13,6 +13,11 @@
 //!     _ => Verdict::StopAll,
 //! });
 //!
+//! // `let _ =` is honest HERE and the reason is local to these two lines: this
+//! // group is four lines old, so nothing has ended, nobody has stopped it, and
+//! // both names are free — `Added::Filed` is the only answer either call can
+//! // give. The rebuild recipe below is the same two calls where that stops
+//! // being true, and it branches instead.
 //! let _ = group.add(ActorId::new("reserve")?, membership!(reserve));
 //! let _ = group.add(ActorId::new("charge")?, membership!(charge));
 //! ```
@@ -180,7 +185,10 @@
 //! ```ignore
 //! // The factory spawns the set, watches it, and publishes the handles. A
 //! // rebuild redoes all three, which is why all three are in one place.
-//! fn build(
+//! //
+//! // `async` for the sake of one branch below: a member the group refused has to
+//! // be retired here, and retiring is a future.
+//! async fn build(
 //!     reserves: &Names<reserve::Handle<Reserve>>,
 //!     charges: &Names<charge::Handle<Charge>>,
 //! ) -> keylink::Result<Group> {
@@ -191,8 +199,20 @@
 //!         Ended::Stopped => Verdict::Forget,
 //!         _ => Verdict::StopAll,
 //!     });
-//!     let _ = group.add(reserve_id.clone(), membership!(reserve));
-//!     let _ = group.add(charge_id.clone(), membership!(charge));
+//!     // **The branch this recipe cannot do without.** `reserve` can end between
+//!     // these two calls; the policy answers `StopAll`; the group closes and
+//!     // retires what it holds. The second `add` then files nothing and answers
+//!     // `Added::Refused`, carrying the only `Retire` anybody has for `charge` —
+//!     // and the loop below rebuilds on `Member`, so a `let _ =` here would leave
+//!     // the old charge running and make the next set one actor too big.
+//!     if let Added::Refused(retire) = group.add(reserve_id.clone(), membership!(reserve)) {
+//!         retire.retire().await;
+//!         return Ok(group);
+//!     }
+//!     if let Added::Refused(retire) = group.add(charge_id.clone(), membership!(charge)) {
+//!         retire.retire().await;
+//!         return Ok(group);
+//!     }
 //!
 //!     // `membership!` clones, so the handles are still ours to publish — and
 //!     // publishing them is the half of a rebuild no verdict could have done.
@@ -202,7 +222,10 @@
 //! }
 //!
 //! loop {
-//!     let group = build(&reserves, &charges)?;
+//!     // A refusal means this group has already ended, so the `ended()` below
+//!     // answers with that ending and the rebuild happens on the next turn of
+//!     // this loop rather than in a second code path.
+//!     let group = build(&reserves, &charges).await?;
 //!     match group.ended().await {
 //!         // The one ending this loop is for.
 //!         GroupEnded::Member { .. } => continue,
@@ -218,8 +241,10 @@
 //! value [`ended`](Group::ended) reads, so the answer a caller receives is
 //! already the far side of teardown. The same locked step that takes the members
 //! off the books marks the group closed, so a stray [`add`](Group::add) on the
-//! old group hands its [`Retire`] straight back rather than filing a member into
-//! a group that watches nothing.
+//! old group answers [`Added::Refused`] and hands its [`Retire`] straight back
+//! rather than filing a member into a group that watches nothing. **Handing it
+//! back is not ending it**, which is the branch the factory above owes and the
+//! reason that factory is `async`.
 //!
 //! What that teardown *is* stays what [`Membership::new`] says and no more:
 //! every member's `retire` ran to completion, which for a
@@ -233,6 +258,12 @@
 //! [`GroupEnded::Dropped`] is why that match rebuilds on one arm and breaks on
 //! the rest: it is the ending with **no** teardown behind it, so its members are
 //! still running and a rebuild on it doubles the set.
+//!
+//! [`Added::Refused`] is that same doubling arriving on the arm this loop *does*
+//! rebuild on, which is why it is a variant of its own and not the `Some` a
+//! displacement also answered. A `Retire` dropped there is one live actor the
+//! next `build` knows nothing about, and `GroupEnded::Member` says nothing about
+//! it either — the group stopped watching it before it was ever filed.
 //!
 //! **Why this is a recipe and not a verdict.** Two reasons, and neither needs
 //! the other. A group-level rebuild produces new actors with new mailboxes —
@@ -296,11 +327,21 @@ type Stamped = Pin<Box<dyn Future<Output = Reported> + Send>>;
 /// A member's own restarts never reach here. This is asked once, when that
 /// member's ending is final.
 ///
-/// `#[non_exhaustive]` and the cost is zero, which is worth saying because the
-/// opposite reading is easy: a caller *constructs* a `Verdict` and never matches
-/// one, and the attribute binds downstream matches only. The crate's own match
-/// on it stays exhaustively checked, and restoring a refused variant stays
-/// additive.
+/// `#[non_exhaustive]`, and it is kept: the crate's own match on it stays
+/// exhaustively checked, and restoring a refused variant stays additive.
+///
+/// **The cost is not zero, and this paragraph used to say it was.** The reading
+/// it rested on — that a caller *constructs* a `Verdict` and never matches one —
+/// is true of the answer a policy returns and false of everything a caller does
+/// with one afterwards. Logging a decision, or unit-testing a policy by calling
+/// it and matching what came back, both need a match, and the attribute makes
+/// each of those need a catch-all arm.
+///
+/// The residual is what a caller writes in that arm. `unreachable!()` is the
+/// natural thing and it is a policy panic, so a variant added here would turn a
+/// caller's logging into [`GroupEnded::PolicyPanicked`] — an arm that is
+/// unreachable today and is exactly what a new variant makes reachable. A caller
+/// with a catch-all worth having writes a value, not a panic.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub enum Verdict {
@@ -392,11 +433,13 @@ pub enum GroupEnded {
     /// The members are still running. This is the group's answer to whoever was
     /// awaiting one, not a statement about the actors.
     ///
-    /// **It is also what a lost [`Group::stop`] looks like.** A stop the
-    /// conductor never observed dies with the state it was written into, so a
-    /// caller that stopped and dropped in the same breath is answered here and
-    /// not at [`Stopped`](Self::Stopped) — with nothing retired. [`Group::stop`]
-    /// carries the whole of it and says what to do instead.
+    /// **A [`Group::stop`] is not answered here, and used to be.** A caller that
+    /// stopped and dropped in the same breath was answered `Dropped` with
+    /// nothing retired, because the flag `stop` raised died with the list the
+    /// conductor needed in order to act on it. It is answered
+    /// [`Stopped`](Self::Stopped) now, teardown and all. So this variant means
+    /// what it says and only that: nobody stopped this group, and nobody is
+    /// holding it any more.
     Dropped,
 }
 
@@ -416,13 +459,19 @@ pub struct Retire {
 }
 
 impl Retire {
-    /// End that member, and wait for it.
+    /// End that member, and wait for the `retire` closure's future to complete.
     ///
-    /// What awaiting this promises is what awaiting any ending in this crate
-    /// promises, and no more: the member's task is gone. It is **not** a promise
-    /// that the member's observers released what they held — a state that
-    /// flushes in `Drop` needs its own signal, exactly as
-    /// [`stop`](crate::LocalActor::stop) says.
+    /// What that means is whatever the closure does, and no more. For a
+    /// [`membership!`](crate::membership) member it means
+    /// [`abort`](crate::LocalActor::abort) was **issued** — `abort` is
+    /// cooperative, so a turn that never reaches an await point is not
+    /// interrupted and the task has not exited when this resolves. A caller who
+    /// needs the task gone writes a `retire` that awaits
+    /// [`stop`](crate::LocalActor::stop), and pays the backoff wait
+    /// [`Membership::new`] prices.
+    ///
+    /// It is also **not** a promise that the member's observers released what
+    /// they held — a state that flushes in `Drop` needs its own signal.
     ///
     /// Dropping this instead ends nothing. The actor runs for as long as
     /// whoever else holds a handle keeps it, which for a
@@ -437,6 +486,62 @@ impl Retire {
 impl fmt::Debug for Retire {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Retire").finish_non_exhaustive()
+    }
+}
+
+/// What [`Group::add`] did.
+///
+/// Three answers rather than an `Option<Retire>`, because two of them carry a
+/// [`Retire`] for **opposite** reasons: [`Displaced`](Self::Displaced) says the
+/// group is watching the new member and here is the one it replaced;
+/// [`Refused`](Self::Refused) says the group is watching nothing and here is
+/// your own member back. An `Option` spelled both of those `Some`, so the
+/// difference lived in a `#[must_use]` string — which is to say a caller had to
+/// read prose to learn which of two opposite things had happened, and the
+/// compiler could not help one who read it wrong.
+///
+/// **The cost of getting it wrong is not a stale value.** `add` consumed the
+/// [`Membership`], so a [`Refused`](Self::Refused) carries the only `Retire` in
+/// existence for an actor nobody watches. A `let _ =` on it drops that, and this
+/// module's rebuild recipe then runs again on the [`GroupEnded::Member`] arm and
+/// builds a second set beside the member it lost — the doubling the recipe warns
+/// about for [`GroupEnded::Dropped`], arriving on the arm that recipe is
+/// *written* to rebuild on.
+///
+/// **Exhaustive, where [`GroupEnded`] beside it is `#[non_exhaustive]`**, and
+/// what settles it is what a wildcard arm costs in each. An ending a caller does
+/// not recognise is still an ending, and `_ => break` is a reasonable thing to
+/// write about one. A wildcard **here** puts a caller back where the `Option`
+/// had them — one arm covering both a displacement and a refusal — which is the
+/// reading this type exists to make unwritable. Nothing is being held open for
+/// either: filed, displaced, refused is what an `add` does.
+#[must_use]
+#[derive(Debug)]
+pub enum Added {
+    /// Watching it, and nothing held that name.
+    Filed,
+    /// Watching the new member. This is the one it displaced.
+    ///
+    /// The replacement keeps the displaced member's position in the teardown
+    /// order — [`Group::add`] says why that is not a fresh registration.
+    Displaced(Retire),
+    /// The group had already ended. The member was **not** filed, and this is
+    /// it back.
+    ///
+    /// Nothing watches it and nothing else can end it. Retire it, or hold it
+    /// and mean that the actor runs on for whoever else has a handle.
+    Refused(Retire),
+}
+
+impl Added {
+    /// Whether the group filed the member and handed nothing back.
+    ///
+    /// The one question that has a `bool` answer, and it is the *absence* of a
+    /// [`Retire`]. It cannot stand in for a match: the two variants it collapses
+    /// are the two this type exists to keep apart.
+    #[must_use]
+    pub fn is_filed(&self) -> bool {
+        matches!(self, Self::Filed)
     }
 }
 
@@ -534,29 +639,69 @@ impl fmt::Debug for Membership {
 /// The ending is not here. It went to the conductor when the member was added,
 /// which is the whole reason [`Retire`] is a type of its own.
 ///
-/// A named struct and not a tuple, for `names.rs`'s reason: three fields read at
+/// A named struct and not a tuple, for `names.rs`'s reason: fields read at
 /// several call sites are several chances to read the stamp as a count.
 struct Entry {
-    name: ActorId,
-    generation: u64,
+    stamp: Stamp,
     retire: Retire,
 }
 
-/// One member's ending, and which membership it belongs to.
+/// Which membership under a name this is: the name, and the generation stamp.
 ///
-/// The first two fields are [`Entry`]'s first two, in that order and no other:
-/// the conductor compares them field for field, and two records that mean the
-/// same pair while listing it in two orders is how a transposed comparison gets
-/// written and not seen.
+/// **One value rather than two fields side by side, and the conductor is why.**
+/// It compares a filed membership against a reported ending, and while these
+/// were two fields on two structs the only thing holding that comparison
+/// together was a comment on [`Reported`] saying the fields were in the same
+/// order on both. A comment cannot fail. A derived [`PartialEq`] on one type
+/// compares every field and cannot be transposed, so the invariant is now
+/// carried by the thing that has to hold it.
+///
+/// `pub(super)` because `keyed.rs` spelled the same pair a third way, as the
+/// `Option<(ActorId, u64)>` an abandoned waiter files under. Its `Waiter` keeps
+/// a bare `generation` and is right to: the name there is the map's key, so a
+/// waiter has no name of its own to pair with.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct Stamp {
+    pub(super) name: ActorId,
+    pub(super) generation: u64,
+}
+
+/// One member's ending, and which membership it belongs to.
 struct Reported {
-    name: ActorId,
-    generation: u64,
+    stamp: Stamp,
     /// `Err` carries a panic message: the future that was to say why this member
     /// ended panicked instead, and there is no [`Ended`] that means that.
     reason: Result<Ended, String>,
 }
 
-/// The membership list, and the two flags the conductor reads.
+/// Where a group is in its one-way life.
+///
+/// One field where there were two `bool`s, and the reason is that only three of
+/// the four pairs those spell are states a group can be in. `stop()` on a group
+/// that had already ended wrote `stopping: true` beside `closed: true`, and
+/// [`Group`]'s own `Debug` printed the pair — a teardown that was over reading
+/// as one in flight.
+///
+/// **That was never a live defect and this is not a fix for one.** The conductor
+/// reads this only after upgrading its [`Weak`], and a conductor whose group is
+/// closed has already broken out of its loop, so nothing ever acted on the
+/// impossible pair. What it could do was mislead a reader holding the printed
+/// value, which is the whole of what a `Debug` is for.
+///
+/// `Phase` and not `settled`, because [`Shared`] already has a `settled` holding
+/// the answer itself. Two fields one hop apart, both named for the same event,
+/// is a reader's problem and was this file's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// The ordinary state: members can be filed and endings are decided on.
+    Watching,
+    /// [`Group::stop`] was called and the conductor has not observed it yet.
+    Stopping,
+    /// The group has ended. [`Group::add`] files nothing from here.
+    Closed,
+}
+
+/// The membership list, and the phase the conductor reads.
 struct State {
     /// Insertion order, so [`Group::names`] is ordered and teardown has a
     /// direction. A `Vec` and not a map: here the order is the point.
@@ -566,40 +711,53 @@ struct State {
     staged: Vec<Stamped>,
     /// The next generation stamp.
     next: u64,
-    /// Set by [`Group::stop`], read by the conductor.
-    stopping: bool,
-    /// Set by the conductor once the group has ended, so that a later
-    /// [`Group::add`] can say so instead of filing a member nothing watches.
-    ///
-    /// `closed` and not `settled`, because [`Shared`] already has a `settled`
-    /// holding the answer itself. Two fields one hop apart, one a `bool` and one
-    /// a channel, both named for the same event, is a reader's problem and was
-    /// this file's.
-    closed: bool,
+    /// Moved by [`Group::stop`] and by [`closing`], read by the conductor and by
+    /// [`Group::add`].
+    phase: Phase,
 }
 
-/// What a [`Group`] and its conductor share.
+/// What a [`Group`] and its conductor share — and, by dying, what tells the
+/// conductor the last [`Group`] is gone.
+///
+/// **This allocation is a liveness token and nothing else, which is the whole of
+/// why `state` is an [`Arc`] rather than the `Mutex` it used to be.** The
+/// conductor watches this through a [`Weak`] and holds `state` *strongly*, so
+/// the membership list outlives the last `Group`. One allocation serving both
+/// roles is what made `stop(); drop(group);` retire nothing: the flag `stop`
+/// raised died with the list the conductor needed in order to act on it, and the
+/// conductor could not read one without keeping the other alive for ever.
 struct Shared {
-    state: Mutex<State>,
+    /// Held strongly by the conductor as well. A dropped `Group` therefore ends
+    /// the *watching* and not the list.
+    state: Arc<Mutex<State>>,
     /// Fired by every mutation of the list, and by this struct's own `Drop`.
     ///
     /// An [`Arc`] the conductor holds a second handle on, rather than a field it
     /// reaches through the [`Weak`]: the conductor *waits* on this, and one that
-    /// had to upgrade in order to wait would keep alive the very state whose
+    /// had to upgrade in order to wait would keep alive the very token whose
     /// drop it is waiting for.
     wake: Arc<Notify>,
     /// The conductor's answer, as a receiver. The conductor holds the sender, so
-    /// it can still answer after this state is gone.
+    /// it can still answer after this token is gone.
     settled: watch::Receiver<Option<GroupEnded>>,
 }
 
+/// Poison recovery rather than propagation, for `names.rs`'s reason: one bad
+/// decision should cost one decision. Nothing here can panic while the lock is
+/// held — the policy runs on the conductor's task with no lock in hand — so that
+/// arm is unreachable in practice and must still be typed.
+///
+/// A free function and not only a method, because the conductor reaches the
+/// state directly now and has no [`Shared`] to call a method on. `keyed.rs`
+/// spells its own the same way and under the same name.
+fn recovering(state: &Mutex<State>) -> MutexGuard<'_, State> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl Shared {
-    /// Poison recovery rather than propagation, for `names.rs`'s reason: one bad
-    /// decision should cost one decision. Nothing here can panic while the lock
-    /// is held — the policy runs on the conductor's task with no lock in hand —
-    /// so this arm is unreachable in practice and must still be typed.
+    /// The [`Group`]-side door to [`recovering`].
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        recovering(&self.state)
     }
 }
 
@@ -645,21 +803,29 @@ impl Group {
     pub fn new(policy: impl FnMut(&ActorId, &Ended) -> Verdict + Send + 'static) -> Self {
         let wake = Arc::new(Notify::new());
         let (report, settled) = watch::channel(None);
+        let state = Arc::new(Mutex::new(State {
+            members: Vec::new(),
+            staged: Vec::new(),
+            next: 0,
+            phase: Phase::Watching,
+        }));
         let shared = Arc::new(Shared {
-            state: Mutex::new(State {
-                members: Vec::new(),
-                staged: Vec::new(),
-                next: 0,
-                stopping: false,
-                closed: false,
-            }),
+            state: Arc::clone(&state),
             wake: Arc::clone(&wake),
             settled,
         });
-        // Weak, so a group nobody holds any more is dropped even with members
-        // still running. `Shared`'s own `Drop` is what wakes the task to find
-        // out.
-        n0_future::task::spawn(conduct(Arc::downgrade(&shared), wake, report, policy));
+        // Two handles, two roles, and that is the point. The `Weak` is liveness:
+        // a group nobody holds any more is dropped even with members still
+        // running, and `Shared`'s own `Drop` is what wakes the task to find out.
+        // `state` is strong, so the list the conductor needs in order to honour a
+        // `stop` survives that drop.
+        n0_future::task::spawn(conduct(
+            Arc::downgrade(&shared),
+            state,
+            wake,
+            report,
+            policy,
+        ));
         Self { shared }
     }
 
@@ -681,17 +847,19 @@ impl Group {
     /// only thing left to do with it, and the type says so.
     ///
     /// A group that has already ended watches nothing more, so `member` is not
-    /// filed and its `Retire` comes straight back rather than sitting where
-    /// nothing will look at it.
-    #[must_use = "the group is not watching this member — either `name` \
-                  displaced it, or the group had already ended and never filed \
-                  it; retire it, or say `let _ =` to mean that it runs on for \
-                  whoever else holds a handle"]
-    pub fn add(&self, name: ActorId, member: Membership) -> Option<Retire> {
+    /// filed and comes straight back as [`Added::Refused`] rather than sitting
+    /// where nothing will look at it. That is a different answer from
+    /// [`Added::Displaced`] and not a shade of it — the type carries the
+    /// difference, because the two cost a caller opposite things.
+    pub fn add(&self, name: ActorId, member: Membership) -> Added {
         let Membership { ended, retire } = member;
         let mut held = self.shared.lock();
-        if held.closed {
-            return Some(retire);
+        // `Closed` and not "anything but `Watching`", deliberately. A group that
+        // is `Stopping` still files: the entry and its staged ending go on the
+        // books as one locked step, so the teardown that follows retires this
+        // member with the rest rather than leaving it out of one.
+        if held.phase == Phase::Closed {
+            return Added::Refused(retire);
         }
         // Every entry is stamped, and `Names`' own "the generation stamp, and
         // the race it is for" documents that race: without one, a displaced
@@ -700,37 +868,37 @@ impl Group {
         // replaced.
         let generation = held.next;
         held.next += 1;
-        let stamped = name.clone();
+        let stamp = Stamp { name, generation };
+        let stamped = stamp.clone();
         held.staged.push(Box::pin(async move {
             // The caller's future, so it is guarded like the caller's policy and
             // the caller's `retire`. An unwind here would take the conductor
             // with it and orphan every member of the group.
             let reason = guarded(ended).await.map_err(|panicked| panicked.bare());
             Reported {
-                name: stamped,
-                generation,
+                stamp: stamped,
                 reason,
             }
         }));
-        let entry = Entry {
-            name,
-            generation,
-            retire,
-        };
-        let displaced = match held
+        let entry = Entry { stamp, retire };
+        // By NAME and not by stamp, which is the one comparison here that must
+        // not be the whole thing: a replacement carries a fresh generation, so a
+        // stamp comparison would match nothing and every `add` would file a
+        // second member under a name that already had one.
+        let answer = match held
             .members
             .iter()
-            .position(|filed| filed.name == entry.name)
+            .position(|filed| filed.stamp.name == entry.stamp.name)
         {
-            Some(at) => Some(std::mem::replace(&mut held.members[at], entry).retire),
+            Some(at) => Added::Displaced(std::mem::replace(&mut held.members[at], entry).retire),
             None => {
                 held.members.push(entry);
-                None
+                Added::Filed
             }
         };
         drop(held);
         self.shared.wake.notify_one();
-        displaced
+        answer
     }
 
     /// Stop watching a member, without ending it and without asking the policy.
@@ -744,7 +912,10 @@ impl Group {
                   handle"]
     pub fn remove(&self, name: &ActorId) -> Option<Retire> {
         let mut held = self.shared.lock();
-        let at = held.members.iter().position(|filed| &filed.name == name)?;
+        let at = held
+            .members
+            .iter()
+            .position(|filed| &filed.stamp.name == name)?;
         let removed = held.members.remove(at).retire;
         drop(held);
         // Nothing the conductor has to do about it — the discard happens on the
@@ -771,7 +942,7 @@ impl Group {
             .lock()
             .members
             .iter()
-            .map(|entry| entry.name.clone())
+            .map(|entry| entry.stamp.name.clone())
             .collect()
     }
 
@@ -809,27 +980,18 @@ impl Group {
     /// this is not `async`: a synchronous request cannot be cancelled halfway
     /// through a teardown by a caller who dropped the future.
     ///
-    /// # THE THING TO KNOW — a `stop` the conductor has not observed is lost
+    /// **It survives the last [`Group`] being dropped in the same breath.**
+    /// `group.stop(); drop(group);` with no await between them retires every
+    /// member and ends [`GroupEnded::Stopped`]. Take
+    /// [`ended`](Self::ended) *before* the drop if you want to await the answer,
+    /// because a `Group` is what hands one out — but the teardown happens
+    /// whether anybody is waiting for it or not.
     ///
-    /// **Hold the group until [`ended`](Self::ended) resolves.** This raises a
-    /// flag inside the shared state and returns. The conductor reads that flag
-    /// only after upgrading its [`Weak`], and dropping the last [`Group`]
-    /// destroys the state and the flag together — so `group.stop();
-    /// drop(group);` with no await between them ends the group
-    /// [`GroupEnded::Dropped`] having retired nothing. On a current-thread
-    /// runtime that is the ordinary case rather than a race: nothing has
-    /// scheduled the conductor yet.
-    ///
-    /// **Stated rather than fixed, and the alternative is worse.** Moving the
-    /// flag into state the conductor holds strongly does not help, because the
-    /// membership list dies with the same drop — and holding *that* strongly
-    /// would keep the group alive for ever and stop [`GroupEnded::Dropped`]
-    /// firing at all, which is the answer a caller awaiting a dropped group
-    /// depends on. Draining the members inside this method instead is a real
-    /// fix and costs the "returns at once" promise above.
-    /// `tests/compose.rs`'s
-    /// `a_stop_the_conductor_has_not_seen_is_lost_when_the_last_group_drops`
-    /// reproduces it, with the one-await control beside it.
+    /// That is a property of the shape rather than of care taken here: the
+    /// membership list lives in an [`Arc`] the group's task holds too, and only
+    /// the *liveness token* dies with the last `Group`. So the conductor can
+    /// still ask "was this group stopped" after every holder is gone, and it
+    /// asks that before it concludes anything about being dropped.
     ///
     /// Idempotent, and takes no deadline: `n0_future::time::timeout` composes
     /// around [`ended`](Self::ended), and a parameter here would duplicate it.
@@ -846,7 +1008,15 @@ impl Group {
     /// policy mid-call, which is the one thing a synchronous closure cannot be
     /// asked to survive.
     pub fn stop(&self) {
-        self.shared.lock().stopping = true;
+        let mut held = self.shared.lock();
+        // A guarded transition, so a `stop` on a group that has already ended
+        // leaves [`Phase::Closed`] standing instead of writing `Stopping` over
+        // it. Nothing downstream was ever fooled by the overwrite — see
+        // [`Phase`] — and the value a caller prints is what it corrects.
+        if held.phase == Phase::Watching {
+            held.phase = Phase::Stopping;
+        }
+        drop(held);
         self.shared.wake.notify_one();
     }
 }
@@ -854,16 +1024,15 @@ impl Group {
 impl fmt::Debug for Group {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let held = self.shared.lock();
-        // `stopping` beside `closed`, because the question a reader debugs with
-        // is "I called `stop()` and `ended()` has not resolved yet" — and
-        // `closed` alone cannot separate a stop the conductor has not observed
-        // yet from a stop nobody called. `staged` is the other half of that:
-        // members filed but not yet watched.
+        // The phase is here because the question a reader debugs with is "I
+        // called `stop()` and `ended()` has not resolved yet", and `Closed`
+        // alone cannot separate a stop the conductor has not observed yet from
+        // a stop nobody called. `staged` is the other half of that: members
+        // filed but not yet watched.
         f.debug_struct("Group")
             .field("members", &held.members.len())
             .field("staged", &held.staged.len())
-            .field("stopping", &held.stopping)
-            .field("closed", &held.closed)
+            .field("phase", &held.phase)
             .finish()
     }
 }
@@ -893,6 +1062,7 @@ impl fmt::Debug for Group {
 /// [`Notified`]: tokio::sync::futures::Notified
 async fn conduct(
     shared: Weak<Shared>,
+    state: Arc<Mutex<State>>,
     wake: Arc<Notify>,
     settled: watch::Sender<Option<GroupEnded>>,
     mut policy: impl FnMut(&ActorId, &Ended) -> Verdict + Send + 'static,
@@ -900,33 +1070,43 @@ async fn conduct(
     let mut endings: FuturesUnordered<Stamped> = FuturesUnordered::new();
 
     let how = loop {
-        // The upgrade lives exactly as long as this block. A conductor holding
-        // an `Arc` across the wait below would keep alive the state whose drop
-        // it is watching for, and `Dropped` would never be reached.
-        let teardown = {
-            let Some(shared) = shared.upgrade() else {
-                break GroupEnded::Dropped;
-            };
-            let stop_requested = {
-                let mut held = shared.lock();
-                // Drained to EMPTY, always, and before anything below is
-                // awaited. This is the whole of the wake discipline above: a
-                // `Notify` coalesces, so one permit can stand for N `add`s, and
-                // a drain that took fewer than all of them would lose members
-                // with nothing to report it.
-                for staged in held.staged.drain(..) {
-                    endings.push(staged);
-                }
-                held.stopping
-            };
-            stop_requested.then(|| closing(&shared))
+        let stopping = {
+            let mut held = recovering(&state);
+            // Drained to EMPTY, always, and before anything below is awaited.
+            // This is the whole of the wake discipline above: a `Notify`
+            // coalesces, so one permit can stand for N `add`s, and a drain that
+            // took fewer than all of them would lose members with nothing to
+            // report it.
+            for staged in held.staged.drain(..) {
+                endings.push(staged);
+            }
+            held.phase == Phase::Stopping
         };
-        if let Some(members) = teardown {
+        // **The phase is read BEFORE liveness, and that order is the fix.** The
+        // reverse order is what lost a `stop`: `stop(); drop(group);` with no
+        // await between them destroyed the token first, the conductor answered
+        // `Dropped` on the failed upgrade, and the flag it would have read was
+        // in the state that went with it. The state outlives the token now, so
+        // the question "was this group stopped" is answerable after the last
+        // `Group` is gone — and it is asked first.
+        if stopping {
             // The one ending that carries the count. The three below name a
             // member and a reason instead, and `GroupEnded::Stopped` says why
             // the number rides on this one alone.
-            let retire_panics = retire_all(members).await;
+            let retire_panics = retire_all(closing(&state)).await;
             break GroupEnded::Stopped { retire_panics };
+        }
+        // Nobody holds a `Group`, and nobody asked for a teardown. `Dropped`
+        // still means what it always meant, because the token still dies with
+        // the last `Group` — what changed is that a stopped group no longer
+        // reaches here.
+        //
+        // `strong_count` and not `upgrade`, which the old shape needed in order
+        // to reach the state through it. There is no `Arc` to accidentally carry
+        // across the wait below now, so the hazard the old comment warned about
+        // has no way to be written.
+        if shared.strong_count() == 0 {
+            break GroupEnded::Dropped;
         }
 
         let mut waiting = std::pin::pin!(wake.notified());
@@ -954,14 +1134,24 @@ async fn conduct(
             continue;
         };
 
-        let Some(shared) = shared.upgrade() else {
-            break GroupEnded::Dropped;
-        };
+        // The last `Group` went away while this was polling. Back to the top
+        // rather than deciding here, because the top is the one place that reads
+        // the phase before it concludes anything — a `stop` filed before that
+        // drop is still owed its teardown, and answering `Dropped` here would be
+        // the bug this commit removes, one screen further down.
+        //
+        // The loop cannot spin on this: the top breaks on `Stopped` or on
+        // `Dropped` and never returns here. The ending in hand is discarded,
+        // which is what a group with no holder did with it before.
+        if shared.strong_count() == 0 {
+            continue;
+        }
         let taken = {
-            let mut held = shared.lock();
-            let filed = held.members.iter().position(|entry| {
-                entry.name == reported.name && entry.generation == reported.generation
-            });
+            let mut held = recovering(&state);
+            let filed = held
+                .members
+                .iter()
+                .position(|entry| entry.stamp == reported.stamp);
             // An ending whose stamp is no longer the one filed under that name
             // belongs to a member that was displaced or removed. Discarded,
             // never decided on.
@@ -997,16 +1187,21 @@ async fn conduct(
         let reason = match reported.reason {
             Ok(reason) => reason,
             Err(message) => {
-                let mut leaving = closing(&shared);
+                let mut leaving = closing(&state);
                 // Its own means of ending, beside every sibling's. Appended
                 // rather than placed, because `retire_all` builds every future
                 // before polling any: the order is a statement about the order
                 // retirement is ISSUED in, which `closing` says at length, and
                 // this member's place in it carries no claim.
                 leaving.push(taken.retire);
-                retire_all(leaving).await;
+                // The count is discarded here and on the two arms below, and
+                // saying so at each is the point of `retire_all` being
+                // `#[must_use]`: only `GroupEnded::Stopped` carries a place to
+                // put it, and that variant's doc argues why the other three do
+                // not. A bare call would leave that decision one screen away.
+                let _ = retire_all(leaving).await;
                 break GroupEnded::EndingPanicked {
-                    member: reported.name,
+                    member: reported.stamp.name,
                     message,
                 };
             }
@@ -1017,19 +1212,19 @@ async fn conduct(
         // `panic = "abort"` caveat on it, are on `GroupEnded::PolicyPanicked`,
         // where a caller meets them — this comment does not repeat them, because
         // two copies drift.
-        match catch_unwind(AssertUnwindSafe(|| policy(&reported.name, &reason))) {
+        match catch_unwind(AssertUnwindSafe(|| policy(&reported.stamp.name, &reason))) {
             Ok(Verdict::Forget) => {}
             Ok(Verdict::StopAll) => {
-                retire_all(closing(&shared)).await;
+                let _ = retire_all(closing(&state)).await;
                 break GroupEnded::Member {
-                    member: reported.name,
+                    member: reported.stamp.name,
                     reason,
                 };
             }
             Err(payload) => {
-                retire_all(closing(&shared)).await;
+                let _ = retire_all(closing(&state)).await;
                 break GroupEnded::PolicyPanicked {
-                    member: reported.name,
+                    member: reported.stamp.name,
                     message: message_of(&*payload),
                 };
             }
@@ -1049,15 +1244,19 @@ async fn conduct(
 /// statement about several actors. Its observable effect is small and saying so
 /// is not a hedge — [`retire_all`] starts every member concurrently, so the
 /// order is a statement about the order retirement is *issued* in.
-fn closing(shared: &Shared) -> Vec<Retire> {
-    let mut held = shared.lock();
+fn closing(state: &Mutex<State>) -> Vec<Retire> {
+    let mut held = recovering(state);
     // The two effects the rest of the module leans on, done under one lock so
-    // that no `add` can interleave between them. `closed` is what makes a later
+    // that no `add` can interleave between them. `Closed` is what makes a later
     // `add` hand its `Retire` straight back instead of filing a member nothing
     // watches, and clearing `staged` drops the endings of members that were
     // added but never drained — they are in this teardown either way, because
     // `add` files the entry and stages the ending as one locked step.
-    held.closed = true;
+    //
+    // Unguarded, unlike `Group::stop`'s transition: this is the one writer that
+    // may overwrite a `Stopping`, because a stop that reached teardown is what
+    // being closed MEANS.
+    held.phase = Phase::Closed;
     held.staged.clear();
     held.members
         .drain(..)
@@ -1091,6 +1290,12 @@ fn closing(shared: &Shared) -> Vec<Retire> {
 /// [`GroupEnded::Stopped`] carries it. This used to be discarded on the floor —
 /// one member vanishing out of a teardown with no report anywhere, in a module
 /// whose own backpressure section says there is no third option that hides.
+///
+/// `#[must_use]` because three of the four callers discard it, and a discard
+/// that is deliberate should be readable where it happens. It used to be a bare
+/// call at each, and the only record that dropping the number there was a
+/// decision lived a screen away on [`GroupEnded::Stopped`].
+#[must_use]
 async fn retire_all(members: Vec<Retire>) -> usize {
     // Annotated rather than inferred, and the annotation is a guard's
     // precondition rather than a habit. Without it the set's item type came from
@@ -1113,7 +1318,7 @@ async fn retire_all(members: Vec<Retire>) -> usize {
             Ok(fut) => retiring.push(guarded(fut)),
             // Counted and not discarded. The closure never produced a future, so
             // there is no retirement of this member's left to wait for.
-            Err(_panicked) => panicked += 1,
+            Err(_lost) => panicked += 1,
         }
     }
     // The other half of the same number: a closure that did produce a future,
@@ -1151,6 +1356,10 @@ async fn retire_all(members: Vec<Retire>) -> usize {
 /// macro does the cloning.
 ///
 /// ```ignore
+/// // The `add` is scaffolding here: what this shows is the argument. This
+/// // snippet names no group, so it cannot claim the discard is safe the way the
+/// // module's own example can — what to do with the `Added` an `add` answers is
+/// // on that type.
 /// let _ = group.add(ActorId::new("reserve")?, membership!(reserve));
 /// ```
 ///

@@ -131,7 +131,7 @@ mod pool;
 mod schedule;
 mod topic;
 
-pub use group::{Group, GroupEnded, Membership, Retire, Verdict};
+pub use group::{Added, Group, GroupEnded, Membership, Retire, Verdict};
 pub use keyed::Endings;
 pub use names::Names;
 pub use pool::{Member, Pool};

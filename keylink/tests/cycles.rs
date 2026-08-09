@@ -319,6 +319,44 @@ fn ring_of_two() -> (
     (a, b, gate, entered)
 }
 
+/// Three wired actors, A → B → C → A.
+///
+/// **The reason this exists is one `Chain` arm and not a bigger number.** A ring
+/// of two exercises `Chain::Empty → One → Deep`, and the arm that grows a `Deep`
+/// chain by one more actor is never reached: the closing edge of a two-ring is
+/// sent from a chain of exactly two. At N = 3 the closing edge C → A is sent from
+/// `Deep([A, B, C])`, which is the first message in the tree whose chain was grown
+/// from a `Deep` rather than from a `One`.
+///
+/// Each actor's `me` is its own handle, as in [`ring_of_two`], so the self-call
+/// probes work at any position in the ring. The strong reference cycle exemption
+/// that helper documents applies here identically, and with one more actor in it.
+fn ring_of_three() -> (ring::Handle<Peer>, ring::Handle<Peer>, ring::Handle<Peer>) {
+    let first = Arc::new(OnceLock::new());
+    let second = Arc::new(OnceLock::new());
+    let third = Arc::new(OnceLock::new());
+
+    let wired = |other: &Arc<OnceLock<ring::Handle<Peer>>>,
+                 me: &Arc<OnceLock<ring::Handle<Peer>>>| {
+        ring::actor(Peer {
+            other: other.clone(),
+            me: me.clone(),
+            entered: Arc::new(AtomicUsize::new(0)),
+            gate: Arc::new(Notify::new()),
+            bumps: 0,
+        })
+    };
+
+    let a = wired(&second, &first);
+    let b = wired(&third, &second);
+    let c = wired(&first, &third);
+
+    first.set(a.clone()).expect("set once");
+    second.set(b.clone()).expect("set once");
+    third.set(c.clone()).expect("set once");
+    (a, b, c)
+}
+
 /// Wait for `a` to be inside its `wait` turn, by looking at the counter the
 /// handler bumps on entry rather than by sleeping.
 async fn inside_a_turn(entered: &AtomicUsize) {
@@ -650,6 +688,62 @@ async fn a_read_from_inside_a_turn_is_refused() {
         .await
         .expect("A's loop is polling")
         .expect("A is running");
+}
+
+/// **A ring of three, and it is the arm two actors cannot reach.**
+///
+/// A → B → C → A. The closing edge C → A is the first message in this tree whose
+/// chain was grown from a `Chain::Deep` rather than from a `Chain::One`: A installs
+/// `One([A])`, B grows it to `Deep([A, B])` through the arm the two-actor ring
+/// already covers, and C grows *that* to `Deep([A, B, C])` through the arm nothing
+/// else touches. So this is a guard for one `match` arm, not a bigger version of
+/// the test above.
+///
+/// It also answers the question a reader asks after the two-actor case — *does it
+/// scale, or does it only know about the actor one hop back* — and the answer has
+/// to be a test, because the code that would be wrong reads identically either way.
+///
+/// Made red by `scripts/break-once.sh` on `turns.rs`, replacing `Chain::with`'s
+/// `                grown.extend(outer.iter().cloned());` with
+/// `                let _ = &outer;` — the grow arm keeps the actor about to run
+/// and drops every ancestor behind it. Watched: "A -> B -> C -> A must be refused
+/// rather than hang: Elapsed(())", after 5.00s.
+///
+/// **And `a_two_actor_cycle_is_refused_at_the_closing_edge` stays GREEN under that
+/// same break** — measured, `1 passed`, exit 0. That is the pairing this test is
+/// for: a two-actor ring closes through the `One → Deep` arm, which this break
+/// does not touch, so a chain that remembers exactly one hop passes that test and
+/// fails this one.
+///
+/// **One line and not the whole arm, deliberately.** Replacing the entire
+/// `Self::Deep(outer) => { .. }` block with `Self::Deep(_) => Self::One(running),`
+/// was tried first and discriminates identically — same red here, same green there
+/// — but a five-line search literal has five lines of `rustfmt` exposure and has to
+/// be quoted whole in this record for `.mise/tasks/anchors` to check it. The
+/// `extend` line alone is the smallest edit that removes the ancestors, and
+/// `outer` stays used by `Vec::with_capacity` on the line above, so the break is a
+/// behaviour change rather than a dead-code build failure.
+#[tokio::test]
+async fn a_three_actor_ring_is_refused_at_the_closing_edge() {
+    let (a, b, c) = ring_of_three();
+
+    let depth = n0_future::time::timeout(SETTLE, a.hop(3))
+        .await
+        .expect("A -> B -> C -> A must be refused rather than hang")
+        .expect("A is running: a refusal is not an ending");
+    assert_eq!(
+        depth, REFUSED,
+        "the closing edge C -> A is refused, and the answer travels back three hops"
+    );
+
+    // All three still polling. A ring that is refused costs the ring nothing,
+    // which is the claim that makes this an error and not a different failure.
+    for (name, actor) in [("A", &a), ("B", &b), ("C", &c)] {
+        n0_future::time::timeout(SETTLE, actor.ping())
+            .await
+            .unwrap_or_else(|_| panic!("{name}'s loop is polling"))
+            .unwrap_or_else(|_| panic!("{name} is running"));
+    }
 }
 
 // ────────────────────────────────────────────────────────────────── the knob

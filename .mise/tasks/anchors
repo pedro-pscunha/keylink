@@ -922,13 +922,13 @@ ANCHORS = [
     # enumerates, and a fresh letter cannot collide with them by arithmetic - the
     # same reason `call-id` took `C`.
     #
-    # FOURTEEN rows and FOURTEEN distinct literals: no two share one, and no
+    # FIFTEEN rows and FIFTEEN distinct literals: no two share one, and no
     # literal appears against two targets. Checked as `(target, literal)` pairs,
     # because this list's headline counts ROWS and two existing rows share a
     # literal - so the numbers coinciding here is a measurement and not an
     # assumption.
     #
-    # It was EIGHT until item M, which added D9 through D14 for the re-entrancy
+    # It was EIGHT until item M, which added D9 through D15 for the re-entrancy
     # refusal and the depth knob. D10 and D11 break the SAME function on two
     # different lines with two different replacements and two different watched
     # sentences, which is the shape D3's note says one row cannot represent - so
@@ -1043,6 +1043,12 @@ ANCHORS = [
     ("D14", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "        // closure it used to carry made one by accident.\n"
      "        let (mail, inbox) = mpsc::channel::<Message<A, M>>(depth.get());"),
+    # D15 covers the `Chain::with` arm that grows an ALREADY-DEEP chain, which a
+    # two-actor ring cannot reach: its closing edge is sent from a chain of exactly
+    # two, built by the `One -> Deep` arm. So D9 and D15 are not the same guard at
+    # two sizes - each reddens a test the other leaves green, measured both ways.
+    ("D15", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
+     "                grown.extend(outer.iter().cloned());"),
     # ── from the ledger-limits PR. Both were measured with `grep -cF` AFTER the
     # record was written, which is the order that matters: adding a quote can only
     # RAISE a count, so measuring first reports a 1 that the record itself then
@@ -1198,20 +1204,20 @@ ANCHORS = [
     # only evidence that all twenty-two restores completed.
     #
     # **G1, G2 and G8 share ONE literal, because they share one physical LINE.**
-    # G1 and G2 were proposed against `policy(&reported.name, &reason)`, which is a
+    # G1 and G2 were proposed against `policy(&reported.stamp.name, &reason)`, which is a
     # fragment of G8's line and occurs nowhere else. Registering it would have
     # declared a new mode-4 fragment, and `FRAGMENT_ANCHORS` above is a NON-GROWTH
     # assertion — adding to it converts a working check into a silent pass. So all
     # three quote the whole line. Three records, one literal, three rows.
     ("G1", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
-     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.name, &reason))) {"),
+     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.stamp.name, &reason))) {"),
     ("G2", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
-     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.name, &reason))) {"),
+     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.stamp.name, &reason))) {"),
     ("G8", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
-     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.name, &reason))) {"),
+     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.stamp.name, &reason))) {"),
     # G3 is DELIBERATELY WEAKER than the break it guards, and that is the whole
     # entry. Its record fences two lines and substitutes the second, because that
-    # second line - `retire_all(closing(&shared)).await;` - occurs THREE times in
+    # second line - `retire_all(closing(&state)).await;` - occurs THREE times in
     # `group.rs` and is unique only under the arm above it. A row carries one
     # literal, and a two-line literal is a fragment by the check at :933.
     #
@@ -1255,11 +1261,19 @@ ANCHORS = [
     ("G5", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
      "            held.members.remove(at)"),
     ("G6", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
-     "                entry.name == reported.name && entry.generation == reported.generation"),
+     "                .position(|entry| entry.stamp == reported.stamp);"),
     # G7 was proposed as `held.staged.drain(..)` and is registered as its enclosing
     # line. The bare call is a fragment; the `for` header is the line.
+    #
+    # **Re-quoted at TWELVE spaces, from sixteen.** M3 lifted the drain out of the
+    # block that upgraded the `Weak`, because the state no longer has to be reached
+    # through it — so the line lost one level of indentation without one character
+    # of its own changing. That is rot cause (a) wearing cause (b)'s clothes, and
+    # the row caught it. The record's own quote is whitespace-insensitive and did
+    # not move, and the substitution is a fragment INSIDE the line, so it did not
+    # move either: this rot was the registered literal alone.
     ("G7", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
-     "                for staged in held.staged.drain(..) {"),
+     "            for staged in held.staged.drain(..) {"),
     # G9 guards the dropped-group ending, whose break empties a three-line
     # `Shared::drop` body. This is the inner line of that fence, whole and unique.
     ("G9", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
@@ -1292,6 +1306,37 @@ ANCHORS = [
     # a record can have and is worth saying where it is rare.
     ("G15", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
      "                leaving.push(taken.retire);"),
+    # G16 is a REGRESSION in the same literal sense G15 is, and for a stronger
+    # reason: its substitution is not code that once stood here, it is the whole
+    # of what the previous SIGNATURE could say. `add` returned `Option<Retire>`,
+    # so a refusal and a displacement were both `Some` and no caller could tell
+    # them apart. Swapping `Added::Refused` for `Added::Displaced` puts the tree
+    # back in that state at the one site where it is now expressible.
+    #
+    # The `return` is required and the fragment is not unique: bare
+    # `Added::Refused` occurs several times in `group.rs` — the variant's own
+    # declaration, the module's rebuild recipe, and `add`'s doc. Only the
+    # twelve-space whole line resolves once.
+    ("G16", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "            return Added::Refused(retire);"),
+    # G17 and G18 are the two DIRECTIONS of M3's one claim, and they are two rows
+    # because no single substitution can show both. G17 restores the old ORDERING —
+    # honour a stop only while somebody still holds the group — and fails case 1 by
+    # value in 0.00s. G18 disables the `Dropped` arm entirely and fails case 3 at
+    # the `NO_PROGRESS` bound in 60.00s, which is the failure the original refusal
+    # of this design predicted.
+    #
+    # **G18's row is the SECOND line of its fence, not the first.** Its break needs
+    # both lines, because `        if shared.strong_count() == 0 {` occurs twice in
+    # `group.rs` — this arm and the `continue` one below the poll — while
+    # `            break GroupEnded::Dropped;` resolves exactly once. So the row is
+    # a rot tripwire on the arm's body and the record carries the fence, which is
+    # G3's arrangement arrived at from the other end: there the unique line was the
+    # header, here it is the body.
+    ("G17", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "        if stopping {"),
+    ("G18", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "            break GroupEnded::Dropped;"),
     # ── the keyed side ───────────────────────────────────────────────────────
     #
     # K1 and K2 share a literal for the R15/R16 reason: two records, two rows. K1
@@ -1313,6 +1358,21 @@ ANCHORS = [
      "        self.lifecycle.push(Arc::new(lifecycle));"),
     ("K3b", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
      "        self.lifecycle.push(Arc::new(lifecycle));"),
+    # L1 and L2 are the two REPORT SITES of one claim, and they are two rows
+    # because the same defect fails differently at each. Both substitutions
+    # restore the line as it stood before the catch, so both are regressions in
+    # the literal sense rather than invented defects.
+    #
+    # L1 kills the CALLER: the unwind crosses `System::mount` and the test dies at
+    # the sink's own `panic!` in 0.00s, before either assertion is read. L2 kills
+    # nobody visible: the unwind dies in a teardown task no one joins, the waiter
+    # is never answered, and the red arrives by value at the `NO_PROGRESS` bound
+    # after 60.00s. **The pair is the evidence that this is not one symptom** —
+    # a reader who saw only L1 would price the defect as a loud crash.
+    ("L1", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
+     "            let _ = crate::panic::catching(|| watching.mounted(id));"),
+    ("L2", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
+     "            let _ = crate::panic::catching(|| watching.ended(id, why));"),
     ("K4", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
      "        for waiter in waiters {"),
     # K5's local is `mine` and its FIELD is `generation`, which is not a slip. Spelled
@@ -2835,6 +2895,17 @@ for record in sorted(set(REDNESS) - row_ids):
 # raised on state the drop destroys has a one-line documented remedy and no
 # one-line break.
 #
+# **Both sentences above are history now, and they are kept as history.** M3 fixed
+# the hazard rather than documenting it: `Shared` became a liveness token holding
+# an `Arc<Mutex<State>>` the conductor also holds, so the list survives the last
+# `Group` and the conductor reads the phase before it concludes anything about
+# liveness. The test inverted, was renamed
+# `a_stop_survives_the_last_group_dropping_in_the_same_breath`, and it now carries
+# TWO substitutions and two rows, G17 and G18. So it is a guard rather than a pin,
+# and this walk does see it: that record naming the harness for the first time is
+# the ONE block behind `RECORD_BLOCKS` moving 157 → 158. Two rows, one block —
+# they are different units, and this file's summary says so at length.
+#
 # **This bump was taken twice.** The first reading was 149 too, and it was
 # discarded rather than used, because a record was still being re-quoted and a
 # count carried across somebody else's edit is the defect this file's own notes
@@ -2891,7 +2962,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # next person to skip the run gets the wrong number on a tree where the two diverge.
 # The agreement is recorded because hiding it would make the run look load-bearing in
 # a way this one was not, and the run is kept because the NEXT one will be.
-RECORD_BLOCKS = 160
+RECORD_BLOCKS = 165
 
 # The one marker the tripwire counts, and the two phrasings records use INSTEAD of
 # naming the harness. Both are read by the same walk, so the blind spot below is a

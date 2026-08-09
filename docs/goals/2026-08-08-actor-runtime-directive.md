@@ -45,8 +45,16 @@ block holds **17** names, not the 15 stated earlier, and none of them moves.
 
 **`turn.rs` is refused, by measurement rather than by taste.** Three doc comments
 link the function through an explicit path: `macros.rs:907` writes
-`[`turn`](keylink::turn)`, and `macros.rs:3100` and `panic.rs:123` write
-`[`turn`](crate::turn)`. A module named `turn` gives `crate::turn` a second
+`[`turn`](keylink::turn)`, and `macros.rs:3100` and `panic.rs:153` write
+`[`turn`](crate::turn)`.
+
+**One line number here had rotted — `panic.rs:123`, now `:153` — and the report
+that found it got the rest of the sentence wrong.** It stated that only two such
+links exist and that `macros.rs:907` carries none. Three exist. The sweep behind
+that claim searched for `crate::turn` and `macros.rs:907` spells it
+`keylink::turn`, which is the whole reason this sentence names that site
+separately. **A negative from a grep is a claim about the pattern, not about the
+tree**, and this one was taken at face value once before being re-measured. A module named `turn` gives `crate::turn` a second
 resolution, and `rustdoc` answers `` `crate::turn` is both a function and a
 module `` — reproduced in a scratch crate under `mise.toml:475`'s real flags,
 exit 101, against exit 0 for a module named `turns`. The plural is the word the

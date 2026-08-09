@@ -3,6 +3,18 @@
 Design of record. The measurement in §1 is the reason this item exists in this
 shape, and it refutes the sentence that has held the constant at 1.
 
+> **`local.rs` is now `turns.rs`.** Item D landed after this plan was written, and
+> every `local.rs:NNNN` below should be read as `turns.rs:NNNN`. **The line numbers
+> are unchanged** — it was a `git mv` plus anchored substitutions, which git
+> recorded as a 99% rename, and it is verified rather than assumed: this plan says
+> the depth constant is at `local.rs:251`, and it is at `turns.rs:251`. The module
+> path is now `crate::turns`. `LocalActor` did not move and did not change name —
+> the type is about locality, and only the file was misnamed.
+>
+> The citations are left as written rather than rewritten, because this plan is a
+> record of what was measured on the tree it was measured against, and a document
+> edited to match a later tree stops being evidence of anything.
+
 ## Review status: PROCEED-AMENDED
 
 Adversarially reviewed at `f74a508` on a separate worktree, with §1's experiment
