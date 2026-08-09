@@ -13,8 +13,16 @@
 #
 #   BREAK_RUNNER="cargo nextest run" break-once.sh … --test drift
 #
-# Filter syntax differs between the two runners: `cargo test` takes a substring,
-# nextest takes a filterset. Pass the filter each one expects.
+# **THE FILTER IS A BARE POSITIONAL UNDER BOTH RUNNERS, and this line used to say
+# "nextest takes a filterset", which sent a reader to a spelling this script cannot
+# deliver.** The filter is appended LAST, after the cargo args, so it lands as the
+# runner's own positional — a SUBSTRING for `cargo test` and, measured on
+# cargo-nextest 0.9.143, a substring for nextest too. A filterset needs `-E`, which
+# can only ride in the cargo args; handed here it matches nothing, and nextest then
+# runs 0 tests and exits 4, which this script's `── exit=` line reads as a caught
+# defect. Pass the plain test name. `-- --exact` in the cargo args reaches BOTH
+# runners' `--exact`, which matches the WHOLE name — see the count below for what
+# that costs a bare `--lib` name.
 set -euo pipefail
 
 file="$1"
@@ -45,8 +53,9 @@ shift 4
 # **A READ FAILURE PRINTS THE SAME ONE-LINE ABORT, and `set -e` is not what
 # reports it.** The first `python3` version let a missing target raise, so the
 # assignment failed and `set -e` killed the script: a `FileNotFoundError`
-# traceback and exit 1, with no `ABORT` line anywhere. Both replay consumers
-# filter this output for `ABORT`, `expected exactly one` and `── exit=`, so a
+# traceback and exit 1, with no `ABORT` line anywhere. Both replay consumers echo
+# every line this script prefixes `── `, plus `ABORT` and `expected exactly one`
+# from the abort below, which carries no prefix because it goes to stderr. So a
 # rotted `target` path — a rot mode the registry names — produced ZERO matching
 # lines, and `replay-anchors` then told the reader to open a log the run never
 # wrote. Measured against `keylink/src/does-not-exist.rs`: the `grep` this
@@ -107,9 +116,12 @@ echo "── runner: ${runner[*]}"
 # WHICH STREAM, before any figure, because naming the wrong one is how this paragraph
 # went wrong twice. Every number below is the PIPED stream ALONE: the runner's own
 # combined output, which is exactly the bytes `tail -15` used to receive and exactly
-# what `tee` writes to `$log`. The four `──` lines this script prints are NOT in it —
-# two are echoed before the pipeline and two after it — so none of them ever reached
-# `tail`, and none of them can consume its window.
+# what `tee` writes to `$log`. The `──` lines this script prints are NOT in it — two
+# are echoed before the pipeline and the rest after it — so none of them ever reached
+# `tail`, and none of them can consume its window. (It said FOUR until the count
+# below added a fifth and a warning of its own. The claim never depended on the
+# number, only on which side of the pipeline they sit, so the number is gone rather
+# than re-counted: a figure nothing rests on is a figure that goes stale unwatched.)
 #
 # What decides survival is how many lines FOLLOW the sentence, because `tail -15`
 # counts from the END: a line survives while at most fourteen follow it. Counted in
@@ -142,4 +154,93 @@ status=${PIPESTATUS[0]}
 set -e
 echo "── exit=$status (non-zero means the test caught it)"
 echo "── log: $log"
+
+# ── HOW MANY TESTS THE FILTER SELECTED, WHICH THE EXIT STATUS CANNOT SAY ───────
+#
+# A break record names ONE guard, and `cargo test` resolves its filter as a
+# SUBSTRING. So a test whose name is a strict PREFIX of a sibling's selects BOTH,
+# and a run where only the SIBLING reddens exits non-zero and prints the
+# sibling's panic. Every consumer of this script searches this output for the
+# sentence a record says it watched, and that sentence can then come out of a
+# test the record does not name — a break that reddened the wrong test, read as
+# evidence for the right one.
+#
+# **COUNTED HERE because there are THREE consumers and they were not equally
+# guarded.** `scripts/replay-fate-breaks.sh` counted for itself, the
+# `replay-anchors` task did not count at all, and a hand-run of this script — the
+# way most of the registered records are re-checked — counted nothing either. One
+# count, printed once, on the one path all three go through. What to DO about a
+# count that is not 1 stays with each consumer, because only they know whether a
+# record is claiming one guard: this script warns and never aborts, since running
+# one break against several tests by name is a legitimate exploratory use and the
+# `replay-anchors` header records somebody doing exactly that.
+#
+# **BOTH RUNNERS, and the count this replaces read only one of them.** It was a
+# libtest-shaped regex inside `replay-fate-breaks.sh`, `[0-9]+ passed; [0-9]+
+# failed`. Measured on this machine 2026-08-09, over real runs of the two-test
+# filter this whole guard exists for:
+#
+#   cargo test    : test result: ok. 2 passed; 0 failed; 0 ignored; …
+#   cargo nextest : Summary [   0.109s] 2 tests run: 2 passed, 18 skipped
+#   cargo nextest : Summary [   0.015s] 1 test run: 0 passed, 1 failed, 182 skipped
+#
+# That regex matches NONE of the nextest lines, so under the runner this script's
+# own header calls required the count came back EMPTY and every arm reading it
+# fell through — the guard was absent exactly where the gate runs. Both forms are
+# read here, and each was measured rather than reasoned about.
+#
+# SUMMED over every totals line rather than read off the first, because a filter
+# with no target runs one binary per target and prints one line each. `?` is NO
+# totals line anywhere: an abort, a tree that did not compile, or a runner whose
+# summary neither pattern knows. **That is not zero**, and a consumer must never
+# read it as zero — zero is a filter that named nothing, which is a different
+# fault with a different remedy.
+selected="$(python3 - "$log" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], errors="replace").read()
+counts = [int(passed) + int(failed) for passed, failed in
+          re.findall(r"^test result: \w+\. (\d+) passed; (\d+) failed", text, re.M)]
+counts += [int(ran) for ran in
+           re.findall(r"^\s*Summary \[[^]]*\] (\d+) tests? run:", text, re.M)]
+print(sum(counts) if counts else "?")
+PY
+)"
+echo "── selected=$selected"
+
+# **THE REMEDY IS THE FULL PATH, and `-- --exact` ALONE is the WRONG one for most
+# of this tree.** `--exact` matches the WHOLE listed name; a `--lib` test lists as
+# `module::tests::name`; and every registered record passes a BARE name. So adding
+# `--exact` to a bare name trades "selected two" for "selected none" — it moves the
+# fault rather than fixing it. Measured 2026-08-09 on
+# `the_recorded_bytes_stay_inside_their_bound` under `-p keylink --lib`: 1 as a
+# substring, **0** with `-- --exact`, and 1 with `-- --exact` and the full path
+# `idempotency::tests::bounds::the_recorded_bytes_stay_inside_their_bound`. An
+# integration binary only looks like an exception, because there the full path IS
+# the bare name.
+#
+# **ONE remedy, and the draft that branched per runner was WRONG about nextest.**
+# It said nextest has no `--exact` and told the reader to reach for
+# `-E 'test(=…)'`. Measured on cargo-nextest 0.9.143: `--exact` IS accepted after
+# `--`, with libtest's semantics — a bare `--lib` name selects 0 and the full path
+# selects 1, exactly as under `cargo test`, and `cargo nextest run --help` documents
+# it. Writing a remedy that names a flag as absent is the same defect class this
+# whole warning exists for, one level up, so the branch is gone.
+if [ "$selected" != 1 ] && [ "$selected" != "?" ]; then
+    echo "── WARNING: this filter selected $selected tests, and a break record names ONE."
+    if [ "$selected" = 0 ]; then
+        echo "──   Nothing ran, so this break cannot redden and never could. Either the"
+        echo "──   name exists nowhere, or the target cannot reach it: a \`#[cfg(test)]\`"
+        echo "──   test inside \`src\` needs --lib and is unreachable under --test."
+    else
+        echo "──   A break that reddens ANY of them satisfies a record naming one, so"
+        echo "──   nothing downstream can say WHICH test printed the watched sentence."
+        echo "──   Take the FULL name — \`cargo test\` with these same cargo args and"
+        echo "──   \`-- --list\`, or \`cargo nextest list\` with them — pass THAT as the"
+        echo "──   filter, and add \`-- --exact\` to the cargo args. Both runners match"
+        echo "──   \`--exact\` against the WHOLE name, so a BARE name under --lib"
+        echo "──   selects zero with it."
+    fi
+fi
 exit 0

@@ -1407,20 +1407,30 @@ ANCHORS = [
      "        self.lifecycle.push(Arc::new(lifecycle));"),
     ("K3b", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
      "        self.lifecycle.push(Arc::new(lifecycle));"),
-    # L1 and L2 are the two REPORT SITES of one claim, and they are two rows
+    # K8 and K9 are the two REPORT SITES of one claim, and they are two rows
     # because the same defect fails differently at each. Both substitutions
     # restore the line as it stood before the catch, so both are regressions in
     # the literal sense rather than invented defects.
     #
-    # L1 kills the CALLER: the unwind crosses `System::mount` and the test dies at
-    # the sink's own `panic!` in 0.00s, before either assertion is read. L2 kills
+    # K8 kills the CALLER: the unwind crosses `System::mount` and the test dies at
+    # the sink's own `panic!` in 0.00s, before either assertion is read. K9 kills
     # nobody visible: the unwind dies in a teardown task no one joins, the waiter
     # is never answered, and the red arrives by value at the `NO_PROGRESS` bound
     # after 60.00s. **The pair is the evidence that this is not one symptom** —
-    # a reader who saw only L1 would price the defect as a loud crash.
-    ("L1", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
+    # a reader who saw only K8 would price the defect as a loud crash.
+    #
+    # **THESE TWO WERE `L1` AND `L2`, AND THE LEDGER-LIMITS WAVE ALREADY OWNED
+    # THOSE.** A row id is the name `REDNESS` resolves a replay by, and
+    # `mise run replay-anchors` builds that lookup as a dict comprehension - so the
+    # LAST duplicate won and the first vanished. Measured before the rename: 113
+    # rows, 111 in the lookup, and both `L1` and `L2` resolving to a different FILE
+    # in a different crate than the row a reader finds first in this list. Nothing
+    # replayed the wrong file, only because no `REDNESS` entry named either id yet.
+    # They take the `K` prefix because that is the wave they landed in, and their
+    # sibling `K3`/`K3b` already cuts `registry.rs`.
+    ("K8", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
      "            let _ = crate::panic::catching(|| watching.mounted(id));"),
-    ("L2", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
+    ("K9", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
      "            let _ = crate::panic::catching(|| watching.ended(id, why));"),
     ("K4", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
      "        for waiter in waiters {"),
@@ -1613,8 +1623,15 @@ ANCHORS = [
      'if [ "$rebasing" = no ] && ps -o args= -p "$PPID" 2>/dev/null | grep -qw -- \'--amend\'; then'),
     ("3b", "scripts/hook-guard.sh", ".githooks/pre-commit",
      'if [ -d "$(git rev-parse --git-path rebase-merge)" ] ||'),
+    # Re-quoted when the filter widened past Rust to the paths the gate READS -
+    # `.mise/tasks/`, `scripts/*.sh` and `.githooks/` - which is rot mode 1 arriving
+    # by the ordinary route: the line was edited, the anchor stopped resolving, and
+    # `mise run anchors` said so before the commit. Split across two source lines
+    # because one would run past this file's width; Python joins them with nothing
+    # between, so the literal is unchanged by the split.
     ("4", "scripts/hook-guard.sh", ".githooks/pre-commit",
-     'if ! grep -qE \'\\.rs$|Cargo\\.toml$|Cargo\\.lock$|rustfmt\\.toml$\' <<<"$linted"; then'),
+     'if ! grep -qE \'\\.rs$|Cargo\\.toml$|Cargo\\.lock$|rustfmt\\.toml$'
+     '|^\\.mise/tasks/|^scripts/.*\\.sh$|^\\.githooks/\' <<<"$linted"; then'),
     ("I1", "scripts/hook-guard.sh", "scripts/install-hooks.sh",
      'if [ -z "$previous" ] || [ "$ours" = yes ]; then'),
     ("I2", "scripts/hook-guard.sh", "scripts/install-hooks.sh",
@@ -1810,6 +1827,26 @@ DESCRIBED = [
 # clean sweep of nine says these nine are sound, and says nothing about the rest.
 # Every run exited 101, so each break reached its test rather than aborting.
 #
+# **AND THAT SWEEP DID NOT HOLD. Re-run at `d2f5e6e`, THREE of the nine could not run
+# at all** - A1, A3 and A4, each with a `replacement` that no longer compiles against
+# the line its `target` now holds. So a clean sweep is a statement about one tree and
+# decays like every other, which is the whole reason this list exists rather than a
+# sentence in a record.
+#
+# **What is worth keeping is HOW they became visible.** Their old report was `the
+# recorded sentence is NOT in this run`, which is the same sentence a break that went
+# GREEN prints - and green is rot in the guard, while this was rot in the row. The
+# harness now prints `── selected=N`, and all three read `?`: no totals line, so the
+# runner never reached a test. That one line separates "the guard stopped catching it"
+# from "this break never ran", and nothing before it could.
+#
+# **In all three the RECORD in the tree was right and the ROW was stale**, which is
+# the opposite direction from the rot this list was built for. A record is prose beside
+# the code it describes and a reviewer reads it when the code moves; a row lives in a
+# registry nobody opens, and `mise run anchors` only checks that its `literal` still
+# resolves - never that its `replacement` still compiles. Both anchors kept resolving
+# the whole time.
+#
 # id -> (replacement, watched substring, test filter, extra runner arguments)
 REDNESS = {
     "L3": ("        self.frame_bytes = bytes;",
@@ -1821,7 +1858,15 @@ REDNESS = {
     "L5": ("            inner.spent = inner.spent.saturating_sub(0);",
            "after n=9: spent",
            "the_counters_agree_with_the_maps_on_every_path", ["-p", "keylink", "--lib"]),
-    "A1": ("    let Some(budget) = idem.attach_budget(crate::MAX_ATTACH) else {",
+    # A1's replacement was written against the line the anchor USED to name and never
+    # followed it. `rpc.rs`'s own record says so in its last paragraph - the cap was
+    # read and clamped on one line, and the read became its own `match` arm - and the
+    # ANCHORS literal followed the move while this replacement did not. Pasted over a
+    # match arm, `let Some(budget) = … else {` gave `error: this file contains an
+    # unclosed delimiter` at `rpc.rs:2196`, so the break never reached a test.
+    # Re-watched 2026-08-09 with the replacement the record names: exit 101,
+    # `── selected=1`, `left: 30s`, `right: 1s`.
+    "A1": ("        Attaching::UpTo(_) => crate::MAX_ATTACH,",
            "the ceiling must be this service's Limits::attach",
            "an_attach_ceiling_below_the_peers_request_governs", ["-p", "keylink", "--lib"]),
     "A2": ("            .map(|_| cap)",
@@ -1831,11 +1876,19 @@ REDNESS = {
     "A2b": ("            .map(|millis| Duration::from_millis(millis))",
             "left: Some(3600s)",
             "a_budget_is_capped_at_the_cap_it_is_given", ["-p", "keylink", "--lib"]),
-    "A3": ("            attach: Duration::from_secs(1),",
+    # A3 and A4 share one substitution, and it stopped compiling when `attach` stopped
+    # being a `Duration`. `Attaching` gave [`Forbidden`] a value of its own, the field
+    # became `Attaching`, and both records in the tree followed - `rpc.rs` and
+    # `idempotency.rs` each name `attach: Attaching::UpTo(Duration::from_secs(1)),` -
+    # while these two rows kept the bare `Duration`. Pasted in, it gave
+    # `error[E0308]: expected `Attaching`, found `Duration``, so neither break reached
+    # a test. Re-watched 2026-08-09, both at exit 101 and `── selected=1`: A3 prints
+    # `left: 1s`, `right: 30s`, and A4 prints `left: UpTo(1s)`, `right: UpTo(30s)`.
+    "A3": ("            attach: Attaching::UpTo(Duration::from_secs(1)),",
            "a request over the ceiling must be held for the ceiling",
            "a_peer_over_the_attach_ceiling_is_held_for_the_default",
            ["-p", "keylink", "--lib"]),
-    "A4": ("            attach: Duration::from_secs(1),",
+    "A4": ("            attach: Attaching::UpTo(Duration::from_secs(1)),",
            "the default ceiling must be the constant the README prints",
            "the_default_attach_ceiling_is_max_attach", ["-p", "keylink", "--lib"]),
     "A5": ("        while inner.held > 0",
@@ -2599,6 +2652,44 @@ for record, lives_in, target, literal in ANCHORS:
 #
 # What it cannot do is notice a record re-quoted and registered NOWHERE. Nothing in
 # this file can - registration is opt-in per record, which the header states.
+# ── a row id must name EXACTLY ONE row ────────────────────────────────────────
+#
+# **The same defect as the one this file's break records exist to catch, one layer
+# up: a check for AT LEAST ONE where EXACTLY ONE is meant.** `mise run
+# replay-anchors` resolves a `REDNESS` id to a row with
+# `{record: (target, literal) for record, _, target, literal in ANCHORS}`. A dict
+# comprehension keeps the LAST duplicate, so a repeated id silently drops a row and
+# the survivor may name a different file in a different crate. The orphan check
+# below asserts an id resolves to at least one row and cannot see this at all.
+#
+# Measured on this list before the fix: 113 rows, **111** distinct ids, `L1` and
+# `L2` twice each - the ledger-limits wave's pair under `keylink/tests/
+# idempotency.rs` and the keyed-compose wave's pair under
+# `keylink/src/actor/registry.rs`. The lookup resolved BOTH ids to the compose
+# rows. Nothing replayed the wrong file, and only because no `REDNESS` entry named
+# either id; the second one to do so would have cut a live literal out of the wrong
+# crate and scored whatever came back. The duplicates are renamed `K8`/`K9`, and
+# this is what stops the state returning.
+#
+# A set or a dict cannot express this check - both collapse the duplicate they are
+# asked about - so it counts over the LIST, which is the only place both rows still
+# exist.
+appearances: dict[str, int] = {}
+for record, _, _, _ in ANCHORS:
+    appearances[record] = appearances.get(record, 0) + 1
+for record, count in sorted(item for item in appearances.items() if item[1] > 1):
+    bad += 1
+    print(f"FAIL {record}: {count} ANCHORS rows share this id", file=sys.stderr)
+    print("       A row id is the name `mise run replay-anchors` resolves a replay",
+          file=sys.stderr)
+    print("       by, and it resolves it through a dict - so the LAST of these rows",
+          file=sys.stderr)
+    print("       wins and the others are unreachable. If they are different breaks,",
+          file=sys.stderr)
+    print("       give each its own id. If they are one break, delete the copies.",
+          file=sys.stderr)
+    print(file=sys.stderr)
+
 row_ids = {record for record, _, _, _ in ANCHORS}
 for record in sorted(row_ids & {record for record, _, _, _ in DESCRIBED}):
     bad += 1
@@ -3075,7 +3166,24 @@ for record in sorted(set(REDNESS) - row_ids):
 # 154 entry above gets: agreement is not evidence. One record, one block, and no
 # second record hiding inside a doc block that already named the harness — which is
 # exactly how the 169 run found its fourth.
-RECORD_BLOCKS = 171
+# 171 → 173, on `harness-exactly-one`. TWO blocks, and NEITHER is a break record —
+# both are `scripts/replay-fate-breaks.sh` explaining its own guard. Its one
+# harness-naming block became three when the exactly-one check was rewritten to read
+# `break-once.sh`'s `── selected=` line: the `rg` line that echoes the harness's
+# output now sits BETWEEN two comment runs that each name the harness, and a run
+# stops at the first line that is not a comment.
+#
+# **So the tripwire moved for a reason it cannot distinguish from a new record, and
+# that is the tripwire working rather than a flaw.** It counts blocks that name the
+# harness; it does not claim they are records. The decision it forces was made and
+# the answer was no row: neither block quotes a search literal, and neither
+# describes a break.
+#
+# Read off the failing run — `FAIL population: 173 comment blocks mention
+# break-once.sh, but RECORD_BLOCKS says 171` — and NOT computed as 171 + 2. The
+# arithmetic happens to agree here, and the entries above say why that is worth
+# nothing: an agreeing subtraction reads as a derivation and is a coincidence.
+RECORD_BLOCKS = 173
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

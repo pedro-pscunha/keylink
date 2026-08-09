@@ -177,7 +177,43 @@ fi
 # `<<<` hands grep a seekable temp file, which has no writer to kill and no
 # pipeline for `pipefail` to judge. Byte-for-byte the same input: `<<<` appends
 # exactly one LF, which is what `printf '%s\n'` did.
-if ! grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$' <<<"$linted"; then
+# ── AND THE PATTERN COVERS WHAT THE GATE READS, NOT ONLY WHAT IT COMPILES ─────
+#
+# It was Rust and Cargo alone, and that left the gate blind to the commits that
+# change the gate. `mise run pre-commit` runs `framing`, `anchors`,
+# `anchors-selftest`, `fmt-check` and `lint-fast`. Two of those read files that are
+# not Rust: `anchors` walks `scripts/*.sh` and `.githooks/*` for its record
+# population and pins the count in `RECORD_BLOCKS`, and `anchors-selftest` lifts
+# functions out of `.mise/tasks/anchors` by name.
+#
+# **So the commit that adds an `ANCHORS` row, moves `RECORD_BLOCKS`, or edits the
+# tripwire itself was the one commit that ran no check at all** — it stages
+# `.mise/tasks/anchors` and nothing else, matches nothing above, and takes the
+# `exit 0`. Measured 2026-08-09 on this repository: a commit staging four files
+# under `.mise/tasks/` and `scripts/` printed only the chained gitleaks scan and
+# landed ungated. The gate that pins those numbers was the gate that could not see
+# them.
+#
+# **`^\.mise/tasks/` whole, rather than the two or three task files that are gate
+# steps today.** Every file in that directory IS a gate task; an edit to any of
+# them is an edit to the checking machinery. An alternation of the current step
+# names is a list hiding inside a rule, and it goes stale the first time a task is
+# added or promoted into `pre-commit` — silently, in the direction that skips.
+#
+# **WHAT IS DELIBERATELY STILL OUT.** Docs, `README`, `AGENTS.md`, RFCs and
+# `mise.toml` pay nothing, because no `pre-commit` step reads them. A prose-only
+# commit is exactly the commit this early exit was written for, and it keeps it.
+# `mise.toml` is the closest call: it defines the lists, but the step that checks
+# it is `task-lists`, which `mise.toml` itself puts in `gate` alone.
+#
+# THE COST, MEASURED WARM, because an early exit is only worth keeping if the
+# thing it skips is expensive. `mise run pre-commit` on this machine 2026-08-09,
+# three consecutive runs: **1.15 s, 1.14 s, 1.15 s**. Per step, each paying its own
+# mise startup: `framing` 0.10, `anchors` 0.12, `anchors-selftest` 0.60,
+# `fmt-check` 0.25, `lint-fast` 0.26. So a registry-only commit goes from 0 s to
+# about **1.2 s**. The one step that can cost more is `lint-fast`, and only when
+# the Rust build is cold — which a registry-only commit does not make it.
+if ! grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$|^\.mise/tasks/|^scripts/.*\.sh$|^\.githooks/' <<<"$linted"; then
     exit 0
 fi
 

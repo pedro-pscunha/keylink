@@ -105,15 +105,23 @@
 #    this record searches, carried inline as a backticked span — and it is the same
 #    line record 2 cites with an elision, which is why that record has no row of its
 #    own and points here:
-#    `if ! grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$' <<<"$linted"; then`
+#    `if ! grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$|^\.mise/tasks/|^scripts/.*\.sh$|^\.githooks/' <<<"$linted"; then`
+#
+#    **The pattern inside that `grep` widened once, and the break did not change.**
+#    It was Rust and Cargo alone until the filter grew the paths the gate READS —
+#    `.mise/tasks/`, `scripts/*.sh` and `.githooks/`. What this scenario replaces is
+#    the here-string, never the pattern, so re-quoting is the whole edit. Re-watched
+#    2026-08-09 against the widened line, and the row below is what it printed —
+#    re-watched rather than assumed, because a record whose anchor moved has had its
+#    output taken on trust exactly once too often in this tree.
 #
 #    In `.githooks/pre-commit`, replace that line
 #
-#        if ! grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$' <<<"$linted"; then
+#        if ! grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$|^\.mise/tasks/|^scripts/.*\.sh$|^\.githooks/' <<<"$linted"; then
 #
 #    with
 #
-#        if ! printf '%s\n' "$linted" | grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$'; then
+#        if ! printf '%s\n' "$linted" | grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$|rustfmt\.toml$|^\.mise/tasks/|^scripts/.*\.sh$|^\.githooks/'; then
 #
 #    Watched — one row, and it is a row no other scenario in this file can reach:
 #

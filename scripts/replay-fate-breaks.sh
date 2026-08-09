@@ -52,10 +52,17 @@ run() {
     echo "════ $label"
     local out
     out="$(./scripts/break-once.sh "$@" 2>&1)" || true
-    echo "$out" | rg "ABORT|expected exactly one|exit=" || true
-    # THE FILTER MUST SELECT SOMETHING, and this is checked BEFORE the recorded
-    # sentence, because a filter that matches nothing fails the check below for a
-    # reason that has nothing to do with the tree.
+    # EVERY LINE `break-once.sh` PRINTS FOR ITSELF, and none of the runner's. That
+    # is the rule now, and it replaces a list of three patterns that had to be
+    # extended by hand each time the harness grew a line — the count below was
+    # invisible here for exactly that reason on its first draft. The harness tags
+    # its own lines `── `; the runner's output carries no such prefix. `ABORT` and
+    # `expected exactly one` stay because the abort is printed on stderr WITHOUT
+    # that prefix.
+    echo "$out" | rg "ABORT|expected exactly one|^── " || true
+    # THE FILTER MUST SELECT EXACTLY ONE TEST, and this is checked BEFORE the
+    # recorded sentence, because a filter that selects the wrong number fails the
+    # check below for a reason that has nothing to do with the tree.
     #
     # `cargo test` with a filter naming no test prints `0 passed` and exits **0**.
     # That reached the arm below as "the break was not reproduced" — the same report
@@ -63,43 +70,43 @@ run() {
     # one is useless for the other. Break 16 sat in that state: it named a test that
     # existed nowhere, so it could never redden and was never able to say so.
     #
-    # The `passed; failed` pair is the discriminator, and it is read as a NUMBER
-    # rather than matched against `0 passed; 0 failed`. A caught break is
-    # `0 passed; 1 failed`; a break that went green is `1 passed; 0 failed`. Their
-    # SUM is how many tests the filter selected, and only one value of it is right.
-    #
     # **Zero was the first failure this caught and TWO OR MORE is the mirror of it,
     # which the equality-to-zero form could not see.** `cargo test` matches a filter
     # as a SUBSTRING, so a test whose name is a strict PREFIX of a sibling's selects
     # both — `a_remote_caller_can_tell_restarting_from_gone` against
     # `..._on_a_keyed_actor`, which is the shape a break record's own anchors hit one
     # level down. Two tests under one break means a run where only the OTHER one
-    # reddens prints `1 passed; 1 failed`, so a zero-check never fires and the
-    # `expected` substring below can be satisfied by output from a test this stanza
-    # does not name. A break that reddened the wrong test, reported as success.
+    # reddens exits non-zero, so a zero-check never fires and the `expected`
+    # substring below can be satisfied by output from a test this stanza does not
+    # name. A break that reddened the wrong test, reported as success.
     #
-    # Every stanza names exactly one target — `--lib` or one `--test` — so there is
-    # one totals line to read. NO totals line means the run never reached the test
-    # binary at all: the harness aborted on its occurrence count, or the tree did not
-    # compile. That is left to the `expected` check below, which already reports it,
-    # rather than given a third failure class that would say the same thing twice.
-    local totals selected
-    totals="$(echo "$out" | rg -o '[0-9]+ passed; [0-9]+ failed' | head -1)"
-    selected="$([ -n "$totals" ] && echo "$totals" | awk '{print $1 + $3}' || echo "")"
+    # **THE COUNT ITSELF MOVED INTO `break-once.sh`, and that is a correctness fix
+    # rather than tidying.** It used to be a `[0-9]+ passed; [0-9]+ failed` regex
+    # here. That is libtest's wording; `cargo nextest run` prints
+    # `Summary [ 0.109s] 2 tests run: …`, so under the runner the gate itself uses,
+    # and which `break-once.sh`'s header calls required, the regex matched nothing,
+    # BOTH arms below fell through, and a stanza passed on the sentence alone —
+    # precisely the state the count was added to end. The harness now counts under
+    # either runner, prints one `── selected=` line, and prints the remedy, so the
+    # `replay-anchors` task and every hand-run are covered by the same reading.
+    #
+    # `?` means the harness found NO totals line: an abort, or a tree that did not
+    # compile. That is not zero and it is not two. It is left to the `expected`
+    # check below, which already reports it, rather than given a third failure class
+    # that would say the same thing twice.
+    local selected
+    selected="$(echo "$out" | rg -o '^── selected=(\S+)' -r '$1' | head -1)"
     if [ "$selected" = 0 ]; then
         echo "  ✗ BROKEN STANZA: the filter selected NO test, so this break cannot"
-        echo "    redden and never could. This is not a tree change — fix the stanza."
-        echo "    The test name here does not exist, or the target cannot reach it"
-        echo "    (a \`#[cfg(test)]\` test inside \`src\` needs --lib, never --test)."
+        echo "    redden and never could. This is not a tree change — fix the stanza,"
+        echo "    with the remedy the harness printed above."
         failed=$((failed + 1))
         return
     fi
-    if [ -n "$selected" ] && [ "$selected" -gt 1 ]; then
+    if [ -n "$selected" ] && [ "$selected" != "?" ] && [ "$selected" -gt 1 ]; then
         echo "  ✗ BROKEN STANZA: the filter selected $selected tests, and a break"
         echo "    that reddens any of them satisfies this stanza. Fix the stanza, not"
-        echo "    the tree: this filter is a substring of more than one test name."
-        echo "    Append \`-- --exact\` to the stanza's cargo args — break-once.sh puts"
-        echo "    the filter last, so it lands as libtest's positional and is exact."
+        echo "    the tree, with the remedy the harness printed above."
         failed=$((failed + 1))
         return
     fi
