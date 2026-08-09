@@ -316,10 +316,19 @@ REDNESS = registry("REDNESS")
 # different FILE in a different crate than the row a reader finds first. This task
 # would then cut a live literal out of the wrong crate and score whatever came back.
 #
-# `mise run anchors` refuses the same state in `pre-commit`, so the committed
-# registry cannot reach here holding one. This is not that check repeated for
-# safety: `REPLAY_REGISTRY` points this task at an UNCOMMITTED file, which no hook
-# has seen, and that is the path a drifted registry actually arrives by.
+# `mise run anchors` refuses the same state, and it sits in BOTH the `pre-commit`
+# and the `gate` list. This is not that check repeated for safety, for two separate
+# reasons - one of them measured while writing this.
+#
+#   * `REPLAY_REGISTRY` points this task at an UNCOMMITTED file, which no hook has
+#     seen. That is the path a drifted registry actually arrives by.
+#   * **`pre-commit` does not fire on a commit that touches no Rust**, and a commit
+#     that adds an `ANCHORS` row is exactly that commit. Read off `.githooks/
+#     pre-commit`: it exits 0 before reaching `mise run pre-commit` unless a staged
+#     path ends `.rs`, `Cargo.toml`, `Cargo.lock` or `rustfmt.toml`. So a duplicate
+#     id can be COMMITTED ungated. `pre-push` runs `gate` with no such filter, so it
+#     cannot be PUSHED - the window is between a commit and a push, and this task is
+#     hand-run inside exactly that window.
 rows: dict[str, tuple[str, str]] = {}
 for record, _, target, literal in ANCHORS:
     if record in rows:
