@@ -433,11 +433,13 @@ pub enum GroupEnded {
     /// The members are still running. This is the group's answer to whoever was
     /// awaiting one, not a statement about the actors.
     ///
-    /// **It is also what a lost [`Group::stop`] looks like.** A stop the
-    /// conductor never observed dies with the state it was written into, so a
-    /// caller that stopped and dropped in the same breath is answered here and
-    /// not at [`Stopped`](Self::Stopped) — with nothing retired. [`Group::stop`]
-    /// carries the whole of it and says what to do instead.
+    /// **A [`Group::stop`] is not answered here, and used to be.** A caller that
+    /// stopped and dropped in the same breath was answered `Dropped` with
+    /// nothing retired, because the flag `stop` raised died with the list the
+    /// conductor needed in order to act on it. It is answered
+    /// [`Stopped`](Self::Stopped) now, teardown and all. So this variant means
+    /// what it says and only that: nobody stopped this group, and nobody is
+    /// holding it any more.
     Dropped,
 }
 
@@ -714,28 +716,48 @@ struct State {
     phase: Phase,
 }
 
-/// What a [`Group`] and its conductor share.
+/// What a [`Group`] and its conductor share — and, by dying, what tells the
+/// conductor the last [`Group`] is gone.
+///
+/// **This allocation is a liveness token and nothing else, which is the whole of
+/// why `state` is an [`Arc`] rather than the `Mutex` it used to be.** The
+/// conductor watches this through a [`Weak`] and holds `state` *strongly*, so
+/// the membership list outlives the last `Group`. One allocation serving both
+/// roles is what made `stop(); drop(group);` retire nothing: the flag `stop`
+/// raised died with the list the conductor needed in order to act on it, and the
+/// conductor could not read one without keeping the other alive for ever.
 struct Shared {
-    state: Mutex<State>,
+    /// Held strongly by the conductor as well. A dropped `Group` therefore ends
+    /// the *watching* and not the list.
+    state: Arc<Mutex<State>>,
     /// Fired by every mutation of the list, and by this struct's own `Drop`.
     ///
     /// An [`Arc`] the conductor holds a second handle on, rather than a field it
     /// reaches through the [`Weak`]: the conductor *waits* on this, and one that
-    /// had to upgrade in order to wait would keep alive the very state whose
+    /// had to upgrade in order to wait would keep alive the very token whose
     /// drop it is waiting for.
     wake: Arc<Notify>,
     /// The conductor's answer, as a receiver. The conductor holds the sender, so
-    /// it can still answer after this state is gone.
+    /// it can still answer after this token is gone.
     settled: watch::Receiver<Option<GroupEnded>>,
 }
 
+/// Poison recovery rather than propagation, for `names.rs`'s reason: one bad
+/// decision should cost one decision. Nothing here can panic while the lock is
+/// held — the policy runs on the conductor's task with no lock in hand — so that
+/// arm is unreachable in practice and must still be typed.
+///
+/// A free function and not only a method, because the conductor reaches the
+/// state directly now and has no [`Shared`] to call a method on. `keyed.rs`
+/// spells its own the same way and under the same name.
+fn recovering(state: &Mutex<State>) -> MutexGuard<'_, State> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl Shared {
-    /// Poison recovery rather than propagation, for `names.rs`'s reason: one bad
-    /// decision should cost one decision. Nothing here can panic while the lock
-    /// is held — the policy runs on the conductor's task with no lock in hand —
-    /// so this arm is unreachable in practice and must still be typed.
+    /// The [`Group`]-side door to [`recovering`].
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        recovering(&self.state)
     }
 }
 
@@ -781,20 +803,29 @@ impl Group {
     pub fn new(policy: impl FnMut(&ActorId, &Ended) -> Verdict + Send + 'static) -> Self {
         let wake = Arc::new(Notify::new());
         let (report, settled) = watch::channel(None);
+        let state = Arc::new(Mutex::new(State {
+            members: Vec::new(),
+            staged: Vec::new(),
+            next: 0,
+            phase: Phase::Watching,
+        }));
         let shared = Arc::new(Shared {
-            state: Mutex::new(State {
-                members: Vec::new(),
-                staged: Vec::new(),
-                next: 0,
-                phase: Phase::Watching,
-            }),
+            state: Arc::clone(&state),
             wake: Arc::clone(&wake),
             settled,
         });
-        // Weak, so a group nobody holds any more is dropped even with members
-        // still running. `Shared`'s own `Drop` is what wakes the task to find
-        // out.
-        n0_future::task::spawn(conduct(Arc::downgrade(&shared), wake, report, policy));
+        // Two handles, two roles, and that is the point. The `Weak` is liveness:
+        // a group nobody holds any more is dropped even with members still
+        // running, and `Shared`'s own `Drop` is what wakes the task to find out.
+        // `state` is strong, so the list the conductor needs in order to honour a
+        // `stop` survives that drop.
+        n0_future::task::spawn(conduct(
+            Arc::downgrade(&shared),
+            state,
+            wake,
+            report,
+            policy,
+        ));
         Self { shared }
     }
 
@@ -949,27 +980,18 @@ impl Group {
     /// this is not `async`: a synchronous request cannot be cancelled halfway
     /// through a teardown by a caller who dropped the future.
     ///
-    /// # THE THING TO KNOW — a `stop` the conductor has not observed is lost
+    /// **It survives the last [`Group`] being dropped in the same breath.**
+    /// `group.stop(); drop(group);` with no await between them retires every
+    /// member and ends [`GroupEnded::Stopped`]. Take
+    /// [`ended`](Self::ended) *before* the drop if you want to await the answer,
+    /// because a `Group` is what hands one out — but the teardown happens
+    /// whether anybody is waiting for it or not.
     ///
-    /// **Hold the group until [`ended`](Self::ended) resolves.** This raises a
-    /// flag inside the shared state and returns. The conductor reads that flag
-    /// only after upgrading its [`Weak`], and dropping the last [`Group`]
-    /// destroys the state and the flag together — so `group.stop();
-    /// drop(group);` with no await between them ends the group
-    /// [`GroupEnded::Dropped`] having retired nothing. On a current-thread
-    /// runtime that is the ordinary case rather than a race: nothing has
-    /// scheduled the conductor yet.
-    ///
-    /// **Stated rather than fixed, and the alternative is worse.** Moving the
-    /// flag into state the conductor holds strongly does not help, because the
-    /// membership list dies with the same drop — and holding *that* strongly
-    /// would keep the group alive for ever and stop [`GroupEnded::Dropped`]
-    /// firing at all, which is the answer a caller awaiting a dropped group
-    /// depends on. Draining the members inside this method instead is a real
-    /// fix and costs the "returns at once" promise above.
-    /// `tests/compose.rs`'s
-    /// `a_stop_the_conductor_has_not_seen_is_lost_when_the_last_group_drops`
-    /// reproduces it, with the one-await control beside it.
+    /// That is a property of the shape rather than of care taken here: the
+    /// membership list lives in an [`Arc`] the group's task holds too, and only
+    /// the *liveness token* dies with the last `Group`. So the conductor can
+    /// still ask "was this group stopped" after every holder is gone, and it
+    /// asks that before it concludes anything about being dropped.
     ///
     /// Idempotent, and takes no deadline: `n0_future::time::timeout` composes
     /// around [`ended`](Self::ended), and a parameter here would duplicate it.
@@ -1040,6 +1062,7 @@ impl fmt::Debug for Group {
 /// [`Notified`]: tokio::sync::futures::Notified
 async fn conduct(
     shared: Weak<Shared>,
+    state: Arc<Mutex<State>>,
     wake: Arc<Notify>,
     settled: watch::Sender<Option<GroupEnded>>,
     mut policy: impl FnMut(&ActorId, &Ended) -> Verdict + Send + 'static,
@@ -1047,33 +1070,43 @@ async fn conduct(
     let mut endings: FuturesUnordered<Stamped> = FuturesUnordered::new();
 
     let how = loop {
-        // The upgrade lives exactly as long as this block. A conductor holding
-        // an `Arc` across the wait below would keep alive the state whose drop
-        // it is watching for, and `Dropped` would never be reached.
-        let teardown = {
-            let Some(shared) = shared.upgrade() else {
-                break GroupEnded::Dropped;
-            };
-            let stop_requested = {
-                let mut held = shared.lock();
-                // Drained to EMPTY, always, and before anything below is
-                // awaited. This is the whole of the wake discipline above: a
-                // `Notify` coalesces, so one permit can stand for N `add`s, and
-                // a drain that took fewer than all of them would lose members
-                // with nothing to report it.
-                for staged in held.staged.drain(..) {
-                    endings.push(staged);
-                }
-                held.phase == Phase::Stopping
-            };
-            stop_requested.then(|| closing(&shared))
+        let stopping = {
+            let mut held = recovering(&state);
+            // Drained to EMPTY, always, and before anything below is awaited.
+            // This is the whole of the wake discipline above: a `Notify`
+            // coalesces, so one permit can stand for N `add`s, and a drain that
+            // took fewer than all of them would lose members with nothing to
+            // report it.
+            for staged in held.staged.drain(..) {
+                endings.push(staged);
+            }
+            held.phase == Phase::Stopping
         };
-        if let Some(members) = teardown {
+        // **The phase is read BEFORE liveness, and that order is the fix.** The
+        // reverse order is what lost a `stop`: `stop(); drop(group);` with no
+        // await between them destroyed the token first, the conductor answered
+        // `Dropped` on the failed upgrade, and the flag it would have read was
+        // in the state that went with it. The state outlives the token now, so
+        // the question "was this group stopped" is answerable after the last
+        // `Group` is gone — and it is asked first.
+        if stopping {
             // The one ending that carries the count. The three below name a
             // member and a reason instead, and `GroupEnded::Stopped` says why
             // the number rides on this one alone.
-            let retire_panics = retire_all(members).await;
+            let retire_panics = retire_all(closing(&state)).await;
             break GroupEnded::Stopped { retire_panics };
+        }
+        // Nobody holds a `Group`, and nobody asked for a teardown. `Dropped`
+        // still means what it always meant, because the token still dies with
+        // the last `Group` — what changed is that a stopped group no longer
+        // reaches here.
+        //
+        // `strong_count` and not `upgrade`, which the old shape needed in order
+        // to reach the state through it. There is no `Arc` to accidentally carry
+        // across the wait below now, so the hazard the old comment warned about
+        // has no way to be written.
+        if shared.strong_count() == 0 {
+            break GroupEnded::Dropped;
         }
 
         let mut waiting = std::pin::pin!(wake.notified());
@@ -1101,11 +1134,20 @@ async fn conduct(
             continue;
         };
 
-        let Some(shared) = shared.upgrade() else {
-            break GroupEnded::Dropped;
-        };
+        // The last `Group` went away while this was polling. Back to the top
+        // rather than deciding here, because the top is the one place that reads
+        // the phase before it concludes anything — a `stop` filed before that
+        // drop is still owed its teardown, and answering `Dropped` here would be
+        // the bug this commit removes, one screen further down.
+        //
+        // The loop cannot spin on this: the top breaks on `Stopped` or on
+        // `Dropped` and never returns here. The ending in hand is discarded,
+        // which is what a group with no holder did with it before.
+        if shared.strong_count() == 0 {
+            continue;
+        }
         let taken = {
-            let mut held = shared.lock();
+            let mut held = recovering(&state);
             let filed = held
                 .members
                 .iter()
@@ -1145,7 +1187,7 @@ async fn conduct(
         let reason = match reported.reason {
             Ok(reason) => reason,
             Err(message) => {
-                let mut leaving = closing(&shared);
+                let mut leaving = closing(&state);
                 // Its own means of ending, beside every sibling's. Appended
                 // rather than placed, because `retire_all` builds every future
                 // before polling any: the order is a statement about the order
@@ -1173,14 +1215,14 @@ async fn conduct(
         match catch_unwind(AssertUnwindSafe(|| policy(&reported.stamp.name, &reason))) {
             Ok(Verdict::Forget) => {}
             Ok(Verdict::StopAll) => {
-                let _ = retire_all(closing(&shared)).await;
+                let _ = retire_all(closing(&state)).await;
                 break GroupEnded::Member {
                     member: reported.stamp.name,
                     reason,
                 };
             }
             Err(payload) => {
-                let _ = retire_all(closing(&shared)).await;
+                let _ = retire_all(closing(&state)).await;
                 break GroupEnded::PolicyPanicked {
                     member: reported.stamp.name,
                     message: message_of(&*payload),
@@ -1202,8 +1244,8 @@ async fn conduct(
 /// statement about several actors. Its observable effect is small and saying so
 /// is not a hedge — [`retire_all`] starts every member concurrently, so the
 /// order is a statement about the order retirement is *issued* in.
-fn closing(shared: &Shared) -> Vec<Retire> {
-    let mut held = shared.lock();
+fn closing(state: &Mutex<State>) -> Vec<Retire> {
+    let mut held = recovering(state);
     // The two effects the rest of the module leans on, done under one lock so
     // that no `add` can interleave between them. `Closed` is what makes a later
     // `add` hand its `Retire` straight back instead of filing a member nothing
