@@ -186,6 +186,73 @@ else:
         f"expected `FAIL {rid}` in the output",
     )
 
+# ── probe 2b: a MISSING target is a diagnostic, and does not eat the rows after it ─
+#
+# Probe 2 above picks a decoy that EXISTS, and says why in as many words: a missing
+# file "is a missing-file error on a different code path". **That path had no
+# guard and no probe.** `read_text()` raised `FileNotFoundError`, nothing here
+# catches anything, and the resolution loop runs before every other check in the
+# task - so one absent file cost EVERY row's result rather than its own. Measured
+# before the guard existed, by moving `keylink/src/local.rs` aside and running the
+# task: a traceback, exit 1, and not one check printed.
+#
+# **A rename is the ordinary way a target goes missing**, and the person doing one
+# needs exactly the list of rows to repoint - which is the list the traceback
+# withheld. It also lands at the worst moment, because this task runs in
+# `pre-commit`: the rename commit cannot be created, and the diagnostic that would
+# unblock it is the thing suppressed.
+#
+# **Two rows are perturbed, and that is the whole probe.** Asserting only that a
+# missing target prints something would pass on a task that still died right after
+# printing it. The second row is given a decoy that EXISTS, so it fails the ordinary
+# count-0 way - and it sits LATER in the list than the missing one. Seeing both
+# named in one run is what says the first fault no longer suppresses the second.
+#
+# **The first check below is satisfied by the DEFECT and carries no weight on its
+# own** - measured, by disabling the guard and re-running: `a missing target fails
+# the gate` stayed green while the other three went red. It asserts `code == 1`, and
+# a traceback exits 1 too, so it cannot tell the diagnostic from the crash it
+# replaced. It is kept because a guard that reports and then exits 0 is a different
+# regression and nothing else here would catch it. **The three below it are the ones
+# that discriminate**, and the ratio is worth stating: three of four checks in this
+# probe fail when the guard goes, and the fourth is green either way.
+rows = re.findall(r'^    \("([^"]+)", "([^"]+)", "([^"]+)",', source, re.M)
+if len(rows) < 2:
+    check("two ANCHORS rows are findable", False, f"found {len(rows)}")
+else:
+    (gid, glives, gtarget), (rid2, rlives, rtarget) = rows[0], rows[1]
+    ghost = "keylink/src/this-file-does-not-exist.rs"
+    decoy2 = "Cargo.toml" if rtarget != "Cargo.toml" else "README.md"
+    two = source.replace(
+        f'("{gid}", "{glives}", "{gtarget}",',
+        f'("{gid}", "{glives}", "{ghost}",',
+        1,
+    ).replace(
+        f'("{rid2}", "{rlives}", "{rtarget}",',
+        f'("{rid2}", "{rlives}", "{decoy2}",',
+        1,
+    )
+    code, out = run(two)
+    check("a missing target fails the gate", code == 1, f"exit {code}, expected 1")
+    check(
+        "a missing target does not raise",
+        "Traceback" not in out and "FileNotFoundError" not in out,
+        "the task died with a traceback instead of reporting - one absent file "
+        "suppresses every check in the task when this regresses",
+    )
+    check(
+        "a missing target names the row and the path",
+        f"FAIL {gid}" in out and ghost in out,
+        f"expected `FAIL {gid}` and the missing path `{ghost}` in the output",
+    )
+    check(
+        "a missing target does not suppress the rows after it",
+        f"FAIL {rid2}" in out,
+        f"row {rid2} was ALSO made unresolvable and went unreported - the task "
+        f"stopped at {gid} rather than carrying on, which is the defect this "
+        "probe exists for",
+    )
+
 # ── probe 3: a row in ANCHORS and DESCRIBED at once ────────────────────────────
 #
 # The two lists say opposite things about one record, so an id in both is a defect

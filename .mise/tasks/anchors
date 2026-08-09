@@ -1923,6 +1923,35 @@ def spans(text: str) -> set[str]:
 
 cache: dict[str, str] = {}
 spancache: dict[str, set[str]] = {}
+absent: dict[str, bool] = {}
+
+
+def gone(path: str) -> bool:
+    """Whether a REGISTERED path does not exist. Cached - three loops ask.
+
+    **A missing registered file used to be a TRACEBACK rather than a diagnostic**,
+    and the shape of that failure is the reason this exists. `read_text()` raises
+    `FileNotFoundError`, the first loop below runs before every other check in this
+    file, and nothing here catches anything - so ONE missing file did not cost one
+    row's result, it cost EVERY row's. Measured before the guard was written, by
+    moving `keylink/src/local.rs` aside and running this task: a traceback, exit 1,
+    and not one check printed.
+
+    That is the wrong failure shape for a gate whose entire value is being specific.
+    **A rename is the ORDINARY reason a registered file vanishes** - the person doing
+    one needs the list of rows to repoint, which is precisely the list this task
+    holds and precisely what the traceback withheld. It also arrives at the worst
+    moment: this task runs in `pre-commit`, so the rename commit could not be created
+    and the diagnostic that would have unblocked it was the thing suppressed.
+
+    Existence, not readability. A file that exists and cannot be decoded still
+    raises, and deliberately: `script()` below documents that case and guards it by
+    reading BYTES. Widening this to a bare `except` would swallow that one too, and
+    an unreadable file is a different fault from an absent one.
+    """
+    if path not in absent:
+        absent[path] = not (ROOT / path).exists()
+    return absent[path]
 
 # TWO counters, and the split is the whole of a defect this task shipped with.
 #
@@ -1961,6 +1990,24 @@ bad = 0
 unresolved = 0
 
 for record, lives_in, target, literal in ANCHORS:
+    if gone(target):
+        bad += 1
+        unresolved += 1
+        print(f"FAIL {record}: the TARGET FILE is gone - `{target}` does not exist",
+              file=sys.stderr)
+        print("       likely cause:    it was RENAMED or deleted and this row still "
+              "names the old path", file=sys.stderr)
+        print(f"       record lives in: {lives_in}", file=sys.stderr)
+        print(f"       break edits:     {target}", file=sys.stderr)
+        print(f"       anchor:          {literal}", file=sys.stderr)
+        print("       Repoint the row and the record that quotes it. Every OTHER row "
+              "below", file=sys.stderr)
+        print("       still reports, which is the point of this arm: before it "
+              "existed, one", file=sys.stderr)
+        print("       missing file suppressed every check in this file rather than "
+              "one.", file=sys.stderr)
+        print(file=sys.stderr)
+        continue
     if target not in cache:
         cache[target] = (ROOT / target).read_text()
     found = cache[target].count(literal)
@@ -2048,6 +2095,8 @@ FRAGMENT_ANCHORS = {
 fragments = set()
 resolved = set()
 for record, lives_in, target, literal in ANCHORS:
+    if gone(target):
+        continue  # already reported above, with the repointing instructions
     if target not in cache:
         cache[target] = (ROOT / target).read_text()
     body = cache[target]
@@ -2313,6 +2362,23 @@ for probe_path, probe_text in PROBES:
     print(file=sys.stderr)
 
 for record, lives_in, target, literal in ANCHORS:
+    # The RECORD's file, not the target's - a different path and a different fault.
+    # A row can name a live target and a record file that has moved, so this arm
+    # cannot be folded into the one above.
+    if gone(lives_in):
+        bad += 1
+        print(f"FAIL {record}: the RECORD'S FILE is gone - `{lives_in}` does not exist",
+              file=sys.stderr)
+        print("       likely cause:    it was RENAMED or deleted and this row still "
+              "names the old path", file=sys.stderr)
+        print(f"       record lives in: {lives_in}", file=sys.stderr)
+        print(f"       break edits:     {target}", file=sys.stderr)
+        print("       The record is the source of truth for the anchor, so a row "
+              "whose record", file=sys.stderr)
+        print("       cannot be found is unreplayable even when its literal still "
+              "resolves.", file=sys.stderr)
+        print(file=sys.stderr)
+        continue
     if lives_in not in spancache:
         spancache[lives_in] = quoted_spans(lives_in)
     if flat(literal) in spancache[lives_in]:
