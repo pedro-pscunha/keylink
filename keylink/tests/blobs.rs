@@ -1189,10 +1189,87 @@ async fn a_blob_response_carries_the_reply_and_the_address_together() {
 /// a test that only fetched the granted id would pass.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/macros.rs`, replacing the
-/// generated `Granting::granted` arm's `__keylink_granted_id!` with `None` — a
-/// reply that carries an address and never declares it, which is the shape of
-/// the defect `Granting` exists to prevent. Watched: `the address a keyed actor
+/// generated `Granting::granted` arm's
+/// `$crate::__keylink_granted_id!([<$kind>], __value)` with
+/// `{ let _ = __value; ::core::option::Option::None }` — a reply that carries an
+/// address and never declares it, which is the shape of the defect `Granting`
+/// exists to prevent. Watched: `the address a keyed actor
 /// returned must be fetchable: BlobRefused { id: BlobId(78063835..) }`.
+///
+/// **That pair is RECONSTRUCTED from the recorded output and has not been replayed.**
+/// What is unverified is that THIS anchor and THIS replacement are what produced the
+/// sentence. `mise run replay-anchors` on R28 is what settles that, and nothing else can.
+///
+/// **The sentence's PROVENANCE is unestablished, and an earlier version of this record
+/// said it was "inherited from the original observation".** That attributed it to a
+/// watched run nobody can point to. The anchor this row carried when the sentence was
+/// written was the bare macro name, and the paragraph below proves that pair cannot
+/// compile — so whatever produced the sentence, it was not the recorded substitution. It
+/// may have been a real panic from a hand-made edit; that is plausible and it is not
+/// established.
+///
+/// **What IS established is that the recorded ADDRESS is the right one, which makes the
+/// sentence WELL-FORMED for this break.** `BlobId` prints hex, and BLAKE3 of this test's
+/// own published bytes — `the datasheet a keyed actor handed out` — is
+/// `78063835b32825bd..`, the recorded prefix exactly. So the refused address is the
+/// PUBLISHED blob's, not the unpublished control's `1bbf29b2..`, and refusing the
+/// published address is precisely what a `granted()` answering `None` causes.
+///
+/// **That arithmetic cannot show the line was ever PRINTED, and it would be flattering to
+/// read it that way.** This test is handed the published address on a GREEN run, so a
+/// sentence assembled from a green run's id plus hand-written error text carries the same
+/// prefix as one copied out of a red run. The hash separates the right address from the
+/// wrong address. It does not separate observed from assembled — so the register here is
+/// **well-founded**, and never "watched".
+///
+/// **The anchor here used to be the bare macro name, and the replacement used to
+/// be `None`. That pair cannot produce the output above.** The old anchor was
+/// `__keylink_granted_id!` alone, and `break-once.sh` replaces text, so it would
+/// have left the argument list behind — `$crate::None([<$kind>], __value)`, an
+/// unresolved path called with two arguments. The break would have failed to
+/// COMPILE, and this record would have read as a watched panic. The replacement is
+/// a block because the arm must yield `::core::option::Option<$crate::BlobId>`, and
+/// `let _ = __value;` keeps the pattern's binding used.
+///
+/// **That is MEASURED now rather than inferred, which makes the repair necessary
+/// rather than tidy.** A positive control compiled both pairs against an isolated
+/// archive of `25cbbac`, on 2026-08-08: the OLD pair FAILS to compile, the NEW pair
+/// COMPILES. Dated because it is a claim about one tree and one toolchain, and a
+/// re-measurer on a later tree is entitled to know which. The recorded error appears
+/// verbatim —
+/// `error[E0425]: cannot find function, tuple struct or tuple variant None in
+/// module $crate`.
+///
+/// **A replayer matching that text must expect MORE than that one error.** The same
+/// run also reported `cannot find value rpc / recv / send in this scope`, because
+/// this macro expands at several sites and one broken body errors at every one of
+/// them. Reading the paragraph above as promising a single diagnostic, then treating
+/// the extra ones as a different failure, is the mistake it invites.
+///
+/// **And a compile check still says nothing about redness.** It settles two things
+/// only: that the old pair could not have produced the recorded panic, and that the
+/// new pair gets far enough to run. Whether the new pair produces THIS sentence is
+/// still `mise run replay-anchors` and nothing else, exactly as the reconstruction
+/// paragraph above says.
+///
+/// **The narrow anchor is quoted above as HISTORY, and that is the whole reason it
+/// is there.** The paragraphs before it explain why the old pair could not produce
+/// the recorded output, and that explanation is about one specific substitution, so
+/// it has to name it. `__keylink_granted_id!` → `None` is the thing that fails to
+/// compile, and an account of it that will not quote it stops parsing. The quote is
+/// part of the argument rather than a device.
+///
+/// **It is NOT kept to satisfy `mise run anchors`, and saying so matters because the
+/// reason it once had has expired.** The registry is committed carrying the wide
+/// literal, so the wide span is what the record-quote check reads and the narrow one
+/// contributes nothing to it. For a while the pair existed so that the row and this
+/// record could be edited in either order, and that problem is spent. A reason that
+/// has lapsed is precisely what gets a quote deleted later, so it is retired here in
+/// writing instead of being left to be rediscovered as dead weight.
+///
+/// **Deleting the narrow quote has already been proposed and reversed twice.** It
+/// reads as a leftover to anyone who checks only whether the gate still needs it,
+/// and the gate does not. What needs it is the reader of the paragraph above.
 #[tokio::test]
 async fn a_keyed_actors_blob_method_grants_the_address_it_returns() {
     let server = local_node().await;

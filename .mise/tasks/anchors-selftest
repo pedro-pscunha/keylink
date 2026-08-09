@@ -325,34 +325,50 @@ check(
 #
 # `ast` lifts the functions out of the task and executes those alone, so this neither
 # runs the gate nor touches the tree.
-READER = ("flat", "comment_blocks", "spans")
-reader: dict = {"re": re}
+READER = ("flat", "comment_blocks", "spans", "markers_for")
+MARKER_SETS = ("MARKERS", "HASH_MARKERS", "HASH_SUFFIXES")
+reader: dict = {"re": re, "pathlib": pathlib}
 lifted = [
     node
     for node in ast.parse(source).body
     if (isinstance(node, ast.FunctionDef) and node.name in READER)
-    or (isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "MARKERS")
+    or (isinstance(node, ast.Assign)
+        and getattr(node.targets[0], "id", "") in MARKER_SETS)
 ]
 exec(compile(ast.Module(body=lifted, type_ignores=[]), str(TASK), "exec"), reader)
 check(
     "the task's comment reader is liftable by name",
-    {"MARKERS", "flat", "comment_blocks", "spans"} <= set(reader),
-    "expected `MARKERS`, `flat`, `comment_blocks` and `spans` at the task's top "
-    "level; the cases below read the reader by those names",
+    set(READER) | set(MARKER_SETS) <= set(reader),
+    f"expected {', '.join(READER + MARKER_SETS)} at the task's top level; the cases "
+    "below read the reader by those names",
 )
-markers = [
-    node
-    for node in ast.walk(ast.parse(source))
-    if isinstance(node, ast.Tuple)
-    and [getattr(e, "value", None) for e in node.elts] == ["///", "//!", "//"]
-]
-check(
-    "the comment marker is written down exactly once",
-    len(markers) == 1,
-    f"found {len(markers)} copies of the marker tuple. Two readers with two copies "
-    "is how the record-quote check and the population walk came to disagree, and "
-    "the disagreement was invisible because both were green",
-)
+
+# ── THE SINGLE-DEFINITION ASSERTION COVERS EVERY MARKER SET, NOT JUST THE RUST ONE
+#
+# It used to match one hard-coded triple, `["///", "//!", "//"]`. That was the whole
+# policy when the reader had one marker set — and once `HASH_MARKERS` existed, a SECOND
+# `("#",)` literal anywhere in the task would have passed this check in silence, which is
+# the exact hazard the failure message below names. The predicate is now derived from the
+# sets the task itself defines, so adding a third one extends this check for free instead
+# of leaving it behind.
+if set(MARKER_SETS) <= set(reader):
+    wanted = {name: list(reader[name]) for name in MARKER_SETS}
+    copies = {name: 0 for name in MARKER_SETS}
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Tuple):
+            continue
+        value = [getattr(e, "value", None) for e in node.elts]
+        for name, target in wanted.items():
+            if value == target:
+                copies[name] += 1
+    duplicated = {name: n for name, n in copies.items() if n != 1}
+    check(
+        "every marker set is written down exactly once",
+        not duplicated,
+        f"marker-set literal counts are {copies}, and each must be 1. Two readers with "
+        "two copies is how the record-quote check and the population walk came to "
+        "disagree, and the disagreement was invisible because both were green",
+    )
 if {"comment_blocks", "spans"} <= set(reader):
     WRAPPED = (
         "impl Ledger {\n"
@@ -388,6 +404,40 @@ if {"comment_blocks", "spans"} <= set(reader):
         f"{sorted(set().union(*(reader['spans'](b) for b in split_blocks)))}. Joining "
         "a whole file's comment lines lets an unclosed backtick pair with one in "
         "another function and invent a span no comment contains",
+    )
+
+# ── `markers_for` HAD NO SELF-TEST COVERAGE AT ALL, and it decides every read ───
+#
+# The reader cases above lift `comment_blocks` and `spans` and exercise them on synthetic
+# text. `markers_for` chooses WHICH markers those get, and it was neither lifted nor
+# called here — so the whole per-file policy rested on the task's own probes. Those probes
+# are real coverage and they run in the gate, but they check the two arms the task needs
+# TODAY; the table below pins the policy itself, including the arms no walked file uses.
+if "markers_for" in reader:
+    mf = reader["markers_for"]
+    RUST, HASH = tuple(reader["MARKERS"]), tuple(reader["HASH_MARKERS"])
+    CASES = (
+        # path,                     first bytes,            expected,  why
+        ("keylink/src/rpc.rs",      "//! docs",             RUST, "Rust by suffix"),
+        ("scripts/hook-guard.sh",   "#!/usr/bin/env bash",  HASH, "shell by suffix"),
+        ("tools/helper.py",         "import os",            HASH, "python by suffix, no shebang"),
+        (".githooks/pre-push",      "#!/usr/bin/env bash",  HASH, "suffix-less, by shebang"),
+        (".githooks/pre-push.sample", "#!/bin/sh",          HASH, "SUFFIXED script, by shebang"),
+        ("README.md",               "# A title",            RUST, "a `#` heading is NOT a shebang"),
+        ("keylink/src/lib.rs",      "#![allow(unused)]",     RUST, "an inner ATTRIBUTE is not a shebang"),
+    )
+    wrong = [
+        f"{path} -> {mf(path, text)} wanted {want} ({why})"
+        for path, text, want, why in CASES
+        if mf(path, text) != want
+    ]
+    check(
+        "markers_for places every kind this task can meet",
+        not wrong,
+        "markers_for disagreed on: " + "; ".join(wrong) + ". The `.rs` arms are the "
+        "dangerous ones: a Rust file read with `#` turns every attribute into a comment "
+        "line, and a shell file read with `///` yields an EMPTY haystack that this task "
+        "reports as a quote nobody wrote",
     )
 
 print()

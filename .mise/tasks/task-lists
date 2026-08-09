@@ -83,21 +83,49 @@ MISE description="Every copy of the pre-commit task list agrees with mise.toml"
 #
 # ── AND WHAT IT DOES NOT CHECK ────────────────────────────────────────────────
 #
-# `gate`, which is a different and longer list with its own copies in `README.md`.
-# Nothing here says a word about those. This closes the `pre-commit` list because
-# that is the list with three copies and a measured history of drifting.
+# `gate`, which is a different and longer list. Nothing here says a word about it.
+# This closes the `pre-commit` list because that is the list with three copies and a
+# measured history of drifting.
+#
+# This paragraph used to add "with its own copies in `README.md`", and that was an
+# overstatement. Measured 2026-08-08: README.md holds NO enumerated copy of the
+# `gate` list. Of the step names sampled, `framing`, `deny` and `msrv` appear in
+# scattered prose while `anchors`, `fmt-check`, `lint` and `package` appear zero
+# times — and a copy of a list would carry all of them. So there is nothing there for
+# this task to have been declining to check, and the sentence was inventing an
+# exposure rather than declaring one. `mise.toml` itself is the only other place that
+# names gate steps in prose, and that site is one ordinal, not a list.
 #
 # It also never RUNS the fallback. It compares text; whether the hook then behaves
 # is `mise run hook-guard`'s question.
 #
 # ── MADE RED, EVERY BREAK RUN AND WATCHED, EACH NAMING THE ROWS IT REDDENS ─────
 #
-# **None of these rows is registered in `.mise/tasks/anchors`, deliberately.** That
-# registry's record-quote check reads `///`, `//!` and `//` markers and has no `#`
-# arm, so it finds zero backticked spans in a shell file and would fail a row here
-# for not being quoted by a record that quotes it. Its population walk globs `*.rs`
-# only. `scripts/hook-guard.sh`'s header carries the measurement and the exposure
-# that follows from it.
+# **None of these rows is registered in `.mise/tasks/anchors`, deliberately - and the
+# reason written here was falsified by the commit that made registering possible.** It
+# said that registry's record-quote check reads `///`, `//!` and `//` with no `#` arm, so
+# it would find zero backticked spans in a shell file and fail a row here for not being
+# quoted by a record that quotes it; and that its population walk globs `*.rs` only.
+#
+# **Both halves are now false.** That check chooses its markers per file, so this file -
+# which opens `#!/usr/bin/env python3` - is read with `#` and yields **72 distinct spans**
+# through the shipped reader, counted after this paragraph was written. The walk covers
+# `scripts/*.sh`, `.githooks/*` and both library crates plus `demo`, and nineteen shell
+# rows are registered against it.
+#
+# The review that found this measured **65**, and the seven-span difference is this
+# paragraph: writing prose about a file's spans adds spans to that file. Counted after the
+# edit rather than before it, which is the only order that gives a true number.
+#
+# **The CONCLUSION stands and the reason is now the live one: no row lives here.** That
+# registry's walk covers every file a registered record can live in, and `.mise/tasks/*`
+# is excluded because it holds no row - an exclusion that follows from the rule rather
+# than sitting on a list. Registering `T1`-`T10` would put the only rows in an unwalked
+# file and manufacture a false `unseen`.
+#
+# This sentence is the shape it warns about, one file over: **a reason written from a
+# capability's absence rots the moment the capability arrives**, and nothing red says so,
+# because a reason for NOT doing something is never exercised.
 #
 # Perturbed on a COPY: the four files this task reads, plus `.mise/tasks/`, copied
 # into a `git init`-ed temp directory. The task resolves its root from the cwd

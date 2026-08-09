@@ -572,11 +572,38 @@ async fn a_key_state_query_on_a_service_that_keys_nothing_is_fresh() {
 /// rg -n -A1 'fn method\(&self\) -> &.static str \{' keylink/src/actor/remote.rs
 /// ```
 ///
-/// Two matches today, and both must be read: `139: fn method(..) {` followed by
-/// `140: self.message.method()`, which is the impl this test rests on, and
-/// `573:`/`574: match self {`, a `Rpc` impl inside that file's own test module.
-/// A constant at 140 is the defect; a third match is a third `Rpc` impl and wants
-/// looking at.
+/// Two matches today, and both must be read. The first is `139: fn method(..) {`
+/// followed by `140: self.message.method()`, which is the impl this test rests on.
+/// The second is **the one inside that file's own `#[cfg(test)]` module**, and it is
+/// told apart by what sits at it rather than by where it sits: it answers with
+/// `match self {` instead of forwarding to an inner request, and `rg` prints it one
+/// indent deeper because it is nested in the module. A constant at 140 is the defect;
+/// a third match ABOVE the `#[cfg(test)]` line is a third production `Rpc` impl and
+/// wants looking at.
+///
+/// **The second half of that used to be stated as `573`/`574` and had rotted; the
+/// first pair had not.** Nothing moved in either impl — `keylink/src/actor/remote.rs`
+/// grew above its test module, which pushed the second match down and left the first
+/// where it was. The characterisation survived the move; only the position did not.
+///
+/// Which half rotted is the lesson: **the half stated as an absolute line number, and
+/// not the half stated as a relationship.** `139`/`140` are quoted with the text that
+/// sits there, so a reader who finds that text at another number has still found the
+/// impl; `573`/`574` carried nothing but a position. So the second match is named
+/// above by the side of `#[cfg(test)]` it falls on and by the line it answers with,
+/// neither of which an insertion above it can move. `139`/`140` keep their numbers
+/// because they carry their text, which is the same rule read the other way.
+///
+/// `records_none_still_runs_the_work_at_most_once`'s record is the shape for the
+/// FIRST half of this: it names `Guard::record` and asserts a relationship between
+/// two statements, and carries no line number at all. It was **not** clean of the
+/// general fault when this branch reached it, and holding it up as though it were is
+/// the same mistake one level up — it also said the break reddens "fourteen of this
+/// file's tests", and a count over an open set rots on the fifteenth such test
+/// anybody writes. That count is gone now: the record states the property and marks
+/// the size unmeasured, so the two records agree rather than one recommending a
+/// shape the other had already broken. A relationship cannot rot. A number can,
+/// whether it indexes a line or a population.
 #[tokio::test]
 async fn a_keyed_actor_service_applies_the_same_policy() {
     let server = local_node().await;
@@ -1110,8 +1137,33 @@ async fn start_recordless() -> Fixture {
 /// handler's counter: the repeat ran.
 ///
 /// **That break is very wide** — giving a key back instead of spending it reddens
-/// fourteen of this file's tests, every one that asserts a repeat is not re-run.
-/// Width is the finding: `settle` is the single line at-most-once rests on.
+/// every test in this file that asserts a repeat is not re-run. Width is the
+/// finding: `settle` is the single line at-most-once rests on.
+///
+/// **How many that is is NOT recorded here, and the omission is deliberate.** This
+/// sentence said "fourteen" until this branch. Nothing had measured it, nothing can
+/// see it go stale, and it rots on the fifteenth such test anybody writes — the
+/// exact fault `.mise/tasks/anchors` warns about for its own row count, sitting in
+/// the record this branch had held up as the shape to copy. The property above
+/// survives a test being added. A count does not.
+///
+/// **And a static sweep is not a substitute for running it**, which is worth saying
+/// because the sweep looks convincing. The property is written in at least three
+/// unrelated assertion shapes here: a refusal, as `expect_err` on the retry; a run
+/// counter read through a third key, as this test does; and plain equality with the
+/// first answer, as `a_repeated_key_does_not_run_the_handler_twice` does. A sweep
+/// keyed on refusals and counters misses that third shape, so it under-reports while
+/// reading as exhaustive — measured, by writing one and watching it drop that test.
+/// Only `mise run replay-anchors` on this row settles the size, and no gate runs it.
+///
+/// **R20's two halves age differently, and that is the reason to keep them side by
+/// side.** The `claim_key`-before-`next` citation below asserts a RELATIONSHIP
+/// between two line numbers while naming neither, so nothing inserted above either
+/// one can invalidate it. That half really is the shape to copy. This population
+/// half was a bare count, and it rotted quietly in the same doc comment. One
+/// durable citation beside one rotted number, in one record, is the clearest
+/// evidence on this branch that the fault is the FORM of a claim and not the care
+/// of whoever wrote it.
 ///
 /// **What that break does NOT reach is this test's last assertion**, and it is worth
 /// saying which half is unguarded. The break trips the `expect_err` above it, so the
@@ -1405,10 +1457,20 @@ async fn the_defaults_reproduce_todays_behaviour() {
 /// with the configured value discarded, the default ceiling records it and the
 /// repeat is answered instead of refused.
 ///
-/// **The break is narrow, and that is the point.** It reddens this test and nothing
-/// else in the file, because this is the only one that asserts a refusal the default
-/// cannot produce. Every other guard on this feature reaches the bounds through
-/// `Ledger::new` and stays green.
+/// **The break is wider than this test, and the second guard it reddens is in this
+/// file.** It reddens this one, which is the only test asserting a refusal the
+/// default cannot produce. It also reddens
+/// `a_tombstone_bound_below_the_churn_runs_the_work_twice`, and the reason is that
+/// `ServiceBuilder::limits` has exactly one caller — the `start_limited` fixture
+/// above — which both tests go through. With the configured `Limits` discarded, that
+/// fixture's `.tombstones(nz(1))` becomes the default `MAX_TOMBSTONES`, 8192, against
+/// a churn of two keys. The tombstone then survives the churn and the retry is
+/// refused `Forgotten` rather than running the work a second time, which is the very
+/// red that test records for itself at a bound of 64. That second redness was derived
+/// from the fixture and the two records, not run, and so is not yet watched.
+///
+/// The unit guards on this feature do stay green under it: they reach the bounds
+/// through `Ledger::new` and never go through the builder at all.
 #[tokio::test]
 async fn a_frame_ceiling_set_on_the_builder_reaches_the_ledger() {
     let limited = start_limited(Limits::default().frame_bytes(nz(1))).await;
