@@ -13,7 +13,10 @@ the tree.
 ## 1. What this is
 
 Seven conditions are one fact on both sides of keylink. Locally each is a typed
-variant; remotely each is a **string prefix inside `Failed(String)`**. Prefixes
+variant. **Five of the seven** are a **string prefix inside `Failed(String)`**
+remotely — five consts exist (`reply.rs:154,161,181,189,206`), not seven.
+`Gone` reaches a peer as `NoSuchActor` (`turns.rs:4644`, argued at
+`reply.rs:88`), and `Expired` has no prefix producer at all. Prefixes
 are associated consts, which `postcard_schema` does not hash
 (`reply.rs:119-124`), so the handshake cannot protect them. A drifted peer meets
 a moved prefix as a `Failed` it silently stops recognising.
@@ -77,7 +80,11 @@ wire and must stay sealed.
 (`:334-335`).
 
 `EndReason` moves here too (goal item 11), and the move is **wire-free**: type
-names and module paths are not hashed. The move is one retarget of the re-export
+names and module paths are not hashed (`hash.rs:193-201` comments out the
+name-hashing line). What IS hashed: variant names (`hash.rs:203-204`) and
+**struct field names (`hash.rs:232-233`, `hash_named_value`)** — the second
+citation matters, because item 7's field rename is the redeploy and earlier
+revisions cited only the range that proves the variant half. The move is one retarget of the re-export
 at `lib.rs:252-255`, because `tests/inspect.rs:22-26` imports from the crate
 root. **Move only — rename nothing.** `EndReason`'s 6 variant names and 8 field
 names ARE hashed.
@@ -284,9 +291,13 @@ compute a hash.
 
 ## 5. The twin guard — six properties, not four
 
-The old guard (`turns.rs:5101`) asserts six things over two flat enums. Its
-premise dies with the collapse; `slot()`, `EVERY` and `twin()`
-(`turns.rs:4909-4946`) are invalidated together. `const EVERY: [Undelivered; 7]`
+The old guard (`turns.rs:5101`) holds **eight `assert` macros over three enums** —
+its own comment at `turns.rs:5153` says "The third enum". Revisions 1 and 2 said
+"six things over two flat enums"; that was the count of distinct *properties*,
+not of assertions or of enums, and stating it as either was wrong. Its premise
+dies with the collapse; `slot()`, `EVERY` and `twin()` (`turns.rs:4908-4949`,
+including `twin()`'s `Faulted(_) => None` arm at `:4947`) are invalidated
+together. `const EVERY: [Undelivered; 7]`
 (`turns.rs:4908`) cannot even stay a `const` once variants carry `String`.
 
 **Do not delete it and call the type system a replacement.** The type system
@@ -328,13 +339,27 @@ untouched, so `replay-anchors` is safe. Stated so nobody re-checks it.
 
 ## 7. The consumers — the actual bulk of this wave
 
-**Test sites: 20.** Three use the const and break at compile time
+**Test sites: at least 27, and the plan asserts no total.** Three separate
+measurements gave 16, 20 and 27; each enumeration was incomplete rather than
+mis-added. **The predicate, not the count, is the instruction: every test site
+that matches on `RemoteError::Failed` text or on a prefix.** The verification is
+`cargo nextest run --workspace` green, not a tally.
+
+The enumerated floor, which is a starting point and not a boundary. Three use
+the const and break at compile time
 (`defer.rs:1199`, `singleton.rs:1117`, `:1121`). Nine hard-code the literal and
 fail at run time (`defer.rs:718,920`, `supervision.rs:1155,1166,1380,1503,1514`,
 `actors.rs:735`, `singleton.rs:992`). Four compare whole rendered strings
-(`singleton.rs:1018,1113,1267`, `keylink/tests/persist.rs:507` — **the keylink
-crate, not `keylink-persist`**). Four are match arms and table drivers one line
-above the ones already listed (`supervision.rs:1130,1165,1467,1513`).
+(`singleton.rs:1018` and `:1267` read `format!("observer refused: {REFUSER}")`;
+**`singleton.rs:1113` reads `format!("observer panicked: {PANICKER}")`** — a
+different prefix and a different const, which revisions 1 and 2 both got wrong by
+attaching one quoted form to three lines; plus `keylink/tests/persist.rs:507` —
+**the keylink crate, not `keylink-persist`**). Four are match arms and table
+drivers one line above the ones already listed
+(`supervision.rs:1130,1165,1467,1513`). Seven more found by a third pass:
+`supervision.rs:1789`, `actors.rs:650,724,2299`, `singleton.rs:400`, and
+`singleton.rs:936` — the `failed_reason` **helper itself**, which every literal
+site above routes through.
 
 **Broken by the new `RemoteError` variants, not by the prefixes:**
 `actor/remote.rs:726-737` (`the_capacity_refusal_reads_the_same_by_hand_and_lazily`
@@ -360,11 +385,25 @@ sees a broken link at all. Budget for
 `rustdoc::redundant_explicit_links`, which is on and not allowed: a mechanical
 rename preserving `[`X`](crate::X)` trips it where the shorthand now suffices.
 
-**Three tests die, not two:** `no_failure_prefix_is_a_prefix_of_another`
-(`turns.rs:4855`), `no_other_served_failure_begins_with_one_of_the_five`
-(`actor/remote.rs:776`), `the_five_prefixes_are_the_text_a_peer_matches_on`
-(`reply.rs:332-337`). Two break records die with them (`reply.rs:310-330`,
-`turns.rs:4834-4853`).
+**FOUR tests die.** Revision 1 said two, revision 2 said three; measured, it is
+four: `no_failure_prefix_is_a_prefix_of_another` (`turns.rs:4855`),
+`the_gone_answer_is_not_a_failed_and_carries_no_prefix` (`turns.rs:4895`),
+`no_other_served_failure_begins_with_one_of_the_five` (`actor/remote.rs:776`),
+`the_five_prefixes_are_the_text_a_peer_matches_on` (`reply.rs:332`). Break
+records die with them (`reply.rs:310-330`, `turns.rs:4834-4853`,
+`turns.rs:4867-4893`).
+
+**`scripts/replay-fate-breaks.sh` drives two of those four**, and no revision
+before this one mentioned the script: `:216` runs
+`no_other_served_failure_begins_with_one_of_the_five` and `:301` runs
+`the_five_prefixes_are_the_text_a_peer_matches_on`. Fourteen of its lines quote a
+prefix literal. **§6 declares `mise run replay-anchors` as a proof, so commit 6
+breaks a declared proof unless the script moves in the same commit.**
+
+**Commit 6 orphans two intra-doc links** that only `mise run docs` will see:
+`error.rs:67` (`[`RemoteError::REFUSED`](crate::RemoteError::REFUSED)`) and
+`actor/remote.rs:765` (`[`RemoteError::DROPPED`]`). Stale prose accompanies them
+at `error.rs:61`, `protocol.rs:1178` and `README.md:187,195`.
 
 **`README.md:143,184,185,187,194.** Line 187 states the wire rendering this wave
 deletes and needs a rewrite, not a rename. `CONTRIBUTING.md` carries one affected
