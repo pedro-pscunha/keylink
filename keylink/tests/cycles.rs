@@ -542,14 +542,22 @@ async fn a_read_from_inside_a_turn_is_a_self_deadlock() {
 /// nothing about the *cycle*.
 ///
 /// **What the break reaches is one arm, and naming the arm is the whole
-/// statement.** `Deferred::send` is the only caller of `parking::park`, so this
-/// substitution discards the value of every parked reply whose turn then COMMITS
-/// — which is every guard needing a parked answer to arrive, wherever it lives.
-/// It leaves `Verdict`'s other two arms untouched: a reply the observer chain
-/// REFUSES and a reply lost to a FAULT are each resolved by their own arm, so a
-/// guard asserting one of those losses still sees it. And a reply simply dropped,
-/// as `defer.rs`'s `abandon` drops it, never calls `send` and so never reaches
-/// `park` at all.
+/// statement.** `Deferred::send` is the only caller of `parking::park` outside
+/// `parking.rs`'s own unit tests, so this substitution discards the value of every
+/// parked reply whose turn then COMMITS — which is every guard needing a parked
+/// answer to arrive, wherever it lives. It leaves `Verdict`'s other two arms
+/// untouched: a reply the observer chain REFUSES and a reply lost to a FAULT are
+/// each resolved by their own arm, so a guard asserting one of those losses still
+/// sees it. And a reply simply dropped, as `defer.rs`'s `abandon` drops it, never
+/// calls `send` and so never reaches `park` at all.
+///
+/// **That qualifier does not weaken the "every", because a count of callers was
+/// never what licensed it.** `parking.rs`'s unit tests call `park` four times, each
+/// handing it a bare `Parked` closure of their own — a `Box<dyn FnOnce(Verdict)>`
+/// that owns no `Reply`, which is why that file constructs none. They never execute
+/// the line this break substitutes. What licenses "every" is narrower and does not
+/// move when a fifth such test is written: `Deferred::send` is the only place a
+/// REPLY is ever parked, so every parked reply's answer runs the arm above.
 ///
 /// **This sentence used to say the break reddens every `#[defer]` test in the
 /// tree, and that is the shape to avoid.** It reads as a population, and which
