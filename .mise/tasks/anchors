@@ -283,7 +283,7 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 #
 # Deriving it would mean parsing prose for "replacing `X` with `Y` in `path`",
 # and a heuristic that misses a record checks nothing while reporting success.
-# So the list is explicit, exactly as `local.rs`'s
+# So the list is explicit, exactly as `turns.rs`'s
 # `no_failure_prefix_is_a_prefix_of_another` spells out its four prefixes and
 # says a fifth has to be added by hand.
 #
@@ -936,9 +936,9 @@ ANCHORS = [
     # says nothing about the indented one. Third instance of that shape in this
     # registry, and the general form is worth the line: state the measurement that
     # made quoting impossible, never the property that made it look impossible.
-    ("D1", "keylink/tests/cycles.rs", "keylink/src/local.rs",
+    ("D1", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "const LOCAL_MAILBOX_DEPTH: usize = 1;"),
-    ("D2", "keylink/tests/cycles.rs", "keylink/src/local.rs",
+    ("D2", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "        self.task.abort();"),
     # A whole line at twelve spaces, inside `Deferred::send`'s parking callback. Its
     # record quoted it WITHOUT the indentation until this branch, which made the
@@ -959,7 +959,7 @@ ANCHORS = [
     # higher than the eight rows added here could explain; the extra block was that
     # record. Anyone re-quoting this anchor must fix `persist.rs` too, and nothing
     # here will say so, because a row names one `lives_in`.
-    ("D3", "keylink/tests/cycles.rs", "keylink/src/local.rs",
+    ("D3", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "            Verdict::Committed => reply.answer(Answered::Ran(value)),"),
     ("D4", "keylink/tests/cycles.rs", "keylink/src/compose/topic.rs",
      "            Overflow::DropSubscriber => self.publish_dropping(item),"),
@@ -1223,7 +1223,7 @@ ANCHORS = [
     # record says to run one at a time and label the log.
     ("G12", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
      "        match catching(member.end) {"),
-    ("G13", "keylink/tests/compose.rs", "keylink/src/local.rs",
+    ("G13", "keylink/tests/compose.rs", "keylink/src/turns.rs",
      "if !restarting {"),
     ("G14", "keylink/tests/compose.rs", "keylink/src/panic.rs",
      "            Err(panic) => Poll::Ready(Err(Panic::caught(panic))),"),
@@ -1498,8 +1498,20 @@ ANCHORS = [
     # Re-derived at `8fc1443`, after both shell files were committed - **registering
     # against a file still being edited is the C6 hazard, where a row is pinned to bytes
     # that move under it.** Count **1** in `scripts/install-hooks.sh`, quoted by EQUALITY
-    # in the carrier, a whole line, and neither containing nor contained by any of the
-    # other 72 literals.
+    # in the carrier, a whole line, and neither containing nor contained by any other
+    # registered literal.
+    #
+    # **That last clause used to carry a number - "the other 72 literals" - and it was
+    # wrong in two ways at once.** The date rescues the `Count **1**` measurement and does
+    # NOT rescue this one: containment is a property of the WHOLE registry, so it changes
+    # whenever anybody adds a row, on a commit that need not touch this row or this file.
+    # The `compose-group` merge falsified it by adding twenty-three.
+    #
+    # And it was mis-nouned from the start. At `8fc1443` the registry held **72 rows over
+    # 64 distinct literals**, so 72 counted ROWS while the noun said literals - the figure
+    # was never a literal count at any tree. The number is dropped rather than refreshed,
+    # because a refreshed one rots on the next row anybody registers. What matters is the
+    # property, and the resolution check above re-derives it every run.
     #
     # **Its indentation is NOT load-bearing** - the bare form also counts 1. So it patterns
     # with `H13` and `5` above rather than with `H6`/`H7`, and that answer was measured
@@ -1743,11 +1755,19 @@ MARKERS = ("///", "//!", "//")
 # the one check in this file that fails loudly on a population change would stay green
 # while the haystack every record is matched against had grown.
 #
-# **That 127 is NOT `RECORD_BLOCKS`, which is 132**, and an earlier version of this
-# paragraph named the constant. The two differ because the walk now covers shell files as
-# well - the 127 here is the `.rs` half alone, held fixed to isolate the marker set as the
-# only variable. Naming the constant made the sentence read as false the moment the walk
-# widened, while the measurement behind it never moved.
+# **That 127 is NOT `RECORD_BLOCKS`**, and an earlier version of this paragraph named the
+# constant. The two differ because the walk now covers shell files as well - the 127 here
+# is the `.rs` half alone, held fixed to isolate the marker set as the only variable.
+# Naming the constant made the sentence read as false the moment the walk widened, while
+# the measurement behind it never moved.
+#
+# **This paragraph then did it a SECOND time and had to be corrected again.** The version
+# before this one read "which is 132" - it removed the constant from the argument and
+# left the constant's VALUE in the same sentence, which is the identical defect wearing
+# the fix. It was true when written and the `compose-group` merge falsified it, exactly as
+# the widening falsified the first version. The value is gone now rather than updated:
+# updating it would only schedule the third correction. The live figure is printed by
+# every run of this task, and that is where a reader should get it.
 #
 # The mechanism, on the smallest sample that shows it - one `///` doc comment between
 # `#![allow(dead_code)]` and two attributes. Under `MARKERS` the reader returns one
@@ -1923,6 +1943,35 @@ def spans(text: str) -> set[str]:
 
 cache: dict[str, str] = {}
 spancache: dict[str, set[str]] = {}
+absent: dict[str, bool] = {}
+
+
+def gone(path: str) -> bool:
+    """Whether a REGISTERED path does not exist. Cached - three loops ask.
+
+    **A missing registered file used to be a TRACEBACK rather than a diagnostic**,
+    and the shape of that failure is the reason this exists. `read_text()` raises
+    `FileNotFoundError`, the first loop below runs before every other check in this
+    file, and nothing here catches anything - so ONE missing file did not cost one
+    row's result, it cost EVERY row's. Measured before the guard was written, by
+    moving `keylink/src/turns.rs` aside and running this task: a traceback, exit 1,
+    and not one check printed.
+
+    That is the wrong failure shape for a gate whose entire value is being specific.
+    **A rename is the ORDINARY reason a registered file vanishes** - the person doing
+    one needs the list of rows to repoint, which is precisely the list this task
+    holds and precisely what the traceback withheld. It also arrives at the worst
+    moment: this task runs in `pre-commit`, so the rename commit could not be created
+    and the diagnostic that would have unblocked it was the thing suppressed.
+
+    Existence, not readability. A file that exists and cannot be decoded still
+    raises, and deliberately: `script()` below documents that case and guards it by
+    reading BYTES. Widening this to a bare `except` would swallow that one too, and
+    an unreadable file is a different fault from an absent one.
+    """
+    if path not in absent:
+        absent[path] = not (ROOT / path).exists()
+    return absent[path]
 
 # TWO counters, and the split is the whole of a defect this task shipped with.
 #
@@ -1961,6 +2010,24 @@ bad = 0
 unresolved = 0
 
 for record, lives_in, target, literal in ANCHORS:
+    if gone(target):
+        bad += 1
+        unresolved += 1
+        print(f"FAIL {record}: the TARGET FILE is gone - `{target}` does not exist",
+              file=sys.stderr)
+        print("       likely cause:    it was RENAMED or deleted and this row still "
+              "names the old path", file=sys.stderr)
+        print(f"       record lives in: {lives_in}", file=sys.stderr)
+        print(f"       break edits:     {target}", file=sys.stderr)
+        print(f"       anchor:          {literal}", file=sys.stderr)
+        print("       Repoint the row and the record that quotes it. Every OTHER row "
+              "below", file=sys.stderr)
+        print("       still reports, which is the point of this arm: before it "
+              "existed, one", file=sys.stderr)
+        print("       missing file suppressed every check in this file rather than "
+              "one.", file=sys.stderr)
+        print(file=sys.stderr)
+        continue
     if target not in cache:
         cache[target] = (ROOT / target).read_text()
     found = cache[target].count(literal)
@@ -2048,6 +2115,8 @@ FRAGMENT_ANCHORS = {
 fragments = set()
 resolved = set()
 for record, lives_in, target, literal in ANCHORS:
+    if gone(target):
+        continue  # already reported above, with the repointing instructions
     if target not in cache:
         cache[target] = (ROOT / target).read_text()
     body = cache[target]
@@ -2138,7 +2207,7 @@ for record in sorted((FRAGMENT_ANCHORS & resolved) - fragments):
 # rebase that correctly re-quotes a record and forgets this list leaves the gate
 # validating a string no record uses - green.
 #
-# `local.rs`'s `no_failure_prefix_is_a_prefix_of_another` is NOT the precedent for
+# `turns.rs`'s `no_failure_prefix_is_a_prefix_of_another` is NOT the precedent for
 # a hand-written list of copies. Its own comment says it "names the consts rather
 # than the strings, so it cannot drift from the wire" - hand-written *references*
 # to one source of truth. A doc comment cannot be referenced from Python, so the
@@ -2313,6 +2382,23 @@ for probe_path, probe_text in PROBES:
     print(file=sys.stderr)
 
 for record, lives_in, target, literal in ANCHORS:
+    # The RECORD's file, not the target's - a different path and a different fault.
+    # A row can name a live target and a record file that has moved, so this arm
+    # cannot be folded into the one above.
+    if gone(lives_in):
+        bad += 1
+        print(f"FAIL {record}: the RECORD'S FILE is gone - `{lives_in}` does not exist",
+              file=sys.stderr)
+        print("       likely cause:    it was RENAMED or deleted and this row still "
+              "names the old path", file=sys.stderr)
+        print(f"       record lives in: {lives_in}", file=sys.stderr)
+        print(f"       break edits:     {target}", file=sys.stderr)
+        print("       The record is the source of truth for the anchor, so a row "
+              "whose record", file=sys.stderr)
+        print("       cannot be found is unreplayable even when its literal still "
+              "resolves.", file=sys.stderr)
+        print(file=sys.stderr)
+        continue
     if lives_in not in spancache:
         spancache[lives_in] = quoted_spans(lives_in)
     if flat(literal) in spancache[lives_in]:
@@ -2515,7 +2601,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # 103 → 111 on the deadlock-audit branch: eight new harness blocks, seven in
 # `tests/cycles.rs` and one in `tests/blocking_work.rs`.
 #
-# 111 → the figure below on `ledger-limits`, rebased onto `fbb7e43`. Five records,
+# 111 → 116 on `ledger-limits`, rebased onto `fbb7e43`. Five records,
 # all REGISTERED above:
 #
 #   L1, L2  `keylink/tests/idempotency.rs` — the builder-wiring guard and the
@@ -2548,7 +2634,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # `an_attach_ceiling_of_zero_refuses_the_attacher_at_once` shares A2's literal with a
 # different replacement, so it adds a block without adding a row.
 #
-# 122 → the figure below, one commit later, for the pool bounds' maximal end: ONE
+# 122 → 123, one commit later, for the pool bounds' maximal end: ONE
 # block, `a_maximal_pool_evicts_nothing`, registered as A5.
 #
 # **Both figures were read off a run at their own commit's tree, and the second one
@@ -2564,10 +2650,10 @@ for record in sorted(set(REDNESS) - row_ids):
 # the same way the line above was**: the tripwire was left at 123 and the pre-commit
 # hook answered `124 comment blocks mention break-once.sh` from the walk.
 #
-# 124 → the figure below, two commits later on the same branch, for `Attaching` and for
+# 124 → 127, two commits later on the same branch, for `Attaching` and for
 # the panic-restart gap. **THREE new blocks, ONE new row, and the net is +3.** An earlier
 # version of this note said "THREE new blocks, ONE retired, ONE new row", which reaches
-# 126 and not the figure below. The retirement is real and it subtracts nothing, and that
+# 126 and not 127. The retirement is real and it subtracts nothing, and that
 # is the part an auditor cannot re-derive from the two ends alone:
 #
 #   added    `a_forbidden_ceiling_is_refused_without_a_waiting_place`, whose literal is
@@ -2733,7 +2819,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # What is NOT claimed: that 132 is a count of break records. It is a count of blocks
 # naming the harness, three of which are the harness itself.
 #
-# 149 and 132 → the figure below, at the merge of `compose-group` into `main`. **The
+# 149 and 132 → 154, at the merge of `compose-group` into `main`. **The
 # two entries above are the only pair in this file that do not chain**, and that is
 # the entry: they are siblings, not steps. Both start at 127, neither could see the
 # other, and the merged tree carries BOTH causes — twenty-two new record blocks on

@@ -808,7 +808,7 @@ async fn a_fatal_stop_skips_the_budget() {
 /// The other half of `Stop::fatal`, and the half that had no test: **a fatal
 /// refusal of a turn that *panicked* is not honoured.**
 ///
-/// `local.rs`'s `(refused, panicked)` match reports a refused fault as
+/// `turns.rs`'s `(refused, panicked)` match reports a refused fault as
 /// `Ended::Panicked` naming the handler rather than the observer, because a
 /// durability adapter refuses every panicked turn and reporting the adapter
 /// points an operator at the wrong code. That ending carries no observer, so it
@@ -1093,7 +1093,7 @@ async fn a_handle_survives_its_actors_restart() {
 /// `singleton.rs`. That is the mechanical reason nothing in this suite caught the
 /// regression.
 ///
-/// Made red on round 3 by `scripts/break-once.sh keylink/src/local.rs` on
+/// Made red on round 3 by `scripts/break-once.sh keylink/src/turns.rs` on
 /// `Lent::ending`'s `Standing::Gone` → `Standing::Running` — a supervisor that
 /// refuses the restart and tells the peer the actor is still there, which is the
 /// regression verbatim. Watched: `round 2: expected gone, got
@@ -1287,7 +1287,7 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
 /// mailbox `supervise` owns for the actor's whole life still read open. Both paths
 /// answer it from the verdict now, and neither reads a mailbox.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/local.rs` on `Lent::ending`'s
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `Lent::ending`'s
 /// `return Standing::Restarting(Arc::new(reason.clone()));` → `return Standing::Gone;`,
 /// which is a supervisor that grants the restart and tells the peer to stop
 /// asking anyway. Watched: `round 1: expected restarting: , got
@@ -1303,7 +1303,7 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
 /// guard on the verdict.
 ///
 /// The deterministic guard for that ordering is
-/// `local::tests::an_ending_incarnation_settles_its_verdict_and_its_mailbox_before_its_state`,
+/// `turns::tests::an_ending_incarnation_settles_its_verdict_and_its_mailbox_before_its_state`,
 /// which observes inside the state's own `Drop` — the only instant that can see
 /// which writer got there first. Its singleton twin above *is* reliably red on
 /// round 2, because a `LocalActor` has no mailbox floor under it.
@@ -1446,7 +1446,7 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
 /// state exists, so the reply that dies is the one riding the mailbox message the
 /// unwind drops.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/local.rs`, disarming
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs`, disarming
 /// `supervise`'s floor at its declaration. Watched: `a peer whose actor died in
 /// its own factory must not be told it is serving: Remote(Failed("dropped: the
 /// actor is serving and this reply was never answered"))`.
@@ -1522,7 +1522,7 @@ async fn a_peer_whose_factory_panicked_is_told_the_actor_is_gone() {
 /// what dies is a `Deferred` the state was holding, which is the case the whole
 /// three-way answer is about.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/local.rs`, disarming
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs`, disarming
 /// `run_loop`'s floor immediately after it is armed. Watched: `a peer whose actor
 /// died in its own feed must not be told it is serving: Remote(Failed("dropped:
 /// the actor is serving and this reply was never answered"))`.
@@ -1591,7 +1591,7 @@ async fn a_peer_whose_feed_panicked_is_told_the_actor_is_gone() {
     );
 }
 
-/// **The gap `local.rs`'s `supervise` documents, pinned as behaviour.** A keyed call
+/// **The gap `turns.rs`'s `supervise` documents, pinned as behaviour.** A keyed call
 /// whose turn panics on a supervised DURABLE actor is refused
 /// `IdempotencyRefusal::Interrupted` on every retry, even though the restart rolled the
 /// state back and the entry the turn appended is provably gone.

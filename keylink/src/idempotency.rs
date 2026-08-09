@@ -350,7 +350,7 @@ pub enum IdempotencyRefusal {
     /// **The refusal is then coarser than what the crate knows**: the crate knows the
     /// turn's effect on the state did not survive, and this variant can only say that
     /// whether the work took effect is unknown.
-    /// `local.rs`'s `supervise` carries the chain, why the gap is left open, and which
+    /// `turns.rs`'s `supervise` carries the chain, why the gap is left open, and which
     /// parts of it nothing guards.
     ///
     /// [`key_state`](crate::RpcClient::key_state) asks about a key without running

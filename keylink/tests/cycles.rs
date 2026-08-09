@@ -251,7 +251,7 @@ async fn inside_a_turn(entered: &AtomicUsize) {
 /// an `rpc` would block on the answer either way and could not tell the two
 /// apart.
 ///
-/// Made red by `scripts/break-once.sh`, replacing `local.rs`'s
+/// Made red by `scripts/break-once.sh`, replacing `turns.rs`'s
 /// `const LOCAL_MAILBOX_DEPTH: usize = 1;` with the whole line
 /// `const LOCAL_MAILBOX_DEPTH: usize = 2;` — spelled out because `= 2;` alone, which
 /// is what this record used to say, substitutes for the *entire* searched line and
@@ -263,14 +263,14 @@ async fn inside_a_turn(entered: &AtomicUsize) {
 ///
 /// **The message names the constant and not its value, and that is deliberate.** It
 /// read "LOCAL_MAILBOX_DEPTH is 1" until this branch, which put a copy of a value
-/// defined in `local.rs` into a failure message in `tests/`, where nothing checks
+/// defined in `turns.rs` into a failure message in `tests/`, where nothing checks
 /// it: raise the depth and the assertion fails while its own message asserts the old
 /// value as a fact. Naming the constant instead keeps the message an accurate
 /// statement of what must hold, whatever the depth is, and still points the reader
-/// at the one line that governs it. `local.rs`'s
+/// at the one line that governs it. `turns.rs`'s
 /// `no_failure_prefix_is_a_prefix_of_another` is the precedent — it names the consts
 /// rather than the strings, so it cannot drift from the wire. The value is private
-/// to `local.rs`, so an integration test cannot interpolate it and naming it is the
+/// to `turns.rs`, so an integration test cannot interpolate it and naming it is the
 /// only option here.
 #[tokio::test]
 async fn a_running_turn_leaves_exactly_one_free_permit_behind_it() {
@@ -569,7 +569,7 @@ async fn a_read_from_inside_a_turn_is_a_self_deadlock() {
 /// `.mise/tasks/anchors` warns about for its own row count. Counting the attribute
 /// does not rescue it either: the deferred method `tests/inspect.rs` drives is
 /// declared in `src/console.rs`, so no count taken over the test files reaches it.
-/// The arm has none of these problems. It is one line of `local.rs`, and the
+/// The arm has none of these problems. It is one line of `turns.rs`, and the
 /// anchor registered for this record IS that line.
 ///
 /// **One row does not cover that line, though, and this record is not its only

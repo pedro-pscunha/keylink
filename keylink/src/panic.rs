@@ -9,7 +9,7 @@
 //!
 //! This lived in `actor.rs`, now `actor/remote.rs`, which owns the wire wrapper
 //! and the walk to a mailbox. That was an inversion:
-//! `local.rs` has no transport in it at all and still had to depend on the file
+//! `turns.rs` has no transport in it at all and still had to depend on the file
 //! that owns the wire format in order to run a turn safely. The keyed, networked
 //! system is one **consumer** of this, beside the local handle, the generated
 //! code and the observer chain. Nothing here knows what a peer is.
@@ -24,7 +24,7 @@ use std::task::{Context, Poll};
 ///
 /// Carries the original payload, not a rendering of it, so that a **local**
 /// caller can be given the panic it would have got from an ordinary function
-/// call — see [`Panic::resume`] and `local.rs`. A remote caller gets
+/// call — see [`Panic::resume`] and `turns.rs`. A remote caller gets
 /// [`Display`](fmt::Display) inside [`RemoteError::Failed`], because an unwind
 /// does not cross a network.
 ///
@@ -255,7 +255,7 @@ impl<F: Future> Future for Guarded<F> {
 ///
 /// Synchronous on purpose rather than an `async` wrapper: neither call is a
 /// future, and wrapping them in one would put a borrow of the state across an
-/// await for no reason — the same trap `local.rs`'s observer catch avoids.
+/// await for no reason — the same trap `turns.rs`'s observer catch avoids.
 ///
 /// `pub(crate)` for the reason [`guarded`] is: no expansion names it, and the
 /// keyed decode/encode sites it was written for are keylink's own.

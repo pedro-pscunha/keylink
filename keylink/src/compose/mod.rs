@@ -74,7 +74,7 @@
 //!
 //! # Designed against a mailbox of one, and where a deeper one would change this
 //!
-//! `local.rs`'s `LOCAL_MAILBOX_DEPTH` is 1 — as is `registry.rs`'s
+//! `turns.rs`'s `LOCAL_MAILBOX_DEPTH` is 1 — as is `registry.rs`'s
 //! `DEFAULT_MAILBOX_DEPTH`, the keyed side's — and every number in this module is
 //! chosen against that.
 //! One item in flight per subscriber matches it: a subscriber is "slow" exactly

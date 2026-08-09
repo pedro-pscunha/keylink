@@ -1113,7 +1113,7 @@ async fn a_member_that_ends_for_good_reaches_the_policy_once() {
 }
 
 /// **The break this record names reddens one half, and the other half has none.**
-/// `scripts/break-once.sh keylink/src/local.rs`, replacing `supervise`'s
+/// `scripts/break-once.sh keylink/src/turns.rs`, replacing `supervise`'s
 /// `if !restarting {` with `if true {` — an outer loop that publishes every
 /// incarnation's ending instead of only its last, which is the mistake this
 /// module's structural claim rests on not being made. Watched: it fails before
@@ -2300,7 +2300,7 @@ async fn an_ending_that_panics_retires_the_member_it_could_not_hear() {
 ///
 /// **That break is wider than the one it replaces, and the width is the price.**
 /// `guarded` is also what wraps a caller's ending future in `Group::add` and a
-/// turn in `local.rs`, so this reddens `panic.rs`'s own
+/// turn in `turns.rs`, so this reddens `panic.rs`'s own
 /// `guarded_turns_a_panic_into_a_value` and anything else that leans on the
 /// catch. Run it against this test's filter and read that one result; a
 /// whole-suite run under it says nothing about this guard in particular.
