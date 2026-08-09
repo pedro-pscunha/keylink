@@ -114,12 +114,26 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 # because it says how to reach a verdict rather than naming a way something rots.
 #
 # **A sweep that matches "a number inside a recorded output" cannot tell a BORROWED
-# value from a COINCIDENCE. Only tracing the break's data flow can.** Measured
-# 2026-08-08: of five sites a number-shaped sweep reported as borrowed, **two were
-# OWNED by their own test** — one constant and one test argument happened to be the
-# same number, so one figure had two candidate owners and the sweep could not see
-# which. The same collision appears where two limits are equal by intent, and again
-# where a same-named helper in a different file owns the value.
+# value from a COINCIDENCE. Only tracing the break's data flow can.** A sweep of that
+# shape reported five sites as borrowed on 2026-08-08 and **two were OWNED by their own
+# test** - one constant and one test argument happening to be the same number, so one
+# figure had two candidate owners and no pattern over the text could say which.
+#
+# **THE COLLISION IS NAMED HERE SO IT CAN BE CHECKED, and citing the sites rather than
+# the count is the point.** `MAX_ATTACH` is `Duration::from_secs(30)` at
+# `keylink/src/idempotency.rs:266`, and `Duration::from_secs(30)` is ALSO what two tests
+# pass as their own argument: `an_attacher_over_the_cap_is_refused_before_it_parks` and
+# `a_parked_attacher_keeps_its_place_for_the_whole_wait`, both in `keylink/src/rpc.rs`.
+# A `30` in either record's output has two candidate owners. The same shape recurs where
+# two limits are equal by intent - `MAX_RUNNING_PER_PEER` and `MAX_WAITING_PER_PEER` - and
+# again where a helper in another file owns a `30` of its own,
+# `keylink/tests/relay.rs`'s `PATIENCE`.
+#
+# **The 5-and-2 figures are the reviewer's measurement and are NOT re-derivable from this
+# file**, because the sweep's own site list is not recorded here. The collision above is,
+# and it is the part that makes the method's claim checkable: a reader can confirm that
+# one number has two owners without needing the sweep. An earlier version of this note
+# gave the count and named no site at all, which left both halves unauditable.
 #
 # The deciding step is **which operand survives the break.** A value that is read,
 # passed on and then clamped against another can be reported by either side, and
@@ -265,15 +279,34 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 # were restored line by line rather than by checkout, because a checkout of this file
 # would take the prose written beside them with it.
 #
-# THE CONTROL FIRST, and it is required: the unperturbed task printed `ok: 49
+# **EVERY FIGURE BELOW WAS RE-RUN AND RE-TRANSCRIBED AT `82b8366`, and two of the three
+# had gone stale in the way this file exists to catch.** They were first recorded when
+# the registry held 49 rows and no shell row; registering nineteen changed what these
+# cuts print, and the records kept the old numbers while the cuts kept working. **A break
+# record's watched output is a property of the TREE, not of the substitution** - so it
+# rots when the registry grows, without the break or the guard changing at all. That is
+# the same class as an anchor rotting under a sibling's edit, one field over.
+#
+# THE CONTROL FIRST, and it is required: the unperturbed task prints `ok: 70
 # REGISTERED rows resolve to exactly one occurrence` and **exit 0**. A red is only
 # evidence after a green.
 #
 # M1. **Kill the arm.** Replace `return HASH_MARKERS if hashed else MARKERS` with
-#     `return MARKERS`. Watched: **exit 1**, TWO failures, one per probe, each headed
+#     `return MARKERS`. Watched: **exit 1** and **22 FAIL lines** - 2 headed
 #     FAIL reader: the ... marker arm finds no backticked span in a ...-commented
-#     record, with `markers chosen: ('///', '//!', '//')` and `blocks read: []`. The
-#     anchor-rot playbook is correctly NOT printed, because `unresolved` stays 0.
+#     record, with `markers chosen: ('///', '//!', '//')` and `blocks read: []`; **19
+#     rows reported NOT QUOTED by their own record**; and one
+#     `FAIL population: 127 comment blocks mention break-once.sh, but RECORD_BLOCKS
+#     says 132.` The anchor-rot playbook is correctly NOT printed, because `unresolved`
+#     stays 0.
+#
+#     **The 19 are the answer to a question this record used to get wrong**: killing the
+#     arm reddens every row whose `lives_in` is a shell file, because their haystack goes
+#     empty - and there are exactly 19 of those. The population line is the second
+#     effect: the walk loses the five shell harness blocks and reports 127 against a
+#     constant of 132. An earlier version of this entry said "TWO failures", which was
+#     true when no shell row was registered and became an understatement by a factor of
+#     eleven the moment nineteen were.
 #
 #     That heading is transcribed with the two markers ELIDED rather than quoted,
 #     because quoting it would nest a backtick inside a backticked span - the junk-span
@@ -290,16 +323,25 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 #     Replace `blocks = comment_blocks(text, markers_for(path, text))` with
 #     `blocks = comment_blocks(text)`. Watched TWICE, and the two runs disagree:
 #
-#       * against the FIRST version of the probe, which called the reader directly:
+#       * against the FIRST version of the probe, which called the reader directly, and
+#         **on the tree AS IT THEN WAS - 49 rows, none of them in a shell file**:
 #         **exit 0**, and output byte-identical to the green run under `diff`. Every
-#         registered `lives_in` is a `.rs` file, so the policy this task now depends on
-#         was checked by NOTHING. The probe was green because it had reimplemented the
-#         plumbing it existed to check.
-#       * against the probe as it stands, driving `quoted_spans`: **exit 1**, two
-#         failures, and the diagnostic separates the fault — `markers chosen: ('#',)`
-#         is right and `blocks read` HOLDS the span, while the haystack came back
-#         empty. Right markers over a block holding the span means the caller dropped
-#         them.
+#         registered `lives_in` was a `.rs` file at that moment, so the policy this task
+#         depends on was checked by NOTHING. The probe was green because it had
+#         reimplemented the plumbing it existed to check.
+#
+#         **That premise is now FALSE and the sentence is kept in the past tense for
+#         that reason.** Nineteen rows live in `scripts/hook-guard.sh` today, so this
+#         cut reddens the tree on its own - see the second bullet. The finding still
+#         stands as a finding: a probe that rebuilds its subject's steps tests its own
+#         copy of them, and it was green when nothing else could have caught it.
+#       * against the probe as it stands, driving `quoted_spans`, re-run at `82b8366`:
+#         **exit 1** and **21 FAIL lines** - 2 `FAIL reader` and **19 rows NOT QUOTED**.
+#         No population failure, because this cut is in `quoted_spans` and leaves the
+#         walk's own `markers_for` call alone, so the harness count stays 132.
+#         The diagnostic separates the fault — `markers chosen: ('#',)` is right and
+#         `blocks read` HOLDS the span, while the haystack came back empty. Right
+#         markers over a block holding the span means the caller dropped them.
 #
 # M3 is the finding worth keeping: **a probe that rebuilds its subject's steps tests
 # its own copy of them.** The first version passed every perturbation of the policy it
@@ -995,11 +1037,27 @@ ANCHORS = [
     # case from rot mode 1's same-file trap. Mode 1 spells the pair out; the short form
     # is that here the second copy can only ever be another line of real code.
     #
-    # ── THE REDNESS OF ALL NINETEEN IS UNREPLAYED, AND THAT IS THE POINT TO READ ──
+    # ── NO ROW HERE CARRIES A `REDNESS` ENTRY, AND FIVE HAVE BEEN REPLAYED ANYWAY ──
     #
     # Every check above says an anchor RESOLVES: that `break-once.sh` can find it, once,
     # and edit it. **Not one of them says the break still reddens the guard its record
     # names.** Registering these buys anchor-rot detection and buys nothing else.
+    #
+    # **The heading here used to say "the redness of all nineteen is UNREPLAYED", and that
+    # was false for five of them.** `scripts/hook-guard.sh` records that records **4, H1,
+    # H4, H11 and H12** have been driven through `scripts/break-hook-record.sh`, with
+    # printed row sets of **1, 23, 14, 1 and 4**. That driver copies the tree, runs a
+    # control first, refuses to report a perturbed result unless the control is green, and
+    # fails a perturbation that reddens nothing. **That is redness verification**, by a
+    # different instrument from `replay-anchors` and a real one.
+    #
+    # So the true statement is narrower and is about THIS registry: **zero of the nineteen
+    # carry a `REDNESS` entry, so `mise run replay-anchors` covers none of them.** The
+    # other fourteen rest on one author's watched run.
+    #
+    # Naming the five matters beyond accuracy: the wave scoped to replay the unreplayed
+    # rows reads this figure, and an over-broad "all nineteen" would have sent it to
+    # replay five rows a second time.
     #
     # It is written here rather than left to be inferred because **a paste-ready row
     # list is exactly the artefact somebody mistakes for verified coverage** - nineteen
@@ -1279,9 +1337,11 @@ MARKERS = ("///", "//!", "//")
 #
 # A break record written in a SHELL file could not be read at all until this existed.
 # The tuple above has no `#` arm, so `comment_blocks` found **0** backticked spans in
-# `scripts/hook-guard.sh` and **0** in `.githooks/pre-push` - measured 2026-08-08
-# (-03:00) by lifting this reader out of the task with `ast`, against **293 distinct
-# spans over 121 blocks** in `keylink/src/rpc.rs` on the same run.
+# `scripts/hook-guard.sh` and **0** in `.githooks/pre-push` - measured by lifting this
+# reader out of the task with `ast`, against **304 distinct spans over 121 blocks** in
+# `keylink/src/rpc.rs`, re-measured at `82b8366`. The block count was right first time and
+# the span count read 293, low by 11; no `.rs` file has changed since `fd085a4`, so 304 is
+# the figure and 293 was never a figure of this tree.
 #
 # **The consequence INVERTS the check, which is why this is a defect and not a gap.**
 # Registering a shell row against a zero-span haystack reddens the gate with
@@ -1292,19 +1352,34 @@ MARKERS = ("///", "//!", "//")
 # **`#` may NOT go into `MARKERS`, and that is a correctness bound rather than
 # taste.** In Rust `#` opens an ATTRIBUTE, so `MARKERS + ("#",)` makes
 # `#[derive(Debug)]` and `#![allow(..)]` comment lines. They then join the adjacent
-# doc-comment run and an attribute's text becomes part of a citable block. Measured
-# 2026-08-08 (-03:00) over the walk's own 70 `.rs` files, both marker sets through the
-# same reader: **3077 blocks → 3293, and 3620 distinct spans → 3624**, with **40 of
-# the 127 harness blocks** then holding `[test]`, `[cfg(` or `[allow(` text where
-# **0** do today.
+# doc-comment run and an attribute's text becomes part of a citable block. **Re-measured
+# at `82b8366`** over the 70 `.rs` files of the two library crates, both marker sets
+# through the same reader: **3077 blocks → 3293, and 3659 distinct spans → 3663**, with
+# **41 of the 127 harness blocks** then holding `[test]`, `[cfg(` or `[allow(` text
+# against **1** today.
 #
-# **And `RECORD_BLOCKS` does not move — 127 either way — which is what makes the
-# widening quiet.** The 216 extra blocks do not enter the tripwire's count, measured
-# rather than reasoned: the harness figure reads 127 under both marker sets. And
-# merging an attribute INTO a harness block cannot change whether that block says
-# `break-once.sh`, since adding text never removes a substring. So the one check in
-# this file that fails loudly on a population change would stay green while the
-# haystack every record is matched against had grown.
+# **Two of those four figures were wrong when first written, and both absolutes were low
+# by the same 39** - 3620/3624 against 3659/3663 - while the `+4` delta between them was
+# exact. A delta surviving while both ends are wrong is the shape a subtraction hides, and
+# it is why the absolutes are re-measured rather than carried.
+#
+# **The today figure is 1 and not 0**, and the one is instructive: a block in
+# `keylink/tests/idempotency.rs` writes `#[cfg(test)]` inside a backticked span, so it
+# satisfies this paragraph's own `[cfg(` predicate while containing no attribute at all.
+# The predicate matches TEXT, and prose about an attribute is text.
+#
+# **And the harness-block count over those `.rs` files does not move — 127 either way —
+# which is what makes the widening quiet.** The 216 extra blocks do not enter it, measured
+# rather than reasoned. And merging an attribute INTO a harness block cannot change
+# whether that block says `break-once.sh`, since adding text never removes a substring. So
+# the one check in this file that fails loudly on a population change would stay green
+# while the haystack every record is matched against had grown.
+#
+# **That 127 is NOT `RECORD_BLOCKS`, which is 132**, and an earlier version of this
+# paragraph named the constant. The two differ because the walk now covers shell files as
+# well - the 127 here is the `.rs` half alone, held fixed to isolate the marker set as the
+# only variable. Naming the constant made the sentence read as false the moment the walk
+# widened, while the measurement behind it never moved.
 #
 # The mechanism, on the smallest sample that shows it - one `///` doc comment between
 # `#![allow(dead_code)]` and two attributes. Under `MARKERS` the reader returns one
@@ -1346,8 +1421,23 @@ MARKERS = ("///", "//!", "//")
 #     `#`-leading, and exactly **1** carrying a backtick: a comment inside a generated
 #     rebase-editor stub, which invents the single span `pick`.
 #   * That span reaches nothing. It equals no registered literal, and its block does not
-#     say `break-once.sh`, so it is not even a harness block. Of the two harness blocks
-#     in that file, **0** carry a registered literal, and **0** contain a heredoc line.
+#     say `break-once.sh`, so it is not even a harness block.
+#   * Of the two harness blocks in that file, **4 and 10** carry a registered literal at
+#     `82b8366`, and **0** contain a heredoc line. **The zero is the load-bearing half:
+#     no heredoc line is inside a block that carries a row, so the over-approximation
+#     touches no figure.**
+#
+# **That pair was recorded as 0 and 0, and the reason is a dating defect worth naming: it
+# is an INTERSECTION, and only one of its two operands was dated.** The spans come from
+# `scripts/hook-guard.sh`, which is pinned at `97b29b7` below. The registered literals come
+# from `ANCHORS` in THIS file, which is pinned nowhere - and 0/0 was true of the registry
+# at `97b29b7`, before nineteen shell rows existed. A reader obeying the instruction below
+# and re-running the scan gets 4 and 10.
+#
+# The general form: **dating a figure means dating every operand it reads.** A file-side
+# date on a cross-file intersection reads as complete and covers half the input. The
+# conclusion survives either way, because it rests on the 0 heredoc lines rather than on
+# the carrying counts.
 #
 # So the over-approximation costs one junk span today and moves no figure. The MECHANISM
 # stays: a heredoc holding a shell script whose `#` comment quotes a real code line could
@@ -1376,10 +1466,30 @@ def markers_for(path: str, text: str) -> tuple[str, ...]:
     Rust keeps the three strict markers, and so does anything this cannot place: the
     strict set is the safe default, because it cannot mistake a directive for a
     comment. Widening is opt-in per kind, never global.
+
+    **The shebang is read WHATEVER the suffix, and gating it on a suffix-less name was a
+    defect in the silent direction.** It used to require `suffix == ""`, so a `.bash`,
+    `.zsh`, `.sample` or `.template` file got the Rust markers even though its first
+    line stated its kind - and a shell file read with Rust markers yields an EMPTY
+    haystack, which this task reports as a quote nobody wrote rather than as a reader
+    that could not read. `.githooks/` is the exposed directory, because git's own
+    convention there is `*.sample`. The suffix list stays as the fast path.
+
+    **`#![` IS EXCLUDED, and that exclusion is the whole difficulty of reading a
+    shebang.** A Rust INNER ATTRIBUTE - `#![allow(..)]`, `#![no_std]`, any crate-level
+    attribute - begins with the same two bytes as a shebang. Dropping the suffix gate
+    without this exclusion hands `('#',)` to every `.rs` file that opens with one, and
+    then every attribute in it becomes a comment line and its contents become citable
+    spans. A shebang names an interpreter, so `#!` followed by `[` is not one.
+
+    Caught by `anchors-selftest`, not by review and not by the tree: no `.rs` file under
+    the walk currently opens with `#![`, so **the gate stayed green through the defect**
+    and only a case written for the purpose failed. That is the same argument as the
+    probes one screen down, arriving on the arm that was supposed to be the safe half.
     """
     suffix = pathlib.PurePath(path).suffix
-    hashed = suffix in HASH_SUFFIXES or (suffix == "" and text.startswith("#!"))
-    return HASH_MARKERS if hashed else MARKERS
+    shebang = text.startswith("#!") and not text.startswith("#![")
+    return HASH_MARKERS if suffix in HASH_SUFFIXES or shebang else MARKERS
 
 
 def comment_blocks(text: str, markers: tuple[str, ...] = MARKERS) -> list[str]:
@@ -1568,6 +1678,7 @@ FRAGMENT_ANCHORS = {
 }
 
 fragments = set()
+resolved = set()
 for record, lives_in, target, literal in ANCHORS:
     if target not in cache:
         cache[target] = (ROOT / target).read_text()
@@ -1575,6 +1686,7 @@ for record, lives_in, target, literal in ANCHORS:
     at = body.find(literal)
     if at < 0:
         continue  # already reported above
+    resolved.add(record)
     # Whether the anchor SPANS COMPLETE LINES, not whether it was quoted with its
     # indentation. Records quote line content without leading whitespace as a matter
     # of course, and that is fine: `break-once.sh` matches the substring either way.
@@ -1596,12 +1708,27 @@ for record, lives_in, target, literal in ANCHORS:
     # character, so the span is every line the literal touches.
     #
     # **`last` is the final character's index rather than one past the end, and that is
-    # load-bearing for the two rows whose literal ENDS in a newline.** For `C8` and
-    # `C11`, one-past-the-end sits on the NEXT line, so the span would swallow it and
-    # both rows would turn into fragments - a fix for one shape breaking two rows of
-    # another. Indexing the last character makes `find` land on that same newline and
-    # stop there. Measured over all rows before and after: the only classification that
-    # moves is the one this fix is for.
+    # load-bearing for two of the THREE rows whose literal ENDS in a newline.** Derived
+    # over every row at `82b8366`: `C8`, `C8b` and `C11` end in a newline, and under
+    # one-past-the-end **`C8` and `C8b` flip to FRAGMENT while `C11` does not.**
+    #
+    # **The discriminator is what sits on the next line, and it is worth naming because
+    # the safe row is safe by accident.** One-past-the-end lands on the line AFTER the
+    # literal, so the span swallows it - and then `.strip()` decides. `C8` and `C8b` are
+    # followed by `    }`, which survives stripping and makes the span differ from the
+    # literal. `C11` is followed by a BLANK line, which `.strip()` erases, so the
+    # swallowed span still compares equal. `C11` therefore stays WHOLE under all three
+    # bounds, and it would start failing the day somebody wrote a line under it.
+    #
+    # Indexing the last character makes `find` land on the literal's own closing newline
+    # and stop there, so nothing is swallowed and no row depends on its neighbour being
+    # blank. Measured over all rows before and after: the only classification that moves
+    # is the one this fix is for.
+    #
+    # **An earlier version of this paragraph said "the two rows" and named `C8` and
+    # `C11`** - wrong on the count and on one of the two names, and derived from a
+    # pattern rather than from a sweep. `C8b` did not exist when the sentence was first
+    # drafted and was not added when it was created one commit later.
     start = body.rfind("\n", 0, at) + 1
     last = at + len(literal) - 1
     end = body.find("\n", last)
@@ -1619,7 +1746,18 @@ for record in sorted(fragments - FRAGMENT_ANCHORS):
     print("       line including its indentation, or describe the edit instead.",
           file=sys.stderr)
     print(file=sys.stderr)
-for record in sorted(FRAGMENT_ANCHORS - fragments):
+# ── OVER-DECLARATION IS REPORTED ONLY FOR A ROW WHOSE ANCHOR RESOLVED ─────────
+#
+# **A row whose anchor counts 0 `continue`s above and never enters `fragments`, so a
+# bare `FRAGMENT_ANCHORS - fragments` includes it and prints "its anchor is a whole line
+# now - drop it from that set".** The anchor is GONE, not whole-line, and the remedy
+# printed is the wrong edit: dropping the declaration removes the one line that says
+# this row was knowingly a fragment, while the real failure - resolution - is already
+# reported above with its own remedy.
+#
+# So the difference is reported against `resolved`. A vanished anchor is one failure with
+# one diagnosis, not two with one of them misleading.
+for record in sorted((FRAGMENT_ANCHORS & resolved) - fragments):
     bad += 1
     print(f"FAIL {record}: listed in FRAGMENT_ANCHORS but its anchor is a whole "
           "line now - drop it from that set", file=sys.stderr)
@@ -1692,11 +1830,13 @@ def quoted_spans(path: str, text: str | None = None) -> set[str]:
     `#` while a record in Rust keeps the three strict markers. Before that, a shell
     file returned an empty haystack and every row registered against one reddened.
 
-    `text` overrides the read, and it exists so this function can be EXERCISED. With
-    the read hard-wired, dropping `markers_for` from the line below left this task
-    printing byte-identical output at exit 0, because every registered `lives_in` is a
-    `.rs` file - measured, by making that exact cut. A seam a probe can drive is the
-    difference between the policy being checked here and being checked nowhere.
+    `text` overrides the read, and it exists so this function can be EXERCISED. When it
+    was added, dropping `markers_for` from the line below left this task printing
+    byte-identical output at exit 0 - measured, by making that exact cut - because every
+    registered `lives_in` was then a `.rs` file. **That is no longer true: nineteen rows
+    live in `scripts/hook-guard.sh`, so the same cut now reddens 19 of them.** The seam
+    is kept because it covers the arm for a kind no row has yet - and because a probe
+    that drives this function is what proved the plumbing was checked by nothing.
     """
     if text is None:
         text = (ROOT / path).read_text()
@@ -1706,22 +1846,47 @@ def quoted_spans(path: str, text: str | None = None) -> set[str]:
 
 # ── the `#` ARM HAS NO EXERCISER IN THE TREE, SO ONE IS WRITTEN HERE ───────────
 #
-# Every `lives_in` above is a `.rs` file. So no perturbation of the TREE can redden
-# the `#` arm - the whole registry passes with `markers_for` returning `MARKERS`
-# unconditionally, which is the state this file shipped in. **A behaviour no run
-# exercises has no break record**, and an unexercised reader reporting an empty
-# haystack as an absent quote is the exact defect this arm was added for. So the arm
-# is exercised on text written here for the purpose, for the same reason
-# `anchors-selftest` exercises the wrapped-quote reader on synthetic input.
+# **THE HEADING ABOVE WAS TRUE WHEN WRITTEN AND IS NOW HALF FALSE, and the half that
+# survives is what these probes still cover.** It was written when every `lives_in` was
+# a `.rs` file, so no perturbation of the TREE could redden the `#` arm and the whole
+# registry passed with `markers_for` returning `MARKERS` unconditionally. **Nineteen
+# rows now live in `scripts/hook-guard.sh`**, so that cut reddens 19 rows against the
+# tree today - measured at `82b8366` as M1 records.
+#
+# So the arm is no longer unexercised. **What is still unexercised is one CLAUSE of the
+# policy**, and the probes are kept for that, which the end condition below now states
+# per clause rather than for the arm as a whole.
+#
+# The original reason survives as a reason: **a behaviour no run exercises has no break
+# record**, and an unexercised reader reporting an empty haystack as an absent quote is
+# the exact defect this arm was added for. The arm is exercised on text written here for
+# the purpose, for the same reason `anchors-selftest` exercises the wrapped-quote reader
+# on synthetic input.
 #
 # **POSITIVE, never by absence.** The probe is a `#` comment that DOES carry a
 # backticked span, and the check is that the span comes back. A reader proves nothing
 # about a marker until that marker has been watched to MATCH; counting zero failures
 # is what the old reader did on every shell file.
 #
-# It reads no file, so it costs nothing, and it states its own end: once a row
-# registered in a shell file exercises this arm against the tree, this probe is
-# redundant and can go.
+# It reads no file, so it costs nothing. **The end condition is PER CLAUSE, and stating
+# it for the arm as a whole was a defect that would have deleted live coverage.** An
+# earlier version said: redundant once a row registered in a shell file exercises this
+# arm against the tree. That condition is now met - for ONE clause:
+#
+#   `probe.sh`     the SUFFIX clause. **Retired condition MET.** Nineteen rows have
+#                  `lives_in = scripts/hook-guard.sh`, a `.sh` file, so the tree
+#                  exercises this clause 19 rows deep and M1 measures it. This probe is
+#                  genuinely redundant now and is kept only as the cheaper diagnostic.
+#   `hooks/probe`  the SHEBANG clause, for a SUFFIX-LESS file. **Condition NOT met, and
+#                  it cannot be met by the current registry.** Measured at `82b8366`: no
+#                  registered `lives_in` is suffix-less, `.githooks/pre-commit` and
+#                  `.githooks/pre-push` contribute **0 of the 132** harness blocks, and
+#                  removing the shebang clause leaves the walk at **132** - so the
+#                  tripwire does not move either. **Delete this entry and the clause has
+#                  no coverage at all**, which is exactly what M2 exists to show.
+#
+# So: `hooks/probe` stays until a row's `lives_in` is a suffix-less file. Anyone acting
+# on the old one-line condition would have removed both.
 #
 # **It drives `quoted_spans`, NOT the reader underneath it, and that choice was forced
 # by a measurement.** An earlier version called `comment_blocks` and `spans` directly.
@@ -1735,9 +1900,16 @@ def quoted_spans(path: str, text: str | None = None) -> set[str]:
 # is what `.githooks/pre-push` needs, since it has no suffix to key on. One probe would
 # leave the clause written for the second of those two files unexercised - which is
 # this same defect, one clause smaller.
+# A THIRD probe covers `.py`, which no walked file and no `lives_in` has. It was
+# unreachable AND unexercised, which is this file's own standard turned on itself: a
+# behaviour no run exercises has no break record. Dropping `.py` from `HASH_SUFFIXES` was
+# the alternative and is worse - the arm is CORRECT, and a Python module without a
+# shebang is exactly the case the suffix list exists to place, since the shebang clause
+# cannot see it.
 PROBES = (
     ("probe.sh", "set -eu\n# replacing `expected_len=64` with 40.\n"),
     ("hooks/probe", "#!/usr/bin/env bash\n# replacing `expected_len=64` with 40.\n"),
+    ("probe.py", "import os\n# replacing `expected_len=64` with 40.\n"),
 )
 for probe_path, probe_text in PROBES:
     # The DECISION is `quoted_spans`, and these two are the DIAGNOSTIC only - the halves
@@ -2093,6 +2265,21 @@ UNNAMED = ("Made red", "Red under")
 # `.githooks/*` are in because they hold records, and `.mise/tasks/*` is OUT because no
 # row lives there - an exclusion that is a consequence rather than an entry on a list.
 #
+# **`demo/` WAS MISSING, and it was missing in the way this paragraph is meant to prevent.**
+# `Cargo.toml` lists three workspace members - `keylink`, `keylink-persist` and `demo` -
+# and this walk named two. So the file stated the rule twice, presented every exclusion as
+# a consequence, and silently carried a third member as an unargued omission: the word
+# "demo" did not appear anywhere in it. **A rule that is applied by hand has a list
+# hiding inside it**, and the way to find that list is to ask which entries the rule would
+# have admitted that nobody wrote down.
+#
+# `demo/**/*.rs` is now walked. Measured at `82b8366`: one file, 39 blocks, **0** naming
+# the harness - so `RECORD_BLOCKS` stayed at 132 and the tripwire did not move, confirmed
+# by running it rather than predicted. **The gap was PROSPECTIVE, and closing it while it
+# costs nothing is the only cheap moment**: a break record added to `demo/` tomorrow would
+# have been invisible, and the figure would have understated the population with nothing
+# to say so.
+#
 # **Passing `markers_for` is what makes the widening real, and whether forgetting it is
 # SILENT depends on when.** A shell file read with the Rust markers contributes ZERO
 # blocks. So:
@@ -2107,12 +2294,30 @@ UNNAMED = ("Made red", "Red under")
 #
 # So the constant converts the omission from silent to loud, and only once somebody has
 # set it from a correct run. That ordering is the whole value of pinning it.
+def script(path: pathlib.Path) -> bool:
+    """Whether a suffix-less file is a script, decided by its first two BYTES.
+
+    `.githooks/` is globbed whole rather than by suffix, because its files have no
+    suffix - so anything that lands there is handed to this walk. **`read_text()` on a
+    non-UTF-8 file raises `UnicodeDecodeError`, which turns this gate into a traceback
+    rather than a diagnostic**, and the platform makes that concrete: a stray
+    `.DS_Store` in `.githooks/` is one Finder visit away, and git's own `*.sample` files
+    live there too. Measured: `read_text()` on a file whose third byte is `0x82` raises.
+
+    Reading the shebang as BYTES cannot raise, so the filter is the guard. `scripts/*.sh`
+    needs none - it is suffix-filtered already.
+    """
+    with path.open("rb") as handle:
+        return handle.read(2) == b"#!"
+
+
 all_blocks: list[str] = []
 for path in sorted(
     list((ROOT / "keylink").rglob("*.rs"))
     + list((ROOT / "keylink-persist").rglob("*.rs"))
+    + list((ROOT / "demo").rglob("*.rs"))
     + list((ROOT / "scripts").glob("*.sh"))
-    + [p for p in (ROOT / ".githooks").iterdir() if p.is_file()]
+    + [p for p in (ROOT / ".githooks").iterdir() if p.is_file() and script(p)]
 ):
     text = path.read_text()
     all_blocks += comment_blocks(text, markers_for(str(path.relative_to(ROOT)), text))
