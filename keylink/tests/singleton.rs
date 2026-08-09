@@ -1075,7 +1075,9 @@ impl Observer<Ledger> for PanicsOnWhatCompleted {
 /// either.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `rendered`'s new
-/// arm, sending it back out under the refusal's prefix:
+/// arm. Search
+/// `Outcome::Err(RemoteError::Failed(format!("{OBSERVER_PANICKED}{name}"))),`
+/// and send it back out under the refusal's prefix instead:
 /// `Outcome::Err(RemoteError::Failed(format!("{REFUSED}{name}"))),`. Watched:
 /// `left: "observer refused: panics-on-completed-turns"`,
 /// `right: "observer panicked: panics-on-completed-turns"`.

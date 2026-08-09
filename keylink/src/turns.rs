@@ -6005,10 +6005,12 @@ mod tests {
     /// the sentence was the whole of what it got, and it was the refusal's.
     ///
     /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on
-    /// [`Deferred::send`]'s release arm, giving it the refusal's answer:
+    /// [`Deferred::send`]'s release arm. Search
+    /// `Verdict::ObserverPanicked { name } => reply.answer(Answered::ObserverPanicked { name }),`
+    /// and give it the refusal's answer instead:
     /// `Verdict::ObserverPanicked { name } => reply.answer(Answered::Refused { name }),`.
-    /// The quote is unindented and the code is not, which is what keeps the anchor
-    /// unique in its own file.
+    /// Both quotes are unindented and the code is not, which is what keeps the
+    /// anchor unique in its own file.
     ///
     /// **This record's first anchor was dead on arrival, and the reason is worth
     /// more than the fix.** It quoted the arm's *body* off a three-line block —
@@ -6016,8 +6018,14 @@ mod tests {
     /// the single line above, taking the count to 0. The check had been run
     /// **before** the formatter, which owns the line breaks and is not the
     /// author's to promise. `.mise/tasks/anchors` names that rot mode; nothing
-    /// caught this instance, because the gate checks **registered** rows and this
-    /// record is not one. Verify an anchor after `cargo fmt`, never before.
+    /// caught this instance, because the gate checked only **registered** rows and
+    /// this record was not one. It is registered now, as `O3`.
+    ///
+    /// **The sequencing is the lesson and it is not obvious**, so it is written
+    /// here rather than left to be inferred: format first, then count. Every anchor
+    /// this branch adds was re-measured **after** `cargo fmt` once this was found,
+    /// and all five resolve to exactly one. `scripts/break-once.sh`'s own header
+    /// carries the rule, because that is where an author meets the harness.
     ///
     /// Watched: `a parked caller must read the same words as the turn's own:
     /// Err(Refused { name: "falling-over" })`. **The assertion above it stayed

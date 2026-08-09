@@ -1699,6 +1699,32 @@ ANCHORS = [
     # apart and disagree.
     ("I4", "scripts/hook-guard.sh", "scripts/install-hooks.sh",
      '    if [ "$worktrees" -gt 1 ]; then'),
+    # ── `O`, from `observer-crashed`: a panicking observer is not a refusal ─────
+    #
+    # **Registered because one of these four was DEAD and nothing said so.** `O3`'s
+    # record first quoted the release arm's BODY, off a three-line block. Uniqueness
+    # was measured at 1 - and then `cargo fmt` collapsed the block onto the single
+    # line registered below, taking the count to 0. It was dead at the branch's first
+    # commit, dead at every commit after it, and dead at the SHA a merge gate
+    # reviewed, because this gate checks REGISTERED rows and the row did not exist.
+    #
+    # That is mode 2 in this file's header - the formatter rewrapped it - arriving
+    # for the second time in one day, after `D11` in `#41`. Two instances, one cause,
+    # so `scripts/break-once.sh`'s own header now carries the rule: **`cargo fmt`
+    # owns the line breaks, so an anchor over a multi-line block is counted AFTER
+    # formatting.**
+    #
+    # `O3` and `O4` are same-file rows and their records quote UNINDENTED for mode
+    # 1's reason. `O4`'s bare line occurs twice in `turns.rs`, so its record says out
+    # loud to pass the indentation; the registered literal carries it.
+    ("O1", "keylink/tests/observe.rs", "keylink/src/turns.rs",
+     "        (Ok(_), Some(Withheld::Panicked { name })) => Answered::ObserverPanicked { name },\n"),
+    ("O2", "keylink/tests/singleton.rs", "keylink/src/turns.rs",
+     '            Outcome::Err(RemoteError::Failed(format!("{OBSERVER_PANICKED}{name}"))),\n'),
+    ("O3", "keylink/src/turns.rs", "keylink/src/turns.rs",
+     "            Verdict::ObserverPanicked { name } => reply.answer(Answered::ObserverPanicked { name }),\n"),
+    ("O4", "keylink/src/turns.rs", "keylink/src/turns.rs",
+     "            Ok(()) | Err(NotQueued::Closed) => {}\n"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.

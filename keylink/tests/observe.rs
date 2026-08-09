@@ -441,8 +441,10 @@ async fn an_observer_runs_before_the_caller_is_answered() {
 /// which fact; the text is what a caller prints, and it is the half that was
 /// false.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `turn`'s fold,
-/// giving the panicked arm the refusal's answer:
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `turn`'s fold.
+/// Search
+/// `(Ok(_), Some(Withheld::Panicked { name })) => Answered::ObserverPanicked { name },`
+/// and give the panicked arm the refusal's answer instead:
 /// `(Ok(_), Some(Withheld::Panicked { name })) => Answered::Refused { name },`.
 /// Watched: `left: Refused { name: "exploding" }`,
 /// `right: ObserverPanicked { name: "exploding" }`.
