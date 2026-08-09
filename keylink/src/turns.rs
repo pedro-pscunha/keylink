@@ -863,7 +863,7 @@ impl<T> Answered<T> {
 /// the [`Verdict`] a parked caller is released with, once to build the answer the
 /// turn's own caller reads.
 #[derive(Clone, Copy)]
-enum Withheld {
+enum ObserverVerdict {
     /// [`Observer::after_turn`] returned `Err`. The flag is
     /// [`Stop::is_fatal`](crate::Stop::is_fatal).
     Vetoed {
@@ -919,7 +919,7 @@ async fn observed_turn<A, T, F>(
     hooks: &mut [Box<dyn Observer<A>>],
     method: &'static str,
     turn: F,
-) -> (Result<T, Panic>, Option<Withheld>, Option<Ended>)
+) -> (Result<T, Panic>, Option<ObserverVerdict>, Option<Ended>)
 where
     A: 'static,
     // `Send` on `T` and not on `A`. The handler's value is held across the
@@ -960,10 +960,10 @@ where
     };
 
     // Two things, because the two audiences need different granularity: the
-    // [`Withheld`] is what the caller is told, and the `Arc` is what the [`Ended`]
-    // carries. `Withheld::Vetoed` holds [`Stop::is_fatal`] as well, because that is
+    // [`ObserverVerdict`] is what the caller is told, and the `Arc` is what the [`Ended`]
+    // carries. `ObserverVerdict::Vetoed` holds [`Stop::is_fatal`] as well, because that is
     // the one thing about a refusal a supervisor reads and nothing else does.
-    let mut withheld: Option<(Withheld, Arc<dyn Error + Send + Sync>)> = None;
+    let mut withheld: Option<(ObserverVerdict, Arc<dyn Error + Send + Sync>)> = None;
     for observer in hooks.iter_mut() {
         let name = observer.name();
         // TWO catches, because `after_turn` has two halves that can panic and
@@ -1002,7 +1002,7 @@ where
             Ok(Ok(())) => {}
             Ok(Err(stop)) => {
                 let (reason, fatal) = stop.into_parts();
-                withheld = Some((Withheld::Vetoed { name, fatal }, Arc::from(reason)));
+                withheld = Some((ObserverVerdict::Vetoed { name, fatal }, Arc::from(reason)));
                 break;
             }
             // `Panic` implements `Display` and not `Error`, and is not `Sync`,
@@ -1017,7 +1017,7 @@ where
             // with the second for as long as one slot carried both.
             Err(panic) => {
                 let reason: Box<dyn Error + Send + Sync> = panic.to_string().into();
-                withheld = Some((Withheld::Panicked { name }, Arc::from(reason)));
+                withheld = Some((ObserverVerdict::Panicked { name }, Arc::from(reason)));
                 break;
             }
         }
@@ -1034,8 +1034,8 @@ where
     // ending names the fault, and there is nothing committed either way.
     let verdict = match (&panicked, &withheld) {
         (Some(_), _) => Verdict::Faulted,
-        (None, Some((Withheld::Vetoed { name, .. }, _))) => Verdict::Refused { name },
-        (None, Some((Withheld::Panicked { name }, _))) => Verdict::ObserverPanicked { name },
+        (None, Some((ObserverVerdict::Vetoed { name, .. }, _))) => Verdict::Refused { name },
+        (None, Some((ObserverVerdict::Panicked { name }, _))) => Verdict::ObserverPanicked { name },
         (None, None) => Verdict::Committed,
     };
     for release in parked {
@@ -1061,13 +1061,13 @@ where
         // same `who` the parked callers were released with above.
         (Some((who, error)), None) => {
             let end = match who {
-                Withheld::Vetoed { name, fatal } => Ended::Observer { name, error, fatal },
+                ObserverVerdict::Vetoed { name, fatal } => Ended::Observer { name, error, fatal },
                 // Never fatal: an observer that panicked made no claim about
                 // whether another incarnation would fare better, and answering one
                 // for it would be a claim nobody made. It is written here, on the
                 // one line that needs a flag, rather than into the slot the caller
                 // also reads.
-                Withheld::Panicked { name } => Ended::Observer {
+                ObserverVerdict::Panicked { name } => Ended::Observer {
                     name,
                     error,
                     fatal: false,
@@ -1153,14 +1153,14 @@ where
     // promises about a panicking call. A turn that *completed* and was refused is
     // withheld, because a caller must not be handed an uncommitted value.
     //
-    // Withholding is the same on both `Withheld` arms and the sentence is not. The
+    // Withholding is the same on both `ObserverVerdict` arms and the sentence is not. The
     // decision needs two answers and the report needs three, and one slot carrying
     // both is what told a caller *the {name} observer refused this turn* about an
     // observer that fell over.
     reply.answer(match (ran, withheld) {
         (Ok(value), None) => Answered::Ran(value),
-        (Ok(_), Some(Withheld::Vetoed { name, .. })) => Answered::Refused { name },
-        (Ok(_), Some(Withheld::Panicked { name })) => Answered::ObserverPanicked { name },
+        (Ok(_), Some(ObserverVerdict::Vetoed { name, .. })) => Answered::Refused { name },
+        (Ok(_), Some(ObserverVerdict::Panicked { name })) => Answered::ObserverPanicked { name },
         (Err(panic), _) => Answered::Faulted(panic),
     });
     end
@@ -1228,8 +1228,8 @@ where
     match ran {
         Ok(Replied(Settled::Now(reply, value))) => reply.answer(match withheld {
             None => Answered::Ran(value),
-            Some(Withheld::Vetoed { name, .. }) => Answered::Refused { name },
-            Some(Withheld::Panicked { name }) => Answered::ObserverPanicked { name },
+            Some(ObserverVerdict::Vetoed { name, .. }) => Answered::Refused { name },
+            Some(ObserverVerdict::Panicked { name }) => Answered::ObserverPanicked { name },
         }),
         Ok(Replied(Settled::Later)) => {}
         // The `Panic` is dropped rather than reported, because the channel it

@@ -1718,7 +1718,7 @@ ANCHORS = [
     # 1's reason. `O4`'s bare line occurs twice in `turns.rs`, so its record says out
     # loud to pass the indentation; the registered literal carries it.
     ("O1", "keylink/tests/observe.rs", "keylink/src/turns.rs",
-     "        (Ok(_), Some(Withheld::Panicked { name })) => Answered::ObserverPanicked { name },\n"),
+     "        (Ok(_), Some(ObserverVerdict::Panicked { name })) => Answered::ObserverPanicked { name },\n"),
     ("O2", "keylink/tests/singleton.rs", "keylink/src/turns.rs",
      '            Outcome::Err(RemoteError::Failed(format!("{OBSERVER_PANICKED}{name}"))),\n'),
     ("O3", "keylink/src/turns.rs", "keylink/src/turns.rs",

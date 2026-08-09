@@ -443,9 +443,9 @@ async fn an_observer_runs_before_the_caller_is_answered() {
 ///
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `turn`'s fold.
 /// Search
-/// `(Ok(_), Some(Withheld::Panicked { name })) => Answered::ObserverPanicked { name },`
+/// `(Ok(_), Some(ObserverVerdict::Panicked { name })) => Answered::ObserverPanicked { name },`
 /// and give the panicked arm the refusal's answer instead:
-/// `(Ok(_), Some(Withheld::Panicked { name })) => Answered::Refused { name },`.
+/// `(Ok(_), Some(ObserverVerdict::Panicked { name })) => Answered::Refused { name },`.
 /// Watched: `left: Refused { name: "exploding" }`,
 /// `right: ObserverPanicked { name: "exploding" }`.
 #[tokio::test]
