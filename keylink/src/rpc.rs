@@ -16,6 +16,18 @@
 //! (100 by default), so an unbounded number of handler tasks is not reachable
 //! from the network.
 //!
+//! **That hundred is a DEPENDENCY's default, which makes it a different kind
+//! of borrowed number from any constant this crate owns.** A limit here rots
+//! when somebody edits a `const`, and a grep for the old value then finds
+//! every sentence that repeated it. An external default rots on a version
+//! bump instead: no file here changes, no gate reads it, and the sentence goes
+//! on reading like a statement about keylink. `docs/rfc-04-actors.md` holds
+//! the verification against the transport crate's own source at the version it
+//! was read, which is the only honest form that citation can take. So rely on
+//! the NAME — `local.rs` bounds its queue by `max_concurrent_bidi_streams`
+//! without spelling a number — and read the figure here as an order of
+//! magnitude.
+//!
 //! It also removes a whole category of protocol design: with one stream per
 //! call there is nothing to correlate, so there are no request ids, no
 //! out-of-order reply matching, and no cancellation bookkeeping. Dropping the
@@ -807,7 +819,10 @@ mod tests {
     /// `start_paused` is what makes that assertion honest rather than a race.
     /// With the bound removed this call parks on its 30 second budget, tokio
     /// auto-advances to the timer, and the answer comes back `InFlight` — so
-    /// the test fails on the variant rather than hanging.
+    /// the test fails on the variant rather than hanging. That budget is the duration
+    /// this test asks for below, not [`MAX_ATTACH`], which currently holds the same
+    /// number — worth saying because a sweep reading the figure alone cannot tell the
+    /// two apart, and one read it as the constant.
     #[tokio::test(start_paused = true)]
     async fn an_attacher_over_the_cap_is_refused_before_it_parks() {
         let ledger = Ledger::new(Limits::default(), Records::Memory);
@@ -957,6 +972,17 @@ mod tests {
     /// `assertion `left == right` failed: the ceiling must be this service's
     /// Limits::attach`, `left: 30s`, `right: 1s`.
     ///
+    /// **That `left` has two owners holding one value, and only one of them is local,
+    /// so it is recorded rather than replaced.** The replacement puts [`MAX_ATTACH`]
+    /// back as the cap and `attach_budget` then clamps the request to it, so the hold
+    /// is the SMALLER of this test's own thirty second request and the constant. The
+    /// two are equal deliberately — the paragraph above says the peer asks the default
+    /// ceiling exactly — so the number is reproducible from this file, and it still
+    /// moves if the constant ever drops BELOW the request. That is the difference from
+    /// `a_peer_over_the_attach_ceiling_is_held_for_the_default` and
+    /// `a_peer_under_the_attach_ceiling_keeps_its_own_budget`, where `left` or `right`
+    /// **is** the constant and no local literal reproduces it.
+    ///
     /// **The line this quotes moved twice, and the break set moved with it.** It was
     /// `let Some(budget) = idem.attach_budget(ledger.attach_cap()) else {` when the cap
     /// was read and clamped on one line; the read is its own `match` arm now, because
@@ -997,7 +1023,19 @@ mod tests {
     /// and this is the guard that says the default reaches the accept path rather
     /// than only the struct. Watched, under `cargo test`:
     /// `assertion `left == right` failed: a request over the ceiling must be held
-    /// for the ceiling`, `left: 1s`, `right: 30s`.
+    /// for the ceiling`, where `left: 1s` is the replacement's own duration, quoted
+    /// above, and `right` is [`MAX_ATTACH`] — the constant the assertion below names
+    /// rather than spells.
+    ///
+    /// **This record made the argument above and then broke it in its own watched
+    /// output.** That paragraph says a hard-coded thirty rots in the one direction
+    /// nothing catches, and the transcription beneath it went on to spell that very
+    /// number out, in the same block, for the same constant. The general form is what
+    /// to keep, because it says where to look rather than what happened here: **a
+    /// reader who has just been convinced by an argument is the least likely person to
+    /// audit the transcription beneath it.** So check a record against the rule it
+    /// argues for LAST, and never read the argument as evidence that the record already
+    /// complies with it.
     #[tokio::test(start_paused = true)]
     async fn a_peer_over_the_attach_ceiling_is_held_for_the_default() {
         assert_eq!(
@@ -1020,7 +1058,9 @@ mod tests {
     /// `.map(|_| cap)` in `keylink/src/idempotency.rs`, which is the ceiling
     /// swallowing the request. Watched, under `cargo test`:
     /// `assertion `left == right` failed: a request under the ceiling must be kept`,
-    /// `left: 30s`, `right: 1s`.
+    /// where `left` is [`MAX_ATTACH`] — the default ceiling returned whole, because the
+    /// replacement discards the request — and `right: 1s` is the budget this test asks
+    /// for.
     #[tokio::test(start_paused = true)]
     async fn a_peer_under_the_attach_ceiling_keeps_its_own_budget() {
         assert_eq!(
@@ -1052,7 +1092,11 @@ mod tests {
     /// `keylink/src/idempotency.rs` — the cap going away rather than moving.
     /// Watched, under `cargo test`:
     /// `assertion `left == right` failed: a zero ceiling must refuse without
-    /// waiting`, `left: 30s`, `right: 0ns`.
+    /// waiting`, `left: 30s`, `right: 0ns`. **Both values are this file's own, and a
+    /// sweep for borrowed numbers will flag that thirty wrongly** — one already did.
+    /// This break DELETES the clamp rather than moving the cap, so the hold is exactly
+    /// the request the test makes below and [`MAX_ATTACH`] never enters the result at
+    /// all.
     #[tokio::test(start_paused = true)]
     async fn an_attach_ceiling_of_zero_refuses_the_attacher_at_once() {
         assert_eq!(
@@ -1145,7 +1189,21 @@ mod tests {
     /// `a_zero_hold_still_spends_a_waiting_place` stays green, which is what says the
     /// pair is not one test twice. Watched, under `cargo test`:
     /// `assertion `left == right` failed: a forbidden setting must be refused before a
-    /// place is asked for`, `left: TooManyRunning { limit: 128 }`, `right: InFlight`.
+    /// place is asked for`, `left: TooManyRunning`, `right: InFlight`.
+    ///
+    /// **The `limit` field the real line carries is left out of that transcription, and
+    /// not for brevity.** This record owns the message above and the `right` it names —
+    /// both are in this file, a few lines below — and it owns nothing at all about the
+    /// count. `Ledger::wait` builds the refusal from `self.limits.waiting_per_peer`,
+    /// which `Limits`'s `Default` fills from
+    /// [`MAX_WAITING_PER_PEER`]; a service can then move that value through
+    /// `Limits::waiting_per_peer` without touching the constant at all. Recording the
+    /// number would also point at the wrong owner as readily as the right one:
+    /// `MAX_RUNNING_PER_PEER` holds the same value **by intent** and says so in its own
+    /// doc, so the printed count alone does not say which cap was reached.
+    /// `left: TooManyRunning` is a substring of the real line, which is what a replay
+    /// matches, and `a_zero_hold_still_spends_a_waiting_place` drops the count from its
+    /// mirrored output for this same reason.
     #[tokio::test(start_paused = true)]
     async fn a_forbidden_ceiling_is_refused_without_a_waiting_place() {
         assert_eq!(
@@ -1194,7 +1252,12 @@ mod tests {
     /// a replacement of its own, so it adds no row. **MEASURED at this tree, whole-lib,
     /// one run: ONE guard red, this one.** Watched, under `cargo test`:
     /// `assertion `left == right` failed: a zero hold must still spend a waiting
-    /// place`, `left: InFlight`, `right: TooManyRunning { limit: 128 }`.
+    /// place`, `left: InFlight`, `right: TooManyRunning`. The count that line prints is
+    /// left out for the reason
+    /// `a_forbidden_ceiling_is_refused_without_a_waiting_place` sets out: it is
+    /// [`MAX_WAITING_PER_PEER`]'s number arriving here through `Limits`, and this record
+    /// owns none of it. The assertion below names that constant rather than a number,
+    /// which is where a reader should go.
     #[tokio::test(start_paused = true)]
     async fn a_zero_hold_still_spends_a_waiting_place() {
         assert_eq!(
@@ -1484,9 +1547,18 @@ where
     /// The key state never leaves memory whatever this says. **What
     /// [`Records::None`] does shorten is the at-most-once *window*, by about a
     /// ninth**, because a settled key skips the record pool and enters the tombstone
-    /// pool directly. That lands on the one degradation `README.md`'s limit 4 says a
-    /// caller cannot detect. [`Records`] carries the operands and the argument; read
-    /// it before choosing `None` for a privacy requirement, because the sentence
+    /// pool directly. That lands on the one degradation a caller cannot detect: past
+    /// [`MAX_TOMBSTONES`](crate::MAX_TOMBSTONES) a key reads `Fresh` again, and `Fresh`
+    /// is what a key that was never used looks like too. `README.md` argues it under
+    /// its tombstone limit — named by subject here, because what stood in this sentence
+    /// was the ORDINAL "limit 4", and an ordinal is a positional anchor pointed at
+    /// prose rather than at a literal. Any item inserted above it in that numbered list
+    /// repoints this sentence silently, and neither a count nor a gate can see that.
+    /// `.mise/tasks/anchors` numbers the same rot mode three for quoted lines. The
+    /// ratio above is derived from [`MAX_RECORDS`](crate::MAX_RECORDS) against both
+    /// pools together, so it moves whenever either constant does. [`Records`] carries
+    /// the operands and the argument; read it before choosing `None` for a privacy
+    /// requirement, because the sentence
     /// that used to sit here — *"no setting here can weaken at-most-once"* — was
     /// false, and this is the doc a caller reads at the instant it types the call.
     #[must_use]
