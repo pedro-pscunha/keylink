@@ -12,14 +12,18 @@ Keyed actors reach the registry through a different door than local ones. Seven
 builder doors exist where four would do. Correct all four, in order, without
 moving either ALPN hash.
 
-## In flight, and NOT yet merged
+## Merged, as of PR #29
 
-`compose-group` carries `compose::Group`, `compose::Endings`, `Lifecycle` as a
-list and not one slot, and `guarded` as a named future. **It is committed and it
-is not merged.** `git merge-base --is-ancestor compose-group main` returns
-non-zero, and `keylink/src/compose/group.rs` does not exist on `main`. An earlier
-draft of this file said "merged", which the tree did not support. Verify against
-your own checkout before item B reconciles with anything.
+`compose-group` carried `compose::Group`, `compose::Endings`, `Lifecycle` as a
+list and not one slot, and `guarded` as a named future. **It is now MERGED**, at
+merge commit `f74a508`. `git merge-base --is-ancestor 28fab9e main` returns zero
+and `keylink/src/compose/group.rs` exists on `main`.
+
+**This section said "committed and NOT merged" until the merge, and before that an
+even earlier draft said "merged" when the tree did not support it.** Both readings
+have now been true of this file at different times, which is exactly why the
+instruction below survives the state changing: verify against your own checkout,
+because a status sentence is the fastest-rotting thing in a directive.
 
 **`Endings` is a second, working answer to B.** B reconciles with it or is
 refused. Do not build a third.
@@ -389,12 +393,22 @@ taste — see F.
 ## Traps, all measured
 
 - **`.mise/tasks/anchors` has no `try` anywhere.** Its target cache calls
-  `read_text()`, so a vanished `local.rs` raises `FileNotFoundError` and the
-  task dies before printing one check. It runs in `pre-commit`, so **the rename
-  commit cannot be created unless it repoints rows D1, D2 and D3.** Consider
-  making it report a missing target instead. One missing file currently
-  suppresses every other row's check, so the cost is not one wrong answer but
-  forty-eight absent ones.
+  `read_text()` — four sites on the merged tree — so a vanished `local.rs`
+  raises `FileNotFoundError` and the task dies before printing one check. It
+  runs in `pre-commit`, so **the rename commit cannot be created unless it
+  repoints every row targeting that file.**
+
+  **That is FOUR rows, not three.** This trap said "D1, D2 and D3" and PR #29
+  added `G13`, which targets `keylink/src/local.rs` from
+  `keylink/tests/compose.rs`. Re-measured on the merged tree: D1, D2, D3 and
+  G13. A trap that enumerates its instances goes stale every time somebody adds
+  one, so re-derive the list with `rg -c '"keylink/src/local\.rs"'
+  .mise/tasks/anchors` rather than trusting this sentence.
+
+  Make the task report a missing target instead — that is the crash-guard
+  commit, and it goes FIRST, as its own commit. The cost of the crash is not one
+  wrong answer but every check in the file, because the task dies rather than
+  skipping a row.
 - `scripts/replay-fate-breaks.sh` hardcodes `local.rs` on 16 lines, and no gate
   runs it. Repoint by hand and print the result.
 - `RECORD_BLOCKS` must NOT move on a rename — the walk is path-insensitive. A
@@ -407,7 +421,11 @@ taste — see F.
       actually enforces "no behavior change", and it is the one to keep if only
       one survives.
 - [ ] D: `rg -n 'local\.rs|crate::local|\blocal::|\bmod local\b' keylink scripts
-      .mise README.md CONTRIBUTING.md` returns zero. Baseline **89**.
+      .mise README.md CONTRIBUTING.md` returns zero. Baseline **102 lines across
+      27 files**, re-measured on `f74a508` — the merge of PR #29. It was **89
+      across 23** when first taken, and compose added the difference. Re-measure
+      before starting: this baseline rots on every merge, not on every edit to
+      `local.rs`.
 
 **The sweep this replaces was wrong twice over, and the second way is the
 instructive one.** `rg -n 'crate::local|src/local\.rs' .` does not return zero
@@ -434,15 +452,26 @@ directories, so it saw none of the five `.mise/tasks/anchors` lines — name
 - [ ] D: `RECORD_BLOCKS` absent from the rename commit's diff, and `docs/`
       absent from its file list.
 
-**The "under 30 changed lines" estimate was low by 3x and is replaced.**
-Measured: **89 name-carrying lines across 23 files outside `docs/`** — 4
+**The "under 30 changed lines" estimate was low by 3x and is replaced.** The
+figure has now been taken on two different trees, and BOTH are recorded, because
+the delta is the useful part.
+
+**On `0ab8366`: 89 name-carrying lines across 23 files outside `docs/`** — 4
 compile-critical, **19 break-record paths rather than 7** (the other 12 live in
 `supervision.rs`, `defer.rs`, `feeds.rs`, `persist.rs` and `cycles.rs`, not in
 `local.rs`), 16 replay-script arguments, 45 prose lines inside code, and 5 in
-`.mise/tasks/anchors`. Predicted diff **93 changed lines, band 90-96**: the 89
-names, the header's first line, and 3 for the `pub use` block if `cargo fmt`
-moves it as a unit. Everything under `docs/` is left alone per
-`CONTRIBUTING.md:322`.
+`.mise/tasks/anchors`. Predicted diff was 93 changed lines, band 90-96.
+
+**On `f74a508`, after PR #29 merged: 102 lines across 27 files** — 24 files under
+`keylink`, 2 under `.mise`, 1 under `scripts`. `scripts/replay-fate-breaks.sh`
+still carries 16, unchanged.
+
+**The sub-breakdown above belongs to the 89-line tree and has NOT been
+re-derived.** Only the total and the per-directory split were re-measured. Do not
+carry those five sub-figures onto the new tree — 4 + 19 + 16 + 45 + 5 sums to 89,
+so any of them reused against 102 is wrong by construction. Re-measure them, or
+work from the total and drop the breakdown. Everything under `docs/` is left
+alone per `CONTRIBUTING.md:322`.
 - [ ] C: `rg 'actor_with|actor_wired|spawn_wired' keylink/src` returns zero, and
       **`mise run docs` is green** — a deleted door named only in a rustdoc
       example is a doc break and not a compile error.
