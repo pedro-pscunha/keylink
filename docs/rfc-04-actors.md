@@ -1025,6 +1025,48 @@ idempotency ledger is **volatile**, so effectively-once is a property of one pro
 lifetime, not of a key. That is the real gap against a journalled system, and it is one
 sentence rather than a section. See also §9.1.
 
+**"No links" is overturned too, 2026-08-08, and it is the second movement of the same
+decision rather than a new one.** The paragraph above says supervision is not an Erlang
+transplant — *"There is no process tree, no links, no exit signals, and Wave 9 built none
+of them"* — and that was an accurate description of Wave 9. It is no longer a
+description of the crate. RFC-07 §9.8 recorded, as Wave 9 landed, that the dead-pid
+argument defeats sibling-*restart* strategies and *"does not touch ordered shutdown,
+escalation, or lifecycle grouping. Those are judged wanted."* `keylink::compose::Group`
+built all three, and RFC-07 §14 is its record. A group that **ends** its members when one
+of them ends for good is death propagation across a set — `Links` under another name, and
+the one Erlang mechanism this sentence denied that the crate now has.
+
+Most of that sentence still holds, and the surviving part is worth separating from the
+part that fell. There is no process **tree**: a group is a flat set a caller assembles,
+not a parent/child relation the runtime maintains. There are no exit **signals**: nothing
+is sent anywhere, and a member never tells the group it died — the group observes an
+ending it was handed when the member was added. And restart stayed the member's own job
+and never the group's, which is the half RFC-07 §9.8 refused and RFC-07 §14.5 refused
+again with three reasons of its own.
+
+*One citation above is off by a subsection and is corrected here rather than edited there:
+the bullet saying `Supervisor`, `Strategy`, `OneForAll`/`RestForOne` and trees are "named
+as refused in RFC-07 §9.10" means **§9.8**, which is the section that names them. §9.10 is
+"What Wave 9 did NOT do" and names none of the four.*
+
+**Capability E's row is now half-overturned, 2026-08-08.** §2's refused-designs table reads
+*"Supervision, restart, actor trees | large | **Reject.** Section 8."*, and this section is
+the reason it points at. Two of those three shipped; one did not.
+
+- **Supervision** — shipped in Wave 9. RFC-07 §9.
+- **Restart** — shipped in Wave 9, per actor, bounded by an `Intensity`. Never per group:
+  RFC-07 §14.5 gives the three facts that killed a group-level restart verdict, and the
+  sharpest is that `Intensity` exposes only `pub fn new`, so a sibling module cannot spend
+  one.
+- **Actor trees** — still rejected, and rejected a second time on contact. A `Group` is a
+  flat set. Nesting one inside another is a composition a caller writes, with a lossy
+  mapping it supplies itself, rather than a parent/child relation the crate maintains.
+
+The row's **cost** column aged worse than its verdict. "Large" was wrong twice over: Wave
+9's supervision is a closure and an `Intensity` rather than the `Actor::Args`, strategy
+enum and limiter this section predicted, and `compose::Group` is one new file that changes
+nothing in `local.rs`.
+
 ---
 
 ## 9. Prior art

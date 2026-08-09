@@ -55,11 +55,7 @@ impl Panic {
     ///
     /// [`resume`]: Self::resume
     pub(crate) fn caught(payload: Box<dyn std::any::Any + Send>) -> Self {
-        let message = payload
-            .downcast_ref::<&str>()
-            .map(|s| (*s).to_string())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "panicked".to_string());
+        let message = message_of(&*payload);
         Self {
             message: format!("the actor panicked: {message}"),
             payload,
@@ -75,6 +71,19 @@ impl Panic {
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// What the panicking code said, without the framing [`message`] puts on it.
+    ///
+    /// [`message`] answers *"the actor panicked: …"*, which is true where a turn
+    /// ran caller code and false where something else did — `compose::Group`
+    /// catches a panicking *ending future*, and an actor that is running
+    /// perfectly well must not be reported as having panicked. Reads the payload
+    /// this already holds rather than storing a second copy of the text.
+    ///
+    /// [`message`]: Self::message
+    pub(crate) fn bare(&self) -> String {
+        message_of(&*self.payload)
     }
 
     /// Panic in the calling task, with the payload the handler panicked with.
@@ -101,6 +110,26 @@ impl fmt::Debug for Panic {
             .field("message", &self.message)
             .finish()
     }
+}
+
+/// What a caught payload panicked with, as text.
+///
+/// The two downcasts are the two shapes `panic!` produces, and the fallback is
+/// for the third: a payload of some other type, which `panic_any` can make and
+/// which has no text at all.
+///
+/// **Separate from [`Panic::caught`] because the wording is not shared.**
+/// `caught` wraps this in *"the actor panicked: …"*, which is true where a turn
+/// ran caller code and false everywhere else — `compose::Group` catches a
+/// panicking *policy*, which is neither an actor nor a turn, and needs the bare
+/// message. The extraction is the part both want; the sentence around it is not.
+/// This exists because that second caller had copied these five lines verbatim.
+pub(crate) fn message_of(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|panicked| (*panicked).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panicked".to_string())
 }
 
 /// Run one future, turning a panic into a value instead of a dead actor.

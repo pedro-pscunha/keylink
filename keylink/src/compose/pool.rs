@@ -62,9 +62,14 @@
 //!   — and each handle survives its own faults without the pool knowing. A
 //!   supervised member's mailbox outlives its incarnations, so `pick` keeps
 //!   working across a restart and nothing in this module has to learn about one.
-//!   That is the design rather than an omission: `compose` holds no supervision
-//!   mechanism of its own, because composition and supervision compose rather
-//!   than one containing the other.
+//!   That is the design rather than an omission, and it is a claim about
+//!   *restarting* only: nothing in `compose` restarts anything, because a
+//!   supervised member already does. One member's ending mattering to the others
+//!   is a different question with its own answer one file over —
+//!   [`Group`](super::Group) watches a set of actors and asks a policy the caller
+//!   wrote whether the rest carry on without one, and it restarts nothing either.
+//!   A pool is not that and does not grow into it: `pick` keeps no list of who is
+//!   alive, and a member ending here is nobody's business but its own.
 //! - **Not keyed.** If which member handles a message matters, the member is an
 //!   identity and the thing wanted is [`System`](crate::System) or
 //!   [`Names`](super::Names).

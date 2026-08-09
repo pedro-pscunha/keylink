@@ -188,6 +188,9 @@ pub enum GroupEnded {
     Member { member: ActorId, reason: Ended },
     /// The policy panicked while deciding about this member.
     PolicyPanicked { member: ActorId, message: String },
+    /// The future that was to report this member's ending panicked instead.
+    /// Added in revision 3 — see §8.
+    EndingPanicked { member: ActorId, message: String },
     /// [`Group::stop`] was called.
     Stopped,
     /// Every `Group` was dropped, so nothing decides any more.
@@ -294,8 +297,16 @@ that refused a taken name would refuse a restart nondeterministically.
 ### 4.5 What `A → B → A` closure actually claims
 
 Revision 1 said "unwritable". That is false: a synchronous closure cannot await,
-but it can block — `n0_future::future::block_on` is public and unconditional, and
-a `std::sync::Mutex` an actor holds across an await needs no dependency at all.
+but it can block — and a `std::sync::Mutex` an actor holds across an await needs
+no dependency at all to do it.
+
+*Correction, found while writing the RFC record:* revision 2 said
+`n0_future::future::block_on` is "public and unconditional". It is public and
+**conditional**. `n0-future` does not define it — it arrives through the glob
+`pub use futures_lite::future::*` (`n0-future-0.3.2/src/lib.rs:79`), and the
+function is `pub` under `#[cfg(feature = "std")]`
+(`futures-lite-2.6.1/src/future.rs:52-53`). The claim it supports is unchanged,
+because the `Mutex` route needs no feature at all.
 
 The property that survives a hostile reader:
 
@@ -548,7 +559,70 @@ feature gates and must keep compiling under `--no-default-features` and for
 
 ---
 
-## 8. What is still open
+## 8. Revision 3 — four things implementation found that review did not
+
+Recorded rather than edited away, because the value of the record is that it
+shows what was believed at the time.
+
+1. **`add` and `remove` cannot return a `Membership`.** An ending future has one
+   owner, and `add` moves it into the conductor's `FuturesUnordered`. They return
+   `Option<Retire>` instead — a separate type whose only method is
+   `async fn retire(self)`. It is a distinct type on purpose: a `Membership` can
+   be added and a `Retire` cannot, so they are not one type with a field that is
+   sometimes absent. The first fix attempted was `Membership { ended: Option<..> }`,
+   which makes a value that *looks* re-addable and, if re-added, files a member
+   the policy can never be asked about. That is the unenforced promise this repo
+   refuses, so it was replaced rather than documented.
+2. **§4.7's "wakes once, finds nothing, and ends" had no wake source.** That
+   sentence is `names.rs:151-153`'s, and there the wake comes from the actor's
+   own ending. A group with two healthy members and no holder has none, so the
+   conductor would have waited forever instead of publishing `Dropped`. The
+   shared state's `Drop` fires the `Notify`, and the conductor holds the
+   `Arc<Notify>` beside the `Weak`, dropping the upgraded `Arc` before every
+   await.
+3. **§4.6's "await them all together, in the `FuturesUnordered` the conductor
+   holds" is not type-possible.** Endings and retirements have different item
+   types. Teardown uses a second set. One set would need an enum wrapper on every
+   ending, permanently, for a path that runs once.
+4. **`every_member_is_retired_before_any_is_awaited` names an order
+   `FuturesUnordered` does not promise.** The provable claim is that every retire
+   future is *built* before any is polled and none waits on another to complete.
+   The test is renamed `no_members_retirement_waits_on_another`.
+
+`Group` derives `Clone` (a `GroupEnded::Dropped` meaning "every `Group` was
+dropped" needs clones to mean anything, and `Names` is `Clone`); `Group` holds
+the `watch::Receiver` while the conductor holds the `Sender`, because `Dropped`
+must be published *after* the shared state is gone; and a replacement keeps the
+displaced member's position in the `Vec`, because that position is its place in
+the teardown order.
+
+**`GroupEnded` has a fifth variant, `EndingPanicked`, and it closes the last
+uncaught path.** §4.8 guarded the policy and nothing else, and quality review
+found three more pieces of caller code running on the conductor's task: the
+member's ending future, the retire closure, and the retire future. The failure
+was proved rather than argued — with the catch removed, two panicking members
+filed between two healthy ones orphan every member and answer `GroupEnded::Dropped`
+to a caller **still holding a live `Group`**. A wrong answer, not a missing one.
+
+The retire closure and its future are now caught with `panic.rs`'s existing
+`catching` and `guarded`, so a panic there costs one member. The ending future
+was the hard one: no `Ended` variant means *"the future that was going to say why
+panicked instead"*, so reporting `Vanished` or `Panicked` would be a false
+reason. The first answer was to document it as uncatchable. That was overruled —
+documenting a silent group-wide orphan does not make it acceptable — and the
+honest fix is a variant rather than a lie. `GroupEnded` is `#[non_exhaustive]`
+and the crate is unpublished, which `observe.rs:430-431` prices as free.
+
+**`add` on a group that has already ended files nothing and hands the membership
+straight back** as a `Retire`. The spec was silent, and the alternative is a
+leak: a member filed into a group whose conductor has exited is watched by
+nothing, decided on by nothing, and retired by nothing — which is the failure
+this whole feature exists to prevent, reached from the other side. The caller
+gets the means to end it and a `names()` that stays empty.
+
+---
+
+## 9. What is still open
 
 1. **`membership!` beside `Membership::new` is two doors.** `CONTRIBUTING.md:215`
    says one way to build a thing. The argument for both: the macro expands to the

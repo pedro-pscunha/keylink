@@ -1274,7 +1274,41 @@ for record in sorted(set(REDNESS) - row_ids):
 # versions of this note said "TWO new rows" for rows that no longer exist, then "NO new
 # row" one edit after that, then an arithmetic landing one short. All three were written
 # while the tree was still moving, which is exactly what a carried figure is.
-RECORD_BLOCKS = 127
+# 127 → the figure below, on `compose-group`, for `compose::Group`. **FOURTEEN new
+# blocks, all in `keylink/tests/compose.rs`, and NO new row yet.** Read off a FAILURE,
+# the way every figure above it was: the constant was left at 127 and the pre-commit
+# hook answered `141 comment blocks mention break-once.sh` from the walk.
+#
+# The accounting, because the delta is not the number of new tests and an auditor
+# cannot re-derive it from the two ends. The file went from 15 tests to 29, and from
+# 11 blocks to 25; the rest of the tree is unchanged at 116, and 116 + 25 = 141.
+# Fourteen blocks against twelve reddenable claims, because:
+#
+#   THIRTEEN carry a `Watched:` line. Several name a break that is honest about
+#            covering only half of what the test asserts, which is a block each and
+#            a row each once measured. One test carries TWO, because a panicking
+#            retire closure and a panicking retire future are two defects.
+#   ONE      carries no `Watched:` line at all: `members_are_reported_in_the_order_they_were_added`,
+#            whose defect is `Vec` → `HashMap` — a field type, an insert and a read.
+#            `break-once.sh` substitutes ONE literal, so it cannot express a
+#            restructure, and the block exists to say so rather than to claim a
+#            guard. That is exactly the case `rfc-07-the-turn-model.md:2280-2285`
+#            set the precedent for with `two_clones_of_a_pool_share_one_rotation`.
+#
+# **This entry named the wrong test for that block on its first writing**, and said
+# the `A -> B -> A` claim instead. Both are un-breakable and only one of them is the
+# block: the cycle claim lives in a `compile_fail` doctest in `group.rs`, which
+# mentions the harness nowhere and therefore contributes NO block at all. The count
+# was right and the noun was wrong, which is the failure this file's own notes keep
+# warning about — it was found by walking the blocks, not by re-reading the number.
+#
+# **No row is added here, and that is deliberate rather than an omission.** A row
+# claims a literal resolves exactly once and that the record quotes it. Both are
+# true only after the break has been RUN, and these thirteen still read
+# `Watched: TO BE MEASURED`. Registering them now would pin a literal against a
+# failure nobody has watched, which is the defect this whole task exists to catch.
+# The rows land with the commit that replaces those thirteen lines with real output.
+RECORD_BLOCKS = 141
 
 # The one marker the tripwire counts, and the two phrasings records use INSTEAD of
 # naming the harness. Both are read by the same walk, so the blind spot below is a

@@ -53,7 +53,8 @@
 //!   one, outside this crate.
 //! - **The compositions every actor system grows**, each with its backpressure
 //!   written down rather than inherited from an unbounded queue: fan-out, a
-//!   pool, a schedule and a name registry. See [`compose`].
+//!   pool, a schedule, a name registry, and a set of actors that end together.
+//!   See [`compose`].
 //! - **Its own introspection, served over itself.** [`System::status`] lists
 //!   what is running; [`inspect`] serves that list and a live lifecycle log on
 //!   an ALPN and an [`Allowlist`] of their own, and [`Console`] is the peer that
@@ -195,9 +196,9 @@ mod body;
 // duplicate for as long as the process lives, and this is what a caller's own
 // state does about the restart the ledger cannot cross.
 mod call;
-// A `pub mod` and not five root re-exports. The one thing these four share is an
+// A `pub mod` and not six root re-exports. The one thing these five share is an
 // argument about backpressure, and a module is where it can be written once
-// instead of five times. Its docs live in `compose/mod.rs`: an outer `///` here
+// instead of six times. Its docs live in `compose/mod.rs`: an outer `///` here
 // beside the inner `//!` there merges the two and resolves the merged doc's
 // intra-doc links in *this* file's scope, which turns every `[`Topic`]` in that
 // module doc into a broken link under `mise run docs`.
