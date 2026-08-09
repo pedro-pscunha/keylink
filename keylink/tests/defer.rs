@@ -287,7 +287,7 @@ async fn an_answer_given_inside_a_deferred_turn_is_withheld_when_an_observer_ref
 /// The channel is in the state, the state is owned by the loop's task, and the loop
 /// exiting drops both — so the caller's wait ends because the sender is gone. Inside
 /// keylink that is `TurnLost::Gone`; through a generated `Handle` it is
-/// `Undelivered`, which is the same fact under this path's one error type.
+/// `Undelivered::Gone`, the variant `ask` maps that one into.
 ///
 /// **The timeout is the assertion.** A hang is not a failure to a test harness, so
 /// the wait is bounded and the bound is what goes red. `turns.rs`'s own unit test

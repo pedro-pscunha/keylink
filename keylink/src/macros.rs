@@ -1828,8 +1828,9 @@ macro_rules! __keylink_service {
             /// message gets the panic — resumed with its own payload, close to
             /// the way an ordinary function call would deliver it. Both halves
             /// matter: the first keeps one bad message from costing every later
-            /// one, the second keeps `Undelivered` meaning "the actor is gone"
-            /// rather than "something went wrong somewhere".
+            /// one, and the second keeps a fault out of
+            /// [`Undelivered`](keylink::Undelivered) altogether, so no variant
+            /// of it has to mean "something went wrong somewhere".
             ///
             /// Two places it is **not** like an ordinary call, both structural:
             /// a `tell` has no channel to carry the panic, so it is caught and
@@ -2326,12 +2327,20 @@ macro_rules! __keylink_service {
 
                 /// Resolve when this actor ends, and say why.
                 ///
-                /// [`Undelivered`](keylink::Undelivered) says "gone", and it
-                /// must not be stretched to say "gave up on durability". This is
-                /// the second question, asked separately — and it is the only
-                /// way to learn that an [`Observer`](keylink::Observer) refused
-                /// a turn, because a local call is told `Undelivered` either
-                /// way.
+                /// [`Undelivered::Gone`](keylink::Undelivered::Gone) says
+                /// "gone", and it must not be stretched to say "gave up on
+                /// durability". This is the second question, asked separately.
+                ///
+                /// **It is not where a refusal is learned, in either
+                /// direction.** An `rpc` refused by an
+                /// [`Observer`](keylink::Observer) is answered
+                /// [`Undelivered::Refused`](keylink::Undelivered::Refused) with
+                /// that observer's name, so the call carries the fact itself;
+                /// and a refusal that did not declare itself
+                /// [`fatal`](keylink::Stop::fatal) ends one incarnation rather
+                /// than the actor, so a supervised actor restarts and this does
+                /// not resolve at all. What it adds is the observer's own
+                /// **error**, which no reply channel carries.
                 ///
                 /// Holds no mailbox sender, so awaiting it does not keep the
                 /// actor alive: dropping every handle both ends the actor and
@@ -3786,7 +3795,13 @@ macro_rules! __keylink_local_method {
         ///
         /// # Errors
         ///
-        /// [`Undelivered`](keylink::Undelivered) when the actor is gone.
+        /// [`Undelivered`](keylink::Undelivered), one variant per way the call
+        /// lost its value: [`Gone`](keylink::Undelivered::Gone) when the actor
+        /// is gone, [`Refused`](keylink::Undelivered::Refused) when an
+        /// [`Observer`](keylink::Observer) refused the turn that ran — the actor
+        /// is alive, and a supervised one may be restarting — and
+        /// [`Reentrant`](keylink::Undelivered::Reentrant) when the call was made
+        /// from inside this actor's own turn.
         ///
         /// # Panics
         ///
@@ -3860,7 +3875,9 @@ macro_rules! __keylink_local_method {
         ///
         /// # Errors
         ///
-        /// [`Undelivered`](keylink::Undelivered) when the actor is gone.
+        /// The same [`Undelivered`](keylink::Undelivered) variants an `rpc`
+        /// answers, for the same reasons: this goes through the same `ask`, and
+        /// the blob is written by the turn rather than after it.
         pub async fn $name(&self $(, $arg: $ty )*)
             -> ::core::result::Result<($ret, $crate::BlobId), $crate::Undelivered> {
             self.inner

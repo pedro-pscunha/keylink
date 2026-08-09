@@ -96,12 +96,13 @@
 //! only for [`notify`](LocalActor::notify) — return `Ok` for a message that is
 //! then dropped unrun, because `Ok` there means "queued" and nothing else.
 //!
-//! It is also why [`ended`](LocalActor::ended) exists rather than a second error
-//! variant. An [`Observer`] that refuses a turn ends the actor,
-//! and the caller of that turn is told [`Undelivered`] like any other — which
-//! is true, and which does not say *why*. `Undelivered` means "gone" and must
-//! not be stretched to mean "gave up on durability", so the second question is
-//! asked separately and answered by [`Ended`].
+//! It is also why [`ended`](LocalActor::ended) exists rather than one more error
+//! variant. An [`Observer`] that refuses a turn is named in the error its caller
+//! gets — [`Undelivered::Refused`] carries [`Observer::name`] — and what is
+//! *not* there is that observer's own error, because [`Undelivered`] is `Copy`
+//! and `Eq` and a boxed reason is neither. `Undelivered::Gone` means "gone" and
+//! must not be stretched to mean "gave up on durability", so the second question
+//! is asked separately and answered by [`Ended`].
 //!
 //! The method names and success types match the remote client for `rpc` and
 //! `tell`. They do not for the other three: `blob` hands back a
@@ -3056,39 +3057,57 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Undelivered {
     /// The call did not reach a committed turn. **Usually** the actor is gone —
-    /// it stopped, was aborted, or its loop ended — but two other states arrive
-    /// here and in both of them the actor is **alive**.
+    /// it stopped, was aborted, or its loop ended — and one other state arrives
+    /// here in which the actor is **alive**.
     ///
-    /// # The two live causes, named because the variant's name does not
+    /// # The live cause still folded in, and what naming it would take
     ///
-    /// [`TurnLost::Refused`] is an observer refusing a completed turn: its own doc
-    /// is *"It **ran** and was not committed"*, and the actor is already serving
-    /// the next message. [`TurnLost::Expired`] is a queueing budget expiring while
-    /// the message waited. Neither means the actor is no longer running.
+    /// A handler that takes [`Reply::later`] and drops the [`Deferred`] closes the
+    /// reply channel without sending. `answered` sees a dropped sender, and a
+    /// dropped sender carries no reason — the silence a dead loop leaves behind is
+    /// the same silence. Two producers, one arm.
     ///
-    /// **Use [`ask_catching`](LocalActor::ask_catching) to tell them apart.** It
-    /// answers the whole [`TurnLost`], which is exhaustive precisely so a caller
-    /// can match the cause.
+    /// The **served** path separates them, and by reading rather than by
+    /// inferring: a peer's dispatch holds a registry entry, and beside it the
+    /// actor's `Standing`. `Running` there is what makes the answer
+    /// `Failed("dropped: ..")` instead of
+    /// [`NoSuchActor`](crate::RemoteError::NoSuchActor). A local call has no
+    /// registry entry, so there is no standing for this door to read.
     ///
-    /// # Why the collapse is deliberate here, and where it is not
-    ///
-    /// `ask` collapses because a plain caller has no different action to take: it
-    /// asked for a value and there is none. Widening this enum would force every
-    /// call site to match a case it cannot act on.
-    ///
-    /// **That reasoning does NOT extend one layer down, and `TurnLost`'s own doc
-    /// says so** — its section *"Four now, because the fourth was being reported
-    /// as `Gone`"* records that mapping a fourth state onto `Gone` "means
-    /// something else and specific — the actor is no longer running — so the first
-    /// local origin to carry a queue budget would have reported a live actor as
-    /// gone, silently". `TurnLost` split those states apart on that argument. This
-    /// variant re-joins them for the one caller that cannot use the difference,
-    /// and says so rather than letting the name imply the actor died.
-    ///
-    /// The message says *undelivered* and not *gone* for that reason: it is true
-    /// of all three causes, where "no longer running" was false for two of them.
+    /// The message therefore says *undelivered* and not *gone*: true of both
+    /// causes, where "no longer running" is false for one of them.
     #[error("this call was not delivered to a committed turn")]
     Gone,
+    /// An [`Observer`] refused this turn. It **ran** and was not
+    /// committed, so there is no value to hand back — and the actor is **not**
+    /// gone.
+    ///
+    /// A supervisor may already be rebuilding it: the retry decision reads the
+    /// flag [`Stop::fatal`](crate::Stop::fatal) sets, so a refusal that did not
+    /// declare itself fatal ends the incarnation and starts another. This arrived as
+    /// [`Gone`](Self::Gone) until it had a variant of its own, which told a
+    /// caller to stop calling an actor a supervisor was putting back.
+    ///
+    /// The name is carried rather than left to a second lookup because
+    /// [`ended`](LocalActor::ended) cannot supply it here: it resolves when the
+    /// **actor** ends, and a non-fatal refusal ends only one incarnation.
+    #[error("the {name} observer refused this turn: it ran and was not committed")]
+    Refused {
+        /// [`Observer::name`].
+        name: &'static str,
+    },
+    /// A [`QueueTimeout`](crate::QueueTimeout) budget expired while the message
+    /// waited. It **never started**, so the actor is untouched and still running.
+    ///
+    /// Unreachable from a local call today, for [`TurnLost::Expired`]'s reason:
+    /// this path builds its own local [`Origin`], one carries no [`Queueing`],
+    /// and there is nothing to expire.
+    /// It is a variant rather than a fold into [`Gone`](Self::Gone) because that
+    /// fold is the defect [`TurnLost`] was split to remove one layer down — the
+    /// first local origin to carry a budget would have had a live actor reported
+    /// as gone, silently, through a public API.
+    #[error("the queueing budget expired before this turn started: nothing ran")]
+    Expired,
     /// The call was made from inside the target actor's own turn, and would have
     /// deadlocked.
     ///
@@ -3142,10 +3161,10 @@ pub enum NotQueued {
     ///
     /// `Closed` and not `Gone`, because this names the one thing the send
     /// observed. [`Undelivered::Gone`] hedges — its own doc spends a section
-    /// saying the actor is *usually* gone, because two of the states it folds in
-    /// arrive through a lost reply channel and leave the actor alive. A closed
-    /// mailbox has no such hedge: the receiver is dropped or it is not, and it is
-    /// dropped only when the loop is finished with it.
+    /// saying the actor is *usually* gone, because the dropped reply channel it
+    /// still folds in leaves the actor alive. A closed mailbox has no such hedge:
+    /// the receiver is dropped or it is not, and it is dropped only when the loop
+    /// is finished with it.
     ///
     /// A **restart does not reach here.** The receiver outlives every incarnation
     /// of a supervised actor — the same fact [`is_busy`](LocalActor::is_busy)
@@ -3176,7 +3195,9 @@ pub enum NotQueued {
 ///
 /// A send that failed produces one of two states, and `Undelivered` has a name for
 /// each: a closed mailbox is one of the ways it means [`Gone`](Undelivered::Gone),
-/// and a refusal is the same refusal.
+/// and a re-entrant refusal is the same refusal. Neither reaches
+/// [`Refused`](Undelivered::Refused), which is a verdict on a turn that ran and
+/// so cannot exist for a message that never entered the mailbox.
 ///
 /// **The reverse impl does not exist and must not be written.** `Undelivered`
 /// answers a question that includes the turn's own verdict, so mapping it back
@@ -3561,7 +3582,13 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     ///
     /// # Errors
     ///
-    /// [`Undelivered`] when the actor is gone, before or during the turn.
+    /// [`Undelivered::Gone`] when the actor is gone, before or during the turn;
+    /// [`Undelivered::Refused`] when an [`Observer`] refused the turn that ran,
+    /// which leaves the actor alive and possibly restarting;
+    /// [`Undelivered::Expired`] when a queueing budget ran out before the turn
+    /// started, which a local origin cannot do today; and
+    /// [`Undelivered::Reentrant`] when the call came from inside the target
+    /// actor's own turn. One per [`TurnLost`], except the fault this resumes.
     ///
     /// # The turn runs even if you stop waiting
     ///
@@ -3615,30 +3642,22 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     where
         T: Send + 'static,
     {
-        // Every loss collapses to `Undelivered` here, on purpose: a local
-        // caller learns WHY from [`ended`](Self::ended), and widening this
-        // error would make every existing call site match on a case it has
-        // nothing to do about. A **fault** is the exception, because it is not
-        // a loss: the value a panicking function produces is the panic, so the
-        // caller gets it.
+        // One arm per loss, and no fold: `Undelivered` names every state
+        // `TurnLost` does. It used to collapse `Refused` and `Expired` into
+        // `Gone` under a comment saying a local caller learns why from
+        // [`ended`](Self::ended) — which does not hold for either. A non-fatal
+        // refusal ends one incarnation, so a supervised actor restarts and
+        // `ended` never resolves; an expired budget starts no turn at all.
+        //
+        // A **fault** is the exception, because it is not a loss: the value a
+        // panicking function produces is the panic, so the caller gets it.
         match self.ask_catching(mail).await {
             Ok(value) => Ok(value),
             Err(TurnLost::Faulted(panic)) => panic.resume(),
-            // `Refused` ends the actor, so `Undelivered` is true of it by the
-            // time a caller reads it. `Expired` does NOT — and it cannot be
-            // reported precisely here, because this method has one error type by
-            // design. It is unreachable from a local origin today; if a later wave
-            // gives one a budget, this is the call that has to widen or the call
-            // sites have to move to `ask_catching`, and that is a decision rather
-            // than a mapping. Named here so it is a decision somebody makes.
-            // Nothing was queued and the actor is still running, so this is the
-            // one loss that is NOT a `Gone`. It has its own variant for the
-            // reason the arm above collapses three into one: `Gone` tells a
-            // caller to stop calling, and this caller's actor is alive.
+            Err(TurnLost::Gone) => Err(Undelivered::Gone),
+            Err(TurnLost::Refused { name }) => Err(Undelivered::Refused { name }),
+            Err(TurnLost::Expired) => Err(Undelivered::Expired),
             Err(TurnLost::Reentrant) => Err(Undelivered::Reentrant),
-            Err(TurnLost::Gone | TurnLost::Refused { .. } | TurnLost::Expired) => {
-                Err(Undelivered::Gone)
-            }
         }
     }
 
@@ -5115,8 +5134,9 @@ mod tests {
     /// And the answer when nobody ever answers: **`TurnLost::Gone`, not a hang.**
     ///
     /// Here rather than only in `tests/defer.rs` because this is where the variant
-    /// is visible — a generated `Handle` folds every loss into `Undelivered`, so
-    /// the criterion's own words can only be asserted from inside the crate.
+    /// is visible — a generated `Handle` never yields a `TurnLost` at all, only
+    /// the `Undelivered` [`ask`](LocalActor::ask) maps one into, so the
+    /// criterion's own words can only be asserted from inside the crate.
     ///
     /// The timeout is the assertion. A hang is not a failure to a harness.
     #[tokio::test]
@@ -5196,22 +5216,22 @@ mod tests {
         panic!("nothing ever parked");
     }
 
-    /// **The commit point for a released reply, at the variant a `Handle` folds
-    /// away.** A turn that answers a parked caller and is then refused by an
-    /// observer must not let that answer cross — and the parked caller is told the
-    /// same thing the turn's own caller is, naming the same observer.
+    /// **The commit point for a released reply.** A turn that answers a parked
+    /// caller and is then refused by an observer must not let that answer cross —
+    /// and the parked caller is told the same thing the turn's own caller is,
+    /// naming the same observer.
     ///
     /// This is where the `#[defer]` durability window closed. Before it,
     /// `Deferred::send` wrote to the channel from inside the handler, so the parked
     /// caller had `99` before any observer had seen anything, and a `Persist` that
     /// then refused left it holding an answer for state that was never stored.
     ///
-    /// Here rather than only in `tests/persist.rs` because
-    /// [`ask`](LocalActor::ask) collapses every loss to `Undelivered`: **the
-    /// difference between "refused" and "gone" is only visible from inside the
-    /// crate**, and the difference is the whole finding — a caller told `Gone`
-    /// stops calling, and a caller told `Refused` knows the turn ran and was not
-    /// committed.
+    /// Here rather than only in `tests/persist.rs` because a **parked** caller is
+    /// the half that door cannot reach: `tests/persist.rs` drives the turn's own
+    /// caller through a `Handle`, and the released reply is answered by
+    /// `parking.rs` on a channel the handler took with `later()`. Both are
+    /// asserted below, on the same name, which is the whole finding — the two
+    /// callers of one turn must not be told different things about it.
     ///
     /// Made red by `scripts/break-once.sh` on `parking.rs`'s `park`, replacing the
     /// `if let Some(mut lot) = slot.take() {` guard with `if let Some(mut lot) =

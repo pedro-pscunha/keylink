@@ -466,13 +466,12 @@ async fn a_refusal_before_persist_prevents_the_store() {
 ///
 /// # Over two real nodes, because the promise is a peer's
 ///
-/// A local caller cannot see this: the generated handle collapses
-/// `Answered::Refused` into `Undelivered` — *"the actor is no longer
-/// running"* — and `ended()` is the only local route to the reason. A **peer**
-/// is told `observer refused: persist`, produced by `turns.rs` under a comment
-/// reading *"The turn ran and was not committed"*, and that sentence is the
-/// whole of what the caller has to act on. Asserting it here is what makes the
-/// fix "the code was made to match the promise" rather than a preference.
+/// A local caller is told `Undelivered::Refused { name: "persist" }` and has to
+/// go to `ended()` for the observer's own error. A **peer** is told
+/// `observer refused: persist`, produced by `turns.rs` under a comment reading
+/// *"The turn ran and was not committed"*, and that sentence is the whole of
+/// what the caller has to act on. Asserting it over two real nodes is what makes
+/// the fix "the code was made to match the promise" rather than a preference.
 ///
 /// Made red by putting the retry back — a `finish` that stores when a flag set
 /// before the write is still standing. `Flaky` then holds `[1, 2]` and the
@@ -828,10 +827,10 @@ async fn waiting_for(vault: &teller::Handle<Vault>, want: u64) {
 /// refusal rather than a receipt, and the balance on the disk is still 100, so
 /// there is no receipt anywhere for a debit that is not stored.
 ///
-/// A `Handle` folds every loss into `Undelivered`, so the precise
-/// `TurnLost::Refused { name: "persist" }` underneath is asserted in
-/// `turns.rs::a_released_reply_is_refused_with_the_turn_that_released_it`, where
-/// the variant is visible.
+/// A `Handle` answers `Undelivered::Refused { name: "persist" }` here, and the
+/// `TurnLost::Refused { name: "persist" }` it is mapped from — one variant per
+/// state, so the two spellings carry the same name — is asserted in
+/// `turns.rs::a_released_reply_is_refused_with_the_turn_that_released_it`.
 ///
 /// Watched to fail from both ends, because two facts have to hold at once and
 /// one break can only reach one of them:

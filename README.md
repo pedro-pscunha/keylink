@@ -180,9 +180,11 @@ match ledger.ended().await {
 }
 ```
 
-Returning `Err` ends the actor, and `Handle::ended()` says which observer and
-why — `Undelivered` means "gone" and must not be stretched to mean "gave up on
-durability". A refused turn reaches a peer as `Failed("observer refused: ..")`
+Returning `Err` ends the actor. The refused caller is told
+`Undelivered::Refused { name }`, so it learns which observer without a second
+lookup, and `ended()` adds that observer's own error — `Undelivered::Gone` means
+"gone" and must not be stretched to mean "gave up on durability". A refused turn
+reaches a peer as `Failed("observer refused: ..")`
 rather than `NoSuchActor`, which would say "there is nothing here, stop asking"
 about a turn that ran.
 

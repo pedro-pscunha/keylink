@@ -431,7 +431,13 @@ async fn an_observer_runs_before_the_caller_is_answered() {
 async fn a_panicking_observer_ends_the_actor_and_is_named() {
     let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(Exploding)]);
 
-    assert_eq!(ledger.post(1).await, Err(Undelivered::Gone));
+    // The caller is told which observer, and by the same name `ended` reports
+    // below: a panicking observer is folded into the refusal path — `Panic` is
+    // not an `Error`, so `observed_turn` renders it and keeps the name.
+    assert_eq!(
+        ledger.post(1).await,
+        Err(Undelivered::Refused { name: "exploding" })
+    );
 
     match ledger.ended().await {
         Ended::Observer { name, error, .. } => {
@@ -479,9 +485,9 @@ async fn a_panicked_turn_reaches_its_caller_and_then_ends_the_actor() {
 ///
 /// The turn ran and was not committed, so handing back the value would publish a
 /// state no restart can reproduce — the exact fault the port exists to prevent,
-/// arrived at through the reply instead of through the store. A local caller
-/// fails one way, so it is told `Undelivered`, and `ended` is the only place
-/// the reason survives.
+/// arrived at through the reply instead of through the store. The caller is told
+/// `Undelivered::Refused` and which observer said so, and `ended` carries the
+/// observer's own **error** — two facts on two channels, not one fact twice.
 #[tokio::test]
 async fn a_refused_turn_answers_its_caller_with_nothing() {
     let ran = ran();
@@ -490,7 +496,10 @@ async fn a_refused_turn_answers_its_caller_with_nothing() {
         vec![Box::new(Recording::refusing("saver", &ran))],
     );
 
-    assert_eq!(ledger.post(1).await, Err(Undelivered::Gone));
+    assert_eq!(
+        ledger.post(1).await,
+        Err(Undelivered::Refused { name: "saver" })
+    );
     assert_eq!(
         *ran.lock().unwrap(),
         ["saver"],
@@ -586,7 +595,10 @@ async fn a_read_runs_no_observers() {
 #[tokio::test]
 async fn an_observer_can_give_up_with_a_message_or_with_an_error() {
     let with_message = ledger::actor_with(Ledger::default(), vec![Box::new(GivesUp::WithMessage)]);
-    assert_eq!(with_message.post(1).await, Err(Undelivered::Gone));
+    assert_eq!(
+        with_message.post(1).await,
+        Err(Undelivered::Refused { name: "message" })
+    );
     match with_message.ended().await {
         Ended::Observer { name, error, .. } => {
             assert_eq!(name, "message");
@@ -596,7 +608,10 @@ async fn an_observer_can_give_up_with_a_message_or_with_an_error() {
     }
 
     let with_error = ledger::actor_with(Ledger::default(), vec![Box::new(GivesUp::WithError)]);
-    assert_eq!(with_error.post(1).await, Err(Undelivered::Gone));
+    assert_eq!(
+        with_error.post(1).await,
+        Err(Undelivered::Refused { name: "error" })
+    );
     match with_error.ended().await {
         Ended::Observer { name, error, .. } => {
             assert_eq!(name, "error");
@@ -628,7 +643,12 @@ async fn observers_run_in_order_and_the_first_refusal_stops_the_rest() {
         ],
     );
 
-    assert_eq!(ledger.post(1).await, Err(Undelivered::Gone));
+    // The name is the refusing observer's and not the chain's first: the caller
+    // is told which one stopped it.
+    assert_eq!(
+        ledger.post(1).await,
+        Err(Undelivered::Refused { name: "second" })
+    );
     assert_eq!(
         *ran.lock().unwrap(),
         ["first", "second"],
@@ -672,7 +692,10 @@ impl Observer<Ledger> for ExplodesBeforeItYields {
 async fn an_observer_that_panics_before_it_yields_is_still_named() {
     let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(ExplodesBeforeItYields)]);
 
-    assert_eq!(ledger.post(1).await, Err(Undelivered::Gone));
+    assert_eq!(
+        ledger.post(1).await,
+        Err(Undelivered::Refused { name: "early" })
+    );
 
     match ledger.ended().await {
         Ended::Observer { name, error, .. } => {
@@ -828,7 +851,10 @@ async fn finish_receives_the_same_ending_the_actor_reports() {
         ],
     );
 
-    assert_eq!(ledger.post(1).await, Err(Undelivered::Gone));
+    assert_eq!(
+        ledger.post(1).await,
+        Err(Undelivered::Refused { name: "vetoing" })
+    );
 
     let reported = ledger.ended().await;
     match &reported {

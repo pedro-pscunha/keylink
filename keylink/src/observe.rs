@@ -398,9 +398,11 @@ impl fmt::Display for Stop {
 
 /// Why an actor is no longer running.
 ///
-/// [`Undelivered`](crate::Undelivered) says "gone", and it must not be
-/// stretched to say "gave up on durability". This is the second question, asked
-/// separately.
+/// [`Undelivered::Gone`](crate::Undelivered::Gone) says "gone", and it must not
+/// be stretched to say "gave up on durability". This is the second question,
+/// asked separately: a refused caller is told
+/// [`Undelivered::Refused`](crate::Undelivered::Refused) and the observer's
+/// name, and this carries the observer's own error.
 ///
 /// # Exhaustive, and deliberately not `#[non_exhaustive]` — decided once, here
 ///

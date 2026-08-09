@@ -144,6 +144,19 @@ const REFUSED: u64 = u64::MAX;
 /// turn you called from.
 const GONE: u64 = u64::MAX - 1;
 
+/// What a call answers for a loss **this file installs nothing to produce**: an
+/// [`Observer`](keylink::Observer) refusing a turn that ran, or a queueing budget
+/// expiring before one started.
+///
+/// A third sentinel and not [`GONE`], for [`GONE`]'s own reason. Both of those
+/// leave the actor alive, so answering *stop calling* about either is exactly the
+/// collapse [`Undelivered`] was widened to remove — and a test that re-made the
+/// fold here would stay green while hiding it. No `Peer` is built with an
+/// observer, and a local origin carries no queueing budget, so an assertion that
+/// ever reads this is reporting a change in what `ask` maps rather than anything
+/// about the ring.
+const SURPRISE: u64 = u64::MAX - 2;
+
 /// The right answer from `self_tell_twice`: the first self-`tell` landed in the
 /// permit the loop released when it took the message it is running, and the
 /// second was refused because there was no permit left.
@@ -182,10 +195,15 @@ impl ring::Actor for Peer {
 
     async fn self_read(&mut self, _cx: Caller<'_>) -> u64 {
         let me = self.me.get().expect("wired").clone();
+        // A read runs no observers and starts no turn, so the two arms below it
+        // are unreachable through this door twice over — named rather than
+        // wildcarded, because a wildcard here would also swallow whatever a
+        // sixth state turned out to be.
         match me.with_state(|state: &Peer| state.bumps).await {
             Ok(bumps) => bumps,
             Err(keylink::Undelivered::Reentrant) => REFUSED,
             Err(keylink::Undelivered::Gone) => GONE,
+            Err(keylink::Undelivered::Refused { .. } | keylink::Undelivered::Expired) => SURPRISE,
         }
     }
 
@@ -259,10 +277,11 @@ fn answered(hop: Result<u64, keylink::Undelivered>) -> u64 {
     match hop {
         // A sentinel travels back unchanged. Adding a hop count to it would
         // rename it — and `REFUSED` is `u64::MAX`, so it would also overflow.
-        Ok(depth @ (REFUSED | GONE)) => depth,
+        Ok(depth @ (REFUSED | GONE | SURPRISE)) => depth,
         Ok(depth) => depth + 1,
         Err(keylink::Undelivered::Reentrant) => REFUSED,
         Err(keylink::Undelivered::Gone) => GONE,
+        Err(keylink::Undelivered::Refused { .. } | keylink::Undelivered::Expired) => SURPRISE,
     }
 }
 
