@@ -3162,15 +3162,16 @@ pub struct LocalActor<A, M> {
     ended: watch::Receiver<Option<Ended>>,
     /// What a peer whose reply just died is told. The keyed twin of this cell
     /// lives beside the registry entry; here the handle carries it, because a
-    /// singleton has no entry. See [`Standing`] for why it is not the channel
-    /// above.
+    /// **local** actor has no registry entry to hang it on. Serving one changes
+    /// nothing about that — it is the same actor with a second door. See
+    /// [`Standing`] for why it is not the channel above.
     fate: Fate,
     /// Whether a turn is running right now, for [`is_busy`](Self::is_busy).
     ///
     /// The other end of this `Arc` lives in the [`Watched`] the loop is polling,
     /// which is what lets a turn on the actor's own task be read from a caller's.
     /// The keyed twin is `registry.rs`'s `Busy`, kept beside the registry entry;
-    /// a singleton has no entry, so the handle carries it — which is [`fate`]'s
+    /// a local actor has no entry, so the handle carries it — which is [`fate`]'s
     /// arrangement and, unlike `fate`, this one is read by the handle's holder
     /// rather than by a served dispatch.
     ///
@@ -4276,7 +4277,7 @@ where
         }
     };
 
-    // The id is the service name because a singleton has no other one — and
+    // The id is the service name because a local actor has no other one — and
     // after `stop()` the ALPN stays registered, so this is answered for as long
     // as the server runs.
     let gone = || {

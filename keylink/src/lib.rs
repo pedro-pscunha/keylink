@@ -40,8 +40,11 @@
 //! - **State, when sharing it is the awkward part.** The same `service!` block
 //!   generates an `Actor` trait taking `&mut self`, so state lives on a task
 //!   rather than behind a `Mutex` — locally through a generated `Handle`, and
-//!   over the network with no change to the wire. See [`LocalActor`], and
-//!   [`System`] for many keyed instances behind one ALPN.
+//!   over the network with no change to the wire. **Two kinds of actor, and
+//!   serving is not a third:** a [`LocalActor`] behind a generated `Handle`, and
+//!   a keyed instance mounted in a [`System`] under an [`ActorId`] with its own
+//!   ALPN. `Handle::service` puts a local one on the wire without making it
+//!   either a new kind or a new type.
 //! - **Content addressing.** A `blob` method hands back an address; iroh-blobs
 //!   moves the bytes, admitted only against a grant keylink recorded when it
 //!   returned that address to that peer. See [`Blobs`].
