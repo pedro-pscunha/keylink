@@ -789,11 +789,11 @@ mod tests {
             crate::FollowRefused::Ahead { after: 9, seq: 4 }.to_string(),
             crate::FollowRefused::Crowded { parked: 64 }.to_string(),
             // `deliver_to_local`'s re-entrancy arm, and the only one of these the
-            // doc above ever missed. It is rendered through `Undelivered` at that
+            // doc above ever missed. It is rendered through `Unanswered` at that
             // site rather than through the `NotQueued` the send returns, so this
             // names the same type the wire does — a guard reading the other one
             // would go green on a text no peer receives.
-            crate::Undelivered::Reentrant.to_string(),
+            crate::Unanswered::Reentrant.to_string(),
         ];
 
         for text in &others {

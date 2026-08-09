@@ -1049,7 +1049,7 @@ ANCHORS = [
     # two sizes - each reddens a test the other leaves green, measured both ways.
     ("D15", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "                grown.extend(outer.iter().cloned());"),
-    # ── from the `reply-not-gone` branch, where `Undelivered` went from *the actor
+    # ── from the `reply-not-gone` branch, where `Unanswered` went from *the actor
     # is gone* to six variants and `answered` started reading `Fate` to choose
     # between three of them. `E` for items E+F, on `D`'s reasoning: a fresh letter
     # cannot collide with a reserved numeric gap by arithmetic.
@@ -1082,7 +1082,7 @@ ANCHORS = [
     ("E3", "keylink/tests/supervision.rs", "keylink/src/turns.rs",
      "            Standing::Restarting(reason) => TurnLost::Restarting(reason),"),
     ("E4", "keylink/tests/observe.rs", "keylink/src/turns.rs",
-     "            Err(TurnLost::Refused { name }) => Err(Undelivered::Refused { name }),"),
+     "            Err(TurnLost::Refused { name }) => Err(Unanswered::Refused { name }),"),
     # F1 is the first row whose TARGET is `macros.rs`, and that is the point rather
     # than an accident. `supervised_deep` is a generated door with no caller in the
     # tree, and `Handle`'s `inner` field carries no `pub`, so it is also the only

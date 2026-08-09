@@ -13,7 +13,7 @@
 //! |-----------|-------------|-----------------------------------------------------|
 //! | completed | accepted    | the value                                           |
 //! | panicked  | refused     | the panic, resumed — and the actor then ends        |
-//! | completed | refused     | `Undelivered::Refused { name }`, turn not committed |
+//! | completed | refused     | `Unanswered::Refused { name }`, turn not committed |
 //!
 //! Three rows and three tests, because they are three different promises and an
 //! implementation that collapses any two of them still passes a test written for
@@ -34,8 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keylink::{
-    Caller, Ended, FinishFut, Intensity, Observer, Stop, TurnFut, TurnInfo, TurnOutcome,
-    Undelivered,
+    Caller, Ended, FinishFut, Intensity, Observer, Stop, TurnFut, TurnInfo, TurnOutcome, Unanswered,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -453,7 +452,7 @@ async fn a_panicking_observer_ends_the_actor_and_is_named() {
     let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(Exploding)]);
 
     let lost = ledger.post(1).await.expect_err("the observer panicked");
-    assert_eq!(lost, Undelivered::ObserverPanicked { name: "exploding" });
+    assert_eq!(lost, Unanswered::ObserverPanicked { name: "exploding" });
     assert_eq!(
         lost.to_string(),
         "the exploding observer panicked during this turn: it ran and was not committed",
@@ -477,7 +476,7 @@ async fn a_panicking_observer_ends_the_actor_and_is_named() {
 ///
 /// Both halves are load-bearing. Withholding the reply here would reverse what
 /// `turns.rs` promises about a panicking call, and the caller would be told
-/// `Undelivered` — "the actor is gone" — about a message that in fact ran and
+/// `Unanswered` — "the actor is gone" — about a message that in fact ran and
 /// exploded. And reporting the refusing observer instead of the panic would
 /// point an operator at the durability adapter for a fault in a `service!`
 /// method, which is why the two variants are not one.
@@ -506,7 +505,7 @@ async fn a_panicked_turn_reaches_its_caller_and_then_ends_the_actor() {
 /// The turn ran and was not committed, so handing back the value would publish a
 /// state no restart can reproduce — the exact fault the port exists to prevent,
 /// arrived at through the reply instead of through the store. The caller is told
-/// `Undelivered::Refused` and which observer said so, and `ended` carries the
+/// `Unanswered::Refused` and which observer said so, and `ended` carries the
 /// observer's own **error** — two facts on two channels, not one fact twice.
 #[tokio::test]
 async fn a_refused_turn_answers_its_caller_with_nothing() {
@@ -518,7 +517,7 @@ async fn a_refused_turn_answers_its_caller_with_nothing() {
 
     assert_eq!(
         ledger.post(1).await,
-        Err(Undelivered::Refused { name: "saver" })
+        Err(Unanswered::Refused { name: "saver" })
     );
     assert_eq!(
         *ran.lock().unwrap(),
@@ -540,9 +539,9 @@ async fn a_refused_turn_answers_its_caller_with_nothing() {
 ///
 /// [`Stop::new`] is non-fatal, so `retryable` sends this ending to a restart: one
 /// incarnation is gone and another is coming. The caller of the refused turn
-/// arrived as `Undelivered::Gone` — *stop calling* — about an actor a supervisor
+/// arrived as `Unanswered::Gone` — *stop calling* — about an actor a supervisor
 /// was in the middle of putting back, which is the sentence
-/// [`Undelivered::Refused`] exists to replace.
+/// [`Unanswered::Refused`] exists to replace.
 ///
 /// # The name is carried, and it could not be read anywhere else
 ///
@@ -566,8 +565,8 @@ async fn a_refused_turn_answers_its_caller_with_nothing() {
 /// that factory built, which is the same fact from the state's side.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `ask`'s
-/// `Err(TurnLost::Refused { name }) => Err(Undelivered::Refused { name }),` →
-/// `Err(TurnLost::Refused { .. }) => Err(Undelivered::Gone),`, the fold this
+/// `Err(TurnLost::Refused { name }) => Err(Unanswered::Refused { name }),` →
+/// `Err(TurnLost::Refused { .. }) => Err(Unanswered::Gone),`, the fold this
 /// variant was split out of. Watched: `a non-fatal refusal ends one incarnation,
 /// and the caller must not be told the actor is gone`, `left: Err(Gone)`,
 /// `right: Err(Refused { name: "saver" })`.
@@ -603,7 +602,7 @@ async fn a_local_caller_is_told_refused_when_a_non_fatal_observer_refuses() {
 
     assert_eq!(
         ledger.post(1).await,
-        Err(Undelivered::Refused { name: "saver" }),
+        Err(Unanswered::Refused { name: "saver" }),
         "a non-fatal refusal ends one incarnation, and the caller must not be \
          told the actor is gone"
     );
@@ -707,7 +706,7 @@ async fn an_observer_can_give_up_with_a_message_or_with_an_error() {
     let with_message = ledger::actor_with(Ledger::default(), vec![Box::new(GivesUp::WithMessage)]);
     assert_eq!(
         with_message.post(1).await,
-        Err(Undelivered::Refused { name: "message" })
+        Err(Unanswered::Refused { name: "message" })
     );
     match with_message.ended().await {
         Ended::Observer { name, error, .. } => {
@@ -720,7 +719,7 @@ async fn an_observer_can_give_up_with_a_message_or_with_an_error() {
     let with_error = ledger::actor_with(Ledger::default(), vec![Box::new(GivesUp::WithError)]);
     assert_eq!(
         with_error.post(1).await,
-        Err(Undelivered::Refused { name: "error" })
+        Err(Unanswered::Refused { name: "error" })
     );
     match with_error.ended().await {
         Ended::Observer { name, error, .. } => {
@@ -757,7 +756,7 @@ async fn observers_run_in_order_and_the_first_refusal_stops_the_rest() {
     // is told which one stopped it.
     assert_eq!(
         ledger.post(1).await,
-        Err(Undelivered::Refused { name: "second" })
+        Err(Unanswered::Refused { name: "second" })
     );
     assert_eq!(
         *ran.lock().unwrap(),
@@ -815,7 +814,7 @@ async fn an_observer_that_panics_before_it_yields_is_still_named() {
     // observer's code sits, reported as a distinction about the turn.
     assert_eq!(
         ledger.post(1).await,
-        Err(Undelivered::ObserverPanicked { name: "early" })
+        Err(Unanswered::ObserverPanicked { name: "early" })
     );
 
     match ledger.ended().await {
@@ -974,7 +973,7 @@ async fn finish_receives_the_same_ending_the_actor_reports() {
 
     assert_eq!(
         ledger.post(1).await,
-        Err(Undelivered::Refused { name: "vetoing" })
+        Err(Unanswered::Refused { name: "vetoing" })
     );
 
     let reported = ledger.ended().await;

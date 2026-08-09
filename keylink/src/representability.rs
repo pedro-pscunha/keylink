@@ -102,7 +102,7 @@ use crate::{
     ActorId, ActorStatus, Admission, Admittance, AdmittedPeer, Allowlist, BlobId, Caller,
     DynamicAdmission, Ended, Eviction, FinishFut, IdempotencyKey, Intensity, Keyable, LocalActor,
     MountError, Observer, Origin, ProvenPeer, Records, Retention, TurnFut, TurnInfo, TurnOutcome,
-    Undelivered,
+    Unanswered,
 };
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
@@ -852,7 +852,7 @@ impl Observer<Ledger> for Recorder {
 /// — `Ledger` is hand-written, is not a `service!`, and has no mailbox enum to
 /// name.
 async fn a_read_cannot_mutate_either<M>(actor: &LocalActor<Ledger, M>) {
-    let _: Result<ThroughShared, Undelivered> = actor.read(|state| state.post()).await;
+    let _: Result<ThroughShared, Unanswered> = actor.read(|state| state.post()).await;
 }
 
 // ─────────────────────── one reply channel, one answer: Wave 2c's `#[defer]`

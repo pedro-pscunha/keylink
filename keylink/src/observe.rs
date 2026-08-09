@@ -401,10 +401,10 @@ impl fmt::Display for Stop {
 
 /// Why an actor is no longer running.
 ///
-/// [`Undelivered::Gone`](crate::Undelivered::Gone) says "gone", and it must not
+/// [`Unanswered::Gone`](crate::Unanswered::Gone) says "gone", and it must not
 /// be stretched to say "gave up on durability". This is the second question,
 /// asked separately: a refused caller is told
-/// [`Undelivered::Refused`](crate::Undelivered::Refused) and the observer's
+/// [`Unanswered::Refused`](crate::Unanswered::Refused) and the observer's
 /// name, and this carries the observer's own error.
 ///
 /// # Exhaustive, and deliberately not `#[non_exhaustive]` — decided once, here
@@ -513,12 +513,12 @@ pub enum Ended {
     /// The only ending a [supervised](crate::LocalActor::spawn_supervised) actor
     /// can reach that an unsupervised one cannot, and the reason the whole enum
     /// is worth having: "gone" is already
-    /// [`Undelivered::Gone`](crate::Undelivered::Gone)'s answer, and an operator needs
+    /// [`Unanswered::Gone`](crate::Unanswered::Gone)'s answer, and an operator needs
     /// to know whether this actor stopped because somebody asked it to or
     /// because it could not be kept alive.
     ///
     /// The mailbox closes when this is published, so every later call reports it
-    /// — [`Undelivered::Gone`](crate::Undelivered::Gone) to a door that wanted a
+    /// — [`Unanswered::Gone`](crate::Unanswered::Gone) to a door that wanted a
     /// value, [`NotQueued::Closed`](crate::NotQueued::Closed) to one that wanted
     /// only to be queued — and a peer is told
     /// [`RemoteError::NoSuchActor`](crate::RemoteError::NoSuchActor).
@@ -661,7 +661,7 @@ impl From<&Ended> for EndReason {
 
 /// Why a turn produced no value.
 ///
-/// Replaces [`Undelivered`](crate::Undelivered) on the catching paths. The two
+/// Replaces [`Unanswered`](crate::Unanswered) on the catching paths. The two
 /// name the same losses and differ by **one variant and one payload**: this one
 /// has [`Faulted`](Self::Faulted), which an [`ask`](crate::LocalActor::ask)
 /// resumes into its caller instead of reporting, and its
@@ -781,7 +781,7 @@ pub enum TurnLost {
     /// An observer **panicked** watching this turn. It **ran** and was not
     /// committed.
     ///
-    /// [`Undelivered::ObserverPanicked`](crate::Undelivered::ObserverPanicked) is
+    /// [`Unanswered::ObserverPanicked`](crate::Unanswered::ObserverPanicked) is
     /// the same fact at the door that resumes a fault rather than reporting it,
     /// and carries the argument for the split from [`Refused`](Self::Refused): the
     /// two withhold the value for two different reasons and only one of them is a
@@ -822,7 +822,7 @@ pub enum TurnLost {
     /// Distinct from [`Gone`](Self::Gone) for that enum's stated reason and this
     /// one's mirror of it: the actor is not merely still running, it is running
     /// the turn this call was made from.
-    /// [`Undelivered::Reentrant`](crate::Undelivered::Reentrant) is the same fact
+    /// [`Unanswered::Reentrant`](crate::Unanswered::Reentrant) is the same fact
     /// at the doors that ask for a value and resume a fault rather than report it,
     /// and [`NotQueued::Reentrant`](crate::NotQueued::Reentrant) at the doors that
     /// ask only to be queued and so have no reply channel to hear a verdict on.

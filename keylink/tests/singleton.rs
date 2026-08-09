@@ -208,7 +208,7 @@ async fn a_handle_to_a_stopped_actor_reports_a_closed_mailbox() {
         .await
         .expect("a stop from outside the actor's own turn is never refused");
 
-    assert_eq!(spare.post(1, 0).await, Err(keylink::Undelivered::Gone));
+    assert_eq!(spare.post(1, 0).await, Err(keylink::Unanswered::Gone));
     assert!(!spare.is_running());
 }
 

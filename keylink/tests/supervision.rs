@@ -45,7 +45,7 @@ use std::time::Duration;
 use keylink::Persist;
 use keylink::{
     Allowlist, Caller, Deferred, Ended, Intensity, Observer, RemoteError, Replied, Reply, Server,
-    Stop, Stream, TurnFut, TurnInfo, TurnOutcome, Undelivered,
+    Stop, Stream, TurnFut, TurnInfo, TurnOutcome, Unanswered,
 };
 #[cfg(feature = "persist-file")]
 use keylink_persist::file::Files;
@@ -1192,16 +1192,16 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
 ///
 /// A peer reads `Failed("restarting: ..")` and `NoSuchActor` because the wire
 /// carries no variant per cause. A local caller holds the handle, so it gets
-/// [`Undelivered::Restarting`] and [`Undelivered::Gone`] — two values, and the
-/// whole reason `Undelivered` grew from *the actor is gone* into a six-variant
+/// [`Unanswered::Restarting`] and [`Unanswered::Gone`] — two values, and the
+/// whole reason `Unanswered` grew from *the actor is gone* into a six-variant
 /// enum. Both answers came back `Gone` before that split, which told a caller to
 /// stop calling an actor a supervisor was in the middle of putting back.
 ///
 /// Two rounds and one budgeted restart, exactly as the served twin above:
 ///
-/// 1. the parked `place` → `Undelivered::Restarting`, the incarnation did not
+/// 1. the parked `place` → `Unanswered::Restarting`, the incarnation did not
 ///    survive the fault and another is coming;
-/// 2. once the budget is out → `Undelivered::Gone`, which is final.
+/// 2. once the budget is out → `Unanswered::Gone`, which is final.
 ///
 /// # Three ways this passes for the wrong reason, and what refuses each
 ///
@@ -1250,7 +1250,7 @@ async fn a_local_caller_can_tell_restarting_from_gone() {
         limit(1, Duration::from_millis(50)),
     );
 
-    for (round, expected) in [(1u8, Undelivered::Restarting), (2, Undelivered::Gone)] {
+    for (round, expected) in [(1u8, Unanswered::Restarting), (2, Unanswered::Gone)] {
         // Parked by the handler and never answered. Held across the fault below.
         let placing = {
             let desk = desk.clone();
@@ -1298,7 +1298,7 @@ async fn a_local_caller_can_tell_restarting_from_gone() {
     // which is why it is not what round 2 asserts.
     assert_eq!(
         desk.place(3).await,
-        Err(Undelivered::Gone),
+        Err(Unanswered::Gone),
         "an actor that gave up refuses the send itself"
     );
     assert!(

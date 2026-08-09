@@ -83,7 +83,7 @@
 //!
 //! # Two types, two error types, on purpose
 //!
-//! A local call loses its value more than one way, and [`Undelivered`] names each
+//! A local call loses its value more than one way, and [`Unanswered`] names each
 //! one rather than folding them. It is not [`Error`](crate::Error) for a separate
 //! reason: RFC-04 §5.2 and §5.5 reject a handle that is the same type locally and
 //! remotely, because such a handle must either claim failures the local case
@@ -107,9 +107,9 @@
 //!
 //! It is also why [`ended`](LocalActor::ended) exists rather than one more error
 //! variant. An [`Observer`] that refuses a turn is named in the error its caller
-//! gets — [`Undelivered::Refused`] carries [`Observer::name`] — and what is
-//! *not* there is that observer's own error, because [`Undelivered`] is `Copy`
-//! and `Eq` and a boxed reason is neither. `Undelivered::Gone` means "gone" and
+//! gets — [`Unanswered::Refused`] carries [`Observer::name`] — and what is
+//! *not* there is that observer's own error, because [`Unanswered`] is `Copy`
+//! and `Eq` and a boxed reason is neither. `Unanswered::Gone` means "gone" and
 //! must not be stretched to mean "gave up on durability", so the second question
 //! is asked separately and answered by [`Ended`].
 //!
@@ -161,7 +161,7 @@
 //! function call would deliver it.
 //!
 //! Both halves matter. Catching keeps one bad message from costing every later
-//! one. Resuming keeps [`Undelivered`] free of **faults**: every variant it has is
+//! one. Resuming keeps [`Unanswered`] free of **faults**: every variant it has is
 //! about delivery or about the actor, and none of them is "the actor is fine and
 //! your message exploded". [`TurnLost::Faulted`] is the variant that says exactly
 //! that, and it is the one difference between the two enums — it exists on the
@@ -184,7 +184,7 @@
 //! `guarded`, including the closure that produces the turn's future. What is
 //! left is a user `Drop` — on the state when the actor ends, or on a reply value
 //! dropped here because the caller went away. Either kills the loop, and every
-//! handle then reports [`Undelivered`]: the same lie the panic policy exists
+//! handle then reports [`Unanswered`]: the same lie the panic policy exists
 //! to remove, through a narrower door. And `panic = "abort"` defeats all of it.
 //!
 //! [`Handle`]: crate::LocalActor
@@ -265,7 +265,7 @@ use crate::{
 /// that varies; it is the choice that maximises the chance of the block.
 ///
 /// The remaining hazard is closed by a mechanism rather than by a number: a
-/// re-entrant call is refused at any depth, with [`Undelivered::Reentrant`] or
+/// re-entrant call is refused at any depth, with [`Unanswered::Reentrant`] or
 /// its twin [`NotQueued::Reentrant`] according to which of the two questions the
 /// door asked. See [`LocalActor::send`].
 ///
@@ -1707,7 +1707,7 @@ enum Message<A, M> {
     /// cannot mutate, so storing after it is waste.
     Read(Read<A>),
     /// Ends the loop, which drops the receiver, which is what makes every other
-    /// handle report a closed mailbox from then on — [`Undelivered::Gone`] to a
+    /// handle report a closed mailbox from then on — [`Unanswered::Gone`] to a
     /// door that wanted a value, [`NotQueued::Closed`] to one that wanted only to
     /// be queued.
     Stop,
@@ -3143,14 +3143,14 @@ where
     supervise(factory, limit, Keyed(inbox), &fate).await
 }
 
-/// A local call that never entered the mailbox, and why.
+/// A local call that got no answer, and why.
 ///
 /// Not [`Error`](crate::Error), and deliberately not convertible into one:
 /// `Error::Transport`, `Error::SchemaMismatch` and `Error::Closed` have no local
 /// counterpart, and a caller must not be able to `?` a local failure into a
 /// remote error type and lose which one it was. RFC-04 §5.3.
 ///
-/// # It replaced a unit struct called `Undelivered`, and the name was the fault
+/// # It replaced a unit struct called `MailboxClosed`, and the name was the fault
 ///
 /// That type's own first line read *"The actor is gone. The only way a local call
 /// fails."* The second sentence stopped being true when a re-entrant call became
@@ -3164,7 +3164,7 @@ where
 /// [`Ended`] and [`TurnLost`] carry that argument: a caller matches this, and a
 /// wildcard arm is the collapse the split exists to prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Undelivered {
+pub enum Unanswered {
     /// The actor is no longer running. It stopped, was aborted, its loop ended,
     /// or a supervisor gave up on it. **Stop calling.**
     ///
@@ -3292,12 +3292,12 @@ pub enum Undelivered {
 ///
 /// The error of the doors that ask *did this get queued* — [`LocalActor::notify`]
 /// and [`LocalActor::stop`], plus the private `send` they both go through.
-/// [`Undelivered`] is the error of the doors that ask *did I get a value*:
+/// [`Unanswered`] is the error of the doors that ask *did I get a value*:
 /// [`ask`](LocalActor::ask) and [`read`](LocalActor::read).
 ///
 /// # Two types because the two questions have different answers, not different styles
 ///
-/// Everything `Undelivered` names beyond these two states is a verdict on a turn
+/// Everything `Unanswered` names beyond these two states is a verdict on a turn
 /// that already exists, and it arrives on a **reply channel**. These doors have
 /// none to hear it on: `stop` sends a request that is not a turn, and `notify`
 /// drops the receiving half before it sends. So one shared type would put on a
@@ -3344,7 +3344,7 @@ pub enum Undelivered {
 ///
 /// # Exhaustive, and deliberately not `#[non_exhaustive]`
 ///
-/// [`Undelivered`]'s own argument — a caller matches this, and a wildcard arm is
+/// [`Unanswered`]'s own argument — a caller matches this, and a wildcard arm is
 /// the collapse the split exists to prevent. It is stronger here: the two
 /// decisions above are the whole of what `send` does before the message is in the
 /// channel, so a third variant is a change to that function rather than a variant
@@ -3363,7 +3363,7 @@ pub enum NotQueued {
     /// most wrong: the receiver is also dropped when a supervisor gives up and when
     /// an unsupervised loop simply ends.
     ///
-    /// [`Undelivered::Gone`] and [`TurnLost::Gone`] are that same fact stated about
+    /// [`Unanswered::Gone`] and [`TurnLost::Gone`] are that same fact stated about
     /// the actor, and the three of them carry **one sentence** between them: *the
     /// actor is no longer running*. Three variants on three enums for one sentence
     /// is what the split chose — a caller matches the answer of the door it used,
@@ -3374,9 +3374,9 @@ pub enum NotQueued {
     /// hand.
     ///
     /// The two used to disagree, and this paragraph used to explain the
-    /// disagreement: `Undelivered::Gone` also absorbed a reply dropped by a live
+    /// disagreement: `Unanswered::Gone` also absorbed a reply dropped by a live
     /// actor, so it hedged where this cannot. That producer is
-    /// [`Undelivered::Dropped`] now, and the hedge is gone with it.
+    /// [`Unanswered::Dropped`] now, and the hedge is gone with it.
     ///
     /// A **restart does not reach here.** The receiver outlives every incarnation
     /// of a supervised actor — the same fact [`is_busy`](LocalActor::is_busy)
@@ -3387,13 +3387,13 @@ pub enum NotQueued {
     /// The call was made from inside the target actor's own turn, and would have
     /// deadlocked.
     ///
-    /// [`Undelivered::Reentrant`] is the same fact through the other pair of
+    /// [`Unanswered::Reentrant`] is the same fact through the other pair of
     /// doors, and carries the same message: the actor is **still running** — it is
     /// running the turn this call was made from.
     ///
     /// `TurnLost::Reentrant` carries it too, so this sentence lives on three enums.
     /// `every_turn_lost_except_faulted_has_one_undelivered_twin_with_the_same_words`
-    /// holds all three, this one through `From<NotQueued> for Undelivered` — the
+    /// holds all three, this one through `From<NotQueued> for Unanswered` — the
     /// widening the crate actually performs, so the guard cannot agree with a
     /// mapping no caller takes. It was kept in step by hand until then, and
     /// this paragraph said so without saying that nothing enforced it.
@@ -3412,15 +3412,15 @@ pub enum NotQueued {
 /// The one direction that is total, and the reason [`read`](LocalActor::read) can
 /// keep its `?`.
 ///
-/// A send that failed produces one of two states, and `Undelivered` has a name for
-/// each: a closed mailbox is one of the ways it means [`Gone`](Undelivered::Gone),
+/// A send that failed produces one of two states, and `Unanswered` has a name for
+/// each: a closed mailbox is one of the ways it means [`Gone`](Unanswered::Gone),
 /// and a re-entrant refusal is the same refusal. Neither reaches
-/// [`Refused`](Undelivered::Refused), which is a verdict on a turn that ran and
+/// [`Refused`](Unanswered::Refused), which is a verdict on a turn that ran and
 /// so cannot exist for a message that never entered the mailbox.
 ///
 /// # What the forward direction buys, since it is the one that exists
 ///
-/// `read` asks *did I get a value*, so its caller is owed `Undelivered` for the
+/// `read` asks *did I get a value*, so its caller is owed `Unanswered` for the
 /// whole call — and the first thing that can go wrong inside it is a send, which
 /// answers the narrower type. Without this the method would either return two
 /// error types or match the send by hand, and a hand-written match is where the
@@ -3434,11 +3434,11 @@ pub enum NotQueued {
 /// which uses it to decide *which type* renders onto the wire rather than to
 /// propagate.
 ///
-/// **The reverse impl does not exist and must not be written.** `Undelivered`
+/// **The reverse impl does not exist and must not be written.** `Unanswered`
 /// answers a question that includes the turn's own verdict, so mapping it back
 /// would have to decide what a lost reply means to a door that never had one —
 /// which is the collapse this split removed.
-impl From<NotQueued> for Undelivered {
+impl From<NotQueued> for Unanswered {
     fn from(not_queued: NotQueued) -> Self {
         match not_queued {
             NotQueued::Closed => Self::Gone,
@@ -3600,7 +3600,7 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
     /// whatever this is — and it does **not** make a self-call safe.
     ///
     /// Every public door but one refuses a re-entrant call by **identity** rather
-    /// than by the permit, so depth cannot reach them: [`Undelivered::Reentrant`]
+    /// than by the permit, so depth cannot reach them: [`Unanswered::Reentrant`]
     /// from an [`ask`](Self::ask) or a [`read`](Self::read),
     /// [`TurnLost::Reentrant`] from [`ask_catching`](Self::ask_catching), and
     /// [`NotQueued::Reentrant`] from a [`stop`](Self::stop).
@@ -3828,16 +3828,16 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     ///
     /// # Errors
     ///
-    /// [`Undelivered::Gone`] when the actor is gone, before or during the turn;
-    /// [`Undelivered::Dropped`] when a live actor threw this reply away without
-    /// answering it; [`Undelivered::Restarting`] when the incarnation that owed
-    /// the answer died and another is coming; [`Undelivered::Refused`] when an
+    /// [`Unanswered::Gone`] when the actor is gone, before or during the turn;
+    /// [`Unanswered::Dropped`] when a live actor threw this reply away without
+    /// answering it; [`Unanswered::Restarting`] when the incarnation that owed
+    /// the answer died and another is coming; [`Unanswered::Refused`] when an
     /// [`Observer`] refused the turn that ran, which leaves the actor alive and
-    /// possibly restarting; [`Undelivered::Expired`] when a queueing budget ran
+    /// possibly restarting; [`Unanswered::Expired`] when a queueing budget ran
     /// out before the turn started, which a local origin cannot do today; and
-    /// [`Undelivered::Reentrant`] when the call came from inside the target
+    /// [`Unanswered::Reentrant`] when the call came from inside the target
     /// actor's own turn. One per [`TurnLost`], except the fault this resumes —
-    /// and [`Restarting`](Undelivered::Restarting) arrives without the ending its
+    /// and [`Restarting`](Unanswered::Restarting) arrives without the ending its
     /// [`TurnLost`] twin carries, because this type is `Copy`.
     ///
     /// # The turn runs even if you stop waiting
@@ -3853,7 +3853,7 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     /// **cycle** shapes are documented where they are built — a self-call, on the
     /// generated `Handle`, and a ring of two or more actors, in the section below
     /// that one — and neither is detectable by a type, which is why both are
-    /// **refused at runtime** with [`Undelivered::Reentrant`] rather than left to
+    /// **refused at runtime** with [`Unanswered::Reentrant`] rather than left to
     /// hang. A turn can also simply await something that never fires, which is
     /// neither shape and which nothing here reaches.
     ///
@@ -3888,11 +3888,11 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     /// With whatever the handler panicked with, after the actor has survived it.
     /// Use [`ask_catching`](Self::ask_catching) where an unwind must not escape
     /// — a connection's task, for one.
-    pub async fn ask<T>(&self, mail: impl FnOnce(Origin, Reply<T>) -> M) -> Result<T, Undelivered>
+    pub async fn ask<T>(&self, mail: impl FnOnce(Origin, Reply<T>) -> M) -> Result<T, Unanswered>
     where
         T: Send + 'static,
     {
-        // One arm per loss, and no fold: `Undelivered` names every state
+        // One arm per loss, and no fold: `Unanswered` names every state
         // `TurnLost` does. It used to collapse `Refused` and `Expired` into
         // `Gone` under a comment saying a local caller learns why from
         // [`ended`](Self::ended) — which does not hold for either. A non-fatal
@@ -3904,17 +3904,17 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
         match self.ask_catching(mail).await {
             Ok(value) => Ok(value),
             Err(TurnLost::Faulted(panic)) => panic.resume(),
-            Err(TurnLost::Gone) => Err(Undelivered::Gone),
-            Err(TurnLost::Dropped) => Err(Undelivered::Dropped),
+            Err(TurnLost::Gone) => Err(Unanswered::Gone),
+            Err(TurnLost::Dropped) => Err(Unanswered::Dropped),
             // The `Ended` is dropped here and nowhere else, because
-            // `Undelivered` is `Copy` and `Eq` and an `Arc` is neither. The fact
-            // crosses, the reason does not, and `Undelivered::Restarting` says so
+            // `Unanswered` is `Copy` and `Eq` and an `Arc` is neither. The fact
+            // crosses, the reason does not, and `Unanswered::Restarting` says so
             // where a caller meets it.
-            Err(TurnLost::Restarting(_reason)) => Err(Undelivered::Restarting),
-            Err(TurnLost::Refused { name }) => Err(Undelivered::Refused { name }),
-            Err(TurnLost::ObserverPanicked { name }) => Err(Undelivered::ObserverPanicked { name }),
-            Err(TurnLost::Expired) => Err(Undelivered::Expired),
-            Err(TurnLost::Reentrant) => Err(Undelivered::Reentrant),
+            Err(TurnLost::Restarting(_reason)) => Err(Unanswered::Restarting),
+            Err(TurnLost::Refused { name }) => Err(Unanswered::Refused { name }),
+            Err(TurnLost::ObserverPanicked { name }) => Err(Unanswered::ObserverPanicked { name }),
+            Err(TurnLost::Expired) => Err(Unanswered::Expired),
+            Err(TurnLost::Reentrant) => Err(Unanswered::Reentrant),
         }
     }
 
@@ -4052,7 +4052,7 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     ///
     /// # Errors
     ///
-    /// [`NotQueued`] and not [`Undelivered`], because this door asks only whether
+    /// [`NotQueued`] and not [`Unanswered`], because this door asks only whether
     /// the message was queued. Both of its states are reachable here:
     /// [`NotQueued::Closed`] when the actor is gone, and [`NotQueued::Reentrant`]
     /// under the full-mailbox half of the rule above. Nothing that happens to the
@@ -4108,17 +4108,17 @@ impl<A, M> LocalActor<A, M> {
     ///
     /// # Errors
     ///
-    /// Two of [`Undelivered`]'s variants, and the door is what narrows it.
-    /// [`Undelivered::Reentrant`] when the call came from inside the target actor's
+    /// Two of [`Unanswered`]'s variants, and the door is what narrows it.
+    /// [`Unanswered::Reentrant`] when the call came from inside the target actor's
     /// own turn — a read takes a permit and then waits for the loop, so it is
     /// refused under the same half of the rule an [`ask`](Self::ask) is — and
-    /// [`Undelivered::Gone`] when the actor is gone.
-    /// [`Undelivered::Refused`] and [`Undelivered::Expired`] cannot occur for the
-    /// reason above: no observers, no budget. [`Undelivered::Dropped`] and
-    /// [`Undelivered::Restarting`] cannot occur for a different reason, and it is
+    /// [`Unanswered::Gone`] when the actor is gone.
+    /// [`Unanswered::Refused`] and [`Unanswered::Expired`] cannot occur for the
+    /// reason above: no observers, no budget. [`Unanswered::Dropped`] and
+    /// [`Unanswered::Restarting`] cannot occur for a different reason, and it is
     /// the next section.
     ///
-    /// # A dead read channel is [`Gone`](Undelivered::Gone), and that is total rather than inferred
+    /// # A dead read channel is [`Gone`](Unanswered::Gone), and that is total rather than inferred
     ///
     /// The private `answered` reads the actor's standing when a reply channel dies,
     /// because a local `ask` can lose its reply to a live actor or to a restart.
@@ -4144,10 +4144,10 @@ impl<A, M> LocalActor<A, M> {
     /// that is restarting. Giving this method the same standing match `answered`
     /// makes would close that, and it is **refused today as a behaviour change** —
     /// a read whose channel died mid-restart would begin answering
-    /// [`Undelivered::Restarting`] — rather than because the read is cheaper.
+    /// [`Unanswered::Restarting`] — rather than because the read is cheaper.
     ///
     /// [`Handle::with_state`]: crate::LocalActor
-    pub async fn read<T, F>(&self, read: F) -> Result<T, Undelivered>
+    pub async fn read<T, F>(&self, read: F) -> Result<T, Unanswered>
     where
         T: Send + 'static,
         F: FnOnce(&A) -> T + Send + 'static,
@@ -4170,7 +4170,7 @@ impl<A, M> LocalActor<A, M> {
             Refuse::Always,
         )
         .await?;
-        match answer.await.map_err(|_| Undelivered::Gone)? {
+        match answer.await.map_err(|_| Unanswered::Gone)? {
             Ok(value) => Ok(value),
             Err(panic) => panic.resume(),
         }
@@ -4213,7 +4213,7 @@ impl<A, M> LocalActor<A, M> {
     ///
     /// Ordered: everything sent before this is handled and answered. Anything
     /// queued behind it is dropped unrun when the loop drops the receiver — an
-    /// [`ask`](Self::ask) waiting on one is told [`Undelivered`], and a
+    /// [`ask`](Self::ask) waiting on one is told [`Unanswered`], and a
     /// [`notify`](Self::notify) is told nothing, because it was already told
     /// `Ok`.
     ///
@@ -4259,7 +4259,7 @@ impl<A, M> LocalActor<A, M> {
     /// documented as idempotent; the send's own `Closed` is swallowed here for
     /// that reason and not for want of a channel.
     ///
-    /// So the error is [`NotQueued`] rather than [`Undelivered`] twice over: this
+    /// So the error is [`NotQueued`] rather than [`Unanswered`] twice over: this
     /// door asks only whether the request was queued, and it discards half of even
     /// that.
     ///
@@ -4299,7 +4299,7 @@ impl<A, M> LocalActor<A, M> {
     /// reaches an await point is not interrupted and this returns having done
     /// nothing; and until the runtime drops the task,
     /// [`is_running`](Self::is_running) still says `true`. Callers waiting on a
-    /// dropped turn do get [`Undelivered`]: dropping the receiver drains the
+    /// dropped turn do get [`Unanswered`]: dropping the receiver drains the
     /// buffer, and each queued turn owns its reply channel.
     ///
     /// # What a peer whose reply this destroys is told, and where that comes from
@@ -4331,7 +4331,7 @@ impl<A, M> LocalActor<A, M> {
     /// Whether the actor is still handling messages.
     ///
     /// Advisory: it can stop between this answer and the next call, which is why
-    /// every call reports the loss on its own — [`Undelivered`] or
+    /// every call reports the loss on its own — [`Unanswered`] or
     /// [`NotQueued`], by door — rather than asking a caller to check first.
     #[must_use]
     pub fn is_running(&self) -> bool {
@@ -4751,7 +4751,7 @@ where
         // `rendered` is the arm that ships it. The premise here is *nothing can
         // produce it*, and that premise is false everywhere except this arm.
         //
-        // **The wire sentence belongs to `Undelivered`, so the conversion is
+        // **The wire sentence belongs to `Unanswered`, so the conversion is
         // explicit.** A bare `refused.to_string()` renders whichever type `send`
         // happens to return — `NotQueued` since the send-shaped doors were split
         // off — so a local refactor could re-point the bytes a peer reads without
@@ -4763,7 +4763,7 @@ where
         //
         // **No test covers this path, and the guard this line used to cite is not
         // one.** `remote::no_other_served_failure_begins_with_one_of_the_five` builds
-        // `Undelivered::Reentrant.to_string()` by hand and asserts every prefix
+        // `Unanswered::Reentrant.to_string()` by hand and asserts every prefix
         // against that string. It never calls this function and never
         // reads which type renders here, so reverting this line to
         // `refused.to_string()` leaves it green. Nothing else calls
@@ -4772,7 +4772,7 @@ where
         // peer cannot produce a re-entrant call in the first place.
         Err(refused @ NotQueued::Reentrant) => {
             return (
-                Outcome::Err(RemoteError::Failed(Undelivered::from(refused).to_string())),
+                Outcome::Err(RemoteError::Failed(Unanswered::from(refused).to_string())),
                 Body::empty(),
             )
         }
@@ -4903,47 +4903,47 @@ mod tests {
         );
     }
 
-    /// One [`Undelivered`] per [`TurnLost`] that is not a fault, sampled once so
+    /// One [`Unanswered`] per [`TurnLost`] that is not a fault, sampled once so
     /// the coverage assertion below has something to index.
-    const EVERY: [Undelivered; 7] = [
-        Undelivered::Gone,
-        Undelivered::Dropped,
-        Undelivered::Restarting,
-        Undelivered::Refused { name: "observer" },
-        Undelivered::ObserverPanicked { name: "observer" },
-        Undelivered::Expired,
-        Undelivered::Reentrant,
+    const EVERY: [Unanswered; 7] = [
+        Unanswered::Gone,
+        Unanswered::Dropped,
+        Unanswered::Restarting,
+        Unanswered::Refused { name: "observer" },
+        Unanswered::ObserverPanicked { name: "observer" },
+        Unanswered::Expired,
+        Unanswered::Reentrant,
     ];
 
     /// Which slot of [`EVERY`] this is.
     ///
-    /// Exhaustive over [`Undelivered`], which is one of the two compile errors
+    /// Exhaustive over [`Unanswered`], which is one of the two compile errors
     /// the guard below rests on.
-    fn slot(mine: &Undelivered) -> usize {
+    fn slot(mine: &Unanswered) -> usize {
         match mine {
-            Undelivered::Gone => 0,
-            Undelivered::Dropped => 1,
-            Undelivered::Restarting => 2,
-            Undelivered::Refused { .. } => 3,
-            Undelivered::ObserverPanicked { .. } => 4,
-            Undelivered::Expired => 5,
-            Undelivered::Reentrant => 6,
+            Unanswered::Gone => 0,
+            Unanswered::Dropped => 1,
+            Unanswered::Restarting => 2,
+            Unanswered::Refused { .. } => 3,
+            Unanswered::ObserverPanicked { .. } => 4,
+            Unanswered::Expired => 5,
+            Unanswered::Reentrant => 6,
         }
     }
 
-    /// The [`Undelivered`] that means the same thing, or `None` for the one
+    /// The [`Unanswered`] that means the same thing, or `None` for the one
     /// variant [`ask`](LocalActor::ask) resumes instead of returning.
     ///
     /// Exhaustive over [`TurnLost`], which is the other compile error.
-    fn twin(lost: &TurnLost) -> Option<Undelivered> {
+    fn twin(lost: &TurnLost) -> Option<Unanswered> {
         match lost {
-            TurnLost::Gone => Some(Undelivered::Gone),
-            TurnLost::Dropped => Some(Undelivered::Dropped),
-            TurnLost::Restarting(_) => Some(Undelivered::Restarting),
-            TurnLost::Refused { name } => Some(Undelivered::Refused { name }),
-            TurnLost::ObserverPanicked { name } => Some(Undelivered::ObserverPanicked { name }),
-            TurnLost::Expired => Some(Undelivered::Expired),
-            TurnLost::Reentrant => Some(Undelivered::Reentrant),
+            TurnLost::Gone => Some(Unanswered::Gone),
+            TurnLost::Dropped => Some(Unanswered::Dropped),
+            TurnLost::Restarting(_) => Some(Unanswered::Restarting),
+            TurnLost::Refused { name } => Some(Unanswered::Refused { name }),
+            TurnLost::ObserverPanicked { name } => Some(Unanswered::ObserverPanicked { name }),
+            TurnLost::Expired => Some(Unanswered::Expired),
+            TurnLost::Reentrant => Some(Unanswered::Reentrant),
             TurnLost::Faulted(_) => None,
         }
     }
@@ -4951,7 +4951,7 @@ mod tests {
     /// One fact reads as one sentence, whichever door a caller came through.
     ///
     /// [`ask_catching`](LocalActor::ask_catching) answers [`TurnLost`] and
-    /// [`ask`](LocalActor::ask) answers [`Undelivered`], and every variant of the
+    /// [`ask`](LocalActor::ask) answers [`Unanswered`], and every variant of the
     /// second is the first minus its fault. Two enums saying different things
     /// about one condition is what an operator reads as two conditions — and the
     /// texts were kept in step by hand until this test, with `Reentrant` already
@@ -4967,7 +4967,7 @@ mod tests {
     /// with every gate step green. That is the state this test's first paragraph
     /// describes, surviving one enum past the pair it was written for.
     ///
-    /// **The mapping is `From<NotQueued> for Undelivered` rather than a third
+    /// **The mapping is `From<NotQueued> for Unanswered` rather than a third
     /// helper**, so the walk reads the conversion the crate performs instead of a
     /// copy that could quietly agree with nothing. It carries the compile error
     /// too: that impl is exhaustive over `NotQueued`, so a third state there is
@@ -4975,7 +4975,7 @@ mod tests {
     ///
     /// The property is injectivity and not the exactly-once above, because two
     /// states are being checked against a seven-slot space: each `NotQueued` state
-    /// widens to a distinct `Undelivered`, and the two assertions are two-sided on
+    /// widens to a distinct `Unanswered`, and the two assertions are two-sided on
     /// purpose — `<= 1` alone is satisfied by a walk that ran zero times, so the
     /// count of written slots is asserted against the sample's own length.
     ///
@@ -4986,7 +4986,7 @@ mod tests {
     ///
     /// **RFC-07 §15.2 is the full ruling and this is its pointer.** It records
     /// what this sentence compresses: `NotQueued` reaches the guard through
-    /// `From<NotQueued> for Undelivered` rather than through [`twin`], so it is
+    /// `From<NotQueued> for Unanswered` rather than through [`twin`], so it is
     /// held as a **widening** and not as a twin — which is why the name saying
     /// *twin* is an under-claim rather than a wrong claim. It also measured what
     /// the rename would have cost and refused it anyway, on the ground that this
@@ -5000,7 +5000,7 @@ mod tests {
     ///
     /// What it has instead is two exhaustive matches, and both are `error[E0004]`
     /// the moment either enum grows: [`twin`] over [`TurnLost`], and [`slot`] over
-    /// [`Undelivered`]. An author who adds a variant lands in this file and has to
+    /// [`Unanswered`]. An author who adds a variant lands in this file and has to
     /// say what its twin is, which is the whole of the enforcement.
     ///
     /// **A third mechanism was claimed for this guard in design and it does not
@@ -5018,7 +5018,7 @@ mod tests {
     /// # The residual, named rather than argued away
     ///
     /// **Two hand-written arrays, and `E0004` forces an author into this file
-    /// without forcing either of them to grow.** `EVERY` samples [`Undelivered`]
+    /// without forcing either of them to grow.** `EVERY` samples [`Unanswered`]
     /// and `lost` samples [`TurnLost`]. An author who adds a variant to both
     /// enums, writes the two new arms, points [`slot`] at an **existing** index
     /// and leaves the new `TurnLost` out of `lost` gets past every assertion here:
@@ -5058,12 +5058,12 @@ mod tests {
     /// "found 2". The filter for all three is this test's own name, plus
     /// `-p keylink --lib`:
     ///
-    /// - change one character of [`Undelivered::Dropped`]'s `#[error]` text — the
+    /// - change one character of [`Unanswered::Dropped`]'s `#[error]` text — the
     ///   whole attribute line is unique in this file, so it is what the harness is
     ///   given. Watched: `one fact must read as one sentence: Dropped and
     ///   Dropped`, with `left` and `right` printing the two sentences one
     ///   character apart.
-    /// - point [`slot`]'s `Undelivered::Expired` arm at `0` instead of `5`.
+    /// - point [`slot`]'s `Unanswered::Expired` arm at `0` instead of `5`.
     ///   Watched: `every variant is written exactly once, and this one was written
     ///   2 times: [2, 1, 1, 1, 1, 0, 1] at slot 0`, `left: 2`, `right: 1`. **This
     ///   record predicted slot 4 and "written 0 times", and the run said slot 0
@@ -5072,15 +5072,15 @@ mod tests {
     ///   rather than the arm that fires, which is the sentence a reader would
     ///   otherwise search the log for and not find.
     ///
-    ///   Re-run when [`ObserverPanicked`](Undelivered::ObserverPanicked) took slot
+    ///   Re-run when [`ObserverPanicked`](Unanswered::ObserverPanicked) took slot
     ///   4 and pushed `Expired` to 5. Both halves of the record moved and neither
     ///   was computed: the arm's own number is read off the source, and the array
     ///   is read off the failing run — a seventh slot appears in it, and the
     ///   *emptied* slot moved from 4 to 5 while the reported one stayed 0.
-    /// - point `From<NotQueued> for Undelivered`'s `Closed` arm at
+    /// - point `From<NotQueued> for Unanswered`'s `Closed` arm at
     ///   `Self::Reentrant`. Its arm line is unique in this file where **neither
     ///   `#[error]` attribute is** — both of `NotQueued`'s texts are byte-identical
-    ///   to an `Undelivered` variant's in this same file, which is the fact the
+    ///   to an `Unanswered` variant's in this same file, which is the fact the
     ///   test exists to hold and also the reason the string cannot be the anchor.
     ///   Watched: `one fact must read as one sentence: Closed and Reentrant`,
     ///   `left: "the actor is no longer running"`,
@@ -5090,7 +5090,7 @@ mod tests {
     ///   The injectivity assertion beside it **cannot be reddened on its own
     ///   today, and that follows from the texts rather than from a search**: the
     ///   two `NotQueued` sentences differ, so any collapse of the mapping also
-    ///   pairs one of them with an `Undelivered` whose text is the other's — the
+    ///   pairs one of them with an `Unanswered` whose text is the other's — the
     ///   equality fires first, as it did above. It guards a future in which a third
     ///   `NotQueued` state widens onto a slot already taken.
     ///
@@ -5157,7 +5157,7 @@ mod tests {
         let mut widened = [0u32; EVERY.len()];
 
         for one in &queued {
-            let mine = Undelivered::from(*one);
+            let mine = Unanswered::from(*one);
             assert_eq!(
                 one.to_string(),
                 mine.to_string(),
@@ -5168,7 +5168,7 @@ mod tests {
 
         assert!(
             widened.iter().all(|count| *count <= 1),
-            "two `NotQueued` states must not widen onto one `Undelivered`: {widened:?}",
+            "two `NotQueued` states must not widen onto one `Unanswered`: {widened:?}",
         );
         assert_eq!(
             widened.iter().filter(|count| **count == 1).count(),
@@ -5504,7 +5504,7 @@ mod tests {
             .await
             .expect("a stop from outside the actor's own turn is never refused");
 
-        assert_eq!(spare.ask(add(1)).await, Err(Undelivered::Gone));
+        assert_eq!(spare.ask(add(1)).await, Err(Unanswered::Gone));
         // The same closed mailbox through the other question, so the other type:
         // an `ask` lost a reply channel too and a `notify` never had one.
         assert_eq!(spare.notify(add(1)).await, Err(NotQueued::Closed));
@@ -5584,7 +5584,7 @@ mod tests {
     async fn held() -> (
         LocalActor<Counter, Mail>,
         oneshot::Sender<()>,
-        tokio::task::JoinHandle<Result<usize, Undelivered>>,
+        tokio::task::JoinHandle<Result<usize, Unanswered>>,
     ) {
         hold(LocalActor::spawn(Counter::default())).await
     }
@@ -5596,7 +5596,7 @@ mod tests {
     ) -> (
         LocalActor<Counter, Mail>,
         oneshot::Sender<()>,
-        tokio::task::JoinHandle<Result<usize, Undelivered>>,
+        tokio::task::JoinHandle<Result<usize, Unanswered>>,
     ) {
         let (entered, started) = oneshot::channel();
         let (release, releasing) = oneshot::channel();
@@ -5777,7 +5777,7 @@ mod tests {
 
         assert_eq!(
             wedged.await.expect("the caller is not itself aborted"),
-            Err(Undelivered::Gone),
+            Err(Unanswered::Gone),
             "an aborted turn reports the actor as gone"
         );
     }
@@ -5823,7 +5823,7 @@ mod tests {
     ///
     /// Here rather than only in `tests/defer.rs` because this is where the variant
     /// is visible — a generated `Handle` never yields a `TurnLost` at all, only
-    /// the `Undelivered` [`ask`](LocalActor::ask) maps one into, so the
+    /// the `Unanswered` [`ask`](LocalActor::ask) maps one into, so the
     /// criterion's own words can only be asserted from inside the crate.
     ///
     /// The timeout is the assertion. A hang is not a failure to a harness.

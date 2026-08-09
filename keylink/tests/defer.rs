@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use keylink::{
     ActorId, Allowlist, Caller, Deferred, Ended, Eviction, Observer, RemoteError, Replied, Reply,
-    Server, Stop, TurnFut, TurnInfo, Undelivered,
+    Server, Stop, TurnFut, TurnInfo, Unanswered,
 };
 
 mod common;
@@ -297,7 +297,7 @@ async fn an_answer_given_inside_a_deferred_turn_is_withheld_when_an_observer_ref
 /// The channel is in the state, the state is owned by the loop's task, and the loop
 /// exiting drops both — so the caller's wait ends because the sender is gone. Inside
 /// keylink that is `TurnLost::Gone`; through a generated `Handle` it is
-/// `Undelivered::Gone`, the variant `ask` maps that one into.
+/// `Unanswered::Gone`, the variant `ask` maps that one into.
 ///
 /// **The timeout is the assertion.** A hang is not a failure to a test harness, so
 /// the wait is bounded and the bound is what goes red. `turns.rs`'s own unit test
@@ -373,7 +373,7 @@ async fn a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_
         .expect("a panicking deferred handler must not hang its caller")
         .expect("the panic is NOT resumed in the caller, unlike every other kind");
     assert!(
-        matches!(answer, Err(Undelivered::Dropped)),
+        matches!(answer, Err(Unanswered::Dropped)),
         "a handler that panicked before answering owes its caller a refusal: got {answer:?}"
     );
 
@@ -421,7 +421,7 @@ async fn a_live_actor_that_drops_a_deferred_is_told_dropped_and_not_gone() {
 
     assert_eq!(
         book.abandon(3).await,
-        Err(Undelivered::Dropped),
+        Err(Unanswered::Dropped),
         "a dropped `Deferred` costs the caller its answer and not the actor"
     );
 
@@ -530,7 +530,7 @@ async fn an_answer_sent_inside_a_turn_that_then_panics_does_not_cross() {
         .expect("a withheld answer must not hang its caller")
         .expect("the caller is not itself panicking");
     assert!(
-        matches!(answer, Err(Undelivered::Dropped)),
+        matches!(answer, Err(Unanswered::Dropped)),
         "a panicking turn's answer crossed anyway: {answer:?}"
     );
 
@@ -556,7 +556,16 @@ async fn an_answer_sent_inside_a_turn_that_then_panics_does_not_cross() {
 /// Made red by `scripts/break-once.sh keylink/src/parking.rs` on `park`'s
 /// `if let Some(answer) = carried {` → `if let Some(answer) = Option::<Parked>::None {`,
 /// which drops an off-turn answer instead of giving it. Watched: `a send from
-/// another task must not be gated by the turn that spawned it: Undelivered`.
+/// another task must not be gated by the turn that spawned it: Dropped`.
+///
+/// **The harness cannot express that break, so it was applied by hand.** The
+/// literal counts **2** in `parking.rs` — `park`'s own arm, and a record in that
+/// same file quoting it — so `break-once.sh` aborts at its count assert before a
+/// backup exists, and no row here can register it. Re-measured on 2026-08-09
+/// with the substitution written into `park`'s arm directly: control green, then
+/// exit 101 on this one test. The watched word read `Undelivered` before that,
+/// and the panic is `expect`'s, so it prints the error's `Debug` — a variant's
+/// name, never the type's.
 #[tokio::test]
 async fn a_deferred_sent_from_another_task_is_not_gated_by_the_turn_that_spawned_it() {
     let book = orders::actor(Book::default());
@@ -726,7 +735,7 @@ async fn a_local_caller_and_a_peer_agree_about_an_abandoned_deferred() {
     // answers agree about the actor, not that they share a channel.
     assert_eq!(
         book.abandon(3).await,
-        Err(Undelivered::Dropped),
+        Err(Unanswered::Dropped),
         "the local door names the same cause the peer's prefix does"
     );
 
@@ -1156,7 +1165,7 @@ async fn a_peer_whose_parked_reply_is_drained_is_not_told_its_call_timed_out() {
 /// **The other half of the `dropped: ` arm, which had no served test at all.**
 ///
 /// `a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_actor`
-/// is a **local** call: it asserts `is_err()` on a `Undelivered` and never
+/// is a **local** call: it asserts `is_err()` on a `Unanswered` and never
 /// reaches `deliver_to_local`, so nothing anywhere asserted what a *peer* reads
 /// for this. The arm's own comment concedes the case — "a handler that panics
 /// after taking `reply.later()` arrives here too" — and the sentence it rendered

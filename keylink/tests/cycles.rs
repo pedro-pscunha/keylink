@@ -21,7 +21,7 @@
 //!
 //! Item M closed the ring: every local message carries the chain of turns it was
 //! sent from, and a send to an actor already on that chain is refused with
-//! [`Undelivered::Reentrant`] rather than queued. So the tests below assert a
+//! [`Unanswered::Reentrant`] rather than queued. So the tests below assert a
 //! **refusal** where they used to assert a hang, and the mechanism is identity
 //! rather than the permit — measured, because at depth 32 every deadlock guard in
 //! this file still fired.
@@ -151,7 +151,7 @@ const GONE: u64 = u64::MAX - 1;
 ///
 /// A third sentinel and not [`GONE`], for [`GONE`]'s own reason. Every one of them
 /// leaves an actor a caller can still reach, so answering *stop calling* about any
-/// is exactly the collapse [`Undelivered`] was widened to remove — and a test that
+/// is exactly the collapse [`Unanswered`] was widened to remove — and a test that
 /// re-made the fold here would stay green while hiding it.
 ///
 /// Each is refuted by this file rather than by the crate: no `Peer` is built with
@@ -205,14 +205,14 @@ impl ring::Actor for Peer {
         // swallow whatever the next state turned out to be.
         match me.with_state(|state: &Peer| state.bumps).await {
             Ok(bumps) => bumps,
-            Err(keylink::Undelivered::Reentrant) => REFUSED,
-            Err(keylink::Undelivered::Gone) => GONE,
+            Err(keylink::Unanswered::Reentrant) => REFUSED,
+            Err(keylink::Unanswered::Gone) => GONE,
             Err(
-                keylink::Undelivered::Refused { .. }
-                | keylink::Undelivered::ObserverPanicked { .. }
-                | keylink::Undelivered::Expired
-                | keylink::Undelivered::Dropped
-                | keylink::Undelivered::Restarting,
+                keylink::Unanswered::Refused { .. }
+                | keylink::Unanswered::ObserverPanicked { .. }
+                | keylink::Unanswered::Expired
+                | keylink::Unanswered::Dropped
+                | keylink::Unanswered::Restarting,
             ) => SURPRISE,
         }
     }
@@ -283,20 +283,20 @@ impl ring::Actor for Peer {
 /// place: two of them wrote `map_or(u64::MAX, |depth| depth + 1)`, which folds a
 /// refusal and a departure into one value and then overflows on the way back
 /// through the next hop.
-fn answered(hop: Result<u64, keylink::Undelivered>) -> u64 {
+fn answered(hop: Result<u64, keylink::Unanswered>) -> u64 {
     match hop {
         // A sentinel travels back unchanged. Adding a hop count to it would
         // rename it — and `REFUSED` is `u64::MAX`, so it would also overflow.
         Ok(depth @ (REFUSED | GONE | SURPRISE)) => depth,
         Ok(depth) => depth + 1,
-        Err(keylink::Undelivered::Reentrant) => REFUSED,
-        Err(keylink::Undelivered::Gone) => GONE,
+        Err(keylink::Unanswered::Reentrant) => REFUSED,
+        Err(keylink::Unanswered::Gone) => GONE,
         Err(
-            keylink::Undelivered::Refused { .. }
-            | keylink::Undelivered::ObserverPanicked { .. }
-            | keylink::Undelivered::Expired
-            | keylink::Undelivered::Dropped
-            | keylink::Undelivered::Restarting,
+            keylink::Unanswered::Refused { .. }
+            | keylink::Unanswered::ObserverPanicked { .. }
+            | keylink::Unanswered::Expired
+            | keylink::Unanswered::Dropped
+            | keylink::Unanswered::Restarting,
         ) => SURPRISE,
     }
 }
@@ -601,11 +601,11 @@ async fn a_two_actor_cycle_is_refused_at_the_closing_edge() {
 ///
 /// `abort` on **one** actor frees the other: A's task dies, its queued message
 /// from B is dropped, that drop closes B's reply channel, B's handler gets
-/// `Undelivered::Gone` and returns, and B's loop is polling again. So B answers
+/// `Unanswered::Gone` and returns, and B's loop is polling again. So B answers
 /// `ping` afterwards — it is a live actor with its state intact.
 ///
 /// A is not recovered. It is destroyed, which is what `abort` documents: "the
-/// state is **destroyed**". The original caller is told `Undelivered::Gone`.
+/// state is **destroyed**". The original caller is told `Unanswered::Gone`.
 /// Naming this as "recovers both" would be the crate claiming a repair it does
 /// not perform, so the guard asserts the asymmetry rather than the phrase.
 ///
@@ -679,7 +679,7 @@ async fn aborting_one_actor_of_a_cycle_frees_the_other_and_destroys_it() {
         .expect("B answered: B is the one that was freed, not the one destroyed");
     assert_eq!(
         answer, GONE,
-        "A was destroyed, so B's hop into it is told `Undelivered::Gone`"
+        "A was destroyed, so B's hop into it is told `Unanswered::Gone`"
     );
 
     n0_future::time::timeout(SETTLE, b.ping())
@@ -1060,7 +1060,7 @@ async fn the_supervised_deep_door_takes_the_depth_it_was_given() {
 /// the anchor rots.
 ///
 /// Not hypothetical, and it has already happened once in the **other** direction:
-/// at `ac5a6ef` this arm was a three-line block, `Undelivered::Reentrant` was
+/// at `ac5a6ef` this arm was a three-line block, `Unanswered::Reentrant` was
 /// renamed to the shorter `NotQueued::Reentrant`, `rustfmt` collapsed the block
 /// onto one line, and D11's row in `.mise/tasks/anchors` had to be re-quoted. Any
 /// rename that moves this line either way does it again, and with two columns left
@@ -1203,7 +1203,7 @@ async fn a_supervised_actor_still_refuses_a_self_call() {
 /// the vocabulary for that: `scripts/break-once.sh` replacing `Deferred::send`'s
 /// `Verdict::Committed => reply.answer(Answered::Ran(value)),` with
 /// `Verdict::Committed => drop((reply, value)),`. Watched: "the actor is running:
-/// Undelivered". That proves the parked answer is load-bearing and proves
+/// Dropped". That proves the parked answer is load-bearing and proves
 /// nothing about the *cycle*.
 ///
 /// **What the break reaches is one arm, and naming the arm is the whole

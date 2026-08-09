@@ -466,7 +466,7 @@ async fn a_refusal_before_persist_prevents_the_store() {
 ///
 /// # Over two real nodes, because the promise is a peer's
 ///
-/// A local caller is told `Undelivered::Refused { name: "persist" }` and has to
+/// A local caller is told `Unanswered::Refused { name: "persist" }` and has to
 /// go to `ended()` for the observer's own error. A **peer** is told
 /// `observer refused: persist`, produced by `turns.rs` under a comment reading
 /// *"The turn ran and was not committed"*, and that sentence is the whole of
@@ -827,7 +827,7 @@ async fn waiting_for(vault: &teller::Handle<Vault>, want: u64) {
 /// refusal rather than a receipt, and the balance on the disk is still 100, so
 /// there is no receipt anywhere for a debit that is not stored.
 ///
-/// A `Handle` answers `Undelivered::Refused { name: "persist" }` here, and the
+/// A `Handle` answers `Unanswered::Refused { name: "persist" }` here, and the
 /// `TurnLost::Refused { name: "persist" }` it is mapped from — one variant per
 /// state, so the two spellings carry the same name — is asserted in
 /// `turns.rs::a_released_reply_is_refused_with_the_turn_that_released_it`.
@@ -907,7 +907,7 @@ async fn a_deferred_reply_whose_turn_was_not_stored_is_refused() {
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `Deferred::send`'s
 /// `Verdict::Committed => reply.answer(Answered::Ran(value)),` →
 /// `Verdict::Committed => drop(value),`. Watched: `the receipt reaches its
-/// caller when the turn commits: Undelivered`.
+/// caller when the turn commits: Dropped`.
 #[tokio::test]
 async fn a_deferred_reply_that_is_answered_is_a_stored_reply() {
     let store = Flaky::new();
