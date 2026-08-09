@@ -727,10 +727,10 @@ keylink::service! {
 /// A balance, and the withdrawals waiting for somebody to approve them.
 ///
 /// `waiting` is **not** part of the snapshot and cannot be: a [`Deferred`] is a
-/// live channel to a caller in this process. A restart answers nothing — the
-/// loop drains parked replies as `TurnLost::Gone` on the way out — which is a
-/// second reason a parked reply and a durable state need thinking about
-/// together.
+/// live channel to a caller in this process. A restart answers nothing — the loop
+/// drains parked replies as `TurnLost::Restarting` on the way out, so the callers
+/// are told to retry rather than handed a value — which is a second reason a
+/// parked reply and a durable state need thinking about together.
 #[derive(Default)]
 struct Vault {
     balance: u64,

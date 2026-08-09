@@ -145,16 +145,20 @@ const REFUSED: u64 = u64::MAX;
 const GONE: u64 = u64::MAX - 1;
 
 /// What a call answers for a loss **this file installs nothing to produce**: an
-/// [`Observer`](keylink::Observer) refusing a turn that ran, or a queueing budget
-/// expiring before one started.
+/// [`Observer`](keylink::Observer) refusing a turn that ran, a queueing budget
+/// expiring before one started, a live actor throwing a parked reply away, or an
+/// incarnation dying with one held.
 ///
-/// A third sentinel and not [`GONE`], for [`GONE`]'s own reason. Both of those
-/// leave the actor alive, so answering *stop calling* about either is exactly the
-/// collapse [`Undelivered`] was widened to remove — and a test that re-made the
-/// fold here would stay green while hiding it. No `Peer` is built with an
-/// observer, and a local origin carries no queueing budget, so an assertion that
-/// ever reads this is reporting a change in what `ask` maps rather than anything
-/// about the ring.
+/// A third sentinel and not [`GONE`], for [`GONE`]'s own reason. Every one of them
+/// leaves an actor a caller can still reach, so answering *stop calling* about any
+/// is exactly the collapse [`Undelivered`] was widened to remove — and a test that
+/// re-made the fold here would stay green while hiding it.
+///
+/// Each is refuted by this file rather than by the crate: no `Peer` is built with
+/// an observer, a local origin carries no queueing budget, both deferred handlers
+/// **send** what they park, and nothing here panics, so the one supervised `Peer`
+/// never restarts. An assertion that ever reads this is reporting a change in what
+/// `ask` maps rather than anything about the ring.
 const SURPRISE: u64 = u64::MAX - 2;
 
 /// The right answer from `self_tell_twice`: the first self-`tell` landed in the
@@ -195,15 +199,20 @@ impl ring::Actor for Peer {
 
     async fn self_read(&mut self, _cx: Caller<'_>) -> u64 {
         let me = self.me.get().expect("wired").clone();
-        // A read runs no observers and starts no turn, so the two arms below it
-        // are unreachable through this door twice over — named rather than
-        // wildcarded, because a wildcard here would also swallow whatever a
-        // sixth state turned out to be.
+        // A read runs no observers, starts no turn, and parks no reply, so the
+        // four arms below it are unreachable through this door several times
+        // over — named rather than wildcarded, because a wildcard here would also
+        // swallow whatever the next state turned out to be.
         match me.with_state(|state: &Peer| state.bumps).await {
             Ok(bumps) => bumps,
             Err(keylink::Undelivered::Reentrant) => REFUSED,
             Err(keylink::Undelivered::Gone) => GONE,
-            Err(keylink::Undelivered::Refused { .. } | keylink::Undelivered::Expired) => SURPRISE,
+            Err(
+                keylink::Undelivered::Refused { .. }
+                | keylink::Undelivered::Expired
+                | keylink::Undelivered::Dropped
+                | keylink::Undelivered::Restarting,
+            ) => SURPRISE,
         }
     }
 
@@ -281,7 +290,12 @@ fn answered(hop: Result<u64, keylink::Undelivered>) -> u64 {
         Ok(depth) => depth + 1,
         Err(keylink::Undelivered::Reentrant) => REFUSED,
         Err(keylink::Undelivered::Gone) => GONE,
-        Err(keylink::Undelivered::Refused { .. } | keylink::Undelivered::Expired) => SURPRISE,
+        Err(
+            keylink::Undelivered::Refused { .. }
+            | keylink::Undelivered::Expired
+            | keylink::Undelivered::Dropped
+            | keylink::Undelivered::Restarting,
+        ) => SURPRISE,
     }
 }
 

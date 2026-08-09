@@ -123,7 +123,7 @@ pub(crate) enum Verdict {
         name: &'static str,
     },
     /// The handler panicked. The reply channel is dropped, so the parked caller
-    /// is told [`TurnLost::Gone`](crate::TurnLost::Gone).
+    /// is told [`TurnLost::Dropped`](crate::TurnLost::Dropped).
     ///
     /// **Not `Faulted`, and it is not a near miss.** There is one
     /// [`Panic`](crate::Panic), it is the original payload rather than a message,
@@ -132,10 +132,14 @@ pub(crate) enum Verdict {
     /// caller, who gets it. A payload cannot be cloned to tell two, and
     /// manufacturing a second one from a string is the thing `panic.rs` refuses.
     ///
-    /// `Gone` is also already the established answer here: [`Deferred`](crate::Deferred)
-    /// documents a turn that takes a parked reply out of the state and then panics
-    /// as resolving it `Gone`, and a durability adapter refuses a panicked turn,
-    /// so there was nothing committed for the value to be an answer about.
+    /// **And not `Gone` either**, which is what this arm produced while a dropped
+    /// channel had one answer. The loop caught the panic, so the actor is serving
+    /// the next message while this caller reads the answer — and `Dropped` is the
+    /// same answer [`Deferred`](crate::Deferred) documents for a turn that takes a
+    /// parked reply out of the state and then panics. A durability adapter refuses
+    /// a panicked turn, so there was nothing committed for the value to be an
+    /// answer about; that is why nothing crosses, and it says nothing about the
+    /// actor.
     Faulted,
 }
 

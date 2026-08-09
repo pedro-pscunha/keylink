@@ -597,6 +597,29 @@ impl fmt::Display for Ended {
 /// Unreachable today, and written to be *correct* if something reaches it, which
 /// is the choice `Mail`'s `send` and `recv` variants already make one layer out.
 ///
+/// # Two axes, and every answer comes from exactly one of them
+///
+/// [`Refused`](Self::Refused), [`Faulted`](Self::Faulted) and
+/// [`Expired`](Self::Expired) are about **this call**. The loop reached a verdict
+/// and put it on the reply channel, so the answer arrives written down.
+/// [`Reentrant`](Self::Reentrant) is the same axis one step earlier: the call is
+/// refused before it is queued, so it never has a channel to be answered on.
+///
+/// [`Dropped`](Self::Dropped), [`Restarting`](Self::Restarting) and
+/// [`Gone`](Self::Gone) are about **the actor**. Nothing was ever put on the
+/// channel — it died holding no verdict — and a dead channel carries no reason,
+/// so the answer is read off the actor's own standing after the death rather than
+/// inferred from the silence. That read happens in one private place, which is
+/// what keeps the three of them from being decided twice.
+///
+/// So the mapping is total rather than layered: a reply channel either carries a
+/// verdict or it does not, and the second case has exactly one thing to read. No
+/// answer is half of one axis and half of the other.
+///
+/// `Gone` has a second producer that skips the read, and it agrees with it: a
+/// closed mailbox refuses the send outright, and a local actor's mailbox is closed
+/// only where there will be no next incarnation.
+///
 /// # Exhaustive, and deliberately not `#[non_exhaustive]`
 ///
 /// Like [`Ended`] and [`Departure`](crate::Departure): a caller matches this, and
@@ -606,8 +629,42 @@ impl fmt::Display for Ended {
 #[derive(Debug, thiserror::Error)]
 pub enum TurnLost {
     /// The actor was gone, or ended while this turn waited.
+    ///
+    /// **Stop calling.** There is no next incarnation: the loop is finished, or a
+    /// supervisor gave up, or the actor was aborted or destroyed.
     #[error("the actor is no longer running")]
     Gone,
+    /// The actor is serving, and this reply was thrown away unanswered.
+    ///
+    /// A handler took [`Reply::later`](crate::Reply::later) and dropped the
+    /// [`Deferred`](crate::Deferred) — the sanctioned move `#[defer]` exists for,
+    /// and what that type's `#[must_use]` asks a handler to say out loud — or a
+    /// handler panicked while holding the channel, so it died in the unwind. The
+    /// loop caught the panic, kept the state, and answers the next message.
+    ///
+    /// **Distinct from [`Gone`](Self::Gone), and that distinction is the whole of
+    /// this variant.** A caller told `Gone` should stop calling; a caller told this
+    /// has an actor that is still there. It is the same split
+    /// [`Faulted`](Self::Faulted) makes for a turn that exploded, for a reply that
+    /// never reached one.
+    ///
+    /// A peer reads this sentence behind the crate's `"dropped: "` prefix, from a
+    /// rendering that reads the same fact about the same actor.
+    #[error("the actor is serving and this reply was never answered")]
+    Dropped,
+    /// The incarnation that owed this answer is gone, and a supervisor is starting
+    /// another.
+    ///
+    /// The reply died with the state that held it, in the teardown between two
+    /// incarnations. **Retrying is the move**: the mailbox never closes across a
+    /// restart, so a call made now waits for the incarnation that is coming.
+    ///
+    /// Carries the ending that caused the restart, behind an [`Arc`] because
+    /// [`Ended`] is [`Clone`] and one ending answers every reply that died with
+    /// that state. [`ended`](crate::LocalActor::ended) is not a second way to read
+    /// it: a restart is not an ending, so that future does not resolve here.
+    #[error("the incarnation that owed this answer is gone and another is coming")]
+    Restarting(Arc<Ended>),
     /// An observer refused this turn. It **ran** and was not committed.
     #[error("the {name} observer refused this turn: it ran and was not committed")]
     Refused {

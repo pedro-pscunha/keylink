@@ -2962,7 +2962,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # next person to skip the run gets the wrong number on a tree where the two diverge.
 # The agreement is recorded because hiding it would make the run look load-bearing in
 # a way this one was not, and the run is kept because the NEXT one will be.
-RECORD_BLOCKS = 165
+RECORD_BLOCKS = 166
 
 # The one marker the tripwire counts, and the two phrasings records use INSTEAD of
 # naming the harness. Both are read by the same walk, so the blind spot below is a

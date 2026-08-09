@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use keylink::{
     ActorId, Allowlist, Caller, Deferred, Ended, Eviction, Observer, RemoteError, Replied, Reply,
-    Server, Stop, TurnFut, TurnInfo,
+    Server, Stop, TurnFut, TurnInfo, Undelivered,
 };
 
 mod common;
@@ -325,9 +325,21 @@ async fn a_parked_reply_whose_actor_ends_is_answered_rather_than_hanging() {
 /// other kind.
 ///
 /// A handler that panics before consuming its `Reply` drops it inside the unwinding
-/// future, so there is nothing left to answer with: the caller is told the actor is
-/// gone instead of being handed the panic the way `ask` hands one on every other
-/// kind. The actor survives it, which is the half that keeps the trade worth making.
+/// future, so there is nothing left to answer with: the caller is told `Dropped`
+/// instead of being handed the panic the way `ask` hands one on every other kind.
+/// The actor survives it, which is the half that keeps the trade worth making — and
+/// which is why the answer is *dropped* and not *gone*.
+///
+/// **Asserted on the variant rather than on `is_err`.** Both halves of the trade
+/// are then one assertion apart: the answer names an actor that is serving, and the
+/// call below it is served. An `is_err` here passed identically while the crate
+/// told this caller to stop calling.
+///
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `answered`'s
+/// `Standing::Running => TurnLost::Dropped,` → `Standing::Running =>
+/// TurnLost::Gone,` — the fold this variant was split out of. Watched: `a handler
+/// that panicked before answering owes its caller a refusal: got Err(Gone)`. The
+/// `is_err` this replaced stayed **green** through that same break.
 #[tokio::test]
 async fn a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_actor() {
     let book = orders::actor(Book::default());
@@ -341,7 +353,7 @@ async fn a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_
         .expect("a panicking deferred handler must not hang its caller")
         .expect("the panic is NOT resumed in the caller, unlike every other kind");
     assert!(
-        answer.is_err(),
+        matches!(answer, Err(Undelivered::Dropped)),
         "a handler that panicked before answering owes its caller a refusal: got {answer:?}"
     );
 
@@ -394,16 +406,24 @@ async fn a_reply_parked_before_a_fault_is_still_answered_after_it() {
 /// adapter refuses one, so releasing its values would hand out answers about
 /// state that was never stored.
 ///
-/// `Gone` and not `Faulted`, and that is not a near miss: there is one `Panic`,
+/// `Dropped` and not `Faulted`, and that is not a near miss: there is one `Panic`,
 /// it is the original payload rather than a message, and it belongs to the turn's
-/// own caller. `turns.rs`'s
-/// `a_released_reply_is_gone_when_the_turn_that_released_it_panicked` asserts the
-/// variant, which a `Handle` folds away.
+/// own caller. The actor caught that panic and is still serving, which is what
+/// makes the answer *dropped* rather than *gone*. `turns.rs`'s
+/// `a_released_reply_is_dropped_when_the_turn_that_released_it_panicked` asserts
+/// the same variant one layer down, where a `TurnLost` is visible.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `Deferred::send`'s
 /// `Verdict::Faulted => drop(reply),` → `Verdict::Faulted =>
 /// reply.answer(Answered::Ran(value)),`. Watched: `a panicking turn's answer
 /// crossed anyway: Ok(15)`.
+///
+/// **A second break, because the first proves only that nothing crossed.** The
+/// assertion also names *which* answer, and no break above it can go red on the
+/// wrong one. `answered`'s `Standing::Running => TurnLost::Dropped,` →
+/// `Standing::Running => TurnLost::Gone,` is the fold, and it is red here:
+/// `a panicking turn's answer crossed anyway: Err(Gone)`. The `is_err` this
+/// assertion replaced stayed green through it.
 #[tokio::test]
 async fn an_answer_sent_inside_a_turn_that_then_panics_does_not_cross() {
     let book = orders::actor(Book::default());
@@ -431,7 +451,7 @@ async fn an_answer_sent_inside_a_turn_that_then_panics_does_not_cross() {
         .expect("a withheld answer must not hang its caller")
         .expect("the caller is not itself panicking");
     assert!(
-        answer.is_err(),
+        matches!(answer, Err(Undelivered::Dropped)),
         "a panicking turn's answer crossed anyway: {answer:?}"
     );
 
@@ -545,7 +565,7 @@ async fn a_peer_gets_an_answer_parked_past_its_own_turn() {
 /// added a cause that channel can die from **while the actor is running**: a handler
 /// takes `reply.later()` and drops the `Deferred`. That is sanctioned rather than
 /// misuse — `Deferred`'s own `#[must_use]` says "dropping a deferred reply answers
-/// the caller `Gone`; that is sometimes right, so say so with `drop`" — so the
+/// the caller `Dropped`; that is sometimes right, so say so with `drop`" — so the
 /// answer a peer reads for it has to be true.
 ///
 /// No supervision, no panic, no `stop()`. The actor answers the very next call on
