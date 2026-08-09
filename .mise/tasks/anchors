@@ -3183,7 +3183,34 @@ for record in sorted(set(REDNESS) - row_ids):
 # break-once.sh, but RECORD_BLOCKS says 171` — and NOT computed as 171 + 2. The
 # arithmetic happens to agree here, and the entries above say why that is worth
 # nothing: an agreeing subtraction reads as a derivation and is a coincidence.
-RECORD_BLOCKS = 173
+# 173 → 177, on `observer-crashed`, measured AFTER rebasing onto `99c7bec` and not
+# before. FOUR blocks, and a fifth record that is deliberately not one of them.
+#
+# The four: `tests/observe.rs`'s `a_panicking_observer_ends_the_actor_and_is_named`,
+# `tests/singleton.rs`'s `an_observer_that_panicked_reaches_a_peer_under_its_own_prefix`,
+# and `turns.rs`'s own `a_released_reply_reads_the_panic_with_the_turn_that_released_it`
+# and `a_second_stop_returns_ok_rather_than_the_send_s_own_closed`.
+#
+# **The fifth record names no harness on purpose**, so it lands in `UNNAMED` and
+# outside this population: `tests/observe.rs`'s `ExplodesBeforeItYields` says "the
+# same one-line edit as <sibling> above" rather than quoting the literal a second
+# time, because a literal's count is a property of the literal and not of the row.
+# Five records, four blocks. A `+5` typed off the diff would have been wrong by
+# one, which is the 169-run class this ledger already names once.
+#
+# **This branch measured the constant THREE times and only the third counts.** It
+# read 174 on `d2f5e6e`, then 175 after a fourth record landed, and both were dead
+# the moment `harness-exactly-one` merged — that branch moved the same constant to
+# 173 for reasons having nothing to do with this one. Neither figure was carried
+# across the rebase. The tree was rebased, the constant left at 173, and the task
+# asked: `FAIL population: 177 comment blocks mention break-once.sh, but
+# RECORD_BLOCKS says 173`.
+#
+# **173 + 4 = 177, and the agreement is worth nothing**, for the reason the 154 and
+# 171 entries above both give. It is worth recording only because the two branches
+# that fed it moved the number for unrelated causes, so the arithmetic agreeing is
+# a coincidence over a merge rather than over one wave.
+RECORD_BLOCKS = 177
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a
