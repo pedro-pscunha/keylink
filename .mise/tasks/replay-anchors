@@ -55,6 +55,19 @@ MISE description="Replay each REDNESS row's break and check it reddens its own g
 # an extra requirement inside one arm. It is never a substitute for the sentence, and
 # no arm passes on an exit code alone.
 #
+# ── AND ONE ARM READS A COUNT, WHICH IS NOT A VERDICT BUT A PRECONDITION ───────
+#
+# The sibling in that paragraph is a whole class, and the `exit=0` test caught it in
+# ONE cell only. A row names ONE guard; `cargo test` resolves a filter as a
+# SUBSTRING; so a name that is a strict prefix of a sibling's selects both, and the
+# recorded sentence can arrive from the test the row does NOT name. `scripts/
+# break-once.sh` now counts what its filter selected — under either runner, once,
+# for all three of its consumers — and prints `── selected=N`. Any N that is not 1
+# refuses the row BEFORE the cells below, because it disqualifies the evidence
+# rather than scoring it: with two tests under one filter, no cell is answerable.
+# The `exit=0` test stays as the narrower guard that still works when the harness
+# could not count, and `── selected=?` is exactly that state.
+#
 # ── THE TWO MODES A PASS/FAIL CELL CANNOT HOLD ─────────────────────────────────
 #
 # Both were MEASURED on 2026-08-08 by applying the registry's `N1` break —
@@ -297,7 +310,24 @@ def registry(name: str):
 
 ANCHORS = registry("ANCHORS")
 REDNESS = registry("REDNESS")
-rows = {record: (target, literal) for record, _, target, literal in ANCHORS}
+# EXACTLY ONE row per id, and this used to be a dict comprehension - which keeps the
+# LAST duplicate and drops the rest without a word. Measured on the registry at
+# `d2f5e6e`: 113 rows, 111 ids, `L1` and `L2` twice each, and both resolving to a
+# different FILE in a different crate than the row a reader finds first. This task
+# would then cut a live literal out of the wrong crate and score whatever came back.
+#
+# `mise run anchors` refuses the same state in `pre-commit`, so the committed
+# registry cannot reach here holding one. This is not that check repeated for
+# safety: `REPLAY_REGISTRY` points this task at an UNCOMMITTED file, which no hook
+# has seen, and that is the path a drifted registry actually arrives by.
+rows: dict[str, tuple[str, str]] = {}
+for record, _, target, literal in ANCHORS:
+    if record in rows:
+        sys.exit(f"{TASK} has more than one ANCHORS row with the id {record}. This "
+                 "task resolves a REDNESS entry to a row by that id, so a repeated "
+                 "one makes every row but the last unreachable - and the last may "
+                 "name a different file. Give each row its own id.")
+    rows[record] = (target, literal)
 
 # A `REDNESS` id with no `ANCHORS` row, refused HERE and not as a bare `KeyError` at
 # the lookup below. `mise run anchors` fails on the same state and names the same two
@@ -329,6 +359,23 @@ def started(out: str) -> bool:
     return any(line.strip().startswith(STARTED) for line in out.splitlines())
 
 
+def selected(out: str) -> int | None:
+    """How many tests the filter selected, as `break-once.sh` counted them.
+
+    `None` is the harness's `?`, and it is NOT zero: no totals line was printed at
+    all, which is an abort or a tree that did not compile. Zero is a filter that
+    named nothing, and the arms below must be able to tell those two apart.
+
+    The COUNT is not done here on purpose. `break-once.sh` does it once, for all
+    three of its consumers, under either runner - see its own heading.
+    """
+    for line in out.splitlines():
+        if line.startswith("── selected="):
+            value = line[len("── selected="):].split()[0]
+            return int(value) if value.isdigit() else None
+    return None
+
+
 def outcome(watched: str, unaffected: str | None, out: str,
             killed: bool) -> tuple[str, str]:
     """Score one replayed break. Pure, so `--selftest` can reach every arm.
@@ -337,6 +384,28 @@ def outcome(watched: str, unaffected: str | None, out: str,
     Returns one of `red`, `hang`, `unaffected` or `fail`, and the reason to print.
     """
     saw = watched in out
+    # ── EXACTLY ONE TEST, BEFORE ANY OTHER ARM ────────────────────────────────
+    #
+    # A `REDNESS` row names ONE guard, and `cargo test` resolves its filter as a
+    # SUBSTRING - so a name that is a strict PREFIX of a sibling's selects both. A
+    # run where only the SIBLING reddens then prints a panic, and every arm below
+    # reads text: `red` would accept a sentence the named guard never printed.
+    #
+    # FIRST, and not folded into the arms, because it disqualifies the EVIDENCE
+    # rather than scoring it. Which cell a row belongs in is unanswerable once the
+    # output could have come from either of two tests, and that is as true of a
+    # declared `unaffected` as of a `red`. The `unaffected` arm's `exit != 0` test
+    # is a NARROWER version of this one that survives - it catches a two-test run
+    # only when the sibling actually reddened, and only in that one cell.
+    #
+    # `None` falls through untouched. That is `── selected=?`, where the harness
+    # found no totals line, and the arms below already report an abort and a
+    # non-compiling tree correctly. Nine of the nine registered filters select one
+    # today, measured, so this arm is PREVENTIVE and fires on nothing in this tree.
+    picked = selected(out)
+    if picked is not None and picked != 1:
+        return "fail", (f"the filter selected {picked} tests, so no line in this run "
+                        "can be attributed to the guard this row names")
     if unaffected:
         if killed:
             return "fail", ("this row DECLARES the guard unaffected, and the run had to "
@@ -455,14 +524,20 @@ def selftest() -> int:
     # Shaped on the `break-once.sh` log measured 2026-08-08, with the sentence and the
     # filter spliced in from REDNESS so no fixture can agree with a registry that
     # moved. `build=False` is the run killed while cargo was still compiling.
-    def transcript(body: str, status: int | None, build: bool = True) -> str:
+    def transcript(body: str, status: int | None, build: bool = True,
+                   picked: str = "1") -> str:
         head = "── broken: <target>\n── runner: cargo test\n"
         head += "   Compiling keylink v0.1.0 (<root>/keylink)\n"
         if build:
             head += ("    Finished `test` profile [unoptimized + debuginfo] in 2.55s\n"
                      "     Running unittests src/lib.rs (target/debug/deps/keylink-<h>)\n\n")
+        # `picked` is the harness's own `── selected=` line, and it is emitted only
+        # beside an `── exit=` line because that is where the harness prints it: it
+        # counts out of the log AFTER the run. `?` is the value for a run whose
+        # totals line the harness could not find.
         tail = "" if status is None else (
-            f"── exit={status} (non-zero means the test caught it)\n── log: <path>\n")
+            f"── exit={status} (non-zero means the test caught it)\n"
+            f"── selected={picked}\n── log: <path>\n")
         return head + body + tail
 
     record = next(iter(REDNESS))
@@ -516,11 +591,54 @@ def selftest() -> int:
     verdict, _ = outcome(sentence, reason, ok, killed=False)
     check("a declared row whose pass sentence is absent fails", verdict == "fail",
           f"verdict {verdict}: `unaffected` must still cost a watched line")
+    # `picked="?"` on purpose, and it is what keeps this probe measuring the arm it
+    # was written for. This fixture holds TWO tests, so a `── selected=2` would be
+    # caught one arm earlier and the `exit != 0` test below it would stop being
+    # exercised at all - an assertion passing for a reason it does not name. `?` is
+    # the harness's own value for a run it could not count, which is the state this
+    # arm has to survive: the sibling arm is the NARROW guard that still works when
+    # the count is unavailable.
     sibling = transcript(f"running 2 tests\ntest {test_filter} ... ok\n"
-                         "test a_sibling_under_the_same_filter ... FAILED\n", 101)
+                         "test a_sibling_under_the_same_filter ... FAILED\n", 101,
+                         picked="?")
+    check("the sibling fixture carries no usable count", selected(sibling) is None,
+          f"selected read {selected(sibling)}, so the exactly-one arm would score "
+          "this fixture and the exit-status arm under it would go unexercised")
     verdict, _ = outcome(passed, reason, sibling, killed=False)
     check("a declared row is refused when a sibling reddened", verdict == "fail",
           f"verdict {verdict}: exit={exit_status(sibling)} says the break was observed")
+
+    # ── the count itself: a filter that named two guards disqualifies the run ─────
+    #
+    # The registered filters all select one today, so nothing in the tree reaches
+    # this. It is the arm that makes a record naming a PREFIX of a sibling's name
+    # fail instead of reading as evidence.
+    two = transcript(f"running 2 tests\ntest {test_filter} ... ok\n"
+                     "test a_sibling_under_the_same_filter ... FAILED\n"
+                     f"thread 'a_sibling_under_the_same_filter' panicked:\n{sentence}\n",
+                     101, picked="2")
+    check("the two-test fixture reports a count of 2", selected(two) == 2,
+          f"selected read {selected(two)}, so the probes under it are void")
+    check("the recorded sentence IS in the two-test fixture", sentence in two,
+          "the fixture lacks the sentence, so the probe below would pass without "
+          "the count doing any work")
+    verdict, _ = outcome(sentence, None, two, killed=False)
+    check("a run whose filter selected TWO fails, sentence or no sentence",
+          verdict == "fail", f"verdict {verdict}: the sentence came from a sibling")
+    # GREEN and two, so the count is the ONLY thing that can refuse it. The fixture
+    # above exits 101, which the declared arm's own `exit != 0` test already
+    # catches - a probe run against it would pass with this arm deleted, which is a
+    # probe measuring the wrong guard. Watched: with the arm cut, this one fails and
+    # that one does not.
+    two_green = transcript(f"running 2 tests\ntest {test_filter} ... ok\n"
+                           "test a_sibling_under_the_same_filter ... ok\n", 0,
+                           picked="2")
+    verdict, _ = outcome(passed, reason, two_green, killed=False)
+    check("a DECLARED row whose filter selected two fails, even all-green",
+          verdict == "fail", f"verdict {verdict}: `unaffected` needs one guard too")
+    check("the control fixture reports a count of 1", selected(red) == 1,
+          f"selected read {selected(red)}: the control passes only because the count "
+          "is right, not because it is missing")
     verdict, _ = outcome(passed, reason, transcript("running 1 test\n", None), killed=True)
     check("a declared row that HANGS fails", verdict == "fail", f"verdict {verdict}")
 
@@ -601,8 +719,9 @@ def selftest() -> int:
               f"{', '.join(failures)}", file=sys.stderr)
         return 1
     print("ok: every arm scored as recorded — red, a red at the wrong sentence, an "
-          "aborted anchor, an undeclared green, a declared one, both sides of the "
-          "timeout, the row shape, and the kill itself")
+          "aborted anchor, an undeclared green, a declared one, a filter that "
+          "selected two, both sides of the timeout, the row shape, and the kill "
+          "itself")
     return 0
 
 
@@ -644,14 +763,18 @@ for record in plan:
          test_filter, *extra],
         SECONDS,
     )
-    # The three lines `replay-fate-breaks.sh` echoes - whether the harness aborted,
-    # and what the runner exited with - plus the log PATH, which that script does not
-    # echo and which the failure arm below sends the reader to. Without it the remedy
-    # named a file whose name appeared nowhere. Never the whole test log: the harness
-    # keeps that in the file this line names.
+    # EVERY line the harness prints for itself, and none of the runner's. It tags its
+    # own with `── `, so that prefix is the whole rule - and it replaces a list of
+    # four startswith tests that had to grow by hand whenever the harness grew a
+    # line. The `── selected=` count and the remedy beside it were invisible here on
+    # their first draft for exactly that reason. `ABORT` and `expected exactly one`
+    # stay listed because the abort goes to stderr WITHOUT the prefix.
+    #
+    # Never the whole test log: the harness keeps that in the file its `── log:` line
+    # names, and the failure arm below sends the reader there.
     for line in out.splitlines():
         if ("ABORT" in line or "expected exactly one" in line
-                or line.startswith("── exit=") or line.startswith("── log:")):
+                or line.startswith("── ")):
             print(f"     {line}")
     if killed:
         # What was SENT, not what ended it: SIGTERM goes first so the restore runs,
