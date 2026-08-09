@@ -564,6 +564,16 @@ async fn a_read_from_inside_a_turn_is_a_self_deadlock() {
 /// The arm has none of these problems. It is one line of `local.rs`, and the
 /// anchor registered for this record IS that line.
 ///
+/// **One row does not cover that line, though, and this record is not its only
+/// reader.** `tests/persist.rs::a_deferred_reply_that_is_answered_is_a_stored_reply`
+/// breaks the SAME line with a different replacement — `Verdict::Committed =>
+/// drop(value),` rather than the `drop((reply, value))` above — and watches a
+/// different sentence. That record is unregistered, so the registry carries one row
+/// for a line two records rely on, and a row names one `lives_in` and cannot say so.
+/// Anyone re-quoting this anchor must fix `persist.rs` too. The registry holds D3
+/// unsplit on purpose and says it is next, so this paragraph is the reader's only
+/// warning until that happens.
+///
 /// The break that would have isolated the cycle does not exist. `Reply::later`'s
 /// `Replied(Settled::Later)` → `Replied(Settled::Now)` was tried first and does
 /// not compile — `Settled::Now` is `Now(Reply<T>, T)`, so the arm needs the two

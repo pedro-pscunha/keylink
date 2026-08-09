@@ -1219,12 +1219,39 @@ async fn a_blob_response_carries_the_reply_and_the_address_together() {
 /// a block because the arm must yield `::core::option::Option<$crate::BlobId>`, and
 /// `let _ = __value;` keeps the pattern's binding used.
 ///
+/// **That is MEASURED now rather than inferred, which makes the repair necessary
+/// rather than tidy.** A positive control compiled both pairs against an isolated
+/// archive of `25cbbac`: the OLD pair FAILS to compile, the NEW pair COMPILES. The
+/// recorded error appears verbatim —
+/// `error[E0425]: cannot find function, tuple struct or tuple variant None in
+/// module $crate`.
+///
+/// **A replayer matching that text must expect MORE than that one error.** The same
+/// run also reported `cannot find value rpc / recv / send in this scope`, because
+/// this macro expands at several sites and one broken body errors at every one of
+/// them. Reading the paragraph above as promising a single diagnostic, then treating
+/// the extra ones as a different failure, is the mistake it invites.
+///
+/// **And a compile check still says nothing about redness.** It settles two things
+/// only: that the old pair could not have produced the recorded panic, and that the
+/// new pair gets far enough to run. Whether the new pair produces THIS sentence is
+/// still `mise run replay-anchors` and nothing else, exactly as the reconstruction
+/// paragraph above says.
+///
 /// **Both spans are quoted here on purpose, and the narrow one is not dead weight.**
 /// `mise run anchors` requires the registered literal to appear as a whole
 /// backticked span somewhere in this file, so a record quoting the old anchor *and*
 /// the new one satisfies that check whichever of the two the row currently names.
-/// That is what lets the registry row and this record be edited in either order.
-/// Delete `__keylink_granted_id!` above and the row's own history stops resolving.
+/// That is what lets the registry row and this record be edited in either order, and
+/// it means neither half can redden alone — including after a later revert of either
+/// one. Delete `__keylink_granted_id!` above and the row's own history stops
+/// resolving.
+///
+/// **That deletion is the obvious tidy-up, and it has already been made and undone
+/// twice.** The narrow span reads as a leftover, because nothing in the file says
+/// what it is for. This paragraph is what stops a third round: the quote is load
+/// bearing precisely when the registry disagrees with it, which is the one moment
+/// nobody is looking at this file.
 #[tokio::test]
 async fn a_keyed_actors_blob_method_grants_the_address_it_returns() {
     let server = local_node().await;

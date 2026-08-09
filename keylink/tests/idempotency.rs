@@ -596,11 +596,14 @@ async fn a_key_state_query_on_a_service_that_keys_nothing_is_fresh() {
 ///
 /// `records_none_still_runs_the_work_at_most_once`'s record is the shape for the
 /// FIRST half of this: it names `Guard::record` and asserts a relationship between
-/// two statements, and carries no line number at all. It is **not** clean of the
-/// general fault, and pointing at it as though it were would be the same mistake one
-/// level up: it also says the break "reddens fourteen of this file's tests", and a
-/// count over an open set rots on the fifteenth such test anybody writes. A
-/// relationship cannot rot; a number can, whether it indexes a line or a population.
+/// two statements, and carries no line number at all. It was **not** clean of the
+/// general fault when this branch reached it, and holding it up as though it were is
+/// the same mistake one level up — it also said the break reddens "fourteen of this
+/// file's tests", and a count over an open set rots on the fifteenth such test
+/// anybody writes. That count is gone now: the record states the property and marks
+/// the size unmeasured, so the two records agree rather than one recommending a
+/// shape the other had already broken. A relationship cannot rot. A number can,
+/// whether it indexes a line or a population.
 #[tokio::test]
 async fn a_keyed_actor_service_applies_the_same_policy() {
     let server = local_node().await;
@@ -1134,8 +1137,33 @@ async fn start_recordless() -> Fixture {
 /// handler's counter: the repeat ran.
 ///
 /// **That break is very wide** — giving a key back instead of spending it reddens
-/// fourteen of this file's tests, every one that asserts a repeat is not re-run.
-/// Width is the finding: `settle` is the single line at-most-once rests on.
+/// every test in this file that asserts a repeat is not re-run. Width is the
+/// finding: `settle` is the single line at-most-once rests on.
+///
+/// **How many that is is NOT recorded here, and the omission is deliberate.** This
+/// sentence said "fourteen" until this branch. Nothing had measured it, nothing can
+/// see it go stale, and it rots on the fifteenth such test anybody writes — the
+/// exact fault `.mise/tasks/anchors` warns about for its own row count, sitting in
+/// the record this branch had held up as the shape to copy. The property above
+/// survives a test being added. A count does not.
+///
+/// **And a static sweep is not a substitute for running it**, which is worth saying
+/// because the sweep looks convincing. The property is written in at least three
+/// unrelated assertion shapes here: a refusal, as `expect_err` on the retry; a run
+/// counter read through a third key, as this test does; and plain equality with the
+/// first answer, as `a_repeated_key_does_not_run_the_handler_twice` does. A sweep
+/// keyed on refusals and counters misses that third shape, so it under-reports while
+/// reading as exhaustive — measured, by writing one and watching it drop that test.
+/// Only `mise run replay-anchors` on this row settles the size, and no gate runs it.
+///
+/// **R20's two halves age differently, and that is the reason to keep them side by
+/// side.** The `claim_key`-before-`next` citation below asserts a RELATIONSHIP
+/// between two line numbers while naming neither, so nothing inserted above either
+/// one can invalidate it. That half really is the shape to copy. This population
+/// half was a bare count, and it rotted quietly in the same doc comment. One
+/// durable citation beside one rotted number, in one record, is the clearest
+/// evidence on this branch that the fault is the FORM of a claim and not the care
+/// of whoever wrote it.
 ///
 /// **What that break does NOT reach is this test's last assertion**, and it is worth
 /// saying which half is unguarded. The break trips the `expect_err` above it, so the
