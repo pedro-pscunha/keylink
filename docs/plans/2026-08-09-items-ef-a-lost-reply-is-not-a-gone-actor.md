@@ -174,7 +174,7 @@ and `Faulted` removed, because `ask` resumes it.
 `ask_catching` is repriced in the same breath: after this it buys the `Panic`
 payload and the `Arc<Ended>` reason, **not** "tell them apart".
 
-### `Display` strings
+### `Display` strings — ruled before they are written
 
 The two enums describe the same facts, so the six shared variants carry the
 **same** string, and a guard checks it. `Undelivered::Gone`'s string returns to
@@ -184,6 +184,52 @@ That reverses a change this session made three days ago. It was right then: with
 two variants, `Gone` covered three causes and "not delivered to a committed turn"
 was the only sentence true of all three. `Gone` now has exactly one cause, and the
 specific sentence is the honest one again.
+
+**The revert was checked against every producer rather than assumed.** After the
+change `Undelivered::Gone` has four producers, in two groups. `Standing::Gone`
+means "there will be no next incarnation" by its own doc. A closed mailbox means
+the same: `is_running()` is `!mail.is_closed()` (`turns.rs:3908`), `close()` has
+exactly two callers on a local actor and both are give-up arms (`turns.rs:2738`,
+`2904`), and `Inbox::close`'s own doc states the invariant — *"only on a path
+where there will be no next incarnation"*. The restart arm returns before
+reaching it (`turns.rs:2735-2736`), and `Lent` never drops the receiver anyway.
+**No producer leaves the actor alive.**
+
+Two of the six sentences are new, and **both are sentences this crate already
+wrote**, which is what makes the shared-text rule literal instead of argued:
+
+- `Dropped` is `lost()`'s wire sentence minus its prefix (`turns.rs:4192-4194`).
+  A peer reads `dropped: the actor is serving and this reply was never answered`;
+  a local caller reads the same sentence without the prefix.
+- `Restarting` is `Standing::Restarting`'s own doc (`turns.rs:2408`).
+
+Neither may be written **with** its wire prefix: two texts differing only by a
+prefix is how a `starts_with` becomes ambiguous, which is what
+`no_failure_prefix_is_a_prefix_of_another` exists about.
+
+`Restarting` is the one variant where identical text and identical payload cannot
+both hold — `TurnLost` carries `Arc<Ended>` and `Undelivered` cannot. **Both texts
+stay payload-free**, which costs nothing: `lost` already renders the reason
+separately, and it never goes through `Display`.
+
+`Reentrant` is **already byte-identical across the two enums, by hand, with
+nothing enforcing it.** The rule is half-kept already, which is the argument for
+the guard rather than for the rule.
+
+### One pre-existing gap this change makes matter
+
+`no_other_served_failure_begins_with_one_of_the_four` (`actor/remote.rs:752-783`)
+documents itself as covering *"every other `RemoteError::Failed` keylink itself
+builds on a served path"*. Its list holds four entries and **omits
+`Undelivered::Reentrant`**, which `turns.rs:4302` builds into a served `Failed`.
+The claim is false today; nothing is broken only because that text happens to
+begin with none of the four prefixes.
+
+It matters now because `sent` becomes a `Result<(), NotQueued>`, so a bare
+`refused.to_string()` there would silently start rendering a **different type's**
+`Display` onto the wire — and §1's trace shows no test would see it. C1 renders
+through `Undelivered::from(refused)` explicitly, and adds the missing entry so the
+guard consumes the text it already claims to.
 
 ---
 
@@ -256,6 +302,35 @@ and none covered the two new supervised cases.
 
 **The control is not written.** Four tests already pin it — `turns.rs:4690`,
 `4746`, `5009`, `singleton.rs:211`. Name them; a fifth is duplication.
+
+### The twin guard, and what it does NOT check
+
+**Rust has no reflection over enum variants, so no test can enumerate them.** Any
+design claiming otherwise is wrong, and this one says what it rests on instead:
+
+- a new `TurnLost` variant is `E0004` in the exhaustive `twin` match;
+- a new `Undelivered` variant is `E0004` in the exhaustive `slot` match;
+- the sample array is **fixed-size** and indexed by literals, so a seventh
+  variant's natural `EVERY[6]` fires rustc's deny-by-default
+  `unconditional_panic`. **Verify that in one line before trusting it** — if it
+  only warns, the array becomes a `const` with an explicit length assertion.
+
+Four assertions, each aimed at a way the test could pass by consuming nothing:
+`covered.iter().all(..)` refuses a loop that ran zero times or over a subset;
+`without_a_twin == 1` refuses a `twin` that returns `None` for everything and
+skips every comparison; a set of the rendered texts refuses two variants sharing
+one sentence; a non-empty check refuses `#[error("")]`, which satisfies equality
+and says nothing. Both sides come from their own `Display` on values built from
+literals — the `Undelivered` is never derived from the `TurnLost`'s text, which is
+the tautology this shape invites.
+
+**The residual, named rather than hidden:** an author who adds a variant and
+points `slot` at an *existing* index gets past all three mechanisms. That belongs
+in the test's own doc, not in a claim that the check is total.
+
+Two break records, not one: one changes a character in `Dropped`'s `#[error]`
+(exercises the equality), one points `slot`'s `Expired` arm at `0` (exercises the
+coverage). A single record would leave half the test defended by prose.
 
 Each behavioural guard is watched red-then-green via `scripts/break-once.sh` with
 a break record, per `CONTRIBUTING.md`.
@@ -333,7 +408,34 @@ That needed "a return channel and a `Drop` impl on the reply of every method".
 So the re-pricing is exact: **the loss of the panic remains, the loss of the
 distinction is closed.**
 
-Appended as a dated section, per `CONTRIBUTING.md:334`.
+**The price was re-checked, not assumed.** A reader will ask whether item M's turn
+chain is that return channel. It is not, on two grounds that are about the
+mechanism rather than about effort. **Direction:** the chain travels caller →
+actor, cloned into each `Message::Mail` at send; the refused feature needs the
+reply's destination travelling actor → caller at drop time. **Content:** the
+chain is actor identities for a membership test — `turns.rs:1339` says "One
+actor, for **chain membership and nothing else**" — so it can name who is calling
+and cannot name where an answer goes. `Reply` and `Deferred` still have no `Drop`
+impl at all, which is exactly what §4.8 asked for and did not build. `Fate` fails
+the same way and for the same reason it succeeds at the thing this branch uses it
+for: it is a cell about the *actor*, with no payload and no reply identity, so it
+can make the caller's sentence true and cannot hand it a `Panic`.
+
+Appended as a dated section, per `CONTRIBUTING.md:334`. Drafted at
+`.tmp/c5/rfc-07-appendix.md`.
+
+**Two of the eight `MailboxClosed` occurrences are not renamed.** Lines 1526 and
+1720 are quoted **break-record output** — transcripts of runs that happened and
+printed that word. Six read as `Undelivered` from here on; those two stay,
+because correcting a record of a real run would falsify it. `MailboxClosed` is
+now zero occurrences in `keylink/src`; the RFC is the only place it survives.
+
+**Sequencing:** the appendix states that
+`a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_actor`
+asserts `Dropped`. That is true only **after** the worklist's `tests/defer.rs`
+rows land. Appending it earlier would give the RFC a claim the tree does not
+hold — the defect this branch exists to fix. So the append is the **last** step
+of C5, not the first.
 
 ---
 
