@@ -288,7 +288,7 @@
 //! - **A budget.** Nothing bounds how often this loop rebuilds.
 //!   [`Intensity`](crate::Intensity) bounds one actor's incarnations inside its
 //!   own supervision loop and cannot be spent here — its `max` and the backoff
-//!   it implies are private to `local.rs`, and `compose` is a sibling module. A
+//!   it implies are private to `turns.rs`, and `compose` is a sibling module. A
 //!   `Verdict::Restart` was to have carried that bound and could not get it. So
 //!   the trade is stated rather than sold: this buys control over what a rebuild
 //!   republishes and pays a restart budget for it, and a caller who wants one
@@ -378,7 +378,7 @@ pub enum GroupEnded {
     /// **`panic = "abort"` defeats this**, as it defeats every `catch_unwind` in
     /// the crate: there is no unwind to catch, so the process goes and no
     /// [`Group`] ends at all. Stated here rather than assumed, because
-    /// `local.rs` and `panic.rs` already state it twice and a third silent copy
+    /// `turns.rs` and `panic.rs` already state it twice and a third silent copy
     /// is the drift those two exist to prevent.
     PolicyPanicked {
         /// The member the policy was asked about.
@@ -1019,12 +1019,12 @@ impl fmt::Debug for Group {
 ///
 /// It waits on two inputs with **no `select!`**: `tokio`'s `macros` feature is
 /// off for `wasm32-unknown-unknown`, so a `select!` here would not compile for a
-/// browser. The house pattern is a hand-written `poll_fn`, which `local.rs`
+/// browser. The house pattern is a hand-written `poll_fn`, which `turns.rs`
 /// already uses for the actor loop's own two inputs.
 ///
 /// # The wake discipline, because the actor loop's argument does not transfer
 ///
-/// `local.rs` can say of its `poll_fn` that it cannot lose a wakeup, because *a
+/// `turns.rs` can say of its `poll_fn` that it cannot lose a wakeup, because *a
 /// poll that returns `Pending` has taken nothing*. A [`Notified`] that returns
 /// `Ready` **has taken the permit**. So this loop is written to one invariant:
 ///

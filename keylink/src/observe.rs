@@ -62,7 +62,7 @@
 //!
 //! What was left was the slice and the question of who owns the `Vec` for a
 //! lazily spawned actor. Feeds forced it, because a keyed actor with a feed needs
-//! the same `select!` a local one does: there is **one loop** now, in `local.rs`,
+//! the same `select!` a local one does: there is **one loop** now, in `turns.rs`,
 //! and both paths enter it with a state, a `Vec` of observers and a set of feeds.
 //! The owner of the `Vec` is whoever builds the actor —
 //! `<service>::spawn_wired(state, observers, feeds)` for a keyed one, called from
@@ -310,7 +310,7 @@ pub enum TurnOutcome<'a> {
 /// [`is_fatal`](Self::is_fatal) here, and `fatal` on
 /// [`Ended::Observer`] — which is argued separately and
 /// on its own merits further down. `into_parts` is `pub(crate)` and has two
-/// callers, both in `local.rs`, so an internal enum would buy a self-describing
+/// callers, both in `turns.rs`, so an internal enum would buy a self-describing
 /// return at those two sites and be a private synonym for a shape the public API
 /// spells as a `bool` anyway. That is a judgement about one type against three
 /// call sites, not a constraint — and calling it a constraint is what this
@@ -538,7 +538,7 @@ pub enum Ended {
 /// One line, for a log or for the string a peer is handed.
 ///
 /// [`Debug`](fmt::Debug) is derived and prints the fields; this prints the
-/// sentence. `local.rs` puts one of these behind a `"restarting: "` prefix on the
+/// sentence. `turns.rs` puts one of these behind a `"restarting: "` prefix on the
 /// served path, and a struct-literal rendering there would be noise on a wire.
 impl fmt::Display for Ended {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -1,4 +1,4 @@
-//! An actor that never leaves the process.
+//! The turn model, and the local actor that never leaves the process.
 //!
 //! This is the base case. RFC-04 §5.4 states the reason plainly:
 //!
@@ -3775,7 +3775,7 @@ mod tests {
     /// spelled out here, so **a fifth prefix has to be added to it by hand**; it
     /// names the consts rather than the strings, so it cannot drift from the wire.
     ///
-    /// Made red by `scripts/break-once.sh keylink/src/local.rs`, giving [`DROPPED`]
+    /// Made red by `scripts/break-once.sh keylink/src/turns.rs`, giving [`DROPPED`]
     /// the value `"panicked: dropped: "`. Watched:
     /// `"panicked: " is a prefix of "panicked: dropped: "`.
     #[test]
@@ -3806,7 +3806,7 @@ mod tests {
     /// asking** — so `NoSuchActor` staying a variant is what keeps it impossible
     /// to miss.
     ///
-    /// Made red by `scripts/break-once.sh keylink/src/local.rs` on `lost`'s
+    /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `lost`'s
     /// `Standing::Gone` arm → `RemoteError::Failed(format!("{DROPPED}{id}"))`.
     /// Watched: `left: Failed("dropped: id")`, `right: NoSuchActor { id: "id" }`.
     ///
@@ -4620,7 +4620,7 @@ mod tests {
     /// refuses a `Stopped` outright because nobody restarts an actor that was
     /// asked to stop.
     ///
-    /// Made red by `scripts/break-once.sh keylink/src/local.rs` on `Lent::ending`'s
+    /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `Lent::ending`'s
     /// `Standing::Gone` → `Standing::Running`, which is the old behaviour written
     /// as a value instead of as a silence. Watched: `a spent budget is not a live
     /// actor: Running`.
@@ -4726,7 +4726,7 @@ mod tests {
     ///
     /// Made red three ways, each watched:
     ///
-    /// - `scripts/break-once.sh keylink/src/local.rs`, replacing `run_loop`'s
+    /// - `scripts/break-once.sh keylink/src/turns.rs`, replacing `run_loop`'s
     ///   `fate.settle(inbox.ending(&reason));` with a `Drop` guard holding the
     ///   same verdict — decided in the same place, still reaching [`supervise`],
     ///   published at the end of `run_loop` instead, after `drop(state)`. That is
@@ -4919,7 +4919,7 @@ mod tests {
     /// never had. The remedy is structural rather than the line coming back:
     /// `supervise`'s floor stays armed across the backoff and the factory.
     ///
-    /// Made red by `scripts/break-once.sh keylink/src/local.rs`, disarming
+    /// Made red by `scripts/break-once.sh keylink/src/turns.rs`, disarming
     /// `supervise`'s floor at its declaration. Watched: `an actor destroyed
     /// between incarnations is gone, not restarting: Restarting(Panicked {
     /// message: "this incarnation is over" })`.
@@ -4968,7 +4968,7 @@ mod tests {
     /// The cell is read directly rather than through a peer, because what is
     /// wrong here is the cell itself and no reply has to die to prove it.
     ///
-    /// Made red by `scripts/break-once.sh keylink/src/local.rs`, moving
+    /// Made red by `scripts/break-once.sh keylink/src/turns.rs`, moving
     /// `supervise`'s floor back inside the loop body — the shape this replaces,
     /// verbatim. Watched: `a supervisor that is still rebuilding must not read as
     /// gone: Gone`.
@@ -5056,7 +5056,7 @@ mod tests {
     /// replay set covered it — break 21 disarms at the *declaration*, a different
     /// edit — so correct code was protected by prose.
     ///
-    /// Made red by `scripts/break-once.sh keylink/src/local.rs`, adding the third
+    /// Made red by `scripts/break-once.sh keylink/src/turns.rs`, adding the third
     /// disarm: `floor.disarm();` before the `run_loop` call and
     /// `floor = Floor::armed(fate);` after it. Watched: `a state that panicked on
     /// the way out is gone, not restarting: Restarting(Panicked { message: "this

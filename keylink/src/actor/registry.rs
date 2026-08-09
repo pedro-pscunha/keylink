@@ -46,7 +46,7 @@
 //! wire type: [`ActorId`], which is what a registry is keyed by and which would
 //! move with it, and [`Ended`], which is what [`System::shutdown`] reports.
 //! **`Ended` is a new item on §16.8's bill**, and it is put here rather than left
-//! to be counted later: `local.rs` names it too, so a split would have to give
+//! to be counted later: `turns.rs` names it too, so a split would have to give
 //! both halves somewhere to see it from. That is a smaller cost than a second
 //! lifecycle vocabulary, which is what returning anything else would have been.
 
@@ -64,7 +64,7 @@ use n0_future::task::{AbortOnDropHandle, JoinHandle};
 use n0_future::time::Instant;
 use tokio::sync::mpsc;
 
-use crate::local::{Fate, Standing};
+use crate::turns::{Fate, Standing};
 use crate::{ActorId, Ended};
 
 /// Messages that may wait ahead of the one being handled, when nobody says.
@@ -86,7 +86,7 @@ const DEFAULT_MAILBOX_DEPTH: usize = 1;
 ///
 /// An `Arc<AtomicBool>` behind a name, so that the pair cannot be assembled from
 /// two unrelated flags and so the invariant has one place to be written. The
-/// invariant is: **`local.rs`'s `run_loop` sets it on the way into a turn and
+/// invariant is: **`turns.rs`'s `run_loop` sets it on the way into a turn and
 /// clears it on the way out, for both of an actor's inputs, and nothing else
 /// writes it.** [`System::status`] reads it.
 ///
@@ -142,7 +142,7 @@ impl Busy {
 /// is 7,424, against 256 for 32 pointers. The cost of boxing is one allocation
 /// per message, on a path that already allocates.
 ///
-/// # The box here is half of the decision, and the other half is in `local.rs`
+/// # The box here is half of the decision, and the other half is in `turns.rs`
 ///
 /// The sentence that used to sit here — that the pressure "gets worse as `M`
 /// grows, and `M` is the caller's to grow" — was true and was about the wrong
@@ -188,7 +188,7 @@ impl Busy {
 /// [`ActorStatus::busy`] stays `false` for it. That is the honest answer rather
 /// than a flag `recv` sets: `recv` cannot see when the turn it handed out ended,
 /// so a flag set here would read `true` for an idle actor from its first message
-/// until its last. Every actor a `service!` produces runs `local.rs`'s one loop,
+/// until its last. Every actor a `service!` produces runs `turns.rs`'s one loop,
 /// which is where the flag is maintained.
 ///
 /// # It carries a second cell now, for the same reason and a different question
@@ -280,7 +280,7 @@ impl<M> Mailbox<M> {
     }
 
     /// Refuse further messages while letting the buffer drain. See
-    /// `local.rs`'s `Inbox::close`, which owns the argument: only a supervisor
+    /// `turns.rs`'s `Inbox::close`, which owns the argument: only a supervisor
     /// calls this, on the path where there will be no next incarnation.
     pub(crate) fn close(&mut self) {
         self.slots.close();
@@ -3269,7 +3269,7 @@ mod tests {
     ///
     /// **Two earlier shapes were both weaker, and the second one only looked
     /// stronger.** One future holding both made "the recorder drops first" a
-    /// claim about generator drop order — the reasoning `local.rs` refuses as *a
+    /// claim about generator drop order — the reasoning `turns.rs` refuses as *a
     /// fact about rustc rather than about this crate*. Splitting them into two
     /// `let`s in one block did not fix it: siblings in one scope drop in reverse
     /// declaration order, which is the same category of guarantee. Only the

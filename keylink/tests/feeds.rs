@@ -408,7 +408,7 @@ async fn a_panic_in_a_feed_handler_ends_the_actor() {
 /// would name `Fills` half the time.
 ///
 /// Red-tested by making the loop treat a finished feed as `Ended::Stopped`:
-/// `scripts/break-once.sh keylink/src/local.rs 'reason = Ended::Feed { name };' \
+/// `scripts/break-once.sh keylink/src/turns.rs 'reason = Ended::Feed { name };' \
 /// 'reason = Ended::Stopped; let _ = name;' a_feed_that_ends_ends_the_actor_and_names_it`.
 #[tokio::test]
 async fn a_feed_that_ends_ends_the_actor_and_names_it() {
@@ -562,7 +562,7 @@ async fn neither_input_starves_the_other() {
 /// than a shortcut: a keyed actor with a feed is driven entirely from inside this
 /// process, so the thing being tested is the *loop*, with no transport in the way
 /// to explain a pass. The mailbox half of the same loop is `Turn::run` at the same
-/// call site — `keylink/src/local.rs`'s `dispatch`, which `rg` shows is the only
+/// call site — `keylink/src/turns.rs`'s `dispatch`, which `rg` shows is the only
 /// one — so an observer that sees a keyed feed turn is an observer on the keyed
 /// loop.
 #[tokio::test]

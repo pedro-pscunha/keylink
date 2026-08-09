@@ -290,7 +290,7 @@ async fn an_answer_given_inside_a_deferred_turn_is_withheld_when_an_observer_ref
 /// `MailboxClosed`, which is the same fact under this path's one error type.
 ///
 /// **The timeout is the assertion.** A hang is not a failure to a test harness, so
-/// the wait is bounded and the bound is what goes red. `local.rs`'s own unit test
+/// the wait is bounded and the bound is what goes red. `turns.rs`'s own unit test
 /// asserts the `TurnLost::Gone` underneath, where the variant is visible.
 ///
 /// Red-tested by `::core::mem::forget(state)` in place of the loop's own drop, which
@@ -394,11 +394,11 @@ async fn a_reply_parked_before_a_fault_is_still_answered_after_it() {
 ///
 /// `Gone` and not `Faulted`, and that is not a near miss: there is one `Panic`,
 /// it is the original payload rather than a message, and it belongs to the turn's
-/// own caller. `local.rs`'s
+/// own caller. `turns.rs`'s
 /// `a_released_reply_is_gone_when_the_turn_that_released_it_panicked` asserts the
 /// variant, which a `Handle` folds away.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/local.rs` on `Deferred::send`'s
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `Deferred::send`'s
 /// `Verdict::Faulted => drop(reply),` → `Verdict::Faulted =>
 /// reply.answer(Answered::Ran(value)),`. Watched: `a panicking turn's answer
 /// crossed anyway: Ok(15)`.
@@ -549,7 +549,7 @@ async fn a_peer_gets_an_answer_parked_past_its_own_turn() {
 /// No supervision, no panic, no `stop()`. The actor answers the very next call on
 /// the same connection, which is the half `NoSuchActor` denies.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/local.rs` on the arm itself,
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on the arm itself,
 /// `lost`'s whole `Standing::Running` arm — the two-line `format!` and its
 /// closing `)),` — replaced by
 /// `Standing::Running => RemoteError::NoSuchActor { id: id.to_owned() },`, which
@@ -604,7 +604,7 @@ async fn a_live_actor_does_not_tell_a_peer_no_such_actor() {
 /// `Life` channel and `is_running()` and was right here by luck of timing rather
 /// than by ordering; see the twin below for the case where that luck ran out.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/local.rs` on the default
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on the default
 /// `Inbox::ending` — anchored on its whole three-line body, since a bare
 /// `Standing::Gone` occurs fourteen times in this file and the harness aborts
 /// on an ambiguous anchor. Watched: `a stopped actor is gone, not merely
@@ -653,7 +653,7 @@ async fn a_stopped_actor_still_tells_a_peer_no_such_actor() {
 /// and false outright for a supervised one, whose receiver belongs to the
 /// supervisor's frame.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/local.rs` on `Floor`'s own
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `Floor`'s own
 /// `Drop`, `self.fate.settle(Standing::Gone);` → `Standing::Running`. Watched:
 /// `an aborted actor is gone, and its own loop will never say so:
 /// Remote(Failed("dropped: the actor is serving and this reply was never answered"))`.
@@ -1004,7 +1004,7 @@ async fn a_peer_whose_parked_reply_is_drained_is_not_told_its_call_timed_out() {
 /// that is the honest outcome rather than a gap — the `Reply` died in the unwind,
 /// so there is no channel left to render a `Panic` down.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/local.rs` on `lost`'s
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `lost`'s
 /// `Standing::Running` arm → `RemoteError::Failed(format!("{}bad", RemoteError::PANICKED))`,
 /// which is the answer this case would have if the fault reached the peer as a
 /// fault. Watched: `a panicking deferred handler loses the reply, and that is

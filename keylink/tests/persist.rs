@@ -460,7 +460,7 @@ async fn a_refusal_before_persist_prevents_the_store() {
 /// A local caller cannot see this: the generated handle collapses
 /// `Answered::Refused` into `MailboxClosed` — *"the actor is no longer
 /// running"* — and `ended()` is the only local route to the reason. A **peer**
-/// is told `observer refused: persist`, produced by `local.rs` under a comment
+/// is told `observer refused: persist`, produced by `turns.rs` under a comment
 /// reading *"The turn ran and was not committed"*, and that sentence is the
 /// whole of what the caller has to act on. Asserting it here is what makes the
 /// fix "the code was made to match the promise" rather than a preference.
@@ -531,7 +531,7 @@ async fn a_turn_whose_store_failed_is_not_written_on_the_way_out() {
 /// restarting process races.
 ///
 /// Red-tested by leaking the hooks instead of dropping them
-/// (`std::mem::forget(hooks)` in `keylink/src/local.rs`), which is the shape of
+/// (`std::mem::forget(hooks)` in `keylink/src/turns.rs`), which is the shape of
 /// any teardown that publishes the ending first.
 #[tokio::test]
 async fn the_claim_is_free_the_instant_stop_returns() {
@@ -818,7 +818,7 @@ async fn waiting_for(vault: &teller::Handle<Vault>, want: u64) {
 ///
 /// A `Handle` folds every loss into `MailboxClosed`, so the precise
 /// `TurnLost::Refused { name: "persist" }` underneath is asserted in
-/// `local.rs::a_released_reply_is_refused_with_the_turn_that_released_it`, where
+/// `turns.rs::a_released_reply_is_refused_with_the_turn_that_released_it`, where
 /// the variant is visible.
 ///
 /// Watched to fail from both ends, because two facts have to hold at once and
@@ -893,7 +893,7 @@ async fn a_deferred_reply_whose_turn_was_not_stored_is_refused() {
 /// completed store. Under the old behaviour that implication ran the other way
 /// and this read could see 100.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/local.rs` on `Deferred::send`'s
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `Deferred::send`'s
 /// `Verdict::Committed => reply.answer(Answered::Ran(value)),` →
 /// `Verdict::Committed => drop(value),`. Watched: `the receipt reaches its
 /// caller when the turn commits: MailboxClosed`.

@@ -24,7 +24,7 @@
 //! on reading like a statement about keylink. `docs/rfc-04-actors.md` holds
 //! the verification against the transport crate's own source at the version it
 //! was read, which is the only honest form that citation can take. So rely on
-//! the NAME — `local.rs` bounds its queue by `max_concurrent_bidi_streams`
+//! the NAME — `turns.rs` bounds its queue by `max_concurrent_bidi_streams`
 //! without spelling a number — and read the figure here as an order of
 //! magnitude.
 //!

@@ -270,7 +270,7 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// the fairness bit the loop alternates.
 ///
 /// It cost three attempts to land it at 256 rather than at 1,987, and the middle two
-/// are recorded on `local.rs::dispatch` because both were the *same* mistake — a
+/// are recorded on `turns.rs::dispatch` because both were the *same* mistake — a
 /// value sized by the caller's service materialised inside the loop's future. First
 /// an `async fn dispatch` stored its argument in the future it returned (slope 1,987,
 /// this file's phase-4 assertion firing by a factor of fifteen); then a boxed-future

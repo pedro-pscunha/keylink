@@ -2715,7 +2715,7 @@ async fn until_buffered(system: &gate::System, messages: u64) -> keylink::ActorS
 /// entered. Both say "busy" about an actor that has not started, and neither says
 /// anything at all about a turn that is still going.
 ///
-/// Over the wire on purpose. The flag is set in `local.rs`'s one loop, and the keyed
+/// Over the wire on purpose. The flag is set in `turns.rs`'s one loop, and the keyed
 /// path reaches that loop through generated code and a mailbox the registry made, so
 /// an in-process assertion would leave the delivery path untested.
 ///
@@ -2856,7 +2856,7 @@ async fn busy_is_true_during_a_feed_turn() {
 /// puts the tick last instead.
 ///
 /// Red-tested by deleting the loop's alternation — `mail_first = true` in
-/// `keylink/src/local.rs` — which is `tests/feeds.rs`'s break for the same rule.
+/// `keylink/src/turns.rs` — which is `tests/feeds.rs`'s break for the same rule.
 /// Watched: the tick arrives fourth.
 #[tokio::test]
 async fn a_saturated_mailbox_at_depth_does_not_starve_a_feed() {

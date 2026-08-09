@@ -47,7 +47,7 @@
 //! There is deliberately **no third policy**, and the missing one is the one
 //! every fan-out reaches for: keep the item for later. A per-subscriber queue is
 //! an unbounded queue the moment a subscriber is durably slower than the
-//! publisher, and an unbounded queue is what `local.rs` refuses by name — it
+//! publisher, and an unbounded queue is what `turns.rs` refuses by name — it
 //! turns a latency problem into memory growth and a diagnosis into an OOM.
 //!
 //! There is no [`Default`] for either [`Topic`] or [`Overflow`], for the reason

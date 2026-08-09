@@ -1352,7 +1352,7 @@ macro_rules! __keylink_service {
             ///
             /// What it no longer is, is a loop. The keyed loop used to read the
             /// queue deadline, mark idempotency progress, guard the panic and render
-            /// the refusal itself, in ~150 lines that had to agree with `local.rs`'s
+            /// the refusal itself, in ~150 lines that had to agree with `turns.rs`'s
             /// and twice did not: one spelled the deadline `>` where the other
             /// spelled `>=`, and one rendered a panic bare where the other prefixed
             /// it. Wave 1b made the *dispatch* one path and left two loops around
