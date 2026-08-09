@@ -374,6 +374,13 @@ const BUDGET_PER_LOCAL_ACTOR: isize = LOCAL_MEASURED + LOCAL_SLACK;
 ///
 /// # It was 2,029, and item M's re-entrancy chain is what moved it
 ///
+/// **The price, stated once so it can be rejected without being re-derived:
+/// re-entrancy detection costs 280 bytes per idle actor on the LOCAL path, and
+/// nothing on the keyed one.** That is the whole of what this raise buys. A later
+/// wave that decides the refusal is not worth 280 bytes per actor has the figure
+/// here and does not have to reconstruct where it came from — and the way to spend
+/// it back is to delete the mechanism, not to widen [`LOCAL_SLACK`].
+///
 /// Every local message now carries the chain of turns it was sent from, so
 /// `Message::Mail` grew by a `Chain` — and this is the one place in the crate
 /// where that is multiplied: `tokio::sync::mpsc` allocates its first block of 32
