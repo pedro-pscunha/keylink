@@ -1332,6 +1332,43 @@ pub trait Lifecycle: Send + Sync + 'static {
 ///
 /// Cheap to clone: every clone names the same registry.
 ///
+/// # Awaiting a keyed actor's ending, and why there is no method here for it
+///
+/// A local actor hands its caller `ended()`. A keyed one has no such method, and
+/// the reason is a field that does not exist: an `Entry` holds a mailbox, a join
+/// handle, an eviction clock, a busy cell and a `Fate` — **no channel carrying an
+/// ending**. There is nothing here for a method to read, so adding one would mean
+/// adding a channel to every keyed actor to serve the callers that ask.
+///
+/// What exists instead is a report. [`Lifecycle::ended`] is called for every
+/// teardown, and `compose::Endings` is the implementation that turns those reports
+/// into awaitable futures. The steps are worth walking, because a section that
+/// says only *install `Endings`* walks a reader into a window:
+///
+/// 1. **The `Ended` is synthesised, not read.** [`System::shutdown`] drops the
+///    registry's sender and joins the task, then names the outcome: a clean join is
+///    [`Ended::Stopped`], a join error is [`Ended::Vanished`], and an expired budget
+///    aborts. None of the three is a reason the *loop* decided — the loop is not
+///    asked. Only one of the four teardown paths answers *why it exited*, and
+///    `Endings`' own module doc carries the table.
+/// 2. **The report is a broadcast with no memory.** It goes to whatever is
+///    installed at the instant it fires, and nothing keeps it.
+/// 3. **`compose::Endings::watch` files a waiter under the name, when it is
+///    called.** That is the whole mechanism: a `oneshot` sender pushed into a map,
+///    answered by a later report.
+/// 4. **So a report that fires before the waiter is filed resolves nothing**, and
+///    is not remembered. A `watch` asked for after that point does not resolve
+///    late; it waits for the life of the system.
+///
+/// The consequence is the one thing to take away: **ask for the future before the
+/// actor can end.** Mount, then watch, then send — not send, then watch. No
+/// signature closes the window, `Endings`' module doc states it per mounting path,
+/// and the ordering is the reader's to get right rather than the type's to enforce.
+///
+/// `compose::Endings` is backticks and not a link, for the reason
+/// [`SystemBuilder::lifecycle`] gives at length: `compose` is built on top of this
+/// module, and a link from here would point the seam at the layer above it.
+///
 /// `M` is what a mailbox carries, and it is a parameter because everything here
 /// — the map, the cap, the eviction clock, the lifecycle — is about *which*
 /// actor and never about what a message is made of. Naming a message type in

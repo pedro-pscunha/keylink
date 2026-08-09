@@ -1433,6 +1433,28 @@ macro_rules! __keylink_service {
             /// nobody outside can await *why*. `System::stop` and `System::abort`
             /// await the task, not a reason.
             ///
+            /// # Testing: a keyed actor needs no node and no client
+            ///
+            /// Give this door a [`Feeds`] and a keyed actor is driven **entirely
+            /// in-process**: mount it into a
+            /// [`System`](keylink::System), push into the feed's own sender, and the
+            /// loop runs turns with nothing dialled and no `KeyedClient` built.
+            ///
+            /// It works because a feed is the actor's *second input* and needs no
+            /// caller — there is nobody to address, so there is nothing to address it
+            /// over. Both inputs land at one call site: `turns.rs`'s `dispatch` runs
+            /// `Turn::run` for a mailbox message and for a feed item alike, so what a
+            /// feed-driven test exercises is the keyed loop itself.
+            ///
+            /// That is the reason to prefer it rather than a convenience. A keyed test
+            /// that goes through a node proves the loop **and** the transport, so a
+            /// pass has two explanations and a failure has two suspects. Removing the
+            /// transport removes one of each.
+            ///
+            /// `keylink/tests/feeds.rs::an_observer_attached_to_a_keyed_actor_runs` is
+            /// the worked example, and RFC-07 §5.6 is where the pattern was recorded
+            /// before it was written down here.
+            ///
             /// # Panics
             ///
             /// Panics when called outside a tokio runtime.

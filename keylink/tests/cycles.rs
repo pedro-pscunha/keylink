@@ -891,6 +891,122 @@ async fn a_deeper_mailbox_takes_one_more_message_behind_a_running_turn() {
         .expect("the actor is running");
 }
 
+/// The same knob through the **supervised** door, which had no caller at all.
+///
+/// `supervised_deep` is the fourth of the generated spawn doors and the only one
+/// nothing reached: `actor` and `supervised` are used across this suite, the test
+/// above uses `actor_deep`, and this one was written from the macro outwards with
+/// nobody on the other side of it. That is not the same as *no purpose* —
+/// `Handle`'s `inner` field carries no `pub`, so this door is the only route a
+/// `service!` user has to `LocalActor::spawn_supervised_deep`. Unreached and
+/// unreachable-around is the combination worth a test.
+///
+/// # One half is asserted and the other is carried by the signature
+///
+/// The door's body is one line, so what can go wrong in it is narrow. It can
+/// **lose the depth** — by forwarding to `spawn_supervised`, or by passing a
+/// constant — and that is what the assertions below see.
+///
+/// It cannot lose the **supervision**: `spawn_deep` takes `(state, observers,
+/// feeds, depth)` and this takes `(factory, limit, depth)`, so a factory cannot be
+/// handed to the unsupervised door and the mutation does not compile. Stated
+/// rather than asserted, because a compile error and a caught defect leave the
+/// harness by the same exit and a break that cannot build proves nothing about
+/// this test.
+///
+/// # Why it is here rather than in `tests/supervision.rs`
+///
+/// The claim is the knob's, not supervision's: two `tell`s fit behind a running
+/// turn at depth 2 and a third does not, exactly as above. `Wait` is what pins a
+/// turn open without sleeping, and it lives in this file. Nothing faults, so the
+/// supervisor never restarts anything and `SURPRISE`'s note above — that no `Peer`
+/// panics here — still holds.
+///
+/// Made red by `scripts/break-once.sh keylink/src/macros.rs` on the door itself,
+/// `inner: $crate::LocalActor::spawn_supervised_deep(factory, limit, depth),`
+/// replaced by `inner: $crate::LocalActor::spawn_supervised(factory, limit),` —
+/// the depth accepted and dropped one line later, which is the failure a caller
+/// cannot see. **Hand the harness the whole line with its twenty spaces of
+/// indentation**, which is what `F1` registers. Watched:
+/// `a second message must fit at depth 2: the supervised door dropped it:
+/// Elapsed(())`, after 5.00s, because the second `tell` into a depth-1 mailbox
+/// blocks rather than answering.
+///
+/// The break is in `macros.rs` and not in `turns.rs` on purpose. The channel line
+/// inside `spawn_supervised_deep` is shared word for word with `spawn_deep` — the
+/// record above measures that collision — so breaking there would test the path
+/// both doors share. The gap this closes is the **door**, and the door is one
+/// line in the macro.
+#[tokio::test]
+async fn the_supervised_deep_door_takes_the_depth_it_was_given() {
+    let me = Arc::new(OnceLock::new());
+    let other = Arc::new(OnceLock::new());
+    let gate = Arc::new(Notify::new());
+    let entered = Arc::new(AtomicUsize::new(0));
+
+    let a = {
+        let me = me.clone();
+        let other = other.clone();
+        let gate = gate.clone();
+        let entered = entered.clone();
+        ring::supervised_deep(
+            move || {
+                let me = me.clone();
+                let other = other.clone();
+                let gate = gate.clone();
+                let entered = entered.clone();
+                async move {
+                    Ok((
+                        Peer {
+                            other,
+                            me,
+                            entered,
+                            gate,
+                            bumps: 0,
+                        },
+                        Vec::new(),
+                        (),
+                    ))
+                }
+            },
+            Intensity::new(
+                NonZeroU32::new(3).expect("a budget of at least one"),
+                Duration::from_secs(10),
+            )
+            .expect("a recovery span whose backoff is not zero"),
+            NonZeroUsize::new(2).expect("two is not zero"),
+        )
+    };
+    me.set(a.clone()).expect("set once");
+
+    let waiting = {
+        let a = a.clone();
+        tokio::spawn(async move { a.wait().await })
+    };
+    inside_a_turn(&entered).await;
+
+    n0_future::time::timeout(SETTLE, a.bump())
+        .await
+        .expect("the permit the loop released when it took `wait` is free")
+        .expect("the actor is running");
+    n0_future::time::timeout(SETTLE, a.bump())
+        .await
+        .expect("a second message must fit at depth 2: the supervised door dropped it")
+        .expect("the actor is running");
+
+    assert!(
+        n0_future::time::timeout(HANG, a.bump()).await.is_err(),
+        "and a third must not: the depth asked for is 2, not unbounded"
+    );
+
+    gate.notify_one();
+    n0_future::time::timeout(SETTLE, waiting)
+        .await
+        .expect("the gate was released")
+        .expect("the caller is not itself panicking")
+        .expect("the actor is running");
+}
+
 // ──────────────────────────────────────────── the two halves, and the two paths
 
 /// **The rule has two halves and this is both of them, in one turn.**

@@ -446,6 +446,24 @@ pub async fn deliver_to_actor<S: KeyedService>(
     let budget = cx.queueing();
     let progress = cx.progress();
     let (reply, answer) = Reply::channel();
+    // **No chain, and the absence is structural rather than an omission here.**
+    // `route.mail` is a `Mailbox<M>`: it carries the message and has no room for a
+    // chain, so this send cannot pass one. `turns.rs`'s `Keyed::poll_next` stamps
+    // `Chain::Empty` when the loop takes the message, which is the keyed path's
+    // whole answer to "which turns is this call behind".
+    //
+    // It is safe because the value is the one a read would produce. A keyed call
+    // arrives on a connection's task, which has run no turn, so `current()` here
+    // would return `Chain::Empty` too — the hard-coded value and the live read
+    // agree, and the re-entrancy check has nothing to find either way.
+    //
+    // `deliver_to_local` passes `current()` at the same point and its comment names
+    // the door that would separate the two: a local door delivering a served call
+    // **inline** on the caller's task. That door does not exist on either path. If
+    // it is ever built for a keyed actor, agreeing-by-accident stops being enough
+    // and this line is where it breaks — but it cannot be fixed here alone, because
+    // the mailbox type has to grow room for a chain first. Recorded so that the
+    // asymmetry between the two sends reads as a decision rather than as drift.
     let queueing = route
         .mail
         .send(Box::new(S::mail(Origin::peer(cx), message, body, reply)));
