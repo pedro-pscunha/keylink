@@ -2004,7 +2004,7 @@ macro_rules! __keylink_service {
                 /// This is what [`service`] is, with the mailbox in place of the
                 /// `Arc`, and the two are alternatives: one router owns one
                 /// ALPN, so registering both on a node is
-                /// [`ConfigError::DuplicateAlpn`](keylink::ConfigError).
+                /// [`ConfigError::DuplicateAlpn`](keylink::ConfigError::DuplicateAlpn).
                 ///
                 /// Because the reply is the service's own typed `Response`,
                 /// everything that reads one keeps working: per-method

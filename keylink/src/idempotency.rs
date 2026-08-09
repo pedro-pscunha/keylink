@@ -276,7 +276,7 @@ pub const MAX_RUNNING_PER_PEER: usize = 128;
 
 /// Calls with keys the whole ledger may have in dispatch at once.
 ///
-/// The per-peer cap alone is not a bound: [`Allowlist::Anyone`](crate::Allowlist)
+/// The per-peer cap alone is not a bound: [`Allowlist::Anyone`](crate::Allowlist::Anyone)
 /// makes the number of peers a property of the network rather than of the
 /// configuration.
 pub const MAX_RUNNING: usize = 4096;
@@ -300,7 +300,7 @@ pub const MAX_WAITING_PER_PEER: usize = 128;
 /// Attaching calls the whole ledger may have parked at once.
 ///
 /// Two levels for the reason the running pair has two:
-/// [`Allowlist::Anyone`](crate::Allowlist) makes the peer count a property of
+/// [`Allowlist::Anyone`](crate::Allowlist::Anyone) makes the peer count a property of
 /// the network. A quarter of [`MAX_RUNNING`] rather than the same number,
 /// because a waiter produces nothing — it costs a task and a stream pair, and
 /// it may still be refused when its budget runs out — so the node spends the

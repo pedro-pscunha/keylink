@@ -4319,3 +4319,85 @@ twice: `scripts/break-once.sh` substitutes one literal, so a claim whose defect
 is a *restructure* cannot be reddened by it at all. §8.7's own note about
 `two_clones_of_a_pool_share_one_rotation` (lines 2279-2284) is both the precedent
 and the treatment — say so here, rather than count it as a proven guard.
+
+---
+
+## 15. Revision, 2026-08-09: §4.11's twin-guard bullet — one count corrected, and the name kept
+
+Appended, and **§4.11 is not edited**. Both halves below are about the same
+bullet, the one for
+`turns::every_turn_lost_except_faulted_has_one_undelivered_twin_with_the_same_words`.
+
+`CONTRIBUTING.md`'s carve-out was checked first and reaches neither half. It
+permits renaming *an identifier a break record names*, "because that changes a
+pointer and not a claim". §15.1 corrects a **count**, which is a claim and not a
+pointer. §15.2 renames nothing. So an append is the only treatment available for
+either, and that is what this is.
+
+### 15.1 "a seventh variant in either enum is `E0004`" holds for one enum, not two
+
+§4.11's bullet says:
+
+> Two exhaustive matches, so a seventh variant in either enum is `E0004`.
+
+Measured on `d2f5e6e`:
+
+```
+rg -n -A100 '^pub enum TurnLost'    keylink/src/observe.rs | rg '^\s*[0-9]+[-:]\s{4}[A-Z]'
+rg -n -A70  '^pub enum Undelivered' keylink/src/turns.rs   | rg '^\s*[0-9]+[-:]\s{4}[A-Z]'
+```
+
+`TurnLost` has **seven** variants: `Gone`, `Dropped`, `Restarting`, `Refused`,
+`Faulted`, `Expired`, `Reentrant`. `Undelivered` has **six**, that list without
+`Faulted`. So a seventh in `Undelivered` is `E0004`, and a seventh in `TurnLost`
+is what already shipped — Wave 9's `Restarting`, which the two matches absorbed
+without the sentence being revisited.
+
+**The guard did not rot; the number describing it did.** The mechanism is
+unchanged and this file is the only site carrying the figure. `keylink/src/turns.rs`
+states the same fact numberlessly, in the record above the test — *"two exhaustive
+matches, and both are `error[E0004]` the moment either enum grows"* — and that
+sentence is still exactly true. Read §4.11's bullet that way. The neighbouring
+claim about `EVERY[6]` is a different one, about a six-slot array, and the record
+beside the test already withdraws the compile-error part of it.
+
+**The general form, which is §13's lesson arriving a second time.** A count of a
+thing this document does not own is a citation that rots on somebody else's
+commit. §13 recorded it for a moved pin; this records it for a variant count. Cite
+the guard rather than the value it currently produces, and where the value *is*
+the record — as it is in a break record's watched output — it cannot be removed
+and an appended correction is the only honest treatment.
+
+### 15.2 The guard's name says two enums, its body holds three, and the name is kept
+
+The test is the twin guard, and the decision recorded here is **not to rename
+it**. `keylink/src/turns.rs` already carries the one-line version of this beside
+the test — *"the name still says undelivered twin, which now undersells the body
+by one enum"* — and this is the fuller statement, in the file the name is a
+pointer in.
+
+The three enums are `TurnLost`, `Undelivered` and `NotQueued`, and the name says
+two: `NotQueued` reaches this guard through `From<NotQueued> for Undelivered`
+rather than through `twin`, so it is held as a widening and not as a twin. The
+name is a filter and a pointer in §4.11, and under-claiming is the safe direction
+for both.
+
+**What the rename would have cost, measured rather than estimated.** This section
+aside, five sites name it: the `fn`, two `NotQueued` doc paragraphs, §4.11's
+bullet, and one row in
+`docs/plans/2026-08-09-items-ef-a-lost-reply-is-not-a-gone-actor.md`. It is in no
+operational registry — zero hits in `.mise/tasks/anchors` and zero in
+`scripts/replay-fate-breaks.sh`. No `fn` name in `keylink/src`, `keylink/tests`,
+`keylink-persist` or `demo` stands in a prefix relation with it, in either
+direction; the count of those names is deliberately not written here, because it
+is a value this section does not control. So no `cargo test` filter would widen.
+§4.11's own record states its filter *by relationship* — "the filter for all three
+is this test's own name" — so it survives a rename untouched, which is the one
+site a rename normally breaks.
+
+**So the rename was cheap and was still refused.** A name that asserts less than
+its body costs a reader one sentence, and that sentence is now written twice. The
+failure this crate keeps having is the opposite one: names and numbers that assert
+more than the tree can support — §15.1 immediately above is an instance. Buying a
+rename here would spend an edit on the safe direction of an error whose expensive
+direction is what the file is about.

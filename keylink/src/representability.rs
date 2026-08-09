@@ -242,7 +242,7 @@ impl beta::Actor for BetaState {
 }
 
 /// The keyed and singleton contracts of one service must not collide, or a node
-/// could not serve both — [`ConfigError::DuplicateAlpn`](crate::ConfigError) is
+/// could not serve both — [`ConfigError::DuplicateAlpn`](crate::ConfigError::DuplicateAlpn) is
 /// what a collision would become, at startup, on a tree where nothing looked
 /// wrong.
 ///
@@ -757,7 +757,7 @@ trait LedgerIsReadableThroughAShared {
 
 impl LedgerIsReadableThroughAShared for Ledger {}
 
-/// The claim, RFC-06 §2.8: [`Observer::after_turn`](crate::Observer) takes `&A`
+/// The claim, RFC-06 §2.8: [`Observer::after_turn`] takes `&A`
 /// and never `&mut A`, so no observer can call a `service!` method or assign to
 /// a field.
 ///

@@ -574,9 +574,23 @@ Known gaps, in rough priority order:
   in **Reliable delivery** above.
 - A keyed instance has no `ended()`. `System::shutdown(&id, budget)` reports
   whether it drained or had to be killed, which is a different question from why
-  its loop exited; the keyed loop computes that and throws it away.
-- No supervision or restart. What a fault costs depends on which input caused it:
-  a panicking `rpc` turn costs that message, the actor survives, and the caller is
+  its loop exited. The keyed loop does not throw that away — it returns its
+  ending and `Registry::reap` hands it to every registered `Lifecycle`. What is
+  missing is a per-actor future to await it on, so an ending reaches a listener
+  and never a caller who asked for that one actor.
+- **Supervision restarts one actor, and no strategy reaches its siblings.**
+  `LocalActor::spawn_supervised`, `spawn_supervised_deep` and
+  `run_keyed_supervised` take an `Intensity` and put a fresh incarnation on the
+  same task and the same mailbox, so a caller whose reply died mid-restart is
+  told `Restarting` rather than `Gone`. There is no `Supervisor` type, no
+  `OneForAll`/`RestForOne` and no parent/child tree; RFC-07 §9.8 refuses each one
+  and gives the reason. `compose::Group` is the part of that caveat which was
+  built — shared fate across several actors, retired in reverse insertion order —
+  and its two verdicts are `Forget` and `StopAll`, so nothing there restarts a
+  sibling either. Restarting is opt-in, so the rest of this bullet is the
+  unsupervised default, and under a supervisor it is what one incarnation costs.
+  What a fault costs depends on which input caused it: a panicking `rpc` turn
+  costs that message, the actor survives, and the caller is
   told rather than left to infer it. A panic in a `feed` handler ends the actor,
   and so does a feed that simply stops — nobody is waiting on a feed item, so
   dropping its fault would carry on over a half-applied state. `Ended` says which

@@ -215,7 +215,7 @@ impl Grants {
     }
 
     /// Poison recovery rather than propagation, the same call
-    /// [`Ledger`](crate::MAX_RECORDS) makes: a handler that panicked must not
+    /// `Ledger` makes: a handler that panicked must not
     /// wedge admission for every later peer. Nothing here can panic while the
     /// lock is held, so this arm is unreachable in practice and must still be
     /// typed — `.unwrap()` and `.expect()` are denied by the workspace lints.
