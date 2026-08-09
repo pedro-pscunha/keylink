@@ -148,8 +148,15 @@ MISE description="Replay each REDNESS row's break and check it reddens its own g
 #
 # The default is 600 s per row, which has to clear a COLD build rather than the 120 s
 # at which the measured hang was killed by hand. `REPLAY_TIMEOUT` moves it. A genuine
-# hang therefore costs the full timeout, which is the right price for a task that is
-# run by hand and never in a gate.
+# hang therefore costs the full timeout, which is the right price for a REPLAY that is
+# run by hand.
+#
+# **Only the replay path reads this timeout**, and the sentence above said "a task that
+# is run by hand and never in a gate" until `--selftest` became a gate step. That arm
+# passes its own two seconds at its one `run_watched` call, so registering it put no
+# 600 s wait into anybody's push. This is the third sentence in this file to be
+# narrowed for the same reason, after the heading below and its closing paragraph: a
+# claim about the whole file was true only of one of its two arms.
 #
 # And the `hang` arm requires a line saying the runner got PAST its build. `running `
 # is libtest's and `Finished ` is cargo's, and both were read off the one measured
@@ -221,10 +228,13 @@ MISE description="Replay each REDNESS row's break and check it reddens its own g
 # author already ran it once, and that run is the thing being re-checked.
 #
 # `--selftest` is a different animal, and the heading above says REPLAY for that
-# reason: it edits nothing, runs no cargo, and writes only inside the system temp
-# directory, so it is gate-safe on the same terms as `anchors-selftest`. **And it IS
-# registered**, in `mise.toml`'s `gate` list, after that list's text-only checks and
-# placed by its own cheapest-first rule. Deliberately NOT in `pre-commit`: that
+# reason: it edits nothing, runs no cargo, and writes only under the system temp
+# directory — a scratch directory and one output sink, and it removes both — so it is
+# gate-safe on the same terms as `anchors-selftest`. **And it IS registered**, in
+# `mise.toml`'s `gate` list, LAST among the steps there that need no compile and
+# immediately above the first step that does. It sat higher, above `fmt-check`, until
+# a reviewer timed the two: that list orders cheapest failures first, and this step
+# cannot beat a step with no two-second floor. Deliberately NOT in `pre-commit`: that
 # hook's filter tests for Rust and this file is not Rust, so there it would fire only
 # by coincidence. The entry passes `args = ["--selftest"]` rather than a flag inside
 # the task name, so nothing depends on how a wrapper parses a flag.
@@ -245,6 +255,7 @@ MISE description="Replay each REDNESS row's break and check it reddens its own g
 import ast
 import os
 import pathlib
+import shutil
 import signal
 import subprocess
 import sys
@@ -369,7 +380,14 @@ def run_watched(argv: list[str], seconds: int) -> tuple[str, bool]:
     heading above; the short of it is that SIGKILL skips `break-once.sh`'s restore and
     a PID-only signal orphans the runner.
     """
-    sink = pathlib.Path(tempfile.mkstemp(prefix="replay-anchors-")[1])
+    # `mkstemp` hands back an OPEN descriptor and a path, and this needs only the path:
+    # the `with` below opens its own. Taking `[1]` and dropping the fd leaked one
+    # descriptor per call, held until the process exited — one for a self-test and one
+    # per row for a replay, so no run reached a limit and nothing would have reported
+    # it either.
+    fd, name = tempfile.mkstemp(prefix="replay-anchors-")
+    os.close(fd)
+    sink = pathlib.Path(name)
     try:
         with sink.open("w") as handle:
             done = subprocess.Popen(argv, stdout=handle, stderr=subprocess.STDOUT,
@@ -543,29 +561,39 @@ def selftest() -> int:
     scratch = pathlib.Path(tempfile.mkdtemp(prefix="replay-anchors-selftest-"))
     marker, pidfile = scratch / "trap-ran", scratch / "child-pid"
     probe = scratch / "sleeping-break.sh"
-    probe.write_text("#!/usr/bin/env bash\nset -euo pipefail\n"
-                     f'restore() {{ echo RESTORED >> "{marker}"; }}\n'
-                     "trap restore EXIT\n"
-                     'echo "── broken: <nothing at all>"\n'
-                     f'sleep 120 & echo "$!" > "{pidfile}"\n'
-                     "wait\n")
-    probe.chmod(0o755)
-    out, killed = run_watched([str(probe)], 2)
-    check("the wall-clock kill fires", killed,
-          f"run_watched returned killed={killed} for a shell that sleeps 120 s")
-    check("the killed run's partial output is kept", "── broken:" in out,
-          f"the sink held {out!r}, so a hang would be scored with nothing to read")
-    trap = marker.read_text().strip() if marker.exists() else "<no file>"
-    check("the killed shell ran its restore trap", trap == "RESTORED",
-          f"the trap left {trap!r}: a break killed this way would stay in the file")
-    child = int(pidfile.read_text().strip()) if pidfile.exists() else 0
     try:
-        os.kill(child, 0)
-        alive = True
-    except (ProcessLookupError, PermissionError):
-        alive = False
-    check("the signal reached the shell's child, not only the shell", not alive,
-          f"pid {child} is still running, so a killed row would leave the runner behind")
+        probe.write_text("#!/usr/bin/env bash\nset -euo pipefail\n"
+                         f'restore() {{ echo RESTORED >> "{marker}"; }}\n'
+                         "trap restore EXIT\n"
+                         'echo "── broken: <nothing at all>"\n'
+                         f'sleep 120 & echo "$!" > "{pidfile}"\n'
+                         "wait\n")
+        probe.chmod(0o755)
+        out, killed = run_watched([str(probe)], 2)
+        check("the wall-clock kill fires", killed,
+              f"run_watched returned killed={killed} for a shell that sleeps 120 s")
+        check("the killed run's partial output is kept", "── broken:" in out,
+              f"the sink held {out!r}, so a hang would be scored with nothing to read")
+        trap = marker.read_text().strip() if marker.exists() else "<no file>"
+        check("the killed shell ran its restore trap", trap == "RESTORED",
+              f"the trap left {trap!r}: a break killed this way would stay in the file")
+        child = int(pidfile.read_text().strip()) if pidfile.exists() else 0
+        try:
+            os.kill(child, 0)
+            alive = True
+        except (ProcessLookupError, PermissionError):
+            alive = False
+        check("the signal reached the shell's child, not only the shell", not alive,
+              f"pid {child} is still running, so a killed row would leave the runner "
+              "behind")
+    finally:
+        # Removed, and NOT kept the way `break-once.sh` keeps its log. That log is the
+        # evidence a reader's conclusion rests on; this directory holds a sleeping
+        # shell and a pid, and every failure detail above already prints what it read
+        # out of them, so removing it destroys no evidence. Twenty-seven of these had
+        # accumulated under one TMPDIR before this line existed, one per run — and
+        # since `--selftest` became a gate step that is one per push, per worktree.
+        shutil.rmtree(scratch, ignore_errors=True)
 
     print()
     if failures:

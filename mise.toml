@@ -153,11 +153,16 @@ run = [
     # this reads is Rust, so there it would fire only by coincidence. The task's own
     # header argues that out.
     { task = "task-lists" },
+    { task = "fmt-check" },
+    { task = "deny" },
     # `replay-anchors` replays each `REDNESS` row's break and scores the result. That
     # task is in no list and cannot be: it edits the tree and runs one `cargo test`
     # per row. Its `--selftest` arm is the opposite — it feeds the classifier
     # synthetic transcripts, edits nothing, runs no cargo, and writes only under the
-    # system temp directory.
+    # system temp directory — a scratch directory and one output sink, both of which
+    # it removes. "Writes only under the temp directory" was true and silent about
+    # removal while it leaked one directory per run, so the removal is stated here
+    # rather than left for a reader to assume.
     #
     # **The `anchors-selftest` precedent above does NOT apply here, and copying its
     # sentence would be a false reason.** That one runs immediately after the task it
@@ -166,19 +171,24 @@ run = [
     # replayer whose classifier is also only ever hand-run has nothing pinning it,
     # and four watched breaks redden this classifier today.
     #
-    # So it is placed by this list's own rule instead, cheapest failures first. It
-    # sits after the three text-only checks because it is not quite free: its floor
+    # So it is placed by this list's own rule instead, cheapest failures first — and
+    # LAST among the steps that need no compile, immediately above `lint`, which is
+    # the first step that does. It cannot be as cheap as those neighbours: its floor
     # is the two seconds its kill probe waits, read off that constant rather than
-    # timed. NOT in `pre-commit`, for `task-lists`' reason directly above — the
-    # commit hook's filter tests for Rust, and this task's subject is a Python file
-    # under `.mise/tasks/`, so there it would fire only by coincidence.
+    # timed. **It sat above `fmt-check` until a reviewer timed it**, which made this
+    # paragraph cite a rule the entry did not follow. Timed three times each on
+    # 2026-08-09, `fmt-check` and `deny` both ran inside that two-second floor and
+    # this ran just over it. Only the ORDER is claimed: the figures included mise's
+    # own startup, and the machine was running other work.
+    #
+    # NOT in `pre-commit`, for `task-lists`' reason a few lines above — the commit
+    # hook's filter tests for Rust, and this task's subject is a Python file under
+    # `.mise/tasks/`, so there it would fire only by coincidence.
     #
     # `args` rather than a flag inside the task name: mise passes an args list
     # through as given, so this does not depend on how a wrapper parses `--selftest`.
     # The task exits 1 when handed a row name, so this must stay its only argument.
     { task = "replay-anchors", args = ["--selftest"] },
-    { task = "fmt-check" },
-    { task = "deny" },
     { task = "lint" },
     { task = "features" },
     { task = "test" },
