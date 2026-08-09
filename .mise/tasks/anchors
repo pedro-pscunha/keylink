@@ -584,17 +584,45 @@ ANCHORS = [
     # `group.rs` and is unique only under the arm above it. A row carries one
     # literal, and a two-line literal is a fragment by the check at :933.
     #
-    # So the row pins the ARM the claim lives on, and not the argument the fence
-    # exists to disambiguate. Rename the variant, restructure the `match`, or move
-    # the teardown out of that arm, and this reddens and the record gets re-read.
-    # Change `closing(&shared)` alone and it does not. Weaker-and-registered beats
-    # unregistered-with-a-reason here: an unregistered record rots in silence.
+    # So the row is a rot tripwire on the **arm**, not on what the arm does.
+    # Rename `Verdict::StopAll`, delete the arm, restructure the `match`, or
+    # re-indent it, and this reddens. Change the arm's BODY and it does not —
+    # including this record's own substitution, which edits the line below and
+    # leaves the header untouched. That is the cost of a one-literal row where the
+    # break needs a two-line fence, and it is taken knowingly.
+    #
+    # An earlier version of this entry claimed the row also reddens if you "move
+    # the teardown out of that arm". **That was false for the record's own break**
+    # and the merge gate caught it. Weaker-and-registered still beats
+    # unregistered-with-a-reason: an unregistered record rots in silence. What it
+    # does not beat is a row whose entry overstates what it catches.
     ("G3", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
      "            Ok(Verdict::StopAll) => {"),
     ("G4", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
      "            Ok(fut) => retiring.push(guarded(fut)),"),
+    # G5 was re-quoted after the `EndingPanicked` fix, and BOTH halves had rotted.
+    # The fix made that line the block's value, so it lost its semicolon and the
+    # registered literal counted 0 — loud, an `ABORT` at the grep before any
+    # backup. The SUBSTITUTION had rotted too, and that half was quiet: the old
+    # `let _ = at;` yields `()`, so the break became `error[E0609]: no field
+    # `retire` on type `()`` and still printed `── exit=101`. **A rotted anchor and
+    # a rotted substitution are two failures and only the first is loud.** Third
+    # time on this branch that a dead break reported the same exit as a caught one.
+    #
+    # The whole line is required and the fragment is not unique: bare
+    # `held.members.remove(at)` occurs TWICE in `group.rs` — the conductor's, and
+    # `Group::remove`'s `let removed = held.members.remove(at).retire;`. Only the
+    # twelve-space whole line resolves once.
+    #
+    # **Leaving the decided member on the books stopped being expressible in one
+    # line**, structurally: the block must now yield an owned `Entry`, and the only
+    # way to obtain one is to take it out, because `Entry` holds a boxed `FnOnce`
+    # and is not `Clone`. So the break takes the WRONG member instead. The
+    # observable the test reads is unchanged — the decided member is left filed and
+    # `names()` returns it — so the claim survives and only the mechanism moved.
+    # The extra removal is a side effect the test does not read.
     ("G5", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
-     "            held.members.remove(at);"),
+     "            held.members.remove(at)"),
     ("G6", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
      "                entry.name == reported.name && entry.generation == reported.generation"),
     # G7 was proposed as `held.staged.drain(..)` and is registered as its enclosing
@@ -622,6 +650,17 @@ ANCHORS = [
      "if !restarting {"),
     ("G14", "keylink/tests/compose.rs", "keylink/src/panic.rs",
      "            Err(panic) => Poll::Ready(Err(Panic::caught(panic))),"),
+    # G15 guards a bug the merge gate found: the reported member's `Entry` was
+    # removed and DROPPED, so on `EndingPanicked` the group retired every healthy
+    # member and left running the one member it could no longer hear — with the
+    # only `Retire` anybody had for it gone.
+    #
+    # Its substitution is `drop(taken);`, which is the code as it stood before the
+    # guard existed. So this is a regression in the literal sense: the break
+    # restores the defect rather than inventing one, which is the strongest shape
+    # a record can have and is worth saying where it is rare.
+    ("G15", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "                leaving.push(taken.retire);"),
     # ── the keyed side ───────────────────────────────────────────────────────
     #
     # K1 and K2 share a literal for the R15/R16 reason: two records, two rows. K1
@@ -1459,7 +1498,28 @@ for record in sorted(set(REDNESS) - row_ids):
 # once and verified two replacements COMPILE, which is neither the same thing as a
 # red test nor claimed to be. Twenty `Watched: TO BE MEASURED` lines is the honest
 # state. The rows land with the commit that replaces them with real output.
-RECORD_BLOCKS = 148
+#
+# 148 → the figure below, same branch, for the merge gate's two Major findings.
+# Read off a FAILURE: the constant was left at 148 and `mise run anchors` answered
+# `149 comment blocks`. ONE new block, in `keylink/tests/compose.rs`, 31 → 32:
+# `an_ending_that_panics_retires_the_member_it_could_not_hear`, which guards the
+# bug the gate found — the reported member's `Entry` was removed and DROPPED, so
+# `EndingPanicked` retired every healthy member and left running the one member
+# the group could no longer hear, with the only `Retire` anybody had for it gone.
+#
+# The second fix adds no block on purpose.
+# `a_stop_the_conductor_has_not_seen_is_lost_when_the_last_group_drops` is a
+# regression pin with no substitution, so its record never names the harness and
+# this walk cannot see it. That is the honest state and not an omission: a `stop`
+# raised on state the drop destroys has a one-line documented remedy and no
+# one-line break.
+#
+# **This bump was taken twice.** The first reading was 149 too, and it was
+# discarded rather than used, because a record was still being re-quoted and a
+# count carried across somebody else's edit is the defect this file's own notes
+# keep naming. The number came back the same. That is a coincidence worth nothing
+# and the re-reading is worth the turn it cost.
+RECORD_BLOCKS = 149
 
 # The one marker the tripwire counts, and the two phrasings records use INSTEAD of
 # naming the harness. Both are read by the same walk, so the blind spot below is a

@@ -391,6 +391,12 @@ pub enum GroupEnded {
     ///
     /// The members are still running. This is the group's answer to whoever was
     /// awaiting one, not a statement about the actors.
+    ///
+    /// **It is also what a lost [`Group::stop`] looks like.** A stop the
+    /// conductor never observed dies with the state it was written into, so a
+    /// caller that stopped and dropped in the same breath is answered here and
+    /// not at [`Stopped`](Self::Stopped) — with nothing retired. [`Group::stop`]
+    /// carries the whole of it and says what to do instead.
     Dropped,
 }
 
@@ -465,9 +471,9 @@ impl Membership {
     /// `stop`-based teardown of a member sitting in backoff cannot return until
     /// that backoff elapses.
     ///
-    /// **Both arguments are caller code, and a panic in either is caught.**
-    /// Which one panicked decides what the group does, and the two answers are
-    /// different because the consequences are:
+    /// **Both arguments are caller code, and a panic in either *while it runs*
+    /// is caught.** Which one panicked decides what the group does, and the two
+    /// answers are different because the consequences are:
     ///
     /// - `retire`, in **either** half — the closure or the future it returns —
     ///   costs **one member**. The rest are still retired and the group's ending
@@ -476,6 +482,19 @@ impl Membership {
     /// - `ended` costs the **group**, as [`GroupEnded::EndingPanicked`]. Nothing
     ///   can be asked of the policy about a member whose reason never arrived,
     ///   and carrying on would leave a caller believing that member is watched.
+    ///
+    /// **Their DESTRUCTORS are out of scope, and that is the boundary of the
+    /// word "either" above.** A fifth piece of caller code runs on the group's
+    /// task and is not caught: the `Drop` of these futures, when a teardown
+    /// clears the staging list and when the retirement set is dropped. A
+    /// panicking destructor unwinds the conductor, and every awaiter of
+    /// [`Group::ended`] is then told [`GroupEnded::Dropped`] while the caller
+    /// still holds a live [`Group`] — the wrong answer the catches above exist
+    /// to remove, arriving through the one door they do not cover. It is not
+    /// covered because a panicking destructor is already outside what this
+    /// crate supports: `std` calls it "a panic in a destructor during unwind"
+    /// and aborts on the second one, so catching the first buys a process that
+    /// is one panic from death either way.
     ///
     /// No [`Ended`] is invented for the second case, which is why it is a
     /// [`GroupEnded`] variant rather than a reason: no variant of `Ended` means
@@ -790,6 +809,28 @@ impl Group {
     /// this is not `async`: a synchronous request cannot be cancelled halfway
     /// through a teardown by a caller who dropped the future.
     ///
+    /// # THE THING TO KNOW — a `stop` the conductor has not observed is lost
+    ///
+    /// **Hold the group until [`ended`](Self::ended) resolves.** This raises a
+    /// flag inside the shared state and returns. The conductor reads that flag
+    /// only after upgrading its [`Weak`], and dropping the last [`Group`]
+    /// destroys the state and the flag together — so `group.stop();
+    /// drop(group);` with no await between them ends the group
+    /// [`GroupEnded::Dropped`] having retired nothing. On a current-thread
+    /// runtime that is the ordinary case rather than a race: nothing has
+    /// scheduled the conductor yet.
+    ///
+    /// **Stated rather than fixed, and the alternative is worse.** Moving the
+    /// flag into state the conductor holds strongly does not help, because the
+    /// membership list dies with the same drop — and holding *that* strongly
+    /// would keep the group alive for ever and stop [`GroupEnded::Dropped`]
+    /// firing at all, which is the answer a caller awaiting a dropped group
+    /// depends on. Draining the members inside this method instead is a real
+    /// fix and costs the "returns at once" promise above.
+    /// `tests/compose.rs`'s
+    /// `a_stop_the_conductor_has_not_seen_is_lost_when_the_last_group_drops`
+    /// reproduces it, with the one-await control beside it.
+    ///
     /// Idempotent, and takes no deadline: `n0_future::time::timeout` composes
     /// around [`ended`](Self::ended), and a parameter here would duplicate it.
     /// **That composition is the answer to an unbounded wait, not a flourish** —
@@ -916,7 +957,7 @@ async fn conduct(
         let Some(shared) = shared.upgrade() else {
             break GroupEnded::Dropped;
         };
-        {
+        let taken = {
             let mut held = shared.lock();
             let filed = held.members.iter().position(|entry| {
                 entry.name == reported.name && entry.generation == reported.generation
@@ -935,8 +976,19 @@ async fn conduct(
             // Off the books before the policy is asked, because both answers
             // want it gone: `Forget` carries on without it, and `StopAll` names
             // it rather than retiring an actor that has already ended.
-            held.members.remove(at);
-        }
+            //
+            // **Bound and not discarded, because both of those answers assume
+            // the reason ARRIVED.** It did on the two verdict paths, so dropping
+            // this entry there drops a `Retire` for an actor that is already
+            // gone, which is what dropping one is for. On the `Err` arm below
+            // the reason never arrived, so "already ended" is precisely what is
+            // unknown — and this is the only `Retire` in existence for that
+            // member, because `add` consumed the caller's `Membership`. Dropping
+            // it there left an actor running that nothing could reach, which is
+            // the state `Membership::new` calls leaving a caller believing that
+            // member is watched.
+            held.members.remove(at)
+        };
 
         // An ending that panicked instead of arriving. The stamp was checked
         // first, above, so a member that was displaced or removed is discarded
@@ -945,7 +997,14 @@ async fn conduct(
         let reason = match reported.reason {
             Ok(reason) => reason,
             Err(message) => {
-                retire_all(closing(&shared)).await;
+                let mut leaving = closing(&shared);
+                // Its own means of ending, beside every sibling's. Appended
+                // rather than placed, because `retire_all` builds every future
+                // before polling any: the order is a statement about the order
+                // retirement is ISSUED in, which `closing` says at length, and
+                // this member's place in it carries no claim.
+                leaving.push(taken.retire);
+                retire_all(leaving).await;
                 break GroupEnded::EndingPanicked {
                     member: reported.name,
                     message,

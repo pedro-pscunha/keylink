@@ -1383,6 +1383,11 @@ async fn no_members_retirement_waits_on_another() {
     // many retire futures COMPLETED, which is the "waits on" half.
     let called = Arc::new(AtomicUsize::new(0));
     let finished = Arc::new(AtomicUsize::new(0));
+    // What `called` had reached at the moment `quick`'s future was FIRST POLLED.
+    // A count read after the teardown cannot carry the "built before polled"
+    // claim — one-at-a-time reaches 2 as well, just later — so the claim is
+    // read where it is true or not: inside the future, on its first poll.
+    let called_when_polled = Arc::new(AtomicUsize::new(0));
     let (release, held) = oneshot::channel::<()>();
 
     // Neither member ends on its own: `pending` is an ending that never comes, so
@@ -1390,9 +1395,11 @@ async fn no_members_retirement_waits_on_another() {
     let quick = {
         let called = Arc::clone(&called);
         let finished = Arc::clone(&finished);
+        let called_when_polled = Arc::clone(&called_when_polled);
         Membership::new(std::future::pending(), move || {
             called.fetch_add(1, Ordering::SeqCst);
             async move {
+                called_when_polled.store(called.load(Ordering::SeqCst), Ordering::SeqCst);
                 finished.fetch_add(1, Ordering::SeqCst);
             }
         })
@@ -1424,10 +1431,14 @@ async fn no_members_retirement_waits_on_another() {
         settles(|| finished.load(Ordering::SeqCst) == 1).await,
         "a member's retirement does not wait on the one retired before it"
     );
+    // Read INSIDE `quick`'s future, on its first poll. `called == 2` measured
+    // after the fact would also hold for a loop that built and polled one member
+    // at a time, which is the spelling `retire_all` refuses — so the count is
+    // taken at the only instant that separates the two.
     assert_eq!(
-        called.load(Ordering::SeqCst),
+        called_when_polled.load(Ordering::SeqCst),
         2,
-        "and every retire future was built before any of them was polled"
+        "both retire closures had already run when the first retire future was polled"
     );
 
     // Released, the teardown finishes and the group answers.
@@ -1442,10 +1453,52 @@ async fn no_members_retirement_waits_on_another() {
 }
 
 /// Made red by `scripts/break-once.sh keylink/src/compose/group.rs`, replacing the
-/// conductor's `held.members.remove(at);` with `let _ = at;` — a member decided
-/// about and left on the books, which is the leak that makes `names()` a list of
-/// actors the group is no longer watching. Watched: "`Forget` takes the member
+/// conductor's `            held.members.remove(at)` with
+/// `            { let last = held.members.len() - 1; held.members.remove(last) }`
+/// — the newest member taken off the books instead of the one the conductor
+/// decided about, so the decided one is left behind and `names()` becomes a list
+/// of actors the group is no longer watching. Watched: "`Forget` takes the member
 /// off the books and leaves the rest". Exit 101, by value, in 0.01s.
+///
+/// **This record's first substitution rotted, and both halves of it rotted at
+/// once.** It read: replace `held.members.remove(at);` with `let _ = at;`. The
+/// fix for the `EndingPanicked` leak made that line the enclosing block's
+/// *value* — it lost its semicolon — so the literal stopped occurring and
+/// `break-once.sh` aborted at its grep, before taking a backup. `mise run
+/// anchors` caught it as `FAIL G5: the anchor IS GONE`.
+///
+/// **And the old replacement would not have compiled either.** `let _ = at;`
+/// makes the block yield `()`, which is then bound and read as `taken.retire` on
+/// the `Err` arm: measured, `error[E0609]: no field 'retire' on type '()'`, and
+/// `break-once.sh` reports that as `── exit=101` — indistinguishable from a
+/// caught defect unless you read the log. A rotted anchor and a rotted
+/// substitution are two failures and only the first one is loud.
+///
+/// **Why the replacement removes the wrong member rather than none.** Leaving
+/// the decided member on the books is no longer expressible in one line: the
+/// block has to *yield an `Entry`*, and the only way to get an owned one is to
+/// take it out — `Entry` holds a boxed `FnOnce` and is not `Clone`. So the
+/// nearest expressible defect is taking the wrong one, which reddens the same
+/// assertion for the same reason. Two candidates were tried and rejected first,
+/// both by measurement: `swap_remove(held.members.len() - 1)` and
+/// `remove(held.members.len() - 1)` are both `error[E0502]`, because the length
+/// read and the removal borrow the `MutexGuard` at once and two-phase borrows do
+/// not reach through the `Deref`. Binding `last` first is what makes it compile.
+///
+/// **THE PRECONDITION, because a wrong-index break is only wrong at some
+/// indices.** This substitution takes the LAST member, so it reddens only while
+/// the ended member is not the last one. Here the ended member is the FIRST —
+/// `leaving` is added before `staying`, and `leaving` is the one aborted — so
+/// `last` is `staying` and the decided member is left behind. **Add a member
+/// after `staying`, or end `staying` instead, and this break goes green while
+/// proving nothing.**
+///
+/// That is not hypothetical. `held.members.remove(0)` was the other candidate
+/// and it is the mirror image: the ended member IS at index 0 here, so `remove(0)`
+/// and `remove(at)` are the same call. Measured — `── exit=0`, the test passed
+/// under the break. A substitution that indexes must state which index the test
+/// puts the ended member at, or the next person to reorder the `add` calls turns
+/// this guard off without touching it.
 #[tokio::test]
 async fn forget_removes_the_member_and_leaves_the_others_serving() {
     let (asked, policy) = recording(Verdict::Forget);
@@ -1786,6 +1839,16 @@ async fn a_dropped_group_ends_as_dropped_and_leaves_its_members_running() {
     let waiting = group.ended();
 
     drop(group);
+    // **`names()` alone cannot carry this claim.** The `Dropped` path never
+    // clears `members`, so this vector is what it is whether the group is still
+    // watching or has already given up. The poll below is the half that can
+    // fail: a group that had ended would answer its `ended()` on the first
+    // poll, and `stop_all_ends_the_group_and_names_the_member_that_caused_it`
+    // holds the control proving that poll CAN be `Some`.
+    assert!(
+        n0_future::future::poll_once(held.ended()).await.is_none(),
+        "one clone left is a group that has NOT ended"
+    );
     assert_eq!(
         held.names(),
         vec![name.clone()],
@@ -1801,6 +1864,102 @@ async fn a_dropped_group_ends_as_dropped_and_leaves_its_members_running() {
         member.whoami().await.expect("still serving"),
         5,
         "and its members are still running: dropping a group stops watching, it ends nothing"
+    );
+}
+
+/// **A regression pin on a hazard, not a guard on a property.** It asserts what
+/// the code does today, and what it does today is lose a [`Group::stop`] the
+/// conductor never observed.
+///
+/// [`stop`](Group::stop) raises a flag inside `Shared` and returns. The
+/// conductor reads that flag only *after* its `Weak` upgrade succeeds. So
+/// `stop(); drop(group);` with no await between them destroys `Shared` — and
+/// the flag with it — before the conductor has been polled once, the upgrade
+/// then fails, and the group ends [`GroupEnded::Dropped`] having retired
+/// nothing. On a current-thread runtime that is not a race but the ordinary
+/// case: nothing has scheduled the conductor yet.
+///
+/// **Reproduced before it was written down.** The hazard was first reasoned
+/// from the code at a merge gate; this test is what turned it into a fact.
+///
+/// **It carries its own control, because the first half alone is vacuous.**
+/// Dropping a group answers `Dropped` and leaves its members running whether
+/// `stop` was called or not, so the first half cannot tell a *lost* stop from a
+/// stop nobody made. The second half is the identical sequence with one await
+/// between `stop` and the drop, and it ends [`GroupEnded::Stopped`] with the
+/// member retired. The difference between the two halves is that await and
+/// nothing else, which is what makes the first half a statement about `stop`.
+///
+/// **No fix, and the reason is that the obvious one does not work.** Moving
+/// `stopping` into an [`Arc`] the conductor holds strongly does not help,
+/// because the members list dies with `Shared` too — and holding *that* strongly
+/// would keep the state alive for ever and stop `Dropped` firing at all, which
+/// is the answer `a_dropped_group_ends_as_dropped_and_leaves_its_members_running`
+/// exists to protect. Making `stop` drain the members itself is a real fix and it
+/// costs `stop`'s "returns at once" promise plus a second route for the
+/// `retire_panics` count to reach the watch. The documented remedy is one line
+/// on [`Group::stop`]: hold the group until [`ended`](Group::ended) resolves.
+#[tokio::test]
+async fn a_stop_the_conductor_has_not_seen_is_lost_when_the_last_group_drops() {
+    let (_asked, policy) = recording(Verdict::Forget);
+    let group = Group::new(policy);
+    let name = ActorId::new("member").expect("a name");
+    let member = worker::actor(Worker { me: 1 });
+
+    assert!(group
+        .add(name.clone(), keylink::membership!(member))
+        .is_none());
+
+    // Taken while the group is still held, so something is left to answer.
+    let waiting = group.ended();
+
+    // **No await between these two lines, and that is the whole hazard.** The
+    // conductor has not been polled once, so the flag `stop` raises is read by
+    // nobody before `drop` takes the state it lives in.
+    group.stop();
+    drop(group);
+
+    assert!(
+        matches!(bounded(waiting).await, GroupEnded::Dropped),
+        "a `stop` the conductor never observed is lost with the state it was \
+         written into, and the group ends as though nobody had called it"
+    );
+
+    // The cost of that, and the reason this is worth a test rather than a
+    // sentence: the teardown `stop` asked for never ran.
+    spun().await;
+    assert_eq!(
+        member.whoami().await.expect("still serving"),
+        1,
+        "and no member was retired, though `stop` was called before the drop"
+    );
+
+    // ── the control: the same sequence, one await apart ──────────────────────
+    //
+    // Without this the half above says nothing. A dropped group answers
+    // `Dropped` and leaves its members running whether or not anybody called
+    // `stop`, so only the contrast makes the first half a claim about `stop`.
+    let (_asked, policy) = recording(Verdict::Forget);
+    let observed = Group::new(policy);
+    let second = worker::actor(Worker { me: 2 });
+    assert!(observed
+        .add(
+            ActorId::new("observed").expect("a name"),
+            keylink::membership!(second),
+        )
+        .is_none());
+
+    observed.stop();
+    // The one difference. The conductor gets a turn, reads the flag, and tears
+    // down before anything drops the state the flag lives in.
+    let ended = bounded(observed.ended()).await;
+    assert!(
+        matches!(ended, GroupEnded::Stopped { retire_panics: 0 }),
+        "the same `stop`, observed before the drop, ends the group as `Stopped`: {ended:?}"
+    );
+    assert!(
+        settles(|| !second.is_running()).await,
+        "and retires the member, which is what the first half lost"
     );
 }
 
@@ -2018,6 +2177,81 @@ async fn an_ending_that_panics_ends_the_group_as_ending_panicked() {
     assert!(
         settles(|| !sibling.is_running()).await,
         "and every other member is retired rather than left running and unwatched"
+    );
+}
+
+/// The member the group could not hear is retired too, and this test exists
+/// because its sibling above **cannot see that**.
+///
+/// `an_ending_that_panics_ends_the_group_as_ending_panicked` hands the doomed
+/// name a `|| async {}` retire and no actor at all, so the only member it can
+/// observe being retired is the healthy one. That left the interesting half
+/// untested: `conduct` takes the reported member off the books *before* it
+/// reads the reason, and on this path the reason never arrived.
+///
+/// **Both premises for taking it off the books need the reason to have
+/// arrived.** `Forget` carries on without a member that ended; `StopAll` names
+/// it rather than retiring an actor that has already ended. Here nothing ended,
+/// as far as anyone knows — the future that was going to say so panicked. So the
+/// member may be running, and its [`Retire`](keylink::compose::Retire) was the
+/// only means anybody had of ending it. `Membership::new` calls carrying on in
+/// that state "leaving a caller believing that member is watched".
+///
+/// Made red by `scripts/break-once.sh keylink/src/compose/group.rs`, replacing
+/// the conductor's `            leaving.push(taken.retire);` with
+/// `            drop(taken);` — the entry taken off the books and its means of
+/// ending dropped with it, which is the defect this test was written against.
+/// Watched: "the member whose ending panicked is retired as well: the group
+/// cannot hear it, and it holds the only `Retire` anybody had for it". Exit 101,
+/// by value, in 0.01s. That replacement restores the code exactly as it stood
+/// before this test existed, so the break is the regression rather than an
+/// invention — the test was watched failing against it first and passing after.
+#[tokio::test]
+async fn an_ending_that_panics_retires_the_member_it_could_not_hear() {
+    let (_asked, policy) = recording(Verdict::Forget);
+    let group = Group::new(policy);
+    let doomed = ActorId::new("doomed").expect("a name");
+    // A REAL actor behind the panicking ending, which is the whole difference
+    // from the sibling guard: its `retire` aborts something observable.
+    let unheard = worker::actor(Worker { me: 1 });
+    let sibling = worker::actor(Worker { me: 2 });
+
+    assert!(group
+        .add(doomed.clone(), {
+            let unheard = unheard.clone();
+            Membership::new(panicking_ending(), move || async move {
+                unheard.abort();
+            })
+        })
+        .is_none());
+    assert!(group
+        .add(
+            ActorId::new("sibling").expect("a name"),
+            keylink::membership!(sibling),
+        )
+        .is_none());
+
+    match bounded(group.ended()).await {
+        GroupEnded::EndingPanicked { member, .. } => {
+            assert_eq!(member, doomed, "the group names the member it lost");
+        }
+        other => panic!("a panicking ending must end the group as `EndingPanicked`, got {other:?}"),
+    }
+
+    // The half the sibling guard already covers, kept so that a failure below
+    // cannot be read as "the teardown never ran at all".
+    assert!(
+        settles(|| !sibling.is_running()).await,
+        "every other member is retired"
+    );
+
+    // THIS is the decision. Nobody else holds a means of ending this member —
+    // the group consumed it at `add` — so a teardown that skips it leaves an
+    // actor running that nothing can reach.
+    assert!(
+        settles(|| !unheard.is_running()).await,
+        "the member whose ending panicked is retired as well: the group cannot \
+         hear it, and it holds the only `Retire` anybody had for it"
     );
 }
 
@@ -2485,10 +2719,22 @@ async fn an_abandoned_watch_unfiles_its_own_waiter_and_not_a_later_one() {
 /// already answered `Err` leaves the completed [`oneshot::Receiver`] to be
 /// polled a second time, which tokio refuses by panicking. The guard goes red,
 /// but for a broken receiver contract rather than for the hang the claim is
-/// about — a break that fails for its own reason. Expressing the liveness half
-/// faithfully means never resolving the receiver at all, and this arm, which
-/// runs only *after* the receiver has resolved, cannot say that. Treat the
-/// liveness half as **unbroken** until an anchor that can express it exists.
+/// about — a break that fails for its own reason.
+///
+/// **The liveness half has a defect that DOES model it, and it is not a
+/// one-line substitution.** `Awaited` holds a [`Weak`](std::sync::Weak) to the
+/// waiter map; a **strong** [`Arc`] there keeps every `oneshot::Sender` alive
+/// past the last [`Endings`], so the receiver never errs, the `Err` arm above
+/// is never reached, and the caller waits for ever — which is exactly the hang
+/// this test denies. That is three literals at once: the field's type, the
+/// `Arc::downgrade` that fills it, and the `Weak::upgrade` in `Drop`.
+/// `break-once.sh` replaces one literal, so it cannot express this, and the two
+/// halves of a three-site edit do not compile on their own.
+///
+/// Recorded as a **regression pin and not a guard**, which is
+/// `members_are_reported_in_the_order_they_were_added`'s label for the same
+/// shape: the claim is real and this file cannot redden it. The value half above
+/// is a guard and was measured; the liveness half is this paragraph.
 ///
 /// A waiter that nothing can ever report to is answered rather than left
 /// waiting, and it is answered with the one reason that says *the whole thing
