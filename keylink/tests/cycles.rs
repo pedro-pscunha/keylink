@@ -257,9 +257,21 @@ async fn inside_a_turn(entered: &AtomicUsize) {
 /// is what this record used to say, substitutes for the *entire* searched line and
 /// leaves a syntax error. Watched: the second
 /// `bump` then completes too and the test fails at
-/// "a second message must not fit: LOCAL_MAILBOX_DEPTH is 1". That is the right
-/// red — it is the depth, and not the loop's release of the permit, that this
-/// assertion pins.
+/// "a second message must not fit: LOCAL_MAILBOX_DEPTH is spent by the first". That
+/// is the right red — it is the depth, and not the loop's release of the permit, that
+/// this assertion pins.
+///
+/// **The message names the constant and not its value, and that is deliberate.** It
+/// read "LOCAL_MAILBOX_DEPTH is 1" until this branch, which put a copy of a value
+/// defined in `local.rs` into a failure message in `tests/`, where nothing checks
+/// it: raise the depth and the assertion fails while its own message asserts the old
+/// value as a fact. Naming the constant instead keeps the message an accurate
+/// statement of what must hold, whatever the depth is, and still points the reader
+/// at the one line that governs it. `local.rs`'s
+/// `no_failure_prefix_is_a_prefix_of_another` is the precedent — it names the consts
+/// rather than the strings, so it cannot drift from the wire. The value is private
+/// to `local.rs`, so an integration test cannot interpolate it and naming it is the
+/// only option here.
 #[tokio::test]
 async fn a_running_turn_leaves_exactly_one_free_permit_behind_it() {
     let (a, _b, gate, entered) = ring_of_two();
@@ -277,7 +289,7 @@ async fn a_running_turn_leaves_exactly_one_free_permit_behind_it() {
 
     assert!(
         n0_future::time::timeout(HANG, a.bump()).await.is_err(),
-        "a second message must not fit: LOCAL_MAILBOX_DEPTH is 1"
+        "a second message must not fit: LOCAL_MAILBOX_DEPTH is spent by the first"
     );
 
     gate.notify_one();
@@ -527,8 +539,30 @@ async fn a_read_from_inside_a_turn_is_a_self_deadlock() {
 /// `Verdict::Committed => reply.answer(Answered::Ran(value)),` with
 /// `Verdict::Committed => drop((reply, value)),`. Watched: "the actor is running:
 /// MailboxClosed". That proves the parked answer is load-bearing and proves
-/// nothing about the *cycle*, because it reddens every `#[defer]` test in the
-/// tree.
+/// nothing about the *cycle*.
+///
+/// **What the break reaches is one arm, and naming the arm is the whole
+/// statement.** `Deferred::send` is the only caller of `parking::park`, so this
+/// substitution discards the value of every parked reply whose turn then COMMITS
+/// — which is every guard needing a parked answer to arrive, wherever it lives.
+/// It leaves `Verdict`'s other two arms untouched: a reply the observer chain
+/// REFUSES and a reply lost to a FAULT are each resolved by their own arm, so a
+/// guard asserting one of those losses still sees it. And a reply simply dropped,
+/// as `defer.rs`'s `abandon` drops it, never calls `send` and so never reaches
+/// `park` at all.
+///
+/// **This sentence used to say the break reddens every `#[defer]` test in the
+/// tree, and that is the shape to avoid.** It reads as a population, and which
+/// population is left to the reader: on "every test in a file that writes
+/// `#[defer]`" it is simply false, because `tests/protocol.rs` declares a
+/// `#[defer] rpc` that no test drives at all. On "every test needing a parked
+/// answer" it is about right — but then it is a claim over an OPEN set, and the
+/// next such test anybody writes silently joins it, which is the rot
+/// `.mise/tasks/anchors` warns about for its own row count. Counting the attribute
+/// does not rescue it either: the deferred method `tests/inspect.rs` drives is
+/// declared in `src/console.rs`, so no count taken over the test files reaches it.
+/// The arm has none of these problems. It is one line of `local.rs`, and the
+/// anchor registered for this record IS that line.
 ///
 /// The break that would have isolated the cycle does not exist. `Reply::later`'s
 /// `Replied(Settled::Later)` → `Replied(Settled::Now)` was tried first and does

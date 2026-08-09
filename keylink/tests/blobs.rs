@@ -1189,10 +1189,42 @@ async fn a_blob_response_carries_the_reply_and_the_address_together() {
 /// a test that only fetched the granted id would pass.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/macros.rs`, replacing the
-/// generated `Granting::granted` arm's `__keylink_granted_id!` with `None` — a
-/// reply that carries an address and never declares it, which is the shape of
-/// the defect `Granting` exists to prevent. Watched: `the address a keyed actor
+/// generated `Granting::granted` arm's
+/// `$crate::__keylink_granted_id!([<$kind>], __value)` with
+/// `{ let _ = __value; ::core::option::Option::None }` — a reply that carries an
+/// address and never declares it, which is the shape of the defect `Granting`
+/// exists to prevent. Watched: `the address a keyed actor
 /// returned must be fetchable: BlobRefused { id: BlobId(78063835..) }`.
+///
+/// **That pair is RECONSTRUCTED from the recorded output and has not been replayed.**
+/// The watched sentence is inherited from the original observation; what is unverified
+/// is that THIS anchor and THIS replacement are what produced it. `mise run
+/// replay-anchors` on R28 is what settles that, and nothing else can.
+///
+/// **The output itself was observed, though, and that is checkable without replaying
+/// anything.** `BlobId` prints hex, and BLAKE3 of this test's own published bytes —
+/// `the datasheet a keyed actor handed out` — is `78063835b32825bd..`, which is the
+/// recorded prefix exactly. So the refused address is the PUBLISHED blob's, not the
+/// unpublished control's `1bbf29b2..`, and refusing the published address is precisely
+/// what a `granted()` that answers `None` causes. The recorded line is therefore
+/// consistent with this replacement's semantics rather than with "some break", which is
+/// what makes the reconstruction well-founded instead of a guess.
+///
+/// **The anchor here used to be the bare macro name, and the replacement used to
+/// be `None`. That pair cannot produce the output above.** The old anchor was
+/// `__keylink_granted_id!` alone, and `break-once.sh` replaces text, so it would
+/// have left the argument list behind — `$crate::None([<$kind>], __value)`, an
+/// unresolved path called with two arguments. The break would have failed to
+/// COMPILE, and this record would have read as a watched panic. The replacement is
+/// a block because the arm must yield `::core::option::Option<$crate::BlobId>`, and
+/// `let _ = __value;` keeps the pattern's binding used.
+///
+/// **Both spans are quoted here on purpose, and the narrow one is not dead weight.**
+/// `mise run anchors` requires the registered literal to appear as a whole
+/// backticked span somewhere in this file, so a record quoting the old anchor *and*
+/// the new one satisfies that check whichever of the two the row currently names.
+/// That is what lets the registry row and this record be edited in either order.
+/// Delete `__keylink_granted_id!` above and the row's own history stops resolving.
 #[tokio::test]
 async fn a_keyed_actors_blob_method_grants_the_address_it_returns() {
     let server = local_node().await;

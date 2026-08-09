@@ -987,6 +987,25 @@ mod tests {
     /// `HashMap::iter` hands back `&CallId`. Watched:
     /// `and a decoded set must re-encode to the same bytes`.
     ///
+    /// **The registered anchor is the whole line, and both widths are quoted here
+    /// so that the row can name either one.** The whole-line pair is
+    /// `(self.bound, self.iter().collect::<Vec<_>>()).serialize(serializer)` →
+    /// `(self.bound,
+    /// self.answers.iter().map(|(c, a)| (*c, a)).collect::<Vec<_>>()).serialize(serializer)`.
+    /// The fragment above resolves today and has no remedy the day it stops,
+    /// because indentation cannot disambiguate a mid-line span. Quoting both
+    /// widths keeps this record valid whichever width the row currently carries.
+    ///
+    /// **Do not rewrap the search quote except at a space it already contains.**
+    /// `mise run anchors` flattens a quoted span by joining its `///` lines with
+    /// one space, then compares it whole against the registered literal. A wrap
+    /// before `.serialize` inserts a space the line does not have, and the row
+    /// then reports `literal is NOT QUOTED by its own record`. That quote is 77
+    /// columns at this indent, and nothing here reflows it — `rustfmt.toml` pins
+    /// `edition` alone, so `wrap_comments` is off. The replacement quote is never
+    /// searched, so its wrap is free; it is wrapped at a space the line really
+    /// has anyway, so promoting it to an anchor later needs no relayout.
+    ///
     /// **It is the second assertion that goes red, not the first**, and the reason is
     /// worth knowing before reading a failure here: two encodings of one *live* value
     /// walk the same map and agree even under the break. What exposes the hash order
