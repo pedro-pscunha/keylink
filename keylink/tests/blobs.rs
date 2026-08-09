@@ -1197,18 +1197,30 @@ async fn a_blob_response_carries_the_reply_and_the_address_together() {
 /// returned must be fetchable: BlobRefused { id: BlobId(78063835..) }`.
 ///
 /// **That pair is RECONSTRUCTED from the recorded output and has not been replayed.**
-/// The watched sentence is inherited from the original observation; what is unverified
-/// is that THIS anchor and THIS replacement are what produced it. `mise run
-/// replay-anchors` on R28 is what settles that, and nothing else can.
+/// What is unverified is that THIS anchor and THIS replacement are what produced the
+/// sentence. `mise run replay-anchors` on R28 is what settles that, and nothing else can.
 ///
-/// **The output itself was observed, though, and that is checkable without replaying
-/// anything.** `BlobId` prints hex, and BLAKE3 of this test's own published bytes —
-/// `the datasheet a keyed actor handed out` — is `78063835b32825bd..`, which is the
-/// recorded prefix exactly. So the refused address is the PUBLISHED blob's, not the
-/// unpublished control's `1bbf29b2..`, and refusing the published address is precisely
-/// what a `granted()` that answers `None` causes. The recorded line is therefore
-/// consistent with this replacement's semantics rather than with "some break", which is
-/// what makes the reconstruction well-founded instead of a guess.
+/// **The sentence's PROVENANCE is unestablished, and an earlier version of this record
+/// said it was "inherited from the original observation".** That attributed it to a
+/// watched run nobody can point to. The anchor this row carried when the sentence was
+/// written was the bare macro name, and the paragraph below proves that pair cannot
+/// compile — so whatever produced the sentence, it was not the recorded substitution. It
+/// may have been a real panic from a hand-made edit; that is plausible and it is not
+/// established.
+///
+/// **What IS established is that the recorded ADDRESS is the right one, which makes the
+/// sentence WELL-FORMED for this break.** `BlobId` prints hex, and BLAKE3 of this test's
+/// own published bytes — `the datasheet a keyed actor handed out` — is
+/// `78063835b32825bd..`, the recorded prefix exactly. So the refused address is the
+/// PUBLISHED blob's, not the unpublished control's `1bbf29b2..`, and refusing the
+/// published address is precisely what a `granted()` answering `None` causes.
+///
+/// **That arithmetic cannot show the line was ever PRINTED, and it would be flattering to
+/// read it that way.** This test is handed the published address on a GREEN run, so a
+/// sentence assembled from a green run's id plus hand-written error text carries the same
+/// prefix as one copied out of a red run. The hash separates the right address from the
+/// wrong address. It does not separate observed from assembled — so the register here is
+/// **well-founded**, and never "watched".
 ///
 /// **The anchor here used to be the bare macro name, and the replacement used to
 /// be `None`. That pair cannot produce the output above.** The old anchor was

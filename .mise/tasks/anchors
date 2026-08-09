@@ -74,7 +74,29 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 #    `actor/remote.rs`, `H2`/`H3` and `H6`/`H7` in `.githooks/pre-push`).
 #
 #    The practical form: **after adding any quote, count the literal and not the
-#    row** - then check whether another row shares it.
+#    row** - then check whether another row shares it **or CONTAINS it**.
+#
+#    **"Shares" is equality and does not reach CONTAINMENT, which is a ninth coupling
+#    the eight pairs above do not describe.** Measured over the registry: exactly two
+#    containments exist, and both are inside `H11`, whose five-line literal contains
+#    `H5`'s whole literal and `H6`/`H7`'s whole literal as substrings. **So one site of
+#    five lines in `.githooks/pre-push` carries FOUR rows.** Built in memory, four
+#    perturbations of that block:
+#
+#      a second copy of the whole block      H5 2  H6 2  H7 2  H11 2   four rows abort
+#      a second copy of its FIRST line       H5 1  H6 2  H7 2  H11 1   H6 and H7 abort
+#      a copy of H5's line INSIDE the block  H5 2  H6 1  H7 1  H11 0   H5 aborts, H11 GONE
+#      a comment added in its `else` arm     H5 1  H6 1  H7 1  H11 0   H11 alone is gone
+#
+#    Row three is the one to hold in mind: one added line yields `IS NOT UNIQUE (2x)` for
+#    `H5` and `IS GONE` for `H11` at once, with different `likely cause` text, and
+#    **neither failure names the other row.**
+#
+#    **The insertion's LOCATION decides it, and that is measured rather than assumed.**
+#    The same duplicate line appended at the END of the file gives `H5` 2 and leaves
+#    `H11` at **1**, because H11's five lines are still contiguous. Only a copy placed
+#    INSIDE the block breaks H11's contiguity. So "duplicate H5's line" is not one
+#    perturbation - it is two, with different blast radii.
 #
 #    **AND THE OPPOSITE CASE EXISTS, so read which one you are in before acting.**
 #    `H6` and `H7` also carry load-bearing indentation and for the reverse reason:
@@ -491,12 +513,30 @@ ANCHORS = [
     # and `let _ = __value;` keeps the pattern binding used.
     #
     # **That pair is RECONSTRUCTED and UNREPLAYED, and the record says so in those
-    # words.** Nobody has applied this substitution. What IS established is that the
-    # recorded output was observed: `BlobId` prints hex, and BLAKE3 of the test's own
-    # published bytes is `78063835b32825bd..`, the recorded prefix exactly, so the
-    # refused address is the published blob's and not the unpublished control's. That
-    # makes the reconstruction consistent with the replacement's semantics rather than
-    # a guess.
+    # words.** Nobody has applied this substitution.
+    #
+    # **What IS established is narrower than "the output was observed", and an earlier
+    # version of this paragraph claimed the wider thing.** `BlobId` prints hex, and
+    # BLAKE3 of the test's own published bytes is `78063835b32825bd..` - the recorded
+    # prefix exactly - so the refused address is the PUBLISHED blob's and not the
+    # unpublished control's. That makes the recorded sentence **WELL-FORMED for this
+    # break**: it names the address a `granted()` answering `None` would cause to be
+    # refused.
+    #
+    # **A hash cannot establish that anything ever PRINTED it.** The published address is
+    # computable from a GREEN run - this test publishes those bytes and is handed that id
+    # when everything works - so a sentence assembled from a green run's address plus
+    # hand-written error text carries the same prefix as one copied out of a red run. The
+    # arithmetic separates "the right address" from "the wrong address". It does not
+    # separate OBSERVED from ASSEMBLED, and the earlier wording read as though it did.
+    #
+    # **And this branch closed the only provenance it could have claimed.** R28's
+    # registered literal was the bare macro name from `40001d0` until `3d509f9`, both on
+    # this branch - so the pair on record when that sentence was written is the pair the
+    # compile control proves cannot build. Whatever produced the sentence, it was not the
+    # recorded substitution. It may still have been a real watched panic from a hand-made
+    # edit, and that history is plausible; **it is not established, and a hash cannot
+    # establish it.**
     #
     # **AND THE PAIR NOW COMPILES, measured — so what is open is narrower than it was.**
     # Compiled in an isolated `git archive` of `25cbbac` with its own target directory,
@@ -505,10 +545,22 @@ ANCHORS = [
     # struct or tuple variant None in module $crate`, which is the failure this record's
     # earlier version claimed as a watched panic.
     #
-    # So the tiers are now: the OUTPUT was observed (BLAKE3), the SUBSTITUTION is a legal
-    # program (compiled), and **the REDNESS is still unreplayed**. A compile check says
-    # the break can be built. It says nothing about whether it reddens the guard this
-    # record names, and `mise run replay-anchors` on R28 is still what closes that.
+    # So the tiers are, in what each instrument actually supports:
+    #
+    #   ADDRESS      the recorded address is the published blob's, by BLAKE3. So the
+    #                sentence is WELL-FORMED for this break. **Not** evidence that a run
+    #                printed it.
+    #   PROGRAM      the substitution compiles, and the retired pair provably does not.
+    #                A legal program, not a red one.
+    #   REDNESS      unestablished. No run of this pair exists.
+    #   PROVENANCE   unestablished. The sentence's origin is unknown, and the only pair
+    #                this row carried when it was written cannot compile.
+    #
+    # **Nothing here says "observed", and the register to keep is the one this record's
+    # own prose already used: WELL-FOUNDED.** A reconstruction consistent with a
+    # measurement is well-founded. It is not a watched run, and calling it one errs in
+    # the flattering direction - which is the single direction every figure in this file
+    # is written to avoid.
     #
     # **Still a FRAGMENT, so `FRAGMENT_ANCHORS` below is unchanged**: the line
     # continues `, )+`, so the whole line would drag the repetition's comma and closer
@@ -608,6 +660,19 @@ ANCHORS = [
     # either. Worth stating because the decoupling that removed a sequencing hazard
     # created a tidying one, and a reader who knows only the first will not expect the
     # second.
+    #
+    # **AND IT MOVED A DETECTION TO ANOTHER SEAM, so C6 must stay OUT of
+    # `FRAGMENT_ANCHORS`.** Because the record still quotes the retired narrow form,
+    # `flat(narrow)` IS a member of `quoted_spans("keylink/src/call.rs")` - measured. So
+    # **if this row ever regresses to the narrow anchor, the record-quote check PASSES.**
+    # What catches the regression is the FRAGMENT check: the narrow form is not a whole
+    # line, because `:580` continues `.serialize(serializer)`, and C6 is no longer
+    # declared. Both halves measured.
+    #
+    # The regression IS caught, and loudly. But it is caught by ONE check now instead of
+    # two, and that check is a set membership somebody could change for an unrelated
+    # reason. **Adding C6 back to `FRAGMENT_ANCHORS` would remove the last guard against
+    # this row narrowing, silently.** Do not.
     #
     # **The replacement widened by the same suffix, and it had to.** It is now
     # `(self.bound, self.answers.iter().map(|(c, a)| (*c, a)).collect::<Vec<_>>()).serialize(serializer)`.
@@ -723,10 +788,18 @@ ANCHORS = [
     # or the message can notice.**
     #
     # R19's record stands in for a break it cannot run by printing an `rg` command over
-    # `keylink/src/actor/remote.rs` and naming its two matches. Run verbatim at this
-    # tree: the first pair, `139:`/`140: self.message.method()`, is still exact. The
-    # second pair read `573:`/`574: match self {` and the command now prints **619/620**
-    # - that file grew above its test module and pushed the second impl down 46 lines.
+    # `keylink/src/actor/remote.rs`, and naming its two matches. **Run verbatim against
+    # that file as it stands at `832ec62`**, the last commit to touch it: the first pair,
+    # `139:`/`140: self.message.method()`, is exact. The second pair read `573:`/`574:
+    # match self {` and the command printed **619/620** - that file grew above its test
+    # module and pushed the second impl down 46 lines.
+    #
+    # **The commit handle is there because an earlier version said "at this tree" and
+    # "now", which name no tree and read as current - for POSITIONS IN A FILE THIS
+    # REGISTRY DOES NOT OWN.** That is the sixth rot mode this very record introduces,
+    # committed by the paragraph introducing it, nine lines above the sentence that
+    # mandates against it. `832ec62` is immutable; whether it is still the last commit to
+    # that file is a fact about a later tree and is deliberately not claimed.
     #
     # **THIS COMMENT NO LONGER SAYS WHICH WORDING THE RECORD CURRENTLY USES, and that is
     # the third correction to this same paragraph.** It has said, in order: "both numbers
@@ -1055,6 +1128,24 @@ ANCHORS = [
     # carry a `REDNESS` entry, so `mise run replay-anchors` covers none of them.** The
     # other fourteen rest on one author's watched run.
     #
+    # **And I1, I2 and I3 being invisible to the population tripwire costs nothing, which
+    # is a better sentence than saying the tripwire cannot see them.** Their records never
+    # say `break-once.sh`, so they are three of the 13 `rows_unseen` - announced by the
+    # summary rather than hidden. The guard that matters for them is the **per-row
+    # record-quote check**, which cannot miss a record whose QUOTE is gone: measured by
+    # cutting the one comment block that carries all three literals, the check then fails
+    # for exactly `I1`, `I2` and `I3`, while the harness count stays 2. **A row that EXISTS
+    # is guarded per row; the tripwire only ever answered a question about the
+    # population.**
+    #
+    # **"Whose quote is gone" and not "that was deleted", because those differ and the
+    # first attempt at this measurement proved it.** Cutting every comment line that
+    # mentions `install-hooks.sh` - a plausible way to delete these records - left all
+    # three literals still quoted and the check still GREEN, because the lines carrying the
+    # spans do not name the file. So this check guards the QUOTE, not the record: degrade a
+    # record's prose while leaving its backticked span and nothing here notices. The
+    # guarantee is narrow and it is the narrow one that was measured.
+    #
     # Naming the five matters beyond accuracy: the wave scoped to replay the unreplayed
     # rows reads this figure, and an over-broad "all nineteen" would have sent it to
     # replay five rows a second time.
@@ -1116,6 +1207,17 @@ ANCHORS = [
     # `    if [ -n "$updates" ]; then`, so it could have been registered against that
     # line alone - but that literal is ALREADY H6's and H7's, so a third row on it
     # detects nothing new. Bookkeeping dressed as coverage.
+    #
+    # **THIS BLOCK CARRIES FOUR ROWS, and the other two are H6/H7 AND H5.** H11's five
+    # lines contain H6/H7's whole literal (its first line) and **H5's whole literal** (its
+    # second, the `<<<"$updates"` forward). Registry-wide these are the only two
+    # containments, so the coupling is bounded and it is bounded here.
+    #
+    # H6 was named beside this row from the start; **H5 was named nowhere** - it appeared
+    # in the whole task only in its own row tuple. So an author editing these five lines
+    # could find three of the four rows they were about to move and never learn of the
+    # fourth. Mode 1's containment clause carries the measured blast radii; the reason
+    # they are recorded there and named here is that a reader arrives from either end.
     #
     # The literal is the two-arm chained forward, five complete lines, and it was taken
     # from the target's own bytes rather than retyped - the byte class where a
@@ -2025,6 +2127,19 @@ for record in sorted(set(REDNESS) - row_ids):
 #
 # What it buys: ADDING a break record forces a decision about registering it,
 # instead of this list silently falling further behind a growing population.
+#
+# **That holds only for a record whose PHRASING one of the two populations recognises,
+# and one class escapes both.** A record that says neither `break-once.sh` nor "Made red"
+# nor "Red under" - one phrased, say, as `Replace X with Y` - sits outside `HARNESS` and
+# outside `UNNAMED`, so adding it moves nothing and no decision is forced. Measured: an
+# I-shaped record block inserted into `scripts/hook-guard.sh` left harness blocks at 2 and
+# marked blocks at 2.
+#
+# Left as it is rather than widened, on this file's own reasoning: the tripwire's value is
+# LOUDNESS ON CHANGE and not completeness, and every widening still leaves some other
+# phrasing outside. What is fixed here is the CLAIM - "forces a decision" is true of the
+# phrasings the walk knows and false in general, and a reader who takes it generally will
+# trust a green run to mean no record was added.
 #
 # ── THE METHOD, because this number now fails the build when it moves ─────────
 #
