@@ -1238,6 +1238,19 @@ ANCHORS = [
     # a record can have and is worth saying where it is rare.
     ("G15", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
      "                leaving.push(taken.retire);"),
+    # G16 is a REGRESSION in the same literal sense G15 is, and for a stronger
+    # reason: its substitution is not code that once stood here, it is the whole
+    # of what the previous SIGNATURE could say. `add` returned `Option<Retire>`,
+    # so a refusal and a displacement were both `Some` and no caller could tell
+    # them apart. Swapping `Added::Refused` for `Added::Displaced` puts the tree
+    # back in that state at the one site where it is now expressible.
+    #
+    # The `return` is required and the fragment is not unique: bare
+    # `Added::Refused` occurs several times in `group.rs` — the variant's own
+    # declaration, the module's rebuild recipe, and `add`'s doc. Only the
+    # twelve-space whole line resolves once.
+    ("G16", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "            return Added::Refused(retire);"),
     # ── the keyed side ───────────────────────────────────────────────────────
     #
     # K1 and K2 share a literal for the R15/R16 reason: two records, two rows. K1
@@ -2751,7 +2764,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # next person to skip the run gets the wrong number on a tree where the two diverge.
 # The agreement is recorded because hiding it would make the run look load-bearing in
 # a way this one was not, and the run is kept because the NEXT one will be.
-RECORD_BLOCKS = 154
+RECORD_BLOCKS = 155
 
 # The one marker the tripwire counts, and the two phrasings records use INSTEAD of
 # naming the harness. Both are read by the same walk, so the blind spot below is a

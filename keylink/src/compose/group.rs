@@ -180,7 +180,10 @@
 //! ```ignore
 //! // The factory spawns the set, watches it, and publishes the handles. A
 //! // rebuild redoes all three, which is why all three are in one place.
-//! fn build(
+//! //
+//! // `async` for the sake of one branch below: a member the group refused has to
+//! // be retired here, and retiring is a future.
+//! async fn build(
 //!     reserves: &Names<reserve::Handle<Reserve>>,
 //!     charges: &Names<charge::Handle<Charge>>,
 //! ) -> keylink::Result<Group> {
@@ -191,8 +194,20 @@
 //!         Ended::Stopped => Verdict::Forget,
 //!         _ => Verdict::StopAll,
 //!     });
-//!     let _ = group.add(reserve_id.clone(), membership!(reserve));
-//!     let _ = group.add(charge_id.clone(), membership!(charge));
+//!     // **The branch this recipe cannot do without.** `reserve` can end between
+//!     // these two calls; the policy answers `StopAll`; the group closes and
+//!     // retires what it holds. The second `add` then files nothing and answers
+//!     // `Added::Refused`, carrying the only `Retire` anybody has for `charge` —
+//!     // and the loop below rebuilds on `Member`, so a `let _ =` here would leave
+//!     // the old charge running and make the next set one actor too big.
+//!     if let Added::Refused(retire) = group.add(reserve_id.clone(), membership!(reserve)) {
+//!         retire.retire().await;
+//!         return Ok(group);
+//!     }
+//!     if let Added::Refused(retire) = group.add(charge_id.clone(), membership!(charge)) {
+//!         retire.retire().await;
+//!         return Ok(group);
+//!     }
 //!
 //!     // `membership!` clones, so the handles are still ours to publish — and
 //!     // publishing them is the half of a rebuild no verdict could have done.
@@ -202,7 +217,10 @@
 //! }
 //!
 //! loop {
-//!     let group = build(&reserves, &charges)?;
+//!     // A refusal means this group has already ended, so the `ended()` below
+//!     // answers with that ending and the rebuild happens on the next turn of
+//!     // this loop rather than in a second code path.
+//!     let group = build(&reserves, &charges).await?;
 //!     match group.ended().await {
 //!         // The one ending this loop is for.
 //!         GroupEnded::Member { .. } => continue,
@@ -218,8 +236,10 @@
 //! value [`ended`](Group::ended) reads, so the answer a caller receives is
 //! already the far side of teardown. The same locked step that takes the members
 //! off the books marks the group closed, so a stray [`add`](Group::add) on the
-//! old group hands its [`Retire`] straight back rather than filing a member into
-//! a group that watches nothing.
+//! old group answers [`Added::Refused`] and hands its [`Retire`] straight back
+//! rather than filing a member into a group that watches nothing. **Handing it
+//! back is not ending it**, which is the branch the factory above owes and the
+//! reason that factory is `async`.
 //!
 //! What that teardown *is* stays what [`Membership::new`] says and no more:
 //! every member's `retire` ran to completion, which for a
@@ -233,6 +253,12 @@
 //! [`GroupEnded::Dropped`] is why that match rebuilds on one arm and breaks on
 //! the rest: it is the ending with **no** teardown behind it, so its members are
 //! still running and a rebuild on it doubles the set.
+//!
+//! [`Added::Refused`] is that same doubling arriving on the arm this loop *does*
+//! rebuild on, which is why it is a variant of its own and not the `Some` a
+//! displacement also answered. A `Retire` dropped there is one live actor the
+//! next `build` knows nothing about, and `GroupEnded::Member` says nothing about
+//! it either — the group stopped watching it before it was ever filed.
 //!
 //! **Why this is a recipe and not a verdict.** Two reasons, and neither needs
 //! the other. A group-level rebuild produces new actors with new mailboxes —
@@ -416,13 +442,19 @@ pub struct Retire {
 }
 
 impl Retire {
-    /// End that member, and wait for it.
+    /// End that member, and wait for the `retire` closure's future to complete.
     ///
-    /// What awaiting this promises is what awaiting any ending in this crate
-    /// promises, and no more: the member's task is gone. It is **not** a promise
-    /// that the member's observers released what they held — a state that
-    /// flushes in `Drop` needs its own signal, exactly as
-    /// [`stop`](crate::LocalActor::stop) says.
+    /// What that means is whatever the closure does, and no more. For a
+    /// [`membership!`](crate::membership) member it means
+    /// [`abort`](crate::LocalActor::abort) was **issued** — `abort` is
+    /// cooperative, so a turn that never reaches an await point is not
+    /// interrupted and the task has not exited when this resolves. A caller who
+    /// needs the task gone writes a `retire` that awaits
+    /// [`stop`](crate::LocalActor::stop), and pays the backoff wait
+    /// [`Membership::new`] prices.
+    ///
+    /// It is also **not** a promise that the member's observers released what
+    /// they held — a state that flushes in `Drop` needs its own signal.
     ///
     /// Dropping this instead ends nothing. The actor runs for as long as
     /// whoever else holds a handle keeps it, which for a
@@ -437,6 +469,62 @@ impl Retire {
 impl fmt::Debug for Retire {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Retire").finish_non_exhaustive()
+    }
+}
+
+/// What [`Group::add`] did.
+///
+/// Three answers rather than an `Option<Retire>`, because two of them carry a
+/// [`Retire`] for **opposite** reasons: [`Displaced`](Self::Displaced) says the
+/// group is watching the new member and here is the one it replaced;
+/// [`Refused`](Self::Refused) says the group is watching nothing and here is
+/// your own member back. An `Option` spelled both of those `Some`, so the
+/// difference lived in a `#[must_use]` string — which is to say a caller had to
+/// read prose to learn which of two opposite things had happened, and the
+/// compiler could not help one who read it wrong.
+///
+/// **The cost of getting it wrong is not a stale value.** `add` consumed the
+/// [`Membership`], so a [`Refused`](Self::Refused) carries the only `Retire` in
+/// existence for an actor nobody watches. A `let _ =` on it drops that, and this
+/// module's rebuild recipe then runs again on the [`GroupEnded::Member`] arm and
+/// builds a second set beside the member it lost — the doubling the recipe warns
+/// about for [`GroupEnded::Dropped`], arriving on the arm that recipe is
+/// *written* to rebuild on.
+///
+/// **Exhaustive, where [`GroupEnded`] beside it is `#[non_exhaustive]`**, and
+/// what settles it is what a wildcard arm costs in each. An ending a caller does
+/// not recognise is still an ending, and `_ => break` is a reasonable thing to
+/// write about one. A wildcard **here** puts a caller back where the `Option`
+/// had them — one arm covering both a displacement and a refusal — which is the
+/// reading this type exists to make unwritable. Nothing is being held open for
+/// either: filed, displaced, refused is what an `add` does.
+#[must_use]
+#[derive(Debug)]
+pub enum Added {
+    /// Watching it, and nothing held that name.
+    Filed,
+    /// Watching the new member. This is the one it displaced.
+    ///
+    /// The replacement keeps the displaced member's position in the teardown
+    /// order — [`Group::add`] says why that is not a fresh registration.
+    Displaced(Retire),
+    /// The group had already ended. The member was **not** filed, and this is
+    /// it back.
+    ///
+    /// Nothing watches it and nothing else can end it. Retire it, or hold it
+    /// and mean that the actor runs on for whoever else has a handle.
+    Refused(Retire),
+}
+
+impl Added {
+    /// Whether the group filed the member and handed nothing back.
+    ///
+    /// The one question that has a `bool` answer, and it is the *absence* of a
+    /// [`Retire`]. It cannot stand in for a match: the two variants it collapses
+    /// are the two this type exists to keep apart.
+    #[must_use]
+    pub fn is_filed(&self) -> bool {
+        matches!(self, Self::Filed)
     }
 }
 
@@ -681,17 +769,15 @@ impl Group {
     /// only thing left to do with it, and the type says so.
     ///
     /// A group that has already ended watches nothing more, so `member` is not
-    /// filed and its `Retire` comes straight back rather than sitting where
-    /// nothing will look at it.
-    #[must_use = "the group is not watching this member — either `name` \
-                  displaced it, or the group had already ended and never filed \
-                  it; retire it, or say `let _ =` to mean that it runs on for \
-                  whoever else holds a handle"]
-    pub fn add(&self, name: ActorId, member: Membership) -> Option<Retire> {
+    /// filed and comes straight back as [`Added::Refused`] rather than sitting
+    /// where nothing will look at it. That is a different answer from
+    /// [`Added::Displaced`] and not a shade of it — the type carries the
+    /// difference, because the two cost a caller opposite things.
+    pub fn add(&self, name: ActorId, member: Membership) -> Added {
         let Membership { ended, retire } = member;
         let mut held = self.shared.lock();
         if held.closed {
-            return Some(retire);
+            return Added::Refused(retire);
         }
         // Every entry is stamped, and `Names`' own "the generation stamp, and
         // the race it is for" documents that race: without one, a displaced
@@ -717,20 +803,20 @@ impl Group {
             generation,
             retire,
         };
-        let displaced = match held
+        let answer = match held
             .members
             .iter()
             .position(|filed| filed.name == entry.name)
         {
-            Some(at) => Some(std::mem::replace(&mut held.members[at], entry).retire),
+            Some(at) => Added::Displaced(std::mem::replace(&mut held.members[at], entry).retire),
             None => {
                 held.members.push(entry);
-                None
+                Added::Filed
             }
         };
         drop(held);
         self.shared.wake.notify_one();
-        displaced
+        answer
     }
 
     /// Stop watching a member, without ending it and without asking the policy.
