@@ -13,6 +13,11 @@
 //!     _ => Verdict::StopAll,
 //! });
 //!
+//! // `let _ =` is honest HERE and the reason is local to these two lines: this
+//! // group is four lines old, so nothing has ended, nobody has stopped it, and
+//! // both names are free — `Added::Filed` is the only answer either call can
+//! // give. The rebuild recipe below is the same two calls where that stops
+//! // being true, and it branches instead.
 //! let _ = group.add(ActorId::new("reserve")?, membership!(reserve));
 //! let _ = group.add(ActorId::new("charge")?, membership!(charge));
 //! ```
@@ -1309,6 +1314,10 @@ async fn retire_all(members: Vec<Retire>) -> usize {
 /// macro does the cloning.
 ///
 /// ```ignore
+/// // The `add` is scaffolding here: what this shows is the argument. This
+/// // snippet names no group, so it cannot claim the discard is safe the way the
+/// // module's own example can — what to do with the `Added` an `add` answers is
+/// // on that type.
 /// let _ = group.add(ActorId::new("reserve")?, membership!(reserve));
 /// ```
 ///

@@ -50,6 +50,10 @@
 //!
 //! let retiring = system.clone();
 //! let retired = id.clone();
+//! // Discarded because this group cannot answer anything else yet: it is new,
+//! // and this is its first member. A group that may have ended between two
+//! // `add` calls must branch on `Added::Refused` instead — see the rebuild
+//! // recipe in `group.rs`.
 //! let _ = group.add(
 //!     id,
 //!     Membership::new(ended, move || async move {
