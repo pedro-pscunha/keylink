@@ -1329,6 +1329,22 @@ assert "the empty read names NOTHING TO PUSH before it names unknown" \
 #
 #         FAIL the installer treats a SIBLING worktree's .githooks as ours too
 #
+# I4. **Delete the blast-radius warning, which is what a tidy-up does to it.** The
+#     literal this record searches, carried inline as a backticked span:
+#     `    if [ "$worktrees" -gt 1 ]; then`
+#
+#     In `scripts/install-hooks.sh`, replace that line with `    if false; then`, so the
+#     script writes `core.hooksPath` across every worktree and says nothing about it.
+#     Watched:
+#
+#         FAIL the installer says how far the core.hooksPath write reaches
+#
+#     **This row exists because the WARNING was the fix.** F5 was that one installer run
+#     re-points five worktrees silently; a sentence announcing it, with nothing pinning
+#     the sentence, is one cleanup away from the silence coming back. The row reads the
+#     count the script DERIVED from `git worktree list` rather than a number written
+#     down, so it also fails if that derivation is replaced by a literal.
+#
 # I3. **Write an absolute value, reversing the decision.** Replace
 #     `git config core.hooksPath .githooks` with
 #     `git config core.hooksPath "$PWD/.githooks"`. Watched:
@@ -1384,7 +1400,16 @@ printf '#!/usr/bin/env bash\necho SCANNER\n' >"$scratch/global-hooks/pre-commit"
 chmod +x "$scratch/global-hooks/pre-commit"
 git config core.hooksPath "$scratch/paths/.githooks"
 git config hooks.chain "$scratch/global-hooks"
-./scripts/install-hooks.sh >/dev/null 2>&1
+#       CAPTURED rather than discarded, because the installer's blast radius is the
+#       thing it was silent about. This repository has five worktrees sharing one
+#       `core.hooksPath`, so one run re-points all five — and if the sentence saying so
+#       is itself unpinned, a tidy-up deletes it and the silence comes back. This
+#       scratch repository has TWO worktrees, and the count is derived from
+#       `git worktree list` rather than written down, so the row reads the number the
+#       script computed.
+./scripts/install-hooks.sh >"$pushlog" 2>&1
+assert "the installer says how far the core.hooksPath write reaches" \
+    grep -qF "reaches all 2 worktrees" "$pushlog"
 assert "the installer leaves a foreign hooks.chain alone" \
     test "$(git config --get hooks.chain)" = "$scratch/global-hooks"
 assert "the installer writes the relative core.hooksPath" \

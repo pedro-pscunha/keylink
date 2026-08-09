@@ -125,8 +125,13 @@ worktrees="$(git worktree list --porcelain | grep -c '^worktree ' || true)"
 git config core.hooksPath .githooks
 chmod +x .githooks/*
 
-if [ "$hooks_path_before" != ".githooks" ]; then
-    echo "core.hooksPath: ${hooks_path_before:-<unset>} -> .githooks"
+# Read BACK rather than restating the value written above. A message that repeats the
+# literal from the line before it cannot report that line changing; this one reads what
+# git now holds, so it stays true if the write above is ever edited.
+hooks_path_after="$(git config --get core.hooksPath || true)"
+
+if [ "$hooks_path_before" != "$hooks_path_after" ]; then
+    echo "core.hooksPath: ${hooks_path_before:-<unset>} -> $hooks_path_after"
     if [ "$worktrees" -gt 1 ]; then
         echo "  this is SHARED config (extensions.worktreeConfig is off), so the"
         echo "  change reaches all $worktrees worktrees. Each now runs the hooks in"
