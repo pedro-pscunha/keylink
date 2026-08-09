@@ -254,6 +254,29 @@ renumbers later variants and risks the misdecode `reply.rs:48-53` describes.
 
 ## 4. The work, in commits
 
+**Where things actually are, as commits land.** Every `file:line` above was
+measured at `b1f4422` and describes the tree BEFORE that commit. They are not
+edited as the wave proceeds — a pointer rewritten in place stops showing what was
+true when the instruction was written. This table is appended to instead.
+
+| after | fact | was | is |
+|---|---|---|---|
+| commit 1 (`ec242c2`) | private `Withheld` | `turns.rs:866` | `ObserverVerdict`, same line |
+| commit 2 (`c165009`) | `EndReason` decl | `console.rs:184` | `observe.rs:591` |
+| commit 2 | `From<&Ended>` | `console.rs:230` | `observe.rs:637` |
+| commit 2 | the re-export | `lib.rs:253` (`console` list) | `lib.rs:323` (`observe` list) |
+| commit 2 | `EndReason` links left in `console.rs` | `:41,42,179,384,390` | `:41,42,297,303` + field at `:164` (`:179` travelled with the type) |
+
+**Two source-prose lines went stale at commit 2 and are scheduled for commit 7,
+not fixed in place:** `console.rs:297` reads ``#[non_exhaustive]`, where
+[`EndReason`] beside it is not` — "beside" was literal when both types shared a
+file and is now figurative. The argument is unaffected: `FollowRefused` is
+sealed, `EndReason` is not, and neither changed.
+
+**`docs/audits/` is NOT updated, ever.** It is dated evidence — "written
+2026-08-09 against `main` at `0119504`" — and its citations are correct at that
+commit. Editing it would destroy the thing that makes it checkable.
+
 `lint-fast` is `cargo clippy -p keylink --lib` (`mise.toml:258`) — **library
 target only**. A green `pre-commit` is NOT proof a commit compiles. Every commit
 below must be verified with `cargo check --workspace --all-targets` **and**
