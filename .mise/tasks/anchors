@@ -1083,6 +1083,21 @@ ANCHORS = [
      "            Standing::Restarting(reason) => TurnLost::Restarting(reason),"),
     ("E4", "keylink/tests/observe.rs", "keylink/src/turns.rs",
      "            Err(TurnLost::Refused { name }) => Err(Undelivered::Refused { name }),"),
+    # F1 is the first row whose TARGET is `macros.rs`, and that is the point rather
+    # than an accident. `supervised_deep` is a generated door with no caller in the
+    # tree, and `Handle`'s `inner` field carries no `pub`, so it is also the only
+    # route a `service!` user has to `LocalActor::spawn_supervised_deep`. The break
+    # is the door's own line — the depth accepted and forwarded to the door that
+    # does not take one — and NOT the channel line inside `spawn_supervised_deep`,
+    # which `spawn_deep` shares word for word and which `D1`'s note already measures
+    # at count 2. Breaking the shared line would test the path both doors reach; the
+    # gap here is the one line only this door has.
+    #
+    # Whole line including its twenty spaces, so this is not the mode-4 shape `D3`
+    # was widened out of. Measured after the record was written: 1 in `macros.rs`,
+    # and the record lives in `cycles.rs`, so its own quote cannot raise that.
+    ("F1", "keylink/tests/cycles.rs", "keylink/src/macros.rs",
+     "                    inner: $crate::LocalActor::spawn_supervised_deep(factory, limit, depth),"),
     # ── from the ledger-limits PR. Both were measured with `grep -cF` AFTER the
     # record was written, which is the order that matters: adding a quote can only
     # RAISE a count, so measuring first reports a 1 that the record itself then
@@ -3049,7 +3064,18 @@ for record in sorted(set(REDNESS) - row_ids):
 # exception: this counts comment BLOCKS. `defer.rs`'s peer/local pairing gained a
 # SECOND break inside the doc block it already had, and `cycles.rs`'s
 # `Refuse::WhenFull` record gained a filter and a column measurement inside its own.
-RECORD_BLOCKS = 170
+#
+# 170 → 171, on `refused-item-notes`. ONE block: `cycles.rs` gains
+# `the_supervised_deep_door_takes_the_depth_it_was_given`, the guard for the one
+# generated spawn door nothing called. Read off the failing run — `FAIL population:
+# 171 comment blocks mention break-once.sh, but RECORD_BLOCKS says 170` — and not
+# from the diff, which is the rule this file has caught itself breaking twice.
+#
+# The `+1` and the measurement agree here, and that is worth the same sentence the
+# 154 entry above gets: agreement is not evidence. One record, one block, and no
+# second record hiding inside a doc block that already named the harness — which is
+# exactly how the 169 run found its fourth.
+RECORD_BLOCKS = 171
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a
