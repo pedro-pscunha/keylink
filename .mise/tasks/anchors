@@ -2641,6 +2641,28 @@ for record in sorted(set(REDNESS) - row_ids):
 # phrasings the walk knows and false in general, and a reader who takes it generally will
 # trust a green run to mean no record was added.
 #
+# **SUPERSEDED IN PART, and the reasoning above is why rather than despite.** The
+# paragraph is right that completeness is unreachable and right to fix the claim. What it
+# did not weigh is that the SUMMARY LINE is the only place a reader learns how blind the
+# tripwire is, so an under-wide `UNNAMED` does not merely leave records out - it prints a
+# blind figure smaller than the blindness, which reads as a bound. A THIRD phrasing family
+# was found doing exactly that: "Red-tested by", "Reddened by" and "Watched break" matched
+# neither population while sitting on unmistakable break records - `registry.rs`,
+# `representability.rs`, `turns.rs`'s own `mod tests`, and integration tests across
+# `actor_memory.rs`, `actors.rs`, `compose.rs`, `inspect.rs`, `mailbox_latency.rs` and
+# `persist.rs` among them.
+#
+# So `UNNAMED` now carries five phrasings, and the summary says the figure is a SAMPLE of
+# the blind spot rather than its size - which is this paragraph's own argument, stated
+# where the number is printed instead of only here. Measured off the run, never computed:
+# the widened population went 227 -> 248 and the blind figure 57 -> 78. `RECORD_BLOCKS`
+# counts `HARNESS` alone and did not move, which was checked rather than assumed.
+#
+# The two figures are NOT the same measurement as "24 blocks say Watched and match no
+# signal", which is what pointed here. That counted a WORD; this counts three phrasings.
+# Some of those 24 say "Watched" only in a sentence quoting output, and some records this
+# now catches never say the word at all.
+#
 # ── THE METHOD, because this number now fails the build when it moves ─────────
 #
 # A reviewer measured 86 where this says 98. Both are right for their own
@@ -2997,6 +3019,21 @@ for record in sorted(set(REDNESS) - row_ids):
 # The agreement is recorded because hiding it would make the run look load-bearing in
 # a way this one was not, and the run is kept because the NEXT one will be.
 #
+# 165 → 166, at `81eabe9` on `reply-not-gone`, and **it landed with no entry here** -
+# written in afterwards, from git rather than from memory, which is why it is thinner
+# than its neighbours. `git show <sha>:.mise/tasks/anchors` over the branch puts the
+# move at that commit and nowhere else: 165 through `6502cc8`, 166 at `81eabe9`, 170
+# at `e3047da`. ONE block, in `keylink/tests/defer.rs` - the record on
+# `a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_actor`,
+# which was an `is_err()` assertion with no record at all and gained both the variant
+# and the break in that commit. Verified as the only one: `+1` added line matching
+# `break-once.sh` across the whole diff, `+0` in every other file.
+#
+# **The gap is the finding, not the number.** A constant that fails the build on
+# movement was moved correctly and silently, so the ledger below it described a tree
+# one step behind while every gate step stayed green - the entry is what makes the
+# next reader able to tell a bump from a rebase, and a bump with no entry spends that.
+#
 # 166 → 170, on the `reply-not-gone` branch. Four new guards, four new records, and
 # **the run is what caught the fourth**: the first failing run printed 169, because
 # the record in `turns.rs`'s own `mod tests` said only "Made red twice" and named no
@@ -3014,12 +3051,16 @@ for record in sorted(set(REDNESS) - row_ids):
 # `Refuse::WhenFull` record gained a filter and a column measurement inside its own.
 RECORD_BLOCKS = 170
 
-# The one marker the tripwire counts, and the two phrasings records use INSTEAD of
-# naming the harness. Both are read by the same walk, so the blind spot below is a
+# The one marker the tripwire counts, and the phrasings records use INSTEAD of
+# naming the harness. All are read by the same walk, so the blind spot below is a
 # subtraction between two figures measured by one loop on one tree - never a
 # constant, and never two snapshots taken at different times.
+#
+# `UNNAMED` is a SAMPLE and not the population, and the summary line says so. Any
+# record phrased outside these five is invisible to both figures, which is the
+# argument the header makes at length where the first widening was declined.
 HARNESS = "break-once.sh"
-UNNAMED = ("Made red", "Red under")
+UNNAMED = ("Made red", "Red under", "Red-tested by", "Reddened by", "Watched break")
 
 # ── THE WALK COVERS WHAT A `lives_in` CAN BE, AND THAT IS THE WHOLE RULE ───────
 #
@@ -3260,9 +3301,9 @@ print(
 # walk over ONE tree - so this cannot become a snapshot of a tree that has moved,
 # which is what happened to each of the three triples the header lists.
 print(
-    f"    widened to \"{UNNAMED[0]}\" and \"{UNNAMED[1]}\" the walk finds "
+    "    widened to " + ", ".join(f'"{p}"' for p in UNNAMED) + f" the walk finds "
     f"{len(marked_blocks)} record blocks, so {blind} name no harness and the "
-    "tripwire above is blind to them"
+    "tripwire above is blind to them - a SAMPLE of the blind spot, never its size"
 )
 print(
     f"    {len(REDNESS)} of the {len(ANCHORS)} rows carry a WATCHED REPLAY - "

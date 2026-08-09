@@ -3292,6 +3292,13 @@ pub enum NotQueued {
     /// doors, and carries the same message: the actor is **still running** — it is
     /// running the turn this call was made from.
     ///
+    /// `TurnLost::Reentrant` carries it too, so this sentence lives on three enums.
+    /// `every_turn_lost_except_faulted_has_one_undelivered_twin_with_the_same_words`
+    /// holds all three, this one through `From<NotQueued> for Undelivered` — the
+    /// widening the crate actually performs, so the guard cannot agree with a
+    /// mapping no caller takes. It was kept in step by hand until then, and
+    /// this paragraph said so without saying that nothing enforced it.
+    ///
     /// The two doors that answer this are refused under **different halves** of
     /// the rule, and the private `Refuse` parameter is what says which.
     /// [`stop`](LocalActor::stop) waits for an ending only the blocked turn can
@@ -4807,8 +4814,7 @@ mod tests {
         }
     }
 
-    /// One fact reads as one sentence, whichever of the two doors a caller came
-    /// through.
+    /// One fact reads as one sentence, whichever door a caller came through.
     ///
     /// [`ask_catching`](LocalActor::ask_catching) answers [`TurnLost`] and
     /// [`ask`](LocalActor::ask) answers [`Undelivered`], and every variant of the
@@ -4816,6 +4822,33 @@ mod tests {
     /// about one condition is what an operator reads as two conditions — and the
     /// texts were kept in step by hand until this test, with `Reentrant` already
     /// byte-identical across the pair and nothing holding it there.
+    ///
+    /// # Three enums, because two was the shape of the wave and not of the crate
+    ///
+    /// [`NotQueued`] is the third, and it was outside this guard while its own
+    /// [`Reentrant`](NotQueued::Reentrant) doc asserted it "carries the same
+    /// message" as the other two. It does, by hand: one edit to any of those three
+    /// strings and a `notify`, `tell` or `stop` caller prints one sentence for a
+    /// deadlock refusal while an `ask` caller prints another, about one condition,
+    /// with every gate step green. That is the state this test's first paragraph
+    /// describes, surviving one enum past the pair it was written for.
+    ///
+    /// **The mapping is `From<NotQueued> for Undelivered` rather than a third
+    /// helper**, so the walk reads the conversion the crate performs instead of a
+    /// copy that could quietly agree with nothing. It carries the compile error
+    /// too: that impl is exhaustive over `NotQueued`, so a third state there is
+    /// `error[E0004]` on **production** code rather than on a test's own match.
+    ///
+    /// The property is injectivity and not the exactly-once above, because two
+    /// states are being checked against a six-slot space: each `NotQueued` state
+    /// widens to a distinct `Undelivered`, and the two assertions are two-sided on
+    /// purpose — `<= 1` alone is satisfied by a walk that ran zero times, so the
+    /// count of written slots is asserted against the sample's own length.
+    ///
+    /// The name still says *undelivered twin*, which now undersells the body by
+    /// one enum. Left as it is deliberately: the name is what a filter is typed
+    /// against and what §4.11 of RFC-07 records, and a name that asserts less than
+    /// the body is not the failure mode this file is about.
     ///
     /// # Rust has no reflection over variants, so this cannot enumerate them
     ///
@@ -4857,7 +4890,7 @@ mod tests {
     /// produces `[2, 1, 1, 1, 0, 1]`, a doubled slot **and** an empty one, so it
     /// reddens under either reading and does not separate them.
     ///
-    /// # Four assertions, each against a way this could hold for nothing
+    /// # Every assertion is against a way this could hold for nothing
     ///
     /// The sentences are compared between two values built from literals, so
     /// neither side is derived from the other's text — the tautology this shape
@@ -4865,15 +4898,17 @@ mod tests {
     /// subset; `without_a_twin` refuses a [`twin`] that answers `None` to
     /// everything and so skips every comparison; the distinct-sentence count
     /// refuses two variants copy-pasted to one text, which the pairwise equality
-    /// cannot see; and the emptiness check refuses `#[error("")]` on a pair, which
-    /// satisfies the equality and says nothing.
+    /// cannot see; the emptiness check refuses `#[error("")]` on a pair, which
+    /// satisfies the equality and says nothing; and the widened-slot count refuses
+    /// a `NotQueued` walk that ran zero times, which the `<= 1` beside it would
+    /// otherwise pass.
     ///
-    /// Made red twice by `scripts/break-once.sh keylink/src/turns.rs`, because one
-    /// break exercises the equality and the other the coverage, and one alone
-    /// would leave half of this defended by prose. Both edits are in **this**
-    /// file, so neither is quoted — a record quoting its own search literal is a
-    /// second occurrence and the harness aborts at "found 2". The filter for both
-    /// is this test's own name, plus `-p keylink --lib`:
+    /// Made red three times by `scripts/break-once.sh keylink/src/turns.rs`, one
+    /// per property, because any one alone leaves the rest defended by prose. All
+    /// three edits are in **this** file, so none is quoted — a record quoting its
+    /// own search literal is a second occurrence and the harness aborts at
+    /// "found 2". The filter for all three is this test's own name, plus
+    /// `-p keylink --lib`:
     ///
     /// - change one character of [`Undelivered::Dropped`]'s `#[error]` text — the
     ///   whole attribute line is unique in this file, so it is what the harness is
@@ -4888,6 +4923,22 @@ mod tests {
     ///   before the emptied one. The prediction named the arm that was edited
     ///   rather than the arm that fires, which is the sentence a reader would
     ///   otherwise search the log for and not find.
+    /// - point `From<NotQueued> for Undelivered`'s `Closed` arm at
+    ///   `Self::Reentrant`. Its arm line is unique in this file where **neither
+    ///   `#[error]` attribute is** — both of `NotQueued`'s texts are byte-identical
+    ///   to an `Undelivered` variant's in this same file, which is the fact the
+    ///   test exists to hold and also the reason the string cannot be the anchor.
+    ///   Watched: `one fact must read as one sentence: Closed and Reentrant`,
+    ///   `left: "the actor is no longer running"`,
+    ///   `right: "this call was made from inside the target actor's own turn: it
+    ///   would deadlock"`.
+    ///
+    ///   The injectivity assertion beside it **cannot be reddened on its own
+    ///   today, and that follows from the texts rather than from a search**: the
+    ///   two `NotQueued` sentences differ, so any collapse of the mapping also
+    ///   pairs one of them with an `Undelivered` whose text is the other's — the
+    ///   equality fires first, as it did above. It guards a future in which a third
+    ///   `NotQueued` state widens onto a slot already taken.
     ///
     /// Both runs also print `panicked at .. : twin` above the failure, from the
     /// `catching` below. That is the [`Faulted`](TurnLost::Faulted) sample being
@@ -4942,6 +4993,32 @@ mod tests {
         assert!(
             words.iter().all(|text| !text.is_empty()),
             "an empty `#[error]` makes every equality above hold for nothing",
+        );
+
+        // The third enum. `From` is the mapping rather than a fourth helper: it
+        // is the conversion the crate performs, so this reads the production
+        // widening instead of a copy of it that could agree with nothing.
+        let queued = [NotQueued::Closed, NotQueued::Reentrant];
+        let mut widened = [0u32; EVERY.len()];
+
+        for one in &queued {
+            let mine = Undelivered::from(*one);
+            assert_eq!(
+                one.to_string(),
+                mine.to_string(),
+                "one fact must read as one sentence: {one:?} and {mine:?}",
+            );
+            widened[slot(&mine)] += 1;
+        }
+
+        assert!(
+            widened.iter().all(|count| *count <= 1),
+            "two `NotQueued` states must not widen onto one `Undelivered`: {widened:?}",
+        );
+        assert_eq!(
+            widened.iter().filter(|count| **count == 1).count(),
+            queued.len(),
+            "every `NotQueued` state is widened exactly once: {widened:?}",
         );
     }
 
