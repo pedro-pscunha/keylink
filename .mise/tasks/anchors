@@ -62,6 +62,20 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 #    bare** - so re-indenting either record's quote to match the code would abort
 #    it. Do not tidy it.
 #
+#    **AND ONE ADDED QUOTE CAN REDDEN TWO ROWS, because rows share literals.**
+#    Measured over the registry: `keylink/src/idempotency.rs` is the target of
+#    THREE pairs that each share one literal - `R15`/`R16`, `A2`/`A2b` and
+#    `A3`/`A4`. A count is a property of the LITERAL, not of the row, so a single
+#    new quote of any of those three takes that literal from 1 to 2 and **both**
+#    rows abort together. This multiplies mode 1 rather than adding to it: the
+#    same-file trap says a quote can collide, and this says the blast radius of one
+#    collision is two rows in that file, four elsewhere by the same arithmetic
+#    (`C5`/`C5b` in `call.rs`, `C8`/`C8b` in `middleware.rs`, `P1`/`P2` in
+#    `actor/remote.rs`, `H2`/`H3` and `H6`/`H7` in `.githooks/pre-push`).
+#
+#    The practical form: **after adding any quote, count the literal and not the
+#    row** - then check whether another row shares it.
+#
 #    **AND THE OPPOSITE CASE EXISTS, so read which one you are in before acting.**
 #    `H6` and `H7` also carry load-bearing indentation and for the reverse reason:
 #    their `lives_in` is `scripts/hook-guard.sh` while their `target` is
@@ -93,6 +107,46 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 # The question that reaches all four: **is the anchor's uniqueness a property of
 # the LINE, or of its NEIGHBOURS?** — with the sharpening mode 4 forces, that a
 # fragment is not a line at all.
+#
+# ── A METHOD, NOT A MODE: A NUMBER-SHAPED SWEEP CANNOT DECIDE A BORROWED VALUE ─
+#
+# This one is about records generally rather than about anchors, and it is a METHOD
+# because it says how to reach a verdict rather than naming a way something rots.
+#
+# **A sweep that matches "a number inside a recorded output" cannot tell a BORROWED
+# value from a COINCIDENCE. Only tracing the break's data flow can.** Measured
+# 2026-08-08: of five sites a number-shaped sweep reported as borrowed, **two were
+# OWNED by their own test** — one constant and one test argument happened to be the
+# same number, so one figure had two candidate owners and the sweep could not see
+# which. The same collision appears where two limits are equal by intent, and again
+# where a same-named helper in a different file owns the value.
+#
+# The deciding step is **which operand survives the break.** A value that is read,
+# passed on and then clamped against another can be reported by either side, and
+# which side depends on what the substitution does — so it differs per break, and no
+# pattern over the text reaches it.
+#
+# So there are THREE verdicts and not two:
+#
+#   BORROWED     the record is quoting a value it does not own. Name the constant.
+#   OWNED        the test supplies the value itself. Leave it, and say a sweep will
+#                re-flag it, so the next sweep does not re-open a closed question.
+#   CONDITIONAL  the figure IS derivable from its own file and rots only under a
+#                stated change. Keep it and state the condition — **replacing a
+#                derivable number is a new false claim in the direction of
+#                tidiness**, which is the failure that looks like diligence.
+#
+# ── AND THE HAZARD THAT TRAVELS WITH IT ───────────────────────────────────────
+#
+# **A reader who has just been convinced by an argument is the least likely person to
+# audit the transcription beneath it.** So check a record against the rule it argues
+# for LAST, and never read the argument as evidence that the record already complies.
+#
+# The general form is worth more than the instance: a record can argue correctly that
+# a value must be derived, and then spell that value out a few lines below inside the
+# same block. The argument reads as the check having been done. The offending figure
+# is deliberately not quoted here, because quoting it would put the borrowed value
+# back into a file arguing against borrowing it.
 #
 # ── THE REMEDY THAT DISSOLVES "THE EDIT SITE SPANS SEVERAL LINES" ─────────────
 #
@@ -400,8 +454,19 @@ ANCHORS = [
     # published bytes is `78063835b32825bd..`, the recorded prefix exactly, so the
     # refused address is the published blob's and not the unpublished control's. That
     # makes the reconstruction consistent with the replacement's semantics rather than
-    # a guess, and it leaves exactly one thing open: whether this pair compiles and
-    # prints that line. `mise run replay-anchors` on R28 is what closes it.
+    # a guess.
+    #
+    # **AND THE PAIR NOW COMPILES, measured — so what is open is narrower than it was.**
+    # Compiled in an isolated `git archive` of `25cbbac` with its own target directory,
+    # live tree untouched: the unperturbed control exits 0, the NEW pair COMPILES, and
+    # **the OLD pair provably does not** — `error[E0425]: cannot find function, tuple
+    # struct or tuple variant None in module $crate`, which is the failure this record's
+    # earlier version claimed as a watched panic.
+    #
+    # So the tiers are now: the OUTPUT was observed (BLAKE3), the SUBSTITUTION is a legal
+    # program (compiled), and **the REDNESS is still unreplayed**. A compile check says
+    # the break can be built. It says nothing about whether it reddens the guard this
+    # record names, and `mise run replay-anchors` on R28 is still what closes that.
     #
     # **Still a FRAGMENT, so `FRAGMENT_ANCHORS` below is unchanged**: the line
     # continues `, )+`, so the whole line would drag the repetition's comma and closer
@@ -482,12 +547,25 @@ ANCHORS = [
     # whole line, which is mode 4's own remedy. C6 was the one instance left out of
     # line with it.
     #
-    # Measured on this tree, after the record edit landed and before this row moved:
-    # the whole line at `keylink/src/call.rs:580` counts **1** at its eight spaces of
-    # indentation, because the record quotes it UNINDENTED. That asymmetry is the whole
-    # mechanism, and it is fragile in one direction only - had the record quoted the
-    # line WITH its indentation, the count would be **2** and this row would abort at
-    # `break-once.sh`'s count assert. Measured both spellings before trusting one.
+    # ── DO NOT TIDY THIS ROW'S INDENTATION. All four spellings measured in
+    # `keylink/src/call.rs`, so the number attaches to the spelling it belongs to:
+    #
+    #   1   the REGISTERED form - the whole line at its eight spaces
+    #   2   the same line BARE - the code at 580 plus the record's wide quote
+    #   1   the retired narrow form, indented
+    #   3   the retired narrow form, bare
+    #
+    # **So stripping this row's indentation gives count 2 and an abort**, and the abort
+    # names uniqueness rather than whitespace, so the cause reads as anything but the
+    # eight spaces.
+    #
+    # **The both-spans decoupling is what raised those figures, and it was a deliberate
+    # trade.** The record quotes this line TWICE - narrow and wide - so that the row and
+    # the record could land in either order. That took the bare wide form from 1 to 2 and
+    # the bare narrow form from 2 to 3. Indentation is now the only thing disambiguating
+    # either. Worth stating because the decoupling that removed a sequencing hazard
+    # created a tidying one, and a reader who knows only the first will not expect the
+    # second.
     #
     # **The replacement widened by the same suffix, and it had to.** It is now
     # `(self.bound, self.answers.iter().map(|(c, a)| (*c, a)).collect::<Vec<_>>()).serialize(serializer)`.
@@ -496,6 +574,16 @@ ANCHORS = [
     # where `Result<S::Ok, S::Error>` is wanted - a COMPILE error instead of the
     # recorded assertion, which is R28's defect exactly. Anchor and replacement widen
     # together or not at all.
+    #
+    # **Both halves of that are now MEASURED rather than reasoned**, in the same isolated
+    # archive of `25cbbac` as R28's: the widened pair COMPILES, and the mismatched pair -
+    # wide anchor with the narrow replacement - fails with
+    # `error[E0308]: mismatched types`. So the trap this paragraph warns about is a
+    # watched failure and not a prediction.
+    #
+    # **The redness is still unreplayed.** Compiling says the substitution is a legal
+    # program; it says nothing about which guard goes red. That is `replay-anchors`' job
+    # and no gate runs it.
     #
     # **C6 therefore LEAVES `FRAGMENT_ANCHORS`, in this same edit.** The whole-line
     # test reads the row's literal against its enclosing line, so the two must move as
@@ -1249,9 +1337,9 @@ MARKERS = ("///", "//!", "//")
 #
 # **That safety is a property of the CONSUMER, not of the reader, and the walk now reads
 # hash-commented files - so the question is no longer hypothetical. MEASURED, and the
-# answer is that the hazard is REAL AND INERT.** Counted over the two hook files on
-# 2026-08-08 (-03:00) by scanning heredoc bodies and intersecting them with this reader's
-# blocks:
+# answer is that the hazard is REAL AND INERT.** Counted by scanning heredoc bodies and
+# intersecting them with this reader's blocks, against `scripts/hook-guard.sh` and
+# `.githooks/pre-push` **as they stand at `97b29b7`**, on 2026-08-08 (-03:00):
 #
 #   * `.githooks/pre-push` has **no heredoc at all** - 0 lines inside one.
 #   * `scripts/hook-guard.sh` has five heredocs, **15 lines** inside them, **5** of those

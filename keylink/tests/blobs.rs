@@ -1221,8 +1221,10 @@ async fn a_blob_response_carries_the_reply_and_the_address_together() {
 ///
 /// **That is MEASURED now rather than inferred, which makes the repair necessary
 /// rather than tidy.** A positive control compiled both pairs against an isolated
-/// archive of `25cbbac`: the OLD pair FAILS to compile, the NEW pair COMPILES. The
-/// recorded error appears verbatim —
+/// archive of `25cbbac`, on 2026-08-08: the OLD pair FAILS to compile, the NEW pair
+/// COMPILES. Dated because it is a claim about one tree and one toolchain, and a
+/// re-measurer on a later tree is entitled to know which. The recorded error appears
+/// verbatim —
 /// `error[E0425]: cannot find function, tuple struct or tuple variant None in
 /// module $crate`.
 ///
@@ -1238,20 +1240,24 @@ async fn a_blob_response_carries_the_reply_and_the_address_together() {
 /// still `mise run replay-anchors` and nothing else, exactly as the reconstruction
 /// paragraph above says.
 ///
-/// **Both spans are quoted here on purpose, and the narrow one is not dead weight.**
-/// `mise run anchors` requires the registered literal to appear as a whole
-/// backticked span somewhere in this file, so a record quoting the old anchor *and*
-/// the new one satisfies that check whichever of the two the row currently names.
-/// That is what lets the registry row and this record be edited in either order, and
-/// it means neither half can redden alone — including after a later revert of either
-/// one. Delete `__keylink_granted_id!` above and the row's own history stops
-/// resolving.
+/// **The narrow anchor is quoted above as HISTORY, and that is the whole reason it
+/// is there.** The paragraphs before it explain why the old pair could not produce
+/// the recorded output, and that explanation is about one specific substitution, so
+/// it has to name it. `__keylink_granted_id!` → `None` is the thing that fails to
+/// compile, and an account of it that will not quote it stops parsing. The quote is
+/// part of the argument rather than a device.
 ///
-/// **That deletion is the obvious tidy-up, and it has already been made and undone
-/// twice.** The narrow span reads as a leftover, because nothing in the file says
-/// what it is for. This paragraph is what stops a third round: the quote is load
-/// bearing precisely when the registry disagrees with it, which is the one moment
-/// nobody is looking at this file.
+/// **It is NOT kept to satisfy `mise run anchors`, and saying so matters because the
+/// reason it once had has expired.** The registry is committed carrying the wide
+/// literal, so the wide span is what the record-quote check reads and the narrow one
+/// contributes nothing to it. For a while the pair existed so that the row and this
+/// record could be edited in either order, and that problem is spent. A reason that
+/// has lapsed is precisely what gets a quote deleted later, so it is retired here in
+/// writing instead of being left to be rediscovered as dead weight.
+///
+/// **Deleting the narrow quote has already been proposed and reversed twice.** It
+/// reads as a leftover to anyone who checks only whether the gate still needs it,
+/// and the gate does not. What needs it is the reader of the paragraph above.
 #[tokio::test]
 async fn a_keyed_actors_blob_method_grants_the_address_it_returns() {
     let server = local_node().await;
