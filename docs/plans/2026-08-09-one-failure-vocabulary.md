@@ -265,10 +265,22 @@ minutes and parallel buys conflicts in the largest file in the crate. **Run
 | 6 | delete the prefix machinery | no | rows `O2` + records | 14 |
 | 7 | RFC/README/CONTRIBUTING appends | no | no | no |
 
-**Commit 1 is not a pure rename.** It re-quotes AND re-watches the record at
-`tests/observe.rs:446,448` (row `anchors:1720`). `anchors` is step 2 of
-`pre-commit`, so the commit cannot land while row and record disagree. Count the
-new literal's uniqueness **after `cargo fmt`**.
+**Commit 1 re-quotes row `O1` but does NOT re-watch it.** Earlier revisions said
+it must re-watch, and §8 said re-quote only; §8 was right. The watched text at
+`tests/observe.rs:449-450` is `left: Refused { name: "exploding" }` /
+`right: ObserverPanicked { name: "exploding" }` — those are `Answered` and
+`Undelivered` names, untouched by renaming the private `Withheld`. Re-quote the
+literal (row `anchors:1720`, quotes at `tests/observe.rs:446,448`) in the same
+commit, and count its uniqueness **after `cargo fmt`**. `anchors` is step 2 of
+`pre-commit`, so the commit cannot land while row and record disagree.
+
+**`O1` IS re-watched at commit 5**, and no earlier revision said so: the collapse
+changes the watched text, because `tests/observe.rs:456` asserts
+`Undelivered::ObserverPanicked { name }`.
+
+**Per-commit verification must include `cargo nextest run --workspace`.**
+`cargo check --all-targets` and `mise run docs` cannot see a red suite, and the
+sites that "fail at run time" are green to both.
 
 **Commit 5 is the big one, and it is deliberately not split.** It carries: public
 `Withheld`; the `TurnLost`/`Unanswered` collapse; the `RemoteError` reshape; the
@@ -326,7 +338,8 @@ failing run, never compute it.**
 |---|---|
 | One object both sides | `a_local_caller_and_a_peer_read_the_same_withheld`, asserting **value equality of two `Withheld`s** for the **four** conditions of §2.3, plus `Panicked` served-side only |
 | The consts are gone | `rg 'PANICKED\|OBSERVER_PANICKED\|RESTARTING\|DROPPED\|REFUSED' keylink/src` — scoped to `keylink/src`, NOT `reply.rs`: the five exist **twice**, at `reply.rs:154/161/181/189/206` and as aliases at `turns.rs:4501-4505`. Expect residue at `admission.rs:77` (`const REFUSED: u32 = 1;`, unrelated — do not touch) |
-| Every former producer is typed | enumerate `turns.rs:4547,4554,4562,4618,4639` and assert each by name |
+| Every former producer is typed | enumerate `turns.rs:4547,4554,4562,4618,4639` **and `:4644`** — the `Standing::Gone` arm is the wave's ONLY peer-visible behaviour change and every earlier revision left it untested |
+| `Gone` crosses as a typed variant | after the wave **five** conditions are both-sided, not four. The equality test must assert `Gone` too, and it is the newest one |
 | `Failed` has no in-crate producer | `rg 'RemoteError::Failed\(\|Self::Failed\(' keylink/src` returns only the carved-out `turns.rs:4775` and any break-record doc line. **There is no `Middleware` producer to expect** — it lives in user code (`rpc.rs:1438`) |
 | The hash moved once | both pins updated in commit 5 from one failing run, release note written naming **both** tests — `CONTRIBUTING.md:197-210` names only the first |
 | Nothing regressed | `mise run gate` (18 steps), `cargo nextest run --workspace`, `mise run anchors`, `mise run replay-anchors`, `mise run docs` under `-D warnings` |
@@ -339,11 +352,30 @@ untouched, so `replay-anchors` is safe. Stated so nobody re-checks it.
 
 ## 7. The consumers — the actual bulk of this wave
 
-**Test sites: at least 27, and the plan asserts no total.** Three separate
-measurements gave 16, 20 and 27; each enumeration was incomplete rather than
-mis-added. **The predicate, not the count, is the instruction: every test site
-that matches on `RemoteError::Failed` text or on a prefix.** The verification is
-`cargo nextest run --workspace` green, not a tally.
+**There are TWO disjoint test surfaces, and revisions 1–3 enumerated only one.**
+
+**Surface A — the prefix consumers.** Sites matching on `RemoteError::Failed`
+text or on a prefix const. Measurements: 16, 20, 27. Each enumeration was
+incomplete rather than mis-added.
+
+**Surface B — the collapse consumers.** Sites naming a collapsing
+`Undelivered::` or `TurnLost::` variant. Measurements: 28 lines across 5 files,
+then 56 across 6 (`defer.rs` 15, `cycles.rs` 15, `observe.rs` 14,
+`supervision.rs` 7, `persist.rs` 4, `singleton.rs` 1) on a pattern that also
+matched `TurnLost::`.
+
+**The overlap between A and B is zero**, and B is the larger. `cycles.rs:208-215`
+and `:292-298` are **exhaustive `match` arms naming every collapsing variant by
+hand, `Expired` included** — they cannot compile after the collapse. Revisions
+1–3 named `cycles.rs` only to EXCLUDE it as a break-record false positive, and
+never as a test site at all.
+
+This matters because §4 makes commit 5 atomic and hands it "every test site that
+stops compiling". Surface B **is** most of that set.
+
+**The instruction is the predicate, never a total**, and there are two of them:
+every site matching on `Failed` text or a prefix, and every site naming a
+collapsing variant. The verification is `cargo nextest run --workspace` green.
 
 The enumerated floor, which is a starting point and not a boundary. Three use
 the const and break at compile time
@@ -366,8 +398,12 @@ site above routes through.
 — decide whether `AtCapacity`'s `#[error]` keeps the sentence *"the actor system
 is at its capacity of 10000 live actors"*), `tests/actors.rs:836`
 (`contains("capacity")`), `tests/actors.rs:468` and `:3144`
-(`contains("actor id")`). Also `representability.rs:105,855`, which is
-`#[cfg(test)]` so `cargo check` alone will not report it.
+(`contains("actor id")`).
+
+`keylink/src/representability.rs:105,855` belongs to **commit 3, not commit 5** —
+both lines name `Undelivered` only (`:105` an import, `:855` a type annotation),
+neither names `RemoteError`. It is `keylink/src/`, not a `tests/` path, and it is
+`#[cfg(test)]` (`lib.rs:234-235`), so `cargo check` alone will not report it.
 
 **Intra-doc links: ~122 OCCURRENCES, ~75 doc LINES, measured at `b1f4422`.**
 State the unit, because the two figures differ and both are true: a doc line can
@@ -405,8 +441,11 @@ breaks a declared proof unless the script moves in the same commit.**
 `actor/remote.rs:765` (`[`RemoteError::DROPPED`]`). Stale prose accompanies them
 at `error.rs:61`, `protocol.rs:1178` and `README.md:187,195`.
 
-**`README.md:143,184,185,187,194.** Line 187 states the wire rendering this wave
-deletes and needs a rewrite, not a rename. `CONTRIBUTING.md` carries one affected
+**`README.md:143,184,185,187,194,195` — SIX lines, not five.** Both `:187`
+(`Failed("observer refused: ..")`) and `:195`
+(`Failed("observer panicked: ..")`) state a wire rendering this wave deletes and
+need a rewrite, not a rename. **No gate reads `README.md`**, so nothing catches
+a survivor. `CONTRIBUTING.md` carries one affected
 line (`:282`) that the collapse does not change.
 
 **`NodeStatus::lost` → `dropped` is exactly three code sites**: `console.rs:317`
@@ -414,7 +453,9 @@ line (`:282`) that the collapse does not change.
 must NOT move, including the byte-identical `EventPage::lost` at
 `console.rs:352`, 35 lines away. **Forbid a file-wide substitution in
 `console.rs`.** Three doc passages carry the old wording and no compiler reads
-them: `console.rs:95-96`, `:101`, `:814`. `lost` is also a free function
+them: `console.rs:101` and `:814` — but **`console.rs:95` carries the intra-doc link
+`` [`NodeStatus::lost`] ``, so `mise run docs` under `-D warnings` DOES read it
+and fails on it after the rename.** `lost` is also a free function
 (`turns.rs:4616`), an `Events` field and method (`console.rs:507,558`), a
 parameter (`turns.rs:4938`) and a local (`turns.rs:5102,5424`,
 `console.rs:818`) — **item 7 renames the `NodeStatus` field and nothing else.**
@@ -477,9 +518,13 @@ rename-ledger append per affected RFC file, saying the names moved and at which
 commit. An implementer reading "80 lines affected" and rewriting history is the
 failure this paragraph exists to prevent.
 
-**Twelve lines sit inside break-record rows** (`rfc-04:3706`; `rfc-07:1090`,
-`:1104`, `:1112`, `:1113`, `:1122`, `:1123`, `:2900`, `:3746`, `:3754`) and are
-edited in place **only after** the carve-out is widened per §2.6.
+**TEN lines sit inside break-record rows** — earlier revisions said twelve while
+enumerating ten: `rfc-04:3706`; `rfc-07:1090`, `:1104`, `:1112`, `:1113`,
+`:1122`, `:1123`, `:2900`, `:3746`, `:3754`. Of those, **`rfc-04:3706` needs no
+widening** — it names a method and a file path, which
+`CONTRIBUTING.md:337-338`'s existing carve-out already covers. The other nine
+quote search literals and are edited in place **only after** the carve-out is
+widened per §2.6.
 
 **Counts and watched output are appended, never edited**: `rfc-07:4345-4351`,
 `:4479-4493`, `:4511`, `:4530`, `:4554`, `:4580-4587`, `rfc-08:886`.
