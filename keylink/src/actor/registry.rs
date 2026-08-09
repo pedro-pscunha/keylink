@@ -1310,7 +1310,7 @@ pub struct ActorStatus {
 /// hook, so `std`'s default one prints at the fault before the unwind is caught.
 ///
 /// [`Events`]: crate::Events
-/// [`NodeStatus::lost`]: crate::NodeStatus
+/// [`NodeStatus::lost`]: crate::NodeStatus::lost
 pub trait Lifecycle: Send + Sync + 'static {
     /// An actor is now mounted under `id` and its task is running.
     ///
