@@ -25,6 +25,7 @@
 //! | one wake drains every pending add | `adds_made_while_the_policy_runs_are_all_watched` |
 //! | a policy that panics ends the group instead of orphaning it | `a_policy_that_panics_ends_the_group_rather_than_orphaning_it` |
 //! | a group nobody holds answers its waiters instead of hanging | `a_dropped_group_ends_as_dropped_and_leaves_its_members_running` |
+//! | a `stop` survives the last `Group` dropping in the same breath, and `Dropped` still fires for a group nobody stopped | `a_stop_survives_the_last_group_dropping_in_the_same_breath` |
 //! | members are reported in the order they were added | `members_are_reported_in_the_order_they_were_added` |
 //! | a member asleep in a backoff is retired without waiting it out | `a_member_asleep_in_backoff_is_retired_without_waiting_out_its_backoff` |
 //! | an ending that panics ends the group and names the member it was awaiting | `an_ending_that_panics_ends_the_group_as_ending_panicked` |
@@ -1266,7 +1267,7 @@ async fn a_fatal_refusal_reaches_the_policy_without_a_restart() {
 ///
 /// ```text
 ///             Ok(Verdict::StopAll) => {
-///                 let _ = retire_all(closing(&shared)).await;
+///                 let _ = retire_all(closing(&state)).await;
 /// ```
 ///
 /// with `let _ = retire_all(Vec::new()).await;` on the second line — a group
@@ -1279,7 +1280,7 @@ async fn a_fatal_refusal_reaches_the_policy_without_a_restart() {
 /// value, in 0.00s.
 ///
 /// **Pass the WHOLE fence.** The second line alone,
-/// `let _ = retire_all(closing(&shared)).await;`, occurs twice in `group.rs`.
+/// `let _ = retire_all(closing(&state)).await;`, occurs twice in `group.rs`.
 /// The literal is unique only because the `Ok(Verdict::StopAll) => {` line above
 /// it is part of it. Shortened, `break-once.sh` aborts on a count of 2 before it
 /// takes a backup — safe, and a wasted run.
@@ -1897,8 +1898,12 @@ async fn a_policy_that_panics_ends_the_group_rather_than_orphaning_it() {
 /// **That break was GREEN, in 0.00s, until the body below was changed to park
 /// the conductor first.** The wake matters only to a conductor already waiting at
 /// `wake.notified()`, and the original test reached `drop` before the conductor's
-/// first poll ever ran — so that poll found the state gone on its own `upgrade`
-/// and answered `Dropped` down a path with no wake in it. The test named a
+/// first poll ever ran — so that poll found the liveness token already gone on
+/// its own check and answered `Dropped` down a path with no wake in it. (That
+/// check was a `Weak::upgrade` when this was written and is a `strong_count`
+/// since M3 split the token from the state; what the poll finds is the same
+/// thing, and what it no longer finds missing is the membership list.) The test
+/// named a
 /// mechanism it could not reach. Parking it is what puts the wake under test, and
 /// the `waker` member exists for that and for nothing else. Expect this break to
 /// redden **by timeout** now, at the [`NO_PROGRESS`] bound, because a parked
@@ -1928,8 +1933,8 @@ async fn a_dropped_group_ends_as_dropped_and_leaves_its_members_running() {
     // Nothing observable says "parked", so it is constructed: a second member
     // ends, the policy is asked about it, and the conductor loops back to its
     // wait. Without this the whole test runs before the conductor's first poll,
-    // and that poll then finds the state already gone on its own `upgrade` —
-    // which answers `Dropped` with no wake involved at all. That is not a
+    // and that poll then finds the liveness token already gone on its own check
+    // — which answers `Dropped` with no wake involved at all. That is not a
     // hypothetical: this guard was GREEN with `Shared::drop`'s body deleted
     // until this block was added.
     let waker = worker::actor(Worker { me: 6 });
@@ -1978,40 +1983,78 @@ async fn a_dropped_group_ends_as_dropped_and_leaves_its_members_running() {
     );
 }
 
-/// **A regression pin on a hazard, not a guard on a property.** It asserts what
-/// the code does today, and what it does today is lose a [`Group::stop`] the
-/// conductor never observed.
+/// A [`Group::stop`] outlives the last [`Group`] being dropped in the same
+/// breath, and the teardown it asked for runs.
 ///
-/// [`stop`](Group::stop) raises a flag inside `Shared` and returns. The
-/// conductor reads that flag only *after* its `Weak` upgrade succeeds. So
-/// `stop(); drop(group);` with no await between them destroys `Shared` — and
-/// the flag with it — before the conductor has been polled once, the upgrade
-/// then fails, and the group ends [`GroupEnded::Dropped`] having retired
-/// nothing. On a current-thread runtime that is not a race but the ordinary
-/// case: nothing has scheduled the conductor yet.
+/// **This test used to assert the opposite.** `stop` raised a flag inside the one
+/// `Arc<Shared>` that was both the membership list and the liveness token, so
+/// `stop(); drop(group);` with no await destroyed the flag before the conductor
+/// had been polled once — the group ended [`GroupEnded::Dropped`] having retired
+/// nothing, and on a current-thread runtime that was the ordinary case rather
+/// than a race. `Shared` is now a liveness token holding an
+/// `Arc<Mutex<State>>` the conductor also holds, so the list survives the drop
+/// and the conductor reads the phase **before** it concludes anything about
+/// liveness.
 ///
-/// **Reproduced before it was written down.** The hazard was first reasoned
-/// from the code at a merge gate; this test is what turned it into a fact.
+/// **Three cases, and the third is what keeps the first from being vacuous.**
 ///
-/// **It carries its own control, because the first half alone is vacuous.**
-/// Dropping a group answers `Dropped` and leaves its members running whether
-/// `stop` was called or not, so the first half cannot tell a *lost* stop from a
-/// stop nobody made. The second half is the identical sequence with one await
-/// between `stop` and the drop, and it ends [`GroupEnded::Stopped`] with the
-/// member retired. The difference between the two halves is that await and
-/// nothing else, which is what makes the first half a statement about `stop`.
+/// 1. `stop(); drop(group);` with no await — the case that used to lose.
+/// 2. The same sequence one await apart. It was the control that proved case 1
+///    was about `stop` rather than about dropping, and it is kept because it now
+///    says something else: the await stopped being load-bearing. Two spellings,
+///    one answer, which is the fix stated as an observable.
+/// 3. A drop with **no** `stop` at all, which must still answer
+///    [`GroupEnded::Dropped`] with the member running.
 ///
-/// **No fix, and the reason is that the obvious one does not work.** Moving
-/// the phase into an [`Arc`] the conductor holds strongly does not help,
-/// because the members list dies with `Shared` too — and holding *that* strongly
-/// would keep the state alive for ever and stop `Dropped` firing at all, which
-/// is the answer `a_dropped_group_ends_as_dropped_and_leaves_its_members_running`
-/// exists to protect. Making `stop` drain the members itself is a real fix and it
-/// costs `stop`'s "returns at once" promise plus a second route for the
-/// `retire_panics` count to reach the watch. The documented remedy is one line
-/// on [`Group::stop`]: hold the group until [`ended`](Group::ended) resolves.
+/// Case 3 is the one to keep if this test is ever shortened. Cases 1 and 2 pass
+/// trivially under a "fix" that made every dropped group answer `Stopped` — and
+/// that failure is not hypothetical, it is the exact objection this design was
+/// refused on: holding the state strongly was said to keep the group alive for
+/// ever and stop `Dropped` firing at all. It does not, because what the last
+/// `Group` takes with it is the token and not the list.
+/// `a_dropped_group_ends_as_dropped_and_leaves_its_members_running` guards the
+/// same thing from outside; this copy is here so a reader of case 1 does not
+/// have to go and find it.
+///
+/// Made red by `scripts/break-once.sh keylink/src/compose/group.rs`, replacing
+/// the conductor's `        if stopping {` with
+/// `        if stopping && shared.strong_count() > 0 {` — which is the old
+/// ordering exactly: honour a stop only while somebody still holds the group,
+/// and otherwise fall through to the `Dropped` arm below. Watched: case 1 fails
+/// with "a `stop` raised before the last `Group` dropped is still honoured, and
+/// the group ends as `Stopped`: Dropped". Exit 101, by value, in 0.00s.
+///
+/// **The second direction is a second break**, because one substitution cannot
+/// show both. Replace
+///
+/// ```text
+///         if shared.strong_count() == 0 {
+///             break GroupEnded::Dropped;
+/// ```
+///
+/// with `        if false {` on the first line. A group nobody holds is then
+/// never answered at all, and case 3 fails at the [`NO_PROGRESS`] bound after
+/// 60.00s rather than by value. That is the direction the original refusal
+/// predicted — holding the state strongly stopping `Dropped` from firing — and
+/// it is now measured rather than argued.
+///
+/// **Pass the WHOLE fence for that one.** `        if shared.strong_count() == 0 {`
+/// occurs TWICE in `group.rs`: this arm, and the one below the poll that
+/// `continue`s. Shortened, `break-once.sh` aborts on a count of 2 before it takes
+/// a backup — safe, and a wasted run. The registered row therefore pins the
+/// fence's second line, `            break GroupEnded::Dropped;`, which resolves
+/// exactly once — the reverse of G3, where the unique line is the header.
+///
+/// **That second break reddens through [`bounded`], whose message is identical
+/// at all three of this test's await points**, so the failure line alone does not
+/// say which case hung. It was attributed rather than assumed: the same
+/// substitution run against
+/// `a_dropped_group_ends_as_dropped_and_leaves_its_members_running`, which
+/// exercises the dropped-group path and nothing else, reddens at the same bound
+/// in 60.01s. So the substitution breaks `Dropped` and not `stop`, which is
+/// what case 3 is the only case here to depend on.
 #[tokio::test]
-async fn a_stop_the_conductor_has_not_seen_is_lost_when_the_last_group_drops() {
+async fn a_stop_survives_the_last_group_dropping_in_the_same_breath() {
     let (_asked, policy) = recording(Verdict::Forget);
     let group = Group::new(policy);
     let name = ActorId::new("member").expect("a name");
@@ -2024,32 +2067,33 @@ async fn a_stop_the_conductor_has_not_seen_is_lost_when_the_last_group_drops() {
     // Taken while the group is still held, so something is left to answer.
     let waiting = group.ended();
 
-    // **No await between these two lines, and that is the whole hazard.** The
-    // conductor has not been polled once, so the flag `stop` raises is read by
-    // nobody before `drop` takes the state it lives in.
+    // **No await between these two lines, and that used to be the whole hazard.**
+    // The conductor has not been polled once, so nothing has read the phase
+    // before `drop` takes the token. The state it is written in is the
+    // conductor's too, and outlives it.
     group.stop();
     drop(group);
 
+    let ended = bounded(waiting).await;
     assert!(
-        matches!(bounded(waiting).await, GroupEnded::Dropped),
-        "a `stop` the conductor never observed is lost with the state it was \
-         written into, and the group ends as though nobody had called it"
+        matches!(ended, GroupEnded::Stopped { retire_panics: 0 }),
+        "a `stop` raised before the last `Group` dropped is still honoured, and \
+         the group ends as `Stopped`: {ended:?}"
     );
 
-    // The cost of that, and the reason this is worth a test rather than a
-    // sentence: the teardown `stop` asked for never ran.
-    spun().await;
-    assert_eq!(
-        member.whoami().await.expect("still serving"),
-        1,
-        "and no member was retired, though `stop` was called before the drop"
+    // THIS is the decision, and it is the half a `GroupEnded` cannot carry: the
+    // teardown `stop` asked for actually ran.
+    assert!(
+        settles(|| !member.is_running()).await,
+        "and the member it asked to retire is retired"
     );
 
-    // ── the control: the same sequence, one await apart ──────────────────────
+    // ── case 2: the same sequence, one await apart ───────────────────────────
     //
-    // Without this the half above says nothing. A dropped group answers
-    // `Dropped` and leaves its members running whether or not anybody called
-    // `stop`, so only the contrast makes the first half a claim about `stop`.
+    // This was the control that made the old first half a claim about `stop`.
+    // Kept, and it now carries the opposite reading: the two spellings answer
+    // the same thing, so the await is no longer what decides whether a stop is
+    // honoured.
     let (_asked, policy) = recording(Verdict::Forget);
     let observed = Group::new(policy);
     let second = worker::actor(Worker { me: 2 });
@@ -2061,8 +2105,6 @@ async fn a_stop_the_conductor_has_not_seen_is_lost_when_the_last_group_drops() {
         .is_filed());
 
     observed.stop();
-    // The one difference. The conductor gets a turn, reads the flag, and tears
-    // down before anything drops the state the flag lives in.
     let ended = bounded(observed.ended()).await;
     assert!(
         matches!(ended, GroupEnded::Stopped { retire_panics: 0 }),
@@ -2070,7 +2112,39 @@ async fn a_stop_the_conductor_has_not_seen_is_lost_when_the_last_group_drops() {
     );
     assert!(
         settles(|| !second.is_running()).await,
-        "and retires the member, which is what the first half lost"
+        "and retires the member, exactly as the case above now does"
+    );
+
+    // ── case 3: a drop with no `stop`, which must STILL be `Dropped` ─────────
+    //
+    // Without this, cases 1 and 2 pass under a change that made every dropped
+    // group answer `Stopped`. That is not a hypothetical failure mode — it is
+    // the objection this design was refused on, so it is the one measured here.
+    let (_asked, policy) = recording(Verdict::Forget);
+    let abandoned = Group::new(policy);
+    let third = worker::actor(Worker { me: 3 });
+    assert!(abandoned
+        .add(
+            ActorId::new("abandoned").expect("a name"),
+            keylink::membership!(third),
+        )
+        .is_filed());
+
+    let orphaned = abandoned.ended();
+    drop(abandoned);
+
+    let ended = bounded(orphaned).await;
+    assert!(
+        matches!(ended, GroupEnded::Dropped),
+        "a group nobody stopped still ends as `Dropped` when its last holder \
+         goes: holding the state strongly did not make the token immortal: \
+         {ended:?}"
+    );
+    spun().await;
+    assert_eq!(
+        third.whoami().await.expect("still serving"),
+        3,
+        "and its members are still running, which is what `Dropped` promises"
     );
 }
 
