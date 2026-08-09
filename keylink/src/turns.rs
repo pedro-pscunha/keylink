@@ -5698,6 +5698,14 @@ mod tests {
     /// `Standing::Running => TurnLost::Dropped,` → `Standing::Running =>
     /// TurnLost::Gone,`, the fold the variant was split out of. Watched:
     /// `a value sent by a turn that then panicked crossed anyway: Err(Gone)`.
+    ///
+    /// **Hand the harness that literal with its twelve spaces of indentation, and
+    /// the paragraph above is why.** This record lives in the file it breaks, so
+    /// the bare form counts 2 here — the arm, and this record's own copy of it —
+    /// and the harness aborts at "found 2". The indented form is unique, and it
+    /// cannot be written out above without becoming a second copy of itself, which
+    /// is the same trap one rung down. The records in `tests/defer.rs` that quote
+    /// this arm carry the same clause; this copy is what makes it needed.
     #[tokio::test]
     async fn a_released_reply_is_dropped_when_the_turn_that_released_it_panicked() {
         let actor: LocalActor<Counter, Mail> = LocalActor::spawn(Counter::default());

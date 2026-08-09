@@ -497,6 +497,12 @@ async fn a_reply_parked_before_a_fault_is_still_answered_after_it() {
 /// `Standing::Running => TurnLost::Gone,` is the fold, and it is red here:
 /// `a panicking turn's answer crossed anyway: Err(Gone)`. The `is_err` this
 /// assertion replaced stayed green through it.
+///
+/// **Hand the harness that literal with its twelve spaces of indentation.** The
+/// bare form counts 2 in `turns.rs` — the arm itself, and that file's own
+/// `mod tests` quoting the same break unindented inside a `///` line — so the
+/// harness aborts at "found 2". Sibling records above carry the same clause; this
+/// one did not, and the quote it hands a reader was unrunnable as written.
 #[tokio::test]
 async fn an_answer_sent_inside_a_turn_that_then_panics_does_not_cross() {
     let book = orders::actor(Book::default());

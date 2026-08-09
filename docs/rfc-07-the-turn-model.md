@@ -1060,29 +1060,89 @@ happens-before — and the ordinary restart path is not exempt from it, because 
 ordinary restart path is the one §12.4 describes. The local door renders that
 window; it does not widen it.
 
-**A row in §12.8 was edited in place, and it is put back.** The break-record row
-for `defer::a_live_actor_does_not_tell_a_peer_no_such_actor` was rewritten to
-carry the test's new name and a second break that did not exist when §12 was
-written. CONTRIBUTING.md's rule for RFCs is why it is reverted rather than kept:
-the value of a record is that it shows what was believed at the time, and a row
-that acquires a later wave's break stops being a record of its own. Both facts
-belong here instead.
+**A row in §12.8 was edited in place, and half of that edit is put back.** The
+edit did two different things and only one of them is the kind CONTRIBUTING.md's
+RFC rule forbids.
 
-- **The rename.** That test is
-  `defer::a_local_caller_and_a_peer_agree_about_an_abandoned_deferred` now. The
-  old name is half of what it holds, and it named a setup that cannot be built —
-  see the destination argument above, which is the reason the extension took a new
-  claim rather than a wider version of the old one.
-  `scripts/replay-fate-breaks.sh` follows the new name, because it has to run;
-  §12.8's row records the name the run was made under.
-- **The second break.** §12.8 records one break, on `lost`'s `Standing::Running`
-  arm, and that is the whole of what §12 built: the local door read no `Standing`
-  then. It does now, so the test carries a second — `answered`'s
-  `Standing::Running => TurnLost::Dropped,` → `… TurnLost::Gone,` — and either
-  break alone leaves the other half green, which is the measurement that makes the
-  pairing worth asserting rather than a restatement. Quote that literal with its
-  **twelve spaces** of indentation; the bare form resolves twice in `turns.rs` and
-  aborts the harness.
+- **The rename stays in the row.** The test §12.8 named is
+  `defer::a_local_caller_and_a_peer_agree_about_an_abandoned_deferred` now, and the
+  row carries that name. The belief §12 recorded is *this guard is covered by this
+  break*, and that belief is unchanged — only the name moved. A row pointing at a
+  test that no longer exists preserves nothing and rots, and the cost of that is
+  measured rather than argued: `scripts/replay-fate-breaks.sh`'s stanza 16 named a
+  test that existed nowhere, so `cargo test` printed `0 passed; N filtered out` and
+  **exited 0**, and the script read that as *the break was not reproduced* — the
+  same report a genuinely rotted anchor gives, from the opposite cause. That is why
+  it now discriminates on `0 passed; 0 failed` and calls it a broken stanza. Stanza
+  11 replays this row's break and filters on this test's name; `e3047da` moved it
+  with the rename, and had it not, the stanza would have sat in exactly that state.
+  Keeping a table runnable is not editing it to match new code.
+
+  The old name was `defer::a_live_actor_does_not_tell_a_peer_no_such_actor`. It is
+  half of what the test now holds, and it named a setup that cannot be built — see
+  the destination argument above, which is why the extension took a new claim
+  rather than a wider version of the old one.
+- **The second break comes out of the row and lands here.** The edit also extended
+  that cell to name a break that did not exist when §12 was written, which makes
+  the table read as though two breaks were known then. §12 built one: `lost`'s
+  `Standing::Running` arm, because the local door read no `Standing` at all. It
+  does now, so the test carries a second — `answered`'s
+  `Standing::Running => TurnLost::Dropped,` → `… TurnLost::Gone,` — and **either
+  break alone leaves the other half green**, which is the measurement that makes
+  the pairing worth asserting rather than a restatement. The peer half runs first,
+  so its watched sentence came back unchanged when the local half was added, and
+  that was recorded rather than assumed.
+
+**The four guards `e3047da` added, which §12.8 does not list.** They are the local
+half of what §12 built for a peer, so they belong to this section rather than to
+that table. Each was watched red then green, and each names the wrong-reason pass
+it is exposed to in its own doc; the breaks and sentences below are read off those
+records.
+
+- `defer::a_live_actor_that_drops_a_deferred_is_told_dropped_and_not_gone` — the
+  sanctioned loss through the local door. Break: `answered`'s
+  `Standing::Running => TurnLost::Dropped,` → `… TurnLost::Gone,`. Watched:
+  ``a dropped `Deferred` costs the caller its answer and not the actor``,
+  `left: Err(Gone)`, `right: Err(Dropped)`. It asserts the variant **and** the next
+  call, because a `Fate` stuck at `Standing::Running` for an actor that is in fact
+  gone answers `Dropped` with its meaning inverted, and only "the next call is
+  answered" refuses that.
+- `supervision::a_local_caller_can_tell_restarting_from_gone` — the served twin
+  without the network. Break: `answered`'s
+  `Standing::Restarting(reason) => TurnLost::Restarting(reason),` →
+  `Standing::Restarting(_) => TurnLost::Gone,`. Watched: `round 1: a lost reply on
+  a restarting actor must say so`, `left: Gone`, `right: Restarting`. Round 2
+  asserts the **parked** reply rather than a fresh call, because a fresh call after
+  the give-up answers `Gone` off `NotQueued::Closed` and never reaches the
+  `Standing` read this is about. Round 2 stays green under that break by design —
+  the fold lands on the answer it already expects, and the served twin carries the
+  break that moves it.
+- `observe::a_local_caller_is_told_refused_when_a_non_fatal_observer_refuses` —
+  §2.6's third row under a supervisor. Break: `ask`'s
+  `Err(TurnLost::Refused { name }) => Err(Undelivered::Refused { name }),` →
+  `Err(TurnLost::Refused { .. }) => Err(Undelivered::Gone),`. Watched: `a non-fatal
+  refusal ends one incarnation, and the caller must not be told the actor is gone`,
+  `left: Err(Gone)`, `right: Err(Refused { name: "saver" })`. `Refused` rides the
+  turn axis and arrives with or without a supervisor, so the second `post` is what
+  makes this the supervised case rather than a rename of the test above it.
+- `turns::every_turn_lost_except_faulted_has_one_undelivered_twin_with_the_same_words`
+  — one fact reads as one sentence whichever door a caller came through. Two
+  exhaustive matches, so a seventh variant in either enum is `E0004`. Broken twice,
+  because one break exercises the equality and the other the coverage: changing one
+  character of `Undelivered::Dropped`'s `#[error]` text watches `one fact must read
+  as one sentence: Dropped and Dropped`; pointing `slot`'s `Undelivered::Expired`
+  arm at `0` watches `every variant is written exactly once, and this one was
+  written 2 times: [2, 1, 1, 1, 0, 1] at slot 0`. **That second record predicted
+  slot 4 and "written 0 times" and the run said slot 0 and 2** — the loop walks the
+  slots in order, so the doubled slot is reached before the emptied one.
+
+  Its residual is named where it lives and is narrower than it first reads. `EVERY`
+  and `lost` are two hand-written sample arrays, and `E0004` forces an author into
+  the file without forcing either array to grow — so a variant added to both enums,
+  given its two arms, and left out of the `TurnLost` sample is exercised by nothing.
+  What that author does **not** get past is pointing `slot` at an existing index
+  while the variant *is* in the sample: the shared slot is then written twice, and
+  the exactly-once count catches it.
 
 ---
 
@@ -3682,7 +3742,7 @@ two lines now, and `scripts/replay-fate-breaks.sh` runs the whole set.
 | `registry::abort_settles_the_served_answer_before_it_destroys_the_actor` | `System::abort`'s settle → `Standing::Running` |
 | `registry::an_expired_shutdown_budget_settles_the_served_answer_before_the_abort` | `drain`'s settle → `Standing::Running` |
 | `remote::no_other_served_failure_begins_with_one_of_the_four` | `RouteError::AtCapacity`'s `Display` gains a `"dropped: "` prefix |
-| `defer::a_live_actor_does_not_tell_a_peer_no_such_actor` | `lost`'s `Standing::Running` arm → `NoSuchActor` |
+| `defer::a_local_caller_and_a_peer_agree_about_an_abandoned_deferred` | `lost`'s `Standing::Running` arm → `NoSuchActor` |
 | `defer::a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer` | the same arm → `Failed("panicked: bad")` |
 | `defer::a_stopped_actor_still_tells_a_peer_no_such_actor` | the default `Inbox::ending` → `Standing::Running` |
 | `defer::an_aborted_actor_tells_a_peer_no_such_actor` | `LocalActor::abort`'s settle → `Standing::Running` |
