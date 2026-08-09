@@ -2,7 +2,7 @@
 //!
 //! # The window this closes
 //!
-//! [`Deferred::send`](crate::Deferred) used to write to the reply channel from
+//! [`Deferred::send`](crate::Deferred::send) used to write to the reply channel from
 //! inside the running handler. Its own documentation said so — *"nothing is owed
 //! to the turn running now: the value crosses the channel directly, and this
 //! turn's observers neither see it nor gate it"* — and that sentence is the whole

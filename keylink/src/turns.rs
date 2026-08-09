@@ -566,7 +566,7 @@ impl<T> Reply<T> {
 /// `Reply` drops it inside the unwinding future, so the caller is told `Dropped`
 /// rather than being handed the panic the way [`LocalActor::ask`] hands one on
 /// every other kind. The actor still survives, the observer chain still reads
-/// [`TurnOutcome::Panicked`](crate::TurnOutcome), and the panic hook already ran
+/// [`TurnOutcome::Panicked`], and the panic hook already ran
 /// at the fault — which is the trade [`notify`](LocalActor::notify) documents for
 /// a `tell`, arriving here for a structural reason instead of a policy one. The
 /// surviving actor is what the answer names: `Dropped` is the same sentence for
@@ -851,7 +851,8 @@ impl<T> Answered<T> {
 /// caller is owed different sentences for.
 ///
 /// The third element of the slot [`observed_turn`] folds used to be
-/// [`Stop::is_fatal`](crate::Stop) — a `bool` beside the name — and a panic has
+/// [`Stop::is_fatal`](crate::Stop::is_fatal) — a `bool` beside the name — and a
+/// panic has
 /// no such claim to put in it. Writing `false` there spelled *the author said
 /// another incarnation can help* for an author who said nothing at all, and it
 /// spelled it the same way a deliberate [`Stop::new`](crate::Stop::new) does, so
@@ -1194,7 +1195,7 @@ where
 ///   inside the unwinding future, so there is nothing left to answer with and the
 ///   caller's wait ends [`TurnLost::Dropped`] — which names the actor that
 ///   survives, so the caller is not told to stop calling one that is serving. The
-///   observers saw [`TurnOutcome::Panicked`](crate::TurnOutcome), and the panic
+///   observers saw [`TurnOutcome::Panicked`](crate::TurnOutcome::Panicked), and the panic
 ///   hook ran at the fault. This is the one thing `#[defer]` costs against every
 ///   other kind, and [`Replied`] says so where a reader meets the type.
 #[doc(hidden)]
@@ -3878,7 +3879,7 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     /// [`abort`](Self::abort) is the recovery and it is the only one. It destroys
     /// the state — that is the price, and it is why it is a separate method — and
     /// it is also what makes `ended` resolve, as
-    /// [`Ended::Vanished`](crate::Ended), since an aborted task filled nothing.
+    /// [`Ended::Vanished`], since an aborted task filled nothing.
     /// In a two-actor ring it frees the other actor and destroys only the one it
     /// names. Guarded at N = 2 by `tests/cycles.rs`.
     ///
@@ -4261,6 +4262,13 @@ impl<A, M> LocalActor<A, M> {
     /// So the error is [`NotQueued`] rather than [`Undelivered`] twice over: this
     /// door asks only whether the request was queued, and it discards half of even
     /// that.
+    ///
+    /// **Both halves are held by a test rather than by the paragraph above.**
+    /// `cycles::a_self_stop_is_refused_rather_than_wedging_the_actor` produces the
+    /// refusal, and `a_second_stop_returns_ok_rather_than_the_send_s_own_closed`
+    /// in this file's `mod tests` holds the swallow — which was the argued half
+    /// and the unasserted one, because nothing in the workspace read this method's
+    /// `Ok`.
     pub async fn stop(&self) -> Result<(), NotQueued> {
         match self.send(Message::Stop, Refuse::Always).await {
             Ok(()) | Err(NotQueued::Closed) => {}
@@ -4524,7 +4532,7 @@ const DROPPED: &str = Failure::DROPPED;
 /// The stutter is still there and is deliberately not fixed here:
 /// `Panic::caught` builds its message as `the actor panicked: {payload}`, and
 /// that same string is what [`Ended::Panicked`] and
-/// [`TurnOutcome::Panicked`](crate::TurnOutcome) carry. Removing one of the two
+/// [`TurnOutcome::Panicked`] carry. Removing one of the two
 /// prefixes is a decision about `panic.rs`'s vocabulary, and it belongs where
 /// `Panic` is rather than inside a dispatch.
 pub(crate) fn rendered<Resp>(
@@ -4969,6 +4977,18 @@ mod tests {
     /// one enum. Left as it is deliberately: the name is what a filter is typed
     /// against and what §4.11 of RFC-07 records, and a name that asserts less than
     /// the body is not the failure mode this file is about.
+    ///
+    /// **RFC-07 §15.2 is the full ruling and this is its pointer.** It records
+    /// what this sentence compresses: `NotQueued` reaches the guard through
+    /// `From<NotQueued> for Undelivered` rather than through [`twin`], so it is
+    /// held as a **widening** and not as a twin — which is why the name saying
+    /// *twin* is an under-claim rather than a wrong claim. It also measured what
+    /// the rename would have cost and refused it anyway, on the ground that this
+    /// crate's expensive failure is the opposite direction: names and numbers that
+    /// assert more than the tree can support. **The name stays.**
+    ///
+    /// That ruling is about the name and not the count, so it is unmoved by the
+    /// seventh variant this guard now walks.
     ///
     /// # Rust has no reflection over variants, so this cannot enumerate them
     ///
@@ -5482,6 +5502,68 @@ mod tests {
         // The same closed mailbox through the other question, so the other type:
         // an `ask` lost a reply channel too and a `notify` never had one.
         assert_eq!(spare.notify(add(1)).await, Err(NotQueued::Closed));
+    }
+
+    /// `stop`'s error type is one variant wider than `stop` can produce, and the
+    /// half that makes it so was argued and not asserted.
+    ///
+    /// [`stop`](LocalActor::stop)'s `# Errors` block says
+    /// [`NotQueued::Reentrant`] is the **only** error it can return, and that
+    /// [`NotQueued::Closed`] "never leaves this method". The first half has a
+    /// guard — `cycles::a_self_stop_is_refused_rather_than_wedging_the_actor`
+    /// produces the refusal. The second had none: **the one send `stop` makes can
+    /// return `Closed`**, and only the `Ok(()) | Err(NotQueued::Closed) => {}` arm
+    /// keeps it inside. Nothing anywhere read `stop`'s `Ok`, so that arm could
+    /// have been narrowed to `Ok(())` and every test in the workspace would have
+    /// stayed green while a caller that stopped an actor twice got an error the
+    /// documentation says is unreachable.
+    ///
+    /// The line above it is asserted too, and it is the reason `wait_for` is not
+    /// `changed()`: the second `stop` must **return**. A fresh receiver marks the
+    /// current value as seen, so `changed()` on an already-ended actor waits for a
+    /// second ending that never comes. The timeout is what separates "returned an
+    /// error" from "hung", and only a two-sided check can tell those apart —
+    /// `expect_err` on a hang is a test that never finishes.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `stop`'s first
+    /// arm, replacing it with a pair that lets the send's own refusal out:
+    ///
+    /// ```text
+    /// Ok(()) => {}
+    /// Err(closed @ NotQueued::Closed) => return Err(closed),
+    /// ```
+    ///
+    /// Quoted unindented, because this record lives in the file its break edits.
+    /// Watched: `stopping a stopped actor is what the caller asked for, so its own
+    /// Closed must not escape: Err(Closed)`, `left: Err(Closed)`, `right: Ok(())`.
+    ///
+    /// **The obvious break is not a break, and it was run first.** Deleting the
+    /// `| Err(NotQueued::Closed)` alternative alone leaves the match
+    /// non-exhaustive, so the harness exits **101 on `error[E0004]`** — a red that
+    /// reddens the same way a caught defect does, on a run where the test never
+    /// executed. The second arm is what makes the edit compile and therefore what
+    /// makes the assertion the thing being measured. This is written down because
+    /// the exhaustiveness that makes the mistake easy is the same property the
+    /// guard above [`twin`] rests on.
+    #[tokio::test]
+    async fn a_second_stop_returns_ok_rather_than_the_send_s_own_closed() {
+        // Annotated, because this test never sends a message and `M` is otherwise
+        // ambiguous: `Infallible` also implements `Turn<Counter>`.
+        let actor: LocalActor<Counter, Mail> = LocalActor::spawn(Counter::default());
+        actor
+            .stop()
+            .await
+            .expect("a stop from outside the actor's own turn is never refused");
+
+        let again = n0_future::time::timeout(Duration::from_secs(5), actor.stop())
+            .await
+            .expect("stop is documented as idempotent, so a second one must return");
+        assert_eq!(
+            again,
+            Ok(()),
+            "stopping a stopped actor is what the caller asked for, so its own \
+             Closed must not escape: {again:?}",
+        );
     }
 
     /// Spawn an actor already inside a turn, and hand back the two ends that

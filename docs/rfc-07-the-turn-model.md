@@ -1127,18 +1127,14 @@ records.
   makes this the supervised case rather than a rename of the test above it.
 - `turns::every_turn_lost_except_faulted_has_one_undelivered_twin_with_the_same_words`
   — one fact reads as one sentence whichever door a caller came through. Two
-  exhaustive matches, so one more variant in either enum is `E0004`. Broken twice,
+  exhaustive matches, so a seventh variant in either enum is `E0004`. Broken twice,
   because one break exercises the equality and the other the coverage: changing one
   character of `Undelivered::Dropped`'s `#[error]` text watches `one fact must read
   as one sentence: Dropped and Dropped`; pointing `slot`'s `Undelivered::Expired`
   arm at `0` watches `every variant is written exactly once, and this one was
-  written 2 times: [2, 1, 1, 1, 1, 0, 1] at slot 0`. **That second record predicted
+  written 2 times: [2, 1, 1, 1, 0, 1] at slot 0`. **That second record predicted
   slot 4 and "written 0 times" and the run said slot 0 and 2** — the loop walks the
   slots in order, so the doubled slot is reached before the emptied one.
-
-  Both enums grew a seventh variant, `ObserverPanicked`, and the `E0004` above is
-  what named every site. The array in that second watched sentence is seven long
-  now and was read off the re-run, never edited to fit.
 
   Its residual is named where it lives and is narrower than it first reads. `EVERY`
   and `lost` are two hand-written sample arrays, and `E0004` forces an author into
@@ -3873,7 +3869,7 @@ name and a claim nothing checked.
   *sentence*: the registry's capacity refusal, an `ActorId` a peer sent that fails
   validation, and a console follow refusal. None collides, and nothing would have
   noticed if one did —
-  `no_failure_prefix_is_a_prefix_of_another` compares the five against each other
+  `no_failure_prefix_is_a_prefix_of_another` compares the four against each other
   and would stay green while a `RouteError` variant beginning `"dropped: "` made
   every peer's `starts_with` ambiguous. The claim is narrowed to *every prefix
   `rendered` and `lost` build*, and `no_other_served_failure_begins_with_one_of_the_five`
@@ -4464,3 +4460,76 @@ next author meets it while writing the figure rather than after a reader trips o
 it. It carries no licence for the second half beyond what the append-only rule
 already gives, which is deliberate: correcting a figure is still an append, and
 this section is one.
+## 17. Revision, 2026-08-09: §4.11's twin guard gains a seventh slot, and its watched array with it
+
+Appended, and **§4.11 is not edited** — the same discipline §15 states, for the
+same bullet, and §15.1 is the section half of this one continues.
+
+`CONTRIBUTING.md`'s carve-out reaches the two table rows in §"`scripts/replay-fate-breaks.sh`
+runs all twenty-three" and one prose pointer, and nothing else here. Those three
+name tests that were **renamed** —
+`remote::no_other_served_failure_begins_with_one_of_the_four` and
+`reply::the_four_prefixes_are_the_text_a_peer_matches_on`, both `_five` now,
+because both embedded a count in the name and the fifth served prefix landed. A
+replay row whose filter names a test that no longer exists selects **zero tests**
+and reports success, so those are pointers that must stay runnable. Everything
+below is a claim and is appended.
+
+### 17.1 Both enums have seven variants now, so §15.1's asymmetry has closed
+
+§15.1 measured, on `d2f5e6e`, that `TurnLost` had seven variants and
+`Undelivered` six — and concluded that §4.11's *"a seventh variant in either enum
+is `E0004`"* held for one enum and not two.
+
+At `43fa7c1` both have **seven**: `ObserverPanicked` landed on each, so that a
+caller whose turn met an observer that panicked is no longer told the observer
+refused. §15.1's figures were exact at the commit it names and are not edited.
+What that section says numberlessly is the part that survives every such move,
+and it is worth repeating rather than recounting: *"two exhaustive matches, and
+both are `error[E0004]` the moment either enum grows"*. Read §4.11's bullet that
+way; the number in it was never the mechanism.
+
+The addition was measured against that claim, which is the only reason it is
+worth an entry. `slot` and `twin` were the **only** two `E0004`s inside
+`keylink/src` — the mechanism fired exactly where §15.1 says it does. `EVERY` and
+the `lost` sample grew by hand, which §4.11's own residual paragraph predicts and
+which no compiler forces.
+
+### 17.2 The watched array is a break record's output and cannot be corrected in place
+
+§4.11's second break watches:
+
+> `every variant is written exactly once, and this one was written 2 times:
+> [2, 1, 1, 1, 0, 1] at slot 0`
+
+That is what the run printed, and it stays. §15.1 states the rule it falls under:
+*"where the value **is** the record — as it is in a break record's watched output
+— it cannot be removed and an appended correction is the only honest treatment"*.
+
+Re-run at `43fa7c1`, with the same break re-expressed against the moved arm —
+`slot`'s `Undelivered::Expired` points at `5` now, not `4` — the run prints:
+
+> `every variant is written exactly once, and this one was written 2 times:
+> [2, 1, 1, 1, 1, 0, 1] at slot 0`
+
+Read off the failing run and not computed. Two things moved and only one of them
+is the seventh slot: the **emptied** slot went 4 → 5 with `Expired`, while the
+**reported** slot stayed 0, because the loop still reaches the doubled slot
+first. A correction that had only lengthened the array would have been wrong in
+the half that record already exists to warn about — §4.11 records that this break
+was mispredicted once before, in exactly that field.
+
+`keylink/src/turns.rs`'s own copy of the record was re-run and rewritten there,
+because a break record beside its test is a live instruction rather than a
+historical claim. This file keeps both readings, which is the difference between
+the two homes.
+
+### 17.3 §"the four prefixes" in §9's prose is a count and is not edited
+
+Two sentences in this file say `no_failure_prefix_is_a_prefix_of_another`
+*"compares the four against each other"* and describes the guard set as four. The
+identifier is unchanged, so nothing is renamed and the carve-out does not apply.
+
+**Five at `43fa7c1`.** The fifth is `RemoteError::OBSERVER_PANICKED`, and it is
+the first prefix in that set to share a word with another one, which is the whole
+reason the by-hand list is the guard rather than the eye.

@@ -780,7 +780,7 @@ quotes a search literal, that literal must occur **exactly once** in its stated
 target, which is `break-once.sh`'s own precondition and nothing more.
 
 Its list is written out by hand, and that is deliberate for the reason `local.rs`'s
-`no_failure_prefix_is_a_prefix_of_another` spells out its five prefixes by hand: a
+`no_failure_prefix_is_a_prefix_of_another` spells out its four prefixes by hand: a
 heuristic that parsed prose for *"replacing `X` with `Y`"* and missed a record would
 check nothing while reporting success. **The honest limitation is that a record added
 without an entry there is unchecked**, which is the cost of the hand-maintained list.
@@ -872,3 +872,23 @@ its counts while its anchor had been dead for some time.
   producer of `Forgotten` the table never mentions. Stated as which function calls
   which rather than as a caller *count*, per §9.1 — a count of callers is a value
   this document cannot keep true.
+
+---
+
+## Appendix, 2026-08-09: §9.2's "four prefixes" has moved to five
+
+Appended, and **§9.2 is not edited.** The sentence cites
+`no_failure_prefix_is_a_prefix_of_another` to explain why the anchors registry is
+written out by hand, and says that guard *"spells out its four prefixes by
+hand"*. The identifier is unchanged, so `CONTRIBUTING.md`'s carve-out does not
+apply: what moved is a count, and a count is a claim.
+
+**Five at `43fa7c1`**, the fifth being `RemoteError::OBSERVER_PANICKED`. The
+argument §9.2 borrows it for is untouched and is if anything stronger: the fifth
+prefix had to be added to that list by hand, and it is the first one sharing a
+word with an existing prefix — `"observer panicked: "` against `"panicked: "` and
+`"observer refused: "` — so the by-hand list is what says the three do not
+collide, rather than the eye.
+
+Cite the guard rather than the number it currently spells, which is the form §9.1
+already prefers for callers.
