@@ -322,11 +322,21 @@ type Stamped = Pin<Box<dyn Future<Output = Reported> + Send>>;
 /// A member's own restarts never reach here. This is asked once, when that
 /// member's ending is final.
 ///
-/// `#[non_exhaustive]` and the cost is zero, which is worth saying because the
-/// opposite reading is easy: a caller *constructs* a `Verdict` and never matches
-/// one, and the attribute binds downstream matches only. The crate's own match
-/// on it stays exhaustively checked, and restoring a refused variant stays
-/// additive.
+/// `#[non_exhaustive]`, and it is kept: the crate's own match on it stays
+/// exhaustively checked, and restoring a refused variant stays additive.
+///
+/// **The cost is not zero, and this paragraph used to say it was.** The reading
+/// it rested on — that a caller *constructs* a `Verdict` and never matches one —
+/// is true of the answer a policy returns and false of everything a caller does
+/// with one afterwards. Logging a decision, or unit-testing a policy by calling
+/// it and matching what came back, both need a match, and the attribute makes
+/// each of those need a catch-all arm.
+///
+/// The residual is what a caller writes in that arm. `unreachable!()` is the
+/// natural thing and it is a policy panic, so a variant added here would turn a
+/// caller's logging into [`GroupEnded::PolicyPanicked`] — an arm that is
+/// unreachable today and is exactly what a new variant makes reachable. A caller
+/// with a catch-all worth having writes a value, not a panic.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub enum Verdict {
@@ -622,29 +632,69 @@ impl fmt::Debug for Membership {
 /// The ending is not here. It went to the conductor when the member was added,
 /// which is the whole reason [`Retire`] is a type of its own.
 ///
-/// A named struct and not a tuple, for `names.rs`'s reason: three fields read at
+/// A named struct and not a tuple, for `names.rs`'s reason: fields read at
 /// several call sites are several chances to read the stamp as a count.
 struct Entry {
-    name: ActorId,
-    generation: u64,
+    stamp: Stamp,
     retire: Retire,
 }
 
-/// One member's ending, and which membership it belongs to.
+/// Which membership under a name this is: the name, and the generation stamp.
 ///
-/// The first two fields are [`Entry`]'s first two, in that order and no other:
-/// the conductor compares them field for field, and two records that mean the
-/// same pair while listing it in two orders is how a transposed comparison gets
-/// written and not seen.
+/// **One value rather than two fields side by side, and the conductor is why.**
+/// It compares a filed membership against a reported ending, and while these
+/// were two fields on two structs the only thing holding that comparison
+/// together was a comment on [`Reported`] saying the fields were in the same
+/// order on both. A comment cannot fail. A derived [`PartialEq`] on one type
+/// compares every field and cannot be transposed, so the invariant is now
+/// carried by the thing that has to hold it.
+///
+/// `pub(super)` because `keyed.rs` spelled the same pair a third way, as the
+/// `Option<(ActorId, u64)>` an abandoned waiter files under. Its `Waiter` keeps
+/// a bare `generation` and is right to: the name there is the map's key, so a
+/// waiter has no name of its own to pair with.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct Stamp {
+    pub(super) name: ActorId,
+    pub(super) generation: u64,
+}
+
+/// One member's ending, and which membership it belongs to.
 struct Reported {
-    name: ActorId,
-    generation: u64,
+    stamp: Stamp,
     /// `Err` carries a panic message: the future that was to say why this member
     /// ended panicked instead, and there is no [`Ended`] that means that.
     reason: Result<Ended, String>,
 }
 
-/// The membership list, and the two flags the conductor reads.
+/// Where a group is in its one-way life.
+///
+/// One field where there were two `bool`s, and the reason is that only three of
+/// the four pairs those spell are states a group can be in. `stop()` on a group
+/// that had already ended wrote `stopping: true` beside `closed: true`, and
+/// [`Group`]'s own `Debug` printed the pair — a teardown that was over reading
+/// as one in flight.
+///
+/// **That was never a live defect and this is not a fix for one.** The conductor
+/// reads this only after upgrading its [`Weak`], and a conductor whose group is
+/// closed has already broken out of its loop, so nothing ever acted on the
+/// impossible pair. What it could do was mislead a reader holding the printed
+/// value, which is the whole of what a `Debug` is for.
+///
+/// `Phase` and not `settled`, because [`Shared`] already has a `settled` holding
+/// the answer itself. Two fields one hop apart, both named for the same event,
+/// is a reader's problem and was this file's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// The ordinary state: members can be filed and endings are decided on.
+    Watching,
+    /// [`Group::stop`] was called and the conductor has not observed it yet.
+    Stopping,
+    /// The group has ended. [`Group::add`] files nothing from here.
+    Closed,
+}
+
+/// The membership list, and the phase the conductor reads.
 struct State {
     /// Insertion order, so [`Group::names`] is ordered and teardown has a
     /// direction. A `Vec` and not a map: here the order is the point.
@@ -654,16 +704,9 @@ struct State {
     staged: Vec<Stamped>,
     /// The next generation stamp.
     next: u64,
-    /// Set by [`Group::stop`], read by the conductor.
-    stopping: bool,
-    /// Set by the conductor once the group has ended, so that a later
-    /// [`Group::add`] can say so instead of filing a member nothing watches.
-    ///
-    /// `closed` and not `settled`, because [`Shared`] already has a `settled`
-    /// holding the answer itself. Two fields one hop apart, one a `bool` and one
-    /// a channel, both named for the same event, is a reader's problem and was
-    /// this file's.
-    closed: bool,
+    /// Moved by [`Group::stop`] and by [`closing`], read by the conductor and by
+    /// [`Group::add`].
+    phase: Phase,
 }
 
 /// What a [`Group`] and its conductor share.
@@ -738,8 +781,7 @@ impl Group {
                 members: Vec::new(),
                 staged: Vec::new(),
                 next: 0,
-                stopping: false,
-                closed: false,
+                phase: Phase::Watching,
             }),
             wake: Arc::clone(&wake),
             settled,
@@ -776,7 +818,11 @@ impl Group {
     pub fn add(&self, name: ActorId, member: Membership) -> Added {
         let Membership { ended, retire } = member;
         let mut held = self.shared.lock();
-        if held.closed {
+        // `Closed` and not "anything but `Watching`", deliberately. A group that
+        // is `Stopping` still files: the entry and its staged ending go on the
+        // books as one locked step, so the teardown that follows retires this
+        // member with the rest rather than leaving it out of one.
+        if held.phase == Phase::Closed {
             return Added::Refused(retire);
         }
         // Every entry is stamped, and `Names`' own "the generation stamp, and
@@ -786,27 +832,27 @@ impl Group {
         // replaced.
         let generation = held.next;
         held.next += 1;
-        let stamped = name.clone();
+        let stamp = Stamp { name, generation };
+        let stamped = stamp.clone();
         held.staged.push(Box::pin(async move {
             // The caller's future, so it is guarded like the caller's policy and
             // the caller's `retire`. An unwind here would take the conductor
             // with it and orphan every member of the group.
             let reason = guarded(ended).await.map_err(|panicked| panicked.bare());
             Reported {
-                name: stamped,
-                generation,
+                stamp: stamped,
                 reason,
             }
         }));
-        let entry = Entry {
-            name,
-            generation,
-            retire,
-        };
+        let entry = Entry { stamp, retire };
+        // By NAME and not by stamp, which is the one comparison here that must
+        // not be the whole thing: a replacement carries a fresh generation, so a
+        // stamp comparison would match nothing and every `add` would file a
+        // second member under a name that already had one.
         let answer = match held
             .members
             .iter()
-            .position(|filed| filed.name == entry.name)
+            .position(|filed| filed.stamp.name == entry.stamp.name)
         {
             Some(at) => Added::Displaced(std::mem::replace(&mut held.members[at], entry).retire),
             None => {
@@ -830,7 +876,10 @@ impl Group {
                   handle"]
     pub fn remove(&self, name: &ActorId) -> Option<Retire> {
         let mut held = self.shared.lock();
-        let at = held.members.iter().position(|filed| &filed.name == name)?;
+        let at = held
+            .members
+            .iter()
+            .position(|filed| &filed.stamp.name == name)?;
         let removed = held.members.remove(at).retire;
         drop(held);
         // Nothing the conductor has to do about it — the discard happens on the
@@ -857,7 +906,7 @@ impl Group {
             .lock()
             .members
             .iter()
-            .map(|entry| entry.name.clone())
+            .map(|entry| entry.stamp.name.clone())
             .collect()
     }
 
@@ -932,7 +981,15 @@ impl Group {
     /// policy mid-call, which is the one thing a synchronous closure cannot be
     /// asked to survive.
     pub fn stop(&self) {
-        self.shared.lock().stopping = true;
+        let mut held = self.shared.lock();
+        // A guarded transition, so a `stop` on a group that has already ended
+        // leaves [`Phase::Closed`] standing instead of writing `Stopping` over
+        // it. Nothing downstream was ever fooled by the overwrite — see
+        // [`Phase`] — and the value a caller prints is what it corrects.
+        if held.phase == Phase::Watching {
+            held.phase = Phase::Stopping;
+        }
+        drop(held);
         self.shared.wake.notify_one();
     }
 }
@@ -940,16 +997,15 @@ impl Group {
 impl fmt::Debug for Group {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let held = self.shared.lock();
-        // `stopping` beside `closed`, because the question a reader debugs with
-        // is "I called `stop()` and `ended()` has not resolved yet" — and
-        // `closed` alone cannot separate a stop the conductor has not observed
-        // yet from a stop nobody called. `staged` is the other half of that:
-        // members filed but not yet watched.
+        // The phase is here because the question a reader debugs with is "I
+        // called `stop()` and `ended()` has not resolved yet", and `Closed`
+        // alone cannot separate a stop the conductor has not observed yet from
+        // a stop nobody called. `staged` is the other half of that: members
+        // filed but not yet watched.
         f.debug_struct("Group")
             .field("members", &held.members.len())
             .field("staged", &held.staged.len())
-            .field("stopping", &held.stopping)
-            .field("closed", &held.closed)
+            .field("phase", &held.phase)
             .finish()
     }
 }
@@ -1003,7 +1059,7 @@ async fn conduct(
                 for staged in held.staged.drain(..) {
                     endings.push(staged);
                 }
-                held.stopping
+                held.phase == Phase::Stopping
             };
             stop_requested.then(|| closing(&shared))
         };
@@ -1045,9 +1101,10 @@ async fn conduct(
         };
         let taken = {
             let mut held = shared.lock();
-            let filed = held.members.iter().position(|entry| {
-                entry.name == reported.name && entry.generation == reported.generation
-            });
+            let filed = held
+                .members
+                .iter()
+                .position(|entry| entry.stamp == reported.stamp);
             // An ending whose stamp is no longer the one filed under that name
             // belongs to a member that was displaced or removed. Discarded,
             // never decided on.
@@ -1090,9 +1147,14 @@ async fn conduct(
                 // retirement is ISSUED in, which `closing` says at length, and
                 // this member's place in it carries no claim.
                 leaving.push(taken.retire);
-                retire_all(leaving).await;
+                // The count is discarded here and on the two arms below, and
+                // saying so at each is the point of `retire_all` being
+                // `#[must_use]`: only `GroupEnded::Stopped` carries a place to
+                // put it, and that variant's doc argues why the other three do
+                // not. A bare call would leave that decision one screen away.
+                let _ = retire_all(leaving).await;
                 break GroupEnded::EndingPanicked {
-                    member: reported.name,
+                    member: reported.stamp.name,
                     message,
                 };
             }
@@ -1103,19 +1165,19 @@ async fn conduct(
         // `panic = "abort"` caveat on it, are on `GroupEnded::PolicyPanicked`,
         // where a caller meets them — this comment does not repeat them, because
         // two copies drift.
-        match catch_unwind(AssertUnwindSafe(|| policy(&reported.name, &reason))) {
+        match catch_unwind(AssertUnwindSafe(|| policy(&reported.stamp.name, &reason))) {
             Ok(Verdict::Forget) => {}
             Ok(Verdict::StopAll) => {
-                retire_all(closing(&shared)).await;
+                let _ = retire_all(closing(&shared)).await;
                 break GroupEnded::Member {
-                    member: reported.name,
+                    member: reported.stamp.name,
                     reason,
                 };
             }
             Err(payload) => {
-                retire_all(closing(&shared)).await;
+                let _ = retire_all(closing(&shared)).await;
                 break GroupEnded::PolicyPanicked {
-                    member: reported.name,
+                    member: reported.stamp.name,
                     message: message_of(&*payload),
                 };
             }
@@ -1138,12 +1200,16 @@ async fn conduct(
 fn closing(shared: &Shared) -> Vec<Retire> {
     let mut held = shared.lock();
     // The two effects the rest of the module leans on, done under one lock so
-    // that no `add` can interleave between them. `closed` is what makes a later
+    // that no `add` can interleave between them. `Closed` is what makes a later
     // `add` hand its `Retire` straight back instead of filing a member nothing
     // watches, and clearing `staged` drops the endings of members that were
     // added but never drained — they are in this teardown either way, because
     // `add` files the entry and stages the ending as one locked step.
-    held.closed = true;
+    //
+    // Unguarded, unlike `Group::stop`'s transition: this is the one writer that
+    // may overwrite a `Stopping`, because a stop that reached teardown is what
+    // being closed MEANS.
+    held.phase = Phase::Closed;
     held.staged.clear();
     held.members
         .drain(..)
@@ -1177,6 +1243,12 @@ fn closing(shared: &Shared) -> Vec<Retire> {
 /// [`GroupEnded::Stopped`] carries it. This used to be discarded on the floor —
 /// one member vanishing out of a teardown with no report anywhere, in a module
 /// whose own backpressure section says there is no third option that hides.
+///
+/// `#[must_use]` because three of the four callers discard it, and a discard
+/// that is deliberate should be readable where it happens. It used to be a bare
+/// call at each, and the only record that dropping the number there was a
+/// decision lived a screen away on [`GroupEnded::Stopped`].
+#[must_use]
 async fn retire_all(members: Vec<Retire>) -> usize {
     // Annotated rather than inferred, and the annotation is a guard's
     // precondition rather than a habit. Without it the set's item type came from
@@ -1199,7 +1271,7 @@ async fn retire_all(members: Vec<Retire>) -> usize {
             Ok(fut) => retiring.push(guarded(fut)),
             // Counted and not discarded. The closure never produced a future, so
             // there is no retirement of this member's left to wait for.
-            Err(_panicked) => panicked += 1,
+            Err(_lost) => panicked += 1,
         }
     }
     // The other half of the same number: a closure that did produce a future,

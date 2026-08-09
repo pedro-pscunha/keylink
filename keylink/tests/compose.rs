@@ -1069,8 +1069,8 @@ fn refusing(fatal: bool, recovered_after: Duration) -> (worker::Handle<Worker>, 
 }
 
 /// Made red by `scripts/break-once.sh keylink/src/compose/group.rs`, replacing
-/// `policy(&reported.name, &reason)` with
-/// `policy(&reported.name, &Ended::Stopped)` — a policy told a reason the group
+/// `policy(&reported.stamp.name, &reason)` with
+/// `policy(&reported.stamp.name, &Ended::Stopped)` — a policy told a reason the group
 /// invented instead of the one the member ended with, which is the shape of every
 /// supervisor that reports its own teardown for somebody else's fault.
 /// Watched: it fails at the policy's own argument, "with the reason it ended
@@ -1192,8 +1192,8 @@ async fn a_members_own_restart_never_reaches_the_policy() {
 
 /// Made red by the same break as `a_member_that_ends_for_good_reaches_the_policy_once`:
 /// `scripts/break-once.sh keylink/src/compose/group.rs`, replacing
-/// `policy(&reported.name, &reason)` with
-/// `policy(&reported.name, &Ended::Stopped)`. Watched: it fails at `seen[0].1`,
+/// `policy(&reported.stamp.name, &reason)` with
+/// `policy(&reported.stamp.name, &Ended::Stopped)`. Watched: it fails at `seen[0].1`,
 /// "and handed the supervisor's own reason rather than one the group invented:
 /// Stopped", where the supervisor produced `GaveUp { after: 0 }`. Exit 101, by
 /// value, in 0.00s — and that line is the one the paragraph below is about.
@@ -1266,11 +1266,11 @@ async fn a_fatal_refusal_reaches_the_policy_without_a_restart() {
 ///
 /// ```text
 ///             Ok(Verdict::StopAll) => {
-///                 retire_all(closing(&shared)).await;
+///                 let _ = retire_all(closing(&shared)).await;
 /// ```
 ///
-/// with `retire_all(Vec::new()).await;` on the second line — a group that ends
-/// itself and leaves every sibling running, which is the outcome this whole
+/// with `let _ = retire_all(Vec::new()).await;` on the second line — a group
+/// that ends itself and leaves every sibling running, which is the outcome this
 /// module exists to prevent and the one a `GroupEnded` alone cannot tell you
 /// about. Watched: the `GroupEnded::Member` arm above still passes, and what
 /// fails is the sibling assertion — "every other member is retired, not left
@@ -1279,10 +1279,17 @@ async fn a_fatal_refusal_reaches_the_policy_without_a_restart() {
 /// value, in 0.00s.
 ///
 /// **Pass the WHOLE fence.** The second line alone,
-/// `retire_all(closing(&shared)).await;`, occurs three times in `group.rs`. The
-/// literal is unique only because the `Ok(Verdict::StopAll) => {` line above it
-/// is part of it. Shortened, `break-once.sh` aborts on a count of 3 before it
+/// `let _ = retire_all(closing(&shared)).await;`, occurs twice in `group.rs`.
+/// The literal is unique only because the `Ok(Verdict::StopAll) => {` line above
+/// it is part of it. Shortened, `break-once.sh` aborts on a count of 2 before it
 /// takes a backup — safe, and a wasted run.
+///
+/// **Both lines of the fence grew a `let _ =` when `retire_all` became
+/// `#[must_use]`, and only the second one matters here.** The registered anchor
+/// is the arm header, which did not move, so `mise run anchors` stayed green
+/// across that change while the substitution above rotted underneath it. The
+/// fence was re-quoted and the break re-run rather than reasoned about — a
+/// rotted substitution reports the same `exit 101` as a caught defect.
 #[tokio::test]
 async fn stop_all_ends_the_group_and_names_the_member_that_caused_it() {
     let (asked, policy) = recording(Verdict::StopAll);
@@ -1453,7 +1460,7 @@ async fn an_add_after_the_group_ended_is_refused_rather_than_a_displacement() {
 ///
 /// **The serial spelling must discard the result, and the first version of this
 /// record did not.** `Ok(fut) => guarded(fut).await,` does not compile: `guarded`
-/// yields `Result<(), Panic>` and the sibling `Err(_panicked) => panicked += 1,`
+/// yields `Result<(), Panic>` and the sibling `Err(_lost) => panicked += 1,`
 /// arm yields `()`, so the match arms disagree. Run as written it exits 101 on
 /// E0308 and tests nothing — and a non-zero exit from `break-once.sh` reads as a
 /// caught defect, so that failure is the one shaped most like success. The
@@ -1630,11 +1637,19 @@ async fn forget_removes_the_member_and_leaves_the_others_serving() {
 
 /// Made red by `scripts/break-once.sh keylink/src/compose/group.rs`, replacing the
 /// conductor's
-/// `entry.name == reported.name && entry.generation == reported.generation` with
-/// `entry.name == reported.name` — the generation stamp dropped, so the displaced
-/// member's still-pending ending is decided on under a name its replacement now
-/// owns. Watched: "a displaced member's ending is discarded on its stamp, never
+/// `                .position(|entry| entry.stamp == reported.stamp);` with
+/// `                .position(|entry| entry.stamp.name == reported.stamp.name);`
+/// — the generation half of the stamp dropped, so the displaced member's
+/// still-pending ending is decided on under a name its replacement now owns.
+/// Watched: "a displaced member's ending is discarded on its stamp, never
 /// decided on". Exit 101, by value, in 0.01s.
+///
+/// **Re-quoted when `Stamp` was extracted, and the break was re-run rather than
+/// re-reasoned.** Both halves moved: the anchor was the two-field comparison and
+/// is now the `position` line that replaced it, and the substitution was
+/// `entry.name == reported.name` and is now the same defect spelled through the
+/// stamp. A rotted anchor is loud and a rotted substitution is not, so the
+/// second half is the one this note exists for.
 ///
 /// The same race `names.rs` documents and the same fix, watched here from the
 /// side that matters for a group: not a wrong eviction but a wrong **decision**,
@@ -1803,9 +1818,9 @@ async fn adds_made_while_the_policy_runs_are_all_watched() {
 }
 
 /// Made red by `scripts/break-once.sh keylink/src/compose/group.rs`, replacing
-/// `match catch_unwind(AssertUnwindSafe(|| policy(&reported.name, &reason))) {`
+/// `match catch_unwind(AssertUnwindSafe(|| policy(&reported.stamp.name, &reason))) {`
 /// with
-/// `match Ok::<Verdict, Box<dyn std::any::Any + Send>>(policy(&reported.name, &reason)) {`
+/// `match Ok::<Verdict, Box<dyn std::any::Any + Send>>(policy(&reported.stamp.name, &reason)) {`
 /// — the panic uncaught, so the conductor dies with it and every member is left
 /// running and unwatched, which is the group-actor problem this module refuses,
 /// reached from the other side. Watched: "a panicking policy must end the group,
@@ -1987,7 +2002,7 @@ async fn a_dropped_group_ends_as_dropped_and_leaves_its_members_running() {
 /// nothing else, which is what makes the first half a statement about `stop`.
 ///
 /// **No fix, and the reason is that the obvious one does not work.** Moving
-/// `stopping` into an [`Arc`] the conductor holds strongly does not help,
+/// the phase into an [`Arc`] the conductor holds strongly does not help,
 /// because the members list dies with `Shared` too — and holding *that* strongly
 /// would keep the state alive for ever and stop `Dropped` firing at all, which
 /// is the answer `a_dropped_group_ends_as_dropped_and_leaves_its_members_running`

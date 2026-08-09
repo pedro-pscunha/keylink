@@ -181,6 +181,7 @@ use std::task::{Context, Poll};
 
 use tokio::sync::oneshot;
 
+use super::group::Stamp;
 use crate::{ActorId, Ended, Lifecycle};
 
 /// Who is waiting for which name.
@@ -272,7 +273,10 @@ impl Endings {
             .push(Waiter { generation, tell });
         Awaited {
             ending,
-            filed: Some((name.clone(), generation)),
+            filed: Some(Stamp {
+                name: name.clone(),
+                generation,
+            }),
             waiting: Arc::downgrade(&self.waiting),
         }
     }
@@ -369,10 +373,18 @@ impl fmt::Debug for Endings {
 struct Awaited {
     ending: oneshot::Receiver<Ended>,
     /// Which waiter to take back out if this is dropped before it resolves, and
-    /// `None` once it has. A resolved waiter is already gone from the map — the
-    /// report took it out to send — so the `Drop` below must not take the lock to
-    /// discover that.
-    filed: Option<(ActorId, u64)>,
+    /// `None` once [`Future::poll`] has handed the value over.
+    ///
+    /// **Not `None` merely because the report was SENT**, and an earlier version
+    /// of this comment said otherwise — that a resolved waiter is already gone
+    /// from the map, so the `Drop` below need not take the lock to discover it.
+    /// Only `poll` clears this, so a caller whose answer is sitting in the
+    /// channel and who then drops the future without polling arrives at `Drop`
+    /// holding `Some`, takes the lock, and finds the name already gone: the
+    /// report removed the whole entry in order to send. That is why the vacant
+    /// case below is a silent no-op rather than an assertion — an ordinary
+    /// caller reaches it.
+    filed: Option<Stamp>,
     /// [`Weak`], so an `Awaited` nobody has resolved does not keep the waiters
     /// alive past the last [`Endings`]. That is what makes the dropped-registry
     /// case reachable, and it resolves [`Ended::Vanished`].
@@ -405,7 +417,11 @@ impl Drop for Awaited {
         // line is both unreadable and over the width, so rustfmt breaks it into
         // three. A break record anchors on it, and a one-line anchor is worth a
         // shorter local.
-        let Some((name, mine)) = self.filed.take() else {
+        let Some(Stamp {
+            name,
+            generation: mine,
+        }) = self.filed.take()
+        else {
             return;
         };
         let Some(waiting) = Weak::upgrade(&self.waiting) else {

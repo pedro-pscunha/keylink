@@ -1144,17 +1144,17 @@ ANCHORS = [
     # only evidence that all twenty-two restores completed.
     #
     # **G1, G2 and G8 share ONE literal, because they share one physical LINE.**
-    # G1 and G2 were proposed against `policy(&reported.name, &reason)`, which is a
+    # G1 and G2 were proposed against `policy(&reported.stamp.name, &reason)`, which is a
     # fragment of G8's line and occurs nowhere else. Registering it would have
     # declared a new mode-4 fragment, and `FRAGMENT_ANCHORS` above is a NON-GROWTH
     # assertion — adding to it converts a working check into a silent pass. So all
     # three quote the whole line. Three records, one literal, three rows.
     ("G1", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
-     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.name, &reason))) {"),
+     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.stamp.name, &reason))) {"),
     ("G2", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
-     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.name, &reason))) {"),
+     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.stamp.name, &reason))) {"),
     ("G8", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
-     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.name, &reason))) {"),
+     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.stamp.name, &reason))) {"),
     # G3 is DELIBERATELY WEAKER than the break it guards, and that is the whole
     # entry. Its record fences two lines and substitutes the second, because that
     # second line - `retire_all(closing(&shared)).await;` - occurs THREE times in
@@ -1201,7 +1201,7 @@ ANCHORS = [
     ("G5", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
      "            held.members.remove(at)"),
     ("G6", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
-     "                entry.name == reported.name && entry.generation == reported.generation"),
+     "                .position(|entry| entry.stamp == reported.stamp);"),
     # G7 was proposed as `held.staged.drain(..)` and is registered as its enclosing
     # line. The bare call is a fragment; the `for` header is the line.
     ("G7", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
