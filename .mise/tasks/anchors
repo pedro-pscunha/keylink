@@ -283,7 +283,7 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 #
 # Deriving it would mean parsing prose for "replacing `X` with `Y` in `path`",
 # and a heuristic that misses a record checks nothing while reporting success.
-# So the list is explicit, exactly as `local.rs`'s
+# So the list is explicit, exactly as `turns.rs`'s
 # `no_failure_prefix_is_a_prefix_of_another` spells out its four prefixes and
 # says a fifth has to be added by hand.
 #
@@ -936,9 +936,9 @@ ANCHORS = [
     # says nothing about the indented one. Third instance of that shape in this
     # registry, and the general form is worth the line: state the measurement that
     # made quoting impossible, never the property that made it look impossible.
-    ("D1", "keylink/tests/cycles.rs", "keylink/src/local.rs",
+    ("D1", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "const LOCAL_MAILBOX_DEPTH: usize = 1;"),
-    ("D2", "keylink/tests/cycles.rs", "keylink/src/local.rs",
+    ("D2", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "        self.task.abort();"),
     # A whole line at twelve spaces, inside `Deferred::send`'s parking callback. Its
     # record quoted it WITHOUT the indentation until this branch, which made the
@@ -959,7 +959,7 @@ ANCHORS = [
     # higher than the eight rows added here could explain; the extra block was that
     # record. Anyone re-quoting this anchor must fix `persist.rs` too, and nothing
     # here will say so, because a row names one `lives_in`.
-    ("D3", "keylink/tests/cycles.rs", "keylink/src/local.rs",
+    ("D3", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "            Verdict::Committed => reply.answer(Answered::Ran(value)),"),
     ("D4", "keylink/tests/cycles.rs", "keylink/src/compose/topic.rs",
      "            Overflow::DropSubscriber => self.publish_dropping(item),"),
@@ -1223,7 +1223,7 @@ ANCHORS = [
     # record says to run one at a time and label the log.
     ("G12", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
      "        match catching(member.end) {"),
-    ("G13", "keylink/tests/compose.rs", "keylink/src/local.rs",
+    ("G13", "keylink/tests/compose.rs", "keylink/src/turns.rs",
      "if !restarting {"),
     ("G14", "keylink/tests/compose.rs", "keylink/src/panic.rs",
      "            Err(panic) => Poll::Ready(Err(Panic::caught(panic))),"),
@@ -1934,7 +1934,7 @@ def gone(path: str) -> bool:
     `FileNotFoundError`, the first loop below runs before every other check in this
     file, and nothing here catches anything - so ONE missing file did not cost one
     row's result, it cost EVERY row's. Measured before the guard was written, by
-    moving `keylink/src/local.rs` aside and running this task: a traceback, exit 1,
+    moving `keylink/src/turns.rs` aside and running this task: a traceback, exit 1,
     and not one check printed.
 
     That is the wrong failure shape for a gate whose entire value is being specific.
@@ -2187,7 +2187,7 @@ for record in sorted((FRAGMENT_ANCHORS & resolved) - fragments):
 # rebase that correctly re-quotes a record and forgets this list leaves the gate
 # validating a string no record uses - green.
 #
-# `local.rs`'s `no_failure_prefix_is_a_prefix_of_another` is NOT the precedent for
+# `turns.rs`'s `no_failure_prefix_is_a_prefix_of_another` is NOT the precedent for
 # a hand-written list of copies. Its own comment says it "names the consts rather
 # than the strings, so it cannot drift from the wire" - hand-written *references*
 # to one source of truth. A doc comment cannot be referenced from Python, so the

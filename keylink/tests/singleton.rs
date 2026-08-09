@@ -733,7 +733,7 @@ struct BehindAHeldTurn {
     /// caller had long since been answered — read **before** the retry.
     ///
     /// Its own assertion, and not a step towards the last one, because
-    /// `local.rs` heads a section "The turn runs even if you stop waiting": *a
+    /// `turns.rs` heads a section "The turn runs even if you stop waiting": *a
     /// caller that gives up on a `reserve` has still reserved*. No test drops an
     /// `ask` future and checks that; this line is the whole of what pins it,
     /// and until the fix below it was pinned only by the doubled entry of a
@@ -845,7 +845,7 @@ async fn a_timeout_settles_the_key_it_gave_up_on_where_a_queue_timeout_leaves_it
     assert_eq!(
         timed_out.before_the_retry,
         vec![1, 2],
-        "the turn ran after its caller was told TimedOut, which is `local.rs`'s promise that \
+        "the turn ran after its caller was told TimedOut, which is `turns.rs`'s promise that \
          dropping the wait does not cancel the turn"
     );
     let refused = timed_out

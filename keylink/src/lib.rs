@@ -140,7 +140,7 @@ compile_error!(
 // holds an `Rc<RefCell<_>>` and is `!Send` for a real reason. That one is gated
 // on `web`.
 //
-// `local.rs` is NOT gated on anything: `LocalActor` holds an
+// `turns.rs` is NOT gated on anything: `LocalActor` holds an
 // `Arc<n0_future::task::JoinHandle<()>>`, which in a browser wraps an
 // `Rc<RefCell<_>>` in a `SendWrapper`. `SendWrapper` is `Send` and `Sync` for
 // every `T` and panics if it is dereferenced — or dropped — on another thread,
@@ -157,7 +157,7 @@ compile_error!(
     target_feature = "atomics"
 ))]
 compile_error!(
-    "keylink assumes a single-threaded browser. `local.rs` holds a thread-affine \
+    "keylink assumes a single-threaded browser. `turns.rs` holds a thread-affine \
      task handle behind a `Send + Sync` type, and the `web` feature adds an \
      `unsafe impl Send` beside it. Threaded wasm is not supported."
 );
@@ -210,14 +210,14 @@ mod console;
 mod error;
 mod idempotency;
 mod keys;
-mod local;
 mod macros;
 mod middleware;
 mod node;
 mod observe;
 mod panic;
+mod turns;
 // Where an answer waits for the verdict of the turn that produced it. Its own
-// module and not four items in `local.rs`, because the invariant it holds — a
+// module and not four items in `turns.rs`, because the invariant it holds — a
 // lot is a local of one turn, so nothing can be parked outside one — is a
 // property of these types together and of nothing else in that file.
 mod parking;
@@ -314,10 +314,6 @@ pub use idempotency::{
     MAX_TOMBSTONES, MAX_WAITING, MAX_WAITING_PER_PEER, RECORD_TTL,
 };
 pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
-pub use local::{
-    deliver_to_local, feed_turn, run_keyed, run_keyed_supervised, turn, turn_deferred, Deferred,
-    Fed, Feeds, Hooks, Incarnation, Intensity, LocalActor, MailboxClosed, Replied, Reply, Turn,
-};
 pub use middleware::{Caller, Context, Middleware, Next, QueueTimeout, Queueing, Rpc, Timeout};
 pub use node::{derive_alpn, Node};
 pub use observe::{Ended, FinishFut, Observer, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome};
@@ -330,6 +326,10 @@ pub use rpc::{
     Dispatch, IdempotentClient, RpcClient, Server, ServerBuilder, Service, ServiceBuilder,
 };
 pub use subscribers::Subscribers;
+pub use turns::{
+    deliver_to_local, feed_turn, run_keyed, run_keyed_supervised, turn, turn_deferred, Deferred,
+    Fed, Feeds, Hooks, Incarnation, Intensity, LocalActor, MailboxClosed, Replied, Reply, Turn,
+};
 pub use watch::{Departure, Watch};
 pub use wire::{Envelope, WireKinds, MAX_HEADER};
 

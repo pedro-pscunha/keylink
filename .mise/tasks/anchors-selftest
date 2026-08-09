@@ -193,7 +193,7 @@ else:
 # guard and no probe.** `read_text()` raised `FileNotFoundError`, nothing here
 # catches anything, and the resolution loop runs before every other check in the
 # task - so one absent file cost EVERY row's result rather than its own. Measured
-# before the guard existed, by moving `keylink/src/local.rs` aside and running the
+# before the guard existed, by moving `keylink/src/turns.rs` aside and running the
 # task: a traceback, exit 1, and not one check printed.
 #
 # **A rename is the ordinary way a target goes missing**, and the person doing one

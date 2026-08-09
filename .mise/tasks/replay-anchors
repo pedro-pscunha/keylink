@@ -21,7 +21,7 @@ MISE description="Replay each REDNESS row's break and check it reddens its own g
 # record wastes a reader's time; an under-claiming one makes a stalled run read as a
 # broken harness — which is this whole file's failure mode, one layer down.
 #
-# (`N1` here is the registry row id. `keylink/src/local.rs` uses the same two
+# (`N1` here is the registry row id. `keylink/src/turns.rs` uses the same two
 # characters for an unrelated finding about incarnations, so the substitution is
 # spelled out below rather than left to the id.)
 #

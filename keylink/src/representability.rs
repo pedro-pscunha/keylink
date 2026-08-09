@@ -82,7 +82,7 @@
 //! named test, as §"A third half this file cannot reach" does. A cycle is built
 //! out of ordinary sends that are each correct alone, so no pattern matches the
 //! defect rather than the mechanism, and a grep can only bound the search:
-//! `rg -c 'self\.mail\.send' keylink/src/local.rs` reports `1` and exits 0,
+//! `rg -c 'self\.mail\.send' keylink/src/turns.rs` reports `1` and exits 0,
 //! because every local mailbox message funnels through `LocalActor::send` — and
 //! that count says nothing about whether two trips through it form a loop, which
 //! is the whole of the gap. The keyed path and `Topic`'s fan-out have their own
@@ -830,7 +830,7 @@ impl Observer<Ledger> for Recorder {
 /// The probe is the same one read through a bound rather than through a
 /// parameter. [`LocalActor::read`] promises `F: FnOnce(&A) -> T`, so the
 /// closure's argument is a `&Ledger` and `post` resolves to the trait default.
-/// Widen that bound to `FnOnce(&mut A) -> T` in `local.rs` and the argument is a
+/// Widen that bound to `FnOnce(&mut A) -> T` in `turns.rs` and the argument is a
 /// `&mut Ledger`, the inherent method matches a step earlier, `T` infers as
 /// `ThroughMut`, and the annotation below says otherwise: `E0308`.
 ///
@@ -848,7 +848,7 @@ impl Observer<Ledger> for Recorder {
 /// mailbox stopped being a boxed closure. This probe is written over **any** `M`
 /// rather than over one service's generated enum, and it compiles, which states
 /// the property that made the parameter affordable: `read` needs to know nothing
-/// about a turn. Bound it to `M: Turn<A>` in `local.rs` and this stops compiling
+/// about a turn. Bound it to `M: Turn<A>` in `turns.rs` and this stops compiling
 /// — `Ledger` is hand-written, is not a `service!`, and has no mailbox enum to
 /// name.
 async fn a_read_cannot_mutate_either<M>(actor: &LocalActor<Ledger, M>) {
@@ -878,7 +878,7 @@ async fn a_read_cannot_mutate_either<M>(actor: &LocalActor<Ledger, M>) {
 ///   nothing could return one it kept from an earlier turn.
 ///
 /// The break, executed by hand: add `#[derive(Clone)]` to any of the three in
-/// `local.rs`. Its concrete impl then overlaps the blanket one and it is `E0119:
+/// `turns.rs`. Its concrete impl then overlaps the blanket one and it is `E0119:
 /// conflicting implementations`.
 ///
 /// Coherence and not shadowing, for the reason this module's header gives, and

@@ -89,10 +89,10 @@ pub enum RemoteError {
     /// told to stop asking and it would be false.
     ///
     /// **On both served paths**, which this sentence could not say for one wave:
-    /// `local.rs`'s `deliver_to_local` separated the causes and
+    /// `turns.rs`'s `deliver_to_local` separated the causes and
     /// `actor/remote.rs`'s `deliver_to_actor` rendered all of them as this
     /// variant, so the paragraph above was a promise a keyed actor did not keep.
-    /// The two render through `local.rs`'s `lost` now, off a verdict each actor's
+    /// The two render through `turns.rs`'s `lost` now, off a verdict each actor's
     /// own loop settles before it drops anything.
     #[error("no actor is mounted as {id}")]
     NoSuchActor {
@@ -111,7 +111,7 @@ pub enum RemoteError {
 /// The prefixes [`RemoteError::Failed`] carries on keylink's own served paths.
 ///
 /// **Public because a peer has to match on them, and could not name them.** The
-/// four were `const`s private to `local.rs` for four waves, documented as a
+/// four were `const`s private to `turns.rs` for four waves, documented as a
 /// contract in four rustdocs, while every caller in and out of this repository
 /// hard-coded `why.starts_with("dropped: ")`. A contract nobody can name by
 /// symbol is a string literal with a paragraph next to it.
@@ -127,7 +127,7 @@ pub enum RemoteError {
 ///
 /// **No one of these four is a prefix of another**, in either direction, so a
 /// peer matching with `starts_with` is never ambiguous.
-/// `local::tests::no_failure_prefix_is_a_prefix_of_another` holds it, and a fifth
+/// `turns::tests::no_failure_prefix_is_a_prefix_of_another` holds it, and a fifth
 /// has to be added to that list by hand.
 ///
 /// The claim used to read *"every prefix a `RemoteError::Failed` carries on the

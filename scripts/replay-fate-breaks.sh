@@ -73,7 +73,7 @@ keylink/src/actor/remote.rs \
 
 run "2 keyed restart" \
 'round 1: expected restarting: , got Remote(NoSuchActor { id: "desks/4471" })' \
-keylink/src/local.rs \
+keylink/src/turns.rs \
 '        if retryable(reason) && self.budget.spend(self.started.elapsed()) {
             return Standing::Restarting(Arc::new(reason.clone()));' \
 '        if retryable(reason) && self.budget.spend(self.started.elapsed()) {
@@ -82,7 +82,7 @@ keylink/src/local.rs \
 
 run "3 singleton give-up (multi_thread)" \
 'round 2: expected gone, got Remote(Failed("dropped: the actor is serving and this reply was never answered"))' \
-keylink/src/local.rs \
+keylink/src/turns.rs \
 '        self.close();
         Standing::Gone' \
 '        self.close();
@@ -91,7 +91,7 @@ keylink/src/local.rs \
 
 run "4 verdict settled after drop(state)" \
 'an incarnation'"'"'s verdict must be settled before its state dies: [(Running, false), (Running, true)]' \
-keylink/src/local.rs \
+keylink/src/turns.rs \
 '    let verdict = inbox.ending(&reason);
     fate.settle(verdict.clone());' \
 "    let verdict = inbox.ending(&reason);
@@ -108,7 +108,7 @@ keylink/src/local.rs \
 
 run "5 give-up does not close the mailbox" \
 'a give-up must close the mailbox and a restart must not: [(Restarting(Panicked { message: "this incarnation is over" }), false), (Gone, false)]' \
-keylink/src/local.rs \
+keylink/src/turns.rs \
 '        self.close();
         Standing::Gone' \
 '        Standing::Gone' \
@@ -116,7 +116,7 @@ keylink/src/local.rs \
 
 run "6 verdict never published" \
 'an incarnation'"'"'s verdict must be settled before its state dies: [(Running, false), (Running, true)]' \
-keylink/src/local.rs \
+keylink/src/turns.rs \
 '    let verdict = inbox.ending(&reason);
     fate.settle(verdict.clone());' \
 '    let verdict = inbox.ending(&reason);' \
@@ -124,7 +124,7 @@ keylink/src/local.rs \
 
 run "7 refusal arm answers running" \
 'a spent budget is not a live actor: Running' \
-keylink/src/local.rs \
+keylink/src/turns.rs \
 '        self.close();
         Standing::Gone' \
 '        self.close();
@@ -160,7 +160,7 @@ keylink/src/actor/registry.rs \
 
 run "11 lost live arm -> NoSuchActor" \
 'a live actor must not be reported as absent: Remote(NoSuchActor { id: "Orders" })' \
-keylink/src/local.rs \
+keylink/src/turns.rs \
 '        Standing::Running => RemoteError::Failed(format!(
             "{DROPPED}the actor is serving and this reply was never answered"
         )),' \
@@ -169,7 +169,7 @@ keylink/src/local.rs \
 
 run "12 lost live arm -> panicked" \
 'a panicking deferred handler loses the reply, and that is what the peer must read: "panicked: bad"' \
-keylink/src/local.rs \
+keylink/src/turns.rs \
 '        Standing::Running => RemoteError::Failed(format!(
             "{DROPPED}the actor is serving and this reply was never answered"
         )),' \
@@ -178,7 +178,7 @@ keylink/src/local.rs \
 
 run "13 default Inbox::ending -> running" \
 'a stopped actor is gone, not merely unanswering: Remote(Failed("dropped: the actor is serving and this reply was never answered"))' \
-keylink/src/local.rs \
+keylink/src/turns.rs \
 '    fn ending(&mut self, _reason: &Ended) -> Standing {
         Standing::Gone
     }' \
@@ -189,7 +189,7 @@ keylink/src/local.rs \
 
 run "14 the Floor writes running" \
 'an aborted actor is gone, and its own loop will never say so: Remote(Failed("dropped: the actor is serving and this reply was never answered"))' \
-keylink/src/local.rs \
+keylink/src/turns.rs \
 '    fn drop(&mut self) {
         if self.armed {
             self.fate.settle(Standing::Gone);' \
@@ -231,7 +231,7 @@ keylink/src/reply.rs \
 
 run "18 supervise has no floor (factory panic)" \
 'a peer whose actor died in its own factory must not be told it is serving: Remote(Failed("dropped: the actor is serving and this reply was never answered"))' \
-keylink/src/local.rs \
+keylink/src/turns.rs \
 '    let mut floor = Floor::armed(fate);
     let mut budget = Budget::new(limit);' \
 '    let mut floor = Floor::armed(fate);
@@ -241,7 +241,7 @@ keylink/src/local.rs \
 
 run "19 run_loop has no floor (feed panic)" \
 'a peer whose actor died in its own feed must not be told it is serving: Remote(Failed("dropped: the actor is serving and this reply was never answered"))' \
-keylink/src/local.rs \
+keylink/src/turns.rs \
 '    let mut floor = Floor::armed(fate);
     let mut reason = Ended::Stopped;' \
 '    let mut floor = Floor::armed(fate);
@@ -251,14 +251,14 @@ keylink/src/local.rs \
 
 run "20 gone becomes a Failed" \
 'left: Failed("dropped: id")' \
-keylink/src/local.rs \
+keylink/src/turns.rs \
 '        Standing::Gone => RemoteError::NoSuchActor { id: id.to_owned() },' \
 '        Standing::Gone => RemoteError::Failed(format!("{DROPPED}{id}")),' \
   the_gone_answer_is_not_a_failed_and_carries_no_prefix -p keylink --lib
 
 run "21 no floor between incarnations (N1)" \
 'an actor destroyed between incarnations is gone, not restarting: Restarting(Panicked { message: "this incarnation is over" })' \
-keylink/src/local.rs \
+keylink/src/turns.rs \
 '    let mut floor = Floor::armed(fate);
     let mut budget = Budget::new(limit);' \
 '    let mut floor = Floor::armed(fate);
@@ -268,7 +268,7 @@ keylink/src/local.rs \
 
 run "22 a per-iteration floor writes Gone on continue (N2)" \
 'a supervisor that is still rebuilding must not read as gone: Gone' \
-keylink/src/local.rs \
+keylink/src/turns.rs \
 '    let mut floor = Floor::armed(fate);
     let mut budget = Budget::new(limit);
     loop {' \
@@ -279,7 +279,7 @@ keylink/src/local.rs \
 
 run "23 the third disarm around run_loop (load-bearing floor)" \
 'a state that panicked on the way out is gone, not restarting: Restarting(Panicked { message: "this incarnation is over" })' \
-keylink/src/local.rs \
+keylink/src/turns.rs \
 '        let (reason, verdict) = run_loop(state, hooks, feeds, lent, fate).await;' \
 '        floor.disarm();
         let (reason, verdict) = run_loop(state, hooks, feeds, lent, fate).await;

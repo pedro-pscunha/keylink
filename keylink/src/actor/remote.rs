@@ -57,7 +57,7 @@ use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 
 use super::registry::{RouteError, System};
-use crate::local::{lost, rendered, Reply};
+use crate::turns::{lost, rendered, Reply};
 use crate::{ActorId, Body, BodyReader, Caller, Context, Outcome, Queueing, RemoteError, Rpc};
 
 // ─────────────────────────────────────────────────────────── the wire wrapper
@@ -259,7 +259,7 @@ enum Provenance {
 impl Origin {
     /// A message from inside this process.
     ///
-    /// `pub(crate)` and called from `local.rs`: a `Handle` method hands the
+    /// `pub(crate)` and called from `turns.rs`: a `Handle` method hands the
     /// builder closure an origin rather than letting generated code write one, so
     /// the expansion never names either constructor. It carried an
     /// `allow(dead_code)` for one wave, while the mailbox it belongs in was still
@@ -721,9 +721,9 @@ mod tests {
     /// **Every other `RemoteError::Failed` keylink itself builds on a served
     /// path, and none of them begins like one of the four prefixes.**
     ///
-    /// `local.rs`'s const block claimed those four were *every* prefix a `Failed`
+    /// `turns.rs`'s const block claimed those four were *every* prefix a `Failed`
     /// carries on the served path. It was false in at least three places, and all
-    /// three are here rather than in `local.rs` because this is the file they are
+    /// three are here rather than in `turns.rs` because this is the file they are
     /// built in — `From<RouteError>` two hundred lines up, and
     /// [`deliver_to_actor`]'s own `validate` step. Each is a whole **sentence**
     /// rather than a prefix, which is exactly why nothing has ever collided and

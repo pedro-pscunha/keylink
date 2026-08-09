@@ -450,7 +450,7 @@ async fn a_panicking_observer_ends_the_actor_and_is_named() {
 /// as `Ended::Observer`.
 ///
 /// Both halves are load-bearing. Withholding the reply here would reverse what
-/// `local.rs` promises about a panicking call, and the caller would be told
+/// `turns.rs` promises about a panicking call, and the caller would be told
 /// `MailboxClosed` — "the actor is gone" — about a message that in fact ran and
 /// exploded. And reporting the refusing observer instead of the panic would
 /// point an operator at the durability adapter for a fault in a `service!`
