@@ -1820,6 +1820,26 @@ DESCRIBED = [
 # clean sweep of nine says these nine are sound, and says nothing about the rest.
 # Every run exited 101, so each break reached its test rather than aborting.
 #
+# **AND THAT SWEEP DID NOT HOLD. Re-run at `d2f5e6e`, THREE of the nine could not run
+# at all** - A1, A3 and A4, each with a `replacement` that no longer compiles against
+# the line its `target` now holds. So a clean sweep is a statement about one tree and
+# decays like every other, which is the whole reason this list exists rather than a
+# sentence in a record.
+#
+# **What is worth keeping is HOW they became visible.** Their old report was `the
+# recorded sentence is NOT in this run`, which is the same sentence a break that went
+# GREEN prints - and green is rot in the guard, while this was rot in the row. The
+# harness now prints `── selected=N`, and all three read `?`: no totals line, so the
+# runner never reached a test. That one line separates "the guard stopped catching it"
+# from "this break never ran", and nothing before it could.
+#
+# **In all three the RECORD in the tree was right and the ROW was stale**, which is
+# the opposite direction from the rot this list was built for. A record is prose beside
+# the code it describes and a reviewer reads it when the code moves; a row lives in a
+# registry nobody opens, and `mise run anchors` only checks that its `literal` still
+# resolves - never that its `replacement` still compiles. Both anchors kept resolving
+# the whole time.
+#
 # id -> (replacement, watched substring, test filter, extra runner arguments)
 REDNESS = {
     "L3": ("        self.frame_bytes = bytes;",
@@ -1831,7 +1851,15 @@ REDNESS = {
     "L5": ("            inner.spent = inner.spent.saturating_sub(0);",
            "after n=9: spent",
            "the_counters_agree_with_the_maps_on_every_path", ["-p", "keylink", "--lib"]),
-    "A1": ("    let Some(budget) = idem.attach_budget(crate::MAX_ATTACH) else {",
+    # A1's replacement was written against the line the anchor USED to name and never
+    # followed it. `rpc.rs`'s own record says so in its last paragraph - the cap was
+    # read and clamped on one line, and the read became its own `match` arm - and the
+    # ANCHORS literal followed the move while this replacement did not. Pasted over a
+    # match arm, `let Some(budget) = … else {` gave `error: this file contains an
+    # unclosed delimiter` at `rpc.rs:2196`, so the break never reached a test.
+    # Re-watched 2026-08-09 with the replacement the record names: exit 101,
+    # `── selected=1`, `left: 30s`, `right: 1s`.
+    "A1": ("        Attaching::UpTo(_) => crate::MAX_ATTACH,",
            "the ceiling must be this service's Limits::attach",
            "an_attach_ceiling_below_the_peers_request_governs", ["-p", "keylink", "--lib"]),
     "A2": ("            .map(|_| cap)",
@@ -1841,11 +1869,19 @@ REDNESS = {
     "A2b": ("            .map(|millis| Duration::from_millis(millis))",
             "left: Some(3600s)",
             "a_budget_is_capped_at_the_cap_it_is_given", ["-p", "keylink", "--lib"]),
-    "A3": ("            attach: Duration::from_secs(1),",
+    # A3 and A4 share one substitution, and it stopped compiling when `attach` stopped
+    # being a `Duration`. `Attaching` gave [`Forbidden`] a value of its own, the field
+    # became `Attaching`, and both records in the tree followed - `rpc.rs` and
+    # `idempotency.rs` each name `attach: Attaching::UpTo(Duration::from_secs(1)),` -
+    # while these two rows kept the bare `Duration`. Pasted in, it gave
+    # `error[E0308]: expected `Attaching`, found `Duration``, so neither break reached
+    # a test. Re-watched 2026-08-09, both at exit 101 and `── selected=1`: A3 prints
+    # `left: 1s`, `right: 30s`, and A4 prints `left: UpTo(1s)`, `right: UpTo(30s)`.
+    "A3": ("            attach: Attaching::UpTo(Duration::from_secs(1)),",
            "a request over the ceiling must be held for the ceiling",
            "a_peer_over_the_attach_ceiling_is_held_for_the_default",
            ["-p", "keylink", "--lib"]),
-    "A4": ("            attach: Duration::from_secs(1),",
+    "A4": ("            attach: Attaching::UpTo(Duration::from_secs(1)),",
            "the default ceiling must be the constant the README prints",
            "the_default_attach_ceiling_is_max_attach", ["-p", "keylink", "--lib"]),
     "A5": ("        while inner.held > 0",
