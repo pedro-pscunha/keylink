@@ -3052,8 +3052,39 @@ where
 /// wildcard arm is the collapse the split exists to prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Undelivered {
-    /// The actor is gone: it stopped, was aborted, or its loop ended.
-    #[error("the actor is no longer running")]
+    /// The call did not reach a committed turn. **Usually** the actor is gone —
+    /// it stopped, was aborted, or its loop ended — but two other states arrive
+    /// here and in both of them the actor is **alive**.
+    ///
+    /// # The two live causes, named because the variant's name does not
+    ///
+    /// [`TurnLost::Refused`] is an observer refusing a completed turn: its own doc
+    /// is *"It **ran** and was not committed"*, and the actor is already serving
+    /// the next message. [`TurnLost::Expired`] is a queueing budget expiring while
+    /// the message waited. Neither means the actor is no longer running.
+    ///
+    /// **Use [`ask_catching`](LocalActor::ask_catching) to tell them apart.** It
+    /// answers the whole [`TurnLost`], which is exhaustive precisely so a caller
+    /// can match the cause.
+    ///
+    /// # Why the collapse is deliberate here, and where it is not
+    ///
+    /// `ask` collapses because a plain caller has no different action to take: it
+    /// asked for a value and there is none. Widening this enum would force every
+    /// call site to match a case it cannot act on.
+    ///
+    /// **That reasoning does NOT extend one layer down, and `TurnLost`'s own doc
+    /// says so** — its section *"Four now, because the fourth was being reported
+    /// as `Gone`"* records that mapping a fourth state onto `Gone` "means
+    /// something else and specific — the actor is no longer running — so the first
+    /// local origin to carry a queue budget would have reported a live actor as
+    /// gone, silently". `TurnLost` split those states apart on that argument. This
+    /// variant re-joins them for the one caller that cannot use the difference,
+    /// and says so rather than letting the name imply the actor died.
+    ///
+    /// The message says *undelivered* and not *gone* for that reason: it is true
+    /// of all three causes, where "no longer running" was false for two of them.
+    #[error("this call was not delivered to a committed turn")]
     Gone,
     /// The call was made from inside the target actor's own turn, and would have
     /// deadlocked.

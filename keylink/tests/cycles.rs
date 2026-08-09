@@ -578,10 +578,28 @@ async fn a_two_actor_cycle_is_refused_at_the_closing_edge() {
 /// and completes in milliseconds. So the wedge is built the way the crate says
 /// cannot be repaired at all: `wait` holds A's turn open on a gate the test never
 /// releases, which is the residual `ask` documents — *a turn can also simply await
-/// something that never fires, which is neither cycle shape*. Everything this test
-/// asserts is unchanged; what changed is the one line that makes A unresponsive,
-/// and the shape it is now built from is the one the refusal deliberately cannot
-/// reach.
+/// something that never fires, which is neither cycle shape*. The shape it is now
+/// built from is the one the refusal deliberately cannot reach: no send is
+/// involved in holding A, so no chain check can see it.
+///
+/// **An earlier version of this note said "everything this test asserts is
+/// unchanged; what changed is the one line that makes A unresponsive". That
+/// claimed an invariance the rewrite does not have**, and a review caught it by
+/// extracting the function body from both trees and comparing rather than reading
+/// the sentence. Four assertions are genuinely identical — `b.ping()` answers,
+/// `!a.is_running()`, `b.is_running()`, and `a.ended()` is `Vanished`. Three
+/// things moved:
+///
+/// * **the blocked caller changed subject.** It was A's own `hop(2)` closing the
+///   ring; it is now B calling into A. A different actor is being told.
+/// * **an assertion changed shape**, `assert!(answer.is_err())` to
+///   `assert_eq!(answer, GONE)`. Stronger, and kept — but changed.
+/// * **an assertion was added**, that B answered because B is the one freed
+///   rather than the one destroyed.
+///
+/// The rewrite is an improvement. "Only one line changed" is the kind of sentence
+/// that stops a reviewer looking, which is the whole reason it is corrected here
+/// rather than quietly softened.
 ///
 /// Made red by `scripts/break-once.sh`, replacing `LocalActor::abort`'s
 /// `self.task.abort();` with `()`. Watched: "the caller of an aborted actor is
