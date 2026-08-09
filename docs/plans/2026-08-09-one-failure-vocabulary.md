@@ -1,11 +1,18 @@
 # Wave 1 — one failure vocabulary, both sides
 
-Plan for `docs/goals/2026-08-09-one-failure-vocabulary.md`, revision 2, written
-against `unify-surfaces` at `b1f4422`.
+Plan for `docs/goals/2026-08-09-one-failure-vocabulary.md`, **revision 4**,
+written against `unify-surfaces` at `b1f4422` and revised through `fd4cd3d`.
 
 Revision 1 went through a three-lens plan gate and came back with **7 Critical
-and 16 Major**. This revision is a rewrite, not a patch. §11 records what
-changed and why, so nobody re-derives the refuted version.
+and 16 Major**; revisions 3 and 4 answered an evidence pass and a targeted
+re-check. This is a rewrite, not a patch. §11 records what changed, so nobody
+re-derives a refuted version.
+
+**This plan asserts no totals.** Four separate counts in it grew on every
+measurement — test sites, break records, prefix guards (2 → 3 → 4) and the
+collapse surface. None was an arithmetic error; every partial enumeration added
+up correctly. So each figure below is either a **measurement for sizing**,
+labelled as such, or a **predicate with a command that proves it**.
 
 Read the goal's appended corrections first. Five of ITS claims are false against
 the tree.
@@ -24,16 +31,16 @@ a moved prefix as a `Failed` it silently stops recognising.
 Give those conditions one Rust object carried by both sides and encoded on the
 wire, and delete the prefix machinery.
 
-**It is not a small deletion.** The crate loses five consts and three tests.
-Against that, all of these have to move: **20 test consumer sites** (enumerated
-in §7, and the only figure here I assert exactly), **on the order of 122
-intra-doc link occurrences**, **five RFC files**, five README lines, and a
-break-record registry.
+**It is not a small deletion.** The crate loses five consts and **four** tests
+(§7). Against that, all of these have to move: **two disjoint test surfaces**
+(§7 — the prefix consumers and the collapse consumers, overlap zero), **on the
+order of 122 intra-doc link occurrences**, **five RFC files**, **six README
+lines**, `scripts/replay-fate-breaks.sh`, and a break-record registry.
 
 The wave is dominated by the consumers of the channel being deleted, not by the
-channel. Every figure above except the 20 is a **measurement at `b1f4422` for
-sizing**, not a claim to verify against — the verifications are `mise run docs`,
-`mise run anchors` and the suite.
+channel. Every figure here is a **measurement at `b1f4422` for sizing**, not a
+claim to verify against — the verifications are `cargo nextest run --workspace`,
+`mise run docs` and `mise run anchors`.
 
 ## 2. Six rulings
 
@@ -131,7 +138,10 @@ Revision 1 claimed six. Measured, four have a producer on each side:
   on the ground `turns.rs:3265-3271` already uses: written to be correct if
   something reaches it. `rendered`'s arm stays `TimedOut`.
 
-**The success criterion asserts FOUR**, plus `Panicked` served-side only.
+**Before the wave four are both-sided. AFTER the wave five are**, because
+`turns.rs:4644` gains `Gone`. The equality test asserts all five, and `Gone` —
+the wave's only peer-visible behaviour change — is the one every earlier
+revision left untested. `Panicked` is asserted served-side only.
 
 ### 2.4 Re-entrancy keeps its `Failed`, carved out by name
 
@@ -270,7 +280,7 @@ it must re-watch, and §8 said re-quote only; §8 was right. The watched text at
 `tests/observe.rs:449-450` is `left: Refused { name: "exploding" }` /
 `right: ObserverPanicked { name: "exploding" }` — those are `Answered` and
 `Undelivered` names, untouched by renaming the private `Withheld`. Re-quote the
-literal (row `anchors:1720`, quotes at `tests/observe.rs:446,448`) in the same
+literal (row `anchors:1721` (the row OPENS at :1720; the literal is on the continuation line), quotes at `tests/observe.rs:446,448`) in the same
 commit, and count its uniqueness **after `cargo fmt`**. `anchors` is step 2 of
 `pre-commit`, so the commit cannot land while row and record disagree.
 
@@ -560,7 +570,8 @@ Refuted and replaced: the `#[non_exhaustive]` argument (§2.1); "six conditions
 reachable from both", now four (§2.3); the re-entrancy contradiction (§2.4); the
 claim that the collapse only adds data (§2.5); the parallel-execution
 instruction (§4); the commit split that left the tree red for three commits
-(§4); "two guards", now three tests (§7); 16 test sites, now 20 (§7); four RFC
+(§4); "two guards", now **four** tests (§7); a single test surface of 16, now
+**two disjoint surfaces** with no asserted total (§7); four RFC
 appends, now five files (§9). Added entirely: rustdoc's 122 links, the README,
 `RECORD_BLOCKS`, wasm, the break-record schedule, and the ruling that a
 `Self::Failed(` spelling made the old success criterion blind to a site it was
