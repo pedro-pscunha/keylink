@@ -11,39 +11,57 @@
 //! so a self `tell` succeeds only if nobody else took the permit first. That is
 //! load-dependent, which is what makes it dangerous.
 //!
-//! At N = 2 nothing is load-dependent. Both sends succeed on an idle pair, and both
-//! callers then block on an **answer** that only a loop can produce. So A → B → A
-//! hangs on the first attempt, every time, with no contention anywhere — a harder
-//! failure than the one the crate already warns about, and a quieter one. What
-//! `LOCAL_MAILBOX_DEPTH = 1` buys is not silence on the send — any depth ≥ 1 is
-//! silent for one queued message, and `mpsc::channel(0)` panics, so there is no
-//! depth that *would* complain. What 1 buys is that **exactly one** message fits:
-//! the ring closes quietly, and the very next caller blocks. Both halves are
-//! asserted below.
+//! At N = 2 nothing is load-dependent. Both sends *would* succeed on an idle pair,
+//! and both callers would then block on an **answer** that only a loop can
+//! produce. So A → B → A used to hang on the first attempt, every time, with no
+//! contention anywhere — a harder failure than the one the crate already warns
+//! about, and a quieter one.
+//!
+//! # It is refused now, and the depth is not what does it
+//!
+//! Item M closed the ring: every local message carries the chain of turns it was
+//! sent from, and a send to an actor already on that chain is refused with
+//! [`Undelivered::Reentrant`] rather than queued. So the tests below assert a
+//! **refusal** where they used to assert a hang, and the mechanism is identity
+//! rather than the permit — measured, because at depth 32 every deadlock guard in
+//! this file still fired.
+//!
+//! What the depth buys is therefore much smaller than this header used to claim,
+//! and it is worth keeping exact: any depth ≥ 1 is silent for one queued message,
+//! and `mpsc::channel(0)` panics, so no depth *would* have complained about the
+//! send. What 1 buys is that **exactly one** message fits — nothing about
+//! deadlock, and the first test below is the only thing in this file that depends
+//! on it.
 //!
 //! The order of these tests is the argument:
 //!
 //! - a turn runs with its own permit already free, so exactly one message fits
-//!   behind it — the fact the rest depends on;
-//! - A → B → A hangs, and so does everything else either actor is asked;
-//! - `abort` recovers the *other* actor and destroys the one it names;
-//! - a read from inside a turn is the same deadlock through
-//!   [`Handle::with_state`];
-//! - parking the reply and leaving the turn breaks the cycle — and parking it
-//!   without leaving the turn does not, which is the distinction a reader needs;
+//!   behind it — the one depth fact this file rests on;
+//! - A → B → A is refused at the closing edge, and both actors stay live;
+//! - `abort` recovers the *other* actor and destroys the one it names — wedged by
+//!   a turn that never returns, which is the shape no refusal can reach;
+//! - a read from inside a turn is the same refusal through
+//!   [`Handle::with_state`], and it is the SELF half of the pair the ring test is
+//!   the RING half of;
+//! - parking the reply and leaving the turn breaks the cycle — a spawned task
+//!   starts a fresh chain, which is why the crate's documented remedy still works
+//!   — and parking it without leaving the turn does not, which is the distinction
+//!   a reader needs;
 //! - and the cycle `compose` already breaks: the same publish from inside a turn
 //!   hangs under [`Overflow::BlockPublisher`] and completes under
 //!   [`Overflow::DropSubscriber`], so that policy is a safety property and not a
-//!   preference about throughput.
+//!   preference about throughput. A `Topic` is not a `LocalActor`, so no chain
+//!   reaches it and that hang is a stated residual rather than an oversight.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use keylink::compose::{Overflow, Subscription, Topic};
-use keylink::{Caller, Ended, Replied, Reply};
+use keylink::{Caller, Ended, Intensity, Replied, Reply};
 use tokio::sync::Notify;
 
 keylink::service! {
@@ -62,6 +80,17 @@ keylink::service! {
     /// Reads this actor's own state, from inside its own turn, through the
     /// public read seam.
     rpc SelfRead() -> u64;
+
+    /// `tell`s itself twice from inside its own turn, and reports which of
+    /// [`TELL_THEN_REFUSED`]'s four outcomes happened. Both halves of the rule
+    /// in one turn: the first send takes the permit the loop released, the
+    /// second finds the mailbox full.
+    rpc SelfTellTwice() -> u64;
+
+    /// Calls `stop` on itself from inside its own turn. A `stop` takes a permit
+    /// like any message and then waits for a loop that cannot exit while this
+    /// turn is running, so it is the refuse-always half at its clearest.
+    rpc SelfStop() -> u64;
 
     /// Holds the turn open until the test releases the gate. Nothing else here
     /// can pin a turn without also sleeping.
@@ -102,19 +131,47 @@ struct Peer {
     bumps: u64,
 }
 
+/// What a hop answers when the edge it tried to close was **refused as
+/// re-entrant**: the actor it called is already on the chain of turns behind it.
+const REFUSED: u64 = u64::MAX;
+
+/// What a hop answers when the actor it called was **gone** — aborted out from
+/// under it, which is the recovery path this file also measures.
+///
+/// A second sentinel and not one shared with [`REFUSED`], because the whole point
+/// of the error gaining a second variant is that a caller can tell the two apart:
+/// gone means stop calling, and refused means the actor is alive and running the
+/// turn you called from.
+const GONE: u64 = u64::MAX - 1;
+
+/// The right answer from `self_tell_twice`: the first self-`tell` landed in the
+/// permit the loop released when it took the message it is running, and the
+/// second was refused because there was no permit left.
+///
+/// **Both halves of the rule, observed in one turn.** A `tell` waits for a permit
+/// and nothing else, so refusing it into a free slot would delete a working
+/// pattern — the message runs after the turn returns. Refusing it into a full one
+/// replaces an intermittent hang with an intermittent error the caller can see.
+const TELL_THEN_REFUSED: u64 = 1;
+
+/// Both self-`tell`s landed: either the depth moved, or the refuse-when-full half
+/// is not firing.
+const BOTH_TELLS_LANDED: u64 = 2;
+
+/// The first self-`tell` was refused: the refuse-**always** half leaked into
+/// `tell`, which deletes the pattern the rule promises to keep.
+const FIRST_TELL_REFUSED: u64 = 3;
+
+/// Neither shape — a `Gone`, which would mean the actor died mid-turn.
+const TELL_SURPRISE: u64 = 4;
+
 impl ring::Actor for Peer {
     async fn hop(&mut self, _cx: Caller<'_>, hops: u64) -> u64 {
         if hops == 0 {
             return 0;
         }
         let other = self.other.get().expect("wired").clone();
-        // `MailboxClosed` is a real answer here and not a failure: it is what a
-        // hop gets when the actor it is calling was aborted out from under it,
-        // which is the recovery path this file also measures.
-        other
-            .hop(hops - 1)
-            .await
-            .map_or(u64::MAX, |depth| depth + 1)
+        answered(other.hop(hops - 1).await)
     }
 
     async fn ping(&mut self, _cx: Caller<'_>) -> u64 {
@@ -123,9 +180,35 @@ impl ring::Actor for Peer {
 
     async fn self_read(&mut self, _cx: Caller<'_>) -> u64 {
         let me = self.me.get().expect("wired").clone();
-        me.with_state(|state: &Peer| state.bumps)
-            .await
-            .unwrap_or(u64::MAX)
+        match me.with_state(|state: &Peer| state.bumps).await {
+            Ok(bumps) => bumps,
+            Err(keylink::Undelivered::Reentrant) => REFUSED,
+            Err(keylink::Undelivered::Gone) => GONE,
+        }
+    }
+
+    async fn self_tell_twice(&mut self, _cx: Caller<'_>) -> u64 {
+        let me = self.me.get().expect("wired").clone();
+        let first = me.bump().await;
+        let second = me.bump().await;
+        match (first, second) {
+            (Ok(()), Err(keylink::Undelivered::Reentrant)) => TELL_THEN_REFUSED,
+            (Ok(()), Ok(())) => BOTH_TELLS_LANDED,
+            (Err(keylink::Undelivered::Reentrant), _) => FIRST_TELL_REFUSED,
+            _ => TELL_SURPRISE,
+        }
+    }
+
+    async fn self_stop(&mut self, _cx: Caller<'_>) -> u64 {
+        let me = self.me.get().expect("wired").clone();
+        match me.stop().await {
+            Err(keylink::Undelivered::Reentrant) => REFUSED,
+            Err(keylink::Undelivered::Gone) => GONE,
+            // Unreachable while the check holds, and it is what a hang would
+            // become if the check were removed — this handler would never get
+            // here at all, and the test's timeout is what would say so.
+            Ok(()) => 0,
+        }
     }
 
     async fn wait(&mut self, _cx: Caller<'_>) -> u64 {
@@ -144,11 +227,7 @@ impl ring::Actor for Peer {
         // Off the turn's task, which is the half that matters: the turn returns
         // now, so the loop is polling again by the time the peer calls back.
         tokio::spawn(async move {
-            let depth = other
-                .hop(hops - 1)
-                .await
-                .map_or(u64::MAX, |depth| depth + 1);
-            deferred.send(depth);
+            deferred.send(answered(other.hop(hops - 1).await));
         });
         replied
     }
@@ -163,12 +242,25 @@ impl ring::Actor for Peer {
         let other = self.other.get().expect("wired").clone();
         // Parked, and then awaited anyway. The turn has not returned, so the
         // loop is not polling, so nothing about the park has helped.
-        let depth = other
-            .hop(hops - 1)
-            .await
-            .map_or(u64::MAX, |depth| depth + 1);
-        deferred.send(depth);
+        deferred.send(answered(other.hop(hops - 1).await));
         replied
+    }
+}
+
+/// One hop's answer, turned into this actor's own.
+///
+/// Shared by the three hopping handlers so that a sentinel is decided in **one**
+/// place: two of them wrote `map_or(u64::MAX, |depth| depth + 1)`, which folds a
+/// refusal and a departure into one value and then overflows on the way back
+/// through the next hop.
+fn answered(hop: Result<u64, keylink::Undelivered>) -> u64 {
+    match hop {
+        // A sentinel travels back unchanged. Adding a hop count to it would
+        // rename it — and `REFUSED` is `u64::MAX`, so it would also overflow.
+        Ok(depth @ (REFUSED | GONE)) => depth,
+        Ok(depth) => depth + 1,
+        Err(keylink::Undelivered::Reentrant) => REFUSED,
+        Err(keylink::Undelivered::Gone) => GONE,
     }
 }
 
@@ -246,23 +338,30 @@ async fn inside_a_turn(entered: &AtomicUsize) {
 ///
 /// This is `macros.rs`'s self-`tell` paragraph turned into an observation. The
 /// first `bump` completes while the actor is wedged inside `wait` — the mailbox
-/// took it — and the second does not, because `LOCAL_MAILBOX_DEPTH` is 1 and the
-/// first one is now sitting in it. `tell` is the only method that can show this:
-/// an `rpc` would block on the answer either way and could not tell the two
+/// took it — and the second does not, because `DEFAULT_LOCAL_MAILBOX_DEPTH` is 1
+/// and the first one is now sitting in it. `tell` is the only method that can show
+/// this: an `rpc` would block on the answer either way and could not tell the two
 /// apart.
 ///
+/// **These `bump`s come from the test's task and not from a turn**, so the
+/// re-entrancy check is not what they meet — this test measures the permit, which
+/// is the one thing in this file the depth still governs.
+///
 /// Made red by `scripts/break-once.sh`, replacing `turns.rs`'s
-/// `const LOCAL_MAILBOX_DEPTH: usize = 1;` with the whole line
-/// `const LOCAL_MAILBOX_DEPTH: usize = 2;` — spelled out because `= 2;` alone, which
-/// is what this record used to say, substitutes for the *entire* searched line and
-/// leaves a syntax error. Watched: the second
-/// `bump` then completes too and the test fails at
-/// "a second message must not fit: LOCAL_MAILBOX_DEPTH is spent by the first". That
-/// is the right red — it is the depth, and not the loop's release of the permit, that
-/// this assertion pins.
+/// `const DEFAULT_LOCAL_MAILBOX_DEPTH: NonZeroUsize = NonZeroUsize::MIN;` with the
+/// whole line
+/// `const DEFAULT_LOCAL_MAILBOX_DEPTH: NonZeroUsize = match NonZeroUsize::new(2) { Some(two) => two, None => NonZeroUsize::MIN };`
+/// — spelled out in full because the replacement substitutes for the *entire*
+/// searched line, and written as a `match` rather than an `unwrap` because the
+/// workspace denies `unwrap_used` in `keylink/src` and a break that fails to
+/// compile is a red that proves nothing. Watched: the second `bump` then completes
+/// too and the test fails at
+/// "a second message must not fit: DEFAULT_LOCAL_MAILBOX_DEPTH is spent by the first".
+/// That is the right red — it is the depth, and not the loop's release of the
+/// permit, that this assertion pins.
 ///
 /// **The message names the constant and not its value, and that is deliberate.** It
-/// read "LOCAL_MAILBOX_DEPTH is 1" until this branch, which put a copy of a value
+/// read "LOCAL_MAILBOX_DEPTH is 1" until item M, which put a copy of a value
 /// defined in `turns.rs` into a failure message in `tests/`, where nothing checks
 /// it: raise the depth and the assertion fails while its own message asserts the old
 /// value as a fact. Naming the constant instead keeps the message an accurate
@@ -289,7 +388,7 @@ async fn a_running_turn_leaves_exactly_one_free_permit_behind_it() {
 
     assert!(
         n0_future::time::timeout(HANG, a.bump()).await.is_err(),
-        "a second message must not fit: LOCAL_MAILBOX_DEPTH is spent by the first"
+        "a second message must not fit: DEFAULT_LOCAL_MAILBOX_DEPTH is spent by the first"
     );
 
     gate.notify_one();
@@ -333,6 +432,34 @@ async fn a_running_turn_leaves_exactly_one_free_permit_behind_it() {
 /// hop count rather than on the crate: the hang is the *absence* of a mechanism, so
 /// no crate line can be edited to remove it.
 ///
+/// # This test asserted a HANG until item M, and the rewrite is the item
+///
+/// Everything above about the mechanism still holds — both sends *would* succeed,
+/// and neither caller *would* get an answer. What changed is that the closing
+/// edge is now refused before it is sent, by identity rather than by the permit,
+/// so the ring answers [`REFUSED`] instead of hanging. The assertion below is the
+/// same claim with the outcome the crate now produces.
+///
+/// The asymmetry the old test measured with two `tell`s is gone with the hang: no
+/// mailbox stays full, because nothing is left waiting in one. What replaces it is
+/// the half a reader needs now — **both actors are still live and polling after
+/// the refusal**, which is what makes this an error rather than a different
+/// failure.
+///
+/// Made red by `scripts/break-once.sh` on `turns.rs`, replacing `Chain::holds`'s
+/// `            Self::Deep(deep) => deep.iter().any(|each| each.is(who)),` with
+/// `            Self::Deep(_) => false,` — a chain that can name the turn it is in
+/// and none of the turns behind it. Watched: "A -> B -> A must be refused rather
+/// than hang: Elapsed(())", after 5.00s.
+///
+/// **And `a_read_from_inside_a_turn_is_refused` stays GREEN under that same
+/// break** — measured, exit 0, 1 passed. That pairing is why both tests exist and
+/// it is the design's own Critical finding turned into evidence: a chain that can
+/// only ever hold ONE actor detects a self-call and silently misses `A → B → A`,
+/// which is the deterministic hazard. The rejected design — putting the chain on
+/// `Origin` — could have installed nothing but `Chain::One`, so it would have
+/// shipped in exactly this state, with this test red and that one green.
+///
 /// # The convention, and it is narrower twice over
 ///
 /// `break-once.sh` greps and counts **only its search literal**; the replacement is
@@ -356,101 +483,102 @@ async fn a_running_turn_leaves_exactly_one_free_permit_behind_it() {
 /// along. The counts are in `.mise/tasks/anchors`, which registers the indented form
 /// and re-checks it on every run.
 #[tokio::test]
-async fn a_two_actor_cycle_hangs_and_wedges_both_actors() {
+async fn a_two_actor_cycle_is_refused_at_the_closing_edge() {
     let (a, b, _gate, _entered) = ring_of_two();
 
-    let mut hopping = {
-        let a = a.clone();
-        tokio::spawn(async move { a.hop(2).await })
-    };
-
-    assert!(
-        n0_future::time::timeout(HANG, &mut hopping).await.is_err(),
-        "A -> B -> A must hang"
-    );
-    // The asymmetry, asserted with the one method that can see it: a `tell`
-    // resolves when the **send** completes rather than when the loop runs it, so it
-    // separates a full mailbox from a busy loop. A's one free permit was consumed
-    // by B's call, so this blocks in `send`; B's is still free, so the same call to
-    // B is accepted.
-    //
-    // **This has to come before the pings, and that is not a style choice.** A
-    // `ping` to B succeeds at the *send* — B's permit is free — and only then times
-    // out waiting for the answer, so it leaves B's mailbox full. Asserting the
-    // permits afterwards measures the pings instead of the deadlock: written that
-    // way round, `b.bump()` blocks and fails with
-    // "B's permit is still free, so the send completes: Elapsed(())".
-    assert!(
-        n0_future::time::timeout(HANG, a.bump()).await.is_err(),
-        "A's mailbox is full: B's call took the one permit A released"
-    );
-    n0_future::time::timeout(SETTLE, b.bump())
+    let depth = n0_future::time::timeout(SETTLE, a.hop(2))
         .await
-        .expect("B's permit is still free, so the send completes")
-        .expect("B is running, wedged but not gone");
-
-    // And neither loop is polling. That is all a ping can say — it times out at
-    // both ends, and cannot tell a full mailbox from a busy loop.
-    assert!(
-        n0_future::time::timeout(HANG, a.ping()).await.is_err(),
-        "A is inside the turn that is waiting on B"
-    );
-    assert!(
-        n0_future::time::timeout(HANG, b.ping()).await.is_err(),
-        "B is inside the turn that is waiting on A"
+        .expect("A -> B -> A must be refused rather than hang")
+        .expect("A is running: a refusal is not an ending");
+    assert_eq!(
+        depth, REFUSED,
+        "the closing edge B -> A is the one refused, and the answer travels back"
     );
 
-    // Not hygiene. A wedged pair holds two tasks that outlive this test's
-    // runtime shutdown otherwise, and a leaked busy actor is the failure mode
-    // this repo has paid for once already.
-    a.abort();
-    b.abort();
+    // The half that makes this a remedy rather than a different failure: both
+    // actors are still polling, and neither mailbox is holding anything. A `tell`
+    // is used for A because it is the method that can see a full mailbox — it
+    // resolves at the send — and a `ping` for B because it is the method that can
+    // see a loop that is not polling.
+    n0_future::time::timeout(SETTLE, a.bump())
+        .await
+        .expect("A's mailbox is empty: nothing was left waiting in it")
+        .expect("A is running");
+    n0_future::time::timeout(SETTLE, b.ping())
+        .await
+        .expect("B's loop is polling: its turn returned when the refusal did")
+        .expect("B is running");
+
+    // Nothing to abort — neither actor is wedged, which is the whole point — but
+    // the handles are a strong reference cycle, so the runtime's teardown is what
+    // ends them. See `ring_of_two`.
 }
 
 /// The recovery, and the word for it is not "recovers both".
 ///
 /// `abort` on **one** actor frees the other: A's task dies, its queued message
 /// from B is dropped, that drop closes B's reply channel, B's handler gets
-/// `MailboxClosed` and returns, and B's loop is polling again. So B answers
+/// `Undelivered::Gone` and returns, and B's loop is polling again. So B answers
 /// `ping` afterwards — it is a live actor with its state intact.
 ///
 /// A is not recovered. It is destroyed, which is what `abort` documents: "the
-/// state is **destroyed**". The original caller is told `MailboxClosed`. Naming
-/// this as "recovers both" would be the crate claiming a repair it does not
-/// perform, so the guard asserts the asymmetry rather than the phrase.
+/// state is **destroyed**". The original caller is told `Undelivered::Gone`.
+/// Naming this as "recovers both" would be the crate claiming a repair it does
+/// not perform, so the guard asserts the asymmetry rather than the phrase.
+///
+/// # The wedge is a held turn and no longer a ring, and the swap is item M
+///
+/// This test used to wedge A by closing the A → B → A ring, which is refused now
+/// and completes in milliseconds. So the wedge is built the way the crate says
+/// cannot be repaired at all: `wait` holds A's turn open on a gate the test never
+/// releases, which is the residual `ask` documents — *a turn can also simply await
+/// something that never fires, which is neither cycle shape*. Everything this test
+/// asserts is unchanged; what changed is the one line that makes A unresponsive,
+/// and the shape it is now built from is the one the refusal deliberately cannot
+/// reach.
 ///
 /// Made red by `scripts/break-once.sh`, replacing `LocalActor::abort`'s
 /// `self.task.abort();` with `()`. Watched: "the caller of an aborted actor is
 /// told, not left hanging: Elapsed(())" — which is one assertion *earlier* than
 /// the one this test is named for. Worth recording rather than tidying: with
-/// nothing aborted the cycle simply stays wedged, so the first thing to fail is
-/// the caller still hanging, and B's freedom is never reached to be checked.
+/// nothing aborted A simply stays wedged, so the first thing to fail is the
+/// caller still hanging, and B's freedom is never reached to be checked.
 #[tokio::test]
 async fn aborting_one_actor_of_a_cycle_frees_the_other_and_destroys_it() {
-    let (a, b, _gate, _entered) = ring_of_two();
+    let (a, b, _gate, entered) = ring_of_two();
 
-    let mut hopping = {
+    // A goes into a turn that never returns, and the gate is never notified.
+    let held = {
         let a = a.clone();
-        tokio::spawn(async move { a.hop(2).await })
+        tokio::spawn(async move { a.wait().await })
     };
-    // Let the cycle close before aborting it, or this measures a race instead.
-    // Waiting on the call itself and not on `b.ping()`: an un-polled `spawn`
-    // leaves B idle, so a ping answers at once and proves nothing. This assertion
-    // failed exactly that way when it was written the other way round.
+    inside_a_turn(&entered).await;
+
+    // B calls A. A's loop released its permit when it took `wait`, so the send
+    // lands and B then blocks on an answer A cannot produce — B is wedged behind
+    // A, which is what the abort has to free.
+    let mut hopping = {
+        let b = b.clone();
+        tokio::spawn(async move { b.hop(1).await })
+    };
     assert!(
         n0_future::time::timeout(HANG, &mut hopping).await.is_err(),
-        "the cycle must close before the abort means anything"
+        "B must be waiting on A before the abort means anything"
     );
 
     a.abort();
+    // The task holding A's turn open is A's own, and `abort` took it. This one is
+    // only the caller that was waiting on it.
+    held.abort();
 
     let answer = n0_future::time::timeout(SETTLE, hopping)
         .await
         .expect("the caller of an aborted actor is told, not left hanging")
-        .expect("the caller is not itself panicking");
-    assert!(
-        answer.is_err(),
-        "A was destroyed, so its caller gets MailboxClosed"
+        .expect("the caller is not itself panicking")
+        .expect("B answered: B is the one that was freed, not the one destroyed");
+    assert_eq!(
+        answer, GONE,
+        "A was destroyed, so B's hop into it is told `Undelivered::Gone`"
     );
 
     n0_future::time::timeout(SETTLE, b.ping())
@@ -480,45 +608,282 @@ async fn aborting_one_actor_of_a_cycle_frees_the_other_and_destroys_it() {
 
 // ────────────────────────────────────────────────────── the read inside a turn
 
-/// A read from inside a turn is the same deadlock, through the public read seam.
+/// A read from inside a turn is the same refusal, through the public read seam.
 ///
 /// `Handle::with_state` is `LocalActor::read`, and `read` takes a mailbox permit
-/// like any other message. On an idle actor the send therefore succeeds — it takes
-/// the one free permit the running turn left — and then waits for an answer that
-/// only the loop can produce. **That step is inherited, not asserted here:** the
-/// single timeout below cannot separate a send that completed from one still
-/// blocked, and what establishes the free permit is the first test in this file.
-/// The permit is what the crate's self-`tell`
-/// paragraph is about; here it is not the binding constraint, and the hang is
-/// unconditional rather than load-dependent.
+/// like any other message — so on an idle actor the send used to succeed, taking
+/// the free permit the running turn left, and then wait forever for an answer only
+/// the loop could produce. It is `Refuse::Always` now, and the actor is on its own
+/// chain, so it never reaches the permit at all.
 ///
-/// Made red by `scripts/break-once.sh` on this file, searching for `self_read`'s
-/// read line — pass it **with its eight spaces of indentation** —
-/// `me.with_state(|state: &Peer| state.bumps)`, and replacing it with
-/// `std::future::ready(Ok::<u64, keylink::MailboxClosed>({ let _ = me; 0 }))` — a
-/// read that never enters the mailbox, keeping the handle binding used so the break
-/// is a behaviour change and not a dead-code build failure. Watched: "a read from
-/// inside a turn must hang", in 0.00s.
+/// **The permit is not what decides this, and that is the point.** The one method
+/// that never touches `&mut self` is refused at any depth, because what makes it a
+/// deadlock is the answer rather than the slot.
 ///
-/// Both halves quoted, under the indentation rule the two-actor record above states.
-/// The search line is the **first** line of a three-line chain and is a whole line
-/// in its own right, which is what makes it quotable; the `.await` and
-/// `.unwrap_or` below it are `rustfmt`'s to move, and if it ever reflows this anchor
-/// goes to count 0 — loud, and what `.mise/tasks/anchors` exists to catch.
+/// This test is the SELF-call half of the pair, and the two-actor test above is
+/// the ring half. Both must be here: the design that put the chain on `Origin`
+/// would have passed this one and failed that one, which is why the vehicle is the
+/// private `Message` enum.
+///
+/// Made red by `scripts/break-once.sh`, replacing `Inbox::identity`'s
+/// `Some(Actor(Arc::clone(&self.busy)))` with `None` — the `Watched` impl, which
+/// is the only thing that gives a local actor an identity to be found on a chain.
+/// Watched: "a read from inside a turn must be refused, not hang: Elapsed(())",
+/// because without an identity the chain is empty, the send takes the free permit,
+/// and the read waits for a loop that is inside the turn that asked.
 #[tokio::test]
-async fn a_read_from_inside_a_turn_is_a_self_deadlock() {
+async fn a_read_from_inside_a_turn_is_refused() {
     let (a, _b, _gate, _entered) = ring_of_two();
 
-    let mut reading = {
-        let a = a.clone();
-        tokio::spawn(async move { a.self_read().await })
-    };
-    assert!(
-        n0_future::time::timeout(HANG, &mut reading).await.is_err(),
-        "a read from inside a turn must hang"
+    let bumps = n0_future::time::timeout(SETTLE, a.self_read())
+        .await
+        .expect("a read from inside a turn must be refused, not hang")
+        .expect("A is running: a refusal is not an ending");
+    assert_eq!(
+        bumps, REFUSED,
+        "`with_state` on your own handle is a message to yourself"
     );
 
-    a.abort();
+    // Still polling, which is what separates a refusal from the deadlock it
+    // replaces.
+    n0_future::time::timeout(SETTLE, a.ping())
+        .await
+        .expect("A's loop is polling")
+        .expect("A is running");
+}
+
+// ────────────────────────────────────────────────────────────────── the knob
+
+/// The depth is a **default** now, and this is the door that overrides it.
+///
+/// The same observation as the first test in this file, one message further
+/// along: at depth 2 a running turn leaves two slots behind it, so two `tell`s fit
+/// and the third does not. `tell` is again the only method that can show it — an
+/// `rpc` would block on the answer either way.
+///
+/// **It is a knob and not a moved default.** Every other actor in this file is
+/// spawned through `ring::actor`, which takes 1, and every assertion about
+/// depth-1 behaviour above still holds beside this one. That pairing is the whole
+/// claim: the door exists, and using it changes nothing for anybody who does not.
+///
+/// **And the depth is not what makes a self-call safe**, which is why this test
+/// does not touch the refusal: a re-entrant call is refused by identity at any
+/// depth, and `a_self_tell_fits_once_and_is_refused_when_the_mailbox_is_full` is
+/// the guard for the one place where depth and the rule interact.
+///
+/// Made red by `scripts/break-once.sh` on `turns.rs` — the knob accepted and then
+/// ignored, which is the failure a caller could not see. Watched: "a second
+/// message must fit at depth 2: the knob was ignored: Elapsed(())", after 5.00s,
+/// because a third `tell` into a depth-1 mailbox blocks rather than answering.
+///
+/// **The search literal is two lines, and it has to be.** `spawn_deep` and
+/// `spawn_supervised_deep` both open with
+/// `        let (mail, inbox) = mpsc::channel::<Message<A, M>>(depth.get());`, so
+/// that line alone aborts the harness at "expected exactly one occurrence, found
+/// 2" — measured, not predicted. The comment line above it is what makes the
+/// unsupervised one unique, so the search literal is the pair
+/// `        // closure it used to carry made one by accident.
+///         let (mail, inbox) = mpsc::channel::<Message<A, M>>(depth.get());`,
+/// replaced by the same pair with `DEFAULT_LOCAL_MAILBOX_DEPTH.get()` in place of
+/// `depth.get()`. The two-line anchor is registered in `.mise/tasks/anchors`, so a
+/// `rustfmt` reflow between those lines goes to count 0 rather than quietly
+/// breaking the wrong function.
+#[tokio::test]
+async fn a_deeper_mailbox_takes_one_more_message_behind_a_running_turn() {
+    let me = Arc::new(OnceLock::new());
+    let gate = Arc::new(Notify::new());
+    let entered = Arc::new(AtomicUsize::new(0));
+
+    let a = ring::actor_deep(
+        Peer {
+            other: me.clone(),
+            me: me.clone(),
+            entered: entered.clone(),
+            gate: gate.clone(),
+            bumps: 0,
+        },
+        Vec::new(),
+        ring::Feeds::new(),
+        NonZeroUsize::new(2).expect("two is not zero"),
+    );
+    me.set(a.clone()).expect("set once");
+
+    let waiting = {
+        let a = a.clone();
+        tokio::spawn(async move { a.wait().await })
+    };
+    inside_a_turn(&entered).await;
+
+    n0_future::time::timeout(SETTLE, a.bump())
+        .await
+        .expect("the permit the loop released when it took `wait` is free")
+        .expect("the actor is running");
+    n0_future::time::timeout(SETTLE, a.bump())
+        .await
+        .expect("a second message must fit at depth 2: the knob was ignored")
+        .expect("the actor is running");
+
+    assert!(
+        n0_future::time::timeout(HANG, a.bump()).await.is_err(),
+        "and a third must not: the depth asked for is 2, not unbounded"
+    );
+
+    gate.notify_one();
+    n0_future::time::timeout(SETTLE, waiting)
+        .await
+        .expect("the gate was released")
+        .expect("the caller is not itself panicking")
+        .expect("the actor is running");
+}
+
+// ──────────────────────────────────────────── the two halves, and the two paths
+
+/// **The rule has two halves and this is both of them, in one turn.**
+///
+/// `ask`, `read` and `stop` are refused whether or not the mailbox has room,
+/// because the hang is on the answer and a free slot does not save it. A `tell`
+/// waits for a permit and nothing else, so refusing it into a free slot would
+/// delete a working pattern — the message runs after the turn returns. So the
+/// first self-`tell` must land and the second must be refused.
+///
+/// The two are asserted together because a check that cannot tell them apart
+/// passes half of this and fails the other half whichever way it errs. `send`
+/// receives byte-identical arguments from `notify` and from the ask path, so what
+/// separates them is the parameter naming the half and nothing else.
+///
+/// Made red twice, and the two reds are opposite:
+///
+/// - `scripts/break-once.sh` on `turns.rs`, replacing `notify`'s
+///   `            Refuse::WhenFull,` with `            Refuse::Always,`. Watched:
+///   "the first self-tell takes the permit the loop released: 3", the code for
+///   [`FIRST_TELL_REFUSED`].
+/// - and replacing `send`'s
+///   `                Refuse::WhenFull if self.mail.capacity() == 0 => {` with
+///   `                Refuse::WhenFull if false => {`. Watched: "a self-tell into
+///   a full mailbox must be refused, not block: Elapsed(())", after 5.00s.
+///
+/// **The second red is a TIMEOUT and not [`BOTH_TELLS_LANDED`]**, which is what
+/// this record predicted before it was run. The prediction was wrong about the
+/// mechanism in a way worth keeping: with the arm off, the second `tell` does not
+/// *land*, it **blocks** — the mailbox really is full, and the only task that can
+/// free the permit is the one inside this turn. So `BOTH_TELLS_LANDED` names a
+/// state the crate cannot reach by removing this check, and the code that would
+/// report it is unreachable through this break. It stays in the enum because it is
+/// what a **deeper default** would produce, which is a different edit.
+#[tokio::test]
+async fn a_self_tell_fits_once_and_is_refused_when_the_mailbox_is_full() {
+    let (a, _b, _gate, _entered) = ring_of_two();
+
+    let outcome = n0_future::time::timeout(SETTLE, a.self_tell_twice())
+        .await
+        .expect("a self-tell into a full mailbox must be refused, not block")
+        .expect("A is running");
+    assert_eq!(
+        outcome, TELL_THEN_REFUSED,
+        "the first self-tell takes the permit the loop released and the second \
+         finds the mailbox full"
+    );
+}
+
+/// `stop` on your own handle is the refuse-always half at its clearest: it takes
+/// a permit like any message and then waits for a loop that cannot exit while
+/// this turn is running.
+///
+/// It is also the reason `stop` gained a `Result`. With no error position the
+/// refusal would be a silent no-op — an actor told to stop, not stopping, and
+/// nobody told — which is the fallback this crate refuses everywhere else.
+///
+/// Made red by `scripts/break-once.sh` on `turns.rs`, replacing `stop`'s
+/// `        match self.send(Message::Stop, Refuse::Always).await {` with
+/// `        match self.send(Message::Stop, Refuse::WhenFull).await {`. Watched:
+/// "a self-stop must be refused rather than wedge the actor: Elapsed(())" — the
+/// timeout, because the permit is free, so the stop is queued and the handler
+/// then waits for a loop that is inside it.
+#[tokio::test]
+async fn a_self_stop_is_refused_rather_than_wedging_the_actor() {
+    let (a, _b, _gate, _entered) = ring_of_two();
+
+    let outcome = n0_future::time::timeout(SETTLE, a.self_stop())
+        .await
+        .expect("a self-stop must be refused rather than wedge the actor")
+        .expect("A is running");
+    assert_eq!(outcome, REFUSED, "a stop is a message to yourself");
+
+    // And the actor really is still there, which is the difference between a
+    // refusal and the stop it declined to perform.
+    n0_future::time::timeout(SETTLE, a.ping())
+        .await
+        .expect("A's loop is polling")
+        .expect("A is running: a refused stop stopped nothing");
+}
+
+/// **A supervised actor refuses a self-call too, and nothing would have said so.**
+///
+/// The supervised path does not hand the loop the mailbox it was spawned with: it
+/// hands it a `Lent`, a delegating wrapper the supervisor owns, so an incarnation
+/// borrows the mailbox rather than owning it. `Lent` forwards `identity` in one
+/// line, exactly as it already forwards `mark_busy` — and a delegating wrapper
+/// that forgets to forward turns a safety check off with **no test failing**,
+/// because the default is `None` and `None` means "this actor cannot be named".
+///
+/// So this test is not a variation on the one above. It is the only thing in the
+/// tree that distinguishes a forwarded identity from a forgotten one, and every
+/// supervised actor in production runs the path it covers.
+///
+/// Made red by `scripts/break-once.sh` on `turns.rs`, replacing `Lent`'s
+/// `        self.inbox.identity()` with `        None`. Watched: "a supervised
+/// self-read must be refused rather than hang: Elapsed(())" — the timeout, and
+/// the unsupervised twin above stays green through it, which is the whole of what
+/// this test adds.
+#[tokio::test]
+async fn a_supervised_actor_still_refuses_a_self_call() {
+    let me = Arc::new(OnceLock::new());
+    let other = Arc::new(OnceLock::new());
+
+    let a = {
+        let me = me.clone();
+        let other = other.clone();
+        ring::supervised(
+            move || {
+                let me = me.clone();
+                let other = other.clone();
+                async move {
+                    Ok((
+                        Peer {
+                            other,
+                            me,
+                            entered: Arc::new(AtomicUsize::new(0)),
+                            gate: Arc::new(Notify::new()),
+                            bumps: 0,
+                        },
+                        Vec::new(),
+                        (),
+                    ))
+                }
+            },
+            Intensity::new(
+                NonZeroU32::new(3).expect("a budget of at least one"),
+                Duration::from_secs(10),
+            )
+            .expect("a recovery span whose backoff is not zero"),
+        )
+    };
+    me.set(a.clone()).expect("set once");
+    other.set(a.clone()).expect("set once");
+
+    let bumps = n0_future::time::timeout(SETTLE, a.self_read())
+        .await
+        .expect("a supervised self-read must be refused rather than hang")
+        .expect("the supervised actor is running");
+    assert_eq!(
+        bumps, REFUSED,
+        "`Lent` forwards the identity, so a supervised actor is on its own chain"
+    );
+
+    n0_future::time::timeout(SETTLE, a.ping())
+        .await
+        .expect("the incarnation's loop is polling")
+        .expect("a refusal is not an ending, and did not spend a restart");
 }
 
 // ─────────────────────────────────────────────────────────── the cycle-breaker
@@ -538,7 +903,7 @@ async fn a_read_from_inside_a_turn_is_a_self_deadlock() {
 /// the vocabulary for that: `scripts/break-once.sh` replacing `Deferred::send`'s
 /// `Verdict::Committed => reply.answer(Answered::Ran(value)),` with
 /// `Verdict::Committed => drop((reply, value)),`. Watched: "the actor is running:
-/// MailboxClosed". That proves the parked answer is load-bearing and proves
+/// Undelivered". That proves the parked answer is load-bearing and proves
 /// nothing about the *cycle*.
 ///
 /// **What the break reaches is one arm, and naming the arm is the whole
@@ -618,27 +983,31 @@ async fn a_parked_reply_that_leaves_the_turn_breaks_the_cycle() {
 /// The control, and the reason the sentence has to say "leaves the turn".
 ///
 /// This handler parks its reply exactly as the one above does, and then awaits
-/// the hop **without returning**. It hangs. So `Reply::later` is not the
-/// cycle-breaker by itself — returning from the turn is, and `later` is what
-/// makes returning possible while a caller is still owed an answer.
+/// the hop **without returning**. The ring is still a ring, so the closing edge
+/// is refused and the chain answers [`REFUSED`] rather than the depth. So
+/// `Reply::later` is not the cycle-breaker by itself — returning from the turn is,
+/// and `later` is what makes returning possible while a caller is still owed an
+/// answer.
 ///
-/// Guarded by construction rather than by a break: the two tests differ in one
-/// thing, the `tokio::spawn` around the hop, and they disagree. Reddening this
+/// **It asserted a hang until item M**, and the pair still says the same thing
+/// with a different second half: the two tests differ in one line, the
+/// `tokio::spawn` around the hop, and they disagree about the answer. The spawned
+/// one reaches depth 2; this one is refused.
+///
+/// Guarded by construction rather than by a break, for that reason: reddening this
 /// one means deleting that difference, which is the other test.
 #[tokio::test]
 async fn a_parked_reply_that_stays_in_the_turn_does_not_break_the_cycle() {
     let (a, _b, _gate, _entered) = ring_of_two();
 
-    let mut hopping = {
-        let a = a.clone();
-        tokio::spawn(async move { a.parked_blocking_hop(2).await })
-    };
-    assert!(
-        n0_future::time::timeout(HANG, &mut hopping).await.is_err(),
-        "parking the reply without leaving the turn must still hang"
+    let depth = n0_future::time::timeout(SETTLE, a.parked_blocking_hop(2))
+        .await
+        .expect("parking the reply without leaving the turn must be refused")
+        .expect("A is running");
+    assert_eq!(
+        depth, REFUSED,
+        "the ring closed on A while A's turn was still on the stack"
     );
-
-    a.abort();
 }
 
 // ─────────────────────────────────────────── the cycle a policy already breaks

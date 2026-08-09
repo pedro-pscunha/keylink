@@ -1564,7 +1564,7 @@ macro_rules! __keylink_service {
             ///
             /// ```ignore
             /// let warehouse = inventory::actor(Warehouse::seeded());
-            /// let item = warehouse.get_item("ADU-014".into()).await?;   // Err = MailboxClosed
+            /// let item = warehouse.get_item("ADU-014".into()).await?;   // Err = Undelivered
             /// ```
             ///
             /// To serve the **same** actor to other machines as well, call
@@ -1650,6 +1650,51 @@ macro_rules! __keylink_service {
                 Handle { inner: $crate::LocalActor::spawn_fed(state, observers, feeds) }
             }
 
+            /// [`actor_wired`]'s three arguments, plus the **mailbox depth**.
+            ///
+            /// How many messages may wait ahead of the one being handled.
+            /// [`actor`], [`actor_with`] and [`actor_wired`] all take the
+            /// default, which is 1, and this is the door that overrides it.
+            ///
+            /// ```ignore
+            /// let orders = orders::actor_deep(
+            ///     Book::new(),
+            ///     vec![],
+            ///     orders::Feeds::new(exchange.subscribe()),
+            ///     NonZeroUsize::new(8)?,
+            /// );
+            /// ```
+            ///
+            /// A deeper mailbox lets a caller get further ahead of the actor,
+            /// and that is the whole of what it buys. It is **not** a bound on
+            /// memory, and it does **not** make a self-call safe: a call made
+            /// from inside the target actor's own turn is refused by identity
+            /// rather than by the permit, so it answers
+            /// [`Undelivered::Reentrant`](keylink::Undelivered::Reentrant) at
+            /// every depth.
+            ///
+            /// # CAUTION: a deeper mailbox raises the shutdown budget owed
+            ///
+            /// [`stop`](Handle::stop) still drains what is queued, so raising
+            /// this raises how long it can take, by up to N turns. Nothing can
+            /// check that for you.
+            ///
+            /// # Panics
+            ///
+            /// Panics when called outside a tokio runtime, like every other
+            /// spawn.
+            #[must_use]
+            pub fn actor_deep<A: Actor>(
+                state: A,
+                observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
+                feeds: Feeds,
+                depth: ::core::num::NonZeroUsize,
+            ) -> Handle<A> {
+                Handle {
+                    inner: $crate::LocalActor::spawn_deep(state, observers, feeds, depth),
+                }
+            }
+
             /// Start one actor of this service that is **rebuilt** when an
             /// incarnation fails.
             ///
@@ -1707,13 +1752,50 @@ macro_rules! __keylink_service {
                 Handle { inner: $crate::LocalActor::spawn_supervised(factory, limit) }
             }
 
+            /// [`supervised`], plus the **mailbox depth**.
+            ///
+            /// The supervised twin of [`actor_deep`]. The mailbox belongs to the
+            /// actor rather than to an incarnation, so this depth is set once
+            /// and survives every restart — which is the same fact that makes a
+            /// restart need no re-queue.
+            ///
+            /// # CAUTION: a deeper mailbox raises the shutdown budget owed
+            ///
+            /// [`actor_deep`] carries the warning, and under supervision it is
+            /// the same warning with more turns behind it.
+            ///
+            /// # Panics
+            ///
+            /// Panics when called outside a tokio runtime, like every other
+            /// spawn.
+            #[must_use]
+            pub fn supervised_deep<A: Actor, N, Fut, F>(
+                factory: N,
+                limit: $crate::Intensity,
+                depth: ::core::num::NonZeroUsize,
+            ) -> Handle<A>
+            where
+                N: ::core::ops::FnMut() -> Fut + ::core::marker::Send + 'static,
+                Fut: ::core::future::Future<
+                        Output = ::core::result::Result<
+                            $crate::Incarnation<A, F>,
+                            $crate::Stop,
+                        >,
+                    > + ::core::marker::Send,
+                F: $crate::Feeds<A>,
+            {
+                Handle {
+                    inner: $crate::LocalActor::spawn_supervised_deep(factory, limit, depth),
+                }
+            }
+
             /// A handle to an actor in this process.
             ///
             /// Its methods are the ones written in `service!`, with the same
             /// names, the same argument order and the same success types as
             /// [`Client`]'s. The error type is the difference, and it is the
             /// whole difference: a local call fails one way, so it fails with
-            /// [`MailboxClosed`](keylink::MailboxClosed) and never with
+            /// [`Undelivered`](keylink::Undelivered) and never with
             /// [`Error`](keylink::Error).
             ///
             /// That is deliberate and permanent. RFC-04 §5.5: a handle that is
@@ -1734,7 +1816,7 @@ macro_rules! __keylink_service {
             /// message gets the panic — resumed with its own payload, close to
             /// the way an ordinary function call would deliver it. Both halves
             /// matter: the first keeps one bad message from costing every later
-            /// one, the second keeps `MailboxClosed` meaning "the actor is gone"
+            /// one, the second keeps `Undelivered` meaning "the actor is gone"
             /// rather than "something went wrong somewhere".
             ///
             /// Two places it is **not** like an ordinary call, both structural:
@@ -1753,77 +1835,89 @@ macro_rules! __keylink_service {
             /// another task, and the turn runs to completion. A `reserve` that
             /// the caller timed out has still decremented the stock.
             ///
-            /// # An actor must not call itself. Any method, including `tell`.
+            /// # An actor must not call itself — and it is now REFUSED rather than hung
             ///
             /// A handler that awaits **any** method on a handle to its own actor
-            /// can deadlock, and the mechanism is worth knowing because one of
-            /// the four cases is load-dependent — it passes every test and
-            /// appears in production, while the other three fail the first time
-            /// they run.
+            /// would deadlock. Since item M it does not: the message carries the
+            /// chain of turns it was sent from, so a send to an actor already on
+            /// that chain answers
+            /// [`Undelivered::Reentrant`](keylink::Undelivered::Reentrant)
+            /// instead of being queued. The four cases and their mechanisms are
+            /// unchanged and worth knowing, because what each one *would* have
+            /// done is what decides whether it is refused:
             ///
-            /// - **`rpc`, always.** The reply cannot be produced until the actor
-            ///   takes the next message, and the actor is busy being this
-            ///   handler.
-            /// - **`tell`, under contention.** The mailbox holds one message.
-            ///   The actor released that permit when it took the message it is
-            ///   running now, so a self `tell` succeeds *only if nobody else
-            ///   took the permit first*. A served actor always has other
-            ///   senders. When the permit is gone the `send` itself blocks, and
-            ///   only the actor can free it.
-            /// - **[`stop`](Self::stop), always.** It takes a permit like any
-            ///   message, and then waits for a loop that cannot exit.
-            /// - **[`with_state`](Self::with_state), always.** A read is a
-            ///   message too. It takes the free permit and then waits for the
-            ///   loop to run the closure, so the one method that never touches
-            ///   `&mut self` still deadlocks exactly like an `rpc`.
+            /// - **`rpc`, refused always.** The reply cannot be produced until
+            ///   the actor takes the next message, and the actor is busy being
+            ///   this handler. A free mailbox slot does not save it, so the slot
+            ///   is not consulted.
+            /// - **`tell`, refused only when the mailbox is FULL.** The actor
+            ///   released its permit when it took the message it is running now,
+            ///   so a self `tell` into a free slot is legitimate: it runs after
+            ///   this turn returns. When the permit is gone the send would block
+            ///   with only this actor able to free it, and that is the case that
+            ///   is refused. Note the direction — this is the one case that was
+            ///   ever load-dependent, and it was *depth 1* that made the block
+            ///   likely rather than a deeper mailbox.
+            /// - **[`stop`](Self::stop), refused always.** It takes a permit like
+            ///   any message, and then waits for a loop that cannot exit. It
+            ///   returns a `Result` for this reason and no other.
+            /// - **[`with_state`](Self::with_state), refused always.** A read is
+            ///   a message too, so the one method that never touches `&mut self`
+            ///   is refused exactly like an `rpc`.
             ///
             /// An earlier version of this comment said a self `tell` was fine
             /// because it waits for nothing. It waits for a permit.
             ///
-            /// This is true of every actor system and it is not detected here:
-            /// no type can tell one actor's handle from another's. Call the
-            /// method on `&mut self` instead — it is the same code without the
-            /// round trip. If the work must happen *after* the current turn,
-            /// spawn a task that holds a handle; that task is not the actor and
-            /// can wait for a permit safely.
+            /// **It is not detected by a type, and could not be**: identity here
+            /// is per *instance*, and no type can tell one actor's handle from
+            /// another's. So it is a runtime refusal with an error position, and
+            /// the remedy is unchanged: call the method on `&mut self` instead —
+            /// it is the same code without the round trip. If the work must
+            /// happen *after* the current turn, spawn a task that holds a handle;
+            /// that task is not the actor, starts a fresh chain, and can wait for
+            /// a permit safely.
             ///
-            /// # The count of actors does not matter: `A → B → A` hangs too
+            /// # The count of actors does not matter: `A → B → A` is refused too
             ///
             /// Nothing above needs the handle to be your **own**. Actor A calling
-            /// actor B, whose handler calls A, hangs both for ever, and so does
-            /// any longer ring. A handler holds `&mut A` and `A` can hold another
-            /// actor's handle, so two collaborating actors each holding the
-            /// other's is an ordinary design and not an exotic one — it is the
+            /// actor B, whose handler calls A, would hang both for ever, and so
+            /// would any longer ring. A handler holds `&mut A` and `A` can hold
+            /// another actor's handle, so two collaborating actors each holding
+            /// the other's is an ordinary design and not an exotic one — it is the
             /// shape a reader is most likely to build.
             ///
-            /// It is **worse than the self-`tell` case above, not milder.** Both
-            /// sends succeed, and for two different reasons: the **opening** send
-            /// A→B lands because B is idle with an empty mailbox, and the
-            /// **closing** send B→A lands because A's loop released its own permit
-            /// when it took the message it is now running. So nothing complains at
-            /// either end. What neither caller gets is an *answer*, because the
-            /// only task that could produce one is the task waiting for it. A ring
-            /// therefore needs no contention and hangs the first time it runs — the
-            /// load-dependence that lets the self-`tell` case survive testing is
-            /// absent, and the deadlock is unconditional.
+            /// It was **worse than the self-`tell` case above, not milder.** Both
+            /// sends would succeed, and for two different reasons: the **opening**
+            /// send A→B lands because B is idle with an empty mailbox, and the
+            /// **closing** send B→A would land because A's loop released its own
+            /// permit when it took the message it is now running. So nothing
+            /// complained at either end. What neither caller got is an *answer*,
+            /// because the only task that could produce one is the task waiting
+            /// for it. A ring therefore needs no contention and hung the first
+            /// time it ran — the load-dependence that lets the self-`tell` case
+            /// survive testing is absent, and the deadlock was unconditional.
             ///
-            /// Both actors are then stuck in **two different ways**, which is
-            /// worth knowing when reading a stack: a further call to A blocks in
-            /// `send`, because B's message took A's one free permit, while a
-            /// further call to B is accepted and blocks on the answer.
+            /// **The chain closes it**, and closing the ring is the reason it
+            /// travels in the message rather than being a flag on the actor: the
+            /// closing send B→A carries `[A, B]`, sees A, and is refused. The
+            /// opening send A→B is untouched, because B is not on it.
             ///
-            /// The remedy across two actors is not "call it on `&mut self`" —
-            /// there is no `&mut` to reach. It is to stop being inside the turn:
-            /// park the reply with
+            /// The remedy across two actors is unchanged, and it is now the way to
+            /// make a ring *work* rather than the way to avoid a hang. It is not
+            /// "call it on `&mut self`" — there is no `&mut` to reach. It is to
+            /// stop being inside the turn: park the reply with
             /// [`Reply::later`](keylink::Reply::later), hand the outbound call to
             /// a spawned task and **return**, so the loop is polling again when
-            /// the peer calls back. Parking alone is not enough; see
+            /// the peer calls back. A spawned task starts a **fresh chain**, so
+            /// nothing is refused there either. Parking alone is not enough; see
             /// [`Deferred`](keylink::Deferred), which says which half does the
             /// work.
             ///
-            /// `keylink/tests/cycles.rs` builds the two-actor ring and watches it
-            /// hang under a timeout, and pins the recovery: `abort` frees the
-            /// *other* actor and destroys the one it names.
+            /// `keylink/tests/cycles.rs` builds the two-actor ring and pins the
+            /// refusal, the self-call, the supervised path, both halves of the
+            /// `tell` rule, and the recovery for the hang no refusal can reach —
+            /// a turn that simply never returns, where `abort` frees the *other*
+            /// actor and destroys the one it names.
             ///
             /// # Which methods are here
             ///
@@ -2083,12 +2177,12 @@ macro_rules! __keylink_service {
                 ///
                 /// # Errors
                 ///
-                /// [`MailboxClosed`](keylink::MailboxClosed) when the actor is
+                /// [`Undelivered`](keylink::Undelivered) when the actor is
                 /// gone.
                 pub async fn with_state<T, F>(
                     &self,
                     read: F,
-                ) -> ::core::result::Result<T, $crate::MailboxClosed>
+                ) -> ::core::result::Result<T, $crate::Undelivered>
                 where
                     T: ::core::marker::Send + 'static,
                     F: ::core::ops::FnOnce(&A) -> T + ::core::marker::Send + 'static,
@@ -2104,9 +2198,17 @@ macro_rules! __keylink_service {
 
                 /// Stop after the messages already queued, then wait for the
                 /// actor to end. Every other handle reports
-                /// [`MailboxClosed`](keylink::MailboxClosed) from then on.
-                pub async fn stop(&self) {
-                    self.inner.stop().await;
+                /// [`Undelivered::Gone`](keylink::Undelivered::Gone) from then
+                /// on.
+                ///
+                /// # Errors
+                ///
+                /// [`Undelivered::Reentrant`](keylink::Undelivered::Reentrant)
+                /// when called from inside the actor's own turn. An actor that
+                /// is already gone is `Ok`, because stopping a stopped actor is
+                /// what the caller asked for.
+                pub async fn stop(&self) -> ::core::result::Result<(), $crate::Undelivered> {
+                    self.inner.stop().await
                 }
 
                 /// Cancel the actor where it stands, destroying its state.
@@ -2154,11 +2256,11 @@ macro_rules! __keylink_service {
 
                 /// Resolve when this actor ends, and say why.
                 ///
-                /// [`MailboxClosed`](keylink::MailboxClosed) says "gone", and it
+                /// [`Undelivered`](keylink::Undelivered) says "gone", and it
                 /// must not be stretched to say "gave up on durability". This is
                 /// the second question, asked separately — and it is the only
                 /// way to learn that an [`Observer`](keylink::Observer) refused
-                /// a turn, because a local call is told `MailboxClosed` either
+                /// a turn, because a local call is told `Undelivered` either
                 /// way.
                 ///
                 /// Holds no mailbox sender, so awaiting it does not keep the
@@ -3614,14 +3716,14 @@ macro_rules! __keylink_local_method {
         ///
         /// # Errors
         ///
-        /// [`MailboxClosed`](keylink::MailboxClosed) when the actor is gone.
+        /// [`Undelivered`](keylink::Undelivered) when the actor is gone.
         ///
         /// # Panics
         ///
         /// With whatever the handler panicked with, after the actor has
         /// survived it.
         pub async fn $name(&self $(, $arg: $ty )*)
-            -> ::core::result::Result<$ret, $crate::MailboxClosed> {
+            -> ::core::result::Result<$ret, $crate::Undelivered> {
             self.inner
                 .ask(move |__from, __reply| Mail::$variant {
                     origin: __from,
@@ -3652,9 +3754,9 @@ macro_rules! __keylink_local_method {
         ///
         /// # Errors
         ///
-        /// [`MailboxClosed`](keylink::MailboxClosed) when the actor is gone.
+        /// [`Undelivered`](keylink::Undelivered) when the actor is gone.
         pub async fn $name(&self $(, $arg: $ty )*)
-            -> ::core::result::Result<(), $crate::MailboxClosed> {
+            -> ::core::result::Result<(), $crate::Undelivered> {
             self.inner
                 .notify(move |__from, __reply| Mail::$variant {
                     origin: __from,
@@ -3678,9 +3780,9 @@ macro_rules! __keylink_local_method {
         ///
         /// # Errors
         ///
-        /// [`MailboxClosed`](keylink::MailboxClosed) when the actor is gone.
+        /// [`Undelivered`](keylink::Undelivered) when the actor is gone.
         pub async fn $name(&self $(, $arg: $ty )*)
-            -> ::core::result::Result<($ret, $crate::BlobId), $crate::MailboxClosed> {
+            -> ::core::result::Result<($ret, $crate::BlobId), $crate::Undelivered> {
             self.inner
                 .ask(move |__from, __reply| Mail::$variant {
                     origin: __from,

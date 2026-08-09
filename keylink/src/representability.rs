@@ -101,8 +101,8 @@ use crate::compose::{Overflow, Topic};
 use crate::{
     ActorId, ActorStatus, Admission, Admittance, AdmittedPeer, Allowlist, BlobId, Caller,
     DynamicAdmission, Ended, Eviction, FinishFut, IdempotencyKey, Intensity, Keyable, LocalActor,
-    MailboxClosed, MountError, Observer, Origin, ProvenPeer, Records, Retention, TurnFut, TurnInfo,
-    TurnOutcome,
+    MountError, Observer, Origin, ProvenPeer, Records, Retention, TurnFut, TurnInfo, TurnOutcome,
+    Undelivered,
 };
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
@@ -852,7 +852,7 @@ impl Observer<Ledger> for Recorder {
 /// — `Ledger` is hand-written, is not a `service!`, and has no mailbox enum to
 /// name.
 async fn a_read_cannot_mutate_either<M>(actor: &LocalActor<Ledger, M>) {
-    let _: Result<ThroughShared, MailboxClosed> = actor.read(|state| state.post()).await;
+    let _: Result<ThroughShared, Undelivered> = actor.read(|state| state.post()).await;
 }
 
 // ─────────────────────── one reply channel, one answer: Wave 2c's `#[defer]`
@@ -1061,6 +1061,51 @@ fn no_mailbox_can_be_asked_to_be_unbounded(builder: beta::SystemBuilder) -> beta
     let depth: fn(beta::SystemBuilder, NonZeroUsize) -> beta::SystemBuilder =
         beta::SystemBuilder::mailbox_depth;
     depth(builder, NonZeroUsize::MIN)
+}
+
+/// The **local** twin, and it is a second probe rather than a second line above
+/// because it is a second knob.
+///
+/// The keyed depth had a probe from the day it existed and the local depth was a
+/// private constant with nothing to pin. Once the local mailbox gained doors that
+/// take a depth, the same widening is sayable on this path — and the claim above
+/// is about *a mailbox*, not about the registry's. A probe that covered one door
+/// while the other was free to take an `Option<usize>` would be the shape this
+/// module exists to refuse: a guarantee whose wording outruns its guard.
+///
+/// Both local doors are pinned, because the mailbox is created in exactly two
+/// places and a knob that reached only one of them would leave the supervised
+/// path — which is the production path — unpinned.
+///
+/// The break is the same one line-for-line: change either `NonZeroUsize` below to
+/// `usize`, or widen either door's parameter, and this file stops compiling with
+/// `E0308`.
+///
+/// Made red by `scripts/break-once.sh` on this file, replacing
+/// `    let unsupervised: fn(Parking, Hooks, (), NonZeroUsize) -> Probe = LocalActor::spawn_deep;`
+/// with the same line reading `usize` in place of `NonZeroUsize`. Watched, and the
+/// diagnostic is quoted rather than the exit code because for a probe the compile
+/// error IS the guard and `── exit=101` alone cannot tell one from a typo:
+/// `error[E0308]: mismatched types ... expected fn pointer, found fn item`, with
+/// `expected fn pointer `fn(Parking, .., usize) -> ..`` against
+/// `found fn item `fn(_, .., NonZero<usize>) -> ..``.
+fn no_local_mailbox_can_be_asked_to_be_unbounded() {
+    /// The observers half of a spawn's triple. An alias so the two pins below
+    /// read as pins rather than as type puzzles — `clippy::type_complexity` is
+    /// `deny` here, and the only part of these signatures under test is the
+    /// **last** parameter.
+    type Hooks = Vec<Box<dyn crate::Observer<Parking>>>;
+    /// What a supervised factory hands back, ready-made.
+    type Rebuilt = std::future::Ready<Result<(Parking, Hooks, ()), crate::Stop>>;
+    /// The actor both doors produce.
+    type Probe = LocalActor<Parking, Parked>;
+
+    let unsupervised: fn(Parking, Hooks, (), NonZeroUsize) -> Probe = LocalActor::spawn_deep;
+    let _ = unsupervised;
+
+    let supervised: fn(fn() -> Rebuilt, crate::Intensity, NonZeroUsize) -> Probe =
+        LocalActor::spawn_supervised_deep;
+    let _ = supervised;
 }
 
 // ───────────────────────────────── no ledger bound can be asked to be zero

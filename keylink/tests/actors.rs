@@ -958,7 +958,8 @@ async fn the_connection_outlives_the_actors_on_it() {
 /// real. Made red by making `shutdown` an alias of `abort`.
 ///
 /// Two calls and not one, because "queued turns are answered" is the claim and
-/// one message in flight does not queue anything. `LOCAL_MAILBOX_DEPTH` is 1, so the second
+/// one message in flight does not queue anything. The default local mailbox depth
+/// is 1, so the second
 /// `apply` is buffered behind the first and is the queued turn; the budget covers
 /// both holds together, which is the depth-versus-budget relationship 4a's doc
 /// names — at depth N a budget has to cover N + 1 turns, not one.
@@ -2842,7 +2843,8 @@ async fn busy_is_true_during_a_feed_turn() {
 /// **A saturated mailbox at depth > 1 still does not starve a feed.**
 ///
 /// `tests/feeds.rs` pins the fairness rule at the default depth and says what it
-/// cannot reach: *"with `LOCAL_MAILBOX_DEPTH = 1` on a single-threaded test runtime,
+/// cannot reach: *"at the default local mailbox depth of 1, on a single-threaded
+/// test runtime,
 /// the loop
 /// takes the slot's message, runs the turn and polls again without yielding, so the
 /// parked sender has not been rescheduled and the mailbox is deterministically

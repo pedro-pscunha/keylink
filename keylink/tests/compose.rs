@@ -829,7 +829,10 @@ async fn a_named_actor_is_reachable_by_name_and_unregistered_when_it_ends() {
     );
 
     // And an ending — any ending — unregisters it.
-    still.stop().await;
+    still
+        .stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
     assert!(
         settles(|| names.get(&ledger).is_none()).await,
         "an actor that ended is unregistered"
@@ -863,7 +866,10 @@ async fn the_ending_of_a_displaced_actor_does_not_evict_the_one_that_replaced_it
 
     // The first actor ends. Its eviction task wakes with the name still in the
     // map — filed under the SAME `ActorId` — and must leave the second alone.
-    first.stop().await;
+    first
+        .stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
     drop(displaced);
     spun().await;
 
@@ -913,7 +919,10 @@ async fn unregistering_frees_the_name_without_waiting_for_an_ending() {
     assert!(names
         .register(ledger.clone(), other.clone(), other.ended())
         .is_none());
-    actor.stop().await;
+    actor
+        .stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
     drop(taken);
     spun().await;
     assert_eq!(
@@ -1118,7 +1127,7 @@ async fn a_member_that_ends_for_good_reaches_the_policy_once() {
 /// incarnation's ending instead of only its last, which is the mistake this
 /// module's structural claim rests on not being made. Watched: it fails before
 /// the policy is ever consulted, at "the next incarnation answers:
-/// MailboxClosed" — the outer loop published the first incarnation's ending, so
+/// Undelivered" — the outer loop published the first incarnation's ending, so
 /// the handle is dead and there is no second incarnation to answer. Exit 101, by
 /// value, in 0.00s.
 ///

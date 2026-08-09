@@ -130,7 +130,10 @@ async fn run(files: &Files, id: &StateId, entries: &[u64]) -> Vec<u64> {
     durable.store(&snapshot).await.expect("stores");
 
     let seen = ledger.entries().await.expect("running");
-    ledger.stop().await;
+    ledger
+        .stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
     seen
 }
 

@@ -74,9 +74,11 @@
 //!
 //! # Designed against a mailbox of one, and where a deeper one would change this
 //!
-//! `turns.rs`'s `LOCAL_MAILBOX_DEPTH` is 1 — as is `registry.rs`'s
+//! `turns.rs`'s `DEFAULT_LOCAL_MAILBOX_DEPTH` is 1 — as is `registry.rs`'s
 //! `DEFAULT_MAILBOX_DEPTH`, the keyed side's — and every number in this module is
-//! chosen against that.
+//! chosen against that. Both are DEFAULTS: a caller can raise either, and this
+//! module's numbers do not move with them, which is the whole of the paragraph
+//! below.
 //! One item in flight per subscriber matches it: a subscriber is "slow" exactly
 //! when it is still inside a turn while the next item arrives, which is the same
 //! definition of slow the mailbox already uses.

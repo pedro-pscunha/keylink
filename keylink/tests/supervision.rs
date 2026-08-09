@@ -657,11 +657,13 @@ async fn a_supervised_actor_that_gave_up_answers_stop() {
 
     tokio::time::timeout(NO_PROGRESS, ticker.stop())
         .await
-        .expect("an actor that gave up must answer stop() rather than hang");
+        .expect("an actor that gave up must answer stop() rather than hang")
+        .expect("a stop from outside the actor's own turn is never refused");
     // Idempotent, and still true the second time.
     tokio::time::timeout(NO_PROGRESS, ticker.stop())
         .await
-        .expect("stop() is documented idempotent, and giving up does not change that");
+        .expect("stop() is documented idempotent, and giving up does not change that")
+        .expect("a stop from outside the actor's own turn is never refused");
 }
 
 /// A restart is not an ending, and it is structural rather than filtered: the

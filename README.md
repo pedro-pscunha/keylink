@@ -140,7 +140,7 @@ of behind a `Mutex`:
 
 ```rust
 let warehouse = inventory::actor(Warehouse::seeded());  // in this process
-warehouse.reserve("ADU-014".into(), 2).await?;          // Err = MailboxClosed
+warehouse.reserve("ADU-014".into(), 2).await?;          // Err = Undelivered
 
 let server = warehouse.serve(&node, allow)?;            // and to other machines
 ```
@@ -181,7 +181,7 @@ match ledger.ended().await {
 ```
 
 Returning `Err` ends the actor, and `Handle::ended()` says which observer and
-why — `MailboxClosed` means "gone" and must not be stretched to mean "gave up on
+why — `Undelivered` means "gone" and must not be stretched to mean "gave up on
 durability". A refused turn reaches a peer as `Failed("observer refused: ..")`
 rather than `NoSuchActor`, which would say "there is nothing here, stop asking"
 about a turn that ran.
