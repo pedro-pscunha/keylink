@@ -490,6 +490,14 @@ async fn a_running_turn_leaves_exactly_one_free_permit_behind_it() {
 /// and none of the turns behind it. Watched: "A -> B -> A must be refused rather
 /// than hang: Elapsed(())", after 5.00s.
 ///
+/// **That break reddens TWO tests, and naming one of them was one edit away from
+/// naming the wrong one.** `a_parked_reply_that_stays_in_the_turn_does_not_break_the_cycle`
+/// fails under it too, at "parking the reply without leaving the turn must be
+/// refused: Elapsed(())" — measured, not inferred, and unsurprising once said: that
+/// test is a two-actor ring as well, differing only in where the reply is parked.
+/// Neither is incidental and either would catch the defect; this one is the record
+/// because it is the ring stated as a ring.
+///
 /// **And `a_read_from_inside_a_turn_is_refused` stays GREEN under that same
 /// break** — measured, exit 0, 1 passed. That pairing is why both tests exist and
 /// it is the design's own Critical finding turned into evidence: a chain that can

@@ -1524,6 +1524,22 @@ impl<F: Future + Unpin> Future for Chained<F> {
         // would otherwise leave one turn's chain visible to the next thing polled
         // on this thread — an unrelated actor refused for being on a chain it was
         // never on.
+        //
+        // **The unwind path is REACHABLE and is NOT tested, and that is said here
+        // rather than left to be inferred.** It is not reachable by the two
+        // obvious routes: [`turn`] catches the handler with `guarded` and each
+        // observer with a `catch_unwind` plus a `guarded`, so neither reaches this
+        // frame. What is left is a panic in the generated arm outside `turn`, in
+        // the plumbing between those guards, or in a `Drop` run as the dispatch
+        // future unwinds — and this crate already treats that as a real ending:
+        // [`Watched`]'s own `Drop` exists for "a turn whose unwind escapes the
+        // loop". No test in this tree drives it, and no break has been watched
+        // against this line.
+        //
+        // The guard matters *because* the unwind is fatal to the task and not to
+        // the thread: the worker goes on to poll other actors, and a chain left
+        // behind would refuse one of them by name. `parking.rs` makes the same
+        // trade at the same place, for the same reason.
         let _restore = Restore(chain);
         Pin::new(inner).poll(cx)
     }
@@ -3206,6 +3222,18 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
     /// [`Undelivered::Reentrant`] is the answer at every depth.
     /// `DEFAULT_LOCAL_MAILBOX_DEPTH` carries the measurement, and it is private
     /// because the two doors above are the whole of the public surface for it.
+    ///
+    /// # What was measured, and the ring it does not cover
+    ///
+    /// "No depth converts a deterministic deadlock into an intermittent one" was
+    /// measured at depth 32 on **local** rings, where every hop is a `LocalActor`
+    /// and the chain reaches every edge. A ring closed through a **keyed or served
+    /// hop** is not caught by the chain — a keyed mailbox carries none — and its
+    /// behaviour above depth 1 is **unmeasured**. Nothing ships changed, because
+    /// the default stays 1 and that is the depth every existing guard runs at; but
+    /// a caller raising this in a system with keyed hops is outside what was
+    /// tested, and should treat the resulting hang or non-hang as unknown rather
+    /// than as covered by the paragraph above.
     ///
     /// # CAUTION: a deeper mailbox raises the shutdown budget owed
     ///
