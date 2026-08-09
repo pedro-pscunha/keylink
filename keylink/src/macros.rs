@@ -1997,6 +1997,33 @@ macro_rules! __keylink_service {
                 /// The local [`Handle`] keeps working while this is served, and
                 /// messages from both sides share the one mailbox.
                 ///
+                /// # This creates no actor, and there is no type for what it makes
+                ///
+                /// **There are two kinds of actor in this crate — local and
+                /// keyed — and serving is not a third.** It is an add-on to a
+                /// local handle. This method takes `&self`, clones the handle's
+                /// inner `LocalActor`, and hands back the same
+                /// [`ServiceBuilder`](keylink::ServiceBuilder) the free
+                /// [`service`] returns, on the **same ALPN** — which is why
+                /// registering both is a `DuplicateAlpn`. It spawns no task and
+                /// allocates no channel.
+                ///
+                /// So a served actor has no mailbox of its own:
+                /// [`deliver_to_local`](keylink::deliver_to_local) pushes into
+                /// the same `LocalActor` channel this handle's own methods push
+                /// into. **No type represents a served actor**, which is the
+                /// check on everything above — there is nothing for a third row
+                /// in a table to name.
+                ///
+                /// A keyed actor *is* the second kind, and the tree says so with
+                /// types: it is mounted in a [`System`](keylink::System) under an
+                /// [`ActorId`](keylink::ActorId) and carries its own ALPN over
+                /// its own hashed contract.
+                ///
+                /// The word **singleton** appears elsewhere in these docs for
+                /// this arrangement. Read it as *"a service served from one local
+                /// handle"* — a way of serving, not a kind of actor.
+                ///
                 /// # What it costs
                 ///
                 /// Calls no longer overlap. Four concurrent `list`s take four

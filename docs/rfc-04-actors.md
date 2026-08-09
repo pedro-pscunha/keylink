@@ -2223,6 +2223,27 @@ commits earlier.
 system or one singleton per service, because one router owns one ALPN — refused at
 startup, with a test.
 
+**Appended 2026-08-09 — the table above is a comparison of two SERVING PATHS, and it
+has been read as a taxonomy of actors.** Nothing above is edited; this note is what a
+reader should carry into it.
+
+There are **two kinds of actor: local and keyed.** Serving is not a third. The column
+headed "The singleton" is not a kind of actor — it is a local actor with
+`Handle::service` called on it, and the crate has no type for that state. Read from the
+code on 2026-08-09: `Handle::service` takes `&self`, clones the handle's inner
+`LocalActor`, and returns the same `ServiceBuilder` the free `service` returns on the
+same ALPN; it spawns no task and allocates no channel; and `deliver_to_local` pushes
+into the same `LocalActor` channel the handle's own methods use. No `struct`, `enum`,
+`trait` or alias anywhere in the tree carries the name.
+
+**This document is where the noun was coined**, in §0's summary — "Capabilities A to E
+are the **singleton actor**" — and where it first appears as a table column, twice over:
+that summary is itself a capability table. Which is why the
+note sits here rather than in one of the twenty other files that use the word. The
+word is not wrong; what it names is *"a service served from one local handle"*, a way
+of serving. `Handle::service`'s own rustdoc carries the correction at the point of use,
+which is where a caller meets it and this document is not.
+
 ### 15.4 §1.4's arithmetic is wrong. The win is bigger than claimed
 
 §1.4 is this RFC's justification, so it was checked rather than repeated. The demo's

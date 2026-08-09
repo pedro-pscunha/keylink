@@ -205,7 +205,10 @@ impl Busy {
 /// [`LocalActor`](crate::LocalActor) carries both — the fate for a served
 /// dispatch, and its own busy cell for
 /// [`is_busy`](crate::LocalActor::is_busy) — but it carries them **on the
-/// handle**, because a singleton has no registry entry to hang either on. This
+/// handle**, because a local actor has no registry entry to hang either on.
+/// Serving it does not give it one: `Handle::service` clones the same
+/// `LocalActor` and adds a door, so what decides where these live is the actor's
+/// kind and never whether anybody serves it. This
 /// sentence used to say a `LocalActor` "deliberately has no `Busy`"; that was
 /// true of the type in this file and stopped being true of the concept when the
 /// local twin shipped, so it says which is which now.
