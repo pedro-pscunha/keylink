@@ -171,21 +171,44 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 #   OWNED        `an_attach_ceiling_of_zero_refuses_the_attacher_at_once` - the break
 #                DELETES the clamp, so the hold is the test's own request and `MAX_ATTACH`
 #                never enters the result.
-#   OWNED        a parking test whose budget is its own `Duration::from_secs(30)`.
+#   OWNED        `an_attacher_over_the_cap_is_refused_before_it_parks` - the budget is
+#                the test's own `Duration::from_secs(30)`.
 #
-# **The fifth is the one entry not named by test, and its identifier did not survive.**
-# It reached this file as two line numbers in `rpc.rs`, and neither resolves to what it
-# described - at `41efc75` those lines are a closing paren and a `Ledger::new`. Two
-# parking tests carry their own `from_secs(30)` and either fits the description:
-# `an_attacher_over_the_cap_is_refused_before_it_parks` and
-# `a_parked_attacher_keeps_its_place_for_the_whole_wait`. **Naming one would be a guess**,
-# so both are named and the ambiguity is recorded - which is this file's own sixth rot
-# mode, arriving in the paragraph that exists to make a claim checkable.
+# **The fifth was identified by ATTACHMENT, after a line-numbered citation for it had
+# already rotted.** It first reached this file as two line numbers in `rpc.rs`, and
+# neither resolved to what it described - one was a closing paren, the other a
+# `Ledger::new`. A `///` block attaches to the item that FOLLOWS it, so "which test?"
+# has a mechanical answer that no insertion can move: read the block above each candidate
+# `fn` and see which holds the sentence. This one's opens *"The cap has to be met before
+# the task parks, or it is not a cap"* and contains *"With the bound removed this call
+# parks on its 30 second budget"*. The rejected candidate,
+# `a_parked_attacher_keeps_its_place_for_the_whole_wait`, opens on a different property -
+# *"Taking a place before the park is only half the property: it has to be held for the
+# whole wait"*. **Each clause appears in exactly one block, so the mapping is unique
+# rather than a best fit**, and that retires the line-numbered dataset entirely.
 #
-# **The verdicts ARE corroborated from the tree, by a check independent of the sweep.**
-# The two BORROWED tests carry no literal `Duration::from_secs(30)` at all - their 30 can
-# only come from the constant - while the CONDITIONAL and OWNED ones each carry their own.
-# Presence or absence of the literal agrees with all four named verdicts.
+# ── AND THE CROSS-CHECK BELOW IS NARROWER THAN THIS PARAGRAPH ONCE CLAIMED ─────
+#
+# There IS a check on the verdicts independent of the sweep: **the two BORROWED tests
+# carry no literal `Duration::from_secs(30)` at all**, so their 30 can only come from the
+# constant. That separates BORROWED from not-borrowed and agrees with every verdict above.
+#
+# **It cannot discriminate WITHIN the owned set, which is exactly where the ambiguity
+# sat.** Measured over `keylink/src/rpc.rs`: **SIX** tests carry their own literal thirty -
+# `an_attacher_over_the_cap_is_refused_before_it_parks`,
+# `a_parked_attacher_keeps_its_place_for_the_whole_wait`,
+# `an_attach_ceiling_below_the_peers_request_governs`,
+# `an_attach_ceiling_of_zero_refuses_the_attacher_at_once`,
+# `a_forbidden_ceiling_is_refused_without_a_waiting_place` and
+# `a_zero_hold_still_spends_a_waiting_place`. So presence of the literal narrows five
+# candidates to six, which is no narrowing at all. **Attachment is the check that
+# discriminates; presence is the check that classifies.**
+#
+# **An earlier version of this paragraph presented presence as confirming all the named
+# verdicts, which over-claimed its own reach.** That is TWICE now that the paragraph
+# arguing a citation must be checkable has carried a check narrower than it claimed -
+# first a count with no sites, then a test that cannot separate the case it was offered
+# for. Worth saying inside it, because the failure keeps choosing this paragraph.
 #
 # The deciding step is **which operand survives the break.** A value that is read,
 # passed on and then clamped against another can be reported by either side, and
@@ -1321,6 +1344,22 @@ ANCHORS = [
      '    exec mise run pre-push'),
     ("5", "scripts/hook-guard.sh", ".githooks/pre-commit",
      '    exec mise run pre-commit'),
+    # ── I4 PINS THE INSTALLER'S WORKTREE WARNING, and the break that earned it is the
+    # edit somebody makes on purpose: replacing the condition with `if false`, which is
+    # what a reader does to a warning they find noisy. One row reddens and nothing else.
+    #
+    # Re-derived at `8fc1443`, after both shell files were committed - **registering
+    # against a file still being edited is the C6 hazard, where a row is pinned to bytes
+    # that move under it.** Count **1** in `scripts/install-hooks.sh`, quoted by EQUALITY
+    # in the carrier, a whole line, and neither containing nor contained by any of the
+    # other 72 literals.
+    #
+    # **Its indentation is NOT load-bearing** - the bare form also counts 1. So it patterns
+    # with `H13` and `5` above rather than with `H6`/`H7`, and that answer was measured
+    # rather than inferred from the neighbourhood, because those two pairs sit four rows
+    # apart and disagree.
+    ("I4", "scripts/hook-guard.sh", "scripts/install-hooks.sh",
+     '    if [ "$worktrees" -gt 1 ]; then'),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -1488,6 +1527,23 @@ def flat(text: str) -> str:
     A record's quote is broken by the comment's own wrapping; the target's copy is
     not. Comparing them raw finds nothing and reports a false failure - the same
     trap a plain `grep -c` over a record hits.
+
+    ── THE GENERAL RULE, FOR ANYONE BUILDING A SECOND READER OF RECORDS ──────────
+
+    **In this repository every quotable sentence crosses a line break.** The prose wraps
+    at roughly 78 to 90 columns, so a sentence long enough to be worth citing is longer
+    than a line and is therefore split by definition. **Any checker that matches a
+    record's prose LINE BY LINE will report a sentence missing that is plainly there** -
+    and it will report it as a zero, which reads as an absence in the tree rather than a
+    defect in the instrument.
+
+    This function is why the checks here do not have that bug, and it is stated as a rule
+    rather than as this function's own justification because **the thing being built
+    around it is a checker that reads records.** Measured on 2026-08-08: two false
+    absences in one pass of such a checker, one from a needle spanning a `///` break and
+    one from `grep -F` where `.` cannot match an apostrophe. Normalizing the block to one
+    line found both immediately. So: **join the block first, then match.** A negative
+    result from a line-oriented read of this prose is a statement about the reader.
     """
     return " ".join(text.split())
 
