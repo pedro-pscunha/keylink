@@ -165,10 +165,25 @@ fi
 # "$updates_read"` says and what a `-gt 0` would not.
 #
 # **And `updates_read` must be above zero, which is the load-bearing half.**
-# Zero lines read means UNKNOWN, never "no updates". An empty read is precisely
-# what a bug in the capture above produces, so treating it as all-deletions
-# would skip the entire gate on it, silently, in the one direction this whole
-# change exists to remove. Unknown runs the gate and says why.
+# Zero lines read means UNKNOWN, never "no updates", so treating it as
+# all-deletions would skip the entire gate on it — silently, in the one direction
+# this whole change exists to remove. Unknown runs the gate and says why.
+#
+# **THE ORDINARY PRODUCER OF AN EMPTY READ IS AN UP-TO-DATE PUSH, and this comment
+# used to say a capture bug was the only one.** Measured 2026-08-08 against a
+# dumping hook, in a repository whose branch was already on the remote: `git push
+# origin work`, a bare `git push`, `git push --all origin`, `git push origin
+# HEAD:refs/heads/work` and `git push --force origin work` each ran this hook with
+# ZERO bytes and zero lines on stdin, while git printed `Everything up-to-date`.
+# Git writes an update line per ref it will UPDATE, and an up-to-date push updates
+# none — so the empty read is common, not pathological.
+#
+# The safe direction is kept anyway: unknown still runs the gate. What that costs
+# is a full gate on a push that delivers nothing, which is a real cost and is
+# stated here rather than discovered. What it buys is that a capture bug — the rare
+# producer — cannot skip the gate silently. The message says "nothing to push"
+# first, because that is what a developer seeing it has almost certainly done, and
+# the previous wording read as an internal fault when nothing was wrong.
 #
 # Both arms announce themselves. A gate that quietly did not run is
 # indistinguishable, in the output, from a gate that passed.
@@ -180,7 +195,9 @@ if [ "$updates_read" -gt 0 ] && [ "$deletions" -eq "$updates_read" ]; then
 fi
 
 if [ "$updates_read" -eq 0 ]; then
-    echo "pre-push: no ref update arrived on stdin, so the gate RUNS." >&2
+    echo "pre-push: no ref update arrived on stdin — most likely NOTHING TO PUSH." >&2
+    echo "pre-push: an up-to-date push sends no update line, and git will say" >&2
+    echo "pre-push: 'Everything up-to-date' below. The gate RUNS anyway, because" >&2
     echo "pre-push: an empty read means unknown, and unknown is not a deletion." >&2
 fi
 

@@ -107,8 +107,33 @@ fi
 
 # Relative, for the reasons in the header. Also the only spelling that makes
 # re-running this script idempotent, which the absolute one is not.
+#
+# ── AND THE WRITE REACHES EVERY WORKTREE, SO IT SAYS SO ──────────────────────
+#
+# `core.hooksPath` is not per-worktree unless `extensions.worktreeConfig` is on, and
+# it is off here. So this one line lands in the SHARED config and every linked
+# worktree reads it. Going from an absolute value to the relative one therefore
+# switches every worktree at once — from one checkout's hooks to each worktree's own
+# branch's hooks — and the header's hazard then applies to each of them: a branch
+# whose tree carries no `.githooks/` runs NO hook and the push succeeds.
+#
+# That was silent until this printed it. The count is derived from `git worktree
+# list` rather than written down, and the previous value is read BEFORE the write,
+# because after it there is nothing left to compare against.
+hooks_path_before="$(git config --get core.hooksPath || true)"
+worktrees="$(git worktree list --porcelain | grep -c '^worktree ' || true)"
 git config core.hooksPath .githooks
 chmod +x .githooks/*
+
+if [ "$hooks_path_before" != ".githooks" ]; then
+    echo "core.hooksPath: ${hooks_path_before:-<unset>} -> .githooks"
+    if [ "$worktrees" -gt 1 ]; then
+        echo "  this is SHARED config (extensions.worktreeConfig is off), so the"
+        echo "  change reaches all $worktrees worktrees. Each now runs the hooks in"
+        echo "  ITS OWN branch's .githooks/ — and a branch without that directory"
+        echo "  runs no hook at all."
+    fi
+fi
 
 echo "installed: .githooks/pre-commit, .githooks/pre-push"
 echo

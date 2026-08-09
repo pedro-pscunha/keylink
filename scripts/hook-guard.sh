@@ -95,7 +95,13 @@
 #    the guard would certify a hook that is dead in every worktree this repo is
 #    developed in.
 #
-# 4. **Restore the pipe, which is the shape `main` carries right now.** The literal
+# 4. **Restore the pipe, which is the shape this file used to carry.** `main` carries
+#    the HERE-STRING, verified by reading `main:.githooks/pre-commit` rather than
+#    inferred: the fix went in with the merge that took this hook to the here-string,
+#    and the two branches' code is identical once comments are stripped. This clause
+#    used to say `main` carried the pipe, which read as "the 64 KiB bypass is live on
+#    the default branch" — the strongest possible reason to hurry a merge, and false.
+#    The literal
 #    this record searches, carried inline as a backticked span — and it is the same
 #    line record 2 cites with an elision, which is why that record has no row of its
 #    own and points here:
@@ -118,37 +124,60 @@
 #    exists at all: the bug is invisible at every size the rest of this script uses,
 #    and it fails in the direction that reports success.
 #
+# 5. **Weaken the LIST the commit hook execs.** The literal this record searches,
+#    carried inline as a backticked span:
+#    `    exec mise run pre-commit`
+#
+#    In `.githooks/pre-commit`, replace that line with `    exec mise run fmt-check` —
+#    one task instead of five. Watched, one row, and it is the row added for it:
+#
+#        FAIL the commit hook runs the WHOLE pre-commit list and not a subset
+#
+#    **Before that row existed this break reddened NOTHING**, from a green control.
+#    `check yes` asks whether the stub was REACHED and never which task reached it, so
+#    every `check yes` in Part One stayed green while the hook ran a single formatter.
+#    H13 is the same hole in the push hook, where it is worse.
+#
 # Quoting those literals is safe for the reason `break-once.sh` cares about: this
 # record is not in the file whose literal it quotes, so the anchor stays unique in
 # its target.
 #
-# ── WHY NONE OF THESE ROWS IS IN `.mise/tasks/anchors`, AND IT IS NOT AN OVERSIGHT
+# ── THESE ROWS ARE REGISTERED. WHAT FOLLOWS IS HISTORY, AND IT IS KEPT AS HISTORY
 #
-# Every record here quotes an exact production line, which is precisely what that
-# registry exists to stop rotting. Registering them was proposed and is **not
-# possible as that task stands** — it would redden the gate rather than guard
-# anything, and the reason was measured rather than read:
+# **Read this before you touch a row.** If `mise run anchors` sent you here with
+# `this task's literal is NOT QUOTED by its own record`, the remedy is the rule two
+# paragraphs down — quote the literal inline. **It is never to delete the row.** An
+# earlier version of this heading said none of these rows was in `.mise/tasks/anchors`
+# and that registering them was not possible, which pointed a reader who followed the
+# gate's own instruction at exactly the one action the registry argues against.
 #
-#   * `anchors`' record-quote check calls `quoted_spans(lives_in)`, which keeps only
-#     lines starting `///`, `//!` or `//`. It has no `#` arm. Run against
-#     `scripts/hook-guard.sh` and `.githooks/pre-push` it finds **0** backticked
-#     spans in each, against 228 in `keylink/src/rpc.rs`. So a row whose `lives_in`
-#     is this file fails with "this task's literal is NOT QUOTED by its own record"
-#     while the record quotes it plainly.
-#   * the population walk globs `*.rs` under `keylink` and `keylink-persist` only, so
-#     a shell block is not in the denominator either. That half is why these records
-#     never appear in the "harness blocks" figure.
+# Every record in this file is registered EXCEPT record 2, which has no literal to
+# register and says so where a reader meets it. The rows are named rather than counted,
+# because a count here rots the next time a record is added: **H1 through H12** against
+# `.githooks/pre-push`, **records 1, 3a, 3b and 4** against `.githooks/pre-commit`, and
+# **I1, I2 and I3** against `scripts/install-hooks.sh`. `.mise/tasks/anchors` is the
+# source of truth for the current set; this list is a map, not a ledger.
 #
-# The sentence at `.mise/tasks/anchors`'s L5 — "`break-once.sh` takes a FILE, so any
-# production line in it is a legal target" — is about which LINE may be broken, not
-# about which files the registry can read. Reading it as the second thing is what
-# made registration look free.
+# What changed, since the old text argued from two facts that were true when written:
 #
-# **So the exposure is real and it is named here rather than closed:** an edit to
-# `.githooks/pre-push` can silently rot the production literal that EVERY H-numbered
-# record below quotes, and no gate says so. A count stood in this sentence and is gone
-# on purpose: it said "up to ten", and H12 quoting a line no other record quotes is all
-# it took to make it wrong — the same rot the row lists below avoid by naming rows.
+#   * `markers_for` now picks the comment markers per FILE, so a hash-commented file
+#     is read with `#` and a `.rs` file keeps the three strict markers. A shell record
+#     is therefore visible to the record-quote check at all, which it was not.
+#   * the population walk covers what a record can live in rather than `*.rs` under
+#     the two crates, so these blocks are in the denominator too.
+#
+# **The count that used to sit here is deleted rather than re-measured, and that is
+# the lesson worth keeping.** It said `0` spans in each shell file "against 228 in
+# `keylink/src/rpc.rs`". The 0 was true of the old marker set and is false of the new
+# one. The 228 matched no unit at either end of this branch — `rpc.rs` reads 304
+# distinct spans and 552 occurrences at the tip — and it was a figure about a file this
+# record does not own, which is the whole reason it rotted unnoticed. A quantity you do
+# not control does not belong in a record; the mechanism does.
+#
+# **And the ordering is the finding, not a detail:** the commit that registered these
+# rows touched `.mise/tasks/anchors` and nothing else. The enabling commit never opened
+# the file it enabled, so every claim in this header stayed as it was written while the
+# thing it described was replaced underneath it.
 #
 # **THE RULE FOR EVERY RECORD IN THIS FILE, stated as a property rather than as a list,
 # because the next author's record is not in anybody's list:** a literal that is
@@ -176,11 +205,10 @@
 # displayed their literal and matched NOTHING, not even by containment, until this rule
 # was applied to each; H1, H4 and the other H rows already matched inline, as did I1,
 # I2 and I3. Record 2 is the only record here that cannot comply, for the reason above.
-# Teaching `quoted_spans` a `#` marker and widening the walk would
-# close it, in the task that owns those two functions rather than here.
-# `scripts/break-hook-record.sh` is the partial answer available today — a replay
-# aborts when a quoted literal is missing or no longer unique, which is the same
-# precondition `anchors` checks, on demand instead of every gate.
+# `scripts/break-hook-record.sh` remains the on-demand half: a replay aborts when a
+# quoted literal is missing or no longer unique, which is the same precondition
+# `anchors` now checks on every gate. What neither of them checks is REDNESS — that the
+# break still fails the row its record names.
 #
 # `rebasing=no` counts **1** in `.githooks/pre-commit`, measured with `grep -cF`
 # after this record was written. The near-miss is worth naming, because the first
@@ -291,6 +319,14 @@ git add b.rs
 fresh
 git commit -qm "add b.rs"
 check yes "an ordinary commit staging Rust runs the gate"
+#       AND THE MARKER'S CONTENT, not merely its existence. `ran()` asks only whether
+#       the stub was reached, so until this row existed the hook could `exec mise run`
+#       ANY task and every `check yes` in Part One stayed green. Measured: replacing
+#       this hook's `exec mise run pre-commit` with `exec mise run fmt-check` reddened
+#       NOTHING in this file. One row per hook is enough, because one line in each hook
+#       decides what the marker holds — see record 5.
+assert "the commit hook runs the WHOLE pre-commit list and not a subset" \
+    grep -qx 'run pre-commit' "$GATE_MARKER"
 
 # ── 3. An ordinary commit that stages nothing linted. The fast path, which is the
 #       reason this hook has a filter at all.
@@ -479,15 +515,31 @@ echo "       (the staged path list measured $wide_bytes bytes)"
 # H2. **Treat an unknown read as all-deletions.** Replace
 #     `if [ "$updates_read" -gt 0 ] && [ "$deletions" -eq "$updates_read" ]; then`
 #     with `if [ "$deletions" -eq "$updates_read" ]; then` — zero equals zero, so
-#     an empty read skips the entire gate. Watched:
+#     an empty read skips the entire gate. Watched — four rows, the last two added by
+#     scenario 14 and measured rather than inferred, because a new scenario widens every
+#     earlier break that disables the machinery it depends on:
 #
 #         empty stdin RUNS the gate
 #         the empty read is announced as unknown
+#         an UP-TO-DATE push reads empty stdin and RUNS the gate
+#         the empty read names NOTHING TO PUSH before it names unknown
+#
+#     **Scenario 14 is what makes this break's cost concrete.** Before it, every row
+#     here drove the hook directly, so this break looked like a guard against a capture
+#     bug. It is also a guard against an ordinary `git push` on a current branch
+#     silently skipping the gate.
 #
 # H3. **Skip on ANY deletion instead of every.** Replace the same line with
 #     `if [ "$updates_read" -gt 0 ] && [ "$deletions" -gt 0 ]; then`. Watched:
 #
 #         a delete plus an update in one push RUNS the gate
+#
+#     **H2 holds the only inline span of the line both records search, so a re-quote
+#     there reddens H3 as well.** The record-quote check is per `lives_in` FILE rather
+#     than per record, which is why H3 passes today on a span it does not carry — and
+#     why widening or rewording H2's citation fails BOTH rows, while the failure text
+#     sends the reader to H3, whose record never quoted the anchor. Measured over the
+#     registered rows: H3 is the only one with zero own-quote occurrences.
 #
 # H4. **Drop the comparison against HEAD.** Replace
 #     `        if [ "$sha" != "$head_sha" ]; then` with `        if false; then`.
@@ -629,22 +681,30 @@ echo "       (the staged path list measured $wide_bytes bytes)"
 #         [ -z "${_remote_sha//0/}" ] || git merge-base --is-ancestor "$_remote_sha" "$local_sha" || exit 1
 #
 #     — the fourth field consulted, which is the only thing that would make this
-#     hook's decision depend on the tip the REMOTE holds. Watched — four rows, all of
+#     hook's decision depend on the tip the REMOTE holds. Watched — six rows, all of
 #     them scenario 13's:
 #
 #         a force-push of a rewritten history reaches the gate
 #         a force-push of a rewritten history is ACCEPTED
+#         a force-push after --amend reaches the gate
 #         a force-push after --amend is ACCEPTED
+#         a --force-with-lease push reaches the gate
 #         a --force-with-lease push is ACCEPTED
 #
-#     **Every earlier row stays green, and the reason is TWO facts about this file
-#     rather than luck.** A deletion never reaches the added line at all, because
-#     `is_deletion` takes the branch above it — and scenarios 2, 3, 4 and 9 are the
-#     only ones that push to a ref the remote already holds. Every non-deletion push
-#     here CREATES its remote ref, so the fourth field is all zeros and the added test
-#     short-circuits. Scenario 13 is the only place a real sha reaches that
-#     comparison, and the replay agreeing with that reading is what makes it a
-#     measurement rather than an argument.
+#     **Every row outside scenario 13 stays green, and the reason is THREE facts about
+#     this file rather than luck.** A DELETION never reaches the added line, because
+#     `is_deletion` takes the branch above it — scenarios 2, 3, 4 and 9. An UP-TO-DATE
+#     push never reaches it either, because git sends no update line and the loop is
+#     not entered at all — scenario 14, which pushes to a ref the remote already holds
+#     and is still unaffected. And every REMAINING push here creates its remote ref, so
+#     the fourth field is all zeros and the added test short-circuits. Scenario 13 is
+#     the only place a real sha reaches that comparison.
+#
+#     The three-way reason is itself a repair: this paragraph first said scenarios 2,
+#     3, 4 and 9 were the only rows pushing to a ref the remote already holds, and
+#     scenario 14 falsified that the day it was added — while the replay went on
+#     printing the same six rows, because the CONCLUSION was right and the reason was
+#     not. A replay agreeing with a reading does not check the reading.
 #
 #     The rewind rows do NOT move, and that pair is the part worth keeping: the
 #     rewind is still refused, only for a different reason and with no message. A
@@ -655,6 +715,42 @@ echo "       (the staged path list measured $wide_bytes bytes)"
 #     less — H11 is the other, and its shape is a payload past one pipe buffer rather
 #     than a rewind. That is why the paragraph below no longer says every break here
 #     narrows the hook: it was already wrong about H11 before H12 arrived.
+#
+# H13. **Weaken the gate the hook EXECS — one word, and it was the false green this
+#     file could not see.** The literal this record searches, carried inline as a
+#     backticked span:
+#     `    exec mise run pre-push`
+#
+#     In `.githooks/pre-push`, replace that line with `    exec mise run pre-commit`.
+#     The hook then runs the five-task commit list on every push and exits 0. Watched —
+#     ONE row, the one added for it:
+#
+#         FAIL the push hook runs the WHOLE gate and not a subset
+#
+#     **Before that row existed this break reddened NOTHING, and three checkers agreed
+#     it was fine**, each measured from a control made green first: `scripts/hook-guard.sh`
+#     exit 0 with every assertion holding; `mise run anchors` unmoved, because none of
+#     the twelve registered `.githooks/pre-push` literals covers this line; and
+#     `.mise/tasks/task-lists` green, because it checks the `pre-commit` list and reads
+#     no line of this hook. CI is off by decision, so nothing downstream existed.
+#     Consequence: every push in every worktree runs 5 tasks instead of 18 — `test`,
+#     `docs`, `deny`, `msrv`, `features`, `examples`, `package` and all four wasm steps
+#     absent, silently, at exit 0.
+#
+#     **The defect was `ran()`, not this line.** `ran()` is `[ -s "$GATE_MARKER" ]`: it
+#     asks whether the gate was REACHED and never which gate, so any substitution that
+#     keeps the stub reachable is invisible to it. Two rows now read the marker's
+#     CONTENT — this one and record 5's — and two is the right number rather than a
+#     compromise, because ONE `exec` line per hook decides what the marker holds. A
+#     third row in another scenario would re-measure the same line.
+#
+#     **And the coverage arithmetic is the uncomfortable part.** This hook holds 93 code
+#     lines; the twelve registered literals touch 12 of them. The anchors exist to make
+#     a hook edit visible, and the line they left uncovered was the one that names the
+#     gate. Two other uncovered lines were driven to check the script catches them
+#     anyway — inverting `if is_deletion "$local_sha"` gives 23 FAIL rows, and
+#     `if [ -n "$delivering" ]` replaced by `if false` gives 15 — so uncovered is not
+#     the same as unguarded. This line was the one where it was.
 #
 # ── AND THE ROWS NO BREAK ABOVE REDDENS, NAMED RATHER THAN LEFT TO LOOK COVERED
 #
@@ -757,6 +853,14 @@ fresh
 push origin work
 check yes "an ordinary push of HEAD runs the gate"
 assert "an ordinary push of HEAD succeeds" test "$pushed_status" -eq 0
+#       THE MARKER'S CONTENT, and this row is the one that closes a measured FALSE
+#       GREEN. `ran()` tests `-s` alone, so replacing this hook's `exec mise run
+#       pre-push` with `exec mise run pre-commit` left every row in this file green,
+#       `mise run anchors` unmoved and `.mise/tasks/task-lists` green — while every
+#       push in every worktree ran the five-task list instead of the whole gate. CI is
+#       off by decision, so nothing downstream existed to catch it. See H13.
+assert "the push hook runs the WHOLE gate and not a subset" \
+    grep -qx 'run pre-push' "$GATE_MARKER"
 
 # ── 2. THE CASE. A branch deletion, with nothing else in the push. There is no
 #       tree to build, so every step of the gate is a step about an unrelated
@@ -797,12 +901,16 @@ push origin :refs/heads/doomed3 work:refs/heads/extra
 check yes "a delete plus an update in one push RUNS the gate"
 assert "the mixed push succeeds" test "$pushed_status" -eq 0
 
-# ── 5 and 6. EMPTY STDIN IS UNKNOWN, NOT EMPTY. Driven directly rather than
-#       through `git push`, because git always writes at least one update line —
-#       so an empty read is not a push git can produce, it is what a bug in the
-#       capture produces. Treating it as all-deletions would skip the whole gate
-#       on the one input that means "I could not tell", which is the false green
-#       this change exists to remove.
+# ── 5 and 6. EMPTY STDIN IS UNKNOWN, NOT EMPTY. Driven directly here, and the
+#       reason used to be stated as "git always writes at least one update line, so
+#       an empty read is not a push git can produce" — **which is FALSE, and
+#       scenario 14 below is the push that produces it.** An up-to-date push writes
+#       no update line at all. What driving the hook directly still buys is
+#       CONTROL over the chained hook's stdin, which scenario 14 does not have.
+#
+#       Treating an empty read as all-deletions would skip the whole gate on the one
+#       input that means "I could not tell", which is the false green this change
+#       exists to remove.
 #
 #       The same run answers a second question: the chained hook must receive
 #       NOTHING rather than a blank line, because a lone LF is one malformed
@@ -1053,12 +1161,17 @@ assert "the tag refusal names an OBJECT rather than a commit" \
 #       carries. The non-ancestry is asserted separately, in the row below, because
 #       that is the half which makes the push a rewind at all.
 #
-#       THE GATE-RAN QUESTION IS ASKED ONCE, and that is deliberate rather than an
-#       omission. All three accepting forms deliver the identical update line — same
-#       ref, same sha, a non-zero fourth field — so a second `check yes` would be
-#       one measurement under a different command's name. What the amend and lease
-#       rows add is about GIT: both spellings still run this hook, and both still
-#       resolve the refspec to HEAD.
+#       THE GATE-RAN QUESTION IS ASKED FOR EACH OF THE THREE, because the sentence
+#       that justified asking it once was FALSE. It said the three accepting forms
+#       deliver the identical update line, same ref and same sha. Measured with a dump
+#       hook over these very three pushes: **one distinct ref, but THREE distinct
+#       delivered shas and three distinct fourth-field shas, none of them zero.** Each
+#       `--amend` writes a new commit, so each push carries a sha the previous one did
+#       not. What the three genuinely share is the SHAPE — one ref, a non-zero fourth
+#       field, and a delivered sha equal to HEAD — and the shape is what the argument
+#       needs. But a shape argument pins nothing, and a `check` costs one line, so
+#       each form now asks the gate-ran question for itself: a change that accepted the
+#       amend WITHOUT gating it used to stay green here.
 #
 #       THE ACCEPTING ROWS ARE WHAT PINS THIS, not the refusing one. A hook that
 #       grew a rewind guard would satisfy every other row in this file, and it would
@@ -1104,6 +1217,7 @@ git add three.txt
 git commit -q --amend --no-edit
 fresh
 push --force origin work
+check yes "a force-push after --amend reaches the gate"
 assert "a force-push after --amend is ACCEPTED" test "$pushed_status" -eq 0
 #       `--force-with-lease`, which compares the remote against the tracking ref
 #       instead of overwriting blindly. The row above is what leaves that ref
@@ -1113,6 +1227,7 @@ git add three.txt
 git commit -q --amend --no-edit
 fresh
 push --force-with-lease origin work
+check yes "a --force-with-lease push reaches the gate"
 assert "a --force-with-lease push is ACCEPTED" test "$pushed_status" -eq 0
 #       A rewind to an OLDER commit, over the branch the remote holds. Git allows it
 #       because it was forced; this hook refuses it because the tree the gate would
@@ -1122,6 +1237,38 @@ fresh
 push --force origin "$force_older:refs/heads/work"
 check no "a force-push REWINDING to an older commit never reaches the gate"
 assert "a force-push of an older commit is REFUSED" test "$pushed_status" -ne 0
+
+# ── 14. AN UP-TO-DATE PUSH, which is the input scenarios 5 and 6 called impossible.
+#       Git writes one update line per ref it will UPDATE, and a push with nothing to
+#       deliver updates none — so `git push` on a current branch runs this hook with
+#       ZERO bytes on stdin. Measured across five spellings before this row existed:
+#       `git push origin work`, a bare `git push`, `--all`, an explicit
+#       `HEAD:refs/heads/work` and `--force` each read zero bytes and zero lines.
+#
+#       So the empty read has an ORDINARY producer, not only a bug in the capture, and
+#       this is the row that stops that being rediscovered. The hook's decision is
+#       unchanged and deliberately so: unknown runs the gate, because a capture bug
+#       must never skip it silently. **The cost is real and this row is where it is
+#       visible** — an already-landed push pays the whole gate for a push that
+#       delivers nothing.
+#
+#       The FIRST assertion is the anti-vacuity one: without it, a row that pushed
+#       something after all would still be green on the two rows below it.
+newrepo "$scratch/push-current"
+echo "one" >one.txt
+git add one.txt
+git commit -q -m "one"
+git init -q --bare "$scratch/remote-current"
+git remote add origin "$scratch/remote-current"
+git push -q --no-verify origin work
+fresh
+push origin work
+assert "the up-to-date push really had nothing to deliver" \
+    grep -qF "Everything up-to-date" "$pushlog"
+check yes "an UP-TO-DATE push reads empty stdin and RUNS the gate"
+assert "the up-to-date push still succeeds" test "$pushed_status" -eq 0
+assert "the empty read names NOTHING TO PUSH before it names unknown" \
+    grep -qF "NOTHING TO PUSH" "$pushlog"
 
 # ══ PART THREE — scripts/install-hooks.sh, and WHICH hook file runs ═════════
 #
