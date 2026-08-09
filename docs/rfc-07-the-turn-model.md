@@ -4524,12 +4524,53 @@ because a break record beside its test is a live instruction rather than a
 historical claim. This file keeps both readings, which is the difference between
 the two homes.
 
-### 17.3 §"the four prefixes" in §9's prose is a count and is not edited
+### 17.3 §"the four prefixes" is a count and is not edited
 
-Two sentences in this file say `no_failure_prefix_is_a_prefix_of_another`
-*"compares the four against each other"* and describes the guard set as four. The
+Two sentences in the §9 bullet beginning *"keylink builds a `Failed` from at
+least three other places"* say `no_failure_prefix_is_a_prefix_of_another`
+*"compares the four against each other"* and describe the guard set as four. The
 identifier is unchanged, so nothing is renamed and the carve-out does not apply.
 
 **Five at `43fa7c1`.** The fifth is `RemoteError::OBSERVER_PANICKED`, and it is
 the first prefix in that set to share a word with another one, which is the whole
 reason the by-hand list is the guard rather than the eye.
+
+### 17.4 One sentence in that bullet now reads "five renders three", and that is the honest state
+
+**Read this before trying to parse §9's line 3875.** After the rename above it
+reads:
+
+> The claim is narrowed to *every prefix `rendered` and `lost` build*, and
+> `no_other_served_failure_begins_with_one_of_the_five` renders the other three
+> and checks them.
+
+Five renders three, and **both halves are correct in their own register.** The
+identifier was carried forward under the carve-out, because a pointer that names
+a test which no longer exists is a dead pointer — this branch measured what that
+costs, and the answer is a replay stanza selecting **zero tests** while reporting
+success. The figure was not carried forward, because a count is what a row
+asserts. So the sentence is deliberately half-current and half-historical, and
+this section is what tells a reader which half is which.
+
+**What a reader who counts finds, and it depends on the unit.** Measured on
+`keylink/src/actor/remote.rs`'s `others` array at `43fa7c1`: **five rendered
+values, from four places.** The values are the registry's capacity refusal, an
+oversized `ActorId`'s validation failure, `FollowRefused::Ahead`,
+`FollowRefused::Crowded`, and `Undelivered::Reentrant`. The two `FollowRefused`
+arms are one place, which is the whole of the gap between four and five — and a
+correction that had written one number without naming its unit would have been
+wrong against the other.
+
+**The "three" is not a slip and predates this branch.** The same bullet opens
+*"at least three other places"* and then lists exactly three. Both figures were
+written when three were known. The fourth — `deliver_to_local`'s re-entrancy arm
+— was found later, and `remote.rs`'s own doc records the finding in the register
+this file cannot: *"The fourth is built in `turns.rs`, and being the exception is
+why this list missed it"*, beside the line that renders it. So the bullet is
+internally coherent as a record of its own wave, and editing one number inside it
+would leave the sentence above it claiming three as well.
+
+Cite `no_other_served_failure_begins_with_one_of_the_five` and read the array,
+which is the form §15.1 prefers and the only one that cannot rot: the guard
+renders every case it knows about, and the assertion is against the bytes rather
+than against a total.
