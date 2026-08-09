@@ -926,6 +926,32 @@ async fn a_deeper_mailbox_takes_one_more_message_behind_a_running_turn() {
 /// state the crate cannot reach by removing this check, and the code that would
 /// report it is unreachable through this break. It stays in the enum because it is
 /// what a **deeper default** would produce, which is a different edit.
+///
+/// # The filter, and the two columns the second anchor has left
+///
+/// Both runs take this test's own name —
+/// `a_self_tell_fits_once_and_is_refused_when_the_mailbox_is_full` — plus
+/// `--test cycles`. The harness appends the filter **positionally** to its runner,
+/// so it is a plain substring and never a nextest `test(..)` filterset: a
+/// filterset there matches nothing, runs zero tests, and exits non-zero, which the
+/// banner prints as a caught defect. The filter was described in prose and not
+/// written down here until a reader had to reconstruct it.
+///
+/// **CAUTION: the second anchor is 98 of the 100 columns `rustfmt` allows.** Two
+/// columns of headroom, so a longer type name anywhere on that line reflows it and
+/// the anchor rots.
+///
+/// Not hypothetical, and it has already happened once in the **other** direction:
+/// at `ac5a6ef` this arm was a three-line block, `Undelivered::Reentrant` was
+/// renamed to the shorter `NotQueued::Reentrant`, `rustfmt` collapsed the block
+/// onto one line, and D11's row in `.mise/tasks/anchors` had to be re-quoted. Any
+/// rename that moves this line either way does it again, and with two columns left
+/// the growing direction is now the cheap one.
+///
+/// It is loud rather than silent when it happens: `mise run anchors` fails before
+/// the harness is ever reached, and the harness would abort at "found 0". The
+/// figure is measured against the line as it stands and is not a limit anyone
+/// chose, so it belongs beside the anchor rather than in a rule.
 #[tokio::test]
 async fn a_self_tell_fits_once_and_is_refused_when_the_mailbox_is_full() {
     let (a, _b, _gate, _entered) = ring_of_two();

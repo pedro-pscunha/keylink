@@ -45,7 +45,7 @@ use std::time::Duration;
 use keylink::Persist;
 use keylink::{
     Allowlist, Caller, Deferred, Ended, Intensity, Observer, RemoteError, Replied, Reply, Server,
-    Stop, Stream, TurnFut, TurnInfo, TurnOutcome,
+    Stop, Stream, TurnFut, TurnInfo, TurnOutcome, Undelivered,
 };
 #[cfg(feature = "persist-file")]
 use keylink_persist::file::Files;
@@ -1180,6 +1180,126 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
             keylink::Error::Remote(RemoteError::NoSuchActor { .. })
         ),
         "an actor that gave up is gone for good: got {after:?}"
+    );
+    assert!(
+        matches!(ended(desk.ended()).await, Ended::GaveUp { after: 1, .. }),
+        "one restart was budgeted, and the second fault spent nothing left"
+    );
+}
+
+/// The same three answers through the **local** door, where they are variants
+/// rather than rendered sentences.
+///
+/// A peer reads `Failed("restarting: ..")` and `NoSuchActor` because the wire
+/// carries no variant per cause. A local caller holds the handle, so it gets
+/// [`Undelivered::Restarting`] and [`Undelivered::Gone`] — two values, and the
+/// whole reason `Undelivered` grew from *the actor is gone* into a six-variant
+/// enum. Both answers came back `Gone` before that split, which told a caller to
+/// stop calling an actor a supervisor was in the middle of putting back.
+///
+/// Two rounds and one budgeted restart, exactly as the served twin above:
+///
+/// 1. the parked `place` → `Undelivered::Restarting`, the incarnation did not
+///    survive the fault and another is coming;
+/// 2. once the budget is out → `Undelivered::Gone`, which is final.
+///
+/// # Three ways this passes for the wrong reason, and what refuses each
+///
+/// - **The fault overtakes the park.** Then round 1 loses a reply that was never
+///   parked, and the assertion is about nothing. The poll loop below is carried
+///   from the served twin, where it is recorded as an observed *hang* rather than
+///   a hypothetical.
+/// - **Round 2 passes on the closed mailbox instead of on the read.** A fresh
+///   call after the give-up fails at `send`, which also answers `Gone` — the same
+///   variant off a different producer: `NotQueued::Closed`, which never reaches
+///   the `Standing` read this test is about. So round 2 asserts the **parked**
+///   reply, which was queued long before the mailbox closed. The send-side fact
+///   is asserted separately at the end, and says which it is.
+/// - **Single-threaded scheduling hides the window.** The served twin records
+///   that `rg -n 'multi_thread' keylink/tests` returned exactly one hit before it
+///   — "the mechanical reason nothing in this suite caught the regression". Four
+///   workers here for that reason, and not because this test needs them to pass.
+///
+/// `boom` is spawned rather than awaited because a local `rpc` **resumes** the
+/// handler's panic in whoever awaited it, and that would be this test. The
+/// served twin asserts the `"panicked: "` prefix at the same point; the local
+/// equivalent of that fact is a caller task that unwinds.
+///
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `answered`'s
+/// `Standing::Restarting(reason) => TurnLost::Restarting(reason),` →
+/// `Standing::Restarting(_) => TurnLost::Gone,` — the fold that made a restart
+/// indistinguishable from an ending. Watched: `round 1: a lost reply on a
+/// restarting actor must say so`, `left: Gone`, `right: Restarting`.
+///
+/// **Round 2 stays green under that break**, and that is the shape of the guard
+/// rather than a gap: the break folds `Restarting` onto the answer round 2 already
+/// expects. Round 2 is what the *other* fold would move, and the served twin above
+/// carries the break for it. The filter is this test's own name, which contains
+/// the word `local` and so does not also match
+/// `a_remote_caller_can_tell_restarting_from_gone`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_caller_can_tell_restarting_from_gone() {
+    // One restart, so the second fault is terminal and "gone" is reachable
+    // inside one test without a storm.
+    let desk = desk::supervised(
+        move || async move {
+            let observers: Vec<Box<dyn Observer<Desk>>> =
+                vec![Box::new(RefuseFaults { fatal: false })];
+            Ok((Desk::default(), observers, ()))
+        },
+        limit(1, Duration::from_millis(50)),
+    );
+
+    for (round, expected) in [(1u8, Undelivered::Restarting), (2, Undelivered::Gone)] {
+        // Parked by the handler and never answered. Held across the fault below.
+        let placing = {
+            let desk = desk.clone();
+            tokio::spawn(async move { desk.place(round.into()).await })
+        };
+        // **Asked, never assumed.** A fault that overtook the park would end the
+        // incarnation the park was meant to be lost with, leaving the placed
+        // order sitting in the *next* one for ever.
+        for _ in 0..1_000 {
+            if desk.parked().await.expect("the actor answers") == 1 {
+                break;
+            }
+            n0_future::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            desk.parked().await.expect("the actor answers"),
+            1,
+            "round {round}: the order has to be parked before the fault"
+        );
+
+        let booming = {
+            let desk = desk.clone();
+            tokio::spawn(async move { desk.boom().await })
+        };
+        assert!(
+            booming
+                .await
+                .expect_err("a local `rpc` resumes the handler's panic in its caller")
+                .is_panic(),
+            "round {round}: the fault has to be a fault"
+        );
+
+        let placed = placing
+            .await
+            .expect("the caller task is not itself panicking")
+            .expect_err("a parked reply whose incarnation ended is not answered");
+        assert_eq!(
+            placed, expected,
+            "round {round}: a lost reply on a restarting actor must say so"
+        );
+    }
+
+    // And it stays gone, through the other door: the mailbox is closed, so the
+    // send itself fails and nothing is queued. Same variant, different mechanism,
+    // which is why it is not what round 2 asserts.
+    assert_eq!(
+        desk.place(3).await,
+        Err(Undelivered::Gone),
+        "an actor that gave up refuses the send itself"
     );
     assert!(
         matches!(ended(desk.ended()).await, Ended::GaveUp { after: 1, .. }),

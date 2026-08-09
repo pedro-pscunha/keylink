@@ -186,7 +186,7 @@ keylink/src/turns.rs \
             "{DROPPED}the actor is serving and this reply was never answered"
         )),' \
 '        Standing::Running => RemoteError::NoSuchActor { id: id.to_owned() },' \
-  a_live_actor_does_not_tell_a_peer_no_such_actor -p keylink --test defer
+  a_local_caller_and_a_peer_agree_about_an_abandoned_deferred -p keylink --test defer
 
 run "12 lost live arm -> panicked" \
 'a panicking deferred handler loses the reply, and that is what the peer must read: "panicked: bad"' \

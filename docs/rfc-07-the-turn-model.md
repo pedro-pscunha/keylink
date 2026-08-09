@@ -3586,7 +3586,7 @@ two lines now, and `scripts/replay-fate-breaks.sh` runs the whole set.
 | `registry::abort_settles_the_served_answer_before_it_destroys_the_actor` | `System::abort`'s settle → `Standing::Running` |
 | `registry::an_expired_shutdown_budget_settles_the_served_answer_before_the_abort` | `drain`'s settle → `Standing::Running` |
 | `remote::no_other_served_failure_begins_with_one_of_the_four` | `RouteError::AtCapacity`'s `Display` gains a `"dropped: "` prefix |
-| `defer::a_live_actor_does_not_tell_a_peer_no_such_actor` | `lost`'s `Standing::Running` arm → `NoSuchActor` |
+| `defer::a_local_caller_and_a_peer_agree_about_an_abandoned_deferred` | `lost`'s `Standing::Running` arm → `NoSuchActor`, and `answered`'s `Standing::Running` arm → `TurnLost::Gone` — one break per door |
 | `defer::a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer` | the same arm → `Failed("panicked: bad")` |
 | `defer::a_stopped_actor_still_tells_a_peer_no_such_actor` | the default `Inbox::ending` → `Standing::Running` |
 | `defer::an_aborted_actor_tells_a_peer_no_such_actor` | `LocalActor::abort`'s settle → `Standing::Running` |

@@ -28,12 +28,14 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::io;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keylink::{
-    Caller, Ended, FinishFut, Observer, Stop, TurnFut, TurnInfo, TurnOutcome, Undelivered,
+    Caller, Ended, FinishFut, Intensity, Observer, Stop, TurnFut, TurnInfo, TurnOutcome,
+    Undelivered,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -513,6 +515,96 @@ async fn a_refused_turn_answers_its_caller_with_nothing() {
         }
         other => panic!("got {other:?}"),
     }
+}
+
+/// §2.6 row three under a **supervisor**, where the refusal is not the end of the
+/// actor and the caller must not be told that it is.
+///
+/// [`Stop::new`] is non-fatal, so `retryable` sends this ending to a restart: one
+/// incarnation is gone and another is coming. The caller of the refused turn
+/// arrived as `Undelivered::Gone` — *stop calling* — about an actor a supervisor
+/// was in the middle of putting back, which is the sentence
+/// [`Undelivered::Refused`] exists to replace.
+///
+/// # The name is carried, and it could not be read anywhere else
+///
+/// `ended()` cannot supply it here: it resolves when the **actor** ends, and this
+/// ending belongs to one incarnation. So a caller that wants to know which
+/// observer refused has this variant or has nothing.
+///
+/// # How the first assertion passes for the wrong reason, and what refuses it
+///
+/// `Refused` rides the **turn** axis, so it arrives whether or not there is a
+/// supervisor above the loop. Without the second assertion this is
+/// `a_refused_turn_answers_its_caller_with_nothing` above with a word changed, and
+/// it would say nothing about the restart — which is the whole reason this case is
+/// separate. The second `post` is answered by an incarnation the first one's
+/// refusal caused to exist.
+///
+/// The factory refuses on the **first** incarnation only, through a flag it owns
+/// rather than a second observer type: an observer refusing every turn would
+/// refuse the next incarnation's too, so the actor would storm and no `post`
+/// would ever be answered. `1` back from the second call is the fresh `Ledger`
+/// that factory built, which is the same fact from the state's side.
+///
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `ask`'s
+/// `Err(TurnLost::Refused { name }) => Err(Undelivered::Refused { name }),` →
+/// `Err(TurnLost::Refused { .. }) => Err(Undelivered::Gone),`, the fold this
+/// variant was split out of. Watched: `a non-fatal refusal ends one incarnation,
+/// and the caller must not be told the actor is gone`, `left: Err(Gone)`,
+/// `right: Err(Refused { name: "saver" })`.
+///
+/// The second `post` is never reached under that break, so it is guarded by the
+/// supervisor's own tests rather than by this one — what it does here is stop the
+/// first assertion from being true of a dead actor.
+#[tokio::test]
+async fn a_local_caller_is_told_refused_when_a_non_fatal_observer_refuses() {
+    let ran = ran();
+    let observed = ran.clone();
+    let refused_once = Arc::new(AtomicBool::new(false));
+    let ledger = ledger::supervised(
+        move || {
+            let observed = observed.clone();
+            let refused_once = refused_once.clone();
+            async move {
+                let first = !refused_once.swap(true, Ordering::SeqCst);
+                let saver: Box<dyn Observer<Ledger>> = if first {
+                    Box::new(Recording::refusing("saver", &observed))
+                } else {
+                    Box::new(Recording::accepting("saver", &observed))
+                };
+                Ok((Ledger::default(), vec![saver], ()))
+            }
+        },
+        Intensity::new(
+            NonZeroU32::new(1).expect("a budget of at least one"),
+            Duration::from_millis(50),
+        )
+        .expect("a recovery span whose backoff is not zero"),
+    );
+
+    assert_eq!(
+        ledger.post(1).await,
+        Err(Undelivered::Refused { name: "saver" }),
+        "a non-fatal refusal ends one incarnation, and the caller must not be \
+         told the actor is gone"
+    );
+
+    // The half that makes this the supervised case rather than the turn-axis one.
+    assert_eq!(
+        ledger
+            .post(2)
+            .await
+            .expect("a non-fatal refusal costs one incarnation, not the actor"),
+        1,
+        "the next incarnation is serving, and its ledger is the one the factory \
+         built rather than the refused turn's"
+    );
+    assert_eq!(
+        *ran.lock().unwrap(),
+        ["saver", "saver"],
+        "one observer per incarnation, and both of them ran"
+    );
 }
 
 /// `ended` holds a watch receiver and no mailbox sender, so awaiting it does not

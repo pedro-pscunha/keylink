@@ -4553,6 +4553,7 @@ where
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+    use std::collections::BTreeSet;
     use std::time::Duration;
 
     use super::*;
@@ -4621,6 +4622,186 @@ mod tests {
             },
             "one of the three answers is not a `Failed` at all, so the set of \
              prefixes is smaller than the set of answers"
+        );
+    }
+
+    /// One [`Undelivered`] per [`TurnLost`] that is not a fault, sampled once so
+    /// the coverage assertion below has something to index.
+    const EVERY: [Undelivered; 6] = [
+        Undelivered::Gone,
+        Undelivered::Dropped,
+        Undelivered::Restarting,
+        Undelivered::Refused { name: "observer" },
+        Undelivered::Expired,
+        Undelivered::Reentrant,
+    ];
+
+    /// Which slot of [`EVERY`] this is.
+    ///
+    /// Exhaustive over [`Undelivered`], which is one of the two compile errors
+    /// the guard below rests on.
+    fn slot(mine: &Undelivered) -> usize {
+        match mine {
+            Undelivered::Gone => 0,
+            Undelivered::Dropped => 1,
+            Undelivered::Restarting => 2,
+            Undelivered::Refused { .. } => 3,
+            Undelivered::Expired => 4,
+            Undelivered::Reentrant => 5,
+        }
+    }
+
+    /// The [`Undelivered`] that means the same thing, or `None` for the one
+    /// variant [`ask`](LocalActor::ask) resumes instead of returning.
+    ///
+    /// Exhaustive over [`TurnLost`], which is the other compile error.
+    fn twin(lost: &TurnLost) -> Option<Undelivered> {
+        match lost {
+            TurnLost::Gone => Some(Undelivered::Gone),
+            TurnLost::Dropped => Some(Undelivered::Dropped),
+            TurnLost::Restarting(_) => Some(Undelivered::Restarting),
+            TurnLost::Refused { name } => Some(Undelivered::Refused { name }),
+            TurnLost::Expired => Some(Undelivered::Expired),
+            TurnLost::Reentrant => Some(Undelivered::Reentrant),
+            TurnLost::Faulted(_) => None,
+        }
+    }
+
+    /// One fact reads as one sentence, whichever of the two doors a caller came
+    /// through.
+    ///
+    /// [`ask_catching`](LocalActor::ask_catching) answers [`TurnLost`] and
+    /// [`ask`](LocalActor::ask) answers [`Undelivered`], and every variant of the
+    /// second is the first minus its fault. Two enums saying different things
+    /// about one condition is what an operator reads as two conditions — and the
+    /// texts were kept in step by hand until this test, with `Reentrant` already
+    /// byte-identical across the pair and nothing holding it there.
+    ///
+    /// # Rust has no reflection over variants, so this cannot enumerate them
+    ///
+    /// What it has instead is two exhaustive matches, and both are `error[E0004]`
+    /// the moment either enum grows: [`twin`] over [`TurnLost`], and [`slot`] over
+    /// [`Undelivered`]. An author who adds a variant lands in this file and has to
+    /// say what its twin is, which is the whole of the enforcement.
+    ///
+    /// **A third mechanism was claimed for this guard in design and it does not
+    /// exist.** The claim was that a seventh arm would write `EVERY[6]`, and that
+    /// a constant index past the end of a sized array fires rustc's deny-by-default
+    /// `unconditional_panic`. That lint reads a **syntactically constant** index,
+    /// and this guard indexes with `slot(&mine)` — a value computed at run time —
+    /// so the lint has nothing to fire on and an over-long index would be an
+    /// ordinary panic in this test rather than a compile error. It is not claimed
+    /// here, and it would have held only for a file whose style is literal indices,
+    /// which no test can force a later author to keep.
+    ///
+    /// # The residual, named rather than argued away
+    ///
+    /// **Two hand-written arrays, and `E0004` forces an author into this file
+    /// without forcing either of them to grow.** `EVERY` samples [`Undelivered`]
+    /// and `lost` samples [`TurnLost`]. An author who adds a variant to both
+    /// enums, writes the two new arms, points [`slot`] at an **existing** index
+    /// and leaves the new `TurnLost` out of `lost` gets past every assertion here:
+    /// nothing exercises the new pair, so the counts below are unchanged and
+    /// green.
+    ///
+    /// What that same author does **not** get past is adding the new variant to
+    /// `lost` and pointing [`slot`] at an existing index — the shared slot is then
+    /// written twice. That case is caught by the exactly-once count and would not
+    /// be caught by an at-least-once one, and it is the whole of what the
+    /// strengthening buys.
+    ///
+    /// It buys nothing against the enums as they stand today, which is worth
+    /// saying rather than leaving for a reader to discover: six twins over six
+    /// slots means any fold also leaves a hole, so the two readings agree on every
+    /// break reachable now. The second break below is the measurement — it
+    /// produces `[2, 1, 1, 1, 0, 1]`, a doubled slot **and** an empty one, so it
+    /// reddens under either reading and does not separate them.
+    ///
+    /// # Four assertions, each against a way this could hold for nothing
+    ///
+    /// The sentences are compared between two values built from literals, so
+    /// neither side is derived from the other's text — the tautology this shape
+    /// invites. Beyond that: the per-slot count refuses a loop that ran over a
+    /// subset; `without_a_twin` refuses a [`twin`] that answers `None` to
+    /// everything and so skips every comparison; the distinct-sentence count
+    /// refuses two variants copy-pasted to one text, which the pairwise equality
+    /// cannot see; and the emptiness check refuses `#[error("")]` on a pair, which
+    /// satisfies the equality and says nothing.
+    ///
+    /// Made red twice by `scripts/break-once.sh keylink/src/turns.rs`, because one
+    /// break exercises the equality and the other the coverage, and one alone
+    /// would leave half of this defended by prose. Both edits are in **this**
+    /// file, so neither is quoted — a record quoting its own search literal is a
+    /// second occurrence and the harness aborts at "found 2". The filter for both
+    /// is this test's own name, plus `-p keylink --lib`:
+    ///
+    /// - change one character of [`Undelivered::Dropped`]'s `#[error]` text — the
+    ///   whole attribute line is unique in this file, so it is what the harness is
+    ///   given. Watched: `one fact must read as one sentence: Dropped and
+    ///   Dropped`, with `left` and `right` printing the two sentences one
+    ///   character apart.
+    /// - point [`slot`]'s `Undelivered::Expired` arm at `0` instead of `4`.
+    ///   Watched: `every variant is written exactly once, and this one was written
+    ///   2 times: [2, 1, 1, 1, 0, 1] at slot 0`, `left: 2`, `right: 1`. **This
+    ///   record predicted slot 4 and "written 0 times", and the run said slot 0
+    ///   and 2**: the loop walks the slots in order, so the doubled one is reached
+    ///   before the emptied one. The prediction named the arm that was edited
+    ///   rather than the arm that fires, which is the sentence a reader would
+    ///   otherwise search the log for and not find.
+    ///
+    /// Both runs also print `panicked at .. : twin` above the failure, from the
+    /// `catching` below. That is the [`Faulted`](TurnLost::Faulted) sample being
+    /// built and not a second failure.
+    #[test]
+    fn every_turn_lost_except_faulted_has_one_undelivered_twin_with_the_same_words() {
+        let lost = [
+            TurnLost::Gone,
+            TurnLost::Dropped,
+            TurnLost::Restarting(Arc::new(Ended::Stopped)),
+            TurnLost::Refused { name: "observer" },
+            TurnLost::Expired,
+            TurnLost::Reentrant,
+            TurnLost::Faulted(catching(|| panic!("twin")).expect_err("it panicked")),
+        ];
+
+        let mut written = [0u32; EVERY.len()];
+        let mut without_a_twin = 0;
+
+        for one in &lost {
+            match twin(one) {
+                None => without_a_twin += 1,
+                Some(mine) => {
+                    assert_eq!(
+                        one.to_string(),
+                        mine.to_string(),
+                        "one fact must read as one sentence: {one:?} and {mine:?}",
+                    );
+                    written[slot(&mine)] += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            without_a_twin, 1,
+            "`Faulted` is the one variant `ask` resumes rather than maps",
+        );
+        for (at, count) in written.iter().enumerate() {
+            assert_eq!(
+                *count, 1,
+                "every variant is written exactly once, and this one was written \
+                 {count} times: {written:?} at slot {at}",
+            );
+        }
+
+        let words: BTreeSet<String> = EVERY.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            words.len(),
+            EVERY.len(),
+            "two variants share one sentence: {words:?}",
+        );
+        assert!(
+            words.iter().all(|text| !text.is_empty()),
+            "an empty `#[error]` makes every equality above hold for nothing",
         );
     }
 

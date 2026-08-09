@@ -1049,6 +1049,40 @@ ANCHORS = [
     # two sizes - each reddens a test the other leaves green, measured both ways.
     ("D15", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "                grown.extend(outer.iter().cloned());"),
+    # ── from the `reply-not-gone` branch, where `Undelivered` went from *the actor
+    # is gone* to six variants and `answered` started reading `Fate` to choose
+    # between three of them. `E` for items E+F, on `D`'s reasoning: a fresh letter
+    # cannot collide with a reserved numeric gap by arithmetic.
+    #
+    # ALL FOUR cross-file, so each record's own quote lives in a `tests/*.rs` file
+    # and cannot contribute to the count in `turns.rs`.
+    #
+    # **E1 and E2 are the same literal against the same target, deliberately**, and
+    # they are the `P1`/`P2` shape rather than a duplicate: one edit reddens two
+    # guards in one file, on two different assertions, with two different watched
+    # sentences. Measured both ways - under this break `a_live_actor_that_drops_a_
+    # deferred_is_told_dropped_and_not_gone` fails at its variant assertion and the
+    # pairing fails at its LOCAL half, with the pairing's peer half green in that
+    # same run.
+    #
+    # **The twelve spaces are what make E1 and E2 resolve at all.** The bare form
+    # counts 2 in `turns.rs`: `mod tests` there carries a record of the same break
+    # at `ask_catching`'s twin, and it quotes the arm unindented inside a `///`
+    # line. Same-file collision arriving from the TARGET's side, which is the mode
+    # `P1`'s note names. `flat()` collapses the indentation before comparing, so the
+    # records may go on quoting the bare form and this row still finds it.
+    ("E1", "keylink/tests/defer.rs", "keylink/src/turns.rs",
+     "            Standing::Running => TurnLost::Dropped,"),
+    ("E2", "keylink/tests/defer.rs", "keylink/src/turns.rs",
+     "            Standing::Running => TurnLost::Dropped,"),
+    # E3 and E4 are the other two arms the split created, one per enum. The pairing
+    # record's OTHER break - `lost`'s whole three-line `Standing::Running` arm - has
+    # no row here and needs none: that record quotes its REPLACEMENT and describes
+    # its search, so there is no literal for a row to check.
+    ("E3", "keylink/tests/supervision.rs", "keylink/src/turns.rs",
+     "            Standing::Restarting(reason) => TurnLost::Restarting(reason),"),
+    ("E4", "keylink/tests/observe.rs", "keylink/src/turns.rs",
+     "            Err(TurnLost::Refused { name }) => Err(Undelivered::Refused { name }),"),
     # ── from the ledger-limits PR. Both were measured with `grep -cF` AFTER the
     # record was written, which is the order that matters: adding a quote can only
     # RAISE a count, so measuring first reports a 1 that the record itself then
@@ -2962,7 +2996,23 @@ for record in sorted(set(REDNESS) - row_ids):
 # next person to skip the run gets the wrong number on a tree where the two diverge.
 # The agreement is recorded because hiding it would make the run look load-bearing in
 # a way this one was not, and the run is kept because the NEXT one will be.
-RECORD_BLOCKS = 166
+#
+# 166 → 170, on the `reply-not-gone` branch. Four new guards, four new records, and
+# **the run is what caught the fourth**: the first failing run printed 169, because
+# the record in `turns.rs`'s own `mod tests` said only "Made red twice" and named no
+# harness. That put it in `UNNAMED` and outside the population this constant counts,
+# so a `+4` typed off the diff would have been wrong by one against a tripwire that
+# was right. The record now names `break-once.sh`, which is what it ran under, and
+# the re-run printed 170. **This is the class the header above calls out** - a record
+# phrased so neither population recognises it - arriving as a live miscount rather
+# than as a hypothetical, on the first branch to add records after the note was
+# written.
+#
+# Two edits in this wave moved it by ZERO, and that is the rule rather than an
+# exception: this counts comment BLOCKS. `defer.rs`'s peer/local pairing gained a
+# SECOND break inside the doc block it already had, and `cycles.rs`'s
+# `Refuse::WhenFull` record gained a filter and a column measurement inside its own.
+RECORD_BLOCKS = 170
 
 # The one marker the tripwire counts, and the two phrasings records use INSTEAD of
 # naming the harness. Both are read by the same walk, so the blind spot below is a
