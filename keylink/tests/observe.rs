@@ -9,11 +9,11 @@
 //!
 //! What is pinned here is §2.6, the table that says who gets an answer:
 //!
-//! | the turn  | an observer | the caller of a local call gets                |
-//! |-----------|-------------|------------------------------------------------|
-//! | completed | accepted    | the value                                      |
-//! | panicked  | refused     | the panic, resumed — and the actor then ends   |
-//! | completed | refused     | `Undelivered`, with the turn not committed   |
+//! | the turn  | an observer | the caller of a local call gets                     |
+//! |-----------|-------------|-----------------------------------------------------|
+//! | completed | accepted    | the value                                           |
+//! | panicked  | refused     | the panic, resumed — and the actor then ends        |
+//! | completed | refused     | `Undelivered::Refused { name }`, turn not committed |
 //!
 //! Three rows and three tests, because they are three different promises and an
 //! implementation that collapses any two of them still passes a test written for
@@ -28,12 +28,14 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::io;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keylink::{
-    Caller, Ended, FinishFut, Observer, Stop, TurnFut, TurnInfo, TurnOutcome, Undelivered,
+    Caller, Ended, FinishFut, Intensity, Observer, Stop, TurnFut, TurnInfo, TurnOutcome,
+    Undelivered,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -431,7 +433,13 @@ async fn an_observer_runs_before_the_caller_is_answered() {
 async fn a_panicking_observer_ends_the_actor_and_is_named() {
     let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(Exploding)]);
 
-    assert_eq!(ledger.post(1).await, Err(Undelivered::Gone));
+    // The caller is told which observer, and by the same name `ended` reports
+    // below: a panicking observer is folded into the refusal path — `Panic` is
+    // not an `Error`, so `observed_turn` renders it and keeps the name.
+    assert_eq!(
+        ledger.post(1).await,
+        Err(Undelivered::Refused { name: "exploding" })
+    );
 
     match ledger.ended().await {
         Ended::Observer { name, error, .. } => {
@@ -479,9 +487,9 @@ async fn a_panicked_turn_reaches_its_caller_and_then_ends_the_actor() {
 ///
 /// The turn ran and was not committed, so handing back the value would publish a
 /// state no restart can reproduce — the exact fault the port exists to prevent,
-/// arrived at through the reply instead of through the store. A local caller
-/// fails one way, so it is told `Undelivered`, and `ended` is the only place
-/// the reason survives.
+/// arrived at through the reply instead of through the store. The caller is told
+/// `Undelivered::Refused` and which observer said so, and `ended` carries the
+/// observer's own **error** — two facts on two channels, not one fact twice.
 #[tokio::test]
 async fn a_refused_turn_answers_its_caller_with_nothing() {
     let ran = ran();
@@ -490,7 +498,10 @@ async fn a_refused_turn_answers_its_caller_with_nothing() {
         vec![Box::new(Recording::refusing("saver", &ran))],
     );
 
-    assert_eq!(ledger.post(1).await, Err(Undelivered::Gone));
+    assert_eq!(
+        ledger.post(1).await,
+        Err(Undelivered::Refused { name: "saver" })
+    );
     assert_eq!(
         *ran.lock().unwrap(),
         ["saver"],
@@ -504,6 +515,96 @@ async fn a_refused_turn_answers_its_caller_with_nothing() {
         }
         other => panic!("got {other:?}"),
     }
+}
+
+/// §2.6 row three under a **supervisor**, where the refusal is not the end of the
+/// actor and the caller must not be told that it is.
+///
+/// [`Stop::new`] is non-fatal, so `retryable` sends this ending to a restart: one
+/// incarnation is gone and another is coming. The caller of the refused turn
+/// arrived as `Undelivered::Gone` — *stop calling* — about an actor a supervisor
+/// was in the middle of putting back, which is the sentence
+/// [`Undelivered::Refused`] exists to replace.
+///
+/// # The name is carried, and it could not be read anywhere else
+///
+/// `ended()` cannot supply it here: it resolves when the **actor** ends, and this
+/// ending belongs to one incarnation. So a caller that wants to know which
+/// observer refused has this variant or has nothing.
+///
+/// # How the first assertion passes for the wrong reason, and what refuses it
+///
+/// `Refused` rides the **turn** axis, so it arrives whether or not there is a
+/// supervisor above the loop. Without the second assertion this is
+/// `a_refused_turn_answers_its_caller_with_nothing` above with a word changed, and
+/// it would say nothing about the restart — which is the whole reason this case is
+/// separate. The second `post` is answered by an incarnation the first one's
+/// refusal caused to exist.
+///
+/// The factory refuses on the **first** incarnation only, through a flag it owns
+/// rather than a second observer type: an observer refusing every turn would
+/// refuse the next incarnation's too, so the actor would storm and no `post`
+/// would ever be answered. `1` back from the second call is the fresh `Ledger`
+/// that factory built, which is the same fact from the state's side.
+///
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `ask`'s
+/// `Err(TurnLost::Refused { name }) => Err(Undelivered::Refused { name }),` →
+/// `Err(TurnLost::Refused { .. }) => Err(Undelivered::Gone),`, the fold this
+/// variant was split out of. Watched: `a non-fatal refusal ends one incarnation,
+/// and the caller must not be told the actor is gone`, `left: Err(Gone)`,
+/// `right: Err(Refused { name: "saver" })`.
+///
+/// The second `post` is never reached under that break, so it is guarded by the
+/// supervisor's own tests rather than by this one — what it does here is stop the
+/// first assertion from being true of a dead actor.
+#[tokio::test]
+async fn a_local_caller_is_told_refused_when_a_non_fatal_observer_refuses() {
+    let ran = ran();
+    let observed = ran.clone();
+    let refused_once = Arc::new(AtomicBool::new(false));
+    let ledger = ledger::supervised(
+        move || {
+            let observed = observed.clone();
+            let refused_once = refused_once.clone();
+            async move {
+                let first = !refused_once.swap(true, Ordering::SeqCst);
+                let saver: Box<dyn Observer<Ledger>> = if first {
+                    Box::new(Recording::refusing("saver", &observed))
+                } else {
+                    Box::new(Recording::accepting("saver", &observed))
+                };
+                Ok((Ledger::default(), vec![saver], ()))
+            }
+        },
+        Intensity::new(
+            NonZeroU32::new(1).expect("a budget of at least one"),
+            Duration::from_millis(50),
+        )
+        .expect("a recovery span whose backoff is not zero"),
+    );
+
+    assert_eq!(
+        ledger.post(1).await,
+        Err(Undelivered::Refused { name: "saver" }),
+        "a non-fatal refusal ends one incarnation, and the caller must not be \
+         told the actor is gone"
+    );
+
+    // The half that makes this the supervised case rather than the turn-axis one.
+    assert_eq!(
+        ledger
+            .post(2)
+            .await
+            .expect("a non-fatal refusal costs one incarnation, not the actor"),
+        1,
+        "the next incarnation is serving, and its ledger is the one the factory \
+         built rather than the refused turn's"
+    );
+    assert_eq!(
+        *ran.lock().unwrap(),
+        ["saver", "saver"],
+        "one observer per incarnation, and both of them ran"
+    );
 }
 
 /// `ended` holds a watch receiver and no mailbox sender, so awaiting it does not
@@ -586,7 +687,10 @@ async fn a_read_runs_no_observers() {
 #[tokio::test]
 async fn an_observer_can_give_up_with_a_message_or_with_an_error() {
     let with_message = ledger::actor_with(Ledger::default(), vec![Box::new(GivesUp::WithMessage)]);
-    assert_eq!(with_message.post(1).await, Err(Undelivered::Gone));
+    assert_eq!(
+        with_message.post(1).await,
+        Err(Undelivered::Refused { name: "message" })
+    );
     match with_message.ended().await {
         Ended::Observer { name, error, .. } => {
             assert_eq!(name, "message");
@@ -596,7 +700,10 @@ async fn an_observer_can_give_up_with_a_message_or_with_an_error() {
     }
 
     let with_error = ledger::actor_with(Ledger::default(), vec![Box::new(GivesUp::WithError)]);
-    assert_eq!(with_error.post(1).await, Err(Undelivered::Gone));
+    assert_eq!(
+        with_error.post(1).await,
+        Err(Undelivered::Refused { name: "error" })
+    );
     match with_error.ended().await {
         Ended::Observer { name, error, .. } => {
             assert_eq!(name, "error");
@@ -628,7 +735,12 @@ async fn observers_run_in_order_and_the_first_refusal_stops_the_rest() {
         ],
     );
 
-    assert_eq!(ledger.post(1).await, Err(Undelivered::Gone));
+    // The name is the refusing observer's and not the chain's first: the caller
+    // is told which one stopped it.
+    assert_eq!(
+        ledger.post(1).await,
+        Err(Undelivered::Refused { name: "second" })
+    );
     assert_eq!(
         *ran.lock().unwrap(),
         ["first", "second"],
@@ -672,7 +784,10 @@ impl Observer<Ledger> for ExplodesBeforeItYields {
 async fn an_observer_that_panics_before_it_yields_is_still_named() {
     let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(ExplodesBeforeItYields)]);
 
-    assert_eq!(ledger.post(1).await, Err(Undelivered::Gone));
+    assert_eq!(
+        ledger.post(1).await,
+        Err(Undelivered::Refused { name: "early" })
+    );
 
     match ledger.ended().await {
         Ended::Observer { name, error, .. } => {
@@ -828,7 +943,10 @@ async fn finish_receives_the_same_ending_the_actor_reports() {
         ],
     );
 
-    assert_eq!(ledger.post(1).await, Err(Undelivered::Gone));
+    assert_eq!(
+        ledger.post(1).await,
+        Err(Undelivered::Refused { name: "vetoing" })
+    );
 
     let reported = ledger.ended().await;
     match &reported {

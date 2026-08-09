@@ -398,9 +398,11 @@ impl fmt::Display for Stop {
 
 /// Why an actor is no longer running.
 ///
-/// [`Undelivered`](crate::Undelivered) says "gone", and it must not be
-/// stretched to say "gave up on durability". This is the second question, asked
-/// separately.
+/// [`Undelivered::Gone`](crate::Undelivered::Gone) says "gone", and it must not
+/// be stretched to say "gave up on durability". This is the second question,
+/// asked separately: a refused caller is told
+/// [`Undelivered::Refused`](crate::Undelivered::Refused) and the observer's
+/// name, and this carries the observer's own error.
 ///
 /// # Exhaustive, and deliberately not `#[non_exhaustive]` — decided once, here
 ///
@@ -508,12 +510,14 @@ pub enum Ended {
     /// The only ending a [supervised](crate::LocalActor::spawn_supervised) actor
     /// can reach that an unsupervised one cannot, and the reason the whole enum
     /// is worth having: "gone" is already
-    /// [`Undelivered`](crate::Undelivered)'s answer, and an operator needs
+    /// [`Undelivered::Gone`](crate::Undelivered::Gone)'s answer, and an operator needs
     /// to know whether this actor stopped because somebody asked it to or
     /// because it could not be kept alive.
     ///
-    /// The mailbox closes when this is published, so every later call reports
-    /// [`Undelivered`](crate::Undelivered) and a peer is told
+    /// The mailbox closes when this is published, so every later call reports it
+    /// — [`Undelivered::Gone`](crate::Undelivered::Gone) to a door that wanted a
+    /// value, [`NotQueued::Closed`](crate::NotQueued::Closed) to one that wanted
+    /// only to be queued — and a peer is told
     /// [`RemoteError::NoSuchActor`](crate::RemoteError::NoSuchActor).
     GaveUp {
         /// How many incarnations were spent before giving up.
@@ -559,9 +563,18 @@ impl fmt::Display for Ended {
 
 /// Why a turn produced no value.
 ///
-/// Replaces [`Undelivered`](crate::Undelivered) on the catching paths,
-/// because "the actor is gone" and "this turn was refused" ask a caller for
-/// different things and the served path has to tell a peer which it was.
+/// Replaces [`Undelivered`](crate::Undelivered) on the catching paths. The two
+/// name the same losses and differ by **one variant and one payload**: this one
+/// has [`Faulted`](Self::Faulted), which an [`ask`](crate::LocalActor::ask)
+/// resumes into its caller instead of reporting, and its
+/// [`Restarting`](Self::Restarting) carries the [`Ended`] that caused the restart
+/// where the other carries the bare fact.
+///
+/// Both differences cost `Copy` and `Eq` — a [`Panic`] and an [`Arc`] are neither
+/// — which is what the other type keeps and this one spends. So the choice is
+/// made by the **door**, not by two vocabularies: a catching path has to hand a
+/// peer the reason, and a resuming one has already handed the caller the panic
+/// itself. The two axes below are the same two on both types.
 ///
 /// # Three answers and not two, and why the third carries a payload
 ///
@@ -578,7 +591,7 @@ impl fmt::Display for Ended {
 /// type that dropped it would make the crate's whole panic policy
 /// unimplementable on top of the catching path.
 ///
-/// # Four now, because the fourth was being reported as [`Gone`](Self::Gone)
+/// # `Expired` is an answer of its own, because it was being reported as [`Gone`](Self::Gone)
 ///
 /// `Answered` has had a fourth state — "the queueing budget expired while this
 /// message waited, and nothing ran" — since before this enum existed, and
@@ -593,6 +606,29 @@ impl fmt::Display for Ended {
 /// Unreachable today, and written to be *correct* if something reaches it, which
 /// is the choice `Mail`'s `send` and `recv` variants already make one layer out.
 ///
+/// # Two axes, and every answer comes from exactly one of them
+///
+/// [`Refused`](Self::Refused), [`Faulted`](Self::Faulted) and
+/// [`Expired`](Self::Expired) are about **this call**. The loop reached a verdict
+/// and put it on the reply channel, so the answer arrives written down.
+/// [`Reentrant`](Self::Reentrant) is the same axis one step earlier: the call is
+/// refused before it is queued, so it never has a channel to be answered on.
+///
+/// [`Dropped`](Self::Dropped), [`Restarting`](Self::Restarting) and
+/// [`Gone`](Self::Gone) are about **the actor**. Nothing was ever put on the
+/// channel — it died holding no verdict — and a dead channel carries no reason,
+/// so the answer is read off the actor's own standing after the death rather than
+/// inferred from the silence. That read happens in one private place, which is
+/// what keeps the three of them from being decided twice.
+///
+/// So the mapping is total rather than layered: a reply channel either carries a
+/// verdict or it does not, and the second case has exactly one thing to read. No
+/// answer is half of one axis and half of the other.
+///
+/// `Gone` has a second producer that skips the read, and it agrees with it: a
+/// closed mailbox refuses the send outright, and a local actor's mailbox is closed
+/// only where there will be no next incarnation.
+///
 /// # Exhaustive, and deliberately not `#[non_exhaustive]`
 ///
 /// Like [`Ended`] and [`Departure`](crate::Departure): a caller matches this, and
@@ -602,8 +638,42 @@ impl fmt::Display for Ended {
 #[derive(Debug, thiserror::Error)]
 pub enum TurnLost {
     /// The actor was gone, or ended while this turn waited.
+    ///
+    /// **Stop calling.** There is no next incarnation: the loop is finished, or a
+    /// supervisor gave up, or the actor was aborted or destroyed.
     #[error("the actor is no longer running")]
     Gone,
+    /// The actor is serving, and this reply was thrown away unanswered.
+    ///
+    /// A handler took [`Reply::later`](crate::Reply::later) and dropped the
+    /// [`Deferred`](crate::Deferred) — the sanctioned move `#[defer]` exists for,
+    /// and what that type's `#[must_use]` asks a handler to say out loud — or a
+    /// handler panicked while holding the channel, so it died in the unwind. The
+    /// loop caught the panic, kept the state, and answers the next message.
+    ///
+    /// **Distinct from [`Gone`](Self::Gone), and that distinction is the whole of
+    /// this variant.** A caller told `Gone` should stop calling; a caller told this
+    /// has an actor that is still there. It is the same split
+    /// [`Faulted`](Self::Faulted) makes for a turn that exploded, for a reply that
+    /// never reached one.
+    ///
+    /// A peer reads this sentence behind the crate's `"dropped: "` prefix, from a
+    /// rendering that reads the same fact about the same actor.
+    #[error("the actor is serving and this reply was never answered")]
+    Dropped,
+    /// The incarnation that owed this answer is gone, and a supervisor is starting
+    /// another.
+    ///
+    /// The reply died with the state that held it, in the teardown between two
+    /// incarnations. **Retrying is the move**: the mailbox never closes across a
+    /// restart, so a call made now waits for the incarnation that is coming.
+    ///
+    /// Carries the ending that caused the restart, behind an [`Arc`] because
+    /// [`Ended`] is [`Clone`] and one ending answers every reply that died with
+    /// that state. [`ended`](crate::LocalActor::ended) is not a second way to read
+    /// it: a restart is not an ending, so that future does not resolve here.
+    #[error("the incarnation that owed this answer is gone and another is coming")]
+    Restarting(Arc<Ended>),
     /// An observer refused this turn. It **ran** and was not committed.
     #[error("the {name} observer refused this turn: it ran and was not committed")]
     Refused {
@@ -637,7 +707,11 @@ pub enum TurnLost {
     /// one's mirror of it: the actor is not merely still running, it is running
     /// the turn this call was made from.
     /// [`Undelivered::Reentrant`](crate::Undelivered::Reentrant) is the same fact
-    /// at the doors that carry one error instead of four.
+    /// at the doors that ask for a value and resume a fault rather than report it,
+    /// and [`NotQueued::Reentrant`](crate::NotQueued::Reentrant) at the doors that
+    /// ask only to be queued and so have no reply channel to hear a verdict on.
+    /// Three enums, one fact, because a caller matches the answer of the door it
+    /// used.
     #[error("this call was made from inside the target actor's own turn: it would deadlock")]
     Reentrant,
 }

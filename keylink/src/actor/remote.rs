@@ -722,10 +722,16 @@ mod tests {
     /// path, and none of them begins like one of the four prefixes.**
     ///
     /// `turns.rs`'s const block claimed those four were *every* prefix a `Failed`
-    /// carries on the served path. It was false in at least three places, and all
-    /// three are here rather than in `turns.rs` because this is the file they are
-    /// built in — `From<RouteError>` two hundred lines up, and
-    /// [`deliver_to_actor`]'s own `validate` step. Each is a whole **sentence**
+    /// carries on the served path. It was false in at least four places. Three are
+    /// here rather than in `turns.rs` because this is the file they are built in —
+    /// `From<RouteError>` two hundred lines up, and [`deliver_to_actor`]'s own
+    /// `validate` step.
+    ///
+    /// **The fourth is built in `turns.rs`, and being the exception is why this
+    /// list missed it** while the doc above claimed *every* other served `Failed`:
+    /// `deliver_to_local`'s re-entrancy arm renders a local error onto the wire,
+    /// which no other line in this file does. It went uncovered for as long as the
+    /// prose said it was covered. Each is a whole **sentence**
     /// rather than a prefix, which is exactly why nothing has ever collided and
     /// why nothing would have noticed if something had:
     /// `no_failure_prefix_is_a_prefix_of_another` checks the four against each
@@ -764,6 +770,12 @@ mod tests {
             // `console.rs`'s follow refusal, both arms.
             crate::FollowRefused::Ahead { after: 9, seq: 4 }.to_string(),
             crate::FollowRefused::Crowded { parked: 64 }.to_string(),
+            // `deliver_to_local`'s re-entrancy arm, and the only one of these the
+            // doc above ever missed. It is rendered through `Undelivered` at that
+            // site rather than through the `NotQueued` the send returns, so this
+            // names the same type the wire does — a guard reading the other one
+            // would go green on a text no peer receives.
+            crate::Undelivered::Reentrant.to_string(),
         ];
 
         for text in &others {

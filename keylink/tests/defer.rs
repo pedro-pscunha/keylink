@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use keylink::{
     ActorId, Allowlist, Caller, Deferred, Ended, Eviction, Observer, RemoteError, Replied, Reply,
-    Server, Stop, TurnFut, TurnInfo,
+    Server, Stop, TurnFut, TurnInfo, Undelivered,
 };
 
 mod common;
@@ -161,11 +161,21 @@ async fn parked(book: &orders::Handle<Book>, want: u64) {
 /// released it.
 ///
 /// Made red by `scripts/break-once.sh`, replacing `Deferred::send`'s
-/// `self.0.answer(Answered::Ran(value));` with `drop((self, value));` — a park that
-/// takes the channel away and never gives it back. Watched: this fails at the
-/// answer, "the actor is running: Undelivered", which is what a caller sees when
-/// the channel dies unanswered. It prints rather than hangs because the wait is
-/// bounded by the sender being dropped, not by a timeout.
+/// `Verdict::Committed => reply.answer(Answered::Ran(value)),` with
+/// `Verdict::Committed => drop((reply, value)),` — a park that takes the channel
+/// away and never gives it back. Watched: this fails at the answer,
+/// `the actor is running: Dropped`, which is what a caller sees when a **live**
+/// actor lets the channel die unanswered. It prints rather than hangs because the
+/// wait is bounded by the sender being dropped, not by a timeout.
+///
+/// **Both halves of that were re-measured on 2026-08-09 rather than carried, and
+/// both had moved.** The literal read `self.0.answer(Answered::Ran(value));`, which
+/// is not in the tree: `send` binds the reply and parks a callback, so the answer
+/// sits on a `Verdict` arm and the old quote could not be applied at all. And the
+/// watched word read `Undelivered` — the panic is `expect`'s, so it prints the
+/// error's `Debug`, which was the type's name while it was a unit struct and is the
+/// variant's name now. Control first, 5 of 5 green; then 2 failed under the break,
+/// this test and its sibling below.
 #[tokio::test]
 async fn a_parked_reply_is_answered_from_a_later_turn() {
     let book = orders::actor(Book::default());
@@ -192,8 +202,8 @@ async fn a_parked_reply_is_answered_from_a_later_turn() {
 ///
 /// **Reddened, but not on its distinguishing claim, and that is worth saying.** The
 /// break is the one its sibling above uses — `Deferred::send`'s
-/// `self.0.answer(Answered::Ran(value));` replaced by `drop((self, value));` —
-/// watched here as "running: Undelivered" at the first order. That fails both
+/// `Verdict::Committed` arm, answering replaced by a drop — watched here as
+/// `running: Dropped` at the first order, in the same run. That fails both
 /// tests, so it proves the parked channel is load-bearing and proves nothing about
 /// *two* of them. No one-literal edit isolates the plural: a `Reply` is built per
 /// call by generated code and `later` consumes it, so "the deferred reply per actor"
@@ -287,7 +297,7 @@ async fn an_answer_given_inside_a_deferred_turn_is_withheld_when_an_observer_ref
 /// The channel is in the state, the state is owned by the loop's task, and the loop
 /// exiting drops both — so the caller's wait ends because the sender is gone. Inside
 /// keylink that is `TurnLost::Gone`; through a generated `Handle` it is
-/// `Undelivered`, which is the same fact under this path's one error type.
+/// `Undelivered::Gone`, the variant `ask` maps that one into.
 ///
 /// **The timeout is the assertion.** A hang is not a failure to a test harness, so
 /// the wait is bounded and the bound is what goes red. `turns.rs`'s own unit test
@@ -325,9 +335,31 @@ async fn a_parked_reply_whose_actor_ends_is_answered_rather_than_hanging() {
 /// other kind.
 ///
 /// A handler that panics before consuming its `Reply` drops it inside the unwinding
-/// future, so there is nothing left to answer with: the caller is told the actor is
-/// gone instead of being handed the panic the way `ask` hands one on every other
-/// kind. The actor survives it, which is the half that keeps the trade worth making.
+/// future, so there is nothing left to answer with: the caller is told `Dropped`
+/// instead of being handed the panic the way `ask` hands one on every other kind.
+/// The actor survives it, which is the half that keeps the trade worth making — and
+/// which is why the answer is *dropped* and not *gone*.
+///
+/// **Asserted on the variant rather than on `is_err`.** Both halves of the trade
+/// are then one assertion apart: the answer names an actor that is serving, and the
+/// call below it is served. An `is_err` here passed identically while the crate
+/// told this caller to stop calling.
+///
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `answered`'s
+/// `Standing::Running => TurnLost::Dropped,` → `Standing::Running =>
+/// TurnLost::Gone,` — the fold this variant was split out of. Watched: `a handler
+/// that panicked before answering owes its caller a refusal: got Err(Gone)`. The
+/// `is_err` this replaced stayed **green** through that same break.
+///
+/// **Hand the harness that literal with its twelve spaces of indentation.** The
+/// bare form counts 2 in `turns.rs`, whose own `mod tests` quotes the arm
+/// unindented inside a `///` line, and the harness aborts at "found 2".
+///
+/// Measured at `81eabe9`, the commit that wrote this record and that `mod tests`
+/// one together: the bare form already counted **2** there, so the quote above has
+/// never been runnable as written and the watched run must have been given some
+/// other spelling of it. Nothing here is unchecked as a result — the sentence is
+/// still what the break prints — but the clause a reader would copy was not.
 #[tokio::test]
 async fn a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_actor() {
     let book = orders::actor(Book::default());
@@ -341,12 +373,65 @@ async fn a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_
         .expect("a panicking deferred handler must not hang its caller")
         .expect("the panic is NOT resumed in the caller, unlike every other kind");
     assert!(
-        answer.is_err(),
+        matches!(answer, Err(Undelivered::Dropped)),
         "a handler that panicked before answering owes its caller a refusal: got {answer:?}"
     );
 
     // The half that matters: one bad message cost one message.
     assert_eq!(book.fill(7).await.expect("still running"), 0);
+}
+
+/// The sanctioned loss, through the local door: a handler that takes
+/// `reply.later()` and **drops** the `Deferred` owes its caller `Dropped`.
+///
+/// No panic, no `stop()`, no supervisor. `Book::abandon` says `drop` out loud,
+/// which is what `Deferred`'s own `#[must_use]` asks for, so this is the one cause
+/// of a dead reply channel that is neither a fault nor an ending — and the actor is
+/// untouched by it.
+///
+/// # The two assertions are one guard, and the second is not decoration
+///
+/// The variant alone can pass with its meaning inverted. `answered` reads
+/// `Fate` to choose between the three, and a `Fate` left at `Standing::Running`
+/// for an actor that is in fact gone answers `Dropped` — *the actor is serving* —
+/// about a dead actor. That is the mirror of the defect this variant was split out
+/// to remove, and no assertion on the variant can see it, because the variant is
+/// the one it expects. The `fill` below refuses it: a gone actor answers nothing.
+///
+/// So neither half stands alone. The `fill` on its own was true before this
+/// change, is true after it and would be true after a revert; the variant on its
+/// own cannot tell *serving* from *reported as serving*.
+///
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `answered`'s
+/// `Standing::Running => TurnLost::Dropped,` → `Standing::Running =>
+/// TurnLost::Gone,` — the fold the variant was split out of. **Hand the harness
+/// the literal with its twelve spaces of indentation.** The bare form counts 2 in
+/// `turns.rs`: that file's own `mod tests` records the same break against
+/// `a_released_reply_is_dropped_when_the_turn_that_released_it_panicked`, and its
+/// quote sits unindented inside a `///` line. Same-file collision arriving from
+/// the target's side, and the harness aborts at "found 2".
+///
+/// Watched: `a dropped `Deferred` costs the caller its answer and not the actor`,
+/// `left: Err(Gone)`, `right: Err(Dropped)` — the variant assertion, which is the
+/// one the name rests on. The `fill` is never reached under this break, so it is
+/// asserted here and guarded by the ordinary `#[defer]` tests above.
+#[tokio::test]
+async fn a_live_actor_that_drops_a_deferred_is_told_dropped_and_not_gone() {
+    let book = orders::actor(Book::default());
+
+    assert_eq!(
+        book.abandon(3).await,
+        Err(Undelivered::Dropped),
+        "a dropped `Deferred` costs the caller its answer and not the actor"
+    );
+
+    // What makes the line above a sentence about a LIVE actor rather than a
+    // sentence a dead one could also produce.
+    assert_eq!(
+        book.fill(7).await.expect("the actor is still serving"),
+        0,
+        "the actor answers the call after the one whose reply it threw away"
+    );
 }
 
 /// **The decision Wave 2a's `Faulted` forces: a reply parked before a fault stays
@@ -394,16 +479,30 @@ async fn a_reply_parked_before_a_fault_is_still_answered_after_it() {
 /// adapter refuses one, so releasing its values would hand out answers about
 /// state that was never stored.
 ///
-/// `Gone` and not `Faulted`, and that is not a near miss: there is one `Panic`,
+/// `Dropped` and not `Faulted`, and that is not a near miss: there is one `Panic`,
 /// it is the original payload rather than a message, and it belongs to the turn's
-/// own caller. `turns.rs`'s
-/// `a_released_reply_is_gone_when_the_turn_that_released_it_panicked` asserts the
-/// variant, which a `Handle` folds away.
+/// own caller. The actor caught that panic and is still serving, which is what
+/// makes the answer *dropped* rather than *gone*. `turns.rs`'s
+/// `a_released_reply_is_dropped_when_the_turn_that_released_it_panicked` asserts
+/// the same variant one layer down, where a `TurnLost` is visible.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `Deferred::send`'s
 /// `Verdict::Faulted => drop(reply),` → `Verdict::Faulted =>
 /// reply.answer(Answered::Ran(value)),`. Watched: `a panicking turn's answer
 /// crossed anyway: Ok(15)`.
+///
+/// **A second break, because the first proves only that nothing crossed.** The
+/// assertion also names *which* answer, and no break above it can go red on the
+/// wrong one. `answered`'s `Standing::Running => TurnLost::Dropped,` →
+/// `Standing::Running => TurnLost::Gone,` is the fold, and it is red here:
+/// `a panicking turn's answer crossed anyway: Err(Gone)`. The `is_err` this
+/// assertion replaced stayed green through it.
+///
+/// **Hand the harness that literal with its twelve spaces of indentation.** The
+/// bare form counts 2 in `turns.rs` — the arm itself, and that file's own
+/// `mod tests` quoting the same break unindented inside a `///` line — so the
+/// harness aborts at "found 2". Sibling records above carry the same clause; this
+/// one did not, and the quote it hands a reader was unrunnable as written.
 #[tokio::test]
 async fn an_answer_sent_inside_a_turn_that_then_panics_does_not_cross() {
     let book = orders::actor(Book::default());
@@ -431,7 +530,7 @@ async fn an_answer_sent_inside_a_turn_that_then_panics_does_not_cross() {
         .expect("a withheld answer must not hang its caller")
         .expect("the caller is not itself panicking");
     assert!(
-        answer.is_err(),
+        matches!(answer, Err(Undelivered::Dropped)),
         "a panicking turn's answer crossed anyway: {answer:?}"
     );
 
@@ -511,9 +610,14 @@ async fn a_deferred_sent_from_another_task_is_not_gated_by_the_turn_that_spawned
 /// unanswered was reported to the peer as though the service had never been mounted.
 /// The test went red either way — the finding was about what an operator reads.
 /// **Fixed:** `deliver_to_local` now splits the dead-channel arm three ways, and the
-/// same break watched under it prints `Remote(Failed("dropped: the reply was taken
-/// out of the turn and never answered"))`. `a_live_actor_does_not_tell_a_peer_no_such_actor`
-/// reaches the same rendering through the public API with nothing broken at all.
+/// same break watched under it printed `Remote(Failed("dropped: the reply was taken
+/// out of the turn and never answered"))`. **That is a transcript and not the
+/// current text.** `lost`'s `Standing::Running` arm has been rewritten since — its
+/// own comment records that the sentence was wrong twice, both times by naming a
+/// cause — so the prefix is what survives from that run and the words after it are
+/// read off `lost`. `a_local_caller_and_a_peer_agree_about_an_abandoned_deferred`
+/// reaches the same rendering through the public API with nothing broken at all,
+/// and it matches on the **prefix** for exactly this reason.
 #[tokio::test]
 async fn a_peer_gets_an_answer_parked_past_its_own_turn() {
     let node = local_node().await;
@@ -538,27 +642,62 @@ async fn a_peer_gets_an_answer_parked_past_its_own_turn() {
     assert_eq!(answer.expect("the call succeeded"), 21);
 }
 
-/// A **live** actor must not be reported to a peer as absent.
+/// One actor, one cause, two doors, two answers that agree — and a **live** actor
+/// must not be reported to a peer as absent.
 ///
 /// The served path had one `Err(_)` arm for a dead reply channel and rendered it
 /// [`RemoteError::NoSuchActor`] — *there is nothing here, stop asking*. `#[defer]`
 /// added a cause that channel can die from **while the actor is running**: a handler
 /// takes `reply.later()` and drops the `Deferred`. That is sanctioned rather than
 /// misuse — `Deferred`'s own `#[must_use]` says "dropping a deferred reply answers
-/// the caller `Gone`; that is sometimes right, so say so with `drop`" — so the
-/// answer a peer reads for it has to be true.
+/// the caller `Dropped`; that is sometimes right, so say so with `drop`" — so the
+/// answer a peer reads for it has to be true, and so does the answer a local caller
+/// reads for the same cause on the same actor.
+///
+/// # The old name promised a setup that cannot exist
+///
+/// It was `a_live_actor_does_not_tell_a_peer_no_such_actor`, which is half of what
+/// this now holds, and the pairing it was extended into cannot be written the way
+/// the obvious reading of "both sides see it" asks for: **a reply has exactly one
+/// destination**, so a peer's abandoned reply and a local caller's abandoned reply
+/// are two replies and never one seen twice. The achievable claim is the one in the
+/// first line, and it is the one worth having — a name describing an impossible
+/// setup invites an implementer to approximate it and call the approximation done.
+///
+/// # Both halves assert what they got, and neither asserts `is_err`
+///
+/// Two `Err`s compared against `Err` is the wrong-reason pass this pairing is most
+/// exposed to: every wrong answer here is also an error. So the peer half matches
+/// on the `"dropped: "` **prefix** and the local half on the **variant**, and a
+/// break that collapses either door back onto *gone* moves one of the two.
 ///
 /// No supervision, no panic, no `stop()`. The actor answers the very next call on
 /// the same connection, which is the half `NoSuchActor` denies.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on the arm itself,
-/// `lost`'s whole `Standing::Running` arm — the two-line `format!` and its
-/// closing `)),` — replaced by
-/// `Standing::Running => RemoteError::NoSuchActor { id: id.to_owned() },`, which
-/// collapses the split back into the pre-fix single answer. Watched:
-/// `a live actor must not be reported as absent: Remote(NoSuchActor { id: "Orders" })`.
+/// Made red twice, once per door, because either break leaves the other half
+/// green — which is the same evidence that makes the pairing worth asserting:
+///
+/// - `scripts/break-once.sh keylink/src/turns.rs` on the served arm itself,
+///   `lost`'s whole `Standing::Running` arm — the two-line `format!` and its
+///   closing `)),` — replaced by
+///   `Standing::Running => RemoteError::NoSuchActor { id: id.to_owned() },`, which
+///   collapses the split back into the pre-fix single answer. Watched:
+///   `a live actor must not be reported as absent: Remote(NoSuchActor { id: "Orders" })`.
+///   **Re-watched after the local half was added, and the sentence came back
+///   unchanged**, which is the answer to the question adding it raises: the peer
+///   half runs first, so it is still what fails first and the record did not
+///   need re-quoting. Recorded because "unchanged" is a result and assuming it
+///   would have been a guess.
+/// - and on the local arm, `answered`'s
+///   `Standing::Running => TurnLost::Dropped,` → `Standing::Running =>
+///   TurnLost::Gone,`. Quote that literal with its **twelve spaces** of
+///   indentation; the bare form counts 2 in `turns.rs`, which aborts the harness.
+///   Watched: `the local door names the same cause the peer's prefix does`,
+///   `left: Err(Gone)`, `right: Err(Dropped)` — and the peer half above it passed
+///   in that same run, which is the measurement behind "either break leaves the
+///   other half green".
 #[tokio::test]
-async fn a_live_actor_does_not_tell_a_peer_no_such_actor() {
+async fn a_local_caller_and_a_peer_agree_about_an_abandoned_deferred() {
     let node = local_node().await;
     let caller = local_node().await;
     let book = orders::actor(Book::default());
@@ -581,6 +720,15 @@ async fn a_live_actor_does_not_tell_a_peer_no_such_actor() {
         ),
         other => panic!("a live actor must not be reported as absent: {other:?}"),
     }
+
+    // The other door, on the same actor and the same cause. Two replies rather
+    // than one, for the reason the doc gives — what is asserted is that the two
+    // answers agree about the actor, not that they share a channel.
+    assert_eq!(
+        book.abandon(3).await,
+        Err(Undelivered::Dropped),
+        "the local door names the same cause the peer's prefix does"
+    );
 
     // Same connection, immediately after. This is what makes the finding a
     // defect rather than a wording preference.
@@ -608,8 +756,24 @@ async fn a_live_actor_does_not_tell_a_peer_no_such_actor() {
 ///
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on the default
 /// `Inbox::ending` — anchored on its whole three-line body, since a bare
-/// `Standing::Gone` occurs fourteen times in this file and the harness aborts
-/// on an ambiguous anchor. Watched: `a stopped actor is gone, not merely
+/// `Standing::Gone` is **not unique** in that file and the harness aborts on an
+/// ambiguous anchor.
+///
+/// **That clause carried a count — "occurs fourteen times" — and the count is the
+/// part that rotted.** Measured across the commits that touched it: 14 at
+/// `3628f14`, where the clause was written and where it was **right**; 16 from
+/// `99ce53f`; 17 at `81eabe9`, one commit into this wave. So this is not a figure
+/// somebody got wrong — it is a figure that was correct, was never re-derived, and
+/// went stale under three unrelated commits while reading like evidence.
+///
+/// **Replaced by the property, which is what the anchor actually needs.**
+/// `Standing::Gone` is one arm of a standing `turns.rs` matches on in the
+/// supervisor, in the served renderer, in `answered` and in its own tests, so
+/// *more than one* follows from how the file is written rather than from a
+/// population anyone must keep. The harness aborts at any count that is not 1,
+/// which makes uniqueness the whole requirement and the exact number a fact this
+/// record never needed. A count is what a reader trusts and nobody re-runs.
+/// Watched: `a stopped actor is gone, not merely
 /// unanswering: Remote(Failed("dropped: the actor is serving and this reply was never answered"))`.
 #[tokio::test]
 async fn a_stopped_actor_still_tells_a_peer_no_such_actor() {
@@ -733,7 +897,7 @@ async fn keyed(nodes: &[keylink::Node; 2]) -> (orders::System, orders::KeyedClie
 /// `#[must_use]` asks a handler to make. It is mounted, it ran the turn, and it
 /// answers the very next call on the same connection.
 ///
-/// The twin of `a_live_actor_does_not_tell_a_peer_no_such_actor` one path over,
+/// The twin of `a_local_caller_and_a_peer_agree_about_an_abandoned_deferred` one path over,
 /// and the pair is the point: `deliver_to_local` and `deliver_to_actor` render
 /// through one function now, so a condition cannot be answered two ways.
 ///

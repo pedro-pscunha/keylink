@@ -144,6 +144,23 @@ const REFUSED: u64 = u64::MAX;
 /// turn you called from.
 const GONE: u64 = u64::MAX - 1;
 
+/// What a call answers for a loss **this file installs nothing to produce**: an
+/// [`Observer`](keylink::Observer) refusing a turn that ran, a queueing budget
+/// expiring before one started, a live actor throwing a parked reply away, or an
+/// incarnation dying with one held.
+///
+/// A third sentinel and not [`GONE`], for [`GONE`]'s own reason. Every one of them
+/// leaves an actor a caller can still reach, so answering *stop calling* about any
+/// is exactly the collapse [`Undelivered`] was widened to remove — and a test that
+/// re-made the fold here would stay green while hiding it.
+///
+/// Each is refuted by this file rather than by the crate: no `Peer` is built with
+/// an observer, a local origin carries no queueing budget, both deferred handlers
+/// **send** what they park, and nothing here panics, so the one supervised `Peer`
+/// never restarts. An assertion that ever reads this is reporting a change in what
+/// `ask` maps rather than anything about the ring.
+const SURPRISE: u64 = u64::MAX - 2;
+
 /// The right answer from `self_tell_twice`: the first self-`tell` landed in the
 /// permit the loop released when it took the message it is running, and the
 /// second was refused because there was no permit left.
@@ -162,7 +179,9 @@ const BOTH_TELLS_LANDED: u64 = 2;
 /// `tell`, which deletes the pattern the rule promises to keep.
 const FIRST_TELL_REFUSED: u64 = 3;
 
-/// Neither shape — a `Gone`, which would mean the actor died mid-turn.
+/// Neither shape — a `NotQueued::Closed`, which would mean the actor died
+/// mid-turn. It is the whole of what the wildcard arm below can still reach: a
+/// `tell` answers two states, and the other one is matched by name twice.
 const TELL_SURPRISE: u64 = 4;
 
 impl ring::Actor for Peer {
@@ -180,10 +199,20 @@ impl ring::Actor for Peer {
 
     async fn self_read(&mut self, _cx: Caller<'_>) -> u64 {
         let me = self.me.get().expect("wired").clone();
+        // A read runs no observers, starts no turn, and parks no reply, so the
+        // four arms below it are unreachable through this door several times
+        // over — named rather than wildcarded, because a wildcard here would also
+        // swallow whatever the next state turned out to be.
         match me.with_state(|state: &Peer| state.bumps).await {
             Ok(bumps) => bumps,
             Err(keylink::Undelivered::Reentrant) => REFUSED,
             Err(keylink::Undelivered::Gone) => GONE,
+            Err(
+                keylink::Undelivered::Refused { .. }
+                | keylink::Undelivered::Expired
+                | keylink::Undelivered::Dropped
+                | keylink::Undelivered::Restarting,
+            ) => SURPRISE,
         }
     }
 
@@ -192,9 +221,9 @@ impl ring::Actor for Peer {
         let first = me.bump().await;
         let second = me.bump().await;
         match (first, second) {
-            (Ok(()), Err(keylink::Undelivered::Reentrant)) => TELL_THEN_REFUSED,
+            (Ok(()), Err(keylink::NotQueued::Reentrant)) => TELL_THEN_REFUSED,
             (Ok(()), Ok(())) => BOTH_TELLS_LANDED,
-            (Err(keylink::Undelivered::Reentrant), _) => FIRST_TELL_REFUSED,
+            (Err(keylink::NotQueued::Reentrant), _) => FIRST_TELL_REFUSED,
             _ => TELL_SURPRISE,
         }
     }
@@ -202,8 +231,8 @@ impl ring::Actor for Peer {
     async fn self_stop(&mut self, _cx: Caller<'_>) -> u64 {
         let me = self.me.get().expect("wired").clone();
         match me.stop().await {
-            Err(keylink::Undelivered::Reentrant) => REFUSED,
-            Err(keylink::Undelivered::Gone) => GONE,
+            Err(keylink::NotQueued::Reentrant) => REFUSED,
+            Err(keylink::NotQueued::Closed) => GONE,
             // Unreachable while the check holds, and it is what a hang would
             // become if the check were removed — this handler would never get
             // here at all, and the test's timeout is what would say so.
@@ -257,10 +286,16 @@ fn answered(hop: Result<u64, keylink::Undelivered>) -> u64 {
     match hop {
         // A sentinel travels back unchanged. Adding a hop count to it would
         // rename it — and `REFUSED` is `u64::MAX`, so it would also overflow.
-        Ok(depth @ (REFUSED | GONE)) => depth,
+        Ok(depth @ (REFUSED | GONE | SURPRISE)) => depth,
         Ok(depth) => depth + 1,
         Err(keylink::Undelivered::Reentrant) => REFUSED,
         Err(keylink::Undelivered::Gone) => GONE,
+        Err(
+            keylink::Undelivered::Refused { .. }
+            | keylink::Undelivered::Expired
+            | keylink::Undelivered::Dropped
+            | keylink::Undelivered::Restarting,
+        ) => SURPRISE,
     }
 }
 
@@ -878,9 +913,10 @@ async fn a_deeper_mailbox_takes_one_more_message_behind_a_running_turn() {
 ///   "the first self-tell takes the permit the loop released: 3", the code for
 ///   [`FIRST_TELL_REFUSED`].
 /// - and replacing `send`'s
-///   `                Refuse::WhenFull if self.mail.capacity() == 0 => {` with
-///   `                Refuse::WhenFull if false => {`. Watched: "a self-tell into
-///   a full mailbox must be refused, not block: Elapsed(())", after 5.00s.
+///   `                Refuse::WhenFull if self.mail.capacity() == 0 => return Err(NotQueued::Reentrant),`
+///   with `                Refuse::WhenFull if false => return Err(NotQueued::Reentrant),`.
+///   Watched: "a self-tell into a full mailbox must be refused, not block:
+///   Elapsed(())", after 5.00s.
 ///
 /// **The second red is a TIMEOUT and not [`BOTH_TELLS_LANDED`]**, which is what
 /// this record predicted before it was run. The prediction was wrong about the
@@ -890,6 +926,32 @@ async fn a_deeper_mailbox_takes_one_more_message_behind_a_running_turn() {
 /// state the crate cannot reach by removing this check, and the code that would
 /// report it is unreachable through this break. It stays in the enum because it is
 /// what a **deeper default** would produce, which is a different edit.
+///
+/// # The filter, and the two columns the second anchor has left
+///
+/// Both runs take this test's own name —
+/// `a_self_tell_fits_once_and_is_refused_when_the_mailbox_is_full` — plus
+/// `--test cycles`. The harness appends the filter **positionally** to its runner,
+/// so it is a plain substring and never a nextest `test(..)` filterset: a
+/// filterset there matches nothing, runs zero tests, and exits non-zero, which the
+/// banner prints as a caught defect. The filter was described in prose and not
+/// written down here until a reader had to reconstruct it.
+///
+/// **CAUTION: the second anchor is 98 of the 100 columns `rustfmt` allows.** Two
+/// columns of headroom, so a longer type name anywhere on that line reflows it and
+/// the anchor rots.
+///
+/// Not hypothetical, and it has already happened once in the **other** direction:
+/// at `ac5a6ef` this arm was a three-line block, `Undelivered::Reentrant` was
+/// renamed to the shorter `NotQueued::Reentrant`, `rustfmt` collapsed the block
+/// onto one line, and D11's row in `.mise/tasks/anchors` had to be re-quoted. Any
+/// rename that moves this line either way does it again, and with two columns left
+/// the growing direction is now the cheap one.
+///
+/// It is loud rather than silent when it happens: `mise run anchors` fails before
+/// the harness is ever reached, and the harness would abort at "found 0". The
+/// figure is measured against the line as it stands and is not a limit anyone
+/// chose, so it belongs beside the anchor rather than in a rule.
 #[tokio::test]
 async fn a_self_tell_fits_once_and_is_refused_when_the_mailbox_is_full() {
     let (a, _b, _gate, _entered) = ring_of_two();

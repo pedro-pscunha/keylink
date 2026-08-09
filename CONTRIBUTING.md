@@ -333,3 +333,8 @@ when a change rests on a judgement somebody will question in six months.
 
 Do not edit an RFC so that it matches new code. Append to it. The value of the
 record is that it shows what was believed at the time.
+
+One carve-out: an identifier in an operational table — the test a break record
+names — may be renamed in place to keep the row runnable, because that changes a
+pointer and not a claim. Anything the row *asserts* is still appended, never
+edited in.

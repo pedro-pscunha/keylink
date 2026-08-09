@@ -63,14 +63,43 @@ run() {
     # one is useless for the other. Break 16 sat in that state: it named a test that
     # existed nowhere, so it could never redden and was never able to say so.
     #
-    # The `0 passed; 0 failed` pair is the discriminator. A caught break is
-    # `0 passed; 1 failed`; a break that went green is `1 passed; 0 failed`. Only a
-    # filter that selected nothing gives zero of both.
-    if echo "$out" | rg -q '0 passed; 0 failed'; then
+    # The `passed; failed` pair is the discriminator, and it is read as a NUMBER
+    # rather than matched against `0 passed; 0 failed`. A caught break is
+    # `0 passed; 1 failed`; a break that went green is `1 passed; 0 failed`. Their
+    # SUM is how many tests the filter selected, and only one value of it is right.
+    #
+    # **Zero was the first failure this caught and TWO OR MORE is the mirror of it,
+    # which the equality-to-zero form could not see.** `cargo test` matches a filter
+    # as a SUBSTRING, so a test whose name is a strict PREFIX of a sibling's selects
+    # both — `a_remote_caller_can_tell_restarting_from_gone` against
+    # `..._on_a_keyed_actor`, which is the shape a break record's own anchors hit one
+    # level down. Two tests under one break means a run where only the OTHER one
+    # reddens prints `1 passed; 1 failed`, so a zero-check never fires and the
+    # `expected` substring below can be satisfied by output from a test this stanza
+    # does not name. A break that reddened the wrong test, reported as success.
+    #
+    # Every stanza names exactly one target — `--lib` or one `--test` — so there is
+    # one totals line to read. NO totals line means the run never reached the test
+    # binary at all: the harness aborted on its occurrence count, or the tree did not
+    # compile. That is left to the `expected` check below, which already reports it,
+    # rather than given a third failure class that would say the same thing twice.
+    local totals selected
+    totals="$(echo "$out" | rg -o '[0-9]+ passed; [0-9]+ failed' | head -1)"
+    selected="$([ -n "$totals" ] && echo "$totals" | awk '{print $1 + $3}' || echo "")"
+    if [ "$selected" = 0 ]; then
         echo "  ✗ BROKEN STANZA: the filter selected NO test, so this break cannot"
         echo "    redden and never could. This is not a tree change — fix the stanza."
         echo "    The test name here does not exist, or the target cannot reach it"
         echo "    (a \`#[cfg(test)]\` test inside \`src\` needs --lib, never --test)."
+        failed=$((failed + 1))
+        return
+    fi
+    if [ -n "$selected" ] && [ "$selected" -gt 1 ]; then
+        echo "  ✗ BROKEN STANZA: the filter selected $selected tests, and a break"
+        echo "    that reddens any of them satisfies this stanza. Fix the stanza, not"
+        echo "    the tree: this filter is a substring of more than one test name."
+        echo "    Append \`-- --exact\` to the stanza's cargo args — break-once.sh puts"
+        echo "    the filter last, so it lands as libtest's positional and is exact."
         failed=$((failed + 1))
         return
     fi
@@ -108,7 +137,7 @@ keylink/src/turns.rs \
         Standing::Gone' \
 '        self.close();
         Standing::Running' \
-  a_remote_caller_can_tell_restarting_from_gone -p keylink --test supervision
+  a_remote_caller_can_tell_restarting_from_gone -p keylink --test supervision -- --exact
 
 run "4 verdict settled after drop(state)" \
 'an incarnation'"'"'s verdict must be settled before its state dies: [(Running, false), (Running, true)]' \
@@ -186,7 +215,7 @@ keylink/src/turns.rs \
             "{DROPPED}the actor is serving and this reply was never answered"
         )),' \
 '        Standing::Running => RemoteError::NoSuchActor { id: id.to_owned() },' \
-  a_live_actor_does_not_tell_a_peer_no_such_actor -p keylink --test defer
+  a_local_caller_and_a_peer_agree_about_an_abandoned_deferred -p keylink --test defer
 
 run "12 lost live arm -> panicked" \
 'a panicking deferred handler loses the reply, and that is what the peer must read: "panicked: bad"' \

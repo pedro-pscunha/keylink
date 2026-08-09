@@ -1669,9 +1669,14 @@ macro_rules! __keylink_service {
             /// and that is the whole of what it buys. It is **not** a bound on
             /// memory, and it does **not** make a self-call safe: a call made
             /// from inside the target actor's own turn is refused by identity
-            /// rather than by the permit, so it answers
-            /// [`Undelivered::Reentrant`](keylink::Undelivered::Reentrant) at
-            /// every depth.
+            /// rather than by the permit, so it answers a `Reentrant` at every
+            /// depth:
+            /// [`Undelivered::Reentrant`](keylink::Undelivered::Reentrant) from
+            /// an `rpc`, a `blob` or a [`with_state`](Handle::with_state),
+            /// [`NotQueued::Reentrant`](keylink::NotQueued::Reentrant) from a
+            /// [`stop`](Handle::stop). A `tell` is the one door the permit still
+            /// decides — refused only when the mailbox is **full** — so depth
+            /// changes how often that fires, never whether the hazard is closed.
             ///
             /// # CAUTION: a deeper mailbox raises the shutdown budget owed
             ///
@@ -1794,9 +1799,16 @@ macro_rules! __keylink_service {
             /// Its methods are the ones written in `service!`, with the same
             /// names, the same argument order and the same success types as
             /// [`Client`]'s. The error type is the difference, and it is the
-            /// whole difference: a local call fails one way, so it fails with
-            /// [`Undelivered`](keylink::Undelivered) and never with
-            /// [`Error`](keylink::Error).
+            /// whole difference: a local call cannot fail the ways a remote one
+            /// can, so it never fails with [`Error`](keylink::Error).
+            ///
+            /// **Two local error types, and they are the two questions a door
+            /// asks.** An `rpc` or a `blob` asks *did I get a value* and answers
+            /// [`Undelivered`](keylink::Undelivered). A `tell` or
+            /// [`stop`](Self::stop) asks *did this get queued*, has no reply
+            /// channel, and answers [`NotQueued`](keylink::NotQueued) — two
+            /// states rather than every state a lost reply can be in. One type
+            /// for both would advertise on `stop` what `stop` cannot produce.
             ///
             /// That is deliberate and permanent. RFC-04 §5.5: a handle that is
             /// one type in both places must either claim failures the local
@@ -1816,8 +1828,9 @@ macro_rules! __keylink_service {
             /// message gets the panic — resumed with its own payload, close to
             /// the way an ordinary function call would deliver it. Both halves
             /// matter: the first keeps one bad message from costing every later
-            /// one, the second keeps `Undelivered` meaning "the actor is gone"
-            /// rather than "something went wrong somewhere".
+            /// one, and the second keeps a fault out of
+            /// [`Undelivered`](keylink::Undelivered) altogether, so no variant
+            /// of it has to mean "something went wrong somewhere".
             ///
             /// Two places it is **not** like an ordinary call, both structural:
             /// a `tell` has no channel to carry the panic, so it is caught and
@@ -1840,9 +1853,12 @@ macro_rules! __keylink_service {
             /// A handler that awaits **any** method on a handle to its own actor
             /// would deadlock. Since item M it does not: the message carries the
             /// chain of turns it was sent from, so a send to an actor already on
-            /// that chain answers
-            /// [`Undelivered::Reentrant`](keylink::Undelivered::Reentrant)
-            /// instead of being queued. The four cases and their mechanisms are
+            /// that chain answers a `Reentrant` instead of being queued —
+            /// [`Undelivered::Reentrant`](keylink::Undelivered::Reentrant) from
+            /// an `rpc`,
+            /// [`NotQueued::Reentrant`](keylink::NotQueued::Reentrant) from a
+            /// `tell` or a [`stop`](Self::stop), which is the same fact through
+            /// the door that only queues. The four cases and their mechanisms are
             /// unchanged and worth knowing, because what each one *would* have
             /// done is what decides whether it is refused:
             ///
@@ -2224,8 +2240,16 @@ macro_rules! __keylink_service {
                 ///
                 /// # Errors
                 ///
-                /// [`Undelivered`](keylink::Undelivered) when the actor is
-                /// gone.
+                /// Two of [`Undelivered`](keylink::Undelivered)'s variants,
+                /// because this is
+                /// [`LocalActor::read`](keylink::LocalActor::read) and a read
+                /// runs no observers and carries no queueing budget:
+                /// [`Reentrant`](keylink::Undelivered::Reentrant) when the call
+                /// came from inside this actor's own turn, and
+                /// [`Gone`](keylink::Undelivered::Gone) when the actor is gone.
+                /// That method's own documentation carries the argument for why
+                /// a dead read channel is `Gone` and never `Dropped` or
+                /// `Restarting`.
                 pub async fn with_state<T, F>(
                     &self,
                     read: F,
@@ -2244,17 +2268,25 @@ macro_rules! __keylink_service {
                 }
 
                 /// Stop after the messages already queued, then wait for the
-                /// actor to end. Every other handle reports
-                /// [`Undelivered::Gone`](keylink::Undelivered::Gone) from then
-                /// on.
+                /// actor to end. Every other handle reports a closed mailbox
+                /// from then on — an `rpc` as
+                /// [`Undelivered::Gone`](keylink::Undelivered::Gone), a `tell`
+                /// as [`NotQueued::Closed`](keylink::NotQueued::Closed).
                 ///
                 /// # Errors
                 ///
-                /// [`Undelivered::Reentrant`](keylink::Undelivered::Reentrant)
-                /// when called from inside the actor's own turn. An actor that
+                /// [`NotQueued::Reentrant`](keylink::NotQueued::Reentrant),
+                /// and it is the only error this returns: called from inside
+                /// the actor's own turn, where it would otherwise wait for an
+                /// ending only this turn can reach.
+                ///
+                /// [`NotQueued`](keylink::NotQueued) and not
+                /// [`Undelivered`](keylink::Undelivered) because a `stop` asks
+                /// only whether the request was queued — it has no reply
+                /// channel, so no verdict on a turn can reach it. An actor that
                 /// is already gone is `Ok`, because stopping a stopped actor is
                 /// what the caller asked for.
-                pub async fn stop(&self) -> ::core::result::Result<(), $crate::Undelivered> {
+                pub async fn stop(&self) -> ::core::result::Result<(), $crate::NotQueued> {
                     self.inner.stop().await
                 }
 
@@ -2303,12 +2335,20 @@ macro_rules! __keylink_service {
 
                 /// Resolve when this actor ends, and say why.
                 ///
-                /// [`Undelivered`](keylink::Undelivered) says "gone", and it
-                /// must not be stretched to say "gave up on durability". This is
-                /// the second question, asked separately — and it is the only
-                /// way to learn that an [`Observer`](keylink::Observer) refused
-                /// a turn, because a local call is told `Undelivered` either
-                /// way.
+                /// [`Undelivered::Gone`](keylink::Undelivered::Gone) says
+                /// "gone", and it must not be stretched to say "gave up on
+                /// durability". This is the second question, asked separately.
+                ///
+                /// **It is not where a refusal is learned, in either
+                /// direction.** An `rpc` refused by an
+                /// [`Observer`](keylink::Observer) is answered
+                /// [`Undelivered::Refused`](keylink::Undelivered::Refused) with
+                /// that observer's name, so the call carries the fact itself;
+                /// and a refusal that did not declare itself
+                /// [`fatal`](keylink::Stop::fatal) ends one incarnation rather
+                /// than the actor, so a supervised actor restarts and this does
+                /// not resolve at all. What it adds is the observer's own
+                /// **error**, which no reply channel carries.
                 ///
                 /// Holds no mailbox sender, so awaiting it does not keep the
                 /// actor alive: dropping every handle both ends the actor and
@@ -3763,7 +3803,24 @@ macro_rules! __keylink_local_method {
         ///
         /// # Errors
         ///
-        /// [`Undelivered`](keylink::Undelivered) when the actor is gone.
+        /// [`Undelivered`](keylink::Undelivered), one variant per way the call
+        /// lost its value: [`Gone`](keylink::Undelivered::Gone) when the actor
+        /// is gone, [`Dropped`](keylink::Undelivered::Dropped) when a live actor
+        /// threw this reply away without answering it,
+        /// [`Restarting`](keylink::Undelivered::Restarting) when the incarnation
+        /// that owed the answer died and a supervisor is starting another,
+        /// [`Refused`](keylink::Undelivered::Refused) when an
+        /// [`Observer`](keylink::Observer) refused the turn that ran — the actor
+        /// is alive, and a supervised one may be restarting —
+        /// [`Expired`](keylink::Undelivered::Expired) when a queueing budget ran
+        /// out before the turn started, which a local origin cannot do today,
+        /// and [`Reentrant`](keylink::Undelivered::Reentrant) when the call was
+        /// made from inside this actor's own turn.
+        ///
+        /// "One variant per way" is a promise of completeness, so it is the
+        /// whole enum: a fault is the one loss missing, and it is missing
+        /// because this method resumes the panic in the caller rather than
+        /// reporting it.
         ///
         /// # Panics
         ///
@@ -3801,9 +3858,19 @@ macro_rules! __keylink_local_method {
         ///
         /// # Errors
         ///
-        /// [`Undelivered`](keylink::Undelivered) when the actor is gone.
+        /// [`NotQueued`](keylink::NotQueued), which is the whole of what a
+        /// `tell` can report and the reason it is not
+        /// [`Undelivered`](keylink::Undelivered): the sentence above — no reply
+        /// channel — is exactly the sentence that says no verdict on the turn
+        /// can arrive here.
+        ///
+        /// [`NotQueued::Closed`](keylink::NotQueued::Closed) when the actor is
+        /// gone, and
+        /// [`NotQueued::Reentrant`](keylink::NotQueued::Reentrant) for a
+        /// self-`tell` into a **full** mailbox — into a free slot it is queued
+        /// and runs after the current turn returns.
         pub async fn $name(&self $(, $arg: $ty )*)
-            -> ::core::result::Result<(), $crate::Undelivered> {
+            -> ::core::result::Result<(), $crate::NotQueued> {
             self.inner
                 .notify(move |__from, __reply| Mail::$variant {
                     origin: __from,
@@ -3827,7 +3894,9 @@ macro_rules! __keylink_local_method {
         ///
         /// # Errors
         ///
-        /// [`Undelivered`](keylink::Undelivered) when the actor is gone.
+        /// The same [`Undelivered`](keylink::Undelivered) variants an `rpc`
+        /// answers, for the same reasons: this goes through the same `ask`, and
+        /// the blob is written by the turn rather than after it.
         pub async fn $name(&self $(, $arg: $ty )*)
             -> ::core::result::Result<($ret, $crate::BlobId), $crate::Undelivered> {
             self.inner
