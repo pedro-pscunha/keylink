@@ -1860,17 +1860,23 @@ impl<M> SystemBuilder<M> {
     /// crate's own console on one side and a library type on the other, so the
     /// two calls are written by two different people. A program with
     /// `.lifecycle(events)` for [`Inspector`](crate::Inspector) that later adds
-    /// `.lifecycle(endings)` for [`Endings`](crate::compose::Endings) lost its
-    /// console silently — no error, no warning, no method returning what it
-    /// displaced. The failure surfaced as a console that had stopped showing
-    /// mounts, a long way from the builder line that caused it.
+    /// `.lifecycle(endings)` for `compose::Endings` lost its console silently —
+    /// no error, no warning, no method returning what it displaced. The failure
+    /// surfaced as a console that had stopped showing mounts, a long way from
+    /// the builder line that caused it.
     ///
     /// The alternative was to keep one slot and return the displaced sink, which
-    /// is [`Names::register`](crate::compose::Names::register)'s answer to the
-    /// same shape. It is right there and wrong here: a name is *one* actor, so
-    /// displacing is what registering a second one means, while a report is a
-    /// broadcast and two watchers of one system are not in competition. Nothing
-    /// about a mount is consumed by being reported.
+    /// is `compose::Names::register`'s answer to the same shape. It is right
+    /// there and wrong here: a name is *one* actor, so displacing is what
+    /// registering a second one means, while a report is a broadcast and two
+    /// watchers of one system are not in competition. Nothing about a mount is
+    /// consumed by being reported.
+    ///
+    /// **Both `compose::` names above are backticks on purpose, not links
+    /// waiting to be written.** `compose` is built on top of this module, so an
+    /// intra-doc link from here would point the seam at the layer above it —
+    /// the cost the module header names at the top of this file. Do not "fix"
+    /// them.
     ///
     /// **Order is install order and it is observable**, because the reports run
     /// one after another on the reporting task. Do not build on it: it says

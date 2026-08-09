@@ -163,7 +163,7 @@
 //!
 //! Per [`watch`](Endings::watch): one `oneshot` channel, two [`ActorId`] clones —
 //! one for the map key, one the future carries so its `Drop` can find its own
-//! slot — and a `u64`.
+//! waiter — and a `u64` generation.
 //!
 //! Per ending with **no** waiter: one hash lookup. No allocation and no clone of
 //! the [`Ended`], which matters because every ending in a system with one watched
@@ -198,7 +198,11 @@ struct Waiter {
     /// Which waiter under this name it is, so that an abandoned future removes
     /// its own and not a later one's. The module doc argues why resolution needs
     /// no stamp and this path does.
-    slot: u64,
+    ///
+    /// `generation` and not `slot`, because `names.rs` and `group.rs` both call
+    /// this exact thing a generation. One concept under two names across three
+    /// files is the drift the paragraph above claims to be avoiding.
+    generation: u64,
     /// Resolves this waiter's future. Dropped without sending only when the
     /// future was dropped first.
     tell: oneshot::Sender<Ended>,
@@ -244,34 +248,55 @@ impl Endings {
     /// Several waiters may hold `name` at once and each is answered. Dropping the
     /// future unfiles its waiter, so abandoning one costs nothing after the drop.
     ///
-    /// It resolves [`Ended::Vanished`] if every [`Endings`] clone is dropped
-    /// while it waits — including the one the [`System`](crate::System) holds, so
-    /// this is the whole system going away rather than the actor. Nothing can
+    /// It resolves [`Ended::Vanished`] when **every** [`Endings`] clone is
+    /// dropped while it waits, the one you are holding included. Nothing can
     /// report through a registry that no longer exists, and resolving is louder
     /// than the alternative: an `Endings` that was built, watched and never
     /// installed would otherwise hang its callers with no signal at all.
+    ///
+    /// **It is not a signal that the system went away**, and this paragraph
+    /// used to say it was. The trigger is the last strong reference dying, and
+    /// [`watch`](Self::watch) takes `&self` — so any caller watching a second
+    /// name is still holding a clone, as the module doc's own example is. A
+    /// dropped [`System`](crate::System) reports nothing at all: nothing in
+    /// `registry.rs` implements [`Drop`] for it, so the clone it held going away
+    /// is one clone of several and the waiters simply stay pending.
+    #[must_use = "a `watch` nobody awaits files a waiter and reads no ending; \
+                  hold the future, or do not ask for it"]
     pub fn watch(&self, name: &ActorId) -> impl Future<Output = Ended> + Send + 'static {
         let (tell, ending) = oneshot::channel();
-        let slot = self.next.fetch_add(1, Ordering::Relaxed);
-        self.lock()
+        let generation = self.next.fetch_add(1, Ordering::Relaxed);
+        recovering(&self.waiting)
             .entry(name.clone())
             .or_default()
-            .push(Waiter { slot, tell });
-        Watch {
+            .push(Waiter { generation, tell });
+        Awaited {
             ending,
-            filed: Some((name.clone(), slot)),
+            filed: Some((name.clone(), generation)),
             waiting: Arc::downgrade(&self.waiting),
         }
     }
 
-    /// Poison recovery rather than propagation, which is [`Names`](super::Names)'
-    /// argument for the same helper: one bad report should cost one report.
-    /// Nothing here can panic while the lock is held — the sends happen after the
-    /// guard is dropped — so this arm is unreachable in practice and must still
-    /// be typed.
+    /// The lock, for the one caller that has a `&self` to reach it through.
     fn lock(&self) -> MutexGuard<'_, Waiting> {
-        self.waiting.lock().unwrap_or_else(PoisonError::into_inner)
+        recovering(&self.waiting)
     }
+}
+
+/// Take the lock, recovering from poison rather than propagating it.
+///
+/// A free function over the [`Mutex`] and not a method, because [`Awaited`]'s
+/// [`Drop`] reaches the same map through a [`Weak`] and has no `&Endings` to call
+/// a method on. It was written out a second time there, bare, with the argument
+/// living only here — one policy in two places, and the copy carried no reason
+/// for itself.
+///
+/// Poison recovery rather than propagation is [`Names`](super::Names)' argument
+/// for the same helper: one bad report should cost one report. Nothing here can
+/// panic while the lock is held — the sends happen after the guard is dropped —
+/// so this arm is unreachable in practice and must still be typed.
+fn recovering(waiting: &Mutex<Waiting>) -> MutexGuard<'_, Waiting> {
+    waiting.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Lifecycle for Endings {
@@ -333,20 +358,28 @@ impl fmt::Debug for Endings {
 /// A named type and not an `async` block, and the [`Drop`] impl below is the
 /// whole reason: an abandoned waiter has to come back out of the map, and an
 /// `async` block has nowhere to put that.
-struct Watch {
+///
+/// **`Awaited` and not `Watch`, because this crate already has a `Watch`.**
+/// `watch.rs`'s is public, is the connection-departure future, and is the one
+/// `crate::Watch` resolves to — so an intra-doc link written here meant the
+/// transport type, silently and while rustdoc stayed green, because the link was
+/// valid. Two futures of one name in one crate, both reached through a method
+/// called `watch`, is a collision that produced exactly that defect inside its
+/// own diff. This one is private, so the rename costs nothing outside this file.
+struct Awaited {
     ending: oneshot::Receiver<Ended>,
-    /// Which slot to take back out if this is dropped before it resolves, and
+    /// Which waiter to take back out if this is dropped before it resolves, and
     /// `None` once it has. A resolved waiter is already gone from the map — the
     /// report took it out to send — so the `Drop` below must not take the lock to
     /// discover that.
     filed: Option<(ActorId, u64)>,
-    /// [`Weak`], so a `Watch` nobody has resolved does not keep the waiters alive
-    /// past the last [`Endings`]. That is what makes the dropped-registry case
-    /// reachable, and it resolves [`Ended::Vanished`].
+    /// [`Weak`], so an `Awaited` nobody has resolved does not keep the waiters
+    /// alive past the last [`Endings`]. That is what makes the dropped-registry
+    /// case reachable, and it resolves [`Ended::Vanished`].
     waiting: Weak<Mutex<Waiting>>,
 }
 
-impl Future for Watch {
+impl Future for Awaited {
     type Output = Ended;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Ended> {
@@ -365,21 +398,26 @@ impl Future for Watch {
     }
 }
 
-impl Drop for Watch {
+impl Drop for Awaited {
     fn drop(&mut self) {
-        let Some((name, slot)) = self.filed.take() else {
+        // `mine` and not `generation`, which is what the field is called: the two
+        // are compared on one line below, and at `generation != generation` that
+        // line is both unreadable and over the width, so rustfmt breaks it into
+        // three. A break record anchors on it, and a one-line anchor is worth a
+        // shorter local.
+        let Some((name, mine)) = self.filed.take() else {
             return;
         };
         let Some(waiting) = Weak::upgrade(&self.waiting) else {
             return;
         };
-        let mut held = waiting.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held = recovering(&waiting);
         if let hash_map::Entry::Occupied(mut under) = held.entry(name) {
-            // By slot and never by name. Another `watch` under this name may have
-            // filed a waiter since this one was abandoned, and taking the whole
-            // entry would unwatch it silently — a live caller waiting on a future
-            // nothing can now resolve.
-            under.get_mut().retain(|waiter| waiter.slot != slot);
+            // By generation and never by name. Another `watch` under this name
+            // may have filed a waiter since this one was abandoned, and taking
+            // the whole entry would unwatch it silently — a live caller waiting
+            // on a future nothing can now resolve.
+            under.get_mut().retain(|waiter| waiter.generation != mine);
             // A name with no waiters left is a key nothing reads. Leaving it
             // would make the map grow with names watched once rather than with
             // names watched now, which is the bound this type claims.

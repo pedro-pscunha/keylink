@@ -558,6 +558,114 @@ ANCHORS = [
     # SAME-FILE and indented, so the record's unindented copy is not a second occurrence.
     ("M2", "keylink/src/rpc.rs", "keylink/src/rpc.rs",
      "        Attaching::Forbidden => return Claimed::Refuse(IdempotencyRefusal::InFlight.into()),"),
+    # ── `compose::Group` and `compose::Endings` ──────────────────────────────
+    #
+    # Twenty-two substitutions were run in the paired gate worktree before any row
+    # below was written. Every one reddened its own named test, every one printed
+    # `── exit=101`, and every one reported `34 filtered out` of 35, so no filter
+    # caught a neighbour. Controls green before and after; the second control is the
+    # only evidence that all twenty-two restores completed.
+    #
+    # **G1, G2 and G8 share ONE literal, because they share one physical LINE.**
+    # G1 and G2 were proposed against `policy(&reported.name, &reason)`, which is a
+    # fragment of G8's line and occurs nowhere else. Registering it would have
+    # declared a new mode-4 fragment, and `FRAGMENT_ANCHORS` above is a NON-GROWTH
+    # assertion — adding to it converts a working check into a silent pass. So all
+    # three quote the whole line. Three records, one literal, three rows.
+    ("G1", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.name, &reason))) {"),
+    ("G2", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.name, &reason))) {"),
+    ("G8", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "        match catch_unwind(AssertUnwindSafe(|| policy(&reported.name, &reason))) {"),
+    # G3 is DELIBERATELY WEAKER than the break it guards, and that is the whole
+    # entry. Its record fences two lines and substitutes the second, because that
+    # second line - `retire_all(closing(&shared)).await;` - occurs THREE times in
+    # `group.rs` and is unique only under the arm above it. A row carries one
+    # literal, and a two-line literal is a fragment by the check at :933.
+    #
+    # So the row pins the ARM the claim lives on, and not the argument the fence
+    # exists to disambiguate. Rename the variant, restructure the `match`, or move
+    # the teardown out of that arm, and this reddens and the record gets re-read.
+    # Change `closing(&shared)` alone and it does not. Weaker-and-registered beats
+    # unregistered-with-a-reason here: an unregistered record rots in silence.
+    ("G3", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "            Ok(Verdict::StopAll) => {"),
+    ("G4", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "            Ok(fut) => retiring.push(guarded(fut)),"),
+    ("G5", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "            held.members.remove(at);"),
+    ("G6", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "                entry.name == reported.name && entry.generation == reported.generation"),
+    # G7 was proposed as `held.staged.drain(..)` and is registered as its enclosing
+    # line. The bare call is a fragment; the `for` header is the line.
+    ("G7", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "                for staged in held.staged.drain(..) {"),
+    # G9 guards the dropped-group ending, whose break empties a three-line
+    # `Shared::drop` body. This is the inner line of that fence, whole and unique.
+    ("G9", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "        self.wake.notify_one();"),
+    # G10's break swaps `abort` for `stop`. It reddens at the NO_PROGRESS bound at
+    # 60.00s rather than by assertion, because `supervise` polls its inbox only
+    # inside `run_loop` and never across either sleep, so a `stop`-based teardown of
+    # a member in backoff cannot return until that backoff elapses. Measured.
+    ("G10", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "            handle.abort();"),
+    ("G11", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "            let reason = guarded(ended).await.map_err(|panicked| panicked.bare());"),
+    # G12's other half is G14, one record reaching across two files. Both print the
+    # SAME failure sentence, so nothing in the output says which was applied - the
+    # record says to run one at a time and label the log.
+    ("G12", "keylink/tests/compose.rs", "keylink/src/compose/group.rs",
+     "        match catching(member.end) {"),
+    ("G13", "keylink/tests/compose.rs", "keylink/src/local.rs",
+     "if !restarting {"),
+    ("G14", "keylink/tests/compose.rs", "keylink/src/panic.rs",
+     "            Err(panic) => Poll::Ready(Err(Panic::caught(panic))),"),
+    # ── the keyed side ───────────────────────────────────────────────────────
+    #
+    # K1 and K2 share a literal for the R15/R16 reason: two records, two rows. K1
+    # claims a waiter is handed the loop's reason; K2 claims that reason survives the
+    # two hops a `Group` adds. **That substitution reddens FIVE tests**, so a
+    # whole-target run under it says nothing about any single guard.
+    ("K1", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
+     "            let _ = waiter.tell.send(why.clone());"),
+    ("K2", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
+     "            let _ = waiter.tell.send(why.clone());"),
+    # K3 and K3b are the two DIRECTIONS of one claim, both measured. `= vec![..]`
+    # keeps only the last and fails by value in 0.00s; `if is_empty() { push }` keeps
+    # only the first and fails at the bound in 60.00s. A single-slot list fails either
+    # way, and which way says which slot survived. A list that stays permanently EMPTY
+    # is still indistinguishable from keep-first, and the test now reads both
+    # observables into locals before asserting either so the message names the
+    # direction rather than leaving it to which assertion fired.
+    ("K3", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
+     "        self.lifecycle.push(Arc::new(lifecycle));"),
+    ("K3b", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
+     "        self.lifecycle.push(Arc::new(lifecycle));"),
+    ("K4", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
+     "        for waiter in waiters {"),
+    # K5's local is `mine` and its FIELD is `generation`, which is not a slip. Spelled
+    # `waiter.generation != generation` the line runs to 101 characters and rustfmt
+    # breaks it into three - turning a one-line anchor into a fence, which is the
+    # shape G3 above is already paying for. The field carries the shared vocabulary
+    # `names.rs` uses and the local absorbs the width.
+    ("K5", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
+     "            under.get_mut().retain(|waiter| waiter.generation != mine);"),
+    ("K6", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
+     "                under.remove();"),
+    # K7 is the VALUE half only, and its liveness half is registered NOWHERE on
+    # purpose. That substitution does go red, and it goes red for the wrong reason:
+    # returning `Pending` from an arm that only runs after the receiver has already
+    # answered polls a completed `oneshot::Receiver` twice, and tokio refuses it at
+    # `oneshot.rs:1291` with `called after complete`. The claim is that a waiter
+    # nobody can report to is ANSWERED rather than left waiting, and a
+    # receiver-contract panic does not test that. A faithful break would have to leave
+    # the receiver unpolled, which an arm downstream of its resolution cannot do.
+    # **A guard that is red for the wrong reason keeps passing once its claim stops
+    # being true, so it is worth less than no guard.**
+    ("K7", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
+     "            Poll::Ready(Err(_)) => Ended::Vanished,"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.

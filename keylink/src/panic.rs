@@ -200,7 +200,17 @@ pub(crate) fn guarded<F: Future>(fut: F) -> Guarded<F> {
 /// `lib.rs`'s `#![deny(unsafe_code)]` lifts exactly once, by name, for something
 /// else. The box carries the pinning instead, and makes `Guarded<F>` [`Unpin`]
 /// for every `F`, so [`Pin::get_mut`] is enough to reach the field —
-/// [`Watch`](crate::Watch) is polled the same way for the same reason.
+/// `compose::keyed`'s `Awaited` is polled the same way for the same reason.
+///
+/// **Backticks and not an intra-doc link, and that is a repair.** This read
+/// ``[`Watch`](crate::Watch)`` and meant the private future in
+/// `compose/keyed.rs`. `crate::Watch` is `watch.rs`'s connection-departure
+/// future, which is a different type polled with `get_mut` for a different
+/// reason — it boxes because iroh hands back an unnameable `impl Future`. The
+/// link was **valid**, so `mise run docs` stayed green and no gate in this repo
+/// could ever have caught it. `CONTRIBUTING.md` says to reach for backticks when
+/// a name is ambiguous, and two futures called `Watch` is that. The private one
+/// is now `Awaited`, so the ambiguity is gone as well as the link.
 ///
 /// It is the allocation the `async fn` body already made. What moved is when:
 /// the box is built when [`guarded`] is called rather than at the first poll.

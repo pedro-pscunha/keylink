@@ -1558,6 +1558,14 @@ async fn a_displaced_members_ending_does_not_reach_the_policy_as_its_replacement
 /// every staged add: the three filed while the policy ran are all watched".
 /// Exit 101, by value, in 0.01s.
 ///
+/// **The anchor row pins the enclosing line and not the call**, which is
+/// `for staged in held.staged.drain(..) {`. `held.staged.drain(..)` on its own is
+/// a fragment, and a fragment cannot be registered: `FRAGMENT_ANCHORS` in
+/// `.mise/tasks/anchors` is a non-growth assertion, so declaring a new one
+/// converts a working check into a silent pass. The substitution still edits the
+/// `drain(..)` call inside that line. Move the loop and the row reddens; change
+/// what the drain feeds and it does not.
+///
 /// **`steady` is in this test for that break and not for the claim.** The break
 /// loses whichever member is first in a drain, and on a current-thread runtime the
 /// conductor has not run when the two opening `add` calls are made — so without a
@@ -1710,6 +1718,13 @@ async fn a_policy_that_panics_ends_the_group_rather_than_orphaning_it() {
 /// with `fn drop(&mut self) {}` — the one wake a dropped group has. Without it a
 /// group with two healthy members and no holder is noticed only when some member
 /// happens to end, so nothing answers whoever is awaiting [`Group::ended`].
+///
+/// **The anchor row pins `self.wake.notify_one();`**, the one line inside that
+/// body, because a row carries a single literal and the substitution above spans
+/// three lines. The row is therefore a rot tripwire on the wake and not on the
+/// `Drop` impl: delete the impl and the row reddens, rename `wake` and it
+/// reddens, but replace the body with a different single wake and it does not.
+/// The fence is what the break needs; this line is what the list can hold.
 /// Watched: at the [`NO_PROGRESS`] bound, exactly as the paragraph below
 /// predicts — [`bounded`] panics with "this must resolve rather than run for
 /// ever: Elapsed(())" after 60.00s inside the test and 62.9s of wall time.
@@ -2249,17 +2264,34 @@ async fn a_keyed_actors_own_ending_reaches_a_watch_future_with_its_reason() {
 /// with `        self.lifecycle = vec![Arc::new(lifecycle)];` — the single slot
 /// that method's own doc records as the defect it replaced, where a second
 /// `.lifecycle(..)` displaced the first with no error, no warning and no
-/// returned value. Watched: "the sink installed first is told too: a second
-/// `.lifecycle(..)` adds, it does not displace". Exit 101, by value, in 0.00s —
-/// the SECOND assertion, which is what the install order was chosen to buy.
+/// returned value. Watched: "both sinks are told … the `Endings` installed
+/// second got `Some(Stopped)`, and the recorder installed first fired: false".
+/// Exit 101, by value, in 0.00s.
 ///
-/// **The install order is chosen so that the break reddens by assertion rather
-/// than by timeout**, which is the same choice `NO_PROGRESS` records having got
-/// wrong once. With the recorder installed first and [`Endings`] second, a
-/// single slot keeps [`Endings`]: the watch still resolves and the recorder is
-/// empty, so this fails at [`settles`] in well under a second. Installed the
-/// other way round the watch would never resolve and this would sit at the bound
-/// instead.
+/// **A second substitution, for the other direction.** Replace the same literal
+/// with `        if self.lifecycle.is_empty() { self.lifecycle.push(Arc::new(lifecycle)); }`
+/// — a single slot that keeps the FIRST sink rather than the last, which is the
+/// same defect from the other end. Watched: "both sinks are told … the
+/// `Endings` installed second got `None`, and the recorder installed first
+/// fired: true". Exit 101, at the [`NO_PROGRESS`] bound, after 60.00s.
+///
+/// **Two substitutions, two directions, and the message names which one** —
+/// which is the thing a guard on a list has to do and the easiest thing to
+/// believe without checking. Both were measured against this body, not reasoned
+/// about:
+///
+/// | the defect | `Endings` got | recorder fired | time |
+/// |---|---|---|---|
+/// | keeps only the LAST | `Some(Stopped)` | `false` | 0.00s |
+/// | keeps only the FIRST | `None` | `true` | 60.00s |
+/// | keeps NEITHER | `None` | `false` | 60.00s |
+///
+/// **Both observables are read before either is asserted, and that third row is
+/// why.** Asserting the `Endings` first and aborting there would leave the
+/// recorder unread, so keep-first and keep-nothing would produce one symptom
+/// between them. Reading both into locals costs nothing when both are true and
+/// separates all three when they are not. The bottom row is the one still
+/// predicted rather than measured — no substitution here induces it.
 #[tokio::test]
 async fn two_lifecycles_on_one_system_both_fire() {
     let endings = Endings::new();
@@ -2280,17 +2312,25 @@ async fn two_lifecycles_on_one_system_both_fire() {
     ends.send(Ended::Stopped)
         .expect("the loop is waiting for its ending");
 
-    assert!(
-        matches!(bounded(watching).await, Ended::Stopped),
-        "the `Endings` installed second is told"
-    );
+    // **Both sinks are READ before either is asserted.** Asserting the first and
+    // aborting would leave the second observable unread, and three broken
+    // implementations then share two symptoms: keep-first and keep-nothing both
+    // die here with nothing said about the recorder. Reading both first costs
+    // nothing when they are both true, and names both when they are not.
+    //
+    // `timeout` rather than `bounded`, because `bounded` panics on expiry and the
+    // whole point is to carry the answer down to the assertion instead.
+    let told_endings = n0_future::time::timeout(NO_PROGRESS, watching).await.ok();
+    let told_recorder = settles(|| !seen.lock().expect("not poisoned").is_empty()).await;
 
     // THIS is the decision, and it is about the sink that was installed FIRST: a
     // program that adds `.lifecycle(endings)` to a builder that already had
     // `.lifecycle(events)` must not lose its console to do it.
     assert!(
-        settles(|| !seen.lock().expect("not poisoned").is_empty()).await,
-        "the sink installed first is told too: a second `.lifecycle(..)` adds, it does not displace"
+        matches!(told_endings, Some(Ended::Stopped)) && told_recorder,
+        "both sinks are told, because a second `.lifecycle(..)` adds and does not \
+         displace — the `Endings` installed second got {told_endings:?}, and the \
+         recorder installed first fired: {told_recorder}"
     );
     assert_eq!(
         seen.lock().expect("not poisoned").clone(),
@@ -2352,19 +2392,20 @@ async fn two_watchers_on_one_name_are_both_answered() {
 /// Two breaks, one per half, because the two halves are two claims. Both with
 /// `scripts/break-once.sh keylink/src/compose/keyed.rs`.
 ///
-/// **Not a later one.** Replace `Watch`'s
-/// `            under.get_mut().retain(|waiter| waiter.slot != slot);` with
+/// **Not a later one.** Replace `Awaited`'s
+/// `            under.get_mut().retain(|waiter| waiter.generation != mine);` with
 /// `            under.get_mut().clear();` — the whole entry emptied on one
 /// abandonment, which is the defect the comment on that very line names: a live
 /// caller left waiting on a future nothing can resolve any more. Watched: "the
 /// waiter filed after the abandoned one is still filed, and carries the true
-/// reason: Vanished". Exit 101, **by value**, in 0.00s.
+/// reason: Vanished". Exit 101, **by value**, in 0.00s. Re-measured against the
+/// re-quoted literal after `slot` became `generation`, rather than carried.
 ///
 /// **This record predicted the bound and the prediction was wrong.** It said to
 /// expect a timeout, on the reasoning that *unfiling the wrong waiter produces
 /// no wrong value, it produces no value*. That sentence stops one step early.
 /// `clear()` drops every [`Waiter`] in the vector, the kept one included;
-/// dropping a `Waiter` drops its `oneshot::Sender`; and `Watch::poll` maps a
+/// dropping a `Waiter` drops its `oneshot::Sender`; and `Awaited::poll` maps a
 /// dropped sender to [`Ended::Vanished`] rather than to `Pending`. So it does
 /// produce a wrong value, and the guard reddens in no time at all. The error was
 /// reasoning about the map without following the `Drop` out of it — the same
@@ -2424,7 +2465,7 @@ async fn an_abandoned_watch_unfiles_its_own_waiter_and_not_a_later_one() {
 }
 
 /// Made red by `scripts/break-once.sh keylink/src/compose/keyed.rs`, replacing
-/// `Watch::poll`'s `            Poll::Ready(Err(_)) => Ended::Vanished,` with
+/// `Awaited::poll`'s `            Poll::Ready(Err(_)) => Ended::Vanished,` with
 /// `            Poll::Ready(Err(_)) => Ended::Stopped,` — the whole system going
 /// away reported as a clean stop, which is the one thing a caller has to be able
 /// to tell it from. Watched: "a waiter nothing can ever report to is answered
