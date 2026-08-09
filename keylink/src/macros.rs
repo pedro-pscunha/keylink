@@ -2020,9 +2020,29 @@ macro_rules! __keylink_service {
                 /// [`ActorId`](keylink::ActorId) and carries its own ALPN over
                 /// its own hashed contract.
                 ///
-                /// The word **singleton** appears elsewhere in these docs for
-                /// this arrangement. Read it as *"a service served from one local
-                /// handle"* — a way of serving, not a kind of actor.
+                /// The word **singleton** appears elsewhere in these docs, and it
+                /// names **two different things**. One gloss cannot cover both.
+                ///
+                /// * Where it names an **actor** — "a singleton has no registry
+                ///   entry" — read *"a local actor"*. That is a way of serving,
+                ///   not a kind of actor.
+                /// * Where it names an **ALPN, a contract or a `Client`** — "the
+                ///   keyed and singleton ALPNs" — read *"unkeyed"*. That wire
+                ///   identity belongs to the **service**, not to any actor.
+                ///
+                /// The second reading is not a refinement of the first, and the
+                /// paragraph above is why: the free [`service`] takes a plain
+                /// `Handler` with **no actor anywhere** and registers on the same
+                /// `alpn()` this method does. So a reader told that "the singleton
+                /// ALPN" means "served from one local handle" would conclude a
+                /// plain concurrent service is served from a handle. It is not —
+                /// the two share a wire identity and nothing else.
+                ///
+                /// An earlier version of this block gave the single gloss "a
+                /// service served from one local handle" for every site, which was
+                /// **false for the ALPN group** and true only for the actor one.
+                /// It was caught by a reviewer reading the sites the gloss governs
+                /// rather than the gloss itself.
                 ///
                 /// # What it costs
                 ///
