@@ -94,12 +94,24 @@ on 2026-08-08 against the hook:
 | a lightweight tag at `HEAD` | accepted, gate ran |
 | **any annotated tag, including one at `HEAD`** | refused |
 | an annotated tag at an older commit | refused |
+| `git push --force` after rewriting history | accepted, gate ran, the new tip landed |
+| `git push --force` after `git commit --amend` | accepted, gate ran |
+| `git push --force-with-lease` | accepted, gate ran |
+| `git push --force` rewinding a branch to an older commit | refused |
 
 `git push --all` is refused as soon as any branch it carries is not at `HEAD`, and
 not before. The annotated tag is the case worth knowing before you hit it: git sends
 a tag's OWN object sha on the hook's stdin, so `git tag -a v1.0 && git push origin
 v1.0` at the tip is refused even though the tag points at `HEAD`. Push it with
 `--no-verify`.
+
+**A force-push is not a case at all, because the hook never asks what the remote
+held.** Git writes that tip as the fourth field of each update line, and the hook
+reads that field and never looks at it again — so a rewrite, an `--amend` and a
+`--force-with-lease` are each judged only on the sha they deliver. All three deliver
+`HEAD`, so all three run the gate and land. A forced rewind to an *older* commit is
+refused for the ordinary reason: what it delivers is not `HEAD`. All four were
+measured against the hook, and `scripts/hook-guard.sh`'s scenario 13 pins them.
 
 You need [`mise`](https://mise.jdx.dev) and rustup. Nothing else is a manual
 step: `rust-toolchain.toml` requests the `wasm32-unknown-unknown` target and the

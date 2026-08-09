@@ -121,8 +121,25 @@
 # made registration look free.
 #
 # **So the exposure is real and it is named here rather than closed:** an edit to
-# `.githooks/pre-push` can silently rot up to ten literals quoted in this file, and
-# no gate says so. Teaching `quoted_spans` a `#` marker and widening the walk would
+# `.githooks/pre-push` can silently rot the production literal that EVERY H-numbered
+# record below quotes, and no gate says so. A count stood in this sentence and is gone
+# on purpose: it said "up to ten", and H12 quoting a line no other record quotes is all
+# it took to make it wrong — the same rot the row lists below avoid by naming rows.
+#
+# **THE RULE FOR A RECORD AUTHOR HERE, so the next one does not have to discover it:**
+# a literal that is registered, or may be, carries an INLINE backticked span somewhere
+# in its record — whatever else that record does to present it. The record-quote check
+# compares backticked spans by EQUALITY, so an INDENTED DISPLAY BLOCK is invisible to
+# it: a record showing its literal that way gets accused of not quoting a literal it
+# quotes plainly, and every remedy the failure prints is then wrong. Keep the display
+# block where it reads better and put the inline span beside it. A long literal may
+# WRAP across comment lines, because the reader joins a block's lines before it cuts
+# spans out — H11's is wrapped for exactly that reason.
+#
+# Measured with the shipped reader lifted out of `.mise/tasks/anchors` rather than
+# reasoned about: H1 and H4 already carried theirs inline and matched; H11 and H12
+# displayed theirs and matched NOTHING, not even by containment, until this rule was
+# applied to both. Teaching `quoted_spans` a `#` marker and widening the walk would
 # close it, in the task that owns those two functions rather than here.
 # `scripts/break-hook-record.sh` is the partial answer available today — a replay
 # aborts when a quoted literal is missing or no longer unique, which is the same
@@ -408,11 +425,14 @@ echo "       (the staged path list measured $wide_bytes bytes)"
 #         an ANNOTATED tag at HEAD never reaches the gate
 #         an ANNOTATED tag at HEAD is REFUSED, git having sent the tag object's sha
 #         the tag refusal names an OBJECT rather than a commit
+#         a force-push REWINDING to an older commit never reaches the gate
+#         a force-push of an older commit is REFUSED
 #
-#     Twenty-one rows, re-measured when scenario 12 was added rather than assumed to
-#     be unchanged: a new scenario silently widens the redness of every earlier break
-#     that disables the machinery it depends on. The last three rows are that
-#     widening.
+#     Twenty-three rows, re-measured when scenario 13 was added rather than assumed
+#     to be unchanged, exactly as scenario 12 forced a re-measurement before it: a new
+#     scenario silently widens the redness of every earlier break that disables the
+#     machinery it depends on. The last five rows are those two widenings — three from
+#     scenario 12, two from scenario 13.
 #
 #     `a deletion-only push RUNS the chained hook` does NOT move, and that is
 #     worth more than the list: the chain is still REACHED, it is only handed
@@ -434,8 +454,8 @@ echo "       (the staged path list measured $wide_bytes bytes)"
 #
 # H4. **Drop the comparison against HEAD.** Replace
 #     `        if [ "$sha" != "$head_sha" ]; then` with `        if false; then`.
-#     Watched — twelve rows, the last three of them added by scenario 12 and measured
-#     rather than inferred:
+#     Watched — fourteen rows, the last five of them added by scenarios 12 and 13 and
+#     measured rather than inferred:
 #
 #         a delivered sha that is not HEAD never reaches the gate
 #         a delivered sha that is not HEAD is REFUSED
@@ -449,6 +469,8 @@ echo "       (the staged path list measured $wide_bytes bytes)"
 #         an ANNOTATED tag at HEAD never reaches the gate
 #         an ANNOTATED tag at HEAD is REFUSED, git having sent the tag object's sha
 #         the tag refusal names an OBJECT rather than a commit
+#         a force-push REWINDING to an older commit never reaches the gate
+#         a force-push of an older commit is REFUSED
 #
 # H5. **Stop re-delivering stdin to the chain.** Replace
 #     `        "$chain/pre-push" "$@" <<<"$updates"` with
@@ -483,7 +505,13 @@ echo "       (the staged path list measured $wide_bytes bytes)"
 #
 #         empty stdin hands the chained hook nothing, not a blank line
 #
-# H11. **Restore the PIPE to the chain.** Replace the two-arm forward
+# H11. **Restore the PIPE to the chain.** The literal this record searches, carried
+#      inline as one backticked span — the reader joins a block's comment lines before
+#      it cuts spans out, so a span may wrap across lines, and this one has to:
+#      `if [ -n "$updates" ]; then "$chain/pre-push" "$@" <<<"$updates" else
+#      "$chain/pre-push" "$@" </dev/null fi`
+#
+#      Replace the two-arm forward
 #
 #          if [ -n "$updates" ]; then
 #              "$chain/pre-push" "$@" <<<"$updates"
@@ -548,6 +576,46 @@ echo "       (the staged path list measured $wide_bytes bytes)"
 #     HEAD. That is also why the hook is CORRECT as written. Only an explicit
 #     `--git-dir=` beats the exported variable.
 #
+# H12. **Refuse a rewind, which is the guard a reader assumes this hook already
+#     has.** The literal this record searches, carried inline as a backticked span:
+#     `delivering="$delivering$local_ref $local_sha"$'\n'`
+#
+#     In `.githooks/pre-push`, replace that line
+#
+#         delivering="$delivering$local_ref $local_sha"$'\n'
+#
+#     with that same line followed by
+#
+#         [ -z "${_remote_sha//0/}" ] || git merge-base --is-ancestor "$_remote_sha" "$local_sha" || exit 1
+#
+#     — the fourth field consulted, which is the only thing that would make this
+#     hook's decision depend on the tip the REMOTE holds. Watched — four rows, all of
+#     them scenario 13's:
+#
+#         a force-push of a rewritten history reaches the gate
+#         a force-push of a rewritten history is ACCEPTED
+#         a force-push after --amend is ACCEPTED
+#         a --force-with-lease push is ACCEPTED
+#
+#     **Every earlier row stays green, and the reason is TWO facts about this file
+#     rather than luck.** A deletion never reaches the added line at all, because
+#     `is_deletion` takes the branch above it — and scenarios 2, 3, 4 and 9 are the
+#     only ones that push to a ref the remote already holds. Every non-deletion push
+#     here CREATES its remote ref, so the fourth field is all zeros and the added test
+#     short-circuits. Scenario 13 is the only place a real sha reaches that
+#     comparison, and the replay agreeing with that reading is what makes it a
+#     measurement rather than an argument.
+#
+#     The rewind rows do NOT move, and that pair is the part worth keeping: the
+#     rewind is still refused, only for a different reason and with no message. A
+#     refusal satisfies `check no` whatever produced it, so what pins this break is
+#     the three ACCEPTING rows and not the refusing one.
+#
+#     This is one of only TWO breaks here that make the hook refuse MORE rather than
+#     less — H11 is the other, and its shape is a payload past one pipe buffer rather
+#     than a rewind. That is why the paragraph below no longer says every break here
+#     narrows the hook: it was already wrong about H11 before H12 arrived.
+#
 # ── AND THE ROWS NO BREAK ABOVE REDDENS, NAMED RATHER THAN LEFT TO LOOK COVERED
 #
 # Two kinds, and neither is decoration:
@@ -557,20 +625,27 @@ echo "       (the staged path list measured $wide_bytes bytes)"
 #     push succeeds`, `empty stdin does not refuse the push` and `the push whose
 #     chain was measured also reached the gate`. They exist so that no fix can
 #     satisfy this file by refusing everything or by gating everything — a
-#     failure mode the nine breaks above cannot produce, because each one narrows
-#     the hook rather than widening it.
+#     failure mode MOST breaks above cannot produce, because they make the hook do
+#     LESS. **Two make it refuse MORE, each in one narrow shape:** H11 for a
+#     payload past one pipe buffer, H12 for a rewind. This paragraph used to say
+#     every break here narrows the hook, and H11 was already the counter-example
+#     before H12 was written. Scenario 11's row and scenario 13's three accepting
+#     rows are what catch those two.
 #   * ANTI-VACUITY PRECONDITIONS on the measurement itself: `git delivered an
 #     update line to compare against`, `git delivered exactly one line, its LF
 #     included`, `the linked worktree and its owning checkout sit at different
-#     commits`, `the wide push's update payload exceeds one 64 KiB pipe buffer`, and
+#     commits`, `the wide push's update payload exceeds one 64 KiB pipe buffer`,
 #     scenario 12's pair `the annotated tag's OBJECT sha differs from HEAD` and `the
-#     annotated tag nevertheless POINTS at HEAD`. They are claims about what git did,
-#     not about the hook. Two are there because `cmp` of two empty files passes; the
-#     third is there because scenario 10 asserts nothing at all if the two HEADs
-#     happen to agree; the fourth is there because scenario 11 passes against the very
-#     spelling it exists to reject as soon as its payload drops below one buffer; the
-#     last pair is there because a tag refusal is only interesting once the tag is
-#     known to point at HEAD.
+#     annotated tag nevertheless POINTS at HEAD`, and scenario 13's `the force-push is
+#     a rewind: the remote's tip is not an ancestor of HEAD`. They are claims about
+#     what git did, not about the hook. Two are there because `cmp` of two empty files
+#     passes; the third is there because scenario 10 asserts nothing at all if the two
+#     HEADs happen to agree; the fourth is there because scenario 11 passes against the
+#     very spelling it exists to reject as soon as its payload drops below one buffer;
+#     the tag pair is there because a tag refusal is only interesting once the tag is
+#     known to point at HEAD; the last is there because `--force` on a push that would
+#     fast-forward anyway is accepted for a reason that has nothing to do with force,
+#     which would leave every accepting row in scenario 13 green and empty.
 #   * CANARIES ON GIT ITSELF, both in Part Three: `a RELATIVE core.hooksPath runs
 #     the pushing worktree's own hook` and `an ABSOLUTE core.hooksPath runs the
 #     owning checkout's hook instead`. No break in this repository can move them,
@@ -924,6 +999,90 @@ assert "an ANNOTATED tag at HEAD is REFUSED, git having sent the tag object's sh
 assert "the tag refusal names an OBJECT rather than a commit" \
     grep -qF "delivers an object that is not HEAD" "$pushlog"
 
+# ── 13. A FORCE-PUSH, which is a claim about the tip the REMOTE holds and not
+#       about what the push delivers — so this hook does not consult it, and until
+#       this scenario existed nothing said so either way.
+#
+#       Git writes the remote's current sha as the FOURTH field of each update line,
+#       and that field is the only thing distinguishing a rewind from a
+#       fast-forward. This hook reads the first two fields and discards the fourth,
+#       so a rewrite, an `--amend` and a `--force-with-lease` all hand it the same
+#       input an ordinary push does. Measured with a hook that only dumps what it
+#       was sent, on a forced update over a branch the remote held: one update line,
+#       whose fourth field was that branch's old sha rather than the zeros a new ref
+#       carries. The non-ancestry is asserted separately, in the row below, because
+#       that is the half which makes the push a rewind at all.
+#
+#       THE GATE-RAN QUESTION IS ASKED ONCE, and that is deliberate rather than an
+#       omission. All three accepting forms deliver the identical update line — same
+#       ref, same sha, a non-zero fourth field — so a second `check yes` would be
+#       one measurement under a different command's name. What the amend and lease
+#       rows add is about GIT: both spellings still run this hook, and both still
+#       resolve the refspec to HEAD.
+#
+#       THE ACCEPTING ROWS ARE WHAT PINS THIS, not the refusing one. A hook that
+#       grew a rewind guard would satisfy every other row in this file, and it would
+#       block the amend-then-force-push this repository does as ordinary practice —
+#       discovered by a developer rather than here. H12 is that break.
+#
+#       And the rewind IS refused, which scenario 7 cannot say: there the branch is
+#       new on the remote and the fourth field is all zeros. Here the branch exists
+#       and the fourth field is a real sha, which is the only shape in this file
+#       where a reader could expect the hook to consult it.
+newrepo "$scratch/push-force"
+echo "one" >one.txt
+git add one.txt
+git commit -q -m "one"
+echo "two" >two.txt
+git add two.txt
+git commit -q -m "two"
+git init -q --bare "$scratch/remote-force"
+git remote add origin "$scratch/remote-force"
+git push -q --no-verify origin work
+remote_tip="$(git rev-parse HEAD)"
+#       The rewrite: the tip the remote holds is dropped rather than built on.
+git reset -q --hard HEAD~1
+echo "three" >three.txt
+git add three.txt
+git commit -q -m "a rewritten tip"
+#       An ANTI-VACUITY PRECONDITION, and the row this scenario would be worthless
+#       without: `--force` on a push that would fast-forward anyway is accepted for
+#       a reason that has nothing to do with force, and every row below would stay
+#       green. Spelled as a merge base rather than as `! git merge-base
+#       --is-ancestor`, because `assert` runs its argument list as a command and a
+#       leading `!` is a reserved word only when bash PARSES it.
+assert "the force-push is a rewind: the remote's tip is not an ancestor of HEAD" \
+    test "$(git merge-base "$remote_tip" HEAD)" != "$remote_tip"
+fresh
+push --force origin work
+check yes "a force-push of a rewritten history reaches the gate"
+assert "a force-push of a rewritten history is ACCEPTED" test "$pushed_status" -eq 0
+#       An `--amend` and then a force-push, which is this repository's own workflow
+#       and the form a refusal would cost the most.
+echo "more" >>three.txt
+git add three.txt
+git commit -q --amend --no-edit
+fresh
+push --force origin work
+assert "a force-push after --amend is ACCEPTED" test "$pushed_status" -eq 0
+#       `--force-with-lease`, which compares the remote against the tracking ref
+#       instead of overwriting blindly. The row above is what leaves that ref
+#       matching, so the lease holds and the push reaches this hook at all.
+echo "yet more" >>three.txt
+git add three.txt
+git commit -q --amend --no-edit
+fresh
+push --force-with-lease origin work
+assert "a --force-with-lease push is ACCEPTED" test "$pushed_status" -eq 0
+#       A rewind to an OLDER commit, over the branch the remote holds. Git allows it
+#       because it was forced; this hook refuses it because the tree the gate would
+#       build is not the tree the push delivers.
+force_older="$(git rev-parse HEAD~1)"
+fresh
+push --force origin "$force_older:refs/heads/work"
+check no "a force-push REWINDING to an older commit never reaches the gate"
+assert "a force-push of an older commit is REFUSED" test "$pushed_status" -ne 0
+
 # ══ PART THREE — scripts/install-hooks.sh, and WHICH hook file runs ═════════
 #
 # Every scenario above asks what a hook DOES. These ask which file git runs at
@@ -957,9 +1116,11 @@ assert "the tag refusal names an OBJECT rather than a commit" \
 #
 #     scripts/break-hook-record.sh .githooks/pre-push from-literal.txt to-literal.txt
 #
-# **Which records have been through it, named rather than implied: 4, H1, H4 and
-# H11.** Those are the ones this session added or whose row list it changed, and the
-# printed sets matched them exactly — 1, 21, 12 and 1 rows. The rest predate the
+# **Which records have been through it, named rather than implied: 4, H1, H4, H11 and
+# H12.** Those are the ones a session added or whose row list it changed, and the
+# printed sets matched them exactly — 1, 23, 14, 1 and 4 rows. H1's and H4's figures
+# are the re-measured ones: scenario 13 widened both, and the replay is what said by
+# how much rather than a reader deciding it looked unchanged. The rest predate the
 # script and their row lists remain one author's watched run, which is the whole
 # reason the script exists. Replaying them is worth doing and is not done here.
 #

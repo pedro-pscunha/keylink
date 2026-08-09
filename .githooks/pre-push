@@ -203,12 +203,35 @@ fi
 #     a LIGHTWEIGHT tag at HEAD                  ACCEPTED, gate ran
 #     an ANNOTATED tag at HEAD                   REFUSED
 #     an annotated tag at an OLDER commit        REFUSED
+#     git push --force after a rewrite           ACCEPTED, gate ran, the new tip landed
+#     git push --force after --amend             ACCEPTED, gate ran
+#     git push --force-with-lease                ACCEPTED, gate ran
+#     git push --force of an OLDER commit        REFUSED
 #
 # So `git push --all` is not refused as such. It is refused as soon as ANY branch it
 # carries is not at HEAD, and in a repository whose branches all sit at HEAD it goes
 # through the gate and lands. `git push <remote> <branch>` naming a sibling branch is
 # the same story: refused because that branch's tip is not HEAD, not because it was
 # named.
+#
+# **AND `--force` IS NOT A CASE AT ALL, WHICH IS WHAT THE THREE ACCEPTING ROWS ABOVE
+# ARE FOR.** A rewind is a claim about the tip the REMOTE holds, and git puts that tip
+# in the FOURTH field of each update line — which the loop that classifies the updates
+# reads into `_remote_sha` and then never looks at again. The underscore is the
+# convention saying so, and no line of code below that read mentions it.
+#
+# Measured with a hook that only dumps what it was sent, both halves in one run. On a
+# forced update over a branch the remote already held: one update line, and its fourth
+# field was that branch's old sha. On a push CREATING a ref: all zeros there instead,
+# for a new branch and for a new annotated tag alike. So the fourth field is the one
+# place a rewind is visible at all, and reading it is what a hook would have to do to
+# tell the two apart. That is also why the break which consults it reddens the force
+# rows and no others — `scripts/hook-guard.sh`'s H12, replayed.
+#
+# So a history rewrite, a `git commit --amend` and a `--force-with-lease` all arrive
+# here in the ordinary shape, each delivering HEAD, and the gate ran for each. A forced
+# REWIND to an older commit is refused for the one reason everything else here is:
+# what it delivers is not HEAD. Scenario 13 of `scripts/hook-guard.sh` pins all four.
 #
 # **AN ANNOTATED TAG AT THE TIP IS REFUSED, AND THAT IS THE ONE NOBODY PREDICTS.**
 # `git tag -a v1.0 && git push origin v1.0` at the tip delivers neither an older
