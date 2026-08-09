@@ -151,11 +151,41 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 # again where a helper in another file owns a `30` of its own,
 # `keylink/tests/relay.rs`'s `PATIENCE`.
 #
-# **The 5-and-2 figures are the reviewer's measurement and are NOT re-derivable from this
-# file**, because the sweep's own site list is not recorded here. The collision above is,
-# and it is the part that makes the method's claim checkable: a reader can confirm that
-# one number has two owners without needing the sweep. An earlier version of this note
-# gave the count and named no site at all, which left both halves unauditable.
+# **THE FIVE SITES, NAMED, so the verdicts can be argued with.** All in
+# `keylink/src/rpc.rs`. An earlier version of this note gave the count and named no site
+# at all, which made both halves unauditable:
+#
+#   BORROWED     `a_peer_over_the_attach_ceiling_is_held_for_the_default` - the break
+#                replaces the Default, and the test asserts `MAX_ATTACH` by SYMBOL, so
+#                the right-hand side IS the constant.
+#   BORROWED     `a_peer_under_the_attach_ceiling_keeps_its_own_budget` - the break is
+#                `.map(|_| cap)`, so the left-hand side is the default ceiling returned
+#                whole.
+#   CONDITIONAL  `an_attach_ceiling_below_the_peers_request_governs` - the break makes the
+#                cap `MAX_ATTACH`, then the `min` runs against the test's OWN
+#                thirty-second request. Both operands are 30, so the figure is
+#                reproducible from this file alone and rots only if the constant drops
+#                BELOW the request. **Keep it and state that condition**: replacing a
+#                genuinely derivable number is a new false claim in the direction of
+#                tidiness, which is why three cells beat two.
+#   OWNED        `an_attach_ceiling_of_zero_refuses_the_attacher_at_once` - the break
+#                DELETES the clamp, so the hold is the test's own request and `MAX_ATTACH`
+#                never enters the result.
+#   OWNED        a parking test whose budget is its own `Duration::from_secs(30)`.
+#
+# **The fifth is the one entry not named by test, and its identifier did not survive.**
+# It reached this file as two line numbers in `rpc.rs`, and neither resolves to what it
+# described - at `41efc75` those lines are a closing paren and a `Ledger::new`. Two
+# parking tests carry their own `from_secs(30)` and either fits the description:
+# `an_attacher_over_the_cap_is_refused_before_it_parks` and
+# `a_parked_attacher_keeps_its_place_for_the_whole_wait`. **Naming one would be a guess**,
+# so both are named and the ambiguity is recorded - which is this file's own sixth rot
+# mode, arriving in the paragraph that exists to make a claim checkable.
+#
+# **The verdicts ARE corroborated from the tree, by a check independent of the sweep.**
+# The two BORROWED tests carry no literal `Duration::from_secs(30)` at all - their 30 can
+# only come from the constant - while the CONDITIONAL and OWNED ones each carry their own.
+# Presence or absence of the literal agrees with all four named verdicts.
 #
 # The deciding step is **which operand survives the break.** A value that is read,
 # passed on and then clamped against another can be reported by either side, and
