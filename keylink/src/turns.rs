@@ -4396,13 +4396,22 @@ where
         // unreachable from a peer — see the send above. A fifth prefix would be a
         // wire-visible discriminator invented for a case nothing can produce.
         //
-        // The text is `NotQueued::Reentrant`'s and it is byte-identical to
-        // `Undelivered::Reentrant`'s, which this arm read before the two questions
-        // were split: the same fact through a different door is the same sentence,
-        // and a wire string must not move because a local type did.
+        // **The conversion is explicit because this is the only place either local
+        // enum's `Display` becomes bytes a peer reads.** `refused` is a
+        // `NotQueued` since the send-shaped doors were split off, so a bare
+        // `refused.to_string()` here would silently re-point the wire sentence at
+        // whichever type `send` happens to return — a wire-text change made by a
+        // local refactor, which no test in this crate would catch. Rendering
+        // through [`Undelivered`] keeps one source for the sentence: the public
+        // error a peer's local twin would have seen. The two enums carry equal
+        // text today and **no guard asserts that they do**, which is the whole
+        // reason not to lean on it —
+        // `remote::no_other_served_failure_begins_with_one_of_the_four` consumes
+        // this rendering, and it checks the four prefixes rather than the two
+        // types against each other.
         Err(refused @ NotQueued::Reentrant) => {
             return (
-                Outcome::Err(RemoteError::Failed(refused.to_string())),
+                Outcome::Err(RemoteError::Failed(Undelivered::from(refused).to_string())),
                 Body::empty(),
             )
         }
