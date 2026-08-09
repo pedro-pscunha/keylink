@@ -89,7 +89,7 @@ pub enum RemoteError {
     /// told to stop asking and it would be false.
     ///
     /// **On both served paths**, which this sentence could not say for one wave:
-    /// `turns.rs`'s `deliver_to_local` separated the causes and
+    /// `turns.rs`'s `deliver_to_singleton` separated the causes and
     /// `actor/remote.rs`'s `deliver_to_actor` rendered all of them as this
     /// variant, so the paragraph above was a promise a keyed actor did not keep.
     /// The two render through `turns.rs`'s `lost` now, off a verdict each actor's

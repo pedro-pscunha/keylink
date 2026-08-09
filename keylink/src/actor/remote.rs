@@ -457,7 +457,7 @@ pub async fn deliver_to_actor<S: KeyedService>(
     // would return `Chain::Empty` too — the hard-coded value and the live read
     // agree, and the re-entrancy check has nothing to find either way.
     //
-    // `deliver_to_local` passes `current()` at the same point and its comment names
+    // `deliver_to_singleton` passes `current()` at the same point and its comment names
     // the door that would separate the two: a local door delivering a served call
     // **inline** on the caller's task. That door does not exist on either path. If
     // it is ever built for a keyed actor, agreeing-by-accident stops being enough
@@ -527,7 +527,7 @@ pub async fn deliver_to_actor<S: KeyedService>(
     // The cell the route handed back is settled by that actor's own loop before
     // it drops anything, so this read happens-after the verdict for the drop that
     // woke it. What it cannot close is the *late* direction, and
-    // `deliver_to_local` states it in full: an actor that moved on between the
+    // `deliver_to_singleton` states it in full: an actor that moved on between the
     // death and this read is described as it is now rather than as it was.
     answer
         .await
@@ -747,7 +747,7 @@ mod tests {
     ///
     /// **The fourth is built in `turns.rs`, and being the exception is why this
     /// list missed it** while the doc above claimed *every* other served `Failed`:
-    /// `deliver_to_local`'s re-entrancy arm renders a local error onto the wire,
+    /// `deliver_to_singleton`'s re-entrancy arm renders a local error onto the wire,
     /// which no other line in this file does. It went uncovered for as long as the
     /// prose said it was covered. Each is a whole **sentence**
     /// rather than a prefix, which is exactly why nothing has ever collided and
@@ -788,7 +788,7 @@ mod tests {
             // `console.rs`'s follow refusal, both arms.
             crate::FollowRefused::Ahead { after: 9, seq: 4 }.to_string(),
             crate::FollowRefused::Crowded { parked: 64 }.to_string(),
-            // `deliver_to_local`'s re-entrancy arm, and the only one of these the
+            // `deliver_to_singleton`'s re-entrancy arm, and the only one of these the
             // doc above ever missed. It is rendered through `Unanswered` at that
             // site rather than through the `NotQueued` the send returns, so this
             // names the same type the wire does — a guard reading the other one

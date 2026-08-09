@@ -618,7 +618,7 @@ async fn a_deferred_sent_from_another_task_is_not_gated_by_the_turn_that_spawned
 /// The actor exists, was reached, and ran the turn; a served reply that died
 /// unanswered was reported to the peer as though the service had never been mounted.
 /// The test went red either way — the finding was about what an operator reads.
-/// **Fixed:** `deliver_to_local` now splits the dead-channel arm three ways, and the
+/// **Fixed:** `deliver_to_singleton` now splits the dead-channel arm three ways, and the
 /// same break watched under it printed `Remote(Failed("dropped: the reply was taken
 /// out of the turn and never answered"))`. **That is a transcript and not the
 /// current text.** `lost`'s `Standing::Running` arm has been rewritten since — its
@@ -907,7 +907,7 @@ async fn keyed(nodes: &[keylink::Node; 2]) -> (orders::System, orders::KeyedClie
 /// answers the very next call on the same connection.
 ///
 /// The twin of `a_local_caller_and_a_peer_agree_about_an_abandoned_deferred` one path over,
-/// and the pair is the point: `deliver_to_local` and `deliver_to_actor` render
+/// and the pair is the point: `deliver_to_singleton` and `deliver_to_actor` render
 /// through one function now, so a condition cannot be answered two ways.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/actor/remote.rs` on the arm
@@ -1166,7 +1166,7 @@ async fn a_peer_whose_parked_reply_is_drained_is_not_told_its_call_timed_out() {
 ///
 /// `a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_actor`
 /// is a **local** call: it asserts `is_err()` on a `Unanswered` and never
-/// reaches `deliver_to_local`, so nothing anywhere asserted what a *peer* reads
+/// reaches `deliver_to_singleton`, so nothing anywhere asserted what a *peer* reads
 /// for this. The arm's own comment concedes the case — "a handler that panics
 /// after taking `reply.later()` arrives here too" — and the sentence it rendered
 /// said "the reply was taken out of the turn and never answered", which names the

@@ -521,7 +521,7 @@ impl Queueing {
 ///
 /// **Both paths now make each check in one place, and neither writes it.** The
 /// permit-side bound is in `deliver_to_actor` for a keyed actor and in
-/// `deliver_to_local` for a singleton; the turn-side one is in `keylink::turn`,
+/// `deliver_to_singleton` for a singleton; the turn-side one is in `keylink::turn`,
 /// which every generated mailbox arm calls and which reads
 /// [`Queueing::expired`](Queueing::expired) off the origin the message arrived
 /// with.

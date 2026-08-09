@@ -1544,7 +1544,7 @@ macro_rules! __keylink_service {
             /// nothing outside `mount`'s closure could see. It does not live there
             /// now: each actor's loop settles a verdict into a cell the registry
             /// made, next to the one `System::status` already reads, and
-            /// `deliver_to_actor` and `deliver_to_local` render it through one
+            /// `deliver_to_actor` and `deliver_to_singleton` render it through one
             /// function. Nothing about this signature, `mount`, `Mounted` or the
             /// registry's API changed for it.
             ///
@@ -2047,7 +2047,7 @@ macro_rules! __keylink_service {
                 /// allocates no channel.
                 ///
                 /// So a served actor has no mailbox of its own:
-                /// [`deliver_to_local`](keylink::deliver_to_local) pushes into
+                /// [`deliver_to_singleton`](keylink::deliver_to_singleton) pushes into
                 /// the same `LocalActor` channel this handle's own methods push
                 /// into. **No type represents a served actor**, which is the
                 /// check on everything above — there is nothing for a third row
@@ -2154,7 +2154,7 @@ macro_rules! __keylink_service {
                                 // clones of `Progress` for three facts, the
                                 // queue deadline, the five-arm match that turned
                                 // a `Queued`/`TurnLost` back into an `Outcome` —
-                                // lives in `deliver_to_local` now, beside the
+                                // lives in `deliver_to_singleton` now, beside the
                                 // keyed twin it kept disagreeing with. What is
                                 // left here is the one thing only generated code
                                 // can do: name the variant.
@@ -2165,7 +2165,7 @@ macro_rules! __keylink_service {
                                 // origin around a `Context` it already
                                 // delivered — so it is handed IN to this
                                 // closure rather than written here.
-                                $crate::deliver_to_local(
+                                $crate::deliver_to_singleton(
                                     &actor,
                                     cx,
                                     stringify!($svc),

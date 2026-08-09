@@ -1840,7 +1840,7 @@ trait Inbox<A, M>: Send {
     ///
     /// That window is instructions wide and has no await in it, which is why it is
     /// invisible on a current-thread runtime and why the served answer is **not**
-    /// built on it: `deliver_to_local` reads the verdict, not the mailbox. This
+    /// built on it: `deliver_to_singleton` reads the verdict, not the mailbox. This
     /// repairs the public method rather than the wire answer, and the two are
     /// deliberately separate — one fact, two consequences, decided at one place.
     fn close(&mut self);
@@ -2237,7 +2237,7 @@ where
     // queued behind this turn, the state that takes its parked replies with it —
     // happens after it in this task's program order, so a reader woken by one of
     // those deaths has a happens-before edge to this store through the reply
-    // channel it was waiting on. `deliver_to_local` and `deliver_to_actor` both
+    // channel it was waiting on. `deliver_to_singleton` and `deliver_to_actor` both
     // read the result and cannot be early.
     //
     // Disarmed first, because from here the loop has an answer of its own and a
@@ -2496,7 +2496,7 @@ pub type Incarnation<A, F> = (A, Vec<Box<dyn Observer<A>>>, F);
 ///
 /// **It also replaced a third state on that channel, rather than adding a
 /// mechanism.** Wave 9 gave it a `Life::Restarting(Ended)` arm so that
-/// `deliver_to_local` and `supervise` could both read a restart off it. Neither
+/// `deliver_to_singleton` and `supervise` could both read a restart off it. Neither
 /// does now — the first reads this, and the second reads this too — so the arm
 /// went, the channel is back to `Option<Ended>` at eight bytes less per local
 /// actor, and `run_keyed_supervised`'s `watch` channel *with no reader at all* is
@@ -2583,7 +2583,7 @@ pub(crate) struct Fate(Arc<Mutex<Standing>>);
 /// actor is serving*, about an actor that would never answer again.
 ///
 /// It was a **regression** against the shape this design replaced, which is why
-/// it is a floor here and not a filed defect. `deliver_to_local` used to read
+/// it is a floor here and not a filed defect. `deliver_to_singleton` used to read
 /// `is_running()` beside the verdict; an unwind drops the `mpsc::Receiver`, and
 /// `Receiver::drop` closes the channel *before* it drains, so `is_closed()` was
 /// already true when the queued message's reply died. Deleting the cross-check
@@ -3111,7 +3111,7 @@ where
 /// `#[must_use]` asks for — reads `Failed("dropped: ..")`, and an actor that has
 /// genuinely ended, or was aborted or evicted, still reads `NoSuchActor`. So a
 /// plain unsupervised keyed actor no longer says *there is nothing here* about a
-/// reply it dropped while running. `deliver_to_actor` and `deliver_to_local`
+/// reply it dropped while running. `deliver_to_actor` and `deliver_to_singleton`
 /// render all three through one function, [`lost`], so the two paths cannot say
 /// different things about one condition.
 ///
@@ -3430,7 +3430,7 @@ pub enum NotQueued {
 ///
 /// `impl From` rather than a named method so that `?` performs it, which puts the
 /// widening at the call site and leaves nothing to forget. Both callers today are
-/// in this file — `read`'s `?`, and [`deliver_to_local`]'s explicit conversion,
+/// in this file — `read`'s `?`, and [`deliver_to_singleton`]'s explicit conversion,
 /// which uses it to decide *which type* renders onto the wire rather than to
 /// propagate.
 ///
@@ -3505,7 +3505,7 @@ pub struct LocalActor<A, M> {
     /// below now, which is settled early enough to be right; see [`Standing`].
     ended: watch::Receiver<Option<Ended>>,
     /// What a caller whose reply just died is told — a peer through
-    /// [`deliver_to_local`], and a local one through [`answered`](Self::answered).
+    /// [`deliver_to_singleton`], and a local one through [`answered`](Self::answered).
     /// **Both, and that is the point**: one cell answers one question, so the two
     /// doors cannot say different things about one dead reply. The keyed twin
     /// lives beside the registry entry; here the handle carries it, because a
@@ -3992,7 +3992,7 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     /// compile error here rather than an arm quietly folded into `Gone`, which is
     /// exactly how a dropped reply came to be reported as a gone actor.
     ///
-    /// The window this cannot close is the one [`deliver_to_local`] states, and it
+    /// The window this cannot close is the one [`deliver_to_singleton`] states, and it
     /// is the same window for the same reason — the read is after the death, so an
     /// actor that moved on between the two reads as where it is now.
     async fn answered<T>(
@@ -4419,7 +4419,7 @@ impl<A, M> LocalActor<A, M> {
     /// # The re-entrancy check is here because this is that one place
     ///
     /// Five non-test callers reach it — `answered` (serving both asks), `notify`,
-    /// `read`, `stop` and [`deliver_to_local`] — and there is no sixth door. Which
+    /// `read`, `stop` and [`deliver_to_singleton`] — and there is no sixth door. Which
     /// half of the rule applies is [`Refuse`]'s parameter, because the message
     /// alone cannot say.
     ///
@@ -4520,7 +4520,7 @@ const DROPPED: &str = Failure::DROPPED;
 /// the turn it just watched", and panic text is usually caller-derived.
 ///
 /// There are two more now — [`RESTARTING`] and [`DROPPED`], both built in
-/// [`deliver_to_local`] on the arm that answers a reply channel that died
+/// [`deliver_to_singleton`] on the arm that answers a reply channel that died
 /// without sending, and a fifth — [`OBSERVER_PANICKED`] — for the observer that
 /// fell over rather than deciding anything, which this function rendered as
 /// [`REFUSED`] until it had a prefix of its own. The five are declared together
@@ -4607,7 +4607,7 @@ pub(crate) fn rendered<Resp>(
 /// A live actor that dropped a reply and then ended reads `Gone`, and *stop
 /// asking* is the right instruction for it. A restart whose next incarnation is
 /// already running reads `Running`, and *the actor is there* is the right one for
-/// that. [`deliver_to_local`] and `deliver_to_actor` both state the window they
+/// that. [`deliver_to_singleton`] and `deliver_to_actor` both state the window they
 /// cannot close; neither of them can produce a sentence that is false at the
 /// moment it is written.
 ///
@@ -4677,7 +4677,7 @@ pub(crate) fn lost(standing: Standing, id: &str) -> RemoteError {
 /// listening or not, so a caller that gives up is giving up on work that
 /// happened. RFC-04 §16.12.
 #[doc(hidden)]
-pub async fn deliver_to_local<A, M, Resp>(
+pub async fn deliver_to_singleton<A, M, Resp>(
     actor: &LocalActor<A, M>,
     cx: Context,
     service: &'static str,
@@ -4767,7 +4767,7 @@ where
         // against that string. It never calls this function and never
         // reads which type renders here, so reverting this line to
         // `refused.to_string()` leaves it green. Nothing else calls
-        // `deliver_to_local` and reads its refusal bytes either. A guard would have
+        // `deliver_to_singleton` and reads its refusal bytes either. A guard would have
         // to be **built** rather than watched, because the paragraph above argues a
         // peer cannot produce a re-entrant call in the first place.
         Err(refused @ NotQueued::Reentrant) => {
