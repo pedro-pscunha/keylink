@@ -334,19 +334,7 @@ when a change rests on a judgement somebody will question in six months.
 Do not edit an RFC so that it matches new code. Append to it. The value of the
 record is that it shows what was believed at the time.
 
-**One exception, and the line runs between a pointer and a claim.** Some RFC
-sections carry operational tables — *run this break against this guard*. A row in
-one of those may be updated so that it still resolves: a renamed test, a moved
-path, a script that is now spelled differently. A pointer at something that no
-longer exists preserves no belief, it just rots, and the cost is measured rather
-than argued — `scripts/replay-fate-breaks.sh` had a stanza naming a test that
-existed nowhere, `cargo test` printed `0 passed; N filtered out` and **exited 0**,
-and that read as *the break was not reproduced*: the same report a genuinely
-rotted anchor gives, from the opposite cause.
-
-What may not change is what the row **claims**. Adding a second break, widening a
-condition, altering a watched sentence, or extending a cell to cover something the
-wave did not build all insert knowledge the record did not have, and that is the
-thing this rule exists to stop. The test is one question: after the edit, does the
-row assert anything it did not assert before? If yes, it belongs in an appended
-section that says which wave learned it — not in the row.
+One carve-out: an identifier in an operational table — the test a break record
+names — may be renamed in place to keep the row runnable, because that changes a
+pointer and not a claim. Anything the row *asserts* is still appended, never
+edited in.
