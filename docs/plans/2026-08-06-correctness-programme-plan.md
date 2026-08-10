@@ -1,5 +1,11 @@
 # Plan: keylink correctness programme
 
+> **Current testing note (2026-08-10):** Any ALPN literal-pin step below is
+> historical and is superseded by `CONTRIBUTING.md`'s **The wire contract**.
+> The literal-pin tests are ignored until keylink has a stable version. Do not
+> run or update them, and do not order work around them. The active contract
+> property tests remain in the gate.
+
 Executes `docs/goals/2026-08-06-correctness-programme.md`. One integration branch
 `correctness-programme`, atomic commits, one PR to `main`.
 

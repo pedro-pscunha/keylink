@@ -1,5 +1,11 @@
 # Wave 4 — a factory over N handles, and the bookkeeping keylink already owns
 
+> **Current testing note (2026-08-10):** Any ALPN literal-pin step below is
+> historical and is superseded by `CONTRIBUTING.md`'s **The wire contract**.
+> The literal-pin tests are ignored until keylink has a stable version. Do not
+> run or update them, and do not order work around them. The active contract
+> property tests remain in the gate.
+
 Rebuild of the keylink × ractor proposal, Rev. A (2026-08-08, written against
 `main @ 99ce53f`). Re-derived in full against `d54f302`.
 
@@ -511,7 +517,7 @@ impl Permit<'_, Warehouse> {
 `rustc` on 2026-08-10: on an inherent impl it warns *"`#[must_use]` attribute
 cannot be used on inherent impl blocks"* under `unused_attributes`, which is on
 by default. Both clippy steps pass `-D warnings` — `lint-fast` at
-`mise.toml:258`, which the commit hook runs, and `lint` at `mise.toml:275-276` —
+`lint-fast`, which the commit hook runs, and the full `lint` task —
 so an earlier draft of this block, which put the attribute on the impl, would
 have reddened the gate at the first commit.
 
@@ -743,7 +749,7 @@ and no hand-run gate.
 | `ByKey` fails fast over a dead member, and never hangs | `a_dead_members_keys_answer_closed_and_do_not_hang` — **does not exist; commit 4 writes it.** Stop one member, dispatch a key that hashes to it, assert `Err(NotQueued::Closed)` inside a deadline. §9 records the cost this cannot remove. |
 | `RemoteError` gained exactly one variant | `awk 'NR>=74 && /^}/{exit} NR>74 && /^    [A-Z][A-Za-z]+/{n++} END{print n}' keylink/src/reply.rs` → `10` today, `11` after. **The second `NR>74` is load-bearing**: without it the counting rule is unguarded and also counts the derive list at `reply.rs:71`, which prints `11` today and reads as a pass. |
 | `Routing` has four variants and no boolean | `test -f keylink/src/compose/factory.rs && ! rg -q 'bool' keylink/src/compose/factory.rs`. **The bare `rg -n 'bool' <path>` exits 2 with empty stdout on a file that does not exist yet**, which reads as "names none". The `test -f` is what makes the row fail correctly before commit 3. §3.1's enum makes the boolean unrepresentable by construction, so this row is a second opinion and not the argument. |
-| Nothing regressed | `mise run gate` — **18 steps**, counted by `awk '/^\[tasks.gate\]/,/^\]/' mise.toml \| grep -c '{ task ='`. |
+| Nothing regressed | `mise run gate` — every declared step in `[tasks.gate]` prints and exits green. |
 | The new break records actually replay | **`scripts/replay-fate-breaks.sh`, by hand, on a clean worktree.** No gate step replays a record. |
 
 ---
@@ -802,7 +808,7 @@ which is already stale at `d54f302` and is not this proposal's to fix.
    target.
 
 wasm: `mod compose` is unconditional, and nothing in this proposal reaches a
-clock, `tokio::select!` or `std::time::Instant`. Four of the eighteen gate steps
+clock, `tokio::select!` or `std::time::Instant`. Four gate steps
 are wasm, so a red one there reads as a link problem rather than a design one.
 
 ---

@@ -284,8 +284,8 @@ description = "Every test once, with native integration suites sharing one proce
 # modules in one libtest process. Four suites stay separate because they use a
 # process-wide measurement, nested Cargo, or scheduling-sensitive handshake
 # evidence. The manifest marks the aggregate `test = false`, so an ordinary
-# `cargo test` does not run everything twice. Its inventory test fails if a new
-# native test file is omitted.
+# `cargo test` does not run everything twice. Its inventory test fails if a test
+# file is omitted or an isolated suite loses its exact native/browser selector.
 #
 # Unit tests and keylink's native integrations share one workspace feature
 # resolution. A wildcard second selection picks up every integration target in

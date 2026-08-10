@@ -1,5 +1,11 @@
 # Wave 1 — one failure vocabulary, both sides
 
+> **Current testing note (2026-08-10):** Any ALPN literal-pin step below is
+> historical and is superseded by `CONTRIBUTING.md`'s **The wire contract**.
+> The literal-pin tests are ignored until keylink has a stable version. Do not
+> run or update them, and do not order work around them. The active contract
+> property tests remain in the gate.
+
 Plan for `docs/goals/2026-08-09-one-failure-vocabulary.md`, **revision 4**,
 written against `unify-surfaces` at `b1f4422` and revised through `fd4cd3d`.
 
@@ -283,7 +289,7 @@ sealed, `EndReason` is not, and neither changed.
 2026-08-09 against `main` at `0119504`" — and its citations are correct at that
 commit. Editing it would destroy the thing that makes it checkable.
 
-`lint-fast` is `cargo clippy -p keylink --lib` (`mise.toml:258`) — **library
+`lint-fast` is `cargo clippy -p keylink --lib` — **library
 target only**. A green `pre-commit` is NOT proof a commit compiles. Every commit
 below must be verified with `cargo check --workspace --all-targets` **and**
 `mise run docs` before it lands.
@@ -381,7 +387,7 @@ failing run, never compute it.**
 | `Gone` crosses as a typed variant | after the wave **five** conditions are both-sided, not four. The equality test must assert `Gone` too, and it is the newest one |
 | `Failed` has no in-crate producer | `rg 'RemoteError::Failed\(\|Self::Failed\(' keylink/src` returns only the carved-out `turns.rs:4775` and any break-record doc line. **There is no `Middleware` producer to expect** — it lives in user code (`rpc.rs:1438`) |
 | The hash moved once | both pins updated in commit 5 from one failing run, release note written naming **both** tests — `CONTRIBUTING.md:197-210` names only the first |
-| Nothing regressed | `mise run gate` (18 steps), `mise run test`, `mise run anchors`, `mise run replay-anchors`, `mise run docs` under `-D warnings` |
+| Nothing regressed | `mise run gate` (every declared step), `mise run test`, `mise run anchors`, `mise run replay-anchors`, `mise run docs` under `-D warnings` |
 
 **Already discharged at `b1f4422`:** the audit is tracked under
 `docs/audits/2026-08-09-local-vs-remote/` (7 files). Do not re-do it.
@@ -581,7 +587,7 @@ local-fidelity loss per §2.5.
 
 ## 10. wasm
 
-Four of the eighteen gate steps are `wasm`, `wasm-guards`, `wasm-web`,
+Four gate steps are `wasm`, `wasm-guards`, `wasm-web`,
 `wasm-browser`. The dimension that matters is **`--no-default-features`
 compilation of `keylink` AND `keylink-persist`**. `mod console` (`lib.rs:212`)
 and `mod observe` (`lib.rs:219`) are unconditional, so the `EndReason` move stays

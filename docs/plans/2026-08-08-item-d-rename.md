@@ -93,7 +93,7 @@ keylink/src/macros.rs:907: /// Every arm is [`turn`](keylink::turn) or its defer
 keylink/src/macros.rs:3100:/// Every arm is one call to [`turn`](crate::turn) or [`turn_deferred`](crate::turn_deferred)
 ```
 
-`mise.toml:475` runs rustdoc as:
+`[tasks.docs]` runs rustdoc as:
 
 ```
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --all-features -p keylink -p keylink-persist -p demo

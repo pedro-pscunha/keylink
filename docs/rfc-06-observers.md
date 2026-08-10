@@ -1356,3 +1356,11 @@ isolated.
 The invariant in this RFC is unchanged: the canonical task still selects the
 whole workspace. The implementation is now plain Cargo, and nextest is no longer
 a repository tool.
+
+### Appendix, 2026-08-10: isolated selectors now fail closed
+
+The aggregate inventory now checks more than file membership. It reads the
+repository task definitions and requires every isolated native suite as an exact
+`--test` selector in `[tasks.test]`. It also requires the browser-only suite as an
+exact selector in `.mise/tasks/wasm-browser`. A file cannot be moved out of the
+aggregate and then silently disappear from the gate.
