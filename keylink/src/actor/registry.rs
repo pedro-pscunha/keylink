@@ -65,7 +65,7 @@ use n0_future::time::Instant;
 use tokio::sync::mpsc;
 
 use crate::turns::{Fate, Standing};
-use crate::{ActorId, Ended};
+use crate::{ActorId, Ended, Serving};
 
 /// Messages that may wait ahead of the one being handled, when nobody says.
 ///
@@ -608,6 +608,40 @@ struct Entry<M> {
     fate: Fate,
 }
 
+impl<M> Entry<M> {
+    /// The two facts this entry can state about a turn, folded once.
+    ///
+    /// One body rather than two because [`ActorStatus`] and [`Serving`] both
+    /// carry this pair, and two computations of one pair is exactly the drift
+    /// [`Serving`] exists to make impossible: [`System::status`]'s row for an
+    /// actor and [`System::serving`]'s answer about the same actor read the same
+    /// lines, so they cannot disagree.
+    ///
+    /// Takes no lock and touches no clock, so a caller already holding the read
+    /// guard can call it per entry, and asking does **not** reset
+    /// [`ActorStatus::idle_for`] — a diagnostic that kept an actor alive against
+    /// [`Eviction::Idle`] would be a policy, not a reading.
+    fn serving(&self) -> Serving {
+        Serving {
+            busy: self.busy.running(),
+            // `saturating_sub` cannot fire: permits outstanding are bounded
+            // by the buffer they came from. It is written this way because a
+            // diagnostic must not be the thing that panics, and because the
+            // alternative is an `expect` on a path with nothing to say.
+            // `try_from` and not `as`, the same call `now()` makes: the
+            // widening cannot fail on any target keylink builds for, and a
+            // diagnostic must not be the thing that panics if one ever
+            // appears.
+            buffered: u64::try_from(
+                self.mail
+                    .max_capacity()
+                    .saturating_sub(self.mail.capacity()),
+            )
+            .unwrap_or(u64::MAX),
+        }
+    }
+}
+
 /// Where a message goes, and what its caller is told if the answer never comes.
 ///
 /// [`Registry::route`]'s answer, and a struct rather than the bare sender it used
@@ -841,27 +875,18 @@ impl<M> Registry<M> {
         let now = self.now();
         self.read()
             .iter()
-            .map(|(id, entry)| ActorStatus {
-                id: id.clone(),
-                idle_for: Duration::from_millis(
-                    now.saturating_sub(entry.last_seen.load(Ordering::Relaxed)),
-                ),
-                busy: entry.busy.running(),
-                // `saturating_sub` cannot fire: permits outstanding are bounded
-                // by the buffer they came from. It is written this way because a
-                // diagnostic must not be the thing that panics, and because the
-                // alternative is an `expect` on a path with nothing to say.
-                // `try_from` and not `as`, the same call `now()` makes: the
-                // widening cannot fail on any target keylink builds for, and a
-                // diagnostic must not be the thing that panics if one ever
-                // appears.
-                buffered: u64::try_from(
-                    entry
-                        .mail
-                        .max_capacity()
-                        .saturating_sub(entry.mail.capacity()),
-                )
-                .unwrap_or(u64::MAX),
+            .map(|(id, entry)| {
+                // The two turn facts come from `Entry::serving`, so this row and
+                // the `Serving` a peer reads for the same actor cannot disagree.
+                let Serving { busy, buffered } = entry.serving();
+                ActorStatus {
+                    id: id.clone(),
+                    idle_for: Duration::from_millis(
+                        now.saturating_sub(entry.last_seen.load(Ordering::Relaxed)),
+                    ),
+                    busy,
+                    buffered,
+                }
             })
             .collect()
     }
@@ -1768,6 +1793,39 @@ impl<M> System<M> {
     #[must_use]
     pub fn status(&self) -> Vec<ActorStatus> {
         self.inner.status()
+    }
+
+    /// What the actor under `id` is doing, as of now.
+    ///
+    /// The two turn facts [`Self::status`] reports, for one actor instead of
+    /// every actor, and read from the same lines — so a row of that list and this
+    /// answer for the same id cannot disagree. [`Serving`] carries what the pair
+    /// does and does not claim, and the singleton twin is
+    /// [`LocalActor::serving`](crate::LocalActor::serving).
+    ///
+    /// # `None` is the liveness answer, and it is exact here
+    ///
+    /// Nothing is mounted under that id. **This is a non-inserting reader, and
+    /// that is the whole point of it not going through routing.** Routing takes
+    /// the write lock and inserts from the factory a system was built with, so on
+    /// a [`SystemBuilder::spawn_with`] system a status question asked that way
+    /// would *create* the actor it was asked about. This takes the read lock the
+    /// way [`Self::contains`] does and answers about what is already there:
+    /// asking what an actor is doing must not be how one comes into existence.
+    ///
+    /// It does not move [`ActorStatus::idle_for`] either, so watching an actor
+    /// does not stop [`Eviction::Idle`] sweeping it.
+    ///
+    /// # Evidence, never a precondition
+    ///
+    /// [`Self::status`]'s own warning applies unchanged to one row of it: the
+    /// actor can be evicted, stopped or spawned between this answer and the next
+    /// line, with no message and no error in between. Address it and handle
+    /// [`RemoteError::NoSuchActor`](crate::RemoteError::NoSuchActor); do not read
+    /// `Some` here and act as though the actor is still there.
+    #[must_use]
+    pub fn serving(&self, id: &ActorId) -> Option<Serving> {
+        self.inner.read().get(id).map(Entry::serving)
     }
 
     /// [`Self::status`], read through a handle that does **not** keep this

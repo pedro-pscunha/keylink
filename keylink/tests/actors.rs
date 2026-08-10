@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use keylink::{
     ActorId, Addressed, Allowlist, Body, BodyReader, Context, Ended, Error, Eviction,
     IdempotencyKey, IdempotencyRefusal, Middleware, MountError, Next, Node, Outcome, QueueTimeout,
-    RemoteError, RpcClient, Server, Timeout, Withheld,
+    RemoteError, RpcClient, Server, Serving, Timeout, Withheld,
 };
 // The port and its file adapter, for the one thing a counter cannot show: what a
 // detached actor is still HOLDING. `Claim` is deliberately not in scope — nothing
@@ -2850,6 +2850,335 @@ async fn busy_is_true_during_a_feed_turn() {
 
     fixture.ticked.add_permits(1);
     until_idle(&fixture.system).await;
+}
+
+// ────────────────────────────────────── what a PEER may learn about that turn
+
+/// How long a call that should answer at once is given before it is called stuck.
+///
+/// Three orders of magnitude out, and nothing here asserts elapsed time: its
+/// expiry means a `__status` is waiting on something, which is the whole defect
+/// this section exists to catch. A bare `await` would express the same guard by
+/// hanging, and a guard that fails by hanging says nothing about what happened.
+const NOT_STUCK: Duration = Duration::from_secs(30);
+
+/// **A wedged actor answers `__status` to a peer, during the turn that wedged
+/// it.**
+///
+/// The wave's central claim, on the keyed door — its singleton twin is
+/// `a_wedged_singleton_answers_status_to_its_handle_and_to_a_peer`, and between
+/// them they are the only tests in the tree that can fail if `__status` ever
+/// becomes a message. `macros.rs` states the constraint on
+/// `Handle::is_busy`: this is the question you cannot ask the actor, because a
+/// message asking it queues behind the turn you are asking about. So the answer
+/// is produced inside the `Dispatch` closure, above `deliver_to_actor`, and
+/// nothing enters the mailbox.
+///
+/// **The ordering is the proof, and it is not a clock.** `hold`'s handler is
+/// parked on a semaphore with no permits, so its turn cannot end until this test
+/// adds one — and the permit is added strictly *after* the peer's `__status` has
+/// answered. There is no arrangement of events in which that answer was produced
+/// after the turn finished.
+///
+/// **The mailbox is FULL while the question is asked**, which is the second half
+/// and the reason for the queued `touch`: at depth one, `buffered == 1` means
+/// there is no slot left. A `__status` delivered as a message could not even be
+/// accepted, let alone answered — and `buffered` reading `1` rather than `2` is
+/// the same fact from the other side, since a status that took a slot would count
+/// itself.
+///
+/// A whole-call `Timeout` rather than the fixture's default `QueueTimeout`,
+/// following `a_saturated_mailbox_at_depth_does_not_starve_a_feed`: a message is
+/// meant to sit in this mailbox for as long as the test needs, and a queue budget
+/// would refuse it for doing exactly that. Nothing here is timed.
+///
+/// Made red by `scripts/break-once.sh keylink/src/macros.rs`, replacing the keyed
+/// closure's interception test —
+/// `let __answer = if ::core::matches!(
+/// request.message(),
+/// Request::__Status { .. }
+/// ) {` — with `let __answer = if false {`, so `__Status` falls through to
+/// `deliver_to_actor` like any other message. Watched:
+/// `a `__status` that enqueued would wait behind the wedged turn, and this one
+/// did: Elapsed(())`. Registered as `S1`.
+#[tokio::test]
+async fn a_wedged_actor_answers_status_during_its_turn() {
+    let mut fixture = gated_behind(Timeout::after(Duration::from_secs(60))).await;
+    let client = &fixture.client;
+    let release = &fixture.release;
+    let system = &fixture.system;
+    let entered = &mut fixture.entered;
+
+    let holding = async { gate::at(client, id("gate")).hold().await };
+    let queued = async { gate::at(client, id("gate")).touch().await };
+    let asking = async {
+        entered.recv().await.expect("`hold` enters its turn");
+        // The mailbox is full before the question is asked, so the answer below
+        // cannot have come through it.
+        let held = until_buffered(system, 1).await;
+        assert!(held.busy, "the turn holding the actor is still running");
+
+        let serving = tokio::time::timeout(NOT_STUCK, gate::at(client, id("gate")).__status())
+            .await
+            .expect(
+                "a `__status` that enqueued would wait behind the wedged turn, and this one did",
+            )
+            .expect("a wedged actor still answers the question it cannot be asked");
+
+        assert!(
+            serving.busy,
+            "the actor is inside `hold` and the answer says so"
+        );
+        assert_eq!(
+            serving.buffered, 1,
+            "the queued `touch` and nothing else: a `__status` that took a mailbox \
+             slot would have counted itself here"
+        );
+
+        // Only now. Every line above ran while the turn was parked on this
+        // semaphore, which is what "during its turn" means.
+        release.add_permits(1);
+        serving
+    };
+
+    let (answered, touched, serving) = tokio::join!(holding, queued, asking);
+    answered.expect("the held call answers");
+    touched.expect("the queued call answers");
+
+    // And the reading was about the actor rather than about the asking: once the
+    // turn is over the same question answers the opposite way.
+    until_idle(system).await;
+    let after = gate::at(client, id("gate"))
+        .__status()
+        .await
+        .expect("an idle actor answers too");
+    assert_eq!(
+        after,
+        Serving {
+            busy: false,
+            buffered: 0
+        },
+        "a `__status` reporting the state of asking would read `busy: true` here \
+         as well, because it would itself be the turn"
+    );
+    assert_ne!(
+        serving, after,
+        "the two readings are of one actor in two states, so a constant answer \
+         passes neither"
+    );
+}
+
+/// **A local caller and a peer read the same `Serving` for one keyed actor.**
+///
+/// Two doors, one value, asserted by equality rather than field by field. The
+/// callers are named because §5 of the plan names the wrong one: on the keyed
+/// path the local door is **`System::serving`** and not a `Handle` — a keyed
+/// actor has no handle, the registry owns its mailbox, and `System::serving` is
+/// the reader `Registry::status` shares its body with. The peer's door is
+/// **`gate::at(..).__status()`**, over a real QUIC connection to another node.
+///
+/// Asserted in **both** states, because a constant satisfies one of them. Idle
+/// is the cheap half; wedged is the half that matters, and it is deterministic
+/// for `a_wedged_actor_answers_status_during_its_turn`'s reason — the handler is
+/// parked on a semaphore, so `busy` cannot change under either reading.
+///
+/// **Keyed on both sides on purpose.** A keyed mailbox carries only the service's
+/// own messages while a `LocalActor`'s channel also carries a `read` and the stop
+/// request, so `buffered` compares as a predicate across the two kinds and never
+/// as a count. Comparing a keyed `Serving` against a singleton one by value would
+/// assert something this crate does not claim.
+///
+/// Made red by `scripts/break-once.sh keylink/src/actor/remote.rs`, replacing
+/// `serving_of_actor`'s `.serving(actor)` with
+/// `.serving(actor).map(|_| Serving { busy: false, buffered: 0 })`, so the peer's
+/// answer stops coming from the registry. Watched:
+/// `assertion `left == right` failed: one actor, one instant, two doors`,
+/// `left: Serving { busy: true, buffered: 0 }` and
+/// `right: Serving { busy: false, buffered: 0 }`. Registered as `S2`.
+#[tokio::test]
+async fn a_local_caller_and_a_peer_read_the_same_serving() {
+    let mut fixture = start_gated().await;
+    let client = &fixture.client;
+    let release = &fixture.release;
+    let system = &fixture.system;
+    let entered = &mut fixture.entered;
+    let who = id("gate");
+
+    let idle_here = system.serving(&who).expect("the actor is mounted");
+    let idle_there = gate::at(client, who.clone())
+        .__status()
+        .await
+        .expect("the peer's question is answered");
+    assert_eq!(
+        idle_here, idle_there,
+        "one actor, one instant, two doors — at rest"
+    );
+    assert_eq!(
+        idle_here,
+        Serving {
+            busy: false,
+            buffered: 0
+        },
+        "and nothing has been called yet"
+    );
+
+    let holding = async { gate::at(client, who.clone()).hold().await };
+    let comparing = async {
+        entered.recv().await.expect("`hold` enters its turn");
+        let there = tokio::time::timeout(NOT_STUCK, gate::at(client, who.clone()).__status())
+            .await
+            .expect("a wedged actor answers its peer")
+            .expect("the peer's question is answered");
+        // Read second and while the same turn is still parked, so the two
+        // readings are of one state rather than of two.
+        let here = system.serving(&who).expect("the actor is still mounted");
+        release.add_permits(1);
+        (here, there)
+    };
+
+    let (answered, (here, there)) = tokio::join!(holding, comparing);
+    answered.expect("the held call answers");
+
+    assert_eq!(here, there, "one actor, one instant, two doors");
+    assert!(
+        here.busy,
+        "and the state they agree on is the one the test arranged"
+    );
+}
+
+/// **A wedged singleton answers `__status` to its own `Handle` and to a peer,
+/// with the same value.**
+///
+/// The second of the two doors that answer with a `Serving`: `keyed_service`'s
+/// closure answers above `deliver_to_actor` and this one answers above
+/// `deliver_to_singleton`. A test of one says nothing about the other, and the
+/// arms are separate code. The concurrent `service<H: Handler>` door answers
+/// `__Status` inside its `Dispatch` too and is the third such closure — it
+/// refuses with `NotAnActor` rather than folding a `Serving`, and `S4` guards it.
+/// This is also the only place `Handle::__status` — the synchronous local door,
+/// which sends nothing at all — is read.
+///
+/// The same `Gate` state and the same semaphore as the keyed tests, served the
+/// other way: `actor_wired` rather than `spawn_wired`, `service` rather than
+/// `keyed_service`, `Client` rather than `KeyedClient`. So what differs between
+/// this test and its keyed twin is the door and nothing else.
+///
+/// **No value is written down for `buffered`.** The two sides are compared
+/// against each other, never against a literal: a `LocalActor`'s channel carries
+/// more than the service's own messages, and pinning a number here would assert
+/// something `Serving` says it does not claim.
+///
+/// **Read in two states, because one state is passed by a constant.** Equality
+/// between the doors plus `busy` at the wedged instant is satisfied by a
+/// `Serving { busy: true, buffered: 0 }` hard-coded into `serving_of_singleton`
+/// — measured, not assumed, and that is the true reading of those two assertions
+/// on their own. The idle pair taken after the permit closes it: the peer's
+/// wedged answer and the peer's idle answer have to differ, and no constant can
+/// do that. Both of the compared readings are the **peer's**, because the local
+/// door folds `LocalActor::serving` directly and never reaches the body a
+/// constant would replace. `a_wedged_actor_answers_status_during_its_turn` has
+/// carried this guard since it was written; this test did not.
+///
+/// Made red by `scripts/break-once.sh keylink/src/macros.rs`, replacing
+/// `if ::core::matches!(&req, Request::__Status { .. }) {` with `if false {`, so
+/// the singleton door delivers the question instead of answering it. Watched:
+/// `a `__status` that enqueued would wait behind the wedged turn, and this one
+/// did: Elapsed(())`. Registered as `S3`.
+#[tokio::test]
+async fn a_wedged_singleton_answers_status_to_its_handle_and_to_a_peer() {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let (entered_tx, mut entered) = mpsc::unbounded_channel();
+    let (turns_tx, _turns) = mpsc::unbounded_channel();
+    let (ticks, tick_rx) = mpsc::channel(16);
+    let release = Arc::new(Semaphore::new(0));
+    let ticked = Arc::new(Semaphore::new(0));
+
+    let actor = gate::actor_wired(
+        Gate {
+            entered: entered_tx,
+            release: Arc::clone(&release),
+            touches: 0,
+            turns: turns_tx,
+            ticked,
+        },
+        Vec::new(),
+        gate::Feeds::new(ticking(tick_rx)),
+    );
+    let server = Server::builder(&node)
+        .service(actor.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("one service, no duplicate ALPN");
+    let client = gate::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("the client dials the singleton");
+
+    let holding = async { client.hold().await };
+    let comparing = async {
+        entered.recv().await.expect("`hold` enters its turn");
+        let there = tokio::time::timeout(NOT_STUCK, client.__status())
+            .await
+            .expect(
+                "a `__status` that enqueued would wait behind the wedged turn, and this one did",
+            )
+            .expect("a wedged singleton still answers");
+        // Synchronous, and that is the point of it: it reads a flag beside the
+        // mailbox and sends nothing, so it answers while the turn holds the actor.
+        let here = actor.__status();
+        release.add_permits(1);
+        (here, there)
+    };
+
+    let (answered, (here, there)) = tokio::join!(holding, comparing);
+    answered.expect("the held call answers");
+
+    assert_eq!(here, there, "one actor, one instant, two doors");
+    assert!(
+        here.busy,
+        "the actor is inside `hold`, and both doors say so"
+    );
+
+    // And the reading was about the actor rather than about the asking: once the
+    // turn is over, the same two doors answer the opposite way.
+    //
+    // Waited out on the LOCAL door deliberately. `serving_of_singleton` is the
+    // body a constant answer would be substituted into, so a wait that polled the
+    // peer would be satisfied by the very value under test — and a substituted
+    // `busy: true` would hang here instead of failing an assertion.
+    // `LocalActor::serving` is a different producer and settles on its own.
+    let after_here = tokio::time::timeout(NOT_STUCK, async {
+        loop {
+            let row = actor.__status();
+            if !row.busy {
+                return row;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a turn that has answered its caller must clear `busy`");
+    let after_there = client
+        .__status()
+        .await
+        .expect("an idle singleton answers its peer too");
+
+    // Both readings are the PEER's, which is what makes this bite: `here` and
+    // `after_here` come from `LocalActor::serving`, and comparing those two would
+    // leave the peer's producer free to answer with a constant.
+    assert_ne!(
+        there, after_there,
+        "two peer readings of one actor in two states, so a constant answer \
+         passes neither"
+    );
+    assert_eq!(
+        after_here, after_there,
+        "one actor, one instant, two doors — at rest"
+    );
+
+    // The feed's sender outlives the actor on purpose: dropping it ends the actor,
+    // and this test is about one that is running.
+    drop(ticks);
+    server.shutdown().await.expect("stops");
 }
 
 /// **A saturated mailbox at depth > 1 still does not starve a feed.**
