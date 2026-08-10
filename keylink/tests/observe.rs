@@ -21,9 +21,9 @@
 //! the observer really does run before the reply, that `ended` can be awaited
 //! without keeping the actor alive, and that a read is not a turn.
 //!
-//! There is no node in this file and no `mod common`. An observer belongs to
-//! `LocalActor`, a keyed actor mounted through `System` has none at all, and
-//! every call below is a local one.
+//! There is no node in this file and no `mod common`. The calls below are local
+//! ones; both `LocalActor` and generated keyed actors can carry observers, while
+//! the keyed lifecycle path is exercised in `feeds.rs`.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -43,6 +43,8 @@ keylink::service! {
     service Ledger;
 
     rpc Post(entry: u64) -> u64;
+    /// A clock-controlled turn used to pin the duration observability field.
+    rpc Slow() -> u64;
     /// Panics, so a turn that ends badly is reachable from a handle.
     rpc Boom() -> u64;
 }
@@ -58,6 +60,11 @@ impl ledger::Actor for Ledger {
     async fn post(&mut self, _cx: Caller<'_>, entry: u64) -> u64 {
         self.entries.push(entry);
         self.entries.len() as u64
+    }
+
+    async fn slow(&mut self, _cx: Caller<'_>) -> u64 {
+        n0_future::time::sleep(Duration::from_secs(1)).await;
+        0
     }
 
     async fn boom(&mut self, _cx: Caller<'_>) -> u64 {
@@ -224,6 +231,21 @@ impl Observer<Ledger> for Naming {
     }
 }
 
+struct Timing {
+    durations: mpsc::UnboundedSender<Duration>,
+}
+
+impl Observer<Ledger> for Timing {
+    fn name(&self) -> &'static str {
+        "timing"
+    }
+
+    fn after_turn<'a>(&'a mut self, _state: &'a Ledger, turn: TurnInfo<'a>) -> TurnFut<'a> {
+        let _ = self.durations.send(turn.duration);
+        Box::pin(async { Ok(()) })
+    }
+}
+
 /// How a [`Finishing`] observer falls over, and where.
 ///
 /// Two halves rather than one, for the reason `after_turn` has two: a plain `fn`
@@ -347,6 +369,22 @@ impl Observer<Ledger> for GivesUp {
             }
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_observer_receives_the_handler_duration() {
+    let (durations, mut seen) = mpsc::unbounded_channel();
+    let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(Timing { durations })]);
+
+    let call = tokio::spawn(async move { ledger.slow().await.expect("running") });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+
+    assert_eq!(call.await.expect("no panic"), 0);
+    assert_eq!(
+        seen.recv().await.expect("the observer ran"),
+        Duration::from_secs(1)
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────── the port
@@ -909,13 +947,20 @@ async fn an_observer_can_be_unit_tested_without_an_actor() {
     let state = Ledger { entries: vec![7] };
 
     naming
-        .after_turn(&state, TurnInfo::for_test(TurnOutcome::Completed, "Post"))
+        .after_turn(
+            &state,
+            TurnInfo::for_test(TurnOutcome::Completed, "Post", Duration::ZERO),
+        )
         .await
         .expect("the observer accepted the turn");
     naming
         .after_turn(
             &state,
-            TurnInfo::for_test(TurnOutcome::Panicked { message: "torn" }, "Boom"),
+            TurnInfo::for_test(
+                TurnOutcome::Panicked { message: "torn" },
+                "Boom",
+                Duration::ZERO,
+            ),
         )
         .await
         .expect("the observer accepted the fault");

@@ -1276,7 +1276,8 @@ async fn a_live_keyed_actor_does_not_tell_a_peer_no_such_actor() {
     let nodes = [local_node().await, local_node().await];
     let (system, client, _server) = keyed(&nodes).await;
 
-    let lost = orders::at(&client, book_id())
+    let lost = client
+        .at(book_id())
         .abandon(3)
         .await
         .expect_err("a dropped `Deferred` answers nobody");
@@ -1288,7 +1289,8 @@ async fn a_live_keyed_actor_does_not_tell_a_peer_no_such_actor() {
     // Same connection, same id, immediately after. This is what makes the
     // finding a defect rather than a wording preference.
     assert_eq!(
-        orders::at(&client, book_id())
+        client
+            .at(book_id())
             .parked()
             .await
             .expect("the actor is still serving"),
@@ -1332,7 +1334,7 @@ async fn an_aborted_keyed_actor_tells_a_peer_the_actor_is_gone() {
 
     let placing = {
         let client = client.clone();
-        tokio::spawn(async move { orders::at(&client, book_id()).place(3).await })
+        tokio::spawn(async move { client.at(book_id()).place(3).await })
     };
     keyed_parked(&client, 1).await;
     assert!(system.abort(&book_id()).await, "it was mounted");
@@ -1417,7 +1419,7 @@ async fn a_keyed_actor_holding_a_parked_reply_drains_inside_its_budget() {
 
     let placing = {
         let client = client.clone();
-        tokio::spawn(async move { orders::at(&client, book_id()).place(3).await })
+        tokio::spawn(async move { client.at(book_id()).place(3).await })
     };
     keyed_parked(&client, 1).await;
 
@@ -1499,7 +1501,7 @@ async fn a_peer_whose_parked_reply_is_drained_is_not_told_its_call_timed_out() {
 
     let placing = {
         let client = client.clone();
-        tokio::spawn(async move { orders::at(&client, book_id()).place(3).await })
+        tokio::spawn(async move { client.at(book_id()).place(3).await })
     };
     keyed_parked(&client, 1).await;
     let ended = system.shutdown(&book_id(), Duration::from_secs(30)).await;
@@ -1590,7 +1592,8 @@ async fn a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer() 
 /// [`parked`]'s keyed twin: wait by asking the actor rather than by sleeping.
 async fn keyed_parked(client: &orders::KeyedClient, want: u64) {
     for _ in 0..500 {
-        if orders::at(client, book_id())
+        if client
+            .at(book_id())
             .parked()
             .await
             .expect("the actor is running")

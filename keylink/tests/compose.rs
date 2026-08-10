@@ -3133,8 +3133,8 @@ impl Lifecycle for Watched {
 }
 
 /// Made red by `scripts/break-once.sh keylink/src/compose/keyed.rs`, replacing
-/// `Lifecycle::ended`'s `            let _ = waiter.tell.send(why.clone());`
-/// with `            let _ = waiter.tell.send(Ended::Vanished);` — a waiter
+/// `Lifecycle::ended`'s `        let _ = waiter.tell.send(why.clone());`
+/// with `        let _ = waiter.tell.send(Ended::Vanished);` — a waiter
 /// answered with a reason the registry never gave it, which is exactly the
 /// *synthesised* half of that module's four-path table arriving on the one path
 /// that has a true reason. Watched: "the waiter carries the reason the loop
@@ -3147,8 +3147,9 @@ impl Lifecycle for Watched {
 /// is the exception and stays green, because it reaches `Vanished` through the
 /// dropped-sender arm and never through `send` at all.
 ///
-/// `Vanished` is the replacement and not some other constant, because it is what
-/// [`System::abort`](keylink::System::abort) reports: a waiter that answered the
+/// `Vanished` is the replacement and not some other constant, because it is the
+/// synthetic value [`System::abort`](keylink::System::abort) reports when
+/// cancellation wins before the loop publishes: a waiter that answered the
 /// teardown's reason instead of the loop's would look exactly like this.
 #[tokio::test]
 async fn a_keyed_actors_own_ending_reaches_a_watch_future_with_its_reason() {
@@ -3186,6 +3187,67 @@ async fn a_keyed_actors_own_ending_reaches_a_watch_future_with_its_reason() {
         matches!(why, Ended::GaveUp { after: 3, .. }),
         "the waiter carries the reason the loop returned, fields and all: {why:?}"
     );
+}
+
+/// An old teardown reported after a replacement mounts must resolve only the
+/// old incarnation's waiters. `ActorId` is reusable; it is not task identity.
+#[tokio::test]
+async fn a_late_old_lifecycle_report_does_not_answer_the_replacements_waiter() {
+    let endings = Endings::new();
+    let system = worker::System::builder(Eviction::Never)
+        .lifecycle(endings.clone())
+        .build();
+    let id = ActorId::new("ledger/reused").expect("a name");
+
+    let old_watching = endings.watch(&id);
+    let (finish_old, old_finishes) = oneshot::channel();
+    system
+        .mount(id.clone(), ending_when(old_finishes))
+        .expect("the old incarnation mounts");
+    let shutting_down = {
+        let system = system.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            system
+                .shutdown(&id, Duration::from_secs(60))
+                .await
+                .expect("the old incarnation was mounted")
+        })
+    };
+    assert!(
+        settles(|| !system.contains(&id)).await,
+        "shutdown unmounts the old incarnation before it drains"
+    );
+
+    let (finish_new, new_finishes) = oneshot::channel();
+    system
+        .mount(id.clone(), ending_when(new_finishes))
+        .expect("the replacement mounts during the old drain");
+    let mut new_watching = Box::pin(endings.watch(&id));
+
+    finish_old
+        .send(gave_up(1))
+        .expect("the old incarnation may finish");
+    assert!(matches!(
+        shutting_down.await.expect("shutdown task joins"),
+        Ended::Stopped
+    ));
+    assert!(matches!(bounded(old_watching).await, Ended::Stopped));
+    assert!(
+        n0_future::future::poll_once(&mut new_watching)
+            .await
+            .is_none(),
+        "the old report must not answer the replacement's waiter"
+    );
+    assert!(system.contains(&id), "the replacement remains mounted");
+
+    finish_new
+        .send(gave_up(2))
+        .expect("the replacement may finish");
+    assert!(matches!(
+        bounded(new_watching).await,
+        Ended::GaveUp { after: 2, .. }
+    ));
 }
 
 /// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs`, replacing
@@ -3316,8 +3378,8 @@ impl Lifecycle for BrokenOnEnding {
 ///
 /// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs`, replacing
 /// `report_mounted`'s
-/// `            let _ = crate::panic::catching(|| watching.mounted(id));` with
-/// `            watching.mounted(id);` — which is the line as it stood before
+/// `            let _ = crate::panic::catching(|| watching.__mounted(id, incarnation));` with
+/// `            watching.__mounted(id, incarnation);` — which is the line as it stood before
 /// the catch, so the break restores the defect rather than inventing one.
 /// Watched: the panic escapes `system.mount(..)` and kills the test with "the
 /// console sink is broken on a mount", before either assertion below is read.
@@ -3366,8 +3428,8 @@ async fn a_panicking_lifecycle_sink_does_not_unwind_into_the_mount_it_reports() 
 ///
 /// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs`, replacing
 /// `report_ended`'s
-/// `            let _ = crate::panic::catching(|| watching.ended(id, why));` with
-/// `            watching.ended(id, why);` — again the line as it stood before the
+/// `            let _ = crate::panic::catching(|| watching.__ended(id, incarnation, why));` with
+/// `            watching.__ended(id, incarnation, why);` — again the line as it stood before the
 /// catch. Watched: "the `Endings` installed after the broken sink is still
 /// answered: None". Exit 101, by value, at the [`NO_PROGRESS`] bound after
 /// 60.00s.
@@ -3412,7 +3474,7 @@ async fn a_panicking_lifecycle_sink_does_not_deprive_the_next_of_an_ending() {
 }
 
 /// Made red by `scripts/break-once.sh keylink/src/compose/keyed.rs`, replacing
-/// `Lifecycle::ended`'s `        for waiter in waiters {` with
+/// `Lifecycle::ended`'s `    for waiter in waiters {` with
 /// `        for waiter in waiters.into_iter().take(1) {` — a fan-out that reaches
 /// the first waiter and stops, which is the shape
 /// `a_publisher_fans_out_to_three_subscribers_each_on_its_own_feed` breaks on the
@@ -3465,8 +3527,8 @@ async fn two_watchers_on_one_name_are_both_answered() {
 /// `scripts/break-once.sh keylink/src/compose/keyed.rs`.
 ///
 /// **Not a later one.** Replace `Awaited`'s
-/// `            under.get_mut().retain(|waiter| waiter.generation != mine);` with
-/// `            under.get_mut().clear();` — the whole entry emptied on one
+/// `            watched.pending.retain(|waiter| waiter.generation != mine);` with
+/// `            watched.pending.clear();` — the whole entry emptied on one
 /// abandonment, which is the defect the comment on that very line names: a live
 /// caller left waiting on a future nothing can resolve any more. Watched: "the
 /// waiter filed after the abandoned one is still filed, and carries the true
@@ -3483,8 +3545,8 @@ async fn two_watchers_on_one_name_are_both_answered() {
 /// reasoning about the map without following the `Drop` out of it — the same
 /// shape as trusting a mechanism you have not opened.
 ///
-/// **Its own.** Replace `                under.remove();` with
-/// `                let _ = &under;` — the emptied key left in the map, so the
+/// **Its own.** Replace `                let _ = under.remove_entry();` with
+/// `                let _ = under.get();` — the emptied key left in the map, so the
 /// map grows with names watched *once* rather than with names watched *now*,
 /// which is the bound the type claims. Watched: "and neither does an abandoned
 /// one: Endings { watching: 1 }". Exit 101, by value, in 0.00s.
@@ -3538,9 +3600,9 @@ async fn an_abandoned_watch_unfiles_its_own_waiter_and_not_a_later_one() {
 
 /// Made red by `scripts/break-once.sh keylink/src/compose/keyed.rs`, replacing
 /// `Awaited::poll`'s `            Poll::Ready(Err(_)) => Ended::Vanished,` with
-/// `            Poll::Ready(Err(_)) => Ended::Stopped,` — the whole system going
-/// away reported as a clean stop, which is the one thing a caller has to be able
-/// to tell it from. Watched: "a waiter nothing can ever report to is answered
+/// `            Poll::Ready(Err(_)) => Ended::Stopped,` — the last `Endings`
+/// clone and its waiter map going away reported as a clean stop, which is the one
+/// thing a caller has to be able to tell it from. Watched: "a waiter nothing can ever report to is answered
 /// rather than left waiting: Stopped". Exit 101, by value, in 0.00s.
 ///
 /// **That covers the value half only, and the liveness half needs its own
@@ -3616,8 +3678,8 @@ async fn a_watch_outliving_its_endings_resolves_vanished_rather_than_hanging() {
 /// **The same literal as
 /// `a_keyed_actors_own_ending_reaches_a_watch_future_with_its_reason`, and a
 /// different claim.** `scripts/break-once.sh keylink/src/compose/keyed.rs`,
-/// replacing `            let _ = waiter.tell.send(why.clone());` with
-/// `            let _ = waiter.tell.send(Ended::Vanished);`. There the claim is
+/// replacing `        let _ = waiter.tell.send(why.clone());` with
+/// `        let _ = waiter.tell.send(Ended::Vanished);`. There the claim is
 /// that a *waiter* is handed the loop's reason. Here it is that the reason
 /// survives the two hops a group adds — through the hand-written [`Membership`]
 /// below, into the policy's argument, and out as [`GroupEnded::Member`].
@@ -3630,9 +3692,9 @@ async fn a_watch_outliving_its_endings_resolves_vanished_rather_than_hanging() {
 ///
 /// The file already runs one literal for two guards on the policy's reason, and
 /// records why they are not one claim; this is that arrangement on the keyed
-/// side. `Vanished` is the replacement because it is what
-/// [`System::abort`](keylink::System::abort) reports and `abort` is what this
-/// member's `retire` calls — a group reading the teardown's reason instead of
+/// side. `Vanished` is the replacement because it is the synthetic value
+/// [`System::abort`](keylink::System::abort) reports when cancellation wins, and
+/// `abort` is what this member's `retire` calls — a group reading the teardown's reason instead of
 /// the loop's would be indistinguishable from a correct one under any other
 /// value.
 #[tokio::test]
@@ -3711,4 +3773,41 @@ async fn a_keyed_actor_is_a_group_member_end_to_end() {
         settles(|| !sibling.is_running()).await,
         "and the sibling nobody asked about is retired, not left serving"
     );
+}
+
+/// The direct keyed ending future has the exact shape `Membership` needs once
+/// the actor is mounted; the `Option` is handled at that boundary, not hidden.
+#[tokio::test]
+async fn a_group_accepts_the_direct_system_ending_of_a_keyed_member() {
+    let system = worker::System::builder(Eviction::Never).build();
+    let id = ActorId::new("ledger/direct").expect("a name");
+    let (ends, told) = oneshot::channel();
+    system
+        .mount(id.clone(), ending_when(told))
+        .expect("the system mounts it");
+    let watching = system
+        .ended(&id)
+        .expect("the member was just mounted and is directly observable");
+
+    let group = Group::new(|_who: &ActorId, _why: &Ended| Verdict::StopAll);
+    let retiring = system.clone();
+    let retired = id.clone();
+    assert!(group
+        .add(
+            id.clone(),
+            Membership::new(watching, move || async move {
+                retiring.abort(&retired).await;
+            }),
+        )
+        .is_filed());
+
+    ends.send(gave_up(4))
+        .expect("the loop is waiting for its ending");
+    assert!(matches!(
+        bounded(group.ended()).await,
+        GroupEnded::Member {
+            member,
+            reason: Ended::GaveUp { after: 4, .. },
+        } if member == id
+    ));
 }

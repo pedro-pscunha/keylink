@@ -956,8 +956,10 @@ where
     // value here instead of writing it. The lot is a local of *this* function
     // rather than anything the loop owns, which is what makes "nothing is parked
     // at `finish`" structural — see `parking.rs`.
+    let started = Instant::now();
     let mut parking = Parking::new(turn(state));
     let answer = guarded(&mut parking).await;
+    let duration = started.elapsed();
     // Out before the observer chain reborrows the state: a `Vec<Parked>` names no
     // lifetime, while the future in `parking` holds the handler's `&mut A`.
     let parked = parking.take();
@@ -975,6 +977,7 @@ where
             None => TurnOutcome::Completed,
         },
         method,
+        duration,
     };
 
     // Two things, because the two audiences need different granularity: the
@@ -1498,9 +1501,14 @@ impl<A: Send> Turn<A> for std::convert::Infallible {
 /// keeps its niche. The price is one atomic increment per entry, paid only on
 /// the nested path.
 #[derive(Clone)]
-struct Actor(Arc<AtomicBool>);
+pub(crate) struct Actor(Arc<AtomicBool>);
 
 impl Actor {
+    /// Build an identity from the actor's shared busy cell.
+    pub(crate) fn new(busy: Arc<AtomicBool>) -> Self {
+        Self(busy)
+    }
+
     /// The same actor, by allocation and never by address.
     fn is(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
@@ -1530,7 +1538,7 @@ impl Actor {
 /// for the reason `One` exists: it allocates a node for **every** top-level turn,
 /// which trades cold bytes for work on the hot path.
 #[derive(Clone, Default)]
-enum Chain {
+pub(crate) enum Chain {
     /// Nothing is on the stack: this thread is between turns, or on a task that
     /// never ran one — a connection's, or a caller's.
     #[default]
@@ -1566,7 +1574,7 @@ impl Chain {
     }
 
     /// Whether this actor's turn is one of the ones on the stack.
-    fn holds(&self, who: &Actor) -> bool {
+    pub(crate) fn holds(&self, who: &Actor) -> bool {
         match self {
             Self::Empty => false,
             Self::One(one) => one.is(who),
@@ -1602,7 +1610,7 @@ fn exchange(held: &mut Chain) {
 /// have already been destroyed is not running a turn, which is the `Empty` case
 /// exactly, and raising a panic inside somebody else's destructor is not an
 /// improvement on sending.
-fn current() -> Chain {
+pub(crate) fn current() -> Chain {
     CHAIN
         .try_with(|slot| {
             let held = slot.take();
@@ -1799,12 +1807,14 @@ trait Inbox<A, M>: Send {
     /// would lose this check silently, with no test failing — which is what a
     /// `None` default buys and costs at the same time.
     ///
-    /// # What a keyed actor's `None` means, stated rather than hidden
+    /// # What a keyed actor's identity means, stated rather than hidden
     ///
-    /// A keyed mailbox carries no chain — [`Keyed::poll_next`] maps a bare `M`
-    /// into [`Message::Mail`] with [`Chain::Empty`] — so a ring closed through a
-    /// keyed or served hop is not caught. That is one of the residuals this wave
-    /// names rather than one it missed.
+    /// A keyed mailbox carries the sender's [`Chain`] alongside its `M`.
+    /// [`Keyed::poll_next`] preserves it, and the loop appends this mailbox's
+    /// identity before dispatch. A local keyed reference therefore participates in
+    /// the same self-call and ring check as a local handle; a remote connection
+    /// normally starts with [`Chain::Empty`] because it is outside any actor turn.
+    ///
     fn identity(&self) -> Option<Actor> {
         None
     }
@@ -1977,7 +1987,11 @@ impl<A: Send, M: Send> Inbox<A, M> for Keyed<M> {
     ) -> std::task::Poll<Option<Message<A, M>>> {
         self.0
             .poll_recv(cx)
-            .map(|mail| mail.map(|mail| Message::Mail(mail, Chain::Empty)))
+            .map(|mail| mail.map(|(mail, chain)| Message::Mail(mail, chain)))
+    }
+
+    fn identity(&self) -> Option<Actor> {
+        Some(self.0.identity())
     }
 
     /// The mailbox is what the registry kept a handle on, so it is the way back to
@@ -2112,9 +2126,10 @@ fn dispatch<'a, A: 'a, T: Turn<A>>(
 /// dispatch. Feeds are what made the split untenable rather than merely untidy,
 /// because a second input needs a `select` and nobody wanted to write two.
 ///
-/// Returns the reason instead of publishing it, because only the local path has
-/// anywhere to publish it to: a `LocalActor` has an `ended` watch channel and a
-/// keyed actor has none. Everything whose *order* matters happens in here.
+/// Returns the reason to the keyed registry, which publishes it through the
+/// shared [`System::ended`](crate::System::ended) watch channel. A local actor
+/// also exposes its ending directly through [`LocalActor::ended`]. Everything
+/// whose *order* matters happens in here.
 ///
 /// # Teardown order, which is the fix rather than a detail
 ///
@@ -2319,9 +2334,10 @@ where
 /// the full argument; the return type here is the half of it that lives in this
 /// file.
 ///
-/// So a keyed actor still has no `ended()` channel for a *caller* to await — a
-/// handle is what would hold one, and a keyed actor is addressed by id — but the
-/// ending is no longer lost: the registry reaps its own entry with this value.
+/// A keyed actor's ending is observable through [`System::ended`](crate::System::ended),
+/// which subscribes to the entry by id before the registry reaps it. The ending
+/// is therefore no longer lost: the registry and its lifecycle callbacks receive
+/// this value as the actor leaves.
 #[doc(hidden)]
 pub async fn run_keyed<A, M, F>(
     state: A,
@@ -3090,12 +3106,10 @@ where
 /// the user's crate. The registry is untouched by any of this — `mount` takes a
 /// closure over a `Mailbox`, and this is that closure's whole body.
 ///
-/// A keyed actor still has no `ended()` channel for a caller to await. It no
-/// longer allocates one either: this used to build a `watch` channel with **no
-/// reader**, because the supervisor's own restart verdict was a third state on
-/// it. That verdict lives in the [`Fate`] cell the registry already made — where
-/// a served dispatch can read it too — so the channel is gone rather than
-/// explained, and one small allocation per supervised keyed actor went with it.
+/// A supervised keyed actor's ending is observable through
+/// [`System::ended`](crate::System::ended). The registry owns one shared watch
+/// channel per live entry; the supervisor's restart verdict remains in the
+/// [`Fate`] cell, while the channel resolves only when the final incarnation ends.
 ///
 /// # One mechanism serves both keyed paths, and that is not a coincidence
 ///
@@ -3778,17 +3792,14 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
     /// shedding actor refuses a re-entrant call for being re-entrant rather than
     /// for being full.
     ///
-    /// # What was measured, and the ring it does not cover
+    /// # Ring detection includes local keyed hops
     ///
-    /// "No depth converts a deterministic deadlock into an intermittent one" was
-    /// measured at depth 32 on **local** rings, where every hop is a `LocalActor`
-    /// and the chain reaches every edge. A ring closed through a **keyed or served
-    /// hop** is not caught by the chain — a keyed mailbox carries none — and its
-    /// behaviour above depth 1 is **unmeasured**. Nothing ships changed, because
-    /// the default stays 1 and that is the depth every existing guard runs at; but
-    /// a caller raising this in a system with keyed hops is outside what was
-    /// tested, and should treat the resulting hang or non-hang as unknown rather
-    /// than as covered by the paragraph above.
+    /// The chain travels with registry mailbox messages, and the keyed loop adds
+    /// its own identity before dispatch. A local ring that crosses keyed actors is
+    /// therefore refused by the same identity check as a ring of `LocalActor`s;
+    /// `tests/actors.rs` covers both a self-call and a two-actor keyed ring. A real
+    /// network hop starts on another task and cannot carry this in-process chain,
+    /// so this guarantee does not extend across a remote connection.
     ///
     /// # CAUTION: a deeper mailbox raises the shutdown budget owed
     ///
@@ -4995,7 +5006,10 @@ impl<A, M> OwnedPermit<A, M> {
 /// Everything else is the same reading. A fault is the caller's value rather than
 /// a loss, a dead reply channel is [`withheld_for`] over the standing, and every
 /// other way a turn produced nothing is a [`Withheld`].
-async fn asked<T>(answer: oneshot::Receiver<Answered<T>>, fate: &Fate) -> Result<T, Unanswered> {
+pub(crate) async fn asked<T>(
+    answer: oneshot::Receiver<Answered<T>>,
+    fate: &Fate,
+) -> Result<T, Unanswered> {
     match answer.await {
         Ok(Answered::Ran(value)) => Ok(value),
         Ok(Answered::Faulted(panic)) => panic.resume(),

@@ -528,6 +528,13 @@ impl Queueing {
 /// So the two paths cannot disagree about a comparison neither of them spells,
 /// which is what the three hand-written ones above turned out to be worth.
 ///
+/// Why a [`QueueTimeout`] could not represent its deadline on the target clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("queue timeout budget is too large for the target clock")]
+pub struct QueueTimeoutError;
+
+/// A queue budget applied by [`Middleware`].
+///
 /// # On a `Handler` it refuses nothing, and that is not a lie
 ///
 /// A [`Handler`](crate::Middleware) is dispatched immediately and never queues,
@@ -541,9 +548,21 @@ pub struct QueueTimeout {
 
 impl QueueTimeout {
     /// Refuse any message still waiting to start after `budget`.
-    #[must_use]
-    pub fn after(budget: Duration) -> Self {
-        Self { budget }
+    ///
+    /// The budget is checked against the target clock at construction time. A
+    /// deadline is computed again when a request reaches the layer; that second
+    /// computation uses the same checked operation and conservatively expires
+    /// immediately if the clock has since reached its representable limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueueTimeoutError`] when the target clock cannot represent a
+    /// deadline starting now after `budget`.
+    pub fn try_after(budget: Duration) -> Result<Self, QueueTimeoutError> {
+        Instant::now()
+            .checked_add(budget)
+            .map(|_| Self { budget })
+            .ok_or(QueueTimeoutError)
     }
 }
 
@@ -558,8 +577,14 @@ impl<Req: Send + 'static, Resp: Send + 'static> Middleware<Req, Resp> for QueueT
         // The deadline is stamped HERE, when the call reached this layer, so an
         // outer layer that took its time is spent out of this budget rather
         // than added to it.
+        let now = Instant::now();
+        // `try_after` checks this at construction time. Re-check here because a
+        // long-lived layer can outlive the clock range it was created in; an
+        // unrepresentable deadline is safest as an already-expired budget, not a
+        // panic in the dispatch task.
+        let deadline = now.checked_add(self.budget).unwrap_or(now);
         cx.queueing = Some(Queueing {
-            deadline: Instant::now() + self.budget,
+            deadline,
             millis: u64::try_from(self.budget.as_millis()).unwrap_or(u64::MAX),
         });
         next(cx, req, body)
@@ -698,6 +723,14 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn an_unrepresentable_budget_is_rejected() {
+        assert!(matches!(
+            QueueTimeout::try_after(Duration::MAX),
+            Err(QueueTimeoutError),
+        ));
+    }
 
     /// A budget is spent **at** its deadline, not a tick later.
     ///

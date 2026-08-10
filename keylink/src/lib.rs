@@ -242,7 +242,7 @@ mod wire;
 
 pub use actor::{
     deliver_to_actor, mount, serving_of_actor, ActorStatus, Addressed, Eviction, KeyedService,
-    Lifecycle, Mailbox, MountError, Mounted, Origin, System, SystemBuilder,
+    Lifecycle, LocalError, Mailbox, MountError, Mounted, Origin, System, SystemBuilder,
 };
 pub use admission::{Admission, Admittance, DynamicAdmission, Revocable, Revocation};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
@@ -306,8 +306,8 @@ pub mod inspect {
     /// too — which is a maintenance cost worth naming rather than a one-off.
     #[doc(hidden)]
     pub use crate::console::inspect::{
-        actor, actor_with, at, keyed_service, serve, service, spawn, spawn_wired, Actor, Handler,
-        IdempotentClient, KeyedClient, OwnedPermit, Permit,
+        actor, actor_with, at_local, keyed_service, serve, service, spawn, spawn_wired, Actor,
+        Handler, IdempotentClient, KeyedClient, OwnedPermit, Permit,
     };
 }
 pub use error::{ConfigError, Error, Failure, Result, Transport};
@@ -317,7 +317,9 @@ pub use idempotency::{
     MAX_TOMBSTONES, MAX_WAITING, MAX_WAITING_PER_PEER, RECORD_TTL,
 };
 pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
-pub use middleware::{Caller, Context, Middleware, Next, QueueTimeout, Queueing, Rpc, Timeout};
+pub use middleware::{
+    Caller, Context, Middleware, Next, QueueTimeout, QueueTimeoutError, Queueing, Rpc, Timeout,
+};
 pub use node::{derive_alpn, Node};
 pub use observe::{
     EndReason, Ended, FinishFut, Observer, Serving, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome,

@@ -62,10 +62,10 @@ use std::time::Duration;
 
 use n0_future::task::{AbortOnDropHandle, JoinHandle};
 use n0_future::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
-use crate::turns::{Fate, Standing};
-use crate::{ActorId, Ended, Serving};
+use crate::turns::{current, Actor, Chain, Fate, Standing};
+use crate::{ActorId, Ended, Origin, Reply, Serving, Unanswered, Withheld};
 
 /// Messages that may wait ahead of the one being handled, when nobody says.
 ///
@@ -113,6 +113,10 @@ impl Busy {
 
     fn running(&self) -> bool {
         self.0.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn identity(&self) -> Actor {
+        Actor::new(Arc::clone(&self.0))
     }
 }
 
@@ -214,7 +218,7 @@ impl Busy {
 /// local twin shipped, so it says which is which now.
 #[doc(hidden)]
 pub struct Mailbox<M> {
-    slots: mpsc::Receiver<Box<M>>,
+    slots: mpsc::Receiver<(Box<M>, Chain)>,
     busy: Busy,
     fate: Fate,
 }
@@ -259,16 +263,23 @@ impl<M> Mailbox<M> {
     /// take its messages somehow.
     #[doc(hidden)]
     pub async fn recv(&mut self) -> Option<Box<M>> {
-        self.slots.recv().await
+        self.slots.recv().await.map(|(mail, _chain)| mail)
     }
 
     /// The same receive as a poll, which is what the one loop wants: it selects
-    /// against a feed without building a future over either input.
+    /// against a feed without building a future over either input. The chain is
+    /// kept on this crate-visible path so keyed loops participate in the same
+    /// re-entrancy check as local actors; hand-written loops intentionally keep
+    /// the old `recv` surface and discard it.
     pub(crate) fn poll_recv(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Box<M>>> {
+    ) -> std::task::Poll<Option<(Box<M>, Chain)>> {
         self.slots.poll_recv(cx)
+    }
+
+    pub(crate) fn identity(&self) -> Actor {
+        self.busy.identity()
     }
 
     /// Report a turn starting or ending. See [`Busy`] for whose job this is.
@@ -593,9 +604,66 @@ pub(super) enum RouteError {
     },
 }
 
+/// What a local keyed call can learn without crossing the wire.
+///
+/// Routing refusals stay separate from a turn that ran: there is no remote
+/// transport error to report, and folding `NoSuchActor` or `AtCapacity` into a
+/// `Withheld` would claim that a handler had already started. Once a message is
+/// queued, the existing [`Unanswered`] vocabulary carries the turn's outcome.
+/// Keyed local delivery parks on the bounded mailbox until a slot opens; this
+/// surface has no queue-timeout parameter and therefore reports no `Full` case.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LocalError {
+    /// No actor is mounted under this id and no lazy factory built one.
+    #[error("nothing is mounted as {id} and no factory built one")]
+    NoSuchActor {
+        /// The id that was addressed.
+        id: ActorId,
+    },
+    /// The registry cannot admit another live actor.
+    #[error("the actor system is at its capacity of {capacity} live actors")]
+    AtCapacity {
+        /// The configured live-actor cap.
+        capacity: usize,
+    },
+    /// The actor's mailbox closed before this message could be queued.
+    #[error("the actor is no longer running")]
+    Closed,
+    /// The call would wait on the actor's own turn.
+    #[error("this call was made from inside the target actor's own turn: it would deadlock")]
+    Reentrant,
+    /// The message ran, but its reply was not handed back.
+    #[error("{0}")]
+    Turn(Withheld),
+}
+
+impl From<RouteError> for LocalError {
+    fn from(error: RouteError) -> Self {
+        match error {
+            RouteError::NoSuchActor { id } => Self::NoSuchActor { id },
+            RouteError::AtCapacity { capacity } => Self::AtCapacity { capacity },
+        }
+    }
+}
+
+fn local_error(error: Unanswered) -> LocalError {
+    match error {
+        Unanswered::Turn(withheld) => LocalError::Turn(withheld),
+        Unanswered::Reentrant => LocalError::Reentrant,
+        // Keyed local delivery uses `send`, so a full mailbox parks the caller
+        // until a slot opens. `asked` runs after that send and cannot produce the
+        // local handle's `Full` refusal.
+        Unanswered::Full => unreachable!("keyed local delivery cannot shed a queued message"),
+    }
+}
+
 struct Entry<M> {
-    mail: mpsc::Sender<Box<M>>,
+    mail: mpsc::Sender<(Box<M>, Chain)>,
     task: JoinHandle<()>,
+    /// Identity of this mounted incarnation, distinct from its reusable id.
+    /// The task carries a clone so a late natural ending cannot reap a newer
+    /// actor remounted under the same id.
+    identity: Arc<()>,
     /// Milliseconds since the registry's epoch, as of the last message routed
     /// here. An atomic so that touching an actor stays on the read lock.
     last_seen: AtomicU64,
@@ -606,6 +674,8 @@ struct Entry<M> {
     /// by `deliver_to_actor` — see [`Fate`], which owns that invariant, and
     /// [`Route`], which is how it leaves the registry.
     fate: Fate,
+    /// The ending reported by the actor's loop, shared with local waiters.
+    ended: watch::Sender<Option<Ended>>,
 }
 
 impl<M> Entry<M> {
@@ -653,7 +723,9 @@ impl<M> Entry<M> {
 /// somebody else's incarnation.
 pub(super) struct Route<M> {
     /// One end of the actor's mailbox, cloned out of the entry.
-    pub(super) mail: mpsc::Sender<Box<M>>,
+    pub(super) mail: mpsc::Sender<(Box<M>, Chain)>,
+    /// The actor identity used by local re-entrancy checks.
+    pub(super) actor: Actor,
     /// The cell that actor's own loop settles before it drops anything.
     pub(super) fate: Fate,
 }
@@ -727,15 +799,17 @@ impl<M> Registry<M> {
     /// unwind was a failure policy too. Nothing is reported about the catch:
     /// there is no channel here to report it on, and the panic hook has already
     /// printed at the fault.
-    fn report_mounted(&self, id: &ActorId) {
+    fn report_mounted(&self, id: &ActorId, identity: &Arc<()>) {
+        let incarnation = Arc::as_ptr(identity) as usize;
         for watching in &self.lifecycle {
-            let _ = crate::panic::catching(|| watching.mounted(id));
+            let _ = crate::panic::catching(|| watching.__mounted(id, incarnation));
         }
     }
 
-    fn report_ended(&self, id: &ActorId, why: &Ended) {
+    fn report_ended(&self, id: &ActorId, identity: &Arc<()>, why: &Ended) {
+        let incarnation = Arc::as_ptr(identity) as usize;
         for watching in &self.lifecycle {
-            let _ = crate::panic::catching(|| watching.ended(id, why));
+            let _ = crate::panic::catching(|| watching.__ended(id, incarnation, why));
         }
     }
 
@@ -752,21 +826,35 @@ impl<M> Registry<M> {
     ///
     /// [`System::shutdown`], [`System::abort`] and [`Registry::sweep`] all take
     /// the entry out **before** they await the task, and each reports its own
-    /// ending afterwards. So when one of them is the cause, this finds nothing
-    /// and says nothing, and the ending is reported exactly once by whoever
-    /// asked for it. When nobody asked, this is the only site that can report at
-    /// all.
+    /// ending afterwards. The id may be remounted during that await, so absence
+    /// is not the interlock: the task's opaque identity must still match the
+    /// current entry. A late old task therefore neither removes nor reports
+    /// through its replacement. When nobody asked for teardown, this is the only
+    /// site that can report at all.
     ///
     /// The removed [`Entry`] holds the `JoinHandle` of the task running this
     /// line. Dropping it detaches a task that is finishing anyway, which is the
     /// one case where a detach costs nothing.
-    fn reap(&self, id: &ActorId, why: &Ended) {
+    fn reap(&self, id: &ActorId, identity: &Arc<()>, why: &Ended) {
+        // A teardown removes its entry before awaiting the task, so the id may
+        // already belong to a newer incarnation. Only that task's identity may
+        // reap the slot; a late old task must not remove or report through the
+        // replacement.
+        let ours = {
+            let mut entries = self.write();
+            let ours = entries
+                .get(id)
+                .is_some_and(|current| Arc::ptr_eq(&current.identity, identity));
+            if ours {
+                entries.remove(id);
+            }
+            ours
+        };
         // The guard dies with the statement, so `report_ended` runs without it:
         // a `Lifecycle` may ask this same system what is running, exactly as at
         // `System::mount`'s report site.
-        let ours = self.write().remove(id).is_some();
         if ours {
-            self.report_ended(id, why);
+            self.report_ended(id, identity, why);
         }
     }
 
@@ -783,8 +871,8 @@ impl<M> Registry<M> {
     /// number of listeners rather than one per listener, because
     /// [`report_mounted`](Self::report_mounted) hands the same `&ActorId` to each.
     /// Zero listeners still allocate nothing on the mount path.
-    fn announcing(&self, id: &ActorId) -> Option<ActorId> {
-        (!self.lifecycle.is_empty()).then(|| id.clone())
+    fn announcing(&self, id: &ActorId, identity: &Arc<()>) -> Option<(ActorId, Arc<()>)> {
+        (!self.lifecycle.is_empty()).then(|| (id.clone(), identity.clone()))
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<ActorId, Entry<M>>> {
@@ -833,6 +921,7 @@ impl<M> Registry<M> {
                 (
                     Route {
                         mail: entry.mail.clone(),
+                        actor: entry.busy.identity(),
                         fate: entry.fate.clone(),
                     },
                     None,
@@ -853,16 +942,17 @@ impl<M> Registry<M> {
                 let entry = self.entry(free.key(), mounted);
                 let found = Route {
                     mail: entry.mail.clone(),
+                    actor: entry.busy.identity(),
                     fate: entry.fate.clone(),
                 };
-                let announce = self.announcing(free.key());
+                let announce = self.announcing(free.key(), &entry.identity);
                 free.insert(entry);
                 (found, announce)
             }
         };
         drop(entries);
-        if let Some(id) = announce {
-            self.report_mounted(&id);
+        if let Some((id, identity)) = announce {
+            self.report_mounted(&id, &identity);
         }
         Ok(found)
     }
@@ -896,6 +986,7 @@ impl<M> Registry<M> {
         entry.last_seen.store(self.now(), Ordering::Relaxed);
         Some(Route {
             mail: entry.mail.clone(),
+            actor: entry.busy.identity(),
             fate: entry.fate.clone(),
         })
     }
@@ -948,6 +1039,10 @@ impl<M> Registry<M> {
         let (mail, slots) = mpsc::channel(self.mailbox_depth);
         let busy = Busy::default();
         let fate = Fate::default();
+        let (ended, _) = watch::channel(None);
+        let ended_for_task = ended.clone();
+        let identity = Arc::new(());
+        let identity_for_task = identity.clone();
         let inbox = Mailbox {
             slots,
             busy: busy.clone(),
@@ -967,13 +1062,16 @@ impl<M> Registry<M> {
             mail,
             task: n0_future::task::spawn(async move {
                 let why = running.await;
+                ended_for_task.send_replace(Some(why.clone()));
                 if let Some(registry) = registry.upgrade() {
-                    registry.reap(&id, &why);
+                    registry.reap(&id, &identity_for_task, &why);
                 }
             }),
+            identity,
             last_seen: AtomicU64::new(self.now()),
             busy,
             fate,
+            ended,
         }
     }
 
@@ -1030,7 +1128,7 @@ impl<M> Registry<M> {
     /// reaches a `Lifecycle`, and through [`Events`](crate::Events) a console.
     /// The mitigation for the rest is the budget itself: pick it from the longest
     /// turn plus the queue behind it, as [`Eviction::Idle::shutdown_budget`] says.
-    async fn sweep(&self) {
+    async fn sweep(self: &Arc<Self>) {
         let Eviction::Idle {
             after,
             shutdown_budget,
@@ -1056,9 +1154,11 @@ impl<M> Registry<M> {
         // was nowhere to put it and nobody to hand it to. There is one place now,
         // and it is optional — a system with no `Lifecycle` computes the same
         // `Ended` and drops it exactly as before.
-        n0_future::join_all(expired.into_iter().map(|(id, entry)| async move {
-            let ended = drain(entry, shutdown_budget).await;
-            self.report_ended(&id, &ended);
+        n0_future::join_all(expired.into_iter().map(|(id, entry)| {
+            let registry = Arc::clone(self);
+            async move {
+                let _ = drain(registry, id, entry, shutdown_budget).await;
+            }
         }))
         .await;
     }
@@ -1116,15 +1216,72 @@ impl<M> Registry<M> {
 /// - the task's join failed → [`Ended::Vanished`], which is what an aborted or
 ///   panicked task is;
 /// - the budget expired → the task is aborted, joined, and reported
-///   [`Ended::Vanished`], because that is what `abort` produces everywhere else
-///   in the crate.
+///   [`Ended::Vanished`]. A natural ending already published before cancellation
+///   remains authoritative for direct observation.
 ///
 /// The `Ended` is **synthesised from the join**, not read from the actor, and
 /// [`System::shutdown`] carries the argument for that and states its residual.
-async fn drain<M>(entry: Entry<M>, budget: Duration) -> Ended {
+struct TeardownGuard<M> {
+    registry: Arc<Registry<M>>,
+    id: ActorId,
+    ended: watch::Sender<Option<Ended>>,
+    identity: Arc<()>,
+    armed: bool,
+}
+
+impl<M> TeardownGuard<M> {
+    fn complete(&mut self, why: &Ended) {
+        self.ended.send_if_modified(|slot| {
+            if slot.is_none() {
+                *slot = Some(why.clone());
+                true
+            } else {
+                false
+            }
+        });
+        self.registry.report_ended(&self.id, &self.identity, why);
+        self.armed = false;
+    }
+}
+
+impl<M> Drop for TeardownGuard<M> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Cancellation has already caused `AbortOnDropHandle` to abort the
+        // actor. Preserve a natural ending that won the race; otherwise make
+        // the lost teardown explicit to both direct waiters and Lifecycle.
+        let published = { self.ended.borrow().clone() };
+        let why = published.clone().unwrap_or(Ended::Vanished);
+        if published.is_none() {
+            self.ended.send_replace(Some(why.clone()));
+        }
+        self.registry.report_ended(&self.id, &self.identity, &why);
+    }
+}
+
+async fn drain<M>(
+    registry: Arc<Registry<M>>,
+    id: ActorId,
+    entry: Entry<M>,
+    budget: Duration,
+) -> Ended {
     let Entry {
-        mail, task, fate, ..
+        mail,
+        task,
+        fate,
+        ended,
+        identity,
+        ..
     } = entry;
+    let mut report = TeardownGuard {
+        registry,
+        id,
+        ended,
+        identity,
+        armed: true,
+    };
     // Dropping the registry's sender is what ends the loop. The task lives while
     // any other sender does, which is what lets a message already in flight
     // finish rather than be cancelled.
@@ -1141,7 +1298,7 @@ async fn drain<M>(entry: Entry<M>, budget: Duration) -> Ended {
     // what says so.
     drop(mail);
     let mut task = std::pin::pin!(AbortOnDropHandle::new(task));
-    match n0_future::time::timeout(budget, &mut task).await {
+    let why = match n0_future::time::timeout(budget, &mut task).await {
         Ok(Ok(())) => Ended::Stopped,
         Ok(Err(_join)) => Ended::Vanished,
         Err(_expired) => {
@@ -1169,7 +1326,13 @@ async fn drain<M>(entry: Entry<M>, budget: Duration) -> Ended {
             let _ = task.await;
             Ended::Vanished
         }
-    }
+    };
+    // A generated loop publishes its own ending before the registry reaps it.
+    // A shutdown budget that aborts a task has no such turn, so publish the
+    // synthesized result only when the loop did not already report one. The
+    // guard also reports here, making cancellation of the outer future safe.
+    report.complete(&why);
+    why
 }
 
 // ─────────────────────────────────────────────────────────── what is running
@@ -1344,52 +1507,46 @@ pub trait Lifecycle: Send + Sync + 'static {
     /// already addressable and may already have taken a turn.
     fn mounted(&self, id: &ActorId);
 
+    /// Registry-only form carrying one mounted incarnation's opaque identity.
+    #[doc(hidden)]
+    fn __mounted(&self, id: &ActorId, _incarnation: usize) {
+        self.mounted(id);
+    }
+
     /// The actor that was mounted under `id` is gone, and `why`.
     ///
-    /// `why` is the same [`Ended`] the caller of [`System::shutdown`] is handed,
-    /// synthesised from the join — see that method for exactly what
-    /// [`Ended::Stopped`] and [`Ended::Vanished`] do and do not claim. An
-    /// eviction and an [`abort`](System::abort) report through here too, and
-    /// those have no caller to hand it to at all.
+    /// A natural self-ending carries the [`Ended`] returned by the actor loop.
+    /// Shutdown and eviction carry the teardown result synthesized from their
+    /// join; abort carries a natural value that won the cancellation race or
+    /// [`Ended::Vanished`] otherwise. Cancellation of the outer shutdown future
+    /// also reports `Vanished`, so a lifecycle waiter is never abandoned.
     fn ended(&self, id: &ActorId, why: &Ended);
+
+    /// Registry-only form pairing an ending with the incarnation mounted above.
+    #[doc(hidden)]
+    fn __ended(&self, id: &ActorId, _incarnation: usize, why: &Ended) {
+        self.ended(id, why);
+    }
 }
 
 /// A registry of live actors: which ones exist, and for how long.
 ///
 /// Cheap to clone: every clone names the same registry.
 ///
-/// # Awaiting a keyed actor's ending, and why there is no method here for it
+/// # Awaiting a keyed actor's ending
 ///
-/// A local actor hands its caller `ended()`. A keyed one has no such method, and
-/// the reason is a field that does not exist: an `Entry` holds a mailbox, a join
-/// handle, an eviction clock, a busy cell and a `Fate` — **no channel carrying an
-/// ending**. There is nothing here for a method to read, so adding one would mean
-/// adding a channel to every keyed actor to serve the callers that ask.
+/// A local actor hands its caller `ended()`. A keyed actor is addressed by id,
+/// so its system owns the observation door: [`System::ended`] returns an
+/// optional future that subscribes to the entry's watch channel without creating
+/// an actor. `None` means the id is not mounted at the instant of the read.
+/// Subscribe after `mount` and before a teardown can remove the entry.
 ///
-/// What exists instead is a report. [`Lifecycle::ended`] is called for every
-/// teardown, and `compose::Endings` is the implementation that turns those reports
-/// into awaitable futures. The steps are worth walking, because a section that
-/// says only *install `Endings`* walks a reader into a window:
-///
-/// 1. **The `Ended` is synthesised, not read.** [`System::shutdown`] drops the
-///    registry's sender and joins the task, then names the outcome: a clean join is
-///    [`Ended::Stopped`], a join error is [`Ended::Vanished`], and an expired budget
-///    aborts. None of the three is a reason the *loop* decided — the loop is not
-///    asked. Only one of the four teardown paths answers *why it exited*, and
-///    `Endings`' own module doc carries the table.
-/// 2. **The report is a broadcast with no memory.** It goes to whatever is
-///    installed at the instant it fires, and nothing keeps it.
-/// 3. **`compose::Endings::watch` files a waiter under the name, when it is
-///    called.** That is the whole mechanism: a `oneshot` sender pushed into a map,
-///    answered by a later report.
-/// 4. **So a report that fires before the waiter is filed resolves nothing**, and
-///    is not remembered. A `watch` asked for after that point does not resolve
-///    late; it waits for the life of the system.
-///
-/// The consequence is the one thing to take away: **ask for the future before the
-/// actor can end.** Mount, then watch, then send — not send, then watch. No
-/// signature closes the window, `Endings`' module doc states it per mounting path,
-/// and the ordering is the reader's to get right rather than the type's to enforce.
+/// The channel is shared by the actor loop and the registry. The loop publishes
+/// its actual ending before `Registry::reap` removes the entry; `shutdown` and
+/// `abort` publish a synthesized `Ended` when they destroy an actor before its
+/// loop can report one. [`Lifecycle::ended`] still reports every removal, and
+/// `compose::Endings` remains useful when a composition wants to fan those
+/// callbacks into a group-level awaitable.
 ///
 /// `compose::Endings` is backticks and not a link, for the reason
 /// [`SystemBuilder::lifecycle`] gives at length: `compose` is built on top of this
@@ -1487,6 +1644,64 @@ impl<M> System<M> {
         }
     }
 
+    /// Dispatch a typed local keyed RPC through this system's registry.
+    ///
+    /// `service!` calls this hidden seam from its generated local reference. It
+    /// is public because the generated code lives in the caller's crate.
+    #[doc(hidden)]
+    pub async fn __local_ask<T>(
+        &self,
+        actor: &ActorId,
+        mail: impl FnOnce(Origin, Reply<T>) -> M,
+    ) -> Result<T, LocalError>
+    where
+        M: Send + 'static,
+        T: Send + 'static,
+    {
+        let route = self.route(actor).map_err(LocalError::from)?;
+        let chain = current();
+        if chain.holds(&route.actor) {
+            return Err(LocalError::Reentrant);
+        }
+        let fate = route.fate.clone();
+        let (reply, answer) = Reply::channel();
+        let sent = route
+            .mail
+            .send((Box::new(mail(Origin::local(), reply)), chain))
+            .await;
+        drop(route);
+        sent.map_err(|_| LocalError::Closed)?;
+        crate::turns::asked(answer, &fate)
+            .await
+            .map_err(local_error)
+    }
+
+    /// Dispatch a typed local keyed tell through this system's registry.
+    #[doc(hidden)]
+    pub async fn __local_notify<T>(
+        &self,
+        actor: &ActorId,
+        mail: impl FnOnce(Origin, Reply<T>) -> M,
+    ) -> Result<(), LocalError>
+    where
+        M: Send + 'static,
+        T: Send + 'static,
+    {
+        let route = self.route(actor).map_err(LocalError::from)?;
+        let chain = current();
+        if chain.holds(&route.actor) && route.mail.capacity() == 0 {
+            return Err(LocalError::Reentrant);
+        }
+        let (reply, answer) = Reply::channel();
+        drop(answer);
+        let sent = route
+            .mail
+            .send((Box::new(mail(Origin::local(), reply)), chain))
+            .await;
+        drop(route);
+        sent.map_err(|_| LocalError::Closed)
+    }
+
     /// Mount an actor under `id`, starting it.
     ///
     /// Takes effect on the next message. Nothing is announced, no lock outside
@@ -1532,8 +1747,8 @@ impl<M> System<M> {
                         capacity: self.inner.capacity,
                     });
                 }
-                let announce = self.inner.announcing(free.key());
                 let entry = self.inner.entry(free.key(), actor);
+                let announce = self.inner.announcing(free.key(), &entry.identity);
                 free.insert(entry);
                 announce
             }
@@ -1543,8 +1758,8 @@ impl<M> System<M> {
         // deadlock the implementor could not have seen coming. A refusal above
         // returns before this and announces nothing — there is no actor.
         drop(entries);
-        if let Some(id) = announce {
-            self.inner.report_mounted(&id);
+        if let Some((id, identity)) = announce {
+            self.inner.report_mounted(&id, &identity);
         }
         Ok(())
     }
@@ -1635,63 +1850,28 @@ impl<M> System<M> {
     /// survives alongside this because it never drains, which makes it a different
     /// operation rather than this one with a budget of zero.
     ///
-    /// # The `Ended` is synthesised here, and what that costs
+    /// # The `Ended` returned here answers a different question from `System::ended`
     ///
-    /// A registry entry has no `ended` channel — a keyed actor has no `ended()`
-    /// for a caller to await — so this reports what the *join* said: the task
-    /// returned, or it did not.
+    /// This method reports the fate of **this shutdown operation**: `Stopped` when
+    /// the task drained inside `budget`, and `Vanished` when the budget expired or
+    /// the task had already failed and had to be aborted. It does not claim to
+    /// explain why a loop that finished normally ended.
     ///
-    /// **That is not the whole truth, and the gap is new.** The argument this
-    /// design inherited was that a synthesised `Ended` "cannot lie", because
-    /// `Stopped` and `Vanished` were the only two endings a keyed actor had. Wave
-    /// 3 gives a keyed actor observers, and with observers the loop can break on
-    /// its own with [`Ended::Panicked`] or [`Ended::Observer`] — an ending this
-    /// call did not cause and cannot see, because the loop returns normally
-    /// either way and the join says `Ok(())` for both. So:
+    /// The registry entry also carries a watch channel. The generated loop publishes
+    /// its actual [`Ended`] value before the registry reaps it, and
+    /// [`System::ended`] lets a caller that subscribed before removal await that
+    /// value. If `shutdown` has to abort the task, `drain` publishes the synthesized
+    /// `Vanished` value only when the loop did not publish one first.
     ///
-    /// - [`Ended::Vanished`] means the task **did not return**, and it does not
-    ///   say why: this call's abort, an earlier one, a runtime shutdown, or a
-    ///   panic that escaped a turn all arrive here as a failed join. It used to
-    ///   claim "only an abort produces that", which is wrong on its face — the
-    ///   `Vanished` variant's own definition names a runtime shutdown — and
-    ///   `drain`'s doc twelve lines away already said "aborted or panicked". The
-    ///   crate does not split abort from panic here on purpose and not by
-    ///   omission: `JoinError::is_panic()` is hardcoded `false` on wasm, where a
-    ///   panicking task is not unwound at all, so a variant that promised the
-    ///   difference would be a promise one target cannot keep.
-    /// - [`Ended::Stopped`] is exact about **this call**: routing has stopped and
-    ///   the task is finished. It does not claim to be *why* the loop exited. An
-    ///   actor that ended on an observer's refusal a second earlier is reported
-    ///   `Stopped` here.
+    /// These are complementary observations, not two guesses about one value:
+    /// `shutdown` says whether this caller's drain succeeded, while `ended` says
+    /// why the actor loop reported that it was over. A shutdown caused by an
+    /// observer's refusal can therefore return `Stopped` while a pre-existing
+    /// `ended` subscriber receives `Ended::Observer`.
     ///
-    /// Adding `ended: watch::Receiver<Option<Ended>>` to that entry would close
-    /// that gap and is deliberately not done, for a reason that survives Wave 3:
-    /// it is a **second** determination of a fact this call already has. For the
-    /// two answers a shutdown owes a caller — did it drain, did we have to kill
-    /// it — the join is authoritative and a channel adds nothing, and in the one
-    /// case they could disagree the channel is *worse*: an aborted loop never
-    /// fills it, so the receiver reports `Vanished` from a dropped sender, which
-    /// is the join's answer arrived by a longer route.
-    ///
-    /// **The residual named here has since been closed, and this is what it
-    /// cost.** The paragraph used to end *"the keyed loop already computes the
-    /// true `Ended` and throws it away. Whoever wants it should give the loop
-    /// somewhere to put it, not have the registry guess a second time."* That is
-    /// what `Loop` is: the loop returns its ending and `Registry::reap`
-    /// reports it. It does not change what **this** call says, and deliberately
-    /// so — the two are still one determination each, of two different facts.
-    /// This call answers *did it drain*, from the join, for the caller who asked.
-    /// `reap` answers *why it ended*, from the loop, when nobody asked. The
-    /// interlock is that exactly one of them ever fires for one ending, so the
-    /// `Stopped`-for-an-observer's-refusal case above is still what a caller of
-    /// **this** method sees, and it is still honest about being about this call.
     pub async fn shutdown(&self, id: &ActorId, budget: Duration) -> Option<Ended> {
         let entry = self.inner.write().remove(id)?;
-        let ended = drain(entry, budget).await;
-        // The same value the caller is about to receive, and never a second
-        // determination of it: a `Lifecycle` and a caller who both watched this
-        // shutdown must not be able to be told different things.
-        self.inner.report_ended(id, &ended);
+        let ended = drain(Arc::clone(&self.inner), id.clone(), entry, budget).await;
         Some(ended)
     }
 
@@ -1722,13 +1902,23 @@ impl<M> System<M> {
         // is a **hand-written** `mount` loop, which has no `run_loop` and so no
         // floor. `abort_settles_the_served_answer_before_it_destroys_the_actor`
         // drives one for that reason.
+        let ending = entry.ended.subscribe();
         entry.fate.settle(Standing::Gone);
         entry.task.abort();
         let _ = entry.task.await;
-        // [`Ended::Vanished`] and not a fourth spelling: an aborted task is what
-        // that variant means everywhere else in the crate, and `abort` is the one
-        // teardown that does not go through `drain` to say so.
-        self.inner.report_ended(id, &Ended::Vanished);
+        // Publish the synthetic result only after the task has joined. If the
+        // loop won the race before cancellation, its natural `Feed`/`Panicked`/
+        // `Observer` value is already in the channel and remains authoritative.
+        // Delaying the synthetic send keeps a direct `System::ended` waiter and
+        // the lifecycle callback on the same final value.
+        let published = { ending.borrow().clone() };
+        let why = if let Some(why) = published {
+            why
+        } else {
+            entry.ended.send_replace(Some(Ended::Vanished));
+            Ended::Vanished
+        };
+        self.inner.report_ended(id, &entry.identity, &why);
         true
     }
 
@@ -1826,6 +2016,28 @@ impl<M> System<M> {
     #[must_use]
     pub fn serving(&self, id: &ActorId) -> Option<Serving> {
         self.inner.read().get(id).map(Entry::serving)
+    }
+
+    /// Await the ending of the actor currently mounted under `id`.
+    ///
+    /// The future subscribes before the actor is removed from the registry, so
+    /// shutdown, eviction, natural loop endings and aborts all report through the
+    /// same [`Ended`] value. `None` means the id is not live at this instant; like
+    /// [`Self::serving`], this is a non-inserting observation.
+    #[must_use]
+    pub fn ended(&self, id: &ActorId) -> Option<impl Future<Output = Ended> + Send + 'static> {
+        let mut ended = self.inner.read().get(id)?.ended.subscribe();
+        Some(async move {
+            loop {
+                let value = ended.borrow().clone();
+                if let Some(value) = value {
+                    return value;
+                }
+                if ended.changed().await.is_err() {
+                    return Ended::Vanished;
+                }
+            }
+        })
     }
 
     /// [`Self::status`], read through a handle that does **not** keep this
@@ -2714,7 +2926,7 @@ mod tests {
             .route(&one)
             .expect("mounted")
             .mail
-            .send(Box::new(Bare))
+            .send((Box::new(Bare), Chain::Empty))
             .await
             .expect("the one slot is free");
         started.await.expect("the actor enters its turn");
@@ -2957,6 +3169,118 @@ mod tests {
         assert!(!system.abort(&cancelled).await);
     }
 
+    /// A task ending after its id was reused must not reap the replacement.
+    ///
+    /// Shutdown removes the old entry before it awaits, deliberately allowing a
+    /// new incarnation to mount while the old one drains. The old task therefore
+    /// needs entry identity as well as the public id when it reaps itself.
+    #[tokio::test]
+    async fn a_late_old_ending_does_not_reap_a_remounted_incarnation() {
+        let reports = Reported::default();
+        let system: System<Bare> = System::builder(Eviction::Never)
+            .lifecycle(reports.clone())
+            .build();
+        let id = ActorId::new("reused").expect("valid");
+        let (finish_old, old_finishes) = oneshot::channel();
+        system
+            .mount(id.clone(), self_ending(old_finishes))
+            .expect("the old incarnation mounts");
+
+        let shutting_down = {
+            let system = system.clone();
+            let id = id.clone();
+            tokio::spawn(async move { system.shutdown(&id, Duration::from_secs(60)).await })
+        };
+        settle().await;
+        assert!(!system.contains(&id), "shutdown unmounts before awaiting");
+
+        let (finish_new, new_finishes) = oneshot::channel();
+        system
+            .mount(id.clone(), self_ending(new_finishes))
+            .expect("the replacement mounts while the old actor drains");
+        let new_ending = system.ended(&id).expect("the replacement is mounted");
+
+        finish_old.send(()).expect("the old actor may finish");
+        assert!(matches!(
+            shutting_down.await.expect("shutdown task joins"),
+            Some(Ended::Stopped)
+        ));
+        assert!(
+            system.contains(&id),
+            "the old task's late reap must leave the replacement mounted"
+        );
+
+        finish_new.send(()).expect("the replacement may finish");
+        assert!(matches!(new_ending.await, Ended::Feed { name: "ticks" }));
+        settle().await;
+        assert!(!system.contains(&id));
+        assert_eq!(
+            reports.seen(),
+            vec![
+                "mounted reused",
+                "mounted reused",
+                "ended reused Stopped",
+                r#"ended reused Feed { name: "ticks" }"#,
+            ]
+        );
+    }
+
+    /// Cancelling shutdown still settles both observation doors.
+    #[tokio::test]
+    async fn a_cancelled_shutdown_reports_vanished_to_direct_and_lifecycle_waiters() {
+        let reports = Reported::default();
+        let system: System<Bare> = System::builder(Eviction::Never)
+            .lifecycle(reports.clone())
+            .build();
+        let id = ActorId::new("cancelled-shutdown").expect("valid");
+        let (_never_finish, waits_forever) = oneshot::channel();
+        system
+            .mount(id.clone(), self_ending(waits_forever))
+            .expect("the actor mounts");
+        let ending = system.ended(&id).expect("the actor is mounted");
+
+        let shutdown = {
+            let system = system.clone();
+            let id = id.clone();
+            tokio::spawn(async move { system.shutdown(&id, Duration::from_secs(60)).await })
+        };
+        settle().await;
+        assert!(!system.contains(&id), "shutdown has taken the entry");
+        shutdown.abort();
+        assert!(shutdown
+            .await
+            .expect_err("the outer shutdown is cancelled")
+            .is_cancelled());
+
+        assert!(matches!(ending.await, Ended::Vanished));
+        assert_eq!(
+            reports.seen(),
+            vec![
+                "mounted cancelled-shutdown",
+                "ended cancelled-shutdown Vanished",
+            ]
+        );
+    }
+
+    /// Abort publishes one final reason to both direct and callback observers.
+    #[tokio::test]
+    async fn abort_reports_the_same_final_ending_to_both_observation_doors() {
+        let reports = Reported::default();
+        let system: System<Bare> = System::builder(Eviction::Never)
+            .lifecycle(reports.clone())
+            .build();
+        let id = ActorId::new("aborted-ending").expect("valid");
+        system.mount(id.clone(), idler()).expect("the actor mounts");
+        let ending = system.ended(&id).expect("the actor is mounted");
+
+        assert!(system.abort(&id).await);
+        assert!(matches!(ending.await, Ended::Vanished));
+        assert_eq!(
+            reports.seen(),
+            vec!["mounted aborted-ending", "ended aborted-ending Vanished"]
+        );
+    }
+
     /// The refusal that used to cost a task, at the witness type.
     ///
     /// `Mounted` holds an unstarted future, so a refused mount drops a loop that
@@ -3038,7 +3362,7 @@ mod tests {
 
         let mail = system.route(&held).expect("mounted").mail;
         assert_eq!(only(&system).buffered, 0, "nothing is waiting yet");
-        mail.send(Box::new(Bare))
+        mail.send((Box::new(Bare), Chain::Empty))
             .await
             .expect("the one slot is free");
 
@@ -3047,7 +3371,7 @@ mod tests {
         let (sent, mut second) = oneshot::channel();
         let parked = mail.clone();
         n0_future::task::spawn(async move {
-            let _ = sent.send(parked.send(Box::new(Bare)).await.is_ok());
+            let _ = sent.send(parked.send((Box::new(Bare), Chain::Empty)).await.is_ok());
         });
         settle().await;
 
@@ -3128,7 +3452,7 @@ mod tests {
             "an untouched mailbox holds nothing, whatever its depth"
         );
         for expected in 1..=3 {
-            mail.send(Box::new(Bare))
+            mail.send((Box::new(Bare), Chain::Empty))
                 .await
                 .expect("three slots, three messages");
             assert_eq!(
@@ -3141,7 +3465,7 @@ mod tests {
         let (sent, mut fourth) = oneshot::channel();
         let parked = mail.clone();
         n0_future::task::spawn(async move {
-            let _ = sent.send(parked.send(Box::new(Bare)).await.is_ok());
+            let _ = sent.send(parked.send((Box::new(Bare), Chain::Empty)).await.is_ok());
         });
         settle().await;
         assert!(
@@ -3260,7 +3584,7 @@ mod tests {
 
             let mail = system.route(&id).expect("mounted").mail;
             for _ in 0..=slots {
-                mail.send(Box::new(Bare))
+                mail.send((Box::new(Bare), Chain::Empty))
                     .await
                     .expect("a slot, or the loop");
             }

@@ -171,7 +171,14 @@ impl bulky::Actor for Empty {
 /// on a path that already allocates the mailbox slot, and — for a served call — a
 /// QUIC stream and a postcard decode. That is the trade, stated where it is paid:
 /// **an allocation per message against a kilobyte per idle actor.**
-const BUDGET_PER_ACTOR: isize = 2048;
+///
+/// The keyed mailbox now carries its re-entrancy chain beside every message, so
+/// the current measured idle cost is 2,618 bytes rather than the historical 1,722
+/// below. Keep the measurement and cross-allocator slack separate: this ceiling is
+/// not permission for an unrelated frame to grow into the margin.
+const KEYED_MEASURED: isize = 2_618;
+const KEYED_SLACK: isize = 275;
+const BUDGET_PER_ACTOR: isize = KEYED_MEASURED + KEYED_SLACK;
 
 /// The same ceiling, for an actor started with `ledger::actor(..)` instead of
 /// mounted in a [`System`](keylink::System).
@@ -195,9 +202,9 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// Measured on this machine, at ten thousand actors of the `ledger` service
 /// below, with an empty state:
 ///
-/// | path | before the generated mailbox (`c9056e0`) | Wave 1b (`c8712b0`) | Wave 2 (`836179c`) | Wave 3 | Wave 9 | before `Fate` (`810650a`) | `Fate` | with the `Floor` |
-/// |---|---|---|---|---|---|---|---|---|
-/// | keyed, mounted in a `System` | 1,671 | 1,159 | 1,159 | 1,415 | 1,412 | 1,549 | 1,690 | **1,722** |
+/// | path | before the generated mailbox (`c9056e0`) | Wave 1b (`c8712b0`) | Wave 2 (`836179c`) | Wave 3 | Wave 9 | before `Fate` (`810650a`) | `Fate` | with the `Floor` | chain propagation |
+/// |---|---|---|---|---|---|---|---|---|---|
+/// | keyed, mounted in a `System` | 1,671 | 1,159 | 1,159 | 1,415 | 1,412 | 1,549 | 1,690 | **1,722** | **2,618** |
 /// | local, `ledger::actor(..)`   | 1,725 | 1,469 | 1,597 | 1,853 | 1,861 | 1,861 | **2,029** | **2,029** |
 ///
 /// # The `Floor` cost 32 bytes on the keyed path and nothing measurable on the local one
@@ -205,7 +212,9 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// Re-measured because the column before it was written *before* the floor
 /// existed, and a stale figure in this table is the one defect its own
 /// documentation keeps warning about. Keyed 1,690 → **1,722**; local 2,029 →
-/// **2,029**, unmoved to the byte. The floor is a `&Fate` and a `bool` in two
+/// **2,029**, unmoved to the byte. The later chain-propagation column is the
+/// current keyed measurement and is not a `Floor` regression. The floor is a
+/// `&Fate` and a `bool` in two
 /// frames — `run_loop`'s and `supervise`'s — and only the keyed path crossed an
 /// allocator step with it.
 ///
@@ -312,7 +321,8 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// `Box::pin` at the local loop's await is an absolute ceiling (3,005 bytes without
 /// it against 1,597 with) that happens to sit between 1,861 and 2,048. The local
 /// path has **less** headroom than the keyed one: **2,029 against a 2,304 ceiling,
-/// where keyed is 1,722 against 2,048.**
+/// where the current keyed measurement is 2,618 against its derived ceiling of
+/// 2,893.**
 ///
 /// Four numbers rather than the subtraction, deliberately. That sentence has now
 /// been wrong twice, both times because it stated a *derived* figure: first "339
@@ -355,10 +365,10 @@ const BUDGET_PER_ACTOR: isize = 2048;
 /// It restores 275 bytes of headroom against the 187 this literal had at 1,861 —
 /// *more* than before, not "about the same", which the sentence here first
 /// claimed. `LOCAL_SLACK` **is** that headroom rather than a figure derived from
-/// it, which is the point of decomposing the ceiling. The keyed one is untouched:
-/// `BUDGET_PER_ACTOR` is still 2,048 and the measurement is 1,722, so the floor's
-/// 32 bytes came out of *its* margin and tightened that guard rather than
-/// loosening it.
+/// it, which is the point of decomposing the ceiling. The historical keyed
+/// budget was 2,048 against 1,722. Chain propagation now measures 2,618, so
+/// [`KEYED_SLACK`] keeps the current guard derived from that measurement rather
+/// than silently reusing the old ceiling.
 ///
 /// What is **not** relaxed is the thing this budget cannot see and
 /// [`SLOPE_SLACK_OVER_A_KILOBYTE`] can: the slope is 13 bytes over a kilobyte of
@@ -374,8 +384,9 @@ const BUDGET_PER_LOCAL_ACTOR: isize = LOCAL_MEASURED + LOCAL_SLACK;
 /// # It was 2,029, and item M's re-entrancy chain is what moved it
 ///
 /// **The price, stated once so it can be rejected without being re-derived:
-/// re-entrancy detection costs 280 bytes per idle actor on the LOCAL path, and
-/// nothing on the keyed one.** That is the whole of what this raise buys. A later
+/// re-entrancy detection costs 280 bytes per idle actor on the LOCAL path, while
+/// keyed chain provenance adds the measured mailbox cost recorded above.** That
+/// is the whole of what this raise buys. A later
 /// wave that decides the refusal is not worth 280 bytes per actor has the figure
 /// here and does not have to reconstruct where it came from — and the way to spend
 /// it back is to delete the mechanism, not to widen [`LOCAL_SLACK`].
@@ -384,9 +395,10 @@ const BUDGET_PER_LOCAL_ACTOR: isize = LOCAL_MEASURED + LOCAL_SLACK;
 /// `Message::Mail` grew by a `Chain` — and this is the one place in the crate
 /// where that is multiplied: `tokio::sync::mpsc` allocates its first block of 32
 /// slots eagerly, so a type in the slot is paid for 32 times by every idle actor
-/// whether or not anything is ever queued. The keyed path is untouched, because a
-/// keyed mailbox carries no chain: `BUDGET_PER_ACTOR` is still 2,048 against a
-/// measurement of 1,722, unmoved.
+/// whether or not anything is ever queued. The keyed path now carries the same
+/// chain provenance: its mailbox message is `(Box<Mail>, Chain)`. That is why its
+/// measured cost moved to 2,618 and why the keyed budget is derived from
+/// [`KEYED_MEASURED`], rather than the old 1,722 measurement.
 ///
 /// **The change was made cheaper before the number was moved**, which is this
 /// file's own precedent from the `Fate` wave. `Chain::Deep` held an `Arc<[Actor]>`

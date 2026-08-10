@@ -236,7 +236,9 @@ async fn the_actor_list_reaches_a_peer_with_every_field_intact() {
         .map(|n| watched.mount(&id(&format!("obra/{n}"))))
         .collect();
     assert_eq!(
-        journal::at(&watched.journal, id("obra/1"))
+        watched
+            .journal
+            .at(id("obra/1"))
             .post(7)
             .await
             .expect("the actor answers"),
@@ -313,7 +315,9 @@ async fn a_peer_the_inspect_allowlist_refuses_gets_nothing() {
     let _ticks = watched.mount(&id("obra/0"));
 
     assert_eq!(
-        journal::at(&watched.journal, id("obra/0"))
+        watched
+            .journal
+            .at(id("obra/0"))
             .post(1)
             .await
             .expect("the journal service admits this peer"),
@@ -360,7 +364,9 @@ async fn a_console_observes_a_mount_a_turn_and_an_ending() {
     let who = id("obra/7");
     let _ticks = watched.mount(&who);
     assert_eq!(
-        journal::at(&watched.journal, who.clone())
+        watched
+            .journal
+            .at(who.clone())
             .post(3)
             .await
             .expect("the actor answers"),
@@ -433,7 +439,9 @@ async fn an_actor_that_ends_itself_is_delisted_and_reported_to_the_console() {
     let who = id("self-ender");
     let ticks = watched.mount(&who);
     assert_eq!(
-        journal::at(&watched.journal, who.clone())
+        watched
+            .journal
+            .at(who.clone())
             .post(1)
             .await
             .expect("the actor answers while its feed is open"),
@@ -475,7 +483,9 @@ async fn an_actor_that_ends_itself_is_delisted_and_reported_to_the_console() {
     )
     .await;
 
-    let refused = journal::at(&watched.journal, who.clone())
+    let refused = watched
+        .journal
+        .at(who.clone())
         .post(2)
         .await
         .expect_err("the actor is gone, so the call has nothing to reach");
@@ -661,7 +671,9 @@ async fn a_parked_subscriber_does_not_stop_the_actor_serving_turns() {
     );
 
     assert_eq!(
-        journal::at(&watched.journal, who.clone())
+        watched
+            .journal
+            .at(who.clone())
             .post(9)
             .await
             .expect("the watched actor answers with a subscriber attached"),

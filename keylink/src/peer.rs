@@ -30,7 +30,7 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::{EndpointAddr, Node, Result};
+use crate::{EndpointAddr, Error, Node, Result};
 
 /// How a typed client is dialled, so [`Peer`] can re-dial one.
 ///
@@ -42,6 +42,10 @@ pub trait Dial: Sized {
         node: &Node,
         addr: EndpointAddr,
     ) -> impl std::future::Future<Output = Result<Self>> + Send;
+}
+
+fn is_reconnectable(error: &Error) -> bool {
+    matches!(error, Error::Transport(_) | Error::Closed)
 }
 
 /// A lazily connected, self-healing client for one peer.
@@ -102,6 +106,16 @@ impl<C: Dial + Send + Sync> Peer<C> {
         *self.lock() = None;
     }
 
+    fn disconnect_if(&self, client: &Arc<C>) {
+        let mut slot = self.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, client))
+        {
+            *slot = None;
+        }
+    }
+
     /// Run one call, reconnecting once if it fails.
     ///
     /// The closure receives the live client and is invoked at most twice: once
@@ -118,17 +132,20 @@ impl<C: Dial + Send + Sync> Peer<C> {
         Fut: std::future::Future<Output = Result<T>>,
     {
         let client = self.connect().await?;
-        let first = f(client).await;
-        let Err(_reason) = first else {
+        let first = f(client.clone()).await;
+        let Err(reason) = first else {
             return first;
         };
 
-        // A failure here may mean the connection is dead, or may mean the
-        // handler said no. keylink cannot tell those apart from an `Error`
-        // alone, so it re-dials either way and lets the second answer stand.
-        // The cost of being wrong is one extra handshake; the cost of not
-        // re-dialling is a handle that stays broken forever.
-        self.disconnect();
+        // A remote/application or per-stream error proves nothing about the
+        // cached connection's health. Only a transport failure or clean close
+        // both invalidates this client and permits replay; all other errors are
+        // returned without touching a connection another concurrent call may use.
+        if !is_reconnectable(&reason) {
+            return Err(reason);
+        }
+        self.disconnect_if(&client);
+
         let fresh = self.connect().await?;
         f(fresh).await
     }

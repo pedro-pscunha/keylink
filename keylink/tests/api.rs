@@ -153,7 +153,7 @@ async fn the_generated_module_supplies_the_rest_fully_applied() {
     let _: fn(&depot::Client, keylink::IdempotencyKey) -> depot::IdempotentClient =
         depot::Client::with_idempotency;
     let _ = depot::IdempotentClient::close;
-    let _ = depot::at;
+    let _ = depot::KeyedClient::at;
     let _ = depot::keyed_service(&system, Allowlist::anyone());
     // Annotated rather than bare, and the annotation is the assertion: the one
     // thing a caller can get wrong about this door is the argument order, and
@@ -363,4 +363,96 @@ async fn the_surface_generic_trio_resolves_from_outside() {
     // The method that replaces equality, which `Failure` cannot derive: named as
     // a function item, because the annotation is what pins the borrowed answer.
     let _: fn(&Failure) -> Option<&keylink::Withheld> = Failure::withheld;
+}
+
+mod cfg_disabled_service_declarations {
+    keylink::service! {
+        service Disabled;
+        #[cfg(any())]
+        rpc Type(value: u64) -> u64;
+        #[cfg(any())]
+        tell Notify(value: u64) -> ();
+        #[cfg(any())]
+        send Upload(value: u64) -> u64;
+        #[cfg(any())]
+        recv Download(value: u64) -> u64;
+        #[cfg(any())]
+        blob Snapshot(value: u64) -> u64;
+        #[cfg(any())]
+        feed Events(value: u64);
+        rpc Ping(value: u64) -> u64;
+    }
+
+    #[derive(Default)]
+    struct State;
+
+    impl disabled::Actor for State {
+        async fn ping(&mut self, _cx: keylink::Caller<'_>, value: u64) -> u64 {
+            value
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_declarations_leave_no_generated_references() {
+        let _actor = disabled::actor(State);
+    }
+}
+
+mod cfg_attr_declaration_attributes {
+    #![deny(warnings)]
+
+    keylink::service! {
+        service Annotated;
+        #[cfg_attr(all(), doc = "an annotated rpc")]
+        rpc Echo(value: u64) -> u64;
+        #[cfg_attr(all(), doc = "an annotated feed")]
+        feed Updates(value: u64);
+        #[cfg_attr(all(), cfg(any()))]
+        rpc Disabled(value: u64) -> u64;
+        #[cfg_attr(all(), cfg(all()), cfg(any()))]
+        rpc MultiDisabled(value: u64) -> u64;
+        #[cfg_attr(all(), doc = "a feed", cfg(all()), cfg(any()))]
+        feed MultiDisabledFeed(value: u64);
+    }
+}
+
+mod cfg_attr_condition_semantics {
+    keylink::service! {
+        service Conditional;
+        #[cfg_attr(any(), cfg(any()))]
+        rpc Active(value: u64) -> u64;
+        #[cfg_attr(all(), cfg_attr(all(), cfg(any())))]
+        rpc NestedDisabled(value: u64) -> u64;
+        #[cfg_attr(all(), serde(rename = "active-wire"))]
+        rpc SerdeActive(value: u64) -> u64;
+    }
+
+    #[derive(Default)]
+    struct State;
+
+    impl conditional::Actor for State {
+        async fn active(&mut self, _cx: keylink::Caller<'_>, value: u64) -> u64 {
+            value
+        }
+
+        async fn serde_active(&mut self, _cx: keylink::Caller<'_>, value: u64) -> u64 {
+            value
+        }
+    }
+
+    #[tokio::test]
+    async fn cfg_attr_conditions_gate_only_when_the_outer_condition_is_true() {
+        let actor = conditional::actor(State);
+        assert_eq!(
+            actor.active(7).await.expect("active declaration remains"),
+            7
+        );
+        assert_eq!(
+            actor
+                .serde_active(8)
+                .await
+                .expect("serde metadata stays on the wire variant only"),
+            8
+        );
+    }
 }

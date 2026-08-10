@@ -121,14 +121,16 @@ impl<H> Names<H> {
     /// Remember `handle` as `name`, until `ended` resolves.
     ///
     /// `ended` is that actor's own [`ended()`](crate::LocalActor::ended) —
-    /// `handle.ended()` for a generated handle. Passing the *wrong* actor's is
-    /// the one way to misuse this, and it is why the two arrive together at one
-    /// call site rather than being registered separately.
+    /// `handle.ended()` for a generated local handle. For a keyed actor,
+    /// [`System::ended`](crate::System::ended) returns `None` when the id is not
+    /// mounted, so unwrap that state explicitly before registering:
+    /// `let ended = system.ended(&id).expect("the actor was just mounted");`.
+    /// Passing the *wrong* actor's future is the one way to misuse this, and it is why the
+    /// two arrive together at one call site rather than being registered separately.
     ///
-    /// It is an argument rather than something asked of `handle` because a keyed
-    /// actor has no `ended()` to ask for: `H` is whatever a caller holds, and the
-    /// day [`System`](crate::System) grows a per-actor ending channel this takes
-    /// it with no change.
+    /// It is an argument rather than something asked of `handle` because `H` is
+    /// whatever a caller holds: a local handle can expose its ending directly,
+    /// while a keyed future comes from its [`System`](crate::System).
     ///
     /// Returns the handle it displaced, if the name was taken. Dropping that
     /// handle is what lets the displaced actor end, if nothing else holds one.

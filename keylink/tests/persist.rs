@@ -646,12 +646,14 @@ async fn a_keyed_actors_state_survives_its_own_process() {
             .await
             .expect("the client dials the actor system");
 
-        ledger::at(&client, actor.clone())
+        client
+            .at(actor.clone())
             .post(entry)
             .await
             .expect("the keyed actor answers");
         assert_eq!(
-            ledger::at(&client, actor.clone())
+            client
+                .at(actor.clone())
                 .entries()
                 .await
                 .expect("the keyed actor answers"),
@@ -1387,19 +1389,15 @@ async fn a_retried_call_across_a_restart_is_applied_once() {
             .await
             .expect("dials");
         assert_eq!(
-            till::at(&client.with_idempotency(key.clone()), actor.clone())
+            client
+                .with_idempotency(key.clone())
+                .at(actor.clone())
                 .credit(50)
                 .await
                 .expect("the keyed actor answers"),
             50,
         );
-        assert_eq!(
-            till::at(&client, actor.clone())
-                .runs()
-                .await
-                .expect("answers"),
-            1,
-        );
+        assert_eq!(client.at(actor.clone()).runs().await.expect("answers"), 1,);
         assert_eq!(
             client.key_state(key.clone()).await.expect("answers"),
             KeyState::Done,
@@ -1422,7 +1420,9 @@ async fn a_retried_call_across_a_restart_is_applied_once() {
          news rather than a regression — see this test's own doc",
     );
     assert_eq!(
-        till::at(&client.with_idempotency(key.clone()), actor.clone())
+        client
+            .with_idempotency(key.clone())
+            .at(actor.clone())
             .credit(50)
             .await
             .expect("the keyed actor answers"),
@@ -1430,18 +1430,12 @@ async fn a_retried_call_across_a_restart_is_applied_once() {
         "the retry is answered with the FIRST run's balance, out of the state",
     );
     assert_eq!(
-        till::at(&client, actor.clone())
-            .runs()
-            .await
-            .expect("answers"),
+        client.at(actor.clone()).runs().await.expect("answers"),
         1,
         "the work must not have run a second time",
     );
     assert_eq!(
-        till::at(&client, actor.clone())
-            .balance()
-            .await
-            .expect("answers"),
+        client.at(actor.clone()).balance().await.expect("answers"),
         50,
     );
 
@@ -1450,20 +1444,16 @@ async fn a_retried_call_across_a_restart_is_applied_once() {
     //    assertion above would still hold — see this test's own break record.
     let another = IdempotencyKey::new("credit-4472").expect("a valid key");
     assert_eq!(
-        till::at(&client.with_idempotency(another), actor.clone())
+        client
+            .with_idempotency(another)
+            .at(actor.clone())
             .credit(7)
             .await
             .expect("the keyed actor answers"),
         57,
         "a different key from the same peer must be applied, not recognised",
     );
-    assert_eq!(
-        till::at(&client, actor.clone())
-            .runs()
-            .await
-            .expect("answers"),
-        2,
-    );
+    assert_eq!(client.at(actor.clone()).runs().await.expect("answers"), 2,);
 
     // ── the second negative: a caller on a fresh keypair is a different peer, so
     //    the same key is a different call. The precondition, stated as a fact.
@@ -1472,7 +1462,9 @@ async fn a_retried_call_across_a_restart_is_applied_once() {
         .await
         .expect("dials");
     assert_eq!(
-        till::at(&other.with_idempotency(key.clone()), actor.clone())
+        other
+            .with_idempotency(key.clone())
+            .at(actor.clone())
             .credit(50)
             .await
             .expect("the keyed actor answers"),
@@ -1480,13 +1472,7 @@ async fn a_retried_call_across_a_restart_is_applied_once() {
         "a peer that reconnected on a new keypair is not recognised, and the \
          work runs again — silently, which is the limit and not a defect",
     );
-    assert_eq!(
-        till::at(&other, actor.clone())
-            .runs()
-            .await
-            .expect("answers"),
-        3,
-    );
+    assert_eq!(other.at(actor.clone()).runs().await.expect("answers"), 3,);
 
     serving.stop(&actor).await;
 }
@@ -1644,7 +1630,8 @@ fn on_disk_booth(scratch: &Scratch) -> Booth {
 /// sleeping. `waiting_for` above, with a client instead of a `Handle`.
 async fn parked_over_the_wire(client: &booth::KeyedClient, actor: &ActorId, want: u64) {
     for _ in 0..500 {
-        if booth::at(client, actor.clone())
+        if client
+            .at(actor.clone())
             .waiting()
             .await
             .expect("the actor is running")
@@ -1890,7 +1877,7 @@ async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
     let pending = {
         let keyed = client.with_idempotency(first_key.clone());
         let actor = actor.clone();
-        tokio::spawn(async move { booth::at(&keyed, actor).withdraw(40).await })
+        tokio::spawn(async move { keyed.at(actor).withdraw(40).await })
     };
     parked_over_the_wire(&client, &actor, 1).await;
 
@@ -1907,10 +1894,7 @@ async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
     );
 
     assert_eq!(
-        booth::at(&client, actor.clone())
-            .approve()
-            .await
-            .expect("answers"),
+        client.at(actor.clone()).approve().await.expect("answers"),
         1,
     );
     assert_eq!(
@@ -1932,11 +1916,13 @@ async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
     let pending = {
         let keyed = client.with_idempotency(second_key.clone());
         let actor = actor.clone();
-        tokio::spawn(async move { booth::at(&keyed, actor).withdraw(40).await })
+        tokio::spawn(async move { keyed.at(actor).withdraw(40).await })
     };
     parked_over_the_wire(&client, &actor, 1).await;
     assert_eq!(
-        booth::at(&client.with_idempotency(approve_key.clone()), actor.clone())
+        client
+            .with_idempotency(approve_key.clone())
+            .at(actor.clone())
             .approve()
             .await
             .expect("answers"),
@@ -1944,10 +1930,7 @@ async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
     );
     assert_eq!(pending.await.expect("no panic").expect("answers"), 20);
 
-    let seen = booth::at(&client, actor.clone())
-        .seen()
-        .await
-        .expect("answers");
+    let seen = client.at(actor.clone()).seen().await.expect("answers");
     assert_eq!(seen.len(), 4, "four recorded turns, in order: {seen:?}");
     assert_ne!(
         seen[0], "-",
@@ -1993,7 +1976,10 @@ async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
     assert_eq!(
         tokio::time::timeout(
             NO_PROGRESS,
-            booth::at(&client.with_idempotency(second_key.clone()), actor.clone()).withdraw(40),
+            client
+                .with_idempotency(second_key.clone())
+                .at(actor.clone())
+                .withdraw(40),
         )
         .await
         .expect("an unrecognised retry parks and never answers; this must not park")
@@ -2002,10 +1988,7 @@ async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
         "the retry is recognised out of the restored state and answered at once",
     );
     assert_eq!(
-        booth::at(&client, actor.clone())
-            .waiting()
-            .await
-            .expect("answers"),
+        client.at(actor.clone()).waiting().await.expect("answers"),
         0,
         "and nothing was parked a second time",
     );
@@ -2020,16 +2003,10 @@ async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
     let strangers = {
         let keyed = other.with_idempotency(second_key.clone());
         let actor = actor.clone();
-        tokio::spawn(async move { booth::at(&keyed, actor).withdraw(5).await })
+        tokio::spawn(async move { keyed.at(actor).withdraw(5).await })
     };
     parked_over_the_wire(&other, &actor, 1).await;
-    assert_eq!(
-        booth::at(&other, actor.clone())
-            .approve()
-            .await
-            .expect("answers"),
-        1,
-    );
+    assert_eq!(other.at(actor.clone()).approve().await.expect("answers"), 1,);
     assert_eq!(
         strangers.await.expect("no panic").expect("answers"),
         15,

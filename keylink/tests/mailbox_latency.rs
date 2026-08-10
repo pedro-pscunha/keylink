@@ -373,12 +373,12 @@ async fn a_mailbox_holds_exactly_its_depth_and_releases_no_caller_early() {
     // leave the mailbox in a state no assertion here describes.
     let (start, wait_to_start) = oneshot::channel();
 
-    let holding = async { queue::at(client, only()).hold().await };
+    let holding = async { client.at(only()).hold().await };
     let calling = async {
         wait_to_start.await.expect("the watcher starts the callers");
         // Bound first: `queue::at` returns a borrowing handle, so the futures have
         // to outlive the temporaries they are built from.
-        let handles: Vec<_> = (0..CALLERS).map(|_| queue::at(client, only())).collect();
+        let handles: Vec<_> = (0..CALLERS).map(|_| client.at(only())).collect();
         n0_future::join_all(handles.iter().map(|handle| {
             let answered_tx = answered_tx.clone();
             async move {
@@ -516,18 +516,13 @@ async fn what_a_deeper_mailbox_buys_the_caller() {
         // The control: one at a time, so the queue is empty at every call.
         let started = Instant::now();
         for _ in 0..CALLERS {
-            queue::at(&fixture.client, only())
-                .touch()
-                .await
-                .expect("answers");
+            fixture.client.at(only()).touch().await.expect("answers");
         }
         let alone = micros(started.elapsed(), CALLERS);
         settle(&mut fixture, CALLERS).await;
 
         // The burst, timed per caller, with the actor free.
-        let handles: Vec<_> = (0..CALLERS)
-            .map(|_| queue::at(&fixture.client, only()))
-            .collect();
+        let handles: Vec<_> = (0..CALLERS).map(|_| fixture.client.at(only())).collect();
         let each = n0_future::join_all(handles.iter().map(|handle| async move {
             let started = Instant::now();
             handle.touch().await.expect("answers");
@@ -577,10 +572,10 @@ async fn drain_at_depth(fixture: &mut Fixture, callers: u32) -> f64 {
     let turns = &mut fixture.turns;
     let (start, wait_to_start) = oneshot::channel();
 
-    let holding = async { queue::at(client, only()).hold().await };
+    let holding = async { client.at(only()).hold().await };
     let calling = async {
         wait_to_start.await.expect("the watcher starts the callers");
-        let handles: Vec<_> = (0..callers).map(|_| queue::at(client, only())).collect();
+        let handles: Vec<_> = (0..callers).map(|_| client.at(only())).collect();
         n0_future::join_all(handles.iter().map(|handle| handle.touch())).await
     };
     let timing = async {
