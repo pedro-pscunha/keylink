@@ -346,8 +346,10 @@ async fn a_keyed_actor_ending_can_be_awaited_before_shutdown() {
 async fn a_local_keyed_ref_rejects_a_reentrant_call() {
     let system = mounted();
     let actor_id = id("nested");
-    let mut state = Journal::default();
-    state.nested = Some((system.clone(), actor_id.clone()));
+    let state = Journal {
+        nested: Some((system.clone(), actor_id.clone())),
+        ..Journal::default()
+    };
     system
         .mount(actor_id.clone(), journal::spawn(state))
         .expect("the id is free");
