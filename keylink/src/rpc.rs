@@ -89,6 +89,59 @@ enum Stream {
 pub type Dispatch<Req, Resp> =
     Arc<dyn Fn(Context, Req, BodyReader) -> BoxFut<(Outcome<Resp>, Body)> + Send + Sync>;
 
+/// This surface reaches the actor through a [`Dispatch`], so the service's
+/// [`Middleware`] stack and its [`Allowlist`] ran.
+///
+/// Write `impl Calls + Governed` where that must be true. `Calls` is the
+/// per-service trait `service!` generates, so the bound a caller writes reads
+/// `impl journal::Calls + Governed`. A `Handle` is refused, because a local call
+/// reaches the mailbox directly and neither the stack nor the list is on that
+/// path.
+///
+/// # It does NOT mean at-most-once
+///
+/// At-most-once is a property of a **key**, not of a type. It starts at
+/// `Client::with_idempotency(key)` and holds only while the key is stable across
+/// retries, and no bound can see a key's stability. So a plain `Client`
+/// satisfies this bound, carries no key, reaches no ledger, and is at-least-once
+/// under retry exactly as a `Handle` is. Name `IdempotentClient` in the
+/// signature where the ledger is required; this marker cannot stand in for it.
+///
+/// # `GovernedSeal` is not a seal
+///
+/// `service!` writes this trait's impls in the **caller's** crate, where
+/// `pub(crate)` does not reach, so `GovernedSeal` is `pub` for those impls to
+/// name it. A downstream crate can therefore write
+/// `impl keylink::GovernedSeal for MyType {}` and then
+/// `impl keylink::Governed for MyType {}`, and nothing stops it. `#[doc(hidden)]`
+/// keeps the supertrait out of the rendered docs and out of a caller's way; it
+/// is not a visibility modifier and it forbids nothing. So this trait **cannot
+/// be sealed**, and nothing here calls it sealed.
+///
+/// That is the tension `Progress` already carries, for the same reason and with
+/// the same escape hatch: a token only generated code could build would itself
+/// have to be `pub` to be named in the expansion, so the forgery moves by one
+/// line. What makes it tolerable is the same thing too — the boundary this crate
+/// defends is the **peer**, and no peer can reach any of this. A forged marker
+/// tells you about your own binary.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` does not reach the actor through a `Dispatch`",
+    label = "not a governed surface",
+    note = "a `Handle` calls the mailbox directly, so no `Middleware` and no \
+            `Allowlist` ran. Take a `Client`, an `IdempotentClient` or an \
+            `ActorRef`, or drop the `+ Governed` half of the bound."
+)]
+pub trait Governed: GovernedSeal {}
+
+/// The supertrait [`Governed`] carries so that `impl Governed` alone does not
+/// compile.
+///
+/// Not a seal — [`Governed`]'s own docs say why it cannot be one. What it buys
+/// is that the two lines `service!` emits are a shape a hand-written impl has to
+/// copy on purpose rather than reach by writing one obvious line.
+#[doc(hidden)]
+pub trait GovernedSeal {}
+
 /// Serves one protocol: authorizes the peer once per connection, then answers
 /// every stream that connection opens, concurrently.
 pub(crate) struct RpcService<Req, Resp> {
