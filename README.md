@@ -584,6 +584,14 @@ form rather than their compatible one — every call site moves and the old path
 deleted. That stops being true the day somebody deploys this, which is the
 argument for fixing the sharp things now.
 
+**A moved contract hash is therefore not a cost, and nothing here is designed
+around avoiding one.** No change is scheduled, grouped or reshaped to keep a pin
+still, and a pin move is not reported as a price paid — a rename, a new variant
+and a reshaped struct are all free. The only obligation is bookkeeping: the two
+pinned tests in `keylink/tests/protocol.rs` must pass, so a moved hash has its
+literal read off the failing run and written down. This holds until keylink has
+a stable version, and reversing it is the point of reaching one.
+
 Known gaps, in rough priority order:
 
 - **No connection has ever run in a browser.** `mise run wasm-browser` loads the

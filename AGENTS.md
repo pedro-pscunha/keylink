@@ -56,6 +56,34 @@ from a crash.
 - If a loop is unavoidable, bound it, and make the timeout name the marker it
   wanted.
 
+## The ALPN is not a cost, and will not be until there is a stable version
+
+**Decided by Pedro on 2026-08-10. Do not price an ALPN move. Do not schedule
+around one. Do not let one shape a design.** A contract hash that moves costs
+nothing here, and it will keep costing nothing until keylink has a stable
+version. When that day comes, this section is what gets deleted, deliberately.
+
+What that repeals:
+
+- **No commit is ordered so that pin moves land together.** Take the change in
+  its correct form and let the hash fall where it falls.
+- **No design is weighed by whether it pays a pin.** A field rename, a new
+  variant and a reshaped struct are all free. Choose the right shape, not the
+  cheap one.
+- **No proposal reports an ALPN column, and no summary reports a pin move as a
+  cost.** It is not news.
+
+What survives, because it is bookkeeping and not a cost: the two pinned tests
+must pass, so a moved hash needs its literal updated. Read the new value off the
+failing run — never compute it — and the ALPN section of `CONTRIBUTING.md` still
+governs how.
+
+The incident: the factory proposal built a four-commit schedule with **`ALPN
+pin` as a column of the table**, grouped the work so that one commit paid it,
+and carried that reasoning through its rulings and its open questions. Every bit
+of that accounting bought nothing, on a repository whose own `README.md` already
+said an ALPN move costs nothing.
+
 ## Claims
 
 - **State a SHA, a count or a literal only after reading it in the same turn.**
