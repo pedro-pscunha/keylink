@@ -1,5 +1,11 @@
 # RFC-04 — An actor model for keylink
 
+> **Historical design record.** This RFC preserves the state and decisions at its
+> revision dates; it is not a current capability index. Local mailbox depth is now
+> configurable through `Backpressure::{Park, Shed}(NonZeroUsize)` on
+> `LocalActor::spawn_deep` / `spawn_supervised_deep` and generated `actor_deep` /
+> `supervised_deep`. The default remains `Park(1)`.
+
 **Status:** proposal, revision 3. Nothing here is implemented.
 **Target:** `keylink` 0.1.0, iroh 1.0.3, edition 2021, rustc 1.97.
 **Author's recommendation in one line:** answer **(c)** — an actor is one more `Dispatch`, not one more transport; ship it in four steps, and reject supervision.
@@ -3817,23 +3823,24 @@ all, so there is no `N + 1`th caller feeling anything. The claim fails on both p
 for two different reasons, and a later reader who finds `RpcClient::tell` has found
 the reason this paragraph exists rather than a reason to revert.
 
-**§15.10 item 3 is NOT answered by any of this.** That item is about capacity 1 on the
-**local** path, and nothing above touches it: `LOCAL_MAILBOX_DEPTH` is private, has no
-knob by decision, and the argument in `keylink/src/local.rs` for keeping it at one is a
-self-call hazard rather than a latency trade. A number measured through two QUIC
-endpoints says nothing about a mailbox both ends of which are in one process.
+> **Superseded on 2026-08-09:** the paragraph below was true at this revision and
+> is false on current `main`. Commit `4e0fcca` made local depth configurable after
+> measuring the deadlock claim; commit `9535533` generalized the knob into
+> `Backpressure::Park` and `Backpressure::Shed`. The default remains one.
 
-**And the refutation above must not be carried across to it — item 3's sentence is
-sound.** Item 3 says capacity 1 in-process buys "a caller cannot get more than one
-message ahead of the actor", which reads like the local twin of the claim deleted above.
-It is not the same claim, and the difference is which callers get a fire-and-forget
-method. `__keylink_local_method!`'s `tell` arm generates one for a local handle — its
-`Ok` means "the message is in the mailbox", so a local caller does hand a message over
-and go on, and the capacity is what bounds how far ahead it can get. The keyed arm of
-`__keylink_actor_client_method!` generates nothing. So capacity buys a *readable* bound
-on the local path and buys no such thing for a generated keyed client, and the sentence
-that is false above is true there for that reason. Anybody deleting item 3 on the
-strength of this section is deleting a true statement.
+**§15.10 item 3 is NOT answered by this revision's evidence.** At this point in the
+history, `LOCAL_MAILBOX_DEPTH` was private and had no knob. The current implementation
+supersedes that state; this paragraph remains only as the argument later measurement
+reversed.
+
+**At this revision, the refutation above was not carried across to item 3.** Item 3
+said capacity 1 in-process buys "a caller cannot get more than one message ahead of the
+actor", which reads like the local twin of the claim deleted above. The difference was
+which callers get a fire-and-forget method: `__keylink_local_method!`'s `tell` arm
+generates one for a local handle, while the keyed arm generates none. That was the
+argument for keeping the local default at one. Later measurement kept the default but
+rejected the conclusion that no override should exist; the current configurable policy
+is the authority.
 
 ---
 

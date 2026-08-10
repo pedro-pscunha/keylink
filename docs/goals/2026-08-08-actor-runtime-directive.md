@@ -1,5 +1,12 @@
 # Three actor-runtime simplifications, plus one rename
 
+> **Current-state correction (2026-08-10):** Item M below records the state
+> before local mailbox depth became configurable. Current `main` exposes
+> `Backpressure::{Park, Shed}(NonZeroUsize)` through `LocalActor::spawn_deep`,
+> `LocalActor::spawn_supervised_deep`, and the generated `actor_deep` and
+> `supervised_deep` doors. The default remains `Park(1)`. Do not use the old
+> `local.rs` fixed-depth discussion below as current capability evidence.
+
 Operative directive, 2026-08-08. It supersedes
 `2026-08-08-actor-runtime-simplifications.md` wherever the two disagree. That
 file is still the reference for item A's public-interface sketch and for the

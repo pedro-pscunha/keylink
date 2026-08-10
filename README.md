@@ -154,9 +154,32 @@ state. Under the concurrent model that same edit fails the build, because
 
 Two costs, both structural. A turn is not cancellable: dropping the call does
 not stop the handler, and a layer such as `Timeout` refuses the caller without
-ending the turn. And an actor must not call itself — the mailbox holds one
-message, so a handler awaiting its own handle waits for a permit or a reply that
-only it can produce.
+ending the turn. And an actor must not call itself: keylink detects a re-entrant
+local call by actor identity and refuses it instead of relying on mailbox depth.
+
+**Local mailbox policy.** The simple `actor`, `actor_with`, `actor_wired`, and
+supervised doors park at depth 1 by default. The depth is configurable and is not
+pinned at 1. Use the generated `actor_deep` or `supervised_deep` door—or
+`LocalActor::spawn_deep` directly—and choose what a full mailbox does:
+
+```rust
+use std::num::NonZeroUsize;
+use keylink::Backpressure;
+
+let warehouse = inventory::actor_deep(
+    Warehouse::seeded(),
+    vec![],
+    inventory::Feeds::new(),
+    Backpressure::Park(NonZeroUsize::new(32).expect("non-zero depth")),
+);
+```
+
+`Backpressure::Park(depth)` waits for a slot; `Backpressure::Shed(depth)` refuses
+immediately with `Full`. A deeper mailbox lets callers queue further ahead. It
+does not make self-calls safe, bound the memory held by parked senders, or remove
+the need to budget enough time for shutdown to drain queued turns. Keyed actors
+use the separate `SystemBuilder::mailbox_depth(NonZeroUsize)` knob and always
+park.
 
 A `send` method cannot be served this way at all, and `serve` stops compiling for
 a service declaring one. Its handler reads the upload inside the turn, so a peer

@@ -102,6 +102,12 @@ said an ALPN move costs nothing.
   its 15 pull-request runs had failed.
 - A statement that was true when written does not stay true. "There is no git
   remote" was correct on 2026-08-06 and wrong two days later.
+- **Historical goals, plans, RFCs and audits are not current capability evidence.**
+  They deliberately preserve states and decisions that later commits reversed.
+  Before saying a feature does not exist, search the current public source and
+  rustdoc, then check `README.md`. The incident: older actor documents say the
+  local mailbox is fixed at depth 1, while current `main` exposes
+  `Backpressure::{Park, Shed}` through `spawn_deep` and `actor_deep`.
 
 ## Worktrees
 

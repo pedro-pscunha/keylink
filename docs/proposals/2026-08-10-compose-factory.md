@@ -87,8 +87,8 @@ waiting for:
 
 | Path | Door | Where |
 |---|---|---|
-| local | `LocalActor::spawn_deep(.., depth: NonZeroUsize)` → `mpsc::channel(depth.get())` | `turns.rs:3597`, channel at `:3614` |
-| local, generated | `actor_deep`, `supervised_deep` | `macros.rs:2016`, `macros.rs:2101` |
+| local | `LocalActor::spawn_deep(.., Backpressure::{Park, Shed}(NonZeroUsize))` → `mpsc::channel(backpressure.depth().get())` | `turns.rs`, `Backpressure` and `LocalActor::spawn_deep` |
+| local, generated | `actor_deep`, `supervised_deep`, with the same `Backpressure` argument | `macros.rs`, generated actor doors |
 | keyed | `SystemBuilder::mailbox_depth(NonZeroUsize)` → `Registry::entry` makes the channel | `registry.rs:2198`, channel at `registry.rs:948` |
 
 **The sequencing clause is discharged on both halves.** Rev. A's owner decision
@@ -267,8 +267,9 @@ Rev. A deferred `LeastLoaded` on one sentence, and the sentence is now false.
 
 > Zero or one at the local mailbox depth, which is a constant and not a knob
 
-**The depth is a knob** (§2.3): `spawn_deep` takes a `NonZeroUsize` and builds
-`mpsc::channel(depth.get())`, and `buffered()` computes
+**The depth is a knob** (§2.3): `spawn_deep` takes a `Backpressure` carrying a
+`NonZeroUsize` and builds `mpsc::channel(backpressure.depth().get())`, while
+`buffered()` computes
 `max_capacity() - capacity()`, which ranges over that depth.
 
 **`Serving::buffered` carries a narrower claim, and it is the one a factory
@@ -528,8 +529,15 @@ let parsed = ingest.dispatch_keyed(tenant_id, |w| w.parse(blob)).await?;
 // Non-keyed: `Factory<Parser, ()>`, and `dispatch` takes no key.
 // Members built with `actor_deep`, because `LeastLoaded` has no gradient to
 // read at `DEFAULT_MAILBOX_DEPTH` — §3.4.
-let render = Factory::direct(workers(8), |m| parse::actor_deep(Parser::new(m), depth(32)))
-    .routing(Routing::LeastLoaded(Sample::TwoOfN))
+let render = Factory::direct(workers(8), |m| {
+    parse::actor_deep(
+        Parser::new(m),
+        vec![],
+        parse::Feeds::new(),
+        Backpressure::Park(NonZeroUsize::new(32).expect("non-zero depth")),
+    )
+})
+.routing(Routing::LeastLoaded(Sample::TwoOfN))
     .build();
 
 let page = render.dispatch(|w| w.render(doc)).await?;
@@ -874,7 +882,7 @@ Every one measured this pass. Line numbers are the current ones.
 | 4 | `console.rs:543` does `try_send`; `console.rs:494` scopes it | `console.rs:470`; scoped at `console.rs:421-424`. |
 | 5 | `registry.rs:2051` says "Nothing in this crate calls `try_send`"; `registry.rs:1922` carries the unbounded quote | Both are the same paragraph, at **`registry.rs:2110-2117`**. |
 | 6 | `buffered()` at `turns.rs:4292`, `is_busy()` at `turns.rs:4265` | `turns.rs:4367` and `turns.rs:4340`. |
-| 7 | `buffered`'s "zero or one, a constant and not a knob" defers `LeastLoaded` | **The sentence is false at `d54f302`** and still on the page at `turns.rs:4346`. `spawn_deep` (`turns.rs:3597`) takes a `NonZeroUsize` and builds `mpsc::channel(depth.get())` at `:3614`. The deferral is overturned; the sentence is a live defect. |
+| 7 | `buffered`'s "zero or one, a constant and not a knob" defers `LeastLoaded` | **The sentence is false at `d54f302`.** Current `spawn_deep` takes a `Backpressure` carrying a `NonZeroUsize` and builds `mpsc::channel(backpressure.depth().get())`. The deferral is overturned; the fixed-depth sentence was the defect. |
 | 8 | `spawn_deep` at `turns.rs:3538`; `actor_deep` at `macros.rs:1721` | `turns.rs:3597`; `macros.rs:2016`. `supervised_deep` is `macros.rs:2101`. (The wave-4 grounding note's `3637` / `1714` / `1799` are also wrong.) |
 | 9 | `compose::Overflow` re-exported at `compose/mod.rs:108` | `compose/mod.rs:139`. The enum itself at `topic.rs:107` and its not-`#[non_exhaustive]` argument at `:103-105` are both **correct**. |
 | 10 | `registry.rs:1160-1190` carries `ActorStatus`'s `busy` and `idle_for` | `pub struct ActorStatus` at `registry.rs:1215`, `idle_for` at `:1228`. |
