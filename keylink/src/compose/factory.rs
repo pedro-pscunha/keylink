@@ -966,6 +966,63 @@ mod tests {
         release
     }
 
+    /// The signature the whole design rests on: a dispatch future that holds its
+    /// borrowed permit **across an await point** is `Send`.
+    ///
+    /// [`Reserving::reserve`] states `+ Send` on the reservation itself, and that
+    /// is a different claim: it constrains the future a member hands back, not the
+    /// one [`dispatch`](Factory::dispatch) builds around it. `dispatch` is an
+    /// inherent `async fn`, so its future's auto-traits are inferred from its body
+    /// and nothing in the signature records them. That inference is what §5.2 of
+    /// the proposal chose the borrowed permit on, and it was measured on a scratch
+    /// probe that was then deleted — a probe deleted is a measurement, not a
+    /// guard, so it is re-asserted here.
+    ///
+    /// **Watched, because a `Send` assertion is satisfied by a future that holds
+    /// nothing.** With `let not_send = std::rc::Rc::new(());` live across the same
+    /// block the compiler printed *"future returned by `dispatch` is not `Send`"*,
+    /// *"`Rc<()>` which is not `Send`"* and, naming what refused it,
+    /// *"required by a bound in `only_if_send`"*. So the bound is load-bearing and
+    /// this assertion can fail.
+    ///
+    /// **What `yield_now` adds is narrower than it looks, and the first version of
+    /// this comment overstated it.** It claimed that without the yield nothing is
+    /// held across a suspension point and the test passes vacuously. Measured:
+    /// with the yield deleted and the `Rc` kept, the refusal is identical and the
+    /// compiler names `ask`'s own `.await` instead — `ask` consumes the permit, so
+    /// the permit is inside the awaited future either way. The yield buys one
+    /// thing: the permit is a **local of this block** live across a suspension,
+    /// which is the shape the deleted probe measured. It is not what makes the
+    /// assertion able to fail.
+    ///
+    /// **`'static` is the property the borrowed form does not have, and it is not
+    /// the one this asserts.** A borrowed permit cannot cross `tokio::spawn`; it
+    /// does not need to, because this future is awaited in place by the caller.
+    /// [`LocalActor::reserve_owned`] is the `'static` half and §4 kept it for
+    /// callers who spawn.
+    #[tokio::test]
+    async fn a_dispatch_future_holding_its_permit_across_an_await_is_send() {
+        fn only_if_send<F: Send>(future: F) -> F {
+            future
+        }
+
+        let (factory, _handled) = factory(2, Routing::RoundRobin);
+
+        let dispatched = factory.dispatch(|permit| async move {
+            tokio::task::yield_now().await;
+            permit
+                .ask(|origin, reply| Mail::Whoami { origin, reply })
+                .await
+        });
+
+        let me = only_if_send(dispatched)
+            .await
+            .expect("a slot on some member")
+            .expect("the member answers");
+
+        assert_eq!(me, 0, "the future ran, so the permit really was held");
+    }
+
     // ── B IS THIS WAVE'S LETTER, AND EVERY ROW BELOW IS SAME-FILE ─────────────
     //
     // `F` for factory and `R` for routing are both taken — `F1` anchors

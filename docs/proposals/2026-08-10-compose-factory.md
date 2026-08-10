@@ -926,12 +926,34 @@ lines above). Fix the sentence whether or not this proposal ships.
   The probe was deleted after measuring. Re-assert it in commit 1 as a kept
   compile-only guard — a probe deleted is a measurement, not a guard, and this
   signature is the one the whole design rests on.
+
+  **It arrived a wave late.** The built wave shipped the measurement and not the
+  guard; the guard is now
+  `a_dispatch_future_holding_its_permit_across_an_await_is_send` in
+  `factory.rs`'s test module. The near-twin that makes the absence easy to read
+  past is `Reserving::reserve`, which does state `+ Send` in its own signature —
+  a different claim, about the future a **member** hands back rather than the one
+  `dispatch` builds around it. `dispatch` is an inherent `async fn`, so its
+  future's auto-traits are inferred from its body and appear in no signature at
+  all, which is why only a guard can hold them.
 - **Whether `FirstAvailable`'s wait-time spread is bounded at all** on this
   workload, or only bounded in the limit. §7 names the test; nothing has been
   run. The rustdoc must not promise a bound the test has not produced.
-- **What `Shard<K>`'s default hasher should be.** `ByKey` needs a stable hash
-  across process restarts if a caller's per-worker cache is warmed from disk.
-  `DefaultHasher` is not stable across releases. Not decided here.
+
+  **Still unmeasured after the build, and the rustdoc honours the constraint**:
+  `Routing::FirstAvailable` says *"No bound on the spread of per-dispatcher wait
+  time is claimed here, because none has been measured. The claim is soundness
+  and nothing else."*
+- ~~**What `Shard<K>`'s default hasher should be.**~~ **DECIDED by the build, and
+  the decision is to keep the unstable default and name it.** `ByKey` needs a
+  stable hash across process restarts if a caller's per-worker cache is warmed
+  from disk. `DefaultHasher` is not stable across releases. `Shard::by_hash`'s
+  rustdoc now says that the standard library does not promise the algorithm
+  across Rust versions, that within one binary it is stable — which is all
+  *the same tenant lands on the same worker* needs while the process runs — and
+  names the two callers it is wrong for: one warming a per-worker cache from
+  disk, and one sharding a single keyspace from two binaries. `Shard::by` takes
+  a hash the caller owns, for those.
 - **One illegal state survives §3.1's two-door split.** `K` defaults to `()`, so
   `Routing::ByKey(Shard::by_hash())` on a factory that is later dispatched
   yields a `Factory<A, ()>` whose every dispatch hashes the same value onto the
@@ -963,8 +985,13 @@ lines above). Fix the sentence whether or not this proposal ships.
   on a scratch branch and count the `where` clauses. The refusal above is
   reasoned from the absence of negative impls, not measured — so a future author
   who wants the bound has an argument to answer and not a figure to beat.
-- **Nothing was compiled, benchmarked or red-tested.** No design on this page has
-  been built.
+- ~~**Nothing was compiled, benchmarked or red-tested.** No design on this page
+  has been built.~~ **True the day this page was written, false since the wave
+  built it**, and it sat two bullets under a correction that had just been made
+  for the same reason. The subsystem is `keylink/src/compose/factory.rs` and its
+  tests; the bullets above record which of this section's unknowns the build
+  closed and which it left open. **Benchmarked is still accurate** — nothing here
+  has been, and `FirstAvailable`'s spread is the bullet that wants it.
 
 ---
 
