@@ -4026,3 +4026,39 @@ plus the node that holds it.
 
 They are not restated here. A refusal copied into a second place is a second thing
 to keep true, and the copy is the one that rots.
+
+## 16.17 Revision, 2026-08-10: both literals have moved twice since §16.15, and this records both
+
+Appended rather than edited in place, per CONTRIBUTING.md, and for §16.13's and §16.15's
+reason: naming which value the pin became is the content, so an edit would delete the
+record instead of repairing it.
+
+**The pinned literals are now `keylink/Probe/b228be26a183b341` and
+`keylink/Inspect/9ef860a8eabbc99c`.** Both were read off one failing run of
+`cargo test -p keylink --test protocol`, which reported two failures. Neither was
+computed.
+
+**§16.15's pair moved twice, and only the second move is this section's.** That is worth
+stating rather than smoothing over, because the intervening move was never appended here
+and a reader comparing §16.15 to the tree would find a two-step gap and no note of it:
+
+| From | To | Cause |
+|---|---|---|
+| `d75913b8a4742547` / `0572763878b7fb9d` | `4697a79e29347129` / `e7579f60b94c0ea0` | `__Status` on every contract, and `RemoteError::NotAnActor`. Recorded in `keylink/tests/protocol.rs`'s own history, not here. |
+| `4697a79e29347129` / `e7579f60b94c0ea0` | `b228be26a183b341` / `9ef860a8eabbc99c` | `RemoteError` gained `MailboxFull`. This section's. |
+
+The cause of the second move is not in this document. `RemoteError` gained a
+`MailboxFull` variant so a peer meeting a full mailbox on an actor served under
+`Backpressure::Shed` reads an overload rather than a timeout — the two ask a retry
+policy for opposite things, and a peer told `TimedOut` retries the call that is
+already overloading the far side. `RemoteError` reaches every service's hashed
+contract through `Outcome::Err(RemoteError)`, the same route §16.13 and §16.15 both
+trace, so the move is wire-visible for every service including singletons.
+
+Appended after `NotAnActor` rather than inserted, for `NotKeyable`'s reason: the hash
+moves either way and the handshake refuses a drifted peer either way, so what the
+append buys is that no existing variant renumbers and the failure stays a refusal
+rather than becoming a misdecode.
+
+**Nothing in §16.10 through §16.16 changes.** Their claims are about the changes they
+describe, and none of those is the cause of either move above.

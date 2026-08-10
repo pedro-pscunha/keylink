@@ -265,13 +265,40 @@ pub enum Failure {
     /// made from. **No served surface produces this**, and the argument is in
     /// [`Unanswered::Reentrant`]: a request from a peer arrives on a
     /// connection's task, which has run no turn.
+    ///
+    /// The text below is the **fourth** copy of one sentence, beside
+    /// [`Unanswered::Reentrant`], [`NotQueued::Reentrant`](crate::NotQueued::Reentrant)
+    /// and [`TurnLost::Reentrant`](crate::TurnLost::Reentrant). No `From` reaches
+    /// this type from any of them, so `turns.rs`'s
+    /// `one_vocabulary_and_every_loss_in_it_has_a_producer` compares this one
+    /// directly rather than through a conversion.
     #[error("this call was made from inside the target actor's own turn: it would deadlock")]
     Reentrant,
+
+    /// The actor's mailbox was full and it sheds, so the call was refused before
+    /// any turn.
+    ///
+    /// **The second arm both sides produce**, and it is a variant for
+    /// [`Turn`](Self::Turn)'s reason rather than a new one: a local caller reads
+    /// [`Unanswered::Full`] and a peer reads
+    /// [`RemoteError::MailboxFull`], and folding either into
+    /// [`Other`](Self::Other) would leave the two sides matching one condition in
+    /// two places again. It says *back off*; it does not say *retry now*.
+    ///
+    /// **It reads *call* where the other three read *message*, and that is
+    /// deliberate.** This is the one of the four doors that took a call rather
+    /// than a message — a `tell` answers [`NotQueued`](crate::NotQueued) and never
+    /// arrives here. The same guard that holds the `Reentrant` texts equal asserts
+    /// these two are **not**, so unifying them is a decision somebody makes rather
+    /// than a tidy-up nothing notices.
+    #[error("the actor's mailbox is full and it shed this call")]
+    Full,
 
     /// Everything a call can meet that the shared vocabulary does not name.
     ///
     /// **No local surface produces this.** Every variant of [`Error`] except the
-    /// lifted [`RemoteError::Withheld`] arrives here, unnarrowed, which is what
+    /// two lifted ones — [`RemoteError::Withheld`] and
+    /// [`RemoteError::MailboxFull`] — arrives here, unnarrowed, which is what
     /// keeps a schema mismatch and a timeout matchable through the bound.
     #[error("{0}")]
     Other(#[source] Error),
@@ -314,6 +341,7 @@ impl From<Unanswered> for Failure {
         match unanswered {
             Unanswered::Turn(withheld) => Self::Turn(withheld),
             Unanswered::Reentrant => Self::Reentrant,
+            Unanswered::Full => Self::Full,
         }
     }
 }
@@ -325,6 +353,10 @@ impl From<Error> for Failure {
             // arrives as `Other` on the served side and as `Turn` on the local
             // one, and the whole wave buys nothing.
             Error::Remote(RemoteError::Withheld(withheld)) => Self::Turn(withheld),
+            // The same lift for the second such condition, added with the shed
+            // policy that made a peer able to meet it. A served `MailboxFull` and
+            // a local `Unanswered::Full` are one fact, so they get one arm.
+            Error::Remote(RemoteError::MailboxFull) => Self::Full,
             other => Self::Other(other),
         }
     }

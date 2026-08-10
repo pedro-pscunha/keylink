@@ -824,7 +824,7 @@ pub struct Serving {
 /// One shared payload is what deletes the correspondence problem rather than
 /// policing it: there is no second list to keep in step.
 ///
-/// # Two variants stay outside `Withheld`, for two different reasons
+/// # Three variants stay outside `Withheld`, for two different reasons
 ///
 /// [`Faulted`](Self::Faulted) holds the [`Panic`] itself, and that payload is
 /// what [`ask`](crate::LocalActor::ask) resumes into the calling task. It cannot
@@ -833,13 +833,28 @@ pub struct Serving {
 /// the audience that can act on it — the message, through `Display`. So the
 /// split is by what the audience can be *handed*, not by what happened.
 ///
-/// [`Reentrant`](Self::Reentrant) is not about a turn at all. Every `Withheld`
-/// variant describes what happened to a turn that exists; a re-entrant call is
-/// refused before anything is queued, so there is no turn for anything to have
-/// been withheld from. [`Unanswered::Reentrant`](crate::Unanswered::Reentrant)
-/// and [`NotQueued::Reentrant`](crate::NotQueued::Reentrant) are the same fact
-/// at the other doors, and those three `#[error]` texts are the only ones this
-/// crate still keeps in step by hand.
+/// [`Reentrant`](Self::Reentrant) and [`Full`](Self::Full) are not about a turn at
+/// all. Every `Withheld` variant describes what happened to a turn that exists;
+/// both of these are refused before anything is queued, so there is no turn for
+/// anything to have been withheld from.
+/// [`Unanswered::Reentrant`](crate::Unanswered::Reentrant) and
+/// [`NotQueued::Reentrant`](crate::NotQueued::Reentrant) are the first fact at the
+/// other doors, [`Unanswered::Full`](crate::Unanswered::Full) and
+/// [`NotQueued::Full`](crate::NotQueued::Full) the second — and
+/// [`Failure`](crate::Failure) is the **fourth** enum carrying both, at the door
+/// that answers a call made through the bound.
+///
+/// Those **eight** `#[error]` texts are the only ones this crate still keeps in
+/// step by hand. This sentence said six until a merge gate counted them: it
+/// enumerated three enums, and `Failure` was in neither the count nor any guard,
+/// so [`Failure::Reentrant`](crate::Failure::Reentrant) was a fourth byte-identical
+/// sentence nothing held. `turns.rs`'s
+/// `one_vocabulary_and_every_loss_in_it_has_a_producer` compares it now, and
+/// compares it **directly**, because no `From` reaches that type. Seven of the
+/// eight are byte-identical; [`Failure::Full`](crate::Failure::Full) reads *call*
+/// where the other three read *message*, which is the door it answers, and the
+/// same guard pins that difference so unifying the two is a decision rather than
+/// a tidy-up.
 ///
 /// # `Debug` and `Error`, and no other derive
 ///
@@ -852,9 +867,10 @@ pub struct Serving {
 ///
 /// Like [`Ended`] and [`Departure`](crate::Departure): a caller matches this, and
 /// a wildcard arm is the collapse it exists to prevent. `Withheld` makes the same
-/// choice for the same reason, and it is the type a fourth loss would be added
-/// to — so a caller who has matched all three arms here still meets a new loss as
-/// a compile error, one level in.
+/// choice for the same reason, and it is the type a *withheld* loss would be added
+/// to — so a caller who has matched all four arms here still meets a new one as a
+/// compile error, one level in. [`Full`](Self::Full) went on this type instead,
+/// and the paragraph above says why: it is not a loss a turn suffered.
 #[derive(Debug, thiserror::Error)]
 pub enum TurnLost {
     /// The turn was reached and its value was not handed back, and this is which
@@ -891,10 +907,25 @@ pub enum TurnLost {
     /// at the doors that ask for a value and resume a fault rather than report it,
     /// and [`NotQueued::Reentrant`](crate::NotQueued::Reentrant) at the doors that
     /// ask only to be queued and so have no reply channel to hear a verdict on.
-    /// Three enums, one fact, because a caller matches the answer of the door it
-    /// used.
+    /// [`Failure::Reentrant`](crate::Failure::Reentrant) is the fourth, at the door
+    /// a caller reaches through the bound. Four enums, one fact, because a caller
+    /// matches the answer of the door it used.
     #[error("this call was made from inside the target actor's own turn: it would deadlock")]
     Reentrant,
+    /// The mailbox was full and this actor was spawned under
+    /// [`Backpressure::Shed`](crate::Backpressure::Shed), so the call was refused
+    /// instead of parked. **Nothing was queued**, so the actor is untouched.
+    ///
+    /// Outside [`Withheld`] for [`Reentrant`](Self::Reentrant)'s reason: the
+    /// refusal happens before the message reaches the mailbox, so nothing ran and
+    /// nothing was withheld. It is the second fact of that shape on these same
+    /// four enums, and [`NotQueued::Full`](crate::NotQueued::Full) carries the
+    /// whole argument.
+    ///
+    /// **Unreachable under [`Backpressure::Park`](crate::Backpressure::Park)**,
+    /// which is the default on both spawn doors.
+    #[error("the actor's mailbox is full and it shed this message")]
+    Full,
 }
 
 /// Why a call produced no value, on every path that has one.

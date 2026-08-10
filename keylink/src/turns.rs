@@ -296,6 +296,17 @@ use crate::{
 /// shutdown.
 const DEFAULT_LOCAL_MAILBOX_DEPTH: NonZeroUsize = NonZeroUsize::MIN;
 
+/// The whole mailbox policy an actor gets when its spawn names none.
+///
+/// Derived from the depth above rather than repeating the number, so the two
+/// cannot drift. **[`Backpressure::Park`], and that is the half worth pinning**:
+/// a default that shed would turn every existing caller's full mailbox from a
+/// wait into a dropped message, silently, at the next release.
+/// `representability.rs`'s `no_local_mailbox_can_be_asked_to_be_unbounded` asserts
+/// the arm in a `const` block, so changing it here is a compile error there.
+pub(crate) const DEFAULT_LOCAL_BACKPRESSURE: Backpressure =
+    Backpressure::Park(DEFAULT_LOCAL_MAILBOX_DEPTH);
+
 /// The observers an actor lends to one turn.
 ///
 /// An alias so the generated [`Turn`] impl can name the parameter without
@@ -3247,9 +3258,47 @@ pub enum Unanswered {
     /// so a free slot does not save it and it is refused at any depth.
     #[error("this call was made from inside the target actor's own turn: it would deadlock")]
     Reentrant,
+    /// The mailbox was full and this actor was spawned under
+    /// [`Backpressure::Shed`], so the call was refused instead of parked.
+    ///
+    /// Outside [`Withheld`] for [`Reentrant`](Self::Reentrant)'s reason and not a
+    /// weaker one: the refusal happens before the message reaches the mailbox, so
+    /// nothing ran and nothing was withheld. It is the second fact of that shape,
+    /// and [`NotQueued::Full`] carries the rest of the argument — including why
+    /// the arguments are gone and which door loses nothing instead.
+    ///
+    /// # Why this is a variant here rather than an eighth [`Withheld`]
+    ///
+    /// This is what the release's major version bought, so the three grounds are
+    /// written out rather than pointed at. A fold into `Withheld` would have cost
+    /// no variant on this enum and broken no exhaustive match on it.
+    ///
+    /// 1. **[`Withheld`] is a verdict on a turn that ran.** Every variant it has
+    ///    describes what happened to a turn that exists, and a shed message never
+    ///    reached the mailbox. [`Reentrant`](Self::Reentrant) is the standing
+    ///    precedent and it was decided the same way, before this variant existed.
+    /// 2. **[`Withheld`] crosses the wire and this enum does not.** It derives
+    ///    `Schema`, so an eighth variant moves the ALPN and the break lands on
+    ///    every peer — including deployments that never spawn under
+    ///    [`Backpressure::Shed`]. Breaking three local
+    ///    enums leaves the wire where it is.
+    /// 3. **The downstream break is the same either way.** This type's own
+    ///    exhaustiveness heading says a new `Withheld` variant reaches a caller
+    ///    *one level in*, so a caller who matched
+    ///    [`Turn`](Self::Turn)`(..)` exhaustively is broken by the fold as surely
+    ///    as by this variant. The alternative buys no compatibility; it moves the
+    ///    same break onto a type that need not move at all.
+    ///
+    /// Injectivity is **not** one of the grounds, and the `From<NotQueued>` impl
+    /// below says so where a reader is likeliest to reach for it.
+    ///
+    /// **Unreachable under [`Backpressure::Park`]**, which is the default. Retry
+    /// after a backoff, or take a [`Permit`] and keep the arguments.
+    #[error("the actor's mailbox is full and it shed this message")]
+    Full,
 }
 
-/// A message that never entered the mailbox, and which of the two ways.
+/// A message that never entered the mailbox, and which of the three ways.
 ///
 /// The error of the doors that ask *did this get queued* — [`LocalActor::notify`]
 /// and [`LocalActor::stop`], plus the private `send` they both go through.
@@ -3291,13 +3340,21 @@ pub enum Unanswered {
 /// fails a send, `stop` refuses before one. The name that survives all three is the
 /// one that describes the message's position.
 ///
-/// # Two variants because `send` decides twice, not because two is tidy
+/// # Three variants because `send` decides three times, not because three is tidy
 ///
 /// `send` is the one place a message enters the mailbox, and it reaches this type
-/// from exactly two decisions: the identity check, which fires before a permit is
-/// touched, and the channel, which is either closed or is not. A third variant
-/// therefore needs a third *decision* rather than a third line — counting `Err`
-/// sites would answer a question about formatting.
+/// from exactly three decisions: the identity check, which fires before a permit
+/// is touched; the channel, which is either closed or is not; and — under
+/// [`Backpressure::Shed`] alone — whether there is a free slot at all. A fourth
+/// variant therefore needs a fourth *decision* rather than a fourth line —
+/// counting `Err` sites would answer a question about formatting.
+///
+/// **The third decision arrived, and it arrived as a policy rather than as a
+/// line.** This heading read *two variants because `send` decides twice* until
+/// [`Backpressure`] existed, and the paragraph below predicted its own amendment:
+/// a third variant is a change to `send` rather than a variant filed beside two.
+/// It is. Under [`Backpressure::Park`] the shed branch cannot be reached, so a
+/// caller that never names a policy meets the same two answers it always did.
 ///
 /// Nothing that happens after the message is queued can reach here at all, and
 /// that is the structural half: a verdict needs a reply channel and these doors
@@ -3306,10 +3363,12 @@ pub enum Unanswered {
 /// # Exhaustive, and deliberately not `#[non_exhaustive]`
 ///
 /// [`Unanswered`]'s own argument — a caller matches this, and a wildcard arm is
-/// the collapse the split exists to prevent. It is stronger here: the two
-/// decisions above are the whole of what `send` does before the message is in the
-/// channel, so a third variant is a change to that function rather than a variant
-/// added beside it.
+/// the collapse the split exists to prevent. **The attribute stays refused across
+/// the amendment above**, and paying for it is what the amendment cost: adding
+/// [`Full`](Self::Full) broke every exhaustive match on this type in every crate
+/// downstream, and that break is the release's headline rather than a footnote.
+/// Sealing the enum to avoid the next one would hand every caller the wildcard arm
+/// the split exists to prevent, which is a worse trade than a major version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum NotQueued {
     /// The loop's end of the mailbox is dropped, so there is nobody left to take
@@ -3350,9 +3409,14 @@ pub enum NotQueued {
     /// doors, and carries the same message: the actor is **still running** — it is
     /// running the turn this call was made from.
     ///
-    /// [`TurnLost::Reentrant`] carries it too, so this sentence lives on three
-    /// enums — and it is the **only** sentence that still does, now that every
-    /// other loss is one [`Withheld`] value read by three doors.
+    /// [`TurnLost::Reentrant`] carries it too, and
+    /// [`Failure::Reentrant`](crate::Failure::Reentrant) at the door reached
+    /// through the bound — so this sentence lives on four enums, and it is **one
+    /// of the two** that still do, now that every other loss is one [`Withheld`]
+    /// value read by three doors. [`Full`](Self::Full) is the second, and the two
+    /// are the same shape for the same reason: both are
+    /// facts about a message that never entered the mailbox, so neither has a turn
+    /// for [`Withheld`] to be a verdict on.
     /// `one_vocabulary_and_every_loss_in_it_has_a_producer` holds all three, this
     /// one through `From<NotQueued> for Unanswered` — the widening the crate
     /// actually performs, so the guard cannot agree with a mapping no caller
@@ -3367,6 +3431,39 @@ pub enum NotQueued {
     /// allowed; it is refused only when the mailbox is **full**.
     #[error("this call was made from inside the target actor's own turn: it would deadlock")]
     Reentrant,
+    /// The mailbox was full and this actor was spawned under
+    /// [`Backpressure::Shed`], so the send was refused instead of parked.
+    ///
+    /// **The arguments are gone.** Nothing is handed back and nothing can be:
+    /// the generated door takes typed arguments and assembles the mailbox enum
+    /// inside itself, so there is no value the caller ever named for this variant
+    /// to carry. tokio splits the same two cases one layer down and can afford the
+    /// other half — `try_send` returns `TrySendError::Full(message)` because the
+    /// caller had already given the message up, while `try_reserve` has nothing to
+    /// return. keylink's doors are the second shape.
+    ///
+    /// A caller that cannot afford the loss takes a permit first:
+    /// [`try_reserve`](LocalActor::try_reserve) decides admission *before* the
+    /// payload moves, and [`Permit`]'s send cannot fail on fullness. That is why
+    /// the permit doors do not shed and this one does.
+    ///
+    /// **Unreachable under [`Backpressure::Park`]**, which is the default on both
+    /// spawn doors — so an actor whose spawn never named a policy cannot produce
+    /// this. `Closed` and `Reentrant` are facts about *any* mailbox; this one is a
+    /// fact about a mailbox its owner asked to refuse.
+    ///
+    /// [`Unanswered::Full`] and [`TurnLost::Full`] are the same fact at the doors
+    /// that wanted a value, [`Failure::Full`](crate::Failure::Full) at the door
+    /// reached through the bound, and a peer reads
+    /// [`RemoteError::MailboxFull`]. Five names
+    /// for one condition, because a caller matches the answer of the door it used
+    /// — the arrangement [`Reentrant`](Self::Reentrant) already has. **Three of
+    /// the five read alike**, and the two that do not are deliberate:
+    /// `Failure::Full` says *call* where they say *message*, which is the door it
+    /// answers, and `RemoteError::MailboxFull` says *back off rather than retry*,
+    /// because a peer holds no permit to take instead.
+    #[error("the actor's mailbox is full and it shed this message")]
+    Full,
 }
 
 /// The one direction that is total, and the reason [`read`](LocalActor::read) can
@@ -3388,6 +3485,14 @@ pub enum NotQueued {
 /// mapping above is **injective**: each `NotQueued` state has one name over here
 /// and no two collapse onto the same one.
 ///
+/// **Injectivity is a property of this conversion and it decides nothing about
+/// where [`Full`](Unanswered::Full) lives.** A merge gate read this paragraph as
+/// the reason the release broke three enums, so it is worth saying that it is
+/// not: `Full => Turn(Withheld::Full)` is injective too, so the one-variant
+/// alternative passes this test exactly as the shipped mapping does. What refuses
+/// that alternative is [`Unanswered::Full`]'s own heading, on three grounds that
+/// have nothing to do with collisions.
+///
 /// `impl From` rather than a named method so that `?` performs it, which puts the
 /// widening at the call site and leaves nothing to forget. Both callers today are
 /// in this file — `read`'s `?`, and [`deliver_to_singleton`]'s explicit conversion,
@@ -3403,7 +3508,82 @@ impl From<NotQueued> for Unanswered {
         match not_queued {
             NotQueued::Closed => Self::Turn(Withheld::Gone),
             NotQueued::Reentrant => Self::Reentrant,
+            NotQueued::Full => Self::Full,
         }
+    }
+}
+
+/// What a full mailbox does to the sender.
+///
+/// The depth lives **inside** the policy, so *unbounded, with a depth* is
+/// unwritable: there is no depth to set beside a policy, only a policy that
+/// carries one. [`LocalActor::spawn_deep`] and
+/// [`LocalActor::spawn_supervised_deep`] take this in place of the bare
+/// [`NonZeroUsize`] they used to take, for that reason.
+///
+/// # `#[non_exhaustive]`, and [`Overflow`] argues the other way from the same rule
+///
+/// The rule is **who matches**. A caller constructs one of these and hands it to
+/// a spawn door; the crate matches it, in `LocalActor`'s private `send`. Sealing
+/// restricts matching and not construction, so it costs a caller nothing here and
+/// makes a third policy additive. [`Overflow`] refuses the attribute because a
+/// caller matches *that* one, and a `_ =>` arm is exactly what sealing would cost
+/// it.
+///
+/// # There is no `Unbounded`, and it is refused rather than deferred
+///
+/// An unbounded mailbox is `mpsc::unbounded_channel`, whose sender has **no
+/// permits**. [`reserve`](LocalActor::reserve),
+/// [`try_reserve`](LocalActor::try_reserve) and
+/// [`reserve_owned`](LocalActor::reserve_owned) would each need an arm for a
+/// reservation that reserves nothing — a representable-but-meaningless state in
+/// the one type the whole permit surface rests on. The older argument still
+/// stands beside it, at
+/// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth): an
+/// unbounded mailbox converts backpressure into memory growth, so a latency
+/// problem becomes an OOM in a process that had been reporting healthy.
+///
+/// [`Overflow`]: crate::compose::Overflow
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Backpressure {
+    /// Wait for a slot, however long that takes.
+    ///
+    /// What every keylink mailbox did before this type existed, and the default
+    /// on both spawn doors. The sender parks; nothing is dropped and nothing
+    /// errors.
+    Park(NonZeroUsize),
+    /// Refuse at once, and **lose the caller's arguments**.
+    ///
+    /// A full mailbox answers [`NotQueued::Full`] — or [`Unanswered::Full`] and
+    /// [`TurnLost::Full`] at the doors that wanted a value — and the message the
+    /// generated door was about to build is never built. Nothing is handed back,
+    /// because the generated door takes typed arguments and assembles `M` inside
+    /// itself: there is no `Msg` the caller ever named for an error to carry.
+    ///
+    /// A caller that cannot afford to lose them takes a permit first.
+    /// [`try_reserve`](LocalActor::try_reserve) makes the admission decision
+    /// *before* the payload moves, and a [`Permit`]'s send cannot fail on
+    /// fullness. **The three permit doors do not shed** — that is the whole
+    /// reason they exist beside this policy rather than under it.
+    Shed(NonZeroUsize),
+}
+
+impl Backpressure {
+    /// How many messages the mailbox holds, under either policy.
+    ///
+    /// The one place the depth is read, so the channel and the rustdoc cannot
+    /// come to disagree about which number was chosen.
+    #[must_use]
+    pub const fn depth(self) -> NonZeroUsize {
+        match self {
+            Self::Park(depth) | Self::Shed(depth) => depth,
+        }
+    }
+
+    /// Whether a full mailbox refuses instead of parking the sender.
+    const fn sheds(self) -> bool {
+        matches!(self, Self::Shed(_))
     }
 }
 
@@ -3489,6 +3669,13 @@ pub struct LocalActor<A, M> {
     /// `JoinHandle` detaches the task on both targets — it does not cancel it —
     /// so this is the only handle on a turn that never returns.
     task: Arc<JoinHandle<()>>,
+    /// What [`send`](Self::send) does when there is no free slot.
+    ///
+    /// The depth inside it is the same number the channel above was built from,
+    /// in the same expression, so the two cannot come to disagree. `send` reads
+    /// only which arm it is; the depth is here because a policy without its depth
+    /// is the state [`Backpressure`] exists to make unwritable.
+    backpressure: Backpressure,
 }
 
 /// Starting an actor needs `A: Send`, and the reason is exact: a turn's future
@@ -3540,18 +3727,32 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
     /// Panics when called outside a tokio runtime, like every other spawn.
     #[must_use]
     pub fn spawn_fed<F: Feeds<A>>(state: A, hooks: Vec<Box<dyn Observer<A>>>, feeds: F) -> Self {
-        Self::spawn_deep(state, hooks, feeds, DEFAULT_LOCAL_MAILBOX_DEPTH)
+        Self::spawn_deep(state, hooks, feeds, DEFAULT_LOCAL_BACKPRESSURE)
     }
 
-    /// [`spawn_fed`](Self::spawn_fed)'s triple, plus the mailbox depth.
+    /// [`spawn_fed`](Self::spawn_fed)'s triple, plus the mailbox's own policy.
     ///
-    /// The general door, and the only reason the three above are not it: a depth
-    /// nobody chose is what `DEFAULT_LOCAL_MAILBOX_DEPTH` is for, and requiring
+    /// The general door, and the only reason the three above are not it: a policy
+    /// nobody chose is what `DEFAULT_LOCAL_BACKPRESSURE` is for, and requiring
     /// the argument would make every caller name a number it does not care about.
     ///
-    /// [`NonZeroUsize`] because `mpsc::channel(0)` panics.
-    /// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth) is
-    /// the keyed twin and takes the same type for the same reason.
+    /// [`Backpressure`] and not a bare [`NonZeroUsize`], because the depth alone
+    /// does not say what happens past the last slot. It carries the depth —
+    /// [`NonZeroUsize`], because `mpsc::channel(0)` panics — so *a policy without a
+    /// depth* and *a depth without a policy* are both unwritable.
+    /// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth) is the
+    /// keyed twin and still takes the bare number: nothing sheds on that path, and
+    /// widening it there would be a knob with no producer behind it.
+    ///
+    /// # `Shed` reaches every door except the three that reserve
+    ///
+    /// Under [`Backpressure::Shed`] a full mailbox answers [`NotQueued::Full`] —
+    /// or [`Unanswered::Full`] and [`TurnLost::Full`] at the doors that wanted a
+    /// value — and the caller's arguments are gone. [`reserve`](Self::reserve),
+    /// [`try_reserve`](Self::try_reserve) and [`reserve_owned`](Self::reserve_owned)
+    /// are unchanged under either policy: they are the lossless way to ask *am I
+    /// allowed to send*, and a policy that made them lossy would leave a shedding
+    /// actor with no door that keeps a payload.
     ///
     /// # What a deeper mailbox does and does not buy
     ///
@@ -3571,6 +3772,11 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
     /// and changes nothing about whether the hazard is closed.
     /// `DEFAULT_LOCAL_MAILBOX_DEPTH` carries the measurement, and it is private
     /// because the two doors above are the whole of the public surface for it.
+    ///
+    /// [`Backpressure::Shed`] does not reach that rule either. The identity check
+    /// runs first and answers `Reentrant` before the slot is looked at, so a
+    /// shedding actor refuses a re-entrant call for being re-entrant rather than
+    /// for being full.
     ///
     /// # What was measured, and the ring it does not cover
     ///
@@ -3598,7 +3804,7 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
         state: A,
         hooks: Vec<Box<dyn Observer<A>>>,
         feeds: F,
-        depth: NonZeroUsize,
+        backpressure: Backpressure,
     ) -> Self {
         // The channel carries the enum directly and `Message::Mail` carries the
         // box: the same one allocation, in the place that keeps an unboxed `M` out
@@ -3611,7 +3817,7 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
         // message. `Mailbox` in `registry.rs` boxes for the same reason and
         // carries the measured table; this end had no box at all, because the
         // closure it used to carry made one by accident.
-        let (mail, inbox) = mpsc::channel::<Message<A, M>>(depth.get());
+        let (mail, inbox) = mpsc::channel::<Message<A, M>>(backpressure.depth().get());
         let (ended, watching) = watch::channel(None);
         let fate = Fate::default();
         let held = fate.clone();
@@ -3637,6 +3843,7 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
             fate: held,
             busy: watched,
             task: Arc::new(task),
+            backpressure,
         }
     }
 
@@ -3702,16 +3909,18 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
         Fut: Future<Output = Result<Incarnation<A, F>, Stop>> + Send,
         F: Feeds<A>,
     {
-        Self::spawn_supervised_deep(factory, limit, DEFAULT_LOCAL_MAILBOX_DEPTH)
+        Self::spawn_supervised_deep(factory, limit, DEFAULT_LOCAL_BACKPRESSURE)
     }
 
-    /// [`spawn_supervised`](Self::spawn_supervised), plus the mailbox depth.
+    /// [`spawn_supervised`](Self::spawn_supervised), plus the mailbox's own policy.
     ///
     /// The supervised twin of [`spawn_deep`](Self::spawn_deep), and it exists
     /// because the mailbox is created in exactly two places on this path — here
     /// and there — so a knob that reaches every local actor is two signatures and
     /// cannot be one. The mailbox belongs to the **actor** rather than to an
-    /// incarnation, so this depth is set once and survives every restart.
+    /// incarnation, so this policy is set once and survives every restart: a
+    /// [`Backpressure::Shed`] actor sheds while it is restarting, exactly as it
+    /// does while it is running, because the mailbox never went away.
     ///
     /// # CAUTION: a deeper mailbox raises the shutdown budget owed
     ///
@@ -3725,14 +3934,14 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
     pub fn spawn_supervised_deep<N, Fut, F>(
         factory: N,
         limit: Intensity,
-        depth: NonZeroUsize,
+        backpressure: Backpressure,
     ) -> Self
     where
         N: FnMut() -> Fut + Send + 'static,
         Fut: Future<Output = Result<Incarnation<A, F>, Stop>> + Send,
         F: Feeds<A>,
     {
-        let (mail, inbox) = mpsc::channel::<Message<A, M>>(depth.get());
+        let (mail, inbox) = mpsc::channel::<Message<A, M>>(backpressure.depth().get());
         let (ended, watching) = watch::channel(None);
         let fate = Fate::default();
         let held = fate.clone();
@@ -3765,6 +3974,7 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
             fate: held,
             busy: watched,
             task: Arc::new(task),
+            backpressure,
         }
     }
 }
@@ -3871,6 +4081,7 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
             Err(TurnLost::Faulted(panic)) => panic.resume(),
             Err(TurnLost::Turn(withheld)) => Err(Unanswered::Turn(withheld)),
             Err(TurnLost::Reentrant) => Err(Unanswered::Reentrant),
+            Err(TurnLost::Full) => Err(Unanswered::Full),
         }
     }
 
@@ -3977,6 +4188,7 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
         .map_err(|not_queued| match not_queued {
             NotQueued::Closed => TurnLost::Turn(Withheld::Gone),
             NotQueued::Reentrant => TurnLost::Reentrant,
+            NotQueued::Full => TurnLost::Full,
         })?;
         // [`withheld_for`] and not a second copy of its three arms. This door and
         // the served one map the same standing onto the same loss, and they held
@@ -4239,7 +4451,12 @@ impl<A, M> LocalActor<A, M> {
     pub async fn stop(&self) -> Result<(), NotQueued> {
         match self.send(Message::Stop, Refuse::Always).await {
             Ok(()) | Err(NotQueued::Closed) => {}
-            Err(refused @ NotQueued::Reentrant) => return Err(refused),
+            // `Closed` is swallowed because the actor is already what the caller
+            // asked for. These two are not: after either, the actor is **still
+            // running and was never asked to stop**, so returning `Ok` would be
+            // the one lie this door cannot afford — a caller that then waits for
+            // the ending waits forever.
+            Err(refused @ (NotQueued::Reentrant | NotQueued::Full)) => return Err(refused),
         }
         // The END channel, not `mail.closed()`. The loop fills it after it has
         // dropped the observers and the mailbox, so returning from here means
@@ -4343,10 +4560,18 @@ impl<A, M> LocalActor<A, M> {
 
     /// How many messages are waiting ahead of the one being handled.
     ///
-    /// Zero or one at the local mailbox depth, which is a constant and not a
-    /// knob — never a number to compute a queue-length alert from. What it is
-    /// good for is the question it answers exactly — **is this actor's mailbox
-    /// full, and therefore will the next caller block on the permit.**
+    /// It ranges over the depth this actor's mailbox was built with: zero or one
+    /// under [`spawn`](Self::spawn), and up to the depth under
+    /// [`spawn_deep`](Self::spawn_deep), which takes a `NonZeroUsize` and builds
+    /// the channel from it. **This paragraph used to say the depth was "a
+    /// constant and not a knob", and it was false from the commit that added
+    /// that door** — it is corrected here rather than left as the reason a
+    /// caller does not read the number.
+    ///
+    /// What it is good for is the question it answers exactly — **is this
+    /// actor's mailbox full, and therefore will the next caller block on the
+    /// permit.** What it is still not is a count of the service's own messages,
+    /// and the paragraph below says why: this channel carries two other things.
     ///
     /// `ActorStatus::buffered` answers that same question on the keyed side, and
     /// the two are **not** counting the same set: a keyed mailbox carries only
@@ -4396,19 +4621,157 @@ impl<A, M> LocalActor<A, M> {
         }
     }
 
-    /// The one place a message enters the mailbox.
+    /// Wait for a mailbox slot and hold it. Backpressure, made addressable.
+    ///
+    /// Every other door waits for a permit *inside* itself and spends it in the
+    /// same call, so a caller can observe the wait and never the slot. This one
+    /// stops at the slot and hands it over. [`compose::Pool`](crate::compose::Pool)
+    /// names the absence as its own missing piece — *"a `try_pick` across N
+    /// mailboxes needs a `try_reserve` the handle does not have"* — and
+    /// [`try_reserve`](Self::try_reserve) is that door.
+    ///
+    /// The permit is the admission decision, taken **before** the payload moves.
+    /// That is the whole of what it buys: a caller who cannot afford to build a
+    /// message and be told no takes one of these first, and a [`Permit`]'s own
+    /// send cannot be refused for fullness.
+    ///
+    /// # What tokio guarantees here, and what it does not
+    ///
+    /// **Not cancel-safe.** tokio says so of the channel this wraps: *"Cancelling
+    /// a call to `reserve` makes you lose your place in the queue."* Dropping this
+    /// future therefore costs the wait, and a caller who retries starts again at
+    /// the back.
+    ///
+    /// **Capacity is conserved anyway**, which is the narrower promise and the one
+    /// a racing caller needs: a dropped waiter is removed from the wait list and
+    /// any permit already assigned to it is returned. So racing N of these and
+    /// dropping N−1 leaks no slot and wedges no mailbox.
+    ///
+    /// **It is therefore not FIFO across callers.** Each cancellation takes the
+    /// wait-list lock, and a freed slot can be assigned to a waiter that has
+    /// already left. Two tasks racing for one mailbox are ordered by nothing here.
+    /// A single task awaiting two of these one after the other is ordered, for the
+    /// reason a `tell` is: the mailbox is FIFO.
+    ///
+    /// # Errors
+    ///
+    /// [`NotQueued::Closed`] when the loop's end of the mailbox is dropped, and
+    /// [`NotQueued::Reentrant`] when the call is made from inside this actor's own
+    /// turn.
+    ///
+    /// **The refusal is under the `Always` half, where [`notify`](Self::notify) is
+    /// under the `WhenFull` one, and the difference is that there is no message
+    /// yet.** A self-`tell` into a free slot is legitimate because the message it
+    /// carries runs after this turn returns. A *permit* carries no message: the
+    /// caller decides afterwards whether to spend it on a `tell` — which would be
+    /// legitimate — or on an `rpc`, which waits for an answer only the blocked turn
+    /// can produce and hangs for ever. A door that cannot see which one is coming
+    /// has to refuse the pair, so this is refused at any depth.
+    pub async fn reserve(&self) -> Result<Permit<'_, A, M>, NotQueued> {
+        if self.inside_own_turn() {
+            return Err(NotQueued::Reentrant);
+        }
+        match self.mail.reserve().await {
+            Ok(slot) => Ok(Permit {
+                fate: &self.fate,
+                slot,
+            }),
+            Err(_) => Err(NotQueued::Closed),
+        }
+    }
+
+    /// The same, without waiting. `Ok(None)` means this actor is full right now.
+    ///
+    /// Three answers where tokio's own `try_reserve` gives two: it folds *full*
+    /// and *closed* into one error, and this crate splits them everywhere else —
+    /// full is a schedule and closed is a fate. A caller routing across N mailboxes
+    /// wants to try the next one on a full and to stop on a closed, and a single
+    /// error type makes it read the discriminant to find out.
+    ///
+    /// # Errors
+    ///
+    /// [`NotQueued::Closed`] and [`NotQueued::Reentrant`], both exactly as
+    /// [`reserve`](Self::reserve) answers them — including the `Always` half of the
+    /// re-entrancy rule, which is about what the *permit* can be spent on rather
+    /// than about this call waiting. This call never waits.
+    pub fn try_reserve(&self) -> Result<Option<Permit<'_, A, M>>, NotQueued> {
+        if self.inside_own_turn() {
+            return Err(NotQueued::Reentrant);
+        }
+        match self.mail.try_reserve() {
+            Ok(slot) => Ok(Some(Permit {
+                fate: &self.fate,
+                slot,
+            })),
+            Err(mpsc::error::TrySendError::Full(())) => Ok(None),
+            Err(mpsc::error::TrySendError::Closed(())) => Err(NotQueued::Closed),
+        }
+    }
+
+    /// The same as [`reserve`](Self::reserve), owned, so the permit can be stored
+    /// or cross a spawn.
+    ///
+    /// [`Permit`] borrows the handle, so it cannot outlive the frame that reserved
+    /// it: it cannot be stored in a struct and it cannot be moved into a spawned
+    /// task. This is the `'static` half, and it is the **only** difference —
+    /// a future holding a borrowed permit across an await is already `Send`.
+    ///
+    /// Takes `self` because tokio's owned permit does, and it costs one refcount:
+    /// a handle is `Clone` and every clone names the same actor, so a caller who
+    /// still wants the handle clones it first.
+    ///
+    /// # A stored permit outlives the check this door makes
+    ///
+    /// The refusal below is taken **here**, once, on the task that reserves. An
+    /// owned permit that is then handed to the actor's own state and spent from
+    /// inside one of its turns is a re-entrant `rpc` that nothing refuses, and it
+    /// hangs exactly as an unrefused self-call would. That is the price of the
+    /// `'static`, it is not reachable by accident, and [`abort`](Self::abort) is
+    /// the recovery it shares with every other wedged turn.
+    ///
+    /// # Errors
+    ///
+    /// [`NotQueued::Closed`] and [`NotQueued::Reentrant`], as
+    /// [`reserve`](Self::reserve) answers them.
+    pub async fn reserve_owned(self) -> Result<OwnedPermit<A, M>, NotQueued> {
+        if self.inside_own_turn() {
+            return Err(NotQueued::Reentrant);
+        }
+        // The clone is what `reserve_owned` costs: tokio's owned permit consumes a
+        // sender, and this handle carries three other fields the permit still
+        // needs nothing of except the fate below.
+        match self.mail.clone().reserve_owned().await {
+            Ok(slot) => Ok(OwnedPermit {
+                fate: self.fate,
+                slot,
+            }),
+            Err(_) => Err(NotQueued::Closed),
+        }
+    }
+
+    /// Where a message enters the mailbox **after** waiting for its own permit.
+    ///
+    /// It used to be the one place a message entered at all, and this heading said
+    /// so. [`reserve`](Self::reserve) is the second: it takes the permit up front
+    /// and hands it over, and the caller spends it through [`Permit`] without
+    /// coming back here.
     ///
     /// It used to be the one place the box was put on, too. The box moved into
     /// [`Message::Mail`], where it stays until [`dispatch`] takes it off — because a
     /// box that the loop unwraps buys nothing, and that is what
     /// `tests/actor_memory.rs` measured.
     ///
-    /// # The re-entrancy check is here because this is that one place
+    /// # The re-entrancy check is here, and on the three permit doors, and nowhere else
     ///
-    /// Five non-test callers reach it — `answered` (serving both asks), `notify`,
-    /// `read`, `stop` and [`deliver_to_singleton`] — and there is no sixth door. Which
-    /// half of the rule applies is [`Refuse`]'s parameter, because the message
-    /// alone cannot say.
+    /// Five non-test callers reach **this** function — `answered` (serving both
+    /// asks), `notify`, `read`, `stop` and [`deliver_to_singleton`] — and there is no
+    /// sixth. Which half of the rule applies is [`Refuse`]'s parameter, because the
+    /// message alone cannot say.
+    ///
+    /// The permit doors ask the same question through the same
+    /// [`inside_own_turn`](Self::inside_own_turn) and take no [`Refuse`], because at
+    /// a reservation there is no message for one to be about.
+    /// [`reserve`](Self::reserve) carries the argument for the half they take.
     ///
     /// **The rule is decided once here and restated at every door, and the
     /// restatements are prose.** A caller meets the rule where it calls, not in a
@@ -4426,19 +4789,226 @@ impl<A, M> LocalActor<A, M> {
     /// other sender can *free* a permit, only spend one. So the load is not a
     /// check-then-act race against the actor: what it reads cannot change while
     /// the caller is inside the turn that would have to change it.
+    ///
+    /// # The shed is the third decision, and it runs last on purpose
+    ///
+    /// [`Backpressure::Shed`] replaces the awaited `send` with a `try_send`, which
+    /// is the **only** `try_send` on a mailbox in this crate — `console.rs` has the
+    /// other one, on a diagnostic sink that `representability.rs` excludes from the
+    /// mailbox rule by name. It runs after the identity check, so a re-entrant call
+    /// into a shedding actor is answered [`NotQueued::Reentrant`] rather than
+    /// [`NotQueued::Full`]: the deadlock is the more specific fact and the caller
+    /// fixes it differently.
+    ///
+    /// **No door escapes it, and the three that reserve never arrive here.**
+    /// [`reserve`](Self::reserve), [`try_reserve`](Self::try_reserve) and
+    /// [`reserve_owned`](Self::reserve_owned) take the slot themselves and hand it
+    /// over, so a caller that cannot afford to lose its arguments has a door that
+    /// keeps them under either policy. Under [`Backpressure::Park`] the branch
+    /// below is dead and the function is what it always was.
     async fn send(&self, message: Message<A, M>, refuse: Refuse) -> Result<(), NotQueued> {
-        // The `Arc` this handle already carries, read as an identity. Built
-        // before the thread-local is touched so the common off-turn path is one
-        // clone and one match arm on a unit discriminant.
-        let me = Actor(Arc::clone(&self.busy));
-        if current().holds(&me) {
+        if self.inside_own_turn() {
             match refuse {
                 Refuse::Always => return Err(NotQueued::Reentrant),
                 Refuse::WhenFull if self.mail.capacity() == 0 => return Err(NotQueued::Reentrant),
                 Refuse::WhenFull => {}
             }
         }
+        if self.backpressure.sheds() {
+            return self
+                .mail
+                .try_send(message)
+                .map_err(|refused| match refused {
+                    mpsc::error::TrySendError::Full(_) => NotQueued::Full,
+                    mpsc::error::TrySendError::Closed(_) => NotQueued::Closed,
+                });
+        }
         self.mail.send(message).await.map_err(|_| NotQueued::Closed)
+    }
+
+    /// Whether the calling task is inside this actor's own turn.
+    ///
+    /// One reading for two kinds of door: [`send`](Self::send), which then asks
+    /// [`Refuse`] which half of the rule applies, and the three permit doors,
+    /// which have no message for a half to be about. It was inline in `send`
+    /// while `send` was the only place that asked.
+    fn inside_own_turn(&self) -> bool {
+        // The `Arc` this handle already carries, read as an identity. Built
+        // before the thread-local is touched so the common off-turn path is one
+        // clone and one match arm on a unit discriminant.
+        let me = Actor(Arc::clone(&self.busy));
+        current().holds(&me)
+    }
+}
+
+/// One reserved mailbox slot, borrowed from the handle that reserved it.
+///
+/// A slot is held from the moment [`LocalActor::reserve`] returns until this is
+/// spent or dropped, so holding one is holding capacity away from every other
+/// sender. At the default depth of one that is the actor's whole mailbox.
+///
+/// **Spending it cannot wait and cannot be refused for fullness**, which is the
+/// property the whole type exists for: the admission decision was taken at the
+/// reservation, before the caller built anything. What can still happen is
+/// everything that happens to a message *after* it is queued — it may be dropped
+/// unrun by [`stop`](LocalActor::stop) or [`abort`](LocalActor::abort), and its
+/// turn may lose the reply. [`ask`](Self::ask) reports that half; a `tell` through
+/// [`notify`](Self::notify) reports nothing, for the reason
+/// [`LocalActor::notify`] gives.
+///
+/// # Deadlock is a caller's to avoid here, and there is one shape
+///
+/// Holding a permit and then awaiting an answer from the **same** actor on a
+/// second door blocks whenever the permit was the last free slot: the second call
+/// waits for a permit only this one can return. Spend it or drop it first. The
+/// re-entrancy rule does not reach this — it is about a caller inside the actor's
+/// turn, and this caller is outside it, holding the slot that turn needs.
+#[must_use = "a dropped permit returns the slot and sends nothing; \
+              the caller is never told"]
+pub struct Permit<'a, A, M> {
+    /// Read when a reply channel dies, exactly as [`LocalActor::answered`] reads
+    /// it. Borrowed rather than cloned, because the lifetime is already here.
+    fate: &'a Fate,
+    slot: mpsc::Permit<'a, Message<A, M>>,
+}
+
+impl<A, M> Permit<'_, A, M> {
+    /// Spend the slot on one turn and bring back its value.
+    ///
+    /// [`LocalActor::ask`] with the wait already paid. The argument is the same
+    /// builder that door takes, for the same reason: keylink makes the reply
+    /// channel and the [`Origin`] and the generated arm fills in the method's own
+    /// arguments around them.
+    ///
+    /// # Errors
+    ///
+    /// [`Unanswered::Turn`] carrying a [`Withheld`], and **not**
+    /// [`Unanswered::Reentrant`]: that question was asked and answered when the
+    /// permit was reserved, so no spent permit can produce it.
+    ///
+    /// # Panics
+    ///
+    /// With whatever the handler panicked with, after the actor has survived it —
+    /// [`LocalActor::ask`]'s behaviour, because this is the door a generated `rpc`
+    /// goes through on both types.
+    pub async fn ask<T>(self, mail: impl FnOnce(Origin, Reply<T>) -> M) -> Result<T, Unanswered>
+    where
+        T: Send + 'static,
+    {
+        let Self { fate, slot } = self;
+        let (reply, answer) = Reply::channel();
+        slot.send(Message::Mail(
+            Box::new(mail(Origin::local(), reply)),
+            current(),
+        ));
+        asked(answer, fate).await
+    }
+
+    /// Spend the slot on one turn and do not wait for it.
+    ///
+    /// [`LocalActor::notify`] with the wait already paid, and it returns nothing
+    /// rather than a `Result`: that door's two failures are a full mailbox and a
+    /// closed one, the permit answered the first, and there is no channel on which
+    /// to report the second. A mailbox that closes between the reservation and this
+    /// call drops the message unrun — which is what `stop` already does to a
+    /// queued one, and which the door that returned `Ok` could not have reported
+    /// either.
+    pub fn notify<T>(self, mail: impl FnOnce(Origin, Reply<T>) -> M)
+    where
+        T: Send + 'static,
+    {
+        let Self { fate: _, slot } = self;
+        let (reply, answer) = Reply::channel();
+        drop(answer);
+        slot.send(Message::Mail(
+            Box::new(mail(Origin::local(), reply)),
+            current(),
+        ));
+    }
+}
+
+/// [`Permit`] that owns its sender, so it can be stored or cross a spawn.
+///
+/// Everything [`Permit`] documents holds here, including the slot it is holding
+/// away from every other sender. What it adds is that the holding can now outlive
+/// the frame that reserved it, and [`LocalActor::reserve_owned`] states the one
+/// hazard that comes with.
+#[must_use = "a dropped permit returns the slot and sends nothing; \
+              the caller is never told"]
+pub struct OwnedPermit<A, M> {
+    /// [`Permit`]'s, by value, because there is no handle left to borrow from.
+    fate: Fate,
+    slot: mpsc::OwnedPermit<Message<A, M>>,
+}
+
+impl<A, M> OwnedPermit<A, M> {
+    /// [`Permit::ask`], owned.
+    ///
+    /// # Errors
+    ///
+    /// [`Permit::ask`]'s.
+    ///
+    /// # Panics
+    ///
+    /// [`Permit::ask`]'s.
+    pub async fn ask<T>(self, mail: impl FnOnce(Origin, Reply<T>) -> M) -> Result<T, Unanswered>
+    where
+        T: Send + 'static,
+    {
+        let Self { fate, slot } = self;
+        let (reply, answer) = Reply::channel();
+        // The sender tokio hands back is the one this permit was reserved on. It
+        // is dropped rather than returned, because a caller who wants a handle
+        // clones the one they reserved from — which is what `reserve_owned` costs
+        // and says it costs.
+        drop(slot.send(Message::Mail(
+            Box::new(mail(Origin::local(), reply)),
+            current(),
+        )));
+        asked(answer, &fate).await
+    }
+
+    /// [`Permit::notify`], owned.
+    pub fn notify<T>(self, mail: impl FnOnce(Origin, Reply<T>) -> M)
+    where
+        T: Send + 'static,
+    {
+        let Self { fate: _, slot } = self;
+        let (reply, answer) = Reply::channel();
+        drop(answer);
+        drop(slot.send(Message::Mail(
+            Box::new(mail(Origin::local(), reply)),
+            current(),
+        )));
+    }
+}
+
+/// What a permit's `ask` is owed once the message is in the mailbox.
+///
+/// **One state fewer than [`LocalActor::ask`]'s two-step fold, and the missing one
+/// is [`TurnLost::Reentrant`]**: a permit asked that question when it was
+/// reserved, so nothing downstream of a spent permit can produce it. That is the
+/// reason this is a third reading of [`Answered`] rather than a call into the
+/// other two — those start from a send that can still be refused, and this starts
+/// from a message that is already in the mailbox.
+///
+/// Everything else is the same reading. A fault is the caller's value rather than
+/// a loss, a dead reply channel is [`withheld_for`] over the standing, and every
+/// other way a turn produced nothing is a [`Withheld`].
+async fn asked<T>(answer: oneshot::Receiver<Answered<T>>, fate: &Fate) -> Result<T, Unanswered> {
+    match answer.await {
+        Ok(Answered::Ran(value)) => Ok(value),
+        Ok(Answered::Faulted(panic)) => panic.resume(),
+        Ok(Answered::Refused { name }) => Err(Unanswered::Turn(Withheld::Refused {
+            name: name.to_owned(),
+        })),
+        Ok(Answered::ObserverPanicked { name }) => {
+            Err(Unanswered::Turn(Withheld::ObserverPanicked {
+                name: name.to_owned(),
+            }))
+        }
+        Ok(Answered::Expired) => Err(Unanswered::Turn(Withheld::Expired)),
+        Err(_) => Err(Unanswered::Turn(withheld_for(fate.standing()))),
     }
 }
 
@@ -4458,6 +5028,11 @@ impl<A, M> Clone for LocalActor<A, M> {
             fate: self.fate.clone(),
             busy: Arc::clone(&self.busy),
             task: self.task.clone(),
+            // The one field that is genuinely copied, and it is not an exception
+            // to the heading: it is `Copy` because it is the policy itself and not
+            // a handle to one. Two clones of a handle cannot come to disagree
+            // about it, because nothing ever sets it after the spawn.
+            backpressure: self.backpressure,
         }
     }
 }
@@ -4820,6 +5395,19 @@ where
                 Body::empty(),
             )
         }
+        // **This one IS producible, which is the whole difference from the arm
+        // above.** A singleton served under [`Backpressure::Shed`] refuses a peer
+        // the moment its mailbox is full, so this is the served half of
+        // [`NotQueued::Full`] and it earns the wire-visible discriminator the
+        // re-entrant arm was refused.
+        //
+        // [`RemoteError::MailboxFull`] and never [`RemoteError::TimedOut`]: a peer
+        // that reads a timeout retries the same call, and a peer that reads this
+        // backs off. The `QueueTimeout` layer above still answers `TimedOut` for
+        // its own budget, and the two now say different things because they mean
+        // different things — a shed is the far side refusing, a timeout is the far
+        // side being slow.
+        Err(NotQueued::Full) => return (Outcome::Err(RemoteError::MailboxFull), Body::empty()),
     }
     progress.enqueued();
 
@@ -4916,6 +5504,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    // `Failure` is the fourth enum carrying the two hand-written sentences, and
+    // it is the one this module does not otherwise name.
+    use crate::Failure;
 
     /// None of [`lost`]'s three answers is a [`RemoteError::Failed`], so none
     /// carries a prefix and no `starts_with` will ever find one.
@@ -5176,6 +5767,63 @@ mod tests {
             TurnLost::Turn(withheld) => Some(Unanswered::Turn(withheld.clone())),
             TurnLost::Reentrant => Some(Unanswered::Reentrant),
             TurnLost::Faulted(_) => None,
+            TurnLost::Full => Some(Unanswered::Full),
+        }
+    }
+
+    /// The name this state carries in the sample the walk below builds.
+    ///
+    /// # An array is not a match, and these three do not make it one
+    ///
+    /// [`every_withheld`]'s doc carries the whole argument: exhaustiveness forces
+    /// an **arm**, and nothing in Rust forces an **entry** in a sample. What
+    /// closed that hole for [`Withheld`] was [`schema_variants`], off a derive —
+    /// and [`Withheld`] is the only one of these four enums that has one, because
+    /// it is the only one that crosses the wire.
+    ///
+    /// **This is what is available for the other three, and it is worth saying
+    /// what it does and does not buy.** It does not force an entry. It puts
+    /// `error[E0004]` **in this module**, in the file that holds the arrays, so
+    /// an author who adds a fourth [`NotQueued`] state stops at a compile error
+    /// three lines from the array they have to extend — rather than at a guard
+    /// that quietly walks 3 of 4 and passes, which is what this test did for
+    /// [`Full`](NotQueued::Full) until it was found by review. The literal name
+    /// sets in the walk are the other half: a dropped entry fails an assertion
+    /// that **names it**, where a length comparison against the array's own
+    /// `len()` is a tautology and reports nothing.
+    ///
+    /// The strings are hand-written and self-checking, for [`variant_name`]'s
+    /// reason: a typo puts a name in one set and not the other, in both
+    /// directions.
+    fn not_queued_name(one: &NotQueued) -> &'static str {
+        match one {
+            NotQueued::Closed => "Closed",
+            NotQueued::Reentrant => "Reentrant",
+            NotQueued::Full => "Full",
+        }
+    }
+
+    /// [`not_queued_name`]'s, for the enum the value doors answer.
+    fn unanswered_name(one: &Unanswered) -> &'static str {
+        match one {
+            Unanswered::Turn(_) => "Turn",
+            Unanswered::Reentrant => "Reentrant",
+            Unanswered::Full => "Full",
+        }
+    }
+
+    /// [`not_queued_name`]'s, for the enum `ask_catching` answers.
+    ///
+    /// [`twin`] is already exhaustive over this type, so the compile error was
+    /// here before this function was. What was missing is the half that names a
+    /// dropped entry: `twin` answering `None` more often is caught by the count
+    /// below it, and an entry that never existed is not.
+    fn turn_lost_name(one: &TurnLost) -> &'static str {
+        match one {
+            TurnLost::Turn(_) => "Turn",
+            TurnLost::Faulted(_) => "Faulted",
+            TurnLost::Reentrant => "Reentrant",
+            TurnLost::Full => "Full",
         }
     }
 
@@ -5192,26 +5840,29 @@ mod tests {
     ///
     /// **The type system is not the replacement, and saying it is would be the
     /// mistake worth naming.** It gives non-drift on the shared arm and nothing
-    /// else: not the two hand-written `Reentrant` texts, not the sentences a
+    /// else: not the four hand-written `Reentrant` texts, not the sentences a
     /// `NotQueued` widens onto, not collisions between two `Withheld` variants,
     /// and — most of all — **not reachability**. Nothing in Rust says a variant
     /// has a producer, which is exactly how
     /// [`Expired`](Withheld::Expired) reached zero reachable ones without a gate
-    /// noticing. So seven properties are held here by hand, and each one is a way
+    /// noticing. So nine properties are held here by hand, and each one is a way
     /// this could go wrong that the compiler cannot see.
     ///
-    /// # The seven
+    /// # The nine
     ///
-    /// 1. **The two `Reentrant` texts match.** They are hand-written on two
-    ///    enums, and they are the only pair in the crate that still is.
-    /// 2. **[`NotQueued`]'s two states read as their widenings do**, through
+    /// 1. **The four `Reentrant` texts match.** They are hand-written on
+    ///    [`TurnLost`], [`Unanswered`], [`NotQueued`] and [`Failure`], and they
+    ///    are one of the two sets in the crate that still are. This property
+    ///    covers the first two, through [`twin`]; property 8 covers the fourth,
+    ///    which no conversion reaches.
+    /// 2. **[`NotQueued`]'s three states read as their widenings do**, through
     ///    `From<NotQueued> for Unanswered` — the conversion the crate performs,
     ///    not a copy that could agree with nothing. That impl is exhaustive, so a
-    ///    third state is `error[E0004]` on **production** code.
+    ///    fourth state is `error[E0004]` on **production** code.
     /// 3. **No two sentences collide across the whole [`Unanswered`] surface**,
     ///    which is every `Withheld` wrapped in [`Turn`](Unanswered::Turn) plus
-    ///    `Reentrant`. Checking only inside `Withheld` would pass a copy-paste
-    ///    that gave [`Gone`](Withheld::Gone) the re-entrancy sentence.
+    ///    `Reentrant` and `Full`. Checking only inside `Withheld` would pass a
+    ///    copy-paste that gave [`Gone`](Withheld::Gone) the re-entrancy sentence.
     /// 4. **No `#[error]` text is empty**, which refuses an equality that holds
     ///    because both sides are `""`.
     /// 5. **Every `Withheld` has a producer**, checked by *calling* it — see
@@ -5220,12 +5871,25 @@ mod tests {
     /// 6. **The fault exception is exactly one variant wide**, so a [`twin`] that
     ///    answered `None` to everything — and therefore skipped every comparison
     ///    in property 1 — is refused.
-    /// 7. **The sample is every variant the enum has**, compared against the list
-    ///    `#[derive(Schema)]` wrote — see [`schema_variants`]. Without it the
-    ///    other six are properties of *whatever [`every_withheld`] happens to
-    ///    hold*: an eighth loss forces an arm in [`produced`] and in
+    /// 7. **The [`Withheld`] sample is every variant the enum has**, compared
+    ///    against the list `#[derive(Schema)]` wrote — see [`schema_variants`].
+    ///    Without it the others are properties of *whatever [`every_withheld`]
+    ///    happens to hold*: an eighth loss forces an arm in [`produced`] and in
     ///    [`variant_name`], and neither forces an entry in that array, so the walk
     ///    would cover 7 of 8 and pass.
+    /// 8. **[`Failure`]'s two hand-written sentences are compared directly**,
+    ///    because no `From` reaches that type from any of the other three.
+    ///    `Reentrant` must read as [`Unanswered::Reentrant`] does, and
+    ///    [`Failure::Full`] must **not**: it says *call* where the other three say
+    ///    *message*, which is the door it answers rather than drift, and the
+    ///    inequality is what stops that difference being unified by accident.
+    /// 9. **Each of the other three samples is every variant its enum has**,
+    ///    against a literal set of names — see [`not_queued_name`]. It is property
+    ///    7's job done with the one mechanism these three have, and it is weaker:
+    ///    they cross no wire, so no derive writes their variant list and nothing
+    ///    forces an *entry*. What it buys is `error[E0004]` **in this module**
+    ///    beside the arrays, and an assertion that names the entry that went
+    ///    missing.
     ///
     /// # What each property can hold for, if it held for nothing
     ///
@@ -5236,24 +5900,37 @@ mod tests {
     /// is compared against a literal `["Expired"]` rather than a length, which is
     /// what makes it by-name.
     ///
-    /// Property 3's count is against the sample's own length, so a walk over a
-    /// subset cannot pass it. Property 2 asserts both that no two states widen
-    /// onto one answer and that the walk wrote as many as it read, because the
-    /// first alone is satisfied by a loop that ran zero times.
+    /// Property 3's count is against the sample's own length, so it catches a
+    /// collision and **not** a short sample — seven distinct sentences out of
+    /// eight variants pass it, and property 9 is what refuses that. Property 2
+    /// asserts both that no two states widen onto one answer and that the walk
+    /// wrote as many as it read, and that second count is a **literal 3**: read
+    /// off `queued.len()` it compared the array against itself and held for an
+    /// array of any length, including one a new variant had been left out of.
     ///
     /// **The equality in property 1's walk is trivially true on the
     /// [`Turn`](TurnLost::Turn) arm** — both sides render `{0}` of the same
     /// value — and that is said rather than left for a reader to discover. The
-    /// arm that can fail is `Reentrant`, and it is the arm the property is about.
+    /// arms that can fail are `Reentrant` and `Full`, and they are the arms the
+    /// property is about.
     ///
-    /// # Made red three times, one per novel property
+    /// # Made red seven times, one per novel property
     ///
-    /// By `scripts/break-once.sh keylink/src/turns.rs`, filtered on this test's
-    /// own name plus `-p keylink --lib`. All three edits are in **this** file, so
-    /// none of the first two is quoted — a record quoting its own search literal
-    /// is a second occurrence and the harness aborts at "found 2". The third is
-    /// quoted, and measured: `Withheld::Expired,` with its twelve spaces counts 1,
-    /// because this record's own quote of it is not indented that way.
+    /// By `scripts/break-once.sh`, filtered on this test's own name plus
+    /// `-p keylink --lib`. Six edits are in **this** file and the seventh is in
+    /// `keylink/src/error.rs`, so a quote of one of the six is a second
+    /// occurrence unless it is unindented — the harness aborts at "found 2" — and
+    /// the seventh is counted in the file it breaks, where this record is not.
+    /// Measured: `Withheld::Expired,` with its twelve spaces counts 1, because
+    /// this record's own quote of it is not indented that way.
+    ///
+    /// **Four of the seven were added when a merge gate found the guard blind to
+    /// [`Full`](Unanswered::Full).** The release put that variant on three enums
+    /// and grew none of the three samples, so the walk covered 2 of 3, 3 of 4 and
+    /// 2 of 3 — and the only mechanical thing holding the array to the enum was a
+    /// comparison of `queued.len()` against itself. Breaks (a) and (b) are the two
+    /// that were green before it, on a branch whose headline is the variant they
+    /// perturb.
     ///
     /// - point [`produced`]'s gone arm at the wrong producer: search
     ///   `Withheld::Gone => from_lost(Standing::Gone),` and replace it with
@@ -5273,6 +5950,35 @@ mod tests {
     ///   indentation** — bare, each counts 2, because this line is the second. The
     ///   indented search literal counts 1. Watched:
     ///   `every_withheld is not every Withheld`.
+    /// - **(a)** point the widening at the wrong answer: search
+    ///   `NotQueued::Full => Self::Full,` and replace it with
+    ///   `NotQueued::Full => Self::Reentrant,`. Watched:
+    ///   `one fact must read as one sentence: Full and Reentrant`,
+    ///   `left: "the actor's mailbox is full and it shed this message"`,
+    ///   `right: "this call was made from inside the target actor's own turn: it would deadlock"`.
+    ///   **Green before this fix**, because `queued` held two of the three states
+    ///   and the arm was never called.
+    /// - **(b)** the same at the other door: search
+    ///   `TurnLost::Full => Some(Unanswered::Full),` and replace it with
+    ///   `TurnLost::Full => Some(Unanswered::Reentrant),`. Watched: the same
+    ///   sentence and the same two texts, from property 1's walk rather than
+    ///   property 2's. **Green before this fix**, for the same reason: `losses`
+    ///   held three of the four.
+    /// - **(c)** hand the walk the sample this branch shipped with: search
+    ///   `let queued = [NotQueued::Closed, NotQueued::Reentrant, NotQueued::Full];`
+    ///   and replace it with
+    ///   `let queued = [NotQueued::Closed, NotQueued::Reentrant];`. Watched:
+    ///   ``queued` is not every `NotQueued``, `left: {"Closed", "Reentrant"}`,
+    ///   `right: {"Closed", "Full", "Reentrant"}`. This is the break that names
+    ///   the defect the gate found, and it is the one the old `queued.len()`
+    ///   comparison could not express at all.
+    /// - **(d)** drift [`Failure`]'s copy of the re-entrancy sentence, in
+    ///   `keylink/src/error.rs` and so counted there: search
+    ///   `#[error("this call was made from inside the target actor's own turn: it would deadlock")]`
+    ///   — which is unique in that file, where the same text appears twice in this
+    ///   one — and replace `it would deadlock` with `it deadlocks`. Watched:
+    ///   ``one fact must read as one sentence, and `Failure` has no `From` to
+    ///   perform the comparison for it``. Nothing held this text before property 8.
     #[test]
     fn one_vocabulary_and_every_loss_in_it_has_a_producer() {
         let every = every_withheld();
@@ -5310,8 +6016,14 @@ mod tests {
             .iter()
             .cloned()
             .map(Unanswered::Turn)
-            .chain([Unanswered::Reentrant])
+            .chain([Unanswered::Reentrant, Unanswered::Full])
             .collect();
+        assert_eq!(
+            surface.iter().map(unanswered_name).collect::<BTreeSet<_>>(),
+            BTreeSet::from(["Turn", "Reentrant", "Full"]),
+            "the surface is not every `Unanswered`: the set on the left is what \
+             this sample holds and the one on the right is written out once",
+        );
         let words: BTreeSet<String> = surface.iter().map(ToString::to_string).collect();
         assert_eq!(
             words.len(),
@@ -5324,12 +6036,20 @@ mod tests {
         );
 
         // 1 and 6. The fault is the one loss `ask` resumes instead of reporting,
-        // and `Reentrant` is the one sentence still written twice.
+        // and `Reentrant` and `Full` are the two sentences four enums still write
+        // out by hand.
         let losses = [
             TurnLost::Turn(Withheld::Gone),
             TurnLost::Reentrant,
+            TurnLost::Full,
             TurnLost::Faulted(catching(|| panic!("faulted")).expect_err("it panicked")),
         ];
+        assert_eq!(
+            losses.iter().map(turn_lost_name).collect::<BTreeSet<_>>(),
+            BTreeSet::from(["Turn", "Faulted", "Reentrant", "Full"]),
+            "`losses` is not every `TurnLost`: the set on the left is what this \
+             sample holds and the one on the right is written out once",
+        );
         let mut without_a_twin = 0;
         for one in &losses {
             match twin(one) {
@@ -5347,7 +6067,13 @@ mod tests {
         );
 
         // 2. The third enum, through the widening the crate actually performs.
-        let queued = [NotQueued::Closed, NotQueued::Reentrant];
+        let queued = [NotQueued::Closed, NotQueued::Reentrant, NotQueued::Full];
+        assert_eq!(
+            queued.iter().map(not_queued_name).collect::<BTreeSet<_>>(),
+            BTreeSet::from(["Closed", "Reentrant", "Full"]),
+            "`queued` is not every `NotQueued`: the set on the left is what this \
+             sample holds and the one on the right is written out once",
+        );
         let mut widened = BTreeSet::new();
         for one in &queued {
             let mine = Unanswered::from(*one);
@@ -5363,8 +6089,27 @@ mod tests {
         }
         assert_eq!(
             widened.len(),
-            queued.len(),
-            "every `NotQueued` state is widened exactly once: {widened:?}",
+            3,
+            "every `NotQueued` state is widened exactly once, and the three is a \
+             literal for the reason `[\"Expired\"]` above is one: read off \
+             `queued.len()` both sides came from the same hand-written array and \
+             the comparison held for any array at all: {widened:?}",
+        );
+
+        // 8. The fourth enum, which no conversion reaches, so it is compared
+        // against the vocabulary directly.
+        assert_eq!(
+            Failure::Reentrant.to_string(),
+            Unanswered::Reentrant.to_string(),
+            "one fact must read as one sentence, and `Failure` has no `From` to \
+             perform the comparison for it",
+        );
+        assert_ne!(
+            Failure::Full.to_string(),
+            Unanswered::Full.to_string(),
+            "`Failure::Full` says *call* where the other three say *message*, \
+             which is the door it answers and not drift — this fires when the \
+             two are unified, which is a decision rather than a fix",
         );
     }
 
@@ -5429,6 +6174,20 @@ mod tests {
         /// sent it produced nothing committable, and a durability adapter refuses
         /// a panicked turn.
         ReleaseThenBoom { origin: Origin, reply: Reply<usize> },
+        /// Reserve on this actor's **own** handle from inside its own turn, and
+        /// answer what the door said.
+        ///
+        /// The handle rides in the message rather than in the state for the
+        /// reason [`Held`](Self::Held)'s channels do: [`LocalActor::spawn`] wants
+        /// the state before it can hand back a handle to put inside it. Every
+        /// other self-call probe in this workspace is in `tests/cycles.rs` and
+        /// goes through a generated `Handle`; this one is here because the door
+        /// it tests is here.
+        Reserving {
+            origin: Origin,
+            me: LocalActor<Counter, Mail>,
+            reply: Reply<Result<(), NotQueued>>,
+        },
     }
 
     impl Turn<Counter> for Mail {
@@ -5542,6 +6301,25 @@ mod tests {
                     )
                     .await
                 }
+                Mail::Reserving { origin, me, reply } => {
+                    turn(
+                        state,
+                        hooks,
+                        origin,
+                        "Reserving",
+                        reply,
+                        move |_from, _state| {
+                            Box::pin(async move {
+                                // A permit that ever came back is dropped at the
+                                // end of this statement. What the test reads is
+                                // the verdict, and a permit held past the turn
+                                // would wedge this actor for good.
+                                me.reserve().await.map(|_permit| ())
+                            })
+                        },
+                    )
+                    .await
+                }
             }
         }
     }
@@ -5555,6 +6333,201 @@ mod tests {
         let actor = LocalActor::spawn(Counter::default());
         assert_eq!(actor.ask(add(1)).await.expect("running"), 1);
         assert_eq!(actor.ask(add(2)).await.expect("running"), 2);
+    }
+
+    /// A permit carries the turn its slot was reserved for, and answers it.
+    ///
+    /// The cheapest thing that could be wrong here is the permit sending nothing
+    /// at all — [`Permit`] holds the slot and a `Drop` would return it silently,
+    /// so a caller who never checked would see a message that vanished. The
+    /// assertion is on the **answer**, which only a turn that ran can produce.
+    #[tokio::test]
+    async fn a_permit_spends_its_slot_on_a_turn_that_runs() {
+        let actor = LocalActor::spawn(Counter::default());
+
+        let permit = actor.reserve().await.expect("a live actor has a slot");
+        assert_eq!(permit.ask(add(1)).await.expect("running"), 1);
+
+        // And the slot is back, so the actor is not wedged behind its own permit.
+        assert_eq!(actor.ask(add(2)).await.expect("running"), 2);
+    }
+
+    /// The three answers `try_reserve` separates, where tokio's own gives two.
+    ///
+    /// `Ok(None)` is *full right now* and `Err(Closed)` is a fate. Holding a
+    /// permit is what makes the mailbox full without a wedged turn to arrange:
+    /// the default local depth is one, so one held slot is the whole of it.
+    #[tokio::test]
+    async fn try_reserve_separates_a_full_mailbox_from_a_closed_one() {
+        // Annotated, because this test never sends a message and `M` is otherwise
+        // ambiguous: `Infallible` also implements `Turn<Counter>`.
+        let actor: LocalActor<Counter, Mail> = LocalActor::spawn(Counter::default());
+
+        let held = actor.reserve().await.expect("a live actor has a slot");
+        assert!(
+            actor
+                .try_reserve()
+                .expect("a live actor is not closed")
+                .is_none(),
+            "a held permit is the whole of a depth-one mailbox, so the next one is full",
+        );
+
+        // Dropping it returns the slot, which is the half a leak would break.
+        drop(held);
+        assert!(
+            actor
+                .try_reserve()
+                .expect("a live actor is not closed")
+                .is_some(),
+            "a dropped permit must return its slot",
+        );
+
+        actor
+            .stop()
+            .await
+            .expect("a stop from outside is never refused");
+        assert_eq!(
+            actor.try_reserve().err(),
+            Some(NotQueued::Closed),
+            "a stopped actor answers a fate, not a schedule",
+        );
+    }
+
+    /// A shedding mailbox refuses where the default parks, and the permit doors
+    /// do neither.
+    ///
+    /// **The control is the second half, and it is what makes the first half mean
+    /// anything.** `Err(NotQueued::Full)` on its own is equally consistent with a
+    /// `send` that answers `Full` unconditionally, and no assertion above it would
+    /// notice. So the same call is made against a `Park` actor in the same state —
+    /// depth one, its single permit held, mailbox full — and it must **not**
+    /// return. Parking is only observable as an absence, so a deadline is the
+    /// instrument and its expiry is the assertion.
+    ///
+    /// Depth one, so one held permit is the whole mailbox and no wedged turn has
+    /// to be arranged. [`try_reserve`](LocalActor::try_reserve) is asserted under
+    /// `Shed` as well, because the policy must not reach the doors that reserve:
+    /// that is the promise [`NotQueued::Full`]'s own rustdoc makes to a caller who
+    /// cannot afford to lose its arguments, and a shed that swallowed it would
+    /// leave a shedding actor with no lossless door at all.
+    ///
+    /// **Three doors, because the variant reaches a caller by three different
+    /// routes and no two of them share an arm.** `notify` returns the send's own
+    /// error untouched; `ask` goes through `answered`, whose `map_err` widens onto
+    /// [`TurnLost`] and is then folded onto [`Unanswered`]; and `read` uses `?`,
+    /// which is the only local door that runs `From<NotQueued> for Unanswered`.
+    ///
+    /// The third assertion was added because the second did not cover what its
+    /// comment claimed. Mis-widening the `From` impl to `Unanswered::Reentrant`
+    /// left this test **green** — `ask` never runs that impl — so the arm was
+    /// unguarded while a sentence here said it was not. Both breaks are now red,
+    /// and each is red at its own assertion.
+    #[tokio::test]
+    async fn a_shedding_mailbox_refuses_where_the_default_parks() {
+        let depth = NonZeroUsize::MIN;
+
+        let shedding: LocalActor<Counter, Mail> = LocalActor::spawn_deep(
+            Counter::default(),
+            Vec::new(),
+            (),
+            Backpressure::Shed(depth),
+        );
+        let held = shedding.reserve().await.expect("a live actor has a slot");
+        assert_eq!(
+            shedding.notify(add(1)).await,
+            Err(NotQueued::Full),
+            "a queue-only door answers the shed in its own words",
+        );
+        assert_eq!(
+            shedding.ask(add(1)).await.err(),
+            Some(Unanswered::Full),
+            "a door that wanted a value answers the same fact in its own words",
+        );
+        assert_eq!(
+            shedding.read(|state: &Counter| state.inside).await.err(),
+            Some(Unanswered::Full),
+            "`read`'s `?` runs `From<NotQueued>`, which no other local door does",
+        );
+        assert!(
+            shedding
+                .try_reserve()
+                .expect("a live actor is not closed")
+                .is_none(),
+            "the permit doors are unchanged: full is still a schedule, not a refusal",
+        );
+        drop(held);
+
+        // THE CONTROL. Same depth, same held permit, same call — the policy is the
+        // only difference, so it is the only thing the answers above can be
+        // attributed to.
+        let parking: LocalActor<Counter, Mail> = LocalActor::spawn_deep(
+            Counter::default(),
+            Vec::new(),
+            (),
+            Backpressure::Park(depth),
+        );
+        let held = parking.reserve().await.expect("a live actor has a slot");
+        assert!(
+            n0_future::time::timeout(Duration::from_millis(200), parking.notify(add(1)))
+                .await
+                .is_err(),
+            "the default parks on a full mailbox, so this send must not return at all",
+        );
+        drop(held);
+    }
+
+    /// A reserve from inside the target actor's own turn is refused, at any depth.
+    ///
+    /// **The stricter half, and `tell`'s is the comparison that makes it a
+    /// decision.** A self-`tell` into a free slot is allowed, because the message
+    /// it carries runs after this turn returns. A permit carries no message: the
+    /// caller chooses afterwards between a `tell`, which would be fine, and an
+    /// `rpc`, which waits for an answer only the blocked turn can produce. This
+    /// mailbox has a free slot at the moment the handler asks — the loop released
+    /// its permit when it took the message it is running — so a `WhenFull` rule
+    /// here would have answered `Ok` and handed out the deadlock.
+    #[tokio::test]
+    async fn a_reserve_from_inside_a_turn_is_refused_before_the_permit() {
+        let actor = LocalActor::spawn(Counter::default());
+        let me = actor.clone();
+
+        let verdict = actor
+            .ask(move |origin, reply| Mail::Reserving { origin, me, reply })
+            .await
+            .expect("the turn itself runs and answers");
+
+        assert_eq!(
+            verdict.expect_err("a self-reserve must not hand out a permit"),
+            NotQueued::Reentrant,
+            "a reserve from inside the actor's own turn was not refused",
+        );
+
+        // The refusal costs nothing: the actor took no permit and is still here.
+        assert_eq!(actor.ask(add(1)).await.expect("running"), 1);
+    }
+
+    /// An owned permit is `Send + 'static`, so it survives the frame that made it.
+    ///
+    /// The borrowed form cannot be written this way — it borrows the handle — and
+    /// that is the only difference between the two. `macros.rs`'s expansion module
+    /// holds the compile-only half of this claim, which covers the borrowed form
+    /// as well; this is the half that also runs.
+    #[tokio::test]
+    async fn an_owned_permit_crosses_a_spawn_and_still_answers() {
+        let actor = LocalActor::spawn(Counter::default());
+
+        let permit = actor
+            .clone()
+            .reserve_owned()
+            .await
+            .expect("a live actor has a slot");
+
+        let sent = tokio::spawn(async move { permit.ask(add(4)).await });
+        assert_eq!(
+            sent.await.expect("no panic").expect("running"),
+            1,
+            "the permit reserved here answered there",
+        );
     }
 
     /// The load-bearing one. Each turn sets a flag on entry, awaits, and asserts

@@ -10,13 +10,14 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use keylink::{
-    Allowlist, Body, BodyReader, Caller, Context, Middleware, Next, Observer, Outcome, RemoteError,
-    Server, Stop, TurnFut, TurnInfo, TurnOutcome, Withheld,
+    Allowlist, Backpressure, Body, BodyReader, Caller, Context, Middleware, Next, Observer,
+    Outcome, RemoteError, Server, Stop, TurnFut, TurnInfo, TurnOutcome, Withheld,
 };
 
 mod common;
@@ -945,6 +946,88 @@ async fn a_timeout_settles_the_key_it_gave_up_on_where_a_queue_timeout_leaves_it
         vec![1, 2],
         "the retry under the released key is the only time the work happened"
     );
+}
+
+/// The other way load is shed, and the reason it is a different variant from the
+/// two tests above.
+///
+/// `QueueTimeout` answers [`RemoteError::TimedOut`] and means *the far side is
+/// slow*; a shed answers `MailboxFull` and means *the far side is refusing*. A
+/// retry policy reads those two differently — a timeout invites the same retry,
+/// an overload asks for backoff — so the whole value of the variant is that these
+/// two guards disagree about which one a peer gets.
+///
+/// **The mailbox is filled with a permit, not with a held turn.** The two tests
+/// above sleep 80 ms to be sure a message is *in* its turn rather than racing for
+/// it; a permit needs neither, because a permit **is** the capacity. At
+/// `Shed(1)` one outstanding permit is a full mailbox by construction, with no
+/// clock read anywhere and nothing to race.
+///
+/// It also pins the ruling the permit doors were written for: the three of them
+/// do not shed, so this test holds a slot through the very door a caller uses to
+/// avoid losing its arguments, while a peer — which has no permit to take —
+/// loses the call and is told to back off.
+///
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs`, replacing
+/// `Err(NotQueued::Full) => return (Outcome::Err(RemoteError::MailboxFull), Body::empty()),`
+/// with the same arm answering `RemoteError::TimedOut { millis: 0 }`, which is
+/// the fold the variant exists to prevent. Watched:
+/// `a shed must reach a peer as an overload and never as a timeout, got Remote(TimedOut { millis: 0 })`.
+/// Registered as `B10`.
+///
+/// **That arm shipped with no test at all**, in the commit that added the
+/// variant: nothing in the workspace called the served singleton door and read
+/// its refusal bytes, so reverting it left the suite green. Its neighbour one arm
+/// up says the same of itself and cannot be fixed the same way — a peer cannot
+/// produce a re-entrant call — which is what separates a hole that can be closed
+/// from one that is argued shut.
+#[tokio::test]
+async fn a_shed_mailbox_answers_an_overload_and_not_a_timeout() {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let actor = ledger::actor_deep(
+        Ledger::default(),
+        Vec::new(),
+        ledger::Feeds::new(),
+        Backpressure::Shed(NonZeroUsize::MIN),
+    );
+    let server = Server::builder(&node)
+        .service(actor.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("serves");
+    let client = ledger::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+
+    // This actor's whole capacity, held by the caller that took it.
+    let held = actor
+        .__try_reserve()
+        .expect("the actor is running")
+        .expect("the one free slot");
+
+    let refused = client
+        .entries()
+        .await
+        .expect_err("the mailbox is full and this actor sheds");
+    // The variant and not the `Display` text: the sentence is prose and the
+    // discriminant is the contract, and only one of the two is what a retry
+    // policy branches on.
+    match refused {
+        keylink::Error::Remote(RemoteError::MailboxFull) => {}
+        other => {
+            panic!("a shed must reach a peer as an overload and never as a timeout, got {other:?}")
+        }
+    }
+
+    // The refusal was the fullness and nothing else — the same call, over the
+    // same connection, answers once the slot is back.
+    drop(held);
+    assert_eq!(
+        client.entries().await.expect("the slot is back"),
+        Vec::<u64>::new(),
+    );
+
+    server.shutdown().await.expect("stops");
 }
 
 // ─────────────────────────────────────── what a lost turn tells a remote peer

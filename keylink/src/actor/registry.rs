@@ -2104,17 +2104,31 @@ impl<M> SystemBuilder<M> {
     /// thing to reason from. Two questions decide it: does anything downstream act
     /// on how long this actor took, and how long is the longest turn.
     ///
-    /// # A full mailbox BLOCKS the sender. It never drops and it never errors
+    /// # A KEYED mailbox BLOCKS the sender. It never drops and it never errors
     ///
-    /// There is no overflow policy because there is no overflow: past the last
-    /// slot, `send` parks the sending task until the loop frees a permit. Nothing
-    /// in this crate calls `try_send`, and there is **no `unbounded` spelling —
-    /// permanently.** An unbounded mailbox converts backpressure into memory
-    /// growth: a latency problem becomes an OOM, at a moment nobody chose, in a
-    /// process that had been reporting healthy. That is the inversion of failing
-    /// loudly, so it is refused rather than deferred, and
-    /// `keylink/src/representability.rs` holds the probe that says it cannot be
-    /// asked for.
+    /// There is no overflow policy on this path because there is no overflow: past
+    /// the last slot, `send` parks the sending task until the loop frees a permit.
+    /// This builder has no policy argument at all, so a keyed actor parks and there
+    /// is nothing to choose.
+    ///
+    /// **This heading read *a full mailbox* and the paragraph said *nothing in this
+    /// crate calls `try_send`*, and both outgrew their scope.**
+    /// [`Backpressure::Shed`](crate::Backpressure::Shed) is a `try_send`, on the
+    /// **local** doors — [`LocalActor::spawn_deep`](crate::LocalActor::spawn_deep)
+    /// and its supervised twin — where a full mailbox answers
+    /// [`NotQueued::Full`](crate::NotQueued::Full) and loses the caller's
+    /// arguments. That is opt-in, it is not this door, and a sentence claiming the
+    /// whole crate from a knob that governs one path is the drift worth naming
+    /// rather than quietly narrowing.
+    ///
+    /// What did **not** change is the part that was refused rather than deferred:
+    /// there is still **no `unbounded` spelling — permanently**, on either path. An
+    /// unbounded mailbox converts backpressure into memory growth: a latency
+    /// problem becomes an OOM, at a moment nobody chose, in a process that had been
+    /// reporting healthy. A shed is not that — it bounds the mailbox exactly as
+    /// parking does and differs only in what it tells a sender that arrives past
+    /// the last slot. `keylink/src/representability.rs` holds the probes that say
+    /// unbounded cannot be asked for, on both paths.
     ///
     /// One caller-visible exception, and it is opt-in and does not queue: a
     /// [`QueueTimeout`](crate::QueueTimeout) layer turns the wait into

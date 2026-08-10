@@ -52,10 +52,11 @@ use crate::{FollowRefused, IdempotencyKey, KeyState, Withheld};
 /// against the old numbering would decode `Failed("disk full")` as a variant
 /// that no longer exists. Refusing it at the handshake is the correct outcome.
 ///
-/// # Four variants were appended, and the append is the point
+/// # Five variants were appended, and the append is the point
 ///
 /// [`Withheld`](Self::Withheld), [`AtCapacity`](Self::AtCapacity),
-/// [`BadActorId`](Self::BadActorId) and [`FollowRefused`](Self::FollowRefused)
+/// [`BadActorId`](Self::BadActorId), [`FollowRefused`](Self::FollowRefused) and
+/// [`MailboxFull`](Self::MailboxFull)
 /// went on the **end**. An append and an insert move the hash equally — this
 /// enum is in every service's contract, for the reason above — so the handshake
 /// refuses a drifted peer either way and that is not what separates them. What
@@ -64,9 +65,15 @@ use crate::{FollowRefused, IdempotencyKey, KeyState, Withheld};
 /// and the failure is a misdecode rather than a refusal. An append leaves those
 /// indices exactly where they were.
 ///
-/// Nothing produces the four yet: they are the vocabulary the served paths move
-/// onto next, and the move is a separate commit from the one that pays the ALPN
-/// for it.
+/// **All five have a producer.** This paragraph said *nothing produces the four
+/// yet* long after that stopped being true, which is what a sentence about
+/// somebody else's future does: [`Withheld`](Self::Withheld) is answered on both
+/// served paths, [`AtCapacity`](Self::AtCapacity) by the keyed door's
+/// `RouteError` conversion, [`BadActorId`](Self::BadActorId) by both `validate`
+/// calls, [`FollowRefused`](Self::FollowRefused) by `console.rs`'s follow, and
+/// [`MailboxFull`](Self::MailboxFull) by the served singleton door. Each move was
+/// a separate commit from the one that paid the ALPN for it, which is what the
+/// sentence was really recording.
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, postcard_schema::Schema, thiserror::Error,
 )]
@@ -232,6 +239,34 @@ pub enum RemoteError {
     /// answered before any actor is looked for.
     #[error("this service is not served as an actor here, so it has no turn to report")]
     NotAnActor,
+
+    /// The actor's mailbox was full and it is served under
+    /// [`Backpressure::Shed`](crate::Backpressure::Shed), so the call was refused
+    /// instead of queued.
+    ///
+    /// **It asks for backoff, not for a retry**, and that is the whole reason it
+    /// is not [`TimedOut`](Self::TimedOut). A retry policy reads the two
+    /// differently: a timeout invites the same call again, an overload says the
+    /// far side is behind and a second call now makes it worse. Rendering a shed
+    /// as a timeout would hide a load signal inside a latency one.
+    ///
+    /// **Not [`AtCapacity`](Self::AtCapacity), which already exists and means
+    /// something else.** That one is the *registry* — too many live actors, and
+    /// `SystemBuilder::capacity` sets it. This one is one actor's own mailbox.
+    /// Two bounds, two facts, and a peer that folded them would back off from a
+    /// whole node when one actor is hot.
+    ///
+    /// **Not a [`Withheld`](Self::Withheld) variant.** `Withheld` is why a call
+    /// produced no value on every path that *has* one — a turn that ran and lost.
+    /// A shed happens before the turn, which is the ruling `Withheld` already
+    /// records for `Reentrant`: no turn ran, so nothing was withheld.
+    ///
+    /// The local half of the same condition is
+    /// [`NotQueued::Full`](crate::NotQueued::Full), and it carries the argument
+    /// for why the arguments are gone. A peer has no permit to take — that door
+    /// is local — so a peer that meets this has lost the call and rebuilds it.
+    #[error("the actor's mailbox is full: back off rather than retry")]
+    MailboxFull,
 }
 
 /// The reply as it appears on the wire: a value, or a refusal.
