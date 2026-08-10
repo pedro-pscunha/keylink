@@ -1,5 +1,11 @@
 # `compose::Group` — fate sharing for a set of actors
 
+> **Current testing note (2026-08-10):** Any ALPN literal-pin step below is
+> historical and is superseded by `CONTRIBUTING.md`'s **The wire contract**.
+> The literal-pin tests are ignored until keylink has a stable version. Do not
+> run or update them, and do not order work around them. The active contract
+> property tests remain in the gate.
+
 Against `main@0ab8366`. Every citation was read in the tree on 2026-08-08.
 
 **Revision 2.** Four adversarial reviews found 5 Critical and 13 Major defects in
@@ -504,7 +510,7 @@ here rather than counted as a proven guard."*
 
 | test | why no break | what carries the claim instead |
 |---|---|---|
-| `a_member_can_be_added_from_inside_another_members_turn` | making `add` async is a compile error in the test, not a red test | a `compile_fail` doctest, the device `lib.rs:283-289` already uses for "the guard is an absence". It is gated twice — `mise run test` runs doctests (`mise.toml:263`) and `.mise/tasks/features:118` runs them again at the all-off end |
+| `a_member_can_be_added_from_inside_another_members_turn` | making `add` async is a compile error in the test, not a red test | a `compile_fail` doctest, the device `lib.rs:283-289` already uses for "the guard is an absence". It is gated twice — `mise run test` runs doctests and `.mise/tasks/features` runs them again at the all-off end |
 | `members_are_reported_in_the_order_they_were_added` | the break is `Vec` → `HashMap`: a field type, an insert and a read | recorded as a regression pin, not a guard |
 | `a_dropped_group_ends_as_dropped_and_leaves_its_members_running` | `Weak` → `Arc` is one line (`names.rs:153`), but it reddens only the "stops watching" half | name which half the break reddens, as `tests/compose.rs:575-581` does for the pool |
 
@@ -544,8 +550,8 @@ link-reference block scoped to *that* doc comment, which does not reach a child
 module. Write `crate::LocalActor::ended` explicitly, or repeat the block.
 **CAUTION: do not add an explicit path where the bare link already resolves** —
 `rustdoc::redundant_explicit_links` is denied, and 42 instances over 24 lines
-were cleared one commit before `--document-private-items` went on
-(`mise.toml:296-301`).
+were cleared one commit before `--document-private-items` went on;
+`[tasks.docs]` records that transition.
 
 **Nothing in `local.rs`, `macros.rs` or the supervision loop changes.** Revision 1
 could not honour this and did not notice; dropping `Verdict::Restart` (§3.3)

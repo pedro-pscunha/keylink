@@ -1,5 +1,11 @@
 # RFC-06 step 1, adapted to the `correctness-programme` branch
 
+> **Current testing note (2026-08-10):** Any ALPN literal-pin step below is
+> historical and is superseded by `CONTRIBUTING.md`'s **The wire contract**.
+> The literal-pin tests are ignored until keylink has a stable version. Do not
+> run or update them, and do not order work around them. The active contract
+> property tests remain in the gate.
+
 This replaces `keylink-rfc06-implement-prompt.md`. The design does not change —
 RFC-06 is still the design and its implementation brief is still the order of
 work. What changes is **where the work lands**, because the branch it lands on

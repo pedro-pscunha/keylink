@@ -1,5 +1,11 @@
 # Wave 3 — what a peer may learn, and what it may not do
 
+> **Current testing note (2026-08-10):** Any ALPN literal-pin step below is
+> historical and is superseded by `CONTRIBUTING.md`'s **The wire contract**.
+> The literal-pin tests are ignored until keylink has a stable version. Do not
+> run or update them, and do not order work around them. The active contract
+> property tests remain in the gate.
+
 Plan for `docs/goals/2026-08-09-peer-administration.md`, **revision 1**, written
 against `factory` at `2dd3eb4`.
 
@@ -215,8 +221,8 @@ doctest** — doctest **A** below — which is the house form. `turns.rs:412-420
 `observe.rs:185-193`, `actor/remote.rs:166-175` and `registry.rs:1402-1416` all
 pin an error code, and
 `registry.rs:1416` argues why: *"`compile_fail` says only that it failed"*.
-Gated, because `mise.toml:297` runs `cargo test --workspace --doc` inside the
-`test` task, which is gate step 10 of 18.
+Gated, because `[tasks.test]` runs `cargo test --workspace --doc` explicitly and
+`test` is in the gate.
 
 **The name this wave adds must be one a user cannot produce.** `__status` follows
 the crate's existing internal convention (`__invoke_$rpc:snake`,
@@ -379,7 +385,7 @@ Every `file:line` above was measured at `2dd3eb4` and describes the tree
 a pointer edited in place stops showing what was true when the instruction was
 written. Append to the table below instead.
 
-`lint-fast` is `cargo clippy -p keylink --lib` (`mise.toml:258`) — **library
+`lint-fast` is `cargo clippy -p keylink --lib` — **library
 target only** — so a green `pre-commit` is not proof a commit compiles. Verify
 each commit with `cargo check --workspace --all-targets`, `mise run test` and
 `mise run docs` before it lands.
@@ -476,16 +482,16 @@ only `protocol.rs` pins a literal, and `api.rs` is compile-only. The
 verification is `mise run test` green **and `mise run examples`
 green**, not this count.
 
-**The examples are run, not built.** `mise.toml:300-313` names each example on
+**The examples are run, not built.** `[tasks.examples]` names each example on
 its own `cargo run` line, and its comment records why: *"`cargo test
---workspace` compiles the examples and never executes one"*. `examples` is
-**gate step 11 of 18**, so an example whose `service!` regenerated into
-something that compiles and then panics is red at step 11 and nowhere earlier.
+--workspace` compiles the examples and never executes one"*. An example whose
+`service!` regenerated into something that compiles and then panics is red in
+the `examples` gate step and nowhere earlier.
 
 **Intra-doc links.** Do not carry a number. The verification is `mise run docs`
-exiting 0 under `-D warnings`, which is the only gate that sees a broken link
-(step 12 of 18). Budget for `rustdoc::redundant_explicit_links`, which is on and
-**not allowed** (`mise.toml:333-335`).
+exiting 0 under `-D warnings`, which is the only gate that sees a broken link.
+Budget for `rustdoc::redundant_explicit_links`, which `[tasks.docs]` keeps on and
+**does not allow**.
 
 ### Commit 3 — the guards, and each needs a record
 
@@ -539,8 +545,8 @@ commit 4**, or fold any registry edit into commit 3.
 | `WireRequest` gained nothing | `WireRequest` still has exactly `Call` and `KeyState` (`reply.rs:227-236`) |
 | No destructive verb reaches a peer | `rg -n 'shutdown\|abort\|evict_idle\|mount' keylink/src/macros.rs` names no generated client or served arm |
 | The hash moved once | both pins updated in commit 2 from one failing run showing **two** failures, and the release note names **both** tests, as `CONTRIBUTING.md:199-201` already does |
-| Nothing regressed | `mise run gate` (18 steps), `mise run test`, `mise run anchors`, `mise run replay-anchors`, `mise run docs` |
-| The new break records actually replay | **`scripts/replay-fate-breaks.sh`, run by hand.** Nothing in the gate replays a break record — `replay-anchors` self-tests the classifier and `mise.toml:158-164` says the replaying arm "is in no list and cannot be" |
+| Nothing regressed | `mise run gate` (every declared step), `mise run test`, `mise run anchors`, `mise run replay-anchors`, `mise run docs` |
+| The new break records actually replay | **`scripts/replay-fate-breaks.sh`, run by hand.** Nothing in the gate replays a break record — `replay-anchors` self-tests the classifier and `[tasks.gate]` says the replaying arm "is in no list and cannot be" |
 
 ## 6. Tests this wave asks somebody to write
 
@@ -581,7 +587,7 @@ Docs: `docs/rfc-07-the-turn-model.md`, `docs/rfc-08-serving-side-keys.md`,
 
 ## 8. wasm
 
-Four of the eighteen gate steps are `wasm`, `wasm-guards`, `wasm-web`,
+Four gate steps are `wasm`, `wasm-guards`, `wasm-web`,
 `wasm-browser`. The dimension that matters is `--no-default-features`
 compilation of `keylink` **and** `keylink-persist`. `mod observe` and `mod
 console` are unconditional in `lib.rs`, so `Serving` and the `Inspect` change
@@ -804,7 +810,7 @@ not hold.
 4. **How many intra-doc links break.** Not measured, deliberately. `mise run
    docs` is the only thing that sees one.
 5. **Whether `mise run docs` reports a link to the new `#[doc(hidden)]`
-   expansion sites.** `mise.toml:340-382` records three known holes in that gate;
+   expansion sites.** `[tasks.docs]` records three known holes in that gate;
    a link to a `#[doc(hidden)]` item ships as a dead raw href with no warning.
    Any `[`__status`]` link written in commit 2 is in that class and must be
    checked by opening the rendered page, not by reading a green gate.

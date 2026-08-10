@@ -63,7 +63,7 @@ that claim searched for `crate::turn` and `macros.rs:907` spells it
 separately. **A negative from a grep is a claim about the pattern, not about the
 tree**, and this one was taken at face value once before being re-measured. A module named `turn` gives `crate::turn` a second
 resolution, and `rustdoc` answers `` `crate::turn` is both a function and a
-module `` — reproduced in a scratch crate under `mise.toml:475`'s real flags,
+module `` — reproduced in a scratch crate under `[tasks.docs]`'s real flags,
 exit 101, against exit 0 for a module named `turns`. The plural is the word the
 module header already uses: "A feed item and a mailbox message are both a
 `Turn`, dispatched at one call site."

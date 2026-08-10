@@ -1,5 +1,11 @@
 # Wave 2 — one trait, both sides
 
+> **Current testing note (2026-08-10):** Any ALPN literal-pin step below is
+> historical and is superseded by `CONTRIBUTING.md`'s **The wire contract**.
+> The literal-pin tests are ignored until keylink has a stable version. Do not
+> run or update them, and do not order work around them. The active contract
+> property tests remain in the gate.
+
 Plan for `docs/goals/2026-08-09-one-trait-both-sides.md`, **revision 2**, written
 against `one-trait` at `2dd3eb4` — the merge of wave 1.
 
@@ -707,7 +713,7 @@ two `Arc`s, so `Handle<A>: Sync` should hold wherever `Actor` already requires
 ## 4. The work, in commits
 
 `lint-fast` is `cargo clippy -p keylink --lib --all-features -- -D warnings`
-(`mise.toml:254`) — **library target only**, so a green `pre-commit` is not proof
+— **library target only**, so a green `pre-commit` is not proof
 a commit compiles. Revision 1 quoted it without its flags, which understates what
 it does catch and overstates what a green run leaves open. Every commit below is
 verified with **all four** of:
@@ -1082,7 +1088,7 @@ output is byte-identical with the feature on and off, apart from the
 (`macros.rs:4053-4055`) across eight feature subsets, which is what turns that
 from a belief into a check.
 
-**`mise run docs` runs `--all-features`** (`mise.toml:513`), so both
+**`mise run docs` runs `--all-features`**, so both
 `compile_fail` doctests are compiled under a tree where `blocking::Client`
 exists. A doctest asserting `blocking::Client` is not a `Calls` surface would pass
 vacuously if the type were absent — under `--all-features` it is present, and the

@@ -10,6 +10,12 @@
 
 # Goal: One service, one trait, both sides
 
+> **Current testing note (2026-08-10):** Any ALPN literal-pin step below is
+> historical and is superseded by `CONTRIBUTING.md`'s **The wire contract**.
+> The literal-pin tests are ignored until keylink has a stable version. Do not
+> run or update them, and do not order work around them. The active contract
+> property tests remain in the gate.
+
 ## Intent
 
 A `service!` block declares one contract and today produces two worlds that share
@@ -256,7 +262,7 @@ Each is binary and names its proof. Proofs must be **printed in the transcript**
       server and asserts both.
 - [ ] `Undelivered` keeps `Clone + PartialEq + Eq` and every existing
       `assert_eq!` on it still compiles — `mise run test` green.
-- [ ] `mise run gate` exits 0, all 22 steps, output printed.
+- [ ] `mise run gate` exits 0 with every declared step printed.
 - [ ] `mise run anchors` green; `RECORD_BLOCKS` **read off the failing run**, and
       the ledger entry says which run printed it.
 - [ ] `mise run replay-anchors` is N of N with every row at `── selected=1`.
@@ -368,7 +374,7 @@ Isolated worktree via worktrunk (`wt switch -c <branch>` — never raw
 
 - [ ] Every success criterion proven, evidence printed.
 - [ ] Diff inside the blast radius; no unrequested refactors.
-- [ ] `mise run gate` green (22 steps), `mise run test` green,
+- [ ] `mise run gate` green with every declared step, `mise run test` green,
       `mise run anchors` green, `mise run replay-anchors` N of N,
       `mise run docs` clean.
 - [ ] Review waves clean — no open Critical/Major.
@@ -385,7 +391,7 @@ Isolated worktree via worktrunk (`wt switch -c <branch>` — never raw
 ```text
 Satisfy every success criterion and Definition-of-done item in
 docs/goals/2026-08-09-one-service-one-trait.md. AS THE FINAL STEP, print the full
-proof state in ONE block: `mise run gate` output (exit 0, 22 steps), `mise run test` (0 failed), `mise run anchors`, `mise run replay-anchors` (N of N),
+proof state in ONE block: `mise run gate` output (exit 0, every declared step), `mise run test` (0 failed), `mise run anchors`, `mise run replay-anchors` (N of N),
 `mise run docs` (clean under -D warnings), `git diff main...HEAD -- docs/ | rg '^-' |
 rg -v '^---'` (identifier renames only), and the invariant-compliance wave's
 per-invariant pass/fail verdict. The hashed contract may move ONCE and only once.

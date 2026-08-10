@@ -1,5 +1,11 @@
 # Goal 1 of 3: One failure vocabulary, both sides
 
+> **Current testing note (2026-08-10):** Any ALPN literal-pin step below is
+> historical and is superseded by `CONTRIBUTING.md`'s **The wire contract**.
+> The literal-pin tests are ignored until keylink has a stable version. Do not
+> run or update them, and do not order work around them. The active contract
+> property tests remain in the gate.
+
 Supersedes `2026-08-09-one-service-one-trait.md`, which three review passes found
 to be three charters in one hat (8 Critical, 12 Major). This is the first, and the
 only one executable today. The other two are
@@ -191,8 +197,8 @@ pub enum Undelivered /* renamed */ { Turn(Withheld), Reentrant }
       re-entrant call a peer cannot make, so no variant is minted for it.
 - [ ] Both ALPN pins in `keylink/tests/protocol.rs` are updated **once**, with the
       release-note sentence `CONTRIBUTING.md:196-210` requires.
-- [ ] `mise run gate` exits 0 — **18 declared steps** (`mise.toml`'s gate list;
-      the run prints more banners than that, which is not the same count).
+- [ ] `mise run gate` exits 0 with every step in `mise.toml`'s gate list
+      printed; task banners are evidence, not a second hand-maintained count.
 - [ ] `mise run test` green; `mise run anchors` green with
       `RECORD_BLOCKS` **read off the failing run**; `mise run replay-anchors`
       N of N at `── selected=1`; `mise run docs` clean under `-D warnings`.

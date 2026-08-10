@@ -142,8 +142,21 @@ libtest process instead: `keylink/gate-tests/gate.rs` includes the native
 integration suites that can safely share a process, so iroh's endpoint teardown
 is paid once rather than once per file or once per test. Process-wide
 measurements, the nested Cargo build, and the scheduling-sensitive reconnect
-suite remain separate. An inventory test makes a newly added suite fail the gate
-until it is included or deliberately isolated.
+suite remain separate.
+
+The task runs three Cargo commands. The first covers workspace library and binary
+tests, the aggregate, and the isolated native suites. The second uses `--test
+'*'` for integration targets in every workspace member except `keylink`. The
+third runs workspace doctests explicitly. Browser tests belong to
+`wasm-browser`, and examples belong to `examples`; both tasks are separate gate
+steps.
+
+The aggregate inventory fails closed in three directions. Every Rust file under
+`keylink/tests/` must be included in the aggregate or named as isolated. Every
+isolated native suite must appear as an exact `--test` selector in `[tasks.test]`.
+The non-native `browser` suite must appear as an exact selector in
+`.mise/tasks/wasm-browser`. Add a test file without wiring its runner and the
+aggregate fails.
 
 `mise.toml` pins `sccache` and sets `RUSTC_WRAPPER`, so a cargo command run under
 mise compiles through a shared cache. `mise install` fetches it; there is still
@@ -151,10 +164,9 @@ no manual setup step. It also sets `CARGO_INCREMENTAL=0`, because sccache cannot
 cache an incremental build — export `CARGO_INCREMENTAL=1` in a shell where you
 are iterating by hand rather than gating.
 
-Run `mise run deny` by hand whenever you change a dependency. It is the one check no
-hook runs, which is exactly why it was broken for three commits without anybody
-seeing it: a licence, an advisory or a wildcard arrives with a dependency and
-with nothing else.
+While iterating on a dependency change, run `mise run deny` as the focused check.
+The pre-push hook also runs it through the full gate, so dependency policy is not
+a separate manual-only check.
 
 `mise run msrv` compiles the workspace on 1.91, the oldest Rust
 `keylink/Cargo.toml` claims. That number is not inherited from a dependency's
@@ -199,41 +211,24 @@ If you bypass, say so in the pull request, and name which reason applied.
 
 ## The wire contract
 
-`keylink/tests/protocol.rs` pins each ALPN as a string literal, and there are
-**two**: `the_contract_hash_has_not_moved` for `keylink/Probe`, and
-`the_inspect_contract_hash_has_not_moved` for `keylink/Inspect`. A change to a
-type both services carry moves both, so a red on one is a reason to go and look at
-the other rather than evidence that the other is unaffected. When either goes red,
-in this order:
+Keylink has no stable version and has never run in production. A contract-hash
+move therefore costs nothing: do not group commits around one, avoid the correct
+type shape to preserve one, or report one as a compatibility cost.
 
-1. Decide whether this change **should** be visible on the wire.
-2. Only then update the literal, and write the decision down in **both** places
-   that carry it: the commit body, and the ledger in the test's own rustdoc — one
-   entry per move, headed `<old> → <new>`, saying which change moved it and why
-   that change should be visible.
+`keylink/tests/protocol.rs` retains two literal-pin tests for the day a stable
+version is cut: `the_contract_hash_has_not_moved` for `keylink/Probe`, and
+`the_inspect_contract_hash_has_not_moved` for `keylink/Inspect`. Both are
+`#[ignore]`d. Do not run them as a gate and do not update their literals while
+the crate is unstable.
 
-Never step 2 without step 1. Updating a literal to turn a red test green is how
-a deployed fleet silently splits in half.
+The active property tests make a different claim. They prove that different type
+sets derive different contracts and that a peer built from other types is refused
+at the handshake. Those tests stay on because they check the mechanism rather
+than freezing its current output.
 
-**Step 2 said "say so in the release notes", and there are none.** This repository
-has no `CHANGELOG.md` and no release-notes file, so the instruction named an
-artifact that does not exist and every author quietly satisfied it by doing nothing.
-It is rewritten above to name what actually carries the decision. If a peer-visible
-change is wider than the pins — a variant a peer used to match by text, a condition
-that changed answer without changing its rendering — the RFC append for that wave is
-where the full list goes; `docs/rfc-07-the-turn-model.md` §18.7 is the worked
-example, and its own subject is a count that stopped at the easy half.
-
-**The ledger entry is prose, and prose has no test.** A literal that moves twice —
-an amend that re-measures, most often — leaves the first measurement's sentences
-behind, correct when written and orphaned by the second run. `protocol.rs`'s
-`the_contract_hash_has_not_moved` records one that survived a whole merge gate. When
-you re-measure, rewrite every sentence that names a number, not only the `PINNED`
-line the compiler reads.
-
-The pins exist because every other test compiles both peers from one source
-tree. A wire change moves both sides, the handshake still agrees, and the whole
-suite stays green. A test cannot catch a change it participates in.
+When keylink gains a stable version, remove the ignores deliberately. Read new
+literals from the failing run then; never compute them. That is also the point at
+which a contract move becomes a compatibility decision again.
 
 ## Public API
 
