@@ -2767,6 +2767,155 @@ macro_rules! __keylink_service {
                 }
             }
 
+            /// One function, every surface of this service that can make a call.
+            ///
+            /// Each method here is one of this service's `rpc` declarations with
+            /// **one** error type instead of two:
+            /// [`Failure`](keylink::Failure) puts a
+            /// [`Withheld`](keylink::Withheld) in the same arm whether a local
+            /// mailbox withheld the value or a peer did. Write `impl Calls` where
+            /// a function must run against a local actor in a test and a remote
+            /// one in production.
+            ///
+            /// Implemented for `Handle`, `ActorRef`, `Client` and
+            /// `IdempotentClient`. `blocking::Client` is not an implementor:
+            /// every method here hands back a future, and that type exists for
+            /// callers who have no runtime to await one on.
+            ///
+            /// **The concrete surfaces are untouched.** A `Handle`'s own methods
+            /// still answer [`Unanswered`](keylink::Unanswered) and a client's
+            /// still answer [`Error`](keylink::Error). This is a second door,
+            /// opened by writing the bound — which is the act of saying *I have
+            /// chosen not to know which surface I hold.*
+            ///
+            /// # It carries `rpc`, and the four kinds it drops each argued for it
+            ///
+            /// `rpc` is the only kind all four surfaces declare. A caller who
+            /// cannot find a method here will otherwise add it, and each addition
+            /// is refused by a surface in writing:
+            ///
+            /// - **`tell`** — an `ActorRef` has none, because a keyed `tell` is
+            ///   fire-and-forget into a registry that can refuse four ways the
+            ///   caller can never learn about, *"you addressed an actor that does
+            ///   not exist"* among them. An `IdempotentClient` has none either: a
+            ///   client holding a key no longer has a `tell` to call.
+            /// - **`send`** and **`recv`** — a `Handle` has neither. Both halves
+            ///   of streaming are a QUIC stream, and a local handle names no
+            ///   transport to open one on.
+            /// - **`blob`** — all four have one and they do not agree on the
+            ///   answer. A `Handle` gives a [`BlobId`](keylink::BlobId); a served
+            ///   surface gives a [`BlobHandle`](keylink::BlobHandle), which is a
+            ///   content address **plus the node that holds it**, and in this
+            ///   process the holder is you.
+            ///
+            /// So a service declaring no `rpc` gets an **empty** trait, and a
+            /// service mixing kinds gets a trait whose methods are a subset of
+            /// what each of its surfaces can do. Name the concrete surface for
+            /// the rest.
+            ///
+            /// # A handler panic behaves differently by surface
+            ///
+            /// Against a `Handle` it **unwinds into the calling task**, because
+            /// that is what [`ask`](keylink::LocalActor::ask) does with the
+            /// payload. Against a served surface it arrives as
+            /// `Failure::Turn(Withheld::Panicked { .. })`.
+            /// [`Failure`](keylink::Failure) cannot express an unwind, and
+            /// [`TurnLost`](keylink::TurnLost) argues at length why it should not
+            /// try: `Box<dyn Any + Send>` has no encoding, and
+            /// [`Withheld::Panicked`](keylink::Withheld::Panicked) is the same
+            /// fault stated to the audience that can act on it.
+            ///
+            /// # `dyn Calls` does not exist
+            ///
+            /// Every method returns its future in return position, which cannot
+            /// be reached through a trait object — `dyn Calls` is `E0038`.
+            /// [`Dial`](keylink::Dial) is the same shape for the same reason: the
+            /// `+ Send` is what lets a caller's future cross `tokio::spawn`, and
+            /// an `async fn` in a trait does not promise it. Do **not** box the
+            /// future to get an object back; that spends an allocation on every
+            /// local call to buy a thing a caller who needs one type gets for
+            /// free by naming the concrete surface.
+            #[diagnostic::on_unimplemented(
+                message = "`{Self}` is not a calling surface for this service",
+                label = "not a `Calls` surface",
+                note = "implemented for `Handle`, `ActorRef`, `Client` and \
+                        `IdempotentClient`. `blocking::Client` is deliberately \
+                        absent: it is synchronous, and every method here returns \
+                        a future."
+            )]
+            pub trait Calls {
+                $(
+                    $crate::__keylink_calls_decl!(
+                        [$( #[$meta] )*],
+                        [<$kind>],
+                        [<$rpc:snake>],
+                        $rpc,
+                        ($( $arg : $ty ),*),
+                        $ret
+                    );
+                )+
+            }
+
+            impl<A: Actor> Calls for Handle<A> {
+                $(
+                    $crate::__keylink_calls_impl!(
+                        [$( #[$meta] )*],
+                        [<$kind>],
+                        [<$rpc:snake>],
+                        ($( $arg : $ty ),*),
+                        $ret
+                    );
+                )+
+            }
+
+            impl Calls for ActorRef<'_> {
+                $(
+                    $crate::__keylink_calls_impl!(
+                        [$( #[$meta] )*],
+                        [<$kind>],
+                        [<$rpc:snake>],
+                        ($( $arg : $ty ),*),
+                        $ret
+                    );
+                )+
+            }
+
+            impl Calls for Client {
+                $(
+                    $crate::__keylink_calls_impl!(
+                        [$( #[$meta] )*],
+                        [<$kind>],
+                        [<$rpc:snake>],
+                        ($( $arg : $ty ),*),
+                        $ret
+                    );
+                )+
+            }
+
+            impl Calls for IdempotentClient {
+                $(
+                    $crate::__keylink_calls_impl!(
+                        [$( #[$meta] )*],
+                        [<$kind>],
+                        [<$rpc:snake>],
+                        ($( $arg : $ty ),*),
+                        $ret
+                    );
+                )+
+            }
+
+            // Three surfaces, and `Handle` is the one deliberately missing: it
+            // reaches the mailbox directly, so nothing on the `ServiceBuilder`
+            // ran. `blocking::Client` is governed in fact and still gets no impl,
+            // because a marker on a type that cannot satisfy the `Calls` half of
+            // `impl Calls + Governed` is a name nobody can write a bound with.
+            impl $crate::GovernedSeal for ActorRef<'_> {}
+            impl $crate::Governed for ActorRef<'_> {}
+            impl $crate::GovernedSeal for Client {}
+            impl $crate::Governed for Client {}
+            impl $crate::GovernedSeal for IdempotentClient {}
+            impl $crate::Governed for IdempotentClient {}
+
             // The doc comment lives INSIDE the wrap: attached to the macro
             // invocation instead, it documents nothing and is
             // `unused_doc_comments`.
@@ -4039,6 +4188,98 @@ macro_rules! __keylink_client_method {
     };
 }
 
+/// One `Calls` signature, shaped by the rpc kind.
+///
+/// Five arms, four of which expand to nothing — the shape
+/// [`__keylink_local_method`] already takes for `send` and `recv`. `rpc` is the
+/// only kind declared on all four calling surfaces, so it is the only kind a
+/// trait over all four can carry. Each of the other four is missing from at
+/// least one surface, and every absence is a written refusal with an argument:
+/// the `tell` arms of [`__keylink_actor_client_method`] and
+/// [`__keylink_idempotent_client_method`], the `send` and `recv` comment in
+/// [`__keylink_local_method`], and — for `blob`, which every surface HAS — the
+/// [`BlobId`](crate::BlobId) a local call answers where a served one answers a
+/// [`BlobHandle`](crate::BlobHandle). The generated trait's own rustdoc names
+/// all four for a reader who cannot find a method on it.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_calls_decl {
+    ([$( #[$meta:meta] )*], rpc, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Call the `", stringify!($variant), "` rpc on whichever surface this is.")]
+        ///
+        /// # Errors
+        ///
+        /// [`Failure`](keylink::Failure). Its
+        /// [`Turn`](keylink::Failure::Turn) arm carries the
+        /// [`Withheld`](keylink::Withheld) whichever side produced it, which is
+        /// the one condition this trait exists to put in one place.
+        /// [`Reentrant`](keylink::Failure::Reentrant) reaches you only from a
+        /// local handle, and
+        /// [`Other`](keylink::Failure::Other) — carrying the whole
+        /// [`Error`](keylink::Error), so nothing is erased — only from a served
+        /// one.
+        fn $name(&self $(, $arg: $ty )*)
+            -> impl ::core::future::Future<
+                   Output = ::core::result::Result<$ret, $crate::Failure>
+               > + ::core::marker::Send;
+    };
+    ([$( #[$meta:meta] )*], tell, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], send, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], recv, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], blob, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+}
+
+/// One `Calls` body, and there is exactly one for all four implementors.
+///
+/// The body is the surface's **own inherent method**, plus a `From` on the
+/// error, so the trait can never disagree with the method a caller reaches
+/// without it — it *is* that method.
+///
+/// **The tempting alternative is routing `Handle` through
+/// [`LocalActor::ask_catching`](crate::LocalActor::ask_catching)**, which would
+/// make a handler panic behave the same on every surface: an unwind locally
+/// becomes a [`Withheld::Panicked`](crate::Withheld::Panicked) the way a served
+/// call already reports it. It is refused, because it gives one method name two
+/// behaviours on one type — the inherent one outranks the trait one, so the same
+/// call would unwind through `handle.settle(..)` and answer through
+/// `Calls::settle(&handle, ..)`. The divergence is real either way; the
+/// generated trait's rustdoc states it rather than hiding it.
+///
+/// The `$meta` reaches the impl method as well as the declaration, which reads
+/// as duplicated documentation and is not: an attribute that removes a method —
+/// a `#[cfg]` on the `rpc` — has to remove it from the trait and from all four
+/// impls together, or the expansion is `E0046` at whichever end kept it.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_calls_impl {
+    ([$( #[$meta:meta] )*], rpc, $name:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        fn $name(&self $(, $arg: $ty )*)
+            -> impl ::core::future::Future<
+                   Output = ::core::result::Result<$ret, $crate::Failure>
+               > + ::core::marker::Send {
+            async move {
+                self.$name($( $arg ),*).await.map_err(::core::convert::From::from)
+            }
+        }
+    };
+    ([$( #[$meta:meta] )*], tell, $name:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], send, $name:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], recv, $name:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], blob, $name:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+}
+
 /// One expansion of [`service!`], inside the library's own test build.
 ///
 /// keylink never expands its own macro anywhere else, and that is exactly why
@@ -4171,6 +4412,39 @@ mod expansion {
             drop(handle.ping(1));
             drop(handle.note(String::new()));
             drop(handle.manual(String::new()));
+        }
+    }
+
+    /// The `+ Send` that the generated `Calls` trait writes in return position,
+    /// asserted on all four implementors.
+    ///
+    /// A future that is not `Send` cannot cross `tokio::spawn`, so a trait
+    /// declaring `impl Future<..> + Send` is unimplementable for any surface
+    /// whose own method hands back one that is not. Four surfaces produce that
+    /// future from four different machineries — a mailbox, a keyed connection, a
+    /// plain one and a key-scoped one — so one of them regressing is a thing this
+    /// module exists to make visible, at the commit that does it.
+    ///
+    /// Nothing here runs, and nothing here is built: an `rpc` future is
+    /// type-checked from a reference, so this needs no node, no connection and no
+    /// mounted actor. Compiling is the whole assertion.
+    mod every_rpc_future_is_send {
+        #![allow(dead_code, reason = "the proof is that this module compiles")]
+
+        use super::expansion;
+
+        fn assert_send<T: Send>(_: T) {}
+
+        fn four_surfaces<A: expansion::Actor>(
+            handle: &expansion::Handle<A>,
+            actor: &expansion::ActorRef<'_>,
+            client: &expansion::Client,
+            keyed: &expansion::IdempotentClient,
+        ) {
+            assert_send(handle.ping(1));
+            assert_send(actor.ping(1));
+            assert_send(client.ping(1));
+            assert_send(keyed.ping(1));
         }
     }
 }

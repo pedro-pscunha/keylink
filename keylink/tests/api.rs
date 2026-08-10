@@ -25,6 +25,12 @@
 //!    below: this is the only consumer-position file in the repo, and `rpc.rs`
 //!    deliberately reaches `Keyable` through `crate::idempotency` so that the root
 //!    re-export has exactly one guard rather than none.
+//! 5. **The surface-generic trio resolves in BOUND position** — the generated
+//!    `Calls`, plus `Governed` and `Failure` out of the crate root. Bound
+//!    position rather than the two above, because a bound is the only position a
+//!    caller writes these in: `impl Calls + Governed` is the whole deliverable,
+//!    and a trait whose impls a downstream crate cannot see is a trait that does
+//!    not exist out here.
 //!
 //! The pairing of the two positions is still the point rather than pedantry:
 //! `SystemBuilder::DEFAULT_CAPACITY` stopped compiling once while
@@ -45,8 +51,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink::{
-    mount, ActorId, Allowlist, Body, BodyReader, Caller, Ended, Eviction, Keyable, KeyedService,
-    MountError, Origin, Records, Reply,
+    mount, ActorId, Allowlist, Body, BodyReader, Caller, Ended, Eviction, Failure, Governed,
+    Keyable, KeyedService, MountError, Origin, Records, Reply,
 };
 
 keylink::service! {
@@ -309,4 +315,46 @@ async fn the_hidden_seam_the_macro_writes_is_reachable_and_typed() {
     // so `for<'a> fn(&'a Origin) -> Caller<'a>` is what a turn gets and `'static`
     // is not on offer.
     let _: fn(&Origin) -> Caller<'_> = Origin::caller;
+}
+
+/// **The surface-generic trio, written the way a caller writes it: as a bound.**
+///
+/// `Calls` is generated per service and `Governed` comes out of the crate root,
+/// and the two are meant to be spelled together — `impl Calls + Governed` is the
+/// signature that refuses a local handle at the line a reviewer reads. Neither
+/// resolves here by naming a type: a trait is written in bound position, and the
+/// assertion is that each surface **satisfies** the bound out here, in a crate
+/// that reaches the generated impls the way any consumer does.
+///
+/// Turbofish rather than a value, and it costs nothing to say why: a `Client` is
+/// a live QUIC connection and an `ActorRef` borrows one, so a test that built the
+/// four surfaces would need a node, a served service and a mounted actor to prove
+/// a fact the type checker settles with no runtime at all.
+///
+/// `Handle` is in the first list and deliberately absent from the second. That
+/// asymmetry is the whole of what `Governed` buys, and the `compile_fail` guard
+/// that a `Handle` is *refused* lives on `Governed` itself — this test is the
+/// positive half.
+#[tokio::test]
+async fn the_surface_generic_trio_resolves_from_outside() {
+    fn a_calling_surface<C: depot::Calls>() {}
+    fn a_governed_calling_surface<C: depot::Calls + Governed>() {}
+
+    // ── bound position, all four implementors ────────────────────────────────
+    a_calling_surface::<depot::Handle<Counter>>();
+    a_calling_surface::<depot::ActorRef<'static>>();
+    a_calling_surface::<depot::Client>();
+    a_calling_surface::<depot::IdempotentClient>();
+
+    // ── bound position, the three the `Dispatch` stands in front of ──────────
+    a_governed_calling_surface::<depot::ActorRef<'static>>();
+    a_governed_calling_surface::<depot::Client>();
+    a_governed_calling_surface::<depot::IdempotentClient>();
+
+    // ── the error every one of those methods answers ─────────────────────────
+    let _: Option<Failure> = None;
+    let _ = Failure::Reentrant;
+    // The method that replaces equality, which `Failure` cannot derive: named as
+    // a function item, because the annotation is what pins the borrowed answer.
+    let _: fn(&Failure) -> Option<&keylink::Withheld> = Failure::withheld;
 }
