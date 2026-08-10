@@ -1779,6 +1779,25 @@ ANCHORS = [
      "    RemoteError::Withheld(withheld_for(standing))"),
     ("W6", "keylink/src/turns.rs", "keylink/src/turns.rs",
      "            Withheld::Expired,"),
+    # ── T IS THIS WAVE'S LETTER, AND IT IS FRESH FOR THE REASON D AND E WERE ──
+    #
+    # The one-trait wave's two conversions into `Failure`. `C1`, `C2` and `C3` were
+    # the obvious ids and all three are taken above, anchoring `keylink/src/call.rs`
+    # — the `C` series already runs to `C14`. `T` is unused across every file that
+    # holds an id-shaped token, which is the same test `D` and `E` were chosen by.
+    #
+    # Both rows edit `keylink/src/error.rs` from a record that ALSO lives in
+    # `keylink/src/error.rs`, so neither record quotes its own search literal: the
+    # code is indented twelve spaces and the record's quote is not. Measured after
+    # `cargo fmt`, the indented form counts 1 and the bare form counts 2 — which is
+    # the "found 2" abort, present in the file and avoided by the indentation.
+    #
+    # No row anchored `keylink/src/error.rs` before these two, so there is no
+    # incumbent for a new impl block to collide with.
+    ("T1", "keylink/src/error.rs", "keylink/src/error.rs",
+     "            Error::Remote(RemoteError::Withheld(withheld)) => Self::Turn(withheld),"),
+    ("T2", "keylink/src/error.rs", "keylink/src/error.rs",
+     "            Unanswered::Reentrant => Self::Reentrant,"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -3315,7 +3334,20 @@ for record in sorted(set(REDNESS) - row_ids):
 #
 # 174 was READ off the failing run, not computed. The subtraction agrees, and by
 # this ledger's own standard that agreement establishes nothing.
-RECORD_BLOCKS = 176
+#
+# 176 → 177, on `one-trait`. ONE block holding TWO records — `T1` and `T2`, the
+# lift and the fold, both on `error.rs`'s
+# `a_peer_failure_carrying_a_withheld_lands_on_turn`. The two rows are one block
+# because they are one test: the claim is that the local and the served
+# conversions AGREE about a `Withheld`, and a record per half would describe two
+# guards where there is one.
+#
+# **This is the entry where a `+2` typed off the diff would have been wrong**, in
+# the opposite direction from the 169 and 177 runs above, which each found MORE
+# blocks than rows. Two records, one block. Read off the failing run — `FAIL
+# population: 177 comment blocks mention break-once.sh, but RECORD_BLOCKS says
+# 176` — which is what makes the direction visible at all.
+RECORD_BLOCKS = 177
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

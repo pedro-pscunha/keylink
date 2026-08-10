@@ -5,11 +5,21 @@
 //! error `?`s straight into [`Error`] through the [`From`] impls below. That is
 //! the single source of truth for "how does a transport failure become a
 //! keylink failure": one list, in one place.
+//!
+//! # The dependency runs one way, and it runs from here
+//!
+//! [`Failure`] names what happened to a **call**, so it lives beside the enum it
+//! wraps, and this module imports [`Withheld`] to say what happened to a turn.
+//! `observe.rs` names what happened to a turn and does **not** import [`Error`]:
+//! the reverse edge would make an observation module depend on the transport
+//! vocabulary, and nothing on that side has a use for one.
 
 use iroh::endpoint::{
     BindError, ClosedStream, ConnectError, ConnectionError, ReadError, WriteError,
 };
 use iroh::KeyParsingError;
+
+use crate::{RemoteError, Unanswered, Withheld};
 
 /// Everything that can go wrong on a keylink call.
 #[derive(Debug, thiserror::Error)]
@@ -51,8 +61,7 @@ pub enum Error {
     #[error("peer closed the connection")]
     Closed,
 
-    /// The serving side answered with a [`RemoteError`](crate::RemoteError)
-    /// instead of a value.
+    /// The serving side answered with a [`RemoteError`] instead of a value.
     ///
     /// Distinct from a transport failure: the call arrived and was understood.
     /// What happened next is whatever the inner error says, and this layer does
@@ -65,8 +74,8 @@ pub enum Error {
     /// declined".** Neither is true of a handler that exploded or of a deadline
     /// that expired, so a client whose remote handler panicked read
     /// *remote refused: panicked: ..* about a call nobody declined. The word
-    /// belongs to [`Withheld::Refused`](crate::Withheld::Refused) and its
-    /// siblings, one layer in, which say which of them happened.
+    /// belongs to [`Withheld::Refused`] and its siblings, one layer in, which
+    /// say which of them happened.
     #[error("remote error: {0}")]
     Remote(#[from] crate::RemoteError),
 
@@ -176,6 +185,149 @@ pub enum Error {
     /// Reading or writing a body against local storage failed.
     #[error("body io: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// What a call met, whichever surface carried it.
+///
+/// A local call answers with [`Unanswered`] and a served one with [`Error`], and
+/// that one disagreement is the whole of why no function can be written against
+/// both. This is the type a caller who has chosen not to know which surface it
+/// holds names instead.
+///
+/// **Nothing reaches this by accident.** Every inherent method keeps its exact
+/// error type — [`Unanswered`] locally, [`Error`] remotely — and this one is
+/// reachable only through a bound the caller wrote. Writing that bound is the act
+/// of giving up the knowledge, which is why the wider type is not a loss there
+/// and would be one anywhere else.
+///
+/// # One [`Withheld`], from either side
+///
+/// [`Unanswered::Turn`] and an [`Error::Remote`] carrying a
+/// [`RemoteError::Withheld`] both land on [`Turn`](Self::Turn). The shared
+/// condition is matched in one arm regardless of which side produced it, and
+/// that is the only thing a generic caller needs a new type for.
+///
+/// # Two arms are one-sided
+///
+/// [`Other`](Self::Other) has no local producer. [`Reentrant`](Self::Reentrant)
+/// has no served producer: a peer's request arrives on a connection's task,
+/// which has run no turn, so nothing on that side can build one.
+///
+/// # Nothing is erased, and the cost is one level of depth
+///
+/// [`Other`](Self::Other) carries the concrete [`Error`] rather than a
+/// `Box<dyn Error>`, so every served condition stays matchable and the
+/// `source()` chain survives. What it costs is depth — a caller matching a
+/// refusal reads three levels through the bound where it reads two against a
+/// client:
+///
+/// ```text
+/// Error::Remote(RemoteError::Unauthorized(method))                   // against a client
+/// Failure::Other(Error::Remote(RemoteError::Unauthorized(method)))   // through the bound
+/// ```
+///
+/// # `Debug + Error`, and nothing else
+///
+/// [`Error`] is neither `Clone` nor `PartialEq`, so this cannot be either —
+/// while [`Unanswered`] is `Clone + PartialEq + Eq`. A test that today writes
+/// `assert_eq!(handle.get(1).await, Err(Unanswered::Turn(Withheld::Gone)))`
+/// **cannot** write that through the bound, and the remedy is
+/// [`withheld`](Self::withheld) rather than a hand-written `PartialEq`.
+///
+/// # `#[non_exhaustive]`, where the nearest neighbour rules the other way
+///
+/// [`Unanswered`] is deliberately exhaustive, and its heading argues why: its
+/// losses are all local and all enumerated, a new one is added to [`Withheld`],
+/// and exhaustiveness reaches a caller one level in. **The difference here is
+/// the third arm.** [`Other`](Self::Other) carries [`Error`], which is the
+/// transport vocabulary and grows on a schedule this crate does not own, so a
+/// caller who matched this exhaustively would be broken by a wire condition
+/// rather than by a design decision.
+///
+/// # There is no `From<NotQueued>`
+///
+/// A `tell` returns [`NotQueued`](crate::NotQueued) and is not a call this type
+/// carries, so the conversion would have no caller and would be a third door
+/// into an enum with two. [`Unanswered`] already has one if it is ever wanted.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Failure {
+    /// The turn was reached and its value was not handed back.
+    ///
+    /// [`Withheld`] carries which loss it was and what to do next. This is the
+    /// one arm both sides produce.
+    #[error("{0}")]
+    Turn(Withheld),
+
+    /// The call was made from inside the target actor's own turn.
+    ///
+    /// The actor is **still running** — it is running the turn this call was
+    /// made from. **No served surface produces this**, and the argument is in
+    /// [`Unanswered::Reentrant`]: a request from a peer arrives on a
+    /// connection's task, which has run no turn.
+    #[error("this call was made from inside the target actor's own turn: it would deadlock")]
+    Reentrant,
+
+    /// Everything a call can meet that the shared vocabulary does not name.
+    ///
+    /// **No local surface produces this.** Every variant of [`Error`] except the
+    /// lifted [`RemoteError::Withheld`] arrives here, unnarrowed, which is what
+    /// keeps a schema mismatch and a timeout matchable through the bound.
+    #[error("{0}")]
+    Other(#[source] Error),
+}
+
+impl Failure {
+    /// The shared condition, when this is one.
+    ///
+    /// [`Failure`] is not `PartialEq` and cannot be, because [`Error`] is not.
+    /// [`Withheld`] is, so the comparable part stays comparable through here.
+    ///
+    /// **It returns `None` for [`Reentrant`](Self::Reentrant) and `None` for
+    /// [`Other`](Self::Other), so it cannot tell them apart.** It replaces
+    /// equality for one arm, not for three: a test asserting *"this was not a
+    /// turn loss"* through it has asserted nothing about which of the other two
+    /// it was. Match for that.
+    ///
+    /// ```
+    /// use keylink::{Failure, Withheld};
+    ///
+    /// let failure = Failure::Turn(Withheld::Gone);
+    /// assert_eq!(failure.withheld(), Some(&Withheld::Gone));
+    ///
+    /// // `None` discriminates nothing. This is the form that does.
+    /// let failure = Failure::Reentrant;
+    /// assert_eq!(failure.withheld(), None);
+    /// assert!(matches!(failure, Failure::Reentrant));
+    /// ```
+    #[must_use]
+    pub fn withheld(&self) -> Option<&Withheld> {
+        match self {
+            Self::Turn(withheld) => Some(withheld),
+            _ => None,
+        }
+    }
+}
+
+impl From<Unanswered> for Failure {
+    fn from(unanswered: Unanswered) -> Self {
+        match unanswered {
+            Unanswered::Turn(withheld) => Self::Turn(withheld),
+            Unanswered::Reentrant => Self::Reentrant,
+        }
+    }
+}
+
+impl From<Error> for Failure {
+    fn from(error: Error) -> Self {
+        match error {
+            // THE LIFT. Without this arm the one condition both sides produce
+            // arrives as `Other` on the served side and as `Turn` on the local
+            // one, and the whole wave buys nothing.
+            Error::Remote(RemoteError::Withheld(withheld)) => Self::Turn(withheld),
+            other => Self::Other(other),
+        }
+    }
 }
 
 /// A failure that came from iroh rather than from keylink.
@@ -317,3 +469,88 @@ transport_source!(
 
 /// `Result` specialised to [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use std::error::Error as _;
+
+    use super::*;
+
+    /// One condition, two producers, one arm.
+    ///
+    /// [`Withheld`] is what a local caller reads as [`Unanswered::Turn`] and a
+    /// peer reads as [`RemoteError::Withheld`], and a caller through the bound
+    /// must not have to know which produced it. **Both halves are asserted here
+    /// rather than in two tests, because the claim is that they agree**: a lift
+    /// that fired and a local conversion that did not would each pass a test of
+    /// its own.
+    ///
+    /// The second half is the other one-sidedness. [`Unanswered::Reentrant`]
+    /// stays [`Failure::Reentrant`] and does not fold into a turn loss — nothing
+    /// served produces the value, so this conversion is the only place it can be
+    /// lost.
+    ///
+    /// Made red by `scripts/break-once.sh keylink/src/error.rs`, twice, as `T1`
+    /// and `T2`. Both quotes below are unindented and the code is not, which is
+    /// what keeps each anchor unique in its own file.
+    ///
+    /// `T1`, the lift. Search
+    /// `Error::Remote(RemoteError::Withheld(withheld)) => Self::Turn(withheld),`
+    /// and send the value to the fallthrough instead:
+    /// `Error::Remote(remote) => Self::Other(Error::Remote(remote)),`. Watched:
+    /// `── selected=1`, `── exit=100`, and the served half reporting `left: None`
+    /// against `right: Some(Gone)`.
+    ///
+    /// `T2`, the fold. Search `Unanswered::Reentrant => Self::Reentrant,` and
+    /// give reentrancy a turn loss it never had:
+    /// `Unanswered::Reentrant => Self::Turn(Withheld::Dropped),`. Watched:
+    /// `── selected=1`, `── exit=100`, and the local half reporting
+    /// `left: Some(Dropped)` against `right: None`.
+    ///
+    /// **The two breaks redden two different assertions, and that is what says
+    /// the halves are independent.** `T1` stops on the served half's first
+    /// assertion, `T2` on the reentrancy one below it, and neither red is the
+    /// other's.
+    #[test]
+    fn a_peer_failure_carrying_a_withheld_lands_on_turn() {
+        let lifted = Failure::from(Error::Remote(RemoteError::Withheld(Withheld::Gone)));
+        assert_eq!(lifted.withheld(), Some(&Withheld::Gone));
+        assert!(!matches!(lifted, Failure::Other(_)));
+
+        let local = Failure::from(Unanswered::Turn(Withheld::Gone));
+        assert_eq!(local.withheld(), Some(&Withheld::Gone));
+
+        let reentrant = Failure::from(Unanswered::Reentrant);
+        assert_eq!(reentrant.withheld(), None);
+        assert!(matches!(reentrant, Failure::Reentrant));
+    }
+
+    /// The chain a caller `?`s into a report must still reach the wire condition.
+    ///
+    /// **This is a guard on an attribute, not on a body.** `Other` cannot carry
+    /// `#[from]`, because the hand-written `From<Error>` above is what performs
+    /// the lift and a derived one would be a second impl. Dropping `#[from]` and
+    /// stopping there leaves a plain field, and a plain field reports
+    /// `source() == None` — the same enum, the same match arms, the same
+    /// `Display`, and a chain that ends one level early.
+    ///
+    /// Nothing else in the tree would notice: `#[source]` appears in
+    /// `keylink/src` exactly here, against eleven `#[from]`, so there is no
+    /// precedent test to redden.
+    #[test]
+    fn other_keeps_the_error_as_its_source() {
+        let failure = Failure::Other(Error::Remote(RemoteError::TimedOut { millis: 250 }));
+
+        let error = failure
+            .source()
+            .expect("`Other` hands back the error it carries");
+        assert!(error.downcast_ref::<Error>().is_some());
+
+        let remote = error
+            .source()
+            .expect("`Error::Remote` hands back the remote error");
+        assert!(remote.downcast_ref::<RemoteError>().is_some());
+    }
+}

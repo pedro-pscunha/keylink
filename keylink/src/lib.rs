@@ -310,7 +310,7 @@ pub mod inspect {
         IdempotentClient, KeyedClient,
     };
 }
-pub use error::{ConfigError, Error, Result, Transport};
+pub use error::{ConfigError, Error, Failure, Result, Transport};
 pub use idempotency::{
     Attaching, Idempotency, IdempotencyRefusal, KeyState, Keyable, Limits, Records, MAX_ATTACH,
     MAX_RECORDED_BYTES, MAX_RECORDED_FRAME, MAX_RECORDS, MAX_RUNNING, MAX_RUNNING_PER_PEER,
