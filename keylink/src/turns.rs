@@ -210,8 +210,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::panic::{catching, guarded};
 use crate::parking::{Parking, Verdict};
 use crate::{
-    Body, Context, EndReason, Ended, Observer, Origin, Outcome, Panic, Queueing, RemoteError, Stop,
-    TurnInfo, TurnLost, TurnOutcome, Withheld,
+    Body, Context, EndReason, Ended, Observer, Origin, Outcome, Panic, Queueing, RemoteError,
+    Serving, Stop, TurnInfo, TurnLost, TurnOutcome, Withheld,
 };
 
 /// Messages that may wait ahead of the one being handled.
@@ -4374,6 +4374,26 @@ impl<A, M> LocalActor<A, M> {
                 .saturating_sub(self.mail.capacity()),
         )
         .unwrap_or(u64::MAX)
+    }
+
+    /// [`is_busy`](Self::is_busy) and [`buffered`](Self::buffered) as the one
+    /// value both sides of the wire read.
+    ///
+    /// It calls those two and folds the answers, so there is no third reading of
+    /// either fact to drift from them. [`Serving`] carries what the pair does and
+    /// does not claim — including that these are **two** loads and not one
+    /// instant, so an actor can leave its turn between them.
+    ///
+    /// Not a liveness answer: a stopped actor still folds a value here, and
+    /// [`is_running`](Self::is_running) is the separate question. The keyed twin
+    /// is [`System::serving`](crate::System::serving), whose `Option` *is* that
+    /// answer because a registry either has an entry or does not.
+    #[must_use]
+    pub fn serving(&self) -> Serving {
+        Serving {
+            busy: self.is_busy(),
+            buffered: self.buffered(),
+        }
     }
 
     /// The one place a message enters the mailbox.

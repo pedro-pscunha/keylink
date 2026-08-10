@@ -320,7 +320,8 @@ pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use middleware::{Caller, Context, Middleware, Next, QueueTimeout, Queueing, Rpc, Timeout};
 pub use node::{derive_alpn, Node};
 pub use observe::{
-    EndReason, Ended, FinishFut, Observer, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome, Withheld,
+    EndReason, Ended, FinishFut, Observer, Serving, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome,
+    Withheld,
 };
 pub use panic::Panic;
 pub use peer::{Dial, Peer};

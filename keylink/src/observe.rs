@@ -706,6 +706,83 @@ impl fmt::Display for EndReason {
     }
 }
 
+/// What a caller may learn about an actor that is still there.
+///
+/// Two facts, and the pair separates three states where either alone separates
+/// two: idle, inside a turn with the slot still free, and inside a turn with the
+/// next caller already about to block on the permit.
+///
+/// [`LocalActor::serving`](crate::LocalActor::serving) folds it for a singleton
+/// and [`System::serving`](crate::System::serving) for one keyed actor, each
+/// from the two readings its own side already had. Neither invents a fact and
+/// neither takes a new lock the side was not already taking.
+///
+/// **Two readings, and not one instant.** Each field is loaded as the producer
+/// reaches it, about a task on another thread, so the value is stale by the time
+/// it is returned and the two halves need not describe the same moment. That is
+/// the honest shape for this question and the same one
+/// [`System::status`](crate::System::status) states about its list. Evidence,
+/// never a precondition.
+///
+/// # Two types, because they answer two questions
+///
+/// [`ActorStatus`](crate::ActorStatus) is **every actor on this node, to an
+/// operator**, behind `Inspect`'s own ALPN and its own
+/// [`Allowlist`](crate::Allowlist). This is **the actor you just addressed, to
+/// its own caller**. The second is not a narrowing of the first, and the two
+/// fields it does not carry are *unreachable* rather than dropped:
+///
+/// - `ActorStatus` is built in exactly one place, over the keyed entry map, so a
+///   singleton yields **no row at all** rather than a row with holes. The
+///   question has no field-level answer on that side, which is why this is a
+///   type rather than `ActorStatus` with two fields hidden.
+/// - [`ActorStatus::id`](crate::ActorStatus::id) repeats an id the caller of
+///   this one already wrote, and
+///   [`ActorStatus::idle_for`](crate::ActorStatus::idle_for) reads the entry's
+///   eviction clock, which exists in the registry and nowhere else. A singleton
+///   has no entry to read it from, and a second flag meaning "this actor has no
+///   registry" is the parallel fact this crate refuses.
+///
+/// # There is no `is_running`, and each producer already answers it
+///
+/// On the keyed side the `Option` is that answer and it is exact: `None` is
+/// nothing mounted under this id, read **without** mounting one. On the
+/// singleton side the caller holds the actor, and
+/// [`LocalActor::is_running`](crate::LocalActor::is_running) is a separate
+/// question with its own advisory caveat. A `bool` here would be a third
+/// spelling of what two doors already carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Schema)]
+pub struct Serving {
+    /// Inside a turn right now.
+    ///
+    /// True from the moment the loop takes a message or a feed item until that
+    /// turn's handler returns, including across every `await` inside it. A turn
+    /// parked on I/O is a turn that is running.
+    ///
+    /// **This is the question you cannot ask the actor.** A message asking it
+    /// would queue behind the turn that wedged it, and if it ever ran it would
+    /// report `true` about itself — the state of asking rather than the state of
+    /// the actor. So every producer reads a flag beside the mailbox and sends
+    /// nothing.
+    pub busy: bool,
+    /// Queued and not yet taken.
+    ///
+    /// **Comparable as a predicate, not as a count.** *Will the next caller
+    /// block on the permit* is exact on both sides. The number is not: a keyed
+    /// mailbox carries only the service's own messages, while a
+    /// [`LocalActor`](crate::LocalActor)'s channel also carries a
+    /// [`read`](crate::LocalActor::read) and the stop request, so one queued read
+    /// reads `1` there and nothing at all on the keyed side. Never compare two of
+    /// these from the two sides by this field.
+    ///
+    /// A floor on the real backlog either way, and `u64` rather than `usize`,
+    /// both for the reasons
+    /// [`ActorStatus::buffered`](crate::ActorStatus::buffered) carries: senders
+    /// parked waiting for a permit are not observable at all, and a width the
+    /// compiler chooses cannot be half of a contract between two machines.
+    pub buffered: u64,
+}
+
 /// Why a turn produced no value, at the door that hands a caller the fault
 /// itself.
 ///
