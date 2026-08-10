@@ -160,11 +160,17 @@ re-entrancy arm — and nothing else.**
 
 ### 2.5 `Unanswered` loses `Copy`, and loses fidelity too
 
-`Undelivered` is `Copy` today (`turns.rs:3166`). `Copy` is precisely why
-`TurnLost::Restarting(Arc<Ended>)` discards its reason (`turns.rs:3909-3912`) —
-the defect that left a local caller worse-informed than a peer. Carrying the
-reason means carrying data, so `Copy` cannot survive, and neither can
-`&'static str` for the two `name` fields.
+`Undelivered` is `Copy` today (`turns.rs:3166`). Carrying a reason means carrying
+data, so `Copy` cannot survive, and neither can `&'static str` for the two `name`
+fields.
+
+**Correction, measured at `2e6b21d` after this was first written.** Revisions 1–4
+said *"`Copy` is precisely why `TurnLost::Restarting` discards its reason"*. That
+is backwards. `TurnLost::Restarting(Arc<Ended>)` (`observe.rs:774`) **carried**
+the `Ended`; `Unanswered::Restarting` (`turns.rs:3215`) was the **unit** variant.
+`Copy` is why *`Unanswered`* could not hold one — an `Arc` is not `Copy` — so the
+reason was discarded in the `TurnLost → Unanswered` fold, not by `TurnLost`. The
+conclusion is unchanged and the fix is the same; the mechanism was misnamed.
 
 **Revision 1 stopped there and was wrong to.** The collapse also *loses*
 information the local caller has today: `TurnLost::Restarting(Arc<Ended>)` hands
