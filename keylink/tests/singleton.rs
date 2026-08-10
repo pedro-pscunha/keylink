@@ -1245,6 +1245,95 @@ async fn stop_returns_only_once_the_mailbox_is_closed() {
     }
 }
 
+/// A call that arrives after the mailbox closed reads [`Withheld::Gone`] — the
+/// same answer as a reply that died on a gone actor, off the other side of the
+/// send.
+///
+/// # It is one condition, and which answer a peer got used to depend on a race
+///
+/// `deliver_to_singleton` can meet a stopped actor at two points: the send can
+/// fail with `NotQueued::Closed`, or the send can win a permit and the reply
+/// channel can then die with a `Standing::Gone`. Both mean *this actor ran and
+/// has stopped*. They answered differently — `NoSuchActor { id }` from the first
+/// and `Withheld::Gone` from the second — so which of the two sentences a peer
+/// read was decided by whether the actor's loop finished before or after the
+/// permit was granted. Nothing in the call decides it, and no caller can steer
+/// it.
+///
+/// This test drives the **send** side, which was the one answering an
+/// address-shaped sentence. The reply side is
+/// `a_remote_caller_can_tell_restarting_from_gone` in `supervision.rs`, and the
+/// pair is what pins the two paths to one answer.
+///
+/// # Why `NoSuchActor` was the wrong half of the pair to keep
+///
+/// It says *no actor is mounted as X*, which is an answer about an **id** — and a
+/// singleton has no id to be wrong about. It is reached through its own ALPN, so
+/// there is no lookup that can find nothing: the handshake either accepted the
+/// peer or the call never arrived. `stop()` does not unregister the ALPN either,
+/// so this door goes on answering for as long as the server runs, and what it has
+/// to report is that the actor behind it has finished.
+///
+/// # Three ways this passes for the wrong reason, and what refuses each
+///
+/// - **The call fails on the connection rather than at the mailbox.** Then the
+///   error is a transport one and `withheld` panics rather than comparing, which
+///   names what arrived instead.
+/// - **The stop had not landed when the second call was sent.** Then the send
+///   wins a permit, the turn runs, and the assertion sees an `Ok`. `stop()` is
+///   awaited and `is_running()` is asserted `false` in between, and
+///   `stop_returns_only_once_the_mailbox_is_closed` above is what makes that
+///   assertion mean something.
+/// - **The service was never reachable in the first place.** Then a green round
+///   would be measuring a broken client. The first `post` proves the whole path
+///   before anything is stopped.
+///
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on the closed-mailbox
+/// arm: search `Outcome::Err(RemoteError::Withheld(Withheld::Gone)),` and replace
+/// it with
+/// `Outcome::Err(RemoteError::NoSuchActor { id: String::new() }),`. Watched:
+/// `expected a RemoteError::Withheld, got Remote(NoSuchActor { id: "" })`.
+#[tokio::test]
+async fn a_stopped_singleton_answers_gone_rather_than_naming_an_id() {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let actor = ledger::actor(Ledger::default());
+    let server = Server::builder(&node)
+        .service(actor.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("serves");
+    let client = ledger::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+
+    assert_eq!(
+        client.post(1, 0).await.expect("the actor is serving"),
+        1,
+        "the call before the stop must land, or a refusal after it says nothing about the stop"
+    );
+
+    actor
+        .stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
+    assert!(
+        !actor.is_running(),
+        "stop() returned with the mailbox still open, so the call below would reach a turn \
+         instead of the closed door this test is about"
+    );
+
+    let refused = client.post(2, 0).await.expect_err("the mailbox is closed");
+    assert_eq!(
+        withheld(&refused),
+        &Withheld::Gone,
+        "a closed mailbox and a reply that died on a gone actor are one condition: a peer must \
+         not read two different answers depending on which side of the send it landed on"
+    );
+
+    client.close().await.expect("closes");
+    server.shutdown().await.expect("stops");
+}
+
 /// A turn an observer refused must NOT settle its idempotency key as the
 /// refusal, because the turn's effect was never committed.
 ///

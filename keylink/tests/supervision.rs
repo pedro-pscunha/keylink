@@ -1078,6 +1078,11 @@ async fn a_handle_survives_its_actors_restart() {
 ///    `NoSuchActor` — an answer about an **id** — until the losses became one
 ///    vocabulary.
 ///
+/// A fourth answer follows the loop, on the **send** rather than the reply: a
+/// fresh call once the mailbox is closed. It reads `Withheld::Gone` too, and read
+/// `NoSuchActor` for one wave — the same condition answered two ways, with a race
+/// deciding which a peer got.
+///
 /// # `multi_thread`, and it is the whole reason round 3 means anything
 ///
 /// This was `#[tokio::test]` — current-thread — and round 3 passed for a reason
@@ -1176,14 +1181,17 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
     }
 
     // And it stays gone, through the other door: the mailbox is closed, so the
-    // send itself fails.
+    // send itself fails. **`Withheld::Gone`, which is what round 3 read off the
+    // reply channel**, and it was `NoSuchActor` here until the two doors were
+    // pinned to one answer: a caller cannot steer which of them it lands on, so
+    // two sentences for one condition were a race with a wire-visible result.
     let after = client.place(3).await.expect_err("the actor gave up");
     assert!(
         matches!(
             after,
-            keylink::Error::Remote(RemoteError::NoSuchActor { .. })
+            keylink::Error::Remote(RemoteError::Withheld(Withheld::Gone))
         ),
-        "an actor that gave up is gone for good: got {after:?}"
+        "an actor that gave up is gone for good, in the same words on both doors: got {after:?}"
     );
     assert!(
         matches!(ended(desk.ended()).await, Ended::GaveUp { after: 1, .. }),
@@ -1229,7 +1237,7 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
 /// served twin asserts the `"panicked: "` prefix at the same point; the local
 /// equivalent of that fact is a caller task that unwinds.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `answered`'s
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `withheld_for`'s
 /// three-line `Standing::Restarting(reason) => Withheld::Restarting {
 /// reason: EndReason::from(&*reason), },` arm
 /// → `Standing::Restarting(_) => Withheld::Gone,` — the fold that made a restart
@@ -1238,6 +1246,11 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
 /// two dangling lines. Watched: `round 1: a lost reply on a restarting actor must
 /// say so`, `left: Turn(Gone)`,
 /// `right: Turn(Restarting { reason: Panicked { .. } })`.
+///
+/// The arm was `answered`'s copy, at sixteen spaces, and the served twin above had
+/// its own at eight. One function performs the mapping for both doors now, so this
+/// break reddens the served twin in the same run — the local half is what this
+/// record watched, and it is still what it watches.
 ///
 /// **Round 2 stays green under that break**, and that is the shape of the guard
 /// rather than a gap: the break folds `Restarting` onto the answer round 2 already

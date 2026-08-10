@@ -116,10 +116,33 @@ pub enum RemoteError {
         id: String,
     },
 
-    /// Anything else the serving side wants to report.
+    /// Anything the serving side wants to report that this enum has no variant
+    /// for.
     ///
-    /// The `String` is a **discriminator** and not only a message on the served
-    /// paths keylink writes: see the prefix constants on this type.
+    /// # It means a layer somebody wrote, and keylink builds exactly one
+    ///
+    /// Every refusal keylink itself produces has a variant here — a withheld
+    /// turn, a timeout, an idempotency refusal, a capacity refusal, a malformed
+    /// id. So a peer reading a `Failed` is reading a sentence written **in its own
+    /// deployment**, by a layer that answered `Outcome::Err(RemoteError::Failed(..))`
+    /// or by a handler that returned one. That is what makes the `String` useful
+    /// to that peer and useless to this crate: it is not a discriminator, and
+    /// nothing in keylink matches on it.
+    ///
+    /// **The one in-crate exception is named here rather than left in a comment
+    /// four thousand lines away**, which is where it lived and where no reader of
+    /// this variant would meet it: `turns.rs`'s `deliver_to_singleton` answers a
+    /// `Failed` on its `NotQueued::Reentrant` arm, carrying
+    /// [`Unanswered`](crate::Unanswered)'s own sentence. A peer cannot produce a
+    /// re-entrant call — its request arrives on a connection's task, which has run
+    /// no turn — so that arm is written to be right rather than to fire.
+    /// `turns.rs`'s `neither_served_door_answers_a_failed` holds the rest of the
+    /// boundary: nothing `rendered` or `lost` answers is one of these.
+    ///
+    /// The `String` **was** a discriminator that keylink wrote and a peer read off
+    /// the front with `starts_with`, against five prefix constants on this type.
+    /// The losses it discriminated are [`Withheld`](Self::Withheld) variants now,
+    /// and the constants are deleted.
     #[error("{0}")]
     Failed(String),
 
@@ -130,8 +153,8 @@ pub enum RemoteError {
     /// [`Unanswered`](crate::Unanswered) and [`TurnLost`](crate::TurnLost) give a
     /// local caller. It is a variant here so that a peer **matches** the loss
     /// instead of reading it off the front of a [`Failed`](Self::Failed) string
-    /// with `starts_with`, which is what the prefix constants on this type ask a
-    /// peer to do today.
+    /// with `starts_with`, which is what the five prefix constants this type used
+    /// to carry asked a peer to do.
     #[error("{0}")]
     Withheld(Withheld),
 

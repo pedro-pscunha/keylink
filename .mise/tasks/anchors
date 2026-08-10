@@ -1085,18 +1085,27 @@ ANCHORS = [
     # line. Same-file collision arriving from the TARGET's side, which is the mode
     # `P1`'s note names. `flat()` collapses the indentation before comparing, so the
     # records may go on quoting the bare form and this row still finds it.
+    # **Both dropped from sixteen spaces to eight, and the reason is the same edit
+    # that made W1 shorter.** The arm they quote lived in `answered` AND in `lost`,
+    # once each, and it is now `withheld_for`'s only copy - so the bare form's count
+    # went 3 -> 2 (the arm, plus `turns.rs`'s own `///` quote of it) and the
+    # eight-space form is the unique one. Measured on this tree, after `cargo fmt`.
     ("E1", "keylink/tests/defer.rs", "keylink/src/turns.rs",
-     "                Standing::Running => Withheld::Dropped,"),
+     "        Standing::Running => Withheld::Dropped,"),
     ("E2", "keylink/tests/defer.rs", "keylink/src/turns.rs",
-     "                Standing::Running => Withheld::Dropped,"),
+     "        Standing::Running => Withheld::Dropped,"),
     # E3 and E4 are the other two arms the split created, one per enum. The pairing
     # record's OTHER break - `lost`'s whole three-line `Standing::Running` arm - has
     # no row here and needs none: that record quotes its REPLACEMENT and describes
     # its search, so there is no literal for a row to check.
+    # E3 followed E1 and E2 out of `answered` and into `withheld_for`, and its whole
+    # three-line block moved with it - so the block is re-quoted at the extracted
+    # indentation. The bare block now counts 1 either way; the indented form is kept
+    # because it is what a reader hands the harness.
     ("E3", "keylink/tests/supervision.rs", "keylink/src/turns.rs",
-     "                Standing::Restarting(reason) => Withheld::Restarting {\n"
-     "                    reason: EndReason::from(&*reason),\n"
-     "                },"),
+     "        Standing::Restarting(reason) => Withheld::Restarting {\n"
+     "            reason: EndReason::from(&*reason),\n"
+     "        },"),
     ("E4", "keylink/tests/observe.rs", "keylink/src/turns.rs",
      "            Err(TurnLost::Turn(withheld)) => Err(Unanswered::Turn(withheld)),"),
     # F1 is the first row whose TARGET is `macros.rs`, and that is the point rather
@@ -1746,12 +1755,30 @@ ANCHORS = [
     # the records quotes its own search literal — the indentation here is what
     # keeps each unique, and a record that quoted it would abort the harness at
     # "found 2".
+    # **W1 lost its `\n    })` tail, and the tail is what the extraction paid for.**
+    # The literal carried the function's closing braces because the same arm text sat
+    # inside `answered` one indent deeper and a bare quote counted 2. There is one
+    # copy now - `withheld_for`'s - so eight spaces are enough, and the anchor no
+    # longer spans a brace the next refactor moves.
     ("W1", "keylink/src/turns.rs", "keylink/src/turns.rs",
-     "        Standing::Gone => Withheld::Gone,\n    })"),
+     "        Standing::Gone => Withheld::Gone,"),
     ("W2", "keylink/src/turns.rs", "keylink/src/turns.rs",
      "            Withheld::Gone => from_lost(Standing::Gone),"),
     ("W3", "keylink/src/turns.rs", "keylink/src/turns.rs",
      "            Withheld::Dropped,"),
+    # W4 and W5 are the two guards this wave's merge-gate findings added. W4 is the
+    # send-side answer a race used to decide - `NoSuchActor` or `Withheld::Gone`,
+    # depending on whether the mailbox closed before or after the send won a permit.
+    # W5 is the rule that `RemoteError::Failed` means a layer somebody wrote, held by
+    # walking both served doors. W6 is property 7 of the vocabulary guard: the sample
+    # is compared against the variant list `#[derive(Schema)]` writes, so an eighth
+    # loss cannot be walked past.
+    ("W4", "keylink/tests/singleton.rs", "keylink/src/turns.rs",
+     "Outcome::Err(RemoteError::Withheld(Withheld::Gone)),"),
+    ("W5", "keylink/src/turns.rs", "keylink/src/turns.rs",
+     "    RemoteError::Withheld(withheld_for(standing))"),
+    ("W6", "keylink/src/turns.rs", "keylink/src/turns.rs",
+     "            Withheld::Expired,"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -3288,7 +3315,7 @@ for record in sorted(set(REDNESS) - row_ids):
 #
 # 174 was READ off the failing run, not computed. The subtraction agrees, and by
 # this ledger's own standard that agreement establishes nothing.
-RECORD_BLOCKS = 174
+RECORD_BLOCKS = 176
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

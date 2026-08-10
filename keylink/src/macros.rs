@@ -2170,7 +2170,6 @@ macro_rules! __keylink_service {
                                 $crate::deliver_to_singleton(
                                     &actor,
                                     cx,
-                                    stringify!($svc),
                                     move |__from, __reply| Mail::Served {
                                         origin: __from,
                                         request: req,

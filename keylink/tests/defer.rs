@@ -346,15 +346,19 @@ async fn a_parked_reply_whose_actor_ends_is_answered_rather_than_hanging() {
 /// call below it is served. An `is_err` here passed identically while the crate
 /// told this caller to stop calling.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `answered`'s
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `withheld_for`'s
 /// `Standing::Running => Withheld::Dropped,` → `Standing::Running =>
 /// Withheld::Gone,` — the fold this variant was split out of. Watched: `a handler
 /// that panicked before answering owes its caller a refusal: got Err(Turn(Gone))`.
 /// The `is_err` this replaced stayed **green** through that same break.
 ///
-/// **Hand the harness that literal with its twelve spaces of indentation.** The
+/// **Hand the harness that literal with its eight spaces of indentation.** The
 /// bare form counts 2 in `turns.rs`, whose own `mod tests` quotes the arm
 /// unindented inside a `///` line, and the harness aborts at "found 2".
+///
+/// The arm was `answered`'s when this record was written, at sixteen spaces, and
+/// `lost` held a copy of it at eight. One function performs the mapping now, so
+/// there is a single arm and the indentation this record names is its.
 ///
 /// Measured at `81eabe9`, the commit that wrote this record and that `mod tests`
 /// one together: the bare form already counted **2** there, so the quote above has
@@ -403,10 +407,12 @@ async fn a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_
 /// change, is true after it and would be true after a revert; the variant on its
 /// own cannot tell *serving* from *reported as serving*.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `answered`'s
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `withheld_for`'s
 /// `Standing::Running => Withheld::Dropped,` → `Standing::Running =>
-/// Withheld::Gone,` — the fold the variant was split out of. **Hand the harness
-/// the literal with its sixteen spaces of indentation.** The bare form counts 2 in
+/// Withheld::Gone,` — the fold the variant was split out of. It was `answered`'s
+/// arm, at sixteen spaces, until one function took over the mapping for both
+/// doors. **Hand the harness the literal with its eight spaces of
+/// indentation.** The bare form counts 2 in
 /// `turns.rs`: that file's own `mod tests` records the same break against
 /// `a_released_reply_is_dropped_when_the_turn_that_released_it_panicked`, and its
 /// quote sits unindented inside a `///` line. Same-file collision arriving from
@@ -495,12 +501,13 @@ async fn a_reply_parked_before_a_fault_is_still_answered_after_it() {
 ///
 /// **A second break, because the first proves only that nothing crossed.** The
 /// assertion also names *which* answer, and no break above it can go red on the
-/// wrong one. `answered`'s `Standing::Running => Withheld::Dropped,` →
+/// wrong one. `withheld_for`'s `Standing::Running => Withheld::Dropped,` →
 /// `Standing::Running => Withheld::Gone,` is the fold, and it is red here:
 /// `a panicking turn's answer crossed anyway: Err(Turn(Gone))`. The `is_err` this
-/// assertion replaced stayed green through it.
+/// assertion replaced stayed green through it. The arm was `answered`'s when this
+/// was written, at sixteen spaces; both doors read one function now.
 ///
-/// **Hand the harness that literal with its sixteen spaces of indentation.** The
+/// **Hand the harness that literal with its eight spaces of indentation.** The
 /// bare form counts 2 in `turns.rs` — the arm itself, and that file's own
 /// `mod tests` quoting the same break unindented inside a `///` line — so the
 /// harness aborts at "found 2". Sibling records above carry the same clause; this
@@ -686,28 +693,32 @@ async fn a_peer_gets_an_answer_parked_past_its_own_turn() {
 /// No supervision, no panic, no `stop()`. The actor answers the very next call on
 /// the same connection, which is the half `NoSuchActor` denies.
 ///
-/// Made red twice, once per door, because either break leaves the other half
-/// green — which is the same evidence that makes the pairing worth asserting:
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on the one arm both
+/// doors read, `withheld_for`'s `Standing::Running => Withheld::Dropped,` →
+/// `Standing::Running => Withheld::Gone,`, which collapses the split back onto the
+/// answer that means *stop calling*. It cannot be the pre-fix `NoSuchActor` any
+/// more: all three arms are `Withheld` now, so the fold has to happen inside that
+/// vocabulary. Watched: `the local door names the same cause the peer's does`,
+/// `left: Err(Turn(Gone))`, `right: Err(Turn(Dropped))`.
 ///
-/// - `scripts/break-once.sh keylink/src/turns.rs` on the served arm itself,
-///   `lost`'s whole `Standing::Running` arm — the two-line `format!` and its
-///   closing `)),` — replaced by
-///   `Standing::Running => Withheld::Gone,`, which collapses the split back onto
-///   the answer that means *stop calling*. It cannot be the pre-fix
-///   `NoSuchActor` any more: all three arms are `Withheld` now, so the fold has
-///   to happen inside that vocabulary. Watched:
-///   `a live actor must not be reported as absent: Remote(Withheld(Gone))`.
-///   Quote the arm with the comment line above it — `        // the message, and
-///   it will answer the next one.` — because the bare arm text also sits inside
-///   `answered` one indent deeper and counts 2.
-/// - and on the local arm, `answered`'s
-///   `Standing::Running => Withheld::Dropped,` → `Standing::Running =>
-///   Withheld::Gone,`. Quote that literal with its **sixteen spaces** of
-///   indentation; the bare form counts 2 in `turns.rs`, which aborts the harness.
-///   Watched: `the local door names the same cause the peer's does`,
-///   `left: Err(Turn(Gone))`, `right: Err(Turn(Dropped))` — and the peer half passed
-///   in that same run, which is the measurement behind "either break leaves the
-///   other half green".
+/// **Hand the harness that literal with its eight spaces of indentation.** The
+/// bare form counts 2 in `turns.rs`, which aborts the harness.
+///
+/// # It was two breaks, one per door, and the second one stopped existing
+///
+/// This record said *made red twice, once per door, because either break leaves
+/// the other half green* — and that mutual independence was the evidence for
+/// asserting the pairing at all. There were two arms then: `lost`'s, at eight
+/// spaces, and `answered`'s copy of it at sixteen, and each break moved one door.
+///
+/// One function performs the mapping for both doors now, so a single break moves
+/// both halves together and there is no edit that makes them disagree. **That is
+/// the property this test was watching, held by construction instead of by a
+/// guard** — what is left for it to hold is that the shared arm is reached from
+/// both doors and answers `Dropped`, which no type says and which the break above
+/// still reddens. The old served-side literal — quoted with the comment line above
+/// it, `        // the message, and it will answer the next one.` — resolves to
+/// the same arm and is kept out of the registry for that reason.
 #[tokio::test]
 async fn a_local_caller_and_a_peer_agree_about_an_abandoned_deferred() {
     let node = local_node().await;

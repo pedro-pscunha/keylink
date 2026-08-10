@@ -541,11 +541,14 @@ pub enum Ended {
     },
 }
 
-/// One line, for a log or for the string a peer is handed.
+/// One line, for a log.
 ///
 /// [`Debug`](fmt::Debug) is derived and prints the fields; this prints the
-/// sentence. `turns.rs` puts one of these behind a `"restarting: "` prefix on the
-/// served path, and a struct-literal rendering there would be noise on a wire.
+/// sentence. [`EndReason`]'s `Display` mirrors this one arm for arm, and the
+/// mirror is why the two types share a file: this sentence is what an operator
+/// reads out of an actor's own ending, and that one is what a peer reads inside
+/// [`Withheld::Restarting`]'s. A struct-literal rendering on either side would be
+/// noise.
 impl fmt::Display for Ended {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -556,10 +559,9 @@ impl fmt::Display for Ended {
             // producers.** The variant's own doc has always said `Err`, *or
             // panicked*, and an observer that panicked did not give anything up —
             // it fell over. This is the sentence an operator reads in a log, and
-            // `turns.rs` puts it behind `"restarting: "` on the served path, so it
-            // is also the sentence a peer reads about a restart. One verb has to be
-            // true of both producers: they both ended the incarnation, and neither
-            // of them let the turn commit.
+            // `EndReason`'s mirror of it is the sentence a peer reads about a
+            // restart, so one verb has to be true of both producers: they both
+            // ended the incarnation, and neither of them let the turn commit.
             Self::Observer { name, error, .. } => {
                 write!(f, "the {name} observer ended this incarnation: {error}")
             }
@@ -654,6 +656,52 @@ impl From<&Ended> for EndReason {
                 after: *after,
                 error: error.to_string(),
             },
+        }
+    }
+}
+
+/// The same line [`Ended`] writes, from the form that crossed a wire.
+///
+/// # Hand-written, and a mirror rather than a second wording
+///
+/// Every arm writes the sentence [`Display for Ended`](Ended#impl-Display-for-Ended)
+/// writes for the arm it was converted from, because the two are one ending seen
+/// from two sides and a peer that read a *different* sentence about it would have
+/// no way to know it was the same fact. That is the whole reason the two types
+/// share a file: the mirror is checkable by reading forty lines, and it is not
+/// checkable at all if they sit apart.
+///
+/// `#[derive(thiserror::Error)]` would spell the same thing in attributes, and
+/// this is written out instead for [`Ended`]'s reason — the two must be diffed
+/// against each other, and an attribute on the variant and a `write!` in a match
+/// arm do not diff.
+///
+/// # What it is for, which is one caller
+///
+/// [`Withheld::Restarting`] renders it: a peer whose reply died in a restart is
+/// told *another incarnation is coming* **and which ending caused it**. That
+/// sentence carried the ending on `main`, through a `"restarting: "` prefix in
+/// front of the whole of `Ended`'s `Display`, and lost it for one wave when the
+/// prefix became a variant — the `#[error]` text named no field, so an operator
+/// reading `err.to_string()` on the far end got a fixed sentence about an ending
+/// the value was carrying all along.
+///
+/// [`Observer::fatal`](Self::Observer::fatal) is not rendered, exactly as
+/// [`Ended::Observer`]'s `fatal` is not: it is a supervision flag rather than
+/// part of the sentence, and a peer matches the field.
+impl fmt::Display for EndReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stopped => f.write_str("the actor was stopped"),
+            Self::Vanished => f.write_str("the actor's task was cancelled"),
+            Self::Panicked { message } => write!(f, "a turn panicked: {message}"),
+            Self::Observer { name, error, .. } => {
+                write!(f, "the {name} observer ended this incarnation: {error}")
+            }
+            Self::Feed { name } => write!(f, "the {name} feed ended"),
+            Self::GaveUp { after, error } => {
+                write!(f, "gave up after {after} restarts: {error}")
+            }
         }
     }
 }
@@ -797,12 +845,14 @@ pub enum TurnLost {
 /// handshake in both worlds. The attribute decides only what a peer that *can*
 /// decode a variant is allowed to do with it.
 ///
-/// # `Expired` is representable and has no producer, on any path
+/// # `Expired` is representable and no path reaches the one producer it has
 ///
-/// A local `Origin` holds no `Queueing`, so there is no budget to expire and no
-/// local path can build it. Neither is a link, because both are
+/// A local `Origin` holds no `Queueing`, so there is no budget to expire.
+/// Neither is a link, because both are
 /// `#[doc(hidden)]` — rustdoc renders a link to a hidden item as a dead `href`
-/// and `-D warnings` does not see it. On the served side a budget *does* expire,
+/// and `-D warnings` does not see it. `ask_catching` **does** build this variant,
+/// on the arm that reads an expired budget, and that arm is the producer no path
+/// reaches. On the served side a budget *does* expire,
 /// and that
 /// path answers [`RemoteError::TimedOut`](crate::RemoteError::TimedOut), which
 /// carries the millisecond figure this variant has nowhere to put.
@@ -812,7 +862,7 @@ pub enum TurnLost {
 /// [`Gone`](Self::Gone) — which is a live actor reported as finished, silently.
 ///
 /// **Nothing in the type system says a variant is reachable**, which is how this
-/// one reached zero producers without anybody noticing. `turns.rs`'s
+/// one reached zero *reachable* producers without anybody noticing. `turns.rs`'s
 /// `one_vocabulary_and_every_loss_in_it_has_a_producer` is what says so now: it
 /// walks this enum exhaustively and calls the production function that builds
 /// each variant, with this one exempted by name.
@@ -866,9 +916,37 @@ pub enum Withheld {
     /// Carries the ending as an [`EndReason`] and not an [`Ended`], because an
     /// [`Ended::Observer`] holds an `Arc<dyn Error + Send + Sync>` and a trait
     /// object is not data — that type's own documentation carries the argument.
-    #[error("the incarnation that owed this answer is gone and another is coming")]
+    ///
+    /// **The sentence renders the ending, and for one wave it did not.** On the
+    /// served path this condition read `"restarting: "` followed by the whole of
+    /// `Ended`'s `Display`, so a peer logging `err.to_string()` learned *why* the
+    /// incarnation died. When the prefix became this variant the `#[error]` text
+    /// named no field, and the same peer got a fixed sentence about an ending the
+    /// value was carrying all along. `{reason}` is what puts it back, through
+    /// [`EndReason`]'s own `Display`.
+    #[error("the incarnation that owed this answer is gone and another is coming: {reason}")]
     Restarting {
         /// The ending that caused the restart.
+        ///
+        /// # Four of [`EndReason`]'s shapes cannot appear here
+        ///
+        /// A restart is granted by `turns.rs`'s `retryable`, and it answers
+        /// `false` for [`Ended::Stopped`], [`Ended::Vanished`], [`Ended::GaveUp`]
+        /// and an [`Ended::Observer`] that declared itself fatal. `Lent::ending`
+        /// settles `Standing::Restarting` only behind that call, and it is the
+        /// only producer of that standing — so
+        /// [`Stopped`](EndReason::Stopped), [`Vanished`](EndReason::Vanished),
+        /// [`GaveUp`](EndReason::GaveUp) and
+        /// [`Observer { fatal: true }`](EndReason::Observer) are representable in
+        /// this field and unreachable in it. What is left is a fault, a dead feed,
+        /// and a non-fatal observer veto: the three endings another incarnation
+        /// can be expected to survive.
+        ///
+        /// It is an `EndReason` rather than a narrower type because the narrower
+        /// type would be a second vocabulary for one ending — the cost this whole
+        /// enum exists to refuse — and because `retryable` is a function anybody
+        /// may change. A caller that matches all six arms stays correct the day it
+        /// does.
         reason: EndReason,
     },
     /// The actor is no longer running. **Stop calling.**
@@ -880,8 +958,11 @@ pub enum Withheld {
     /// A [`QueueTimeout`](crate::QueueTimeout) budget expired while the message
     /// waited. It **never started**, so the actor is untouched and still running.
     ///
-    /// Has no producer. See this enum's own documentation for what reports the
-    /// expiry instead, and why the variant is kept anyway.
+    /// Has no **reachable** producer, which is narrower than *no producer* and is
+    /// the true claim: `ask_catching` builds it for an expired budget, and no
+    /// local `Origin` carries a budget for that arm to fire on. See this enum's
+    /// own documentation for what reports the expiry on the served side instead,
+    /// and why the variant is kept anyway.
     #[error("the queueing budget expired before this turn started: nothing ran")]
     Expired,
 }

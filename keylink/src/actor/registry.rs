@@ -582,9 +582,10 @@ pub(super) enum RouteError {
     },
     /// The registry is full, so the factory was never called.
     ///
-    /// This sentence *is* rendered — `remote.rs` puts it inside
-    /// `RemoteError::Failed` — and `remote.rs`'s
-    /// `the_capacity_refusal_reads_the_same_by_hand_and_lazily` pins the words.
+    /// This sentence *is* rendered — `remote.rs` widens it onto
+    /// `RemoteError::AtCapacity`, which carries the same cap and writes the same
+    /// words — and `remote.rs`'s
+    /// `the_capacity_refusal_reads_the_same_by_hand_and_lazily` pins them.
     #[error("the actor system is at its capacity of {capacity} live actors")]
     AtCapacity {
         /// The cap that was reached.
@@ -1896,7 +1897,8 @@ impl<M> SystemBuilder<M> {
     /// The most actors this system will hold at once.
     ///
     /// A mount past it is [`MountError::AtCapacity`]; a lazy spawn past it is
-    /// [`RemoteError::Failed`](crate::RemoteError::Failed) naming the cap. This
+    /// [`RemoteError::AtCapacity`](crate::RemoteError::AtCapacity) naming the
+    /// cap. This
     /// is the bound that keeps a lazily spawning system from being a
     /// memory-exhaustion target, so raising it is a statement about how much
     /// memory the process may spend.
