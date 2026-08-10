@@ -1246,9 +1246,43 @@ async fn a_service_serves_as_a_singleton_and_as_an_actor_system_on_one_node() {
 /// nowhere else in this repository — and stayed that way through a whole merge
 /// gate. So a re-measurement rewrites every sentence naming a number, and not
 /// only the `PINNED` line the compiler reads.
+///
+/// # Moved a fifth time, so a peer can ask what an actor is doing
+///
+/// `75cb158fa0f636c8` → `4697a79e29347129`. **Step 1 was answered before the
+/// literal was touched, and the answer is yes — for both of the two causes this
+/// commit carries.**
+///
+/// - **Every `Request` gained `__Status` and every `Response` gained
+///   `__Status(Serving)`.** A local `Handle` could ask whether an actor was
+///   inside a turn and how deep its queue was; a peer could ask neither, on the
+///   service it was already connected to. The pair is generated onto every
+///   contract rather than declared by one, so each service pays this once and
+///   never again for the same reason.
+/// - **`RemoteError` gained `NotAnActor`**, which reaches every contract by the
+///   route the third and fourth moves already walk. It is the answer to
+///   `__Status` from a singleton served with a handler rather than as an actor —
+///   one ALPN carries both ways, so which one is behind a connection is a fact a
+///   peer can learn only from an answer.
+///
+/// A peer built against the old shape must be refused for either cause on its
+/// own. It can decode `__Status` in neither direction, and it would meet
+/// `NotAnActor` as a refusal variant it cannot name — which is exactly the
+/// `starts_with`-shaped mistake the fourth move was made to end.
+///
+/// Appended and not inserted, for `NotKeyable`'s reason: the hash moves either
+/// way, so what the append buys is that no existing variant is renumbered.
+///
+/// **Both pins moved in this run, and the run does not separate the causes.**
+/// Both causes above are shared by every service, so both pins had to move; and
+/// `Inspect` carries a third cause of its own — see
+/// [`the_inspect_contract_hash_has_not_moved`]. So this is one measurement
+/// covering three causes, and the attribution is read off the contract graphs
+/// rather than off the numbers. Both literals were read off that one failing
+/// run, which reported **two** failures. Neither was computed.
 #[test]
 fn the_contract_hash_has_not_moved() {
-    const PINNED: &str = "keylink/Probe/75cb158fa0f636c8";
+    const PINNED: &str = "keylink/Probe/4697a79e29347129";
 
     assert_eq!(
         String::from_utf8_lossy(probe::alpn()),
@@ -1277,7 +1311,40 @@ fn the_contract_hash_has_not_moved() {
 /// hash, which is the whole point — an old console is refused at the handshake
 /// rather than handed four fields where it expected five.
 ///
-/// # It has moved four times, and these are the decisions
+/// # It has moved five times, and these are the decisions
+///
+/// ## `f62a21fb09137ace` → `e7579f60b94c0ea0`, three causes in one commit
+///
+/// Two of the three are shared with every service the crate carries, and
+/// [`the_contract_hash_has_not_moved`] holds their argument: `__Status` on every
+/// `Request` and `Response`, and `RemoteError::NotAnActor`. This is the third,
+/// and it is this service's alone.
+///
+/// **`Inspect` gained `rpc WhyEnded(id) -> Option<EndReason>`.** An ordinary
+/// peer of an ordinary service still cannot ask why an actor ended — that state
+/// is the one in which a service's own methods are not served — but an operator
+/// admitted to this list can now ask about one id instead of following the whole
+/// log to find it. It adds **no information class and no availability**:
+/// `Follow(0)` already hands the same allowlist every retained
+/// [`LifecycleEvent::Ended`](keylink::LifecycleEvent), so this answers a subset
+/// of what that answers. It adds no state either — [`Inspector`] gains no field,
+/// and the lookup walks the ring `follow` already reads.
+///
+/// It is **not** `rpc Ended`, which is the name the wave was planned under. That
+/// generates `ended`, and every `service!` block already puts an `ended` on its
+/// `Handle`; two inherent methods of one name in one impl block is
+/// `error[E0592]`, so the rpc could not have compiled. The name is the fix and
+/// not a preference.
+///
+/// The change should be visible to a console. One built against the old shape
+/// has no method to call and could decode neither the new request variant nor
+/// its reply, so being refused at the handshake is the correct outcome.
+///
+/// **`Probe`'s hash moved in the same run, and here that is expected rather than
+/// evidence**: two of these three causes are shared by every contract. The run
+/// reported both failures together and attributes neither.
+///
+/// [`Inspector`]: keylink::Inspector
 ///
 /// ## `0572763878b7fb9d` → `f62a21fb09137ace`, two causes in one commit
 ///
@@ -1377,7 +1444,7 @@ fn the_contract_hash_has_not_moved() {
 /// [`NodeKey`]: keylink::NodeKey
 #[test]
 fn the_inspect_contract_hash_has_not_moved() {
-    const PINNED: &str = "keylink/Inspect/f62a21fb09137ace";
+    const PINNED: &str = "keylink/Inspect/e7579f60b94c0ea0";
 
     assert_eq!(
         String::from_utf8_lossy(keylink::inspect::alpn()),

@@ -4788,6 +4788,13 @@ written down. Two pins moved because `RemoteError` is carried by every service a
 `CONTRIBUTING.md`'s wire-contract section named only the first test for several
 waves and now names both.
 
+**Both moved again in wave 3, and this table is deliberately not rewritten for
+it.** It records `0c6e6c3`, and a dated table rewritten in place records nothing.
+The current pair is the two `PINNED` constants in `keylink/tests/protocol.rs` —
+values a test holds and this file cannot, which is why naming them here would rot
+on the next move and naming the constants will not. That file's rustdoc ledger
+carries one entry per move, including wave 3's.
+
 ### 18.7 Nine conditions changed for a peer, and this section opened by naming five
 
 The heading of §18 says *"Wave 1 replaced five `Failed(String)` prefixes"*, which is

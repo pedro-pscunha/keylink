@@ -4863,6 +4863,51 @@ where
     }
 }
 
+/// What this actor is doing, without delivering anything to it.
+///
+/// The non-enqueuing twin of [`deliver_to_singleton`], and the singleton half of
+/// what a generated `__status` answers. Generated dispatch calls this **instead
+/// of** that one, above it in the same closure, and nothing enters the mailbox —
+/// which is the whole mechanism rather than an optimisation. [`is_busy`] states
+/// the constraint: a message asking this question would queue behind the turn
+/// that wedged the actor, and if it ever ran it would report `true` about
+/// itself while its own permit counted in [`buffered`]. It would answer the
+/// state of asking rather than the state of the actor.
+///
+/// Governance is untouched by that. The layer chain runs above the dispatch
+/// closure, so a [`Middleware`](crate::Middleware) refuses `__Status` per peer
+/// and per method exactly as it refuses any other; what the interception removes
+/// is the mailbox, not the [`Allowlist`](crate::Allowlist) and not the layer.
+///
+/// # Errors
+///
+/// [`Withheld::Gone`] once the mailbox is closed. That is the one condition and
+/// the one answer [`deliver_to_singleton`] already gives a peer whose call finds
+/// it closed, and the two say it through the same variant on purpose:
+/// [`LocalActor::serving`] folds a value for a stopped actor too — both fields
+/// at rest — and a peer reading that pair could not tell it from an idle actor.
+///
+/// **The window it does not close is [`is_running`]'s own**, and it is the same
+/// one every question about another task has: the actor can stop between this
+/// read and the next line. A supervised actor between incarnations is inside it
+/// — its receiver belongs to the supervisor and outlives each one, so the
+/// mailbox is open and this answers a `Serving` where a *delivery* would report
+/// [`Withheld::Restarting`]. Evidence, never a precondition.
+///
+/// [`is_busy`]: LocalActor::is_busy
+/// [`buffered`]: LocalActor::buffered
+/// [`is_running`]: LocalActor::is_running
+#[doc(hidden)]
+pub fn serving_of_singleton<A, M>(
+    actor: &LocalActor<A, M>,
+) -> std::result::Result<Serving, RemoteError> {
+    if actor.is_running() {
+        Ok(actor.serving())
+    } else {
+        Err(RemoteError::Withheld(Withheld::Gone))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]

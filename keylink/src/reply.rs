@@ -208,6 +208,30 @@ pub enum RemoteError {
     /// it was and the number to resume from.
     #[error("{0}")]
     FollowRefused(FollowRefused),
+
+    /// This node serves the service some other way than as an actor, so there
+    /// is no turn to report.
+    ///
+    /// The answer to the generated `__status` method from a service built with
+    /// the concurrent `service(handler, allow)` door. **One ALPN carries both
+    /// ways of serving a singleton** — the same `Request` reaches a handler and
+    /// an actor — so which of the two a node chose is a fact about that node
+    /// that a peer can learn only from the answer.
+    ///
+    /// A refusal rather than a [`Serving`](crate::Serving) with both fields at
+    /// rest, which is what a concurrent service would truthfully fold: every
+    /// call there takes its own task, so nothing is ever inside a serial turn
+    /// and nothing is ever queued behind one. A peer reading that pair could
+    /// not tell it from an idle actor, and a diagnostic whose "nothing is
+    /// happening" is indistinguishable from "this question does not apply here"
+    /// is the silent fallback this crate refuses.
+    ///
+    /// It is not about an id and says nothing about one, which is what
+    /// separates it from [`NoSuchActor`](Self::NoSuchActor): the keyed door
+    /// answers that one for an id nothing is mounted under, and this one is
+    /// answered before any actor is looked for.
+    #[error("this service is not served as an actor here, so it has no turn to report")]
+    NotAnActor,
 }
 
 /// The reply as it appears on the wire: a value, or a refusal.

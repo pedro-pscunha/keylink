@@ -507,12 +507,30 @@ macro_rules! __keylink_service {
 
             #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, ::postcard_schema::Schema)]
             pub enum Request {
-                $( $( #[$meta] )* $rpc { $( $arg: $ty ),* } ),+
+                $( $( #[$meta] )* $rpc { $( $arg: $ty ),* }, )+
+                /// What the actor answering this service is doing right now.
+                ///
+                /// Declared by no service and generated onto every contract, so
+                /// it moves this service's ALPN once and then never again. The
+                /// two spellings are deliberate and follow the crate's own
+                /// internal convention — `__Status` on the wire, `__status` on
+                /// every client — because a name a user could also write would
+                /// be a name a user could collide with.
+                ///
+                /// **Never delivered.** Both served closures answer it above
+                /// their delivery call, from the flag beside the mailbox, and
+                /// enqueue nothing. A message asking would queue behind the
+                /// turn that wedged the actor.
+                __Status {},
             }
 
             #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, ::postcard_schema::Schema)]
             pub enum Response {
-                $( $rpc($crate::__keylink_response_ty!([<$kind>], $ret)) ),+
+                $( $rpc($crate::__keylink_response_ty!([<$kind>], $ret)), )+
+                /// The answer to [`Request::__Status`]. See
+                /// [`Serving`](keylink::Serving) for what its two fields do and
+                /// do not claim.
+                __Status($crate::Serving),
             }
 
             impl Response {
@@ -521,7 +539,8 @@ macro_rules! __keylink_service {
                 /// sides instead of printing a debug dump.
                 fn variant_name(&self) -> &'static str {
                     match self {
-                        $( Self::$rpc(_) => stringify!($rpc) ),+
+                        $( Self::$rpc(_) => stringify!($rpc), )+
+                        Self::__Status(_) => "__Status",
                     }
                 }
 
@@ -542,6 +561,29 @@ macro_rules! __keylink_service {
                         }
                     }
                 )+
+
+                /// Extract the `__Status` reply, or say what came instead.
+                ///
+                /// The twin of the `into_*` above, written out rather than
+                /// produced by that repetition because `__Status` is declared by
+                /// no service and so appears in no declaration list.
+                ///
+                /// **Not `into___status`**, which is what that repetition would
+                /// have spelled: three interior underscores are `non_snake_case`
+                /// and the workspace denies warnings. Not `into_status` either —
+                /// `rpc Status()` is a declaration this crate promises still
+                /// compiles, and it produces exactly that name. The leading
+                /// underscores are the convention for a name a service cannot
+                /// declare, which is the same reason `__Status` carries them.
+                fn __into_status(self) -> $crate::Result<$crate::Serving> {
+                    match self {
+                        Self::__Status(value) => Ok(value),
+                        other => Err($crate::Error::UnexpectedResponse {
+                            expected: "__Status",
+                            actual: other.variant_name(),
+                        }),
+                    }
+                }
             }
 
             /// Hashed to produce the ALPN, so the gate covers BOTH directions
@@ -603,6 +645,9 @@ macro_rules! __keylink_service {
                     match self {
                         $( Self::$rpc(__value) =>
                             $crate::__keylink_granted_id!([<$kind>], __value), )+
+                        // A status read names no content, so there is no grant
+                        // for `serve_one` to record against the peer.
+                        Self::__Status(_) => ::core::option::Option::None,
                     }
                 }
             }
@@ -690,6 +735,12 @@ macro_rules! __keylink_service {
                 fn method(&self) -> &'static str {
                     match self {
                         $( Request::$rpc { .. } => stringify!($rpc), )+
+                        // The name a layer refuses `__status` by. The generated
+                        // method is answered inside the dispatch, and the chain
+                        // runs above it, so this is what a per-method
+                        // `Middleware` matches on to close the door for a peer
+                        // it does not want reading turn state.
+                        Request::__Status { .. } => "__Status",
                     }
                 }
             }
@@ -716,14 +767,43 @@ macro_rules! __keylink_service {
                         // entered and never answered, both mean it answered.
                         let __progress = cx.progress();
                         ::std::boxed::Box::pin(async move {
-                            __progress.dispatched();
                             let (__response, __body) = match req {
                                 $(
-                                    Request::$rpc { $( $arg ),* } =>
+                                    Request::$rpc { $( $arg ),* } => {
+                                        __progress.dispatched();
                                         [<__invoke_ $rpc:snake>](
                                             handler.as_ref(), &cx, body $(, $arg )*
-                                        ).await,
+                                        ).await
+                                    }
                                 )+
+                                // `__Status` asks which turn is running, and a
+                                // service served THIS way runs none: every call
+                                // takes its own task, so nothing is ever inside
+                                // a serial turn and nothing is ever queued
+                                // behind one. `RemoteError::NotAnActor` says
+                                // that, rather than a `Serving` with both fields
+                                // at rest — which would be true here and
+                                // indistinguishable from an idle actor.
+                                //
+                                // One ALPN carries both ways of serving a
+                                // singleton, so a peer cannot know which it
+                                // dialled and this arm is the answer rather than
+                                // a case that cannot arise.
+                                //
+                                // `unrun`, and `dispatched` moved into the arms
+                                // above it: no handler is entered here, so an
+                                // idempotency key claimed for this call is
+                                // released rather than settled as work that ran
+                                // and never answered.
+                                Request::__Status { .. } => {
+                                    __progress.unrun();
+                                    return (
+                                        $crate::Outcome::Err(
+                                            $crate::RemoteError::NotAnActor,
+                                        ),
+                                        $crate::Body::empty(),
+                                    );
+                                }
                             };
                             __progress.completed();
                             ($crate::Outcome::Ok(__response), __body)
@@ -968,6 +1048,31 @@ macro_rules! __keylink_service {
                                         ($( $arg ),*)
                                     ),
                             )+
+                            // **Nothing builds this, and that is the wave's
+                            // central property rather than an accident.**
+                            // `__Status` is answered above BOTH delivery calls
+                            // — in `keyed_service`'s dispatch closure and in
+                            // `Handle::service`'s — so it never becomes mail. It
+                            // cannot: a question about which turn is running
+                            // cannot be answered by a turn, because that turn
+                            // would report `busy: true` about itself and count
+                            // its own permit in `buffered`.
+                            //
+                            // The arm exists because `Mail::Served` carries the
+                            // whole `Request` and this match must be exhaustive.
+                            // It drops the reply rather than inventing an
+                            // answer, which the caller reads as
+                            // `Withheld::Dropped` — *a live actor took this and
+                            // never answered it* — and which is the truth about
+                            // what happened if a door is ever built that reaches
+                            // here. A `Serving` folded inside the turn would be
+                            // a lie in the one field the type exists for, and
+                            // generated code must not panic in somebody else's
+                            // crate.
+                            Request::__Status { .. } => {
+                                ::core::mem::drop(reply);
+                                ::core::option::Option::None
+                            }
                         },
                     }
                 }
@@ -1210,9 +1315,44 @@ macro_rules! __keylink_service {
                                                 body: $crate::BodyReader| {
                         let system = system.clone();
                         ::std::boxed::Box::pin(async move {
-                            match $crate::deliver_to_actor::<Actors>(&system, cx, request, body)
-                                .await
-                            {
+                            // **`__Status` is answered here and enqueues
+                            // nothing.** This is the mechanism and not a
+                            // shortcut: `Handle::is_busy` states that a message
+                            // asking would queue behind the turn that wedged the
+                            // actor, and if it ever ran it would report
+                            // `busy: true` about itself while its own permit
+                            // counted in `buffered` — the state of asking rather
+                            // than the state of the actor.
+                            //
+                            // Governance is unchanged by that. The layer chain
+                            // runs above this closure, so a `Middleware` refuses
+                            // `__Status` per peer and per method exactly as it
+                            // refuses any other. What is removed is the mailbox,
+                            // not the allowlist and not the layer.
+                            //
+                            // Borrowed rather than split: `Addressed::split` is
+                            // consuming, and an arm that hands the envelope on
+                            // unchanged must not take it apart to look at it.
+                            let __answer = if ::core::matches!(
+                                request.message(),
+                                Request::__Status { .. }
+                            ) {
+                                // Nothing ran, and an arm ending a message
+                                // without entering it has to say so — silence
+                                // here reads as a message that reached a
+                                // mailbox.
+                                cx.progress().unrun();
+                                $crate::serving_of_actor(&system, &request).map(|__serving| {
+                                    (
+                                        $crate::Outcome::Ok(Response::__Status(__serving)),
+                                        $crate::Body::empty(),
+                                    )
+                                })
+                            } else {
+                                $crate::deliver_to_actor::<Actors>(&system, cx, request, body)
+                                    .await
+                            };
+                            match __answer {
                                 ::std::result::Result::Ok(__answer) => __answer,
                                 ::std::result::Result::Err(__refusal) => (
                                     $crate::Outcome::Err(__refusal),
@@ -2152,6 +2292,34 @@ macro_rules! __keylink_service {
                                                     body: $crate::BodyReader| {
                             let actor = actor.clone();
                             ::std::boxed::Box::pin(async move {
+                                // **`__Status` is answered here and enqueues
+                                // nothing**, the same way and for the same
+                                // reason the keyed closure answers it: a message
+                                // asking would queue behind the turn that wedged
+                                // the actor, and if it ever ran it would report
+                                // `busy: true` about itself. `Handle::is_busy`
+                                // states the constraint; this arm is what keeps
+                                // it true for a peer.
+                                //
+                                // The layer chain runs above this closure, so a
+                                // `Middleware` still refuses `__Status` per peer
+                                // and per method. What is removed is the
+                                // mailbox, not the allowlist and not the layer.
+                                if ::core::matches!(&req, Request::__Status { .. }) {
+                                    // Nothing ran, and an arm ending a message
+                                    // without entering it has to say so.
+                                    cx.progress().unrun();
+                                    return match $crate::serving_of_singleton(&actor) {
+                                        ::std::result::Result::Ok(__serving) => (
+                                            $crate::Outcome::Ok(Response::__Status(__serving)),
+                                            $crate::Body::empty(),
+                                        ),
+                                        ::std::result::Result::Err(__refusal) => (
+                                            $crate::Outcome::Err(__refusal),
+                                            $crate::Body::empty(),
+                                        ),
+                                    };
+                                }
                                 // Everything this used to do by hand — three
                                 // clones of `Progress` for three facts, the
                                 // queue deadline, the five-arm match that turned
@@ -2354,6 +2522,28 @@ macro_rules! __keylink_service {
                 #[must_use]
                 pub fn buffered(&self) -> u64 {
                     self.inner.buffered()
+                }
+
+                /// [`is_busy`](Self::is_busy) and [`buffered`](Self::buffered),
+                /// folded into the one value a peer reads.
+                ///
+                /// **The same reading, not an equivalent one.** A peer's
+                /// `__status` on this actor is answered from these two loads,
+                /// through the same [`LocalActor::serving`](keylink::LocalActor::serving)
+                /// this calls, so a local caller and a peer cannot be told
+                /// different things about one actor.
+                ///
+                /// See [`Serving`](keylink::Serving) for what the pair does and
+                /// does not claim — in particular that `buffered` compares as a
+                /// predicate and never as a count, and that the two fields are
+                /// two loads rather than one instant.
+                ///
+                /// Synchronous, and that is the whole of it: it reads a flag
+                /// beside the mailbox and sends nothing, so it answers while a
+                /// turn is holding the actor.
+                #[must_use]
+                pub fn __status(&self) -> $crate::Serving {
+                    self.inner.serving()
                 }
 
                 /// Resolve when this actor ends, and say why.
@@ -2581,6 +2771,52 @@ macro_rules! __keylink_service {
                     &self.actor
                 }
 
+                /// What this actor is doing right now.
+                ///
+                /// The two facts a local
+                /// [`System::serving`](keylink::System::serving) reports, read
+                /// off the same lines on the serving node — see
+                /// [`Serving`](keylink::Serving) for what the pair does and does
+                /// not claim.
+                ///
+                /// **It never enters the mailbox**, so it answers while a turn
+                /// is holding the actor. That is the question's whole point: a
+                /// message asking would queue behind the turn that wedged it,
+                /// and would then report `busy: true` about itself.
+                ///
+                /// **It also does not mount anything.** An ordinary call to an
+                /// unmounted id on a
+                /// [`spawn_with`](keylink::SystemBuilder::spawn_with) system
+                /// builds the actor; this reads the registry and answers
+                /// [`NoSuchActor`](keylink::RemoteError::NoSuchActor). Asking
+                /// what an actor is doing must not be how one comes into
+                /// existence.
+                ///
+                /// A [`Middleware`](keylink::Middleware) on the serving side
+                /// sees this like any other method — under the name `"__Status"`
+                /// — so a node that does not want peers reading turn state
+                /// refuses it there.
+                ///
+                /// # Errors
+                ///
+                /// [`NoSuchActor`](keylink::RemoteError::NoSuchActor) when
+                /// nothing is mounted under this id, and
+                /// [`BadActorId`](keylink::RemoteError::BadActorId) when the id
+                /// is not one — checked before any lookup, so it says nothing
+                /// about what is mounted. Plus whatever the transport or a layer
+                /// answers.
+                pub async fn __status(&self) -> $crate::Result<$crate::Serving> {
+                    let (__response, _body) = self
+                        .client
+                        .send_to(
+                            &self.actor,
+                            Request::__Status {},
+                            $crate::Body::empty(),
+                        )
+                        .await?;
+                    __response.__into_status()
+                }
+
                 $(
                     $crate::__keylink_actor_client_method!(
                         [$( #[$meta] )*],
@@ -2686,6 +2922,43 @@ macro_rules! __keylink_service {
                     self.inner.watch()
                 }
 
+                /// What the actor answering this connection is doing right now.
+                ///
+                /// The two facts a local [`Handle`] reads through its own
+                /// `__status`, over the wire — see
+                /// [`Serving`](keylink::Serving) for what the pair does and does
+                /// not claim.
+                ///
+                /// **It never enters the mailbox**, so it answers while a turn
+                /// is holding the actor. That is the question's whole point: a
+                /// message asking would queue behind the turn that wedged it,
+                /// and would then report `busy: true` about itself.
+                ///
+                /// A [`Middleware`](keylink::Middleware) on the serving side
+                /// sees this like any other method — under the name `"__Status"`
+                /// — so a node that does not want peers reading turn state
+                /// refuses it there.
+                ///
+                /// # Errors
+                ///
+                /// [`NotAnActor`](keylink::RemoteError::NotAnActor) when this
+                /// node serves the service with a [`Handler`] rather than as an
+                /// actor. One ALPN carries both, so which one is behind a
+                /// connection is a fact about that node, and this is where a
+                /// peer learns it.
+                ///
+                /// [`Withheld::Gone`](keylink::Withheld::Gone) once the actor
+                /// has stopped — the same answer every other method gives for
+                /// that one condition. Plus whatever the transport or a layer
+                /// answers.
+                pub async fn __status(&self) -> $crate::Result<$crate::Serving> {
+                    let (__response, _body) = self
+                        .inner
+                        .call(Request::__Status {}, $crate::Body::empty())
+                        .await?;
+                    __response.__into_status()
+                }
+
                 $(
                     $crate::__keylink_client_method!(
                         [$( #[$meta] )*],
@@ -2746,6 +3019,28 @@ macro_rules! __keylink_service {
                 // it here is `clippy::double_must_use`.
                 pub fn watch(&self) -> $crate::Watch {
                     self.inner.watch()
+                }
+
+                /// What the actor answering this connection is doing right now.
+                ///
+                /// See [`Client::__status`], which this is. Present here because
+                /// this type is [`Client`]'s methods **minus every `tell`**, and
+                /// this is not one.
+                ///
+                /// The key rides along and buys nothing, which is honest rather
+                /// than useful: no handler is entered, so the serving side
+                /// releases the key instead of recording a reply under it, and a
+                /// retry reads the actor again rather than a status from before.
+                ///
+                /// # Errors
+                ///
+                /// [`Client::__status`]'.
+                pub async fn __status(&self) -> $crate::Result<$crate::Serving> {
+                    let (__response, _body) = self
+                        .inner
+                        .call(Request::__Status {}, $crate::Body::empty())
+                        .await?;
+                    __response.__into_status()
                 }
 
                 $(

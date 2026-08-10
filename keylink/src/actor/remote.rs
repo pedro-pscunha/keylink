@@ -58,7 +58,9 @@ use serde::{Deserialize, Serialize};
 
 use super::registry::{RouteError, System};
 use crate::turns::{lost, rendered, Reply};
-use crate::{ActorId, Body, BodyReader, Caller, Context, Outcome, Queueing, RemoteError, Rpc};
+use crate::{
+    ActorId, Body, BodyReader, Caller, Context, Outcome, Queueing, RemoteError, Rpc, Serving,
+};
 
 // ─────────────────────────────────────────────────────────── the wire wrapper
 
@@ -122,6 +124,20 @@ impl<T> Addressed<T> {
     #[must_use]
     pub fn split(self) -> (ActorId, T) {
         (self.actor, self.message)
+    }
+
+    /// Look at the message without taking the envelope apart.
+    ///
+    /// [`split`](Self::split) stays the reader for a delivery, and this is not a
+    /// second one: it borrows. Generated keyed dispatch needs it for the one
+    /// decision it makes before delivering anything — whether this is the
+    /// `__Status` question, which it answers itself — and splitting to look
+    /// would mean rebuilding an envelope a peer sent, out of parts held apart,
+    /// which is what `split` is consuming to prevent.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn message(&self) -> &T {
+        &self.message
     }
 }
 
@@ -551,6 +567,58 @@ pub async fn deliver_to_actor<S: KeyedService>(
         .await
         .map(|answered| rendered(answered, budget.map_or(0, Queueing::millis)))
         .map_err(|_| lost(fate.standing()))
+}
+
+/// What the actor this envelope addresses is doing, without delivering anything
+/// to it.
+///
+/// The non-enqueuing twin of [`deliver_to_actor`], and the keyed half of what a
+/// generated `__status` answers. Generated dispatch calls this **instead of**
+/// that one, above it in the same closure, and nothing enters a mailbox — which
+/// is the whole mechanism rather than an optimisation. `Handle::is_busy` states
+/// the constraint: a message asking this question would queue behind the turn
+/// that wedged the actor, and if it ever ran it would report `busy: true` about
+/// itself while its own permit counted in `buffered`. It would answer the state
+/// of asking rather than the state of the actor.
+///
+/// Governance is untouched by that. The layer chain runs above the dispatch
+/// closure, so a [`Middleware`](crate::Middleware) refuses `__Status` per peer
+/// and per method exactly as it refuses any other; what the interception removes
+/// is the mailbox, not the [`Allowlist`](crate::Allowlist) and not the layer.
+///
+/// # It reads, and routing is what inserts
+///
+/// [`System::serving`] takes the read lock, the way `System::contains` does.
+/// `Registry::route` takes the write lock and builds from the factory a
+/// [`SystemBuilder::spawn_with`](crate::SystemBuilder::spawn_with) system was
+/// given, so this question asked through routing would *create* the actor it was
+/// asked about. That is the one behaviour this door has that an ordinary keyed
+/// call does not, and it is why the answer comes from here rather than from a
+/// delivery that happens not to reach a handler.
+///
+/// # Errors
+///
+/// [`RemoteError::BadActorId`] for an id [`ActorId::validate`] refuses, checked
+/// first and before any lookup exactly as [`deliver_to_actor`] checks it, so it
+/// says nothing about what is mounted. Then [`RemoteError::NoSuchActor`] when
+/// nothing is mounted under a well-formed id — which deliberately does not
+/// separate *never existed* from *was stopped*, for the reason that variant
+/// carries.
+#[doc(hidden)]
+pub fn serving_of_actor<M, T>(
+    system: &System<M>,
+    request: &Addressed<T>,
+) -> std::result::Result<Serving, RemoteError> {
+    let actor = &request.actor;
+    actor.validate().map_err(|err| RemoteError::BadActorId {
+        id: actor.to_string(),
+        reason: err.to_string(),
+    })?;
+    system
+        .serving(actor)
+        .ok_or_else(|| RemoteError::NoSuchActor {
+            id: actor.to_string(),
+        })
 }
 
 #[cfg(test)]

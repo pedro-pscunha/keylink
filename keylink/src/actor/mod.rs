@@ -100,4 +100,4 @@ mod remote;
 pub use registry::{
     mount, ActorStatus, Eviction, Lifecycle, Mailbox, MountError, Mounted, System, SystemBuilder,
 };
-pub use remote::{deliver_to_actor, Addressed, KeyedService, Origin};
+pub use remote::{deliver_to_actor, serving_of_actor, Addressed, KeyedService, Origin};

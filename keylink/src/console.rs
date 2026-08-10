@@ -595,6 +595,30 @@ crate::service! {
     /// This node.
     rpc Node() -> NodeStatus;
 
+    /// Why the actor under `id` ended, if this log still holds the event.
+    ///
+    /// A lookup over the ring [`Follow`](inspect::Client::follow) already hands
+    /// out: [`LifecycleEvent::Ended`] is one of the events on every page, so
+    /// this returns a **subset** of what `Follow(0)` returns, to the same
+    /// allowlist. No new state, no new memory and no widening of what a peer
+    /// admitted here may read — a convenience, not a disclosure.
+    ///
+    /// `None` is **not** "still running". It is "this log has no ending for that
+    /// id", which covers an actor that is running, an actor that never existed,
+    /// and an actor whose ending has fallen out of the ring — and this module's
+    /// own limit, *no history before the [`Inspector`] existed*, is why the
+    /// third is not rare. Read [`Actors`](inspect::Client::actors) for what is
+    /// mounted now.
+    ///
+    /// The newest ending wins if an id was mounted, ended, and mounted again
+    /// inside the window.
+    ///
+    /// **Not `Ended`**, which is the name the wave was planned under: the
+    /// generated method would be `ended`, and every `service!` block already
+    /// puts an `ended` on its `Handle`. Two inherent methods of one name in one
+    /// impl block is `error[E0592]`, so the rpc could not have compiled.
+    rpc WhyEnded(id: ActorId) -> Option<EndReason>;
+
     /// The events after `after`, waiting until there is one.
     ///
     /// `#[defer]`, which is the whole design: a call with nothing to report is
@@ -786,6 +810,17 @@ impl inspect::Actor for Inspector {
             actors: (self.actors)().map_or(0, |rows| u64::try_from(rows.len()).unwrap_or(u64::MAX)),
             dropped: self.dropped.load(Ordering::Relaxed),
         }
+    }
+
+    async fn why_ended(&mut self, _cx: Caller<'_>, id: ActorId) -> Option<EndReason> {
+        // Newest first, so an id that was mounted, ended and mounted again
+        // inside the window answers about its latest ending rather than its
+        // first. Nothing is kept for this: the ring is the one `follow` reads,
+        // and the `Inspector` gains no field.
+        self.log.iter().rev().find_map(|(_, event)| match event {
+            LifecycleEvent::Ended { id: ended, why } if *ended == id => Some(why.clone()),
+            _ => None,
+        })
     }
 
     async fn follow(
