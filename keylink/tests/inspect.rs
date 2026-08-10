@@ -492,6 +492,118 @@ async fn an_actor_that_ends_itself_is_delisted_and_reported_to_the_console() {
     let _again = watched.mount(&who);
 }
 
+/// **`WhyEnded` answers from the ring, and answers `None` once the ending has
+/// fallen out of it.**
+///
+/// The whole method, in the two states that mean different things and read the
+/// same. It keeps no state of its own — the walk is over the `VecDeque`
+/// [`Console::events`] already reads — so the ring's bound is its bound, and a
+/// caller that reads `None` has learned that **this log** has no ending for that
+/// id. Not that the actor is running.
+///
+/// So the `None` half is asserted twice, from the two causes that produce it:
+/// an id that never existed, and an id whose ending this node genuinely recorded
+/// and has since dropped. A method that answered from a map of its own would pass
+/// the first and fail the second, which is why the first alone would be a weaker
+/// test than it looks.
+///
+/// **The eviction is driven rather than waited for.** `HISTORY` is two, and three
+/// further mounts are pushed after the ending; the loop below reads `follow(0)` —
+/// which advances nothing on the node — until the page it hands back no longer
+/// carries the ending. That is the ring having dropped it, observed, rather than
+/// a sleep that hoped it had.
+///
+/// Made red by `scripts/break-once.sh keylink/src/console.rs`, replacing
+/// `LifecycleEvent::Ended { id: ended, why } if *ended == id => Some(why.clone()),`
+/// with
+/// `LifecycleEvent::Ended { id: ended, why } if *ended != id => Some(why.clone()),`,
+/// so the walk answers about every actor except the one asked for. Watched:
+/// `the log holds this ending, so the lookup must find it: Elapsed(())` — the
+/// lookup is inside a bounded retry, so a `None` that never becomes `Some` is
+/// reported by the timeout rather than by the value. Registered as `S5`.
+#[tokio::test]
+async fn why_ended_answers_from_the_ring_and_none_once_it_falls_out() {
+    /// Small enough that three later mounts push an ending out of it, and larger
+    /// than one so the ring is a ring rather than a slot.
+    const HISTORY: usize = 2;
+
+    let watched = start(Eviction::Never, HISTORY, true).await;
+    let console = watched.console().await.expect("admitted");
+    let who = id("self-ender");
+
+    assert_eq!(
+        console
+            .why_ended(who.clone())
+            .await
+            .expect("the inspect actor answers"),
+        None,
+        "nothing has ended, and an id this node has never seen is one of the two \
+         ways `None` arises"
+    );
+
+    // The feed's sender is the only thing keeping this actor alive, so dropping
+    // it is the ending — with the loop's own reason, which no synthesis could
+    // produce.
+    let ticks = watched.mount(&who);
+    drop(ticks);
+
+    let ended = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(why) = console
+                .why_ended(who.clone())
+                .await
+                .expect("the inspect actor answers")
+            {
+                return why;
+            }
+        }
+    })
+    .await
+    .expect("the log holds this ending, so the lookup must find it");
+    assert_eq!(
+        ended,
+        EndReason::Feed {
+            name: "Ticks".to_owned()
+        },
+        "the reason is the loop's own, carried whole rather than flattened to a \
+         string"
+    );
+
+    // Three mounts against a ring of two, so the ending is provably behind the
+    // oldest sequence still held. `follow(0)` advances nothing on the node, which
+    // is what makes this loop free to run.
+    let client = watched.client().await;
+    let _later: Vec<_> = (0..3)
+        .map(|n| watched.mount(&id(&format!("obra/{n}"))))
+        .collect();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let page = client
+                .follow(0)
+                .await
+                .expect("the console reads")
+                .expect("a cursor of zero is behind any log, so it is never refused");
+            if !page.events.iter().any(
+                |event| matches!(event, LifecycleEvent::Ended { id: ended, .. } if *ended == who),
+            ) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("three mounts against a ring of two must push one ending out");
+
+    assert_eq!(
+        console
+            .why_ended(who.clone())
+            .await
+            .expect("the inspect actor answers"),
+        None,
+        "the ending this node recorded is gone from the ring, and `None` says \
+         exactly that — never that the actor is running"
+    );
+}
+
 /// **The console does not hold a handler open on an actor.**
 ///
 /// This is the criterion the whole `#[defer]` design exists for, and a weaker

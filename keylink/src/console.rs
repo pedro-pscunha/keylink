@@ -952,6 +952,22 @@ impl Console {
         self.client.node().await
     }
 
+    /// Why the actor under `id` ended, if that node's log still holds the event.
+    ///
+    /// See the rpc it calls,
+    /// [`WhyEnded`](inspect::Client::why_ended), for what `None` covers — and in
+    /// particular that it is **not** "still running".
+    ///
+    /// It does not touch this console's cursor. [`Self::events`] is a stream and
+    /// this is a lookup, so asking it inside a follow loop skips nothing.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the call failed with.
+    pub async fn why_ended(&self, id: ActorId) -> Result<Option<EndReason>> {
+        self.client.why_ended(id).await
+    }
+
     /// The next events, waiting until there are some.
     ///
     /// Advances the cursor, so a loop over this sees every event the node's log

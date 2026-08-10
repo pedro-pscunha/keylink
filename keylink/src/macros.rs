@@ -125,6 +125,95 @@
 /// RPC names are written in `CamelCase` (they become enum variants); the
 /// generated methods are `snake_case`.
 ///
+/// ### A declared name landing on a taken one is refused, per surface
+///
+/// The generated method goes into an `impl` block that already has methods of
+/// its own, so a declaration whose `snake_case` form is one of theirs is two
+/// inherent methods of one name in one block. There is no reserved-word list
+/// anywhere in this macro: the refusal is the compiler's, and the taken set is
+/// therefore **per surface** — `at` is free on a `Handle` and taken on a keyed
+/// client, `ended` is the other way round.
+///
+/// ```compile_fail
+/// // Fails with `error[E0592]: duplicate definitions with name `is_busy``,
+/// // against the `is_busy` this macro puts on every `Handle`.
+/// //
+/// // The code is named HERE and deliberately NOT on the fence. rustdoc does not
+/// // check the code after `compile_fail`, so an annotated code asserts a
+/// // verification it does not perform — this project has shipped five guards
+/// // that were satisfiable without proving their claim, and a fence reading
+/// // `compile_fail,E0592` is how the sixth would look.
+/// //
+/// // Measured rather than predicted: lifting the tag reports **one** error and
+/// // it is that one, so there is no second cause this fence could be satisfied
+/// // by. `rpc Fill` is not padding — a `service!` of one method generates an
+/// // `into_<rpc>` whose catch-all arm is `unreachable_patterns`.
+/// //
+/// // Watched green, which is the failure direction for a `compile_fail`: rename
+/// // the generated `pub fn is_busy` on `Handle` and this reports *"Test compiled
+/// // successfully, but it's marked `compile_fail`"*.
+/// keylink::service! {
+///     service Orders;
+///     rpc Fill(price: u64) -> u64;
+///     rpc IsBusy() -> bool;
+/// }
+/// ```
+///
+/// ### `__Status` is a name a user cannot take, and that is measured here
+///
+/// The generated `__status` follows this file's internal convention — `__Status`
+/// on the wire, `__status` as the method — and a convention is not a mechanism.
+/// The question the wave was planned around is whether a legal `CamelCase` ident
+/// can reach that same spelling.
+///
+/// **It can, and that is not the reservation.** `pastey`'s `:snake` takes
+/// `__Status` to `__status` like any other ident — leading underscores are not
+/// special to it — and the fence below is where that is read off a compiler,
+/// because one of the errors it reports is a duplicate `__status`. The name is
+/// therefore **taken**, not unreachable, and the two are worth keeping apart: an
+/// unreachable name would need no guard at all, while a taken one is held by the
+/// same `E0592` the fence above pins, and stops being held the moment the
+/// expansion stops declaring it.
+///
+/// `__Status` **is** a legal Rust ident and a legal declaration position, so this
+/// compiles or it does not, and the run decides:
+///
+/// ```compile_fail
+/// // Does not compile, measured: **23 errors**, of which the two that are about
+/// // the name are `error[E0428]: the name `__Status` is defined multiple times`
+/// // and `error[E0592]: duplicate definitions with name `__status``. The other
+/// // twenty-one are the wreckage a duplicate variant leaves in the expansion's
+/// // own matches — twelve `E0004`, five `E0308`, one `E0631`.
+/// //
+/// // The codes are named HERE and not on the fence, for the reason the fence
+/// // above gives.
+/// //
+/// // **The control is the same block with the underscores removed**, and it is
+/// // what makes this a statement about the name rather than about the shape:
+/// // `rpc Status()` in this position COMPILES, which is why one is not the
+/// // guard for the other. So the refusal below is attributable to `__Status`
+/// // and to nothing else in the block.
+/// //
+/// // What a green here would mean is not "a doctest rotted": it would mean the
+/// // expansion had stopped declaring `__Status`, a user could then declare it,
+/// // and the name this crate answers a peer's status question by would have to
+/// // change — which moves the ALPN of every service in the fleet.
+/// //
+/// // **That green is NOT watched, and no substitution reaches it.** The fence
+/// // above was, by renaming one method; this one would need the `__Status`
+/// // variant gone from every match the expansion writes over it, and any
+/// // partial cut is a crate that does not build — which is an abort and not a
+/// // green. So this fence rests on the measurement recorded above and on its
+/// // control, and the green direction is reasoned rather than observed.
+/// //
+/// // The measurement itself is cheap to repeat: lift the tag and read the run.
+/// keylink::service! {
+///     service Orders;
+///     rpc Fill(price: u64) -> u64;
+///     rpc __Status() -> u64;
+/// }
+/// ```
+///
 /// ## `#[defer]`: one attribute keylink reads, and the rest it forwards
 ///
 /// An `rpc` marked `#[defer]` is handed its own reply channel and may answer from

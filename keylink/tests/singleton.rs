@@ -615,6 +615,60 @@ async fn a_handler_sees_the_calling_peer() {
     server.shutdown().await.expect("stops");
 }
 
+/// **A concurrently served service refuses `__status` rather than folding one.**
+///
+/// The third arm of the generated status door, and the one nobody asks for. One
+/// ALPN carries both ways of serving a singleton — the same `Request` reaches a
+/// `Handler` and an `Actor`, which is what
+/// `the_same_client_reaches_a_handler_and_an_actor` is about — so a peer cannot
+/// know which is behind its connection, and the concurrent dispatch has to answer
+/// this somehow.
+///
+/// **It refuses, and a truthful `Serving` is what it refuses to send.** Every
+/// call here takes its own task, so nothing is ever inside a serial turn and
+/// nothing is ever queued behind one: `Serving { busy: false, buffered: 0 }`
+/// would be *true* and a peer could not tell it from an idle actor. A diagnostic
+/// whose "nothing is happening" is indistinguishable from "this question does not
+/// apply here" is the silent fallback this crate refuses, so the answer is a
+/// typed variant of its own.
+///
+/// The ordinary call beside it is not padding: it is what makes this a statement
+/// about one method rather than about a service that is not reachable at all.
+///
+/// Made red by `scripts/break-once.sh keylink/src/macros.rs`, replacing the
+/// concurrent arm's `$crate::RemoteError::NotAnActor,` with
+/// `$crate::RemoteError::NoSuchActor { id: ::std::string::String::new() },`.
+/// Watched:
+/// `a concurrent service must refuse this question by name: Remote(NoSuchActor { id: "" })`.
+/// Registered as `S4`.
+#[tokio::test]
+async fn a_concurrent_service_refuses_status_by_name() {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let server = ledger::serve(&node, ConcurrentLedger, Allowlist::anyone()).expect("serves");
+    let client = ledger::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+
+    assert_eq!(
+        client.entries().await.expect("answers"),
+        Vec::<u64>::new(),
+        "the service is reachable, so the refusal below is about the method"
+    );
+
+    let refused = client
+        .__status()
+        .await
+        .expect_err("a handler has no turn to report");
+    assert!(
+        matches!(refused, keylink::Error::Remote(RemoteError::NotAnActor)),
+        "a concurrent service must refuse this question by name: {refused:?}"
+    );
+
+    client.close().await.expect("closes");
+    server.shutdown().await.expect("stops");
+}
+
 // ───────────────────────────────────────────────────── shedding queued load
 
 /// `QueueTimeout` refuses a message that is still **queued** and never one that
