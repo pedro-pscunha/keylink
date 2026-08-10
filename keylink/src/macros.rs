@@ -4255,6 +4255,56 @@ macro_rules! __keylink_calls_decl {
 /// as duplicated documentation and is not: an attribute that removes a method —
 /// a `#[cfg]` on the `rpc` — has to remove it from the trait and from all four
 /// impls together, or the expansion is `E0046` at whichever end kept it.
+///
+/// # Four uses, and the fifth that is not written
+///
+/// `blocking::Client` gets no impl. It is synchronous, every method here returns
+/// a future, and the blocking side has no local surface at all — there is no
+/// `blocking::Handle`, so a synchronous twin of this trait would range over two
+/// surfaces that are both remote and both governed, which is not the genericity
+/// anyone asked for.
+///
+/// That is an **absence**, so no call can assert it and no break record can
+/// substitute a line for it. It is held from a doctest, which compiles as its
+/// own crate and is therefore the position a downstream author meets the refusal
+/// from.
+///
+/// ```compile_fail
+/// // Fails with `E0277`: `depot::blocking::Client` is not a calling surface for
+/// // this service, which is the generated trait's own
+/// // `#[diagnostic::on_unimplemented]` message.
+/// //
+/// // The code is named HERE and deliberately NOT on the fence. rustdoc does not
+/// // check the code after `compile_fail`, so an annotated code asserts a
+/// // verification it does not perform — this project has shipped five guards
+/// // that were satisfiable without proving their claim, and a fence reading
+/// // `compile_fail,E0277` is how the sixth would look.
+/// //
+/// // What stops this passing for the WRONG reason is the FIRST call below.
+/// // `depot::Client` is one of the four implementors, so the service, the
+/// // generated trait, the bound and the function signature all have to resolve
+/// // before the compiler reaches the second call. And `blocking` is a DEFAULT
+/// // feature, so `depot::blocking::Client` is a type that exists: the failure
+/// // is the missing impl and not a missing name.
+/// //
+/// // AND `mise run features` RUNS THIS DOCTEST UNDER `--no-default-features`,
+/// // where it passes for exactly the wrong reason. Measured with the fence off:
+/// // `error[E0433]: cannot find `blocking` in `depot``. A `compile_fail` passes
+/// // on any failure, so that run proves nothing about this guard, and the run
+/// // that does is the default-feature one — `cargo test -p keylink --doc`.
+/// keylink::service! {
+///     service Depot;
+///
+///     rpc Count() -> u64;
+/// }
+///
+/// fn a_calling_surface<C: depot::Calls>(_: &C) {}
+///
+/// fn refused(asynchronous: &depot::Client, synchronous: &depot::blocking::Client) {
+///     a_calling_surface(asynchronous);
+///     a_calling_surface(synchronous);
+/// }
+/// ```
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_calls_impl {

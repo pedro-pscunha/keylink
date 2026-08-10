@@ -124,6 +124,52 @@ pub type Dispatch<Req, Resp> =
 /// line. What makes it tolerable is the same thing too — the boundary this crate
 /// defends is the **peer**, and no peer can reach any of this. A forged marker
 /// tells you about your own binary.
+///
+/// # The refusal, held by a doctest
+///
+/// A `Handle` satisfies `Calls` and must not satisfy this. There is no call that
+/// can assert that — the claim is an **absence**, and an absence has nothing to
+/// drive — so it is held from a doctest, which compiles as its own crate and is
+/// therefore the position a downstream author writes the bound from.
+///
+/// ```compile_fail
+/// // Fails with `E0277`: `depot::Handle<Counter>` does not reach the actor
+/// // through a `Dispatch`, which is this trait's own
+/// // `#[diagnostic::on_unimplemented]` message.
+/// //
+/// // The code is named HERE and deliberately NOT on the fence. rustdoc does not
+/// // check the code after `compile_fail`, so an annotated code asserts a
+/// // verification it does not perform — this project has shipped five guards
+/// // that were satisfiable without proving their claim, and a fence reading
+/// // `compile_fail,E0277` is how the sixth would look.
+/// //
+/// // What stops this passing for the WRONG reason is the FIRST call below.
+/// // `depot::Client` satisfies both halves of the bound, so the service, the
+/// // generated trait, this trait's path, the actor impl and the function
+/// // signature all have to resolve before the compiler ever reaches the second
+/// // call. `Handle<Counter>` satisfies `Calls` too — it is one of the four
+/// // implementors — so `Governed` is the one bound left to fail on.
+/// keylink::service! {
+///     service Depot;
+///
+///     rpc Count() -> u64;
+/// }
+///
+/// struct Counter;
+///
+/// impl depot::Actor for Counter {
+///     async fn count(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+///         0
+///     }
+/// }
+///
+/// fn a_governed_calling_surface<C: depot::Calls + keylink::Governed>(_: &C) {}
+///
+/// fn refused(served: &depot::Client, local: &depot::Handle<Counter>) {
+///     a_governed_calling_surface(served);
+///     a_governed_calling_surface(local);
+/// }
+/// ```
 #[diagnostic::on_unimplemented(
     message = "`{Self}` does not reach the actor through a `Dispatch`",
     label = "not a governed surface",
