@@ -3264,8 +3264,33 @@ pub enum Unanswered {
     /// Outside [`Withheld`] for [`Reentrant`](Self::Reentrant)'s reason and not a
     /// weaker one: the refusal happens before the message reaches the mailbox, so
     /// nothing ran and nothing was withheld. It is the second fact of that shape,
-    /// and [`NotQueued::Full`] carries the whole argument — including why the
-    /// arguments are gone and which door loses nothing instead.
+    /// and [`NotQueued::Full`] carries the rest of the argument — including why
+    /// the arguments are gone and which door loses nothing instead.
+    ///
+    /// # Why this is a variant here rather than an eighth [`Withheld`]
+    ///
+    /// This is what the release's major version bought, so the three grounds are
+    /// written out rather than pointed at. A fold into `Withheld` would have cost
+    /// no variant on this enum and broken no exhaustive match on it.
+    ///
+    /// 1. **[`Withheld`] is a verdict on a turn that ran.** Every variant it has
+    ///    describes what happened to a turn that exists, and a shed message never
+    ///    reached the mailbox. [`Reentrant`](Self::Reentrant) is the standing
+    ///    precedent and it was decided the same way, before this variant existed.
+    /// 2. **[`Withheld`] crosses the wire and this enum does not.** It derives
+    ///    `Schema`, so an eighth variant moves the ALPN and the break lands on
+    ///    every peer — including deployments that never spawn under
+    ///    [`Backpressure::Shed`]. Breaking three local
+    ///    enums leaves the wire where it is.
+    /// 3. **The downstream break is the same either way.** This type's own
+    ///    exhaustiveness heading says a new `Withheld` variant reaches a caller
+    ///    *one level in*, so a caller who matched
+    ///    [`Turn`](Self::Turn)`(..)` exhaustively is broken by the fold as surely
+    ///    as by this variant. The alternative buys no compatibility; it moves the
+    ///    same break onto a type that need not move at all.
+    ///
+    /// Injectivity is **not** one of the grounds, and the `From<NotQueued>` impl
+    /// below says so where a reader is likeliest to reach for it.
     ///
     /// **Unreachable under [`Backpressure::Park`]**, which is the default. Retry
     /// after a backoff, or take a [`Permit`] and keep the arguments.
@@ -3384,10 +3409,12 @@ pub enum NotQueued {
     /// doors, and carries the same message: the actor is **still running** — it is
     /// running the turn this call was made from.
     ///
-    /// [`TurnLost::Reentrant`] carries it too, so this sentence lives on three
-    /// enums — and it is **one of the two** that still do, now that every other
-    /// loss is one [`Withheld`] value read by three doors. [`Full`](Self::Full) is
-    /// the second, and the two are the same shape for the same reason: both are
+    /// [`TurnLost::Reentrant`] carries it too, and
+    /// [`Failure::Reentrant`](crate::Failure::Reentrant) at the door reached
+    /// through the bound — so this sentence lives on four enums, and it is **one
+    /// of the two** that still do, now that every other loss is one [`Withheld`]
+    /// value read by three doors. [`Full`](Self::Full) is the second, and the two
+    /// are the same shape for the same reason: both are
     /// facts about a message that never entered the mailbox, so neither has a turn
     /// for [`Withheld`] to be a verdict on.
     /// `one_vocabulary_and_every_loss_in_it_has_a_producer` holds all three, this
@@ -3426,10 +3453,15 @@ pub enum NotQueued {
     /// fact about a mailbox its owner asked to refuse.
     ///
     /// [`Unanswered::Full`] and [`TurnLost::Full`] are the same fact at the doors
-    /// that wanted a value, and a peer reads
-    /// [`RemoteError::MailboxFull`]. Four names
+    /// that wanted a value, [`Failure::Full`](crate::Failure::Full) at the door
+    /// reached through the bound, and a peer reads
+    /// [`RemoteError::MailboxFull`]. Five names
     /// for one condition, because a caller matches the answer of the door it used
-    /// — the arrangement [`Reentrant`](Self::Reentrant) already has.
+    /// — the arrangement [`Reentrant`](Self::Reentrant) already has. **Three of
+    /// the five read alike**, and the two that do not are deliberate:
+    /// `Failure::Full` says *call* where they say *message*, which is the door it
+    /// answers, and `RemoteError::MailboxFull` says *back off rather than retry*,
+    /// because a peer holds no permit to take instead.
     #[error("the actor's mailbox is full and it shed this message")]
     Full,
 }
@@ -3452,6 +3484,14 @@ pub enum NotQueued {
 /// two enums start disagreeing about one fact. Widening loses nothing because the
 /// mapping above is **injective**: each `NotQueued` state has one name over here
 /// and no two collapse onto the same one.
+///
+/// **Injectivity is a property of this conversion and it decides nothing about
+/// where [`Full`](Unanswered::Full) lives.** A merge gate read this paragraph as
+/// the reason the release broke three enums, so it is worth saying that it is
+/// not: `Full => Turn(Withheld::Full)` is injective too, so the one-variant
+/// alternative passes this test exactly as the shipped mapping does. What refuses
+/// that alternative is [`Unanswered::Full`]'s own heading, on three grounds that
+/// have nothing to do with collisions.
 ///
 /// `impl From` rather than a named method so that `?` performs it, which puts the
 /// widening at the call site and leaves nothing to forget. Both callers today are
@@ -5464,6 +5504,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    // `Failure` is the fourth enum carrying the two hand-written sentences, and
+    // it is the one this module does not otherwise name.
+    use crate::Failure;
 
     /// None of [`lost`]'s three answers is a [`RemoteError::Failed`], so none
     /// carries a prefix and no `starts_with` will ever find one.
@@ -5728,6 +5771,62 @@ mod tests {
         }
     }
 
+    /// The name this state carries in the sample the walk below builds.
+    ///
+    /// # An array is not a match, and these three do not make it one
+    ///
+    /// [`every_withheld`]'s doc carries the whole argument: exhaustiveness forces
+    /// an **arm**, and nothing in Rust forces an **entry** in a sample. What
+    /// closed that hole for [`Withheld`] was [`schema_variants`], off a derive —
+    /// and [`Withheld`] is the only one of these four enums that has one, because
+    /// it is the only one that crosses the wire.
+    ///
+    /// **This is what is available for the other three, and it is worth saying
+    /// what it does and does not buy.** It does not force an entry. It puts
+    /// `error[E0004]` **in this module**, in the file that holds the arrays, so
+    /// an author who adds a fourth [`NotQueued`] state stops at a compile error
+    /// three lines from the array they have to extend — rather than at a guard
+    /// that quietly walks 3 of 4 and passes, which is what this test did for
+    /// [`Full`](NotQueued::Full) until it was found by review. The literal name
+    /// sets in the walk are the other half: a dropped entry fails an assertion
+    /// that **names it**, where a length comparison against the array's own
+    /// `len()` is a tautology and reports nothing.
+    ///
+    /// The strings are hand-written and self-checking, for [`variant_name`]'s
+    /// reason: a typo puts a name in one set and not the other, in both
+    /// directions.
+    fn not_queued_name(one: &NotQueued) -> &'static str {
+        match one {
+            NotQueued::Closed => "Closed",
+            NotQueued::Reentrant => "Reentrant",
+            NotQueued::Full => "Full",
+        }
+    }
+
+    /// [`not_queued_name`]'s, for the enum the value doors answer.
+    fn unanswered_name(one: &Unanswered) -> &'static str {
+        match one {
+            Unanswered::Turn(_) => "Turn",
+            Unanswered::Reentrant => "Reentrant",
+            Unanswered::Full => "Full",
+        }
+    }
+
+    /// [`not_queued_name`]'s, for the enum `ask_catching` answers.
+    ///
+    /// [`twin`] is already exhaustive over this type, so the compile error was
+    /// here before this function was. What was missing is the half that names a
+    /// dropped entry: `twin` answering `None` more often is caught by the count
+    /// below it, and an entry that never existed is not.
+    fn turn_lost_name(one: &TurnLost) -> &'static str {
+        match one {
+            TurnLost::Turn(_) => "Turn",
+            TurnLost::Faulted(_) => "Faulted",
+            TurnLost::Reentrant => "Reentrant",
+            TurnLost::Full => "Full",
+        }
+    }
+
     /// One vocabulary, every loss in it reachable, and no two of them saying the
     /// same sentence.
     ///
@@ -5741,26 +5840,29 @@ mod tests {
     ///
     /// **The type system is not the replacement, and saying it is would be the
     /// mistake worth naming.** It gives non-drift on the shared arm and nothing
-    /// else: not the two hand-written `Reentrant` texts, not the sentences a
+    /// else: not the four hand-written `Reentrant` texts, not the sentences a
     /// `NotQueued` widens onto, not collisions between two `Withheld` variants,
     /// and — most of all — **not reachability**. Nothing in Rust says a variant
     /// has a producer, which is exactly how
     /// [`Expired`](Withheld::Expired) reached zero reachable ones without a gate
-    /// noticing. So seven properties are held here by hand, and each one is a way
+    /// noticing. So nine properties are held here by hand, and each one is a way
     /// this could go wrong that the compiler cannot see.
     ///
-    /// # The seven
+    /// # The nine
     ///
-    /// 1. **The two `Reentrant` texts match.** They are hand-written on two
-    ///    enums, and they are the only pair in the crate that still is.
-    /// 2. **[`NotQueued`]'s two states read as their widenings do**, through
+    /// 1. **The four `Reentrant` texts match.** They are hand-written on
+    ///    [`TurnLost`], [`Unanswered`], [`NotQueued`] and [`Failure`], and they
+    ///    are one of the two sets in the crate that still are. This property
+    ///    covers the first two, through [`twin`]; property 8 covers the fourth,
+    ///    which no conversion reaches.
+    /// 2. **[`NotQueued`]'s three states read as their widenings do**, through
     ///    `From<NotQueued> for Unanswered` — the conversion the crate performs,
     ///    not a copy that could agree with nothing. That impl is exhaustive, so a
-    ///    third state is `error[E0004]` on **production** code.
+    ///    fourth state is `error[E0004]` on **production** code.
     /// 3. **No two sentences collide across the whole [`Unanswered`] surface**,
     ///    which is every `Withheld` wrapped in [`Turn`](Unanswered::Turn) plus
-    ///    `Reentrant`. Checking only inside `Withheld` would pass a copy-paste
-    ///    that gave [`Gone`](Withheld::Gone) the re-entrancy sentence.
+    ///    `Reentrant` and `Full`. Checking only inside `Withheld` would pass a
+    ///    copy-paste that gave [`Gone`](Withheld::Gone) the re-entrancy sentence.
     /// 4. **No `#[error]` text is empty**, which refuses an equality that holds
     ///    because both sides are `""`.
     /// 5. **Every `Withheld` has a producer**, checked by *calling* it — see
@@ -5769,12 +5871,25 @@ mod tests {
     /// 6. **The fault exception is exactly one variant wide**, so a [`twin`] that
     ///    answered `None` to everything — and therefore skipped every comparison
     ///    in property 1 — is refused.
-    /// 7. **The sample is every variant the enum has**, compared against the list
-    ///    `#[derive(Schema)]` wrote — see [`schema_variants`]. Without it the
-    ///    other six are properties of *whatever [`every_withheld`] happens to
-    ///    hold*: an eighth loss forces an arm in [`produced`] and in
+    /// 7. **The [`Withheld`] sample is every variant the enum has**, compared
+    ///    against the list `#[derive(Schema)]` wrote — see [`schema_variants`].
+    ///    Without it the others are properties of *whatever [`every_withheld`]
+    ///    happens to hold*: an eighth loss forces an arm in [`produced`] and in
     ///    [`variant_name`], and neither forces an entry in that array, so the walk
     ///    would cover 7 of 8 and pass.
+    /// 8. **[`Failure`]'s two hand-written sentences are compared directly**,
+    ///    because no `From` reaches that type from any of the other three.
+    ///    `Reentrant` must read as [`Unanswered::Reentrant`] does, and
+    ///    [`Failure::Full`] must **not**: it says *call* where the other three say
+    ///    *message*, which is the door it answers rather than drift, and the
+    ///    inequality is what stops that difference being unified by accident.
+    /// 9. **Each of the other three samples is every variant its enum has**,
+    ///    against a literal set of names — see [`not_queued_name`]. It is property
+    ///    7's job done with the one mechanism these three have, and it is weaker:
+    ///    they cross no wire, so no derive writes their variant list and nothing
+    ///    forces an *entry*. What it buys is `error[E0004]` **in this module**
+    ///    beside the arrays, and an assertion that names the entry that went
+    ///    missing.
     ///
     /// # What each property can hold for, if it held for nothing
     ///
@@ -5785,24 +5900,37 @@ mod tests {
     /// is compared against a literal `["Expired"]` rather than a length, which is
     /// what makes it by-name.
     ///
-    /// Property 3's count is against the sample's own length, so a walk over a
-    /// subset cannot pass it. Property 2 asserts both that no two states widen
-    /// onto one answer and that the walk wrote as many as it read, because the
-    /// first alone is satisfied by a loop that ran zero times.
+    /// Property 3's count is against the sample's own length, so it catches a
+    /// collision and **not** a short sample — seven distinct sentences out of
+    /// eight variants pass it, and property 9 is what refuses that. Property 2
+    /// asserts both that no two states widen onto one answer and that the walk
+    /// wrote as many as it read, and that second count is a **literal 3**: read
+    /// off `queued.len()` it compared the array against itself and held for an
+    /// array of any length, including one a new variant had been left out of.
     ///
     /// **The equality in property 1's walk is trivially true on the
     /// [`Turn`](TurnLost::Turn) arm** — both sides render `{0}` of the same
     /// value — and that is said rather than left for a reader to discover. The
-    /// arm that can fail is `Reentrant`, and it is the arm the property is about.
+    /// arms that can fail are `Reentrant` and `Full`, and they are the arms the
+    /// property is about.
     ///
-    /// # Made red three times, one per novel property
+    /// # Made red seven times, one per novel property
     ///
-    /// By `scripts/break-once.sh keylink/src/turns.rs`, filtered on this test's
-    /// own name plus `-p keylink --lib`. All three edits are in **this** file, so
-    /// none of the first two is quoted — a record quoting its own search literal
-    /// is a second occurrence and the harness aborts at "found 2". The third is
-    /// quoted, and measured: `Withheld::Expired,` with its twelve spaces counts 1,
-    /// because this record's own quote of it is not indented that way.
+    /// By `scripts/break-once.sh`, filtered on this test's own name plus
+    /// `-p keylink --lib`. Six edits are in **this** file and the seventh is in
+    /// `keylink/src/error.rs`, so a quote of one of the six is a second
+    /// occurrence unless it is unindented — the harness aborts at "found 2" — and
+    /// the seventh is counted in the file it breaks, where this record is not.
+    /// Measured: `Withheld::Expired,` with its twelve spaces counts 1, because
+    /// this record's own quote of it is not indented that way.
+    ///
+    /// **Four of the seven were added when a merge gate found the guard blind to
+    /// [`Full`](Unanswered::Full).** The release put that variant on three enums
+    /// and grew none of the three samples, so the walk covered 2 of 3, 3 of 4 and
+    /// 2 of 3 — and the only mechanical thing holding the array to the enum was a
+    /// comparison of `queued.len()` against itself. Breaks (a) and (b) are the two
+    /// that were green before it, on a branch whose headline is the variant they
+    /// perturb.
     ///
     /// - point [`produced`]'s gone arm at the wrong producer: search
     ///   `Withheld::Gone => from_lost(Standing::Gone),` and replace it with
@@ -5822,6 +5950,35 @@ mod tests {
     ///   indentation** — bare, each counts 2, because this line is the second. The
     ///   indented search literal counts 1. Watched:
     ///   `every_withheld is not every Withheld`.
+    /// - **(a)** point the widening at the wrong answer: search
+    ///   `NotQueued::Full => Self::Full,` and replace it with
+    ///   `NotQueued::Full => Self::Reentrant,`. Watched:
+    ///   `one fact must read as one sentence: Full and Reentrant`,
+    ///   `left: "the actor's mailbox is full and it shed this message"`,
+    ///   `right: "this call was made from inside the target actor's own turn: it would deadlock"`.
+    ///   **Green before this fix**, because `queued` held two of the three states
+    ///   and the arm was never called.
+    /// - **(b)** the same at the other door: search
+    ///   `TurnLost::Full => Some(Unanswered::Full),` and replace it with
+    ///   `TurnLost::Full => Some(Unanswered::Reentrant),`. Watched: the same
+    ///   sentence and the same two texts, from property 1's walk rather than
+    ///   property 2's. **Green before this fix**, for the same reason: `losses`
+    ///   held three of the four.
+    /// - **(c)** hand the walk the sample this branch shipped with: search
+    ///   `let queued = [NotQueued::Closed, NotQueued::Reentrant, NotQueued::Full];`
+    ///   and replace it with
+    ///   `let queued = [NotQueued::Closed, NotQueued::Reentrant];`. Watched:
+    ///   ``queued` is not every `NotQueued``, `left: {"Closed", "Reentrant"}`,
+    ///   `right: {"Closed", "Full", "Reentrant"}`. This is the break that names
+    ///   the defect the gate found, and it is the one the old `queued.len()`
+    ///   comparison could not express at all.
+    /// - **(d)** drift [`Failure`]'s copy of the re-entrancy sentence, in
+    ///   `keylink/src/error.rs` and so counted there: search
+    ///   `#[error("this call was made from inside the target actor's own turn: it would deadlock")]`
+    ///   — which is unique in that file, where the same text appears twice in this
+    ///   one — and replace `it would deadlock` with `it deadlocks`. Watched:
+    ///   ``one fact must read as one sentence, and `Failure` has no `From` to
+    ///   perform the comparison for it``. Nothing held this text before property 8.
     #[test]
     fn one_vocabulary_and_every_loss_in_it_has_a_producer() {
         let every = every_withheld();
@@ -5859,8 +6016,14 @@ mod tests {
             .iter()
             .cloned()
             .map(Unanswered::Turn)
-            .chain([Unanswered::Reentrant])
+            .chain([Unanswered::Reentrant, Unanswered::Full])
             .collect();
+        assert_eq!(
+            surface.iter().map(unanswered_name).collect::<BTreeSet<_>>(),
+            BTreeSet::from(["Turn", "Reentrant", "Full"]),
+            "the surface is not every `Unanswered`: the set on the left is what \
+             this sample holds and the one on the right is written out once",
+        );
         let words: BTreeSet<String> = surface.iter().map(ToString::to_string).collect();
         assert_eq!(
             words.len(),
@@ -5873,12 +6036,20 @@ mod tests {
         );
 
         // 1 and 6. The fault is the one loss `ask` resumes instead of reporting,
-        // and `Reentrant` is the one sentence still written twice.
+        // and `Reentrant` and `Full` are the two sentences four enums still write
+        // out by hand.
         let losses = [
             TurnLost::Turn(Withheld::Gone),
             TurnLost::Reentrant,
+            TurnLost::Full,
             TurnLost::Faulted(catching(|| panic!("faulted")).expect_err("it panicked")),
         ];
+        assert_eq!(
+            losses.iter().map(turn_lost_name).collect::<BTreeSet<_>>(),
+            BTreeSet::from(["Turn", "Faulted", "Reentrant", "Full"]),
+            "`losses` is not every `TurnLost`: the set on the left is what this \
+             sample holds and the one on the right is written out once",
+        );
         let mut without_a_twin = 0;
         for one in &losses {
             match twin(one) {
@@ -5896,7 +6067,13 @@ mod tests {
         );
 
         // 2. The third enum, through the widening the crate actually performs.
-        let queued = [NotQueued::Closed, NotQueued::Reentrant];
+        let queued = [NotQueued::Closed, NotQueued::Reentrant, NotQueued::Full];
+        assert_eq!(
+            queued.iter().map(not_queued_name).collect::<BTreeSet<_>>(),
+            BTreeSet::from(["Closed", "Reentrant", "Full"]),
+            "`queued` is not every `NotQueued`: the set on the left is what this \
+             sample holds and the one on the right is written out once",
+        );
         let mut widened = BTreeSet::new();
         for one in &queued {
             let mine = Unanswered::from(*one);
@@ -5912,8 +6089,27 @@ mod tests {
         }
         assert_eq!(
             widened.len(),
-            queued.len(),
-            "every `NotQueued` state is widened exactly once: {widened:?}",
+            3,
+            "every `NotQueued` state is widened exactly once, and the three is a \
+             literal for the reason `[\"Expired\"]` above is one: read off \
+             `queued.len()` both sides came from the same hand-written array and \
+             the comparison held for any array at all: {widened:?}",
+        );
+
+        // 8. The fourth enum, which no conversion reaches, so it is compared
+        // against the vocabulary directly.
+        assert_eq!(
+            Failure::Reentrant.to_string(),
+            Unanswered::Reentrant.to_string(),
+            "one fact must read as one sentence, and `Failure` has no `From` to \
+             perform the comparison for it",
+        );
+        assert_ne!(
+            Failure::Full.to_string(),
+            Unanswered::Full.to_string(),
+            "`Failure::Full` says *call* where the other three say *message*, \
+             which is the door it answers and not drift — this fires when the \
+             two are unified, which is a decision rather than a fix",
         );
     }
 

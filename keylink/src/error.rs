@@ -265,6 +265,13 @@ pub enum Failure {
     /// made from. **No served surface produces this**, and the argument is in
     /// [`Unanswered::Reentrant`]: a request from a peer arrives on a
     /// connection's task, which has run no turn.
+    ///
+    /// The text below is the **fourth** copy of one sentence, beside
+    /// [`Unanswered::Reentrant`], [`NotQueued::Reentrant`](crate::NotQueued::Reentrant)
+    /// and [`TurnLost::Reentrant`](crate::TurnLost::Reentrant). No `From` reaches
+    /// this type from any of them, so `turns.rs`'s
+    /// `one_vocabulary_and_every_loss_in_it_has_a_producer` compares this one
+    /// directly rather than through a conversion.
     #[error("this call was made from inside the target actor's own turn: it would deadlock")]
     Reentrant,
 
@@ -277,6 +284,13 @@ pub enum Failure {
     /// [`RemoteError::MailboxFull`], and folding either into
     /// [`Other`](Self::Other) would leave the two sides matching one condition in
     /// two places again. It says *back off*; it does not say *retry now*.
+    ///
+    /// **It reads *call* where the other three read *message*, and that is
+    /// deliberate.** This is the one of the four doors that took a call rather
+    /// than a message — a `tell` answers [`NotQueued`](crate::NotQueued) and never
+    /// arrives here. The same guard that holds the `Reentrant` texts equal asserts
+    /// these two are **not**, so unifying them is a decision somebody makes rather
+    /// than a tidy-up nothing notices.
     #[error("the actor's mailbox is full and it shed this call")]
     Full,
 

@@ -6,6 +6,14 @@
 //! `hash(key) % N` onto a fixed set of workers, which is the only routing this
 //! crate had no spelling for at all.
 //!
+//! **`ignore` and not `no_run`**, in a module that watches two `compile_fail`
+//! fences in both directions: the `parse` and `render` modules below are what a
+//! `service!` invocation generates, and neither exists — so this fence is checked
+//! by the two `service!`-built factories in `keylink/tests/compose.rs`, which
+//! compile and run, rather than by rustdoc. It is the crate's convention for a
+//! snippet naming generated items, and `turns.rs`, `peer.rs` and
+//! `actor/registry.rs` all take it.
+//!
 //! ```ignore
 //! // Keyed: `Factory<parse::Handle<Parser>, TenantId>`, and `dispatch_keyed` is
 //! // its only sensible door.
@@ -58,9 +66,23 @@
 //!   cannot run it. [`Pool`] carries that argument at length and it
 //!   governs here unchanged.
 //! - **No depth, no drop policy, no TTL.** Queue depth is the thing a permit
-//!   already is; a TTL on a queue that does not exist is a clock for nothing, and
-//!   [`QueueTimeout`](crate::QueueTimeout) is the caller's own deadline and
-//!   already ships.
+//!   already is, and a TTL on a queue that does not exist is a clock for nothing.
+//!   **A factory caller's deadline is the caller's own, and it is
+//!   `n0_future::time::timeout` around the dispatch.**
+//!   [`QueueTimeout`](crate::QueueTimeout) is *not* it: that is a
+//!   [`Middleware`](crate::Middleware) on the **served** path, and both doors here
+//!   are local — [`Permit::ask`](crate::Permit::ask) builds an
+//!   [`Origin`](crate::Origin) that carries no
+//!   [`Queueing`](crate::Queueing), so neither of its checks can fire for a
+//!   dispatch. That includes a dispatch parked on the wedged member
+//!   [`ByKey`](Routing::ByKey) describes below, which is exactly the case a reader
+//!   would reach for it in.
+//!
+//!   Wrapping the dispatch is safe rather than merely available: a cancelled
+//!   [`reserve`](Reserving::reserve) is taken out of the wait list and any permit
+//!   already assigned to it is returned, which is the same property
+//!   [`FirstAvailable`](Routing::FirstAvailable) rests on when it drops N−1
+//!   racers. A timeout therefore abandons the wait and leaks no slot.
 //! - **No background task and no clock.** Nothing here ticks, sweeps or times
 //!   anything out, so a factory adds no task to the members it holds.
 //! - **Nothing to hand back on a refusal.** The factory never owns a payload:
@@ -580,10 +602,25 @@ impl<H: Reserving> Factory<H, ()> {
     {
         // A `Factory<H, ()>` under `ByKey` hashes this, which is the degenerate
         // state the two-door split leaves reachable: every dispatch hashes the
-        // same value onto the same member. It is spelled out rather than made
-        // `unreachable!`, because a caller who wrote
-        // `Routing::<()>::ByKey(Shard::by_hash())` deliberately gets the routing
-        // they asked for rather than a panic.
+        // same value onto the same member, so an eight-member factory serves every
+        // call from one of them.
+        //
+        // **A caller reaches it without meaning to, and this comment used to say
+        // otherwise.** It read *a caller who wrote `Routing::<()>::ByKey(..)`
+        // deliberately gets the routing they asked for*, and no turbofish is
+        // needed: `from_fn` puts no bound on `K`, `dispatch` is what fixes it at
+        // `()`, and `()` implements `Hash` — so
+        // `Factory::from_fn(n, Routing::ByKey(Shard::by_hash()), spawn)` followed
+        // by `.dispatch(..)` compiles, infers, and collapses N to 1 in silence.
+        //
+        // It is not `unreachable!` because the collapse is a routing decision and
+        // not an invariant: the member it picks admits the call and runs it. What
+        // would remove the state is a `Key` bound that `()` does not satisfy —
+        // `docs/proposals/2026-08-10-compose-factory.md` §11 records that trade as
+        // open, and it stays open here: with no negative impls, such a trait needs
+        // a hand-written impl for every key type a caller has and a `where` clause
+        // on every keyed door, which is a cascade paid by every correct caller to
+        // delete one wrong one.
         let permit = self.admit(&()).await?;
         Ok(job(permit).await)
     }
@@ -950,9 +987,9 @@ mod tests {
     /// replacing
     /// `Routing::RoundRobin => self.members.pick().1.reserve().await,`
     /// with
-    /// `Routing::RoundRobin => self.members.members()[0].reserve().await,`, so
-    /// the cursor still turns and every dispatch lands on member zero. Watched:
-    /// "the actor that answered, not the cursor that chose it", left
+    /// `Routing::RoundRobin => { let _ = self.members.pick(); self.members.members()[0].reserve().await }`,
+    /// so the cursor still turns and every dispatch lands on member zero.
+    /// Watched: "the actor that answered, not the cursor that chose it", left
     /// `[0, 0, 0, 0, 0, 0, 0]` against right `[0, 1, 2, 0, 1, 2, 0]`. Registered
     /// as `B1`.
     ///
@@ -960,6 +997,17 @@ mod tests {
     /// the factory moved, which is [`Pool`](super::super::Pool)'s device: a
     /// rotation that reported one member and dispatched to another passes a
     /// cursor-only test.
+    ///
+    /// **The `let _ = ..pick();` is the whole of what this record demonstrates,
+    /// and the substitution ran without it for one commit.** It read
+    /// `self.members.members()[0].reserve().await,` alone, which deletes the only
+    /// call that advances the cursor on this path — `Pool::pick` is the one place
+    /// it moves, and the arm above is its only `RoundRobin` call site. So the
+    /// cursor froze, the break was *cursor stopped **and** routing collapsed*, and
+    /// the sentence claiming a turning cursor described a state the run never
+    /// reached. A frozen cursor is caught by a cursor-only test as well, which is
+    /// exactly the discrimination this record exists to exhibit. Both spellings
+    /// print the same left and right; only this one distinguishes them.
     #[tokio::test]
     async fn round_robin_reaches_each_member_in_turn() {
         let (factory, _handled) = factory(3, Routing::RoundRobin);

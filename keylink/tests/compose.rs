@@ -1040,6 +1040,136 @@ async fn racing_reserves_conserves_capacity() {
     );
 }
 
+/// The same property through the door that performs it: four live members raced,
+/// three cancelled, and every one of them reserves again afterwards.
+///
+/// **[`racing_reserves_conserves_capacity`] does not cover this, and a merge gate
+/// is what found the gap.** That test builds a **one**-member factory and never
+/// dispatches — it reserves on `members()[0]` by hand — so it pins tokio's
+/// guarantee and says nothing about [`Routing::FirstAvailable`] racing anything.
+/// The other two tests of the mode use a member that is *dead*, which answers at
+/// once and never parks. So nothing drove N live members through the N−1
+/// cancellation that is the mode's headline soundness claim until this.
+///
+/// # Freeing every slot before the race resolves is the whole test
+///
+/// A version of this that freed **one** slot could not fail, and writing it that
+/// way is the trap. tokio assigns a released permit to a parked waiter inside the
+/// release — the sibling test above measures exactly that — so freeing one member
+/// hands a permit to that member's racer, which then **wins**. The three losers
+/// would be cancelled having never been assigned anything, and a `Drop` that
+/// returned nothing would leak nothing. There would be no way for the assertion
+/// to fail.
+///
+/// Dropping all four with no `await` between them is what puts a permit in every
+/// racer's hand first. The race then resolves, and the three losers are each
+/// dropped **owning a slot they have to give back**.
+///
+/// Which member wins is not asserted for the same reason: any of the four may be
+/// polled first, so a test naming one would be asserting `FuturesUnordered`'s
+/// scheduling rather than the mode's soundness.
+///
+/// # It has a row, and [`racing_reserves_conserves_capacity`] still does not
+///
+/// That test's record says keylink owns no line whose flip loses a slot, and for
+/// the property *it* pins — tokio's `Drop for Acquire` — that is true. It stops
+/// being true one level out: `first_available` owns the collection the losers
+/// live in, and a line that keeps that collection alive past the winner's return
+/// leaks every permit tokio assigned to them. So there is something to substitute
+/// here, and this row is it.
+///
+/// Made red by `scripts/break-once.sh keylink/src/compose/factory.rs`, replacing
+/// `while let Some(answer) = racing.next().await {`
+/// with the same line under
+/// `let racing: &mut FuturesUnordered<_> = Box::leak(Box::new(racing));` — the
+/// racers are never dropped, so the three losers keep the slots they were
+/// assigned. Watched: "a cancelled racer must give its slot back, and these
+/// members never got one back: `[1, 2, 3]`". Registered as `B11`. The break also
+/// prints `warning: variable does not need to be mutable`, which is a warning and
+/// not the failure; the harness runs no `-D warnings`.
+///
+/// **The three members it names are the losers**, which is the discrimination the
+/// row exists for: a leak in the winner's own path would name a different set,
+/// and a setup that never parked would name none.
+///
+/// # It fails by assertion rather than by timing out
+///
+/// Both waits are [`settles`] rather than a bound, so a race that never resolves
+/// and a slot that never comes back are each a named `assert` — the second one
+/// naming the members that are still full. A test whose only failure mode is a
+/// bound expiring reports a hang, which a harness cannot tell from a slow machine.
+#[tokio::test]
+async fn a_race_across_four_live_members_gives_every_loser_its_slot_back() {
+    // Depth one, so a member's whole capacity is one permit and a slot that does
+    // not come back is a member that never reserves again.
+    let (factory, mut ran, _gates) = bench(
+        4,
+        Routing::FirstAvailable,
+        Backpressure::Park(NonZeroUsize::MIN),
+    );
+
+    // Every member full before the dispatch, so the race has to park on all four
+    // rather than win on one that was free the whole time.
+    let mut slots: Vec<_> = factory
+        .members()
+        .iter()
+        .map(|member| {
+            member
+                .__try_reserve()
+                .expect("the member is running")
+                .expect("the one free slot")
+        })
+        .collect();
+
+    let dispatch = tokio::spawn({
+        let factory = factory.clone();
+        async move {
+            factory
+                .dispatch(|member| async move { member.mark() })
+                .await
+                .expect("a slot on some member");
+        }
+    });
+    spun().await;
+    assert!(
+        !dispatch.is_finished(),
+        "every member is full, so the race must be parked on four members rather \
+         than finished on one",
+    );
+
+    // No `await` between these drops, so all four slots are assigned to the four
+    // parked racers before any of them is polled.
+    slots.clear();
+
+    assert!(
+        settles(|| dispatch.is_finished()).await,
+        "the freed slots must reach the parked racers and resolve the race",
+    );
+    dispatch.await.expect("the dispatch task");
+    assert!(
+        bounded(ran.recv()).await.is_some(),
+        "the winner must run the mark it was handed",
+    );
+
+    // Read as a list rather than an `all`, so a leak names the members that kept
+    // a slot instead of reporting `false`.
+    let full = || {
+        factory
+            .members()
+            .iter()
+            .enumerate()
+            .filter(|(_, member)| !matches!(member.__try_reserve(), Ok(Some(_))))
+            .map(|(at, _)| at)
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        settles(|| full().is_empty()).await,
+        "a cancelled racer must give its slot back, and these members never got \
+         one back: {:?}",
+        full(),
+    );
+}
+
 // ─────────────────────────────────────────────────────────────── the scheduler
 
 /// Wave 7's break, re-run here for the output that commit did not paste:

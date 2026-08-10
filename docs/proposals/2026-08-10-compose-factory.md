@@ -933,14 +933,36 @@ lines above). Fix the sentence whether or not this proposal ships.
   across process restarts if a caller's per-worker cache is warmed from disk.
   `DefaultHasher` is not stable across releases. Not decided here.
 - **One illegal state survives §3.1's two-door split.** `K` defaults to `()`, so
-  `Routing::<()>::ByKey(Shard::by_hash())` is constructible and yields a
-  `Factory<A, ()>` whose every dispatch hashes the same value onto the same
-  worker — a one-worker factory wearing eight workers' clothes. Removing it needs
-  a `Key` bound that `()` does not satisfy, so that `ByKey` cannot be spelled at
-  `K = ()`. That is a new public trait for one degenerate case a caller has to
-  write deliberately, and the trade is not decided here. **Experiment:** try the
-  bound on a scratch branch and count the call sites it forces a `where` clause
-  onto.
+  `Routing::ByKey(Shard::by_hash())` on a factory that is later dispatched
+  yields a `Factory<A, ()>` whose every dispatch hashes the same value onto the
+  same worker — a one-worker factory wearing eight workers' clothes.
+
+  **A caller reaches it by inference, and this paragraph said otherwise until the
+  merge gate on the built wave.** It read *one degenerate case a caller has to
+  write deliberately*, and it wrote the state with a turbofish, which put the
+  cost of the trade at "somebody has to mean it". No turbofish is needed:
+  `from_fn` sits on `impl<H, K> Factory<H, K>` and bounds `K` at nothing,
+  `dispatch` sits on `impl<H: Reserving> Factory<H, ()>` and is what fixes `K` at
+  `()`, and `()` implements `Hash`. So
+  `Factory::from_fn(n, Routing::ByKey(Shard::by_hash()), spawn)` followed by
+  `.dispatch(..)` compiles with nothing spelled out, and the 8 → 1 collapse is
+  silent — no signal in `Serving`, none at the door. The same sentence stood in
+  the code, at `dispatch`'s own body, and both were corrected together;
+  correcting one and leaving the other is how they drift apart again.
+
+  Removing it still needs a `Key` bound that `()` does not satisfy, so that
+  `ByKey` cannot be spelled at `K = ()`, **and the trade stays refused rather
+  than undecided.** Stable Rust has no negative impls, so such a trait can carry
+  no blanket impl over `Hash` — that would readmit `()`. Every caller therefore
+  hand-writes `impl Key for TenantId` for each key type it has, and every keyed
+  door carries a `where K: Key`. That is a cost paid by every correct caller to
+  delete one wrong one, on a state whose reachability is now written down at the
+  door that reaches it.
+
+  **The experiment this bullet asked for was not run.** It said to try the bound
+  on a scratch branch and count the `where` clauses. The refusal above is
+  reasoned from the absence of negative impls, not measured — so a future author
+  who wants the bound has an argument to answer and not a figure to beat.
 - **Nothing was compiled, benchmarked or red-tested.** No design on this page has
   been built.
 

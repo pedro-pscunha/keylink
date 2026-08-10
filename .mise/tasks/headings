@@ -8,9 +8,13 @@ The sentence a reader sees is truncated at whatever word the author happened to
 wrap at, and the remainder reads as the section's opening line.
 
 **Nothing else in this repository can see it.** It is valid markdown, so
-`-D warnings` has nothing to warn about: `mise run docs` renders the truncated
-heading and exits 0. `--document-private-items` does not help — it documents more
-items, and rustdoc has no lint saying a heading is short. And one of the six this
+`-D warnings` has nothing to warn about: the `cargo doc` step of `mise run docs`
+renders the truncated heading and exits 0. **That step and not the task** — this
+paragraph named the task until a merge gate read `mise.toml`, where `docs` runs
+this check as its FIRST step, so `mise run docs` on a wrapped heading fails here
+and the sentence claimed the opposite of what the gate does. The instrument that
+cannot see the defect is rustdoc. `--document-private-items` does not help — it
+documents more items, and rustdoc has no lint saying a heading is short. And one of the six this
 check was written against lives in
 `keylink/tests/supervision.rs`, which `mise run docs` NEVER hands to rustdoc —
 so for that site a grep is not a cheap substitute for the real instrument, it is

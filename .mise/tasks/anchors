@@ -1888,6 +1888,14 @@ ANCHORS = [
     # the perturbation was on the test's own `drop(held);` — so it is in the
     # population figure and absent from this list, which is the shape the coverage
     # line below reports and not a defect in either.
+    #
+    # **`B11` is that sentence's boundary, and it is worth reading beside it.** One
+    # level out from tokio's `Drop`, `first_available` owns the collection the
+    # losers live in — so a line that keeps that collection alive past the winner's
+    # return leaks every permit tokio assigned to them, and THAT is a keylink line.
+    # The row was added by a merge gate: three tests named the mode and not one of
+    # them raced N live members, so the N-1 cancellation the mode's soundness rests
+    # on was undriven.
     ("B1", "keylink/src/compose/factory.rs", "keylink/src/compose/factory.rs",
      "            Routing::RoundRobin => self.members.pick().1.reserve().await,"),
     ("B2", "keylink/src/compose/factory.rs", "keylink/src/compose/factory.rs",
@@ -1909,6 +1917,8 @@ ANCHORS = [
      "            Routing::ByKey(shard) => self.shard(*shard, key).reserve().await,"),
     ("B10", "keylink/tests/singleton.rs", "keylink/src/turns.rs",
      "        Err(NotQueued::Full) => return (Outcome::Err(RemoteError::MailboxFull), Body::empty()),"),
+    ("B11", "keylink/tests/compose.rs", "keylink/src/compose/factory.rs",
+     "        while let Some(answer) = racing.next().await {"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -3508,7 +3518,12 @@ for record in sorted(set(REDNESS) - row_ids):
 # blocks — is wrong in both directions at once, and it is wrong for two independent
 # reasons. Read off the failing run: `FAIL population: 194 comment blocks mention
 # break-once.sh, but RECORD_BLOCKS says 183.`
-RECORD_BLOCKS = 194
+#
+# The merge gate on that same wave added ONE block and ONE row — `B11`, over
+# `first_available`'s racers — and the two moved together for once. Read off the
+# failing run: `FAIL population: 195 comment blocks mention break-once.sh, but
+# RECORD_BLOCKS says 194.`
+RECORD_BLOCKS = 195
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a
