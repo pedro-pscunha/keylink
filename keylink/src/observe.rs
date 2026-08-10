@@ -874,9 +874,11 @@ pub enum TurnLost {
 ///
 /// # `Expired` is representable and has no producer, on either side
 ///
-/// Locally, [`TurnLost::Expired`] carries the reason: a local
-/// [`Origin`](crate::Origin) holds no [`Queueing`](crate::Queueing), so there is
-/// no budget to expire. On the served side a budget *does* expire, and that path
+/// Locally, [`TurnLost::Expired`] carries the reason: a local `Origin` holds no
+/// `Queueing`, so there is no budget to expire. Neither is a link, because both
+/// are `#[doc(hidden)]` — rustdoc renders a link to a hidden item as a dead
+/// `href` and `-D warnings` does not see it.
+/// On the served side a budget *does* expire, and that path
 /// answers with [`RemoteError::TimedOut`](crate::RemoteError::TimedOut), which
 /// carries the millisecond figure this variant has nowhere to put.
 ///
