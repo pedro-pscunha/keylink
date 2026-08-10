@@ -307,6 +307,12 @@
 /// interpreted attributes accumulated separately from pass-through ones. See
 /// [`__keylink_service_munch`](crate::__keylink_service_munch).
 ///
+/// Write `#[defer]` directly. `#[cfg_attr(..., defer)]` is not supported:
+/// `macro_rules!` sees the wrapper before configuration expansion, and keylink does
+/// not branch the generated `Actor` method signature on that payload. When the
+/// handler shape differs by configuration, put complete `service!` declarations
+/// and their implementations behind complementary `#[cfg]` attributes instead.
+///
 /// `#[defer]` on a `tell`, `send`, `recv` or `blob` is a compile error naming the
 /// reason — `__keylink_defer_check!` has the four messages, and this is one of
 /// them:
@@ -464,8 +470,12 @@ macro_rules! service {
 /// `@wire [ .. ] @feeds [ .. ]`. The wire list expands into `Request`, `Response`,
 /// `Contract`, `Handler`, `Client`, `Mail` and the rest exactly as before, and the
 /// feed list reaches none of them. **"Feeds are not on the wire" is therefore a fact
-/// about which list a declaration is in**, checked by the compiler at every one of
-/// those sites, rather than a claim thirteen macros have to keep agreeing about.
+/// about which list a declaration is in.** A rejected declaration does not count as
+/// a wire declaration. If it was the only wire-shaped declaration beside feeds,
+/// diagnostics deliberately report both the declaration error and the independent
+/// feeds-only service-shape error. The list separation is checked by the compiler
+/// at every generated site rather than being a claim thirteen macros have to keep
+/// agreeing about.
 ///
 /// The two arms it did cost are the well-formed `feed Name(item: Type);` and the
 /// refusal for any other shape of one.
