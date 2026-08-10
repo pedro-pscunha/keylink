@@ -2906,6 +2906,33 @@ macro_rules! __keylink_service {
                 )+
             }
 
+            /// [`Handle::__reserve`] and [`Handle::__status`], under the names a
+            /// [`Factory`](keylink::compose::Factory) asks a member for.
+            ///
+            /// **This is the one line `service!` generates because `compose`
+            /// exists**, and `compose`'s own module doc says so. It is generated
+            /// rather than written once in keylink because the mailbox this
+            /// forwards to is [`Handle`]'s private field: a composition outside
+            /// this expansion cannot reach it, and a trait is the only way to
+            /// name "a member of a factory" without naming the service.
+            ///
+            /// Nothing new is reachable through it. Both methods forward to the
+            /// two above, so a factory and a caller holding the handle directly
+            /// cannot be told different things about one actor.
+            impl<A: Actor> $crate::compose::Reserving for Handle<A> {
+                type Permit<'a> = Permit<'a, A> where Self: 'a;
+
+                fn reserve(&self) -> impl ::core::future::Future<
+                    Output = ::core::result::Result<Permit<'_, A>, $crate::NotQueued>,
+                > + ::core::marker::Send {
+                    Handle::__reserve(self)
+                }
+
+                fn status(&self) -> $crate::Serving {
+                    Handle::__status(self)
+                }
+            }
+
             /// A connection to one node's actors **of this service**.
             ///
             /// One connection carries every actor of this service on that node,
@@ -5269,6 +5296,61 @@ mod expansion {
         fn both_forms<A: expansion::Actor + Send + 'static>(handle: &expansion::Handle<A>) {
             assert_send(holding_a_borrowed_permit(handle));
             assert_spawnable(holding_an_owned_permit(handle.clone()));
+        }
+    }
+
+    /// A [`Factory`](crate::compose::Factory) over **generated** handles, and the
+    /// half of it `compose/factory.rs`'s own tests deliberately cannot reach.
+    ///
+    /// Those tests build members out of [`LocalActor`](crate::LocalActor), by
+    /// hand, because the routing rule lives in that file and a probe only this
+    /// macro could build would prove the two agree rather than that the routing
+    /// holds. What is left over is exactly this: that the generated `Handle`
+    /// satisfies [`Reserving`](crate::compose::Reserving), and that a caller's
+    /// closure can be handed the generated `Permit` and call a service method on
+    /// it. Both are signature claims, so compiling is the whole assertion.
+    ///
+    /// `assert_send` is not decoration here either. `dispatch`'s future holds a
+    /// permit across the closure's own await, so this is the same claim
+    /// [`a_held_permit_crosses_an_await`](self::a_held_permit_crosses_an_await)
+    /// makes, one composition further out — and a factory that could not cross a
+    /// `tokio::spawn` would be unusable from any connection task.
+    mod a_factory_dispatches_to_a_generated_handle {
+        #![allow(dead_code, reason = "the proof is that this module compiles")]
+
+        use std::num::NonZeroUsize;
+
+        use super::expansion;
+        use crate::compose::{Factory, Member, Routing, Sample, Shard};
+
+        fn assert_send<T: Send>(_: T) {}
+
+        /// No turbofish and no key: `Routing::RoundRobin` has to infer
+        /// `Routing<()>` from `dispatch`'s own impl block, which is the claim the
+        /// `K = ()` default was added for.
+        fn unkeyed<A: expansion::Actor>(make: impl FnMut(Member) -> expansion::Handle<A>) {
+            let factory = Factory::from_fn(NonZeroUsize::MIN, Routing::RoundRobin, make);
+            assert_send(factory.dispatch(|worker| worker.ping(1)));
+        }
+
+        /// The mode that reads a load, so [`Reserving::status`] is named too.
+        ///
+        /// [`Reserving::status`]: crate::compose::Reserving::status
+        fn by_load<A: expansion::Actor>(make: impl FnMut(Member) -> expansion::Handle<A>) {
+            let factory = Factory::from_fn(
+                NonZeroUsize::MIN,
+                Routing::LeastLoaded(Sample::TwoOfN),
+                make,
+            );
+            assert_send(factory.dispatch(|worker| worker.ping(1)));
+        }
+
+        /// The keyed door, and the only one whose key type has to be inferred
+        /// from the `Shard` rather than from the call.
+        fn keyed<A: expansion::Actor>(make: impl FnMut(Member) -> expansion::Handle<A>) {
+            let factory =
+                Factory::from_fn(NonZeroUsize::MIN, Routing::ByKey(Shard::by_hash()), make);
+            assert_send(factory.dispatch_keyed(7_u64, |worker| worker.ping(1)));
         }
     }
 }

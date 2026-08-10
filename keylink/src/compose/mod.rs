@@ -1,28 +1,41 @@
-//! The six patterns every actor system grows, each with its backpressure
+//! The seven patterns every actor system grows, each with its backpressure
 //! written down.
 //!
-//! Nothing here is on the wire. No iroh type appears in this module, no ALPN
-//! moves, and `service!` generates not one line differently because of it —
-//! these are compositions of things the crate already has: a [`Handle`], a
-//! `feed`, an [`ActorId`](crate::ActorId), and [`n0_future`]'s clock.
+//! Nothing here is on the wire. No iroh type appears in this module and no ALPN
+//! moves — these are compositions of things the crate already has: a [`Handle`],
+//! a `feed`, an [`ActorId`](crate::ActorId), and [`n0_future`]'s clock.
+//!
+//! **`service!` generates exactly one line because this module exists**, and that
+//! sentence used to read "not one line differently". The line is the
+//! [`Reserving`] impl on every generated `Handle`, which is what lets [`Factory`]
+//! ask a member for a slot without naming the service. It is the one thing a
+//! composition genuinely could not do from outside: the generated handle's
+//! mailbox is private to it.
 //!
 //! | pattern | what it is |
 //! |---|---|
 //! | [`Topic`] | fan-out. One publisher, N subscribers, each receiving on a `feed` |
 //! | [`Pool`] | N interchangeable actors behind one cursor, each saying which it is |
+//! | [`Factory`] | the same N, with the cursor replaced by a [`Routing`] rule — including `hash(key) % N` |
 //! | [`after`] / [`every`] | a delayed run and a repeating one, on a cancellable handle |
 //! | [`Names`] | name → local actor, unregistered when the actor ends |
 //! | [`Group`] | a set of actors that end together, or one the rest carry on without |
 //! | [`Endings`] | ending → future, for a keyed actor no handle can be asked |
 //!
-//! Six types and two functions for the six rows. Five of the rows are the first
-//! five patterns; [`Endings`] is a sixth **row** and not a sixth pattern — it is
-//! the keyed half of [`Names`] and [`Group`], both of which want an ending future
-//! and could not get one out of a keyed actor. The sixth **pattern** has no row,
-//! and that is the finding rather than an oversight: handle ergonomics turned out
-//! to be a table rather than a type — all of it already exists under keylink's own
-//! names, and the last section here is the mapping and the argument for not adding
-//! an alias.
+//! Seven types and two functions for the seven rows. Six of the rows are the
+//! first six patterns; [`Endings`] is a seventh **row** and not a seventh pattern
+//! — it is the keyed half of [`Names`] and [`Group`], both of which want an
+//! ending future and could not get one out of a keyed actor. The seventh
+//! **pattern** has no row, and that is the finding rather than an oversight:
+//! handle ergonomics turned out to be a table rather than a type — all of it
+//! already exists under keylink's own names, and the last section here is the
+//! mapping and the argument for not adding an alias.
+//!
+//! [`Factory`] and [`Pool`] are one pattern's two halves rather than two
+//! patterns, and the table lists both because a caller chooses between them: a
+//! pool hands back a handle and lets the caller decide, a factory decides and
+//! hands back the answer. A factory *holds* a pool, so there is one cursor, one
+//! `Box<[H]>` and one `Arc` between them.
 //!
 //! # Every one of these states its backpressure, because that is what was missing from the versions this is modelled on
 //!
@@ -42,6 +55,7 @@
 //! | [`Topic`] with [`Overflow::BlockPublisher`] | the publisher waits | one item in flight per subscriber. [`publish`](Topic::publish) does not return until the slowest has taken it |
 //! | [`Topic`] with [`Overflow::DropSubscriber`] | the subscriber is unsubscribed, loudly | one item in flight per subscriber. A second arriving while the first is unread ends that subscriber's stream, so its actor ends as [`Ended::Feed`](crate::Ended::Feed) |
 //! | [`Pool`] | the caller waits, on that member's own mailbox | the pool holds **no** queue at all. [`pick`](Pool::pick) hands back a handle; the wait is the ordinary mailbox permit |
+//! | [`Factory`] | the caller waits, on the chosen member's own mailbox | the factory holds **no** queue at all. [`dispatch`](Factory::dispatch) hands back a [`Permit`](crate::Permit); the wait is the ordinary mailbox permit, taken before the caller's arguments move |
 //! | [`every`] | the next run is late | a run in progress is never re-entered and a missed tick is never queued. The period is a floor on the *gap*, not a rate |
 //! | [`Names`] | nothing waits | it is a map and a lock. No channel, no queue; bounded by the number of live names |
 //! | [`Group`] | a member slow to die delays the group's next **decision** | one decision at a time, in one task. Endings are futures rather than queue entries, so N members are at most N pending endings and a death allocates nothing |
@@ -124,6 +138,7 @@
 //! [`Handle::ended`]: crate::LocalActor::ended
 //! [`n0_future`]: n0_future
 
+mod factory;
 mod group;
 mod keyed;
 mod names;
@@ -131,6 +146,7 @@ mod pool;
 mod schedule;
 mod topic;
 
+pub use factory::{Factory, Reserving, Routing, Sample, Shard};
 pub use group::{Added, Group, GroupEnded, Membership, Retire, Verdict};
 pub use keyed::Endings;
 pub use names::Names;
