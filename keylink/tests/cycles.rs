@@ -200,20 +200,24 @@ impl ring::Actor for Peer {
     async fn self_read(&mut self, _cx: Caller<'_>) -> u64 {
         let me = self.me.get().expect("wired").clone();
         // A read runs no observers, starts no turn, and parks no reply, so the
-        // five states below it are unreachable through this door several times
+        // six losses below it are unreachable through this door several times
         // over — named rather than wildcarded, because a wildcard here would also
-        // swallow whatever the next state turned out to be.
+        // swallow whatever the next loss turned out to be. They are `Withheld`
+        // variants now rather than `Unanswered` ones, and `Panicked` joins them:
+        // a read resumes a panic in its caller, so it cannot arrive as a value
+        // either.
         match me.with_state(|state: &Peer| state.bumps).await {
             Ok(bumps) => bumps,
             Err(keylink::Unanswered::Reentrant) => REFUSED,
-            Err(keylink::Unanswered::Gone) => GONE,
-            Err(
-                keylink::Unanswered::Refused { .. }
-                | keylink::Unanswered::ObserverPanicked { .. }
-                | keylink::Unanswered::Expired
-                | keylink::Unanswered::Dropped
-                | keylink::Unanswered::Restarting,
-            ) => SURPRISE,
+            Err(keylink::Unanswered::Turn(keylink::Withheld::Gone)) => GONE,
+            Err(keylink::Unanswered::Turn(
+                keylink::Withheld::Panicked { .. }
+                | keylink::Withheld::Refused { .. }
+                | keylink::Withheld::ObserverPanicked { .. }
+                | keylink::Withheld::Expired
+                | keylink::Withheld::Dropped
+                | keylink::Withheld::Restarting { .. },
+            )) => SURPRISE,
         }
     }
 
@@ -290,14 +294,15 @@ fn answered(hop: Result<u64, keylink::Unanswered>) -> u64 {
         Ok(depth @ (REFUSED | GONE | SURPRISE)) => depth,
         Ok(depth) => depth + 1,
         Err(keylink::Unanswered::Reentrant) => REFUSED,
-        Err(keylink::Unanswered::Gone) => GONE,
-        Err(
-            keylink::Unanswered::Refused { .. }
-            | keylink::Unanswered::ObserverPanicked { .. }
-            | keylink::Unanswered::Expired
-            | keylink::Unanswered::Dropped
-            | keylink::Unanswered::Restarting,
-        ) => SURPRISE,
+        Err(keylink::Unanswered::Turn(keylink::Withheld::Gone)) => GONE,
+        Err(keylink::Unanswered::Turn(
+            keylink::Withheld::Panicked { .. }
+            | keylink::Withheld::Refused { .. }
+            | keylink::Withheld::ObserverPanicked { .. }
+            | keylink::Withheld::Expired
+            | keylink::Withheld::Dropped
+            | keylink::Withheld::Restarting { .. },
+        )) => SURPRISE,
     }
 }
 
@@ -601,11 +606,11 @@ async fn a_two_actor_cycle_is_refused_at_the_closing_edge() {
 ///
 /// `abort` on **one** actor frees the other: A's task dies, its queued message
 /// from B is dropped, that drop closes B's reply channel, B's handler gets
-/// `Unanswered::Gone` and returns, and B's loop is polling again. So B answers
+/// `Withheld::Gone` and returns, and B's loop is polling again. So B answers
 /// `ping` afterwards — it is a live actor with its state intact.
 ///
 /// A is not recovered. It is destroyed, which is what `abort` documents: "the
-/// state is **destroyed**". The original caller is told `Unanswered::Gone`.
+/// state is **destroyed**". The original caller is told `Withheld::Gone`.
 /// Naming this as "recovers both" would be the crate claiming a repair it does
 /// not perform, so the guard asserts the asymmetry rather than the phrase.
 ///
@@ -679,7 +684,7 @@ async fn aborting_one_actor_of_a_cycle_frees_the_other_and_destroys_it() {
         .expect("B answered: B is the one that was freed, not the one destroyed");
     assert_eq!(
         answer, GONE,
-        "A was destroyed, so B's hop into it is told `Unanswered::Gone`"
+        "A was destroyed, so B's hop into it is told `Withheld::Gone`"
     );
 
     n0_future::time::timeout(SETTLE, b.ping())

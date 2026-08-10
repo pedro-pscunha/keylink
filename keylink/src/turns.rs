@@ -107,11 +107,12 @@
 //!
 //! It is also why [`ended`](LocalActor::ended) exists rather than one more error
 //! variant. An [`Observer`] that refuses a turn is named in the error its caller
-//! gets — [`Unanswered::Refused`] carries [`Observer::name`] — and what is
-//! *not* there is that observer's own error, because [`Unanswered`] is `Copy`
-//! and `Eq` and a boxed reason is neither. `Unanswered::Gone` means "gone" and
-//! must not be stretched to mean "gave up on durability", so the second question
-//! is asked separately and answered by [`Ended`].
+//! gets — [`Withheld::Refused`] carries the observer's name — and what is
+//! *not* there is that observer's own error, because it is an
+//! `Arc<dyn Error + Send + Sync>` and a trait object is not data.
+//! [`Withheld::Gone`] means "gone" and must not be stretched to mean "gave up on
+//! durability", so the second question is asked separately and answered by
+//! [`Ended`].
 //!
 //! The method names and success types match the remote client for `rpc` and
 //! `tell`. They do not for the other three: `blob` hands back a
@@ -209,8 +210,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::panic::{catching, guarded};
 use crate::parking::{Parking, Verdict};
 use crate::{
-    Body, Context, Ended, Observer, Origin, Outcome, Panic, Queueing, RemoteError, Stop, TurnInfo,
-    TurnLost, TurnOutcome,
+    Body, Context, EndReason, Ended, Observer, Origin, Outcome, Panic, Queueing, RemoteError, Stop,
+    TurnInfo, TurnLost, TurnOutcome, Withheld,
 };
 
 /// Messages that may wait ahead of the one being handled.
@@ -482,10 +483,10 @@ impl<T> Reply<T> {
     /// The [`Deferred<T>`](Deferred) is the answer channel, free of this turn.
     /// Keep it — in the state, most usefully — and [`send`](Deferred::send) on it
     /// whenever the answer exists. Dropping it tells the caller
-    /// [`TurnLost::Dropped`]: *the actor is serving and this reply was never
+    /// [`Withheld::Dropped`]: *the actor is serving and this reply was never
     /// answered*, which is true of a handler that decided there is no answer. An
     /// actor that **ends** with a reply still parked in its state answers
-    /// [`TurnLost::Gone`] instead, and the caller can tell the two apart.
+    /// [`Withheld::Gone`] instead, and the caller can tell the two apart.
     #[must_use = "the token is the proof that this reply was parked, and a \
                   `#[defer]` handler has to return it"]
     pub fn later(self) -> (Deferred<T>, Replied<T>) {
@@ -556,7 +557,7 @@ impl<T> Reply<T> {
 /// It proves the channel was **consumed**, which is stronger than a lint and
 /// weaker than "the caller got an answer". A handler that parks a reply and then
 /// drops the [`Deferred`] has satisfied this type and told its caller
-/// [`TurnLost::Dropped`] — correctly, since nothing answered and the actor is
+/// [`Withheld::Dropped`] — correctly, since nothing answered and the actor is
 /// there. What no type can force is that somebody eventually calls
 /// [`Deferred::send`]; what keylink guarantees is that the caller is never left
 /// waiting on a channel nobody holds, and is never told to stop calling an actor
@@ -660,9 +661,9 @@ enum Settled<T> {
 /// `Clone`, because there is one answer.
 ///
 /// Dropping it without answering is not an error and not silent: the caller's
-/// wait ends with [`TurnLost::Dropped`], and that answer says the actor is still
+/// wait ends with [`Withheld::Dropped`], and that answer says the actor is still
 /// there. An actor that **ends** with replies parked in its state ends the same
-/// waits with [`TurnLost::Gone`] — the same silence on the channel, two answers,
+/// waits with [`Withheld::Gone`] — the same silence on the channel, two answers,
 /// because the callers' next moves differ.
 ///
 /// # This is how a handler calls another actor — but parking is only half of it
@@ -727,9 +728,9 @@ impl<T> Deferred<T> {
     /// **The value is owed to the turn running now, and waits for it.** It is
     /// held until that turn's observer chain has accepted it, and then released
     /// with the same verdict the turn's own caller is answered by: an observer
-    /// that refuses tells this caller [`TurnLost::Refused`] naming the same
+    /// that refuses tells this caller [`Withheld::Refused`] naming the same
     /// observer, and a handler that panics after sending drops the channel, which
-    /// is [`TurnLost::Dropped`] — the actor caught that panic and is serving.
+    /// is [`Withheld::Dropped`] — the actor caught that panic and is serving.
     ///
     /// That is not what deferral costs — it is what makes it free. `#[defer]`'s
     /// point is that the reply outlives the turn that **received** it, and it
@@ -1193,7 +1194,7 @@ where
 ///   channel and is made by [`Reply::answer`] whenever it is.
 /// - **Panicked before the channel was consumed.** The [`Reply`] was dropped
 ///   inside the unwinding future, so there is nothing left to answer with and the
-///   caller's wait ends [`TurnLost::Dropped`] — which names the actor that
+///   caller's wait ends [`Withheld::Dropped`] — which names the actor that
 ///   survives, so the caller is not told to stop calling one that is serving. The
 ///   observers saw [`TurnOutcome::Panicked`](crate::TurnOutcome::Panicked), and the panic
 ///   hook ran at the fault. This is the one thing `#[defer]` costs against every
@@ -1707,7 +1708,7 @@ enum Message<A, M> {
     /// cannot mutate, so storing after it is waste.
     Read(Read<A>),
     /// Ends the loop, which drops the receiver, which is what makes every other
-    /// handle report a closed mailbox from then on — [`Unanswered::Gone`] to a
+    /// handle report a closed mailbox from then on — [`Withheld::Gone`] to a
     /// door that wanted a value, [`NotQueued::Closed`] to one that wanted only to
     /// be queued.
     Stop,
@@ -2111,8 +2112,8 @@ fn dispatch<'a, A: 'a, T: Turn<A>>(
 /// which is false only once the receiver drops, and
 /// `stop_drains_what_was_sent_before_it` asserts exactly that immediately after
 /// `stop().await`. `feeds` releases the subscriptions. `state` goes last, which
-/// answers every [`Deferred`] parked in it — as [`TurnLost::Gone`], or as
-/// [`TurnLost::Restarting`] when a supervisor is putting another incarnation up.
+/// answers every [`Deferred`] parked in it — as [`Withheld::Gone`], or as
+/// [`Withheld::Restarting`] when a supervisor is putting another incarnation up.
 /// Which of the two is not decided here: the verdict is settled into [`Fate`]
 /// above, before the first of these drops, and each parked caller reads it.
 ///
@@ -2559,8 +2560,9 @@ pub(crate) enum Standing {
 /// # A `Mutex` and not an atomic
 ///
 /// [`Standing::Restarting`] carries the ending that caused it, because
-/// `Failed("restarting: {reason}")` is what a peer already reads on the local path
-/// and the two paths render through one function. An `AtomicU8` would hold the
+/// [`Withheld::Restarting`] carries an [`EndReason`] to a peer and to a local
+/// caller alike, and the two paths render through one function. An `AtomicU8`
+/// would hold the
 /// discriminant and drop the sentence, which is the one thing that would make the
 /// keyed answer *different* rather than merely late. It is locked once per
 /// incarnation and once per dead reply, never on a turn, so there is nothing here
@@ -2923,7 +2925,7 @@ impl<A: Send, M: Send, I: Inbox<A, M>> Inbox<A, M> for Lent<'_, I> {
 /// against named guards rather than a preference between two readings.
 ///
 /// **Under that release the double effect is observed rather than argued.** The guard
-/// above then fails carrying a `Failed("panicked: ..")`, and a `Failed` whose text is a
+/// above then fails carrying a `Withheld::Panicked`, and a variant whose payload is a
 /// panic message can only be produced by ENTERING the handler — so the retry ran the turn
 /// a second time on an actor whose first attempt had already panicked. That is the
 /// double-effect the paragraph above says the ledger exists to prevent, seen rather than
@@ -2971,7 +2973,7 @@ where
     //   `run_loop` *after* the verdict was settled `Restarting` and after
     //   `run_loop`'s own floor was disarmed. The parked `Deferred` dies inside
     //   that unwind. This floor is the only thing left to catch it, and without
-    //   it the peer reads `Failed("restarting: ..")` — *retry, another is
+    //   it the peer reads `Withheld::Restarting` — *retry, another is
     //   coming* — about an actor that will never come back.
     //
     //   For *that* case the floor is necessarily late rather than early: the
@@ -3098,7 +3100,7 @@ where
 /// that is a different answer:
 ///
 /// **A `Deferred` parked in the state dies with the incarnation, and that loss now
-/// reaches the peer as `Failed("restarting: {reason}")`** — *the incarnation that
+/// reaches the peer as [`Withheld::Restarting`]** — *the incarnation that
 /// owed you an answer is gone, another is coming, retry*. It used to be
 /// [`RemoteError::NoSuchActor`], which reads *there is nothing here, stop asking*
 /// about an actor that is about to answer the same peer again, and a client that
@@ -3108,8 +3110,8 @@ where
 /// **The other two causes are answered too, and neither needed a supervisor.** A
 /// restart is one of *three* ways a served reply dies: a handler that takes
 /// `reply.later()` and drops the `Deferred` — sanctioned, and what its
-/// `#[must_use]` asks for — reads `Failed("dropped: ..")`, and an actor that has
-/// genuinely ended, or was aborted or evicted, still reads `NoSuchActor`. So a
+/// `#[must_use]` asks for — reads [`Withheld::Dropped`], and an actor that has
+/// genuinely ended, or was aborted or evicted, reads [`Withheld::Gone`]. So a
 /// plain unsupervised keyed actor no longer says *there is nothing here* about a
 /// reply it dropped while running. `deliver_to_actor` and `deliver_to_singleton`
 /// render all three through one function, [`lost`], so the two paths cannot say
@@ -3159,118 +3161,53 @@ where
 /// would be the same lie `ask_catching`'s `Expired` arm names — a live actor
 /// reported as gone through a public API, silently.
 ///
+/// # Two variants, because six of the eight were never this type's own
+///
+/// It listed the same six losses [`TurnLost`] did, in the same order, with the
+/// same `#[error]` texts written a second time — and one test walked the two
+/// lists variant-by-variant to hold the words together. The words stayed in
+/// step. The **payloads** did not: [`TurnLost`]'s restart arm carried the
+/// [`Ended`] and this type's carried a bare unit, so the door a caller picked
+/// decided whether the reason existed, and the guard passed on both.
+///
+/// [`Withheld`] is that list, once. What is left here is the one refusal that is
+/// not about a turn.
+///
+/// # Losing `Copy` is what buys the reason back
+///
+/// `Copy` and `Eq` are why the restart arm was a unit: an `Arc<Ended>` is
+/// neither, so the *fact* crossed this door and the *reason* did not, and
+/// [`ended`](LocalActor::ended) is no second route to it — a restart is not an
+/// ending, so that future does not resolve. [`Withheld`] carries an
+/// [`EndReason`], which is data rather than a trait object,
+/// and it costs `Copy`. `Clone`, `PartialEq` and `Eq` are kept, so a caller that
+/// matched and compared still does.
+///
 /// # Exhaustive, and deliberately not `#[non_exhaustive]`
 ///
 /// [`Ended`] and [`TurnLost`] carry that argument: a caller matches this, and a
-/// wildcard arm is the collapse the split exists to prevent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+/// wildcard arm is the collapse the split exists to prevent. A new loss is added
+/// to [`Withheld`], which makes the same choice — so exhaustiveness reaches a
+/// caller one level in rather than stopping at this enum's two arms.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Unanswered {
-    /// The actor is no longer running. It stopped, was aborted, its loop ended,
-    /// or a supervisor gave up on it. **Stop calling.**
+    /// The turn was reached and its value was not handed back, and this is which
+    /// loss it was.
     ///
-    /// # The sentence is specific again, because the variant is
+    /// [`Withheld`] carries what each one means and what to do next — retry a
+    /// restart, stop calling a gone actor, do neither for a reply a live actor
+    /// threw away. [`TurnLost::Turn`] is the same value at
+    /// [`ask_catching`](LocalActor::ask_catching), and a peer reads it as
+    /// [`RemoteError::Withheld`].
     ///
-    /// It read *"this call was not delivered to a committed turn"* while this arm
-    /// also absorbed a reply dropped by a **live** actor: "no longer running" was
-    /// false for that producer, so the message retreated to something true of both.
-    /// [`Dropped`](Self::Dropped) and [`Restarting`](Self::Restarting) took that
-    /// producer away, and a hedge kept after the thing it hedges against is gone is
-    /// a sentence that tells every remaining caller less than the crate knows.
-    ///
-    /// **Three producers are left, and all three mean it.** A closed mailbox is
-    /// one — and a local actor's mailbox is closed only on a give-up path, never
-    /// between two incarnations. The second is the actor's own standing, read as
-    /// [`TurnLost::Gone`] after a reply channel died carrying nothing.
-    ///
-    /// The third is [`read`](LocalActor::read), and it is the one that does **not**
-    /// read the standing: it maps a dead read channel straight here, which is the
-    /// construct the other doors were split to remove. It is total there rather
-    /// than a survivor, for three facts about the read path that live nowhere near
-    /// this line. `read`'s own documentation carries them, and names what would
-    /// break them.
-    #[error("the actor is no longer running")]
-    Gone,
-    /// The actor is serving, and this reply was thrown away unanswered.
-    ///
-    /// [`TurnLost::Dropped`] through this door, and that variant carries the
-    /// mechanism: a handler took [`Reply::later`] and dropped the [`Deferred`], or
-    /// panicked while holding the channel. The actor survived either way and
-    /// answers the next call.
-    ///
-    /// This is the producer [`Gone`](Self::Gone) used to absorb, and absorbing it
-    /// is what made a local caller stop calling an actor that was still there.
-    #[error("the actor is serving and this reply was never answered")]
-    Dropped,
-    /// The incarnation that owed this answer is gone, and a supervisor is starting
-    /// another. **Retry** — the mailbox never closes across a restart.
-    ///
-    /// A **unit** variant where [`TurnLost::Restarting`] carries the
-    /// [`Ended`] behind an `Arc`, because that `Arc` is neither
-    /// [`Copy`] nor [`Eq`] and this type is both. So the *fact* crosses this door
-    /// and the *reason* does not, and there is no other local door to the reason:
-    /// [`ended`](LocalActor::ended) does not resolve on a restart, because a
-    /// restart is not an ending. A caller that needs it calls
-    /// [`ask_catching`](LocalActor::ask_catching), which answers the richer type.
-    #[error("the incarnation that owed this answer is gone and another is coming")]
-    Restarting,
-    /// An [`Observer`] refused this turn. It **ran** and was not
-    /// committed, so there is no value to hand back — and the actor is **not**
-    /// gone.
-    ///
-    /// A supervisor may already be rebuilding it: the retry decision reads the
-    /// flag [`Stop::fatal`](crate::Stop::fatal) sets, so a refusal that did not
-    /// declare itself fatal ends the incarnation and starts another. This arrived as
-    /// [`Gone`](Self::Gone) until it had a variant of its own, which told a
-    /// caller to stop calling an actor a supervisor was putting back.
-    ///
-    /// The name is carried rather than left to a second lookup because
-    /// [`ended`](LocalActor::ended) cannot supply it here: it resolves when the
-    /// **actor** ends, and a non-fatal refusal ends only one incarnation.
-    #[error("the {name} observer refused this turn: it ran and was not committed")]
-    Refused {
-        /// [`Observer::name`].
-        name: &'static str,
-    },
-    /// An [`Observer`] **panicked** watching this turn. It **ran** and was not
-    /// committed, and the actor is **not** gone.
-    ///
-    /// A separate variant from [`Refused`](Self::Refused), and the separation is
-    /// the whole of it: this arm was that one until it had a variant of its own,
-    /// so a caller whose observer fell over was told *the {name} observer refused
-    /// this turn* about an observer that made no decision at all. Both withhold
-    /// the value, and RFC-06 §2.6 and §5.1 give two different reasons for that —
-    /// a veto means *do not commit*, a crash means nobody read back whether it
-    /// committed. Only the verb differed, and only the verb was wrong.
-    ///
-    /// **What a supervisor does next is the same as for a non-fatal refusal**, and
-    /// that is deliberate rather than an omission: a panicking observer made no
-    /// claim about whether another incarnation would fare better, so
-    /// [`Ended::Observer`] carries `fatal: false` and the
-    /// incarnation is restarted. The field's own documentation carries the
-    /// argument.
-    ///
-    /// The panic's message does not reach here. It reaches
-    /// [`ended`](LocalActor::ended), as
-    /// [`Ended::Observer`]'s `error` — this type is `Copy`
-    /// and `Eq` and an `Arc` is neither, which is the same trade
-    /// [`Restarting`](Self::Restarting) makes.
-    #[error("the {name} observer panicked during this turn: it ran and was not committed")]
-    ObserverPanicked {
-        /// [`Observer::name`].
-        name: &'static str,
-    },
-    /// A [`QueueTimeout`](crate::QueueTimeout) budget expired while the message
-    /// waited. It **never started**, so the actor is untouched and still running.
-    ///
-    /// Unreachable from a local call today, for [`TurnLost::Expired`]'s reason:
-    /// this path builds its own local [`Origin`], one carries no [`Queueing`],
-    /// and there is nothing to expire.
-    /// It is a variant rather than a fold into [`Gone`](Self::Gone) because that
-    /// fold is the defect [`TurnLost`] was split to remove one layer down — the
-    /// first local origin to carry a budget would have had a live actor reported
-    /// as gone, silently, through a public API.
-    #[error("the queueing budget expired before this turn started: nothing ran")]
-    Expired,
+    /// **[`Withheld::Panicked`] does not arrive here, and no local door builds
+    /// one.** A fault reaches [`ask_catching`](LocalActor::ask_catching) as
+    /// [`TurnLost::Faulted`], carrying the payload, and
+    /// [`ask`](LocalActor::ask) resumes that payload into the calling task. So
+    /// the panic reaches its caller as a panic, and the message-shaped variant
+    /// is what a peer reads instead.
+    #[error("{0}")]
+    Turn(Withheld),
     /// The call was made from inside the target actor's own turn, and would have
     /// deadlocked.
     ///
@@ -3279,6 +3216,10 @@ pub enum Unanswered {
     /// the round trip. If the work must happen after the current turn, spawn a
     /// task that holds a handle, which is not the actor and can wait for a permit
     /// safely.
+    ///
+    /// Outside [`Withheld`] because nothing was queued: every variant of that
+    /// enum is a fact about a turn that exists, and this refusal fires before one
+    /// does.
     ///
     /// A `tell` is refused only when the mailbox is **full**, because a self-tell
     /// into a free slot runs after the turn returns and is legitimate. Every
@@ -3363,20 +3304,18 @@ pub enum NotQueued {
     /// most wrong: the receiver is also dropped when a supervisor gives up and when
     /// an unsupervised loop simply ends.
     ///
-    /// [`Unanswered::Gone`] and [`TurnLost::Gone`] are that same fact stated about
-    /// the actor, and the three of them carry **one sentence** between them: *the
-    /// actor is no longer running*. Three variants on three enums for one sentence
-    /// is what the split chose — a caller matches the answer of the door it used,
-    /// and the doors ask different questions — and
-    /// `every_turn_lost_except_faulted_has_one_undelivered_twin_with_the_same_words`
-    /// holds two of the three together, so those two cannot drift apart in silence.
-    /// This variant is the one outside that guard, and the words here are kept by
-    /// hand.
+    /// [`Withheld::Gone`] is that same fact stated about the actor, and the two
+    /// carry **one sentence** between them: *the actor is no longer running*. Two
+    /// variants on two enums for one sentence is what the split chose — a caller
+    /// matches the answer of the door it used, and the doors ask different
+    /// questions. `one_vocabulary_and_every_loss_in_it_has_a_producer` holds the
+    /// two texts together, through the `From<NotQueued> for Unanswered` the crate
+    /// actually performs.
     ///
     /// The two used to disagree, and this paragraph used to explain the
-    /// disagreement: `Unanswered::Gone` also absorbed a reply dropped by a live
-    /// actor, so it hedged where this cannot. That producer is
-    /// [`Unanswered::Dropped`] now, and the hedge is gone with it.
+    /// disagreement: the value-door's gone arm also absorbed a reply dropped by a
+    /// live actor, so it hedged where this cannot. That producer is
+    /// [`Withheld::Dropped`] now, and the hedge is gone with it.
     ///
     /// A **restart does not reach here.** The receiver outlives every incarnation
     /// of a supervised actor — the same fact [`is_busy`](LocalActor::is_busy)
@@ -3391,12 +3330,13 @@ pub enum NotQueued {
     /// doors, and carries the same message: the actor is **still running** — it is
     /// running the turn this call was made from.
     ///
-    /// `TurnLost::Reentrant` carries it too, so this sentence lives on three enums.
-    /// `every_turn_lost_except_faulted_has_one_undelivered_twin_with_the_same_words`
-    /// holds all three, this one through `From<NotQueued> for Unanswered` — the
-    /// widening the crate actually performs, so the guard cannot agree with a
-    /// mapping no caller takes. It was kept in step by hand until then, and
-    /// this paragraph said so without saying that nothing enforced it.
+    /// [`TurnLost::Reentrant`] carries it too, so this sentence lives on three
+    /// enums — and it is the **only** sentence that still does, now that every
+    /// other loss is one [`Withheld`] value read by three doors.
+    /// `one_vocabulary_and_every_loss_in_it_has_a_producer` holds all three, this
+    /// one through `From<NotQueued> for Unanswered` — the widening the crate
+    /// actually performs, so the guard cannot agree with a mapping no caller
+    /// takes.
     ///
     /// The two doors that answer this are refused under **different halves** of
     /// the rule, and the private `Refuse` parameter is what says which.
@@ -3413,10 +3353,10 @@ pub enum NotQueued {
 /// keep its `?`.
 ///
 /// A send that failed produces one of two states, and `Unanswered` has a name for
-/// each: a closed mailbox is one of the ways it means [`Gone`](Unanswered::Gone),
-/// and a re-entrant refusal is the same refusal. Neither reaches
-/// [`Refused`](Unanswered::Refused), which is a verdict on a turn that ran and
-/// so cannot exist for a message that never entered the mailbox.
+/// each: a closed mailbox is one of the ways it means [`Withheld::Gone`], and a
+/// re-entrant refusal is the same refusal. Neither reaches
+/// [`Withheld::Refused`], which is a verdict on a turn that ran and so cannot
+/// exist for a message that never entered the mailbox.
 ///
 /// # What the forward direction buys, since it is the one that exists
 ///
@@ -3441,7 +3381,7 @@ pub enum NotQueued {
 impl From<NotQueued> for Unanswered {
     fn from(not_queued: NotQueued) -> Self {
         match not_queued {
-            NotQueued::Closed => Self::Gone,
+            NotQueued::Closed => Self::Turn(Withheld::Gone),
             NotQueued::Reentrant => Self::Reentrant,
         }
     }
@@ -3828,17 +3768,22 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     ///
     /// # Errors
     ///
-    /// [`Unanswered::Gone`] when the actor is gone, before or during the turn;
-    /// [`Unanswered::Dropped`] when a live actor threw this reply away without
-    /// answering it; [`Unanswered::Restarting`] when the incarnation that owed
-    /// the answer died and another is coming; [`Unanswered::Refused`] when an
+    /// [`Unanswered::Turn`] carrying a [`Withheld`] — [`Gone`](Withheld::Gone)
+    /// when the actor is gone, before or during the turn;
+    /// [`Dropped`](Withheld::Dropped) when a live actor threw this reply away
+    /// without answering it; [`Restarting`](Withheld::Restarting) when the
+    /// incarnation that owed the answer died and another is coming, carrying the
+    /// ending that caused it; [`Refused`](Withheld::Refused) when an
     /// [`Observer`] refused the turn that ran, which leaves the actor alive and
-    /// possibly restarting; [`Unanswered::Expired`] when a queueing budget ran
-    /// out before the turn started, which a local origin cannot do today; and
+    /// possibly restarting; [`ObserverPanicked`](Withheld::ObserverPanicked)
+    /// when one fell over instead of deciding;
+    /// [`Expired`](Withheld::Expired) when a queueing budget ran out before the
+    /// turn started, which a local origin cannot do today. And
     /// [`Unanswered::Reentrant`] when the call came from inside the target
-    /// actor's own turn. One per [`TurnLost`], except the fault this resumes —
-    /// and [`Restarting`](Unanswered::Restarting) arrives without the ending its
-    /// [`TurnLost`] twin carries, because this type is `Copy`.
+    /// actor's own turn.
+    ///
+    /// [`Withheld::Panicked`] is the one that does not arrive: this door resumes
+    /// a fault rather than reporting it.
     ///
     /// # The turn runs even if you stop waiting
     ///
@@ -3892,28 +3837,19 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     where
         T: Send + 'static,
     {
-        // One arm per loss, and no fold: `Unanswered` names every state
-        // `TurnLost` does. It used to collapse `Refused` and `Expired` into
-        // `Gone` under a comment saying a local caller learns why from
-        // [`ended`](Self::ended) — which does not hold for either. A non-fatal
-        // refusal ends one incarnation, so a supervised actor restarts and
-        // `ended` never resolves; an expired budget starts no turn at all.
+        // Three arms and no fold, where there were seven. Six of them mapped one
+        // flat enum's variant onto the other's, and one of those six dropped the
+        // `Ended` on the way — `Unanswered` was `Copy` and an `Arc` is not, so
+        // the fact crossed and the reason did not. The reason crosses now,
+        // because `Withheld` is the same value on both sides and carries an
+        // `EndReason`, which is data.
         //
         // A **fault** is the exception, because it is not a loss: the value a
         // panicking function produces is the panic, so the caller gets it.
         match self.ask_catching(mail).await {
             Ok(value) => Ok(value),
             Err(TurnLost::Faulted(panic)) => panic.resume(),
-            Err(TurnLost::Gone) => Err(Unanswered::Gone),
-            Err(TurnLost::Dropped) => Err(Unanswered::Dropped),
-            // The `Ended` is dropped here and nowhere else, because
-            // `Unanswered` is `Copy` and `Eq` and an `Arc` is neither. The fact
-            // crosses, the reason does not, and `Unanswered::Restarting` says so
-            // where a caller meets it.
-            Err(TurnLost::Restarting(_reason)) => Err(Unanswered::Restarting),
-            Err(TurnLost::Refused { name }) => Err(Unanswered::Refused { name }),
-            Err(TurnLost::ObserverPanicked { name }) => Err(Unanswered::ObserverPanicked { name }),
-            Err(TurnLost::Expired) => Err(Unanswered::Expired),
+            Err(TurnLost::Turn(withheld)) => Err(Unanswered::Turn(withheld)),
             Err(TurnLost::Reentrant) => Err(Unanswered::Reentrant),
         }
     }
@@ -3926,18 +3862,17 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     ///
     /// # Errors
     ///
-    /// Every [`TurnLost`] variant, which is the difference between this and
-    /// [`ask`](Self::ask): [`TurnLost::Gone`] when the actor is gone,
-    /// [`TurnLost::Dropped`] when a live actor threw this reply away,
-    /// [`TurnLost::Restarting`] when the incarnation that owed the answer died and
-    /// another is coming — carrying the [`Ended`] that caused it —
-    /// [`TurnLost::Refused`] when an observer refused the turn,
-    /// [`TurnLost::Faulted`] when the turn ran and panicked (the actor survived
-    /// that one and is still running), [`TurnLost::Expired`] when a queueing
-    /// budget ran out before the turn started, which a local origin cannot do
-    /// today and which is answered truthfully rather than as `Gone` for the day
-    /// one can, and [`TurnLost::Reentrant`] when the call came from inside the
-    /// target actor's own turn.
+    /// Every [`TurnLost`] variant. [`TurnLost::Turn`] carries exactly the
+    /// [`Withheld`] [`ask`](Self::ask) reports, because both doors read the same
+    /// value; [`TurnLost::Faulted`] is the difference between the two, and it
+    /// carries the [`Panic`] itself where `ask` resumes it; and
+    /// [`TurnLost::Reentrant`] when the call came from inside the target actor's
+    /// own turn.
+    ///
+    /// **No local door builds [`Withheld::Panicked`]**, and that is the same
+    /// fact from the other side: a fault reaching a local caller is a payload,
+    /// so it arrives as [`Faulted`](TurnLost::Faulted). `Panicked` is what a
+    /// peer reads, because a peer cannot be handed an unwind.
     pub async fn ask_catching<T>(
         &self,
         mail: impl FnOnce(Origin, Reply<T>) -> M,
@@ -3948,13 +3883,19 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
         match self.answered(mail).await? {
             Answered::Ran(value) => Ok(value),
             Answered::Faulted(panic) => Err(TurnLost::Faulted(panic)),
-            Answered::Refused { name } => Err(TurnLost::Refused { name }),
-            Answered::ObserverPanicked { name } => Err(TurnLost::ObserverPanicked { name }),
+            Answered::Refused { name } => Err(TurnLost::Turn(Withheld::Refused {
+                name: name.to_owned(),
+            })),
+            Answered::ObserverPanicked { name } => {
+                Err(TurnLost::Turn(Withheld::ObserverPanicked {
+                    name: name.to_owned(),
+                }))
+            }
             // Unreachable from here today — a local `Origin` carries no
             // `Queueing`, so there is no budget to expire — and answered with the
             // variant that means what happened anyway.
             //
-            // This arm read `Err(TurnLost::Gone)` behind a comment claiming the
+            // This arm read the gone answer behind a comment claiming the
             // impossibility was "typed rather than asserted". It was asserted, by
             // that comment, and the mapping underneath it was wrong: `Gone` means
             // the actor is no longer running, and an expired budget leaves the
@@ -3967,7 +3908,7 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
             // `ask_catching` builds its own `Origin::local()`, so nothing a test
             // can hand it carries a `Queueing`. What is watched is the served
             // twin, `rendered`'s `Expired` arm, which `tests/actors.rs` pins.
-            Answered::Expired => Err(TurnLost::Expired),
+            Answered::Expired => Err(TurnLost::Turn(Withheld::Expired)),
         }
     }
 
@@ -4011,13 +3952,21 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
         )
         .await
         .map_err(|not_queued| match not_queued {
-            NotQueued::Closed => TurnLost::Gone,
+            NotQueued::Closed => TurnLost::Turn(Withheld::Gone),
             NotQueued::Reentrant => TurnLost::Reentrant,
         })?;
-        answer.await.map_err(|_| match self.fate.standing() {
-            Standing::Running => TurnLost::Dropped,
-            Standing::Restarting(reason) => TurnLost::Restarting(reason),
-            Standing::Gone => TurnLost::Gone,
+        answer.await.map_err(|_| {
+            TurnLost::Turn(match self.fate.standing() {
+                Standing::Running => Withheld::Dropped,
+                // `&*reason` and not `reason`: the `Arc` is one ending shared by
+                // every reply that died with that state, and `EndReason` is the
+                // form of it that has a schema. `From<&Ended>` is the only
+                // conversion, and it has no wildcard arm.
+                Standing::Restarting(reason) => Withheld::Restarting {
+                    reason: EndReason::from(&*reason),
+                },
+                Standing::Gone => Withheld::Gone,
+            })
         })
     }
 
@@ -4108,17 +4057,17 @@ impl<A, M> LocalActor<A, M> {
     ///
     /// # Errors
     ///
-    /// Two of [`Unanswered`]'s variants, and the door is what narrows it.
+    /// Two answers, and the door is what narrows it.
     /// [`Unanswered::Reentrant`] when the call came from inside the target actor's
     /// own turn — a read takes a permit and then waits for the loop, so it is
     /// refused under the same half of the rule an [`ask`](Self::ask) is — and
-    /// [`Unanswered::Gone`] when the actor is gone.
-    /// [`Unanswered::Refused`] and [`Unanswered::Expired`] cannot occur for the
-    /// reason above: no observers, no budget. [`Unanswered::Dropped`] and
-    /// [`Unanswered::Restarting`] cannot occur for a different reason, and it is
+    /// `Unanswered::Turn(`[`Withheld::Gone`]`)` when the actor is gone.
+    /// [`Withheld::Refused`] and [`Withheld::Expired`] cannot occur for the
+    /// reason above: no observers, no budget. [`Withheld::Dropped`] and
+    /// [`Withheld::Restarting`] cannot occur for a different reason, and it is
     /// the next section.
     ///
-    /// # A dead read channel is [`Gone`](Unanswered::Gone), and that is total rather than inferred
+    /// # A dead read channel is [`Gone`](Withheld::Gone), and that is total rather than inferred
     ///
     /// The private `answered` reads the actor's standing when a reply channel dies,
     /// because a local `ask` can lose its reply to a live actor or to a restart.
@@ -4144,7 +4093,7 @@ impl<A, M> LocalActor<A, M> {
     /// that is restarting. Giving this method the same standing match `answered`
     /// makes would close that, and it is **refused today as a behaviour change** —
     /// a read whose channel died mid-restart would begin answering
-    /// [`Unanswered::Restarting`] — rather than because the read is cheaper.
+    /// [`Withheld::Restarting`] — rather than because the read is cheaper.
     ///
     /// [`Handle::with_state`]: crate::LocalActor
     pub async fn read<T, F>(&self, read: F) -> Result<T, Unanswered>
@@ -4170,7 +4119,7 @@ impl<A, M> LocalActor<A, M> {
             Refuse::Always,
         )
         .await?;
-        match answer.await.map_err(|_| Unanswered::Gone)? {
+        match answer.await.map_err(|_| Unanswered::Turn(Withheld::Gone))? {
             Ok(value) => Ok(value),
             Err(panic) => panic.resume(),
         }
@@ -4313,7 +4262,7 @@ impl<A, M> LocalActor<A, M> {
     ///
     /// **This method used to settle that itself, and the line is deleted.** It
     /// was written before the floor existed, and once the floor was added no
-    /// break of the settle here could be made red — `an_aborted_actor_tells_a_peer_no_such_actor`
+    /// break of the settle here could be made red — `an_aborted_actor_tells_a_peer_the_actor_is_gone`
     /// stays green with the whole line removed, because the floor is strictly
     /// earlier in the same drop. A line that cannot be made red is not a guard,
     /// it is a second writer nobody can hold to account, so it went.
@@ -4487,23 +4436,6 @@ impl<A, M> fmt::Debug for LocalActor<A, M> {
 
 // ─────────────────────────────────────────── what a peer is told about a turn
 
-// The five prefixes a `RemoteError::Failed` carries out of `rendered` and
-// `lost`. They live on `RemoteError` itself now, in `reply.rs`, because a peer
-// has to match on them and could not name them: this block held them as private
-// `const`s for four waves while every caller hard-coded the literal.
-//
-// Aliased here rather than qualified at eight use sites, because the use sites
-// are `format!("{PANICKED}{panic}")` and the qualified spelling inside a format
-// string is noise. `reply.rs` carries the whole argument — the property, the
-// guard, and what the claim is a property *of*, which is narrower than this
-// block used to say.
-use crate::RemoteError as Failure;
-const PANICKED: &str = Failure::PANICKED;
-const REFUSED: &str = Failure::REFUSED;
-const OBSERVER_PANICKED: &str = Failure::OBSERVER_PANICKED;
-const RESTARTING: &str = Failure::RESTARTING;
-const DROPPED: &str = Failure::DROPPED;
-
 /// Render one answer as the pair a served dispatch returns.
 ///
 /// **Two dispatch paths reach this and they used to disagree.** The keyed loop
@@ -4513,28 +4445,25 @@ const DROPPED: &str = Failure::DROPPED;
 /// same fault — and there was no keyed twin of the test that pins the prefix, so
 /// both stayed green. One function now, and the two paths cannot drift.
 ///
-/// The prefixes are load-bearing rather than decorative. `RemoteError::Failed`
-/// carries a `String` and not a variant, because a variant sits inside the
-/// hashed contract and would move every service's ALPN — so the **string is the
-/// whole discriminator** between "your message exploded" and "an observer vetoed
-/// the turn it just watched", and panic text is usually caller-derived.
+/// **The discriminator is a variant now, and that is what this commit bought.**
+/// Three of these arms built a [`RemoteError::Failed`] whose *string* told a
+/// peer which loss it was, against five prefix constants and a `starts_with` —
+/// because a variant sits inside the hashed contract and adding one moves every
+/// service's ALPN. `RemoteError::Withheld` is that variant, and the ALPN it
+/// costs was paid in the commit before this one. A peer matches
+/// [`Withheld`] instead of parsing a sentence whose tail is
+/// caller-derived panic text.
 ///
-/// There are two more now — [`RESTARTING`] and [`DROPPED`], both built in
-/// [`deliver_to_singleton`] on the arm that answers a reply channel that died
-/// without sending, and a fifth — [`OBSERVER_PANICKED`] — for the observer that
-/// fell over rather than deciding anything, which this function rendered as
-/// [`REFUSED`] until it had a prefix of its own. The five are declared together
-/// above, with the one property they share and the test that holds it: none of
-/// them is a prefix of another,
-/// and none is a [`RemoteError`] variant, so the contract hash does not move for
-/// any of them.
+/// [`lost`] renders the other three losses through the same enum, so the two
+/// functions no longer share a vocabulary by agreeing on string literals.
 ///
 /// The stutter is still there and is deliberately not fixed here:
 /// `Panic::caught` builds its message as `the actor panicked: {payload}`, and
 /// that same string is what [`Ended::Panicked`] and
-/// [`TurnOutcome::Panicked`] carry. Removing one of the two
-/// prefixes is a decision about `panic.rs`'s vocabulary, and it belongs where
-/// `Panic` is rather than inside a dispatch.
+/// [`TurnOutcome::Panicked`] carry, so [`Withheld::Panicked`]'s own sentence
+/// arrives in front of it. Removing one of the two is a decision about
+/// `panic.rs`'s vocabulary, and it belongs where `Panic` is rather than inside a
+/// dispatch.
 pub(crate) fn rendered<Resp>(
     answered: Answered<(Resp, Body)>,
     millis: u64,
@@ -4542,28 +4471,38 @@ pub(crate) fn rendered<Resp>(
     match answered {
         Answered::Ran((response, body)) => (Outcome::Ok(response), body),
         // A panic must not unwind out of a connection's task, so the remote
-        // caller is told a value. The actor is still alive.
+        // caller is told a value. The actor is still alive. `Panic`'s own
+        // `Display` and no prefix around it: the discriminator is the variant.
         Answered::Faulted(panic) => (
-            Outcome::Err(RemoteError::Failed(format!("{PANICKED}{panic}"))),
+            Outcome::Err(RemoteError::Withheld(Withheld::Panicked {
+                message: panic.to_string(),
+            })),
             Body::empty(),
         ),
         // NOT `NoSuchActor`, which says "there is nothing here, stop asking".
         // The turn ran and was not committed, and the actor is ending for a
         // reason the peer should be able to read.
         Answered::Refused { name } => (
-            Outcome::Err(RemoteError::Failed(format!("{REFUSED}{name}"))),
+            Outcome::Err(RemoteError::Withheld(Withheld::Refused {
+                name: name.to_owned(),
+            })),
             Body::empty(),
         ),
-        // A fifth prefix, because a peer has no `ended()` and this is the whole of
-        // what it learns. It read `{REFUSED}{name}` until this arm existed, which
-        // made the worst-informed audience the one told the observer had decided
-        // something. The prefix moves no ALPN — see `RemoteError`'s const block.
+        // Separate from `Refused` because a veto is a decision an author wrote
+        // down and a panic is the absence of one. A peer has no `ended()`, so
+        // this variant is the whole of what it learns; it read the refusal
+        // sentence for both until the two were split.
         Answered::ObserverPanicked { name } => (
-            Outcome::Err(RemoteError::Failed(format!("{OBSERVER_PANICKED}{name}"))),
+            Outcome::Err(RemoteError::Withheld(Withheld::ObserverPanicked {
+                name: name.to_owned(),
+            })),
             Body::empty(),
         ),
-        // Queued and never started. The value the other bound produces for the
-        // same condition, so a peer cannot tell the two apart by the refusal.
+        // Queued and never started. `TimedOut` and **not** `Withheld::Expired`,
+        // which says the same thing without the figure: this is the one loss
+        // whose useful content is a duration, and the value the other bound
+        // produces for the same condition — so a peer cannot tell the two apart
+        // by the refusal.
         Answered::Expired => (
             Outcome::Err(RemoteError::TimedOut { millis }),
             Body::empty(),
@@ -4599,6 +4538,17 @@ pub(crate) fn rendered<Resp>(
 ///   actor.** It is there, and this one reply was lost.
 /// - [`Standing::Gone`] — **stop asking.**
 ///
+/// # It no longer takes the actor's id, because no answer names one
+///
+/// The `Gone` arm was [`RemoteError::NoSuchActor`], whose whole content is an
+/// id, and it was the only thing the parameter fed. All three answers are
+/// [`Withheld`] now — facts about a turn rather than about an address — so the
+/// parameter went with the variant. Both callers were passing a value they
+/// already had, and neither loses anything: a peer knows which actor it
+/// addressed.
+///
+/// [`RemoteError::NoSuchActor`]: crate::RemoteError::NoSuchActor
+///
 /// # What it is about, which is not what a peer might read into it
 ///
 /// It answers *what is true of this actor now*, not *what killed your reply*. The
@@ -4610,12 +4560,14 @@ pub(crate) fn rendered<Resp>(
 /// that. [`deliver_to_singleton`] and `deliver_to_actor` both state the window they
 /// cannot close; neither of them can produce a sentence that is false at the
 /// moment it is written.
-///
-/// `id` is the singleton's service name or the keyed actor's own id — the two
-/// spellings of "which actor", which is the only thing the paths still differ by.
-pub(crate) fn lost(standing: Standing, id: &str) -> RemoteError {
-    match standing {
-        Standing::Restarting(reason) => RemoteError::Failed(format!("{RESTARTING}{reason}")),
+pub(crate) fn lost(standing: Standing) -> RemoteError {
+    RemoteError::Withheld(match standing {
+        // `&*reason` for `answered`'s reason: the `Arc` is one ending shared by
+        // every reply that died with that state, and `EndReason` is the form of
+        // it that has a schema.
+        Standing::Restarting(reason) => Withheld::Restarting {
+            reason: EndReason::from(&*reason),
+        },
         // **The sentence says what is true of the actor and nothing about where
         // the reply died**, because this arm has three producers and no way to
         // tell them apart:
@@ -4636,13 +4588,23 @@ pub(crate) fn lost(standing: Standing, id: &str) -> RemoteError {
         // `defer::a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer`
         // exercises. What all three share is the actor: it is mounted, it took
         // the message, and it will answer the next one.
-        Standing::Running => RemoteError::Failed(format!(
-            "{DROPPED}the actor is serving and this reply was never answered"
-        )),
-        // NOT a `Failed`: this is the one of the three where *there is nothing
-        // here, stop asking* is true.
-        Standing::Gone => RemoteError::NoSuchActor { id: id.to_owned() },
-    }
+        Standing::Running => Withheld::Dropped,
+        // **This says something narrower than `NoSuchActor` did, and the change
+        // is the point.** It was `NoSuchActor { id }` — *no actor is mounted as
+        // X* — which is an answer about an **id**, and this function is only ever
+        // reached after a message was delivered to an actor that took it. So the
+        // one thing a peer knew for certain here was the one thing the sentence
+        // denied.
+        //
+        // `Withheld::Gone` carries *the actor is no longer running*: this ran and
+        // has stopped, there is no next incarnation, stop calling. **A peer that
+        // matched `NoSuchActor` to mean "stop calling" still gets that
+        // instruction**, from a different variant — and one that no longer
+        // conflates *it ran and ended* with *it never existed*. The registry keeps
+        // `NoSuchActor` for the second, where it is the whole truth: a lookup that
+        // found nothing, before any turn.
+        Standing::Gone => Withheld::Gone,
+    })
 }
 
 /// Answer one peer's request out of this process's own actor, and translate what
@@ -4815,10 +4777,7 @@ where
         // such a caller to retry. Closing it needs a fact about which incarnation
         // owed the answer, and every cheap way to carry one is wrong in the other
         // direction; RFC-07 §12.4 works the generation counter through.
-        Err(_) => (
-            Outcome::Err(lost(actor.fate.standing(), service)),
-            Body::empty(),
-        ),
+        Err(_) => (Outcome::Err(lost(actor.fate.standing())), Body::empty()),
     }
 }
 
@@ -4831,17 +4790,40 @@ mod tests {
 
     use super::*;
 
+    // The five prefixes a `RemoteError::Failed` used to carry out of `rendered`
+    // and `lost`. **Neither function builds one any more** — both render
+    // `RemoteError::Withheld`, so the discriminator is a variant and no peer has
+    // to run `starts_with` on a sentence.
+    //
+    // They live on `RemoteError` itself, in `reply.rs`, where a peer can name
+    // them; these are aliases so the guard below reads as five names rather than
+    // five qualified paths. The aliases sit inside `mod tests` because this test
+    // is now their only reader in this file, and a private const nothing outside
+    // a test uses is `dead_code` in a normal build.
+    //
+    // Kept rather than deleted here: a peer built against the old wire still
+    // matches on them, and removing the constants is its own commit.
+    use crate::RemoteError as Failure;
+    const PANICKED: &str = Failure::PANICKED;
+    const REFUSED: &str = Failure::REFUSED;
+    const OBSERVER_PANICKED: &str = Failure::OBSERVER_PANICKED;
+    const RESTARTING: &str = Failure::RESTARTING;
+    const DROPPED: &str = Failure::DROPPED;
+
     /// The one property the five served-path prefixes share.
     ///
-    /// A peer reads `RemoteError::Failed`'s text to tell "your message exploded"
+    /// A peer read `RemoteError::Failed`'s text to tell "your message exploded"
     /// from "the actor is restarting" from "this reply was dropped", because the
     /// alternative — a variant per cause — sits inside the hashed contract and
     /// moves every service's ALPN. A prefix that is a prefix of another makes
     /// `starts_with` ambiguous and the discriminator stops discriminating.
     ///
-    /// Written into four rustdocs before it was written into a test. The list is
-    /// spelled out here, so **a sixth prefix has to be added to it by hand**; it
-    /// names the consts rather than the strings, so it cannot drift from the wire.
+    /// **keylink no longer builds any of the five**, so what this holds is a
+    /// promise to peers written against the old wire rather than a property of a
+    /// live path. Written into four rustdocs before it was written into a test.
+    /// The list is spelled out here, so **a sixth prefix has to be added to it by
+    /// hand**; it names the consts rather than the strings, so it cannot drift
+    /// from the wire.
     ///
     /// [`OBSERVER_PANICKED`] is the fifth and the first one whose text shares a
     /// word with an existing prefix, which is what makes the by-hand step worth
@@ -4864,298 +4846,272 @@ mod tests {
         }
     }
 
-    /// One of [`lost`]'s three answers is not a [`RemoteError::Failed`] at all,
-    /// so it carries no prefix and no `starts_with` will ever find it.
+    /// None of [`lost`]'s three answers is a [`RemoteError::Failed`], so none
+    /// carries a prefix and no `starts_with` will ever find one.
     ///
-    /// **Renamed, because the old name promised a property nothing here checks.**
-    /// It was `the_four_are_only_what_rendered_and_lost_build` — a set equality,
-    /// against a body that asserts one arm. The set half lives in
-    /// `remote::no_other_served_failure_begins_with_one_of_the_five`, which
-    /// renders the other producers; this one holds the smaller fact that makes
-    /// the count come out: three answers, two prefixes.
+    /// **It used to be one of three, and the gone arm was the exception.** That
+    /// arm answered [`RemoteError::NoSuchActor`](crate::RemoteError::NoSuchActor)
+    /// — *no actor is mounted as X* — about an actor that had taken the message
+    /// and then stopped. `lost` is reached only after a delivery, so the one fact
+    /// a peer could rely on was the one the sentence denied. It is
+    /// [`Withheld::Gone`] now: *this ran, it has stopped, stop calling*.
     ///
-    /// It matters to a peer rather than to a reader. A client that matches only
-    /// on prefixes never sees *gone*, which is the one answer that means **stop
-    /// asking** — so `NoSuchActor` staying a variant is what keeps it impossible
-    /// to miss.
+    /// The instruction a peer acts on is unchanged, and the address-shaped claim
+    /// is gone. `NoSuchActor` stays where it is the whole truth — a registry
+    /// lookup that found nothing, before any turn.
     ///
-    /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `lost`'s
-    /// `Standing::Gone` arm → `RemoteError::Failed(format!("{DROPPED}{id}"))`.
-    /// Watched: `left: Failed("dropped: id")`, `right: NoSuchActor { id: "id" }`.
+    /// This test is what makes the change a decision rather than a drift: the
+    /// assertion names the exact value a peer receives from the arm.
     ///
-    /// **This was the third guard shipped with a promissory note instead of an
-    /// output**, after the two in `tests/supervision.rs`. It is worth naming as a
-    /// pattern rather than a slip: writing the record before running the break
-    /// leaves a sentence that reads like evidence, and the two earlier ones were
-    /// only caught because a reviewer grepped for the placeholder. The replay
-    /// script's premise — every break carries the substring its guard's doc
-    /// records — was false for this one, and its expected string came from a run
-    /// rather than from here.
+    /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `lost`'s gone
+    /// arm. The literal carries the function's closing `})` because the same arm
+    /// text sits inside `answered` one indent level deeper, and a bare quote would
+    /// count 2: search `Standing::Gone => Withheld::Gone,
+    /// })` and replace it with `Standing::Gone => Withheld::Dropped,
+    /// })`. Watched:
+    /// `left: Withheld(Dropped)`, `right: Withheld(Gone)`.
     #[test]
-    fn the_gone_answer_is_not_a_failed_and_carries_no_prefix() {
+    fn the_gone_answer_says_the_actor_ran_and_stopped_rather_than_naming_an_id() {
         assert_eq!(
-            lost(Standing::Gone, "id"),
-            RemoteError::NoSuchActor {
-                id: "id".to_string()
-            },
-            "one of the three answers is not a `Failed` at all, so the set of \
-             prefixes is smaller than the set of answers"
+            lost(Standing::Gone),
+            RemoteError::Withheld(Withheld::Gone),
+            "the gone arm is reached after a delivery, so it must not answer a \
+             question about an id",
         );
     }
 
-    /// One [`Unanswered`] per [`TurnLost`] that is not a fault, sampled once so
-    /// the coverage assertion below has something to index.
-    const EVERY: [Unanswered; 7] = [
-        Unanswered::Gone,
-        Unanswered::Dropped,
-        Unanswered::Restarting,
-        Unanswered::Refused { name: "observer" },
-        Unanswered::ObserverPanicked { name: "observer" },
-        Unanswered::Expired,
-        Unanswered::Reentrant,
-    ];
-
-    /// Which slot of [`EVERY`] this is.
+    /// Every [`Withheld`] there is, sampled once.
     ///
-    /// Exhaustive over [`Unanswered`], which is one of the two compile errors
-    /// the guard below rests on.
-    fn slot(mine: &Unanswered) -> usize {
-        match mine {
-            Unanswered::Gone => 0,
-            Unanswered::Dropped => 1,
-            Unanswered::Restarting => 2,
-            Unanswered::Refused { .. } => 3,
-            Unanswered::ObserverPanicked { .. } => 4,
-            Unanswered::Expired => 5,
-            Unanswered::Reentrant => 6,
+    /// A function and not a `const`, because three of the seven carry a
+    /// [`String`]. Hand-written, because Rust has no reflection over variants —
+    /// what keeps it complete is [`produced`], which is exhaustive over the same
+    /// enum and is `error[E0004]` the moment an eighth loss exists.
+    fn every_withheld() -> [Withheld; 7] {
+        [
+            Withheld::Panicked {
+                message: "boom".to_owned(),
+            },
+            Withheld::Refused {
+                name: "observer".to_owned(),
+            },
+            Withheld::ObserverPanicked {
+                name: "observer".to_owned(),
+            },
+            Withheld::Dropped,
+            Withheld::Restarting {
+                reason: EndReason::Stopped,
+            },
+            Withheld::Gone,
+            Withheld::Expired,
+        ]
+    }
+
+    /// What the production function filed under this loss actually builds, or
+    /// `None` for the one loss nothing reachable builds.
+    ///
+    /// **It calls [`rendered`] and [`lost`] rather than describing them**, which
+    /// is the whole of the reachability claim: a variant whose producer is
+    /// rewired away has nothing to hand back, and an arm pointed at the wrong
+    /// producer returns a different variant than the one it is filed under.
+    ///
+    /// Exhaustive over [`Withheld`], which is the enforcement: an eighth loss is
+    /// a compile error here, and its author has to name the call that builds it
+    /// or say out loud that there is none.
+    fn produced(one: &Withheld) -> Option<Withheld> {
+        fn from_rendered(answered: Answered<((), Body)>) -> Withheld {
+            match rendered(answered, 0).0 {
+                Outcome::Err(RemoteError::Withheld(withheld)) => withheld,
+                other => panic!("`rendered` no longer answers a `Withheld`: {other:?}"),
+            }
         }
+        fn from_lost(standing: Standing) -> Withheld {
+            match lost(standing) {
+                RemoteError::Withheld(withheld) => withheld,
+                other => panic!("`lost` no longer answers a `Withheld`: {other:?}"),
+            }
+        }
+
+        Some(match one {
+            Withheld::Panicked { .. } => from_rendered(Answered::Faulted(
+                catching(|| panic!("produced")).expect_err("it panicked"),
+            )),
+            Withheld::Refused { .. } => from_rendered(Answered::Refused { name: "observer" }),
+            Withheld::ObserverPanicked { .. } => {
+                from_rendered(Answered::ObserverPanicked { name: "observer" })
+            }
+            Withheld::Dropped => from_lost(Standing::Running),
+            Withheld::Restarting { .. } => {
+                from_lost(Standing::Restarting(Arc::new(Ended::Stopped)))
+            }
+            Withheld::Gone => from_lost(Standing::Gone),
+            // **The one exemption, and it is by name below rather than by
+            // count.** A local `Origin` carries no `Queueing`, so
+            // `ask_catching`'s expiry arm cannot fire; the served path answers
+            // `RemoteError::TimedOut`, which carries the millisecond figure this
+            // variant has nowhere to put. Both construction sites for it are
+            // therefore unreachable, and a test cannot drive either.
+            Withheld::Expired => return None,
+        })
     }
 
     /// The [`Unanswered`] that means the same thing, or `None` for the one
     /// variant [`ask`](LocalActor::ask) resumes instead of returning.
     ///
-    /// Exhaustive over [`TurnLost`], which is the other compile error.
-    fn twin(lost: &TurnLost) -> Option<Unanswered> {
-        match lost {
-            TurnLost::Gone => Some(Unanswered::Gone),
-            TurnLost::Dropped => Some(Unanswered::Dropped),
-            TurnLost::Restarting(_) => Some(Unanswered::Restarting),
-            TurnLost::Refused { name } => Some(Unanswered::Refused { name }),
-            TurnLost::ObserverPanicked { name } => Some(Unanswered::ObserverPanicked { name }),
-            TurnLost::Expired => Some(Unanswered::Expired),
+    /// Exhaustive over [`TurnLost`].
+    fn twin(one: &TurnLost) -> Option<Unanswered> {
+        match one {
+            TurnLost::Turn(withheld) => Some(Unanswered::Turn(withheld.clone())),
             TurnLost::Reentrant => Some(Unanswered::Reentrant),
             TurnLost::Faulted(_) => None,
         }
     }
 
-    /// One fact reads as one sentence, whichever door a caller came through.
+    /// One vocabulary, every loss in it reachable, and no two of them saying the
+    /// same sentence.
     ///
-    /// [`ask_catching`](LocalActor::ask_catching) answers [`TurnLost`] and
-    /// [`ask`](LocalActor::ask) answers [`Unanswered`], and every variant of the
-    /// second is the first minus its fault. Two enums saying different things
-    /// about one condition is what an operator reads as two conditions — and the
-    /// texts were kept in step by hand until this test, with `Reentrant` already
-    /// byte-identical across the pair and nothing holding it there.
+    /// # It replaces a guard whose premise stopped existing
     ///
-    /// # Three enums, because two was the shape of the wave and not of the crate
+    /// `every_turn_lost_except_faulted_has_one_undelivered_twin_with_the_same_words`
+    /// walked two flat enums variant-by-variant and held eight assertions over
+    /// three of them. That correspondence is gone: [`TurnLost`] and
+    /// [`Unanswered`] both carry [`Withheld`] now, so the shared arm cannot drift
+    /// because there is nothing for it to drift from.
     ///
-    /// [`NotQueued`] is the third, and it was outside this guard while its own
-    /// [`Reentrant`](NotQueued::Reentrant) doc asserted it "carries the same
-    /// message" as the other two. It does, by hand: one edit to any of those three
-    /// strings and a `notify`, `tell` or `stop` caller prints one sentence for a
-    /// deadlock refusal while an `ask` caller prints another, about one condition,
-    /// with every gate step green. That is the state this test's first paragraph
-    /// describes, surviving one enum past the pair it was written for.
+    /// **The type system is not the replacement, and saying it is would be the
+    /// mistake worth naming.** It gives non-drift on the shared arm and nothing
+    /// else: not the two hand-written `Reentrant` texts, not the sentences a
+    /// `NotQueued` widens onto, not collisions between two `Withheld` variants,
+    /// and — most of all — **not reachability**. Nothing in Rust says a variant
+    /// has a producer, which is exactly how
+    /// [`Expired`](Withheld::Expired) reached zero of them without a gate
+    /// noticing. So six properties are held here by hand, and each one is a way
+    /// this could go wrong that the compiler cannot see.
     ///
-    /// **The mapping is `From<NotQueued> for Unanswered` rather than a third
-    /// helper**, so the walk reads the conversion the crate performs instead of a
-    /// copy that could quietly agree with nothing. It carries the compile error
-    /// too: that impl is exhaustive over `NotQueued`, so a third state there is
-    /// `error[E0004]` on **production** code rather than on a test's own match.
+    /// # The six
     ///
-    /// The property is injectivity and not the exactly-once above, because two
-    /// states are being checked against a seven-slot space: each `NotQueued` state
-    /// widens to a distinct `Unanswered`, and the two assertions are two-sided on
-    /// purpose — `<= 1` alone is satisfied by a walk that ran zero times, so the
-    /// count of written slots is asserted against the sample's own length.
+    /// 1. **The two `Reentrant` texts match.** They are hand-written on two
+    ///    enums, and they are the only pair in the crate that still is.
+    /// 2. **[`NotQueued`]'s two states read as their widenings do**, through
+    ///    `From<NotQueued> for Unanswered` — the conversion the crate performs,
+    ///    not a copy that could agree with nothing. That impl is exhaustive, so a
+    ///    third state is `error[E0004]` on **production** code.
+    /// 3. **No two sentences collide across the whole [`Unanswered`] surface**,
+    ///    which is every `Withheld` wrapped in [`Turn`](Unanswered::Turn) plus
+    ///    `Reentrant`. Checking only inside `Withheld` would pass a copy-paste
+    ///    that gave [`Gone`](Withheld::Gone) the re-entrancy sentence.
+    /// 4. **No `#[error]` text is empty**, which refuses an equality that holds
+    ///    because both sides are `""`.
+    /// 5. **Every `Withheld` has a producer**, checked by *calling* it — see
+    ///    [`produced`]. `Expired` is exempted **by name**, so a second exemption
+    ///    is a visible edit rather than a count going up.
+    /// 6. **The fault exception is exactly one variant wide**, so a [`twin`] that
+    ///    answered `None` to everything — and therefore skipped every comparison
+    ///    in property 1 — is refused.
     ///
-    /// The name still says *undelivered twin*, which now undersells the body by
-    /// one enum. Left as it is deliberately: the name is what a filter is typed
-    /// against and what §4.11 of RFC-07 records, and a name that asserts less than
-    /// the body is not the failure mode this file is about.
+    /// # What each property can hold for, if it held for nothing
     ///
-    /// **RFC-07 §15.2 is the full ruling and this is its pointer.** It records
-    /// what this sentence compresses: `NotQueued` reaches the guard through
-    /// `From<NotQueued> for Unanswered` rather than through [`twin`], so it is
-    /// held as a **widening** and not as a twin — which is why the name saying
-    /// *twin* is an under-claim rather than a wrong claim. It also measured what
-    /// the rename would have cost and refused it anyway, on the ground that this
-    /// crate's expensive failure is the opposite direction: names and numbers that
-    /// assert more than the tree can support. **The name stays.**
+    /// Property 5 is the one that carries its own two-sidedness: [`produced`]
+    /// runs the real function and the assertion compares *discriminants*, so an
+    /// arm pointed at the wrong producer fires and a producer that stopped
+    /// building a `Withheld` at all panics inside the helper. The exemption list
+    /// is compared against a literal `["Expired"]` rather than a length, which is
+    /// what makes it by-name.
     ///
-    /// That ruling is about the name and not the count, so it is unmoved by the
-    /// seventh variant this guard now walks.
+    /// Property 3's count is against the sample's own length, so a walk over a
+    /// subset cannot pass it. Property 2 asserts both that no two states widen
+    /// onto one answer and that the walk wrote as many as it read, because the
+    /// first alone is satisfied by a loop that ran zero times.
     ///
-    /// # Rust has no reflection over variants, so this cannot enumerate them
+    /// **The equality in property 1's walk is trivially true on the
+    /// [`Turn`](TurnLost::Turn) arm** — both sides render `{0}` of the same
+    /// value — and that is said rather than left for a reader to discover. The
+    /// arm that can fail is `Reentrant`, and it is the arm the property is about.
     ///
-    /// What it has instead is two exhaustive matches, and both are `error[E0004]`
-    /// the moment either enum grows: [`twin`] over [`TurnLost`], and [`slot`] over
-    /// [`Unanswered`]. An author who adds a variant lands in this file and has to
-    /// say what its twin is, which is the whole of the enforcement.
+    /// # Made red twice, one per novel property
     ///
-    /// **A third mechanism was claimed for this guard in design and it does not
-    /// exist.** The claim was that one arm past the array would write `EVERY[6]`
-    /// against a six-slot array — `EVERY[7]` now, and the number is not the
-    /// point — and that
-    /// a constant index past the end of a sized array fires rustc's deny-by-default
-    /// `unconditional_panic`. That lint reads a **syntactically constant** index,
-    /// and this guard indexes with `slot(&mine)` — a value computed at run time —
-    /// so the lint has nothing to fire on and an over-long index would be an
-    /// ordinary panic in this test rather than a compile error. It is not claimed
-    /// here, and it would have held only for a file whose style is literal indices,
-    /// which no test can force a later author to keep.
+    /// By `scripts/break-once.sh keylink/src/turns.rs`, filtered on this test's
+    /// own name plus `-p keylink --lib`. Both edits are in **this** file, so
+    /// neither is quoted — a record quoting its own search literal is a second
+    /// occurrence and the harness aborts at "found 2".
     ///
-    /// # The residual, named rather than argued away
-    ///
-    /// **Two hand-written arrays, and `E0004` forces an author into this file
-    /// without forcing either of them to grow.** `EVERY` samples [`Unanswered`]
-    /// and `lost` samples [`TurnLost`]. An author who adds a variant to both
-    /// enums, writes the two new arms, points [`slot`] at an **existing** index
-    /// and leaves the new `TurnLost` out of `lost` gets past every assertion here:
-    /// nothing exercises the new pair, so the counts below are unchanged and
-    /// green.
-    ///
-    /// What that same author does **not** get past is adding the new variant to
-    /// `lost` and pointing [`slot`] at an existing index — the shared slot is then
-    /// written twice. That case is caught by the exactly-once count and would not
-    /// be caught by an at-least-once one, and it is the whole of what the
-    /// strengthening buys.
-    ///
-    /// It buys nothing against the enums as they stand today, which is worth
-    /// saying rather than leaving for a reader to discover: seven twins over seven
-    /// slots means any fold also leaves a hole, so the two readings agree on every
-    /// break reachable now. The second break below is the measurement — it
-    /// produces `[2, 1, 1, 1, 1, 0, 1]`, a doubled slot **and** an empty one, so it
-    /// reddens under either reading and does not separate them.
-    ///
-    /// # Every assertion is against a way this could hold for nothing
-    ///
-    /// The sentences are compared between two values built from literals, so
-    /// neither side is derived from the other's text — the tautology this shape
-    /// invites. Beyond that: the per-slot count refuses a loop that ran over a
-    /// subset; `without_a_twin` refuses a [`twin`] that answers `None` to
-    /// everything and so skips every comparison; the distinct-sentence count
-    /// refuses two variants copy-pasted to one text, which the pairwise equality
-    /// cannot see; the emptiness check refuses `#[error("")]` on a pair, which
-    /// satisfies the equality and says nothing; and the widened-slot count refuses
-    /// a `NotQueued` walk that ran zero times, which the `<= 1` beside it would
-    /// otherwise pass.
-    ///
-    /// Made red three times by `scripts/break-once.sh keylink/src/turns.rs`, one
-    /// per property, because any one alone leaves the rest defended by prose. All
-    /// three edits are in **this** file, so none is quoted — a record quoting its
-    /// own search literal is a second occurrence and the harness aborts at
-    /// "found 2". The filter for all three is this test's own name, plus
-    /// `-p keylink --lib`:
-    ///
-    /// - change one character of [`Unanswered::Dropped`]'s `#[error]` text — the
-    ///   whole attribute line is unique in this file, so it is what the harness is
-    ///   given. Watched: `one fact must read as one sentence: Dropped and
-    ///   Dropped`, with `left` and `right` printing the two sentences one
-    ///   character apart.
-    /// - point [`slot`]'s `Unanswered::Expired` arm at `0` instead of `5`.
-    ///   Watched: `every variant is written exactly once, and this one was written
-    ///   2 times: [2, 1, 1, 1, 1, 0, 1] at slot 0`, `left: 2`, `right: 1`. **This
-    ///   record predicted slot 4 and "written 0 times", and the run said slot 0
-    ///   and 2**: the loop walks the slots in order, so the doubled one is reached
-    ///   before the emptied one. The prediction named the arm that was edited
-    ///   rather than the arm that fires, which is the sentence a reader would
-    ///   otherwise search the log for and not find.
-    ///
-    ///   Re-run when [`ObserverPanicked`](Unanswered::ObserverPanicked) took slot
-    ///   4 and pushed `Expired` to 5. Both halves of the record moved and neither
-    ///   was computed: the arm's own number is read off the source, and the array
-    ///   is read off the failing run — a seventh slot appears in it, and the
-    ///   *emptied* slot moved from 4 to 5 while the reported one stayed 0.
-    /// - point `From<NotQueued> for Unanswered`'s `Closed` arm at
-    ///   `Self::Reentrant`. Its arm line is unique in this file where **neither
-    ///   `#[error]` attribute is** — both of `NotQueued`'s texts are byte-identical
-    ///   to an `Unanswered` variant's in this same file, which is the fact the
-    ///   test exists to hold and also the reason the string cannot be the anchor.
-    ///   Watched: `one fact must read as one sentence: Closed and Reentrant`,
-    ///   `left: "the actor is no longer running"`,
-    ///   `right: "this call was made from inside the target actor's own turn: it
-    ///   would deadlock"`.
-    ///
-    ///   The injectivity assertion beside it **cannot be reddened on its own
-    ///   today, and that follows from the texts rather than from a search**: the
-    ///   two `NotQueued` sentences differ, so any collapse of the mapping also
-    ///   pairs one of them with an `Unanswered` whose text is the other's — the
-    ///   equality fires first, as it did above. It guards a future in which a third
-    ///   `NotQueued` state widens onto a slot already taken.
-    ///
-    /// Both runs also print `panicked at .. : twin` above the failure, from the
-    /// `catching` below. That is the [`Faulted`](TurnLost::Faulted) sample being
-    /// built and not a second failure.
+    /// - point [`produced`]'s gone arm at the wrong producer: search
+    ///   `Withheld::Gone => from_lost(Standing::Gone),` and replace it with
+    ///   `Withheld::Gone => from_lost(Standing::Running),`.
+    ///   Watched: `the producer filed under Gone builds Dropped`,
+    ///   `left: Discriminant(3)`, `right: Discriminant(5)`.
+    /// - give [`every_withheld`]'s `Withheld::Dropped` entry the re-entrancy
+    ///   sentence — it cannot be edited in place, so the break replaces the
+    ///   `Withheld::Dropped,` line with
+    ///   `Withheld::Refused { name: "observer".to_owned() },`, a second copy of an
+    ///   existing variant. Watched:
+    ///   `two answers share one sentence`, `left: 7`, `right: 8`.
     #[test]
-    fn every_turn_lost_except_faulted_has_one_undelivered_twin_with_the_same_words() {
-        let lost = [
-            TurnLost::Gone,
-            TurnLost::Dropped,
-            TurnLost::Restarting(Arc::new(Ended::Stopped)),
-            TurnLost::Refused { name: "observer" },
-            TurnLost::ObserverPanicked { name: "observer" },
-            TurnLost::Expired,
-            TurnLost::Reentrant,
-            TurnLost::Faulted(catching(|| panic!("twin")).expect_err("it panicked")),
-        ];
+    fn one_vocabulary_and_every_loss_in_it_has_a_producer() {
+        let every = every_withheld();
 
-        let mut written = [0u32; EVERY.len()];
-        let mut without_a_twin = 0;
-
-        for one in &lost {
-            match twin(one) {
-                None => without_a_twin += 1,
-                Some(mine) => {
-                    assert_eq!(
-                        one.to_string(),
-                        mine.to_string(),
-                        "one fact must read as one sentence: {one:?} and {mine:?}",
-                    );
-                    written[slot(&mine)] += 1;
-                }
+        // 5. Reachability, by running the producer rather than describing it.
+        let mut exempt = Vec::new();
+        for one in &every {
+            match produced(one) {
+                None => exempt.push(format!("{one:?}")),
+                Some(built) => assert_eq!(
+                    std::mem::discriminant(&built),
+                    std::mem::discriminant(one),
+                    "the producer filed under {one:?} builds {built:?}",
+                ),
             }
         }
+        assert_eq!(
+            exempt,
+            ["Expired"],
+            "`Expired` is the one loss nothing reachable builds, and a second \
+             exemption is a decision rather than an omission",
+        );
 
+        // 3 and 4. The whole surface a caller of `ask` can meet.
+        let surface: Vec<Unanswered> = every
+            .iter()
+            .cloned()
+            .map(Unanswered::Turn)
+            .chain([Unanswered::Reentrant])
+            .collect();
+        let words: BTreeSet<String> = surface.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            words.len(),
+            surface.len(),
+            "two answers share one sentence: {words:?}",
+        );
+        assert!(
+            words.iter().all(|text| !text.is_empty()),
+            "an empty `#[error]` makes every equality here hold for nothing",
+        );
+
+        // 1 and 6. The fault is the one loss `ask` resumes instead of reporting,
+        // and `Reentrant` is the one sentence still written twice.
+        let losses = [
+            TurnLost::Turn(Withheld::Gone),
+            TurnLost::Reentrant,
+            TurnLost::Faulted(catching(|| panic!("faulted")).expect_err("it panicked")),
+        ];
+        let mut without_a_twin = 0;
+        for one in &losses {
+            match twin(one) {
+                None => without_a_twin += 1,
+                Some(mine) => assert_eq!(
+                    one.to_string(),
+                    mine.to_string(),
+                    "one fact must read as one sentence: {one:?} and {mine:?}",
+                ),
+            }
+        }
         assert_eq!(
             without_a_twin, 1,
             "`Faulted` is the one variant `ask` resumes rather than maps",
         );
-        for (at, count) in written.iter().enumerate() {
-            assert_eq!(
-                *count, 1,
-                "every variant is written exactly once, and this one was written \
-                 {count} times: {written:?} at slot {at}",
-            );
-        }
 
-        let words: BTreeSet<String> = EVERY.iter().map(ToString::to_string).collect();
-        assert_eq!(
-            words.len(),
-            EVERY.len(),
-            "two variants share one sentence: {words:?}",
-        );
-        assert!(
-            words.iter().all(|text| !text.is_empty()),
-            "an empty `#[error]` makes every equality above hold for nothing",
-        );
-
-        // The third enum. `From` is the mapping rather than a fourth helper: it
-        // is the conversion the crate performs, so this reads the production
-        // widening instead of a copy of it that could agree with nothing.
+        // 2. The third enum, through the widening the crate actually performs.
         let queued = [NotQueued::Closed, NotQueued::Reentrant];
-        let mut widened = [0u32; EVERY.len()];
-
+        let mut widened = BTreeSet::new();
         for one in &queued {
             let mine = Unanswered::from(*one);
             assert_eq!(
@@ -5163,15 +5119,13 @@ mod tests {
                 mine.to_string(),
                 "one fact must read as one sentence: {one:?} and {mine:?}",
             );
-            widened[slot(&mine)] += 1;
+            assert!(
+                widened.insert(format!("{mine:?}")),
+                "two `NotQueued` states must not widen onto one `Unanswered`: {mine:?}",
+            );
         }
-
-        assert!(
-            widened.iter().all(|count| *count <= 1),
-            "two `NotQueued` states must not widen onto one `Unanswered`: {widened:?}",
-        );
         assert_eq!(
-            widened.iter().filter(|count| **count == 1).count(),
+            widened.len(),
             queued.len(),
             "every `NotQueued` state is widened exactly once: {widened:?}",
         );
@@ -5453,7 +5407,7 @@ mod tests {
             .await
             .expect_err("a stopped actor has no value");
         assert!(
-            matches!(lost, TurnLost::Gone),
+            matches!(lost, TurnLost::Turn(Withheld::Gone)),
             "a stopped actor said {lost:?}"
         );
 
@@ -5478,7 +5432,7 @@ mod tests {
             .expect("the caller is not itself aborted")
             .expect_err("an aborted turn has no value");
         assert!(
-            matches!(lost, TurnLost::Gone),
+            matches!(lost, TurnLost::Turn(Withheld::Gone)),
             "an aborted turn said {lost:?}"
         );
     }
@@ -5504,7 +5458,10 @@ mod tests {
             .await
             .expect("a stop from outside the actor's own turn is never refused");
 
-        assert_eq!(spare.ask(add(1)).await, Err(Unanswered::Gone));
+        assert_eq!(
+            spare.ask(add(1)).await,
+            Err(Unanswered::Turn(Withheld::Gone))
+        );
         // The same closed mailbox through the other question, so the other type:
         // an `ask` lost a reply channel too and a `notify` never had one.
         assert_eq!(spare.notify(add(1)).await, Err(NotQueued::Closed));
@@ -5777,7 +5734,7 @@ mod tests {
 
         assert_eq!(
             wedged.await.expect("the caller is not itself aborted"),
-            Err(Unanswered::Gone),
+            Err(Unanswered::Turn(Withheld::Gone)),
             "an aborted turn reports the actor as gone"
         );
     }
@@ -5819,7 +5776,7 @@ mod tests {
         );
     }
 
-    /// And the answer when nobody ever answers: **`TurnLost::Gone`, not a hang.**
+    /// And the answer when nobody ever answers: **`Withheld::Gone`, not a hang.**
     ///
     /// Here rather than only in `tests/defer.rs` because this is where the variant
     /// is visible — a generated `Handle` never yields a `TurnLost` at all, only
@@ -5851,7 +5808,7 @@ mod tests {
             .expect("the caller is not itself panicking")
             .expect_err("nothing answered it");
         assert!(
-            matches!(lost, TurnLost::Gone),
+            matches!(lost, TurnLost::Turn(Withheld::Gone)),
             "a reply parked in a state that was dropped said {lost:?}"
         );
     }
@@ -5862,7 +5819,7 @@ mod tests {
     /// observer that vetoed the `Park` turn too would leave no actor for a later
     /// turn to release anything from, and the test would pass on `Gone` for the
     /// wrong reason. That is not hypothetical — it is what the first version of
-    /// this test did, and `Err(Gone)` is what it printed.
+    /// this test did, and `Err(Turn(Gone))` is what it printed.
     struct Vetoing {
         method: &'static str,
     }
@@ -5949,7 +5906,7 @@ mod tests {
             .ask_catching(|origin, reply| Mail::Release { origin, reply })
             .await;
         assert!(
-            matches!(releasing, Err(TurnLost::Refused { name: "vetoing" })),
+            matches!(releasing, Err(TurnLost::Turn(Withheld::Refused { ref name })) if name == "vetoing"),
             "the releasing turn's own caller is refused: got {releasing:?}"
         );
 
@@ -5958,7 +5915,7 @@ mod tests {
             .expect("a released reply must not hang its caller")
             .expect("the caller is not itself panicking");
         assert!(
-            matches!(lost, Err(TurnLost::Refused { name: "vetoing" })),
+            matches!(lost, Err(TurnLost::Turn(Withheld::Refused { ref name })) if name == "vetoing"),
             "a released reply crossed a refused turn: {lost:?}"
         );
     }
@@ -6028,7 +5985,7 @@ mod tests {
     /// carries the rule, because that is where an author meets the harness.
     ///
     /// Watched: `a parked caller must read the same words as the turn's own:
-    /// Err(Refused { name: "falling-over" })`. **The assertion above it stayed
+    /// Err(Turn(Refused { name: "falling-over" }))`. **The assertion above it stayed
     /// green under that break**, which is the measurement that makes this test
     /// worth having: the release path and the caller-side fold are two routes to
     /// one fact, and breaking one leaves the other saying the right thing.
@@ -6055,9 +6012,8 @@ mod tests {
         assert!(
             matches!(
                 releasing,
-                Err(TurnLost::ObserverPanicked {
-                    name: "falling-over"
-                })
+                Err(TurnLost::Turn(Withheld::ObserverPanicked { ref name }))
+                    if name == "falling-over"
             ),
             "the releasing turn's own caller reads the panic: got {releasing:?}"
         );
@@ -6069,9 +6025,8 @@ mod tests {
         assert!(
             matches!(
                 lost,
-                Err(TurnLost::ObserverPanicked {
-                    name: "falling-over"
-                })
+                Err(TurnLost::Turn(Withheld::ObserverPanicked { ref name }))
+                    if name == "falling-over"
             ),
             "a parked caller must read the same words as the turn's own: {lost:?}"
         );
@@ -6084,7 +6039,7 @@ mod tests {
     /// was committed — and it cannot be answered `Faulted` either: there is one
     /// `Panic`, it is the original payload rather than a message, and it belongs
     /// to the turn's own caller. So the channel is dropped, and a dropped channel
-    /// inside a **live** actor is [`TurnLost::Dropped`].
+    /// inside a **live** actor is [`Withheld::Dropped`].
     ///
     /// **`Dropped` and not `Gone`, and this test is where the two are told apart
     /// by one run.** The first assertion is `Faulted`, which only a loop that
@@ -6107,11 +6062,11 @@ mod tests {
     ///
     /// So a second break, which is the one this test's name rests on:
     /// [`answered`](LocalActor::answered)'s
-    /// `Standing::Running => TurnLost::Dropped,` → `Standing::Running =>
-    /// TurnLost::Gone,`, the fold the variant was split out of. Watched:
-    /// `a value sent by a turn that then panicked crossed anyway: Err(Gone)`.
+    /// `Standing::Running => Withheld::Dropped,` → `Standing::Running =>
+    /// Withheld::Gone,`, the fold the variant was split out of. Watched:
+    /// `a value sent by a turn that then panicked crossed anyway: Err(Turn(Gone))`.
     ///
-    /// **Hand the harness that literal with its twelve spaces of indentation, and
+    /// **Hand the harness that literal with its sixteen spaces of indentation, and
     /// the paragraph above is why.** This record lives in the file it breaks, so
     /// the bare form counts 2 here — the arm, and this record's own copy of it —
     /// and the harness aborts at "found 2". The indented form is unique, and it
@@ -6145,7 +6100,7 @@ mod tests {
             .expect("a released reply must not hang its caller")
             .expect("the caller is not itself panicking");
         assert!(
-            matches!(lost, Err(TurnLost::Dropped)),
+            matches!(lost, Err(TurnLost::Turn(Withheld::Dropped))),
             "a value sent by a turn that then panicked crossed anyway: {lost:?}"
         );
     }
@@ -6479,7 +6434,7 @@ mod tests {
     ///
     /// `LocalActor::abort` used to settle this itself, and **deleting that line
     /// was a defect of mine**: I judged it unreachable because no break of it
-    /// could redden `an_aborted_actor_tells_a_peer_no_such_actor`, which aborts an
+    /// could redden `an_aborted_actor_tells_a_peer_the_actor_is_gone`, which aborts an
     /// actor sitting *inside* `run_loop`, where the floor genuinely is earlier.
     /// The line was not unguardable — it was unguarded, and this is the guard it
     /// never had. The remedy is structural rather than the line coming back:
@@ -6527,7 +6482,7 @@ mod tests {
     /// *stop asking* about an actor being rebuilt.
     ///
     /// That is the **false** answer, not the merely less useful one: RFC-07 §12.4
-    /// accepts a late read that renders `dropped: `, which is true when it is
+    /// accepts a late read that renders [`Withheld::Dropped`], which is true when it is
     /// written, and refuses the generation counter for producing a sentence that
     /// is not. This was on the wrong side of that line.
     ///

@@ -217,7 +217,7 @@ impl Node {
     /// [`Runtime`]'s `Drop` calls `shutdown_background`. Dropping the node
     /// therefore ends the actor with no ordering and no notification: a handle
     /// held past that point reports
-    /// [`Unanswered::Gone`](crate::Unanswered::Gone) or
+    /// [`Withheld::Gone`](crate::Withheld::Gone) or
     /// [`NotQueued::Closed`](crate::NotQueued::Closed) by door, either of which
     /// says the actor is gone and not why. Keep the node alive for as long as the
     /// actor.

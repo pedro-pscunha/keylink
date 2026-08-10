@@ -1520,16 +1520,18 @@ macro_rules! __keylink_service {
             ///
             /// The one message a restart loses is a `#[defer]`red reply parked in
             /// the state, because the state is dropped when the incarnation ends.
-            /// That loss reaches the peer as `Failed("restarting: {reason}")` —
+            /// That loss reaches the peer as
+            /// [`Withheld::Restarting`](keylink::Withheld::Restarting) —
             /// *the incarnation that owed you an answer is gone, another is
-            /// coming, retry*.
+            /// coming, retry* — carrying the ending that caused it.
             ///
             /// A restart is one of **three** ways that channel dies, and the other
             /// two need no supervisor at all: a handler that takes
             /// `reply.later()` and drops the `Deferred` — sanctioned, and what its
-            /// `#[must_use]` asks for — reads `Failed("dropped: ..")`, and an
+            /// `#[must_use]` asks for — reads
+            /// [`Withheld::Dropped`](keylink::Withheld::Dropped), and an
             /// actor that has genuinely ended, or was aborted or evicted, reads
-            /// [`RemoteError::NoSuchActor`](keylink::RemoteError::NoSuchActor).
+            /// [`Withheld::Gone`](keylink::Withheld::Gone).
             /// The three answers are three different next moves: retry, do not
             /// retry this one call, stop asking.
             ///
@@ -2262,13 +2264,13 @@ macro_rules! __keylink_service {
                 ///
                 /// # Errors
                 ///
-                /// Two of [`Unanswered`](keylink::Unanswered)'s variants,
-                /// because this is
+                /// Two answers, because this is
                 /// [`LocalActor::read`](keylink::LocalActor::read) and a read
                 /// runs no observers and carries no queueing budget:
                 /// [`Reentrant`](keylink::Unanswered::Reentrant) when the call
                 /// came from inside this actor's own turn, and
-                /// [`Gone`](keylink::Unanswered::Gone) when the actor is gone.
+                /// [`Turn`](keylink::Unanswered::Turn) carrying
+                /// [`Gone`](keylink::Withheld::Gone) when the actor is gone.
                 /// That method's own documentation carries the argument for why
                 /// a dead read channel is `Gone` and never `Dropped` or
                 /// `Restarting`.
@@ -2292,7 +2294,7 @@ macro_rules! __keylink_service {
                 /// Stop after the messages already queued, then wait for the
                 /// actor to end. Every other handle reports a closed mailbox
                 /// from then on — an `rpc` as
-                /// [`Unanswered::Gone`](keylink::Unanswered::Gone), a `tell`
+                /// [`Withheld::Gone`](keylink::Withheld::Gone), a `tell`
                 /// as [`NotQueued::Closed`](keylink::NotQueued::Closed).
                 ///
                 /// # Errors
@@ -2357,14 +2359,14 @@ macro_rules! __keylink_service {
 
                 /// Resolve when this actor ends, and say why.
                 ///
-                /// [`Unanswered::Gone`](keylink::Unanswered::Gone) says
+                /// [`Withheld::Gone`](keylink::Withheld::Gone) says
                 /// "gone", and it must not be stretched to say "gave up on
                 /// durability". This is the second question, asked separately.
                 ///
                 /// **It is not where a refusal is learned, in either
                 /// direction.** An `rpc` refused by an
                 /// [`Observer`](keylink::Observer) is answered
-                /// [`Unanswered::Refused`](keylink::Unanswered::Refused) with
+                /// [`Withheld::Refused`](keylink::Withheld::Refused) with
                 /// that observer's name, so the call carries the fact itself;
                 /// and a refusal that did not declare itself
                 /// [`fatal`](keylink::Stop::fatal) ends one incarnation rather
@@ -3825,19 +3827,25 @@ macro_rules! __keylink_local_method {
         ///
         /// # Errors
         ///
-        /// [`Unanswered`](keylink::Unanswered), one variant per way the call
-        /// lost its value: [`Gone`](keylink::Unanswered::Gone) when the actor
-        /// is gone, [`Dropped`](keylink::Unanswered::Dropped) when a live actor
-        /// threw this reply away without answering it,
-        /// [`Restarting`](keylink::Unanswered::Restarting) when the incarnation
-        /// that owed the answer died and a supervisor is starting another,
-        /// [`Refused`](keylink::Unanswered::Refused) when an
+        /// [`Unanswered`](keylink::Unanswered). Its
+        /// [`Turn`](keylink::Unanswered::Turn) arm carries a
+        /// [`Withheld`](keylink::Withheld), one variant per way the call lost
+        /// its value: [`Gone`](keylink::Withheld::Gone) when the actor is gone,
+        /// [`Dropped`](keylink::Withheld::Dropped) when a live actor threw this
+        /// reply away without answering it,
+        /// [`Restarting`](keylink::Withheld::Restarting) when the incarnation
+        /// that owed the answer died and a supervisor is starting another —
+        /// carrying the ending that caused it —
+        /// [`Refused`](keylink::Withheld::Refused) when an
         /// [`Observer`](keylink::Observer) refused the turn that ran — the actor
         /// is alive, and a supervised one may be restarting —
-        /// [`Expired`](keylink::Unanswered::Expired) when a queueing budget ran
-        /// out before the turn started, which a local origin cannot do today,
-        /// and [`Reentrant`](keylink::Unanswered::Reentrant) when the call was
-        /// made from inside this actor's own turn.
+        /// [`ObserverPanicked`](keylink::Withheld::ObserverPanicked) when one
+        /// fell over instead of deciding, and
+        /// [`Expired`](keylink::Withheld::Expired) when a queueing budget ran
+        /// out before the turn started, which a local origin cannot do today.
+        /// Plus [`Reentrant`](keylink::Unanswered::Reentrant) when the call was
+        /// made from inside this actor's own turn, which is outside `Withheld`
+        /// because nothing was queued.
         ///
         /// "One variant per way" is a promise of completeness, so it is the
         /// whole enum: a fault is the one loss missing, and it is missing

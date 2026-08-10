@@ -342,15 +342,25 @@ fn no_such_actor(id: &ActorId) -> RemoteError {
 
 /// What a peer is told, which is deliberately less than what happened.
 ///
-/// The capacity refusal is [`RemoteError::Failed`] and not a variant of its own,
-/// because a cap is this node's configuration and not something the caller can
-/// act on differently from any other refusal. Changing that would move every
-/// service's ALPN, so it is a wire decision rather than a tidying one.
+/// **The capacity refusal is a variant now, and the ALPN it costs is already
+/// paid.** It was [`RemoteError::Failed`] carrying `RouteError`'s own sentence,
+/// on the ground that a variant sits inside the hashed contract and moves every
+/// service's ALPN — true, and the reason it stayed a string for as long as the
+/// wire could not afford one. [`RemoteError::AtCapacity`] is that variant, and a
+/// peer can match a cap it might wait out instead of scanning a sentence for the
+/// word *capacity*.
 impl From<RouteError> for RemoteError {
     fn from(err: RouteError) -> Self {
         match &err {
             RouteError::NoSuchActor { id } => no_such_actor(id),
-            RouteError::AtCapacity { .. } => Self::Failed(err.to_string()),
+            // `try_from` and not `as`: the cap is a `usize` here and a `u64` on
+            // the wire, because `usize` has no wire schema — its width is the
+            // compiler's choice. A cast would wrap silently on a target where
+            // one is wider; this saturates, and a diagnostic must not be the
+            // thing that panics.
+            RouteError::AtCapacity { capacity } => Self::AtCapacity {
+                capacity: u64::try_from(*capacity).unwrap_or(u64::MAX),
+            },
         }
     }
 }
@@ -411,16 +421,19 @@ impl From<RouteError> for RemoteError {
 ///
 /// # Errors
 ///
-/// [`RemoteError::Failed`] for a malformed id or a full registry,
-/// [`RemoteError::NoSuchActor`] when nothing is mounted and no factory built
-/// one, and [`RemoteError::TimedOut`] when the queue budget expired before a
-/// permit arrived.
+/// [`RemoteError::BadActorId`] for a malformed id, [`RemoteError::AtCapacity`]
+/// for a full registry, [`RemoteError::NoSuchActor`] when nothing is mounted and
+/// no factory built one, and [`RemoteError::TimedOut`] when the queue budget
+/// expired before a permit arrived.
 ///
 /// And three more once the message *did* reach an actor and the answer did not
-/// come back, which is [`lost`]'s vocabulary rather than this function's:
-/// `Failed("restarting: ..")` for an incarnation that ended with another coming,
-/// `Failed("dropped: ..")` for a reply a live actor took out of its turn and never
-/// answered, and `NoSuchActor` again for an actor that is genuinely finished.
+/// come back, which is [`lost`]'s vocabulary rather than this function's: a
+/// [`RemoteError::Withheld`] carrying [`Restarting`](crate::Withheld::Restarting)
+/// for an incarnation that ended with another coming,
+/// [`Dropped`](crate::Withheld::Dropped) for a reply a live actor took out of its
+/// turn and never answered, and [`Gone`](crate::Withheld::Gone) for an actor that
+/// is genuinely finished. That last one was `NoSuchActor` — an answer about an
+/// **id**, given after a delivery proved the id was real.
 #[doc(hidden)]
 pub async fn deliver_to_actor<S: KeyedService>(
     system: &System<S::Mail>,
@@ -429,9 +442,14 @@ pub async fn deliver_to_actor<S: KeyedService>(
     body: BodyReader,
 ) -> std::result::Result<(Outcome<S::Response>, Body), RemoteError> {
     let (actor, message) = request.split();
-    actor
-        .validate()
-        .map_err(|err| RemoteError::Failed(err.to_string()))?;
+    // The id and the reason as two fields, so a peer can match on the one it
+    // sent and log the one it did not know. `validate`'s own error is what fills
+    // `reason` — the sentence the crate uses locally rather than a second
+    // wording of the same rule.
+    actor.validate().map_err(|err| RemoteError::BadActorId {
+        id: actor.to_string(),
+        reason: err.to_string(),
+    })?;
 
     let route = system.route(&actor)?;
     // Cloned out so the wait at the bottom can read the verdict without the
@@ -532,7 +550,7 @@ pub async fn deliver_to_actor<S: KeyedService>(
     answer
         .await
         .map(|answered| rendered(answered, budget.map_or(0, Queueing::millis)))
-        .map_err(|_| lost(fate.standing(), actor.as_str()))
+        .map_err(|_| lost(fate.standing()))
 }
 
 #[cfg(test)]
@@ -722,39 +740,46 @@ mod tests {
     /// enums describe different sets of conditions. This is what stops the two
     /// copies from drifting: a peer met the same sentence before this
     /// translation existed, and must go on meeting it.
+    ///
+    /// **A third copy now, and this is where the three are held together.**
+    /// [`RemoteError::AtCapacity`] is a variant rather than a `Failed` carrying
+    /// `RouteError`'s rendered text, so a peer matches the cap instead of reading
+    /// for the word. The `to_string` comparison is what keeps that variant's own
+    /// `#[error]` from drifting off the two it replaced — and it is now a
+    /// comparison between three sentences written in three files rather than two.
+    ///
+    /// The cap crosses as a `u64` where both local enums hold a `usize`, because
+    /// `usize` has no wire schema. The number is asserted rather than the
+    /// conversion, which is the only thing a peer can see.
     #[test]
     fn the_capacity_refusal_reads_the_same_by_hand_and_lazily() {
         let by_hand = MountError::AtCapacity { capacity: 10_000 };
         let lazily = RemoteError::from(RouteError::AtCapacity { capacity: 10_000 });
 
-        assert_eq!(
-            lazily,
-            RemoteError::Failed(
-                "the actor system is at its capacity of 10000 live actors".to_string()
-            )
-        );
+        assert_eq!(lazily, RemoteError::AtCapacity { capacity: 10_000 });
         assert_eq!(lazily.to_string(), by_hand.to_string());
+        assert_eq!(
+            lazily.to_string(),
+            "the actor system is at its capacity of 10000 live actors",
+        );
     }
 
-    /// **Every other `RemoteError::Failed` keylink itself builds on a served
-    /// path, and none of them begins like one of the five prefixes.**
+    /// **The five sentences below do not begin like one of the five prefixes.**
     ///
-    /// `turns.rs`'s const block claimed those four were *every* prefix a `Failed`
-    /// carries on the served path. It was false in at least four places. Three are
-    /// here rather than in `turns.rs` because this is the file they are built in —
-    /// `From<RouteError>` two hundred lines up, and [`deliver_to_actor`]'s own
-    /// `validate` step.
+    /// **Four of the five stopped being `Failed` texts in this commit**, and the
+    /// claim narrowed with them. `From<RouteError>` builds
+    /// [`RemoteError::AtCapacity`], [`deliver_to_actor`]'s `validate` step builds
+    /// [`RemoteError::BadActorId`], and `console.rs` builds
+    /// [`RemoteError::FollowRefused`] — three variants where there were three
+    /// strings. What is left inside a `Failed` is the last entry:
+    /// `deliver_to_singleton`'s re-entrancy arm, which renders a local error onto
+    /// the wire and which no other line in this file does.
     ///
-    /// **The fourth is built in `turns.rs`, and being the exception is why this
-    /// list missed it** while the doc above claimed *every* other served `Failed`:
-    /// `deliver_to_singleton`'s re-entrancy arm renders a local error onto the wire,
-    /// which no other line in this file does. It went uncovered for as long as the
-    /// prose said it was covered. Each is a whole **sentence**
-    /// rather than a prefix, which is exactly why nothing has ever collided and
-    /// why nothing would have noticed if something had:
-    /// `no_failure_prefix_is_a_prefix_of_another` checks the five against each
-    /// other and would stay green while a `RouteError` variant whose `Display`
-    /// began `"dropped: "` made every peer's `starts_with` ambiguous.
+    /// So this is a **collision check between sentences a peer may still meet**
+    /// rather than a survey of live `Failed` producers, and it is kept for the
+    /// same reason the constants are: a peer built against the old wire is still
+    /// running `starts_with`. Removing the constants and this test together is
+    /// its own commit.
     ///
     /// Rendered rather than described, so the assertion is against the bytes a
     /// peer receives.
@@ -766,9 +791,12 @@ mod tests {
     /// rather than writing a sentence that happens to start the same way, which
     /// is half of why they are public now.
     ///
-    /// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs`, giving
-    /// `RouteError::AtCapacity`'s `#[error(..)]` the text `"dropped: the actor
-    /// system is at its capacity of {capacity} live actors"`. Watched:
+    /// Made red by `scripts/break-once.sh keylink/src/reply.rs`, giving
+    /// `RemoteError::AtCapacity`'s `#[error(..)]` the text `"dropped: the actor
+    /// system is at its capacity of {capacity} live actors"`. It was
+    /// `RouteError`'s own attribute in `registry.rs` while this list read the
+    /// registry's sentence; the list reads what the **wire** carries now, so the
+    /// break has to move to the type that renders it. Watched:
     /// `a served Failed that is not one of the five must not begin like one:
     /// "dropped: " starts "dropped: the actor system is at its capacity of 10
     /// live actors"`.
@@ -780,16 +808,18 @@ mod tests {
         .expect("a peer can encode what our constructor refuses");
 
         let others = [
-            // The registry is full, through the `From` impl above.
-            RouteError::AtCapacity { capacity: 10 }.to_string(),
+            // The registry is full. A `RemoteError::AtCapacity` now, so what a
+            // peer reads is this sentence behind a variant.
+            RemoteError::from(RouteError::AtCapacity { capacity: 10 }).to_string(),
             // An id a peer sent that never met our constructor, at
-            // `deliver_to_actor`'s step 2.
+            // `deliver_to_actor`'s step 2. A `RemoteError::BadActorId` now.
             oversized.validate().expect_err("oversized").to_string(),
-            // `console.rs`'s follow refusal, both arms.
+            // `console.rs`'s follow refusal, both arms. A
+            // `RemoteError::FollowRefused` now.
             crate::FollowRefused::Ahead { after: 9, seq: 4 }.to_string(),
             crate::FollowRefused::Crowded { parked: 64 }.to_string(),
-            // `deliver_to_singleton`'s re-entrancy arm, and the only one of these the
-            // doc above ever missed. It is rendered through `Unanswered` at that
+            // `deliver_to_singleton`'s re-entrancy arm, and the only one of these
+            // still inside a `Failed`. It is rendered through `Unanswered` at that
             // site rather than through the `NotQueued` the send returns, so this
             // names the same type the wire does — a guard reading the other one
             // would go green on a text no peer receives.

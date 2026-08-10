@@ -1072,17 +1072,19 @@ ANCHORS = [
     # `P1`'s note names. `flat()` collapses the indentation before comparing, so the
     # records may go on quoting the bare form and this row still finds it.
     ("E1", "keylink/tests/defer.rs", "keylink/src/turns.rs",
-     "            Standing::Running => TurnLost::Dropped,"),
+     "                Standing::Running => Withheld::Dropped,"),
     ("E2", "keylink/tests/defer.rs", "keylink/src/turns.rs",
-     "            Standing::Running => TurnLost::Dropped,"),
+     "                Standing::Running => Withheld::Dropped,"),
     # E3 and E4 are the other two arms the split created, one per enum. The pairing
     # record's OTHER break - `lost`'s whole three-line `Standing::Running` arm - has
     # no row here and needs none: that record quotes its REPLACEMENT and describes
     # its search, so there is no literal for a row to check.
     ("E3", "keylink/tests/supervision.rs", "keylink/src/turns.rs",
-     "            Standing::Restarting(reason) => TurnLost::Restarting(reason),"),
+     "                Standing::Restarting(reason) => Withheld::Restarting {\n"
+     "                    reason: EndReason::from(&*reason),\n"
+     "                },"),
     ("E4", "keylink/tests/observe.rs", "keylink/src/turns.rs",
-     "            Err(TurnLost::Refused { name }) => Err(Unanswered::Refused { name }),"),
+     "            Err(TurnLost::Turn(withheld)) => Err(Unanswered::Turn(withheld)),"),
     # F1 is the first row whose TARGET is `macros.rs`, and that is the point rather
     # than an accident. `supervised_deep` is a generated door with no caller in the
     # tree, and `Handle`'s `inner` field carries no `pub`, so it is also the only
@@ -1720,11 +1722,22 @@ ANCHORS = [
     ("O1", "keylink/tests/observe.rs", "keylink/src/turns.rs",
      "        (Ok(_), Some(ObserverVerdict::Panicked { name })) => Answered::ObserverPanicked { name },\n"),
     ("O2", "keylink/tests/singleton.rs", "keylink/src/turns.rs",
-     '            Outcome::Err(RemoteError::Failed(format!("{OBSERVER_PANICKED}{name}"))),\n'),
+     "            Outcome::Err(RemoteError::Withheld(Withheld::ObserverPanicked {"),
     ("O3", "keylink/src/turns.rs", "keylink/src/turns.rs",
      "            Verdict::ObserverPanicked { name } => reply.answer(Answered::ObserverPanicked { name }),\n"),
     ("O4", "keylink/src/turns.rs", "keylink/src/turns.rs",
      "            Ok(()) | Err(NotQueued::Closed) => {}\n"),
+    # The three below are this wave's collapse onto one `Withheld`. All three
+    # edit `turns.rs` from a record that also lives in `turns.rs`, so none of
+    # the records quotes its own search literal — the indentation here is what
+    # keeps each unique, and a record that quoted it would abort the harness at
+    # "found 2".
+    ("W1", "keylink/src/turns.rs", "keylink/src/turns.rs",
+     "        Standing::Gone => Withheld::Gone,\n    })"),
+    ("W2", "keylink/src/turns.rs", "keylink/src/turns.rs",
+     "            Withheld::Gone => from_lost(Standing::Gone),"),
+    ("W3", "keylink/src/turns.rs", "keylink/src/turns.rs",
+     "            Withheld::Dropped,"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.

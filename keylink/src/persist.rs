@@ -187,9 +187,9 @@ use crate::{Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 ///
 /// A `store` that returns `Err` refuses the turn, which ends the actor and
 /// hands the caller
-/// [`TurnLost::Refused`](crate::TurnLost::Refused) — whose text is *"it ran and
-/// was not committed"*, and which crosses the wire to a peer as
-/// `observer refused: persist` under the same sentence. That is a promise, and
+/// [`Withheld::Refused`](crate::Withheld::Refused) — whose text is *"it ran and
+/// was not committed"*, and which crosses the wire to a peer as that same
+/// value, naming `persist`, under the same sentence. That is a promise, and
 /// the only thing the caller has to act on. A caller who believes it replays;
 /// an operator who reads it replays.
 ///
@@ -253,7 +253,7 @@ use crate::{Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 /// The first observer to return `Err` stops the rest, so an observer placed
 /// before this one can refuse a turn and prevent the write. One placed *after*
 /// it cannot: the write has already happened, and the caller is still told
-/// [`TurnLost::Refused`](crate::TurnLost::Refused). That asymmetry is the
+/// [`Withheld::Refused`](crate::Withheld::Refused). That asymmetry is the
 /// chain's, not this type's — but "last" is the position in which it means what
 /// a reader expects, so it is written here rather than left to be discovered.
 ///

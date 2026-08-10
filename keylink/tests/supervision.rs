@@ -44,8 +44,8 @@ use std::time::Duration;
 #[cfg(feature = "persist-file")]
 use keylink::Persist;
 use keylink::{
-    Allowlist, Caller, Deferred, Ended, Intensity, Observer, RemoteError, Replied, Reply, Server,
-    Stop, Stream, TurnFut, TurnInfo, TurnOutcome, Unanswered,
+    Allowlist, Caller, Deferred, EndReason, Ended, Intensity, Observer, RemoteError, Replied,
+    Reply, Server, Stop, Stream, TurnFut, TurnInfo, TurnOutcome, Unanswered, Withheld,
 };
 #[cfg(feature = "persist-file")]
 use keylink_persist::file::Files;
@@ -81,8 +81,9 @@ keylink::service! {
     /// A second declaration and not a second caller of the first, because a
     /// keyed `tell` has no client method at all — `__keylink_actor_client_method`
     /// refuses one, since four keyed failures are reported on a reply a `tell`
-    /// does not have. A peer's `rpc` gets the fault as `Failed("panicked: ..")`
-    /// rather than as an unwind, which is exactly what this test wants.
+    /// does not have. A peer's `rpc` gets the fault as
+    /// `Withheld::Panicked { message }` rather than as an unwind, which is
+    /// exactly what this test wants.
     rpc Ruin(entry: u64) -> u64;
 }
 
@@ -134,8 +135,8 @@ keylink::service! {
     /// How many orders this incarnation has parked, so a test can wait for a
     /// park to have **happened** rather than assume it raced ahead of the fault.
     rpc Parked() -> u64;
-    /// Panics. Over the wire that is `Failed("panicked: ..")`, and it is here so
-    /// that the two prefixes can be shown side by side.
+    /// Panics. Over the wire that is `Withheld::Panicked`, and it is here so
+    /// that the two answers can be shown side by side.
     rpc Boom() -> u64;
 }
 
@@ -1067,13 +1068,15 @@ async fn a_handle_survives_its_actors_restart() {
 /// that was always `NoSuchActor` — *there is nothing here, stop asking* — which
 /// is a lie about an actor that is being rebuilt and about to answer again. So
 /// the served path reads the supervisor's decision, which is published **before**
-/// the state is dropped, and renders `Failed("restarting: ..")`.
+/// the state is dropped, and renders `Withheld::Restarting`.
 ///
 /// Two real nodes, one QUIC connection, and three answers on it:
 ///
-/// 1. `boom` faults → `Failed("panicked: ..")`, the actor survives the message;
-/// 2. the parked `place` → `Failed("restarting: ..")`, the incarnation did not;
-/// 3. once the budget is out → `NoSuchActor`, which is *gone* and is final.
+/// 1. `boom` faults → `Withheld::Panicked`, the actor survives the message;
+/// 2. the parked `place` → `Withheld::Restarting`, the incarnation did not;
+/// 3. once the budget is out → `Withheld::Gone`, which is final. It was
+///    `NoSuchActor` — an answer about an **id** — until the losses became one
+///    vocabulary.
 ///
 /// # `multi_thread`, and it is the whole reason round 3 means anything
 ///
@@ -1082,7 +1085,7 @@ async fn a_handle_survives_its_actors_restart() {
 /// the actor's task simply ran its whole teardown, returned, and dropped the
 /// receiver before the peer's task was ever polled again, so `Life::Ended` and a
 /// closed mailbox were what that peer eventually read. On more than one worker
-/// the same code answers `Failed("dropped: ..")` — *the actor is still there* —
+/// the same code answers `Withheld::Dropped` — *the actor is still there* —
 /// about an actor that will never answer again.
 ///
 /// Four workers, then, so this test can see the window it is about. It is
@@ -1099,8 +1102,7 @@ async fn a_handle_survives_its_actors_restart() {
 /// `Lent::ending`'s `Standing::Gone` → `Standing::Running` — a supervisor that
 /// refuses the restart and tells the peer the actor is still there, which is the
 /// regression verbatim. Watched: `round 2: expected gone, got
-/// Remote(Failed("dropped: the actor is serving and this reply was never
-/// answered"))`.
+/// Remote(Withheld(Dropped))`.
 /// (The loop indexes its two rounds from one; round 3 above is the second round's
 /// second answer.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1127,7 +1129,7 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
         keylink::Peer::new(&client_node, server_node.endpoint().addr());
     let client = peer.connect().await.expect("the dial");
 
-    for (round, expected) in [(1u8, "restarting: "), (2, "gone")] {
+    for (round, expected) in [(1u8, "restarting"), (2, "gone")] {
         // Parked by the handler and never answered. Held across the fault below.
         let placing = {
             let client = client.clone();
@@ -1151,8 +1153,10 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
 
         let faulted = client.boom().await.expect_err("boom panics");
         assert!(
-            matches!(&faulted, keylink::Error::Remote(RemoteError::Failed(why))
-                     if why.starts_with("panicked: ")),
+            matches!(
+                &faulted,
+                keylink::Error::Remote(RemoteError::Withheld(Withheld::Panicked { .. }))
+            ),
             "a fault is rendered with its own prefix and is not confusable with a \
              restart: got {faulted:?}"
         );
@@ -1162,11 +1166,11 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
             .expect("the caller task is not itself panicking")
             .expect_err("a parked reply whose incarnation ended is not answered");
         match (&placed, expected) {
-            (keylink::Error::Remote(RemoteError::Failed(why)), "restarting: ") => assert!(
-                why.starts_with("restarting: "),
-                "round {round}: a lost reply on a restarting actor must say so: got {why}"
-            ),
-            (keylink::Error::Remote(RemoteError::NoSuchActor { .. }), "gone") => {}
+            (
+                keylink::Error::Remote(RemoteError::Withheld(Withheld::Restarting { .. })),
+                "restarting",
+            ) => {}
+            (keylink::Error::Remote(RemoteError::Withheld(Withheld::Gone)), "gone") => {}
             _ => panic!("round {round}: expected {expected}, got {placed:?}"),
         }
     }
@@ -1190,18 +1194,18 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
 /// The same three answers through the **local** door, where they are variants
 /// rather than rendered sentences.
 ///
-/// A peer reads `Failed("restarting: ..")` and `NoSuchActor` because the wire
-/// carries no variant per cause. A local caller holds the handle, so it gets
-/// [`Unanswered::Restarting`] and [`Unanswered::Gone`] — two values, and the
-/// whole reason `Unanswered` grew from *the actor is gone* into a six-variant
-/// enum. Both answers came back `Gone` before that split, which told a caller to
+/// A peer and a local caller read the **same two values** now —
+/// [`Withheld::Restarting`] and [`Withheld::Gone`] — because one enum crosses
+/// both doors. A peer read `Failed("restarting: ..")` and `NoSuchActor` while the
+/// wire carried no variant per cause, and that is the whole of what this pair of
+/// tests used to be about. Both answers came back `Gone` before the split, which told a caller to
 /// stop calling an actor a supervisor was in the middle of putting back.
 ///
 /// Two rounds and one budgeted restart, exactly as the served twin above:
 ///
-/// 1. the parked `place` → `Unanswered::Restarting`, the incarnation did not
+/// 1. the parked `place` → `Withheld::Restarting`, the incarnation did not
 ///    survive the fault and another is coming;
-/// 2. once the budget is out → `Unanswered::Gone`, which is final.
+/// 2. once the budget is out → `Withheld::Gone`, which is final.
 ///
 /// # Three ways this passes for the wrong reason, and what refuses each
 ///
@@ -1226,10 +1230,14 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
 /// equivalent of that fact is a caller task that unwinds.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `answered`'s
-/// `Standing::Restarting(reason) => TurnLost::Restarting(reason),` →
-/// `Standing::Restarting(_) => TurnLost::Gone,` — the fold that made a restart
-/// indistinguishable from an ending. Watched: `round 1: a lost reply on a
-/// restarting actor must say so`, `left: Gone`, `right: Restarting`.
+/// three-line `Standing::Restarting(reason) => Withheld::Restarting {
+/// reason: EndReason::from(&*reason), },` arm
+/// → `Standing::Restarting(_) => Withheld::Gone,` — the fold that made a restart
+/// indistinguishable from an ending. The whole block is the literal, because
+/// `rustfmt` wraps the struct expression and a one-line anchor inside it leaves
+/// two dangling lines. Watched: `round 1: a lost reply on a restarting actor must
+/// say so`, `left: Turn(Gone)`,
+/// `right: Turn(Restarting { reason: Panicked { .. } })`.
 ///
 /// **Round 2 stays green under that break**, and that is the shape of the guard
 /// rather than a gap: the break folds `Restarting` onto the answer round 2 already
@@ -1250,7 +1258,17 @@ async fn a_local_caller_can_tell_restarting_from_gone() {
         limit(1, Duration::from_millis(50)),
     );
 
-    for (round, expected) in [(1u8, Unanswered::Restarting), (2, Unanswered::Gone)] {
+    for (round, expected) in [
+        (
+            1u8,
+            Unanswered::Turn(Withheld::Restarting {
+                reason: EndReason::Panicked {
+                    message: "the actor panicked: the desk fell over".to_owned(),
+                },
+            }),
+        ),
+        (2, Unanswered::Turn(Withheld::Gone)),
+    ] {
         // Parked by the handler and never answered. Held across the fault below.
         let placing = {
             let desk = desk.clone();
@@ -1298,7 +1316,7 @@ async fn a_local_caller_can_tell_restarting_from_gone() {
     // which is why it is not what round 2 asserts.
     assert_eq!(
         desk.place(3).await,
-        Err(Unanswered::Gone),
+        Err(Unanswered::Turn(Withheld::Gone)),
         "an actor that gave up refuses the send itself"
     );
     assert!(
@@ -1376,8 +1394,10 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
         .await
         .expect_err("the turn panicked");
     assert!(
-        matches!(&faulted, keylink::Error::Remote(RemoteError::Failed(why))
-                 if why.starts_with("panicked: ")),
+        matches!(
+            &faulted,
+            keylink::Error::Remote(RemoteError::Withheld(Withheld::Panicked { .. }))
+        ),
         "got {faulted:?}"
     );
 
@@ -1400,9 +1420,9 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
 /// channel `deliver_to_actor` could not see. The verdict is a cell on the registry
 /// entry now, so this is the same test on the same two prefixes, over a `System`:
 ///
-/// 1. `boom` faults → `Failed("panicked: ..")`, the actor survives the message;
-/// 2. the parked `place` → `Failed("restarting: ..")`, the incarnation did not;
-/// 3. once the budget is out → `NoSuchActor`, which is *gone* and is final.
+/// 1. `boom` faults → `Withheld::Panicked`, the actor survives the message;
+/// 2. the parked `place` → `Withheld::Restarting`, the incarnation did not;
+/// 3. once the budget is out → `Withheld::Gone`, which is final.
 ///
 /// Round 2 is worth naming separately: it is the **give-up**, where the old
 /// singleton split answered `dropped: ` — *the actor is still there* — because the
@@ -1412,8 +1432,8 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `Lent::ending`'s
 /// `return Standing::Restarting(Arc::new(reason.clone()));` → `return Standing::Gone;`,
 /// which is a supervisor that grants the restart and tells the peer to stop
-/// asking anyway. Watched: `round 1: expected restarting: , got
-/// Remote(NoSuchActor { id: "desks/4471" })`.
+/// asking anyway. Watched: `round 1: expected restarting, got
+/// Remote(Withheld(Gone))`.
 ///
 /// **Round 2 is NOT reliably red under that break, and saying so is the point.**
 /// The same edit — `Lent::ending`'s `Standing::Gone` → `Standing::Running`, the
@@ -1464,7 +1484,7 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
         .await
         .expect("the client dials the actor system");
 
-    for (round, expected) in [(1u8, "restarting: "), (2, "gone")] {
+    for (round, expected) in [(1u8, "restarting"), (2, "gone")] {
         // Parked by the handler and never answered. Held across the fault below.
         let placing = {
             let client = client.clone();
@@ -1499,8 +1519,10 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
             .await
             .expect_err("boom panics");
         assert!(
-            matches!(&faulted, keylink::Error::Remote(RemoteError::Failed(why))
-                     if why.starts_with("panicked: ")),
+            matches!(
+                &faulted,
+                keylink::Error::Remote(RemoteError::Withheld(Withheld::Panicked { .. }))
+            ),
             "round {round}: a fault keeps its own prefix on the keyed path too: \
              got {faulted:?}"
         );
@@ -1510,12 +1532,11 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
             .expect("the caller task is not itself panicking")
             .expect_err("a parked reply whose incarnation ended is not answered");
         match (&placed, expected) {
-            (keylink::Error::Remote(RemoteError::Failed(why)), "restarting: ") => assert!(
-                why.starts_with("restarting: "),
-                "round {round}: a lost reply on a restarting keyed actor must say \
-                 so: got {why}"
-            ),
-            (keylink::Error::Remote(RemoteError::NoSuchActor { .. }), "gone") => {}
+            (
+                keylink::Error::Remote(RemoteError::Withheld(Withheld::Restarting { .. })),
+                "restarting",
+            ) => {}
+            (keylink::Error::Remote(RemoteError::Withheld(Withheld::Gone)), "gone") => {}
             _ => panic!("round {round}: expected {expected}, got {placed:?}"),
         }
     }
@@ -1554,7 +1575,7 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
 ///
 /// That is the one path this wave's design left without a settle, and it is on
 /// the side the wave called already correct. What the peer read for it was
-/// `Failed("dropped: ..")` — *the actor is serving, it will answer your next
+/// `Withheld::Dropped` — *the actor is serving, it will answer your next
 /// call* — about an actor that will never answer anything.
 ///
 /// It is also a **regression against `5ecd057`**, which is why it is fixed here
@@ -1570,8 +1591,7 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
 ///
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs`, disarming
 /// `supervise`'s floor at its declaration. Watched: `a peer whose actor died in
-/// its own factory must not be told it is serving: Remote(Failed("dropped: the
-/// actor is serving and this reply was never answered"))`.
+/// its own factory must not be told it is serving: Remote(Withheld(Dropped))`.
 ///
 /// **Disarming and not deleting**, because deleting the line leaves two
 /// `floor.disarm()` calls with nothing to name and the break becomes
@@ -1624,7 +1644,7 @@ async fn a_peer_whose_factory_panicked_is_told_the_actor_is_gone() {
     assert!(
         matches!(
             &lost,
-            keylink::Error::Remote(RemoteError::NoSuchActor { .. })
+            keylink::Error::Remote(RemoteError::Withheld(Withheld::Gone))
         ),
         "a peer whose actor died in its own factory must not be told it is \
          serving: {lost:?}"
@@ -1646,8 +1666,8 @@ async fn a_peer_whose_factory_panicked_is_told_the_actor_is_gone() {
 ///
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs`, disarming
 /// `run_loop`'s floor immediately after it is armed. Watched: `a peer whose actor
-/// died in its own feed must not be told it is serving: Remote(Failed("dropped:
-/// the actor is serving and this reply was never answered"))`.
+/// died in its own feed must not be told it is serving:
+/// Remote(Withheld(Dropped))`.
 ///
 /// **Disarming and not deleting**, as for the factory twin above: `run_loop` has a
 /// `floor.disarm()` of its own at the settle, so deleting the declaration leaves
@@ -1706,7 +1726,7 @@ async fn a_peer_whose_feed_panicked_is_told_the_actor_is_gone() {
     assert!(
         matches!(
             &lost,
-            keylink::Error::Remote(RemoteError::NoSuchActor { .. })
+            keylink::Error::Remote(RemoteError::Withheld(Withheld::Gone))
         ),
         "a peer whose actor died in its own feed must not be told it is serving: \
          {lost:?}"
@@ -1729,7 +1749,7 @@ async fn a_peer_whose_feed_panicked_is_told_the_actor_is_gone() {
 /// is argued on `supervise`, and the argument does not rest on this test.
 ///
 /// `Ruin` and not `Bad`, for the reason the service declaration gives: a peer's `rpc`
-/// receives the fault as `Failed("panicked: ..")` rather than as an unwind in this test.
+/// receives the fault as `Withheld::Panicked` rather than as an unwind in this test.
 /// `RefuseFaults` stands in for `Persist`'s own refusal of a panicked turn — the saver
 /// beside it is the real thing, so the snapshot the next incarnation reads is genuine.
 ///
@@ -1742,7 +1762,8 @@ async fn a_peer_whose_feed_panicked_is_told_the_actor_is_gone() {
 /// registered literal with a replacement of its own, so it adds no row; the search form
 /// carries its eight spaces of indentation. Watched, under `cargo test`:
 /// `a retry must read Interrupted even though the work provably did not survive:
-/// Remote(Failed("panicked: the actor panicked: bad entry"))` — the retry RAN the turn a
+/// Remote(Withheld(Panicked { message: "the actor panicked: bad entry" }))` — the
+/// retry RAN the turn a
 /// second time, which is the double-effect the argument on `supervise` is about.
 #[cfg(feature = "persist-file")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1786,7 +1807,11 @@ async fn a_keyed_call_whose_turn_panicked_stays_interrupted_across_a_restart() {
         .await
         .expect_err("the turn panics");
     assert!(
-        matches!(&faulted, keylink::Error::Remote(RemoteError::Failed(why)) if why.contains("bad entry")),
+        matches!(
+            &faulted,
+            keylink::Error::Remote(RemoteError::Withheld(Withheld::Panicked { ref message }))
+                if message.contains("bad entry")
+        ),
         "a peer must be told the turn panicked: {faulted:?}"
     );
 

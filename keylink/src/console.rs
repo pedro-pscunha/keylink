@@ -949,7 +949,7 @@ impl Console {
             .client
             .follow(self.at)
             .await?
-            .map_err(|refused| crate::RemoteError::Failed(refused.to_string()))?;
+            .map_err(crate::RemoteError::FollowRefused)?;
         self.at = page.next;
         Ok(page)
     }

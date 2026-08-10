@@ -109,7 +109,7 @@ pub(crate) enum Verdict {
     Committed,
     /// An observer refused it. The turn **ran and was not committed**, so a value
     /// it produced must not reach anybody: the parked caller is told
-    /// [`TurnLost::Refused`](crate::TurnLost::Refused) naming the same observer
+    /// [`Withheld::Refused`](crate::Withheld::Refused) naming the same observer
     /// the turn's own caller is told about.
     ///
     /// This is the mirror of the fault that took `Persist::finish` out — a caller
@@ -125,7 +125,7 @@ pub(crate) enum Verdict {
     /// An observer **panicked** watching it. The turn ran and was not committed
     /// for the same reason [`Refused`](Self::Refused) states, so the parked caller
     /// is told
-    /// [`TurnLost::ObserverPanicked`](crate::TurnLost::ObserverPanicked) naming
+    /// [`Withheld::ObserverPanicked`](crate::Withheld::ObserverPanicked) naming
     /// the same observer the turn's own caller is told about.
     ///
     /// **Withholding is right here and the word *refused* was not.** A veto means
@@ -139,7 +139,7 @@ pub(crate) enum Verdict {
         name: &'static str,
     },
     /// The handler panicked. The reply channel is dropped, so the parked caller
-    /// is told [`TurnLost::Dropped`](crate::TurnLost::Dropped).
+    /// is told [`Withheld::Dropped`](crate::Withheld::Dropped).
     ///
     /// **Not `Faulted`, and it is not a near miss.** There is one
     /// [`Panic`](crate::Panic), it is the original payload rather than a message,

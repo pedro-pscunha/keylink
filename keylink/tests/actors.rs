@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use keylink::{
     ActorId, Addressed, Allowlist, Body, BodyReader, Context, Ended, Error, Eviction,
     IdempotencyKey, IdempotencyRefusal, Middleware, MountError, Next, Node, Outcome, QueueTimeout,
-    RemoteError, RpcClient, Server, Timeout,
+    RemoteError, RpcClient, Server, Timeout, Withheld,
 };
 // The port and its file adapter, for the one thing a counter cannot show: what a
 // detached actor is still HOLDING. `Claim` is deliberately not in scope — nothing
@@ -465,7 +465,7 @@ async fn an_oversized_id_is_refused_before_it_reaches_the_registry() {
         .expect_err("an over-long id must be refused");
 
     assert!(
-        matches!(error, Error::Remote(RemoteError::Failed(ref why)) if why.contains("actor id")),
+        matches!(error, Error::Remote(RemoteError::BadActorId { ref reason, .. }) if reason.contains("actor id")),
         "got {error:?}"
     );
     assert_eq!(
@@ -647,7 +647,10 @@ async fn a_panicking_message_costs_one_message_and_not_the_actor() {
         .await
         .expect_err("the handler panics");
     assert!(
-        matches!(error, Error::Remote(RemoteError::Failed(ref why)) if why.contains("panicked")),
+        matches!(
+            error,
+            Error::Remote(RemoteError::Withheld(Withheld::Panicked { .. }))
+        ),
         "got {error:?}"
     );
 
@@ -663,12 +666,12 @@ async fn a_panicking_message_costs_one_message_and_not_the_actor() {
 
 /// **The keyed twin the singleton test asked for and never had.**
 ///
-/// `tests/singleton.rs::both_halves_of_a_lost_turn_carry_their_own_prefix` pins
-/// that a panic reaches a peer as `Failed("panicked: ..")` and an observer's veto
-/// as `Failed("observer refused: ..")`, because `RemoteError::Failed` carries a
-/// `String` rather than a variant — a variant would sit inside the hashed
-/// contract and move every service's ALPN — so **the string is the whole
-/// discriminator**.
+/// `tests/singleton.rs::both_halves_of_a_lost_turn_carry_their_own_variant` pins
+/// that a panic reaches a peer as `Withheld::Panicked` and an observer's veto as
+/// `Withheld::Refused`. Both were prefixes on a `RemoteError::Failed` string for
+/// as long as a variant was unaffordable — a variant sits inside the hashed
+/// contract and moves every service's ALPN — so **the string was the whole
+/// discriminator** until the ALPN was paid.
 ///
 /// It had no keyed counterpart, and the two paths drifted underneath that gap:
 /// the keyed loop rendered a panic as `Panic`'s own `Display` while the
@@ -721,10 +724,12 @@ async fn one_panic_reads_the_same_whichever_way_the_service_is_served() {
         .await
         .expect_err("the same handler panics");
 
-    let (Error::Remote(RemoteError::Failed(keyed)), Error::Remote(RemoteError::Failed(single))) =
-        (&keyed, &single)
+    let (
+        Error::Remote(RemoteError::Withheld(Withheld::Panicked { message: keyed })),
+        Error::Remote(RemoteError::Withheld(Withheld::Panicked { message: single })),
+    ) = (&keyed, &single)
     else {
-        panic!("both paths answer a panic with Failed; got {keyed:?} and {single:?}");
+        panic!("both paths answer a panic with `Withheld::Panicked`; got {keyed:?} and {single:?}");
     };
     assert_eq!(
         keyed, single,
@@ -732,8 +737,8 @@ async fn one_panic_reads_the_same_whichever_way_the_service_is_served() {
          how a panic was rendered"
     );
     assert!(
-        keyed.starts_with("panicked: "),
-        "and the prefix a peer discriminates on has to be there; got {keyed:?}"
+        keyed.contains("this message is bad"),
+        "and the handler's own message has to survive the crossing; got {keyed:?}"
     );
     assert!(
         keyed.contains("this message is bad"),
@@ -833,7 +838,10 @@ async fn lazy_spawn_stops_at_the_capacity() {
         .await
         .expect_err("the system is full");
     assert!(
-        matches!(error, Error::Remote(RemoteError::Failed(ref why)) if why.contains("capacity")),
+        matches!(
+            error,
+            Error::Remote(RemoteError::AtCapacity { capacity: 2 })
+        ),
         "got {error:?}"
     );
     assert_eq!(fixture.system.len(), 2);
@@ -2296,7 +2304,11 @@ async fn a_keyed_call_whose_turn_panicked_settles_the_key_interrupted() {
         .await
         .expect_err("the turn panics");
     assert!(
-        matches!(error, Error::Remote(RemoteError::Failed(ref why)) if why.contains("this turn dies")),
+        matches!(
+            error,
+            Error::Remote(RemoteError::Withheld(Withheld::Panicked { ref message }))
+                if message.contains("this turn dies")
+        ),
         "got {error:?}"
     );
     assert_eq!(
@@ -3141,7 +3153,7 @@ async fn a_malformed_id_is_refused_without_taking_the_actors_mailbox_slot() {
     for (answered, let_go) in answers {
         let error = answered.expect_err("the id is longer than any id can be");
         assert!(
-            matches!(error, Error::Remote(RemoteError::Failed(ref why)) if why.contains("actor id")),
+            matches!(error, Error::Remote(RemoteError::BadActorId { ref reason, .. }) if reason.contains("actor id")),
             "a malformed id must be refused on its own terms, not queued for a slot and \
              then told to try again: got {error:?}"
         );

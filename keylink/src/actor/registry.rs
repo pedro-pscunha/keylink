@@ -240,7 +240,7 @@ pub struct Mailbox<M> {
 /// `supervise` settles `Gone` explicitly on that path, so this is redundant
 /// there, and the case it *does* answer is an **aborted unsupervised keyed**
 /// actor, where `run_loop` owns the mailbox as a parameter and drops it before
-/// the state. `defer::an_aborted_keyed_actor_tells_a_peer_no_such_actor` and its
+/// the state. `defer::an_aborted_keyed_actor_tells_a_peer_the_actor_is_gone` and its
 /// expired-budget twin both record that breaking this line is what reddens them,
 /// while breaking the teardown door's own settle leaves them green.
 ///

@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use keylink::{
     ActorId, Allowlist, Caller, Deferred, Ended, Eviction, Observer, RemoteError, Replied, Reply,
-    Server, Stop, TurnFut, TurnInfo, Unanswered,
+    Server, Stop, TurnFut, TurnInfo, Unanswered, Withheld,
 };
 
 mod common;
@@ -296,12 +296,13 @@ async fn an_answer_given_inside_a_deferred_turn_is_withheld_when_an_observer_ref
 ///
 /// The channel is in the state, the state is owned by the loop's task, and the loop
 /// exiting drops both — so the caller's wait ends because the sender is gone. Inside
-/// keylink that is `TurnLost::Gone`; through a generated `Handle` it is
-/// `Unanswered::Gone`, the variant `ask` maps that one into.
+/// keylink that is `TurnLost::Turn(Withheld::Gone)`; through a generated
+/// `Handle` it is `Unanswered::Turn(Withheld::Gone)` — the same value, carried
+/// by the type the door answers.
 ///
 /// **The timeout is the assertion.** A hang is not a failure to a test harness, so
 /// the wait is bounded and the bound is what goes red. `turns.rs`'s own unit test
-/// asserts the `TurnLost::Gone` underneath, where the variant is visible.
+/// asserts the `Withheld::Gone` underneath, where the variant is visible.
 ///
 /// Red-tested by `::core::mem::forget(state)` in place of the loop's own drop, which
 /// is precisely the property under test — the parked channel dies because the state
@@ -346,10 +347,10 @@ async fn a_parked_reply_whose_actor_ends_is_answered_rather_than_hanging() {
 /// told this caller to stop calling.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `answered`'s
-/// `Standing::Running => TurnLost::Dropped,` → `Standing::Running =>
-/// TurnLost::Gone,` — the fold this variant was split out of. Watched: `a handler
-/// that panicked before answering owes its caller a refusal: got Err(Gone)`. The
-/// `is_err` this replaced stayed **green** through that same break.
+/// `Standing::Running => Withheld::Dropped,` → `Standing::Running =>
+/// Withheld::Gone,` — the fold this variant was split out of. Watched: `a handler
+/// that panicked before answering owes its caller a refusal: got Err(Turn(Gone))`.
+/// The `is_err` this replaced stayed **green** through that same break.
 ///
 /// **Hand the harness that literal with its twelve spaces of indentation.** The
 /// bare form counts 2 in `turns.rs`, whose own `mod tests` quotes the arm
@@ -373,7 +374,7 @@ async fn a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_
         .expect("a panicking deferred handler must not hang its caller")
         .expect("the panic is NOT resumed in the caller, unlike every other kind");
     assert!(
-        matches!(answer, Err(Unanswered::Dropped)),
+        matches!(answer, Err(Unanswered::Turn(Withheld::Dropped))),
         "a handler that panicked before answering owes its caller a refusal: got {answer:?}"
     );
 
@@ -403,16 +404,17 @@ async fn a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_
 /// own cannot tell *serving* from *reported as serving*.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `answered`'s
-/// `Standing::Running => TurnLost::Dropped,` → `Standing::Running =>
-/// TurnLost::Gone,` — the fold the variant was split out of. **Hand the harness
-/// the literal with its twelve spaces of indentation.** The bare form counts 2 in
+/// `Standing::Running => Withheld::Dropped,` → `Standing::Running =>
+/// Withheld::Gone,` — the fold the variant was split out of. **Hand the harness
+/// the literal with its sixteen spaces of indentation.** The bare form counts 2 in
 /// `turns.rs`: that file's own `mod tests` records the same break against
 /// `a_released_reply_is_dropped_when_the_turn_that_released_it_panicked`, and its
 /// quote sits unindented inside a `///` line. Same-file collision arriving from
 /// the target's side, and the harness aborts at "found 2".
 ///
 /// Watched: `a dropped `Deferred` costs the caller its answer and not the actor`,
-/// `left: Err(Gone)`, `right: Err(Dropped)` — the variant assertion, which is the
+/// `left: Err(Turn(Gone))`, `right: Err(Turn(Dropped))` — the variant assertion,
+/// which is the
 /// one the name rests on. The `fill` is never reached under this break, so it is
 /// asserted here and guarded by the ordinary `#[defer]` tests above.
 #[tokio::test]
@@ -421,7 +423,7 @@ async fn a_live_actor_that_drops_a_deferred_is_told_dropped_and_not_gone() {
 
     assert_eq!(
         book.abandon(3).await,
-        Err(Unanswered::Dropped),
+        Err(Unanswered::Turn(Withheld::Dropped)),
         "a dropped `Deferred` costs the caller its answer and not the actor"
     );
 
@@ -493,12 +495,12 @@ async fn a_reply_parked_before_a_fault_is_still_answered_after_it() {
 ///
 /// **A second break, because the first proves only that nothing crossed.** The
 /// assertion also names *which* answer, and no break above it can go red on the
-/// wrong one. `answered`'s `Standing::Running => TurnLost::Dropped,` →
-/// `Standing::Running => TurnLost::Gone,` is the fold, and it is red here:
-/// `a panicking turn's answer crossed anyway: Err(Gone)`. The `is_err` this
+/// wrong one. `answered`'s `Standing::Running => Withheld::Dropped,` →
+/// `Standing::Running => Withheld::Gone,` is the fold, and it is red here:
+/// `a panicking turn's answer crossed anyway: Err(Turn(Gone))`. The `is_err` this
 /// assertion replaced stayed green through it.
 ///
-/// **Hand the harness that literal with its twelve spaces of indentation.** The
+/// **Hand the harness that literal with its sixteen spaces of indentation.** The
 /// bare form counts 2 in `turns.rs` — the arm itself, and that file's own
 /// `mod tests` quoting the same break unindented inside a `///` line — so the
 /// harness aborts at "found 2". Sibling records above carry the same clause; this
@@ -530,7 +532,7 @@ async fn an_answer_sent_inside_a_turn_that_then_panics_does_not_cross() {
         .expect("a withheld answer must not hang its caller")
         .expect("the caller is not itself panicking");
     assert!(
-        matches!(answer, Err(Unanswered::Dropped)),
+        matches!(answer, Err(Unanswered::Turn(Withheld::Dropped))),
         "a panicking turn's answer crossed anyway: {answer:?}"
     );
 
@@ -612,7 +614,8 @@ async fn a_deferred_sent_from_another_task_is_not_gated_by_the_turn_that_spawned
 /// `Answerer::Wrapped(Box::new(move |answered| self.answer(answered.map(wrap))))`
 /// with a closure that drops all three — the conversion installed and then not
 /// performed. Watched, when this was written: `the call succeeded:
-/// Remote(NoSuchActor { id: "Orders" })`.
+/// Remote(NoSuchActor { id: "Orders" })`. **Re-watched after the losses became
+/// variants**, and it now prints `the call succeeded: Remote(Withheld(Dropped))`.
 ///
 /// **That error named the wrong fault, and it was a finding rather than a detail.**
 /// The actor exists, was reached, and ran the turn; a served reply that died
@@ -689,20 +692,20 @@ async fn a_peer_gets_an_answer_parked_past_its_own_turn() {
 /// - `scripts/break-once.sh keylink/src/turns.rs` on the served arm itself,
 ///   `lost`'s whole `Standing::Running` arm — the two-line `format!` and its
 ///   closing `)),` — replaced by
-///   `Standing::Running => RemoteError::NoSuchActor { id: id.to_owned() },`, which
-///   collapses the split back into the pre-fix single answer. Watched:
-///   `a live actor must not be reported as absent: Remote(NoSuchActor { id: "Orders" })`.
-///   **Re-watched after the local half was added, and the sentence came back
-///   unchanged**, which is the answer to the question adding it raises: the peer
-///   half runs first, so it is still what fails first and the record did not
-///   need re-quoting. Recorded because "unchanged" is a result and assuming it
-///   would have been a guess.
+///   `Standing::Running => Withheld::Gone,`, which collapses the split back onto
+///   the answer that means *stop calling*. It cannot be the pre-fix
+///   `NoSuchActor` any more: all three arms are `Withheld` now, so the fold has
+///   to happen inside that vocabulary. Watched:
+///   `a live actor must not be reported as absent: Remote(Withheld(Gone))`.
+///   Quote the arm with the comment line above it — `        // the message, and
+///   it will answer the next one.` — because the bare arm text also sits inside
+///   `answered` one indent deeper and counts 2.
 /// - and on the local arm, `answered`'s
-///   `Standing::Running => TurnLost::Dropped,` → `Standing::Running =>
-///   TurnLost::Gone,`. Quote that literal with its **twelve spaces** of
+///   `Standing::Running => Withheld::Dropped,` → `Standing::Running =>
+///   Withheld::Gone,`. Quote that literal with its **sixteen spaces** of
 ///   indentation; the bare form counts 2 in `turns.rs`, which aborts the harness.
-///   Watched: `the local door names the same cause the peer's prefix does`,
-///   `left: Err(Gone)`, `right: Err(Dropped)` — and the peer half above it passed
+///   Watched: `the local door names the same cause the peer's does`,
+///   `left: Err(Turn(Gone))`, `right: Err(Turn(Dropped))` — and the peer half passed
 ///   in that same run, which is the measurement behind "either break leaves the
 ///   other half green".
 #[tokio::test]
@@ -723,10 +726,7 @@ async fn a_local_caller_and_a_peer_agree_about_an_abandoned_deferred() {
         .await
         .expect_err("a dropped `Deferred` answers nobody");
     match lost {
-        keylink::Error::Remote(RemoteError::Failed(why)) => assert!(
-            why.starts_with("dropped: "),
-            "a lost reply is its own answer and names itself: {why}"
-        ),
+        keylink::Error::Remote(RemoteError::Withheld(Withheld::Dropped)) => {}
         other => panic!("a live actor must not be reported as absent: {other:?}"),
     }
 
@@ -735,7 +735,7 @@ async fn a_local_caller_and_a_peer_agree_about_an_abandoned_deferred() {
     // answers agree about the actor, not that they share a channel.
     assert_eq!(
         book.abandon(3).await,
-        Err(Unanswered::Dropped),
+        Err(Unanswered::Turn(Withheld::Dropped)),
         "the local door names the same cause the peer's prefix does"
     );
 
@@ -783,9 +783,9 @@ async fn a_local_caller_and_a_peer_agree_about_an_abandoned_deferred() {
 /// which makes uniqueness the whole requirement and the exact number a fact this
 /// record never needed. A count is what a reader trusts and nobody re-runs.
 /// Watched: `a stopped actor is gone, not merely
-/// unanswering: Remote(Failed("dropped: the actor is serving and this reply was never answered"))`.
+/// unanswering: Remote(Withheld(Dropped))`.
 #[tokio::test]
-async fn a_stopped_actor_still_tells_a_peer_no_such_actor() {
+async fn a_stopped_actor_still_tells_a_peer_the_actor_is_gone() {
     let node = local_node().await;
     let caller = local_node().await;
     let book = orders::actor(Book::default());
@@ -809,7 +809,10 @@ async fn a_stopped_actor_still_tells_a_peer_no_such_actor() {
         .expect("the caller is not itself panicking")
         .expect_err("the state died holding it");
     assert!(
-        matches!(&lost, keylink::Error::Remote(RemoteError::NoSuchActor { id }) if id == "Orders"),
+        matches!(
+            &lost,
+            keylink::Error::Remote(RemoteError::Withheld(Withheld::Gone))
+        ),
         "a stopped actor is gone, not merely unanswering: {lost:?}"
     );
 }
@@ -833,7 +836,7 @@ async fn a_stopped_actor_still_tells_a_peer_no_such_actor() {
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `Floor`'s own
 /// `Drop`, `self.fate.settle(Standing::Gone);` → `Standing::Running`. Watched:
 /// `an aborted actor is gone, and its own loop will never say so:
-/// Remote(Failed("dropped: the actor is serving and this reply was never answered"))`.
+/// Remote(Withheld(Dropped))`.
 ///
 /// **`LocalActor::abort` used to settle this itself, and that line is deleted.**
 /// Once `run_loop` carried a floor, no break of the settle in `abort` could be
@@ -841,7 +844,7 @@ async fn a_stopped_actor_still_tells_a_peer_no_such_actor() {
 /// floor is strictly earlier in the same drop. A line that cannot be made red is
 /// not a guard.
 #[tokio::test]
-async fn an_aborted_actor_tells_a_peer_no_such_actor() {
+async fn an_aborted_actor_tells_a_peer_the_actor_is_gone() {
     let node = local_node().await;
     let caller = local_node().await;
     let book = orders::actor(Book::default());
@@ -863,7 +866,10 @@ async fn an_aborted_actor_tells_a_peer_no_such_actor() {
         .expect("the caller is not itself panicking")
         .expect_err("the state was destroyed holding it");
     assert!(
-        matches!(&lost, keylink::Error::Remote(RemoteError::NoSuchActor { id }) if id == "Orders"),
+        matches!(
+            &lost,
+            keylink::Error::Remote(RemoteError::Withheld(Withheld::Gone))
+        ),
         "an aborted actor is gone, and its own loop will never say so: {lost:?}"
     );
 }
@@ -911,7 +917,7 @@ async fn keyed(nodes: &[keylink::Node; 2]) -> (orders::System, orders::KeyedClie
 /// through one function now, so a condition cannot be answered two ways.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/actor/remote.rs` on the arm
-/// itself, `.map_err(|_| lost(route.fate.standing(), actor.as_str()))` →
+/// itself, `.map_err(|_| lost(fate.standing()))` →
 /// `.map_err(|_| no_such_actor(&actor))`, which is the pre-fix line word for
 /// word. Watched: `a live keyed actor must not be reported as absent:
 /// Remote(NoSuchActor { id: "obra/4471" })`.
@@ -925,10 +931,7 @@ async fn a_live_keyed_actor_does_not_tell_a_peer_no_such_actor() {
         .await
         .expect_err("a dropped `Deferred` answers nobody");
     match lost {
-        keylink::Error::Remote(RemoteError::Failed(why)) => assert!(
-            why.starts_with("dropped: "),
-            "a lost reply is its own answer and names itself: {why}"
-        ),
+        keylink::Error::Remote(RemoteError::Withheld(Withheld::Dropped)) => {}
         other => panic!("a live keyed actor must not be reported as absent: {other:?}"),
     }
 
@@ -971,10 +974,9 @@ async fn a_live_keyed_actor_does_not_tell_a_peer_no_such_actor() {
 /// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs` on
 /// `Mailbox`'s `Drop`, `self.fate.settle(Standing::Gone);` →
 /// `self.fate.settle(Standing::Running);`. Watched: `an aborted keyed actor is
-/// gone, and its own loop will never say so:
-/// Remote(Failed("dropped: the actor is serving and this reply was never answered"))`.
+/// gone, and its own loop will never say so: Remote(Withheld(Dropped))`.
 #[tokio::test]
-async fn an_aborted_keyed_actor_tells_a_peer_no_such_actor() {
+async fn an_aborted_keyed_actor_tells_a_peer_the_actor_is_gone() {
     let nodes = [local_node().await, local_node().await];
     let (system, client, _server) = keyed(&nodes).await;
 
@@ -991,7 +993,10 @@ async fn an_aborted_keyed_actor_tells_a_peer_no_such_actor() {
         .expect("the caller is not itself panicking")
         .expect_err("the state was destroyed holding it");
     assert!(
-        matches!(&lost, keylink::Error::Remote(RemoteError::NoSuchActor { id }) if id == "obra/4471"),
+        matches!(
+            &lost,
+            keylink::Error::Remote(RemoteError::Withheld(Withheld::Gone))
+        ),
         "an aborted keyed actor is gone, and its own loop will never say so: {lost:?}"
     );
 }
@@ -1094,7 +1099,10 @@ async fn a_keyed_actor_holding_a_parked_reply_drains_inside_its_budget() {
         .expect("the caller is not itself panicking")
         .expect_err("the state was dropped holding it");
     assert!(
-        matches!(&lost, keylink::Error::Remote(RemoteError::NoSuchActor { id }) if id == "obra/4471"),
+        matches!(
+            &lost,
+            keylink::Error::Remote(RemoteError::Withheld(Withheld::Gone))
+        ),
         "a drained actor is gone, and its parked caller is told so: {lost:?}"
     );
 }
@@ -1156,13 +1164,16 @@ async fn a_peer_whose_parked_reply_is_drained_is_not_told_its_call_timed_out() {
         .expect("the caller is not itself panicking")
         .expect_err("the state was dropped holding it");
     assert!(
-        matches!(&lost, keylink::Error::Remote(RemoteError::NoSuchActor { id }) if id == "obra/4471"),
+        matches!(
+            &lost,
+            keylink::Error::Remote(RemoteError::Withheld(Withheld::Gone))
+        ),
         "a drained actor must answer for itself, and a TimedOut means the peer \
          waited out the layer instead: {lost:?}"
     );
 }
 
-/// **The other half of the `dropped: ` arm, which had no served test at all.**
+/// **The other half of the dropped arm, which had no served test at all.**
 ///
 /// `a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_actor`
 /// is a **local** call: it asserts `is_err()` on a `Unanswered` and never
@@ -1204,11 +1215,7 @@ async fn a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer() 
         .await
         .expect_err("the handler panicked holding the reply");
     match lost {
-        keylink::Error::Remote(RemoteError::Failed(why)) => assert!(
-            why.starts_with(RemoteError::DROPPED),
-            "a panicking deferred handler loses the reply, and that is what the \
-             peer must read: {why:?}"
-        ),
+        keylink::Error::Remote(RemoteError::Withheld(Withheld::Dropped)) => {}
         other => panic!("the actor is alive and this is one lost reply: {other:?}"),
     }
 
@@ -1237,7 +1244,7 @@ async fn keyed_parked(client: &orders::KeyedClient, want: u64) {
 /// nothing different from any other `rpc`.
 ///
 /// Reddened by the same `Reply::wrapping` break its sibling above uses, watched here
-/// as "answers: Remote(NoSuchActor { id: "Orders" })" at the **first** assertion.
+/// as "answers: Remote(Withheld(Dropped))" at the **first** assertion.
 /// So the break proves the deferred answer crosses the wire and proves nothing about
 /// this test's second claim — that an ordinary call on the same connection
 /// afterwards finds the stream whole. No one-literal edit was found that leaves a
