@@ -305,10 +305,8 @@ keylink/src/turns.rs \
 run "20 gone becomes dropped" \
 'left: Withheld(Dropped)' \
 keylink/src/turns.rs \
-'        Standing::Gone => Withheld::Gone,
-    })' \
-'        Standing::Gone => Withheld::Dropped,
-    })' \
+'        Standing::Gone => Withheld::Gone,' \
+'        Standing::Gone => Withheld::Dropped,' \
   the_gone_answer_says_the_actor_ran_and_stopped_rather_than_naming_an_id -p keylink --lib
 
 run "21 no floor between incarnations (N1)" \

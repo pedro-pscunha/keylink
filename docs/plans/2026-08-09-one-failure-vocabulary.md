@@ -131,7 +131,7 @@ Revision 1 claimed six. Measured, four have a producer on each side:
   `turns.rs:4643` reads *"NOT a `Failed`: this is the one of the three where
   there is nothing here, stop asking is true."* Rewrite that comment in the same
   commit; a comment left contradicting the code beneath it is silent rot.
-- **`Expired` has no producer on either side.** Locally documented unreachable
+- **`Expired` has one producer, and no path reaches it.** Locally documented unreachable
   (`turns.rs:3265-3271`); on the served side `rendered` maps `Answered::Expired`
   to `RemoteError::TimedOut { millis }` (`turns.rs:4566-4570`), which carries a
   duration `Withheld::Expired` cannot. **Keep the variant, exempt it by name**,

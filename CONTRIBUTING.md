@@ -204,10 +204,29 @@ the other rather than evidence that the other is unaffected. When either goes re
 in this order:
 
 1. Decide whether this change **should** be visible on the wire.
-2. Only then update the literal, and say so in the release notes.
+2. Only then update the literal, and write the decision down in **both** places
+   that carry it: the commit body, and the ledger in the test's own rustdoc — one
+   entry per move, headed `<old> → <new>`, saying which change moved it and why
+   that change should be visible.
 
 Never step 2 without step 1. Updating a literal to turn a red test green is how
 a deployed fleet silently splits in half.
+
+**Step 2 said "say so in the release notes", and there are none.** This repository
+has no `CHANGELOG.md` and no release-notes file, so the instruction named an
+artifact that does not exist and every author quietly satisfied it by doing nothing.
+It is rewritten above to name what actually carries the decision. If a peer-visible
+change is wider than the pins — a variant a peer used to match by text, a condition
+that changed answer without changing its rendering — the RFC append for that wave is
+where the full list goes; `docs/rfc-07-the-turn-model.md` §18.7 is the worked
+example, and its own subject is a count that stopped at the easy half.
+
+**The ledger entry is prose, and prose has no test.** A literal that moves twice —
+an amend that re-measures, most often — leaves the first measurement's sentences
+behind, correct when written and orphaned by the second run. `protocol.rs`'s
+`the_contract_hash_has_not_moved` records one that survived a whole merge gate. When
+you re-measure, rewrite every sentence that names a number, not only the `PINNED`
+line the compiler reads.
 
 The pins exist because every other test compiles both peers from one source
 tree. A wire change moves both sides, the handshake still agrees, and the whole
@@ -386,6 +405,16 @@ a fresh literal invents a break nobody ran. Append that the literal is spent and
 name what replaced the code — the same treatment a deleted test gets, and for the
 same reason: a record that cannot be re-expressed is still a record of something
 that happened.
+
+**The search-literal widening was written by the wave it governs, and no record has
+used it yet.** The branch that added it then met
+`docs/rfc-07-the-turn-model.md` §18.2, which found that both records the widening
+was written for had been *restructured* rather than renamed — so both were declared
+spent under the paragraph above, and neither literal was re-quoted. The widening is
+live, deliberate and **unexercised**: it has passed no test of itself, and the first
+record that uses it will be the first evidence it works. That is stated here rather
+than left as a silence, because a rule adopted and never fired reads exactly like a
+rule nobody agreed to, and the next author is entitled to know which this is.
 
 **Write a figure with the commit it was measured at.** A count of anything in the
 tree — tests in a file, variants in an enum, rows in a registry — is a measurement

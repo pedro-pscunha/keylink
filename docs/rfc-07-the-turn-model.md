@@ -4715,16 +4715,27 @@ the instruction the peer relied on: a peer that matched `NoSuchActor` to mean
 ### 18.4 Local fidelity was lost, and this is a trade rather than a win
 
 `TurnLost::Restarting(Arc<Ended>)` carried the **whole** `Ended`, including
-`Ended::Observer`'s and `Ended::Feed`'s `Arc<dyn Error + Send + Sync>` and every
+`Ended::Observer`'s and `Ended::GaveUp`'s `Arc<dyn Error + Send + Sync>` and every
 link of its `source()` chain. A local caller matching on a lost turn could walk
 that chain from the failure value it already held.
 
 `Withheld::Restarting { reason: EndReason }` cannot. `EndReason` is the projection
-of an ending that has a schema, and it flattens both error arms to `String`:
-`EndReason::Observer { name, error }` and `EndReason::Feed { name, error }` are
-`String` fields, and `EndReason::Panicked { message }` is one too. **A trait object
-is not data, so a wire type cannot hold one** — that is the reason, and it is a
-good one, but it is not free.
+of an ending that has a schema, and it flattens both trait-object arms to `String`:
+`EndReason::Observer { name, error, fatal }` and `EndReason::GaveUp { after, error }`
+carry `String` errors, and `EndReason::Panicked { message }` is a `String` too.
+**A trait object is not data, so a wire type cannot hold one** — that is the
+reason, and it is a good one, but it is not free.
+
+**This paragraph named `Feed` as the second trait-object arm, and it was wrong
+from the day it was written.** `Ended::Feed` carries **only** `name`, and its own
+documentation says why — *"a stream that ended reported nothing to carry"*; there
+has never been an `error` field on either `Ended::Feed` or `EndReason::Feed` for a
+projection to flatten. The arm that does flatten one is `GaveUp`, which this
+section did not mention at all, and it is the costliest of the three to lose: it
+carries the supervisor's reason for abandoning an actor, which is the one ending
+no other door explains. The correction is made in place, here, rather than by an
+append, because a factual error inside an append never described any state of the
+tree — there is no earlier reading of it to preserve.
 
 The chain is still reachable: `Handle::ended()` returns the real `Ended`, `Arc`
 and all. What a local caller lost is that the chain used to **ride the failure
@@ -4776,3 +4787,39 @@ written down. Two pins moved because `RemoteError` is carried by every service a
 `Withheld` entered it, so this is the ordinary case rather than a surprise:
 `CONTRIBUTING.md`'s wire-contract section named only the first test for several
 waves and now names both.
+
+### 18.7 Nine conditions changed for a peer, and this section opened by naming five
+
+The heading of §18 says *"Wave 1 replaced five `Failed(String)` prefixes"*, which is
+true and is **not the whole of what a peer reads differently**. Five is the count of
+deleted prefixes. Nine is the count of conditions whose answer moved, and the four
+this section did not name are the ones a reader is least likely to derive.
+
+| condition | a peer read, on `main` | a peer reads now |
+| --- | --- | --- |
+| a handler panicked | `Failed("panicked: {message}")` | `Withheld(Panicked { message })` |
+| an observer refused a turn that ran | `Failed("refused: {name}")` | `Withheld(Refused { name })` |
+| an observer panicked | `Failed("observer panicked: {name}")` | `Withheld(ObserverPanicked { name })` |
+| a live actor lost a reply | `Failed("dropped: …")` | `Withheld(Dropped)` |
+| an incarnation ended, another is coming | `Failed("restarting: …")` | `Withheld(Restarting { reason })` |
+| the actor ran and has stopped | `NoSuchActor { id }` | `Withheld(Gone)` |
+| the id is malformed | `Failed(..)` over `validate`'s own sentence | `BadActorId { id, reason }` |
+| the registry is full | `Failed("the actor system is at its capacity of {capacity} live actors")` | `AtCapacity { capacity }` |
+| a `Follow` cursor is refused | `Failed(..)` over `FollowRefused`'s own sentence | `FollowRefused(FollowRefused)` |
+
+**`AtCapacity` and `FollowRefused` are the quiet two, and they are the ones worth
+warning about.** Their rendered text did not change by one byte: `RemoteError::AtCapacity`
+carries the identical `#[error]` string `RouteError::AtCapacity` wrote into the
+`Failed`, and `RemoteError::FollowRefused` is `#[error("{0}")]` over the same value
+whose `to_string()` used to fill the `Failed`. So a peer matching those answers by
+**text** still matches them — and a peer matching by **variant** now finds `Failed`
+gone from under it. That is the break that leaves no trace in a diff of strings, and
+it is the reason the count is stated here rather than left at five.
+
+The sixth, `Gone`, is the one behaviour change rather than a re-typing: §18.3 carries
+its argument. The seventh, `BadActorId`, gained the id in its rendering, so its text
+moved as well as its variant; `validate`'s own sentence survives inside `reason`.
+
+Every peer built against any of these nine is refused at the handshake anyway —
+§18.6's pins moved once and cover the lot. What this table is for is the author who
+recompiles against the new crate and has to know which `match` arms to rewrite.

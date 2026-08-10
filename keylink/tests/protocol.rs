@@ -1199,6 +1199,9 @@ async fn a_service_serves_as_a_singleton_and_as_an_actor_system_on_one_node() {
 ///
 /// # Moved a fourth time, to put the failure vocabulary on the wire
 ///
+/// `d75913b8a4742547` → `75cb158fa0f636c8`. **Step 1 was answered before the
+/// literal was touched, and the answer is yes.**
+///
 /// `RemoteError` gained four variants — `Withheld`, `AtCapacity`, `BadActorId`
 /// and `FollowRefused` — and it reaches every service's contract by the route the
 /// third move already walks, so `probe` pays again for a vocabulary none of its
@@ -1225,8 +1228,24 @@ async fn a_service_serves_as_a_singleton_and_as_an_actor_system_on_one_node() {
 /// no other — see [`the_inspect_contract_hash_has_not_moved`]. So this is one
 /// measurement covering two causes, and the attribution below it is read off the
 /// contract graphs rather than off the numbers: `RemoteError` is the only one of
-/// the two that can reach `probe`. Both literals were read off that failing run
-/// rather than derived.
+/// the two that can reach `probe`.
+///
+/// **There were two runs, and the literals above are the second one's.** The first
+/// run measured the four variants alone. The commit was then amended to give
+/// `BadActorId` a `reason` field — an id refused without saying why is the loss
+/// this vocabulary exists to stop — and that moved both pins again, before either
+/// was pushed. `0c6e6c3`'s own body records both runs and is the source of truth
+/// for this entry. Every literal here was read off a failing run rather than
+/// derived; none was read off the first one.
+///
+/// **An amend that re-measures leaves the first measurement's prose behind, and
+/// that is worth a sentence because it will recur.** A constant has a test. A
+/// sentence *about* the constant has nothing, so it survives the re-measurement
+/// that invalidates it. The entry below headed itself with the first run's
+/// destination for `Inspect` — a value which, once the amend landed, existed
+/// nowhere else in this repository — and stayed that way through a whole merge
+/// gate. So a re-measurement rewrites every sentence naming a number, and not
+/// only the `PINNED` line the compiler reads.
 #[test]
 fn the_contract_hash_has_not_moved() {
     const PINNED: &str = "keylink/Probe/75cb158fa0f636c8";
@@ -1260,7 +1279,7 @@ fn the_contract_hash_has_not_moved() {
 ///
 /// # It has moved four times, and these are the decisions
 ///
-/// ## `0572763878b7fb9d` → `f41df1da808b2fa1`, two causes in one commit
+/// ## `0572763878b7fb9d` → `f62a21fb09137ace`, two causes in one commit
 ///
 /// **`Probe`'s hash moved too**, and this is the one entry where that is not by
 /// itself evidence of anything. The commit carries two changes and only one of
@@ -1278,9 +1297,12 @@ fn the_contract_hash_has_not_moved() {
 /// `lost` is refused at the handshake rather than shown one loss counter under
 /// the other's name.
 ///
-/// Both literals were read off one failing run of this file. That run does not
-/// attribute either move to one of the two causes, and nothing here claims it
-/// does.
+/// Both literals were read off a failing run of this file — the **second** of the
+/// two runs the commit needed, and the reason this heading named a destination
+/// that existed nowhere else in the tree until it was corrected.
+/// [`the_contract_hash_has_not_moved`] carries the amend that caused the second
+/// run, and the mechanism. Neither run attributes either move to one of the two
+/// causes, and nothing here claims it does.
 ///
 /// ## `7bbd34fa83c9060c` → `0572763878b7fb9d`, pricing `IdempotencyRefusal::NotKeyable`
 ///

@@ -3167,6 +3167,20 @@ where
 /// would be the same lie `ask_catching`'s `Expired` arm names — a live actor
 /// reported as gone through a public API, silently.
 ///
+/// # It was `Undelivered` for one wave, and a downstream author meets two errors
+///
+/// `MailboxClosed` became `Undelivered` at `4e0fcca`, and `Undelivered` became
+/// `Unanswered` at `8acd7be`. Both moves are loud at compile time, so nobody is
+/// silently wrong — but they land together and look unrelated: `E0433` on the old
+/// path, then `E0382` at the first site that relied on the `Copy` this type no
+/// longer has. **They are one intended change**, and the section below says why the
+/// derive went.
+///
+/// `Undelivered` named the *delivery*, and this type is about the **answer**. A
+/// re-entrant call is refused before anything is queued, and a turn that ran and
+/// was refused by an observer was delivered perfectly. Neither is undelivered.
+/// Both are unanswered.
+///
 /// # Two variants, because six of the eight were never this type's own
 ///
 /// It listed the same six losses [`TurnLost`] did, in the same order, with the

@@ -100,9 +100,11 @@ pub enum RemoteError {
     /// variant claims.** A call that reached a live actor and lost its answer is
     /// not one of them: a handler may take a `#[defer]`red reply out of its turn
     /// and drop it, which answers nobody while the actor goes on serving the
-    /// same connection. That reads as [`Failed`](Self::Failed) under a
-    /// `"dropped: "` prefix instead, because a peer told `NoSuchActor` is being
-    /// told to stop asking and it would be false.
+    /// same connection. That reads as
+    /// [`Withheld(Withheld::Dropped)`](Self::Withheld) instead, because a peer
+    /// told `NoSuchActor` is being told to stop asking and it would be false.
+    /// It read [`Failed`](Self::Failed) under a `"dropped: "` prefix until
+    /// `5198ecb` replaced the five prefixes with the variant.
     ///
     /// **On both served paths**, which this sentence could not say for one wave:
     /// `turns.rs`'s `deliver_to_singleton` separated the causes and

@@ -302,7 +302,7 @@ pub struct EventPage {
 /// on it, and both exist because parking on them is what an unbounded
 /// `Inspector::waiting` looks like from the outside.
 ///
-/// # `#[non_exhaustive]`, where [`EndReason`] beside it is not
+/// # `#[non_exhaustive]`, where [`EndReason`] is not
 ///
 /// Two rules meet here and they point opposite ways, so this is the reasoning
 /// rather than the attribute alone. **Error enums are `#[non_exhaustive]`** in
@@ -323,6 +323,12 @@ pub struct EventPage {
 /// Either way the wire is not the lax half: a new arm moves
 /// [`Inspect`](crate::inspect)'s ALPN, so an old console is refused at the
 /// handshake rather than handed a variant it cannot decode.
+///
+/// This heading read *"where [`EndReason`] **beside it** is not"* until `EndReason`
+/// moved to `observe.rs` at `c165009`, to sit beside the [`Ended`] it projects. The
+/// link still resolves and `mise run docs` stays green, so no gate saw the word go
+/// false — a positional claim about a neighbour is exactly the kind that outlives
+/// the neighbourhood.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Schema, thiserror::Error)]
 #[non_exhaustive]
 pub enum FollowRefused {

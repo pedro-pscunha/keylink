@@ -227,9 +227,16 @@ Each is binary and names its proof. Proofs must be **printed in the transcript**
       `compile_fail` doctest showing the blocking client rejected by the async
       trait's bound. The compile_fail is the guard that keeps the two traits from
       being quietly merged later.
-- [ ] `Withheld` is byte-identical in type and value on both sides for all seven
-      conditions — proven by `a_local_caller_and_a_peer_read_the_same_withheld`,
+- [ ] `Withheld` is byte-identical in type and value on both sides for the **five**
+      conditions reachable from both — `Refused`, `ObserverPanicked`, `Dropped`,
+      `Restarting`, `Gone` — proven by
+      `a_local_caller_and_a_peer_read_the_same_withheld` (`keylink/tests/defer.rs`),
       asserting equality of the two values, not of their rendered text.
+      **This said "all seven", and seven is every variant rather than every
+      both-sided one.** `Panicked` is served-side only — a fault reaching a local
+      caller is a live `Panic` and arrives as `TurnLost::Faulted` — and `Expired`
+      has no reachable producer on either side. Neither has a local value for a
+      peer's to be compared against, so neither is assertable by this test.
 - [ ] Zero `starts_with` on a served failure anywhere in the workspace —
       `rg 'starts_with' keylink/ demo/ keylink-persist/` shows no hit on a
       `RemoteError`/`Failed` value.

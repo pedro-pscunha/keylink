@@ -28,13 +28,14 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use keylink::{
-    ActorId, Allowlist, Caller, Deferred, Ended, Eviction, Observer, RemoteError, Replied, Reply,
-    Server, Stop, TurnFut, TurnInfo, Unanswered, Withheld,
+    ActorId, Allowlist, Caller, Deferred, Ended, Eviction, Intensity, Observer, RemoteError,
+    Replied, Reply, Server, Stop, TurnFut, TurnInfo, TurnOutcome, Unanswered, Withheld,
 };
 
 mod common;
@@ -631,12 +632,12 @@ async fn a_deferred_sent_from_another_task_is_not_gated_by_the_turn_that_spawned
 /// **Fixed:** `deliver_to_singleton` now splits the dead-channel arm three ways, and the
 /// same break watched under it printed `Remote(Failed("dropped: the reply was taken
 /// out of the turn and never answered"))`. **That is a transcript and not the
-/// current text.** `lost`'s `Standing::Running` arm has been rewritten since — its
-/// own comment records that the sentence was wrong twice, both times by naming a
-/// cause — so the prefix is what survives from that run and the words after it are
-/// read off `lost`. `a_local_caller_and_a_peer_agree_about_an_abandoned_deferred`
-/// reaches the same rendering through the public API with nothing broken at all,
-/// and it matches on the **prefix** for exactly this reason.
+/// current text**, and by now nothing of it survives. The five prefixes were
+/// deleted at `5198ecb`, so there is no `"dropped: "` and no sentence after it:
+/// this answer is `Remote(Withheld(Dropped))`, a value rather than prose.
+/// `a_local_caller_and_a_peer_agree_about_an_abandoned_deferred` reaches the same
+/// answer through the public API with nothing broken at all, and it matches on the
+/// **variant**, which is the only thing a peer has left to match on.
 #[tokio::test]
 async fn a_peer_gets_an_answer_parked_past_its_own_turn() {
     let node = local_node().await;
@@ -686,9 +687,11 @@ async fn a_peer_gets_an_answer_parked_past_its_own_turn() {
 /// # Both halves assert what they got, and neither asserts `is_err`
 ///
 /// Two `Err`s compared against `Err` is the wrong-reason pass this pairing is most
-/// exposed to: every wrong answer here is also an error. So the peer half matches
-/// on the `"dropped: "` **prefix** and the local half on the **variant**, and a
-/// break that collapses either door back onto *gone* moves one of the two.
+/// exposed to: every wrong answer here is also an error. So both halves match on
+/// the **variant** — the peer's through `RemoteError::Withheld`, the local one
+/// through `Unanswered::Turn` — and a break that collapses either door back onto
+/// *gone* moves one of the two. The peer half read the `"dropped: "` **prefix**
+/// until `5198ecb` deleted the five prefixes, and there is no string left to read.
 ///
 /// No supervision, no panic, no `stop()`. The actor answers the very next call on
 /// the same connection, which is the half `NoSuchActor` denies.
@@ -698,11 +701,22 @@ async fn a_peer_gets_an_answer_parked_past_its_own_turn() {
 /// `Standing::Running => Withheld::Gone,`, which collapses the split back onto the
 /// answer that means *stop calling*. It cannot be the pre-fix `NoSuchActor` any
 /// more: all three arms are `Withheld` now, so the fold has to happen inside that
-/// vocabulary. Watched: `the local door names the same cause the peer's does`,
-/// `left: Err(Turn(Gone))`, `right: Err(Turn(Dropped))`.
+/// vocabulary. Watched: `a live actor must not be reported as absent:
+/// Remote(Withheld(Gone))`, re-measured on 2026-08-09 and the whole of what the
+/// run prints.
 ///
-/// **Hand the harness that literal with its eight spaces of indentation.** The
-/// bare form counts 2 in `turns.rs`, which aborts the harness.
+/// **The peer half panics first, so the local assertion is never reached under
+/// this break.** This record claimed the local sentence and its `left:`/`right:`
+/// pair — three lines describing output no run of it can produce, since a panic
+/// ends the test and the peer's `match` is the earlier of the two. The break does
+/// redden both halves; only one of them ever gets to say so.
+///
+/// **Hand the harness the comment line above the arm as part of the literal**, and
+/// take it from `scripts/replay-fate-breaks.sh` row 11, which is the copy that
+/// actually runs. This record used to carry a count instead — *"the bare form
+/// counts 2 in `turns.rs`"* — and the bare form counts 1 today, because the second
+/// copy moved into `withheld_for`. A count is a number nobody re-derives; the
+/// script's literal is a gate's input, so it is the thing to point at.
 ///
 /// # It was two breaks, one per door, and the second one stopped existing
 ///
@@ -758,6 +772,330 @@ async fn a_local_caller_and_a_peer_agree_about_an_abandoned_deferred() {
         "the actor answers the call after the one it was reported absent for"
     );
     assert!(book.is_running(), "and nothing ended");
+}
+
+// ────────────────────────────────── one vocabulary, read through both doors
+
+/// The [`Withheld`] a peer read, or a panic naming what arrived instead.
+///
+/// A helper rather than a `matches!` guard, for the reason `singleton.rs`'s twin
+/// gives: the useful thing to say on failure is **which** answer arrived.
+fn peer_withheld(error: keylink::Error) -> Withheld {
+    match error {
+        keylink::Error::Remote(RemoteError::Withheld(loss)) => loss,
+        other => panic!("expected a RemoteError::Withheld, got {other:?}"),
+    }
+}
+
+/// The [`Withheld`] a local caller read, or a panic naming what arrived instead.
+fn local_withheld(lost: Unanswered) -> Withheld {
+    match lost {
+        Unanswered::Turn(loss) => loss,
+        Unanswered::Reentrant => {
+            panic!("expected a withheld turn, got the re-entrancy refusal")
+        }
+    }
+}
+
+/// Panics where the loop can see it, so a turn is lost to the **observer**
+/// rather than to the handler.
+struct Exploding;
+
+impl Observer<Book> for Exploding {
+    fn name(&self) -> &'static str {
+        "exploding"
+    }
+
+    fn after_turn<'a>(&'a mut self, _state: &'a Book, _turn: TurnInfo<'a>) -> TurnFut<'a> {
+        Box::pin(async { panic!("the observer fell over") })
+    }
+}
+
+/// Refuses a panicked turn and passes every other one.
+///
+/// Both halves are load-bearing under supervision: refusing the fault is what
+/// ends the incarnation, and passing everything else is what lets the parked
+/// calls below be placed at all.
+struct RefuseFaults;
+
+impl Observer<Book> for RefuseFaults {
+    fn name(&self) -> &'static str {
+        "refuse-faults"
+    }
+
+    fn after_turn<'a>(&'a mut self, _state: &'a Book, turn: TurnInfo<'a>) -> TurnFut<'a> {
+        let faulted = matches!(turn.outcome, TurnOutcome::Panicked { .. });
+        Box::pin(async move {
+            if faulted {
+                Err(Stop::new("a panicked turn is not committed"))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+/// The criterion the wave was written against: a local caller and a peer read
+/// the **same value**, not two renderings of one condition.
+///
+/// [`Withheld`] is one type carried by three others — [`Unanswered::Turn`] at a
+/// local `ask`, [`TurnLost::Turn`] at an `ask_catching`, and
+/// `RemoteError::Withheld` on the wire — so the claim under test is
+/// `assert_eq!(local, peer)` and nothing weaker. A test that compared each side
+/// against its own literal would pass while the two sides drifted, which is
+/// exactly what the pair of hand-kept enums this wave deleted used to do.
+///
+/// Each condition is also asserted **positively**, against the variant it is
+/// supposed to be. Equality alone is satisfiable by two `Gone`s, which is the
+/// fold every one of these conditions was rescued from.
+///
+/// # Five conditions, and why the other two are absent
+///
+/// `Refused`, `ObserverPanicked`, `Dropped`, `Restarting` and `Gone` are the
+/// whole of what both doors can produce. The two that are missing are missing
+/// for stated reasons rather than for want of a fixture:
+///
+/// - **`Panicked` is served-side only.** `ask_catching`'s own documentation says
+///   *no local door builds `Withheld::Panicked`*: a fault reaching a local caller
+///   is a live [`keylink::Panic`] and arrives as `TurnLost::Faulted`, because an
+///   unwind is a payload and a peer cannot be handed one. There is no local value
+///   to compare a peer's against, so asserting it here would be asserting
+///   something else.
+/// - **`Expired` has no reachable producer on either side.** `ask_catching` builds
+///   it on the arm that reads an expired budget, and a local `Origin` carries no
+///   budget for anything to expire; the served side answers `RemoteError::TimedOut`,
+///   which carries a millisecond figure the variant has nowhere to put.
+///
+/// # `Refused` and `ObserverPanicked` take two actors, and the rest take one
+///
+/// An observer that refuses a completed turn **ends the actor**, so one actor
+/// yields one refusal and the second door would read `Gone` — a green test
+/// proving the opposite of what it claims. Those two conditions therefore drive
+/// one served actor and one plain actor carrying the same observer, and what is
+/// compared is the value each door built for the same cause.
+///
+/// `Dropped`, `Gone` and `Restarting` need no such split: the actor survives a
+/// dropped reply, a stopped actor answers both doors alike, and a restart loses
+/// **both** parked replies to one fault. The last of those is the strongest of
+/// the five — one `Ended`, read twice, through two types.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_caller_and_a_peer_read_the_same_withheld() {
+    let caller = local_node().await;
+
+    // ── Dropped, then Gone, on one actor both doors reach ──────────────────
+
+    let node = local_node().await;
+    let book = orders::actor(Book::default());
+    let _server = Server::builder(&node)
+        .service(book.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("serves");
+    let client = orders::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+
+    let dropped_peer = peer_withheld(
+        client
+            .abandon(1)
+            .await
+            .expect_err("a dropped `Deferred` answers nobody"),
+    );
+    let dropped_local = local_withheld(
+        book.abandon(2)
+            .await
+            .expect_err("a dropped `Deferred` answers nobody"),
+    );
+    assert_eq!(
+        dropped_local, dropped_peer,
+        "one live actor dropped one reply, and the two doors must name one loss"
+    );
+    assert_eq!(
+        dropped_local,
+        Withheld::Dropped,
+        "and it is the loss that means the actor is still there"
+    );
+
+    // The same actor, stopped. Both doors now read the mailbox rather than a
+    // reply channel, which is the other half of the mapping.
+    book.stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
+    let gone_peer = peer_withheld(client.fill(1).await.expect_err("the actor stopped"));
+    let gone_local = local_withheld(book.fill(1).await.expect_err("the actor stopped"));
+    assert_eq!(
+        gone_local, gone_peer,
+        "a stopped actor must say the same thing to both doors"
+    );
+    assert_eq!(
+        gone_local,
+        Withheld::Gone,
+        "and it is the loss that means stop calling"
+    );
+
+    // ── Refused: one observer's name, built twice ──────────────────────────
+
+    let vetoed_node = local_node().await;
+    let vetoed = orders::actor_with(
+        Book::default(),
+        vec![Box::new(Vetoing {
+            saw: Arc::new(AtomicUsize::new(0)),
+        })],
+    );
+    let _vetoed_server = Server::builder(&vetoed_node)
+        .service(vetoed.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("serves");
+    let vetoed_client = orders::Client::connect(&caller, vetoed_node.endpoint().addr())
+        .await
+        .expect("dials");
+    let refused_peer = peer_withheld(
+        vetoed_client
+            .fill(1)
+            .await
+            .expect_err("the observer refused the completed turn"),
+    );
+
+    let vetoed_locally = orders::actor_with(
+        Book::default(),
+        vec![Box::new(Vetoing {
+            saw: Arc::new(AtomicUsize::new(0)),
+        })],
+    );
+    let refused_local = local_withheld(
+        vetoed_locally
+            .fill(1)
+            .await
+            .expect_err("the observer refused the completed turn"),
+    );
+    assert_eq!(
+        refused_local, refused_peer,
+        "a refusal must reach both doors as one value, naming one observer"
+    );
+    assert_eq!(
+        refused_local,
+        Withheld::Refused {
+            name: "vetoing".to_owned()
+        },
+        "and it must name the observer that made the decision"
+    );
+
+    // ── ObserverPanicked: the same shape, one arm apart ────────────────────
+
+    let exploding_node = local_node().await;
+    let exploding = orders::actor_with(Book::default(), vec![Box::new(Exploding)]);
+    let _exploding_server = Server::builder(&exploding_node)
+        .service(exploding.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("serves");
+    let exploding_client = orders::Client::connect(&caller, exploding_node.endpoint().addr())
+        .await
+        .expect("dials");
+    let panicked_peer = peer_withheld(
+        exploding_client
+            .fill(1)
+            .await
+            .expect_err("the observer panicked during the turn"),
+    );
+
+    let exploding_locally = orders::actor_with(Book::default(), vec![Box::new(Exploding)]);
+    let panicked_local = local_withheld(
+        exploding_locally
+            .fill(1)
+            .await
+            .expect_err("the observer panicked during the turn"),
+    );
+    assert_eq!(
+        panicked_local, panicked_peer,
+        "an observer that fell over decided nothing, and both doors must say so alike"
+    );
+    assert_eq!(
+        panicked_local,
+        Withheld::ObserverPanicked {
+            name: "exploding".to_owned()
+        },
+        "and it is not the refusal it was folded onto before this vocabulary existed"
+    );
+    assert_ne!(
+        panicked_local, refused_local,
+        "the two are different facts about the same observer, and a caller acts on them \
+         differently"
+    );
+
+    // ── Restarting: one fault, two parked replies, one ending ──────────────
+
+    let desk_node = local_node().await;
+    let desk = orders::supervised(
+        move || async move {
+            let observers: Vec<Box<dyn Observer<Book>>> = vec![Box::new(RefuseFaults)];
+            Ok((Book::default(), observers, ()))
+        },
+        Intensity::new(
+            NonZeroU32::new(1).expect("a budget of at least one"),
+            Duration::from_millis(50),
+        )
+        .expect("a recovery span whose backoff is not zero"),
+    );
+    let _desk_server = Server::builder(&desk_node)
+        .service(desk.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("serves");
+    let desk_client = orders::Client::connect(&caller, desk_node.endpoint().addr())
+        .await
+        .expect("dials");
+
+    // One parked reply per door, both held across the same fault. This is what
+    // makes the comparison exact rather than merely agreeing: there is one
+    // `Ended`, and `EndReason` is projected from it twice.
+    let placing_peer = {
+        let desk_client = desk_client.clone();
+        tokio::spawn(async move { desk_client.place(1).await })
+    };
+    let placing_local = {
+        let desk = desk.clone();
+        tokio::spawn(async move { desk.place(2).await })
+    };
+    // **Asked, never assumed.** A fault that overtook either park would end the
+    // incarnation that park was meant to be lost with, leaving the order sitting
+    // in the next one for ever.
+    parked(&desk, 2).await;
+
+    // The fault, and it is **not** resumed in this caller. `Boom` panics before
+    // it consumes its own reply, so what dies is the `Reply` inside the turn
+    // rather than the turn answering `Faulted` — the third of the three producers
+    // `withheld_for`'s running arm names. So this call is a lost reply like the
+    // two parked ones, and which loss it reads is the parked replies' assertion
+    // to make and not this line's.
+    let faulted = desk
+        .boom(3)
+        .await
+        .expect_err("the handler panicked before it consumed its own reply");
+    assert!(
+        matches!(faulted, Unanswered::Turn(_)),
+        "the fault has to cost a turn: got {faulted:?}"
+    );
+
+    let restarting_peer = peer_withheld(
+        placing_peer
+            .await
+            .expect("the caller task is not itself panicking")
+            .expect_err("a parked reply whose incarnation ended is not answered"),
+    );
+    let restarting_local = local_withheld(
+        placing_local
+            .await
+            .expect("the caller task is not itself panicking")
+            .expect_err("a parked reply whose incarnation ended is not answered"),
+    );
+    assert_eq!(
+        restarting_local, restarting_peer,
+        "one ending, projected once, must reach both doors as one value — including the \
+         `EndReason` inside it"
+    );
+    assert!(
+        matches!(restarting_local, Withheld::Restarting { .. }),
+        "and the actor is coming back, which is the opposite instruction to `Gone`: got \
+         {restarting_local:?}"
+    );
 }
 
 /// The other half: an actor that really has **stopped** still answers `NoSuchActor`.
@@ -1203,11 +1541,24 @@ async fn a_peer_whose_parked_reply_is_drained_is_not_told_its_call_timed_out() {
 /// that is the honest outcome rather than a gap — the `Reply` died in the unwind,
 /// so there is no channel left to render a `Panic` down.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `lost`'s
-/// `Standing::Running` arm → `RemoteError::Failed(format!("{}bad", RemoteError::PANICKED))`,
-/// which is the answer this case would have if the fault reached the peer as a
-/// fault. Watched: `a panicking deferred handler loses the reply, and that is
-/// what the peer must read: "panicked: bad"`.
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `withheld_for`'s
+/// running arm, `Standing::Running => Withheld::Dropped,` →
+/// `Standing::Running => Withheld::Panicked { message: "bad".to_owned() },`, which
+/// is the answer this case would have if the fault reached the peer as a fault.
+/// Watched: `the actor is alive and this is one lost reply:
+/// Remote(Withheld(Panicked { message: "bad" }))`.
+///
+/// **Hand the harness the comment line above the arm as part of the literal.**
+/// `scripts/replay-fate-breaks.sh` row 12 carries the exact two-line form, and that
+/// is the copy a gate runs.
+///
+/// **This record quoted `RemoteError::Failed(format!("{}bad", RemoteError::PANICKED))`
+/// until it was corrected, and that const was deleted at `5198ecb`.** Applying the
+/// record was therefore a **compile error**, which exits exactly the way a caught
+/// defect exits — so anybody re-running it by hand would have read a build failure
+/// as the guard working. The script carried the corrected literal the whole time,
+/// and the two disagreed in silence: `mise run replay-anchors` replays the script
+/// and never the prose, so no gate was ever going to see it.
 #[tokio::test]
 async fn a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer() {
     let node = local_node().await;

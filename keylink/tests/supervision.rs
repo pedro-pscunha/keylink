@@ -1162,7 +1162,7 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
                 &faulted,
                 keylink::Error::Remote(RemoteError::Withheld(Withheld::Panicked { .. }))
             ),
-            "a fault is rendered with its own prefix and is not confusable with a \
+            "a fault is rendered as its own variant and is not confusable with a \
              restart: got {faulted:?}"
         );
 
@@ -1234,7 +1234,8 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
 ///
 /// `boom` is spawned rather than awaited because a local `rpc` **resumes** the
 /// handler's panic in whoever awaited it, and that would be this test. The
-/// served twin asserts the `"panicked: "` prefix at the same point; the local
+/// served twin asserts `Withheld::Panicked` at the same point — it read the
+/// `"panicked: "` prefix until `5198ecb` deleted the five — and the local
 /// equivalent of that fact is a caller task that unwinds.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `withheld_for`'s
@@ -1431,7 +1432,8 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
 /// Wave 9 gave the singleton served path three answers and left the keyed one
 /// with `NoSuchActor` for all three, because the supervisor's verdict lived on a
 /// channel `deliver_to_actor` could not see. The verdict is a cell on the registry
-/// entry now, so this is the same test on the same two prefixes, over a `System`:
+/// entry now, so this is the same test on the same two answers — two prefixes when
+/// it was written, two `Withheld` variants since `5198ecb` — over a `System`:
 ///
 /// 1. `boom` faults → `Withheld::Panicked`, the actor survives the message;
 /// 2. the parked `place` → `Withheld::Restarting`, the incarnation did not;
@@ -1536,7 +1538,7 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
                 &faulted,
                 keylink::Error::Remote(RemoteError::Withheld(Withheld::Panicked { .. }))
             ),
-            "round {round}: a fault keeps its own prefix on the keyed path too: \
+            "round {round}: a fault keeps its own variant on the keyed path too: \
              got {faulted:?}"
         );
 

@@ -160,10 +160,19 @@ pub enum Undelivered /* renamed */ { Turn(Withheld), Reentrant }
 ## Success criteria
 
 - [ ] `Withheld` decodes on a peer as a **typed variant** — proven by
-      `a_local_caller_and_a_peer_read_the_same_withheld`, asserting **value
-      equality of the two `Withheld`s**, not equality of rendered text, for the
-      six conditions reachable from both. `Panicked` is asserted through
-      `ask_catching`, because `ask` resumes it and cannot yield it.
+      `a_local_caller_and_a_peer_read_the_same_withheld` (`keylink/tests/defer.rs`),
+      asserting **value equality of the two `Withheld`s**, not equality of rendered
+      text, for the **five** conditions reachable from both: `Refused`,
+      `ObserverPanicked`, `Dropped`, `Restarting` and `Gone`. Each is also asserted
+      positively against its own variant, because equality alone is satisfied by
+      two `Gone`s.
+      **This criterion said six, and named `Panicked` as the sixth through
+      `ask_catching`. Both halves were false against the tree.** `ask_catching`'s
+      own documentation reads *"No local door builds `Withheld::Panicked`"*: a fault
+      reaching a local caller is a live `Panic` and arrives as `TurnLost::Faulted`,
+      so there is no local value for a peer's to be compared against. `Panicked` is
+      served-side only, and `Expired` has no reachable producer on either side; the
+      test states both absences rather than covering fewer conditions in silence.
 - [ ] The five prefix consts and both prefix guards **no longer exist** —
       `rg 'PANICKED|OBSERVER_PANICKED|RESTARTING|DROPPED|REFUSED' keylink/src/reply.rs`
       is empty. **Not** a `starts_with` count: only two live sites exist, both
@@ -171,9 +180,15 @@ pub enum Undelivered /* renamed */ { Turn(Withheld), Reentrant }
 - [ ] **Every site that used to build a prefixed `Failed` now builds a typed
       variant** — enumerate the producers in `rendered` and `lost`, and assert
       each by name in one test.
-- [ ] `Failed(String)` has **zero** producers inside `keylink/` — `rg
-      'RemoteError::Failed\(' keylink/src` returns only the `Middleware`
-      pass-through.
+- [ ] `Failed(String)` has **one** producer inside `keylink/src` — `rg
+      'RemoteError::Failed\(' keylink/src` returns `deliver_to_singleton`'s
+      re-entrancy arm (`turns.rs:4783-4788`) and nothing else that builds a value;
+      every other hit is a doc comment or a `matches!` guard asserting the absence.
+      **This criterion said the survivor is "the `Middleware` pass-through", and
+      there is no such producer anywhere in `keylink/src`.** `Middleware` is a user
+      hook: the only `Failed` in `rpc.rs` is an `ignore`-fenced example, which
+      builds nothing. The real survivor is stated at its own site in the tree — a
+      re-entrant call a peer cannot make, so no variant is minted for it.
 - [ ] Both ALPN pins in `keylink/tests/protocol.rs` are updated **once**, with the
       release-note sentence `CONTRIBUTING.md:196-210` requires.
 - [ ] `mise run gate` exits 0 — **18 declared steps** (`mise.toml`'s gate list;
