@@ -310,7 +310,7 @@ pub mod inspect {
         IdempotentClient, KeyedClient,
     };
 }
-pub use error::{ConfigError, Error, Result, Transport};
+pub use error::{ConfigError, Error, Failure, Result, Transport};
 pub use idempotency::{
     Attaching, Idempotency, IdempotencyRefusal, KeyState, Keyable, Limits, Records, MAX_ATTACH,
     MAX_RECORDED_BYTES, MAX_RECORDED_FRAME, MAX_RECORDS, MAX_RUNNING, MAX_RUNNING_PER_PEER,
@@ -329,7 +329,8 @@ pub use peer::{Dial, Peer};
 pub use persist::{Opened, Persist};
 pub use reply::{Outcome, RemoteError, WireRequest, WireResponse};
 pub use rpc::{
-    Dispatch, IdempotentClient, RpcClient, Server, ServerBuilder, Service, ServiceBuilder,
+    Dispatch, Governed, GovernedSeal, IdempotentClient, RpcClient, Server, ServerBuilder, Service,
+    ServiceBuilder,
 };
 pub use subscribers::Subscribers;
 pub use turns::{

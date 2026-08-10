@@ -3909,3 +3909,120 @@ the edit: `turns.rs::deliver_to_singleton` contains the `enqueued()` mark, and
 `turns.rs::turn` contains the `if expired` arm and its `unrun()`. The descriptive
 clauses in those cells — *"after `sent.is_err()` is ruled out"* — are claims, not
 pointers, and are **not** edited.
+
+---
+
+## Appendix, 2026-08-10: §5.5's disjunction stands, and `Calls` takes its first horn
+
+Appended, and **nothing above is edited**, the appendix above this one included.
+
+§5.5 opens by saying it exists *"so that a future proposal to unify `Handle` and
+`Client` has an answer already written, rather than relitigating section 5.2 from
+scratch."* Wave 2 is that proposal. This is the answer, written where the next one
+will look for it.
+
+Wave 2 adds `Calls`: a trait generated inside each service's module, carrying that
+service's `rpc` declarations, implemented for `Handle`, `ActorRef`, `Client` and
+`IdempotentClient`. One `async fn` over `impl Calls` runs against a local actor in
+a test and a remote one in production. Its error type is `Failure`, which puts a
+`Withheld` in one arm whichever side withheld the value.
+
+### It takes the first horn. It is not an escape from the disjunction
+
+§5.5's argument is a disjunction:
+
+> A unified handle must either claim failures the local case cannot have, or hide
+> failures the remote case does have.
+
+`Calls` takes the **first** horn, and takes it deliberately. `Failure::Other`
+carries the concrete `Error`, so through the bound a local surface returns a type
+that can name `Error::SchemaMismatch` — a failure two objects in one process
+cannot have. The variant's own rustdoc concedes exactly that, in the words **"No
+local surface produces this."**
+
+Nothing here dissolves the disjunction. §5.5's closing question — what
+`Error::SchemaMismatch` means for two objects in one process — still has no honest
+answer, and this wave does not supply one: the arm exists in the type and nothing
+on that side ever fills it. **A later proposal that cites this appendix as evidence
+that the disjunction was answered is citing something it does not say.** What is
+answered is narrower — the first horn can be taken at a bounded price, for one
+trait, and the price is below.
+
+### Three things bound the price
+
+**The concrete types are untouched.** `Handle` and `Client` remain distinct types,
+and their inherent methods keep their exact error types — `Unanswered` locally,
+`Error` remotely. No caller that exists today changes, and none of them can reach
+the wide arm at all.
+
+**The wide arm is reachable only from a signature the caller wrote.** `Failure`
+arrives through `impl Calls` and through nothing else. Writing that bound is the
+act of saying *I have chosen not to know which surface I hold*, and a caller who
+has not written it never meets the arm.
+
+**`a_local_surface_never_reports_other` holds it to zero local producers.** In
+`keylink/tests/surfaces.rs` the generic function is driven against a `Handle` into
+each of the two losses `Unanswered` has — a turn loss, by stopping the actor, and
+a re-entrant call, from inside a turn — and each is asserted on its exact variant.
+The arm is wide in the type and empty in fact on the local side, and that is a
+test rather than a sentence.
+
+### The property §5.5 defends survives
+
+§5.5's second paragraph states what it is protecting: merging the types would make
+keylink *"the first place in this crate where a caller cannot tell from the type
+what can go wrong."* That still holds. Wherever a caller names a concrete surface,
+the error type says which world it is in. The width appears at a bound, and only
+at a bound.
+
+### What to watch, and no compiler can see it
+
+Nothing stops callers migrating from `Handle`'s inherent methods to `Calls` **by
+preference**, because one signature is easier to write than two. Each migration
+widens that caller's error type, and no type check is involved in the decision.
+§5.5's property can therefore erode **by convention rather than by type** — no
+compile error, no failing test, and no line in a diff that reads as a design
+change. That is the thing to watch, and it is why this appendix names a horn
+rather than reporting a victory.
+
+The one instrument this wave adds points the other way and is narrower.
+`Governed` marks a surface a `Dispatch` stands in front of, so `impl Calls +
+Governed` refuses a `Handle` at the signature a reviewer reads. It bounds where a
+*local* surface may be passed. It says nothing about which error type a caller
+chose to widen to.
+
+### Two statements in §5.5 were already stale, and the appendix above corrected both
+
+Recorded so that a reader of this section does not think the repair is still owed,
+and so that the same correction is not made twice in different words. Both
+statements were stale **before** this wave: neither was made false by anything
+wave 2 did.
+
+*"A local mailbox has exactly one failure: the task is gone"* was false when it
+was written rather than merely overtaken, and the appendix above carries that
+argument and the count. Measured again here: `Withheld` has **seven** variants in
+`keylink/src/observe.rs`, and after wave 1's collapse `Unanswered` has **two**
+arms, `Turn(Withheld)` and `Reentrant`.
+
+`MailboxClosed`, which §5.5's first bold line names as the local half of the pair,
+was deleted at `4e0fcca`. **Its successor is `Unanswered`**, by way of
+`Undelivered` at `4e0fcca` and the rename to `Unanswered` at `8acd7be`;
+`Unanswered`'s own rustdoc carries that lineage and the argument for each step. It
+is **not** `NotQueued::Closed` — that is the answer of the `tell` door, which asks
+a different question, and `NotQueued::Closed`'s rustdoc says so where it sets
+itself beside `Withheld::Gone`. Read §5.5's sentence as *`Unanswered` and
+`keylink::Error` stay distinct*, which is the claim this wave leaves standing.
+
+### The four kinds `Calls` does not carry
+
+`rpc` is the only kind all four implementors declare, so the trait carries `rpc`
+and emits nothing for the rest. Each absence is already refused in writing at the
+surface that refuses it, and the generated trait's own rustdoc gathers all four
+with the reason for each: `tell` is refused by `ActorRef` and by
+`IdempotentClient`; `send` and `recv` by `Handle`, which names no transport to
+open a stream on; and `blob` is declared by all four while disagreeing about the
+answer — a `BlobId` locally against a `BlobHandle`, which is a content address
+plus the node that holds it.
+
+They are not restated here. A refusal copied into a second place is a second thing
+to keep true, and the copy is the one that rots.

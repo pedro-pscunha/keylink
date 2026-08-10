@@ -1779,6 +1779,43 @@ ANCHORS = [
      "    RemoteError::Withheld(withheld_for(standing))"),
     ("W6", "keylink/src/turns.rs", "keylink/src/turns.rs",
      "            Withheld::Expired,"),
+    # ── T IS THIS WAVE'S LETTER, AND IT IS FRESH FOR THE REASON D AND E WERE ──
+    #
+    # The one-trait wave's two conversions into `Failure`. `C1`, `C2` and `C3` were
+    # the obvious ids and all three are taken above, anchoring `keylink/src/call.rs`
+    # — the `C` series already runs to `C14`. `T` is unused across every file that
+    # holds an id-shaped token, which is the same test `D` and `E` were chosen by.
+    #
+    # Both rows edit `keylink/src/error.rs` from a record that ALSO lives in
+    # `keylink/src/error.rs`, so neither record quotes its own search literal: the
+    # code is indented twelve spaces and the record's quote is not. Measured after
+    # `cargo fmt`, the indented form counts 1 and the bare form counts 2 — which is
+    # the "found 2" abort, present in the file and avoided by the indentation.
+    #
+    # No row anchored `keylink/src/error.rs` before these two, so there is no
+    # incumbent for a new impl block to collide with.
+    ("T1", "keylink/src/error.rs", "keylink/src/error.rs",
+     "            Error::Remote(RemoteError::Withheld(withheld)) => Self::Turn(withheld),"),
+    ("T2", "keylink/src/error.rs", "keylink/src/error.rs",
+     "            Unanswered::Reentrant => Self::Reentrant,"),
+    # The third of the wave, and the one that could not land with the other two.
+    # Its record lives in `keylink/tests/surfaces.rs`, which commit 3 had not
+    # written — registering it there and then printed `FAIL T3: the RECORD'S FILE
+    # is gone`, which is this task checking the record path and not only the
+    # target's. So the row and the file arrive together.
+    #
+    # A DIFFERENT file at each end, so the indentation here carries no
+    # uniqueness burden the way `T1`'s and `T2`'s do: the record is in
+    # `tests/surfaces.rs` and the code is in `keylink/src/macros.rs`. The
+    # indented form is registered anyway because it is the line as `cargo fmt`
+    # leaves it, and both forms resolve to 1.
+    #
+    # One row for four impls. `__keylink_calls_impl!` is one emitter, so this
+    # substitution moves every column of the array
+    # `one_function_calls_four_surfaces` asserts on — measured at
+    # `left: [0, 0, 0, 0]` against `right: [1, 3, 7, 8]`.
+    ("T3", "keylink/tests/surfaces.rs", "keylink/src/macros.rs",
+     "                self.$name($( $arg ),*).await.map_err(::core::convert::From::from)\n"),
     # ── the five guards of the `__status` wave, each replayed by hand at the commit
     # that registered it. Two of them are one claim from two sides and neither is
     # the other's evidence: `__status` is answered inside the `Dispatch`, and the
@@ -3352,6 +3389,26 @@ for record in sorted(set(REDNESS) - row_ids):
 # 174 was READ off the failing run, not computed. The subtraction agrees, and by
 # this ledger's own standard that agreement establishes nothing.
 #
+# 176 → 177, on `one-trait`. ONE block holding TWO records — `T1` and `T2`, the
+# lift and the fold, both on `error.rs`'s
+# `a_peer_failure_carrying_a_withheld_lands_on_turn`. The two rows are one block
+# because they are one test: the claim is that the local and the served
+# conversions AGREE about a `Withheld`, and a record per half would describe two
+# guards where there is one.
+#
+# **This is the entry where a `+2` typed off the diff would have been wrong**, in
+# the opposite direction from the 169 and 177 runs above, which each found MORE
+# blocks than rows. Two records, one block. Read off the failing run — `FAIL
+# population: 177 comment blocks mention break-once.sh, but RECORD_BLOCKS says
+# 176` — which is what makes the direction visible at all.
+#
+# 177 → 178, on `one-trait`, for `T3`. ONE block holding ONE record, which is the
+# ordinary case and is recorded anyway: this ledger's value is that every entry
+# names what it found, so an entry reading "the arithmetic happened to agree" is
+# the one that keeps the next reader from treating agreement as evidence. Read
+# off the failing run — `FAIL population: 178 comment blocks mention
+# break-once.sh, but RECORD_BLOCKS says 177` — and the same run reported no row
+# failure, so `T3`'s literal resolved and its record quoted it in the same pass.
 # 181 is the `__status` wave's commit 3, and it was READ off the failing run in
 # the same way: `FAIL population: 181 comment blocks mention break-once.sh, but
 # RECORD_BLOCKS says 176.` Five guards, five records, five rows below - S1 to S5 -
@@ -3361,7 +3418,22 @@ for record in sorted(set(REDNESS) - row_ids):
 # added two `compile_fail` doctests whose red-test is recorded in the house form
 # for a fence - prose naming the substitution and the message it printed, with no
 # `break-once.sh` in it - so they are not in this figure and were never meant to be.
-RECORD_BLOCKS = 181
+#
+# 181 → 183, MERGING `one-trait` into `main` after the `__status` wave landed.
+# Neither wave saw the other's rows: `one-trait` took 176 → 178 for `T1`-`T3` and
+# `__status` took 176 → 181 for `S1`-`S5`, from the same base.
+#
+# **The arithmetic agrees here, and that is worth writing down precisely because
+# it does.** 178 + 5 and 181 + 2 both land on 183, and the walk independently
+# says 183 — so this entry is the case the two entries above were written to
+# guard against. Agreement is a coincidence of this merge, not a method: the
+# 176 → 177 entry found TWO records in ONE block and the 169 entry found MORE
+# blocks than rows. A reader who takes this row as licence to compute the next
+# one has read the one entry in the ledger that cannot support it.
+#
+# Read off the failing run at the merge commit: `FAIL population: 183 comment
+# blocks mention break-once.sh, but RECORD_BLOCKS says 181.`
+RECORD_BLOCKS = 183
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a
