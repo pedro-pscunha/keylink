@@ -284,6 +284,15 @@ fn dial(node: &Node, addr: EndpointAddr)
 could not cross `tokio::spawn`. `Dial` already pays for `+ Send` in return-position
 `impl Trait`, and `Calls` matches it exactly.
 
+**MEASURED at `b2d046a`, and this was the plan's only inference.** A scratch
+integration test declared a one-method service, took a `Handle` from
+`probe::actor`, and did two things: passed `h.ping()` to
+`fn assert_send<T: Send>(_: T)`, and drove a clone of the handle through
+`tokio::spawn(..).await`. **Both compiled and the test passed.** So a generated
+`Handle<A>` rpc future is `Send` and survives a spawn, which is the property that
+matters — `+ Send` in return position is viable and the fallback ladder below is
+not needed. The probe was deleted after measuring; it existed only to answer this.
+
 ### 2.6 `Governed` is adopted — and it does **not** mean at-most-once
 
 The goal's hazard framing needs two corrections before the marker can be ruled on.
