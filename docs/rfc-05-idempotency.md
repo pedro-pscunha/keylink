@@ -552,3 +552,47 @@ not only to what it carries. And this is the first time **both** pins moved in o
 commit, which is the positive form of the evidence the two entries above give in the
 negative: a change to a type every contract shares must move both, and a change to one
 service's own types must move exactly one.
+
+---
+
+## 14. Revision, 2026-08-10: `Governed` says the `Dispatch` ran, and never that the ledger did
+
+Appended rather than edited in place, per CONTRIBUTING.md. Nothing above is edited. This
+section exists because wave 2 added a marker whose name invites exactly the reading this
+document has to refuse.
+
+`keylink::Governed` marks a calling surface that reaches the actor through a `Dispatch`,
+so the service's `Middleware` stack and its `Allowlist` ran. It is implemented for
+`ActorRef`, `Client` and `IdempotentClient`, and not for `Handle`. `impl Calls +
+Governed` is therefore a bound that refuses a local handle at the signature a reviewer
+reads.
+
+**It does not mean at-most-once, and the counterexample is the plain `Client`.** That
+type satisfies the bound, carries no `IdempotencyKey` and reaches no ledger, so it is
+at-least-once under retry in exactly the way a `Handle` is. A function whose correctness
+needs the ledger is not made correct by `impl Calls + Governed`, and a reviewer who
+reads the bound as *the ledger ran* has read a fact that is not there.
+
+The reason is §1's. At-most-once is a property of **a key**, not of a type: it starts at
+`Client::with_idempotency(key)`, and §7 is this document's account of how much it holds
+even then. It holds only while the key is stable across retries, and a trait bound
+cannot see whether a caller regenerated the key on the way round. A bound that cannot
+see the thing it would promise must not promise it. **Name `IdempotentClient` in the
+signature where the ledger is required** — the type's own name is the honest instrument,
+and it is the only one that carries the key into the signature.
+
+**An `Idempotent` marker beside `Governed` is refused, for that reason and one more.**
+It would have exactly one implementor per service, so it would buy nothing the type name
+does not already buy, and it would still be promising key stability, which no type can
+check. Two markers where one is already read too widely is the wrong direction.
+
+**`Governed` cannot be sealed, and §11.5 is the argument with the nouns changed.**
+`service!` writes the impls in the caller's crate, so the supertrait `GovernedSeal` has
+to be `pub` for those impls to name it — and a supertrait a downstream crate must name is
+one a downstream crate can implement. `#[doc(hidden)]` keeps it out of the rendered docs
+and out of a caller's way; it is not a visibility modifier and it forbids nothing. That
+is §11.5's `Progress` finding exactly: a token only generated code should build has to be
+`pub` to be named in the expansion, so the forgery moves by one line rather than being
+stopped. It takes §11.5's disposition too — documented rather than defended, because
+every route to it is in-process and no peer can reach any of it. A caller who writes both
+impls has lied to a bound inside its own crate, and the ledger is untouched either way.

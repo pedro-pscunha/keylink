@@ -243,6 +243,32 @@ idempotency ledger, keep-alive and congestion window — and no per-instance
 rather than why its loop exited. The budget is not optional: every caller names
 how long it is prepared to wait before the actor is killed instead.
 
+**One function, either surface.** A function that runs against a local actor in a
+test and a remote one in production could not be written: a local call answers
+`Unanswered`, a served one answers `Error`, and no `Result` type is both.
+`service!` also generates `inventory::Calls`, a trait carrying the service's `rpc`
+methods with **one** error type — `Failure`, which puts a `Withheld` in the same
+arm whichever side withheld the value. It is implemented for `Handle`, `ActorRef`,
+`Client` and `IdempotentClient`, so one
+`async fn stock<C: inventory::Calls>(surface: &C) -> Result<u64, Failure>` runs
+against all four. The concrete surfaces are untouched — their own methods still
+answer `Unanswered` and `Error`, and `Failure` is reachable only through the
+bound, which is the act of saying *I have chosen not to know which surface I
+hold*. `impl Calls + Governed` narrows it to the surfaces a `Dispatch` stands in
+front of, which refuses a `Handle`: it means the layers and the allowlist ran, and
+it does **not** mean at-most-once, for which the honest instrument is
+`IdempotentClient` named in the signature.
+
+It carries `rpc` and none of the other four kinds, because `rpc` is the only kind
+all four surfaces declare: an `ActorRef` and an `IdempotentClient` have no `tell`,
+a `Handle` has no `send` and no `recv`, and `blob` answers a `BlobId` locally
+against a `BlobHandle` — a content address plus the node that holds it —
+remotely. One behaviour diverges across the bound, and it is documented rather
+than papered over: a handler panic **unwinds into the calling task** against a
+`Handle`, and arrives as `Failure::Turn(Withheld::Panicked { .. })` against a
+served surface. `Failure` cannot express an unwind, and `TurnLost` argues at
+length why it should not try.
+
 **Sync and async.** `keylink::blocking` mirrors the async API for programs with
 no runtime. It owns a private multi-threaded runtime — mandatory, because a
 current-thread runtime only advances iroh's keepalives during `block_on`, so
