@@ -155,6 +155,12 @@ async fn the_generated_module_supplies_the_rest_fully_applied() {
     let _ = depot::IdempotentClient::close;
     let _ = depot::at;
     let _ = depot::keyed_service(&system, Allowlist::anyone());
+    // Annotated rather than bare, and the annotation is the assertion: the one
+    // thing a caller can get wrong about this door is the argument order, and
+    // it takes `node` first and then the thing being served, exactly as `serve`
+    // does. A bare path would compile whichever way round they went.
+    let _: fn(&keylink::Node, &depot::System, Allowlist) -> keylink::Result<keylink::Server> =
+        depot::keyed_serve;
 
     assert!(system.is_empty());
 }

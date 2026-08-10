@@ -229,9 +229,12 @@ struct Fixture {
 async fn start(system: journal::System) -> Fixture {
     let server = local_node().await;
     let client_node = local_node().await;
-    let running = Server::builder(&server)
-        .service(journal::keyed_service(&system, Allowlist::anyone()).build())
-        .spawn()
+    // `keyed_serve` rather than the builder, and this fixture is where it earns
+    // its keep: every keyed test in this file serves through here, so a twin
+    // that did not reach the same ALPN would redden the file rather than sit
+    // unexercised. The builder form is still what the tests below use whenever
+    // they add a layer, a store or a second service — which is most of them.
+    let running = journal::keyed_serve(&server, &system, Allowlist::anyone())
         .expect("one service, no duplicate ALPN");
     let client = journal::KeyedClient::connect(&client_node, server.endpoint().addr())
         .await

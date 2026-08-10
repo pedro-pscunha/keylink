@@ -1225,6 +1225,50 @@ macro_rules! __keylink_service {
                     .__keylink_declares_blobs(DECLARES_BLOBS)
             }
 
+            /// Serve `system`'s actors alone on `node`, on this service's keyed
+            /// ALPN.
+            ///
+            /// The keyed twin of [`serve`], and the argument order is the same
+            /// one: `node` first, then the thing being served. [`Handle::serve`]
+            /// is the third of the three and does this for a singleton actor.
+            ///
+            /// For several services on one endpoint, build each with
+            /// [`keyed_service`] and register them on a single
+            /// [`Server`](keylink::Server): one router must own every ALPN.
+            ///
+            /// **It decides the same serving-side policies [`serve`] does, and
+            /// takes no argument for any of them.** It calls `build()` itself, so
+            /// a caller never holds the
+            /// [`ServiceBuilder`](keylink::ServiceBuilder) and cannot reach
+            /// [`layer`](keylink::ServiceBuilder::layer),
+            /// [`limits`](keylink::ServiceBuilder::limits),
+            /// [`records`](keylink::ServiceBuilder::records) or
+            /// [`keyable`](keylink::ServiceBuilder::keyable). Go through
+            /// [`keyed_service`] and
+            /// [`Server::builder`](keylink::Server::builder) for any of those.
+            ///
+            /// # Errors
+            ///
+            /// [`ConfigError`](keylink::ConfigError) from
+            /// [`spawn`](keylink::ServerBuilder::spawn), the same as [`serve`].
+            ///
+            /// **A service declaring a `blob` method cannot be served this way**,
+            /// and the refusal is at startup rather than on first call: the store
+            /// is handed over by
+            /// [`with_blobs`](keylink::ServiceBuilder::with_blobs), which is one
+            /// of the builder methods this door cannot reach. Use
+            /// `keyed_service(system, allow).with_blobs(&blobs)` instead.
+            /// [`serve`] has the same limit for the same reason.
+            pub fn keyed_serve(
+                node: &$crate::Node,
+                system: &System,
+                allow: $crate::Allowlist,
+            ) -> $crate::Result<$crate::Server> {
+                $crate::Server::builder(node)
+                    .service(keyed_service(system, allow).build())
+                    .spawn()
+            }
+
             /// Serve this service as an actor: `&mut self`, one message at a
             /// time, state owned by a task rather than shared behind a lock.
             ///
