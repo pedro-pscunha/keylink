@@ -307,7 +307,7 @@ pub mod inspect {
     #[doc(hidden)]
     pub use crate::console::inspect::{
         actor, actor_with, at, keyed_service, serve, service, spawn, spawn_wired, Actor, Handler,
-        IdempotentClient, KeyedClient,
+        IdempotentClient, KeyedClient, OwnedPermit, Permit,
     };
 }
 pub use error::{ConfigError, Error, Failure, Result, Transport};
@@ -336,7 +336,7 @@ pub use subscribers::Subscribers;
 pub use turns::{
     deliver_to_singleton, feed_turn, run_keyed, run_keyed_supervised, serving_of_singleton, turn,
     turn_deferred, Deferred, Fed, Feeds, Hooks, Incarnation, Intensity, LocalActor, NotQueued,
-    Replied, Reply, Turn, Unanswered,
+    OwnedPermit, Permit, Replied, Reply, Turn, Unanswered,
 };
 pub use watch::{Departure, Watch};
 pub use wire::{Envelope, WireKinds, MAX_HEADER};

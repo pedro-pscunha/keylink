@@ -2727,8 +2727,163 @@ macro_rules! __keylink_service {
                     self.inner.ended()
                 }
 
+                /// Wait for a slot in this actor's mailbox and hold it.
+                ///
+                /// Backpressure, made addressable. Every method below waits for
+                /// a permit inside itself and spends it in the same call, so a
+                /// caller sees the wait and never the slot. This stops at the
+                /// slot and hands over a [`Permit`], which carries the same
+                /// methods and whose send cannot wait again.
+                ///
+                /// [`LocalActor::reserve`](keylink::LocalActor::reserve) is what
+                /// this calls, and it carries the whole argument: what tokio
+                /// guarantees when a racing reserve is cancelled — capacity, not
+                /// a place in the queue — and why the re-entrancy refusal is
+                /// stricter here than a `tell`'s.
+                ///
+                /// # The two underscores, and they are not decoration
+                ///
+                /// The same rule `Request::__Status` is written under: *a name a
+                /// user could also write would be a name a user could collide
+                /// with*. Every method on this type that keylink writes shares
+                /// one namespace with every method the service declares, and a
+                /// bare `reserve` here is a `duplicate definitions` error for any
+                /// service declaring an rpc called `Reserve` — which is the rpc
+                /// this crate's own README, RFC-04 and `demo` all use as their
+                /// example. `stop` and `buffered` took that risk before the rule
+                /// was written; these three are written under it.
+                ///
+                /// The bare names live on
+                /// [`LocalActor`](keylink::LocalActor), which is keylink's own
+                /// type and shares its namespace with nobody.
+                ///
+                /// # Errors
+                ///
+                /// [`NotQueued::Closed`](keylink::NotQueued::Closed) when the
+                /// actor is gone, and
+                /// [`NotQueued::Reentrant`](keylink::NotQueued::Reentrant) when
+                /// the call is made from inside this actor's own turn — at any
+                /// depth, because a permit carries no message and the door
+                /// cannot see whether it is about to be spent on a `tell` or on
+                /// an `rpc`.
+                pub async fn __reserve(&self)
+                    -> ::core::result::Result<Permit<'_, A>, $crate::NotQueued> {
+                    self.inner.reserve().await.map(|slot| Permit { inner: slot })
+                }
+
+                /// The same, without waiting. `Ok(None)` means this actor is
+                /// full right now.
+                ///
+                /// Three answers rather than two, so a caller routing across
+                /// several actors can try the next one on a full and stop on a
+                /// closed without reading a discriminant to tell them apart.
+                ///
+                /// # Errors
+                ///
+                /// [`__reserve`](Self::__reserve)'s, and neither of them means
+                /// full.
+                pub fn __try_reserve(&self)
+                    -> ::core::result::Result<
+                        ::core::option::Option<Permit<'_, A>>,
+                        $crate::NotQueued,
+                    > {
+                    self.inner
+                        .try_reserve()
+                        .map(|slot| slot.map(|slot| Permit { inner: slot }))
+                }
+
+                /// The same as [`__reserve`](Self::__reserve), owned, so the
+                /// permit can be stored or moved into a spawned task.
+                ///
+                /// A [`Permit`] borrows this handle, so it cannot outlive the
+                /// frame that reserved it. That is the **only** difference: a
+                /// future holding a borrowed permit across an await is already
+                /// `Send`. Takes `self`, and a handle is `Clone`, so a caller who
+                /// still wants one clones it first.
+                ///
+                /// # Errors
+                ///
+                /// [`__reserve`](Self::__reserve)'s — and
+                /// [`LocalActor::reserve_owned`](keylink::LocalActor::reserve_owned)
+                /// names the hazard the refusal cannot reach once a permit is
+                /// stored.
+                pub async fn __reserve_owned(self)
+                    -> ::core::result::Result<OwnedPermit<A>, $crate::NotQueued> {
+                    self.inner
+                        .reserve_owned()
+                        .await
+                        .map(|slot| OwnedPermit { inner: slot })
+                }
+
                 $(
                     $crate::__keylink_local_method!(
+                        [$( #[$meta] )*],
+                        [<$kind>],
+                        [<$rpc:snake>],
+                        $rpc,
+                        ($( $arg : $ty ),*),
+                        $ret
+                    );
+                )+
+            }
+
+            /// One reserved slot in an actor's mailbox, carrying this service's
+            /// own methods.
+            ///
+            /// Handed out by [`Handle::__reserve`] and
+            /// [`Handle::__try_reserve`]. Every method here takes `self`, because
+            /// a slot admits one message: spending it is the whole of what a
+            /// permit is for, and there is no second send to make.
+            ///
+            /// **The methods here carry no underscores**, and the reason is that
+            /// this type's namespace holds nothing but the service's own methods:
+            /// there is no keylink name for one to collide with, which is exactly
+            /// the condition [`Handle::__reserve`] does not meet.
+            ///
+            /// **The methods differ from [`Handle`]'s in exactly one way — a
+            /// `tell` returns nothing at all rather than a `Result`.** Both of
+            /// that door's failures are answered before a permit exists: full is
+            /// what the reservation waited out, and closed is what it reported.
+            /// An `rpc` still returns a `Result`, because a turn can still lose
+            /// its reply after it is queued.
+            ///
+            /// [`keylink::Permit`] carries what holding one costs — the slot is
+            /// held away from every other sender until this is spent or dropped —
+            /// and the one deadlock shape a caller has to avoid.
+            #[must_use = "a dropped permit returns the slot and sends nothing; \
+                          the caller is never told"]
+            pub struct Permit<'a, A> {
+                inner: $crate::Permit<'a, A, Mail>,
+            }
+
+            impl<A: Actor> Permit<'_, A> {
+                $(
+                    $crate::__keylink_permit_method!(
+                        [$( #[$meta] )*],
+                        [<$kind>],
+                        [<$rpc:snake>],
+                        $rpc,
+                        ($( $arg : $ty ),*),
+                        $ret
+                    );
+                )+
+            }
+
+            /// [`Permit`] that owns its sender, so it can be stored or moved into
+            /// a spawned task.
+            ///
+            /// Handed out by [`Handle::__reserve_owned`], and it carries the same
+            /// methods for the same reasons. The difference is `'static` and
+            /// nothing else.
+            #[must_use = "a dropped permit returns the slot and sends nothing; \
+                          the caller is never told"]
+            pub struct OwnedPermit<A> {
+                inner: $crate::OwnedPermit<A, Mail>,
+            }
+
+            impl<A: Actor> OwnedPermit<A> {
+                $(
+                    $crate::__keylink_permit_method!(
                         [$( #[$meta] )*],
                         [<$kind>],
                         [<$rpc:snake>],
@@ -4564,6 +4719,103 @@ macro_rules! __keylink_local_method {
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
 }
 
+/// One method on a reserved mailbox slot, shaped by the rpc kind.
+///
+/// [`__keylink_local_method`]'s set with the wait already paid, so the arms differ
+/// from it in two ways and only two. Every method takes `self`, because a slot
+/// admits one message. And a `tell` returns nothing rather than
+/// `Result<(), NotQueued>`: that door's two failures are a full mailbox and a
+/// closed one, and the reservation answered both before this method existed.
+///
+/// `send` and `recv` are absent here for the reason they are absent from
+/// [`__keylink_local_method`] — a `BodyReader` and a `Body` are a QUIC stream's
+/// two halves, and reserving a mailbox slot creates no stream.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_permit_method {
+    ([$( #[$meta:meta] )*], rpc, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Spend this permit on the `", stringify!($variant), "` rpc.")]
+        ///
+        /// # Errors
+        ///
+        /// The [`Unanswered`](keylink::Unanswered) variants the same method on
+        /// [`Handle`] answers, minus one:
+        /// [`Reentrant`](keylink::Unanswered::Reentrant) cannot arrive, because
+        /// that question was asked and answered when the permit was reserved.
+        /// What is left is [`Turn`](keylink::Unanswered::Turn) carrying a
+        /// [`Withheld`](keylink::Withheld) — a message can be queued and still
+        /// lose its answer.
+        ///
+        /// # Panics
+        ///
+        /// With whatever the handler panicked with, after the actor has
+        /// survived it, exactly as [`Handle`]'s does.
+        pub async fn $name(self $(, $arg: $ty )*)
+            -> ::core::result::Result<$ret, $crate::Unanswered> {
+            self.inner
+                .ask(move |__from, __reply| Mail::$variant {
+                    origin: __from,
+                    $( $arg, )*
+                    body: (),
+                    reply: __reply,
+                })
+                .await
+        }
+    };
+    ([$( #[$meta:meta] )*], tell, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Spend this permit on the `", stringify!($variant), "` tell.")]
+        ///
+        /// **Returns nothing at all**, where the same method on [`Handle`]
+        /// returns [`Result`]`<(), `[`NotQueued`](keylink::NotQueued)`>`. Both of
+        /// that door's failures are answered before this one is reachable: full
+        /// is what the reservation waited out, and closed is what it reported.
+        ///
+        /// So this cannot be refused, and it still does not mean the turn ran. A
+        /// mailbox that closes between the reservation and this call drops the
+        /// message unrun — which is what
+        /// [`stop`](Handle::stop) already does to a queued one.
+        pub fn $name(self $(, $arg: $ty )*) {
+            self.inner
+                .notify(move |__from, __reply| Mail::$variant {
+                    origin: __from,
+                    $( $arg, )*
+                    body: (),
+                    reply: __reply,
+                });
+        }
+    };
+    ([$( #[$meta:meta] )*], blob, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Spend this permit on the `", stringify!($variant), "` rpc, returning the address of the content it named.")]
+        ///
+        /// # Errors
+        ///
+        /// The same as this permit's `rpc` methods, for the same reason: it goes
+        /// through the same door, and the blob is written by the turn rather than
+        /// after it.
+        pub async fn $name(self $(, $arg: $ty )*)
+            -> ::core::result::Result<($ret, $crate::BlobId), $crate::Unanswered> {
+            self.inner
+                .ask(move |__from, __reply| Mail::$variant {
+                    origin: __from,
+                    $( $arg, )*
+                    body: (),
+                    reply: __reply,
+                })
+                .await
+        }
+    };
+    ([$( #[$meta:meta] )*], send, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], recv, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+}
+
 /// One client method, shaped by the rpc kind.
 #[doc(hidden)]
 #[macro_export]
@@ -4946,6 +5198,65 @@ mod expansion {
             assert_send(actor.ping(1));
             assert_send(client.ping(1));
             assert_send(keyed.ping(1));
+        }
+    }
+
+    /// The signature the whole permit surface rests on: a future holding a
+    /// **borrowed** permit across an await point is `Send`, and only the owned
+    /// form is also `'static`.
+    ///
+    /// It was measured against tokio's own permit on a scratch integration test
+    /// that was then deleted — which is a measurement and not a guard, because
+    /// nothing was left behind to fail. This is the guard. If the borrowed form
+    /// ever stopped being `Send`, `Handle::__reserve` would be unusable from any
+    /// caller whose own future has to cross a `tokio::spawn`, and the answer
+    /// would be to make every door take the owned form and pay a refcount.
+    ///
+    /// **The `yield_now` is fidelity to the measured shape, and it is NOT what
+    /// makes the assertion bite** — an earlier version of this paragraph claimed
+    /// it was. It puts the *permit itself* live across an await point, which is
+    /// what the scratch probe held. Deleting it leaves the permit's data inside
+    /// `ping`'s own future, which is live across the same await, so the
+    /// assertion still covers it. Measured, by deleting the line and asking for
+    /// the stricter bound below: `error[E0521]` fires either way.
+    ///
+    /// **What DOES make it bite** is the pair of bounds. Ask `assert_spawnable`
+    /// for the borrowed form and the module stops compiling with
+    /// `error[E0521]: borrowed data escapes outside of function` — which is the
+    /// `'static` half of the claim, held from the failing side. Watched.
+    ///
+    /// Nothing here runs and nothing is built: the futures are type-checked from
+    /// a reference and dropped. Compiling is the whole assertion.
+    mod a_held_permit_crosses_an_await {
+        #![allow(dead_code, reason = "the proof is that this module compiles")]
+
+        use super::expansion;
+
+        fn assert_send<T: Send>(_: T) {}
+
+        /// What `tokio::spawn` demands, and what the borrowed form deliberately
+        /// does not satisfy.
+        fn assert_spawnable<T: Send + 'static>(_: T) {}
+
+        async fn holding_a_borrowed_permit<A: expansion::Actor>(handle: &expansion::Handle<A>) {
+            let Ok(permit) = handle.__reserve().await else {
+                return;
+            };
+            tokio::task::yield_now().await;
+            let _ = permit.ping(1).await;
+        }
+
+        async fn holding_an_owned_permit<A: expansion::Actor>(handle: expansion::Handle<A>) {
+            let Ok(permit) = handle.__reserve_owned().await else {
+                return;
+            };
+            tokio::task::yield_now().await;
+            let _ = permit.ping(1).await;
+        }
+
+        fn both_forms<A: expansion::Actor + Send + 'static>(handle: &expansion::Handle<A>) {
+            assert_send(holding_a_borrowed_permit(handle));
+            assert_spawnable(holding_an_owned_permit(handle.clone()));
         }
     }
 }

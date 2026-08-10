@@ -4343,10 +4343,18 @@ impl<A, M> LocalActor<A, M> {
 
     /// How many messages are waiting ahead of the one being handled.
     ///
-    /// Zero or one at the local mailbox depth, which is a constant and not a
-    /// knob — never a number to compute a queue-length alert from. What it is
-    /// good for is the question it answers exactly — **is this actor's mailbox
-    /// full, and therefore will the next caller block on the permit.**
+    /// It ranges over the depth this actor's mailbox was built with: zero or one
+    /// under [`spawn`](Self::spawn), and up to the depth under
+    /// [`spawn_deep`](Self::spawn_deep), which takes a `NonZeroUsize` and builds
+    /// the channel from it. **This paragraph used to say the depth was "a
+    /// constant and not a knob", and it was false from the commit that added
+    /// that door** — it is corrected here rather than left as the reason a
+    /// caller does not read the number.
+    ///
+    /// What it is good for is the question it answers exactly — **is this
+    /// actor's mailbox full, and therefore will the next caller block on the
+    /// permit.** What it is still not is a count of the service's own messages,
+    /// and the paragraph below says why: this channel carries two other things.
     ///
     /// `ActorStatus::buffered` answers that same question on the keyed side, and
     /// the two are **not** counting the same set: a keyed mailbox carries only
@@ -4396,19 +4404,157 @@ impl<A, M> LocalActor<A, M> {
         }
     }
 
-    /// The one place a message enters the mailbox.
+    /// Wait for a mailbox slot and hold it. Backpressure, made addressable.
+    ///
+    /// Every other door waits for a permit *inside* itself and spends it in the
+    /// same call, so a caller can observe the wait and never the slot. This one
+    /// stops at the slot and hands it over. [`compose::Pool`](crate::compose::Pool)
+    /// names the absence as its own missing piece — *"a `try_pick` across N
+    /// mailboxes needs a `try_reserve` the handle does not have"* — and
+    /// [`try_reserve`](Self::try_reserve) is that door.
+    ///
+    /// The permit is the admission decision, taken **before** the payload moves.
+    /// That is the whole of what it buys: a caller who cannot afford to build a
+    /// message and be told no takes one of these first, and a [`Permit`]'s own
+    /// send cannot be refused for fullness.
+    ///
+    /// # What tokio guarantees here, and what it does not
+    ///
+    /// **Not cancel-safe.** tokio says so of the channel this wraps: *"Cancelling
+    /// a call to `reserve` makes you lose your place in the queue."* Dropping this
+    /// future therefore costs the wait, and a caller who retries starts again at
+    /// the back.
+    ///
+    /// **Capacity is conserved anyway**, which is the narrower promise and the one
+    /// a racing caller needs: a dropped waiter is removed from the wait list and
+    /// any permit already assigned to it is returned. So racing N of these and
+    /// dropping N−1 leaks no slot and wedges no mailbox.
+    ///
+    /// **It is therefore not FIFO across callers.** Each cancellation takes the
+    /// wait-list lock, and a freed slot can be assigned to a waiter that has
+    /// already left. Two tasks racing for one mailbox are ordered by nothing here.
+    /// A single task awaiting two of these one after the other is ordered, for the
+    /// reason a `tell` is: the mailbox is FIFO.
+    ///
+    /// # Errors
+    ///
+    /// [`NotQueued::Closed`] when the loop's end of the mailbox is dropped, and
+    /// [`NotQueued::Reentrant`] when the call is made from inside this actor's own
+    /// turn.
+    ///
+    /// **The refusal is under the `Always` half, where [`notify`](Self::notify) is
+    /// under the `WhenFull` one, and the difference is that there is no message
+    /// yet.** A self-`tell` into a free slot is legitimate because the message it
+    /// carries runs after this turn returns. A *permit* carries no message: the
+    /// caller decides afterwards whether to spend it on a `tell` — which would be
+    /// legitimate — or on an `rpc`, which waits for an answer only the blocked turn
+    /// can produce and hangs for ever. A door that cannot see which one is coming
+    /// has to refuse the pair, so this is refused at any depth.
+    pub async fn reserve(&self) -> Result<Permit<'_, A, M>, NotQueued> {
+        if self.inside_own_turn() {
+            return Err(NotQueued::Reentrant);
+        }
+        match self.mail.reserve().await {
+            Ok(slot) => Ok(Permit {
+                fate: &self.fate,
+                slot,
+            }),
+            Err(_) => Err(NotQueued::Closed),
+        }
+    }
+
+    /// The same, without waiting. `Ok(None)` means this actor is full right now.
+    ///
+    /// Three answers where tokio's own `try_reserve` gives two: it folds *full*
+    /// and *closed* into one error, and this crate splits them everywhere else —
+    /// full is a schedule and closed is a fate. A caller routing across N mailboxes
+    /// wants to try the next one on a full and to stop on a closed, and a single
+    /// error type makes it read the discriminant to find out.
+    ///
+    /// # Errors
+    ///
+    /// [`NotQueued::Closed`] and [`NotQueued::Reentrant`], both exactly as
+    /// [`reserve`](Self::reserve) answers them — including the `Always` half of the
+    /// re-entrancy rule, which is about what the *permit* can be spent on rather
+    /// than about this call waiting. This call never waits.
+    pub fn try_reserve(&self) -> Result<Option<Permit<'_, A, M>>, NotQueued> {
+        if self.inside_own_turn() {
+            return Err(NotQueued::Reentrant);
+        }
+        match self.mail.try_reserve() {
+            Ok(slot) => Ok(Some(Permit {
+                fate: &self.fate,
+                slot,
+            })),
+            Err(mpsc::error::TrySendError::Full(())) => Ok(None),
+            Err(mpsc::error::TrySendError::Closed(())) => Err(NotQueued::Closed),
+        }
+    }
+
+    /// The same as [`reserve`](Self::reserve), owned, so the permit can be stored
+    /// or cross a spawn.
+    ///
+    /// [`Permit`] borrows the handle, so it cannot outlive the frame that reserved
+    /// it: it cannot be stored in a struct and it cannot be moved into a spawned
+    /// task. This is the `'static` half, and it is the **only** difference —
+    /// a future holding a borrowed permit across an await is already `Send`.
+    ///
+    /// Takes `self` because tokio's owned permit does, and it costs one refcount:
+    /// a handle is `Clone` and every clone names the same actor, so a caller who
+    /// still wants the handle clones it first.
+    ///
+    /// # A stored permit outlives the check this door makes
+    ///
+    /// The refusal below is taken **here**, once, on the task that reserves. An
+    /// owned permit that is then handed to the actor's own state and spent from
+    /// inside one of its turns is a re-entrant `rpc` that nothing refuses, and it
+    /// hangs exactly as an unrefused self-call would. That is the price of the
+    /// `'static`, it is not reachable by accident, and [`abort`](Self::abort) is
+    /// the recovery it shares with every other wedged turn.
+    ///
+    /// # Errors
+    ///
+    /// [`NotQueued::Closed`] and [`NotQueued::Reentrant`], as
+    /// [`reserve`](Self::reserve) answers them.
+    pub async fn reserve_owned(self) -> Result<OwnedPermit<A, M>, NotQueued> {
+        if self.inside_own_turn() {
+            return Err(NotQueued::Reentrant);
+        }
+        // The clone is what `reserve_owned` costs: tokio's owned permit consumes a
+        // sender, and this handle carries three other fields the permit still
+        // needs nothing of except the fate below.
+        match self.mail.clone().reserve_owned().await {
+            Ok(slot) => Ok(OwnedPermit {
+                fate: self.fate,
+                slot,
+            }),
+            Err(_) => Err(NotQueued::Closed),
+        }
+    }
+
+    /// Where a message enters the mailbox **after** waiting for its own permit.
+    ///
+    /// It used to be the one place a message entered at all, and this heading said
+    /// so. [`reserve`](Self::reserve) is the second: it takes the permit up front
+    /// and hands it over, and the caller spends it through [`Permit`] without
+    /// coming back here.
     ///
     /// It used to be the one place the box was put on, too. The box moved into
     /// [`Message::Mail`], where it stays until [`dispatch`] takes it off — because a
     /// box that the loop unwraps buys nothing, and that is what
     /// `tests/actor_memory.rs` measured.
     ///
-    /// # The re-entrancy check is here because this is that one place
+    /// # The re-entrancy check is here, and on the three permit doors, and nowhere else
     ///
-    /// Five non-test callers reach it — `answered` (serving both asks), `notify`,
-    /// `read`, `stop` and [`deliver_to_singleton`] — and there is no sixth door. Which
-    /// half of the rule applies is [`Refuse`]'s parameter, because the message
-    /// alone cannot say.
+    /// Five non-test callers reach **this** function — `answered` (serving both
+    /// asks), `notify`, `read`, `stop` and [`deliver_to_singleton`] — and there is no
+    /// sixth. Which half of the rule applies is [`Refuse`]'s parameter, because the
+    /// message alone cannot say.
+    ///
+    /// The permit doors ask the same question through the same
+    /// [`inside_own_turn`](Self::inside_own_turn) and take no [`Refuse`], because at
+    /// a reservation there is no message for one to be about.
+    /// [`reserve`](Self::reserve) carries the argument for the half they take.
     ///
     /// **The rule is decided once here and restated at every door, and the
     /// restatements are prose.** A caller meets the rule where it calls, not in a
@@ -4427,11 +4573,7 @@ impl<A, M> LocalActor<A, M> {
     /// check-then-act race against the actor: what it reads cannot change while
     /// the caller is inside the turn that would have to change it.
     async fn send(&self, message: Message<A, M>, refuse: Refuse) -> Result<(), NotQueued> {
-        // The `Arc` this handle already carries, read as an identity. Built
-        // before the thread-local is touched so the common off-turn path is one
-        // clone and one match arm on a unit discriminant.
-        let me = Actor(Arc::clone(&self.busy));
-        if current().holds(&me) {
+        if self.inside_own_turn() {
             match refuse {
                 Refuse::Always => return Err(NotQueued::Reentrant),
                 Refuse::WhenFull if self.mail.capacity() == 0 => return Err(NotQueued::Reentrant),
@@ -4439,6 +4581,191 @@ impl<A, M> LocalActor<A, M> {
             }
         }
         self.mail.send(message).await.map_err(|_| NotQueued::Closed)
+    }
+
+    /// Whether the calling task is inside this actor's own turn.
+    ///
+    /// One reading for two kinds of door: [`send`](Self::send), which then asks
+    /// [`Refuse`] which half of the rule applies, and the three permit doors,
+    /// which have no message for a half to be about. It was inline in `send`
+    /// while `send` was the only place that asked.
+    fn inside_own_turn(&self) -> bool {
+        // The `Arc` this handle already carries, read as an identity. Built
+        // before the thread-local is touched so the common off-turn path is one
+        // clone and one match arm on a unit discriminant.
+        let me = Actor(Arc::clone(&self.busy));
+        current().holds(&me)
+    }
+}
+
+/// One reserved mailbox slot, borrowed from the handle that reserved it.
+///
+/// A slot is held from the moment [`LocalActor::reserve`] returns until this is
+/// spent or dropped, so holding one is holding capacity away from every other
+/// sender. At the default depth of one that is the actor's whole mailbox.
+///
+/// **Spending it cannot wait and cannot be refused for fullness**, which is the
+/// property the whole type exists for: the admission decision was taken at the
+/// reservation, before the caller built anything. What can still happen is
+/// everything that happens to a message *after* it is queued — it may be dropped
+/// unrun by [`stop`](LocalActor::stop) or [`abort`](LocalActor::abort), and its
+/// turn may lose the reply. [`ask`](Self::ask) reports that half; a `tell` through
+/// [`notify`](Self::notify) reports nothing, for the reason
+/// [`LocalActor::notify`] gives.
+///
+/// # Deadlock is a caller's to avoid here, and there is one shape
+///
+/// Holding a permit and then awaiting an answer from the **same** actor on a
+/// second door blocks whenever the permit was the last free slot: the second call
+/// waits for a permit only this one can return. Spend it or drop it first. The
+/// re-entrancy rule does not reach this — it is about a caller inside the actor's
+/// turn, and this caller is outside it, holding the slot that turn needs.
+#[must_use = "a dropped permit returns the slot and sends nothing; \
+              the caller is never told"]
+pub struct Permit<'a, A, M> {
+    /// Read when a reply channel dies, exactly as [`LocalActor::answered`] reads
+    /// it. Borrowed rather than cloned, because the lifetime is already here.
+    fate: &'a Fate,
+    slot: mpsc::Permit<'a, Message<A, M>>,
+}
+
+impl<A, M> Permit<'_, A, M> {
+    /// Spend the slot on one turn and bring back its value.
+    ///
+    /// [`LocalActor::ask`] with the wait already paid. The argument is the same
+    /// builder that door takes, for the same reason: keylink makes the reply
+    /// channel and the [`Origin`] and the generated arm fills in the method's own
+    /// arguments around them.
+    ///
+    /// # Errors
+    ///
+    /// [`Unanswered::Turn`] carrying a [`Withheld`], and **not**
+    /// [`Unanswered::Reentrant`]: that question was asked and answered when the
+    /// permit was reserved, so no spent permit can produce it.
+    ///
+    /// # Panics
+    ///
+    /// With whatever the handler panicked with, after the actor has survived it —
+    /// [`LocalActor::ask`]'s behaviour, because this is the door a generated `rpc`
+    /// goes through on both types.
+    pub async fn ask<T>(self, mail: impl FnOnce(Origin, Reply<T>) -> M) -> Result<T, Unanswered>
+    where
+        T: Send + 'static,
+    {
+        let Self { fate, slot } = self;
+        let (reply, answer) = Reply::channel();
+        slot.send(Message::Mail(
+            Box::new(mail(Origin::local(), reply)),
+            current(),
+        ));
+        asked(answer, fate).await
+    }
+
+    /// Spend the slot on one turn and do not wait for it.
+    ///
+    /// [`LocalActor::notify`] with the wait already paid, and it returns nothing
+    /// rather than a `Result`: that door's two failures are a full mailbox and a
+    /// closed one, the permit answered the first, and there is no channel on which
+    /// to report the second. A mailbox that closes between the reservation and this
+    /// call drops the message unrun — which is what `stop` already does to a
+    /// queued one, and which the door that returned `Ok` could not have reported
+    /// either.
+    pub fn notify<T>(self, mail: impl FnOnce(Origin, Reply<T>) -> M)
+    where
+        T: Send + 'static,
+    {
+        let Self { fate: _, slot } = self;
+        let (reply, answer) = Reply::channel();
+        drop(answer);
+        slot.send(Message::Mail(
+            Box::new(mail(Origin::local(), reply)),
+            current(),
+        ));
+    }
+}
+
+/// [`Permit`] that owns its sender, so it can be stored or cross a spawn.
+///
+/// Everything [`Permit`] documents holds here, including the slot it is holding
+/// away from every other sender. What it adds is that the holding can now outlive
+/// the frame that reserved it, and [`LocalActor::reserve_owned`] states the one
+/// hazard that comes with.
+#[must_use = "a dropped permit returns the slot and sends nothing; \
+              the caller is never told"]
+pub struct OwnedPermit<A, M> {
+    /// [`Permit`]'s, by value, because there is no handle left to borrow from.
+    fate: Fate,
+    slot: mpsc::OwnedPermit<Message<A, M>>,
+}
+
+impl<A, M> OwnedPermit<A, M> {
+    /// [`Permit::ask`], owned.
+    ///
+    /// # Errors
+    ///
+    /// [`Permit::ask`]'s.
+    ///
+    /// # Panics
+    ///
+    /// [`Permit::ask`]'s.
+    pub async fn ask<T>(self, mail: impl FnOnce(Origin, Reply<T>) -> M) -> Result<T, Unanswered>
+    where
+        T: Send + 'static,
+    {
+        let Self { fate, slot } = self;
+        let (reply, answer) = Reply::channel();
+        // The sender tokio hands back is the one this permit was reserved on. It
+        // is dropped rather than returned, because a caller who wants a handle
+        // clones the one they reserved from — which is what `reserve_owned` costs
+        // and says it costs.
+        drop(slot.send(Message::Mail(
+            Box::new(mail(Origin::local(), reply)),
+            current(),
+        )));
+        asked(answer, &fate).await
+    }
+
+    /// [`Permit::notify`], owned.
+    pub fn notify<T>(self, mail: impl FnOnce(Origin, Reply<T>) -> M)
+    where
+        T: Send + 'static,
+    {
+        let Self { fate: _, slot } = self;
+        let (reply, answer) = Reply::channel();
+        drop(answer);
+        drop(slot.send(Message::Mail(
+            Box::new(mail(Origin::local(), reply)),
+            current(),
+        )));
+    }
+}
+
+/// What a permit's `ask` is owed once the message is in the mailbox.
+///
+/// **One state fewer than [`LocalActor::ask`]'s two-step fold, and the missing one
+/// is [`TurnLost::Reentrant`]**: a permit asked that question when it was
+/// reserved, so nothing downstream of a spent permit can produce it. That is the
+/// reason this is a third reading of [`Answered`] rather than a call into the
+/// other two — those start from a send that can still be refused, and this starts
+/// from a message that is already in the mailbox.
+///
+/// Everything else is the same reading. A fault is the caller's value rather than
+/// a loss, a dead reply channel is [`withheld_for`] over the standing, and every
+/// other way a turn produced nothing is a [`Withheld`].
+async fn asked<T>(answer: oneshot::Receiver<Answered<T>>, fate: &Fate) -> Result<T, Unanswered> {
+    match answer.await {
+        Ok(Answered::Ran(value)) => Ok(value),
+        Ok(Answered::Faulted(panic)) => panic.resume(),
+        Ok(Answered::Refused { name }) => Err(Unanswered::Turn(Withheld::Refused {
+            name: name.to_owned(),
+        })),
+        Ok(Answered::ObserverPanicked { name }) => {
+            Err(Unanswered::Turn(Withheld::ObserverPanicked {
+                name: name.to_owned(),
+            }))
+        }
+        Ok(Answered::Expired) => Err(Unanswered::Turn(Withheld::Expired)),
+        Err(_) => Err(Unanswered::Turn(withheld_for(fate.standing()))),
     }
 }
 
@@ -5429,6 +5756,20 @@ mod tests {
         /// sent it produced nothing committable, and a durability adapter refuses
         /// a panicked turn.
         ReleaseThenBoom { origin: Origin, reply: Reply<usize> },
+        /// Reserve on this actor's **own** handle from inside its own turn, and
+        /// answer what the door said.
+        ///
+        /// The handle rides in the message rather than in the state for the
+        /// reason [`Held`](Self::Held)'s channels do: [`LocalActor::spawn`] wants
+        /// the state before it can hand back a handle to put inside it. Every
+        /// other self-call probe in this workspace is in `tests/cycles.rs` and
+        /// goes through a generated `Handle`; this one is here because the door
+        /// it tests is here.
+        Reserving {
+            origin: Origin,
+            me: LocalActor<Counter, Mail>,
+            reply: Reply<Result<(), NotQueued>>,
+        },
     }
 
     impl Turn<Counter> for Mail {
@@ -5542,6 +5883,25 @@ mod tests {
                     )
                     .await
                 }
+                Mail::Reserving { origin, me, reply } => {
+                    turn(
+                        state,
+                        hooks,
+                        origin,
+                        "Reserving",
+                        reply,
+                        move |_from, _state| {
+                            Box::pin(async move {
+                                // A permit that ever came back is dropped at the
+                                // end of this statement. What the test reads is
+                                // the verdict, and a permit held past the turn
+                                // would wedge this actor for good.
+                                me.reserve().await.map(|_permit| ())
+                            })
+                        },
+                    )
+                    .await
+                }
             }
         }
     }
@@ -5555,6 +5915,118 @@ mod tests {
         let actor = LocalActor::spawn(Counter::default());
         assert_eq!(actor.ask(add(1)).await.expect("running"), 1);
         assert_eq!(actor.ask(add(2)).await.expect("running"), 2);
+    }
+
+    /// A permit carries the turn its slot was reserved for, and answers it.
+    ///
+    /// The cheapest thing that could be wrong here is the permit sending nothing
+    /// at all — [`Permit`] holds the slot and a `Drop` would return it silently,
+    /// so a caller who never checked would see a message that vanished. The
+    /// assertion is on the **answer**, which only a turn that ran can produce.
+    #[tokio::test]
+    async fn a_permit_spends_its_slot_on_a_turn_that_runs() {
+        let actor = LocalActor::spawn(Counter::default());
+
+        let permit = actor.reserve().await.expect("a live actor has a slot");
+        assert_eq!(permit.ask(add(1)).await.expect("running"), 1);
+
+        // And the slot is back, so the actor is not wedged behind its own permit.
+        assert_eq!(actor.ask(add(2)).await.expect("running"), 2);
+    }
+
+    /// The three answers `try_reserve` separates, where tokio's own gives two.
+    ///
+    /// `Ok(None)` is *full right now* and `Err(Closed)` is a fate. Holding a
+    /// permit is what makes the mailbox full without a wedged turn to arrange:
+    /// the default local depth is one, so one held slot is the whole of it.
+    #[tokio::test]
+    async fn try_reserve_separates_a_full_mailbox_from_a_closed_one() {
+        // Annotated, because this test never sends a message and `M` is otherwise
+        // ambiguous: `Infallible` also implements `Turn<Counter>`.
+        let actor: LocalActor<Counter, Mail> = LocalActor::spawn(Counter::default());
+
+        let held = actor.reserve().await.expect("a live actor has a slot");
+        assert!(
+            actor
+                .try_reserve()
+                .expect("a live actor is not closed")
+                .is_none(),
+            "a held permit is the whole of a depth-one mailbox, so the next one is full",
+        );
+
+        // Dropping it returns the slot, which is the half a leak would break.
+        drop(held);
+        assert!(
+            actor
+                .try_reserve()
+                .expect("a live actor is not closed")
+                .is_some(),
+            "a dropped permit must return its slot",
+        );
+
+        actor
+            .stop()
+            .await
+            .expect("a stop from outside is never refused");
+        assert_eq!(
+            actor.try_reserve().err(),
+            Some(NotQueued::Closed),
+            "a stopped actor answers a fate, not a schedule",
+        );
+    }
+
+    /// A reserve from inside the target actor's own turn is refused, at any depth.
+    ///
+    /// **The stricter half, and `tell`'s is the comparison that makes it a
+    /// decision.** A self-`tell` into a free slot is allowed, because the message
+    /// it carries runs after this turn returns. A permit carries no message: the
+    /// caller chooses afterwards between a `tell`, which would be fine, and an
+    /// `rpc`, which waits for an answer only the blocked turn can produce. This
+    /// mailbox has a free slot at the moment the handler asks — the loop released
+    /// its permit when it took the message it is running — so a `WhenFull` rule
+    /// here would have answered `Ok` and handed out the deadlock.
+    #[tokio::test]
+    async fn a_reserve_from_inside_a_turn_is_refused_before_the_permit() {
+        let actor = LocalActor::spawn(Counter::default());
+        let me = actor.clone();
+
+        let verdict = actor
+            .ask(move |origin, reply| Mail::Reserving { origin, me, reply })
+            .await
+            .expect("the turn itself runs and answers");
+
+        assert_eq!(
+            verdict.expect_err("a self-reserve must not hand out a permit"),
+            NotQueued::Reentrant,
+            "a reserve from inside the actor's own turn was not refused",
+        );
+
+        // The refusal costs nothing: the actor took no permit and is still here.
+        assert_eq!(actor.ask(add(1)).await.expect("running"), 1);
+    }
+
+    /// An owned permit is `Send + 'static`, so it survives the frame that made it.
+    ///
+    /// The borrowed form cannot be written this way — it borrows the handle — and
+    /// that is the only difference between the two. `macros.rs`'s expansion module
+    /// holds the compile-only half of this claim, which covers the borrowed form
+    /// as well; this is the half that also runs.
+    #[tokio::test]
+    async fn an_owned_permit_crosses_a_spawn_and_still_answers() {
+        let actor = LocalActor::spawn(Counter::default());
+
+        let permit = actor
+            .clone()
+            .reserve_owned()
+            .await
+            .expect("a live actor has a slot");
+
+        let sent = tokio::spawn(async move { permit.ask(add(4)).await });
+        assert_eq!(
+            sent.await.expect("no panic").expect("running"),
+            1,
+            "the permit reserved here answered there",
+        );
     }
 
     /// The load-bearing one. Each turn sets a flag on entry, awaits, and asserts
