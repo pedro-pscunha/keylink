@@ -49,6 +49,13 @@ Three waves merged between `99ce53f` and `d54f302`. Each one moves this design.
 no value*, carried by `TurnLost::Turn`, `Unanswered::Turn` and
 `RemoteError::Withheld`. Five `Failed(String)` wire prefixes are deleted.
 
+Measured this pass: **exactly one production producer of `RemoteError::Failed(`
+survives in `keylink/src`, at `turns.rs:4819`.** The other four matches are not
+producers — `turns.rs:4987` and `reply.rs:129` are prose, and `turns.rs:5011` and
+`:5025` are `matches!` patterns in tests asserting the variant is *not* reached.
+So the vocabulary move is essentially complete, and §3.6's new variant lands
+beside a `Failed` that is close to retired rather than beside a live catch-all.
+
 **Rev. A's entire Layer 0 signature does not compile.** It returns
 `Result<Permit<'_, A>, MailboxClosed>` in three places and says Cut 2's error is
 "`MailboxClosed` and nothing else". `MailboxClosed` is not a type at `d54f302`:
@@ -173,6 +180,31 @@ same rule.
 cascades it through every construction site, for extensibility nobody has asked
 for. Adding a variant later is non-breaking on an enum this crate owns.
 
+**The key lives in the type, so a non-keyed factory has no key to pass.**
+`Routing<K>` binds `K` inside `ByKey(Shard<K>)` and nowhere else. A single
+`dispatch(key, job)` door therefore puts the removed state back one level out: a
+`RoundRobin` factory would demand a key it discards, and
+`Factory::direct(..).routing(Routing::RoundRobin).build()` leaves `K`
+uninferable. Two doors on two impl blocks, and `K` defaults to `()`:
+
+```rust
+pub struct Factory<A, K = ()> { /* N handles and a `Routing<K>`, nothing else */ }
+
+impl<A> Factory<A, ()> {
+    /// No key to pass. `RoundRobin`, `FirstAvailable`, `LeastLoaded`.
+    pub async fn dispatch(&self, job: ..) -> Result<.., NotQueued>;
+}
+
+impl<A, K: Hash + Eq> Factory<A, K> {
+    /// `ByKey` only.
+    pub async fn dispatch_keyed(&self, key: K, job: ..) -> Result<.., NotQueued>;
+}
+```
+
+The default is what makes `Routing::RoundRobin` infer `Routing<()>`, so the
+non-keyed builder needs no turbofish. §5.2 shows both calls. One state survives
+this split and §11 records it.
+
 ### 3.2 `Sticky` is refused from this cut
 
 Rev. A's `Sticky` is *"a worker already holding this key keeps it, even after a
@@ -209,19 +241,22 @@ only distinguishing input does not exist.
 Refused, on three grounds, each from `macros.rs:3240-3300`:
 
 1. **No `Calls` method has a key parameter.** `Calls` carries the service's own
-   `rpc` signatures. `Factory::dispatch(key, |w| w.method(..))` takes a key that
-   no generated signature has room for. `ByKey` is unwritable through it.
+   `rpc` signatures. `Factory::dispatch_keyed(key, |w| w.method(..))` takes a key
+   that no generated signature has room for. `ByKey` is unwritable through it.
 2. **The routing mode is a runtime field, not a type parameter.** A
-   `Factory<A>: Calls` impl would be correct for `RoundRobin`, `FirstAvailable`
-   and `LeastLoaded` and wrong for `ByKey`. One type cannot implement a trait for
-   three of its own enum's variants — the impl would have to mis-route or panic
-   on the fourth, which is exactly the illegal state §3.1 removes.
-3. **`dyn Calls` does not exist** (`E0038`, `macros.rs:3285`), so implementing it
-   buys no erasure to pay for the other two.
+   `Factory<A, ()>: Calls` impl would be correct for `RoundRobin`,
+   `FirstAvailable` and `LeastLoaded` and wrong for `ByKey`. One type cannot
+   implement a trait for three of its own enum's variants — the impl would have
+   to mis-route or panic on the fourth, which is exactly the illegal state §3.1
+   removes.
+3. **`dyn Calls` does not exist** — the heading is `macros.rs:3279` and the
+   sentence *"cannot be reached through a trait object — `dyn Calls` is `E0038`"*
+   is `macros.rs:3281-3282` — so implementing it buys no erasure to pay for the
+   other two.
 
 A caller that wants a surface-agnostic function keeps writing it against
 `Calls` and passes one worker's `Handle`. A caller that wants routing calls
-`dispatch`.
+`dispatch` or `dispatch_keyed`.
 
 ### 3.4 `LeastLoaded`'s deferral is overturned
 
@@ -234,13 +269,34 @@ Rev. A deferred `LeastLoaded` on one sentence, and the sentence is now false.
 
 **The depth is a knob** (§2.3): `spawn_deep` takes a `NonZeroUsize` and builds
 `mpsc::channel(depth.get())`, and `buffered()` computes
-`max_capacity() - capacity()`, which ranges over that depth. `Serving::buffered`
-(`observe.rs:788`) carries no such claim and gives a peer the same gradient.
+`max_capacity() - capacity()`, which ranges over that depth.
+
+**`Serving::buffered` carries a narrower claim, and it is the one a factory
+needs.** Its doc opens *"Comparable as a predicate, not as a count."*
+(`observe.rs:789`) and closes *"Never compare two of these from the two sides by
+this field."* (`observe.rs:794-795`). What it forbids is a cross-side
+comparison. What it sanctions is exactly what a factory does:
+
+> So: compare two of these when both came from the same side, and read the
+> field when they did not.
+> — `observe.rs:771-772`
+
+A factory's N members are N of one side, so the comparison is the licensed one.
 
 So `LeastLoaded` ships in the cut. It is the only routing mode needing **no new
 primitive** — `is_busy` (`turns.rs:4340`) and `buffered` (`turns.rs:4367`) are
 both public and both `#[must_use]` today, and `Serving` folds them
 (`turns.rs:4392`).
+
+**The knob exists; the gradient does not exist by default, and that belongs in
+`LeastLoaded`'s rustdoc.** `DEFAULT_MAILBOX_DEPTH` is `1` (`registry.rs:82`) and
+the default local door is `LocalActor::spawn` (`turns.rs:3508`), not
+`spawn_deep`. At depth 1 `buffered()` is 0 or 1, so `LeastLoaded` reads N
+booleans and `Sample::All` pays O(N) relaxed loads to learn what `is_busy` alone
+already says. The mode is worth its place only over members built with
+`actor_deep` (`macros.rs:2016`) or `spawn_deep` (`turns.rs:3597`), and §5.2's
+example is built that way for that reason. Under the default the honest advice is
+`FirstAvailable`, which needs no gradient.
 
 **`turns.rs:4346` is a live doc defect and this proposal fixes it in commit 1**,
 whether or not the rest is accepted. Its sibling paragraph already states the
@@ -271,9 +327,17 @@ impl<A> Handle<A> {
 ```
 
 `Ok(None)` from `try_reserve` means *full right now*. That differs from tokio,
-whose `try_reserve` returns `Result<Permit, TrySendError<()>>`
+whose `try_reserve` returns `Result<Permit<'_, T>, TrySendError<()>>`
 (`bounded.rs:1356`) and folds "full" and "closed" into one error. Splitting them
 is the crate's own habit: full is a schedule and closed is a fate.
+
+**The `()` in that `TrySendError<()>` is the whole reason Cut 1 comes before Cut
+3.** tokio's two refusals differ in what they cost the caller: `try_send`
+(`bounded.rs:924`) hands the message back in `TrySendError::Full(message)`
+(`:928`) because the caller has already given it up, while `try_reserve` has
+nothing to hand back — the admission decision is taken *before* the payload
+moves. A permit is therefore the lossless spelling of "am I allowed to send",
+and §5.3 rests on it.
 
 **`reserve_owned` ships, on a reason that is not the one Rev. A gives.** Rev. A
 justifies it by the queued mode, which §4 deletes. The reason that survives is
@@ -306,7 +370,7 @@ bounds.
 
 So: **a new variant appended to `RemoteError`**, after `NotAnActor`
 (`reply.rs:234`). `RemoteError` is `#[non_exhaustive]` (`reply.rs:73`), derives
-`postcard_schema::Schema`, and `reply.rs:55` says it is in every service's
+`postcard_schema::Schema`, and `reply.rs:60` says it is in every service's
 contract — so a new variant moves **both** ALPN pins.
 
 **Append, never insert**, and the enum's own doc says why (`reply.rs:58-68`): an
@@ -315,16 +379,46 @@ peer either way; what separates them is that an insert renumbers every variant
 after it, so the wire meaning of codes both sides already agreed on changes
 underneath them and the failure is a misdecode rather than a refusal.
 
-**The local half costs no ALPN.** `NotQueued` derives no `Serialize` and no
-`Schema` (`turns.rs:3313`), so it never reaches a contract. It gains a third
-variant for "full", and its own doc anticipated exactly that:
+**The local half costs no ALPN. It costs a semver-major instead.** `NotQueued`
+derives no `Serialize` and no `Schema` (`turns.rs:3313`), so it never reaches a
+contract. It gains a third variant for "full" — and the heading that governs it
+states the price:
 
-> the two decisions above are the whole of what `send` does before the message is
-> in the channel, so a third variant is a change to that function rather than a
-> variant added beside it — `turns.rs:3310-3312`
+> # Exhaustive, and deliberately not `#[non_exhaustive]`
+>
+> [`Unanswered`]'s own argument — a caller matches this, and a wildcard arm is
+> the collapse the split exists to prevent. It is stronger here: the two
+> decisions above are the whole of what `send` does before the message is in the
+> channel, so a third variant is a change to that function rather than a variant
+> added beside it.
+> — `turns.rs:3306-3312`
 
-Shed *is* a change to that function. That paragraph is a description of the
-work, not an objection to it, and it must be amended in the same commit.
+That paragraph makes two claims, and an earlier draft of this section quoted the
+second and dropped the heading and the first — the same failure §10 catches Rev. A
+committing on `compose/mod.rs`. The first claim (`:3308-3309`) is the one that
+binds: **a caller matches `NotQueued` exhaustively, by design, so a third variant
+breaks every match arm in every crate downstream.** §3.1's own rule decides it —
+*the difference is who matches* — and a caller matches this. `NotQueued` is the
+`Overflow` case, not the `Routing` case.
+
+**Decision: take the break, and record it.** Commit 2 is a **semver-major on
+`NotQueued`**, written down in §6 and §8. The alternative — hold `NotQueued` at
+two variants and answer "full" on a separate type from the shed door only — is
+not available. `Backpressure` is a runtime field on the builder, not a type
+parameter, so a door's return type cannot vary with a value chosen at spawn time.
+A per-policy error type would have to lift the policy into the type and cascade
+it through every construction site, which is §3.1's refusal of a `Router` trait
+and §3.3's second ground one level out, and it would widen every door on every
+actor to pay for a policy most actors never set. One variant on one enum is the
+smaller break.
+
+The second claim (`:3310-3312`) survives and is the licence: a shed **is** a third
+decision inside `send`, not a variant filed beside two. `Full` is a unit variant,
+so `Copy`, `Clone`, `PartialEq` and `Eq` all survive the addition — §5.3 rules on
+why it carries no payload. The heading and both sentences are amended in the same
+commit that adds the variant, and the amendment keeps the refusal of
+`#[non_exhaustive]`: sealing the enum would hand callers the wildcard arm the
+split exists to prevent.
 
 ### 3.7 `FirstAvailable` is sound and is not FIFO
 
@@ -367,9 +461,9 @@ argument. Deleted from Rev. A, with the reason:
 | `depth(256)`, `WhenFull::{DropOldest, DropNewest}` | Layer 1 | Queue depth is the thing a permit already is. |
 | `.ttl(Duration)` and its clock | Layer 1 | A TTL on a queue that does not exist. `QueueTimeout` (`middleware.rs:538`) is the caller's deadline and already ships. |
 | `.rate(Rate::new(..))`, leaky bucket, ticker | Layer 1 / R11 | Every ticker is a task per factory. §9 refuses the periodic sweep on the same ground. |
-| `Refused { Full, Expired, Draining, RateLimited, Gone }` | Layer 1 | Four of five variants describe states only the queue can produce. |
-| `Rejected { why, job }` | Layer 1 | Nothing sheds in `direct`, so nothing hands a payload back. |
-| `.on_refused(closure)` | Layer 1 | No refusal to report. |
+| `Refused { Full, Expired, Draining, RateLimited, Gone }` | Layer 1 | Four of five variants describe states only the queue can produce. The fifth survives, on the enum that already owns the door: it is `NotQueued::Full` (§3.6). |
+| `Rejected { why, job }` | Layer 1 | The factory holds no queue, so it never owns a payload to hand back. A **member** under `Backpressure::Shed` does drop one, and drops it on purpose — §5.3 rules on that and names `try_reserve` as the door that loses nothing. |
+| `.on_refused(closure)` | Layer 1 | No refusal the *factory* sees. A shed is answered to the caller synchronously by the member's own door, so a callback would re-tell a fact already returned. |
 | `report_stuck_after(..)` | Layer 4 / R6 | A clock, a ticker and a task per factory, for a signal `LocalActor` does not carry — Rev. A concedes it is invention on the local path. Backlog, §12. |
 | `Sticky(Shard<K>)` and its in-flight key map | Layer 2 | §3.2. The only shared mutable state in the design, bought for a resize that does not exist. |
 
@@ -405,20 +499,40 @@ impl<A> Handle<A> {
 /// A `Permit` carries the same generated methods. Sending cannot wait again.
 #[must_use = "a dropped permit returns the slot and sends nothing; \
               the caller is never told"]
+pub struct Permit<'a, A> { /* .. */ }
+
 impl Permit<'_, Warehouse> {
     pub async fn get_item(self, id: u64) -> Result<Option<Item>, Unanswered>;
 }
 ```
 
+**`#[must_use]` goes on the type, not on the `impl` block.** Measured with
+`rustc` on 2026-08-10: on an inherent impl it warns *"`#[must_use]` attribute
+cannot be used on inherent impl blocks"* under `unused_attributes`, which is on
+by default. Both clippy steps pass `-D warnings` — `lint-fast` at
+`mise.toml:258`, which the commit hook runs, and `lint` at `mise.toml:275-276` —
+so an earlier draft of this block, which put the attribute on the impl, would
+have reddened the gate at the first commit.
+
 ### 5.2 Cut 2 — `Factory::direct`
 
 ```rust
+// Keyed: `Factory<Parser, TenantId>`, and `dispatch_keyed` is its only door.
 let ingest = Factory::direct(workers(8), |m| parse::actor(Parser::new(m)))
     .routing(Routing::ByKey(Shard::by_hash()))
     .build();
 
-let parsed = ingest.dispatch(tenant_id, |w| w.parse(blob)).await?;
+let parsed = ingest.dispatch_keyed(tenant_id, |w| w.parse(blob)).await?;
 // Err is `NotQueued`. `direct` never sheds and holds no queue.
+
+// Non-keyed: `Factory<Parser, ()>`, and `dispatch` takes no key.
+// Members built with `actor_deep`, because `LeastLoaded` has no gradient to
+// read at `DEFAULT_MAILBOX_DEPTH` — §3.4.
+let render = Factory::direct(workers(8), |m| parse::actor_deep(Parser::new(m), depth(32)))
+    .routing(Routing::LeastLoaded(Sample::TwoOfN))
+    .build();
+
+let page = render.dispatch(|w| w.render(doc)).await?;
 ```
 
 One constructor, so there is no second builder type and no combination to make
@@ -447,9 +561,36 @@ Not `Mailbox::park(..)`: `Mailbox<M>` (`registry.rs:216`) is the receiver handed
 to a hand-written loop, and hanging a policy constructor on it gives it a
 meaning it does not have. `Backpressure` names what the thing governs.
 
+**Shed loses the caller's message. That is the ruling, not an oversight, and it
+belongs in `Shed`'s own rustdoc.** `NotQueued` is `Copy` and carries no data
+(`turns.rs:3313`), so `Err(NotQueued::Full)` hands nothing back. tokio splits the
+same two cases one layer down (§3.5): `try_send` returns
+`TrySendError::Full(message)` because the message is already gone, and
+`try_reserve` has nothing to return. keylink cannot copy the first half. The
+generated door takes typed arguments and builds the message inside itself, so
+handing a payload back means returning a `Msg` the caller never named, on an
+error type shared by every door on every actor — a far larger break than §3.6's,
+bought for a policy most actors never set.
+
+So the rule, written where a caller meets it:
+
+- Under `Shed`, a full mailbox answers `Err(NotQueued::Full)` **and the arguments
+  are dropped**. A caller that cannot afford to lose them takes a permit first.
+  `try_reserve` makes the admission decision *before* the payload moves, and a
+  `Permit`'s send cannot fail on fullness. Cut 1 is that door, and it is why Cut 1
+  ships ahead of Cut 3 rather than beside it.
+- On the served side there is no permit to take, so a peer that meets the new
+  `RemoteError` variant (§3.6) has lost the call and rebuilds it. The variant
+  exists to say *back off*, not *retry now* — which is the whole reason it is not
+  `TimedOut`.
+
+This is what §4's deleted `Rejected { why, job }` was meant to buy, and it stays
+deleted: a payload does not need handing back on a path where the caller can
+decline admission before committing it.
+
 **`compose/mod.rs` does not need amending, and Rev. A says it does.** Rev. A
 quotes `compose/mod.rs:41-44` as *"There is no third option."* The sentence is at
-`compose/mod.rs:51-54` and reads:
+`compose/mod.rs:51`, inside a paragraph running to `:54`, and the two read:
 
 > **There is no third option that hides.** A pattern here either applies
 > backpressure to whoever is producing, or ends the consumer and says so.
@@ -489,12 +630,12 @@ it is not the default. A deleted record is a guard the gate stops counting.
 
 Four commits, serially. Commit 2 is the only one that pays an ALPN.
 
-| # | Commit | ALPN pin | anchors registry | intra-doc links |
-|---|---|---|---|---|
-| 1 | `reserve` / `try_reserve` / `reserve_owned` on `Handle` and `LocalActor`, plus the `turns.rs:4346` doc fix | **no** | no | few — new `[`Permit`]`, `[`NotQueued`]`, `[`OwnedPermit`]` targets in `turns.rs` and `macros.rs` |
-| 2 | `Backpressure`, `NotQueued::Full`, the new `RemoteError` variant, the `registry.rs:2110-2117` amendment, the two `representability.rs` probes replaced | **BOTH** | predicate — see below | few |
-| 3 | `compose::Factory`, `Routing`, `Sample`, `Shard` | **no** | no | moderate — a new module, and every link out of it |
-| 4 | the guards, with their break records | **no** | **`RECORD_BLOCKS` + one row per breakable guard** | few |
+| # | Commit | ALPN pin | semver | anchors registry | intra-doc links |
+|---|---|---|---|---|---|
+| 1 | `reserve` / `try_reserve` / `reserve_owned` on `Handle` and `LocalActor`, plus the `turns.rs:4346` doc fix | **no** | minor — additive | no | few — new `[`Permit`]`, `[`NotQueued`]`, `[`OwnedPermit`]` targets in `turns.rs` and `macros.rs` |
+| 2 | `Backpressure`, `NotQueued::Full`, the new `RemoteError` variant, the `turns.rs:3306-3312` and `registry.rs:2110-2117` amendments, the two `representability.rs` probes replaced | **BOTH** | **MAJOR** — see below | predicate — see below | few |
+| 3 | `compose::Factory`, `Routing`, `Sample`, `Shard` | **no** | minor — additive | no | moderate — a new module, and every link out of it |
+| 4 | the guards, with their break records | **no** | none | **`RECORD_BLOCKS` + one row per breakable guard** | few |
 
 ### Commit 1 — nothing reaches the wire
 
@@ -530,8 +671,18 @@ exits without reporting a failure, which reads as a pass.
 One coordinated redeploy. Two nodes across this commit do not misdecode — the
 handshake refuses them — but they do not talk, so both sides move together.
 
-The `registry.rs:2110-2117` paragraph and `turns.rs:3310-3312` are both amended
-here, in the commit that makes them false, not before and not after.
+**This commit is a semver-major, and the break is `NotQueued`, not the wire.**
+`RemoteError` is `#[non_exhaustive]` (`reply.rs:73`), so appending a variant there
+is additive for a matching caller. `NotQueued` is deliberately **not**
+`#[non_exhaustive]` (`turns.rs:3306`) precisely so that callers match it
+exhaustively, so `Full` breaks every match arm downstream. §3.6 decides to take
+that break rather than lift the backpressure policy into the type. The changelog
+entry says *`NotQueued` gained `Full`; add the arm*, and it is the headline of the
+release, not a footnote under the ALPN move.
+
+The `registry.rs:2110-2117` paragraph and the whole of `turns.rs:3306-3312` —
+heading and both sentences — are amended here, in the commit that makes them
+false, not before and not after.
 
 ### Commit 3 — the factory
 
@@ -562,9 +713,11 @@ transcripts and runs no cargo (`mise.toml`, the `replay-anchors` entry).
 "Not part of any gate: it edits the tree." So §7 lists a **manual replay** as a
 verification step.
 
-`mise run pre-commit` filters for Rust. A commit touching only
-`.mise/tasks/anchors` is skipped by the hook that owns the registry, so commit 4
-must carry Rust in the same commit or be gated by hand.
+**A registry-only commit is gated, and an earlier draft said it was not.** The
+hook's filter at `.githooks/pre-commit:216` matches
+`^\.mise/tasks/` alongside `\.rs$`, so a commit touching only `.mise/tasks/anchors`
+runs `mise run pre-commit` like any other. Commit 4 needs no companion Rust file
+and no hand-run gate.
 
 ---
 
@@ -579,8 +732,9 @@ must carry Rust in the same commit or be gated by hand.
 | `LeastLoaded` reads a real gradient above depth 1 | `least_loaded_separates_workers_at_depth_above_one` — **does not exist; commit 4 writes it.** Build members with `actor_deep` (`macros.rs:2016`); at `DEFAULT_MAILBOX_DEPTH` the assertion is vacuous, so the depth is the control. |
 | A full shed mailbox answers a peer an overload, never `TimedOut` | `a_shed_mailbox_answers_an_overload_and_not_a_timeout` — **does not exist; commit 4 writes it.** Assert the variant, not the `Display` text. |
 | Both pins moved once, in commit 2 | `the_contract_hash_has_not_moved` (`protocol.rs:1284`) and `the_inspect_contract_hash_has_not_moved` (`protocol.rs:1446`) — **both exist.** Literals read off the failing run. |
-| `RemoteError` gained exactly one variant | `awk 'NR>=74 && /^}/{exit} /^    [A-Z][A-Za-z]+/{n++} END{print n}' keylink/src/reply.rs` → `10` today, `11` after. |
-| `Routing` has four variants and no boolean | Predicate: no `bool` field on `Routing` or `Factory`; `rg -n 'bool' keylink/src/compose/factory.rs` names none. |
+| `ByKey` fails fast over a dead member, and never hangs | `a_dead_members_keys_answer_closed_and_do_not_hang` — **does not exist; commit 4 writes it.** Stop one member, dispatch a key that hashes to it, assert `Err(NotQueued::Closed)` inside a deadline. §9 records the cost this cannot remove. |
+| `RemoteError` gained exactly one variant | `awk 'NR>=74 && /^}/{exit} NR>74 && /^    [A-Z][A-Za-z]+/{n++} END{print n}' keylink/src/reply.rs` → `10` today, `11` after. **The second `NR>74` is load-bearing**: without it the counting rule is unguarded and also counts the derive list at `reply.rs:71`, which prints `11` today and reads as a pass. |
+| `Routing` has four variants and no boolean | `test -f keylink/src/compose/factory.rs && ! rg -q 'bool' keylink/src/compose/factory.rs`. **The bare `rg -n 'bool' <path>` exits 2 with empty stdout on a file that does not exist yet**, which reads as "names none". The `test -f` is what makes the row fail correctly before commit 3. §3.1's enum makes the boolean unrepresentable by construction, so this row is a second opinion and not the argument. |
 | Nothing regressed | `mise run gate` — **18 steps**, counted by `awk '/^\[tasks.gate\]/,/^\]/' mise.toml \| grep -c '{ task ='`. |
 | The new break records actually replay | **`scripts/replay-fate-breaks.sh`, by hand, on a clean worktree.** No gate step replays a record. |
 
@@ -604,6 +758,14 @@ and `SLOPE_SLACK_OVER_A_KILOBYTE` is 13 bytes over a kilobyte of `Mail`
 type does not obviously move the per-actor figure, but it is the budget most
 likely to notice.
 
+**Semver: commit 2 is a major.** `NotQueued::Full` breaks every exhaustive match
+on `NotQueued` in every crate downstream, because the enum refuses
+`#[non_exhaustive]` on purpose (`turns.rs:3306`) so that those matches stay
+exhaustive. §3.6 takes the break and §6 records it. Nothing else in these four
+commits is anything but additive: `RemoteError` is `#[non_exhaustive]`
+(`reply.rs:73`), and `Backpressure`, `Factory`, `Routing`, `Sample`, `Shard` and
+the three `reserve` doors are all new names.
+
 Registry: `.mise/tasks/anchors` (`RECORD_BLOCKS`, plus whatever `mise run
 anchors` names).
 
@@ -615,10 +777,15 @@ which is already stale at `d54f302` and is not this proposal's to fix.
 **Three known holes in `mise run docs`, all of which this work can fall into:**
 
 1. `mise run docs` **cannot see a link to a `#[doc(hidden)]` item** — it ships as
-   a dead raw href. Ten exist. `Withheld`'s own rustdoc (`observe.rs:946-949`)
-   documents the pattern: it names two `#[doc(hidden)]` items in prose precisely
-   because "rustdoc renders a link to a hidden item as a dead `href` and
-   `-D warnings` does not see it".
+   a dead raw href. `Withheld`'s own rustdoc (`observe.rs:946-949`) documents the
+   pattern: it names two `#[doc(hidden)]` items in prose precisely because
+   "rustdoc renders a link to a hidden item as a dead `href` and `-D warnings`
+   does not see it". **How many exist crate-wide is NOT ESTABLISHED** — no gate
+   and no file carries a count, and an earlier draft of this page asserted ten.
+   **Experiment:** `mise run docs`, then grep the generated
+   `target/doc/keylink/**/*.html` for `href` attributes whose target file does not
+   exist, and count the distinct items. Until that is run, the mechanism is the
+   claim and the number is not.
 2. A `#[cfg(test)] mod` is not reached, flag or no flag, and `keylink/tests/*.rs`
    is unreachable either way (`mise.toml`, the `docs` task's holes 1 and 2). A
    broken link in a break record inside a unit-test module is invisible.
@@ -645,6 +812,31 @@ are wasm, so a red one there reads as a link problem rather than a design one.
   correct for three variants and wrong for one, and `dyn Calls` is `E0038`.
 - **A `Router` trait.** §3.1. A third type parameter cascading through every
   construction site, for extensibility nobody has asked for.
+- **A `Factory::routing()` accessor, or any other API returning a `Routing`.**
+  §3.1's `#[non_exhaustive]` ruling holds on one premise — *a caller constructs a
+  `Routing` and never matches one*. An accessor hands a caller a value to match,
+  which turns a fifth variant from additive into breaking and inverts the ruling
+  without touching it. Refused so the next author cannot invalidate the argument
+  quietly. A caller who wants to know how a factory routes knows already: it
+  passed the `Routing` in.
+- **Any exit for a `ByKey` dispatch onto a member that has ended.** Accepted
+  cost, in `ByKey`'s own rustdoc. A supervisor that gives up closes the mailbox
+  first — `inbox.close()` at `turns.rs:3025`, immediately before it returns
+  `Ended::GaveUp` (`turns.rs:3026`) — and an unsupervised loop drops the receiver
+  on the way out, which `NotQueued::Closed`'s own doc describes
+  (`turns.rs:3315-3316`). So a dead member **fails fast**; it does not hang. What
+  survives is asymmetric between the modes and is the price of the affinity:
+  under `RoundRobin` a dead member costs 1/N of the **traffic** and a retry lands
+  elsewhere, while under `ByKey` it costs 1/N of the **keyspace permanently**,
+  because every retry for that key hashes to the same dead worker. A **wedged**
+  member is the same shape with a worse answer — it never closes anything, so
+  those keys park on the permit until the caller's own deadline, and
+  `LeastLoaded` and `FirstAvailable` route away from it while `ByKey` routes into
+  it forever. **Re-opens exactly when a factory learns a member's ending**, which
+  today means R6 (§12) shipping a stuck-actor signal or the composition watching
+  `Lifecycle`; a `ByKey` factory that could re-shard on that signal is a
+  different design and needs the resize §3.2 refuses. §7 tests only the fast-fail
+  half, because the cost itself is the accepted part.
 - **Reusing `RemoteError::AtCapacity` for a shed.** §3.6. It means the registry
   is full and it has a producer (`actor/remote.rs:377`). Two bounds, two facts.
 - **A `Withheld` variant for a shed.** §3.6. `observe.rs:885-886`'s ruling on
@@ -677,7 +869,7 @@ Every one measured this pass. Line numbers are the current ones.
 | # | Rev. A said | Measured at `d54f302` |
 |---|---|---|
 | 1 | The API returns `Result<.., MailboxClosed>`; Cut 2's error is "`MailboxClosed` and nothing else"; `pool.rs:57-60` documents `MailboxClosed` | **`MailboxClosed` is not a type.** `turns.rs:3161-3172` records it becoming `Undelivered` at `4e0fcca` and then `Unanswered`. `pool.rs:57-60` names `Unanswered` and `NotQueued`. The whole Layer 0 signature does not compile. |
-| 2 | *"There is no third option."* at `compose/mod.rs:41-44`, so shed must amend it first | The sentence is at **`compose/mod.rs:51-52`** and reads *"There is no third option **that hides**."* The dropped words carry the argument. Shed does not hide, so the paragraph does not forbid it and needs no amendment. `compose/mod.rs:41-44` is the backpressure **table**. |
+| 2 | *"There is no third option."* at `compose/mod.rs:41-44`, so shed must amend it first | The sentence is at **`compose/mod.rs:51`**, in a paragraph running to `:54`, and reads *"There is no third option **that hides**."* The dropped words carry the argument. Shed does not hide, so the paragraph does not forbid it and needs no amendment. `compose/mod.rs:41-44` is the backpressure **table**. |
 | 3 | Pool makes three refusals: not a supervisor, not keyed, no queue | The list has three bullets and *"no queue"* is not one of them. It is *not a way to make one actor concurrent* (`:53`), *not a supervisor* (`:56`), *not keyed* (`:74`). "No queue" is the section at `pool.rs:19-30`. |
 | 4 | `console.rs:543` does `try_send`; `console.rs:494` scopes it | `console.rs:470`; scoped at `console.rs:421-424`. |
 | 5 | `registry.rs:2051` says "Nothing in this crate calls `try_send`"; `registry.rs:1922` carries the unbounded quote | Both are the same paragraph, at **`registry.rs:2110-2117`**. |
@@ -696,7 +888,7 @@ Every one measured this pass. Line numbers are the current ones.
 | 18 | ractor's cluster drops mismatched messages silently, `node_session.rs:423-447` | **Holds, and understates it.** Four `let _ = actor.send_serialized(..)` sites: `:423`, `:440`, `:447`, `:496`. Rev. A rated this Med-High from an explorer; it is now read directly. |
 
 **One defect found while checking, unrelated to whether this proposal is
-accepted.** `reply.rs:67-68` says of `Withheld`, `AtCapacity`, `BadActorId` and
+accepted.** `reply.rs:67-69` says of `Withheld`, `AtCapacity`, `BadActorId` and
 `FollowRefused`: *"Nothing produces the four yet."* At least two now do —
 `RemoteError::AtCapacity` from `actor/remote.rs:377` (tested at `:824-827`), and
 `RemoteError::Withheld` on both served paths (`reply.rs:109-114` says so four
@@ -724,10 +916,12 @@ lines above). Fix the sentence whether or not this proposal ships.
 
   **The distinction is `'static`, not `Send`.** A borrowed permit cannot cross
   `tokio::spawn`, and it does not need to: `dispatch`'s future is awaited in
-  place by the caller. `+ Send` alone is what `macros.rs:3287-3291` requires, and
-  the borrowed form has it. **§5.2 keeps the borrowed signature**; `reserve_owned`
-  stays for callers who spawn, which is the reason §4 kept it after deleting the
-  queued mode that first motivated it.
+  place by the caller. `+ Send` alone is what `macros.rs:3283-3285` requires —
+  *"the `+ Send` is what lets a caller's future cross `tokio::spawn`, and an
+  `async fn` in a trait does not promise it"* — and the borrowed form has it.
+  **§5.2 keeps the borrowed signature**; `reserve_owned` stays for callers who
+  spawn, which is the reason §4 kept it after deleting the queued mode that first
+  motivated it.
 
   The probe was deleted after measuring. Re-assert it in commit 1 as a kept
   compile-only guard — a probe deleted is a measurement, not a guard, and this
@@ -738,6 +932,15 @@ lines above). Fix the sentence whether or not this proposal ships.
 - **What `Shard<K>`'s default hasher should be.** `ByKey` needs a stable hash
   across process restarts if a caller's per-worker cache is warmed from disk.
   `DefaultHasher` is not stable across releases. Not decided here.
+- **One illegal state survives §3.1's two-door split.** `K` defaults to `()`, so
+  `Routing::<()>::ByKey(Shard::by_hash())` is constructible and yields a
+  `Factory<A, ()>` whose every dispatch hashes the same value onto the same
+  worker — a one-worker factory wearing eight workers' clothes. Removing it needs
+  a `Key` bound that `()` does not satisfy, so that `ByKey` cannot be spelled at
+  `K = ()`. That is a new public trait for one degenerate case a caller has to
+  write deliberately, and the trade is not decided here. **Experiment:** try the
+  bound on a scratch branch and count the call sites it forces a `where` clause
+  onto.
 - **Nothing was compiled, benchmarked or red-tested.** No design on this page has
   been built.
 
@@ -760,7 +963,7 @@ plan. Order is Rev. A's, by value per unit of risk.
 | R10 | Capability-narrowed handle | ractor's `DerivedActorRef`. keylink authorizes per method on the wire and not at all locally. M / Med / Med. |
 | R11 | Rate limiting | keylink has none. Rev. A folds it into the queued mode, which §4 deletes — so it has no home and needs its own design if it is ever wanted. S / Low / Med. |
 | R12 | Live reconfiguration | Changes worker count on a running factory. **This is what buys `Routing::Sticky` back** (§3.2 and §9). Lowest priority; do it only once the factory has users. M / Med / Low. |
-| — | A priority queue in the factory | Deferred by Rev. A and it has nowhere to live: it exists only inside the queued mode. If it ever ships, carry priority on the call — `dispatch_with(Priority::High, key, job)` — rather than deriving it from the key through a trait, and state the property ractor does not: a steady flood of high priority starves low priority forever, so low-priority work needs a TTL to die visibly. |
+| — | A priority queue in the factory | Deferred by Rev. A and it has nowhere to live: it exists only inside the queued mode. If it ever ships, carry priority on the call — `dispatch_keyed_with(Priority::High, key, job)` — rather than deriving it from the key through a trait, and state the property ractor does not: a steady flood of high priority starves low priority forever, so low-priority work needs a TTL to die visibly. |
 
 ---
 
