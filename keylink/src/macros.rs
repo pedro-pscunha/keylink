@@ -1137,15 +1137,25 @@ macro_rules! __keylink_service {
                                         ($( $arg ),*)
                                     ),
                             )+
-                            // **Nothing builds this, and that is the wave's
-                            // central property rather than an accident.**
-                            // `__Status` is answered above BOTH delivery calls
-                            // — in `keyed_service`'s dispatch closure and in
-                            // `Handle::service`'s — so it never becomes mail. It
-                            // cannot: a question about which turn is running
-                            // cannot be answered by a turn, because that turn
-                            // would report `busy: true` about itself and count
-                            // its own permit in `buffered`.
+                            // **Nothing in this crate builds this, and that is
+                            // the wave's central property rather than an
+                            // accident.** `__Status` is answered above BOTH
+                            // delivery calls — in `keyed_service`'s dispatch
+                            // closure and in `Handle::service`'s — so it never
+                            // becomes mail. It cannot: a question about which
+                            // turn is running cannot be answered by a turn,
+                            // because that turn would report `busy: true` about
+                            // itself and count its own permit in `buffered`.
+                            //
+                            // **Taken rather than unreachable**, which is the
+                            // distinction this file's `__Status` doctest already
+                            // insists on and the reason the sentence above says
+                            // *in this crate*. `Addressed::new` and
+                            // `deliver_to_actor` are `#[doc(hidden)] pub` and
+                            // re-exported at the crate root, and
+                            // `Request::__Status {}` is a public variant of a
+                            // public enum. Every part ships; what does not exist
+                            // is a caller.
                             //
                             // The arm exists because `Mail::Served` carries the
                             // whole `Request` and this match must be exhaustive.
@@ -1158,7 +1168,29 @@ macro_rules! __keylink_service {
                             // a lie in the one field the type exists for, and
                             // generated code must not panic in somebody else's
                             // crate.
+                            //
+                            // `unrun` for the reason the other three `__Status`
+                            // arms call it, and it is the half a dropped reply
+                            // does not cover: this ends a message without
+                            // entering it, and silence means `enqueued`, which
+                            // **settles** a claimed idempotency key as work that
+                            // ran and never answered. `Withheld::Dropped` tells
+                            // the caller what happened to the message; `unrun`
+                            // tells the ledger what happened to the key.
+                            //
+                            // Through `Caller::peer` because that is the whole
+                            // path there is: an origin holds its `Context`
+                            // privately and `caller()` is the borrow it hands
+                            // out. No new surface is added for this — a local
+                            // origin has no proven key and no queue budget, so
+                            // `None` is the correct nothing-to-mark rather than
+                            // a case left unhandled.
                             Request::__Status { .. } => {
+                                if let ::core::option::Option::Some(__cx) =
+                                    origin.caller().peer()
+                                {
+                                    __cx.progress().unrun();
+                                }
                                 ::core::mem::drop(reply);
                                 ::core::option::Option::None
                             }
@@ -1405,19 +1437,14 @@ macro_rules! __keylink_service {
                         let system = system.clone();
                         ::std::boxed::Box::pin(async move {
                             // **`__Status` is answered here and enqueues
-                            // nothing.** This is the mechanism and not a
-                            // shortcut: `Handle::is_busy` states that a message
-                            // asking would queue behind the turn that wedged the
-                            // actor, and if it ever ran it would report
-                            // `busy: true` about itself while its own permit
-                            // counted in `buffered` — the state of asking rather
-                            // than the state of the actor.
-                            //
-                            // Governance is unchanged by that. The layer chain
-                            // runs above this closure, so a `Middleware` refuses
-                            // `__Status` per peer and per method exactly as it
-                            // refuses any other. What is removed is the mailbox,
-                            // not the allowlist and not the layer.
+                            // nothing**, and `serving_of_actor` — the function
+                            // this arm calls — is where that decision is written
+                            // down: why a delivered question could only answer
+                            // the state of asking, and why intercepting it
+                            // removes the mailbox and not the allowlist or the
+                            // layer. Pointed at rather than repeated, because
+                            // this reasoning had nine copies across two files
+                            // and the copies had already drifted apart.
                             //
                             // Borrowed rather than split: `Addressed::split` is
                             // consuming, and an arm that hands the envelope on
@@ -2383,17 +2410,13 @@ macro_rules! __keylink_service {
                             ::std::boxed::Box::pin(async move {
                                 // **`__Status` is answered here and enqueues
                                 // nothing**, the same way and for the same
-                                // reason the keyed closure answers it: a message
-                                // asking would queue behind the turn that wedged
-                                // the actor, and if it ever ran it would report
-                                // `busy: true` about itself. `Handle::is_busy`
-                                // states the constraint; this arm is what keeps
-                                // it true for a peer.
-                                //
-                                // The layer chain runs above this closure, so a
-                                // `Middleware` still refuses `__Status` per peer
-                                // and per method. What is removed is the
-                                // mailbox, not the allowlist and not the layer.
+                                // reason the keyed closure answers it.
+                                // `serving_of_singleton` — the function this arm
+                                // calls — carries both halves: why a delivered
+                                // question could only answer the state of
+                                // asking, and why intercepting it leaves
+                                // governance untouched. This arm is what keeps
+                                // that true for a peer on the singleton door.
                                 if ::core::matches!(&req, Request::__Status { .. }) {
                                     // Nothing ran, and an arm ending a message
                                     // without entering it has to say so.

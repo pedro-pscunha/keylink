@@ -1781,10 +1781,21 @@ ANCHORS = [
      "            Withheld::Expired,"),
     # ── the five guards of the `__status` wave, each replayed by hand at the commit
     # that registered it. Two of them are one claim from two sides and neither is
-    # the other's evidence: `__status` is answered inside the `Dispatch` and there
-    # are exactly TWO such closures, so S1 covers `keyed_service`'s and S3 covers
-    # `Handle::service`'s. A break of one leaves the other green, which is why this
-    # is two rows and two tests rather than one of each.
+    # the other's evidence: `__status` is answered inside the `Dispatch`, and the
+    # closures that answer it are enumerated rather than counted - `keyed_service`'s,
+    # `Handle::service`'s, and the concurrent `service<H: Handler>` door's. S1 covers
+    # the first, S3 the second, S4 the third. A break of one leaves the others green,
+    # which is why these are separate rows and separate tests rather than one of each.
+    #
+    # **Enumerated and not totalled, deliberately.** This paragraph said "there are
+    # exactly TWO such closures" while there were three, and it said so in the
+    # sentence that justifies S1 and S3 - so a reader who trusted the total stopped
+    # before reaching S4, and a wave adding a fourth door had a written invariant
+    # telling it there were two. A list is checkable against the code and a total is
+    # only checkable against a recount nobody runs. Named rather than located,
+    # because this file pins code by quoted search literals for the same reason: a
+    # line number rots on the next edit above it, and two of these three moved in the
+    # very commit that corrected the count.
     #
     # S1 and S3 are the same substitution in spirit - make the interception test
     # false - and their watched sentences are byte-identical, because both tests

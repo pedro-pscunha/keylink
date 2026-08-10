@@ -751,6 +751,25 @@ impl fmt::Display for EndReason {
 /// [`LocalActor::is_running`](crate::LocalActor::is_running) is a separate
 /// question with its own advisory caveat. A `bool` here would be a third
 /// spelling of what two doors already carry.
+///
+/// # `Eq` compares `buffered`, and that is a sharp edge the type does not close
+///
+/// The derive below is field by field, so `==` does the one thing
+/// [`buffered`](Serving::buffered) says never to do: it compares a keyed
+/// mailbox's depth against a singleton channel's as a number. **Prose is the
+/// only thing preventing that**, and a reader who meets the derive before the
+/// field's paragraph would not know it, which is why the warning is here.
+///
+/// Derived anyway, and the trade is deliberate. Every comparison this crate
+/// makes is between two readings of **one** actor served **one** way — the two
+/// doors onto a keyed actor, or the two onto a singleton — where the equality is
+/// exact and is the entire assertion the guards make. Encoding the side in the
+/// type, with a phantom parameter or two structs, would put a type argument on
+/// every caller and every wire signature to forbid a comparison nobody has yet
+/// written. That is a larger permanent cost than the rule it buys.
+///
+/// So: compare two of these when both came from the same side, and read the
+/// field when they did not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Schema)]
 pub struct Serving {
     /// Inside a turn right now.

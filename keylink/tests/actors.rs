@@ -3049,11 +3049,14 @@ async fn a_local_caller_and_a_peer_read_the_same_serving() {
 /// **A wedged singleton answers `__status` to its own `Handle` and to a peer,
 /// with the same value.**
 ///
-/// The second interception, and there are exactly two. `keyed_service`'s closure
-/// answers above `deliver_to_actor` and this one answers above
-/// `deliver_to_singleton`; a test of one says nothing about the other, and the
-/// arms are separate code. This is also the only place `Handle::__status` — the
-/// synchronous local door, which sends nothing at all — is read.
+/// The second of the two doors that answer with a `Serving`: `keyed_service`'s
+/// closure answers above `deliver_to_actor` and this one answers above
+/// `deliver_to_singleton`. A test of one says nothing about the other, and the
+/// arms are separate code. The concurrent `service<H: Handler>` door answers
+/// `__Status` inside its `Dispatch` too and is the third such closure — it
+/// refuses with `NotAnActor` rather than folding a `Serving`, and `S4` guards it.
+/// This is also the only place `Handle::__status` — the synchronous local door,
+/// which sends nothing at all — is read.
 ///
 /// The same `Gate` state and the same semaphore as the keyed tests, served the
 /// other way: `actor_wired` rather than `spawn_wired`, `service` rather than
@@ -3064,6 +3067,17 @@ async fn a_local_caller_and_a_peer_read_the_same_serving() {
 /// against each other, never against a literal: a `LocalActor`'s channel carries
 /// more than the service's own messages, and pinning a number here would assert
 /// something `Serving` says it does not claim.
+///
+/// **Read in two states, because one state is passed by a constant.** Equality
+/// between the doors plus `busy` at the wedged instant is satisfied by a
+/// `Serving { busy: true, buffered: 0 }` hard-coded into `serving_of_singleton`
+/// — measured, not assumed, and that is the true reading of those two assertions
+/// on their own. The idle pair taken after the permit closes it: the peer's
+/// wedged answer and the peer's idle answer have to differ, and no constant can
+/// do that. Both of the compared readings are the **peer's**, because the local
+/// door folds `LocalActor::serving` directly and never reaches the body a
+/// constant would replace. `a_wedged_actor_answers_status_during_its_turn` has
+/// carried this guard since it was written; this test did not.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/macros.rs`, replacing
 /// `if ::core::matches!(&req, Request::__Status { .. }) {` with `if false {`, so
@@ -3122,6 +3136,43 @@ async fn a_wedged_singleton_answers_status_to_its_handle_and_to_a_peer() {
     assert!(
         here.busy,
         "the actor is inside `hold`, and both doors say so"
+    );
+
+    // And the reading was about the actor rather than about the asking: once the
+    // turn is over, the same two doors answer the opposite way.
+    //
+    // Waited out on the LOCAL door deliberately. `serving_of_singleton` is the
+    // body a constant answer would be substituted into, so a wait that polled the
+    // peer would be satisfied by the very value under test — and a substituted
+    // `busy: true` would hang here instead of failing an assertion.
+    // `LocalActor::serving` is a different producer and settles on its own.
+    let after_here = tokio::time::timeout(NOT_STUCK, async {
+        loop {
+            let row = actor.__status();
+            if !row.busy {
+                return row;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a turn that has answered its caller must clear `busy`");
+    let after_there = client
+        .__status()
+        .await
+        .expect("an idle singleton answers its peer too");
+
+    // Both readings are the PEER's, which is what makes this bite: `here` and
+    // `after_here` come from `LocalActor::serving`, and comparing those two would
+    // leave the peer's producer free to answer with a constant.
+    assert_ne!(
+        there, after_there,
+        "two peer readings of one actor in two states, so a constant answer \
+         passes neither"
+    );
+    assert_eq!(
+        after_here, after_there,
+        "one actor, one instant, two doors — at rest"
     );
 
     // The feed's sender outlives the actor on purpose: dropping it ends the actor,
