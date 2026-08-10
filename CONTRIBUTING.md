@@ -196,16 +196,39 @@ If you bypass, say so in the pull request, and name which reason applied.
 
 ## The wire contract
 
-`keylink/tests/protocol.rs::the_contract_hash_has_not_moved` pins the ALPN as a
-string literal. When it goes red, in this order:
+`keylink/tests/protocol.rs` pins each ALPN as a string literal, and there are
+**two**: `the_contract_hash_has_not_moved` for `keylink/Probe`, and
+`the_inspect_contract_hash_has_not_moved` for `keylink/Inspect`. A change to a
+type both services carry moves both, so a red on one is a reason to go and look at
+the other rather than evidence that the other is unaffected. When either goes red,
+in this order:
 
 1. Decide whether this change **should** be visible on the wire.
-2. Only then update the literal, and say so in the release notes.
+2. Only then update the literal, and write the decision down in **both** places
+   that carry it: the commit body, and the ledger in the test's own rustdoc — one
+   entry per move, headed `<old> → <new>`, saying which change moved it and why
+   that change should be visible.
 
 Never step 2 without step 1. Updating a literal to turn a red test green is how
 a deployed fleet silently splits in half.
 
-The pin exists because every other test compiles both peers from one source
+**Step 2 said "say so in the release notes", and there are none.** This repository
+has no `CHANGELOG.md` and no release-notes file, so the instruction named an
+artifact that does not exist and every author quietly satisfied it by doing nothing.
+It is rewritten above to name what actually carries the decision. If a peer-visible
+change is wider than the pins — a variant a peer used to match by text, a condition
+that changed answer without changing its rendering — the RFC append for that wave is
+where the full list goes; `docs/rfc-07-the-turn-model.md` §18.7 is the worked
+example, and its own subject is a count that stopped at the easy half.
+
+**The ledger entry is prose, and prose has no test.** A literal that moves twice —
+an amend that re-measures, most often — leaves the first measurement's sentences
+behind, correct when written and orphaned by the second run. `protocol.rs`'s
+`the_contract_hash_has_not_moved` records one that survived a whole merge gate. When
+you re-measure, rewrite every sentence that names a number, not only the `PINNED`
+line the compiler reads.
+
+The pins exist because every other test compiles both peers from one source
 tree. A wire change moves both sides, the handshake still agrees, and the whole
 suite stays green. A test cannot catch a change it participates in.
 
@@ -246,6 +269,29 @@ feature.
 **`cargo check`, `cargo clippy --all-targets`, the whole test suite and
 `mise run anchors` all pass with those errors in the tree.** `mise run docs` is the
 only gate that sees them, so a green suite is not evidence here.
+
+**And there is one broken link `mise run docs` does not see either.** rustdoc does
+not resolve an intra-doc link to a `#[doc(hidden)]` item, and does not warn about
+it: it emits the raw path as the `href` and leaves it. `-D warnings` is green
+while the rendered page carries `href="crate::Origin"`, which goes nowhere. The
+one gate that catches a broken link is blind to this kind, so read the generated
+HTML instead of the exit code:
+
+    rg -o 'href="(crate|self)::[A-Za-z:_]+"' target/doc/keylink/ | sed 's/.*href="//;s/"//' | sort -u
+
+Every path it prints is a dead link. Ten are dead this way at `5198ecb`, which is
+a measurement and not a target: the check is here so that an *eleventh* is
+noticed, and clearing the ten is its own pass. Name a hidden item in backticks
+rather than linking it — and say in the doc that that is why, because the next
+author who sees a bare backticked type reads it as an oversight and links it.
+
+That last clause is the general rule, and it is worth more than this instance:
+**a fix that removes a defect without recording why is half a fix, and the half
+that rots.** The sentence naming the defect is what stops the next author
+reintroducing it, and it is the first thing a later rewrite drops, because it
+reads as commentary while the fix reads as code. These two links were un-linked
+once with the reason recorded, and a rewrite three commits later kept the fix and
+dropped the reason — which left the tree correct and the next author unwarned.
 
 ## The browser target
 
@@ -335,13 +381,40 @@ Do not edit an RFC so that it matches new code. Append to it. The value of the
 record is that it shows what was believed at the time.
 
 One carve-out: an identifier a break record names — the test it runs, the file it
-edits, the script that drives it — may be renamed in place to keep the record
-runnable, because that changes a pointer and not a claim. **The shape of the
-record does not matter.** Some are table rows and some are bullets; both point,
-and the carve-out is about pointing. What a record *asserts* — a count, a watched
-message, the verdict a break produced — is still appended, never edited in. And
-nothing here permits editing an RFC so that it matches new code: that is the rule
-above, and this carve-out does not reach it.
+edits, the script that drives it, the literal it searches for — may be renamed in
+place to keep the record runnable, because that changes a pointer and not a claim.
+**The shape of the record does not matter.** Some are table rows and some are
+bullets; both point, and the carve-out is about pointing. What a record *asserts*
+— a count, a watched message, the verdict a break produced — is still appended,
+never edited in. And nothing here permits editing an RFC so that it matches new
+code: that is the rule above, and this carve-out does not reach it.
+
+**The search literal is in that list for the same reason the rest of it is.**
+`scripts/break-once.sh` substitutes one literal and refuses one that does not
+occur exactly once in its target, so a record whose literal names a symbol that
+was renamed under it does not run at all. The carve-out exists to keep a record
+runnable, and a stale search literal is the commonest way one stops being: it is a
+pointer into a source file, spelled in that file's own words instead of as a path.
+Reading it as a claim because it is written in code font protects nothing and
+costs the record the only thing it was for.
+
+**Re-quote a rename, never a restructure.** The permission is to spell the same
+line the way the tree now spells it. Where the arm a record broke was split,
+merged, or turned into a different shape, there is no rename to apply, and writing
+a fresh literal invents a break nobody ran. Append that the literal is spent and
+name what replaced the code — the same treatment a deleted test gets, and for the
+same reason: a record that cannot be re-expressed is still a record of something
+that happened.
+
+**The search-literal widening was written by the wave it governs, and no record has
+used it yet.** The branch that added it then met
+`docs/rfc-07-the-turn-model.md` §18.2, which found that both records the widening
+was written for had been *restructured* rather than renamed — so both were declared
+spent under the paragraph above, and neither literal was re-quoted. The widening is
+live, deliberate and **unexercised**: it has passed no test of itself, and the first
+record that uses it will be the first evidence it works. That is stated here rather
+than left as a silence, because a rule adopted and never fired reads exactly like a
+rule nobody agreed to, and the next author is entitled to know which this is.
 
 **Write a figure with the commit it was measured at.** A count of anything in the
 tree — tests in a file, variants in an enum, rows in a registry — is a measurement

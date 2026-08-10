@@ -1196,9 +1196,59 @@ async fn a_service_serves_as_a_singleton_and_as_an_actor_system_on_one_node() {
 /// One cause, one move: nothing else in `probe`'s contract graph changed in the
 /// commit that moved this literal. `Keyable` and `Records` are serving-side
 /// configuration and appear on no wire.
+///
+/// # Moved a fourth time, to put the failure vocabulary on the wire
+///
+/// `d75913b8a4742547` → `75cb158fa0f636c8`. **Step 1 was answered before the
+/// literal was touched, and the answer is yes.**
+///
+/// `RemoteError` gained four variants — `Withheld`, `AtCapacity`, `BadActorId`
+/// and `FollowRefused` — and it reaches every service's contract by the route the
+/// third move already walks, so `probe` pays again for a vocabulary none of its
+/// own methods produce.
+///
+/// Step 1 of `CONTRIBUTING.md`'s rule is answered the same way `NotKeyable`
+/// answered it. `keylink::Withheld` names the losses a peer reads today off the
+/// front of a `Failed(String)` with `starts_with` — *retry this*, *stop calling*,
+/// *an observer vetoed a turn that ran* — and a peer built against the old shape
+/// decodes none of them. Being refused at the handshake is the correct outcome
+/// for a peer that would otherwise match a refusal by its prefix and get a
+/// variant it cannot name.
+///
+/// **Nothing produces the four yet, and the ALPN is paid anyway.** That is the
+/// order the change is worth making in: this commit adds the types, the next one
+/// re-points the served paths onto them, and a peer is refused once rather than
+/// at each of two handshakes.
+///
+/// Appended, not inserted, for `NotKeyable`'s reason: the hash moves either way,
+/// so what the append buys is that no existing variant is renumbered.
+///
+/// **Both pins moved in this run, and the run does not separate the causes.** The
+/// same commit renamed a field of `NodeStatus`, which is in `Inspect`'s graph and
+/// no other — see [`the_inspect_contract_hash_has_not_moved`]. So this is one
+/// measurement covering two causes, and the attribution below it is read off the
+/// contract graphs rather than off the numbers: `RemoteError` is the only one of
+/// the two that can reach `probe`.
+///
+/// **There were two runs, and the literals above are the second one's.** The first
+/// run measured the four variants alone. The commit was then amended to give
+/// `BadActorId` a `reason` field — an id refused without saying why is the loss
+/// this vocabulary exists to stop — and that moved both pins again, before either
+/// was pushed. `0c6e6c3`'s own body records both runs and is the source of truth
+/// for this entry. Every literal here was read off a failing run rather than
+/// derived; none was read off the first one.
+///
+/// **An amend that re-measures leaves the first measurement's prose behind, and
+/// that is worth a sentence because it will recur.** A constant has a test. A
+/// sentence *about* the constant has nothing, so it survives the re-measurement
+/// that invalidates it. The entry below headed itself with the first run's
+/// destination for `Inspect` — a value which, once the amend landed, existed
+/// nowhere else in this repository — and stayed that way through a whole merge
+/// gate. So a re-measurement rewrites every sentence naming a number, and not
+/// only the `PINNED` line the compiler reads.
 #[test]
 fn the_contract_hash_has_not_moved() {
-    const PINNED: &str = "keylink/Probe/d75913b8a4742547";
+    const PINNED: &str = "keylink/Probe/75cb158fa0f636c8";
 
     assert_eq!(
         String::from_utf8_lossy(probe::alpn()),
@@ -1227,7 +1277,32 @@ fn the_contract_hash_has_not_moved() {
 /// hash, which is the whole point — an old console is refused at the handshake
 /// rather than handed four fields where it expected five.
 ///
-/// # It has moved three times, and these are the decisions
+/// # It has moved four times, and these are the decisions
+///
+/// ## `0572763878b7fb9d` → `f62a21fb09137ace`, two causes in one commit
+///
+/// **`Probe`'s hash moved too**, and this is the one entry where that is not by
+/// itself evidence of anything. The commit carries two changes and only one of
+/// them is shared: `RemoteError` gained four variants and sits inside every
+/// contract, so it moves both pins, while `NodeStatus::lost` became
+/// `NodeStatus::dropped` and `NodeStatus` is this service's alone.
+/// [`the_contract_hash_has_not_moved`] carries the argument for the shared half.
+///
+/// The rename is wire-visible and should be. A **field name** is part of the
+/// schema exactly as a variant name is — that test measured the variant case and
+/// records it — and the old name was the only thing left telling a console that
+/// this number is not `EventPage::lost`. One is the channel, dropped before it
+/// was ever sequenced; the other is the ring, sequenced and then pushed out from
+/// under a console that fell behind. A console reading `dropped` where it expects
+/// `lost` is refused at the handshake rather than shown one loss counter under
+/// the other's name.
+///
+/// Both literals were read off a failing run of this file — the **second** of the
+/// two runs the commit needed, and the reason this heading named a destination
+/// that existed nowhere else in the tree until it was corrected.
+/// [`the_contract_hash_has_not_moved`] carries the amend that caused the second
+/// run, and the mechanism. Neither run attributes either move to one of the two
+/// causes, and nothing here claims it does.
 ///
 /// ## `7bbd34fa83c9060c` → `0572763878b7fb9d`, pricing `IdempotencyRefusal::NotKeyable`
 ///
@@ -1302,7 +1377,7 @@ fn the_contract_hash_has_not_moved() {
 /// [`NodeKey`]: keylink::NodeKey
 #[test]
 fn the_inspect_contract_hash_has_not_moved() {
-    const PINNED: &str = "keylink/Inspect/0572763878b7fb9d";
+    const PINNED: &str = "keylink/Inspect/f62a21fb09137ace";
 
     assert_eq!(
         String::from_utf8_lossy(keylink::inspect::alpn()),

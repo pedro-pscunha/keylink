@@ -155,3 +155,38 @@ A new workspace member. `Saver`, `open`, and an error type, per RFC-06 §4.
 Both commits in, `mise run gate` green with the new tests, every guard in §9 watched
 fail through `break-once.sh`, and the number from §7 in the step-2 commit message.
 Nothing pushed — there is no remote, and publishing is Pedro's decision to make.
+
+---
+
+## Appendix, 2026-08-09: the names this brief uses, and the defect its last bullet named
+
+Appended, and **nothing above is edited.** This brief was written against a
+vocabulary Wave 1 replaced. It is kept as the instruction it was; read the
+identifiers through this table.
+
+| was | is | at |
+| --- | --- | --- |
+| `Withheld`, the private observer verdict in `turns.rs` | `ObserverVerdict` | `ec242c2` |
+| `EndReason`, defined in `console.rs` | moved to `observe.rs` | `c165009` |
+| `MailboxClosed`, then `Undelivered` | `Unanswered` | `4e0fcca`, then `8acd7be` |
+| `deliver_to_local` | `deliver_to_singleton` | `80098e4` |
+| `NodeStatus::lost` | `NodeStatus::dropped` | `0c6e6c3` |
+| the five `RemoteError` prefix consts | deleted — `RemoteError::Withheld(Withheld)` | `0c6e6c3`, `5198ecb` |
+
+**The collapse, at `44399de`:** `Unanswered` is `Turn(Withheld)` and `Reentrant`,
+and the list of losses lives once, in `Withheld`. Tests this brief's §9 relied on
+were deleted at `44399de` and `5198ecb` —
+`no_failure_prefix_is_a_prefix_of_another`,
+`no_other_served_failure_begins_with_one_of_the_five`,
+`the_five_prefixes_are_the_text_a_peer_matches_on` and
+`the_gone_answer_is_not_a_failed_and_carries_no_prefix` — because prefixes stopped
+existing, not because the properties stopped holding.
+
+**The last bullet under "Done means" is now closed, and it is worth reading
+twice.** It names as a defect that *"`MailboxClosed` maps to
+`RemoteError::NoSuchActor`, which tells a peer the wrong thing about a refused
+turn."* That was exactly right, it survived this file by several waves, and
+`0c6e6c3` is what fixed it: a refused turn reaches a peer as
+`RemoteError::Withheld(Withheld::Refused { name })`, and `NoSuchActor` is left to
+mean a lookup that found nothing. A brief that names a defect precisely enough to
+be closed years later is doing the job; the entry stays for that reason.

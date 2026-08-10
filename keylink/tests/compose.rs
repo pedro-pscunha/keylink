@@ -1131,7 +1131,7 @@ async fn a_member_that_ends_for_good_reaches_the_policy_once() {
 /// incarnation's ending instead of only its last, which is the mistake this
 /// module's structural claim rests on not being made. Watched: it fails before
 /// the policy is ever consulted, at "the next incarnation answers:
-/// Undelivered" — the outer loop published the first incarnation's ending, so
+/// Gone" — the outer loop published the first incarnation's ending, so
 /// the handle is dead and there is no second incarnation to answer. Exit 101, by
 /// value, in 0.00s.
 ///

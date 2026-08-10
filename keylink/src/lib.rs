@@ -250,8 +250,8 @@ pub use blobs::{BlobHandle, BlobId, Blobs, BlobsAdmission, Granting, Retention, 
 pub use body::{Body, BodyReader};
 pub use call::{Applied, CallId, APPLIED_BOUND};
 pub use console::{
-    Console, EndReason, EventPage, EventStream, Events, FollowRefused, Inspector, LifecycleEvent,
-    NodeKey, NodeStatus, MAX_FOLLOWERS,
+    Console, EventPage, EventStream, Events, FollowRefused, Inspector, LifecycleEvent, NodeKey,
+    NodeStatus, MAX_FOLLOWERS,
 };
 
 /// The client and the wiring for keylink's own `Inspect` service.
@@ -319,7 +319,9 @@ pub use idempotency::{
 pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use middleware::{Caller, Context, Middleware, Next, QueueTimeout, Queueing, Rpc, Timeout};
 pub use node::{derive_alpn, Node};
-pub use observe::{Ended, FinishFut, Observer, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome};
+pub use observe::{
+    EndReason, Ended, FinishFut, Observer, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome, Withheld,
+};
 pub use panic::Panic;
 pub use peer::{Dial, Peer};
 #[cfg(feature = "persist")]
@@ -330,9 +332,9 @@ pub use rpc::{
 };
 pub use subscribers::Subscribers;
 pub use turns::{
-    deliver_to_local, feed_turn, run_keyed, run_keyed_supervised, turn, turn_deferred, Deferred,
-    Fed, Feeds, Hooks, Incarnation, Intensity, LocalActor, NotQueued, Replied, Reply, Turn,
-    Undelivered,
+    deliver_to_singleton, feed_turn, run_keyed, run_keyed_supervised, turn, turn_deferred,
+    Deferred, Fed, Feeds, Hooks, Incarnation, Intensity, LocalActor, NotQueued, Replied, Reply,
+    Turn, Unanswered,
 };
 pub use watch::{Departure, Watch};
 pub use wire::{Envelope, WireKinds, MAX_HEADER};

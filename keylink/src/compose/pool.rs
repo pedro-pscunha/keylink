@@ -56,7 +56,7 @@
 //! - **Not a supervisor.** Nothing here restarts a member, notices one ending, or
 //!   removes one from the rotation. [`pick`](Pool::pick) will keep handing back a
 //!   handle to an actor that has stopped, and the call on it will answer
-//!   [`Undelivered`](crate::Undelivered) or [`NotQueued`](crate::NotQueued), by
+//!   [`Unanswered`](crate::Unanswered) or [`NotQueued`](crate::NotQueued), by
 //!   door. **Restarting is the member's own
 //!   job, and it already has one:** build members with the generated
 //!   `supervised()` — or [`LocalActor::spawn_supervised`](crate::LocalActor::spawn_supervised)

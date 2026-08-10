@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use keylink::{
     Allowlist, Body, BodyReader, Caller, Context, Middleware, Next, Observer, Outcome, RemoteError,
-    Server, Stop, TurnFut, TurnInfo, TurnOutcome,
+    Server, Stop, TurnFut, TurnInfo, TurnOutcome, Withheld,
 };
 
 mod common;
@@ -208,7 +208,10 @@ async fn a_handle_to_a_stopped_actor_reports_a_closed_mailbox() {
         .await
         .expect("a stop from outside the actor's own turn is never refused");
 
-    assert_eq!(spare.post(1, 0).await, Err(keylink::Undelivered::Gone));
+    assert_eq!(
+        spare.post(1, 0).await,
+        Err(keylink::Unanswered::Turn(keylink::Withheld::Gone))
+    );
     assert!(!spare.is_running());
 }
 
@@ -397,8 +400,8 @@ async fn a_panicking_message_is_a_refusal_to_a_remote_caller() {
     assert!(
         matches!(
             error,
-            keylink::Error::Remote(RemoteError::Failed(ref reason))
-                if reason.contains("bad message")
+            keylink::Error::Remote(RemoteError::Withheld(Withheld::Panicked { ref message }))
+                if message.contains("bad message")
         ),
         "got {error:?}"
     );
@@ -892,8 +895,8 @@ async fn a_timeout_settles_the_key_it_gave_up_on_where_a_queue_timeout_leaves_it
 
 // ─────────────────────────────────────── what a lost turn tells a remote peer
 
-/// The name the observer below answers to, and therefore the exact text a peer
-/// reads after `observer refused: `.
+/// The name the observer below answers to, and therefore the exact `name` a peer
+/// reads on a [`Withheld::Refused`].
 ///
 /// A constant so the test asserts the value that reached the wire rather than a
 /// second copy of a literal that could drift from it.
@@ -926,22 +929,30 @@ impl Observer<Ledger> for RefusesWhatCompleted {
     }
 }
 
-/// The `Failed` reason a peer actually read.
+/// The [`Withheld`] a peer actually read.
 ///
 /// A helper rather than a `matches!` guard, because the useful thing to say on
 /// failure is **which** answer arrived instead — `NoSuchActor` above all, which
 /// a bare `matches!` would report as a silent `false`.
-fn failed_reason(error: &keylink::Error) -> &str {
+///
+/// It read the `String` out of a `RemoteError::Failed` until the losses became
+/// variants. What the callers below compare is now the value rather than its
+/// rendering, which is what a peer matches.
+fn withheld(error: &keylink::Error) -> &Withheld {
     match error {
-        keylink::Error::Remote(RemoteError::Failed(reason)) => reason,
-        other => panic!("expected a RemoteError::Failed, got {other:?}"),
+        keylink::Error::Remote(RemoteError::Withheld(loss)) => loss,
+        other => panic!("expected a RemoteError::Withheld, got {other:?}"),
     }
 }
 
 /// A turn refused by an observer reaches a remote caller as
-/// [`RemoteError::Failed`] carrying `observer refused: {name}`, and a turn that
-/// panicked reaches it as `Failed` carrying `panicked: {message}`. One test,
-/// both prefixes, because either one on its own proves nothing.
+/// [`RemoteError::Withheld`] carrying [`Withheld::Refused`], and a turn that
+/// panicked reaches it as [`Withheld::Panicked`]. One test, both variants,
+/// because either one on its own proves nothing.
+///
+/// The two were prefixes on a `Failed` string until the losses became variants,
+/// and the pair is what the discriminator has always been about: a peer that
+/// cannot tell them apart retries a fault or gives up on a refusal.
 ///
 /// # Why the refusal must not be `NoSuchActor`
 ///
@@ -972,7 +983,7 @@ fn failed_reason(error: &keylink::Error) -> &str {
 /// Both prefixes are one property about a pair, so they are pinned together,
 /// here, by one test that fails when either side loses its own.
 #[tokio::test]
-async fn both_halves_of_a_lost_turn_carry_their_own_prefix() {
+async fn both_halves_of_a_lost_turn_carry_their_own_variant() {
     let node = local_node().await;
     let caller = local_node().await;
     let actor = ledger::actor_with(Ledger::default(), vec![Box::new(RefusesWhatCompleted)]);
@@ -987,16 +998,17 @@ async fn both_halves_of_a_lost_turn_carry_their_own_prefix() {
     // The panicking call first, and the order is not cosmetic: the observer
     // passes a panicked turn, so the actor is still there to be refused below.
     let panicked = client.boom().await.expect_err("the handler panicked");
-    let panicked_reason = failed_reason(&panicked).to_owned();
+    let panicked_loss = withheld(&panicked).clone();
+    let Withheld::Panicked { message } = &panicked_loss else {
+        panic!(
+            "a panic must reach a peer as its own variant, or it cannot be told from a refusal; \
+             got {panicked_loss:?}"
+        );
+    };
     assert!(
-        panicked_reason.starts_with("panicked: "),
-        "a panic must reach a peer under its own prefix, or it cannot be told from a refusal; \
-         got {panicked_reason:?}"
-    );
-    assert!(
-        panicked_reason.contains("bad message"),
-        "and it must still carry what the handler panicked with, or the prefix is all a peer \
-         gets; got {panicked_reason:?}"
+        message.contains("bad message"),
+        "and it must still carry what the handler panicked with, or the variant is all a peer \
+         gets; got {message:?}"
     );
 
     let refused = client
@@ -1011,25 +1023,27 @@ async fn both_halves_of_a_lost_turn_carry_their_own_prefix() {
         "a refused turn must not be reported as NoSuchActor: the actor was there, the turn ran, \
          and telling a peer to stop asking is a different fact; got {refused:?}"
     );
-    // Exact, because every byte of this one is chosen here: the format string
-    // in the dispatch and `REFUSER`, with nothing in between.
+    // Exact, because every field of this one is chosen here: the variant the
+    // dispatch builds and `REFUSER`, with nothing in between.
     assert_eq!(
-        failed_reason(&refused),
-        format!("observer refused: {REFUSER}"),
-        "a refusal must reach a peer under its own prefix, naming the observer that made it"
+        withheld(&refused),
+        &Withheld::Refused {
+            name: REFUSER.to_owned()
+        },
+        "a refusal must reach a peer as its own variant, naming the observer that made it"
     );
     assert_ne!(
-        panicked_reason,
-        failed_reason(&refused),
-        "the two answers a peer can only tell apart by their text must not be the same text"
+        &panicked_loss,
+        withheld(&refused),
+        "the two answers must not be one value: a peer acts on them differently"
     );
 
     client.close().await.expect("closes");
     server.shutdown().await.expect("stops");
 }
 
-/// The name the panicking observer answers to, and therefore the exact text a
-/// peer reads after `observer panicked: `.
+/// The name the panicking observer answers to, and therefore the exact `name` a
+/// peer reads on a [`Withheld::ObserverPanicked`].
 const PANICKER: &str = "panics-on-completed-turns";
 
 /// Panics on every turn that **completed**, and passes every turn that panicked.
@@ -1066,23 +1080,24 @@ impl Observer<Ledger> for PanicsOnWhatCompleted {
 ///
 /// # Three texts, pinned against each other rather than one at a time
 ///
-/// The prefix is the only discriminator a peer has — `RemoteError::Failed`
-/// carries a `String` because a variant would move the ALPN — so a prefix that
-/// cannot be told from its neighbours discriminates nothing. Two neighbours
-/// matter here and both are asserted: `observer refused: `, which this case was
-/// folded into, and `panicked: `, which is the **handler** exploding and shares
-/// the verb. Asserting only the new text would stay green if it were a prefix of
-/// either.
+/// The variant is the discriminator a peer has, and it was a **prefix** on a
+/// `RemoteError::Failed` string until the ALPN could afford the variant. Either
+/// way, a discriminator that cannot be told from its neighbours discriminates
+/// nothing. Two neighbours matter here and both are asserted:
+/// [`Withheld::Refused`], which this case was folded into, and
+/// [`Withheld::Panicked`], which is the **handler** exploding. Asserting only the
+/// new variant would stay green if it were one of those.
 ///
-/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `rendered`'s new
-/// arm. Search
-/// `Outcome::Err(RemoteError::Failed(format!("{OBSERVER_PANICKED}{name}"))),`
-/// and send it back out under the refusal's prefix instead:
-/// `Outcome::Err(RemoteError::Failed(format!("{REFUSED}{name}"))),`. Watched:
-/// `left: "observer refused: panics-on-completed-turns"`,
-/// `right: "observer panicked: panics-on-completed-turns"`.
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `rendered`'s
+/// observer-panicked arm. Search
+/// `Outcome::Err(RemoteError::Withheld(Withheld::ObserverPanicked {`
+/// and send it back out as the refusal instead:
+/// `Outcome::Err(RemoteError::Withheld(Withheld::Refused {`. The two carry the
+/// same `name` field, so the one-line swap compiles. Watched:
+/// `left: Refused { name: "panics-on-completed-turns" }`,
+/// `right: ObserverPanicked { name: "panics-on-completed-turns" }`.
 #[tokio::test]
-async fn an_observer_that_panicked_reaches_a_peer_under_its_own_prefix() {
+async fn an_observer_that_panicked_reaches_a_peer_under_its_own_variant() {
     let node = local_node().await;
     let caller = local_node().await;
     let actor = ledger::actor_with(Ledger::default(), vec![Box::new(PanicsOnWhatCompleted)]);
@@ -1106,19 +1121,21 @@ async fn an_observer_that_panicked_reaches_a_peer_under_its_own_prefix() {
         "the actor was there and the turn ran, so telling a peer to stop asking is a different \
          fact; got {crashed:?}"
     );
-    // Exact, because every byte is chosen here: the format string in the dispatch
+    // Exact, because every field is chosen here: the variant the dispatch builds
     // and `PANICKER`, with nothing in between.
     assert_eq!(
-        failed_reason(&crashed),
-        format!("observer panicked: {PANICKER}"),
-        "an observer that fell over must reach a peer under its own prefix, naming it"
+        withheld(&crashed),
+        &Withheld::ObserverPanicked {
+            name: PANICKER.to_owned()
+        },
+        "an observer that fell over must reach a peer as its own variant, naming it"
     );
     assert!(
-        !failed_reason(&crashed).starts_with(RemoteError::REFUSED),
+        !matches!(withheld(&crashed), Withheld::Refused { .. }),
         "and it must not read as a refusal: nothing decided anything"
     );
     assert!(
-        !failed_reason(&crashed).starts_with(RemoteError::PANICKED),
+        !matches!(withheld(&crashed), Withheld::Panicked { .. }),
         "nor as a handler fault, which is the other thing a peer acts on differently"
     );
 
@@ -1228,6 +1245,95 @@ async fn stop_returns_only_once_the_mailbox_is_closed() {
     }
 }
 
+/// A call that arrives after the mailbox closed reads [`Withheld::Gone`] — the
+/// same answer as a reply that died on a gone actor, off the other side of the
+/// send.
+///
+/// # It is one condition, and which answer a peer got used to depend on a race
+///
+/// `deliver_to_singleton` can meet a stopped actor at two points: the send can
+/// fail with `NotQueued::Closed`, or the send can win a permit and the reply
+/// channel can then die with a `Standing::Gone`. Both mean *this actor ran and
+/// has stopped*. They answered differently — `NoSuchActor { id }` from the first
+/// and `Withheld::Gone` from the second — so which of the two sentences a peer
+/// read was decided by whether the actor's loop finished before or after the
+/// permit was granted. Nothing in the call decides it, and no caller can steer
+/// it.
+///
+/// This test drives the **send** side, which was the one answering an
+/// address-shaped sentence. The reply side is
+/// `a_remote_caller_can_tell_restarting_from_gone` in `supervision.rs`, and the
+/// pair is what pins the two paths to one answer.
+///
+/// # Why `NoSuchActor` was the wrong half of the pair to keep
+///
+/// It says *no actor is mounted as X*, which is an answer about an **id** — and a
+/// singleton has no id to be wrong about. It is reached through its own ALPN, so
+/// there is no lookup that can find nothing: the handshake either accepted the
+/// peer or the call never arrived. `stop()` does not unregister the ALPN either,
+/// so this door goes on answering for as long as the server runs, and what it has
+/// to report is that the actor behind it has finished.
+///
+/// # Three ways this passes for the wrong reason, and what refuses each
+///
+/// - **The call fails on the connection rather than at the mailbox.** Then the
+///   error is a transport one and `withheld` panics rather than comparing, which
+///   names what arrived instead.
+/// - **The stop had not landed when the second call was sent.** Then the send
+///   wins a permit, the turn runs, and the assertion sees an `Ok`. `stop()` is
+///   awaited and `is_running()` is asserted `false` in between, and
+///   `stop_returns_only_once_the_mailbox_is_closed` above is what makes that
+///   assertion mean something.
+/// - **The service was never reachable in the first place.** Then a green round
+///   would be measuring a broken client. The first `post` proves the whole path
+///   before anything is stopped.
+///
+/// Made red by `scripts/break-once.sh keylink/src/turns.rs` on the closed-mailbox
+/// arm: search `Outcome::Err(RemoteError::Withheld(Withheld::Gone)),` and replace
+/// it with
+/// `Outcome::Err(RemoteError::NoSuchActor { id: String::new() }),`. Watched:
+/// `expected a RemoteError::Withheld, got Remote(NoSuchActor { id: "" })`.
+#[tokio::test]
+async fn a_stopped_singleton_answers_gone_rather_than_naming_an_id() {
+    let node = local_node().await;
+    let caller = local_node().await;
+    let actor = ledger::actor(Ledger::default());
+    let server = Server::builder(&node)
+        .service(actor.service(Allowlist::anyone()).build())
+        .spawn()
+        .expect("serves");
+    let client = ledger::Client::connect(&caller, node.endpoint().addr())
+        .await
+        .expect("dials");
+
+    assert_eq!(
+        client.post(1, 0).await.expect("the actor is serving"),
+        1,
+        "the call before the stop must land, or a refusal after it says nothing about the stop"
+    );
+
+    actor
+        .stop()
+        .await
+        .expect("a stop from outside the actor's own turn is never refused");
+    assert!(
+        !actor.is_running(),
+        "stop() returned with the mailbox still open, so the call below would reach a turn \
+         instead of the closed door this test is about"
+    );
+
+    let refused = client.post(2, 0).await.expect_err("the mailbox is closed");
+    assert_eq!(
+        withheld(&refused),
+        &Withheld::Gone,
+        "a closed mailbox and a reply that died on a gone actor are one condition: a peer must \
+         not read two different answers depending on which side of the send it landed on"
+    );
+
+    client.close().await.expect("closes");
+    server.shutdown().await.expect("stops");
+}
+
 /// A turn an observer refused must NOT settle its idempotency key as the
 /// refusal, because the turn's effect was never committed.
 ///
@@ -1263,8 +1369,10 @@ async fn a_refused_turn_does_not_settle_its_key_as_the_refusal() {
         .await
         .expect_err("the observer refuses the completed turn");
     assert_eq!(
-        failed_reason(&refused),
-        format!("observer refused: {REFUSER}"),
+        withheld(&refused),
+        &Withheld::Refused {
+            name: REFUSER.to_owned()
+        },
         "the caller of the refused turn is told who refused it"
     );
 

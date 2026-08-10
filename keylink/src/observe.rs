@@ -78,6 +78,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use postcard_schema::Schema;
+use serde::{Deserialize, Serialize};
+
 use crate::Panic;
 
 /// The future an observer returns.
@@ -398,11 +401,10 @@ impl fmt::Display for Stop {
 
 /// Why an actor is no longer running.
 ///
-/// [`Undelivered::Gone`](crate::Undelivered::Gone) says "gone", and it must not
-/// be stretched to say "gave up on durability". This is the second question,
-/// asked separately: a refused caller is told
-/// [`Undelivered::Refused`](crate::Undelivered::Refused) and the observer's
-/// name, and this carries the observer's own error.
+/// [`Withheld::Gone`] says "gone", and it must not be stretched to say "gave up
+/// on durability". This is the second question, asked separately: a refused
+/// caller is told [`Withheld::Refused`] and the observer's name, and this
+/// carries the observer's own error.
 ///
 /// # Exhaustive, and deliberately not `#[non_exhaustive]` — decided once, here
 ///
@@ -425,8 +427,9 @@ impl fmt::Display for Stop {
 ///
 /// - Sealed, a downstream matcher is **forced** to write `_ =>`, and that arm
 ///   silently swallows every ending added later. That is exactly how
-///   `TurnLost::Gone` swallowed a fault for three waves, and it is why Wave 2's
-///   review refused to seal `TurnLost` on this same ground.
+///   `TurnLost`'s own gone-arm swallowed a fault for three waves, and it is why
+///   Wave 2's review refused to seal that type on this same ground. That arm is
+///   [`Withheld::Gone`] now, and the argument moved with it.
 /// - Exhaustive, a downstream matcher gets a compile error at the moment a new
 ///   reason to end exists, which is the moment it has a decision to make. The bill
 ///   is a major version per ending once this crate is published, and today it is
@@ -509,14 +512,13 @@ pub enum Ended {
     ///
     /// The only ending a [supervised](crate::LocalActor::spawn_supervised) actor
     /// can reach that an unsupervised one cannot, and the reason the whole enum
-    /// is worth having: "gone" is already
-    /// [`Undelivered::Gone`](crate::Undelivered::Gone)'s answer, and an operator needs
-    /// to know whether this actor stopped because somebody asked it to or
-    /// because it could not be kept alive.
+    /// is worth having: "gone" is already [`Withheld::Gone`]'s answer, and an
+    /// operator needs to know whether this actor stopped because somebody asked
+    /// it to or because it could not be kept alive.
     ///
     /// The mailbox closes when this is published, so every later call reports it
-    /// — [`Undelivered::Gone`](crate::Undelivered::Gone) to a door that wanted a
-    /// value, [`NotQueued::Closed`](crate::NotQueued::Closed) to one that wanted
+    /// — [`Withheld::Gone`] to a door that wanted a value,
+    /// [`NotQueued::Closed`](crate::NotQueued::Closed) to one that wanted
     /// only to be queued — and a peer is told
     /// [`RemoteError::NoSuchActor`](crate::RemoteError::NoSuchActor).
     GaveUp {
@@ -539,11 +541,14 @@ pub enum Ended {
     },
 }
 
-/// One line, for a log or for the string a peer is handed.
+/// One line, for a log.
 ///
 /// [`Debug`](fmt::Debug) is derived and prints the fields; this prints the
-/// sentence. `turns.rs` puts one of these behind a `"restarting: "` prefix on the
-/// served path, and a struct-literal rendering there would be noise on a wire.
+/// sentence. [`EndReason`]'s `Display` mirrors this one arm for arm, and the
+/// mirror is why the two types share a file: this sentence is what an operator
+/// reads out of an actor's own ending, and that one is what a peer reads inside
+/// [`Withheld::Restarting`]'s. A struct-literal rendering on either side would be
+/// noise.
 impl fmt::Display for Ended {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -554,10 +559,9 @@ impl fmt::Display for Ended {
             // producers.** The variant's own doc has always said `Err`, *or
             // panicked*, and an observer that panicked did not give anything up —
             // it fell over. This is the sentence an operator reads in a log, and
-            // `turns.rs` puts it behind `"restarting: "` on the served path, so it
-            // is also the sentence a peer reads about a restart. One verb has to be
-            // true of both producers: they both ended the incarnation, and neither
-            // of them let the turn commit.
+            // `EndReason`'s mirror of it is the sentence a peer reads about a
+            // restart, so one verb has to be true of both producers: they both
+            // ended the incarnation, and neither of them let the turn commit.
             Self::Observer { name, error, .. } => {
                 write!(f, "the {name} observer ended this incarnation: {error}")
             }
@@ -569,170 +573,225 @@ impl fmt::Display for Ended {
     }
 }
 
-/// Why a turn produced no value.
+/// Why an actor ended, in the form that crosses the wire.
 ///
-/// Replaces [`Undelivered`](crate::Undelivered) on the catching paths. The two
-/// name the same losses and differ by **one variant and one payload**: this one
-/// has [`Faulted`](Self::Faulted), which an [`ask`](crate::LocalActor::ask)
-/// resumes into its caller instead of reporting, and its
-/// [`Restarting`](Self::Restarting) carries the [`Ended`] that caused the restart
-/// where the other carries the bare fact.
+/// # A second vocabulary, and the one place it could not be avoided
 ///
-/// Both differences cost `Copy` and `Eq` — a [`Panic`] and an [`Arc`] are neither
-/// — which is what the other type keeps and this one spends. So the choice is
-/// made by the **door**, not by two vocabularies: a catching path has to hand a
-/// peer the reason, and a resuming one has already handed the caller the panic
-/// itself. The two axes below are the same two on both types.
+/// This crate refuses parallel types for one concept, and this is a parallel
+/// type for [`Ended`]. It exists because [`Ended::Observer`] carries an
+/// `Arc<dyn Error + Send + Sync>`, which has no encoding and no schema — a
+/// trait object is not data. The choice was this, or dropping the one arm that
+/// names *which* observer refused, which is the arm an operator most needs.
 ///
-/// # Three answers and not two, and why the third carries a payload
+/// What keeps the two from drifting is that there is exactly one conversion,
+/// [`From<&Ended>`](#impl-From<%26Ended>-for-EndReason), it is written with no
+/// wildcard arm, and `Ended` is exhaustive. So a new ending is a compile error
+/// **here**, on the line that would otherwise have quietly mapped it to
+/// something else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Schema)]
+pub enum EndReason {
+    /// [`Ended::Stopped`].
+    Stopped,
+    /// [`Ended::Vanished`].
+    Vanished,
+    /// [`Ended::Panicked`].
+    Panicked {
+        /// What the handler panicked with.
+        message: String,
+    },
+    /// [`Ended::Observer`], with the error rendered through `Display`, because
+    /// that is the whole of what survives an `Arc<dyn Error>` crossing a wire.
+    Observer {
+        /// [`Observer::name`].
+        name: String,
+        /// Why it gave up.
+        error: String,
+        /// Whether the observer said another incarnation cannot help.
+        ///
+        /// Carried rather than dropped because it is the difference between "this
+        /// turn was refused" and "this actor is not coming back", and a console
+        /// that showed the first for the second would send an operator looking for
+        /// a restart that was never going to happen.
+        fatal: bool,
+    },
+    /// [`Ended::Feed`].
+    Feed {
+        /// The feed's declared name.
+        name: String,
+    },
+    /// [`Ended::GaveUp`] — a supervisor stopped re-incarnating this actor.
+    ///
+    /// The one ending a console most needs to distinguish, and the reason
+    /// [`Ended`] is worth putting on a wire at all: every other variant means
+    /// something asked the actor to stop, and this one means it could not be kept
+    /// alive.
+    GaveUp {
+        /// Restarts spent before giving up. `0` means the first incarnation was
+        /// the last — see [`Ended::GaveUp::after`], whose sense this copies.
+        after: u32,
+        /// The last incarnation's reason, or the factory's reason for refusing to
+        /// build one, through `Display`.
+        error: String,
+    },
+}
+
+impl From<&Ended> for EndReason {
+    /// No wildcard arm, deliberately: see this type's own documentation.
+    fn from(ended: &Ended) -> Self {
+        match ended {
+            Ended::Stopped => Self::Stopped,
+            Ended::Vanished => Self::Vanished,
+            Ended::Panicked { message } => Self::Panicked {
+                message: message.clone(),
+            },
+            Ended::Observer { name, error, fatal } => Self::Observer {
+                name: (*name).to_owned(),
+                error: error.to_string(),
+                fatal: *fatal,
+            },
+            Ended::Feed { name } => Self::Feed {
+                name: (*name).to_owned(),
+            },
+            Ended::GaveUp { after, error } => Self::GaveUp {
+                after: *after,
+                error: error.to_string(),
+            },
+        }
+    }
+}
+
+/// The same line [`Ended`] writes, from the form that crossed a wire.
 ///
-/// [`Faulted`](Self::Faulted) used to be expressed as a nested
-/// `Result<Result<T, Panic>, TurnLost>`: the fault lived in the *inner* `Err`
-/// and this enum could not name it. Two error positions for one question is the
-/// two-layer unwrap a caller gets wrong, and it left this type able to say only
-/// half of why there is no value.
+/// # Hand-written, and a mirror rather than a second wording
 ///
-/// So the fault moved in here and brought its payload with it, which costs
-/// `Copy`, `Clone` and `Eq` — a [`Panic`] holds `Box<dyn Any + Send>` and is
-/// none of the three. That is the honest price: the payload is what
-/// [`ask`](crate::LocalActor::ask) resumes into the calling task, and an error
-/// type that dropped it would make the crate's whole panic policy
-/// unimplementable on top of the catching path.
+/// Every arm writes the sentence [`Display for Ended`](Ended#impl-Display-for-Ended)
+/// writes for the arm it was converted from, because the two are one ending seen
+/// from two sides and a peer that read a *different* sentence about it would have
+/// no way to know it was the same fact. That is the whole reason the two types
+/// share a file: the mirror is checkable by reading forty lines, and it is not
+/// checkable at all if they sit apart.
 ///
-/// # `Expired` is an answer of its own, because it was being reported as [`Gone`](Self::Gone)
+/// `#[derive(thiserror::Error)]` would spell the same thing in attributes, and
+/// this is written out instead for [`Ended`]'s reason — the two must be diffed
+/// against each other, and an attribute on the variant and a `write!` in a match
+/// arm do not diff.
 ///
-/// `Answered` has had a fourth state — "the queueing budget expired while this
-/// message waited, and nothing ran" — since before this enum existed, and
-/// `ask_catching` mapped it to `Gone` behind a comment reading *"a local origin
-/// carries no `Queueing`, so nothing can expire on this path. Typed rather than
-/// asserted."* It was neither: it mapped an impossible state onto a variant that
-/// means something else and specific — the actor is no longer running — so the
-/// first local origin to carry a queue budget would have reported a live actor as
-/// gone, silently, which is the same shape as the `>`-versus-`>=` deadline
-/// disagreement Wave 1b deleted.
+/// # What it is for, which is one caller
 ///
-/// Unreachable today, and written to be *correct* if something reaches it, which
-/// is the choice `Mail`'s `send` and `recv` variants already make one layer out.
+/// [`Withheld::Restarting`] renders it: a peer whose reply died in a restart is
+/// told *another incarnation is coming* **and which ending caused it**. That
+/// sentence carried the ending on `main`, through a `"restarting: "` prefix in
+/// front of the whole of `Ended`'s `Display`, and lost it for one wave when the
+/// prefix became a variant — the `#[error]` text named no field, so an operator
+/// reading `err.to_string()` on the far end got a fixed sentence about an ending
+/// the value was carrying all along.
 ///
-/// # Two axes, and every answer comes from exactly one of them
+/// [`Observer::fatal`](Self::Observer::fatal) is not rendered, exactly as
+/// [`Ended::Observer`]'s `fatal` is not: it is a supervision flag rather than
+/// part of the sentence, and a peer matches the field.
+impl fmt::Display for EndReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stopped => f.write_str("the actor was stopped"),
+            Self::Vanished => f.write_str("the actor's task was cancelled"),
+            Self::Panicked { message } => write!(f, "a turn panicked: {message}"),
+            Self::Observer { name, error, .. } => {
+                write!(f, "the {name} observer ended this incarnation: {error}")
+            }
+            Self::Feed { name } => write!(f, "the {name} feed ended"),
+            Self::GaveUp { after, error } => {
+                write!(f, "gave up after {after} restarts: {error}")
+            }
+        }
+    }
+}
+
+/// Why a turn produced no value, at the door that hands a caller the fault
+/// itself.
 ///
-/// [`Refused`](Self::Refused), [`Faulted`](Self::Faulted) and
-/// [`Expired`](Self::Expired) are about **this call**. The loop reached a verdict
-/// and put it on the reply channel, so the answer arrives written down.
-/// [`Reentrant`](Self::Reentrant) is the same axis one step earlier: the call is
-/// refused before it is queued, so it never has a channel to be answered on.
+/// Three variants, and the first of them is [`Withheld`] — the crate's one list
+/// of losses, which [`Unanswered`](crate::Unanswered) and
+/// [`RemoteError::Withheld`](crate::RemoteError::Withheld) carry too. A local
+/// caller and a peer therefore read **one** sentence about one condition,
+/// because they read the same value and not two copies of it.
 ///
-/// [`Dropped`](Self::Dropped), [`Restarting`](Self::Restarting) and
-/// [`Gone`](Self::Gone) are about **the actor**. Nothing was ever put on the
-/// channel — it died holding no verdict — and a dead channel carries no reason,
-/// so the answer is read off the actor's own standing after the death rather than
-/// inferred from the silence. That read happens in one private place, which is
-/// what keeps the three of them from being decided twice.
+/// # It was flat, and flat is what made two enums drift
 ///
-/// So the mapping is total rather than layered: a reply channel either carries a
-/// verdict or it does not, and the second case has exactly one thing to read. No
-/// answer is half of one axis and half of the other.
+/// This type and `Unanswered` each listed the same six losses as their own
+/// variants, in the same order, with the same `#[error]` texts written twice.
+/// Nothing held the two lists together except a test that walked them
+/// variant-by-variant — and the walk could only compare what was already there,
+/// so it caught drift in the *words* and never in the *payloads*. `Restarting`
+/// is where that showed: this type carried the ending and `Unanswered` carried
+/// a bare unit, and the guard passed on both.
 ///
-/// `Gone` has a second producer that skips the read, and it agrees with it: a
-/// closed mailbox refuses the send outright, and a local actor's mailbox is closed
-/// only where there will be no next incarnation.
+/// One shared payload is what deletes the correspondence problem rather than
+/// policing it: there is no second list to keep in step.
+///
+/// # Two variants stay outside `Withheld`, for two different reasons
+///
+/// [`Faulted`](Self::Faulted) holds the [`Panic`] itself, and that payload is
+/// what [`ask`](crate::LocalActor::ask) resumes into the calling task. It cannot
+/// move into `Withheld`: `Box<dyn Any + Send>` has no encoding, an unwind does
+/// not cross a network, and [`Withheld::Panicked`] is the same fault stated to
+/// the audience that can act on it — the message, through `Display`. So the
+/// split is by what the audience can be *handed*, not by what happened.
+///
+/// [`Reentrant`](Self::Reentrant) is not about a turn at all. Every `Withheld`
+/// variant describes what happened to a turn that exists; a re-entrant call is
+/// refused before anything is queued, so there is no turn for anything to have
+/// been withheld from. [`Unanswered::Reentrant`](crate::Unanswered::Reentrant)
+/// and [`NotQueued::Reentrant`](crate::NotQueued::Reentrant) are the same fact
+/// at the other doors, and those three `#[error]` texts are the only ones this
+/// crate still keeps in step by hand.
+///
+/// # `Debug` and `Error`, and no other derive
+///
+/// [`Panic`] has none, and it holds `Box<dyn Any + Send>` — so `Clone`, `Eq` and
+/// `Copy` are unavailable here whatever `Withheld` supports. `Unanswered` is the
+/// type that keeps them, and the door decides which a caller gets: a resuming
+/// path is handed the payload, a reporting one is handed the words.
 ///
 /// # Exhaustive, and deliberately not `#[non_exhaustive]`
 ///
 /// Like [`Ended`] and [`Departure`](crate::Departure): a caller matches this, and
-/// a wildcard arm is the collapse it exists to prevent. Sealing it would let a
-/// downstream `_` swallow a fifth answer exactly the way `Gone` swallowed this
-/// fourth one — the defect, not the fix.
+/// a wildcard arm is the collapse it exists to prevent. `Withheld` makes the same
+/// choice for the same reason, and it is the type a fourth loss would be added
+/// to — so a caller who has matched all three arms here still meets a new loss as
+/// a compile error, one level in.
 #[derive(Debug, thiserror::Error)]
 pub enum TurnLost {
-    /// The actor was gone, or ended while this turn waited.
+    /// The turn was reached and its value was not handed back, and this is which
+    /// loss it was.
     ///
-    /// **Stop calling.** There is no next incarnation: the loop is finished, or a
-    /// supervisor gave up, or the actor was aborted or destroyed.
-    #[error("the actor is no longer running")]
-    Gone,
-    /// The actor is serving, and this reply was thrown away unanswered.
-    ///
-    /// A handler took [`Reply::later`](crate::Reply::later) and dropped the
-    /// [`Deferred`](crate::Deferred) — the sanctioned move `#[defer]` exists for,
-    /// and what that type's `#[must_use]` asks a handler to say out loud — or a
-    /// handler panicked while holding the channel, so it died in the unwind. The
-    /// loop caught the panic, kept the state, and answers the next message.
-    ///
-    /// **Distinct from [`Gone`](Self::Gone), and that distinction is the whole of
-    /// this variant.** A caller told `Gone` should stop calling; a caller told this
-    /// has an actor that is still there. It is the same split
-    /// [`Faulted`](Self::Faulted) makes for a turn that exploded, for a reply that
-    /// never reached one.
-    ///
-    /// A peer reads this sentence behind the crate's `"dropped: "` prefix, from a
-    /// rendering that reads the same fact about the same actor.
-    #[error("the actor is serving and this reply was never answered")]
-    Dropped,
-    /// The incarnation that owed this answer is gone, and a supervisor is starting
-    /// another.
-    ///
-    /// The reply died with the state that held it, in the teardown between two
-    /// incarnations. **Retrying is the move**: the mailbox never closes across a
-    /// restart, so a call made now waits for the incarnation that is coming.
-    ///
-    /// Carries the ending that caused the restart, behind an [`Arc`] because
-    /// [`Ended`] is [`Clone`] and one ending answers every reply that died with
-    /// that state. [`ended`](crate::LocalActor::ended) is not a second way to read
-    /// it: a restart is not an ending, so that future does not resolve here.
-    #[error("the incarnation that owed this answer is gone and another is coming")]
-    Restarting(Arc<Ended>),
-    /// An observer refused this turn. It **ran** and was not committed.
-    #[error("the {name} observer refused this turn: it ran and was not committed")]
-    Refused {
-        /// [`Observer::name`].
-        name: &'static str,
-    },
-    /// An observer **panicked** watching this turn. It **ran** and was not
-    /// committed.
-    ///
-    /// [`Undelivered::ObserverPanicked`](crate::Undelivered::ObserverPanicked) is
-    /// the same fact at the door that resumes a fault rather than reporting it,
-    /// and carries the argument for the split from [`Refused`](Self::Refused): the
-    /// two withhold the value for two different reasons and only one of them is a
-    /// decision anybody made.
-    ///
-    /// The panic's own message is on [`Ended::Observer`], as its `error`. This
-    /// variant carries the name for [`Refused`](Self::Refused)'s reason —
-    /// [`ended`](crate::LocalActor::ended) resolves when the **actor** ends, and a
-    /// panicking observer ends one incarnation.
-    #[error("the {name} observer panicked during this turn: it ran and was not committed")]
-    ObserverPanicked {
-        /// [`Observer::name`].
-        name: &'static str,
-    },
+    /// Every one of them is a fact about a turn: it ran and was refused, it ran
+    /// and panicked, it was answered and the answer was thrown away, or the
+    /// incarnation that owed it died. [`Withheld`] carries what each one means
+    /// and what a caller should do next.
+    #[error("{0}")]
+    Turn(Withheld),
     /// The turn ran and panicked. The actor **survived** it.
     ///
-    /// Distinct from [`Gone`](Self::Gone) on purpose, and the distinction is not
+    /// Distinct from [`Withheld::Gone`] on purpose, and the distinction is not
     /// cosmetic: a caller told `Gone` should stop calling, and a caller told
-    /// `Faulted` has an actor that is still serving the next message. Collapsing
-    /// the two is the inference this variant exists to delete — the loop knows
-    /// which happened and now says so.
+    /// `Faulted` has an actor that is still serving the next message.
+    ///
+    /// It carries the [`Panic`] rather than its message, which is the whole
+    /// reason it is not a [`Withheld`] variant: [`ask`](crate::LocalActor::ask)
+    /// resumes this payload into the calling task, so the panic is forwarded
+    /// rather than described. A peer cannot be handed an unwind and reads
+    /// [`Withheld::Panicked`] instead.
     #[error("{0}")]
     Faulted(Panic),
-    /// A [`QueueTimeout`](crate::QueueTimeout) budget expired while the message
-    /// waited. It **never started**, so the actor is untouched and still running.
-    ///
-    /// Unreachable from a local call today, because a local
-    /// [`Origin`](crate::Origin) carries no [`Queueing`](crate::Queueing) and
-    /// there is nothing to expire. It exists because the state it names is one
-    /// `Answered` already has, and the alternative was reporting it as
-    /// [`Gone`](Self::Gone) — see this enum's own documentation for why that was
-    /// the wrong answer rather than a harmless one.
-    #[error("the queueing budget expired before this turn started: nothing ran")]
-    Expired,
     /// The call was made from inside the target actor's own turn, and would have
     /// deadlocked. **Nothing was queued**, so the actor is untouched.
     ///
-    /// Distinct from [`Gone`](Self::Gone) for that enum's stated reason and this
-    /// one's mirror of it: the actor is not merely still running, it is running
-    /// the turn this call was made from.
-    /// [`Undelivered::Reentrant`](crate::Undelivered::Reentrant) is the same fact
+    /// Outside [`Withheld`] because there is no turn: the refusal happens before
+    /// the message reaches the mailbox, so nothing ran and nothing was withheld.
+    /// The actor is not merely still running, it is running the turn this call was
+    /// made from.
+    ///
+    /// [`Unanswered::Reentrant`](crate::Unanswered::Reentrant) is the same fact
     /// at the doors that ask for a value and resume a fault rather than report it,
     /// and [`NotQueued::Reentrant`](crate::NotQueued::Reentrant) at the doors that
     /// ask only to be queued and so have no reply channel to hear a verdict on.
@@ -740,4 +799,170 @@ pub enum TurnLost {
     /// used.
     #[error("this call was made from inside the target actor's own turn: it would deadlock")]
     Reentrant,
+}
+
+/// Why a call produced no value, on every path that has one.
+///
+/// **One list, carried by three types.** [`TurnLost::Turn`] hands it to an
+/// [`ask_catching`](crate::LocalActor::ask_catching),
+/// [`Unanswered::Turn`](crate::Unanswered::Turn) to an
+/// [`ask`](crate::LocalActor::ask), and
+/// [`RemoteError::Withheld`](crate::RemoteError::Withheld) to a peer. The three
+/// differ in what they add around it — a [`Panic`] payload, nothing, a wire
+/// envelope — and not in what they say about the loss, because the loss is this
+/// value and there is no second copy of it.
+///
+/// A peer used to read these off the front of a
+/// [`RemoteError::Failed`](crate::RemoteError::Failed) string with
+/// `starts_with`, against five prefix constants; a local caller read one of two
+/// flat enums whose `#[error]` texts were kept in step by a test. Both were
+/// spellings of *this list*, written a third and a fourth time.
+///
+/// [`Panicked`](Self::Panicked) is the one variant a local caller does not
+/// normally meet, and the reason is the door rather than an omission:
+/// [`ask`](crate::LocalActor::ask) resumes the [`Panic`] into the calling task
+/// and [`TurnLost::Faulted`] hands the payload itself over. A peer can be handed
+/// neither, so what crosses is the message.
+///
+/// # Exhaustive, and deliberately not `#[non_exhaustive]`
+///
+/// The rule is [`FollowRefused`](crate::FollowRefused)'s, and it has two halves:
+/// an enum whose every caller does the same thing with every variant is sealed,
+/// and an enum a caller must be **made** to look at a new arm of is not. This is
+/// the second kind, and three of its variants say so on their own.
+/// [`Restarting`](Self::Restarting) means retry, [`Gone`](Self::Gone) means stop
+/// calling, and [`Refused`](Self::Refused) means an observer vetoed a turn that
+/// ran. A `_ =>` arm picks one of those three answers for a caller who never
+/// read the fourth.
+///
+/// [`Unanswered`](crate::Unanswered) and [`TurnLost`] resolve the same question
+/// the same way and for the same reason, and they resolve it by carrying this
+/// enum. [`RemoteError`](crate::RemoteError) stays `#[non_exhaustive]` on the
+/// other half of the rule: it is *handled*, not exhausted.
+///
+/// **The ALPN is not the argument, in either direction.** A new variant moves it
+/// whichever attribute this type carries, so a drifted peer is refused at the
+/// handshake in both worlds. The attribute decides only what a peer that *can*
+/// decode a variant is allowed to do with it.
+///
+/// # `Expired` is representable and no path reaches the one producer it has
+///
+/// A local `Origin` holds no `Queueing`, so there is no budget to expire.
+/// Neither is a link, because both are
+/// `#[doc(hidden)]` — rustdoc renders a link to a hidden item as a dead `href`
+/// and `-D warnings` does not see it. `ask_catching` **does** build this variant,
+/// on the arm that reads an expired budget, and that arm is the producer no path
+/// reaches. On the served side a budget *does* expire,
+/// and that
+/// path answers [`RemoteError::TimedOut`](crate::RemoteError::TimedOut), which
+/// carries the millisecond figure this variant has nowhere to put.
+///
+/// It is kept anyway: the state it names is one `Answered` already has, and a
+/// variant written to be *correct* if something reaches it beats a fold into
+/// [`Gone`](Self::Gone) — which is a live actor reported as finished, silently.
+///
+/// **Nothing in the type system says a variant is reachable**, which is how this
+/// one reached zero *reachable* producers without anybody noticing. `turns.rs`'s
+/// `one_vocabulary_and_every_loss_in_it_has_a_producer` is what says so now: it
+/// walks this enum exhaustively and calls the production function that builds
+/// each variant, with this one exempted by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Schema, thiserror::Error)]
+pub enum Withheld {
+    /// The turn ran and panicked. The actor **survived** it and answers the next
+    /// message.
+    ///
+    /// Distinct from [`Gone`](Self::Gone) for [`TurnLost::Faulted`]'s reason: a
+    /// peer told `Gone` should stop calling, and this one has an actor that is
+    /// still serving the connection it asked on.
+    #[error("the turn panicked and the actor kept its state: {message}")]
+    Panicked {
+        /// What the handler panicked with, through `Display`.
+        message: String,
+    },
+    /// An observer refused this turn. It **ran** and was not committed.
+    ///
+    /// The actor is **not** gone: a refusal that did not declare itself fatal
+    /// ends one incarnation and a supervisor starts another.
+    #[error("the {name} observer refused this turn: it ran and was not committed")]
+    Refused {
+        /// [`Observer::name`], owned because a peer's copy is not `'static`.
+        name: String,
+    },
+    /// An observer **panicked** watching this turn. It **ran** and was not
+    /// committed.
+    ///
+    /// Separate from [`Refused`](Self::Refused) because both withhold the value
+    /// and only one of them is a decision anybody made. A caller whose observer
+    /// fell over was told *the {name} observer refused this turn* about an
+    /// observer that decided nothing, until this variant's local ancestor
+    /// existed.
+    #[error("the {name} observer panicked during this turn: it ran and was not committed")]
+    ObserverPanicked {
+        /// [`Observer::name`], owned for [`Refused::name`](Self::Refused::name)'s
+        /// reason.
+        name: String,
+    },
+    /// The actor is serving, and this reply was thrown away unanswered.
+    ///
+    /// A handler took [`Reply::later`](crate::Reply::later) and dropped the
+    /// [`Deferred`](crate::Deferred), or panicked while holding the channel.
+    /// **Distinct from [`Gone`](Self::Gone)**, which is the whole of this
+    /// variant: the actor is still there and answers the next call.
+    #[error("the actor is serving and this reply was never answered")]
+    Dropped,
+    /// The incarnation that owed this answer is gone, and a supervisor is
+    /// starting another. **Retrying is the move.**
+    ///
+    /// Carries the ending as an [`EndReason`] and not an [`Ended`], because an
+    /// [`Ended::Observer`] holds an `Arc<dyn Error + Send + Sync>` and a trait
+    /// object is not data — that type's own documentation carries the argument.
+    ///
+    /// **The sentence renders the ending, and for one wave it did not.** On the
+    /// served path this condition read `"restarting: "` followed by the whole of
+    /// `Ended`'s `Display`, so a peer logging `err.to_string()` learned *why* the
+    /// incarnation died. When the prefix became this variant the `#[error]` text
+    /// named no field, and the same peer got a fixed sentence about an ending the
+    /// value was carrying all along. `{reason}` is what puts it back, through
+    /// [`EndReason`]'s own `Display`.
+    #[error("the incarnation that owed this answer is gone and another is coming: {reason}")]
+    Restarting {
+        /// The ending that caused the restart.
+        ///
+        /// # Four of [`EndReason`]'s shapes cannot appear here
+        ///
+        /// A restart is granted by `turns.rs`'s `retryable`, and it answers
+        /// `false` for [`Ended::Stopped`], [`Ended::Vanished`], [`Ended::GaveUp`]
+        /// and an [`Ended::Observer`] that declared itself fatal. `Lent::ending`
+        /// settles `Standing::Restarting` only behind that call, and it is the
+        /// only producer of that standing — so
+        /// [`Stopped`](EndReason::Stopped), [`Vanished`](EndReason::Vanished),
+        /// [`GaveUp`](EndReason::GaveUp) and
+        /// [`Observer { fatal: true }`](EndReason::Observer) are representable in
+        /// this field and unreachable in it. What is left is a fault, a dead feed,
+        /// and a non-fatal observer veto: the three endings another incarnation
+        /// can be expected to survive.
+        ///
+        /// It is an `EndReason` rather than a narrower type because the narrower
+        /// type would be a second vocabulary for one ending — the cost this whole
+        /// enum exists to refuse — and because `retryable` is a function anybody
+        /// may change. A caller that matches all six arms stays correct the day it
+        /// does.
+        reason: EndReason,
+    },
+    /// The actor is no longer running. **Stop calling.**
+    ///
+    /// There is no next incarnation: the loop is finished, or a supervisor gave
+    /// up, or the actor was aborted or destroyed.
+    #[error("the actor is no longer running")]
+    Gone,
+    /// A [`QueueTimeout`](crate::QueueTimeout) budget expired while the message
+    /// waited. It **never started**, so the actor is untouched and still running.
+    ///
+    /// Has no **reachable** producer, which is narrower than *no producer* and is
+    /// the true claim: `ask_catching` builds it for an expired budget, and no
+    /// local `Origin` carries a budget for that arm to fire on. See this enum's
+    /// own documentation for what reports the expiry on the served side instead,
+    /// and why the variant is kept anyway.
+    #[error("the queueing budget expired before this turn started: nothing ran")]
+    Expired,
 }

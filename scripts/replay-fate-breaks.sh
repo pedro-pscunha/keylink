@@ -123,13 +123,13 @@ run "1 keyed live drop" \
 'a live keyed actor must not be reported as absent: Remote(NoSuchActor { id: "obra/4471" })' \
 keylink/src/actor/remote.rs \
 '        .map(|answered| rendered(answered, budget.map_or(0, Queueing::millis)))
-        .map_err(|_| lost(fate.standing(), actor.as_str()))' \
+        .map_err(|_| lost(fate.standing()))' \
 '        .map(|answered| rendered(answered, budget.map_or(0, Queueing::millis)))
         .map_err(|_| no_such_actor(&actor))' \
   a_live_keyed_actor_does_not_tell_a_peer_no_such_actor -p keylink --test defer
 
 run "2 keyed restart" \
-'round 1: expected restarting: , got Remote(NoSuchActor { id: "desks/4471" })' \
+'round 1: expected restarting, got Remote(Withheld(Gone))' \
 keylink/src/turns.rs \
 '        if retryable(reason) && self.budget.spend(self.started.elapsed()) {
             return Standing::Restarting(Arc::new(reason.clone()));' \
@@ -138,7 +138,7 @@ keylink/src/turns.rs \
   a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor -p keylink --test supervision
 
 run "3 singleton give-up (multi_thread)" \
-'round 2: expected gone, got Remote(Failed("dropped: the actor is serving and this reply was never answered"))' \
+'round 2: expected gone, got Remote(Withheld(Dropped))' \
 keylink/src/turns.rs \
 '        self.close();
         Standing::Gone' \
@@ -206,35 +206,26 @@ keylink/src/actor/registry.rs \
             // Before the second await' \
   an_expired_shutdown_budget_settles_the_served_answer_before_the_abort -p keylink --lib
 
-run "10 a RouteError that begins like a prefix" \
-'a served Failed that is not one of the five must not begin like one: "dropped: " starts "dropped: the actor system is at its capacity of 10 live actors"' \
-keylink/src/actor/registry.rs \
-'`the_capacity_refusal_reads_the_same_by_hand_and_lazily` pins the words.
-    #[error("the actor system is at its capacity of {capacity} live actors")]' \
-'`the_capacity_refusal_reads_the_same_by_hand_and_lazily` pins the words.
-    #[error("dropped: the actor system is at its capacity of {capacity} live actors")]' \
-  no_other_served_failure_begins_with_one_of_the_five -p keylink --lib
-
-run "11 lost live arm -> NoSuchActor" \
-'a live actor must not be reported as absent: Remote(NoSuchActor { id: "Orders" })' \
+run "11 lost live arm -> gone" \
+'a live actor must not be reported as absent: Remote(Withheld(Gone))' \
 keylink/src/turns.rs \
-'        Standing::Running => RemoteError::Failed(format!(
-            "{DROPPED}the actor is serving and this reply was never answered"
-        )),' \
-'        Standing::Running => RemoteError::NoSuchActor { id: id.to_owned() },' \
+'        // the message, and it will answer the next one.
+        Standing::Running => Withheld::Dropped,' \
+'        // the message, and it will answer the next one.
+        Standing::Running => Withheld::Gone,' \
   a_local_caller_and_a_peer_agree_about_an_abandoned_deferred -p keylink --test defer
 
 run "12 lost live arm -> panicked" \
-'a panicking deferred handler loses the reply, and that is what the peer must read: "panicked: bad"' \
+'the actor is alive and this is one lost reply: Remote(Withheld(Panicked { message: "bad" }))' \
 keylink/src/turns.rs \
-'        Standing::Running => RemoteError::Failed(format!(
-            "{DROPPED}the actor is serving and this reply was never answered"
-        )),' \
-'        Standing::Running => RemoteError::Failed(format!("{PANICKED}bad")),' \
+'        // the message, and it will answer the next one.
+        Standing::Running => Withheld::Dropped,' \
+'        // the message, and it will answer the next one.
+        Standing::Running => Withheld::Panicked { message: "bad".to_owned() },' \
   a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer -p keylink --test defer
 
 run "13 default Inbox::ending -> running" \
-'a stopped actor is gone, not merely unanswering: Remote(Failed("dropped: the actor is serving and this reply was never answered"))' \
+'a stopped actor is gone, not merely unanswering: Remote(Withheld(Dropped))' \
 keylink/src/turns.rs \
 '    fn ending(&mut self, _reason: &Ended) -> Standing {
         Standing::Gone
@@ -242,10 +233,10 @@ keylink/src/turns.rs \
 '    fn ending(&mut self, _reason: &Ended) -> Standing {
         Standing::Running
     }' \
-  a_stopped_actor_still_tells_a_peer_no_such_actor -p keylink --test defer
+  a_stopped_actor_still_tells_a_peer_the_actor_is_gone -p keylink --test defer
 
 run "14 the Floor writes running" \
-'an aborted actor is gone, and its own loop will never say so: Remote(Failed("dropped: the actor is serving and this reply was never answered"))' \
+'an aborted actor is gone, and its own loop will never say so: Remote(Withheld(Dropped))' \
 keylink/src/turns.rs \
 '    fn drop(&mut self) {
         if self.armed {
@@ -253,10 +244,10 @@ keylink/src/turns.rs \
 '    fn drop(&mut self) {
         if self.armed {
             self.fate.settle(Standing::Running);' \
-  an_aborted_actor_tells_a_peer_no_such_actor -p keylink --test defer
+  an_aborted_actor_tells_a_peer_the_actor_is_gone -p keylink --test defer
 
 run "15 Mailbox floor running (aborted keyed)" \
-'an aborted keyed actor is gone, and its own loop will never say so: Remote(Failed("dropped: the actor is serving and this reply was never answered"))' \
+'an aborted keyed actor is gone, and its own loop will never say so: Remote(Withheld(Dropped))' \
 keylink/src/actor/registry.rs \
 '    fn drop(&mut self) {
         self.fate.settle(Standing::Gone);
@@ -264,7 +255,7 @@ keylink/src/actor/registry.rs \
 '    fn drop(&mut self) {
         self.fate.settle(Standing::Running);
     }' \
-  an_aborted_keyed_actor_tells_a_peer_no_such_actor -p keylink --test defer
+  an_aborted_keyed_actor_tells_a_peer_the_actor_is_gone -p keylink --test defer
 
 # 16 named a test that DOES NOT EXIST, so it could never redden and exited 0 for it.
 # `cargo test` with a filter matching nothing prints `0 passed; N filtered out` and
@@ -291,17 +282,8 @@ keylink/src/actor/registry.rs \
 '            fate.settle(Standing::Running);' \
   an_expired_shutdown_budget_settles_the_served_answer_before_the_abort -p keylink --lib
 
-run "17 the DROPPED prefix moves" \
-'left: "lost: "' \
-keylink/src/reply.rs \
-'/// the actor.
-    pub const DROPPED: &'"'"'static str = "dropped: ";' \
-'/// the actor.
-    pub const DROPPED: &'"'"'static str = "lost: ";' \
-  the_five_prefixes_are_the_text_a_peer_matches_on -p keylink --lib
-
 run "18 supervise has no floor (factory panic)" \
-'a peer whose actor died in its own factory must not be told it is serving: Remote(Failed("dropped: the actor is serving and this reply was never answered"))' \
+'a peer whose actor died in its own factory must not be told it is serving: Remote(Withheld(Dropped))' \
 keylink/src/turns.rs \
 '    let mut floor = Floor::armed(fate);
     let mut budget = Budget::new(limit);' \
@@ -311,7 +293,7 @@ keylink/src/turns.rs \
   a_peer_whose_factory_panicked_is_told_the_actor_is_gone -p keylink --test supervision
 
 run "19 run_loop has no floor (feed panic)" \
-'a peer whose actor died in its own feed must not be told it is serving: Remote(Failed("dropped: the actor is serving and this reply was never answered"))' \
+'a peer whose actor died in its own feed must not be told it is serving: Remote(Withheld(Dropped))' \
 keylink/src/turns.rs \
 '    let mut floor = Floor::armed(fate);
     let mut reason = Ended::Stopped;' \
@@ -320,12 +302,12 @@ keylink/src/turns.rs \
     let mut reason = Ended::Stopped;' \
   a_peer_whose_feed_panicked_is_told_the_actor_is_gone -p keylink --test supervision
 
-run "20 gone becomes a Failed" \
-'left: Failed("dropped: id")' \
+run "20 gone becomes dropped" \
+'left: Withheld(Dropped)' \
 keylink/src/turns.rs \
-'        Standing::Gone => RemoteError::NoSuchActor { id: id.to_owned() },' \
-'        Standing::Gone => RemoteError::Failed(format!("{DROPPED}{id}")),' \
-  the_gone_answer_is_not_a_failed_and_carries_no_prefix -p keylink --lib
+'        Standing::Gone => Withheld::Gone,' \
+'        Standing::Gone => Withheld::Dropped,' \
+  the_gone_answer_says_the_actor_ran_and_stopped_rather_than_naming_an_id -p keylink --lib
 
 run "21 no floor between incarnations (N1)" \
 'an actor destroyed between incarnations is gone, not restarting: Restarting(Panicked { message: "this incarnation is over" })' \

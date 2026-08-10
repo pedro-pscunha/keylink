@@ -283,9 +283,17 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 #
 # Deriving it would mean parsing prose for "replacing `X` with `Y` in `path`",
 # and a heuristic that misses a record checks nothing while reporting success.
-# So the list is explicit, exactly as `turns.rs`'s
-# `no_failure_prefix_is_a_prefix_of_another` spells out its four prefixes and
-# says a fifth has to be added by hand.
+# So the list is explicit, exactly as `turns.rs` once spelled out its `Failed`
+# prefixes by hand and said a new one had to be added to that list the same way.
+# The test then called `no_failure_prefix_is_a_prefix_of_another` was DELETED in
+# the wave that replaced the prefixes with a typed `Withheld` on the wire - there
+# are no prefixes left for it to compare against each other. It is named here as
+# the precedent it was, and deliberately NOT re-pointed at a surviving test:
+# nothing in the tree now makes this argument, and swapping in a live name would
+# turn a historical citation into a false current one.
+#
+# The argument it lent is untouched. A derived list that misses an entry checks
+# nothing while reporting success, which is why this one is written out.
 #
 # **The honest limitation, and it is larger than it sounds: this checks the
 # records REGISTERED below, not the records that exist.** A sweep of every
@@ -1049,9 +1057,15 @@ ANCHORS = [
     # two sizes - each reddens a test the other leaves green, measured both ways.
     ("D15", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "                grown.extend(outer.iter().cloned());"),
-    # ── from the `reply-not-gone` branch, where `Undelivered` went from *the actor
-    # is gone* to six variants and `answered` started reading `Fate` to choose
-    # between three of them. `E` for items E+F, on `D`'s reasoning: a fresh letter
+    # ── from the `reply-not-gone` branch, where the type THEN CALLED `Undelivered`
+    # went from *the actor is gone* to six variants and `answered` started reading
+    # `Fate` to choose between three of them. Both halves are that branch's and
+    # neither describes today: it is `Unanswered` now, renamed in the wave that put
+    # a typed `Withheld` on the wire, and that same wave collapsed it to two
+    # variants - `Turn(Withheld)` and `Reentrant` - because the list of losses it
+    # used to spell inline moved into `Withheld`, whose width `every_withheld`
+    # carries in its own return type. Read the era, not the number.
+    # `E` for items E+F, on `D`'s reasoning: a fresh letter
     # cannot collide with a reserved numeric gap by arithmetic.
     #
     # ALL FOUR cross-file, so each record's own quote lives in a `tests/*.rs` file
@@ -1071,18 +1085,29 @@ ANCHORS = [
     # line. Same-file collision arriving from the TARGET's side, which is the mode
     # `P1`'s note names. `flat()` collapses the indentation before comparing, so the
     # records may go on quoting the bare form and this row still finds it.
+    # **Both dropped from sixteen spaces to eight, and the reason is the same edit
+    # that made W1 shorter.** The arm they quote lived in `answered` AND in `lost`,
+    # once each, and it is now `withheld_for`'s only copy - so the bare form's count
+    # went 3 -> 2 (the arm, plus `turns.rs`'s own `///` quote of it) and the
+    # eight-space form is the unique one. Measured on this tree, after `cargo fmt`.
     ("E1", "keylink/tests/defer.rs", "keylink/src/turns.rs",
-     "            Standing::Running => TurnLost::Dropped,"),
+     "        Standing::Running => Withheld::Dropped,"),
     ("E2", "keylink/tests/defer.rs", "keylink/src/turns.rs",
-     "            Standing::Running => TurnLost::Dropped,"),
+     "        Standing::Running => Withheld::Dropped,"),
     # E3 and E4 are the other two arms the split created, one per enum. The pairing
     # record's OTHER break - `lost`'s whole three-line `Standing::Running` arm - has
     # no row here and needs none: that record quotes its REPLACEMENT and describes
     # its search, so there is no literal for a row to check.
+    # E3 followed E1 and E2 out of `answered` and into `withheld_for`, and its whole
+    # three-line block moved with it - so the block is re-quoted at the extracted
+    # indentation. The bare block now counts 1 either way; the indented form is kept
+    # because it is what a reader hands the harness.
     ("E3", "keylink/tests/supervision.rs", "keylink/src/turns.rs",
-     "            Standing::Restarting(reason) => TurnLost::Restarting(reason),"),
+     "        Standing::Restarting(reason) => Withheld::Restarting {\n"
+     "            reason: EndReason::from(&*reason),\n"
+     "        },"),
     ("E4", "keylink/tests/observe.rs", "keylink/src/turns.rs",
-     "            Err(TurnLost::Refused { name }) => Err(Undelivered::Refused { name }),"),
+     "            Err(TurnLost::Turn(withheld)) => Err(Unanswered::Turn(withheld)),"),
     # F1 is the first row whose TARGET is `macros.rs`, and that is the point rather
     # than an accident. `supervised_deep` is a generated door with no caller in the
     # tree, and `Handle`'s `inner` field carries no `pub`, so it is also the only
@@ -1718,13 +1743,42 @@ ANCHORS = [
     # 1's reason. `O4`'s bare line occurs twice in `turns.rs`, so its record says out
     # loud to pass the indentation; the registered literal carries it.
     ("O1", "keylink/tests/observe.rs", "keylink/src/turns.rs",
-     "        (Ok(_), Some(Withheld::Panicked { name })) => Answered::ObserverPanicked { name },\n"),
+     "        (Ok(_), Some(ObserverVerdict::Panicked { name })) => Answered::ObserverPanicked { name },\n"),
     ("O2", "keylink/tests/singleton.rs", "keylink/src/turns.rs",
-     '            Outcome::Err(RemoteError::Failed(format!("{OBSERVER_PANICKED}{name}"))),\n'),
+     "            Outcome::Err(RemoteError::Withheld(Withheld::ObserverPanicked {"),
     ("O3", "keylink/src/turns.rs", "keylink/src/turns.rs",
      "            Verdict::ObserverPanicked { name } => reply.answer(Answered::ObserverPanicked { name }),\n"),
     ("O4", "keylink/src/turns.rs", "keylink/src/turns.rs",
      "            Ok(()) | Err(NotQueued::Closed) => {}\n"),
+    # The three below are this wave's collapse onto one `Withheld`. All three
+    # edit `turns.rs` from a record that also lives in `turns.rs`, so none of
+    # the records quotes its own search literal — the indentation here is what
+    # keeps each unique, and a record that quoted it would abort the harness at
+    # "found 2".
+    # **W1 lost its `\n    })` tail, and the tail is what the extraction paid for.**
+    # The literal carried the function's closing braces because the same arm text sat
+    # inside `answered` one indent deeper and a bare quote counted 2. There is one
+    # copy now - `withheld_for`'s - so eight spaces are enough, and the anchor no
+    # longer spans a brace the next refactor moves.
+    ("W1", "keylink/src/turns.rs", "keylink/src/turns.rs",
+     "        Standing::Gone => Withheld::Gone,"),
+    ("W2", "keylink/src/turns.rs", "keylink/src/turns.rs",
+     "            Withheld::Gone => from_lost(Standing::Gone),"),
+    ("W3", "keylink/src/turns.rs", "keylink/src/turns.rs",
+     "            Withheld::Dropped,"),
+    # W4 and W5 are the two guards this wave's merge-gate findings added. W4 is the
+    # send-side answer a race used to decide - `NoSuchActor` or `Withheld::Gone`,
+    # depending on whether the mailbox closed before or after the send won a permit.
+    # W5 is the rule that `RemoteError::Failed` means a layer somebody wrote, held by
+    # walking both served doors. W6 is property 7 of the vocabulary guard: the sample
+    # is compared against the variant list `#[derive(Schema)]` writes, so an eighth
+    # loss cannot be walked past.
+    ("W4", "keylink/tests/singleton.rs", "keylink/src/turns.rs",
+     "Outcome::Err(RemoteError::Withheld(Withheld::Gone)),"),
+    ("W5", "keylink/src/turns.rs", "keylink/src/turns.rs",
+     "    RemoteError::Withheld(withheld_for(standing))"),
+    ("W6", "keylink/src/turns.rs", "keylink/src/turns.rs",
+     "            Withheld::Expired,"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -2449,11 +2503,18 @@ for record in sorted((FRAGMENT_ANCHORS & resolved) - fragments):
 # rebase that correctly re-quotes a record and forgets this list leaves the gate
 # validating a string no record uses - green.
 #
-# `turns.rs`'s `no_failure_prefix_is_a_prefix_of_another` is NOT the precedent for
-# a hand-written list of copies. Its own comment says it "names the consts rather
-# than the strings, so it cannot drift from the wire" - hand-written *references*
-# to one source of truth. A doc comment cannot be referenced from Python, so the
-# copy is unavoidable here; what was avoidable is leaving it unchecked.
+# The test then called `no_failure_prefix_is_a_prefix_of_another` was NOT the
+# precedent for a hand-written list of copies. Its own comment said it "names the
+# consts rather than the strings, so it cannot drift from the wire" - hand-written
+# *references* to one source of truth. A doc comment cannot be referenced from
+# Python, so the copy is unavoidable here; what was avoidable is leaving it
+# unchecked.
+#
+# That test was DELETED with the prefixes it guarded, in the wave that put a typed
+# `Withheld` on the wire. The distinction it illustrates - a reference cannot
+# drift, a copy can - is why this list is checked, and it outlives the example.
+# No surviving test is substituted for it here, for the reason given at the top of
+# this file: a live name in place of a dead one reads as a current claim.
 #
 # ── the haystack is BACKTICKED SPANS IN COMMENTS, and both narrowings were bugs
 #
@@ -3236,7 +3297,25 @@ for record in sorted(set(REDNESS) - row_ids):
 # 171 entries above both give. It is worth recording only because the two branches
 # that fed it moved the number for unrelated causes, so the arithmetic agreeing is
 # a coincidence over a merge rather than over one wave.
-RECORD_BLOCKS = 177
+#
+# **177 -> 174, and this is the first entry here where records were DELETED rather
+# than added.** The prefix machinery went: five `RemoteError` consts, and with them
+# the three guards that were the only things asserting anything about the consts —
+# `reply::the_five_prefixes_are_the_text_a_peer_matches_on`,
+# `turns::no_failure_prefix_is_a_prefix_of_another` and
+# `remote::no_other_served_failure_begins_with_one_of_the_five`. Each carried one
+# record, and a record whose substitution edits a deleted const cannot express a
+# defect.
+#
+# **No row moved with them, and that was checked rather than assumed.** The only
+# rows naming either file are `P1`/`P2`, which anchor `    drop(route);` in
+# `actor/remote.rs` and whose records live in `tests/defer.rs` — both untouched. So
+# `CONTRIBUTING.md`'s rule against deleting a row to reach green never came up
+# here; there was no row to delete.
+#
+# 174 was READ off the failing run, not computed. The subtraction agrees, and by
+# this ledger's own standard that agreement establishes nothing.
+RECORD_BLOCKS = 176
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

@@ -24,7 +24,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{IdempotencyKey, KeyState};
+use crate::{FollowRefused, IdempotencyKey, KeyState, Withheld};
 
 /// Why the serving side refused a call.
 ///
@@ -51,6 +51,22 @@ use crate::{IdempotencyKey, KeyState};
 /// for every service, singletons included**, and it is meant to be: a peer built
 /// against the old numbering would decode `Failed("disk full")` as a variant
 /// that no longer exists. Refusing it at the handshake is the correct outcome.
+///
+/// # Four variants were appended, and the append is the point
+///
+/// [`Withheld`](Self::Withheld), [`AtCapacity`](Self::AtCapacity),
+/// [`BadActorId`](Self::BadActorId) and [`FollowRefused`](Self::FollowRefused)
+/// went on the **end**. An append and an insert move the hash equally — this
+/// enum is in every service's contract, for the reason above — so the handshake
+/// refuses a drifted peer either way and that is not what separates them. What
+/// separates them is that an insert renumbers every variant after it, so the
+/// wire meaning of code the two sides already agreed on changes underneath them,
+/// and the failure is a misdecode rather than a refusal. An append leaves those
+/// indices exactly where they were.
+///
+/// Nothing produces the four yet: they are the vocabulary the served paths move
+/// onto next, and the move is a separate commit from the one that pays the ALPN
+/// for it.
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, postcard_schema::Schema, thiserror::Error,
 )]
@@ -84,12 +100,14 @@ pub enum RemoteError {
     /// variant claims.** A call that reached a live actor and lost its answer is
     /// not one of them: a handler may take a `#[defer]`red reply out of its turn
     /// and drop it, which answers nobody while the actor goes on serving the
-    /// same connection. That reads as [`Failed`](Self::Failed) under a
-    /// `"dropped: "` prefix instead, because a peer told `NoSuchActor` is being
-    /// told to stop asking and it would be false.
+    /// same connection. That reads as
+    /// [`Withheld(Withheld::Dropped)`](Self::Withheld) instead, because a peer
+    /// told `NoSuchActor` is being told to stop asking and it would be false.
+    /// It read [`Failed`](Self::Failed) under a `"dropped: "` prefix until
+    /// `5198ecb` replaced the five prefixes with the variant.
     ///
     /// **On both served paths**, which this sentence could not say for one wave:
-    /// `turns.rs`'s `deliver_to_local` separated the causes and
+    /// `turns.rs`'s `deliver_to_singleton` separated the causes and
     /// `actor/remote.rs`'s `deliver_to_actor` rendered all of them as this
     /// variant, so the paragraph above was a promise a keyed actor did not keep.
     /// The two render through `turns.rs`'s `lost` now, off a verdict each actor's
@@ -100,110 +118,96 @@ pub enum RemoteError {
         id: String,
     },
 
-    /// Anything else the serving side wants to report.
+    /// Anything the serving side wants to report that this enum has no variant
+    /// for.
     ///
-    /// The `String` is a **discriminator** and not only a message on the served
-    /// paths keylink writes: see the prefix constants on this type.
+    /// # It means a layer somebody wrote, and keylink builds exactly one
+    ///
+    /// Every refusal keylink itself produces has a variant here — a withheld
+    /// turn, a timeout, an idempotency refusal, a capacity refusal, a malformed
+    /// id. So a peer reading a `Failed` is reading a sentence written **in its own
+    /// deployment**, by a layer that answered `Outcome::Err(RemoteError::Failed(..))`
+    /// or by a handler that returned one. That is what makes the `String` useful
+    /// to that peer and useless to this crate: it is not a discriminator, and
+    /// nothing in keylink matches on it.
+    ///
+    /// **The one in-crate exception is named here rather than left in a comment
+    /// four thousand lines away**, which is where it lived and where no reader of
+    /// this variant would meet it: `turns.rs`'s `deliver_to_singleton` answers a
+    /// `Failed` on its `NotQueued::Reentrant` arm, carrying
+    /// [`Unanswered`](crate::Unanswered)'s own sentence. A peer cannot produce a
+    /// re-entrant call — its request arrives on a connection's task, which has run
+    /// no turn — so that arm is written to be right rather than to fire.
+    /// `turns.rs`'s `neither_served_door_answers_a_failed` holds the rest of the
+    /// boundary: nothing `rendered` or `lost` answers is one of these.
+    ///
+    /// The `String` **was** a discriminator that keylink wrote and a peer read off
+    /// the front with `starts_with`, against five prefix constants on this type.
+    /// The losses it discriminated are [`Withheld`](Self::Withheld) variants now,
+    /// and the constants are deleted.
     #[error("{0}")]
     Failed(String),
-}
 
-/// The prefixes [`RemoteError::Failed`] carries on keylink's own served paths.
-///
-/// **Public because a peer has to match on them, and could not name them.** The
-/// four were `const`s private to `turns.rs` for four waves, documented as a
-/// contract in four rustdocs, while every caller in and out of this repository
-/// hard-coded `why.starts_with("dropped: ")`. A contract nobody can name by
-/// symbol is a string literal with a paragraph next to it.
-///
-/// Exporting them costs no ALPN move, and that is worth being exact about: they
-/// are **not** part of the hashed contract. `Envelope<WireResponse<Response>>`
-/// reaches `Outcome::Err(RemoteError)`, and `postcard_schema` hashes the enum's
-/// variants and fields. Associated constants are not either, so
-/// `keylink/tests/protocol.rs`'s two pins are unmoved by this — checked, not
-/// assumed.
-///
-/// # The property, and exactly what it is a property OF
-///
-/// **No one of these five is a prefix of another**, in either direction, so a
-/// peer matching with `starts_with` is never ambiguous.
-/// `turns::tests::no_failure_prefix_is_a_prefix_of_another` holds it, and a sixth
-/// has to be added to that list by hand.
-///
-/// [`OBSERVER_PANICKED`](Self::OBSERVER_PANICKED) is the fifth and it is the one
-/// worth checking a new prefix against: it neither begins with nor is begun by
-/// [`PANICKED`](Self::PANICKED), which shares its verb, and the guard is what says
-/// so rather than the eye.
-///
-/// The claim used to read *"every prefix a `RemoteError::Failed` carries on the
-/// served path"*, and that was false. keylink builds a `Failed` from at least
-/// three other places whose text is a whole sentence rather than one of these:
-/// the registry's capacity refusal, an [`ActorId`](crate::ActorId) a peer sent
-/// that fails validation, and a console subscription refusal. None of them
-/// collides today, and the same guard checks that too — but the claim these
-/// constants can carry is the narrow one: **every prefix `rendered` and `lost`
-/// build.** A `Failed` whose text came from a caller's own
-/// [`Middleware`](crate::Middleware) is outside any guard here and always will
-/// be.
-impl RemoteError {
-    /// Your message exploded and the actor kept its state.
+    /// The call reached an actor and got no value back, and this is which loss
+    /// it was.
     ///
-    /// The turn panicked, the panic was caught rather than unwound into a
-    /// connection task, and the actor is still serving. Followed by the panic's
-    /// own message, which is usually caller-derived.
-    pub const PANICKED: &'static str = "panicked: ";
+    /// [`Withheld`] is the same vocabulary
+    /// [`Unanswered`](crate::Unanswered) and [`TurnLost`](crate::TurnLost) give a
+    /// local caller. It is a variant here so that a peer **matches** the loss
+    /// instead of reading it off the front of a [`Failed`](Self::Failed) string
+    /// with `starts_with`, which is what the five prefix constants this type used
+    /// to carry asked a peer to do.
+    #[error("{0}")]
+    Withheld(Withheld),
 
-    /// The turn ran and was not committed.
+    /// The system is at its cap of live actors and would not build another.
     ///
-    /// An [`Observer`](crate::Observer) refused it — a durability adapter that
-    /// could not write, most often — so the actor is ending for a reason worth
-    /// telling the peer apart from a fault. Followed by the observer's name.
-    pub const REFUSED: &'static str = "observer refused: ";
+    /// Retryable in the only sense that matters: the cap is a *live* count, so
+    /// an eviction or a shutdown clears it. `SystemBuilder::capacity` sets it.
+    #[error("the actor system is at its capacity of {capacity} live actors")]
+    AtCapacity {
+        /// The cap that was met.
+        ///
+        /// `u64` and not `usize` for [`NodeStatus::actors`](crate::NodeStatus)'
+        /// reason: `usize` has no wire schema at all, because its width is the
+        /// compiler's choice and a browser's is not the server's.
+        capacity: u64,
+    },
 
-    /// An observer **panicked** watching the turn, which ran and was not
-    /// committed.
+    /// The peer addressed something that is not a valid
+    /// [`ActorId`](crate::ActorId).
     ///
-    /// Distinct from [`REFUSED`](Self::REFUSED) because a veto is a decision an
-    /// author wrote down and a panic is the absence of one, and distinct from
-    /// [`PANICKED`](Self::PANICKED) because that one is the **handler**: your
-    /// message exploded, and the actor kept its state. Followed by the observer's
-    /// name.
+    /// Refused before any lookup, so it says nothing about what is mounted —
+    /// unlike [`NoSuchActor`](Self::NoSuchActor), which is an answer about a
+    /// well-formed id.
     ///
-    /// **A prefix and not a fifth [`RemoteError`] variant.** A variant sits inside
-    /// the hashed contract and would move every service's ALPN; a prefix is
-    /// content inside `Failed(String)` and moves nothing. RFC-06 §6 refuses the
-    /// variant route on exactly this ground.
+    /// # Why `reason` is a field rather than a sentence
     ///
-    /// A peer has no [`ended`](crate::LocalActor::ended) to fall back on, so this
-    /// prefix is the whole of what it learns. Before it existed, a peer read
-    /// [`REFUSED`](Self::REFUSED) for both — the worst-informed audience, given
-    /// the same false word.
-    pub const OBSERVER_PANICKED: &'static str = "observer panicked: ";
+    /// The `Failed` this replaces rendered `ActorId::validate`'s own error,
+    /// which is `Error::Invalid { kind, reason }` — so a peer learned *why* the
+    /// id was refused, not merely that it was. Carrying only the id would have
+    /// told a peer to fix something without saying what, which is the loss this
+    /// whole vocabulary exists to stop. It is a separate field rather than
+    /// baked into the id so a caller can match on the id and log the reason.
+    #[error("{id} is not a valid actor id: {reason}")]
+    BadActorId {
+        /// The id as the peer sent it.
+        id: String,
+        /// Why `validate` refused it — length, character set, or shape.
+        ///
+        /// Rendered from [`ActorId::validate`](crate::ActorId::validate)'s
+        /// error, so the sentence a peer reads is the one the crate uses
+        /// locally rather than a second wording of the same rule.
+        reason: String,
+    },
 
-    /// The incarnation that owed you an answer is gone, and another is coming.
+    /// A console's [`Follow`](crate::inspect::Client::follow) was answered
+    /// rather than parked.
     ///
-    /// **Retry.** A supervised actor's state is dropped when an incarnation
-    /// ends, and a reply parked in that state dies with it; the supervisor had
-    /// already granted the restart when this was written. Followed by the ending
-    /// that caused it.
-    pub const RESTARTING: &'static str = "restarting: ";
-
-    /// The actor is serving, and this one reply was never answered.
-    ///
-    /// **Do not retry blindly, and do not give up on the actor**: it is mounted,
-    /// it took the message, and it will answer the next one. A handler took
-    /// `reply.later()` and dropped the `Deferred` — sanctioned, and what that
-    /// type's `#[must_use]` asks for — or panicked after taking it.
-    ///
-    /// The sentence after it deliberately does **not** name a cause, and it took
-    /// two attempts to stop naming one. Three producers reach it: the sanctioned
-    /// drop above, a handler that panicked *after* `reply.later()`, and a handler
-    /// that panicked **before** consuming the channel — where what died is the
-    /// `Reply` itself, inside the turn, never a `Deferred`. "The reply was taken
-    /// out of the turn" described only the first; "the reply left its turn" was
-    /// the same claim reworded, and false of the third. What all three share is
-    /// the actor.
-    pub const DROPPED: &'static str = "dropped: ";
+    /// [`FollowRefused`] carries which of the two reasons
+    /// it was and the number to resume from.
+    #[error("{0}")]
+    FollowRefused(FollowRefused),
 }
 
 /// The reply as it appears on the wire: a value, or a refusal.
@@ -305,35 +309,5 @@ mod tests {
     fn a_refusal_reports_itself_as_an_error() {
         let refused: Outcome<u64> = RemoteError::Unauthorized("write".into()).into();
         assert!(refused.is_err());
-    }
-
-    /// **The five prefixes are bytes on a wire, so their values are pinned like
-    /// bytes on a wire.**
-    ///
-    /// They are public now, which is what makes this necessary rather than
-    /// pedantic: every other assertion in this repository can name the constant
-    /// and would go on passing if the constant's *value* changed, and so would
-    /// every downstream `starts_with`. Nothing else anywhere pins the text a peer
-    /// actually matches on. This does, in the register `tests/protocol.rs` uses
-    /// for an ALPN: a literal that must not move quietly.
-    ///
-    /// It does **not** claim the five may never change. It claims a change is a
-    /// deliberate act with a compatibility argument attached, exactly like a
-    /// hash pin — and unlike an ALPN, moving one of these refuses nothing at the
-    /// handshake, so an old peer meets it as a `Failed` it silently stops
-    /// recognising. That is the more dangerous kind of break and the reason this
-    /// is here.
-    ///
-    /// Made red by `scripts/break-once.sh keylink/src/reply.rs` on
-    /// `pub const DROPPED: &'static str = "dropped: ";` →
-    /// `pub const DROPPED: &'static str = "lost: ";`. Watched: `left: "lost: "`,
-    /// `right: "dropped: "`.
-    #[test]
-    fn the_five_prefixes_are_the_text_a_peer_matches_on() {
-        assert_eq!(RemoteError::PANICKED, "panicked: ");
-        assert_eq!(RemoteError::REFUSED, "observer refused: ");
-        assert_eq!(RemoteError::OBSERVER_PANICKED, "observer panicked: ");
-        assert_eq!(RemoteError::RESTARTING, "restarting: ");
-        assert_eq!(RemoteError::DROPPED, "dropped: ");
     }
 }

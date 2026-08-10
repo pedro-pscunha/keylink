@@ -140,7 +140,7 @@ of behind a `Mutex`:
 
 ```rust
 let warehouse = inventory::actor(Warehouse::seeded());  // in this process
-warehouse.reserve("ADU-014".into(), 2).await?;          // Err = Undelivered
+warehouse.reserve("ADU-014".into(), 2).await?;          // Err = Unanswered
 
 let server = warehouse.serve(&node, allow)?;            // and to other machines
 ```
@@ -181,19 +181,21 @@ match ledger.ended().await {
 ```
 
 Returning `Err` ends the actor. The refused caller is told
-`Undelivered::Refused { name }`, so it learns which observer without a second
-lookup, and `ended()` adds that observer's own error — `Undelivered::Gone` means
-"gone" and must not be stretched to mean "gave up on durability". A refused turn
-reaches a peer as `Failed("observer refused: ..")`
-rather than `NoSuchActor`, which would say "there is nothing here, stop asking"
-about a turn that ran.
+`Unanswered::Turn(Withheld::Refused { name })`, so it learns which observer
+without a second lookup, and `ended()` adds that observer's own error —
+`Withheld::Gone` means "gone" and must not be stretched to mean "gave up on
+durability". A refused turn reaches a peer as
+`RemoteError::Withheld(Withheld::Refused { name })` rather than `NoSuchActor`,
+which would say "there is nothing here, stop asking" about a turn that ran. The
+peer decodes the same `Withheld` the local caller matches on, rather than reading
+a prefix off the front of a string.
 
 **An observer that panics is a third answer and not that one.** The value is
 withheld either way — a veto says "do not commit", a crash says nobody read back
-whether it committed — but the caller is told
-`Undelivered::ObserverPanicked { name }`, and a peer reads
-`Failed("observer panicked: ..")`. Reporting a crash as a refusal named a decision
-nobody made.
+whether it committed — but both are told
+`Withheld::ObserverPanicked { name }`, which is a variant of its own and not a
+shade of the one above it. Reporting a crash as a refusal named a decision nobody
+made.
 
 The actor owns its observers, so nothing is shared and no `Sync` bound appears
 anywhere. `after_turn` returns a boxed future rather than being an `async fn`,

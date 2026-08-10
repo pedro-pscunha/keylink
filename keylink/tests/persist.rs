@@ -466,7 +466,7 @@ async fn a_refusal_before_persist_prevents_the_store() {
 ///
 /// # Over two real nodes, because the promise is a peer's
 ///
-/// A local caller is told `Undelivered::Refused { name: "persist" }` and has to
+/// A local caller is told `Withheld::Refused { name: "persist" }` and has to
 /// go to `ended()` for the observer's own error. A **peer** is told
 /// `observer refused: persist`, produced by `turns.rs` under a comment reading
 /// *"The turn ran and was not committed"*, and that sentence is the whole of
@@ -504,8 +504,13 @@ async fn a_turn_whose_store_failed_is_not_written_on_the_way_out() {
         .await
         .expect_err("a store that failed refuses its turn");
     assert!(
-        refused.to_string().contains("observer refused: persist"),
-        "the promise the peer acts on: got {refused}"
+        matches!(
+            &refused,
+            keylink::Error::Remote(keylink::RemoteError::Withheld(
+                keylink::Withheld::Refused { name }
+            )) if name == "persist"
+        ),
+        "the promise the peer acts on: got {refused:?}"
     );
 
     // `ended()` resolving means `run_loop` ran every observer's `finish` and
@@ -728,7 +733,7 @@ keylink::service! {
 ///
 /// `waiting` is **not** part of the snapshot and cannot be: a [`Deferred`] is a
 /// live channel to a caller in this process. A restart answers nothing — the loop
-/// drains parked replies as `TurnLost::Restarting` on the way out, so the callers
+/// drains parked replies as `Withheld::Restarting` on the way out, so the callers
 /// are told to retry rather than handed a value — which is a second reason a
 /// parked reply and a durable state need thinking about together.
 #[derive(Default)]
@@ -827,8 +832,8 @@ async fn waiting_for(vault: &teller::Handle<Vault>, want: u64) {
 /// refusal rather than a receipt, and the balance on the disk is still 100, so
 /// there is no receipt anywhere for a debit that is not stored.
 ///
-/// A `Handle` answers `Undelivered::Refused { name: "persist" }` here, and the
-/// `TurnLost::Refused { name: "persist" }` it is mapped from — one variant per
+/// A `Handle` answers `Withheld::Refused { name: "persist" }` here, through both
+/// doors, because the two carry one value now — one variant per
 /// state, so the two spellings carry the same name — is asserted in
 /// `turns.rs::a_released_reply_is_refused_with_the_turn_that_released_it`.
 ///
@@ -907,7 +912,7 @@ async fn a_deferred_reply_whose_turn_was_not_stored_is_refused() {
 /// Made red by `scripts/break-once.sh keylink/src/turns.rs` on `Deferred::send`'s
 /// `Verdict::Committed => reply.answer(Answered::Ran(value)),` →
 /// `Verdict::Committed => drop(value),`. Watched: `the receipt reaches its
-/// caller when the turn commits: Undelivered`.
+/// caller when the turn commits: Dropped`.
 #[tokio::test]
 async fn a_deferred_reply_that_is_answered_is_a_stored_reply() {
     let store = Flaky::new();

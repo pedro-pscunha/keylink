@@ -283,7 +283,7 @@ async fn the_actor_list_reaches_a_peer_with_every_field_intact() {
     );
     assert_eq!(node.actors, 3);
     assert_eq!(
-        node.lost, 0,
+        node.dropped, 0,
         "a 256-deep channel does not drop four events, so a non-zero here is a \
          defect in the sink rather than a shallow test"
     );
@@ -578,7 +578,7 @@ async fn a_parked_subscriber_does_not_stop_the_actor_serving_turns() {
 /// only ever describe events the log accepted; an event dropped by
 /// `Events::record`'s `try_send` never gets a sequence number at all, and so was
 /// invisible to it by construction. The only place it surfaced was
-/// `NodeStatus::lost` — a different RPC, which the loop this crate's own
+/// `NodeStatus::dropped` — a different RPC, which the loop this crate's own
 /// documentation tells a reader to write never calls.
 ///
 /// A one-deep sink and a paused inspector is how that burst is made on purpose:
@@ -587,8 +587,13 @@ async fn a_parked_subscriber_does_not_stop_the_actor_serving_turns() {
 ///
 /// Red-tested by removing `dropped` from `EventPage` — which is a compile error
 /// at four sites rather than a red test, so the watched break is
-/// `dropped: self.dropped.load(Ordering::Relaxed)` replaced with `dropped: 0`.
-/// It then fails on `the page must report what the sink threw away`.
+/// `dropped: self.dropped.load(Ordering::Relaxed)` **in `page_after`** replaced
+/// with `dropped: 0`. It then fails on `the page must report what the sink threw
+/// away`.
+///
+/// That line alone resolves **twice** now: `NodeStatus::dropped` is written
+/// identically in `node()` one function away, since the field it fills stopped
+/// being called `lost`. Search it together with the `events,` that follows it.
 #[tokio::test]
 async fn a_page_reports_the_events_the_sink_dropped_before_they_were_sequenced() {
     let serving = local_node().await;
@@ -632,7 +637,7 @@ async fn a_page_reports_the_events_the_sink_dropped_before_they_were_sequenced()
         page.dropped,
         events.lost(),
         "the page must report what the sink threw away, and it is the same \
-         reading `NodeStatus::lost` gives"
+         reading `NodeStatus::dropped` gives"
     );
     assert!(
         page.dropped > 0 && page.events.len() < 16,

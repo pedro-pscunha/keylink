@@ -1274,3 +1274,65 @@ a claim.
 the third and asserts it against **both** neighbours rather than only its own
 text — `observer refused: `, which this case was folded into, and `panicked: `,
 which shares the verb and means the handler.
+
+---
+
+## Appendix, 2026-08-09: there are no wire prefixes now, and `EndReason` left the console
+
+Appended, and **nothing above is edited.** Wave 1 deleted the five `Failed(String)`
+prefixes and put a typed `Withheld` on the wire. Every prefix this file argues
+about is gone as a *string*; each argument's **conclusion** survives as a variant,
+which is why the sections stay and this ledger is the correction.
+
+| was | is | at |
+| --- | --- | --- |
+| `Withheld`, the private observer verdict in `turns.rs` | `ObserverVerdict` — the public `Withheld` took the word | `ec242c2` |
+| `EndReason`, defined in `console.rs` | moved beside the type it projects, in `observe.rs` | `c165009` |
+| `Undelivered` | `Unanswered` | `8acd7be` |
+| `deliver_to_local` | `deliver_to_singleton` | `80098e4` |
+| `NodeStatus::lost` | `NodeStatus::dropped` | `0c6e6c3` |
+| `Failed("observer refused: {name}")` | `Withheld::Refused { name }` | `0c6e6c3`, `5198ecb` |
+| `Failed("observer panicked: {name}")` | `Withheld::ObserverPanicked { name }` | `0c6e6c3`, `5198ecb` |
+
+**The collapse, at `44399de`.** `Unanswered` is `Turn(Withheld)` and `Reentrant`
+now, and the losses are listed once, in `Withheld`. Both the local caller and the
+peer read the same value: the refused caller matches
+`Unanswered::Turn(Withheld::Refused { name })` and the peer matches
+`RemoteError::Withheld(Withheld::Refused { name })`.
+
+**§6's third prefix is a third *variant*, and the argument is better for it.**
+This file spent two sections establishing that `observer panicked` must not be
+folded into `observer refused`, because reporting a crash as a refusal names a
+decision nobody made. That conclusion is upheld and its guard got cheaper: the
+distinction is now the enum discriminant rather than a prefix that had to be
+checked by hand against its neighbours for a shared word. The by-hand collision
+list existed because `"observer panicked: "` shares a word with `"panicked: "` and
+a prefix of `"observer refused: "`. Variants cannot collide, so the guard the
+neighbouring appendix says to cite —
+`no_failure_prefix_is_a_prefix_of_another` — was deleted at `5198ecb` with the
+strings it compared. **Do not re-point that citation at a surviving test.** There
+is no current test making that argument, because there is no longer a way to make
+the mistake it guarded.
+
+Renamed with it, at `44399de`:
+`singleton::an_observer_that_panicked_reaches_a_peer_under_its_own_prefix` is
+`..._under_its_own_variant`, and
+`both_halves_of_a_lost_turn_carry_their_own_prefix` is `..._carry_their_own_variant`.
+
+### `EndReason` was `Inspect`'s alone and is now every service's
+
+`EndReason` was defined in `console.rs`, and the only graph it reached was the one
+`Inspect` serves. `c165009` moved it beside `Ended`, the type it projects, and
+`0c6e6c3` put it inside `Withheld::Restarting { reason }` — which rides
+`RemoteError`, which **every** service carries. So a schema this file could treat
+as a console detail is now on the ALPN of every keylink service, and a change to
+it moves both pins rather than one console's page.
+
+That is the reason it is a projection and not the thing itself.
+`Ended::Observer` holds an `Arc<dyn Error + Send + Sync>`, and a trait object has
+no schema; `EndReason` is the form of an ending that has one. The
+`From<&Ended>` conversion has no wildcard arm on purpose, so adding an `Ended`
+variant is a compile error at the projection rather than a silent widening of what
+every service publishes. The cost of that flattening is recorded in RFC-07's
+appendix of the same date, under local fidelity, and it is a trade rather than a
+win.

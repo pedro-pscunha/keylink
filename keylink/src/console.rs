@@ -92,7 +92,7 @@
 //! - **No event is guaranteed to arrive.** [`Events`] is a bounded channel and
 //!   [`Events::record`] never blocks, because a diagnostic that can stall a
 //!   mount or an eviction is worse than a diagnostic that skips one. What is
-//!   dropped is counted: [`NodeStatus::lost`] for the channel,
+//!   dropped is counted: [`NodeStatus::dropped`] for the channel,
 //!   [`EventPage::lost`] for the ring behind a slow console.
 //! - **No ordering against anything but itself.** Events are sequenced in the
 //!   order the log accepted them. A turn on actor A and a mount of actor B are
@@ -113,8 +113,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::{
-    ActorId, ActorStatus, Caller, Deferred, Ended, EndpointAddr, Lifecycle, Node, Observer,
-    Replied, Reply, Result, Stream, System, TurnFut, TurnInfo, TurnOutcome,
+    ActorId, ActorStatus, Caller, Deferred, EndReason, Ended, EndpointAddr, Lifecycle, Node,
+    Observer, Replied, Reply, Result, Stream, System, TurnFut, TurnInfo, TurnOutcome,
 };
 
 // ────────────────────────────────────────────────────────── what a console reads
@@ -163,93 +163,6 @@ pub enum LifecycleEvent {
         /// Why. See [`Lifecycle::ended`] for exactly what each reason claims.
         why: EndReason,
     },
-}
-
-/// Why an actor ended, in the form that crosses the wire.
-///
-/// # A second vocabulary, and the one place it could not be avoided
-///
-/// This crate refuses parallel types for one concept, and this is a parallel
-/// type for [`Ended`]. It exists because [`Ended::Observer`] carries an
-/// `Arc<dyn Error + Send + Sync>`, which has no encoding and no schema — a
-/// trait object is not data. The choice was this, or dropping the one arm that
-/// names *which* observer refused, which is the arm an operator most needs.
-///
-/// What keeps the two from drifting is that there is exactly one conversion,
-/// [`From<&Ended>`](#impl-From<%26Ended>-for-EndReason), it is written with no
-/// wildcard arm, and `Ended` is exhaustive. So a new ending is a compile error
-/// **here**, on the line that would otherwise have quietly mapped it to
-/// something else.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Schema)]
-pub enum EndReason {
-    /// [`Ended::Stopped`].
-    Stopped,
-    /// [`Ended::Vanished`].
-    Vanished,
-    /// [`Ended::Panicked`].
-    Panicked {
-        /// What the handler panicked with.
-        message: String,
-    },
-    /// [`Ended::Observer`], with the error rendered through `Display`, because
-    /// that is the whole of what survives an `Arc<dyn Error>` crossing a wire.
-    Observer {
-        /// [`Observer::name`].
-        name: String,
-        /// Why it gave up.
-        error: String,
-        /// Whether the observer said another incarnation cannot help.
-        ///
-        /// Carried rather than dropped because it is the difference between "this
-        /// turn was refused" and "this actor is not coming back", and a console
-        /// that showed the first for the second would send an operator looking for
-        /// a restart that was never going to happen.
-        fatal: bool,
-    },
-    /// [`Ended::Feed`].
-    Feed {
-        /// The feed's declared name.
-        name: String,
-    },
-    /// [`Ended::GaveUp`] — a supervisor stopped re-incarnating this actor.
-    ///
-    /// The one ending a console most needs to distinguish, and the reason
-    /// [`Ended`] is worth putting on a wire at all: every other variant means
-    /// something asked the actor to stop, and this one means it could not be kept
-    /// alive.
-    GaveUp {
-        /// Restarts spent before giving up. `0` means the first incarnation was
-        /// the last — see [`Ended::GaveUp::after`], whose sense this copies.
-        after: u32,
-        /// The last incarnation's reason, or the factory's reason for refusing to
-        /// build one, through `Display`.
-        error: String,
-    },
-}
-
-impl From<&Ended> for EndReason {
-    /// No wildcard arm, deliberately: see this type's own documentation.
-    fn from(ended: &Ended) -> Self {
-        match ended {
-            Ended::Stopped => Self::Stopped,
-            Ended::Vanished => Self::Vanished,
-            Ended::Panicked { message } => Self::Panicked {
-                message: message.clone(),
-            },
-            Ended::Observer { name, error, fatal } => Self::Observer {
-                name: (*name).to_owned(),
-                error: error.to_string(),
-                fatal: *fatal,
-            },
-            Ended::Feed { name } => Self::Feed {
-                name: (*name).to_owned(),
-            },
-            Ended::GaveUp { after, error } => Self::GaveUp {
-                after: *after,
-                error: error.to_string(),
-            },
-        }
-    }
 }
 
 /// One node's public key, as it crosses the wire.
@@ -311,10 +224,18 @@ pub struct NodeStatus {
     /// stalling the mount. This is that count, for the life of the process.
     ///
     /// Non-zero means the channel is too shallow for what this node does, and
-    /// the fix is a bigger `depth` at [`Events::new`]. It is **not** the same
-    /// number as [`EventPage::lost`], which is about one console falling behind
-    /// a log that did receive the events.
-    pub lost: u64,
+    /// the fix is a bigger `depth` at [`Events::new`].
+    ///
+    /// # It was called `lost`, and the name was doing the contrast's work
+    ///
+    /// This field and [`EventPage::dropped`] are one quantity read through two
+    /// RPCs — literally one atomic, and [`Inspector::new`] says why it has to be
+    /// the same one. What the old name could not say is that
+    /// [`EventPage::lost`] is a **different** number: that one is the *ring*,
+    /// events this node did sequence and then pushed out from under a console
+    /// that was behind. A paragraph carried that distinction alone for as long
+    /// as the two fields shared a name. The names carry it now.
+    pub dropped: u64,
 }
 
 /// Events after the sequence number a console asked from.
@@ -335,7 +256,7 @@ pub struct NodeStatus {
 /// — `if page.lost > 0 { .. }` — was blind to the likelier of the two. A burst
 /// of mounts deeper than [`Events::new`]'s `depth` is dropped *before* it is
 /// sequenced, so it can never appear in a `lost` computed from sequence numbers,
-/// and the only place it used to surface was [`NodeStatus::lost`] — a different
+/// and the only place it used to surface was [`NodeStatus::dropped`] — a different
 /// call, on a different RPC, that a following console has no reason to make.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Schema)]
 #[non_exhaustive]
@@ -353,9 +274,9 @@ pub struct EventPage {
     /// Events this node produced and never sequenced, for the life of the
     /// process.
     ///
-    /// The same reading [`NodeStatus::lost`] returns, carried here so that one
+    /// The same reading [`NodeStatus::dropped`] returns, carried here so that one
     /// call answers "did I see everything". It is a **running total and not a
-    /// delta**, exactly as `NodeStatus::lost` is: a console compares it against
+    /// delta**, exactly as `NodeStatus::dropped` is: a console compares it against
     /// the previous page's to learn what it missed since, and a first page whose
     /// `dropped` is non-zero says the node was already losing events before this
     /// console arrived.
@@ -381,7 +302,7 @@ pub struct EventPage {
 /// on it, and both exist because parking on them is what an unbounded
 /// `Inspector::waiting` looks like from the outside.
 ///
-/// # `#[non_exhaustive]`, where [`EndReason`] beside it is not
+/// # `#[non_exhaustive]`, where [`EndReason`] is not
 ///
 /// Two rules meet here and they point opposite ways, so this is the reasoning
 /// rather than the attribute alone. **Error enums are `#[non_exhaustive]`** in
@@ -402,6 +323,12 @@ pub struct EventPage {
 /// Either way the wire is not the lax half: a new arm moves
 /// [`Inspect`](crate::inspect)'s ALPN, so an old console is refused at the
 /// handshake rather than handed a variant it cannot decode.
+///
+/// This heading read *"where [`EndReason`] **beside it** is not"* until `EndReason`
+/// moved to `observe.rs` at `c165009`, to sit beside the [`Ended`] it projects. The
+/// link still resolves and `mise run docs` stays green, so no gate saw the word go
+/// false — a positional claim about a neighbour is exactly the kind that outlives
+/// the neighbourhood.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Schema, thiserror::Error)]
 #[non_exhaustive]
 pub enum FollowRefused {
@@ -498,7 +425,7 @@ pub const MAX_FOLLOWERS: usize = 128;
 /// problem into an OOM. Here the sender is a **mount** or an **eviction**, and
 /// blocking one of those on a console would let a diagnostic stall the runtime it
 /// describes. Losing a diagnostic loudly is the lesser failure, so the count is
-/// published at [`NodeStatus::lost`] rather than kept.
+/// published at [`NodeStatus::dropped`] rather than kept.
 ///
 /// [`SystemBuilder::mailbox_depth`]: crate::SystemBuilder::mailbox_depth
 #[derive(Debug, Clone)]
@@ -754,7 +681,7 @@ impl Inspector {
     /// Watch `system` on `node`, keeping the last `history` events.
     ///
     /// `events` is the sink the system and its observers were built with — the
-    /// same value, so that [`NodeStatus::lost`] and [`EventPage::dropped`] report
+    /// same value, so that [`NodeStatus::dropped`] and [`EventPage::dropped`] report
     /// the drops of the channel this inspector is reading and not of some other
     /// one. Only its **counter** is kept; see `Inspector::dropped`.
     ///
@@ -857,7 +784,7 @@ impl inspect::Actor for Inspector {
             // call to `System::len` — one source, so the two answers a console
             // gets from one node cannot disagree by a mount.
             actors: (self.actors)().map_or(0, |rows| u64::try_from(rows.len()).unwrap_or(u64::MAX)),
-            lost: self.dropped.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
         }
     }
 
@@ -1028,7 +955,7 @@ impl Console {
             .client
             .follow(self.at)
             .await?
-            .map_err(|refused| crate::RemoteError::Failed(refused.to_string()))?;
+            .map_err(crate::RemoteError::FollowRefused)?;
         self.at = page.next;
         Ok(page)
     }

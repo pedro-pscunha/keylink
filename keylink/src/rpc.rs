@@ -1434,9 +1434,9 @@ where
     /// documented meaning is *the peer is known, but not for this method*, which is
     /// about the peer's standing rather than about a missing key. It is still the right
     /// choice over [`Failed`](crate::RemoteError::Failed): a peer can `matches!` on it,
-    /// while a `Failed` is prose, and `reply.rs` states that *"a `Failed` whose text
-    /// came from a caller's own `Middleware` is outside any guard here and always will
-    /// be"* — so a `Failed` string here is one nothing protects.
+    /// while a `Failed` is prose. A `Failed` whose text came from a caller's own
+    /// `Middleware` is outside every guard in this crate and always will be — so a
+    /// `Failed` string here is one nothing protects.
     ///
     /// ```ignore
     /// struct RequireKey;

@@ -240,7 +240,7 @@ pub struct Mailbox<M> {
 /// `supervise` settles `Gone` explicitly on that path, so this is redundant
 /// there, and the case it *does* answer is an **aborted unsupervised keyed**
 /// actor, where `run_loop` owns the mailbox as a parameter and drops it before
-/// the state. `defer::an_aborted_keyed_actor_tells_a_peer_no_such_actor` and its
+/// the state. `defer::an_aborted_keyed_actor_tells_a_peer_the_actor_is_gone` and its
 /// expired-budget twin both record that breaking this line is what reddens them,
 /// while breaking the teardown door's own settle leaves them green.
 ///
@@ -582,9 +582,10 @@ pub(super) enum RouteError {
     },
     /// The registry is full, so the factory was never called.
     ///
-    /// This sentence *is* rendered — `remote.rs` puts it inside
-    /// `RemoteError::Failed` — and `remote.rs`'s
-    /// `the_capacity_refusal_reads_the_same_by_hand_and_lazily` pins the words.
+    /// This sentence *is* rendered — `remote.rs` widens it onto
+    /// `RemoteError::AtCapacity`, which carries the same cap and writes the same
+    /// words — and `remote.rs`'s
+    /// `the_capacity_refusal_reads_the_same_by_hand_and_lazily` pins them.
     #[error("the actor system is at its capacity of {capacity} live actors")]
     AtCapacity {
         /// The cap that was reached.
@@ -1273,7 +1274,7 @@ pub struct ActorStatus {
 ///
 /// So an implementation records and returns. keylink's own — [`Events`] — does
 /// exactly that: a bounded channel, `try_send`, and a count of what it could not
-/// fit, published as [`NodeStatus::lost`]. Losing a diagnostic loudly beats
+/// fit, published as [`NodeStatus::dropped`]. Losing a diagnostic loudly beats
 /// blocking a teardown quietly.
 ///
 /// Neither call holds the registry's lock. [`System::mount`] releases the write
@@ -1310,7 +1311,7 @@ pub struct ActorStatus {
 /// hook, so `std`'s default one prints at the fault before the unwind is caught.
 ///
 /// [`Events`]: crate::Events
-/// [`NodeStatus::lost`]: crate::NodeStatus::lost
+/// [`NodeStatus::dropped`]: crate::NodeStatus::dropped
 pub trait Lifecycle: Send + Sync + 'static {
     /// An actor is now mounted under `id` and its task is running.
     ///
@@ -1896,7 +1897,8 @@ impl<M> SystemBuilder<M> {
     /// The most actors this system will hold at once.
     ///
     /// A mount past it is [`MountError::AtCapacity`]; a lazy spawn past it is
-    /// [`RemoteError::Failed`](crate::RemoteError::Failed) naming the cap. This
+    /// [`RemoteError::AtCapacity`](crate::RemoteError::AtCapacity) naming the
+    /// cap. This
     /// is the bound that keeps a lazily spawning system from being a
     /// memory-exhaustion target, so raising it is a statement about how much
     /// memory the process may spend.
