@@ -1302,7 +1302,23 @@ async fn a_service_serves_as_a_singleton_and_as_an_actor_system_on_one_node() {
 /// `RemoteError` is in every service's contract, so `Inspect` moved for this and
 /// for nothing of its own. Both literals were read off one failing run, which
 /// reported **two** failures. Neither was computed.
+/// # Skipped until keylink has a stable version — Pedro's ruling, 2026-08-10
+///
+/// A moved contract hash is not a cost here, so a test that **blocks** the move
+/// is buying nothing and charging a gate run for it. `AGENTS.md` carries the
+/// ruling and `README.md`'s `## Status` states it: nothing is scheduled, grouped
+/// or reshaped to keep a pin still.
+///
+/// **What this does not skip.** The property tests are untouched — that two type
+/// sets derive two different contracts, and that a peer built from other types is
+/// refused at the handshake, are claims about the mechanism rather than about one
+/// literal. Only the literal is parked.
+///
+/// **Re-enable it the day a stable version is cut**, which is the same day the
+/// `AGENTS.md` section goes. Read the new value off the failing run then, exactly
+/// as the note below says. Do not compute it.
 #[test]
+#[ignore = "the ALPN is not a cost until a stable version; see AGENTS.md"]
 fn the_contract_hash_has_not_moved() {
     const PINNED: &str = "keylink/Probe/b228be26a183b341";
 
@@ -1477,7 +1493,14 @@ fn the_contract_hash_has_not_moved() {
 /// [`FollowRefused`]: keylink::FollowRefused
 /// [`EventPage`]: keylink::EventPage
 /// [`NodeKey`]: keylink::NodeKey
+/// # Skipped until keylink has a stable version — Pedro's ruling, 2026-08-10
+///
+/// The pair of this file's other pin, parked for its reason and re-enabled on the
+/// same day. This one moves more often than its own contract changes, because
+/// `RemoteError` is in every service's contract — so it is the pin that most
+/// often blocks a change it has nothing to say about.
 #[test]
+#[ignore = "the ALPN is not a cost until a stable version; see AGENTS.md"]
 fn the_inspect_contract_hash_has_not_moved() {
     const PINNED: &str = "keylink/Inspect/9ef860a8eabbc99c";
 

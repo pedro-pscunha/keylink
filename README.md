@@ -587,10 +587,12 @@ argument for fixing the sharp things now.
 **A moved contract hash is therefore not a cost, and nothing here is designed
 around avoiding one.** No change is scheduled, grouped or reshaped to keep a pin
 still, and a pin move is not reported as a price paid — a rename, a new variant
-and a reshaped struct are all free. The only obligation is bookkeeping: the two
-pinned tests in `keylink/tests/protocol.rs` must pass, so a moved hash has its
-literal read off the failing run and written down. This holds until keylink has
-a stable version, and reversing it is the point of reaching one.
+and a reshaped struct are all free. The two tests that pin the literals are
+`#[ignore]`d, so not even the bookkeeping is owed. What still runs is the pair of
+claims about the mechanism rather than the value: that two type sets derive two
+different contracts, and that a peer built from other types is refused at the
+handshake. This holds until keylink has a stable version, which is when the pins
+come back and reversing it is the point of reaching one.
 
 Known gaps, in rough priority order:
 

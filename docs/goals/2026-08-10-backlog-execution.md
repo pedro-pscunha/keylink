@@ -17,9 +17,12 @@ The reviewer never fixes its own findings.
 
 **The ALPN is not a cost.** A moved contract hash costs nothing until keylink has
 a stable version. Do not price a pin move, order commits around one, or let one
-shape a design. `AGENTS.md` carries the ruling. The only obligation is
-bookkeeping: keep the two pinned tests in `keylink/tests/protocol.rs` passing, and
-**read the new literal off the failing run — never compute it**.
+shape a design. `AGENTS.md` carries the ruling. **The two pinned tests in
+`keylink/tests/protocol.rs` are `#[ignore]`d**, so nothing blocks a hash move and
+no bookkeeping is owed. The property tests still run — two type sets derive two
+different contracts, and a foreign peer is refused at the handshake — so do not
+break those. If you ever re-enable a pin, read its literal off the failing run
+and never compute it.
 
 **Capture every long command to a file.** `cmd 2>&1 | tee /tmp/<name>.log` with
 `set -o pipefail`, and put the exit status into the artifact. Never pipe a gate,

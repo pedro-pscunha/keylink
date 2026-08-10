@@ -156,30 +156,65 @@ fn alpn_of(demo: &Path) -> String {
         .expect("demo connect starts");
 
     let stdout = child.stdout.take().expect("stdout was piped");
-    let alpn = BufReader::new(stdout)
-        .lines()
-        .map_while(Result::ok)
-        .find_map(|line| {
-            line.strip_prefix("alpn:")
-                .map(|rest| rest.trim().to_string())
-        });
+    // Not `map_while(Result::ok)`, which **ends the scan on a read error and says
+    // nothing** — the caller then sees exactly what it sees at a clean EOF. That
+    // is the same defect as the `Stdio::null()` this function used to carry, one
+    // layer in: the failure arrives as an absence. Read errors are kept and
+    // reported.
+    let mut alpn = None;
+    let mut read_error = None;
+    for line in BufReader::new(stdout).lines() {
+        match line {
+            Ok(line) => {
+                if let Some(rest) = line.strip_prefix("alpn:") {
+                    alpn = Some(rest.trim().to_string());
+                    break;
+                }
+            }
+            Err(error) => {
+                read_error = Some(error);
+                break;
+            }
+        }
+    }
 
-    // Before the unwrap, so a missing line does not also leak a process.
-    let _ = child.kill();
-    // Kept, because it separates the two ways this can fail. On the passing path
-    // we killed a live child and this reports the signal. On the failing path the
-    // child had already exited on its own — `kill` changed nothing — so this
-    // reports what it exited with, which is the fact the old message lacked.
-    // `to_string` rather than `{:?}`, which renders the raw wait status: an
-    // ordinary exit 1 prints as `unix_wait_status(256)` and reads like a number
-    // the reader has to decode. `Display` prints `exit status: 1`.
-    let ended = match child.wait() {
-        Ok(status) => status.to_string(),
-        Err(error) => format!("unreadable ({error})"),
+    // **Ask before killing, because `kill` is SIGKILL and would overwrite the
+    // answer.** The first version of this reported `child.wait()` after
+    // `child.kill()` and claimed it showed what the child exited with. That holds
+    // only when the child was already dead. When it was still running — which is
+    // what a read error leaves behind — the status read `signal: 9 (SIGKILL)`,
+    // which is this harness describing its own kill. A diagnostic that reports
+    // the observer's action as the subject's fate is worse than none.
+    let ended = match child.try_wait() {
+        Ok(Some(status)) => format!("it ended on its own with {status}"),
+        // Deliberately not "it hung". Stdout reaches EOF when the write end
+        // closes, which for this child happens as it exits, so a `try_wait` here
+        // races the exit it just observed: a child that is merely slow to be
+        // reaped reads exactly like one that is wedged. Measured — the forced
+        // missing-line path reports this branch for a child that was on its way
+        // out. The wording carries the ambiguity because the call cannot resolve
+        // it, and a harness that names its own race is worth more than one that
+        // guesses which side of it won.
+        Ok(None) => "it had not exited when asked, which a child merely slow to \
+                     exit also reports, so this harness killed it"
+            .to_owned(),
+        Err(error) => format!("its state was unreadable ({error})"),
     };
 
-    alpn.unwrap_or_else(|| {
-        panic!("demo connect prints its alpn before it dials; it ended with {ended} instead")
+    // After the question above, and before the panic, so a missing line does not
+    // also leak a process.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    alpn.unwrap_or_else(|| match read_error {
+        Some(error) => panic!(
+            "demo connect prints its alpn before it dials; reading its stdout failed \
+             ({error}) and {ended}"
+        ),
+        None => panic!(
+            "demo connect prints its alpn before it dials; its stdout ended without \
+             one and {ended}"
+        ),
     })
 }
 

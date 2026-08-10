@@ -73,10 +73,17 @@ What that repeals:
 - **No proposal reports an ALPN column, and no summary reports a pin move as a
   cost.** It is not news.
 
-What survives, because it is bookkeeping and not a cost: the two pinned tests
-must pass, so a moved hash needs its literal updated. Read the new value off the
-failing run — never compute it — and the ALPN section of `CONTRIBUTING.md` still
-governs how.
+**The two pinned tests are `#[ignore]`d**, so nothing blocks a hash move at all,
+not even the bookkeeping. They are `the_contract_hash_has_not_moved` and
+`the_inspect_contract_hash_has_not_moved` in `keylink/tests/protocol.rs`. They
+come back on the day a stable version is cut, which is the day this section goes.
+Read the new literals off the failing run then, as the ALPN section of
+`CONTRIBUTING.md` says. Never compute one.
+
+**The property tests stay on, and they are a different claim**: that two type
+sets derive two different contracts, and that a peer built from other types is
+refused at the handshake. Those are about the mechanism and they still hold.
+Only the literals are parked.
 
 The incident: the factory proposal built a four-commit schedule with **`ALPN
 pin` as a column of the table**, grouped the work so that one commit paid it,
