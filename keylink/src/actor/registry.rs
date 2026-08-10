@@ -1273,7 +1273,7 @@ pub struct ActorStatus {
 ///
 /// So an implementation records and returns. keylink's own — [`Events`] — does
 /// exactly that: a bounded channel, `try_send`, and a count of what it could not
-/// fit, published as [`NodeStatus::lost`]. Losing a diagnostic loudly beats
+/// fit, published as [`NodeStatus::dropped`]. Losing a diagnostic loudly beats
 /// blocking a teardown quietly.
 ///
 /// Neither call holds the registry's lock. [`System::mount`] releases the write
@@ -1310,7 +1310,7 @@ pub struct ActorStatus {
 /// hook, so `std`'s default one prints at the fault before the unwind is caught.
 ///
 /// [`Events`]: crate::Events
-/// [`NodeStatus::lost`]: crate::NodeStatus::lost
+/// [`NodeStatus::dropped`]: crate::NodeStatus::dropped
 pub trait Lifecycle: Send + Sync + 'static {
     /// An actor is now mounted under `id` and its task is running.
     ///

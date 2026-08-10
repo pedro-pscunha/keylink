@@ -24,7 +24,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{IdempotencyKey, KeyState};
+use crate::{FollowRefused, IdempotencyKey, KeyState, Withheld};
 
 /// Why the serving side refused a call.
 ///
@@ -51,6 +51,22 @@ use crate::{IdempotencyKey, KeyState};
 /// for every service, singletons included**, and it is meant to be: a peer built
 /// against the old numbering would decode `Failed("disk full")` as a variant
 /// that no longer exists. Refusing it at the handshake is the correct outcome.
+///
+/// # Four variants were appended, and the append is the point
+///
+/// [`Withheld`](Self::Withheld), [`AtCapacity`](Self::AtCapacity),
+/// [`BadActorId`](Self::BadActorId) and [`FollowRefused`](Self::FollowRefused)
+/// went on the **end**. An append and an insert move the hash equally — this
+/// enum is in every service's contract, for the reason above — so the handshake
+/// refuses a drifted peer either way and that is not what separates them. What
+/// separates them is that an insert renumbers every variant after it, so the
+/// wire meaning of code the two sides already agreed on changes underneath them,
+/// and the failure is a misdecode rather than a refusal. An append leaves those
+/// indices exactly where they were.
+///
+/// Nothing produces the four yet: they are the vocabulary the served paths move
+/// onto next, and the move is a separate commit from the one that pays the ALPN
+/// for it.
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, postcard_schema::Schema, thiserror::Error,
 )]
@@ -106,6 +122,67 @@ pub enum RemoteError {
     /// paths keylink writes: see the prefix constants on this type.
     #[error("{0}")]
     Failed(String),
+
+    /// The call reached an actor and got no value back, and this is which loss
+    /// it was.
+    ///
+    /// [`Withheld`] is the same vocabulary
+    /// [`Unanswered`](crate::Unanswered) and [`TurnLost`](crate::TurnLost) give a
+    /// local caller. It is a variant here so that a peer **matches** the loss
+    /// instead of reading it off the front of a [`Failed`](Self::Failed) string
+    /// with `starts_with`, which is what the prefix constants on this type ask a
+    /// peer to do today.
+    #[error("{0}")]
+    Withheld(Withheld),
+
+    /// The system is at its cap of live actors and would not build another.
+    ///
+    /// Retryable in the only sense that matters: the cap is a *live* count, so
+    /// an eviction or a shutdown clears it. `SystemBuilder::capacity` sets it.
+    #[error("the actor system is at its capacity of {capacity} live actors")]
+    AtCapacity {
+        /// The cap that was met.
+        ///
+        /// `u64` and not `usize` for [`NodeStatus::actors`](crate::NodeStatus)'
+        /// reason: `usize` has no wire schema at all, because its width is the
+        /// compiler's choice and a browser's is not the server's.
+        capacity: u64,
+    },
+
+    /// The peer addressed something that is not a valid
+    /// [`ActorId`](crate::ActorId).
+    ///
+    /// Refused before any lookup, so it says nothing about what is mounted —
+    /// unlike [`NoSuchActor`](Self::NoSuchActor), which is an answer about a
+    /// well-formed id.
+    ///
+    /// # Why `reason` is a field rather than a sentence
+    ///
+    /// The `Failed` this replaces rendered `ActorId::validate`'s own error,
+    /// which is `Error::Invalid { kind, reason }` — so a peer learned *why* the
+    /// id was refused, not merely that it was. Carrying only the id would have
+    /// told a peer to fix something without saying what, which is the loss this
+    /// whole vocabulary exists to stop. It is a separate field rather than
+    /// baked into the id so a caller can match on the id and log the reason.
+    #[error("{id} is not a valid actor id: {reason}")]
+    BadActorId {
+        /// The id as the peer sent it.
+        id: String,
+        /// Why `validate` refused it — length, character set, or shape.
+        ///
+        /// Rendered from [`ActorId::validate`](crate::ActorId::validate)'s
+        /// error, so the sentence a peer reads is the one the crate uses
+        /// locally rather than a second wording of the same rule.
+        reason: String,
+    },
+
+    /// A console's [`Follow`](crate::inspect::Client::follow) was answered
+    /// rather than parked.
+    ///
+    /// [`FollowRefused`] carries which of the two reasons
+    /// it was and the number to resume from.
+    #[error("{0}")]
+    FollowRefused(FollowRefused),
 }
 
 /// The prefixes [`RemoteError::Failed`] carries on keylink's own served paths.

@@ -92,7 +92,7 @@
 //! - **No event is guaranteed to arrive.** [`Events`] is a bounded channel and
 //!   [`Events::record`] never blocks, because a diagnostic that can stall a
 //!   mount or an eviction is worse than a diagnostic that skips one. What is
-//!   dropped is counted: [`NodeStatus::lost`] for the channel,
+//!   dropped is counted: [`NodeStatus::dropped`] for the channel,
 //!   [`EventPage::lost`] for the ring behind a slow console.
 //! - **No ordering against anything but itself.** Events are sequenced in the
 //!   order the log accepted them. A turn on actor A and a mount of actor B are
@@ -224,10 +224,18 @@ pub struct NodeStatus {
     /// stalling the mount. This is that count, for the life of the process.
     ///
     /// Non-zero means the channel is too shallow for what this node does, and
-    /// the fix is a bigger `depth` at [`Events::new`]. It is **not** the same
-    /// number as [`EventPage::lost`], which is about one console falling behind
-    /// a log that did receive the events.
-    pub lost: u64,
+    /// the fix is a bigger `depth` at [`Events::new`].
+    ///
+    /// # It was called `lost`, and the name was doing the contrast's work
+    ///
+    /// This field and [`EventPage::dropped`] are one quantity read through two
+    /// RPCs — literally one atomic, and [`Inspector::new`] says why it has to be
+    /// the same one. What the old name could not say is that
+    /// [`EventPage::lost`] is a **different** number: that one is the *ring*,
+    /// events this node did sequence and then pushed out from under a console
+    /// that was behind. A paragraph carried that distinction alone for as long
+    /// as the two fields shared a name. The names carry it now.
+    pub dropped: u64,
 }
 
 /// Events after the sequence number a console asked from.
@@ -248,7 +256,7 @@ pub struct NodeStatus {
 /// — `if page.lost > 0 { .. }` — was blind to the likelier of the two. A burst
 /// of mounts deeper than [`Events::new`]'s `depth` is dropped *before* it is
 /// sequenced, so it can never appear in a `lost` computed from sequence numbers,
-/// and the only place it used to surface was [`NodeStatus::lost`] — a different
+/// and the only place it used to surface was [`NodeStatus::dropped`] — a different
 /// call, on a different RPC, that a following console has no reason to make.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Schema)]
 #[non_exhaustive]
@@ -266,9 +274,9 @@ pub struct EventPage {
     /// Events this node produced and never sequenced, for the life of the
     /// process.
     ///
-    /// The same reading [`NodeStatus::lost`] returns, carried here so that one
+    /// The same reading [`NodeStatus::dropped`] returns, carried here so that one
     /// call answers "did I see everything". It is a **running total and not a
-    /// delta**, exactly as `NodeStatus::lost` is: a console compares it against
+    /// delta**, exactly as `NodeStatus::dropped` is: a console compares it against
     /// the previous page's to learn what it missed since, and a first page whose
     /// `dropped` is non-zero says the node was already losing events before this
     /// console arrived.
@@ -411,7 +419,7 @@ pub const MAX_FOLLOWERS: usize = 128;
 /// problem into an OOM. Here the sender is a **mount** or an **eviction**, and
 /// blocking one of those on a console would let a diagnostic stall the runtime it
 /// describes. Losing a diagnostic loudly is the lesser failure, so the count is
-/// published at [`NodeStatus::lost`] rather than kept.
+/// published at [`NodeStatus::dropped`] rather than kept.
 ///
 /// [`SystemBuilder::mailbox_depth`]: crate::SystemBuilder::mailbox_depth
 #[derive(Debug, Clone)]
@@ -667,7 +675,7 @@ impl Inspector {
     /// Watch `system` on `node`, keeping the last `history` events.
     ///
     /// `events` is the sink the system and its observers were built with — the
-    /// same value, so that [`NodeStatus::lost`] and [`EventPage::dropped`] report
+    /// same value, so that [`NodeStatus::dropped`] and [`EventPage::dropped`] report
     /// the drops of the channel this inspector is reading and not of some other
     /// one. Only its **counter** is kept; see `Inspector::dropped`.
     ///
@@ -770,7 +778,7 @@ impl inspect::Actor for Inspector {
             // call to `System::len` — one source, so the two answers a console
             // gets from one node cannot disagree by a mount.
             actors: (self.actors)().map_or(0, |rows| u64::try_from(rows.len()).unwrap_or(u64::MAX)),
-            lost: self.dropped.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
         }
     }
 

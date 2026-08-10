@@ -831,3 +831,125 @@ pub enum TurnLost {
     #[error("this call was made from inside the target actor's own turn: it would deadlock")]
     Reentrant,
 }
+
+/// Why a **served** call produced no value.
+///
+/// The wire's half of [`Unanswered`](crate::Unanswered) and [`TurnLost`]. It
+/// names the same losses those two do and it names them as *variants*, where a
+/// peer reads them today as prefixes on a
+/// [`RemoteError::Failed`](crate::RemoteError::Failed) string — a contract a
+/// caller has to match with `starts_with` because there is nothing to match on.
+///
+/// Every `#[error]` sentence here is its local twin's, word for word, so the two
+/// audiences are told the same thing in the same words and the difference is
+/// only which type carried it.
+///
+/// [`Panicked`](Self::Panicked) is the one variant with no local twin, and the
+/// reason is the door rather than an omission: [`ask`](crate::LocalActor::ask)
+/// resumes the [`Panic`] into the calling task and [`TurnLost::Faulted`] hands
+/// the payload itself over. A peer can be handed neither, so what crosses is the
+/// message, behind the sentence
+/// [`RemoteError::PANICKED`](crate::RemoteError::PANICKED) documents.
+///
+/// # Exhaustive, and deliberately not `#[non_exhaustive]`
+///
+/// The rule is [`FollowRefused`](crate::FollowRefused)'s, and it has two halves:
+/// an enum whose every caller does the same thing with every variant is sealed,
+/// and an enum a caller must be **made** to look at a new arm of is not. This is
+/// the second kind, and three of its variants say so on their own.
+/// [`Restarting`](Self::Restarting) means retry, [`Gone`](Self::Gone) means stop
+/// calling, and [`Refused`](Self::Refused) means an observer vetoed a turn that
+/// ran. A `_ =>` arm picks one of those three answers for a caller who never
+/// read the fourth.
+///
+/// [`Unanswered`](crate::Unanswered) and [`TurnLost`] resolve the same question
+/// the same way and for the same reason, and this is the third door onto their
+/// one vocabulary. [`RemoteError`](crate::RemoteError) stays `#[non_exhaustive]`
+/// on the other half of the rule: it is *handled*, not exhausted.
+///
+/// **The ALPN is not the argument, in either direction.** A new variant moves it
+/// whichever attribute this type carries, so a drifted peer is refused at the
+/// handshake in both worlds. The attribute decides only what a peer that *can*
+/// decode a variant is allowed to do with it.
+///
+/// # `Expired` is representable and has no producer, on either side
+///
+/// Locally, [`TurnLost::Expired`] carries the reason: a local
+/// [`Origin`](crate::Origin) holds no [`Queueing`](crate::Queueing), so there is
+/// no budget to expire. On the served side a budget *does* expire, and that path
+/// answers with [`RemoteError::TimedOut`](crate::RemoteError::TimedOut), which
+/// carries the millisecond figure this variant has nowhere to put.
+///
+/// It is kept on [`TurnLost::Expired`]'s own ground: the state it names is one
+/// `Answered` already has, and a variant written to be *correct* if something
+/// reaches it beats a fold into [`Gone`](Self::Gone) — which is a live actor
+/// reported to a peer as finished, silently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Schema, thiserror::Error)]
+pub enum Withheld {
+    /// The turn ran and panicked. The actor **survived** it and answers the next
+    /// message.
+    ///
+    /// Distinct from [`Gone`](Self::Gone) for [`TurnLost::Faulted`]'s reason: a
+    /// peer told `Gone` should stop calling, and this one has an actor that is
+    /// still serving the connection it asked on.
+    #[error("the turn panicked and the actor kept its state: {message}")]
+    Panicked {
+        /// What the handler panicked with, through `Display`.
+        message: String,
+    },
+    /// An observer refused this turn. It **ran** and was not committed.
+    ///
+    /// [`TurnLost::Refused`] and [`Unanswered::Refused`](crate::Unanswered::Refused)
+    /// are the same fact at the local doors. The actor is **not** gone: a refusal
+    /// that did not declare itself fatal ends one incarnation and a supervisor
+    /// starts another.
+    #[error("the {name} observer refused this turn: it ran and was not committed")]
+    Refused {
+        /// [`Observer::name`], owned because a peer's copy is not `'static`.
+        name: String,
+    },
+    /// An observer **panicked** watching this turn. It **ran** and was not
+    /// committed.
+    ///
+    /// Separate from [`Refused`](Self::Refused) for
+    /// [`TurnLost::ObserverPanicked`]'s reason: both withhold the value, and only
+    /// one of them is a decision anybody made.
+    #[error("the {name} observer panicked during this turn: it ran and was not committed")]
+    ObserverPanicked {
+        /// [`Observer::name`], owned for [`Refused::name`](Self::Refused::name)'s
+        /// reason.
+        name: String,
+    },
+    /// The actor is serving, and this reply was thrown away unanswered.
+    ///
+    /// A handler took [`Reply::later`](crate::Reply::later) and dropped the
+    /// [`Deferred`](crate::Deferred), or panicked while holding the channel.
+    /// **Distinct from [`Gone`](Self::Gone)**, which is the whole of this
+    /// variant: the actor is still there and answers the next call.
+    #[error("the actor is serving and this reply was never answered")]
+    Dropped,
+    /// The incarnation that owed this answer is gone, and a supervisor is
+    /// starting another. **Retrying is the move.**
+    ///
+    /// Carries the ending as an [`EndReason`] and not an [`Ended`], because an
+    /// [`Ended::Observer`] holds an `Arc<dyn Error + Send + Sync>` and a trait
+    /// object is not data — that type's own documentation carries the argument.
+    #[error("the incarnation that owed this answer is gone and another is coming")]
+    Restarting {
+        /// The ending that caused the restart.
+        reason: EndReason,
+    },
+    /// The actor is no longer running. **Stop calling.**
+    ///
+    /// There is no next incarnation: the loop is finished, or a supervisor gave
+    /// up, or the actor was aborted or destroyed.
+    #[error("the actor is no longer running")]
+    Gone,
+    /// A [`QueueTimeout`](crate::QueueTimeout) budget expired while the message
+    /// waited. It **never started**, so the actor is untouched and still running.
+    ///
+    /// Has no producer. See this enum's own documentation for what reports the
+    /// expiry instead, and why the variant is kept anyway.
+    #[error("the queueing budget expired before this turn started: nothing ran")]
+    Expired,
+}
