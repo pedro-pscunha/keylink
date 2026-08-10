@@ -6,7 +6,9 @@
 //! that fails until somebody dials again.
 //!
 //! [`Peer`] connects on first use, reuses the connection, and reconnects
-//! **exactly once** when a call fails. A second failure is returned.
+//! **exactly once** when a call proves the connection failed. Application, local
+//! I/O, and per-stream errors are returned without replay. A second failure is
+//! returned.
 //!
 //! # Why once, and not until it works
 //!
@@ -101,7 +103,8 @@ impl<C: Dial + Send + Sync> Peer<C> {
 
     /// Forget the current connection. The next call dials a new one.
     ///
-    /// Rarely needed: [`Self::call`] does this itself when a call fails.
+    /// Rarely needed: [`Self::call`] does this itself when a call proves the
+    /// cached connection failed.
     pub fn disconnect(&self) {
         *self.lock() = None;
     }
@@ -120,12 +123,15 @@ impl<C: Dial + Send + Sync> Peer<C> {
     ///
     /// The closure receives the live client and is invoked at most twice: once
     /// on the existing connection, and once more on a freshly dialled one if the
-    /// first attempt returned an error. **The second result is returned
-    /// whatever it is** — there is no third attempt.
+    /// first attempt returned [`Error::Transport`] or [`Error::Closed`]. Other
+    /// errors are returned without invalidating the cached client. **The second
+    /// result is returned whatever it is** — there is no third attempt, though a
+    /// second connection failure is removed from the cache.
     ///
     /// # Errors
     ///
-    /// The error of the second attempt, or of dialling it.
+    /// A non-connection error from the first attempt, the second attempt's error,
+    /// or an error dialling the replacement.
     pub async fn call<T, F, Fut>(&self, mut f: F) -> Result<T>
     where
         F: FnMut(Arc<C>) -> Fut,
@@ -147,7 +153,11 @@ impl<C: Dial + Send + Sync> Peer<C> {
         self.disconnect_if(&client);
 
         let fresh = self.connect().await?;
-        f(fresh).await
+        let second = f(fresh.clone()).await;
+        if second.as_ref().is_err_and(is_reconnectable) {
+            self.disconnect_if(&fresh);
+        }
+        second
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Arc<C>>> {

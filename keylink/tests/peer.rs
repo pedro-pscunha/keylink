@@ -152,6 +152,40 @@ async fn a_local_io_error_keeps_the_cached_connection() {
     );
 }
 
+/// A failed retry is still known to be a dead connection. Returning its error
+/// must not leave that same client cached for the next independent call.
+#[tokio::test]
+async fn a_second_connection_failure_is_not_left_cached() {
+    let server = local_node().await;
+    let caller = local_node().await;
+    let _running = serve(&server, Arc::new(Ticks::default())).await;
+
+    let peer: Peer<meter::Client> = Peer::new(&caller, server.endpoint().addr());
+    let attempted = std::sync::Mutex::new(Vec::new());
+    let outcome: keylink::Result<()> = peer
+        .call(|client| {
+            attempted.lock().expect("not poisoned").push(client);
+            async { Err(keylink::Error::Closed) }
+        })
+        .await;
+    assert!(matches!(outcome, Err(keylink::Error::Closed)));
+
+    let failed_retry = attempted
+        .lock()
+        .expect("not poisoned")
+        .get(1)
+        .expect("the connection failure is retried once")
+        .clone();
+    let next = peer
+        .connect()
+        .await
+        .expect("the next call reconnects directly");
+    assert!(
+        !Arc::ptr_eq(&failed_retry, &next),
+        "a client whose retry also failed must not remain cached"
+    );
+}
+
 /// And a call that succeeds is never repeated. The obvious other half: a
 /// retry-on-success would double every side effect in the system.
 #[tokio::test]

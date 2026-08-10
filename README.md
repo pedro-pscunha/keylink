@@ -116,7 +116,8 @@ match client.watch().await {
 
 **Reconnecting handles.** Dial-per-message is wasteful and holding one client
 forever is fragile. `Peer<C>` connects on first use, reuses the connection, and
-reconnects **exactly once** when a call fails:
+reconnects **exactly once** when a call reports `Transport` or `Closed`. Remote,
+local I/O, and per-stream errors return without replay:
 
 ```rust
 let peer: Peer<inventory::Client> = Peer::new(&node, addr);
@@ -351,8 +352,9 @@ recipe rather than a feature:
 1. **Put the key on the work, not on the attempt.** `client.with_idempotency(key)`
    records the reply under `(peer, key)`. Every retry of that one piece of work
    carries that one key; different work gets a different key.
-2. **Call through `Peer<C>`.** It reconnects once when a call fails and re-issues
-   the call against the new connection. The ledger belongs to the served
+2. **Call through `Peer<C>`.** It reconnects once when the call reports
+   `Transport` or `Closed` and re-issues the call against the new connection.
+   Application and local errors are not replayed. The ledger belongs to the served
    `Service`, not to the connection, so the retry meets the same record.
 3. **Ask to attach.** `Idempotency::attaching_for(key, budget)` waits for a call
    already in flight under the key instead of being refused with `InFlight` —

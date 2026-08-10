@@ -1062,7 +1062,14 @@ impl<M> Registry<M> {
             mail,
             task: n0_future::task::spawn(async move {
                 let why = running.await;
-                ended_for_task.send_replace(Some(why.clone()));
+                ended_for_task.send_if_modified(|slot| {
+                    if slot.is_none() {
+                        *slot = Some(why.clone());
+                        true
+                    } else {
+                        false
+                    }
+                });
                 if let Some(registry) = registry.upgrade() {
                     registry.reap(&id, &identity_for_task, &why);
                 }
@@ -1689,15 +1696,23 @@ impl<M> System<M> {
     {
         let route = self.route(actor).map_err(LocalError::from)?;
         let chain = current();
-        if chain.holds(&route.actor) && route.mail.capacity() == 0 {
-            return Err(LocalError::Reentrant);
-        }
+        let reentrant = chain.holds(&route.actor);
         let (reply, answer) = Reply::channel();
         drop(answer);
-        let sent = route
-            .mail
-            .send((Box::new(mail(Origin::local(), reply)), chain))
-            .await;
+        let message = (Box::new(mail(Origin::local(), reply)), chain);
+        if reentrant {
+            // Checking `capacity()` before an awaited `send` is a race: another
+            // sender can take the last slot between the two, leaving this actor
+            // waiting on its own turn. `try_send` makes the test and enqueue one
+            // operation while preserving a non-blocking self-notify when room
+            // exists.
+            return match route.mail.try_send(message) {
+                Ok(()) => Ok(()),
+                Err(mpsc::error::TrySendError::Full(_)) => Err(LocalError::Reentrant),
+                Err(mpsc::error::TrySendError::Closed(_)) => Err(LocalError::Closed),
+            };
+        }
+        let sent = route.mail.send(message).await;
         drop(route);
         sent.map_err(|_| LocalError::Closed)
     }
@@ -1886,12 +1901,22 @@ impl<M> System<M> {
     /// `abort()` is called **before** the await, which is why this survived the
     /// wave that deleted `stop`. A caller who wraps this in a timeout and lets it
     /// fire loses the wait and not the cancellation — the request has already
-    /// landed on the task.
+    /// landed on the task. The teardown guard also settles a direct
+    /// [`System::ended`] future and every [`Lifecycle`] callback as
+    /// [`Ended::Vanished`] when that outer wait is cancelled; a natural ending
+    /// already published by the loop remains authoritative.
     ///
     /// Returns whether an actor was mounted under that id.
     pub async fn abort(&self, id: &ActorId) -> bool {
         let Some(entry) = self.inner.write().remove(id) else {
             return false;
+        };
+        let mut report = TeardownGuard {
+            registry: Arc::clone(&self.inner),
+            id: id.clone(),
+            ended: entry.ended.clone(),
+            identity: entry.identity.clone(),
+            armed: true,
         };
         // Before the abort and before the await, for `drain`'s reason: an
         // aborted loop never reaches `Inbox::ending`, so a peer holding a parked
@@ -1912,13 +1937,8 @@ impl<M> System<M> {
         // Delaying the synthetic send keeps a direct `System::ended` waiter and
         // the lifecycle callback on the same final value.
         let published = { ending.borrow().clone() };
-        let why = if let Some(why) = published {
-            why
-        } else {
-            entry.ended.send_replace(Some(Ended::Vanished));
-            Ended::Vanished
-        };
-        self.inner.report_ended(id, &entry.identity, &why);
+        let why = published.unwrap_or(Ended::Vanished);
+        report.complete(&why);
         true
     }
 
@@ -3260,6 +3280,81 @@ mod tests {
                 "ended cancelled-shutdown Vanished",
             ]
         );
+    }
+
+    /// Cancelling the wait around `abort` cannot abandon lifecycle observers.
+    ///
+    /// The actor deliberately stays inside one poll after cancellation is
+    /// requested. That holds the join pending long enough to cancel the outer
+    /// future without a clock or a scheduling guess.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_abort_reports_vanished_to_direct_and_lifecycle_waiters() {
+        let reports = Reported::default();
+        let system: System<Bare> = System::builder(Eviction::Never)
+            .lifecycle(reports.clone())
+            .build();
+        let id = ActorId::new("cancelled-abort").expect("valid");
+        let release = Arc::new(AtomicBool::new(false));
+        let released = Arc::clone(&release);
+        let (entered, entering) = oneshot::channel();
+        let (finished, finishing) = oneshot::channel();
+        system
+            .mount(
+                id.clone(),
+                mount(|mut inbox: Mailbox<Bare>| async move {
+                    let _ = inbox.recv().await;
+                    let _ = entered.send(());
+                    while !released.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    let _ = finished.send(());
+                    Ended::Stopped
+                }),
+            )
+            .expect("the actor mounts");
+        let ending = system.ended(&id).expect("the actor is mounted");
+        system
+            .route(&id)
+            .expect("the actor is routed")
+            .mail
+            .send((Box::new(Bare), Chain::default()))
+            .await
+            .expect("the actor receives one turn");
+        entering.await.expect("the actor entered its turn");
+
+        let aborting = {
+            let system = system.clone();
+            let id = id.clone();
+            tokio::spawn(async move { system.abort(&id).await })
+        };
+        while system.contains(&id) {
+            tokio::task::yield_now().await;
+        }
+        aborting.abort();
+        let cancellation = aborting.await;
+
+        let mut ending = Box::pin(ending);
+        let waker = std::task::Waker::noop();
+        let mut task_cx = std::task::Context::from_waker(waker);
+        let direct = ending.as_mut().poll(&mut task_cx);
+        let during = reports.seen();
+
+        // Release the deliberately non-cooperative poll before any assertion can
+        // panic, so a red run still leaves no spinning task behind.
+        release.store(true, Ordering::Release);
+        let _ = finishing.await;
+        settle().await;
+        let after = reports.seen();
+
+        assert!(cancellation
+            .expect_err("the outer abort is cancelled")
+            .is_cancelled());
+        assert!(matches!(direct, std::task::Poll::Ready(Ended::Vanished)));
+        assert_eq!(
+            during,
+            vec!["mounted cancelled-abort", "ended cancelled-abort Vanished",]
+        );
+        assert_eq!(after, during, "the late actor task must not report twice");
     }
 
     /// Abort publishes one final reason to both direct and callback observers.
