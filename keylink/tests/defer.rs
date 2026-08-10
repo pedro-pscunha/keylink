@@ -794,6 +794,7 @@ fn local_withheld(lost: Unanswered) -> Withheld {
         Unanswered::Reentrant => {
             panic!("expected a withheld turn, got the re-entrancy refusal")
         }
+        Unanswered::Full => panic!("expected a withheld turn, got a shed mailbox"),
     }
 }
 

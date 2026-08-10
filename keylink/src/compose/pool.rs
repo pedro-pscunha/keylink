@@ -23,6 +23,14 @@
 //! the handle directly — so a pool of N actors is N mailboxes and **no queue of
 //! its own**. There is nothing here to grow, and nothing here to configure.
 //!
+//! **Over a member spawned under
+//! [`Backpressure::Shed`](crate::Backpressure::Shed) it is not a wait.** That
+//! member answers [`NotQueued::Full`](crate::NotQueued::Full) at once and loses
+//! the caller's arguments, so "every wait after that" becomes "every wait or
+//! refusal after that" — and it is still the member's own answer rather than the
+//! pool's, which is the sentence above holding rather than bending. A pool does
+//! not choose the policy and cannot see it; whoever built the members did.
+//!
 //! A pool that queued would be the interesting design and the wrong one: work
 //! waiting in a pool's own queue is work no member has admitted yet, which means
 //! the caller is told "accepted" by something that cannot run it. The mailbox is

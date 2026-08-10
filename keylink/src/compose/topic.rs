@@ -116,6 +116,15 @@ pub enum Overflow {
     /// topic for everybody. Choose it when losing a subscriber is worse than
     /// slowing the publisher — an order book, a ledger, anything where the
     /// subscriber's state must not skip an event.
+    ///
+    /// **A subscriber whose actor was spawned under
+    /// [`Backpressure::Shed`](crate::Backpressure::Shed) does not block the
+    /// publisher, and does not stay in step either.** The wait this arm relies on
+    /// is the subscriber's own mailbox permit; a shedding mailbox refuses instead
+    /// of parking, so that subscriber drops events while the publisher runs on.
+    /// Neither half of the trade above then holds for it. Build subscribers that
+    /// park if this is the arm you chose — the two are opposite answers to one
+    /// question, and the mailbox's answer wins because it is nearer.
     BlockPublisher,
     /// Unsubscribe the subscriber, and let its actor end saying so.
     ///

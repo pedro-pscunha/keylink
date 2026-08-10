@@ -268,10 +268,23 @@ pub enum Failure {
     #[error("this call was made from inside the target actor's own turn: it would deadlock")]
     Reentrant,
 
+    /// The actor's mailbox was full and it sheds, so the call was refused before
+    /// any turn.
+    ///
+    /// **The second arm both sides produce**, and it is a variant for
+    /// [`Turn`](Self::Turn)'s reason rather than a new one: a local caller reads
+    /// [`Unanswered::Full`] and a peer reads
+    /// [`RemoteError::MailboxFull`], and folding either into
+    /// [`Other`](Self::Other) would leave the two sides matching one condition in
+    /// two places again. It says *back off*; it does not say *retry now*.
+    #[error("the actor's mailbox is full and it shed this call")]
+    Full,
+
     /// Everything a call can meet that the shared vocabulary does not name.
     ///
     /// **No local surface produces this.** Every variant of [`Error`] except the
-    /// lifted [`RemoteError::Withheld`] arrives here, unnarrowed, which is what
+    /// two lifted ones — [`RemoteError::Withheld`] and
+    /// [`RemoteError::MailboxFull`] — arrives here, unnarrowed, which is what
     /// keeps a schema mismatch and a timeout matchable through the bound.
     #[error("{0}")]
     Other(#[source] Error),
@@ -314,6 +327,7 @@ impl From<Unanswered> for Failure {
         match unanswered {
             Unanswered::Turn(withheld) => Self::Turn(withheld),
             Unanswered::Reentrant => Self::Reentrant,
+            Unanswered::Full => Self::Full,
         }
     }
 }
@@ -325,6 +339,10 @@ impl From<Error> for Failure {
             // arrives as `Other` on the served side and as `Turn` on the local
             // one, and the whole wave buys nothing.
             Error::Remote(RemoteError::Withheld(withheld)) => Self::Turn(withheld),
+            // The same lift for the second such condition, added with the shed
+            // policy that made a peer able to meet it. A served `MailboxFull` and
+            // a local `Unanswered::Full` are one fact, so they get one arm.
+            Error::Remote(RemoteError::MailboxFull) => Self::Full,
             other => Self::Other(other),
         }
     }

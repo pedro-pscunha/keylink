@@ -99,10 +99,10 @@ use std::ops::DerefMut;
 
 use crate::compose::{Overflow, Topic};
 use crate::{
-    ActorId, ActorStatus, Admission, Admittance, AdmittedPeer, Allowlist, BlobId, Caller,
-    DynamicAdmission, Ended, Eviction, FinishFut, IdempotencyKey, Intensity, Keyable, LocalActor,
-    MountError, Observer, Origin, ProvenPeer, Records, Retention, TurnFut, TurnInfo, TurnOutcome,
-    Unanswered,
+    ActorId, ActorStatus, Admission, Admittance, AdmittedPeer, Allowlist, Backpressure, BlobId,
+    Caller, DynamicAdmission, Ended, Eviction, FinishFut, IdempotencyKey, Intensity, Keyable,
+    LocalActor, MountError, Observer, Origin, ProvenPeer, Records, Retention, TurnFut, TurnInfo,
+    TurnOutcome, Unanswered,
 };
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
@@ -1021,7 +1021,8 @@ fn a_deferred_reply_is_send() {
 /// `SystemBuilder` has no inherent method of these names each call resolves to the
 /// trait default and hands back the marker; add `pub fn unbounded(self) -> Self`
 /// and the inherent method outranks the trait, the marker is not what comes back,
-/// and this module stops compiling.
+/// and this module stops compiling. [`Backpressure`](crate::Backpressure) is
+/// shadowed too, because a policy type is where a caller would look for one.
 ///
 /// **A wider depth type**, caught by pinning the signature. The coerced function
 /// item below says `NonZeroUsize` and nothing else, so an `Option<usize>` whose
@@ -1029,6 +1030,23 @@ fn a_deferred_reply_is_send() {
 /// `E0308` at that line. This is the shape the refusal would actually arrive in:
 /// nobody adds a method called `unbounded`, they widen the argument of the one
 /// that already exists.
+///
+/// # The local path took the widening on purpose, and that moved the pin
+///
+/// [`Backpressure`](crate::Backpressure) **is** the `enum Depth { .. }` the
+/// paragraph above names as the hazard, minus the arm that made it one. The local
+/// doors now take it, so their pin is no longer *this argument is a
+/// `NonZeroUsize`* — it is
+/// [`Backpressure::depth`](crate::Backpressure::depth) returning one, totally, for
+/// every arm there is. An `Unbounded` variant cannot be added without widening
+/// that return to an `Option`, which is `E0308` at the coercion below. So the
+/// refusal survived the knob that looked most like it.
+///
+/// **And a shed is not a leak**, which is the other half of why the widening was
+/// affordable: [`Backpressure::Shed`](crate::Backpressure::Shed) bounds the
+/// mailbox exactly as `Park` does and differs only in what it tells a sender that
+/// arrives past the last slot. The claim this section guards is about *memory
+/// growth nobody chose*, and neither arm can produce it.
 ///
 /// # What neither probe reaches, and it is worth naming
 ///
@@ -1052,6 +1070,7 @@ trait NoUnboundedMailbox {
 }
 
 impl NoUnboundedMailbox for beta::SystemBuilder {}
+impl NoUnboundedMailbox for crate::Backpressure {}
 
 fn no_mailbox_can_be_asked_to_be_unbounded(builder: beta::SystemBuilder) -> beta::SystemBuilder {
     let _: NoSuchMethod = builder.unbounded();
@@ -1068,7 +1087,7 @@ fn no_mailbox_can_be_asked_to_be_unbounded(builder: beta::SystemBuilder) -> beta
 ///
 /// The keyed depth had a probe from the day it existed and the local depth was a
 /// private constant with nothing to pin. Once the local mailbox gained doors that
-/// take a depth, the same widening is sayable on this path — and the claim above
+/// take a policy, the same widening is sayable on this path — and the claim above
 /// is about *a mailbox*, not about the registry's. A probe that covered one door
 /// while the other was free to take an `Option<usize>` would be the shape this
 /// module exists to refuse: a guarantee whose wording outruns its guard.
@@ -1077,18 +1096,35 @@ fn no_mailbox_can_be_asked_to_be_unbounded(builder: beta::SystemBuilder) -> beta
 /// places and a knob that reached only one of them would leave the supervised
 /// path — which is the production path — unpinned.
 ///
-/// The break is the same one line-for-line: change either `NonZeroUsize` below to
+/// # Three pins, because the local doors now take a policy rather than a number
+///
+/// **The doors take `Backpressure` and nothing wider.** Widen either parameter to
+/// an `Option<Backpressure>`, or back to a bare `usize`, and the coercions below
+/// are `E0308`.
+///
+/// **`Backpressure::depth` is total and returns a `NonZeroUsize`.** This is the
+/// pin that carries the unbounded claim now: an `Unbounded` variant has no depth,
+/// so adding one forces that return to widen — `E0308` here — or forces the arm to
+/// invent a depth, which is the same lie with more steps.
+///
+/// **The default parks.** `DEFAULT_LOCAL_BACKPRESSURE` is asserted in a `const`
+/// block, so a default that shed would fail to compile rather than quietly turn
+/// every existing caller's full mailbox from a wait into a dropped message.
+/// The two arms are not equally safe to default to, and only one of them is
+/// what every caller before this type existed was already getting.
+///
+/// The break is the same one line-for-line: change either `Backpressure` below to
 /// `usize`, or widen either door's parameter, and this file stops compiling with
 /// `E0308`.
 ///
 /// Made red by `scripts/break-once.sh` on this file, replacing
-/// `    let unsupervised: fn(Parking, Hooks, (), NonZeroUsize) -> Probe = LocalActor::spawn_deep;`
-/// with the same line reading `usize` in place of `NonZeroUsize`. Watched, and the
+/// `    let unsupervised: fn(Parking, Hooks, (), Backpressure) -> Probe = LocalActor::spawn_deep;`
+/// with the same line reading `usize` in place of `Backpressure`. Watched, and the
 /// diagnostic is quoted rather than the exit code because for a probe the compile
 /// error IS the guard and `── exit=101` alone cannot tell one from a typo:
 /// `error[E0308]: mismatched types ... expected fn pointer, found fn item`, with
 /// `expected fn pointer `fn(Parking, .., usize) -> ..`` against
-/// `found fn item `fn(_, .., NonZero<usize>) -> ..``.
+/// `found fn item `fn(_, .., Backpressure) -> ..``.
 fn no_local_mailbox_can_be_asked_to_be_unbounded() {
     /// The observers half of a spawn's triple. An alias so the two pins below
     /// read as pins rather than as type puzzles — `clippy::type_complexity` is
@@ -1100,12 +1136,24 @@ fn no_local_mailbox_can_be_asked_to_be_unbounded() {
     /// The actor both doors produce.
     type Probe = LocalActor<Parking, Parked>;
 
-    let unsupervised: fn(Parking, Hooks, (), NonZeroUsize) -> Probe = LocalActor::spawn_deep;
+    let unsupervised: fn(Parking, Hooks, (), Backpressure) -> Probe = LocalActor::spawn_deep;
     let _ = unsupervised;
 
-    let supervised: fn(fn() -> Rebuilt, crate::Intensity, NonZeroUsize) -> Probe =
+    let supervised: fn(fn() -> Rebuilt, crate::Intensity, Backpressure) -> Probe =
         LocalActor::spawn_supervised_deep;
     let _ = supervised;
+
+    let depth: fn(Backpressure) -> NonZeroUsize = Backpressure::depth;
+    let _ = depth;
+
+    let _: NoSuchMethod = Backpressure::Park(NonZeroUsize::MIN).unbounded();
+    let _: NoSuchMethod = Backpressure::Park(NonZeroUsize::MIN).unbounded_mailbox();
+    let _: NoSuchMethod = Backpressure::Park(NonZeroUsize::MIN).without_backpressure();
+
+    const _: () = assert!(matches!(
+        crate::turns::DEFAULT_LOCAL_BACKPRESSURE,
+        Backpressure::Park(_)
+    ));
 }
 
 // ───────────────────────────────── no ledger bound can be asked to be zero

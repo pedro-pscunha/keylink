@@ -596,3 +596,37 @@ is §11.5's `Progress` finding exactly: a token only generated code should build
 stopped. It takes §11.5's disposition too — documented rather than defended, because
 every route to it is in-process and no peer can reach any of it. A caller who writes both
 impls has lied to a bound inside its own crate, and the ledger is untouched either way.
+
+---
+
+## 15. Revision, 2026-08-10: §13's literals have moved twice, and neither move is this module's
+
+Appended rather than edited in place, per CONTRIBUTING.md, and for §12's and §13's
+reason: §12 exists because §6 and §11.2 named a literal that moved, §13 exists because
+§12 named one itself, and this exists because §13 did. Editing any of them would delete
+the record of which value the pin became, which is that section's whole content.
+
+**The literals are now `keylink/Probe/b228be26a183b341` and
+`keylink/Inspect/9ef860a8eabbc99c`.** §13's `d75913b8a4742547` and `0572763878b7fb9d`
+were true when written. Both new values were read off one failing run of
+`cargo test -p keylink --test protocol`, which reported two failures. Neither was
+computed.
+
+**Two moves separate §13 from the tree, and only the second is this section's.** The
+first — to `4697a79e29347129` and `e7579f60b94c0ea0` — carried `__Status` onto every
+contract and added `RemoteError::NotAnActor`, and it was never appended here. Stated so
+that a reader comparing §13 to the code finds a gap that is explained rather than one
+that looks like drift.
+
+The cause of the second move is again not in this document, and again reaches this
+module by the route §12 spells out: `RemoteError` gained a `MailboxFull` variant, for an
+actor served under `Backpressure::Shed` whose mailbox is full. `IdempotencyRefusal` is
+untouched — it still carries seven variants — but it sits inside the same hashed
+contract as `RemoteError`, so this module's pin moves for a change it did not make. That
+is the third time, and it is the shape §12 predicted: a change to a type every contract
+shares moves both pins, and a change to one service's own types moves exactly one.
+
+**One idempotency-shaped consequence, and it is a non-event.** A shed happens before the
+mailbox, so no turn runs and no ledger entry is written or released — the same position
+`Reentrant` occupies. A peer that meets `MailboxFull` may safely retry the identical key
+after a backoff, because the key was never claimed.

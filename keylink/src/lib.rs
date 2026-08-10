@@ -335,8 +335,8 @@ pub use rpc::{
 pub use subscribers::Subscribers;
 pub use turns::{
     deliver_to_singleton, feed_turn, run_keyed, run_keyed_supervised, serving_of_singleton, turn,
-    turn_deferred, Deferred, Fed, Feeds, Hooks, Incarnation, Intensity, LocalActor, NotQueued,
-    OwnedPermit, Permit, Replied, Reply, Turn, Unanswered,
+    turn_deferred, Backpressure, Deferred, Fed, Feeds, Hooks, Incarnation, Intensity, LocalActor,
+    NotQueued, OwnedPermit, Permit, Replied, Reply, Turn, Unanswered,
 };
 pub use watch::{Departure, Watch};
 pub use wire::{Envelope, WireKinds, MAX_HEADER};

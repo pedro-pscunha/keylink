@@ -1280,9 +1280,31 @@ async fn a_service_serves_as_a_singleton_and_as_an_actor_system_on_one_node() {
 /// covering three causes, and the attribution is read off the contract graphs
 /// rather than off the numbers. Both literals were read off that one failing
 /// run, which reported **two** failures. Neither was computed.
+///
+/// # Moved a sixth time, for one cause, so a peer can be told to back off
+///
+/// `4697a79e29347129` → `b228be26a183b341`. **`RemoteError` gained
+/// `MailboxFull`**, and that is the whole of it: no `Request` or `Response`
+/// changed shape, so this move is narrower than the fifth and the attribution
+/// needs no graph reading.
+///
+/// A peer built against the old shape must be refused, and the reason is the one
+/// the fourth move established: it would meet a refusal variant it cannot name.
+/// Rendering an overload as something it *can* name is what the variant exists to
+/// stop — a peer that reads `TimedOut` retries the same call and makes an
+/// overloaded actor worse, which is a wrong action rather than a lost one.
+///
+/// Appended and not inserted, for `NotKeyable`'s reason, which has now held for
+/// three moves running: the hash moves either way, so what the append buys is
+/// that no existing variant is renumbered.
+///
+/// **Both pins moved again, and this time they moved for the same single cause.**
+/// `RemoteError` is in every service's contract, so `Inspect` moved for this and
+/// for nothing of its own. Both literals were read off one failing run, which
+/// reported **two** failures. Neither was computed.
 #[test]
 fn the_contract_hash_has_not_moved() {
-    const PINNED: &str = "keylink/Probe/4697a79e29347129";
+    const PINNED: &str = "keylink/Probe/b228be26a183b341";
 
     assert_eq!(
         String::from_utf8_lossy(probe::alpn()),
@@ -1439,12 +1461,25 @@ fn the_contract_hash_has_not_moved() {
 /// these two pins discriminate rather than both being satisfiable: one contract
 /// changed, one did not, and exactly one test went red.
 ///
+/// ## `e7579f60b94c0ea0` → `9ef860a8eabbc99c`, for a cause this service does not own
+///
+/// `RemoteError` gained `MailboxFull`. Nothing in `inspect`'s own request or
+/// response types changed, and this contract moved because `RemoteError` is in
+/// **every** service's contract — the route the third, fourth and fifth moves of
+/// [`the_contract_hash_has_not_moved`] already walk.
+///
+/// So this is the mirror of the paragraph above: both pins moved in one run, and
+/// the evidence that they still discriminate is the *previous* entry, where one
+/// moved and one did not. A run in which both move is consistent with a shared
+/// cause and proves nothing on its own. Both literals were read off that one
+/// failing run, which reported two failures. Neither was computed.
+///
 /// [`FollowRefused`]: keylink::FollowRefused
 /// [`EventPage`]: keylink::EventPage
 /// [`NodeKey`]: keylink::NodeKey
 #[test]
 fn the_inspect_contract_hash_has_not_moved() {
-    const PINNED: &str = "keylink/Inspect/e7579f60b94c0ea0";
+    const PINNED: &str = "keylink/Inspect/9ef860a8eabbc99c";
 
     assert_eq!(
         String::from_utf8_lossy(keylink::inspect::alpn()),

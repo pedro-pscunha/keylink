@@ -1974,20 +1974,31 @@ macro_rules! __keylink_service {
                 Handle { inner: $crate::LocalActor::spawn_fed(state, observers, feeds) }
             }
 
-            /// [`actor_wired`]'s three arguments, plus the **mailbox depth**.
+            /// [`actor_wired`]'s three arguments, plus the **mailbox policy**.
             ///
-            /// How many messages may wait ahead of the one being handled.
+            /// How many messages may wait ahead of the one being handled, and
+            /// what happens to the one that arrives past the last slot.
             /// [`actor`], [`actor_with`] and [`actor_wired`] all take the
-            /// default, which is 1, and this is the door that overrides it.
+            /// default — park, at depth 1 — and this is the door that
+            /// overrides it.
             ///
             /// ```ignore
             /// let orders = orders::actor_deep(
             ///     Book::new(),
             ///     vec![],
             ///     orders::Feeds::new(exchange.subscribe()),
-            ///     NonZeroUsize::new(8)?,
+            ///     Backpressure::Park(NonZeroUsize::new(8)?),
             /// );
             /// ```
+            ///
+            /// [`Backpressure::Shed`](keylink::Backpressure::Shed) is the other
+            /// arm: a full mailbox refuses at once and **loses the caller's
+            /// arguments**, answering
+            /// [`NotQueued::Full`](keylink::NotQueued::Full) from a `tell` or a
+            /// [`stop`](Handle::stop) and
+            /// [`Unanswered::Full`](keylink::Unanswered::Full) from an `rpc`. A
+            /// caller that cannot afford that reserves first — the permit doors
+            /// keep the payload under either policy.
             ///
             /// A deeper mailbox lets a caller get further ahead of the actor,
             /// and that is the whole of what it buys. It is **not** a bound on
@@ -2017,10 +2028,10 @@ macro_rules! __keylink_service {
                 state: A,
                 observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
                 feeds: Feeds,
-                depth: ::core::num::NonZeroUsize,
+                backpressure: $crate::Backpressure,
             ) -> Handle<A> {
                 Handle {
-                    inner: $crate::LocalActor::spawn_deep(state, observers, feeds, depth),
+                    inner: $crate::LocalActor::spawn_deep(state, observers, feeds, backpressure),
                 }
             }
 
@@ -2081,12 +2092,13 @@ macro_rules! __keylink_service {
                 Handle { inner: $crate::LocalActor::spawn_supervised(factory, limit) }
             }
 
-            /// [`supervised`], plus the **mailbox depth**.
+            /// [`supervised`], plus the **mailbox policy**.
             ///
             /// The supervised twin of [`actor_deep`]. The mailbox belongs to the
-            /// actor rather than to an incarnation, so this depth is set once
+            /// actor rather than to an incarnation, so this policy is set once
             /// and survives every restart — which is the same fact that makes a
-            /// restart need no re-queue.
+            /// restart need no re-queue, and which means a shedding actor sheds
+            /// while it is rebuilding too.
             ///
             /// # CAUTION: a deeper mailbox raises the shutdown budget owed
             ///
@@ -2101,7 +2113,7 @@ macro_rules! __keylink_service {
             pub fn supervised_deep<A: Actor, N, Fut, F>(
                 factory: N,
                 limit: $crate::Intensity,
-                depth: ::core::num::NonZeroUsize,
+                backpressure: $crate::Backpressure,
             ) -> Handle<A>
             where
                 N: ::core::ops::FnMut() -> Fut + ::core::marker::Send + 'static,
@@ -2114,7 +2126,7 @@ macro_rules! __keylink_service {
                 F: $crate::Feeds<A>,
             {
                 Handle {
-                    inner: $crate::LocalActor::spawn_supervised_deep(factory, limit, depth),
+                    inner: $crate::LocalActor::spawn_supervised_deep(factory, limit, backpressure),
                 }
             }
 

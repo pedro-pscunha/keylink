@@ -1050,7 +1050,7 @@ ANCHORS = [
     # what this gate is for.
     ("D14", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "        // closure it used to carry made one by accident.\n"
-     "        let (mail, inbox) = mpsc::channel::<Message<A, M>>(depth.get());"),
+     "        let (mail, inbox) = mpsc::channel::<Message<A, M>>(backpressure.depth().get());"),
     # D15 covers the `Chain::with` arm that grows an ALREADY-DEEP chain, which a
     # two-actor ring cannot reach: its closing edge is sent from a chain of exactly
     # two, built by the `One -> Deep` arm. So D9 and D15 are not the same guard at
@@ -1112,7 +1112,7 @@ ANCHORS = [
     # than an accident. `supervised_deep` is a generated door with no caller in the
     # tree, and `Handle`'s `inner` field carries no `pub`, so it is also the only
     # route a `service!` user has to `LocalActor::spawn_supervised_deep`. The break
-    # is the door's own line — the depth accepted and forwarded to the door that
+    # is the door's own line — the policy accepted and forwarded to the door that
     # does not take one — and NOT the channel line inside `spawn_supervised_deep`,
     # which `spawn_deep` shares word for word and which `D1`'s note already measures
     # at count 2. Breaking the shared line would test the path both doors reach; the
@@ -1122,7 +1122,7 @@ ANCHORS = [
     # was widened out of. Measured after the record was written: 1 in `macros.rs`,
     # and the record lives in `cycles.rs`, so its own quote cannot raise that.
     ("F1", "keylink/tests/cycles.rs", "keylink/src/macros.rs",
-     "                    inner: $crate::LocalActor::spawn_supervised_deep(factory, limit, depth),"),
+     "                    inner: $crate::LocalActor::spawn_supervised_deep(factory, limit, backpressure),"),
     # ── from the ledger-limits PR. Both were measured with `grep -cF` AFTER the
     # record was written, which is the order that matters: adding a quote can only
     # RAISE a count, so measuring first reports a 1 that the record itself then

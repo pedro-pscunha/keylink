@@ -61,7 +61,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use keylink::compose::{Overflow, Subscription, Topic};
-use keylink::{Caller, Ended, Intensity, Replied, Reply};
+use keylink::{Backpressure, Caller, Ended, Intensity, Replied, Reply};
 use tokio::sync::Notify;
 
 keylink::service! {
@@ -218,6 +218,9 @@ impl ring::Actor for Peer {
                 | keylink::Withheld::Dropped
                 | keylink::Withheld::Restarting { .. },
             )) => SURPRISE,
+            // These actors park, so a shed cannot happen. Named rather than
+            // wildcarded, for the same reason the six above are.
+            Err(keylink::Unanswered::Full) => SURPRISE,
         }
     }
 
@@ -238,6 +241,8 @@ impl ring::Actor for Peer {
         match me.stop().await {
             Err(keylink::NotQueued::Reentrant) => REFUSED,
             Err(keylink::NotQueued::Closed) => GONE,
+            // This actor parks, so a shed cannot happen.
+            Err(keylink::NotQueued::Full) => SURPRISE,
             // Unreachable while the check holds, and it is what a hang would
             // become if the check were removed — this handler would never get
             // here at all, and the test's timeout is what would say so.
@@ -303,6 +308,8 @@ fn answered(hop: Result<u64, keylink::Unanswered>) -> u64 {
             | keylink::Withheld::Dropped
             | keylink::Withheld::Restarting { .. },
         )) => SURPRISE,
+        // These actors park, so a shed cannot happen.
+        Err(keylink::Unanswered::Full) => SURPRISE,
     }
 }
 
@@ -837,16 +844,16 @@ async fn a_three_actor_ring_is_refused_at_the_closing_edge() {
 ///
 /// **The search literal is two lines, and it has to be.** `spawn_deep` and
 /// `spawn_supervised_deep` both open with
-/// `        let (mail, inbox) = mpsc::channel::<Message<A, M>>(depth.get());`, so
-/// that line alone aborts the harness at "expected exactly one occurrence, found
-/// 2" — measured, not predicted. The comment line above it is what makes the
+/// `        let (mail, inbox) = mpsc::channel::<Message<A, M>>(backpressure.depth().get());`,
+/// so that line alone aborts the harness at "expected exactly one occurrence,
+/// found 2" — measured, not predicted. The comment line above it is what makes the
 /// unsupervised one unique, so the search literal is the pair
 /// `        // closure it used to carry made one by accident.
-///         let (mail, inbox) = mpsc::channel::<Message<A, M>>(depth.get());`,
-/// replaced by the same pair with `DEFAULT_LOCAL_MAILBOX_DEPTH.get()` in place of
-/// `depth.get()`. The two-line anchor is registered in `.mise/tasks/anchors`, so a
-/// `rustfmt` reflow between those lines goes to count 0 rather than quietly
-/// breaking the wrong function.
+///         let (mail, inbox) = mpsc::channel::<Message<A, M>>(backpressure.depth().get());`,
+/// replaced by the same pair with `DEFAULT_LOCAL_BACKPRESSURE.depth().get()` in
+/// place of `backpressure.depth().get()`. The two-line anchor is registered in
+/// `.mise/tasks/anchors`, so a `rustfmt` reflow between those lines goes to count 0
+/// rather than quietly breaking the wrong function.
 #[tokio::test]
 async fn a_deeper_mailbox_takes_one_more_message_behind_a_running_turn() {
     let me = Arc::new(OnceLock::new());
@@ -863,7 +870,7 @@ async fn a_deeper_mailbox_takes_one_more_message_behind_a_running_turn() {
         },
         Vec::new(),
         ring::Feeds::new(),
-        NonZeroUsize::new(2).expect("two is not zero"),
+        Backpressure::Park(NonZeroUsize::new(2).expect("two is not zero")),
     );
     me.set(a.clone()).expect("set once");
 
@@ -912,7 +919,8 @@ async fn a_deeper_mailbox_takes_one_more_message_behind_a_running_turn() {
 /// constant — and that is what the assertions below see.
 ///
 /// It cannot lose the **supervision**: `spawn_deep` takes `(state, observers,
-/// feeds, depth)` and this takes `(factory, limit, depth)`, so a factory cannot be
+/// feeds, backpressure)` and this takes `(factory, limit, backpressure)`, so a
+/// factory cannot be
 /// handed to the unsupervised door and the mutation does not compile. Stated
 /// rather than asserted, because a compile error and a caught defect leave the
 /// harness by the same exit and a break that cannot build proves nothing about
@@ -927,9 +935,9 @@ async fn a_deeper_mailbox_takes_one_more_message_behind_a_running_turn() {
 /// panics here — still holds.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/macros.rs` on the door itself,
-/// `inner: $crate::LocalActor::spawn_supervised_deep(factory, limit, depth),`
+/// `inner: $crate::LocalActor::spawn_supervised_deep(factory, limit, backpressure),`
 /// replaced by `inner: $crate::LocalActor::spawn_supervised(factory, limit),` —
-/// the depth accepted and dropped one line later, which is the failure a caller
+/// the policy accepted and dropped one line later, which is the failure a caller
 /// cannot see. **Hand the harness the whole line with its twenty spaces of
 /// indentation**, which is what `F1` registers. Watched:
 /// `a second message must fit at depth 2: the supervised door dropped it:
@@ -978,7 +986,7 @@ async fn the_supervised_deep_door_takes_the_depth_it_was_given() {
                 Duration::from_secs(10),
             )
             .expect("a recovery span whose backoff is not zero"),
-            NonZeroUsize::new(2).expect("two is not zero"),
+            Backpressure::Park(NonZeroUsize::new(2).expect("two is not zero")),
         )
     };
     me.set(a.clone()).expect("set once");
