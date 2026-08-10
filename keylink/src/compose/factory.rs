@@ -211,8 +211,7 @@ pub enum Sample {
 /// build, and a hasher type parameter would cascade through [`Routing`] and
 /// [`Factory`] to buy a generality nobody asked for.
 ///
-/// # The default hash is not stable across releases, and that is a caller's
-/// problem to know about
+/// # The default hash is not stable across releases, and that is a caller's problem to know about
 ///
 /// [`by_hash`](Self::by_hash) uses `std`'s `DefaultHasher`, whose algorithm the
 /// standard library explicitly does not promise across Rust versions. Within one
@@ -285,12 +284,94 @@ impl<K> fmt::Debug for Shard<K> {
 /// matches one: the factory matches it, inside this crate. So the attribute costs
 /// a caller nothing here and makes a fifth mode additive.
 ///
+/// A doctest, because it compiles as its own crate and a probe in
+/// `representability.rs` cannot: in there the attribute is not in force.
+///
+/// ```compile_fail
+/// // Fails with `E0004`: a match on an enum marked `#[non_exhaustive]` needs a
+/// // wildcard arm outside the crate that declared it, and this one has none.
+/// //
+/// // The code is named HERE and deliberately NOT on the fence. rustdoc does not
+/// // check the code after `compile_fail`, so an annotated code asserts a
+/// // verification it does not perform — the same rule `TurnInfo`'s literal guard
+/// // and `Reply::channel`'s privacy guard are written under.
+/// //
+/// // What stops this passing for the WRONG reason — a renamed variant, a moved
+/// // type, a changed payload — is the array. Every variant is CONSTRUCTED there
+/// // before it is matched, in code that has to compile, so the only thing left
+/// // to fail is the attribute. An earlier draft of this type shipped WITHOUT the
+/// // attribute while this section argued for it, and nothing noticed: nothing
+/// // downstream matches a `Routing`, so nothing would.
+/// use keylink::compose::{Routing, Sample, Shard};
+///
+/// let modes: [Routing<u64>; 4] = [
+///     Routing::RoundRobin,
+///     Routing::FirstAvailable,
+///     Routing::LeastLoaded(Sample::All),
+///     Routing::ByKey(Shard::by_hash()),
+/// ];
+///
+/// for mode in modes {
+///     match mode {
+///         Routing::RoundRobin => {}
+///         Routing::FirstAvailable => {}
+///         Routing::LeastLoaded(_) => {}
+///         Routing::ByKey(_) => {}
+///     }
+/// }
+/// ```
+///
+/// Watched both ways, which is what a fence needs and an error code on it does
+/// not give: with the annotation removed the compiler printed
+/// `error[E0004]: non-exhaustive patterns: `_` not covered`, and the note
+/// *"`Routing<u64>` is marked as non-exhaustive, so a wildcard `_` is necessary
+/// to match exhaustively"* — so the attribute is what refused it and not a typo.
+/// With a `_ => {}` arm added it printed
+/// *"Test compiled successfully, but it's marked `compile_fail`"*, which is the
+/// direction that fires the day somebody deletes the attribute.
+///
 /// **That argument holds on one premise, and the premise is a refusal.** There is
 /// no `Factory::routing()` accessor and no other door returning one of these,
 /// deliberately: an accessor hands a caller a value to match, which turns the next
 /// variant from additive into breaking and inverts this section without touching
 /// it. A caller who wants to know how a factory routes knows already — it passed
 /// the `Routing` in.
+///
+/// The premise is held by a second doctest, because a refusal nothing checks is a
+/// paragraph:
+///
+/// ```compile_fail
+/// // Fails with `E0599`: there is no method named `routing` on `Factory`, which
+/// // is the whole of the paragraph above stated where a compiler reads it.
+/// //
+/// // The code is named here rather than on the fence, for the reason the guard
+/// // above gives.
+/// //
+/// // A factory over `()` members, because `from_fn` and `members` put no bound
+/// // on the member type: both names are therefore read off a real `Factory`
+/// // without a runtime, an actor or a service, and a rename of either is a
+/// // compile error in the lines that must compile. The turbofish is load-bearing
+/// // too — `K` is inferred from `dispatch`'s impl block, and nothing here
+/// // dispatches, so leaving it out would fail this fence with `E0282` and prove
+/// // nothing about the accessor.
+/// use std::num::NonZeroUsize;
+///
+/// use keylink::compose::{Factory, Routing};
+///
+/// let factory = Factory::from_fn(NonZeroUsize::MIN, Routing::<()>::RoundRobin, |_member| ());
+/// let members: &[()] = factory.members();
+/// assert_eq!(members.len(), 1);
+///
+/// let _rule = factory.routing();
+/// ```
+///
+/// Watched both ways as well: without the annotation the compiler printed
+/// `error[E0599]: no method named `routing` found for struct `Factory<H, K>` in
+/// the current scope`, pointing at the line and naming it *"private field, not a
+/// method"*. With `routing()` replaced by `members()` — the accessor that does
+/// exist — the fence failed as *"Test compiled successfully, but it's marked
+/// `compile_fail`"*, which is what an author adding the refused accessor would
+/// meet.
 ///
 /// # There is no `Sticky`
 ///
@@ -848,6 +929,37 @@ mod tests {
         release
     }
 
+    // ── B IS THIS WAVE'S LETTER, AND EVERY ROW BELOW IS SAME-FILE ─────────────
+    //
+    // `F` for factory and `R` for routing are both taken — `F1` anchors
+    // `keylink/src/rpc.rs` and the `R` series runs to `R16` — so `B` is chosen by
+    // the test `T`, `D` and `E` were chosen by: unused across every file that
+    // holds an id-shaped token.
+    //
+    // **Every record here lives in the file it breaks**, so none of them may
+    // quote its own search literal with the code's indentation: the registered
+    // literal carries it and a `///` quote does not, which is what keeps the
+    // count at 1. Do not tidy the quotes to match the code.
+    //
+    // Three of these literals are shared with a row whose record lives in
+    // `keylink/tests/compose.rs` — the generated-handle half of the same claims —
+    // so a count taken here is a count for two rows, and adding a quote of any of
+    // them aborts both together.
+
+    /// Made red by `scripts/break-once.sh keylink/src/compose/factory.rs`,
+    /// replacing
+    /// `Routing::RoundRobin => self.members.pick().1.reserve().await,`
+    /// with
+    /// `Routing::RoundRobin => self.members.members()[0].reserve().await,`, so
+    /// the cursor still turns and every dispatch lands on member zero. Watched:
+    /// "the actor that answered, not the cursor that chose it", left
+    /// `[0, 0, 0, 0, 0, 0, 0]` against right `[0, 1, 2, 0, 1, 2, 0]`. Registered
+    /// as `B1`.
+    ///
+    /// The assertion is on the number each **actor** reported, not on the cursor
+    /// the factory moved, which is [`Pool`](super::super::Pool)'s device: a
+    /// rotation that reported one member and dispatched to another passes a
+    /// cursor-only test.
     #[tokio::test]
     async fn round_robin_reaches_each_member_in_turn() {
         let (factory, _handled) = factory(3, Routing::RoundRobin);
@@ -864,6 +976,31 @@ mod tests {
         );
     }
 
+    /// **Two records in one block, and the block is the unit `RECORD_BLOCKS`
+    /// counts** — so this pair moves that figure by one, not by two. It is
+    /// written down here because the registry's ledger has an entry for exactly
+    /// this shape and a reader who computes the next figure instead of reading it
+    /// off the failing run gets it wrong.
+    ///
+    /// Both are `scripts/break-once.sh keylink/src/compose/factory.rs` on
+    /// `let at = usize::try_from((shard.of)(key) % wide).unwrap_or(0);`,
+    /// registered once as `B2` because a row pins a literal and this is one
+    /// literal.
+    ///
+    /// **On the cursor**, replacing it with
+    /// `let at = (usize::try_from((shard.of)(key) % wide).unwrap_or(0)
+    /// + self.members.pick().0.index()) % size;` — affinity replaced by a
+    /// rotation that still spreads. Watched: "one key must reach one member,
+    /// every time", left `0` against right `3`.
+    ///
+    /// **On a constant**, replacing it with
+    /// `let at = usize::try_from((shard.of)(key) % wide).unwrap_or(0) % 1;` —
+    /// affinity kept and the keyspace collapsed onto one member. Watched:
+    /// `64 keys over 4 members reached only [0]`.
+    ///
+    /// Neither break alone reddens both halves, which is why the test has two:
+    /// the first assertion is satisfied by a factory that sends everything to one
+    /// member, and the second by one that ignores the key entirely.
     #[tokio::test]
     async fn one_key_reaches_one_member_and_the_keyspace_still_spreads() {
         let (factory, _handled) = factory(4, Routing::ByKey(Shard::by_hash()));
@@ -891,6 +1028,18 @@ mod tests {
         );
     }
 
+    /// Made red by `scripts/break-once.sh keylink/src/compose/factory.rs`,
+    /// replacing `(serving.buffered, serving.busy)` with
+    /// `(serving.buffered, false)`, so the load reading keeps the queue depth and
+    /// forgets whether the member is inside a turn. Watched: "All chose the
+    /// member that is inside a turn", left `0` against right `0` — an
+    /// `assert_ne`, so the two numbers being equal is the failure. Registered as
+    /// `B3`.
+    ///
+    /// Both samples are driven, because they are two code paths and not one
+    /// parameter: [`Sample::All`] folds over N and [`Sample::TwoOfN`] compares the
+    /// cursor's pick against the next, so a break in either fold leaves the other
+    /// green.
     #[tokio::test]
     async fn least_loaded_leaves_the_member_holding_a_turn_alone() {
         for sample in [Sample::All, Sample::TwoOfN] {
@@ -913,6 +1062,20 @@ mod tests {
         }
     }
 
+    /// Made red by `scripts/break-once.sh keylink/src/compose/factory.rs`,
+    /// replacing `if next_load < best.0 {` with `if next_load > best.0 {`, so the
+    /// mode keeps reading both facts and prefers the member carrying more.
+    /// Watched: "the member with three queued was chosen over the idle one", left
+    /// `1` against right `0`. Registered as `B4`.
+    ///
+    /// **The independence runs one way only, and it was measured rather than
+    /// argued.** `B3`'s break leaves this test green — exit 0 under the same
+    /// harness — because forgetting `is_busy` still prefers the member with less
+    /// queued. This break does **not** leave `B3`'s test green: reversing the
+    /// comparison reddens that one too, exit 100, since a held member's reading is
+    /// the larger of the two there as well. So `B3` is the row that discriminates
+    /// and this one is not, which is the reason both exist and not a reason to
+    /// keep only this.
     #[tokio::test]
     async fn least_loaded_separates_two_members_by_what_is_queued() {
         // The depth is the control: at one, `buffered` is 0 or 1 and this
@@ -945,6 +1108,16 @@ mod tests {
         );
     }
 
+    /// Made red by `scripts/break-once.sh keylink/src/compose/factory.rs`,
+    /// replacing the two refusal arms
+    /// `Err(why) if refused != NotQueued::Reentrant => refused = why,
+    /// Err(_) => {}`
+    /// with `Err(why) => return Err(why),`, which is the race taking the first
+    /// **answer** rather than the first **slot**. Watched:
+    /// `a slot on some member: Closed`. Registered as `B5`.
+    ///
+    /// Two members are stopped rather than one, because a mode that skipped a
+    /// single refusal and then took the next answer would pass with one.
     #[tokio::test]
     async fn first_available_skips_every_member_that_has_ended() {
         let (factory, _handled) = factory(3, Routing::FirstAvailable);
@@ -964,6 +1137,18 @@ mod tests {
         }
     }
 
+    /// Made red by `scripts/break-once.sh keylink/src/compose/factory.rs`,
+    /// replacing `let mut refused = NotQueued::Closed;` with
+    /// `let mut refused = NotQueued::Reentrant;`. The seed is documented as
+    /// overwritten before it is read, and this shows what it costs when it is
+    /// not: the arm that records a refusal is guarded on `refused` not already
+    /// being `Reentrant`, so seeding it with that value makes every arm fall
+    /// through and the loop reports a deadlock nobody had. Watched:
+    /// `assert_eq` failed, left `Reentrant` against right `Closed`. Registered as
+    /// `B6`.
+    ///
+    /// It leaves `B5`'s test green, because that one has a live member and never
+    /// reaches the seed.
     #[tokio::test]
     async fn first_available_reports_a_refusal_only_once_every_member_has_made_one() {
         let (factory, _handled) = factory(3, Routing::FirstAvailable);

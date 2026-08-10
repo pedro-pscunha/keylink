@@ -1852,6 +1852,63 @@ ANCHORS = [
      "                                            $crate::RemoteError::NotAnActor,"),
     ("S5", "keylink/tests/inspect.rs", "keylink/src/console.rs",
      "            LifecycleEvent::Ended { id: ended, why } if *ended == id => Some(why.clone()),"),
+    # ── B IS THE FACTORY WAVE'S LETTER, AND THE OBVIOUS TWO WERE BOTH TAKEN ────
+    #
+    # `F` would be the letter for a factory and `R` for a routing rule. `F1`
+    # anchors `keylink/src/rpc.rs` and the `R` series runs to `R16`, so `B` is
+    # chosen by the same test `T`, `D` and `E` were: unused across every file that
+    # holds an id-shaped token.
+    #
+    # **Six of these ten are SAME-FILE rows** — `B1` to `B6` live in
+    # `keylink/src/compose/factory.rs`'s own `#[cfg(test)]` module and break that
+    # same file. Every one of their record quotes is unindented while the
+    # registered literal keeps the code's indentation, which is what holds each
+    # count at 1. Re-indenting any of those quotes to match the code aborts the row
+    # before a backup exists. Do not tidy them.
+    #
+    # **TWO LITERALS CARRY TWO ROWS EACH, and the pairing is deliberate rather than
+    # duplication.** `B2`/`B7` share the `% wide` line and `B4`/`B8` share the
+    # comparison in `keep_smaller`. In each pair the first record lives beside the
+    # code and drives a HAND-WRITTEN mailbox, and the second lives in
+    # `keylink/tests/compose.rs` and drives a member `service!` generated — so a
+    # break of the routing rule reddens both, while a break of the seam between the
+    # macro and the rule reddens only the second. A count is a property of the
+    # literal and not of the row, so one added quote of either line takes it from 1
+    # to 2 and aborts **both** rows of that pair together.
+    #
+    # `B2`'s record block holds TWO breaks — the shard on the cursor and the shard
+    # on a constant — and one row, because a row pins a literal and those two
+    # breaks substitute one. It is also one BLOCK, which is the unit the tripwire
+    # counts, so this wave's records move `RECORD_BLOCKS` by less than the number
+    # of breaks recorded in them.
+    #
+    # `racing_reserves_conserves_capacity` has a record and **no row**, on purpose:
+    # the property is tokio's `Drop for Acquire` and keylink owns no line whose flip
+    # loses a slot, so there is nothing to substitute. Its block names the harness —
+    # the perturbation was on the test's own `drop(held);` — so it is in the
+    # population figure and absent from this list, which is the shape the coverage
+    # line below reports and not a defect in either.
+    ("B1", "keylink/src/compose/factory.rs", "keylink/src/compose/factory.rs",
+     "            Routing::RoundRobin => self.members.pick().1.reserve().await,"),
+    ("B2", "keylink/src/compose/factory.rs", "keylink/src/compose/factory.rs",
+     "        let at = usize::try_from((shard.of)(key) % wide).unwrap_or(0);"),
+    ("B3", "keylink/src/compose/factory.rs", "keylink/src/compose/factory.rs",
+     "    (serving.buffered, serving.busy)"),
+    ("B4", "keylink/src/compose/factory.rs", "keylink/src/compose/factory.rs",
+     "    if next_load < best.0 {"),
+    ("B5", "keylink/src/compose/factory.rs", "keylink/src/compose/factory.rs",
+     "                Err(why) if refused != NotQueued::Reentrant => refused = why,\n"
+     "                Err(_) => {}\n"),
+    ("B6", "keylink/src/compose/factory.rs", "keylink/src/compose/factory.rs",
+     "        let mut refused = NotQueued::Closed;"),
+    ("B7", "keylink/tests/compose.rs", "keylink/src/compose/factory.rs",
+     "        let at = usize::try_from((shard.of)(key) % wide).unwrap_or(0);"),
+    ("B8", "keylink/tests/compose.rs", "keylink/src/compose/factory.rs",
+     "    if next_load < best.0 {"),
+    ("B9", "keylink/tests/compose.rs", "keylink/src/compose/factory.rs",
+     "            Routing::ByKey(shard) => self.shard(*shard, key).reserve().await,"),
+    ("B10", "keylink/tests/singleton.rs", "keylink/src/turns.rs",
+     "        Err(NotQueued::Full) => return (Outcome::Err(RemoteError::MailboxFull), Body::empty()),"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -3433,7 +3490,25 @@ for record in sorted(set(REDNESS) - row_ids):
 #
 # Read off the failing run at the merge commit: `FAIL population: 183 comment
 # blocks mention break-once.sh, but RECORD_BLOCKS says 181.`
-RECORD_BLOCKS = 183
+# 183 → 194, the factory wave's commit 4. **Eleven blocks for TWELVE recorded
+# substitutions and TEN rows**, and all three figures are different units, which
+# is what this ledger exists to keep visible:
+#
+#   * `B2`'s block records TWO breaks — the shard on the cursor and the shard on a
+#     constant — against ONE literal, so it is one row and one block.
+#   * `racing_reserves_conserves_capacity`'s block records a perturbation of the
+#     TEST rather than of the tree, so it is a block with no row at all: the
+#     property is tokio's `Drop for Acquire` and keylink owns no line to substitute.
+#   * the two `compile_fail` doctests this commit added are in the house form for a
+#     fence — prose naming the substitution and both directions it was watched in,
+#     with no harness named — so they are in neither figure, exactly as the
+#     `__status` wave's two were.
+#
+# So the arithmetic that would have been reached for here — ten rows, therefore ten
+# blocks — is wrong in both directions at once, and it is wrong for two independent
+# reasons. Read off the failing run: `FAIL population: 194 comment blocks mention
+# break-once.sh, but RECORD_BLOCKS says 183.`
+RECORD_BLOCKS = 194
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

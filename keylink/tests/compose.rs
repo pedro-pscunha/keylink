@@ -1,4 +1,4 @@
-//! The five compositions, from outside the crate, with the backpressure claim of
+//! The six compositions, from outside the crate, with the backpressure claim of
 //! each one as an assertion rather than a paragraph.
 //!
 //! | the claim | the test |
@@ -9,6 +9,10 @@
 //! | a slow subscriber under `BlockPublisher` **stops the publisher** instead of growing a buffer | `a_slow_subscriber_blocks_the_publisher_instead_of_growing_a_buffer` |
 //! | a pool spreads turns, and its report agrees with the actor that handled each | `a_pool_spreads_turns_and_each_member_says_which_one_it_is` |
 //! | every clone of a pool shares one rotation | `two_clones_of_a_pool_share_one_rotation` |
+//! | a key reaches one member, the keyspace still spreads, and a clone routes it the same way | `the_same_key_reaches_the_same_worker` |
+//! | `LeastLoaded` reads a real gradient once the mailbox is deeper than one | `least_loaded_separates_workers_at_depth_above_one` |
+//! | a `ByKey` dispatch onto a member that has ended is refused rather than parked | `a_dead_members_keys_answer_closed_and_do_not_hang` |
+//! | a cancelled reservation gives its slot back | `racing_reserves_conserves_capacity` |
 //! | a delayed run lands after the delay and not before | `a_delayed_run_lands_after_the_delay_and_not_before` |
 //! | a repeating run is never re-entered and never queues the ticks it missed | `a_repeating_schedule_never_overlaps_and_never_queues_the_ticks_it_missed` |
 //! | a dropped schedule cancels; a detached one does not | `a_dropped_schedule_runs_nothing`, `a_detached_schedule_outlives_its_handle` |
@@ -97,11 +101,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use keylink::compose::{
-    after, every, Added, Endings, Fanout, Group, GroupEnded, Membership, Names, Overflow, Pool,
-    Subscription, Topic, Verdict,
+    after, every, Added, Endings, Factory, Fanout, Group, GroupEnded, Membership, Names, Overflow,
+    Pool, Routing, Sample, Shard, Subscription, Topic, Verdict,
 };
 use keylink::{
-    ActorId, Caller, Ended, Eviction, Intensity, Lifecycle, Observer, Stop, TurnFut, TurnInfo,
+    ActorId, Backpressure, Caller, Ended, Eviction, Intensity, Lifecycle, NotQueued, Observer,
+    Stop, TurnFut, TurnInfo,
 };
 use n0_future::time::Duration;
 use n0_future::StreamExt;
@@ -133,6 +138,30 @@ keylink::service! {
     /// Answers with this member's own number, so the pool's claim about who
     /// handled a turn can be checked against the actor's.
     rpc Whoami() -> u64;
+}
+
+// A factory member. Its own service and not `Worker`'s, because routing by load
+// needs a member that can be parked inside a turn and have its mailbox filled,
+// and a pool asks a member for neither.
+keylink::service! {
+    service Bench;
+
+    /// Answers with this member's own number, so the factory's claim about who
+    /// it chose is checked against the actor that ran rather than taken on trust.
+    rpc Whoami() -> u64;
+    /// Parks the member inside one turn until the test releases it, so "this
+    /// member is busy" is a state the test constructs rather than one it waits
+    /// for and hopes to catch.
+    rpc Hold() -> u64;
+    /// Reports this member's own number **without a reply**, so a test can learn
+    /// which member handled a dispatch without awaiting one.
+    tell Mark() -> ();
+    /// Occupies a mailbox slot and reports nothing.
+    ///
+    /// The filler the load test queues behind a held turn. It must not reach
+    /// [`Bench::ran`], or the dispatch under test could not be told apart from
+    /// the filler ahead of it.
+    tell Quiet() -> ();
 }
 
 /// How many cooperative yields a bounded spin gets. Large enough that a spawned
@@ -246,6 +275,116 @@ impl worker::Actor for Worker {
 /// `as` cast so that the impossible case is named instead of truncated.
 fn numbered(member: keylink::compose::Member) -> u64 {
     u64::try_from(member.index()).expect("a pool smaller than u64::MAX")
+}
+
+// ─────────────────────────────────────────────────────────── the factory member
+
+/// A [`Factory`] member, built by `service!` rather than by hand.
+///
+/// **That is the whole reason this section exists.** `compose/factory.rs`'s own
+/// tests build members out of `LocalActor`, deliberately: the routing rule lives
+/// in that file, so a probe only the macro could build would prove that the macro
+/// and the routing agree rather than that the routing holds. These prove the
+/// other half — that the rule reaches a generated `Handle` through the generated
+/// `Reserving` impl, and that a caller's closure is handed a generated `Permit`
+/// and calls a declared method on it.
+struct Bench {
+    me: u64,
+    /// Every turn that ran a `mark`, so a test learns which member handled a
+    /// dispatch **without awaiting its reply**.
+    ///
+    /// Not a convenience. The member a wrong routing decision picks is, in the
+    /// load test below, the one deliberately inside a turn — so awaiting the
+    /// reply turns *the wrong member was chosen* into a hang, which names no
+    /// member and which a harness cannot tell from a slow machine. Spending the
+    /// permit on a `tell` and reading this channel after the held turn is
+    /// released makes the same defect a failed `assert` with both numbers in it.
+    ran: mpsc::UnboundedSender<u64>,
+    /// Sent the moment the loop enters `hold` — [`Desk`]'s device and the same
+    /// two fields, because "slow" and "busy" are the same state seen from two
+    /// compositions.
+    entered: Option<oneshot::Sender<()>>,
+    /// Awaited inside `hold`. Dropping the sender releases it.
+    gate: Option<oneshot::Receiver<()>>,
+}
+
+impl bench::Actor for Bench {
+    async fn whoami(&mut self, _cx: Caller<'_>) -> u64 {
+        self.me
+    }
+
+    async fn hold(&mut self, _cx: Caller<'_>) -> u64 {
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.send(());
+        }
+        if let Some(gate) = self.gate.take() {
+            let _ = gate.await;
+        }
+        self.me
+    }
+
+    async fn mark(&mut self, _cx: Caller<'_>) {
+        let _ = self.ran.send(self.me);
+    }
+
+    async fn quiet(&mut self, _cx: Caller<'_>) {}
+}
+
+/// `count` members numbered from zero, the mailbox policy named, and one
+/// [`Gate`] per member in member order.
+///
+/// The policy is an argument rather than a default because it is the **control**
+/// for [`Routing::LeastLoaded`]: at depth one `buffered` is 0 or 1, so that
+/// mode's assertion would be about `is_busy` alone and the depth is what makes it
+/// about a gradient.
+fn bench<K>(
+    count: usize,
+    routing: Routing<K>,
+    mailbox: Backpressure,
+) -> (
+    Factory<bench::Handle<Bench>, K>,
+    mpsc::UnboundedReceiver<u64>,
+    Vec<Gate>,
+) {
+    let (ran, handled) = mpsc::unbounded_channel();
+    let mut gates = Vec::new();
+    let factory = Factory::from_fn(
+        NonZeroUsize::new(count).expect("a non-zero member count"),
+        routing,
+        |member| {
+            let (entered, entered_rx) = oneshot::channel();
+            let (release, gate) = oneshot::channel();
+            gates.push(Gate {
+                entered: entered_rx,
+                release,
+            });
+            bench::actor_deep(
+                Bench {
+                    me: numbered(member),
+                    ran: ran.clone(),
+                    entered: Some(entered),
+                    gate: Some(gate),
+                },
+                Vec::new(),
+                bench::Feeds::new(),
+                mailbox,
+            )
+        },
+    );
+    (factory, handled, gates)
+}
+
+/// Ask the member a key belongs to which one it is, through the generated
+/// `Permit`.
+///
+/// Which member that is stays unknown to the test on purpose: recomputing
+/// `hash(key) % N` here would compare the routing against a copy of itself.
+async fn home(factory: &Factory<bench::Handle<Bench>, u64>, key: u64) -> u64 {
+    factory
+        .dispatch_keyed(key, |member| member.whoami())
+        .await
+        .expect("a slot on some member")
+        .expect("the member answers")
 }
 
 // ─────────────────────────────────────────────────────────────────── the topic
@@ -669,6 +808,235 @@ async fn two_clones_of_a_pool_share_one_rotation() {
         first.index(),
         second.index(),
         "a clone with its own cursor would send every first request to member zero"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────── the factory
+//
+// Two of the four records below — `B7` and `B8` — break the same lines two of
+// `compose/factory.rs`'s own records break, and the overlap is the point rather
+// than a duplication: those rows drive the rule through a mailbox written by
+// hand, and these drive it through a member `service!` generated. So the
+// generated `Reserving` impl is on the path here and is absent from it there,
+// which is the half a probe living beside the rule cannot make.
+
+/// Made red by `scripts/break-once.sh keylink/src/compose/factory.rs`, replacing
+/// `let at = usize::try_from((shard.of)(key) % wide).unwrap_or(0);`
+/// with
+/// `let at = (usize::try_from((shard.of)(key) % wide).unwrap_or(0)
+/// + self.members.pick().0.index()) % size;` — affinity replaced by a rotation
+/// that still spreads, so the second half of this test would pass on its own.
+/// Watched: "one key must reach one member, every time", left `0` against right
+/// `3`. Registered as `B7`.
+///
+/// The clone at the end is the half `compose/factory.rs`'s sibling does not
+/// make: `Clone` copies the routing rule and shares the pool, so a key's home has
+/// to be a property of the factory rather than of the handle it was dispatched
+/// through.
+#[tokio::test]
+async fn the_same_key_reaches_the_same_worker() {
+    let (factory, _ran, _gates) = bench(
+        4,
+        Routing::ByKey(Shard::by_hash()),
+        Backpressure::Park(NonZeroUsize::MIN),
+    );
+
+    let mine = home(&factory, 7).await;
+    for _ in 0..16 {
+        assert_eq!(
+            home(&factory, 7).await,
+            mine,
+            "one key must reach one member, every time",
+        );
+    }
+
+    // The other half, and the one a routing that always answered member zero
+    // would fail: distinct keys are not all one member's.
+    let mut reached = Vec::new();
+    for key in 0..64_u64 {
+        reached.push(home(&factory, key).await);
+    }
+    reached.sort_unstable();
+    reached.dedup();
+    assert!(
+        reached.len() > 1,
+        "64 keys over 4 members reached only {reached:?}",
+    );
+
+    // A key's home is a property of the factory and not of the clone it was
+    // dispatched through. `Clone` copies the rule and shares the pool, so this
+    // is the claim that a second holder cannot be routed somewhere else.
+    assert_eq!(
+        home(&factory.clone(), 7).await,
+        mine,
+        "a clone must route one key to the member the original chose",
+    );
+}
+
+/// Made red by `scripts/break-once.sh keylink/src/compose/factory.rs`, replacing
+/// `if next_load < best.0 {` with `if next_load > best.0 {`, so the mode reads
+/// both facts and prefers the member carrying more. Watched: "the member with
+/// three queued was chosen over the idle one", left `1` against right `0`.
+/// Registered as `B8`.
+///
+/// **The depth is the control and not a detail.** At the default of one,
+/// `buffered` is 0 or 1 and the busy member has nothing queued behind its turn,
+/// so this would be an assertion about `is_busy` alone. At four, member one is
+/// three messages behind **and still admitting**, so choosing it would have
+/// succeeded — the mode declined a member it could have used, which is the only
+/// form in which a gradient is observable from outside.
+///
+/// It is a `mark` and not a `whoami`, for the reason [`Bench::ran`] carries: the
+/// wrong choice here is a member that is inside a turn, so awaiting a reply would
+/// make the defect a hang.
+#[tokio::test]
+async fn least_loaded_separates_workers_at_depth_above_one() {
+    let (factory, mut ran, gates) = bench(
+        2,
+        Routing::LeastLoaded(Sample::All),
+        Backpressure::Park(NonZeroUsize::new(4).expect("four")),
+    );
+
+    let busy = factory.members()[1].clone();
+    let _holding = tokio::spawn(async move { busy.hold().await });
+    let release = gates
+        .into_iter()
+        .nth(1)
+        .expect("member one's gate")
+        .held()
+        .await;
+    for _ in 0..3 {
+        factory.members()[1]
+            .quiet()
+            .await
+            .expect("the member is running");
+    }
+
+    factory
+        .dispatch(|member| async move { member.mark() })
+        .await
+        .expect("a slot on some member");
+    // Released before the answer is read, so a mode that chose member one
+    // reports member one instead of never reporting at all.
+    drop(release);
+
+    assert_eq!(
+        bounded(ran.recv()).await.expect("the chosen member marks"),
+        0,
+        "the member with three queued was chosen over the idle one",
+    );
+}
+
+/// Made red by `scripts/break-once.sh keylink/src/compose/factory.rs`, replacing
+/// `Routing::ByKey(shard) => self.shard(*shard, key).reserve().await,`
+/// with `Routing::ByKey(_) => self.first_available().await,` — a factory that
+/// helpfully routes around the dead member and silently stops being keyed.
+/// Watched: `the member this key belongs to is gone: Ok(1)`. Registered as `B9`.
+///
+/// **That break, and not one on the refusal itself, because the accepted cost is
+/// what this guards.** `ByKey` costs 1/N of the *keyspace permanently* over a
+/// dead member, where `RoundRobin` costs 1/N of the traffic and a retry lands
+/// elsewhere. The defect worth catching is therefore a factory that quietly
+/// converts the first into the second, not one that reports the wrong refusal.
+///
+/// The bound is the second claim and it is a liveness bound, never a ceiling on
+/// how long the work may take: a member that closed its mailbox must **refuse**,
+/// and the one shape that cannot be told from a slow machine is a wait that never
+/// ends.
+#[tokio::test]
+async fn a_dead_members_keys_answer_closed_and_do_not_hang() {
+    let (factory, _ran, _gates) = bench(
+        4,
+        Routing::ByKey(Shard::by_hash()),
+        Backpressure::Park(NonZeroUsize::MIN),
+    );
+    const KEY: u64 = 7;
+
+    // Which member this key belongs to is read off the actor that answered, so
+    // stopping "the right one" does not depend on the test agreeing with the
+    // hash about what that means.
+    let home = home(&factory, KEY).await;
+    factory.members()[usize::try_from(home).expect("a factory smaller than usize::MAX")]
+        .stop()
+        .await
+        .expect("the member was running");
+
+    // Two claims, and the bound is the second one: `ByKey` costs 1/N of the
+    // keyspace permanently over a dead member, and the price of that is a
+    // refusal rather than a wait.
+    let refused = bounded(factory.dispatch_keyed(KEY, |member| member.whoami()))
+        .await
+        .expect_err("the member this key belongs to is gone");
+    assert_eq!(refused, NotQueued::Closed);
+}
+
+/// **This one carries no break record, and the reason is recorded rather than
+/// left to be rediscovered.** The property is tokio's: a cancelled `Acquire` is
+/// taken out of the wait list and any permit already assigned to it is returned,
+/// inside `Drop`. keylink owns no line whose flip loses a slot — `first_available`
+/// collects the racers and drops the losers, and dropping them **is** the
+/// mechanism — so there is nothing to substitute and no row to register. It is a
+/// regression pin on a pinned dependency's guarantee, which is what
+/// [`Routing::FirstAvailable`]'s own soundness claim rests on.
+///
+/// What was watched instead is the assertion, by the perturbation §7 names:
+/// `scripts/break-once.sh keylink/tests/compose.rs` replacing this test's own
+/// `drop(held);` with `::core::mem::forget(held);` — a permit leaked on purpose.
+/// Watched: "a cancelled racer must give its slot back, and this member never got
+/// one back". A capacity test that stayed green under that edit would be
+/// asserting nothing.
+///
+/// **It does not assert a wait-time bound, and must not.** tokio guarantees
+/// capacity conservation and says the opposite about ordering — cancelling a
+/// `reserve` loses its place in the queue — so `FirstAvailable`'s rustdoc claims
+/// soundness and no spread, and a test claiming more than the run has produced
+/// would be the sentence that makes the rustdoc false.
+#[tokio::test]
+async fn racing_reserves_conserves_capacity() {
+    // Depth one, so this member's whole capacity is one permit and a slot that
+    // does not come back is visible in a single reading rather than N.
+    //
+    // The turbofish is the price of a test that never dispatches: `K` is
+    // inferred from `dispatch`'s own impl block everywhere else, and nothing here
+    // dispatches, because the claim is about the reservation underneath one.
+    let (factory, _ran, _gates) = bench(
+        1,
+        Routing::<()>::FirstAvailable,
+        Backpressure::Park(NonZeroUsize::MIN),
+    );
+    let member = &factory.members()[0];
+
+    let held = member
+        .__try_reserve()
+        .expect("the member is running")
+        .expect("the one free slot");
+    assert!(
+        matches!(member.__try_reserve(), Ok(None)),
+        "the one slot is held, so this mailbox is full",
+    );
+
+    let racer = tokio::spawn({
+        let member = member.clone();
+        async move { member.__reserve_owned().await }
+    });
+    spun().await;
+    assert!(
+        !racer.is_finished(),
+        "the racer must be parked on a slot that does not exist yet, or nothing \
+         below is a cancellation",
+    );
+
+    // Dropping the permit **assigns** the freed slot to the parked racer — tokio
+    // does that inside the release, before the racer is ever polled — so
+    // aborting the task now drops a future that owns a permit it never spent.
+    // That is the cancellation `FirstAvailable` performs N−1 times per dispatch.
+    drop(held);
+    racer.abort();
+
+    assert!(
+        settles(|| matches!(member.__try_reserve(), Ok(Some(_)))).await,
+        "a cancelled racer must give its slot back, and this member never got \
+         one back",
     );
 }
 
