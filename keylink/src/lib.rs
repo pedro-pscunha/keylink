@@ -241,8 +241,8 @@ mod watch;
 mod wire;
 
 pub use actor::{
-    deliver_to_actor, mount, ActorStatus, Addressed, Eviction, KeyedService, Lifecycle, Mailbox,
-    MountError, Mounted, Origin, System, SystemBuilder,
+    deliver_to_actor, mount, serving_of_actor, ActorStatus, Addressed, Eviction, KeyedService,
+    Lifecycle, Mailbox, MountError, Mounted, Origin, System, SystemBuilder,
 };
 pub use admission::{Admission, Admittance, DynamicAdmission, Revocable, Revocation};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
@@ -320,7 +320,8 @@ pub use keys::{ActorId, IdempotencyKey, MAX_KEY_LEN};
 pub use middleware::{Caller, Context, Middleware, Next, QueueTimeout, Queueing, Rpc, Timeout};
 pub use node::{derive_alpn, Node};
 pub use observe::{
-    EndReason, Ended, FinishFut, Observer, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome, Withheld,
+    EndReason, Ended, FinishFut, Observer, Serving, Stop, TurnFut, TurnInfo, TurnLost, TurnOutcome,
+    Withheld,
 };
 pub use panic::Panic;
 pub use peer::{Dial, Peer};
@@ -333,9 +334,9 @@ pub use rpc::{
 };
 pub use subscribers::Subscribers;
 pub use turns::{
-    deliver_to_singleton, feed_turn, run_keyed, run_keyed_supervised, turn, turn_deferred,
-    Deferred, Fed, Feeds, Hooks, Incarnation, Intensity, LocalActor, NotQueued, Replied, Reply,
-    Turn, Unanswered,
+    deliver_to_singleton, feed_turn, run_keyed, run_keyed_supervised, serving_of_singleton, turn,
+    turn_deferred, Deferred, Fed, Feeds, Hooks, Incarnation, Intensity, LocalActor, NotQueued,
+    Replied, Reply, Turn, Unanswered,
 };
 pub use watch::{Departure, Watch};
 pub use wire::{Envelope, WireKinds, MAX_HEADER};

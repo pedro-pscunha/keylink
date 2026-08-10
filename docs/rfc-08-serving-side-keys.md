@@ -961,3 +961,9 @@ is the first time the file can point at an instance instead of a hypothetical.
 Read off the failing run, never computed. `RemoteError` is carried by every
 service, so a variant added to it moves every pin — the keyed side is not special
 here, and a wave that sees one pin go red should expect the other.
+
+**Both moved again in wave 3, and this table is deliberately not rewritten for
+it.** It records `0c6e6c3`, and a dated table rewritten in place records nothing.
+The current pair is the two `PINNED` constants in `keylink/tests/protocol.rs` —
+values a test holds and this file cannot — and that file's rustdoc ledger carries
+one entry per move, wave 3's included.
