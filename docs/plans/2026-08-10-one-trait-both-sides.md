@@ -1,7 +1,14 @@
 # Wave 2 — one trait, both sides
 
-Plan for `docs/goals/2026-08-09-one-trait-both-sides.md`, **revision 1**, written
+Plan for `docs/goals/2026-08-09-one-trait-both-sides.md`, **revision 2**, written
 against `one-trait` at `2dd3eb4` — the merge of wave 1.
+
+**Revision 2 applies a plan review, measured at `33e557e`.** Two findings were
+Critical: the three break-record ids §8 claimed are **already registered**, and
+the `Failure::Other` shape as written **deletes the `source()` chain** §2.2
+promises. Six more corrected a mechanism or a population — including a `E0034`
+claim in §4 and §12 that is false, and a table in §2.1 whose columns were not the
+four implementors. Each correction carries the measurement that forced it.
 
 The goal was written on 2026-08-09, before wave 1 landed. **Eight of its factual
 claims are false against this tree**, and §11 lists each one with the measurement
@@ -51,8 +58,9 @@ So this wave adds four things:
    from both sides.
 2. **`Calls`** — one generated trait per service, carrying that service's `rpc`
    methods, implemented for four surfaces.
-3. **`Governed`** — a crate-level sealed marker, so `impl Calls + Governed`
-   refuses a `Handle` at the signature a reviewer reads.
+3. **`Governed`** — a crate-level marker, so `impl Calls + Governed` refuses a
+   `Handle` at the signature a reviewer reads. It is **not sealed**, and §2.6
+   says why it cannot be.
 4. **`keyed_serve`** — the twin of `Handle::serve`, five lines, §2.8.
 
 **And it refuses most of the goal's remaining scope.** §12 lists **ten**
@@ -71,13 +79,21 @@ Measured at `2dd3eb4`: **`rpc` is the only kind present on all four async
 surfaces.** The other four kinds are each absent from at least one, and every
 absence is a *written refusal with an argument*, not an oversight:
 
-| Kind | `Handle` | `ActorRef` | `Client` | `blocking::Client` |
+| Kind | `Handle` | `ActorRef` | `Client` | `IdempotentClient` |
 |---|---|---|---|---|
 | `rpc` | yes | yes | yes | yes |
-| `tell` | yes | **refused** `macros.rs:3695-3719` | yes | yes |
-| `send` | **refused** `macros.rs:3961` | yes | yes | **refused** `macros.rs:3096` |
-| `recv` | **refused** `macros.rs:3963` | yes | yes | **refused** `macros.rs:3097` |
-| `blob` | yes, `BlobId` | yes, `BlobHandle` | yes, `BlobHandle` | **refused** `macros.rs:3101` |
+| `tell` | yes | **refused** `macros.rs:3695-3719` | yes | **refused** `macros.rs:2906-2907` |
+| `send` | **refused** `macros.rs:3961` | yes | yes | yes |
+| `recv` | **refused** `macros.rs:3963` | yes | yes | yes |
+| `blob` | yes, `BlobId` | yes, `BlobHandle` | yes, `BlobHandle` | yes, `BlobHandle` |
+
+**`blocking::Client` is not a column, because it is not an implementor** (§2.5).
+Revision 1 put it here instead of `IdempotentClient`, so the table's population
+was not the sentence's population. Recomputed over the real four, the ruling is
+unchanged and one cell moved sides: `IdempotentClient` is `Client`'s method set
+minus `tell`, dropped by the one arm at `macros.rs:2906-2907` because *"a client
+holding a key no longer has a `tell` to call"*. `blocking::Client`'s own
+refusals are still priced, in §2.5 and §5.
 
 `blob` is the interesting row: it is present on three async surfaces and
 **returns a different type locally**. `Handle` yields `Result<($ret, BlobId),
@@ -126,9 +142,27 @@ pub enum Failure {
     /// Everything a call can meet that the shared vocabulary does not name.
     /// **No local surface produces this.**
     #[error("{0}")]
-    Other(#[from] Error),
+    Other(#[source] Error),
 }
 ```
+
+**`#[source]` is load-bearing and revision 1 lost it.** §3 replaces the derived
+`From<Error>` with a hand-written one, and revision 1 said to drop `#[from]` and
+stopped there — which leaves a plain field. The plan review compiled all three
+shapes against `thiserror 2.0.20` (`Cargo.lock:3895-3896`):
+
+| Arm written as | `Failure::Other(..).source().is_some()` |
+|---|---|
+| `Other(#[from] Error)` | `true` |
+| `Other(Error)` — what revision 1 produced | **`false`** |
+| `Other(#[source] Error)` | `true` |
+
+`#[from]` implies `#[source]`; a bare field implies neither. So the sentence
+below — *"the `source()` chain survives"* — was true of the shape the plan showed
+and false of the shape §3 instructed. **`keylink/src` uses `#[source]` zero
+times** (`rg -n '#\[source\]' keylink/src` is empty against eleven `#[from]`), so
+there is no precedent test and nothing in the gate catches this. §6 gains a row
+that does.
 
 Three properties this shape has and the goal's does not:
 
@@ -136,12 +170,22 @@ Three properties this shape has and the goal's does not:
    `Unanswered::Turn(w)` and `Error::Remote(RemoteError::Withheld(w))` both land
    on `Failure::Turn(w)`. That is the deliverable, and it is the only thing a
    generic caller needs a new type for.
-2. **Nothing is erased.** `Other` carries the concrete `Error`, so every remote
-   condition stays matchable and the `source()` chain survives.
-3. **Two arms are one-sided, and both are checkable.** `Reentrant` has no served
-   producer (wave 1 §2.4: `turns.rs:4769-4780` argues the peer path is
-   unreachable). `Other` has no local producer. Neither is representable-only
-   guesswork — §6 turns both into tests.
+2. **Nothing is erased, and every served condition gains a nesting level.**
+   `Other` carries the concrete `Error`, so every remote condition stays
+   matchable and the `source()` chain survives. The cost is depth, and revision 1
+   stated only the half that flatters the shape: a match reading
+   `Error::Remote(RemoteError::Unauthorized(method))` today
+   (`reply.rs:77`) becomes
+   `Failure::Other(Error::Remote(RemoteError::Unauthorized(method)))` through the
+   trait — **three levels against two**. Write that arm out in `Failure`'s
+   rustdoc.
+3. **Two arms are one-sided. One is tested, the other is argued.** `Other` has no
+   local producer, and §6's `a_local_surface_never_reports_other` makes that a
+   test. `Reentrant` has no served producer, and `turns.rs:4769-4780` carries
+   that argument — `turns.rs:4773` reads *"this one is unreachable from a peer"*.
+   **It is argued, not tested**, and it stays that way, because the premise is
+   that nothing can produce the value and there is therefore no served call to
+   drive at it. Revision 1 said §6 turned both into tests; §6 listed one.
 
 `#[non_exhaustive]` **is** on this one, and the discriminator is wave 1 §2.1's:
 does every caller handle every variant the same way, or must a caller be *made*
@@ -149,6 +193,34 @@ to look at a new one. A generic caller's normal move is `?` — it propagates th
 whole value. `Withheld` stays open one level in, which is where a new loss is
 actually added. This is the `RemoteError` half of the wave-1 rule, not the
 `Withheld` half.
+
+**And the nearest neighbour rules the other way, in writing.** `Unanswered` — the
+enum whose two arms `Failure` reproduces — carries a heading at
+`turns.rs:3206-3211`, *"Exhaustive, and deliberately not `#[non_exhaustive]`"*:
+
+> [`Ended`] and [`TurnLost`] carry that argument: a caller matches this, and a
+> wildcard arm is the collapse the split exists to prevent. A new loss is added
+> to [`Withheld`], which makes the same choice — so exhaustiveness reaches a
+> caller one level in rather than stopping at this enum's two arms.
+
+That is the same argument this plan just used, reaching the opposite verdict, and
+revision 1 never named it. **The difference that decides it is the third arm.**
+`Unanswered` is closed over losses that are all local and all enumerated;
+`Failure` carries `Other(Error)`, and `Error` (`error.rs:17-91`) is the transport
+vocabulary, which grows on a schedule this crate does not own. So a caller who
+matched `Failure` exhaustively would be broken by a wire condition rather than by
+a design decision — the case `#[non_exhaustive]` exists for.
+
+**The cost, stated:** `tests/surfaces.rs` is an integration test, so it is a
+different crate and `#[non_exhaustive]` binds there. Every routing match in it
+needs a wildcard arm, including the ones asserting one-sidedness — so
+`a_local_surface_never_reports_other` is written with `matches!`, not with an
+exhaustive match it cannot write.
+
+**If that argument does not survive first contact, drop the attribute.**
+`Other(Error)` already carries a `#[non_exhaustive]` type, so growth still
+reaches a caller one level in, which is exactly `Unanswered`'s stated design.
+Dropping it costs nothing this plan is relying on.
 
 **Two costs, stated:**
 
@@ -172,6 +244,16 @@ actually added. This is the `RemoteError` half of the wave-1 rule, not the
   `Withheld` is `PartialEq + Eq` (`observe.rs:869`), so the comparable part stays
   comparable. Say this in `Failure`'s rustdoc; a test author who discovers it by
   hitting `E0369` will reach for a derive that cannot exist.
+
+  **`withheld()` returns `None` for `Reentrant` and `None` for `Other`, so it
+  cannot tell them apart.** It replaces equality for one arm, not for three, and
+  a test asserting *"this was not a `Turn`"* through it has asserted nothing
+  about which of the other two it was. Say that in the accessor's own rustdoc,
+  and put the discriminating form in its doc example beside the accessor:
+
+  ```rust
+  assert!(matches!(err, Failure::Reentrant));
+  ```
 - **No `From<NotQueued>`.** `tell` is not in the trait (§2.1), so the conversion
   has no caller. Adding one on speculation puts a third door into `Failure` that
   nothing walks through. `turns.rs:3401` already has `From<NotQueued> for
@@ -218,20 +300,43 @@ today is unaffected. `Failure` is reachable **only through `Calls`**, which is a
 surface a caller opts into by writing a generic bound, and writing that bound is
 precisely the act of saying *I have chosen not to know which surface I hold.*
 
-So §5.5's question has an answer now, and it is not a dodge:
-`Error::SchemaMismatch` reaches a generic caller as `Failure::Other`, an arm
-**no local surface produces**, and §6 makes that a test rather than a claim. The
-crate keeps the property §5.5 is defending — a caller can tell from the type what
-can go wrong — everywhere except the one signature where the caller asked for the
-width.
+**The RFC append must name the horn it takes, and revision 1 called it an
+escape.** §5.5's disjunction (`rfc-04-actors.md:789-790`) is *"A unified handle
+must either claim failures the local case cannot have, or hide failures the
+remote case does have."* `Failure::Other(Error)` **takes the first horn**: through
+the bound, a local surface returns a type that can name `Error::SchemaMismatch`.
+§2.2 concedes exactly that in the words *"no local surface produces this"*.
+Writing *"§5.5's question has an answer now, and it is not a dodge"* over the top
+of a horn taken is how the next proposal gets to cite this wave as a precedent it
+is not. The append is permanent and exists so nobody relitigates §5.2, so it is
+written as:
+
+> §5.5's disjunction stands. `Calls` takes its **first** horn: through the bound,
+> a local surface returns a type that can name `Error::SchemaMismatch`. Three
+> things bound the price. The concrete types are untouched — `Handle`'s inherent
+> methods still return `Unanswered`. The arm is reachable only from a signature
+> the caller wrote. And `a_local_surface_never_reports_other` holds it to zero
+> local producers.
+
+**This does not block the wave.** The property §5.5 is defending is stated at
+`rfc-04-actors.md:794-796` — *"a caller cannot tell from the type what can go
+wrong"* — and it is preserved wherever a caller names a concrete type. The width
+appears only at a bound the caller wrote.
+
+**What to watch, and it is not a type-level risk.** Nothing stops callers
+migrating from `Handle`'s inherent methods to `Calls` **by preference**, because
+one signature is easier to write than two. Every such migration widens that
+caller's error type without any type checking it. §5.5's property would then
+erode **by convention rather than by type**, which no compiler and no test in
+this wave can see. Name it in the append as the thing to watch.
 
 **Two edits §5.5 needs anyway, which wave 1 scheduled and did not make.** Wave
 1's plan §9 listed *"RFC-04 §5.5 re-argued"* among commit 7's appends; measured at
 `2dd3eb4`, the section is unchanged. It carries two statements that are now false:
 
-- `rfc-04-actors.md:791` — *"A local mailbox has exactly one failure: the task is
+- `rfc-04-actors.md:792` — *"A local mailbox has exactly one failure: the task is
   gone."* `Withheld` has seven variants (`observe.rs:870`), and `Unanswered` two
-  arms.
+  arms. (Revision 1 cited `:791`, which is the line above it.)
 - `rfc-04-actors.md:788` — names `MailboxClosed`, a type that no longer exists.
   The current spelling is `NotQueued::Closed` (`turns.rs:3314`).
 
@@ -284,14 +389,34 @@ fn dial(node: &Node, addr: EndpointAddr)
 could not cross `tokio::spawn`. `Dial` already pays for `+ Send` in return-position
 `impl Trait`, and `Calls` matches it exactly.
 
-**MEASURED at `b2d046a`, and this was the plan's only inference.** A scratch
-integration test declared a one-method service, took a `Handle` from
-`probe::actor`, and did two things: passed `h.ping()` to
+**The price is dyn-compatibility, and the generated trait's rustdoc says so in
+one line.** A return-position `impl Trait` method cannot be called through a
+trait object, so `dyn Calls` is `E0038` — **measured**. `Dial` (`peer.rs:41-45`)
+is the same shape for the same reason and is the precedent to cite. **Do not box
+the future as a workaround**: that is the `Box<dyn Error>` move §2.2 already
+refuses, one level down, and it would cost the `Send` bound its whole point. A
+caller who needs one type writes the concrete surface.
+
+**MEASURED at `b2d046a` for `Handle`, then at `33e557e` for all four.** The first
+probe was a scratch integration test that declared a one-method service, took a
+`Handle` from `probe::actor`, and did two things: passed `h.ping()` to
 `fn assert_send<T: Send>(_: T)`, and drove a clone of the handle through
-`tokio::spawn(..).await`. **Both compiled and the test passed.** So a generated
-`Handle<A>` rpc future is `Send` and survives a spawn, which is the property that
-matters — `+ Send` in return position is viable and the fallback ladder below is
-not needed. The probe was deleted after measuring; it existed only to answer this.
+`tokio::spawn(..).await`. Both compiled and the test passed.
+
+**Revision 1 then generalized that one result to four surfaces, which it had not
+measured.** The plan review measured the other three at `33e557e`: a compile-only
+test passed `h.ping()`, `c.ping()`, `a.ping()` and `i.ping()` to
+`fn s<T: Send>(_: T)` for **`Handle<P>`, `Client`, `ActorRef<'_>` and
+`IdempotentClient`**. **All four compile, so all four rpc futures are `Send`.**
+`+ Send` in return position is viable for every implementor and the fallback
+ladder below is not needed. Both probes were deleted after measuring; each
+existed only to answer this.
+
+**Step 1 of commit 3 re-asserts all four anyway, in one file, before the trait is
+written.** A deleted probe is a measurement, not a guard, and §3 says `+ Send` is
+the one thing in this plan that must be compiled before it is committed to. The
+measurement says the ladder will not be needed; the step is what makes a later
+regression visible.
 
 ### 2.6 `Governed` is adopted — and it does **not** mean at-most-once
 
@@ -331,12 +456,51 @@ therefore **not closed by `impl Calls + Governed`**: that bound accepts a plain
 /// `Client::with_idempotency(key)` and it holds only while the key is stable
 /// across retries. A bound cannot see a key's stability, so no bound can promise
 /// this. Name `IdempotentClient` in the signature where the ledger is required.
+///
+/// # `GovernedSeal` is not a seal
+///
+/// `service!` writes this trait's impls in the **caller's** crate, so
+/// `GovernedSeal` must be `pub` for those impls to name it. A downstream crate
+/// can therefore write `impl keylink::GovernedSeal for MyType {}` and then
+/// `impl keylink::Governed for MyType {}`. `#[doc(hidden)]` keeps the supertrait
+/// out of the rendered docs and out of a caller's way. It forbids nothing.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` does not reach the actor through a `Dispatch`",
+    label = "not a governed surface",
+    note = "a `Handle` calls the mailbox directly, so no `Middleware` and no \
+            `Allowlist` ran. Take a `Client`, an `IdempotentClient` or an \
+            `ActorRef`, or drop the `+ Governed` half of the bound."
+)]
 pub trait Governed: GovernedSeal {}
 ```
 
-Sealed through a `#[doc(hidden)] pub trait GovernedSeal {}` re-exported at the
+The supertrait is `#[doc(hidden)] pub trait GovernedSeal {}`, re-exported at the
 crate root, because the impls are written by `service!` expanding in a downstream
-crate and must be able to name the supertrait.
+crate and must be able to name it.
+
+**That makes `Governed` unsealed, and the words must say so.** Revision 1 called
+the trait "sealed" in the same sentence that explains why it cannot be: a
+supertrait a downstream crate must name is a supertrait a downstream crate can
+implement. Any consumer can write `impl keylink::GovernedSeal for MyType {}` and
+then `impl keylink::Governed for MyType {}`, and nothing stops it — `#[doc(hidden)]`
+hides an item from rustdoc and from a reader, and is not a visibility modifier.
+The design is kept, because the tension has no fix and the alternative is no
+marker at all. What changes is the vocabulary: §2.6 and `Governed`'s own rustdoc
+say **cannot be sealed**, never *sealed*.
+
+**`Governed` ships with a caller, and revision 1 gave it none.** Its only
+consumer was the `compile_fail` doctest proving a `Handle` is refused — a guard
+that a name exists, driven by nothing. And the wave's one generic function
+**cannot** carry the bound: `one_function_calls_four_surfaces` is driven against
+a `Handle`, which `Governed` refuses by construction. So commit 4 adds a
+**second** generic function to `tests/surfaces.rs`, taking `impl Calls +
+Governed` and driven against `Client` and `IdempotentClient` — roughly ten lines,
+and §6 carries it as a row.
+
+Without that caller, `Governed` is cut to a later wave. It is kept because
+deleting it leaves **nothing in the language** able to express *"this surface
+went through the `Dispatch`"*; the only remaining instrument is a doc comment,
+which is precisely the invisible thing the goal was right to reject.
 
 **Refuse the second marker.** An `Idempotent` twin would have exactly one
 implementor per service and would still promise something a type cannot check —
@@ -437,7 +601,7 @@ without re-planning anything.
 
 ```rust
 // keylink/src/error.rs
-pub enum Failure { Turn(Withheld), Reentrant, Other(Error) }   // §2.2
+pub enum Failure { Turn(Withheld), Reentrant, Other(#[source] Error) }   // §2.2
 impl Failure { pub fn withheld(&self) -> Option<&Withheld>; }
 
 impl From<Unanswered> for Failure {
@@ -461,10 +625,13 @@ impl From<Error> for Failure {           // the derive on `Other` is NOT enough
 }
 ```
 
-**`#[from]` on `Other` must be dropped in favour of the hand-written impl**, or
-the derive and the match are two `From<Error>` impls and the tree does not
-compile. Keep the arm's doc comment naming the lift; a reviewer reading
-`Self::Other(other)` alone cannot see that one variant was intercepted above it.
+**`#[from]` on `Other` becomes `#[source]`, and dropping it to a bare field is a
+defect.** `#[from]` must go, or the derive and the match are two `From<Error>`
+impls and the tree does not compile. But `#[from]` is also what supplies
+`source()`, so removing it without putting `#[source]` back deletes the chain
+§2.2 promises — measured, three shapes, in §2.2's table. Keep the arm's doc
+comment naming the lift; a reviewer reading `Self::Other(other)` alone cannot see
+that one variant was intercepted above it.
 
 ```rust
 // generated inside `mod $svc`, one per service
@@ -501,6 +668,15 @@ impl $crate::GovernedSeal for IdempotentClient {}
 impl $crate::Governed     for IdempotentClient {}
 ```
 
+**`#[diagnostic::on_unimplemented]` goes on both traits, and this wave is the
+tree's first use of it.** `rg -n 'on_unimplemented' keylink/` returns nothing
+today; every hit in the repo is in `docs/`, and `docs/audits/.../bolder.md:348-349`
+records the same measurement. It is stable since Rust 1.78 and the crate's MSRV
+is `1.91` (`keylink/Cargo.toml:9`), so there is no version question. `Calls`
+carries the note above; `Governed` carries its own (§2.6), naming why a `Handle`
+is refused — a bound that refuses a type without saying why sends the reader to
+the impl list to guess.
+
 One `rpc` body, four times:
 
 ```rust
@@ -530,9 +706,11 @@ two `Arc`s, so `Handle<A>: Sync` should hold wherever `Actor` already requires
 
 ## 4. The work, in commits
 
-`lint-fast` is `cargo clippy -p keylink --lib` (`mise.toml:254`) — **library
-target only**, so a green `pre-commit` is not proof a commit compiles. Every
-commit below is verified with **all four** of:
+`lint-fast` is `cargo clippy -p keylink --lib --all-features -- -D warnings`
+(`mise.toml:254`) — **library target only**, so a green `pre-commit` is not proof
+a commit compiles. Revision 1 quoted it without its flags, which understates what
+it does catch and overstates what a green run leaves open. Every commit below is
+verified with **all four** of:
 
 ```
 cargo check --workspace --all-targets
@@ -545,10 +723,10 @@ The fourth is a **negative** check: no commit here may move it. §6 says why.
 
 | # | Commit | ALPN pin | anchors registry | intra-doc links broken |
 |---|---|---|---|---|
-| 1 | `Failure` in `error.rs` + `From` impls + re-export | **no** | **rows `C1`, `C2`** | 0 |
+| 1 | `Failure` in `error.rs` + `From` impls + re-export | **no** | **rows `T1`, `T2`** | 0 |
 | 2 | `Governed` + `GovernedSeal` in `rpc.rs` + re-exports | **no** | no | 0 |
-| 3 | `Calls` — generated trait + 4 impls + 3 `Governed` impls | **no** | **row `C3`** | 0 |
-| 4 | `tests/surfaces.rs` + the two `compile_fail` doctests | **no** | no | 0 |
+| 3 | `Calls` — generated trait + 4 impls + 3 `Governed` impls | **no** | **row `T3`** | 0 |
+| 4 | `tests/surfaces.rs` — both generic functions — + the two `compile_fail` doctests | **no** | no | 0 |
 | 5 | RFC-04 §5.5, RFC-05, README appends | **no** | no | 0 |
 | 6 | `keyed_serve` | **no** | no | 0 |
 
@@ -590,11 +768,30 @@ generated trait nothing implements, which `pre-commit` cannot see is wrong.
 **Commit 3 must also read `macros.rs:4097-4175` before touching anything.** That
 module — `no_streaming_on_a_local_handle` — proves `Handle` has no `store` and no
 `fetch` by giving it default trait methods and asserting the calls resolve to the
-trait. It survives this wave **because `Calls` carries no `send` and no `recv`**
-(§2.1); a `Calls` that did would make `handle.store()` ambiguous between two
-traits (`E0034`) and break a guard this plan is not otherwise near. The trait's
-`rpc` methods do not collide, because an inherent method outranks a trait method
-and `Handle::ping` is inherent.
+trait (`macros.rs:4164-4165`, `let _: NoSuchMethod = handle.store();`).
+
+**It survives this wave, and revision 1 gave the wrong reason.** Revision 1 wrote
+that it survives *because* `Calls` carries no `send` and no `recv`, and that a
+`Calls` which did would make `handle.store()` ambiguous between two traits
+(`E0034`). **The `E0034` claim is false, measured.** The guard's module writes
+`use super::expansion;` at `macros.rs:4100` — **the module, not the trait**. Rust
+considers a trait method only when the trait is in scope, so a `Calls` carrying
+`store` would not be a candidate there at all. Compiled both ways: module-only
+import compiles clean; adding `use super::expansion::Calls as _;` produces
+`E0034`.
+
+**The true reason, which is weaker and worth writing down as such:** the guard
+survives because **nobody imported the trait**, not because of any ruling in this
+plan. §2.1's decision to omit `send` and `recv` is not what protects it. A later
+commit that adds `use super::expansion::Calls;` to that module breaks the guard,
+and nothing in this plan warns the author who writes that line.
+
+**What actually reddens this guard is an inherent method.** If `Handle` gained an
+inherent `store(name, body)` — which is what a local `send` arm would emit — then
+`handle.store()` resolves to the inherent method, because an inherent method
+outranks a trait method: `E0061` on the argument count, or `E0308` against the
+`NoSuchMethod` annotation. That is also why the trait's `rpc` methods do not
+collide with anything: `Handle::ping` is inherent and wins.
 
 ---
 
@@ -620,8 +817,10 @@ refusal below quotes the argument that already exists rather than inventing one.
 | Claim | Proof | State |
 |---|---|---|
 | One function, four surfaces | `one_function_calls_four_surfaces` — a single `async fn` generic over `journal::Calls`, driven against `Handle`, `ActorRef`, `Client` and `IdempotentClient` in one `#[tokio::test]` | **TO WRITE**, `keylink/tests/surfaces.rs` |
+| `Governed` has a caller | `one_function_calls_two_governed_surfaces` — a second `async fn`, bound `impl Calls + Governed`, driven against `Client` and `IdempotentClient`. The first function cannot carry the bound, because it is driven against a `Handle` (§2.6) | **TO WRITE**, `keylink/tests/surfaces.rs` |
 | The lift happens | `a_peer_failure_carrying_a_withheld_lands_on_turn` — build `Error::Remote(RemoteError::Withheld(Withheld::Gone))`, convert, assert `Failure::Turn(Withheld::Gone)`, and assert `matches!(.., Failure::Other(_))` is false | **TO WRITE**, `keylink/src/error.rs` `#[cfg(test)]` |
 | `Reentrant` survives the conversion | same test, second half: `Unanswered::Reentrant` converts to `Failure::Reentrant` and not to `Other` | **TO WRITE**, same module |
+| The `source()` chain survives | `other_keeps_the_error_as_its_source` — assert `Failure::Other(..).source().is_some()`, and that the chain reaches the `RemoteError` inside it. **This is the row that catches a bare field**: `#[from]` and `#[source]` both give `true`, a plain field gives `false`, and `keylink/src` uses `#[source]` zero times, so no existing test would notice | **TO WRITE**, `keylink/src/error.rs` `#[cfg(test)]` |
 | A local surface never produces `Other` | `a_local_surface_never_reports_other` — drive `<Handle as Calls>` into every loss it can reach (stop the actor for `Gone`; call from inside a turn for `Reentrant`) and assert every error is `Turn` or `Reentrant` | **TO WRITE**, `keylink/tests/surfaces.rs` |
 | `blocking::Client` is not a `Calls` surface | a `compile_fail` doctest on the generated trait | **TO WRITE**, `macros.rs` |
 | `Handle` is refused by `impl Calls + Governed` | a `compile_fail` doctest on `Governed` | **TO WRITE**, `keylink/src/rpc.rs` |
@@ -669,10 +868,18 @@ instruction: *every file that names `Failure`, `Governed`, `GovernedSeal` or
 | `keylink/src/lib.rs` | three re-exports; `Failure` joins the `error` list, `Governed` and `GovernedSeal` the `rpc` list |
 | `keylink/src/macros.rs` | two emitter macros; the `Calls` decl and four impls inside `__keylink_service!`; three `Governed` impls; `keyed_serve`; one `compile_fail` doctest |
 | `keylink/tests/api.rs` | consumer-position resolution of the three new names |
-| `keylink/tests/surfaces.rs` | **new file** — the shared function and the one-sidedness test |
-| `docs/rfc-04-actors.md` | §5.5 append (§2.4), plus the two false statements at `:788` and `:791` |
+| `keylink/tests/surfaces.rs` | **new file** — two generic functions (`Calls`, and `Calls + Governed`) and the one-sidedness test |
+| `docs/rfc-04-actors.md` | §5.5 append (§2.4), plus the two false statements at `:788` and `:792` |
 | `docs/rfc-05-idempotency.md` | append: `Governed` does not mean at-most-once (§2.6) |
 | `README.md` | the trait, and the four kinds it does not carry |
+
+**The name `Calls` is already taken once in the test tree, and it does not
+collide.** `keylink/tests/supervision.rs:419` declares `type Calls =
+Arc<AtomicU32>;`, and that same file invokes `service!` three times
+(`:65`, `:90`, `:128`). There is no collision today, because the generated trait
+lives inside `mod $svc` and the alias is at file scope. Recorded so that a
+`use journal::Calls;` added to that file later is recognised as the collision
+rather than investigated from zero.
 
 **`keylink-persist/` and `demo/` are untouched.** Both are additive-only
 consumers here: nothing is renamed, nothing changes type, and no existing
@@ -711,21 +918,44 @@ value off the failing run of `mise run anchors`. Never compute it** —
 reads as a derivation and is a coincidence. One comment block can hold two rows
 (`anchors:3155`), so a record count is not a block count.
 
-**Three break records, and the reason each one is expressible as a single-line
-substitution:**
+**The ids are `T1`, `T2` and `T3`. Revision 1 wrote `C1`, `C2` and `C3`, and all
+three are already registered** — `anchors:646`, `:648` and `:650`, every one of
+them anchoring `keylink/src/call.rs`. The `C` series already runs `C1 C2 C3 C4 C5
+C5b C6 C7 C8 C8b C9 C10 C11 C12 C13 C14`.
+
+**`T` is a fresh letter, which is the rule this registry already follows.**
+`anchors:928-931` takes `D` for the deadlock-audit branch *"because `R12`-`R14`,
+`R21`-`R24` and `R27` are reserved gaps that nothing enumerates, and a fresh
+letter cannot collide with them by arithmetic — the same reason `call-id` took
+`C`"*; `anchors:1068-1069` takes `E` on the same reasoning, and `anchors:1454`
+takes `K` *"because that is the wave they landed in"*. So the letter names the
+wave, and `T` is this one.
+
+**How the free letter was found. Do not scan this list by eye** — it holds
+`b`/`c` suffixes (`C5b`, `C8b`, `A2b`, `K3b`, `R26b`, `R26c`) and five rows whose
+id is a bare number, and a scan that misses either reports a taken id as free.
+Measured at `33e557e`: the `ANCHORS = [` slice at `anchors:539` was parsed with
+`ast.literal_eval` and enumerated — **123 rows, 123 distinct ids**, under the
+sixteen letters `A C D E F G H I K L M N O P R W` plus the bare numerics. A green
+`mise run anchors` prints the same row count, which is the second method. Then
+every id-shaped quoted token in
+`.mise/tasks/anchors`, `scripts/break-once.sh`, `scripts/replay-fate-breaks.sh`,
+`scripts/hook-guard.sh`, `.mise/tasks/replay-anchors` and `CONTRIBUTING.md` was
+collected, which adds the reserved-gap tokens `R12`, `R14`, `R21`, `R24`, `R26a`
+and `R27` that no row carries. `B J Q S T U V X Y Z` are unused in all six files.
 
 | Row | Guard | The one line to break |
 |---|---|---|
-| `C1` | the lift in `From<Error> for Failure` | the `Error::Remote(RemoteError::Withheld(w)) => Self::Turn(w)` arm — reroute it to `Self::Other(other)` |
-| `C2` | `From<Unanswered> for Failure` keeps `Reentrant` typed | the `Unanswered::Reentrant => Self::Reentrant` arm |
-| `C3` | the trait's bodies are the inherent methods | the single `rpc` arm of `__keylink_calls_impl!` |
+| `T1` | the lift in `From<Error> for Failure` | the `Error::Remote(RemoteError::Withheld(w)) => Self::Turn(w)` arm — reroute it to `Self::Other(other)` |
+| `T2` | `From<Unanswered> for Failure` keeps `Reentrant` typed | the `Unanswered::Reentrant => Self::Reentrant` arm |
+| `T3` | the trait's bodies are the inherent methods | the single `rpc` arm of `__keylink_calls_impl!` |
 
-`C3` breaks all four impls from one line, which is what makes it worth a record:
+`T3` breaks all four impls from one line, which is what makes it worth a record:
 a substitution there reddens `one_function_calls_four_surfaces` for every surface
 at once, proving the test walks the trait and not the inherent methods.
 
 **Registry rows take the tuple shape at `anchors:1745`** —
-`(id, test_file, edited_file, literal)`. `C1` and `C2` edit `keylink/src/error.rs`
+`(id, test_file, edited_file, literal)`. `T1` and `T2` edit `keylink/src/error.rs`
 from tests in the same file, so **the record must not quote its own search
 literal**: `anchors:1753-1757` records that a same-file record quoting itself
 aborts the harness at *"found 2"*. Indentation is what keeps each unique.
@@ -759,9 +989,46 @@ implementer runs it once and records the output in the commit message:
 the harness, and `scripts/replay-fate-breaks.sh` is not a gate step. So the three
 records above are re-checked by hand, once, in the commit that registers them.
 
-**No existing record is at risk.** This wave renames nothing, deletes nothing and
-changes no watched output. `mise run anchors` fails on the three new blocks and on
-nothing else; a failure naming any other row means something unplanned moved.
+**Eleven existing rows anchor literals in files this wave edits, and revision 1
+asserted the risk away without measuring it.** Adding four impl blocks that share
+one emitter is exactly how a quoted line acquires a twin, and a record's literal
+does not have to be near the edit to gain one.
+
+**The predicate, and the command that produces the population.** Rows are at risk
+when their *edited file* — the third tuple field — is a file this wave touches.
+Measured at `33e557e`:
+
+```
+rg -n '^\s*\("[^"]+", "[^"]+", "keylink/src/(rpc|macros)\.rs",' .mise/tasks/anchors
+```
+
+returns exactly these, and they are the rows to watch:
+
+| Row | Declared at | Edits |
+|---|---|---|
+| `R17` | `anchors:544` | `rpc.rs` |
+| `R18` | `anchors:546` | `rpc.rs` |
+| `R25` | `anchors:550` | `macros.rs` |
+| `R26b` | `anchors:552` | `rpc.rs` |
+| `R26c` | `anchors:554` | `rpc.rs` |
+| `R28` | `anchors:635` | `macros.rs` |
+| `C13` | `anchors:835` | `rpc.rs` |
+| `F1` | `anchors:1124` | `macros.rs` |
+| `L1` | `anchors:1133` | `rpc.rs` |
+| `A1` | `anchors:1202` | `rpc.rs` |
+| `M2` | `anchors:1270` | `rpc.rs` |
+
+`A1` and `M2` carry the extra hazard: their records **live in `rpc.rs` and edit
+`rpc.rs`**, so `rpc.rs` gaining `Governed`, `GovernedSeal` and a `compile_fail`
+doctest can move their own counts. **No row edits `keylink/src/error.rs`**
+(`rg -c 'keylink/src/error\.rs' .mise/tasks/anchors` returns nothing), so `T1`
+and `T2` land in a file with no incumbent.
+
+**Run `mise run anchors` after commit 3 and again after `cargo fmt`, and confirm
+the only failing rows are `T1`, `T2` and `T3`.** A red row from the eleven above
+is a twin this wave created, not a mystery — read which literal it names before
+changing anything. A red row from outside both lists means something unplanned
+moved.
 
 ---
 
@@ -774,8 +1041,9 @@ statements this wave makes checkable, not history being rewritten.
 - **RFC-04 §5.5** (`rfc-04-actors.md:783-800`) — §2.4's answer, in full: the types
   stay distinct, inherent methods keep their exact error types, `Failure` is
   reachable only through a bound a caller opts into, and `Error::SchemaMismatch`
-  reaches a generic caller as an arm no local surface produces. Plus the two
-  repairs at `:788` (`MailboxClosed` → `NotQueued::Closed`) and `:791` (*"exactly
+  reaches a generic caller as an arm no local surface produces. **It names the
+  horn it takes** (§2.4) and names the erosion-by-convention risk. Plus the two
+  repairs at `:788` (`MailboxClosed` → `NotQueued::Closed`) and `:792` (*"exactly
   one failure"* → seven `Withheld` variants and two `Unanswered` arms).
 - **RFC-04, a second append** — the four written refusals of §5, gathered in one
   place with the marker's limit, so the next author does not rediscover them one
@@ -884,9 +1152,15 @@ written"*. This is that proposal. §2.4 answers it rather than working around it
   18-line written refusal** (`macros.rs:3941-3960`) whose argument is still true
   about the transport; an RFC append overturning it; **and a rewrite of
   `no_streaming_on_a_local_handle` (`macros.rs:4097-4175`)**, which the goal never
-  names — a `Calls` carrying `store`/`fetch` makes `handle.store()` ambiguous
-  between two traits (`E0034`) and reddens a guard on the very refusal being
-  overturned. Against that: `Calls` works without it, because `rpc` is the kind
+  names — a local `send`/`recv` gives `Handle` **inherent** `store` and `fetch`
+  methods, and an inherent method outranks the guard's trait method, so
+  `handle.store()` at `macros.rs:4164` stops resolving to `NoSuchMethod`:
+  `E0061` on the argument count, or `E0308` on the annotation. Revision 1 said
+  `E0034`, ambiguity between two traits, which is **false** — the guard's module
+  imports `use super::expansion;` (`macros.rs:4100`), the module and not the
+  trait, and a trait method is a candidate only when the trait is in scope (§4).
+  The conclusion is unchanged: the guard is rewritten either way. Against that:
+  `Calls` works without it, because `rpc` is the kind
   every surface has and the goal's own motivating example (`settle`) is an `rpc`.
   **Revisit when a second kind must be in `Calls`** — the trait grows additively
   and nothing here forecloses it.
