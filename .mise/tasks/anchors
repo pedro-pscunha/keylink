@@ -3249,7 +3249,25 @@ for record in sorted(set(REDNESS) - row_ids):
 # 171 entries above both give. It is worth recording only because the two branches
 # that fed it moved the number for unrelated causes, so the arithmetic agreeing is
 # a coincidence over a merge rather than over one wave.
-RECORD_BLOCKS = 177
+#
+# **177 -> 174, and this is the first entry here where records were DELETED rather
+# than added.** The prefix machinery went: five `RemoteError` consts, and with them
+# the three guards that were the only things asserting anything about the consts —
+# `reply::the_five_prefixes_are_the_text_a_peer_matches_on`,
+# `turns::no_failure_prefix_is_a_prefix_of_another` and
+# `remote::no_other_served_failure_begins_with_one_of_the_five`. Each carried one
+# record, and a record whose substitution edits a deleted const cannot express a
+# defect.
+#
+# **No row moved with them, and that was checked rather than assumed.** The only
+# rows naming either file are `P1`/`P2`, which anchor `    drop(route);` in
+# `actor/remote.rs` and whose records live in `tests/defer.rs` — both untouched. So
+# `CONTRIBUTING.md`'s rule against deleting a row to reach green never came up
+# here; there was no row to delete.
+#
+# 174 was READ off the failing run, not computed. The subtraction agrees, and by
+# this ledger's own standard that agreement establishes nothing.
+RECORD_BLOCKS = 174
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

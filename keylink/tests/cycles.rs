@@ -446,11 +446,8 @@ async fn inside_a_turn(entered: &AtomicUsize) {
 /// it: raise the depth and the assertion fails while its own message asserts the old
 /// value as a fact. Naming the constant instead keeps the message an accurate
 /// statement of what must hold, whatever the depth is, and still points the reader
-/// at the one line that governs it. `turns.rs`'s
-/// `no_failure_prefix_is_a_prefix_of_another` is the precedent — it names the consts
-/// rather than the strings, so it cannot drift from the wire. The value is private
-/// to `turns.rs`, so an integration test cannot interpolate it and naming it is the
-/// only option here.
+/// at the one line that governs it. The value is private to `turns.rs`, so an
+/// integration test cannot interpolate it and naming it is the only option here.
 #[tokio::test]
 async fn a_running_turn_leaves_exactly_one_free_permit_behind_it() {
     let (a, _b, gate, entered) = ring_of_two();

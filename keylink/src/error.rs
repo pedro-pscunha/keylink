@@ -57,14 +57,15 @@ pub enum Error {
     /// Distinct from a transport failure: the call arrived and was understood.
     /// What happened next is whatever the inner error says, and this layer does
     /// **not** narrow it — the arm in `rpc.rs` that builds this wraps every
-    /// `RemoteError`, including [`Failed`](crate::RemoteError::Failed) carrying
-    /// the `"panicked: "` prefix and [`TimedOut`](crate::RemoteError::TimedOut).
+    /// `RemoteError`, including [`Withheld`](crate::RemoteError::Withheld)
+    /// carrying a [`Panicked`](crate::Withheld::Panicked) and
+    /// [`TimedOut`](crate::RemoteError::TimedOut).
     ///
     /// **It read *"remote refused: {0}"*, over a doc that said the call "was
     /// declined".** Neither is true of a handler that exploded or of a deadline
     /// that expired, so a client whose remote handler panicked read
     /// *remote refused: panicked: ..* about a call nobody declined. The word
-    /// belongs to [`RemoteError::REFUSED`](crate::RemoteError::REFUSED) and its
+    /// belongs to [`Withheld::Refused`](crate::Withheld::Refused) and its
     /// siblings, one layer in, which say which of them happened.
     #[error("remote error: {0}")]
     Remote(#[from] crate::RemoteError),

@@ -206,13 +206,6 @@ keylink/src/actor/registry.rs \
             // Before the second await' \
   an_expired_shutdown_budget_settles_the_served_answer_before_the_abort -p keylink --lib
 
-run "10 a RouteError that begins like a prefix" \
-'a served Failed that is not one of the five must not begin like one: "dropped: " starts "dropped: the actor system is at its capacity of 10 live actors"' \
-keylink/src/reply.rs \
-'    #[error("the actor system is at its capacity of {capacity} live actors")]' \
-'    #[error("dropped: the actor system is at its capacity of {capacity} live actors")]' \
-  no_other_served_failure_begins_with_one_of_the_five -p keylink --lib
-
 run "11 lost live arm -> gone" \
 'a live actor must not be reported as absent: Remote(Withheld(Gone))' \
 keylink/src/turns.rs \
@@ -288,15 +281,6 @@ keylink/src/actor/registry.rs \
 '            fate.settle(Standing::Gone);' \
 '            fate.settle(Standing::Running);' \
   an_expired_shutdown_budget_settles_the_served_answer_before_the_abort -p keylink --lib
-
-run "17 the DROPPED prefix moves" \
-'left: "lost: "' \
-keylink/src/reply.rs \
-'/// the actor.
-    pub const DROPPED: &'"'"'static str = "dropped: ";' \
-'/// the actor.
-    pub const DROPPED: &'"'"'static str = "lost: ";' \
-  the_five_prefixes_are_the_text_a_peer_matches_on -p keylink --lib
 
 run "18 supervise has no floor (factory panic)" \
 'a peer whose actor died in its own factory must not be told it is serving: Remote(Withheld(Dropped))' \

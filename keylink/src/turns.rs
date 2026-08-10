@@ -4701,17 +4701,17 @@ where
         Ok(()) => {}
         Err(NotQueued::Closed) => return gone(),
         // NOT `NoSuchActor`, which says "there is nothing here, stop asking":
-        // a refused re-entrant call leaves the actor running. `Failed` with the
-        // error's own text and **no prefix**, because the prefixes are the
-        // discriminator between causes a peer acts on differently and this one is
-        // unreachable from a peer — see the send above. A prefix for THIS arm would
-        // be a wire-visible discriminator invented for a case nothing can produce.
+        // a refused re-entrant call leaves the actor running. A bare `Failed`
+        // carrying the error's own text and **not** a `Withheld`, because the
+        // `Withheld` variants are the discriminator between causes a peer acts on
+        // differently and this one is unreachable from a peer — see the send
+        // above. A variant for THIS arm would be a wire-visible discriminator
+        // invented for a case nothing can produce.
         //
-        // That argument is about this arm and does not generalise, which is worth
-        // saying now that the set has grown: `observer panicked: ` was added as a
-        // fifth, and it is producible — `tests/observe.rs` produces one locally and
-        // `rendered` is the arm that ships it. The premise here is *nothing can
-        // produce it*, and that premise is false everywhere except this arm.
+        // That argument is about this arm and does not generalise: every other
+        // loss `rendered` and `lost` answer with IS producible, and each has its
+        // own `Withheld`. The premise here is *nothing can produce it*, and that
+        // premise is false everywhere except this arm.
         //
         // **The wire sentence belongs to `Unanswered`, so the conversion is
         // explicit.** A bare `refused.to_string()` renders whichever type `send`
@@ -4723,15 +4723,11 @@ where
         // bytes a peer reads, and by the paragraph above it is also unreachable —
         // both are true, and neither weakens the other.
         //
-        // **No test covers this path, and the guard this line used to cite is not
-        // one.** `remote::no_other_served_failure_begins_with_one_of_the_five` builds
-        // `Unanswered::Reentrant.to_string()` by hand and asserts every prefix
-        // against that string. It never calls this function and never
-        // reads which type renders here, so reverting this line to
-        // `refused.to_string()` leaves it green. Nothing else calls
-        // `deliver_to_singleton` and reads its refusal bytes either. A guard would have
-        // to be **built** rather than watched, because the paragraph above argues a
-        // peer cannot produce a re-entrant call in the first place.
+        // **No test covers this path.** Nothing calls `deliver_to_singleton` and
+        // reads its refusal bytes, so reverting this line to
+        // `refused.to_string()` leaves the suite green. A guard would have to be
+        // **built** rather than watched, because the paragraph above argues a peer
+        // cannot produce a re-entrant call in the first place.
         Err(refused @ NotQueued::Reentrant) => {
             return (
                 Outcome::Err(RemoteError::Failed(Unanswered::from(refused).to_string())),
@@ -4789,62 +4785,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-
-    // The five prefixes a `RemoteError::Failed` used to carry out of `rendered`
-    // and `lost`. **Neither function builds one any more** — both render
-    // `RemoteError::Withheld`, so the discriminator is a variant and no peer has
-    // to run `starts_with` on a sentence.
-    //
-    // They live on `RemoteError` itself, in `reply.rs`, where a peer can name
-    // them; these are aliases so the guard below reads as five names rather than
-    // five qualified paths. The aliases sit inside `mod tests` because this test
-    // is now their only reader in this file, and a private const nothing outside
-    // a test uses is `dead_code` in a normal build.
-    //
-    // Kept rather than deleted here: a peer built against the old wire still
-    // matches on them, and removing the constants is its own commit.
-    use crate::RemoteError as Failure;
-    const PANICKED: &str = Failure::PANICKED;
-    const REFUSED: &str = Failure::REFUSED;
-    const OBSERVER_PANICKED: &str = Failure::OBSERVER_PANICKED;
-    const RESTARTING: &str = Failure::RESTARTING;
-    const DROPPED: &str = Failure::DROPPED;
-
-    /// The one property the five served-path prefixes share.
-    ///
-    /// A peer read `RemoteError::Failed`'s text to tell "your message exploded"
-    /// from "the actor is restarting" from "this reply was dropped", because the
-    /// alternative — a variant per cause — sits inside the hashed contract and
-    /// moves every service's ALPN. A prefix that is a prefix of another makes
-    /// `starts_with` ambiguous and the discriminator stops discriminating.
-    ///
-    /// **keylink no longer builds any of the five**, so what this holds is a
-    /// promise to peers written against the old wire rather than a property of a
-    /// live path. Written into four rustdocs before it was written into a test.
-    /// The list is spelled out here, so **a sixth prefix has to be added to it by
-    /// hand**; it names the consts rather than the strings, so it cannot drift
-    /// from the wire.
-    ///
-    /// [`OBSERVER_PANICKED`] is the fifth and the first one whose text shares a
-    /// word with an existing prefix, which is what makes the by-hand step worth
-    /// stating twice: `"observer panicked: "` neither begins with nor is begun by
-    /// `"panicked: "` or `"observer refused: "`, and this loop is what says so.
-    ///
-    /// Made red by `scripts/break-once.sh keylink/src/turns.rs`, giving [`DROPPED`]
-    /// the value `"panicked: dropped: "`. Watched:
-    /// `"panicked: " is a prefix of "panicked: dropped: "`.
-    #[test]
-    fn no_failure_prefix_is_a_prefix_of_another() {
-        let all = [PANICKED, REFUSED, OBSERVER_PANICKED, RESTARTING, DROPPED];
-        for (i, outer) in all.iter().enumerate() {
-            for (j, inner) in all.iter().enumerate() {
-                assert!(
-                    i == j || !inner.starts_with(outer),
-                    "{outer:?} is a prefix of {inner:?}",
-                );
-            }
-        }
-    }
 
     /// None of [`lost`]'s three answers is a [`RemoteError::Failed`], so none
     /// carries a prefix and no `starts_with` will ever find one.
