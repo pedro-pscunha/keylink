@@ -77,6 +77,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
@@ -197,12 +198,13 @@ pub trait Observer<A>: Send + 'static {
 /// // off a value keylink itself built, so every name written below is proved to
 /// // exist before it is written, and the only thing left to fail is the
 /// // attribute.
+/// use std::time::Duration;
 /// use keylink::{TurnInfo, TurnOutcome};
 ///
-/// let built = TurnInfo::for_test(TurnOutcome::Completed, "Post");
-/// let (outcome, method) = (built.outcome, built.method);
+/// let built = TurnInfo::for_test(TurnOutcome::Completed, "Post", Duration::ZERO);
+/// let (outcome, method, duration) = (built.outcome, built.method, built.duration);
 ///
-/// let _forged = TurnInfo { outcome, method };
+/// let _forged = TurnInfo { outcome, method, duration };
 /// ```
 ///
 /// [`for_test`]: TurnInfo::for_test
@@ -227,6 +229,12 @@ pub struct TurnInfo<'a> {
     /// methods. This field names whichever declaration produced the turn, which
     /// is why Wave 3 does not have to widen it and must not add a second one.
     pub method: &'static str,
+    /// How long the handler took, excluding observer callbacks.
+    ///
+    /// This is measured around the handler future on the actor task. Observer
+    /// time is intentionally not included: the duration describes the work the
+    /// method or feed performed, while observer overhead is a separate concern.
+    pub duration: Duration,
 }
 
 impl<'a> TurnInfo<'a> {
@@ -247,8 +255,12 @@ impl<'a> TurnInfo<'a> {
     /// test rather than quietly defaulting a field nobody chose.
     #[doc(hidden)]
     #[must_use]
-    pub fn for_test(outcome: TurnOutcome<'a>, method: &'static str) -> Self {
-        Self { outcome, method }
+    pub fn for_test(outcome: TurnOutcome<'a>, method: &'static str, duration: Duration) -> Self {
+        Self {
+            outcome,
+            method,
+            duration,
+        }
     }
 }
 

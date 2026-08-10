@@ -597,6 +597,64 @@ async fn an_observer_attached_to_a_keyed_actor_runs() {
     assert_eq!(*log.lock().unwrap(), vec![Event::Fill(4)]);
 }
 
+#[tokio::test]
+async fn a_keyed_system_ending_reports_a_finished_feed() {
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+    let actor_id = keylink::ActorId::new("books/finished").expect("valid");
+    let (fills, fill_rx) = mpsc::channel(1);
+    drop(fills);
+    let system = book::System::builder(keylink::Eviction::Never).build();
+    system
+        .mount(
+            actor_id.clone(),
+            book::spawn_wired(
+                Book {
+                    log,
+                    entered: None,
+                    gate: None,
+                },
+                Vec::new(),
+                book::Feeds::new(feed(fill_rx), quiet()),
+            ),
+        )
+        .expect("mounts");
+    let ending = system.ended(&actor_id).expect("the actor is mounted");
+
+    assert!(matches!(ending.await, keylink::Ended::Feed { name } if name == "Fills"));
+    assert!(system.ended(&actor_id).is_none());
+}
+
+#[tokio::test]
+async fn a_local_keyed_ref_queues_a_tell() {
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+    let actor_id = keylink::ActorId::new("books/local").expect("valid");
+    let system = book::System::builder(keylink::Eviction::Never).build();
+    system
+        .mount(
+            actor_id.clone(),
+            book::spawn_wired(
+                Book {
+                    log: log.clone(),
+                    entered: None,
+                    gate: None,
+                },
+                Vec::new(),
+                book::Feeds::new(quiet(), quiet()),
+            ),
+        )
+        .expect("mounts");
+
+    book::at_local(&system, actor_id.clone())
+        .note(9)
+        .await
+        .expect("the tell enters the keyed mailbox");
+    system
+        .shutdown(&actor_id, std::time::Duration::from_secs(1))
+        .await
+        .expect("the actor drains the queued tell");
+    assert_eq!(*log.lock().unwrap(), vec![Event::Note(9)]);
+}
+
 // A second, smaller service for the durability half: a plain `Vec<u64>` state
 // with nothing in it but what a feed put there, so what the store holds is
 // exactly the claim.

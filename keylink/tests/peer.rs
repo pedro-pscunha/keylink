@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use keylink::{Allowlist, Context, Node, Peer};
+use keylink::{Allowlist, Context, Node, Peer, RemoteError};
 
 mod common;
 use common::{local_node, local_node_with_idle_timeout};
@@ -89,7 +89,7 @@ async fn a_failed_call_is_retried_exactly_once_on_a_fresh_connection() {
     let outcome: keylink::Result<()> = peer
         .call(|_c| {
             attempts.fetch_add(1, Ordering::SeqCst);
-            async { Err(keylink::Error::BlockingInAsync) }
+            async { Err(keylink::Error::Closed) }
         })
         .await;
 
@@ -98,6 +98,91 @@ async fn a_failed_call_is_retried_exactly_once_on_a_fresh_connection() {
         attempts.load(Ordering::SeqCst),
         2,
         "once on the existing connection, once on a fresh one, and no more"
+    );
+}
+
+/// A remote/application error proves that the first request reached the peer,
+/// so replaying it would be unsafe even though it is represented as `Err`.
+#[tokio::test]
+async fn a_remote_error_is_not_retried() {
+    let server = local_node().await;
+    let caller = local_node().await;
+    let _running = serve(&server, Arc::new(Ticks::default())).await;
+
+    let peer: Peer<meter::Client> = Peer::new(&caller, server.endpoint().addr());
+    let attempts = AtomicUsize::new(0);
+
+    let outcome: keylink::Result<()> = peer
+        .call(|_c| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err(keylink::Error::Remote(RemoteError::TimedOut { millis: 25 })) }
+        })
+        .await;
+
+    assert!(matches!(
+        outcome,
+        Err(keylink::Error::Remote(RemoteError::TimedOut { millis: 25 }))
+    ));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+/// A local body/storage error says nothing about the QUIC connection. It must
+/// return as-is without throwing away a client another call can still use.
+#[tokio::test]
+async fn a_local_io_error_keeps_the_cached_connection() {
+    let server = local_node().await;
+    let caller = local_node().await;
+    let _running = serve(&server, Arc::new(Ticks::default())).await;
+
+    let peer: Peer<meter::Client> = Peer::new(&caller, server.endpoint().addr());
+    let before = peer.connect().await.expect("connects");
+    let outcome: keylink::Result<()> = peer
+        .call(|_client| async {
+            Err(keylink::Error::Io(std::io::Error::other(
+                "the local body sink failed",
+            )))
+        })
+        .await;
+    assert!(matches!(outcome, Err(keylink::Error::Io(_))));
+
+    let after = peer.connect().await.expect("the cached client remains");
+    assert!(
+        Arc::ptr_eq(&before, &after),
+        "local I/O must not invalidate a healthy peer connection"
+    );
+}
+
+/// A failed retry is still known to be a dead connection. Returning its error
+/// must not leave that same client cached for the next independent call.
+#[tokio::test]
+async fn a_second_connection_failure_is_not_left_cached() {
+    let server = local_node().await;
+    let caller = local_node().await;
+    let _running = serve(&server, Arc::new(Ticks::default())).await;
+
+    let peer: Peer<meter::Client> = Peer::new(&caller, server.endpoint().addr());
+    let attempted = std::sync::Mutex::new(Vec::new());
+    let outcome: keylink::Result<()> = peer
+        .call(|client| {
+            attempted.lock().expect("not poisoned").push(client);
+            async { Err(keylink::Error::Closed) }
+        })
+        .await;
+    assert!(matches!(outcome, Err(keylink::Error::Closed)));
+
+    let failed_retry = attempted
+        .lock()
+        .expect("not poisoned")
+        .get(1)
+        .expect("the connection failure is retried once")
+        .clone();
+    let next = peer
+        .connect()
+        .await
+        .expect("the next call reconnects directly");
+    assert!(
+        !Arc::ptr_eq(&failed_retry, &next),
+        "a client whose retry also failed must not remain cached"
     );
 }
 

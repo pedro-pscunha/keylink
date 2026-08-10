@@ -6,7 +6,9 @@
 //! that fails until somebody dials again.
 //!
 //! [`Peer`] connects on first use, reuses the connection, and reconnects
-//! **exactly once** when a call fails. A second failure is returned.
+//! **exactly once** when a call proves the connection failed. Application, local
+//! I/O, and per-stream errors are returned without replay. A second failure is
+//! returned.
 //!
 //! # Why once, and not until it works
 //!
@@ -30,7 +32,7 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::{EndpointAddr, Node, Result};
+use crate::{EndpointAddr, Error, Node, Result};
 
 /// How a typed client is dialled, so [`Peer`] can re-dial one.
 ///
@@ -42,6 +44,10 @@ pub trait Dial: Sized {
         node: &Node,
         addr: EndpointAddr,
     ) -> impl std::future::Future<Output = Result<Self>> + Send;
+}
+
+fn is_reconnectable(error: &Error) -> bool {
+    matches!(error, Error::Transport(_) | Error::Closed)
 }
 
 /// A lazily connected, self-healing client for one peer.
@@ -97,40 +103,61 @@ impl<C: Dial + Send + Sync> Peer<C> {
 
     /// Forget the current connection. The next call dials a new one.
     ///
-    /// Rarely needed: [`Self::call`] does this itself when a call fails.
+    /// Rarely needed: [`Self::call`] does this itself when a call proves the
+    /// cached connection failed.
     pub fn disconnect(&self) {
         *self.lock() = None;
+    }
+
+    fn disconnect_if(&self, client: &Arc<C>) {
+        let mut slot = self.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, client))
+        {
+            *slot = None;
+        }
     }
 
     /// Run one call, reconnecting once if it fails.
     ///
     /// The closure receives the live client and is invoked at most twice: once
     /// on the existing connection, and once more on a freshly dialled one if the
-    /// first attempt returned an error. **The second result is returned
-    /// whatever it is** — there is no third attempt.
+    /// first attempt returned [`Error::Transport`] or [`Error::Closed`]. Other
+    /// errors are returned without invalidating the cached client. **The second
+    /// result is returned whatever it is** — there is no third attempt, though a
+    /// second connection failure is removed from the cache.
     ///
     /// # Errors
     ///
-    /// The error of the second attempt, or of dialling it.
+    /// A non-connection error from the first attempt, the second attempt's error,
+    /// or an error dialling the replacement.
     pub async fn call<T, F, Fut>(&self, mut f: F) -> Result<T>
     where
         F: FnMut(Arc<C>) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
         let client = self.connect().await?;
-        let first = f(client).await;
-        let Err(_reason) = first else {
+        let first = f(client.clone()).await;
+        let Err(reason) = first else {
             return first;
         };
 
-        // A failure here may mean the connection is dead, or may mean the
-        // handler said no. keylink cannot tell those apart from an `Error`
-        // alone, so it re-dials either way and lets the second answer stand.
-        // The cost of being wrong is one extra handshake; the cost of not
-        // re-dialling is a handle that stays broken forever.
-        self.disconnect();
+        // A remote/application or per-stream error proves nothing about the
+        // cached connection's health. Only a transport failure or clean close
+        // both invalidates this client and permits replay; all other errors are
+        // returned without touching a connection another concurrent call may use.
+        if !is_reconnectable(&reason) {
+            return Err(reason);
+        }
+        self.disconnect_if(&client);
+
         let fresh = self.connect().await?;
-        f(fresh).await
+        let second = f(fresh.clone()).await;
+        if second.as_ref().is_err_and(is_reconnectable) {
+            self.disconnect_if(&fresh);
+        }
+        second
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Arc<C>>> {

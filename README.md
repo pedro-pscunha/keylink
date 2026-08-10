@@ -116,7 +116,8 @@ match client.watch().await {
 
 **Reconnecting handles.** Dial-per-message is wasteful and holding one client
 forever is fragile. `Peer<C>` connects on first use, reuses the connection, and
-reconnects **exactly once** when a call fails:
+reconnects **exactly once** when a call reports `Transport` or `Closed`. Remote,
+local I/O, and per-stream errors return without replay:
 
 ```rust
 let peer: Peer<inventory::Client> = Peer::new(&node, addr);
@@ -261,10 +262,20 @@ could send a key, and `KeyedClient::with_idempotency` is it.
 
 What the keyed path still costs: one QUIC connection per actor *service* — not one
 for a node's whole fleet, each with its own handshake, admission decision,
-idempotency ledger, keep-alive and congestion window — and no per-instance
-`ended()`, so `system.shutdown(&id, budget)` reports whether an instance drained
-rather than why its loop exited. The budget is not optional: every caller names
-how long it is prepared to wait before the actor is killed instead.
+idempotency ledger, keep-alive and congestion window. `system.ended(&id)` now
+returns a non-inserting future for a mounted instance, so a listener can await
+the entry's final loop-or-teardown `Ended`; `system.shutdown(&id, budget)` remains the separate
+question of whether that shutdown drained before its budget. The budget is not
+optional: every caller names how long it is prepared to wait before the actor is
+killed instead.
+
+**A typed local keyed reference.** `inventory::at_local(&system, id)` addresses a
+mounted actor in this process and returns `inventory::LocalRef`. Its generated
+`rpc`, `tell`, and `blob` methods use the registry route and the actor's normal
+turn loop, returning transport-free `LocalError`; `send` and `recv` are absent
+because a local reference has no QUIC body stream. Missing ids, capacity and
+closed mailboxes remain distinct from a turn that ran, and the same lifecycle,
+factory and eviction machinery is used as for peer delivery.
 
 **One function, either surface.** A function that runs against a local actor in a
 test and a remote one in production could not be written: a local call answers
@@ -292,13 +303,36 @@ than papered over: a handler panic **unwinds into the calling task** against a
 served surface. `Failure` cannot express an unwind, and `TurnLost` argues at
 length why it should not try.
 
-**Sync and async.** `keylink::blocking` mirrors the async API for programs with
-no runtime. It owns a private multi-threaded runtime — mandatory, because a
-current-thread runtime only advances iroh's keepalives during `block_on`, so
-the connection would stall between calls. Calling it from inside a runtime
-returns `Error::BlockingInAsync` instead of deadlocking. `Node::enter` lends
-that runtime to the calling thread, which is what a synchronous program needs
-to construct an actor at all.
+**Generated surface matrix.** These are deliberate capability boundaries, not
+missing wrappers. A blank cell means the method is not generated on that surface.
+
+| generated surface | `rpc` | `tell` | `send` | `recv` | `blob` | error vocabulary |
+| --- | --- | --- | --- | --- | --- | --- |
+| `Handle<A>` | yes | yes |  |  | yes | `Unanswered` / `NotQueued` |
+| `LocalRef<'_>` | yes | yes |  |  | yes | `LocalError` |
+| `ActorRef<'_>` | yes |  | yes | yes | yes | `Error` |
+| `Client` | yes | yes | yes | yes | yes | `Error` |
+| `IdempotentClient` | yes |  | yes | yes | yes | `Error` |
+| `blocking::Client` | yes | yes |  |  |  | `Error` |
+| `blocking::IdempotentClient` | yes |  |  |  |  | `Error` |
+
+The generated `Calls` trait carries only `rpc`, and is implemented for
+`Handle`, `ActorRef`, `Client`, and `IdempotentClient`; it intentionally does
+not erase `LocalRef`'s transport-free `LocalError` or the blocking client's
+synchronous execution model. `Governed` is present on the three served async
+surfaces (`ActorRef`, `Client`, and `IdempotentClient`), not on a bare local
+handle or local keyed reference.
+
+**Sync and async.** `keylink::blocking` is a narrow singleton client for programs
+with no runtime. Its generated clients expose unary `rpc` and `tell` methods;
+`send`, `recv`, `blob`, and keyed addressing remain async because they carry a
+stream or an async content handle. The blocking module owns a private
+multi-threaded runtime — mandatory, because a current-thread runtime only
+advances iroh's keepalives during `block_on`, so the connection would stall
+between calls. Calling it from inside a runtime returns
+`Error::BlockingInAsync` instead of deadlocking. `Node::enter` lends that
+runtime to the calling thread, which is what a synchronous program needs to
+construct an actor at all.
 
 **The browser.** The crate compiles and links for `wasm32-unknown-unknown` with
 `--no-default-features`. The `web` feature adds `Body::from_web_file` and
@@ -318,8 +352,9 @@ recipe rather than a feature:
 1. **Put the key on the work, not on the attempt.** `client.with_idempotency(key)`
    records the reply under `(peer, key)`. Every retry of that one piece of work
    carries that one key; different work gets a different key.
-2. **Call through `Peer<C>`.** It reconnects once when a call fails and re-issues
-   the call against the new connection. The ledger belongs to the served
+2. **Call through `Peer<C>`.** It reconnects once when the call reports
+   `Transport` or `Closed` and re-issues the call against the new connection.
+   Application and local errors are not replayed. The ledger belongs to the served
    `Service`, not to the connection, so the retry meets the same record.
 3. **Ask to attach.** `Idempotency::attaching_for(key, budget)` waits for a call
    already in flight under the key instead of being refused with `InFlight` —
@@ -640,12 +675,10 @@ Known gaps, in rough priority order:
   across a restart runs the handler again. `keylink-persist` is durability for an
   actor's *state*, not for the ledger. The other six limits of the guarantee are
   in **Reliable delivery** above.
-- A keyed instance has no `ended()`. `System::shutdown(&id, budget)` reports
-  whether it drained or had to be killed, which is a different question from why
-  its loop exited. The keyed loop does not throw that away — it returns its
-  ending and `Registry::reap` hands it to every registered `Lifecycle`. What is
-  missing is a per-actor future to await it on, so an ending reaches a listener
-  and never a caller who asked for that one actor.
+- A keyed instance's `System::ended(&id)` future must be subscribed while the id
+  is mounted; it returns `None` for an id that is not live and never inserts one.
+  The future reports the entry's final loop-or-teardown ending, while
+  `System::shutdown(&id, budget)` separately reports whether that shutdown drained or had to kill it.
 - **Supervision restarts one actor, and no strategy reaches its siblings.**
   `LocalActor::spawn_supervised`, `spawn_supervised_deep` and
   `run_keyed_supervised` take an `Intensity` and put a fresh incarnation on the

@@ -1392,18 +1392,21 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
         .await
         .expect("the client dials the actor system");
 
-    ledger::at(&client, actor.clone())
+    client
+        .at(actor.clone())
         .post(1)
         .await
         .expect("the keyed actor answers");
-    ledger::at(&client, actor.clone())
+    client
+        .at(actor.clone())
         .post(2)
         .await
         .expect("the keyed actor answers");
 
     // Applied, then faulted, then refused: the incarnation ends and the
     // supervisor re-opens the claim the last one has just released.
-    let faulted = ledger::at(&client, actor.clone())
+    let faulted = client
+        .at(actor.clone())
         .ruin(9)
         .await
         .expect_err("the turn panicked");
@@ -1416,7 +1419,8 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
     );
 
     assert_eq!(
-        ledger::at(&client, actor.clone())
+        client
+            .at(actor.clone())
             .entries()
             .await
             .expect("the next incarnation answers"),
@@ -1504,13 +1508,14 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
         let placing = {
             let client = client.clone();
             let id = desk_id.clone();
-            tokio::spawn(async move { desk::at(&client, id).place(round.into()).await })
+            tokio::spawn(async move { client.at(id).place(round.into()).await })
         };
         // **Asked, never assumed**, for the singleton twin's reason: a fault that
         // overtook the park would end the incarnation the park was meant to be
         // lost with, leaving the order sitting in the *next* one for ever.
         for _ in 0..1_000 {
-            if desk::at(&client, desk_id.clone())
+            if client
+                .at(desk_id.clone())
                 .parked()
                 .await
                 .expect("the actor answers")
@@ -1521,7 +1526,8 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
             n0_future::time::sleep(Duration::from_millis(1)).await;
         }
         assert_eq!(
-            desk::at(&client, desk_id.clone())
+            client
+                .at(desk_id.clone())
                 .parked()
                 .await
                 .expect("the actor answers"),
@@ -1529,7 +1535,8 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
             "round {round}: the order has to be parked before the fault"
         );
 
-        let faulted = desk::at(&client, desk_id.clone())
+        let faulted = client
+            .at(desk_id.clone())
             .boom()
             .await
             .expect_err("boom panics");
@@ -1564,7 +1571,8 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
         }
         n0_future::time::sleep(Duration::from_millis(1)).await;
     }
-    let after = desk::at(&client, desk_id.clone())
+    let after = client
+        .at(desk_id.clone())
         .place(3)
         .await
         .expect_err("the actor gave up");

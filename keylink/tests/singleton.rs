@@ -692,7 +692,10 @@ async fn a_queue_timeout_refuses_before_the_mailbox() {
         .service(
             actor
                 .service(Allowlist::anyone())
-                .layer(keylink::QueueTimeout::after(Duration::from_millis(100)))
+                .layer(
+                    keylink::QueueTimeout::try_after(Duration::from_millis(100))
+                        .expect("valid queue timeout budget"),
+                )
                 .build(),
         )
         .spawn()
@@ -743,7 +746,10 @@ async fn a_queue_timeout_leaves_an_idempotency_key_claimable() {
         .service(
             actor
                 .service(Allowlist::anyone())
-                .layer(keylink::QueueTimeout::after(Duration::from_millis(100)))
+                .layer(
+                    keylink::QueueTimeout::try_after(Duration::from_millis(100))
+                        .expect("valid queue timeout budget"),
+                )
                 .build(),
         )
         .spawn()
@@ -928,7 +934,10 @@ async fn a_timeout_settles_the_key_it_gave_up_on_where_a_queue_timeout_leaves_it
         "the refused retry must not have run the work a second time"
     );
 
-    let queued = entries_behind_a_held_turn(keylink::QueueTimeout::after(BUDGET)).await;
+    let queued = entries_behind_a_held_turn(
+        keylink::QueueTimeout::try_after(BUDGET).expect("valid queue timeout budget"),
+    )
+    .await;
     assert_eq!(
         queued.before_the_retry,
         vec![1],

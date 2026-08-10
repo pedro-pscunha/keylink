@@ -490,7 +490,7 @@ pub enum Caller<'a> { Local, Peer(&'a Context) }
 /// are two behaviours, not two doors to one thing, so "one way to build a thing"
 /// does not apply.
 pub struct QueueTimeout { /* … */ }
-impl QueueTimeout { pub fn after(budget: Duration) -> Self; }
+impl QueueTimeout { pub fn try_after(budget: Duration) -> Result<Self, QueueTimeoutError>; }
 
 // ── wave C ────────────────────────────────────────────────────────────
 /// Peers that dialled in, addressable by the accept side. Evicts on Departure.

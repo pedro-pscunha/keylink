@@ -1,18 +1,14 @@
 //! Endings for keyed actors, as futures rather than a callback.
 //!
 //! A local actor answers *when did you end, and why* itself:
-//! [`ended()`](crate::LocalActor::ended) hands back a future. A keyed actor
-//! mounted in a [`System`](crate::System) answers nothing — there is no per-actor
-//! handle to ask, which is the gap [`Names`](super::Names) and
-//! [`Group`](super::Group) both name and neither closes.
+//! [`ended()`](crate::LocalActor::ended) hands back a future. A keyed actor is
+//! addressed by id, so [`System::ended`](crate::System::ended) is its direct
+//! per-actor observation door.
 //!
-//! **The signal is not missing. Its shape is.** A keyed system already computes
-//! the true [`Ended`] for every actor that ends itself and hands it to
-//! [`Lifecycle::ended`] — a supervisor that exhausted its budget arrives there as
-//! [`Ended::GaveUp`], a panicked turn as [`Ended::Panicked`]. What no caller can
-//! do with a `Lifecycle` is *await* one: it is a method the registry calls on its
-//! own task, so a caller who wants to wait writes the channel by hand. This is
-//! that channel, written once.
+//! [`Endings`] remains the composition adapter: it turns the keyed
+//! [`Lifecycle::ended`] callback into futures that [`Group`](super::Group) and
+//! other compositions can own. It deliberately retains its miss-window
+//! semantics; callers that only need one keyed ending should use `System::ended`.
 //!
 //! ```ignore
 //! let endings = Endings::new();
@@ -36,9 +32,11 @@
 //! # A keyed actor as a group member, which is what this was built for
 //!
 //! [`Membership`](super::Membership) wants two values: a future that says when
-//! the member ended, and a way to end it. A keyed actor could supply neither, so
-//! [`Group`](super::Group) watched local actors only. It supplies both now — the
-//! ending from here, the retiring from [`System::abort`](crate::System::abort):
+//! the member ended, and a way to end it. A keyed system supplies both now:
+//! [`System::ended`](crate::System::ended) is the exact-entry door for a member
+//! already mounted, while this adapter fans lifecycle callbacks into futures for
+//! code that must file the waiter before mounting. Retirement uses
+//! [`System::abort`](crate::System::abort):
 //!
 //! ```ignore
 //! // One member gives up, the group ends.
@@ -75,8 +73,9 @@
 //! [`watch`](Endings::watch) files a waiter. [`ended`](Lifecycle::ended) resolves
 //! whatever is filed **at the instant the report arrives** and files nothing for
 //! next time. So an ending reported before its waiter exists reaches nobody, and
-//! that waiter then waits for as long as the system lives — the system going away
-//! is the one thing that still answers it, with [`Ended::Vanished`].
+//! that waiter then remains pending. Dropping the system alone reports nothing;
+//! only dropping the **last** [`Endings`] clone closes the waiter channel and
+//! resolves it as [`Ended::Vanished`].
 //!
 //! Ask for the future before the actor can end:
 //!
@@ -91,12 +90,20 @@
 //!   side, and a `watch` racing an id the network already mounted and killed is
 //!   the honest limit of this type rather than a defect in it.
 //!
-//! [`Names::register`](super::Names::register) has the same race and does not
-//! have this window, and the difference is worth reading rather than assuming.
+//! If an old incarnation is still draining after a replacement mounts, reports
+//! are separated by the registry's opaque incarnation identity. A `watch` filed
+//! after the replacement's mount belongs to the replacement, not to the late old
+//! report. Filing before that mount while the old incarnation is still active is
+//! ambiguous by id alone; use the direct [`System::ended`](crate::System::ended)
+//! door after mounting when exact-entry identity matters.
+//!
+//! [`Names::register`](super::Names::register) does the same adaptation without
+//! this window, and the difference is worth reading rather than assuming.
 //! `register` takes the ending **as an argument**: the future exists before the
 //! registration does, so there is no interval in which the actor is watchable and
-//! unwatched. Here the signal exists only as a callback the registry owns, so the
-//! interval is real and no signature change closes it.
+//! unwatched. For this adapter the signal arrives as a [`Lifecycle`] callback, so
+//! the interval is real. Use [`System::ended`](crate::System::ended) when the
+//! already-mounted entry itself is the observation source.
 //!
 //! **The alternative was to remember endings for names nobody asked about**, so
 //! that a late `watch` could be answered out of a record. That is refused, and it
@@ -118,23 +125,25 @@
 //! |---|---|---|
 //! | the actor ended itself — `reap` | the [`Ended`] its own loop returned | **yes.** [`GaveUp`](Ended::GaveUp), [`Panicked`](Ended::Panicked), [`Observer`](Ended::Observer), [`Feed`](Ended::Feed) all arrive intact |
 //! | [`System::shutdown`](crate::System::shutdown) | synthesised from the join | no. [`Stopped`](Ended::Stopped) means *this shutdown drained it*, and an actor that ended on an observer's refusal a second earlier reads `Stopped` here |
-//! | [`System::abort`](crate::System::abort) | [`Ended::Vanished`], a constant | no. It is what abort *did*, and the loop was never asked |
+//! | [`System::abort`](crate::System::abort) | the loop's natural ending if it won the cancellation race; otherwise [`Ended::Vanished`] | natural only when the loop published first |
 //! | eviction, on the idle clock | synthesised from the same join `shutdown` uses | no, and the same two spellings |
 //!
-//! So a group whose policy branches on [`Ended::GaveUp`] is reading the one path
-//! that can produce it, which is also the only path that fires when **nobody
-//! asked** for the teardown — and that is the case a supervisor exists for. A
-//! policy that branches on [`Ended::Stopped`] to mean "somebody stopped it
+//! So a group whose policy branches on [`Ended::GaveUp`] is reading a reason
+//! produced only by a supervisor exhausting its restart budget. Other natural
+//! endings — [`Feed`](Ended::Feed), [`Panicked`](Ended::Panicked), and
+//! [`Observer`](Ended::Observer) — can also happen without anybody asking for
+//! teardown. A policy that branches on [`Ended::Stopped`] to mean "somebody stopped it
 //! deliberately" is reading a value that also means "it was already dead and the
 //! shutdown found the corpse". [`System::shutdown`](crate::System::shutdown)
 //! argues that at length; nothing here re-decides it.
 //!
-//! **Exactly one report fires per ending, which is why one waiter is enough.**
-//! `shutdown`, `abort` and the sweeper each take the entry out of the map before
-//! they tear it down and report afterwards, and `reap` reports only if the entry
-//! was still there. So a waiter is resolved once and never twice, and a second
-//! [`watch`](Endings::watch) on a name already ended is the miss-window above
-//! rather than a duplicate.
+//! **Exactly one report fires per incarnation.** `shutdown`, `abort` and the
+//! sweeper each take the entry out before teardown and report afterwards; `reap`
+//! reports only if the entry identity still matches. The registry also carries
+//! that opaque identity through its internal lifecycle callback, so an old actor
+//! finishing after a replacement mounted under the same id resolves only the old
+//! incarnation's waiters. A second [`watch`](Endings::watch) on a name already
+//! ended is the miss-window above rather than a duplicate.
 //!
 //! # Backpressure: none, because nothing here queues
 //!
@@ -148,13 +157,13 @@
 //! endings, so there is nothing to await and no `# Panics` for a runtime that is
 //! not there.
 //!
-//! The map is bounded by the number of **live [`watch`](Endings::watch)
-//! futures**, not by the number of names a system has seen: dropping the future
-//! takes its waiter back out. A waiter for a name that is never mounted therefore
-//! costs one entry for exactly as long as its caller holds the future, and
-//! nothing after — the leak such a call could be is closed by that `Drop` rather
-//! than merely documented. `std::mem::forget` on the future defeats it, as it
-//! defeats every `Drop` in the crate.
+//! The map is bounded by the system's **currently mounted incarnations plus live
+//! [`watch`](Endings::watch) futures**, never by historical endings. Tracking a
+//! mounted incarnation even with no waiter is what distinguishes an old teardown
+//! report from a replacement under the same id; its row is removed at that
+//! incarnation's ending. Dropping a future takes its waiter back out. A waiter for
+//! a name never mounted therefore costs one entry only while held.
+//! `std::mem::forget` defeats that `Drop`, as it defeats every `Drop` in the crate.
 //!
 //! # One `Endings` on two systems merges their names
 //!
@@ -169,13 +178,12 @@
 //! one for the map key, one the future carries so its `Drop` can find its own
 //! waiter — and a `u64` generation.
 //!
-//! Per ending with **no** waiter: one hash lookup. No allocation and no clone of
-//! the [`Ended`], which matters because every ending in a system with one watched
-//! actor takes this path. Per ending with `n` waiters: one `Ended` clone each,
+//! Per mount and ending: one hash lookup and an active-incarnation row; the row
+//! is removed at ending. With `n` waiters, the ending is cloned once per waiter,
 //! since each waiter owns its answer.
 
 use std::collections::hash_map;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -192,7 +200,21 @@ use crate::{ActorId, Ended, Lifecycle};
 ///
 /// A type alias because the `Weak` the future holds spells it a second time, and
 /// a nested generic written twice is two chances to write it differently.
-type Waiting = HashMap<ActorId, Vec<Waiter>>;
+type Waiting = HashMap<ActorId, Watched>;
+
+#[derive(Default)]
+struct Watched {
+    /// Waiters filed before the first mount callback for this id.
+    pending: Vec<Waiter>,
+    /// Live incarnations in mount order. More than one exists while an old
+    /// teardown drains after a replacement has mounted under the same id.
+    mounted: VecDeque<Incarnation>,
+}
+
+struct Incarnation {
+    identity: usize,
+    waiters: Vec<Waiter>,
+}
 
 /// One caller waiting on one name.
 ///
@@ -211,6 +233,12 @@ struct Waiter {
     /// Resolves this waiter's future. Dropped without sending only when the
     /// future was dropped first.
     tell: oneshot::Sender<Ended>,
+}
+
+fn resolve(waiters: Vec<Waiter>, why: &Ended) {
+    for waiter in waiters {
+        let _ = waiter.tell.send(why.clone());
+    }
 }
 
 /// Endings for keyed actors, as futures rather than a callback.
@@ -242,13 +270,14 @@ impl Endings {
     ///
     /// **Ask for it before the actor can end.** The future is a waiter filed
     /// under `name` right here, and an ending reported before it is filed
-    /// resolves nothing and is not remembered — so this future then waits for the
-    /// life of the system. The module doc states the window per mounting path and
-    /// why no signature closes it.
+    /// resolves nothing and is not remembered — so this future remains pending
+    /// until a later report under that id or until the last [`Endings`] clone is
+    /// dropped. The module doc states the window per mounting path.
     ///
     /// The [`Ended`] is the registry's, with all four teardown paths' reasons
     /// mixed together; read the table in the module doc before branching on it,
-    /// because only one of the four answers *why the loop exited*.
+    /// because teardown often reports what the operation did rather than why the
+    /// loop exited.
     ///
     /// Several waiters may hold `name` at once and each is answered. Dropping the
     /// future unfiles its waiter, so abandoning one costs nothing after the drop.
@@ -271,10 +300,15 @@ impl Endings {
     pub fn watch(&self, name: &ActorId) -> impl Future<Output = Ended> + Send + 'static {
         let (tell, ending) = oneshot::channel();
         let generation = self.next.fetch_add(1, Ordering::Relaxed);
-        recovering(&self.waiting)
-            .entry(name.clone())
-            .or_default()
-            .push(Waiter { generation, tell });
+        let mut waiting = recovering(&self.waiting);
+        let watched = waiting.entry(name.clone()).or_default();
+        let waiter = Waiter { generation, tell };
+        if let Some(current) = watched.mounted.back_mut() {
+            current.waiters.push(waiter);
+        } else {
+            watched.pending.push(waiter);
+        }
+        drop(waiting);
         Awaited {
             ending,
             filed: Some(Stamp {
@@ -308,26 +342,65 @@ fn recovering(waiting: &Mutex<Waiting>) -> MutexGuard<'_, Waiting> {
 }
 
 impl Lifecycle for Endings {
-    /// Nothing. A mount is not an ending, and this type is not a second
-    /// [`Lifecycle`] for people who want both — install two.
+    /// Direct calls have no incarnation identity. Registry reports use
+    /// `__mounted`, below, which carries the opaque identity needed across a
+    /// remount race.
     fn mounted(&self, _id: &ActorId) {}
 
-    /// Answer every waiter filed under `id`, and file nothing for a waiter that
-    /// arrives later.
+    /// Preserve the public callback's direct-use behavior: resolve every waiter
+    /// under the id. Registry reports use `__ended` and resolve one incarnation.
     fn ended(&self, id: &ActorId, why: &Ended) {
-        // The guard dies with this statement, which is `Registry::reap`'s
-        // discipline for its own reason: `send` wakes the waiting task, and
-        // waking under a lock that task's own `Drop` takes is an edge worth not
-        // having at all rather than one worth arguing is unreachable.
-        let Some(waiters) = self.lock().remove(id) else {
+        let Some(watched) = self.lock().remove(id) else {
             return;
         };
-        for waiter in waiters {
-            // The receiver is gone when a future was dropped between the removal
-            // above and now. That is a caller who stopped caring, so there is
-            // nothing to report and nobody to report it to.
-            let _ = waiter.tell.send(why.clone());
-        }
+        resolve(
+            watched
+                .pending
+                .into_iter()
+                .chain(
+                    watched
+                        .mounted
+                        .into_iter()
+                        .flat_map(|mounted| mounted.waiters),
+                )
+                .collect(),
+            why,
+        );
+    }
+
+    fn __mounted(&self, id: &ActorId, incarnation: usize) {
+        let mut waiting = self.lock();
+        let watched = waiting.entry(id.clone()).or_default();
+        let waiters = std::mem::take(&mut watched.pending);
+        watched.mounted.push_back(Incarnation {
+            identity: incarnation,
+            waiters,
+        });
+    }
+
+    fn __ended(&self, id: &ActorId, incarnation: usize, why: &Ended) {
+        let waiters = {
+            let mut waiting = self.lock();
+            let hash_map::Entry::Occupied(mut under) = waiting.entry(id.clone()) else {
+                return;
+            };
+            let Some(position) = under
+                .get()
+                .mounted
+                .iter()
+                .position(|mounted| mounted.identity == incarnation)
+            else {
+                return;
+            };
+            let Some(mounted) = under.get_mut().mounted.remove(position) else {
+                return;
+            };
+            if under.get().pending.is_empty() && under.get().mounted.is_empty() {
+                under.remove();
+            }
+            mounted.waiters
+        };
+        resolve(waiters, why);
     }
 }
 
@@ -437,12 +510,17 @@ impl Drop for Awaited {
             // may have filed a waiter since this one was abandoned, and taking
             // the whole entry would unwatch it silently — a live caller waiting
             // on a future nothing can now resolve.
-            under.get_mut().retain(|waiter| waiter.generation != mine);
-            // A name with no waiters left is a key nothing reads. Leaving it
-            // would make the map grow with names watched once rather than with
-            // names watched now, which is the bound this type claims.
-            if under.get().is_empty() {
-                under.remove();
+            let watched = under.get_mut();
+            watched.pending.retain(|waiter| waiter.generation != mine);
+            for mounted in &mut watched.mounted {
+                mounted.waiters.retain(|waiter| waiter.generation != mine);
+            }
+            // Active incarnations remain even with no waiters: their identities
+            // are needed to keep a late old ending from resolving a replacement's
+            // waiter. Once no incarnation or pending waiter remains, the key is
+            // dead state and can go.
+            if under.get().pending.is_empty() && under.get().mounted.is_empty() {
+                let _ = under.remove_entry();
             }
         }
     }

@@ -20,13 +20,14 @@
 //! | [`after`] / [`every`] | a delayed run and a repeating one, on a cancellable handle |
 //! | [`Names`] | name → local actor, unregistered when the actor ends |
 //! | [`Group`] | a set of actors that end together, or one the rest carry on without |
-//! | [`Endings`] | ending → future, for a keyed actor no handle can be asked |
+//! | [`Endings`] | lifecycle ending → future, for compositions that need keyed waiters |
 //!
 //! Seven types and two functions for the seven rows. Six of the rows are the
 //! first six patterns; [`Endings`] is a seventh **row** and not a seventh pattern
-//! — it is the keyed half of [`Names`] and [`Group`], both of which want an
-//! ending future and could not get one out of a keyed actor. The seventh
-//! **pattern** has no row, and that is the finding rather than an oversight:
+//! — it adapts [`Lifecycle::ended`](crate::Lifecycle::ended) for compositions that
+//! want to own keyed ending futures. A one-off keyed observation can use
+//! [`System::ended`](crate::System::ended) directly. The seventh **pattern** has
+//! no row, and that is the finding rather than an oversight:
 //! handle ergonomics turned out to be a table rather than a type — all of it
 //! already exists under keylink's own names, and the last section here is the
 //! mapping and the argument for not adding an alias.
@@ -124,13 +125,13 @@
 //! | `stop_gracefully` | [`Handle::stop`] — ordered, drains what was already queued, then waits | Wave 1, and it waits on the `ended` channel rather than `mail.closed()` since Wave 2 |
 //! | `wait_for_shutdown` | [`Handle::ended`] — and it answers *why*, which a `wait_for_shutdown` returning `()` cannot | Wave 2 |
 //!
-//! What was genuinely absent is on the **keyed** path, and this module is where
-//! it is fixed: a keyed actor reached through [`System`](crate::System) has no
-//! per-actor `ended()` for a caller to await, so [`Endings`] writes that channel
-//! once. [`Names`] and [`Group`] both take the ending future as an argument
-//! rather than asking a handle for one, which is what lets either hold a keyed
-//! member now that the channel exists — the argument they already had is the
-//! change they did not need.
+//! What was genuinely absent is on the **composition** path, and this module is
+//! where it is filled: a keyed actor reached through [`System`](crate::System) now
+//! has [`System::ended`](crate::System::ended) for direct observation, while
+//! [`Endings`] adapts keyed [`Lifecycle`](crate::Lifecycle) callbacks into
+//! futures a composition can own. [`Names`] and [`Group`] both take the ending future as an argument rather
+//! than asking a handle for one, which lets local and keyed members share their
+//! existing shape.
 //!
 //! [`Handle`]: crate::LocalActor
 //! [`Handle::is_running`]: crate::LocalActor::is_running

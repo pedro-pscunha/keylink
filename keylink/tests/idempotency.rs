@@ -628,7 +628,8 @@ async fn a_keyed_actor_service_applies_the_same_policy() {
         .expect("the id is free");
 
     let keyed = client.with_idempotency(key("k"));
-    let refused = till::at(&keyed, ActorId::new("till").expect("valid"))
+    let refused = keyed
+        .at(ActorId::new("till").expect("valid"))
         .slow(0)
         .await
         .expect_err("`Slow` is not in this service's policy, actor or not");
@@ -641,7 +642,8 @@ async fn a_keyed_actor_service_applies_the_same_policy() {
     );
 
     assert!(
-        till::at(&keyed, ActorId::new("till").expect("valid"))
+        keyed
+            .at(ActorId::new("till").expect("valid"))
             .reserve("ADU-014".to_string(), 2)
             .await
             .is_ok(),

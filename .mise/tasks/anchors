@@ -1418,9 +1418,9 @@ ANCHORS = [
     # two hops a `Group` adds. **That substitution reddens FIVE tests**, so a
     # whole-target run under it says nothing about any single guard.
     ("K1", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
-     "            let _ = waiter.tell.send(why.clone());"),
+     "        let _ = waiter.tell.send(why.clone());"),
     ("K2", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
-     "            let _ = waiter.tell.send(why.clone());"),
+     "        let _ = waiter.tell.send(why.clone());"),
     # K3 and K3b are the two DIRECTIONS of one claim, both measured. `= vec![..]`
     # keeps only the last and fails by value in 0.00s; `if is_empty() { push }` keeps
     # only the first and fails at the bound in 60.00s. A single-slot list fails either
@@ -1454,20 +1454,20 @@ ANCHORS = [
     # They take the `K` prefix because that is the wave they landed in, and their
     # sibling `K3`/`K3b` already cuts `registry.rs`.
     ("K8", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
-     "            let _ = crate::panic::catching(|| watching.mounted(id));"),
+     "            let _ = crate::panic::catching(|| watching.__mounted(id, incarnation));"),
     ("K9", "keylink/tests/compose.rs", "keylink/src/actor/registry.rs",
-     "            let _ = crate::panic::catching(|| watching.ended(id, why));"),
+     "            let _ = crate::panic::catching(|| watching.__ended(id, incarnation, why));"),
     ("K4", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
-     "        for waiter in waiters {"),
+     "    for waiter in waiters {"),
     # K5's local is `mine` and its FIELD is `generation`, which is not a slip. Spelled
     # `waiter.generation != generation` the line runs to 101 characters and rustfmt
     # breaks it into three - turning a one-line anchor into a fence, which is the
     # shape G3 above is already paying for. The field carries the shared vocabulary
     # `names.rs` uses and the local absorbs the width.
     ("K5", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
-     "            under.get_mut().retain(|waiter| waiter.generation != mine);"),
+     "            watched.pending.retain(|waiter| waiter.generation != mine);"),
     ("K6", "keylink/tests/compose.rs", "keylink/src/compose/keyed.rs",
-     "                under.remove();"),
+     "                let _ = under.remove_entry();"),
     # K7 is the VALUE half only, and its liveness half is registered NOWHERE on
     # purpose. That substitution does go red, and it goes red for the wrong reason:
     # returning `Pending` from an arm that only runs after the receiver has already

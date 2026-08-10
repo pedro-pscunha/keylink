@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 
 use keylink::{
     ActorId, Addressed, Allowlist, Body, BodyReader, Context, Ended, Error, Eviction,
-    IdempotencyKey, IdempotencyRefusal, Middleware, MountError, Next, Node, Outcome, QueueTimeout,
-    RemoteError, RpcClient, Server, Serving, Timeout, Withheld,
+    IdempotencyKey, IdempotencyRefusal, LocalError, Middleware, MountError, Next, Node, Outcome,
+    QueueTimeout, RemoteError, RpcClient, Server, Serving, Timeout, Withheld,
 };
 // The port and its file adapter, for the one thing a counter cannot show: what a
 // detached actor is still HOLDING. `Claim` is deliberately not in scope — nothing
@@ -129,6 +129,13 @@ struct Journal {
     /// `None` unless a test is about overlap. Shared between actors on purpose:
     /// that is what makes it able to say "two of you were in there at once".
     inside: Option<Arc<Inside>>,
+    /// A local keyed reference used from inside one turn to prove the actor
+    /// identity is carried through the registry mailbox.
+    nested: Option<(journal::System, ActorId)>,
+    /// A keyed actor to call from this actor, used by the registry ring test.
+    forward: Option<(journal::System, ActorId)>,
+    /// A keyed actor to call at the closing edge of the registry ring.
+    cycle: Option<(journal::System, ActorId)>,
 }
 
 /// How many handlers were inside a turn at the same moment, and the most there
@@ -162,6 +169,26 @@ impl Inside {
 
 impl journal::Actor for Journal {
     async fn apply(&mut self, _cx: keylink::Caller<'_>, entry: u64, hold_ms: u64) -> u64 {
+        if let Some((system, actor)) = &self.nested {
+            let error = journal::at_local(system, actor.clone())
+                .entries()
+                .await
+                .expect_err("a keyed actor must reject its own nested call");
+            assert!(matches!(error, LocalError::Reentrant));
+        }
+        if let Some((system, actor)) = self.forward.clone() {
+            journal::at_local(&system, actor)
+                .apply(entry, 0)
+                .await
+                .expect("the first edge of the ring is allowed");
+        }
+        if let Some((system, actor)) = self.cycle.clone() {
+            let error = journal::at_local(&system, actor)
+                .apply(entry, 0)
+                .await
+                .expect_err("a keyed actor must reject the closing edge of a ring");
+            assert!(matches!(error, LocalError::Reentrant));
+        }
         if let Some(inside) = &self.inside {
             inside.enter();
         }
@@ -276,9 +303,231 @@ async fn a_mounted_actor_answers_by_id() {
         .mount(id("obra/4471"), journal::spawn(Journal::default()))
         .expect("the id is free");
 
-    let actor = journal::at(&fixture.client, id("obra/4471"));
+    let actor = fixture.client.at(id("obra/4471"));
     assert_eq!(actor.apply(7, 0).await.unwrap(), 7);
     assert_eq!(actor.entries().await.unwrap(), vec![7]);
+}
+
+#[tokio::test]
+async fn a_local_keyed_ref_answers_by_id() {
+    let system = mounted();
+    system
+        .mount(id("obra/4471"), journal::spawn(Journal::default()))
+        .expect("the id is free");
+
+    let actor = journal::at_local(&system, id("obra/4471"));
+    assert_eq!(actor.apply(7, 0).await.unwrap(), 7);
+    assert_eq!(actor.entries().await.unwrap(), vec![7]);
+}
+
+#[tokio::test]
+async fn a_keyed_actor_ending_can_be_awaited_before_shutdown() {
+    let system = mounted();
+    let actor_id = id("ending");
+    system
+        .mount(actor_id.clone(), journal::spawn(Journal::default()))
+        .expect("the id is free");
+    let ending = system
+        .ended(&actor_id)
+        .expect("a mounted actor has an ending future");
+
+    assert!(matches!(
+        system
+            .shutdown(&actor_id, Duration::from_secs(1))
+            .await
+            .expect("the actor drains"),
+        Ended::Stopped
+    ));
+    assert!(matches!(ending.await, Ended::Stopped));
+    assert!(system.ended(&actor_id).is_none());
+}
+
+#[tokio::test]
+async fn a_local_keyed_ref_rejects_a_reentrant_call() {
+    let system = mounted();
+    let actor_id = id("nested");
+    let state = Journal {
+        nested: Some((system.clone(), actor_id.clone())),
+        ..Journal::default()
+    };
+    system
+        .mount(actor_id.clone(), journal::spawn(state))
+        .expect("the id is free");
+
+    let actor = journal::at_local(&system, actor_id.clone());
+    let result = tokio::time::timeout(Duration::from_secs(1), actor.apply(7, 0))
+        .await
+        .expect("the re-entrant call must resolve without waiting for the actor");
+    assert_eq!(result.expect("the outer turn answers"), 7);
+    system
+        .shutdown(&actor_id, Duration::from_secs(1))
+        .await
+        .expect("the actor drains");
+}
+
+#[tokio::test]
+async fn local_keyed_refs_reject_a_two_actor_ring() {
+    let system = mounted();
+    let first = id("ring/first");
+    let second = id("ring/second");
+    system
+        .mount(
+            first.clone(),
+            journal::spawn(Journal {
+                forward: Some((system.clone(), second.clone())),
+                ..Journal::default()
+            }),
+        )
+        .expect("the first id is free");
+    system
+        .mount(
+            second.clone(),
+            journal::spawn(Journal {
+                cycle: Some((system.clone(), first.clone())),
+                ..Journal::default()
+            }),
+        )
+        .expect("the second id is free");
+
+    assert_eq!(
+        journal::at_local(&system, first.clone())
+            .apply(7, 0)
+            .await
+            .expect("the closing edge is refused and the outer turn answers"),
+        7
+    );
+    assert_eq!(
+        journal::at_local(&system, first.clone())
+            .entries()
+            .await
+            .expect("the first actor remains live"),
+        vec![7]
+    );
+    assert_eq!(
+        journal::at_local(&system, second.clone())
+            .entries()
+            .await
+            .expect("the second actor remains live"),
+        vec![7]
+    );
+    system.shutdown(&first, Duration::from_secs(1)).await;
+    system.shutdown(&second, Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn local_keyed_calls_park_when_the_mailbox_is_full() {
+    let system: journal::System = journal::System::builder(Eviction::Never)
+        .mailbox_depth(NonZeroUsize::new(1).expect("non-zero depth"))
+        .build();
+    let actor_id = id("backpressure");
+    let (entered_tx, mut entered) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    system
+        .mount(
+            actor_id.clone(),
+            journal::spawn(Journal {
+                entered: Some(entered_tx),
+                release: Some(Arc::clone(&release)),
+                ..Journal::default()
+            }),
+        )
+        .expect("the id is free");
+
+    let first_system = system.clone();
+    let first_id = actor_id.clone();
+    let first =
+        tokio::spawn(async move { journal::at_local(&first_system, first_id).apply(1, 0).await });
+    assert_eq!(entered.recv().await, Some(1), "the first turn is held");
+
+    let second_system = system.clone();
+    let second_id = actor_id.clone();
+    let second = tokio::spawn(async move {
+        journal::at_local(&second_system, second_id)
+            .apply(2, 0)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if status_of(&system, &actor_id).buffered == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the second local call is in the keyed mailbox");
+
+    // The local keyed route uses `send`, not `try_send`: a caller waits for a
+    // slot rather than receiving a made-up `Full` refusal.
+    let third_ref = journal::at_local(&system, actor_id.clone());
+    let mut third = Box::pin(third_ref.apply(3, 0));
+    let waker = std::task::Waker::noop();
+    let mut task_cx = std::task::Context::from_waker(waker);
+    assert!(
+        matches!(third.as_mut().poll(&mut task_cx), std::task::Poll::Pending),
+        "a full keyed mailbox parks the local call"
+    );
+    drop(third);
+
+    release.add_permits(2);
+    assert_eq!(
+        first
+            .await
+            .expect("first task joins")
+            .expect("first answers"),
+        1
+    );
+    assert_eq!(
+        second
+            .await
+            .expect("second task joins")
+            .expect("second answers"),
+        2
+    );
+    system
+        .shutdown(&actor_id, Duration::from_secs(1))
+        .await
+        .expect("the actor drains");
+}
+
+#[tokio::test]
+async fn a_local_keyed_ref_reports_a_missing_actor_without_a_remote_error() {
+    let system = mounted();
+
+    let error = journal::at_local(&system, id("missing"))
+        .entries()
+        .await
+        .expect_err("the registry has no actor or factory for this id");
+    assert!(matches!(
+        error,
+        LocalError::NoSuchActor { id: actor_id } if actor_id == id("missing")
+    ));
+}
+
+#[tokio::test]
+async fn local_keyed_ref_uses_the_factory_and_reports_capacity() {
+    let system: journal::System = journal::System::builder(Eviction::Never)
+        .capacity(1)
+        .spawn_with(|_| Some(journal::spawn(Journal::default())))
+        .build();
+
+    assert_eq!(
+        journal::at_local(&system, id("factory/one"))
+            .apply(1, 0)
+            .await
+            .expect("the factory builds the first actor"),
+        1
+    );
+    assert!(system.contains(&id("factory/one")));
+
+    let error = journal::at_local(&system, id("factory/two"))
+        .apply(2, 0)
+        .await
+        .expect_err("the registry cap applies to local keyed calls");
+    assert!(matches!(error, LocalError::AtCapacity { capacity: 1 }));
+    system
+        .shutdown(&id("factory/one"), Duration::from_secs(1))
+        .await;
 }
 
 /// The property the whole design exists for: mounting is a map write, so an
@@ -289,7 +538,9 @@ async fn an_actor_mounted_after_the_client_connected_is_reachable_on_the_same_co
     let fixture = start(mounted()).await;
 
     // The connection already exists and has negotiated its ALPN.
-    let missing = journal::at(&fixture.client, id("later"))
+    let missing = fixture
+        .client
+        .at(id("later"))
         .entries()
         .await
         .expect_err("nothing is mounted yet");
@@ -304,10 +555,7 @@ async fn an_actor_mounted_after_the_client_connected_is_reachable_on_the_same_co
         .expect("the id is free");
 
     assert_eq!(
-        journal::at(&fixture.client, id("later"))
-            .entries()
-            .await
-            .unwrap(),
+        fixture.client.at(id("later")).entries().await.unwrap(),
         Vec::<u64>::new(),
         "the same connection must reach an actor that did not exist when it was opened"
     );
@@ -336,7 +584,7 @@ async fn ten_thousand_actors_are_mounted_and_addressable() {
 
     // The ends and the middle, over one connection.
     for n in [0, ACTORS / 2, ACTORS - 1] {
-        let actor = journal::at(&fixture.client, id(&format!("obra/{n}")));
+        let actor = fixture.client.at(id(&format!("obra/{n}")));
         assert_eq!(
             actor.apply(n as u64, 0).await.unwrap(),
             n as u64,
@@ -346,17 +594,11 @@ async fn ten_thousand_actors_are_mounted_and_addressable() {
 
     // Each actor kept its own state, which is what "keyed" means.
     assert_eq!(
-        journal::at(&fixture.client, id("obra/0"))
-            .entries()
-            .await
-            .unwrap(),
+        fixture.client.at(id("obra/0")).entries().await.unwrap(),
         vec![0]
     );
     assert_eq!(
-        journal::at(&fixture.client, id("obra/1"))
-            .entries()
-            .await
-            .unwrap(),
+        fixture.client.at(id("obra/1")).entries().await.unwrap(),
         Vec::<u64>::new(),
         "an actor nobody addressed must not have another's state"
     );
@@ -390,7 +632,9 @@ async fn the_connection_survives_a_message_to_an_unmounted_actor() {
         .mount(id("real"), journal::spawn(Journal::default()))
         .expect("the id is free");
 
-    let error = journal::at(&fixture.client, id("ghost"))
+    let error = fixture
+        .client
+        .at(id("ghost"))
         .apply(1, 0)
         .await
         .expect_err("nothing is mounted there");
@@ -400,10 +644,7 @@ async fn the_connection_survives_a_message_to_an_unmounted_actor() {
     );
 
     assert_eq!(
-        journal::at(&fixture.client, id("real"))
-            .apply(2, 0)
-            .await
-            .unwrap(),
+        fixture.client.at(id("real")).apply(2, 0).await.unwrap(),
         2,
         "a refusal must not poison the connection"
     );
@@ -424,11 +665,15 @@ async fn a_stopped_actor_is_indistinguishable_from_one_that_never_existed() {
         .await
         .is_some());
 
-    let stopped = journal::at(&fixture.client, id("was/real"))
+    let stopped = fixture
+        .client
+        .at(id("was/real"))
         .apply(1, 0)
         .await
         .expect_err("it is gone");
-    let never = journal::at(&fixture.client, id("was/real"))
+    let never = fixture
+        .client
+        .at(id("was/real"))
         .apply(1, 0)
         .await
         .expect_err("and it is still gone");
@@ -462,7 +707,9 @@ async fn an_oversized_id_is_refused_before_it_reaches_the_registry() {
     )
     .await;
 
-    let error = journal::at(&fixture.client, oversized_id())
+    let error = fixture
+        .client
+        .at(oversized_id())
         .apply(1, 0)
         .await
         .expect_err("an over-long id must be refused");
@@ -576,10 +823,7 @@ async fn a_peer_on_another_services_keyed_alpn_is_refused_at_the_handshake() {
             .await
             .expect("journal's own keyed client dials journal's ALPN");
     assert_eq!(
-        journal::at(&journal_client, id("ledger"))
-            .apply(99, 0)
-            .await
-            .unwrap(),
+        journal_client.at(id("ledger")).apply(99, 0).await.unwrap(),
         99
     );
 
@@ -605,30 +849,15 @@ async fn a_peer_on_another_services_keyed_alpn_is_refused_at_the_handshake() {
     let to_vault = vault::KeyedClient::connect(&client_node, both.endpoint().addr())
         .await
         .expect("dials vault's ALPN");
+    assert_eq!(to_journal.at(id("ledger")).apply(99, 0).await.unwrap(), 99);
+    assert_eq!(to_vault.at(id("ledger")).apply(99, 0).await.unwrap(), 99);
     assert_eq!(
-        journal::at(&to_journal, id("ledger"))
-            .apply(99, 0)
-            .await
-            .unwrap(),
-        99
-    );
-    assert_eq!(
-        vault::at(&to_vault, id("ledger"))
-            .apply(99, 0)
-            .await
-            .unwrap(),
-        99
-    );
-    assert_eq!(
-        journal::at(&to_journal, id("ledger"))
-            .entries()
-            .await
-            .unwrap(),
+        to_journal.at(id("ledger")).entries().await.unwrap(),
         vec![99],
         "the two systems hold different actors under the same id, on one node"
     );
     assert_eq!(
-        vault::at(&to_vault, id("ledger")).entries().await.unwrap(),
+        to_vault.at(id("ledger")).entries().await.unwrap(),
         Vec::<u64>::new(),
         "and neither can see the other's state"
     );
@@ -645,7 +874,9 @@ async fn a_panicking_message_costs_one_message_and_not_the_actor() {
         .mount(id("fragile"), journal::spawn(Journal::default()))
         .expect("the id is free");
 
-    let error = journal::at(&fixture.client, id("fragile"))
+    let error = fixture
+        .client
+        .at(id("fragile"))
         .boom()
         .await
         .expect_err("the handler panics");
@@ -658,10 +889,7 @@ async fn a_panicking_message_costs_one_message_and_not_the_actor() {
     );
 
     assert_eq!(
-        journal::at(&fixture.client, id("fragile"))
-            .apply(1, 0)
-            .await
-            .unwrap(),
+        fixture.client.at(id("fragile")).apply(1, 0).await.unwrap(),
         1,
         "the actor must still be serving"
     );
@@ -692,8 +920,9 @@ async fn a_panicking_message_costs_one_message_and_not_the_actor() {
 /// accident: a service can be served as a singleton and as an actor system at
 /// once, so this is one process, one state type, two dispatch paths.
 ///
-/// A keyed actor has no observers, so only the panic half has a twin here. The
-/// refusal half stays where the observers are.
+/// This comparison exercises the default keyed spawn with no observers. Keyed
+/// `spawn_wired` does accept observers; their refusal behavior is covered with
+/// the feed and observer lifecycle tests.
 #[tokio::test]
 async fn one_panic_reads_the_same_whichever_way_the_service_is_served() {
     let server = local_node().await;
@@ -718,7 +947,8 @@ async fn one_panic_reads_the_same_whichever_way_the_service_is_served() {
         .await
         .expect("dials the same node's singleton");
 
-    let keyed = journal::at(&to_keyed, id("fragile"))
+    let keyed = to_keyed
+        .at(id("fragile"))
         .boom()
         .await
         .expect_err("the handler panics");
@@ -772,10 +1002,7 @@ async fn a_first_message_spawns_an_actor_when_the_system_was_given_a_factory() {
     assert!(fixture.system.is_empty(), "nothing is mounted by hand");
 
     assert_eq!(
-        journal::at(&fixture.client, id("obra/9"))
-            .apply(3, 0)
-            .await
-            .unwrap(),
+        fixture.client.at(id("obra/9")).apply(3, 0).await.unwrap(),
         3
     );
 
@@ -784,10 +1011,7 @@ async fn a_first_message_spawns_an_actor_when_the_system_was_given_a_factory() {
 
     // A second message reuses the actor rather than building another.
     assert_eq!(
-        journal::at(&fixture.client, id("obra/9"))
-            .entries()
-            .await
-            .unwrap(),
+        fixture.client.at(id("obra/9")).entries().await.unwrap(),
         vec![3],
         "the second message must reach the actor the first one spawned"
     );
@@ -803,7 +1027,9 @@ async fn a_factory_that_declines_an_id_produces_no_such_actor() {
     )
     .await;
 
-    let error = journal::at(&fixture.client, id("unknown"))
+    let error = fixture
+        .client
+        .at(id("unknown"))
         .apply(1, 0)
         .await
         .expect_err("the factory declines this id");
@@ -828,7 +1054,9 @@ async fn lazy_spawn_stops_at_the_capacity() {
 
     for n in 0..2 {
         assert_eq!(
-            journal::at(&fixture.client, id(&format!("a{n}")))
+            fixture
+                .client
+                .at(id(&format!("a{n}")))
                 .apply(n, 0)
                 .await
                 .unwrap(),
@@ -836,7 +1064,9 @@ async fn lazy_spawn_stops_at_the_capacity() {
         );
     }
 
-    let error = journal::at(&fixture.client, id("a2"))
+    let error = fixture
+        .client
+        .at(id("a2"))
         .apply(2, 0)
         .await
         .expect_err("the system is full");
@@ -919,7 +1149,7 @@ async fn eviction_inside_its_shutdown_budget_does_not_cut_off_a_message_in_fligh
         .expect("the id is free");
 
     // In flight for far longer than `after`, and far inside the budget.
-    let answered = journal::at(&fixture.client, id("slow")).apply(5, 250).await;
+    let answered = fixture.client.at(id("slow")).apply(5, 250).await;
 
     assert_eq!(
         answered.unwrap(),
@@ -942,21 +1172,12 @@ async fn the_connection_outlives_the_actors_on_it() {
     )
     .await;
 
-    assert_eq!(
-        journal::at(&fixture.client, id("first"))
-            .apply(1, 0)
-            .await
-            .unwrap(),
-        1
-    );
+    assert_eq!(fixture.client.at(id("first")).apply(1, 0).await.unwrap(), 1);
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(fixture.system.is_empty(), "the first actor was evicted");
 
     assert_eq!(
-        journal::at(&fixture.client, id("second"))
-            .apply(2, 0)
-            .await
-            .unwrap(),
+        fixture.client.at(id("second")).apply(2, 0).await.unwrap(),
         2,
         "the same connection must still work after every actor on it went away"
     );
@@ -1012,13 +1233,16 @@ async fn shutdown_inside_its_budget_answers_the_turn_in_flight_and_the_one_queue
                 entered: Some(entered_tx),
                 release: None,
                 inside: None,
+                nested: None,
+                forward: None,
+                cycle: None,
             }),
         )
         .expect("the id is free");
 
     let running = {
         let client = &fixture.client;
-        async move { journal::at(client, id("doc")).apply(1, HOLD_MS).await }
+        async move { client.at(id("doc")).apply(1, HOLD_MS).await }
     };
     let sequenced = async {
         assert_eq!(
@@ -1026,7 +1250,7 @@ async fn shutdown_inside_its_budget_answers_the_turn_in_flight_and_the_one_queue
             Some(1),
             "the first turn is inside the actor before anything below runs"
         );
-        let behind = journal::at(&fixture.client, id("doc"));
+        let behind = fixture.client.at(id("doc"));
         let queued = behind.apply(2, 0);
         let stopping = async {
             // The one unobservable event in this test: the queued call reaching a
@@ -1075,13 +1299,16 @@ async fn abort_destroys_the_message_in_flight() {
                 entered: None,
                 release: None,
                 inside: None,
+                nested: None,
+                forward: None,
+                cycle: None,
             }),
         )
         .expect("the id is free");
 
     let client_call = {
         let client = &fixture.client;
-        async move { journal::at(client, id("doc")).apply(1, 200).await }
+        async move { client.at(id("doc")).apply(1, 200).await }
     };
     let aborting = async {
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -1576,6 +1803,9 @@ async fn different_actors_run_concurrently_while_one_actor_stays_serial() {
         entered: Some(entered_tx.clone()),
         release: Some(Arc::clone(&hold)),
         inside: Some(Arc::clone(inside)),
+        nested: None,
+        forward: None,
+        cycle: None,
     };
     for name in ["a", "b"] {
         fixture
@@ -1588,9 +1818,9 @@ async fn different_actors_run_concurrently_while_one_actor_stays_serial() {
         .mount(id("c"), journal::spawn(holder(&alone)))
         .expect("the id is free");
 
-    let a = journal::at(&fixture.client, id("a"));
-    let b = journal::at(&fixture.client, id("b"));
-    let c = journal::at(&fixture.client, id("c"));
+    let a = fixture.client.at(id("a"));
+    let b = fixture.client.at(id("b"));
+    let c = fixture.client.at(id("c"));
 
     // ── two actors overlap ───────────────────────────────────────────────────
     let concurrent = async {
@@ -1632,7 +1862,7 @@ async fn different_actors_run_concurrently_while_one_actor_stays_serial() {
             "the message sent first is the turn that starts"
         );
 
-        let behind = journal::at(&fixture.client, id("c"));
+        let behind = fixture.client.at(id("c"));
         let sending = behind.apply(3, 0);
         let checking = async {
             // Waiting until the message is in the MAILBOX rather than somewhere on
@@ -1843,7 +2073,7 @@ async fn a_layer_refuses_one_keyed_method_and_passes_the_rest() {
     let client = journal::KeyedClient::connect(&client_node, server.endpoint().addr())
         .await
         .expect("the client dials the actor system");
-    let actor = journal::at(&client, id("obra/1"));
+    let actor = client.at(id("obra/1"));
 
     assert_eq!(
         actor.apply(7, 0).await.unwrap(),
@@ -1931,10 +2161,7 @@ async fn a_keyed_actor_sees_the_proven_key_of_its_caller() {
         .expect("the id is free");
 
     assert_eq!(
-        doorman::at(&client, id("gate/1"))
-            .who_called()
-            .await
-            .unwrap(),
+        client.at(id("gate/1")).who_called().await.unwrap(),
         Some(client_node.id().to_string()),
         "the actor must see the dialing peer's proven key, not None"
     );
@@ -2102,7 +2329,9 @@ async fn start_keyed() -> Keyed {
 
 /// The actor's counter, read without a key so reading never settles one.
 async fn touches(fixture: &Keyed) -> u64 {
-    ward::at(&fixture.client, id("ward"))
+    fixture
+        .client
+        .at(id("ward"))
         .touches()
         .await
         .expect("the actor answers")
@@ -2131,13 +2360,15 @@ fn under(fixture: &Keyed, key: &str) -> ward::KeyedClient {
 async fn a_key_attached_through_the_generated_keyed_client_settles() {
     let fixture = start_keyed().await;
 
-    let first = ward::at(&under(&fixture, "touch"), id("ward"))
+    let first = under(&fixture, "touch")
+        .at(id("ward"))
         .touch()
         .await
         .expect("the first call runs");
     assert_eq!(first, 1);
 
-    let again = ward::at(&under(&fixture, "touch"), id("ward"))
+    let again = under(&fixture, "touch")
+        .at(id("ward"))
         .touch()
         .await
         .expect("the retry is answered from the record");
@@ -2162,7 +2393,8 @@ async fn a_key_is_known_to_the_service_it_was_claimed_against_and_no_other() {
     let fixture = start_keyed().await;
     let key = IdempotencyKey::new("scoped").expect("a valid key");
 
-    ward::at(&under(&fixture, "scoped"), id("ward"))
+    under(&fixture, "scoped")
+        .at(id("ward"))
         .touch()
         .await
         .expect("the call runs");
@@ -2223,7 +2455,8 @@ async fn a_key_is_known_to_the_service_it_was_claimed_against_and_no_other() {
 async fn a_keyed_call_whose_reply_does_not_encode_settles_the_key_interrupted() {
     let fixture = start_keyed().await;
 
-    ward::at(&under(&fixture, "touch"), id("ward"))
+    under(&fixture, "touch")
+        .at(id("ward"))
         .unsendable()
         .await
         .expect_err("the reply does not encode");
@@ -2233,7 +2466,8 @@ async fn a_keyed_call_whose_reply_does_not_encode_settles_the_key_interrupted() 
         "the turn ran, which is what makes the key owe something"
     );
 
-    let retried = ward::at(&under(&fixture, "touch"), id("ward"))
+    let retried = under(&fixture, "touch")
+        .at(id("ward"))
         .unsendable()
         .await
         .expect_err("the key settled, so the retry is refused rather than run");
@@ -2264,7 +2498,8 @@ async fn a_keyed_call_whose_reply_does_not_encode_settles_the_key_interrupted() 
 async fn a_keyed_call_whose_reply_panics_while_encoding_settles_the_key_interrupted() {
     let fixture = start_keyed().await;
 
-    ward::at(&under(&fixture, "touch"), id("ward"))
+    under(&fixture, "touch")
+        .at(id("ward"))
         .detonate()
         .await
         .expect_err("the reply's `Serialize` panics");
@@ -2274,7 +2509,8 @@ async fn a_keyed_call_whose_reply_panics_while_encoding_settles_the_key_interrup
         "the turn ran, which is what makes the key owe something"
     );
 
-    let retried = ward::at(&under(&fixture, "touch"), id("ward"))
+    let retried = under(&fixture, "touch")
+        .at(id("ward"))
         .detonate()
         .await
         .expect_err("the key settled, so the retry is refused rather than run");
@@ -2302,7 +2538,8 @@ async fn a_keyed_call_whose_reply_panics_while_encoding_settles_the_key_interrup
 async fn a_keyed_call_whose_turn_panicked_settles_the_key_interrupted() {
     let fixture = start_keyed().await;
 
-    let error = ward::at(&under(&fixture, "touch"), id("ward"))
+    let error = under(&fixture, "touch")
+        .at(id("ward"))
         .explode()
         .await
         .expect_err("the turn panics");
@@ -2320,7 +2557,8 @@ async fn a_keyed_call_whose_turn_panicked_settles_the_key_interrupted() {
         "the turn ran, and mutated, before it panicked"
     );
 
-    let retried = ward::at(&under(&fixture, "touch"), id("ward"))
+    let retried = under(&fixture, "touch")
+        .at(id("ward"))
         .explode()
         .await
         .expect_err("the key settled, so the retry is refused rather than run");
@@ -2384,7 +2622,9 @@ async fn a_garbage_payload_never_reaches_the_actor_and_claims_no_key() {
     // And the connection carries on, which is what makes this a refusal rather
     // than a denial of service.
     assert_eq!(
-        ward::at(&fixture.client, id("ward"))
+        fixture
+            .client
+            .at(id("ward"))
             .touch()
             .await
             .expect("the actor is still there"),
@@ -2413,7 +2653,8 @@ async fn a_payload_that_panics_while_decoding_costs_that_call_and_not_the_actor(
     let key = IdempotencyKey::new("implode").expect("a valid key");
 
     let keyed = under(&fixture, "implode");
-    ward::at(&keyed, id("ward"))
+    keyed
+        .at(id("ward"))
         .implode(Imploding)
         .await
         .map(|_| ())
@@ -2433,7 +2674,9 @@ async fn a_payload_that_panics_while_decoding_costs_that_call_and_not_the_actor(
     );
 
     assert_eq!(
-        ward::at(&fixture.client, id("ward"))
+        fixture
+            .client
+            .at(id("ward"))
             .touch()
             .await
             .expect("the actor is still there"),
@@ -2579,7 +2822,7 @@ struct Gated {
 }
 
 async fn start_gated() -> Gated {
-    gated_behind(QueueTimeout::after(BUDGET)).await
+    gated_behind(QueueTimeout::try_after(BUDGET).expect("valid queue timeout budget")).await
 }
 
 /// The depth `Gated` is built at unless a test says otherwise: the default, so
@@ -2749,7 +2992,7 @@ async fn busy_is_true_during_a_turn_and_false_between_turns() {
     assert!(!before.busy, "nothing has been called yet");
     assert_eq!(before.buffered, 0);
 
-    let holding = async { gate::at(client, id("gate")).hold().await };
+    let holding = async { client.at(id("gate")).hold().await };
     let watching = async {
         entered.recv().await.expect("`hold` enters its turn");
         let during = gate_status(system);
@@ -2791,8 +3034,8 @@ async fn busy_stays_true_across_an_await_inside_a_turn() {
     let system = &fixture.system;
     let entered = &mut fixture.entered;
 
-    let holding = async { gate::at(client, id("gate")).hold().await };
-    let queued = async { gate::at(client, id("gate")).touch().await };
+    let holding = async { client.at(id("gate")).hold().await };
+    let queued = async { client.at(id("gate")).touch().await };
     let watching = async {
         entered.recv().await.expect("`hold` enters its turn");
         // Many chances for the actor's task to be polled again, none of which the
@@ -2912,8 +3155,8 @@ async fn a_wedged_actor_answers_status_during_its_turn() {
     let system = &fixture.system;
     let entered = &mut fixture.entered;
 
-    let holding = async { gate::at(client, id("gate")).hold().await };
-    let queued = async { gate::at(client, id("gate")).touch().await };
+    let holding = async { client.at(id("gate")).hold().await };
+    let queued = async { client.at(id("gate")).touch().await };
     let asking = async {
         entered.recv().await.expect("`hold` enters its turn");
         // The mailbox is full before the question is asked, so the answer below
@@ -2921,7 +3164,7 @@ async fn a_wedged_actor_answers_status_during_its_turn() {
         let held = until_buffered(system, 1).await;
         assert!(held.busy, "the turn holding the actor is still running");
 
-        let serving = tokio::time::timeout(NOT_STUCK, gate::at(client, id("gate")).__status())
+        let serving = tokio::time::timeout(NOT_STUCK, client.at(id("gate")).__status())
             .await
             .expect(
                 "a `__status` that enqueued would wait behind the wedged turn, and this one did",
@@ -2951,7 +3194,8 @@ async fn a_wedged_actor_answers_status_during_its_turn() {
     // And the reading was about the actor rather than about the asking: once the
     // turn is over the same question answers the opposite way.
     until_idle(system).await;
-    let after = gate::at(client, id("gate"))
+    let after = client
+        .at(id("gate"))
         .__status()
         .await
         .expect("an idle actor answers too");
@@ -3008,7 +3252,8 @@ async fn a_local_caller_and_a_peer_read_the_same_serving() {
     let who = id("gate");
 
     let idle_here = system.serving(&who).expect("the actor is mounted");
-    let idle_there = gate::at(client, who.clone())
+    let idle_there = client
+        .at(who.clone())
         .__status()
         .await
         .expect("the peer's question is answered");
@@ -3025,10 +3270,10 @@ async fn a_local_caller_and_a_peer_read_the_same_serving() {
         "and nothing has been called yet"
     );
 
-    let holding = async { gate::at(client, who.clone()).hold().await };
+    let holding = async { client.at(who.clone()).hold().await };
     let comparing = async {
         entered.recv().await.expect("`hold` enters its turn");
-        let there = tokio::time::timeout(NOT_STUCK, gate::at(client, who.clone()).__status())
+        let there = tokio::time::timeout(NOT_STUCK, client.at(who.clone()).__status())
             .await
             .expect("a wedged actor answers its peer")
             .expect("the peer's question is answered");
@@ -3224,14 +3469,14 @@ async fn a_saturated_mailbox_at_depth_does_not_starve_a_feed() {
     let entered = &mut fixture.entered;
     let turns = &mut fixture.turns;
 
-    let holding = async { gate::at(client, id("gate")).hold().await };
+    let holding = async { client.at(id("gate")).hold().await };
     let saturating = async {
         // Bound first: `gate::at` returns a borrowing handle, so the three
         // futures have to outlive the temporaries they are built from.
         let (first, second, third) = (
-            gate::at(client, id("gate")),
-            gate::at(client, id("gate")),
-            gate::at(client, id("gate")),
+            client.at(id("gate")),
+            client.at(id("gate")),
+            client.at(id("gate")),
         );
         let (one, two, three) = tokio::join!(first.touch(), second.touch(), third.touch());
         one.expect("answers");
@@ -3289,7 +3534,9 @@ fn gate_under(fixture: &Gated, key: &str) -> gate::KeyedClient {
 }
 
 async fn gate_touches(fixture: &Gated) -> u64 {
-    gate::at(&fixture.client, id("gate"))
+    fixture
+        .client
+        .at(id("gate"))
         .touches()
         .await
         .expect("the actor answers")
@@ -3317,10 +3564,10 @@ async fn expired_in_the_queue(fixture: &mut Gated, key: &str) -> Result<u64, Err
     let stamped = &mut fixture.stamped;
     let (go, wait) = oneshot::channel();
 
-    let holding = async { gate::at(client, id("gate")).hold().await };
+    let holding = async { client.at(id("gate")).hold().await };
     let queued = async {
         wait.await.expect("the driver says when");
-        gate::at(&keyed, id("gate")).touch().await
+        keyed.at(id("gate")).touch().await
     };
     let driver = async {
         entered.recv().await.expect("`hold` entered its turn");
@@ -3383,7 +3630,8 @@ async fn a_keyed_message_that_expired_in_the_queue_leaves_its_key_claimable() {
         .expect_err("the budget ran out while it queued");
 
     // The actor is free now, so this one runs rather than queues.
-    let ran = gate::at(&gate_under(&fixture, "retried"), id("gate"))
+    let ran = gate_under(&fixture, "retried")
+        .at(id("gate"))
         .touch()
         .await
         .expect("the key must still be claimable");
@@ -3427,11 +3675,11 @@ async fn two_behind_a_held_turn(
     let let_go = AtomicBool::new(false);
     let (go, wait) = oneshot::channel();
 
-    let holding = async { gate::at(client, id("gate")).hold().await };
+    let holding = async { client.at(id("gate")).hold().await };
     let sending = async {
         wait.await.expect("the driver says when");
         let answer = || async {
-            let answered = gate::at(client, target.clone()).touch().await;
+            let answered = client.at(target.clone()).touch().await;
             (answered, let_go.load(Ordering::Acquire))
         };
         tokio::join!(answer(), answer())
@@ -3576,10 +3824,10 @@ async fn queued_when_the_caller_gave_up(fixture: &mut Gated, key: &str) -> Resul
     let entered = &mut fixture.entered;
     let (go, wait) = oneshot::channel();
 
-    let holding = async { gate::at(client, id("gate")).hold().await };
+    let holding = async { client.at(id("gate")).hold().await };
     let queued = async {
         wait.await.expect("the driver says when");
-        let answered = gate::at(&keyed, id("gate")).touch().await;
+        let answered = keyed.at(id("gate")).touch().await;
         // Answered first, released second, and that order is what the caller's
         // answer is about: it was told something while its message was still
         // sitting in the mailbox, unrun.
@@ -3631,7 +3879,8 @@ async fn a_keyed_message_a_timeout_gave_up_on_in_the_mailbox_settles_its_key() {
          back would be an invitation to run the work twice"
     );
 
-    let retried = gate::at(&gate_under(&fixture, "gave-up"), id("gate"))
+    let retried = gate_under(&fixture, "gave-up")
+        .at(id("gate"))
         .touch()
         .await
         .expect_err("a key nobody can report on must be settled, not claimable");
@@ -3665,11 +3914,11 @@ async fn two_keyed_behind_a_held_turn(
     let entered = &mut fixture.entered;
     let (go, wait) = oneshot::channel();
 
-    let holding = async { gate::at(client, id("gate")).hold().await };
+    let holding = async { client.at(id("gate")).hold().await };
     let sending = async {
         wait.await.expect("the driver says when");
-        let one = gate::at(&first, id("gate"));
-        let two = gate::at(&second, id("gate"));
+        let one = first.at(id("gate"));
+        let two = second.at(id("gate"));
         let answered = tokio::join!(one.touch(), two.touch());
         release.add_permits(1);
         answered
@@ -3717,10 +3966,7 @@ async fn only_the_keyed_message_that_got_a_mailbox_permit_settles_its_key() {
 
     let mut settled = 0;
     for key in ["slot", "no-slot"] {
-        match gate::at(&gate_under(&fixture, key), id("gate"))
-            .touch()
-            .await
-        {
+        match gate_under(&fixture, key).at(id("gate")).touch().await {
             Ok(_) => {}
             Err(Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::Interrupted))) => {
                 settled += 1;
@@ -3824,7 +4070,7 @@ async fn a_reply_whose_serialize_panics_costs_that_message_and_not_the_actor() {
         .mount(id("fuse"), fuse::spawn(Fuse))
         .expect("the id is free");
     assert_eq!(
-        fuse::at(&client, id("fuse")).ping().await.unwrap(),
+        client.at(id("fuse")).ping().await.unwrap(),
         1,
         "the actor answers before the message that used to kill it"
     );
@@ -3832,7 +4078,8 @@ async fn a_reply_whose_serialize_panics_costs_that_message_and_not_the_actor() {
     // The turn itself is fine: it returns `Exploding`, and `guarded` sees no
     // panic at all. The unwind happens while the frame is being encoded, on the
     // connection's task.
-    fuse::at(&client, id("fuse"))
+    client
+        .at(id("fuse"))
         .detonate()
         .await
         .map(|_| ())
@@ -3845,7 +4092,7 @@ async fn a_reply_whose_serialize_panics_costs_that_message_and_not_the_actor() {
     );
 
     assert_eq!(
-        fuse::at(&client, id("fuse")).ping().await.unwrap(),
+        client.at(id("fuse")).ping().await.unwrap(),
         1,
         "and the next caller is answered, which is the whole point of the encode having \
          left the actor's task"

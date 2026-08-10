@@ -105,18 +105,18 @@
 //! a time in one task. That is a caller error with a symptom, not an
 //! impossibility.
 //!
-//! # Keyed actors are members, through [`Endings`](super::Endings)
+//! # Keyed actors are members
 //!
-//! A [`Membership`] needs the member's ending, and **a keyed actor has no
-//! `ended()` to ask for** — the same gap [`Names`](super::Names) names one type
-//! over. [`Membership::new`] therefore takes the ending as an argument rather
-//! than asking a handle for one, so it needed no change when the keyed side
-//! grew a per-actor ending channel — and that is the whole of why the argument
-//! is an argument. [`Endings`](super::Endings) is that channel:
-//! [`watch`](super::Endings::watch) hands back the future this constructor
-//! already takes, and [`System::abort`](crate::System::abort) is the retiring.
-//! `keyed.rs` states the one thing the shape costs, which is that a `watch`
-//! filed after its actor ended reaches nobody.
+//! A [`Membership`] needs the member's ending. A keyed actor supplies that
+//! future through [`System::ended`](crate::System::ended): after mounting, handle
+//! its `None` case explicitly or use `expect("the member was just mounted")`.
+//! [`Endings`](super::Endings), meanwhile,
+//! [`Endings`](super::Endings) adapts the same ending callback when a composition
+//! wants to file and fan out its own waiters. [`Membership::new`] takes the
+//! ending as an argument rather than asking a handle for one, so local and keyed
+//! members use the same shape. [`System::abort`](crate::System::abort) is the
+//! retiring operation. `keyed.rs` states the miss-window that applies to an
+//! `Endings::watch` filed after an actor already ended.
 //!
 //! # Cost
 //!

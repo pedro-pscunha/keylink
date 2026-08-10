@@ -4069,3 +4069,12 @@ rather than becoming a misdecode.
 
 **Nothing in §16.10 through §16.16 changes.** Their claims are about the changes they
 describe, and none of those is the cause of either move above.
+
+## 16.18 Revision, 2026-08-10: queue-timeout construction is checked
+
+The examples in earlier sections use the original `QueueTimeout::after` constructor as
+a record of the design at that point. The shipped API now exposes
+`QueueTimeout::try_after`, which returns `QueueTimeoutError` when the target clock cannot
+represent the requested deadline. A caller must handle that result instead of allowing
+an overflowing deadline to panic or silently wrap. The queue-timeout semantics are
+unchanged: it refuses only work that is still waiting in the mailbox.

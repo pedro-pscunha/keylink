@@ -210,7 +210,7 @@ async fn one_function_calls_four_surfaces() {
     let ledgered = total_after(&with_key, 4)
         .await
         .expect("the same actor answers a keyed call");
-    let addressed = total_after(&ledger::at(&to_keyed, id("addressed")), 8)
+    let addressed = total_after(&to_keyed.at(id("addressed")), 8)
         .await
         .expect("the mounted actor answers an addressed call");
 

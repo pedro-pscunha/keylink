@@ -1307,10 +1307,7 @@ async fn a_keyed_actors_blob_method_grants_the_address_it_returns() {
     let client = catalog::KeyedClient::connect(&caller, server.endpoint().addr())
         .await
         .expect("dials the keyed system");
-    let actor = catalog::at(
-        &client,
-        keylink::ActorId::new("warehouse").expect("a valid id"),
-    );
+    let actor = client.at(keylink::ActorId::new("warehouse").expect("a valid id"));
 
     let (manual, handle) = actor
         .datasheet("ADU-014".to_owned())
@@ -1332,6 +1329,33 @@ async fn a_keyed_actors_blob_method_grants_the_address_it_returns() {
         .await
         .expect_err("an address nobody returned must not be fetchable");
     assert_refused(&error, "content the keyed actor never named");
+}
+
+#[tokio::test]
+async fn a_local_keyed_blob_method_returns_its_address() {
+    let blobs = Blobs::memory();
+    let published = blobs
+        .add_bytes(b"the local keyed blob".to_vec())
+        .await
+        .expect("stores");
+    let system: catalog::System = catalog::System::builder(keylink::Eviction::Never).build();
+    let actor_id = keylink::ActorId::new("warehouse").expect("a valid id");
+    system
+        .mount(
+            actor_id.clone(),
+            catalog::spawn(Warehouse {
+                published,
+                unpublished: published,
+            }),
+        )
+        .expect("mounts");
+
+    let (manual, returned) = catalog::at_local(&system, actor_id)
+        .datasheet("ADU-LOCAL".to_owned())
+        .await
+        .expect("the local keyed actor answers");
+    assert_eq!(manual.pages, 42);
+    assert_eq!(returned, published);
 }
 
 /// The startup refusal that could not fire before, and now can.

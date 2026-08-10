@@ -125,33 +125,36 @@
 /// RPC names are written in `CamelCase` (they become enum variants); the
 /// generated methods are `snake_case`.
 ///
+/// `macro_rules!` cannot compare arbitrary identifier fragments or their
+/// `snake_case` spellings. Distinct spellings such as `FooBar` and `Foo_Bar`
+/// can therefore still collide in a generated method or field and are reported
+/// by Rust's duplicate-item diagnostics. RPC and feed declarations use separate
+/// generated namespaces; the explicit taken names below are checked at the
+/// surface that owns them.
+///
 /// ### A declared name landing on a taken one is refused, per surface
 ///
-/// The generated method goes into an `impl` block that already has methods of
-/// its own, so a declaration whose `snake_case` form is one of theirs is two
-/// inherent methods of one name in one block. There is no reserved-word list
-/// anywhere in this macro: the refusal is the compiler's, and the taken set is
-/// therefore **per surface** — `at` is free on a `Handle` and taken on a keyed
-/// client, `ended` is the other way round.
+/// The generated methods do not all share one type. The macro therefore checks
+/// the names at the emitters that own them and reports the surface directly:
+///
+/// - local `Handle`: lifecycle, status and reservation doors;
+/// - local keyed `LocalRef`: `id`;
+/// - remote keyed `ActorRef`: `id` and `__status`;
+/// - remote `Client` and `IdempotentClient`: connection, ledger, status and
+///   close doors;
+/// - blocking `Client` and `IdempotentClient`: their synchronous connection,
+///   ledger and close doors.
+///
+/// `KeyedClient::at` is the addressing door, not an operation surface. A
+/// declared `rpc At` is generated on `ActorRef`, so it remains legal. The same
+/// surface rule is why a name such as `ended` is legal on a remote client but
+/// not on a local handle.
+///
+/// The diagnostic is emitted at the declaration site rather than relying on a
+/// later duplicate-method error inside the expansion:
 ///
 /// ```compile_fail
-/// // Fails with `error[E0592]: duplicate definitions with name `is_busy``,
-/// // against the `is_busy` this macro puts on every `Handle`.
-/// //
-/// // The code is named HERE and deliberately NOT on the fence. rustdoc does not
-/// // check the code after `compile_fail`, so an annotated code asserts a
-/// // verification it does not perform — this project has shipped five guards
-/// // that were satisfiable without proving their claim, and a fence reading
-/// // `compile_fail,E0592` is how the sixth would look.
-/// //
-/// // Measured rather than predicted: lifting the tag reports **one** error and
-/// // it is that one, so there is no second cause this fence could be satisfied
-/// // by. `rpc Fill` is not padding — a `service!` of one method generates an
-/// // `into_<rpc>` whose catch-all arm is `unreachable_patterns`.
-/// //
-/// // Watched green, which is the failure direction for a `compile_fail`: rename
-/// // the generated `pub fn is_busy` on `Handle` and this reports *"Test compiled
-/// // successfully, but it's marked `compile_fail`"*.
+/// // error: rpc `IsBusy` conflicts with generated `Handle::is_busy`. Rename the rpc.
 /// keylink::service! {
 ///     service Orders;
 ///     rpc Fill(price: u64) -> u64;
@@ -159,58 +162,130 @@
 /// }
 /// ```
 ///
-/// ### `__Status` is a name a user cannot take, and that is measured here
+/// ### `__Status` is taken on every generated wire/client surface
 ///
-/// The generated `__status` follows this file's internal convention — `__Status`
-/// on the wire, `__status` as the method — and a convention is not a mechanism.
-/// The question the wave was planned around is whether a legal `CamelCase` ident
-/// can reach that same spelling.
+/// `pastey`'s `:snake` maps the legal declaration `__Status` to `__status`.
+/// The generated status request/reply variants and status methods therefore
+/// need the same direct name check as ordinary operations. The declaration is
+/// diagnosed before those generated items are emitted, so the direct diagnostic
+/// does not turn into a cascade of duplicate-item and exhaustiveness errors.
 ///
-/// **It can, and that is not the reservation.** `pastey`'s `:snake` takes
-/// `__Status` to `__status` like any other ident — leading underscores are not
-/// special to it — and the fence below is where that is read off a compiler,
-/// because one of the errors it reports is a duplicate `__status`. The name is
-/// therefore **taken**, not unreachable, and the two are worth keeping apart: an
-/// unreachable name would need no guard at all, while a taken one is held by the
-/// same `E0592` the fence above pins, and stops being held the moment the
-/// expansion stops declaring it.
-///
-/// `__Status` **is** a legal Rust ident and a legal declaration position, so this
-/// compiles or it does not, and the run decides:
+/// The control `rpc Status()` remains valid: it produces `status`, not the
+/// internal `__status` spelling.
 ///
 /// ```compile_fail
-/// // Does not compile, measured: **23 errors**, of which the two that are about
-/// // the name are `error[E0428]: the name `__Status` is defined multiple times`
-/// // and `error[E0592]: duplicate definitions with name `__status``. The other
-/// // twenty-one are the wreckage a duplicate variant leaves in the expansion's
-/// // own matches — twelve `E0004`, five `E0308`, one `E0631`.
-/// //
-/// // The codes are named HERE and not on the fence, for the reason the fence
-/// // above gives.
-/// //
-/// // **The control is the same block with the underscores removed**, and it is
-/// // what makes this a statement about the name rather than about the shape:
-/// // `rpc Status()` in this position COMPILES, which is why one is not the
-/// // guard for the other. So the refusal below is attributable to `__Status`
-/// // and to nothing else in the block.
-/// //
-/// // What a green here would mean is not "a doctest rotted": it would mean the
-/// // expansion had stopped declaring `__Status`, a user could then declare it,
-/// // and the name this crate answers a peer's status question by would have to
-/// // change — which moves the ALPN of every service in the fleet.
-/// //
-/// // **That green is NOT watched, and no substitution reaches it.** The fence
-/// // above was, by renaming one method; this one would need the `__Status`
-/// // variant gone from every match the expansion writes over it, and any
-/// // partial cut is a crate that does not build — which is an abort and not a
-/// // green. So this fence rests on the measurement recorded above and on its
-/// // control, and the green direction is reasoned rather than observed.
-/// //
-/// // The measurement itself is cheap to repeat: lift the tag and read the run.
+/// // error: rpc `__Status` conflicts with a generated status name. Rename the rpc.
 /// keylink::service! {
 ///     service Orders;
 ///     rpc Fill(price: u64) -> u64;
 ///     rpc __Status() -> u64;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// // error: rpc `Id` conflicts with generated `LocalRef::id`. Rename the rpc.
+/// // error: rpc `Id` conflicts with generated `ActorRef::id`. Rename the rpc.
+/// keylink::service! {
+///     service Orders;
+///     rpc Fill(price: u64) -> u64;
+///     rpc Id() -> u64;
+/// }
+/// ```
+///
+/// `Client` and its idempotent and blocking twins have their own taken names.
+/// The checks are attached only to the methods those surfaces emit: a streaming
+/// declaration does not reserve a blocking name when the blocking surface omits it,
+/// and an idempotent client does not reserve `tell` because it has no tell method.
+///
+/// ```compile_fail
+/// // error: rpc `Connect` conflicts with generated `Client::connect`. Rename the rpc.
+/// // error: rpc `Connect` conflicts with generated `blocking::Client::connect`.
+/// // Rename the rpc.
+/// keylink::service! {
+///     service Orders;
+///     rpc Fill(price: u64) -> u64;
+///     rpc Connect() -> u64;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// // error: rpc `KeyState` conflicts with generated `IdempotentClient::key_state`.
+/// // Rename the rpc.
+/// // The same check also names the ordinary and blocking idempotent surfaces.
+/// keylink::service! {
+///     service Orders;
+///     rpc Fill(price: u64) -> u64;
+///     rpc KeyState() -> u64;
+/// }
+/// ```
+///
+/// Wire variants are a separate namespace from generated method identifiers. `Served`
+/// has no taken method spelling, but `Mail::Served` is the envelope used for a peer
+/// request, so it is refused directly. Conversely, `At` is legal: `KeyedClient::at`
+/// addresses an `ActorRef`, and the operation itself is emitted on that other type.
+///
+/// ```compile_fail
+/// // error: rpc `Served` conflicts with generated `Mail::Served`. Rename the rpc.
+/// keylink::service! {
+///     service Orders;
+///     rpc Fill(price: u64) -> u64;
+///     rpc Served() -> u64;
+/// }
+/// ```
+///
+/// ```
+/// keylink::service! {
+///     service Orders;
+///     rpc At() -> u64;
+/// }
+/// ```
+///
+/// Feeds have one generated field of their own, `Feeds::at`, used as the
+/// round-robin cursor. A feed named `At` is therefore refused, while the feed's
+/// `Handler::on_*` and `Feed::*` names remain otherwise independent:
+///
+/// ```compile_fail
+/// // error: feed `At` conflicts with generated `Feeds::at`. Rename the feed.
+/// keylink::service! {
+///     service Orders;
+///     rpc Fill() -> u64;
+///     feed At(item: u64);
+/// }
+/// ```
+///
+/// The raw spelling is checked too; it normalizes to the same `at` field:
+///
+/// ```compile_fail
+/// // error: feed `r#at` conflicts with generated `Feeds::at`. Rename the feed.
+/// keylink::service! {
+///     service Orders;
+///     rpc Fill() -> u64;
+///     feed r#at(item: u64);
+/// }
+/// ```
+///
+/// Generated method identifiers must also be valid Rust identifiers after
+/// snake-casing. The check runs before `pastey` emits a method, so a declaration
+/// such as `Type` reports the name instead of only `expected identifier` from
+/// `fn type`:
+///
+/// ```compile_fail
+/// // error: rpc `Type` generates the reserved Rust keyword `type`. Rename the rpc.
+/// keylink::service! {
+///     service Orders;
+///     rpc Type() -> u64;
+/// }
+/// ```
+///
+/// The method checks deliberately remain independent of the wire check: `Stop` is a
+/// valid request variant but its generated `Handle::stop` method is taken.
+///
+/// ```compile_fail
+/// // error: rpc `Stop` conflicts with generated `Handle::stop`. Rename the rpc.
+/// keylink::service! {
+///     service Orders;
+///     rpc Fill(price: u64) -> u64;
+///     rpc Stop() -> u64;
 /// }
 /// ```
 ///
@@ -222,13 +297,21 @@
 /// does not move. See [`Reply`](crate::Reply) for the handler shape and
 /// [`Replied`](crate::Replied) for why forgetting to answer is a compile error.
 ///
-/// It is the **only** attribute this macro interprets. Every other one is
-/// forwarded verbatim to the sites that take one, which is why reading this one at
-/// all needs a token-muncher: `service!`'s matcher captures attributes as
+/// `#[defer]` is the only attribute that changes declaration semantics. The
+/// muncher also records `#[cfg]`/`#[cfg_attr]` separately so disabled declarations
+/// disappear from generated match arms and expressions; all other attributes are
+/// forwarded verbatim to the sites that take one. Reading these attributes at all
+/// needs a token-muncher: `service!`'s matcher captures attributes as
 /// `#[$meta:meta]`, and a `meta` fragment is opaque to further matching. So the
 /// declarations are munched a token at a time *before* the fragment forms, with
 /// interpreted attributes accumulated separately from pass-through ones. See
 /// [`__keylink_service_munch`](crate::__keylink_service_munch).
+///
+/// Write `#[defer]` directly. `#[cfg_attr(..., defer)]` is not supported:
+/// `macro_rules!` sees the wrapper before configuration expansion, and keylink does
+/// not branch the generated `Actor` method signature on that payload. When the
+/// handler shape differs by configuration, put complete `service!` declarations
+/// and their implementations behind complementary `#[cfg]` attributes instead.
 ///
 /// `#[defer]` on a `tell`, `send`, `recv` or `blob` is a compile error naming the
 /// reason — `__keylink_defer_check!` has the four messages, and this is one of
@@ -345,6 +428,7 @@ macro_rules! service {
             @done [ ]
             @feeds [ ]
             @attrs [ ]
+            @cfg [ ]
             @defer [ ]
             @rest [ $( $rest )+ ]
         }
@@ -386,8 +470,12 @@ macro_rules! service {
 /// `@wire [ .. ] @feeds [ .. ]`. The wire list expands into `Request`, `Response`,
 /// `Contract`, `Handler`, `Client`, `Mail` and the rest exactly as before, and the
 /// feed list reaches none of them. **"Feeds are not on the wire" is therefore a fact
-/// about which list a declaration is in**, checked by the compiler at every one of
-/// those sites, rather than a claim thirteen macros have to keep agreeing about.
+/// about which list a declaration is in.** A rejected declaration does not count as
+/// a wire declaration. If it was the only wire-shaped declaration beside feeds,
+/// diagnostics deliberately report both the declaration error and the independent
+/// feeds-only service-shape error. The list separation is checked by the compiler
+/// at every generated site rather than being a claim thirteen macros have to keep
+/// agreeing about.
 ///
 /// The two arms it did cost are the well-formed `feed Name(item: Type);` and the
 /// refusal for any other shape of one.
@@ -399,43 +487,2680 @@ macro_rules! service {
 /// Recursion is one step per attribute plus one per declaration, so the deepest
 /// service in this repository munches about a dozen frames against a default
 /// `recursion_limit` of 128.
+/// Split the payload of a `cfg_attr` while retaining only its nested `cfg`
+/// attributes for generated non-item syntax. The original attribute remains in
+/// the declaration metadata, where Rust applies every payload normally.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_cfg_attr {
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @guard $guard:meta @payload [ cfg_attr($condition:meta, $( $nested:tt )*) , $( $payload:tt )* ]
+        @after [ $( $after:tt )* ] @rest [ $( $rest:tt )* ]
+    ) => {
+        $crate::__keylink_cfg_attr! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ $( $attrs )* ] @cfg [ $( $cfg )* ] @defer [ $( $seen )* ]
+            @guard all($guard, $condition) @payload [ $( $nested )* ]
+            @after [
+                @guard $guard @payload [ $( $payload )* ]
+                @after [ $( $after )* ]
+            ]
+            @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @guard $guard:meta @payload [ cfg_attr($condition:meta, $( $nested:tt )*) ]
+        @after [ $( $after:tt )* ] @rest [ $( $rest:tt )* ]
+    ) => {
+        $crate::__keylink_cfg_attr! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ $( $attrs )* ] @cfg [ $( $cfg )* ] @defer [ $( $seen )* ]
+            @guard all($guard, $condition) @payload [ $( $nested )* ]
+            @after [ $( $after )* ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @guard $guard:meta @payload [ cfg($predicate:meta) , $( $payload:tt )* ]
+        @after [ $( $after:tt )* ] @rest [ $( $rest:tt )* ]
+    ) => {
+        $crate::__keylink_cfg_attr! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ $( $attrs )* ]
+            @cfg [ $( $cfg )* #[cfg(any(not($guard), $predicate))] ]
+            @defer [ $( $seen )* ] @guard $guard @payload [ $( $payload )* ]
+            @after [ $( $after )* ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @guard $guard:meta @payload [ cfg($predicate:meta) ]
+        @after [ $( $after:tt )* ] @rest [ $( $rest:tt )* ]
+    ) => {
+        $crate::__keylink_cfg_attr! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ $( $attrs )* ]
+            @cfg [ $( $cfg )* #[cfg(any(not($guard), $predicate))] ]
+            @defer [ $( $seen )* ] @guard $guard @payload [ ]
+            @after [ $( $after )* ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @guard $guard:meta @payload [ $other:meta , $( $payload:tt )* ]
+        @after [ $( $after:tt )* ] @rest [ $( $rest:tt )* ]
+    ) => {
+        $crate::__keylink_cfg_attr! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ $( $attrs )* ] @cfg [ $( $cfg )* ] @defer [ $( $seen )* ]
+            @guard $guard @payload [ $( $payload )* ]
+            @after [ $( $after )* ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @guard $guard:meta @payload [ $other:meta ]
+        @after [ $( $after:tt )* ] @rest [ $( $rest:tt )* ]
+    ) => {
+        $crate::__keylink_cfg_attr! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ $( $attrs )* ] @cfg [ $( $cfg )* ] @defer [ $( $seen )* ]
+            @guard $guard @payload [ ] @after [ $( $after )* ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @guard $guard:meta @payload [ ]
+        @after [ @guard $next_guard:meta @payload [ $( $next_payload:tt )* ]
+                 @after [ $( $after:tt )* ] ] @rest [ $( $rest:tt )* ]
+    ) => {
+        $crate::__keylink_cfg_attr! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ $( $attrs )* ] @cfg [ $( $cfg )* ] @defer [ $( $seen )* ]
+            @guard $next_guard @payload [ $( $next_payload )* ]
+            @after [ $( $after )* ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @guard $guard:meta @payload [ ] @after [ ] @rest [ $( $rest:tt )* ]
+    ) => {
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ $( $attrs )* ] @cfg [ $( $cfg )* ] @defer [ $( $seen )* ]
+            @rest [ $( $rest )* ]
+        }
+    };
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_service_munch {
-    // The one attribute keylink reads. Never forwarded.
+    // `#[defer]` changes semantics and is consumed. Configuration attributes are
+    // recorded separately below so they can gate generated non-item syntax.
     (
         @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
-        @attrs [ $( $attrs:tt )* ] @defer [ $( $_seen:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $_seen:tt )* ]
         @rest [ #[defer] $( $rest:tt )* ]
     ) => {
         $crate::__keylink_service_munch! {
             @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
-            @attrs [ $( $attrs )* ] @defer [ defer ]
+            @attrs [ $( $attrs )* ] @cfg [ $( $cfg )* ] @defer [ defer ]
             @rest [ $( $rest )* ]
         }
     };
+    // Configuration attributes must also gate generated match arms, fields,
+    // and expressions. Keep a second list so those sites do not receive doc
+    // or serde attributes that Rust rejects there.
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ #[cfg($($condition:tt)*)] $( $rest:tt )* ]
+    ) => {
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ $( $attrs )* #[cfg($($condition)*)] ]
+            @cfg [ $( $cfg )* #[cfg($($condition)*)] ] @defer [ $( $seen )* ]
+            @rest [ $( $rest )* ]
+        }
+    };
+    // Keep the complete `cfg_attr` for generated items, and derive one `cfg`
+    // metadata attribute for every nested `cfg` payload. A `cfg_attr` may carry
+    // more than one payload, and a later `cfg` still gates generated match arms,
+    // fields and expressions even when an earlier payload is `doc` or `serde`.
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ #[cfg_attr($condition:meta, $($payload:tt)*)] $( $rest:tt )* ]
+    ) => {
+        $crate::__keylink_cfg_attr! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ $( $attrs )* #[cfg_attr($condition, $($payload)*)] ]
+            @cfg [ $( $cfg )* ] @defer [ $( $seen )* ]
+            @guard $condition @payload [ $($payload)* ]
+            @after [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ #[cfg_attr($($condition:tt)*)] $( $rest:tt )* ]
+    ) => {
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ $( $attrs )* #[cfg_attr($($condition)*)] ]
+            @cfg [ $( $cfg )* ] @defer [ $( $seen )* ]
+            @rest [ $( $rest )* ]
+        }
+    };
+
     // Everything else, kept in order and forwarded verbatim.
     (
         @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
-        @attrs [ $( $attrs:tt )* ] @defer [ $( $seen:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
         @rest [ #[$meta:meta] $( $rest:tt )* ]
     ) => {
         $crate::__keylink_service_munch! {
             @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
-            @attrs [ $( $attrs )* #[$meta] ] @defer [ $( $seen )* ]
+            @attrs [ $( $attrs )* #[$meta] ]
+            @cfg [ $( $cfg )* ] @defer [ $( $seen )* ]
             @rest [ $( $rest )* ]
         }
     };
-    // One `feed`, into the OTHER list. No return type, and exactly one argument.
-    //
-    // BEFORE the wire arm, and the order is load-bearing: `feed Fills(f: F) -> ();`
-    // matches the wire arm with `$kind = feed`, which would put a feed in the
-    // `Request` enum and then fail inside `__keylink_response_ty!` with "no rule
-    // expected `feed`", pointing at a macro the author did not write. The arm below
-    // catches that shape instead and says what is wrong with it.
+    // As with wire variants, `Self`/`self` cannot survive as a generated
+    // enum variant. Diagnose them before the paste expansion parses `Feed`.
     (
         @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
-        @attrs [ $( $attrs:tt )* ] @defer [ $( $seen:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Self ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Self);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Self, feed, Self);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed self ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, self);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], self, feed, self);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+
+    // `Self`/`self` cannot be generated as an enum variant or method name.
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident Self ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, Self);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Self, $kind, Self);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident self ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, self);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], self, $kind, self);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+
+    // Feed fields are not rawized, so every CamelCase spelling whose snake-case
+    // result is a keyword is rejected before `Feeds` is emitted.
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed As ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, As);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], As, feed, As);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Break ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Break);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Break, feed, Break);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Const ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Const);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Const, feed, Const);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Continue ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Continue);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Continue, feed, Continue);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Else ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Else);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Else, feed, Else);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Enum ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Enum);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Enum, feed, Enum);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Extern ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Extern);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Extern, feed, Extern);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed False ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, False);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], False, feed, False);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Fn ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Fn);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Fn, feed, Fn);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed For ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, For);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], For, feed, For);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed If ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, If);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], If, feed, If);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Impl ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Impl);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Impl, feed, Impl);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed In ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, In);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], In, feed, In);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Let ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Let);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Let, feed, Let);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Loop ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Loop);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Loop, feed, Loop);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Match ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Match);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Match, feed, Match);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Mod ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Mod);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Mod, feed, Mod);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Move ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Move);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Move, feed, Move);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Mut ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Mut);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Mut, feed, Mut);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Pub ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Pub);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Pub, feed, Pub);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Ref ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Ref);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Ref, feed, Ref);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Return ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Return);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Return, feed, Return);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Static ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Static);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Static, feed, Static);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Struct ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Struct);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Struct, feed, Struct);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Trait ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Trait);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Trait, feed, Trait);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed True ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, True);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], True, feed, True);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Type ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Type);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Type, feed, Type);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Unsafe ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Unsafe);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Unsafe, feed, Unsafe);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Use ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Use);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Use, feed, Use);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Where ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Where);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Where, feed, Where);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed While ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, While);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], While, feed, While);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Async ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Async);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Async, feed, Async);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Await ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Await);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Await, feed, Await);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Dyn ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Dyn);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Dyn, feed, Dyn);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Abstract ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Abstract);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Abstract, feed, Abstract);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Become ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Become);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Become, feed, Become);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Box ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Box);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Box, feed, Box);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Do ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Do);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Do, feed, Do);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Final ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Final);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Final, feed, Final);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Macro ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Macro);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Macro, feed, Macro);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Override ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Override);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Override, feed, Override);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Priv ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Priv);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Priv, feed, Priv);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Typeof ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Typeof);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Typeof, feed, Typeof);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Unsized ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Unsized);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Unsized, feed, Unsized);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Virtual ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Virtual);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Virtual, feed, Virtual);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Yield ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Yield);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Yield, feed, Yield);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Try ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Try);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Try, feed, Try);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Gen ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Gen);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Gen, feed, Gen);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#As ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#As);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], as, feed, r#As);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#as ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#as);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], as, feed, r#as);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Break ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Break);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], break, feed, r#Break);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#break ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#break);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], break, feed, r#break);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Const ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Const);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], const, feed, r#Const);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#const ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#const);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], const, feed, r#const);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Continue ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Continue);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], continue, feed, r#Continue);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#continue ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#continue);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], continue, feed, r#continue);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Else ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Else);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], else, feed, r#Else);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#else ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#else);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], else, feed, r#else);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Enum ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Enum);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], enum, feed, r#Enum);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#enum ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#enum);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], enum, feed, r#enum);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Extern ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Extern);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], extern, feed, r#Extern);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#extern ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#extern);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], extern, feed, r#extern);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#False ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#False);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], false, feed, r#False);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#false ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#false);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], false, feed, r#false);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Fn ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Fn);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], fn, feed, r#Fn);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#fn ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#fn);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], fn, feed, r#fn);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#For ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#For);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], for, feed, r#For);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#for ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#for);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], for, feed, r#for);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#If ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#If);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], if, feed, r#If);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#if ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#if);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], if, feed, r#if);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Impl ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Impl);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], impl, feed, r#Impl);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#impl ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#impl);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], impl, feed, r#impl);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#In ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#In);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], in, feed, r#In);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#in ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#in);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], in, feed, r#in);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Let ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Let);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], let, feed, r#Let);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#let ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#let);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], let, feed, r#let);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Loop ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Loop);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], loop, feed, r#Loop);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#loop ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#loop);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], loop, feed, r#loop);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Match ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Match);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], match, feed, r#Match);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#match ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#match);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], match, feed, r#match);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Mod ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Mod);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], mod, feed, r#Mod);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#mod ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#mod);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], mod, feed, r#mod);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Move ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Move);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], move, feed, r#Move);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#move ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#move);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], move, feed, r#move);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Mut ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Mut);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], mut, feed, r#Mut);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#mut ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#mut);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], mut, feed, r#mut);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Pub ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Pub);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], pub, feed, r#Pub);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#pub ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#pub);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], pub, feed, r#pub);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Ref ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Ref);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], ref, feed, r#Ref);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#ref ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#ref);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], ref, feed, r#ref);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Return ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Return);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], return, feed, r#Return);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#return ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#return);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], return, feed, r#return);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Static ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Static);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], static, feed, r#Static);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#static ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#static);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], static, feed, r#static);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Struct ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Struct);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], struct, feed, r#Struct);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#struct ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#struct);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], struct, feed, r#struct);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Trait ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Trait);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], trait, feed, r#Trait);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#trait ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#trait);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], trait, feed, r#trait);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#True ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#True);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], true, feed, r#True);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#true ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#true);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], true, feed, r#true);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Type ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Type);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], type, feed, r#Type);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#type ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#type);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], type, feed, r#type);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Unsafe ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Unsafe);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], unsafe, feed, r#Unsafe);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#unsafe ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#unsafe);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], unsafe, feed, r#unsafe);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Use ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Use);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], use, feed, r#Use);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#use ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#use);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], use, feed, r#use);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Where ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Where);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], where, feed, r#Where);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#where ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#where);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], where, feed, r#where);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#While ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#While);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], while, feed, r#While);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#while ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#while);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], while, feed, r#while);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Async ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Async);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], async, feed, r#Async);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#async ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#async);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], async, feed, r#async);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Await ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Await);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], await, feed, r#Await);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#await ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#await);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], await, feed, r#await);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Dyn ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Dyn);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], dyn, feed, r#Dyn);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#dyn ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#dyn);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], dyn, feed, r#dyn);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Abstract ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Abstract);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], abstract, feed, r#Abstract);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#abstract ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#abstract);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], abstract, feed, r#abstract);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Become ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Become);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], become, feed, r#Become);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#become ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#become);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], become, feed, r#become);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Box ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Box);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], box, feed, r#Box);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#box ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#box);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], box, feed, r#box);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Do ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Do);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], do, feed, r#Do);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#do ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#do);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], do, feed, r#do);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Final ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Final);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], final, feed, r#Final);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#final ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#final);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], final, feed, r#final);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Macro ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Macro);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], macro, feed, r#Macro);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#macro ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#macro);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], macro, feed, r#macro);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Override ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Override);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], override, feed, r#Override);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#override ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#override);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], override, feed, r#override);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Priv ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Priv);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], priv, feed, r#Priv);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#priv ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#priv);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], priv, feed, r#priv);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Typeof ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Typeof);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], typeof, feed, r#Typeof);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#typeof ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#typeof);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], typeof, feed, r#typeof);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Unsized ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Unsized);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], unsized, feed, r#Unsized);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#unsized ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#unsized);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], unsized, feed, r#unsized);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Virtual ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Virtual);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], virtual, feed, r#Virtual);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#virtual ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#virtual);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], virtual, feed, r#virtual);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Yield ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Yield);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], yield, feed, r#Yield);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#yield ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#yield);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], yield, feed, r#yield);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Try ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Try);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], try, feed, r#Try);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#try ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#try);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], try, feed, r#try);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#Gen ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#Gen);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], gen, feed, r#Gen);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#gen ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#gen);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], gen, feed, r#gen);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Crate ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Crate);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Crate, feed, Crate);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed Super ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, Super);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Super, feed, Super);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+
+    // `Feeds::at` is the bundle's cursor, so discard the declaration after the
+    // direct diagnostic instead of letting its field collide with that cursor.
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed At ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, At);
+        $crate::__keylink_generated_name_check_module_item!([
+            $( $attrs )*
+        ], feeds, at, At, feed);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed at ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, at);
+        $crate::__keylink_generated_name_check_module_item!([
+            $( $attrs )*
+        ], feeds, at, at, feed);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#At ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#At);
+        $crate::__keylink_generated_name_check_module_item!([
+            $( $attrs )*
+        ], feeds, at, r#At, feed);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed r#at ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, r#at);
+        $crate::__keylink_generated_name_check_module_item!([
+            $( $attrs )*
+        ], feeds, at, r#at, feed);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+
+
+    // Feed names that are keywords still need a direct diagnostic before the
+    // generic feed arm emits an unrawized `Feeds` field. The outer matcher accepts
+    // these tokens; the dedicated arms below discard them before generated syntax.
+    //
+    // The valid one-argument feed arm is below the keyword arms and before the wire
+    // arm. That order is load-bearing: `feed Fills(f: F) -> ();` would otherwise
+    // match the wire arm and fail inside `__keylink_response_ty!` with "no rule
+    // expected `feed`", pointing at a macro the author did not write.
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed as ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, as);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], as, feed, as);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed break ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, break);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], break, feed, break);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed const ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, const);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], const, feed, const);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed continue ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, continue);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], continue, feed, continue);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed else ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, else);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], else, feed, else);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed enum ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, enum);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], enum, feed, enum);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed extern ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, extern);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], extern, feed, extern);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed false ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, false);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], false, feed, false);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed fn ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, fn);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], fn, feed, fn);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed for ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, for);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], for, feed, for);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed if ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, if);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], if, feed, if);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed impl ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, impl);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], impl, feed, impl);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed in ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, in);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], in, feed, in);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed let ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, let);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], let, feed, let);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed loop ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, loop);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], loop, feed, loop);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed match ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, match);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], match, feed, match);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed mod ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, mod);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], mod, feed, mod);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed move ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, move);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], move, feed, move);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed mut ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, mut);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], mut, feed, mut);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed pub ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, pub);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], pub, feed, pub);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed ref ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, ref);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], ref, feed, ref);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed return ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, return);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], return, feed, return);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed static ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, static);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], static, feed, static);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed struct ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, struct);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], struct, feed, struct);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed trait ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, trait);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], trait, feed, trait);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed true ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, true);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], true, feed, true);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed type ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, type);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], type, feed, type);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed unsafe ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, unsafe);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], unsafe, feed, unsafe);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed use ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, use);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], use, feed, use);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed where ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, where);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], where, feed, where);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed while ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, while);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], while, feed, while);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed async ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, async);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], async, feed, async);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed await ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, await);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], await, feed, await);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed dyn ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, dyn);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], dyn, feed, dyn);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed abstract ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, abstract);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], abstract, feed, abstract);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed become ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, become);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], become, feed, become);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed box ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, box);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], box, feed, box);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed do ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, do);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], do, feed, do);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed final ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, final);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], final, feed, final);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed macro ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, macro);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], macro, feed, macro);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed override ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, override);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], override, feed, override);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed priv ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, priv);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], priv, feed, priv);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed typeof ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, typeof);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], typeof, feed, typeof);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed unsized ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, unsized);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], unsized, feed, unsized);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed virtual ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, virtual);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], virtual, feed, virtual);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed yield ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, yield);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], yield, feed, yield);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed try ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, try);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], try, feed, try);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed gen ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, gen);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], gen, feed, gen);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed crate ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, crate);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], crate, feed, crate);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ feed super ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], feed, super);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], super, feed, super);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    // One valid `feed`, into the `@feeds` list. No return type, and exactly one
+    // argument. The generated field is emitted later from that list.
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
         @rest [ feed $feed:ident ( $arg:ident : $ty:ty ) ; $( $rest:tt )* ]
     ) => {
         $crate::__keylink_service_munch! {
@@ -443,15 +3168,15 @@ macro_rules! __keylink_service_munch {
             @done [ $( $done )* ]
             @feeds [
                 $( $feeds )*
-                { [ $( $attrs )* ] [ $( $seen )* ] feed $feed ( $arg : $ty ) }
+                { [ $( $attrs )* ] [ $( $cfg )* ] [ $( $seen )* ] feed $feed ( $arg : $ty ) }
             ]
-            @attrs [ ] @defer [ ]
+            @attrs [ ] @cfg [ ] @defer [ ]
             @rest [ $( $rest )* ]
         }
     };
     // A `feed` written with a return type.
     (
-        @svc $svc:tt @done $done:tt @feeds $feeds:tt @attrs $attrs:tt @defer $defer:tt
+        @svc $svc:tt @done $done:tt @feeds $feeds:tt @attrs $attrs:tt @cfg $cfg:tt @defer $defer:tt
         @rest [ feed $feed:ident ( $( $anything:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
     ) => {
         ::core::compile_error!(::core::concat!(
@@ -471,7 +3196,7 @@ macro_rules! __keylink_service_munch {
     // A `feed` that is not one argument. Said here rather than left to the
     // catch-all, because the catch-all cannot name the declaration.
     (
-        @svc $svc:tt @done $done:tt @feeds $feeds:tt @attrs $attrs:tt @defer $defer:tt
+        @svc $svc:tt @done $done:tt @feeds $feeds:tt @attrs $attrs:tt @cfg $cfg:tt @defer $defer:tt
         @rest [ feed $feed:ident ( $( $anything:tt )* ) ; $( $rest:tt )* ]
     ) => {
         ::core::compile_error!(::core::concat!(
@@ -487,27 +3212,1872 @@ macro_rules! __keylink_service_munch {
              tuple."
         ));
     };
+
+    // `crate` and `super` cannot be raw identifiers. Reject their CamelCase
+    // declarations before the raw method names are pasted.
+    // The same early diagnostic is needed when the declaration token itself is
+    // a lowercase keyword; Rust would otherwise report only a parser error.
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident as ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, as);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], as, $kind, as);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident break ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, break);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], break, $kind, break);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident const ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, const);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], const, $kind, const);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident continue ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, continue);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], continue, $kind, continue);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident else ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, else);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], else, $kind, else);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident enum ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, enum);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], enum, $kind, enum);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident extern ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, extern);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], extern, $kind, extern);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident false ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, false);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], false, $kind, false);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident fn ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, fn);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], fn, $kind, fn);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident for ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, for);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], for, $kind, for);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident if ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, if);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], if, $kind, if);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident impl ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, impl);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], impl, $kind, impl);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident in ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, in);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], in, $kind, in);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident let ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, let);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], let, $kind, let);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident loop ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, loop);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], loop, $kind, loop);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident match ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, match);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], match, $kind, match);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident mod ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, mod);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], mod, $kind, mod);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident move ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, move);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], move, $kind, move);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident mut ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, mut);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], mut, $kind, mut);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident pub ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, pub);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], pub, $kind, pub);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident ref ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, ref);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], ref, $kind, ref);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident return ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, return);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], return, $kind, return);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident static ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, static);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], static, $kind, static);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident struct ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, struct);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], struct, $kind, struct);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident trait ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, trait);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], trait, $kind, trait);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident true ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, true);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], true, $kind, true);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident type ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, type);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], type, $kind, type);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident unsafe ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, unsafe);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], unsafe, $kind, unsafe);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident use ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, use);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], use, $kind, use);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident where ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, where);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], where, $kind, where);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident while ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, while);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], while, $kind, while);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident async ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, async);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], async, $kind, async);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident await ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, await);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], await, $kind, await);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident dyn ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, dyn);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], dyn, $kind, dyn);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident abstract ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, abstract);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], abstract, $kind, abstract);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident become ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, become);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], become, $kind, become);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident box ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, box);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], box, $kind, box);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident do ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, do);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], do, $kind, do);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident final ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, final);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], final, $kind, final);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident macro ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, macro);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], macro, $kind, macro);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident override ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, override);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], override, $kind, override);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident priv ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, priv);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], priv, $kind, priv);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident typeof ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, typeof);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], typeof, $kind, typeof);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident unsized ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, unsized);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], unsized, $kind, unsized);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident virtual ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, virtual);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], virtual, $kind, virtual);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident yield ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, yield);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], yield, $kind, yield);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident try ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, try);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], try, $kind, try);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident gen ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, gen);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], gen, $kind, gen);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident crate ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, crate);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], crate, $kind, crate);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident super ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, super);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], super, $kind, super);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#As ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#As);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], as, $kind, r#As);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#as ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#as);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], as, $kind, r#as);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Break ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Break);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], break, $kind, r#Break);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#break ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#break);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], break, $kind, r#break);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Const ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Const);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], const, $kind, r#Const);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#const ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#const);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], const, $kind, r#const);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Continue ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Continue);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], continue, $kind, r#Continue);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#continue ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#continue);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], continue, $kind, r#continue);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Else ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Else);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], else, $kind, r#Else);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#else ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#else);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], else, $kind, r#else);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Enum ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Enum);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], enum, $kind, r#Enum);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#enum ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#enum);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], enum, $kind, r#enum);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Extern ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Extern);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], extern, $kind, r#Extern);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#extern ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#extern);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], extern, $kind, r#extern);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#False ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#False);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], false, $kind, r#False);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#false ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#false);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], false, $kind, r#false);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Fn ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Fn);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], fn, $kind, r#Fn);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#fn ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#fn);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], fn, $kind, r#fn);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#For ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#For);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], for, $kind, r#For);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#for ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#for);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], for, $kind, r#for);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#If ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#If);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], if, $kind, r#If);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#if ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#if);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], if, $kind, r#if);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Impl ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Impl);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], impl, $kind, r#Impl);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#impl ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#impl);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], impl, $kind, r#impl);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#In ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#In);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], in, $kind, r#In);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#in ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#in);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], in, $kind, r#in);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Let ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Let);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], let, $kind, r#Let);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#let ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#let);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], let, $kind, r#let);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Loop ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Loop);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], loop, $kind, r#Loop);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#loop ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#loop);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], loop, $kind, r#loop);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Match ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Match);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], match, $kind, r#Match);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#match ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#match);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], match, $kind, r#match);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Mod ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Mod);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], mod, $kind, r#Mod);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#mod ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#mod);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], mod, $kind, r#mod);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Move ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Move);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], move, $kind, r#Move);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#move ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#move);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], move, $kind, r#move);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Mut ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Mut);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], mut, $kind, r#Mut);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#mut ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#mut);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], mut, $kind, r#mut);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Pub ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Pub);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], pub, $kind, r#Pub);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#pub ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#pub);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], pub, $kind, r#pub);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Ref ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Ref);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], ref, $kind, r#Ref);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#ref ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#ref);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], ref, $kind, r#ref);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Return ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Return);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], return, $kind, r#Return);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#return ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#return);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], return, $kind, r#return);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Static ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Static);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], static, $kind, r#Static);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#static ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#static);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], static, $kind, r#static);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Struct ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Struct);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], struct, $kind, r#Struct);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#struct ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#struct);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], struct, $kind, r#struct);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Trait ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Trait);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], trait, $kind, r#Trait);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#trait ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#trait);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], trait, $kind, r#trait);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#True ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#True);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], true, $kind, r#True);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#true ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#true);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], true, $kind, r#true);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Type ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Type);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], type, $kind, r#Type);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#type ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#type);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], type, $kind, r#type);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Unsafe ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Unsafe);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], unsafe, $kind, r#Unsafe);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#unsafe ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#unsafe);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], unsafe, $kind, r#unsafe);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Use ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Use);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], use, $kind, r#Use);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#use ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#use);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], use, $kind, r#use);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Where ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Where);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], where, $kind, r#Where);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#where ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#where);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], where, $kind, r#where);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#While ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#While);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], while, $kind, r#While);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#while ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#while);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], while, $kind, r#while);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Async ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Async);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], async, $kind, r#Async);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#async ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#async);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], async, $kind, r#async);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Await ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Await);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], await, $kind, r#Await);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#await ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#await);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], await, $kind, r#await);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Dyn ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Dyn);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], dyn, $kind, r#Dyn);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#dyn ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#dyn);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], dyn, $kind, r#dyn);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Abstract ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Abstract);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], abstract, $kind, r#Abstract);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#abstract ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#abstract);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], abstract, $kind, r#abstract);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Become ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Become);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], become, $kind, r#Become);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#become ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#become);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], become, $kind, r#become);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Box ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Box);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], box, $kind, r#Box);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#box ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#box);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], box, $kind, r#box);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Do ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Do);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], do, $kind, r#Do);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#do ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#do);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], do, $kind, r#do);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Final ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Final);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], final, $kind, r#Final);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#final ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#final);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], final, $kind, r#final);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Macro ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Macro);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], macro, $kind, r#Macro);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#macro ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#macro);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], macro, $kind, r#macro);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Override ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Override);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], override, $kind, r#Override);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#override ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#override);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], override, $kind, r#override);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Priv ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Priv);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], priv, $kind, r#Priv);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#priv ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#priv);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], priv, $kind, r#priv);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Typeof ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Typeof);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], typeof, $kind, r#Typeof);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#typeof ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#typeof);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], typeof, $kind, r#typeof);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Unsized ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Unsized);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], unsized, $kind, r#Unsized);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#unsized ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#unsized);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], unsized, $kind, r#unsized);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Virtual ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Virtual);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], virtual, $kind, r#Virtual);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#virtual ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#virtual);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], virtual, $kind, r#virtual);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Yield ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Yield);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], yield, $kind, r#Yield);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#yield ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#yield);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], yield, $kind, r#yield);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Try ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Try);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], try, $kind, r#Try);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#try ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#try);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], try, $kind, r#try);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Gen ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Gen);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], gen, $kind, r#Gen);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#gen ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#gen);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], gen, $kind, r#gen);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident Crate ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, Crate);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Crate, $kind, Crate);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident Super ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, Super);
+        $crate::__keylink_keyword_name_check_item!([ $( $attrs )* ], Super, $kind, Super);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident __Status ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, __Status);
+        $crate::__keylink_status_name_checks!([ $( $attrs )* ], $kind, __Status);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident Served ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, Served);
+        $crate::__keylink_generated_name_check_module_item!([
+            $( $attrs )*
+        ], wire, Served, Served, $kind);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#__Status ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#__Status);
+        $crate::__keylink_status_name_checks!([ $( $attrs )* ], $kind, r#__Status);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident r#Served ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_defer_check!([ $( $seen )* ], $kind, r#Served);
+        $crate::__keylink_generated_name_check_module_item!([
+            $( $attrs )*
+        ], wire, Served, r#Served, $kind);
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+
     // One complete wire declaration, which closes the attribute run above it.
     (
         @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
-        @attrs [ $( $attrs:tt )* ] @defer [ $( $seen:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
         @rest [ $kind:ident $rpc:ident ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
     ) => {
         $crate::__keylink_service_munch! {
             @svc $svc
             @done [
                 $( $done )*
-                { [ $( $attrs )* ] [ $( $seen )* ] $kind $rpc ( $( $args )* ) -> $ret }
+                { [ $( $attrs )* ] [ $( $cfg )* ] [ $( $seen )* ] $kind $rpc ( $( $args )* ) -> $ret }
             ]
             @feeds [ $( $feeds )* ]
-            @attrs [ ] @defer [ ]
+            @attrs [ ] @cfg [ ] @defer [ ]
             @rest [ $( $rest )* ]
         }
     };
+    // A declaration rejected above may be the entire body. The diagnostic from
+    // that declaration is sufficient; do not add the catch-all grammar error.
+    // An actually empty body cannot reach this arm because `service!` requires
+    // at least one token after `service Name;`.
+    (
+        @svc [ $svc:ident ] @done [ ] @feeds [ ]
+        @attrs [ ] @cfg [ ] @defer [ ] @rest [ ]
+    ) => {};
+
     // Done, with at least one wire declaration and no attribute left dangling.
     (
         @svc [ $svc:ident ] @done [ $( $done:tt )+ ] @feeds [ $( $feeds:tt )* ]
-        @attrs [ ] @defer [ ] @rest [ ]
+        @attrs [ ] @cfg [ ] @defer [ ] @rest [ ]
     ) => {
         $crate::__keylink_service! {
             $svc;
@@ -516,11 +5086,17 @@ macro_rules! __keylink_service_munch {
         }
     };
     // Feeds and nothing else. Refused, and the message says what is missing rather
-    // than "at least one declaration is required" — there ARE declarations.
+    // than "at least one declaration is required" — there ARE declarations. A
+    // disabled feed is removed before this diagnostic, so a cfg-disabled feeds-only
+    // service does not fail merely because its declaration was present in source.
     (
-        @svc [ $svc:ident ] @done [ ] @feeds [ $( $feeds:tt )+ ]
-        @attrs [ ] @defer [ ] @rest [ ]
+        @svc [ $svc:ident ] @done [ ]
+        @feeds [ $( { [ $( #[$fmeta:meta] )* ] [ $( #[$fcfg:meta] )* ]
+                     [ $( $fdefer:tt )? ] feed $feed:ident
+                     ( $farg:ident : $fty:ty ) } )+ ]
+        @attrs [ ] @cfg [ ] @defer [ ] @rest [ ]
     ) => {
+        $( $( #[$fcfg] )*
         ::core::compile_error!(::core::concat!(
             "`service ",
             ::core::stringify!($svc),
@@ -531,7 +5107,7 @@ macro_rules! __keylink_service_munch {
              service would be an empty protocol with a state attached. Declare at \
              least one `rpc`, `tell`, `send`, `recv` or `blob` beside the feeds, \
              or write a plain struct on a task."
-        ));
+        )); )+
     };
     // Anything else is a malformed declaration, and saying so beats "no rule
     // expected this token" pointing into a macro the author did not write.
@@ -570,10 +5146,10 @@ macro_rules! __keylink_service_munch {
 macro_rules! __keylink_service {
     (
         $svc:ident;
-        @wire [ $( { [ $( #[$meta:meta] )* ] [ $( $defer:tt )? ]
-             $kind:ident $rpc:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty } )+ ]
-        @feeds [ $( { [ $( #[$fmeta:meta] )* ] [ $( $fdefer:tt )? ]
-             feed $feed:ident ( $farg:ident : $fty:ty ) } )* ]
+        @wire [ $( { [ $( #[$meta:meta] )* ] [ $( #[$cfg:meta] )* ]
+             [ $( $defer:tt )? ] $kind:ident $rpc:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty } )+ ]
+        @feeds [ $( { [ $( #[$fmeta:meta] )* ] [ $( #[$fcfg:meta] )* ]
+             [ $( $fdefer:tt )? ] feed $feed:ident ( $farg:ident : $fty:ty ) } )* ]
     ) => {
         $crate::pastey::paste! {
         pub mod [<$svc:snake>] {
@@ -589,10 +5165,14 @@ macro_rules! __keylink_service {
             // ordinary signatures for a kind that cannot defer, so a mistake here
             // produces exactly one error — the one that says why — instead of that
             // error plus a service whose trait no longer matches its mailbox.
-            $( $crate::__keylink_defer_check!([$( $defer )?], [<$kind>], $rpc); )+
+            $( $( #[$cfg] )* $crate::__keylink_defer_check!([$( $defer )?], [<$kind>], $rpc); )+
+            // Check keyword spellings before `pastey` emits them after `fn`.
+            // Declaration attributes gate the check along with the declaration.
+            $( $crate::__keylink_keyword_name_check_item!([$( #[$cfg] )*], $rpc, rpc, $rpc); )+
             // And once per feed, which is why the feed record carries a `[defer?]`
             // group it otherwise has no use for.
-            $( $crate::__keylink_defer_check!([$( $fdefer )?], feed, $feed); )*
+            $( $( #[$fcfg] )* $crate::__keylink_defer_check!([$( $fdefer )?], feed, $feed); )*
+            $( $crate::__keylink_keyword_name_check_item!([$( #[$fcfg] )*], $feed, feed, $feed); )*
 
             #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, ::postcard_schema::Schema)]
             pub enum Request {
@@ -615,7 +5195,7 @@ macro_rules! __keylink_service {
 
             #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, ::postcard_schema::Schema)]
             pub enum Response {
-                $( $rpc($crate::__keylink_response_ty!([<$kind>], $ret)), )+
+                $( $( #[$cfg] )* $rpc($crate::__keylink_response_ty!([<$kind>], $ret)), )+
                 /// The answer to [`Request::__Status`]. See
                 /// [`Serving`](keylink::Serving) for what its two fields do and
                 /// do not claim.
@@ -628,12 +5208,13 @@ macro_rules! __keylink_service {
                 /// sides instead of printing a debug dump.
                 fn variant_name(&self) -> &'static str {
                     match self {
-                        $( Self::$rpc(_) => stringify!($rpc), )+
+                        $( $( #[$cfg] )* Self::$rpc(_) => stringify!($rpc), )+
                         Self::__Status(_) => "__Status",
                     }
                 }
 
                 $(
+                    $( #[$cfg] )*
                     /// Extract the reply to one rpc, or say what came instead.
                     ///
                     /// Unreachable against a peer running this same schema —
@@ -705,20 +5286,21 @@ macro_rules! __keylink_service {
             pub trait Handler: Send + Sync + 'static {
                 $(
                     $crate::__keylink_handler_method!(
-                        [$( #[$meta] )*],
-                        [<$kind>], [<$rpc:snake>], ($( $arg : $ty ),*), $ret
+                        [$( #[$cfg] )*],
+                        [<$kind>], [<# $rpc:snake>], ($( $arg : $ty ),*), $ret
                     );
                 )+
             }
 
             $(
+                $( #[$cfg] )*
                 $crate::__keylink_invoke_fn!(
                     [<$kind>],
                     [<__invoke_ $rpc:snake>],
                     Handler,
                     Response,
                     $rpc,
-                    [<$rpc:snake>],
+                    [<# $rpc:snake>],
                     ($( $arg : $ty ),*)
                 );
             )+
@@ -732,7 +5314,7 @@ macro_rules! __keylink_service {
             impl $crate::Granting for Response {
                 fn granted(&self) -> ::core::option::Option<$crate::BlobId> {
                     match self {
-                        $( Self::$rpc(__value) =>
+                        $( $( #[$cfg] )* Self::$rpc(__value) =>
                             $crate::__keylink_granted_id!([<$kind>], __value), )+
                         // A status read names no content, so there is no grant
                         // for `serve_one` to record against the peer.
@@ -747,14 +5329,27 @@ macro_rules! __keylink_service {
             /// declares blob methods and carries no store, which is why
             /// `ConfigError::MissingBlobStore` is a check that can fire rather
             /// than a flag that is always false.
-            const DECLARES_BLOBS: bool =
-                false $( | $crate::__keylink_is_blob!([<$kind>]) )+;
+            const fn __keylink_any(values: &[bool]) -> bool {
+                let mut index = 0;
+                while index < values.len() {
+                    if values[index] {
+                        return true;
+                    }
+                    index += 1;
+                }
+                false
+            }
+
+            const DECLARES_BLOBS: bool = __keylink_any(&[
+                false $(, $( #[$cfg] )* $crate::__keylink_is_blob!($kind))+
+            ]);
 
             /// Whether any method here reads an upload inside its turn, folded
             /// the same way. Read by [`Handle::service`], which refuses to
             /// compile for such a service.
-            const DECLARES_SEND: bool =
-                false $( | $crate::__keylink_is_send!([<$kind>]) )+;
+            const DECLARES_SEND: bool = __keylink_any(&[
+                false $(, $( #[$cfg] )* $crate::__keylink_is_send!($kind))+
+            ]);
 
             /// Whether this service declares a `feed`.
             ///
@@ -762,7 +5357,9 @@ macro_rules! __keylink_service {
             /// which is the shape of the whole decision: a feed is a second list,
             /// so "are there any" is a repetition over that list and needs no arm
             /// anywhere else.
-            const DECLARES_FEEDS: bool = false $( | { let _ = ::core::stringify!($feed); true } )*;
+            const DECLARES_FEEDS: bool = __keylink_any(&[
+                false $(, $( #[$fcfg] )* true)*
+            ]);
 
             /// The compile-time refusal for [`DECLARES_SEND`].
             ///
@@ -823,7 +5420,7 @@ macro_rules! __keylink_service {
 
                 fn method(&self) -> &'static str {
                     match self {
-                        $( Request::$rpc { .. } => stringify!($rpc), )+
+                        $( $( #[$cfg] )* Request::$rpc { .. } => stringify!($rpc), )+
                         // The name a layer refuses `__status` by. The generated
                         // method is answered inside the dispatch, and the chain
                         // runs above it, so this is what a per-method
@@ -856,13 +5453,15 @@ macro_rules! __keylink_service {
                         // entered and never answered, both mean it answered.
                         let __progress = cx.progress();
                         ::std::boxed::Box::pin(async move {
-                            let (__response, __body) = match req {
+                            let (__outcome, __body, __entered) = match req {
                                 $(
+                                    $( #[$cfg] )*
                                     Request::$rpc { $( $arg ),* } => {
                                         __progress.dispatched();
-                                        [<__invoke_ $rpc:snake>](
+                                        let (__response, __body) = [<__invoke_ $rpc:snake>](
                                             handler.as_ref(), &cx, body $(, $arg )*
-                                        ).await
+                                        ).await;
+                                        ($crate::Outcome::Ok(__response), __body, true)
                                     }
                                 )+
                                 // `__Status` asks which turn is running, and a
@@ -886,16 +5485,19 @@ macro_rules! __keylink_service {
                                 // and never answered.
                                 Request::__Status { .. } => {
                                     __progress.unrun();
-                                    return (
+                                    (
                                         $crate::Outcome::Err(
                                             $crate::RemoteError::NotAnActor,
                                         ),
                                         $crate::Body::empty(),
-                                    );
+                                        false,
+                                    )
                                 }
                             };
-                            __progress.completed();
-                            ($crate::Outcome::Ok(__response), __body)
+                            if __entered {
+                                __progress.completed();
+                            }
+                            (__outcome, __body)
                         })
                     });
                 $crate::ServiceBuilder::new(alpn(), allow, dispatch)
@@ -1003,11 +5605,11 @@ macro_rules! __keylink_service {
             /// happen in — and the reply is a value the loop **holds** rather
             /// than a sender sealed inside a closure it can only call.
             ///
-            /// The attributes written on a method in `service!` are deliberately
-            /// **not** forwarded here, exactly as they are not forwarded to
-            /// [`Response`]'s variants: they are written for the wire enum, and
-            /// a `#[serde(..)]` re-emitted onto an enum with no `Serialize`
-            /// derive is `cannot find attribute` pointing at this file.
+            /// Non-configuration attributes written on a method in `service!`
+            /// are deliberately **not** forwarded here. They are written for the
+            /// wire enum, and a `#[serde(..)]` re-emitted onto this local enum
+            /// would be `cannot find attribute` pointing at this file. A `#[cfg]`
+            /// is forwarded so disabled declarations leave no stale match arm.
             ///
             /// # `Served` is one variant and not one per method
             ///
@@ -1031,6 +5633,7 @@ macro_rules! __keylink_service {
             #[doc(hidden)]
             pub enum Mail {
                 $(
+                    $( #[$cfg] )*
                     $rpc {
                         /// Where this message came from. Built by keylink and
                         /// handed in; generated code never constructs one.
@@ -1103,6 +5706,7 @@ macro_rules! __keylink_service {
                 ) -> ::core::option::Option<$crate::Ended> {
                     match self {
                         $(
+                            $( #[$cfg] )*
                             Mail::$rpc { origin, $( $arg, )* body, reply } =>
                                 $crate::__keylink_mail_arm!(
                                     [$( $defer )?],
@@ -1114,12 +5718,13 @@ macro_rules! __keylink_service {
                                     ::core::stringify!($rpc),
                                     reply,
                                     body,
-                                    [<$rpc:snake>],
+                                    [<# $rpc:snake>],
                                     ($( $arg ),*)
                                 ),
                         )+
                         Mail::Served { origin, request, body, reply } => match request {
                             $(
+                                $( #[$cfg] )*
                                 Request::$rpc { $( $arg, )* } =>
                                     $crate::__keylink_served_arm!(
                                         [$( $defer )?],
@@ -1131,7 +5736,7 @@ macro_rules! __keylink_service {
                                         ::core::stringify!($rpc),
                                         reply,
                                         body,
-                                        [<$rpc:snake>],
+                                        [<# $rpc:snake>],
                                         Response,
                                         $rpc,
                                         ($( $arg ),*)
@@ -1219,7 +5824,7 @@ macro_rules! __keylink_service {
             pub enum Feed {
                 $(
                     /// One item from this feed, carrying its declared argument.
-                    $feed($fty),
+                    $( #[$fcfg] )* $feed($fty),
                 )*
             }
 
@@ -1240,6 +5845,7 @@ macro_rules! __keylink_service {
                 ) -> ::core::option::Option<$crate::Ended> {
                     match self {
                         $(
+                            $( #[$fcfg] )*
                             Feed::$feed($farg) => $crate::feed_turn(
                                 __state,
                                 __hooks,
@@ -1279,7 +5885,7 @@ macro_rules! __keylink_service {
             /// type parameter per declared feed.
             #[doc(hidden)]
             pub struct Feeds {
-                $( [<$feed:snake>]: ::core::pin::Pin<
+                $( $( #[$fcfg] )* [<$feed:snake>]: ::core::pin::Pin<
                     ::std::boxed::Box<dyn $crate::Stream<Item = $fty> + ::core::marker::Send>
                 >, )*
                 /// Which feed gets first refusal on the next poll, so a saturated
@@ -1292,11 +5898,12 @@ macro_rules! __keylink_service {
                 /// declaration order.
                 #[must_use]
                 pub fn new(
-                    $( [<$feed:snake>]: impl $crate::Stream<Item = $fty>
+                    $( $( #[$fcfg] )* [<$feed:snake>]: impl $crate::Stream<Item = $fty>
                         + ::core::marker::Send + 'static, )*
                 ) -> Self {
+                    $( $crate::__keylink_feed_name_check_item!([$( #[$fcfg] )*], [<$feed:snake>], $feed); )*
                     Self {
-                        $( [<$feed:snake>]: ::std::boxed::Box::pin([<$feed:snake>]), )*
+                        $( $( #[$fcfg] )* [<$feed:snake>]: ::std::boxed::Box::pin([<$feed:snake>]), )*
                         at: 0,
                     }
                 }
@@ -1314,6 +5921,7 @@ macro_rules! __keylink_service {
                     &mut ::core::task::Context<'_>,
                 ) -> ::core::task::Poll<$crate::Fed<Feed>>] = &[
                     $(
+                        $( #[$fcfg] )*
                         |__feeds: &mut Self, __cx: &mut ::core::task::Context<'_>| {
                             match $crate::Stream::poll_next(
                                 ::core::pin::Pin::as_mut(&mut __feeds.[<$feed:snake>]),
@@ -1379,6 +5987,39 @@ macro_rules! __keylink_service {
             /// Assembles a [`System`]: its eviction policy, its cap, and how it
             /// spawns.
             pub type SystemBuilder = $crate::SystemBuilder<Mail>;
+
+            /// A typed address of one actor in this process. Its methods are the
+            /// service's declared `rpc` and `tell` operations, with no transport
+            /// or remote error in their result.
+            #[derive(Clone, Debug)]
+            pub struct LocalRef<'a> {
+                system: &'a System,
+                actor: $crate::ActorId,
+            }
+
+            impl LocalRef<'_> {
+                /// Which actor this reference addresses.
+                pub fn id(&self) -> &$crate::ActorId {
+                    &self.actor
+                }
+
+                $(
+                    $crate::__keylink_keyed_local_method!(
+                        [$( #[$cfg] )*],
+                        [<$kind>],
+                        [<# $rpc:snake>],
+                        $rpc,
+                        ($( $arg : $ty ),*),
+                        $ret
+                    );
+                )+
+            }
+
+            /// Address one actor of this service in this process.
+            #[must_use]
+            pub fn at_local(system: &System, actor: $crate::ActorId) -> LocalRef<'_> {
+                LocalRef { system, actor }
+            }
 
             /// One live actor of this service, ready to be mounted.
             pub type Mounted = $crate::Mounted<Mail>;
@@ -1613,12 +6254,12 @@ macro_rules! __keylink_service {
                 $(
                     $crate::__keylink_actor_method!(
                         [$( $defer )?],
-                        [$( #[$meta] )*],
-                        [<$kind>], [<$rpc:snake>], ($( $arg : $ty ),*), $ret
+                        [$( #[$cfg] )*],
+                        [<$kind>], [<# $rpc:snake>], ($( $arg : $ty ),*), $ret
                     );
                 )+
                 $(
-                    $( #[$fmeta] )*
+                    $( #[$fcfg] )*
                     #[doc = concat!("Handle one item from the `", stringify!($feed), "` feed.")]
                     ///
                     /// No [`Caller`](keylink::Caller): nobody called. No return:
@@ -1725,13 +6366,14 @@ macro_rules! __keylink_service {
             /// the first adapter, and it is stated here rather than left for the next
             /// author to find at the borrow checker.
             ///
-            /// # What a keyed actor still does not get
+            /// # How a keyed actor's ending is observed
             ///
-            /// An `ended()` channel. The reason an actor stopped — an observer's
-            /// refusal, a fault, a feed that ended — reaches its own observers'
-            /// `finish` and nothing else, so a durability adapter still commits but
-            /// nobody outside can await *why*. `System::stop` and `System::abort`
-            /// await the task, not a reason.
+            /// A keyed actor's reason — an observer's refusal, a fault, or a feed
+            /// that ended — is published to the registry's shared watch channel.
+            /// Subscribe with [`System::ended`](keylink::System::ended) after the
+            /// id is mounted and before teardown removes it. `System::shutdown`
+            /// remains a separate operation: it reports whether its own drain
+            /// completed, while `System::ended` observes the actor's actual ending.
             ///
             /// # Testing: a keyed actor needs no node and no client
             ///
@@ -1805,12 +6447,15 @@ macro_rules! __keylink_service {
             /// `System::status` see one task, exactly as for an unsupervised
             /// keyed actor.
             ///
-            /// # A keyed actor still has no `ended()`
+            /// # A keyed actor's ending is observed through its `System`
             ///
-            /// So [`Ended::GaveUp`](keylink::Ended::GaveUp) reaches its own
-            /// observers' `finish` and nothing a **caller** can await — a handle
-            /// is what would hold that channel, and a keyed actor is addressed
-            /// by id. It does reach the system's
+            /// A keyed actor is addressed by id, so its system owns the observation
+            /// door: [`System::ended`](keylink::System::ended) subscribes to the
+            /// live entry and resolves with the loop's [`Ended`] value. A caller
+            /// must subscribe after mount and before teardown removes the entry;
+            /// `None` means the id is not live at the instant of the read.
+            ///
+            /// The same ending reaches the system's
             /// [`Lifecycle`](keylink::Lifecycle): an actor that has given up
             /// returns its ending from the loop, and the registry unmounts its
             /// own entry with it, so the id is free again and a lazy factory may
@@ -2335,9 +6980,10 @@ macro_rules! __keylink_service {
                 /// [`keyed_service`] too. What is left of §14.8 is one QUIC
                 /// connection per actor *service* rather than one for a node's
                 /// whole fleet — and observers came off that list as well, since
-                /// [`spawn_wired`] runs the same loop this handle does. What a
-                /// keyed actor still lacks is an `ended()` channel, so nobody
-                /// outside can await *why* one stopped.
+                /// [`spawn_wired`] runs the same loop this handle does. A keyed
+                /// actor's ending is observed through
+                /// [`System::ended`](keylink::System::ended), which subscribes by
+                /// id while the registry entry is live.
                 ///
                 /// The idempotency ledger was never on that list, which is what
                 /// this paragraph used to say and is worth keeping: a key is
@@ -2757,13 +7403,10 @@ macro_rules! __keylink_service {
                 ///
                 /// The same rule `Request::__Status` is written under: *a name a
                 /// user could also write would be a name a user could collide
-                /// with*. Every method on this type that keylink writes shares
-                /// one namespace with every method the service declares, and a
-                /// bare `reserve` here is a `duplicate definitions` error for any
-                /// service declaring an rpc called `Reserve` — which is the rpc
-                /// this crate's own README, RFC-04 and `demo` all use as their
-                /// example. `stop` and `buffered` took that risk before the rule
-                /// was written; these three are written under it.
+                /// with*. The reservation doors therefore use the `__reserve`,
+                /// `__try_reserve` and `__reserve_owned` spellings. A service may
+                /// still declare the ordinary `Reserve` name; its generated
+                /// `reserve` method remains independent of these internal doors.
                 ///
                 /// The bare names live on
                 /// [`LocalActor`](keylink::LocalActor), which is keylink's own
@@ -2829,9 +7472,9 @@ macro_rules! __keylink_service {
 
                 $(
                     $crate::__keylink_local_method!(
-                        [$( #[$meta] )*],
+                        [$( #[$cfg] )*],
                         [<$kind>],
-                        [<$rpc:snake>],
+                        [<# $rpc:snake>],
                         $rpc,
                         ($( $arg : $ty ),*),
                         $ret
@@ -2871,9 +7514,9 @@ macro_rules! __keylink_service {
             impl<A: Actor> Permit<'_, A> {
                 $(
                     $crate::__keylink_permit_method!(
-                        [$( #[$meta] )*],
+                        [$( #[$cfg] )*],
                         [<$kind>],
-                        [<$rpc:snake>],
+                        [<# $rpc:snake>],
                         $rpc,
                         ($( $arg : $ty ),*),
                         $ret
@@ -2896,9 +7539,9 @@ macro_rules! __keylink_service {
             impl<A: Actor> OwnedPermit<A> {
                 $(
                     $crate::__keylink_permit_method!(
-                        [$( #[$meta] )*],
+                        [$( #[$cfg] )*],
                         [<$kind>],
-                        [<$rpc:snake>],
+                        [<# $rpc:snake>],
                         $rpc,
                         ($( $arg : $ty ),*),
                         $ret
@@ -2948,8 +7591,8 @@ macro_rules! __keylink_service {
             /// service, a bounded number — and **not** about connection count.
             /// Do not conflate them.
             ///
-            /// Address one actor with [`at`], which gives back a typed handle
-            /// whose methods are the ones written in `service!`.
+            /// Address one actor with [`KeyedClient::at`], which gives back a
+            /// typed handle whose methods are the ones written in `service!`.
             pub struct KeyedClient {
                 inner: $crate::RpcClient<$crate::Addressed<Request>, Response>,
                 /// Attached to every call [`ActorRef`] makes through this
@@ -3045,6 +7688,12 @@ macro_rules! __keylink_service {
                     self.inner.close().await
                 }
 
+                /// Address one actor of this service on this connection.
+                #[must_use]
+                pub fn at(&self, actor: $crate::ActorId) -> ActorRef<'_> {
+                    ActorRef { client: self, actor }
+                }
+
                 /// Send one message to one actor. Called by [`ActorRef`], which
                 /// is the only thing that should build an
                 /// [`Addressed`](keylink::Addressed).
@@ -3080,19 +7729,6 @@ macro_rules! __keylink_service {
                 ) -> $crate::Result<Self> {
                     Self::connect(node, addr).await
                 }
-            }
-
-            /// Address one actor of this service on a connected node.
-            ///
-            /// The handle borrows the connection, so every actor of this service
-            /// on that node is reached over one connection with one
-            /// congestion-control state — which is what a per-actor ALPN would
-            /// have thrown away.
-            pub fn at(
-                client: &KeyedClient,
-                actor: $crate::ActorId,
-            ) -> ActorRef<'_> {
-                ActorRef { client, actor }
             }
 
             /// A typed handle to one actor. Its methods are the ones written in
@@ -3169,9 +7805,9 @@ macro_rules! __keylink_service {
 
                 $(
                     $crate::__keylink_actor_client_method!(
-                        [$( #[$meta] )*],
+                        [$( #[$cfg] )*],
                         [<$kind>],
-                        [<$rpc:snake>],
+                        [<# $rpc:snake>],
                         Request,
                         Response,
                         $rpc,
@@ -3311,9 +7947,10 @@ macro_rules! __keylink_service {
 
                 $(
                     $crate::__keylink_client_method!(
-                        [$( #[$meta] )*],
+                        [$( #[$cfg] )*],
+                        client,
                         [<$kind>],
-                        [<$rpc:snake>],
+                        [<# $rpc:snake>],
                         Request,
                         $rpc,
                         [<into_ $rpc:snake>],
@@ -3395,9 +8032,9 @@ macro_rules! __keylink_service {
 
                 $(
                     $crate::__keylink_idempotent_client_method!(
-                        [$( #[$meta] )*],
+                        [$( #[$cfg] )*],
                         [<$kind>],
-                        [<$rpc:snake>],
+                        [<# $rpc:snake>],
                         Request,
                         $rpc,
                         [<into_ $rpc:snake>],
@@ -3491,9 +8128,9 @@ macro_rules! __keylink_service {
             pub trait Calls {
                 $(
                     $crate::__keylink_calls_decl!(
-                        [$( #[$meta] )*],
+                        [$( #[$cfg] )*],
                         [<$kind>],
-                        [<$rpc:snake>],
+                        [<# $rpc:snake>],
                         $rpc,
                         ($( $arg : $ty ),*),
                         $ret
@@ -3504,9 +8141,10 @@ macro_rules! __keylink_service {
             impl<A: Actor> Calls for Handle<A> {
                 $(
                     $crate::__keylink_calls_impl!(
-                        [$( #[$meta] )*],
+                        [$( #[$cfg] )*],
+                        local_handle,
                         [<$kind>],
-                        [<$rpc:snake>],
+                        [<# $rpc:snake>],
                         ($( $arg : $ty ),*),
                         $ret
                     );
@@ -3516,9 +8154,10 @@ macro_rules! __keylink_service {
             impl Calls for ActorRef<'_> {
                 $(
                     $crate::__keylink_calls_impl!(
-                        [$( #[$meta] )*],
+                        [$( #[$cfg] )*],
+                        actor_ref,
                         [<$kind>],
-                        [<$rpc:snake>],
+                        [<# $rpc:snake>],
                         ($( $arg : $ty ),*),
                         $ret
                     );
@@ -3528,9 +8167,10 @@ macro_rules! __keylink_service {
             impl Calls for Client {
                 $(
                     $crate::__keylink_calls_impl!(
-                        [$( #[$meta] )*],
+                        [$( #[$cfg] )*],
+                        client,
                         [<$kind>],
-                        [<$rpc:snake>],
+                        [<# $rpc:snake>],
                         ($( $arg : $ty ),*),
                         $ret
                     );
@@ -3540,9 +8180,10 @@ macro_rules! __keylink_service {
             impl Calls for IdempotentClient {
                 $(
                     $crate::__keylink_calls_impl!(
-                        [$( #[$meta] )*],
+                        [$( #[$cfg] )*],
+                        idempotent_client,
                         [<$kind>],
-                        [<$rpc:snake>],
+                        [<# $rpc:snake>],
                         ($( $arg : $ty ),*),
                         $ret
                     );
@@ -3567,10 +8208,10 @@ macro_rules! __keylink_service {
             $crate::__keylink_if_blocking! {
             /// The same service, for programs that are not async.
             ///
-            /// Streaming methods (`send`/`recv`) are deliberately absent: their
-            /// bodies are async by nature, and a synchronous wrapper would
-            /// either buffer a whole file or hand back a handle that only works
-            /// inside a runtime.
+            /// Only unary `rpc` and `tell` methods are generated here. `send` and
+            /// `recv` own streaming bodies, and `blob` returns a handle whose fetch
+            /// is asynchronous; synchronous wrappers would either buffer data or
+            /// hand back a handle that only works inside a runtime.
             pub mod blocking {
                 use super::*;
 
@@ -3626,9 +8267,11 @@ macro_rules! __keylink_service {
 
                     $(
                         $crate::__keylink_blocking_method!(
-                            [$( #[$meta] )*],
+                            [$( #[$cfg] )*],
+                            blocking_client,
                             [<$kind>],
-                            [<$rpc:snake>],
+                            [<# $rpc:snake>],
+                            $rpc,
                             ($( $arg : $ty ),*),
                             $ret
                         );
@@ -3664,9 +8307,10 @@ macro_rules! __keylink_service {
 
                     $(
                         $crate::__keylink_idempotent_blocking_method!(
-                            [$( #[$meta] )*],
+                            [$( #[$cfg] )*],
                             [<$kind>],
-                            [<$rpc:snake>],
+                            [<# $rpc:snake>],
+                            $rpc,
                             ($( $arg : $ty ),*),
                             $ret
                         );
@@ -3682,6 +8326,743 @@ macro_rules! __keylink_service {
         }
         }
     };
+}
+
+/// Emit a direct diagnostic when a generated method name lands on a method
+/// keylink already owns on that generated surface.
+///
+/// The check is deliberately surface-specific. A name such as `at` is valid on
+/// an actor handle even though it is the addressing door on `KeyedClient`, and
+/// `ended` is valid on a client even though it is an observation door on a local
+/// handle. A flat reserved-name list would reject valid services and still say
+/// nothing about which generated type owns the name.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_feed_name_conflict {
+    ($surface:literal, $name:literal, $feed:ident) => {
+        ::core::compile_error!(::core::concat!(
+            "feed `",
+            ::core::stringify!($feed),
+            "` conflicts with generated `",
+            $surface,
+            "::",
+            $name,
+            "`. Rename the feed."
+        ));
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_name_conflict {
+    ($kind:ident, $surface:literal, $name:literal, $decl:ident) => {
+        ::core::compile_error!(::core::concat!(
+            ::core::stringify!($kind),
+            " `",
+            ::core::stringify!($decl),
+            "` conflicts with generated `",
+            $surface,
+            "::",
+            $name,
+            "`. Rename the ",
+            ::core::stringify!($kind),
+            "."
+        ));
+    };
+}
+
+/// Check one generated declaration against the methods on one generated surface.
+///
+/// The fallback is intentional: `macro_rules!` cannot compare identifiers, so
+/// the finite generated surface is written here and every other user name is
+/// left alone. Calls are made only from emitters that actually generate that
+/// surface's method, so omitted capabilities (`send`/`recv` locally and
+/// `tell` on an idempotent client) are not falsely reserved.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_generated_name_check_item {
+    ([$( #[$meta:meta] )*], $surface:ident, $name:ident, $variant:ident, $kind:ident) => {
+        $crate::pastey::paste! {
+            $( #[$meta] )*
+            const [<__keylink_generated_name_check_ $surface _ $variant>]: () = {
+                $crate::__keylink_generated_name_check!($surface, $name, $variant, $kind);
+            };
+        }
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_generated_name_check_module_item {
+    ([$( #[$meta:meta] )*], $surface:ident, $name:ident, $variant:ident, $kind:ident) => {
+        $( #[$meta] )*
+        const _: () = {
+            $crate::__keylink_generated_name_check!($surface, $name, $variant, $kind);
+        };
+    };
+}
+
+/// Emit every direct conflict for a declaration before generated methods and
+/// matches are expanded. The caller drops the declaration after this check, so
+/// `#[cfg]` can remove a conflicting declaration without leaving references to it.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_status_name_checks {
+    ([$( #[$meta:meta] )*], $kind:ident, $variant:ident) => {
+        $crate::__keylink_generated_name_check_module_item!([
+            $( #[$meta] )*
+        ], local_handle, __status, $variant, $kind);
+        $crate::__keylink_generated_name_check_module_item!([
+            $( #[$meta] )*
+        ], actor_ref, __status, $variant, $kind);
+        $crate::__keylink_generated_name_check_module_item!([
+            $( #[$meta] )*
+        ], client, __status, $variant, $kind);
+        $crate::__keylink_generated_name_check_module_item!([
+            $( #[$meta] )*
+        ], idempotent_client, __status, $variant, $kind);
+        $crate::__keylink_generated_name_check_module_item!([
+            $( #[$meta] )*
+        ], wire, __Status, $variant, $kind);
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_conflicting_method {
+    ([$( #[$meta:meta] )*], $surface:ident, rpc, $name:ident, $variant:ident) => {
+        $crate::__keylink_generated_name_check_item!([
+            $( #[$meta] )*
+        ], $surface, $name, $variant, rpc);
+    };
+    ([$( #[$meta:meta] )*], $surface:ident, tell, $name:ident, $variant:ident) => {
+        $crate::__keylink_generated_name_check_item!([
+            $( #[$meta] )*
+        ], $surface, $name, $variant, tell);
+    };
+    ([$( #[$meta:meta] )*], $surface:ident, blob, $name:ident, $variant:ident) => {
+        $crate::__keylink_generated_name_check_item!([
+            $( #[$meta] )*
+        ], $surface, $name, $variant, blob);
+    };
+    ([$( #[$meta:meta] )*], actor_ref, send, $name:ident, $variant:ident) => {
+        $crate::__keylink_generated_name_check_item!([
+            $( #[$meta] )*
+        ], actor_ref, $name, $variant, send);
+    };
+    ([$( #[$meta:meta] )*], actor_ref, recv, $name:ident, $variant:ident) => {
+        $crate::__keylink_generated_name_check_item!([
+            $( #[$meta] )*
+        ], actor_ref, $name, $variant, recv);
+    };
+    ([$( #[$meta:meta] )*], client, send, $name:ident, $variant:ident) => {
+        $crate::__keylink_generated_name_check_item!([
+            $( #[$meta] )*
+        ], client, $name, $variant, send);
+    };
+    ([$( #[$meta:meta] )*], client, recv, $name:ident, $variant:ident) => {
+        $crate::__keylink_generated_name_check_item!([
+            $( #[$meta] )*
+        ], client, $name, $variant, recv);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, send, $name:ident, $variant:ident) => {
+        $crate::__keylink_generated_name_check_item!([
+            $( #[$meta] )*
+        ], idempotent_client, $name, $variant, send);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, recv, $name:ident, $variant:ident) => {
+        $crate::__keylink_generated_name_check_item!([
+            $( #[$meta] )*
+        ], idempotent_client, $name, $variant, recv);
+    };
+    ([$( #[$meta:meta] )*], $surface:ident, $kind:ident, $name:ident, $variant:ident) => {};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_feed_name_check_item {
+    ([$( #[$meta:meta] )*], $name:ident, $feed:ident) => {
+        $( #[$meta] )*
+        const _: () = {
+            $crate::__keylink_generated_name_check!(feeds, $name, $feed, feed);
+        };
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_keyword_name_check_item {
+    ([$( #[$meta:meta] )*], $name:ident, $kind:ident, $decl:ident) => {
+        $( #[$meta] )*
+        const _: () = {
+            $crate::__keylink_keyword_name_check!($name, $kind, $decl);
+        };
+    };
+}
+
+/// Reject declaration names whose snake-case spelling is a Rust keyword before
+/// any generated method is parsed. `pastey` can produce a keyword token, but a
+/// keyword cannot be used after `fn`, so a method-body check would be too late.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_keyword_name_check {
+    (as, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(as, $kind, $decl);
+    };
+    (break, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(break, $kind, $decl);
+    };
+    (const, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(const, $kind, $decl);
+    };
+    (continue, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(continue, $kind, $decl);
+    };
+    (crate, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(crate, $kind, $decl);
+    };
+    (else, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(else, $kind, $decl);
+    };
+    (enum, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(enum, $kind, $decl);
+    };
+    (extern, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(extern, $kind, $decl);
+    };
+    (false, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(false, $kind, $decl);
+    };
+    (fn, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(fn, $kind, $decl);
+    };
+    (for, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(for, $kind, $decl);
+    };
+    (if, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(if, $kind, $decl);
+    };
+    (impl, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(impl, $kind, $decl);
+    };
+    (in, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(in, $kind, $decl);
+    };
+    (let, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(let, $kind, $decl);
+    };
+    (loop, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(loop, $kind, $decl);
+    };
+    (match, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(match, $kind, $decl);
+    };
+    (mod, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(mod, $kind, $decl);
+    };
+    (move, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(move, $kind, $decl);
+    };
+    (mut, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(mut, $kind, $decl);
+    };
+    (pub, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(pub, $kind, $decl);
+    };
+    (ref, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(ref, $kind, $decl);
+    };
+    (return, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(return, $kind, $decl);
+    };
+    (self, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(self, $kind, $decl);
+    };
+    (Self, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(Self, $kind, $decl);
+    };
+    (static, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(static, $kind, $decl);
+    };
+    (struct, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(struct, $kind, $decl);
+    };
+    (super, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(super, $kind, $decl);
+    };
+    (trait, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(trait, $kind, $decl);
+    };
+    (true, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(true, $kind, $decl);
+    };
+    (type, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(type, $kind, $decl);
+    };
+    (unsafe, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(unsafe, $kind, $decl);
+    };
+    (use, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(use, $kind, $decl);
+    };
+    (where, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(where, $kind, $decl);
+    };
+    (while, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(while, $kind, $decl);
+    };
+    (async, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(async, $kind, $decl);
+    };
+    (await, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(await, $kind, $decl);
+    };
+    (dyn, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(dyn, $kind, $decl);
+    };
+    (abstract, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(abstract, $kind, $decl);
+    };
+    (become, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(become, $kind, $decl);
+    };
+    (box, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(box, $kind, $decl);
+    };
+    (do, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(do, $kind, $decl);
+    };
+    (final, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(final, $kind, $decl);
+    };
+    (macro, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(macro, $kind, $decl);
+    };
+    (override, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(override, $kind, $decl);
+    };
+    (priv, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(priv, $kind, $decl);
+    };
+    (typeof, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(typeof, $kind, $decl);
+    };
+    (unsized, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(unsized, $kind, $decl);
+    };
+    (virtual, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(virtual, $kind, $decl);
+    };
+    (yield, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(yield, $kind, $decl);
+    };
+    (try, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(try, $kind, $decl);
+    };
+    (gen, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(gen, $kind, $decl);
+    };
+    (As, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(as, $kind, $decl);
+    };
+    (Break, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(break, $kind, $decl);
+    };
+    (Const, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(const, $kind, $decl);
+    };
+    (Continue, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(continue, $kind, $decl);
+    };
+    (Crate, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(crate, $kind, $decl);
+    };
+    (Else, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(else, $kind, $decl);
+    };
+    (Enum, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(enum, $kind, $decl);
+    };
+    (Extern, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(extern, $kind, $decl);
+    };
+    (False, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(false, $kind, $decl);
+    };
+    (Fn, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(fn, $kind, $decl);
+    };
+    (For, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(for, $kind, $decl);
+    };
+    (If, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(if, $kind, $decl);
+    };
+    (Impl, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(impl, $kind, $decl);
+    };
+    (In, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(in, $kind, $decl);
+    };
+    (Let, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(let, $kind, $decl);
+    };
+    (Loop, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(loop, $kind, $decl);
+    };
+    (Match, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(match, $kind, $decl);
+    };
+    (Mod, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(mod, $kind, $decl);
+    };
+    (Move, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(move, $kind, $decl);
+    };
+    (Mut, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(mut, $kind, $decl);
+    };
+    (Pub, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(pub, $kind, $decl);
+    };
+    (Ref, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(ref, $kind, $decl);
+    };
+    (Return, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(return, $kind, $decl);
+    };
+    (Static, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(static, $kind, $decl);
+    };
+    (Struct, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(struct, $kind, $decl);
+    };
+    (Super, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(super, $kind, $decl);
+    };
+    (Trait, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(trait, $kind, $decl);
+    };
+    (True, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(true, $kind, $decl);
+    };
+    (Type, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(type, $kind, $decl);
+    };
+    (Unsafe, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(unsafe, $kind, $decl);
+    };
+    (Use, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(use, $kind, $decl);
+    };
+    (Where, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(where, $kind, $decl);
+    };
+    (While, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(while, $kind, $decl);
+    };
+    (Async, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(async, $kind, $decl);
+    };
+    (Await, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(await, $kind, $decl);
+    };
+    (Dyn, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(dyn, $kind, $decl);
+    };
+    (Abstract, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(abstract, $kind, $decl);
+    };
+    (Become, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(become, $kind, $decl);
+    };
+    (Box, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(box, $kind, $decl);
+    };
+    (Do, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(do, $kind, $decl);
+    };
+    (Final, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(final, $kind, $decl);
+    };
+    (Macro, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(macro, $kind, $decl);
+    };
+    (Override, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(override, $kind, $decl);
+    };
+    (Priv, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(priv, $kind, $decl);
+    };
+    (Typeof, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(typeof, $kind, $decl);
+    };
+    (Unsized, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(unsized, $kind, $decl);
+    };
+    (Virtual, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(virtual, $kind, $decl);
+    };
+    (Yield, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(yield, $kind, $decl);
+    };
+    (Try, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(try, $kind, $decl);
+    };
+    (Gen, $kind:ident, $decl:ident) => {
+        $crate::__keylink_keyword_name_conflict!(gen, $kind, $decl);
+    };
+    ($name:ident, $kind:ident, $decl:ident) => {};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_keyword_name_conflict {
+    ($name:ident, $kind:ident, $decl:ident) => {
+        ::core::compile_error!(::core::concat!(
+            stringify!($kind),
+            " `",
+            ::core::stringify!($decl),
+            "` generates the reserved Rust keyword `",
+            ::core::stringify!($name),
+            "`. Rename the ",
+            stringify!($kind),
+            "."
+        ));
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_generated_name_check {
+    // Wire names are enum variants, not methods. These two are generated into
+    // the same enums as user declarations and need the same direct diagnostic.
+    (wire, __Status, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Request/Response", "__Status", $rpc);
+    };
+    (wire, Served, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Mail", "Served", $rpc);
+    };
+    (wire, $name:ident, $rpc:ident, $kind:ident) => {};
+
+    // `Feeds` has one generated field of its own, the round-robin cursor.
+    // Feed names otherwise form their own enum variants and callback methods,
+    // with no built-in method namespace to reserve.
+    (feeds, at, $feed:ident, $kind:ident) => {
+        $crate::__keylink_feed_name_conflict!("Feeds", "at", $feed);
+    };
+    (feeds, r#at, $feed:ident, $kind:ident) => {
+        $crate::__keylink_feed_name_conflict!("Feeds", "at", $feed);
+    };
+    (feeds, $name:ident, $rpc:ident, $kind:ident) => {};
+
+    (local_handle, service, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "service", $rpc);
+    };
+    (local_handle, r#service, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "service", $rpc);
+    };
+    (local_handle, serve, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "serve", $rpc);
+    };
+    (local_handle, r#serve, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "serve", $rpc);
+    };
+    (local_handle, with_state, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "with_state", $rpc);
+    };
+    (local_handle, r#with_state, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "with_state", $rpc);
+    };
+    (local_handle, stop, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "stop", $rpc);
+    };
+    (local_handle, r#stop, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "stop", $rpc);
+    };
+    (local_handle, abort, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "abort", $rpc);
+    };
+    (local_handle, r#abort, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "abort", $rpc);
+    };
+    (local_handle, is_running, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "is_running", $rpc);
+    };
+    (local_handle, r#is_running, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "is_running", $rpc);
+    };
+    (local_handle, is_busy, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "is_busy", $rpc);
+    };
+    (local_handle, r#is_busy, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "is_busy", $rpc);
+    };
+    (local_handle, buffered, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "buffered", $rpc);
+    };
+    (local_handle, r#buffered, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "buffered", $rpc);
+    };
+    (local_handle, __status, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "__status", $rpc);
+    };
+    (local_handle, r#__status, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "__status", $rpc);
+    };
+    (local_handle, ended, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "ended", $rpc);
+    };
+    (local_handle, r#ended, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "ended", $rpc);
+    };
+    (local_handle, __reserve, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "__reserve", $rpc);
+    };
+    (local_handle, r#__reserve, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "__reserve", $rpc);
+    };
+    (local_handle, __try_reserve, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "__try_reserve", $rpc);
+    };
+    (local_handle, r#__try_reserve, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "__try_reserve", $rpc);
+    };
+    (local_handle, __reserve_owned, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "__reserve_owned", $rpc);
+    };
+    (local_handle, r#__reserve_owned, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Handle", "__reserve_owned", $rpc);
+    };
+    (local_handle, $name:ident, $rpc:ident, $kind:ident) => {};
+
+    (local_ref, id, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "LocalRef", "id", $rpc);
+    };
+    (local_ref, r#id, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "LocalRef", "id", $rpc);
+    };
+    (local_ref, $name:ident, $rpc:ident, $kind:ident) => {};
+
+    (actor_ref, id, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "ActorRef", "id", $rpc);
+    };
+    (actor_ref, r#id, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "ActorRef", "id", $rpc);
+    };
+    (actor_ref, __status, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "ActorRef", "__status", $rpc);
+    };
+    (actor_ref, r#__status, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "ActorRef", "__status", $rpc);
+    };
+    (actor_ref, $name:ident, $rpc:ident, $kind:ident) => {};
+
+    (client, connect, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Client", "connect", $rpc);
+    };
+    (client, r#connect, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Client", "connect", $rpc);
+    };
+    (client, with_idempotency, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Client", "with_idempotency", $rpc);
+    };
+    (client, r#with_idempotency, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Client", "with_idempotency", $rpc);
+    };
+    (client, key_state, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Client", "key_state", $rpc);
+    };
+    (client, r#key_state, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Client", "key_state", $rpc);
+    };
+    (client, watch, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Client", "watch", $rpc);
+    };
+    (client, r#watch, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Client", "watch", $rpc);
+    };
+    (client, __status, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Client", "__status", $rpc);
+    };
+    (client, r#__status, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Client", "__status", $rpc);
+    };
+    (client, close, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Client", "close", $rpc);
+    };
+    (client, r#close, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "Client", "close", $rpc);
+    };
+    (client, $name:ident, $rpc:ident, $kind:ident) => {};
+
+    (idempotent_client, key_state, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "IdempotentClient", "key_state", $rpc);
+    };
+    (idempotent_client, r#key_state, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "IdempotentClient", "key_state", $rpc);
+    };
+    (idempotent_client, watch, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "IdempotentClient", "watch", $rpc);
+    };
+    (idempotent_client, r#watch, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "IdempotentClient", "watch", $rpc);
+    };
+    (idempotent_client, __status, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "IdempotentClient", "__status", $rpc);
+    };
+    (idempotent_client, r#__status, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "IdempotentClient", "__status", $rpc);
+    };
+    (idempotent_client, close, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "IdempotentClient", "close", $rpc);
+    };
+    (idempotent_client, r#close, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "IdempotentClient", "close", $rpc);
+    };
+    (idempotent_client, $name:ident, $rpc:ident, $kind:ident) => {};
+
+    (blocking_client, connect, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "blocking::Client", "connect", $rpc);
+    };
+    (blocking_client, r#connect, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "blocking::Client", "connect", $rpc);
+    };
+    (blocking_client, with_idempotency, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "blocking::Client", "with_idempotency", $rpc);
+    };
+    (blocking_client, r#with_idempotency, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "blocking::Client", "with_idempotency", $rpc);
+    };
+    (blocking_client, key_state, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "blocking::Client", "key_state", $rpc);
+    };
+    (blocking_client, r#key_state, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "blocking::Client", "key_state", $rpc);
+    };
+    (blocking_client, close, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "blocking::Client", "close", $rpc);
+    };
+    (blocking_client, r#close, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "blocking::Client", "close", $rpc);
+    };
+    (blocking_client, $name:ident, $rpc:ident, $kind:ident) => {};
+
+    (blocking_idempotent_client, key_state, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "blocking::IdempotentClient", "key_state", $rpc);
+    };
+    (blocking_idempotent_client, r#key_state, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "blocking::IdempotentClient", "key_state", $rpc);
+    };
+    (blocking_idempotent_client, close, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "blocking::IdempotentClient", "close", $rpc);
+    };
+    (blocking_idempotent_client, r#close, $rpc:ident, $kind:ident) => {
+        $crate::__keylink_name_conflict!($kind, "blocking::IdempotentClient", "close", $rpc);
+    };
+    (blocking_idempotent_client, $name:ident, $rpc:ident, $kind:ident) => {};
+
+    ($surface:ident, $name:ident, $rpc:ident, $kind:ident) => {};
 }
 
 /// One method on a key-scoped client, or nothing at all when it is a `tell`.
@@ -3702,7 +9083,7 @@ macro_rules! __keylink_idempotent_client_method {
     ([$( #[$meta:meta] )*], $kind:ident, $name:ident, $req:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_client_method!(
-            [$( #[$meta] )*], $kind, $name, $req, $variant, $extract,
+            [$( #[$meta] )*], idempotent_client, $kind, $name, $req, $variant, $extract,
             ($( $arg : $ty ),*), $ret
         );
     };
@@ -3713,10 +9094,20 @@ macro_rules! __keylink_idempotent_client_method {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_idempotent_blocking_method {
-    ([$( #[$meta:meta] )*], tell, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
-    ([$( #[$meta:meta] )*], $kind:ident, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+    ([$( #[$meta:meta] )*], tell, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], rpc, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_blocking_method!(
-            [$( #[$meta] )*], $kind, $name, ($( $arg : $ty ),*), $ret
+            [$( #[$meta] )*], blocking_idempotent_client, rpc, $name, $variant,
+            ($( $arg : $ty ),*), $ret
+        );
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_blocking_method!(
+            [$( #[$meta] )*], blocking_idempotent_client, $kind, $name, $variant,
+            ($( $arg : $ty ),*), $ret
         );
     };
 }
@@ -3865,11 +9256,61 @@ macro_rules! __keylink_is_send {
     };
 }
 
-/// One blocking client method. Streaming kinds produce nothing.
+/// One blocking client method. Only unary `rpc` and `tell` kinds produce code;
+/// `send`, `recv` and `blob` stay asynchronous.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_blocking_method {
-    ([$( #[$meta:meta] )*], tell, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+    ([$( #[$meta:meta] )*], blocking_client, $kind:ident, connect, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_client, $kind, connect, $variant);
+    };
+    ([$( #[$meta:meta] )*], blocking_client, $kind:ident, r#connect, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_client, $kind, connect, $variant);
+    };
+    ([$( #[$meta:meta] )*], blocking_client, $kind:ident, with_idempotency, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_client, $kind, with_idempotency, $variant);
+    };
+    ([$( #[$meta:meta] )*], blocking_client, $kind:ident, r#with_idempotency, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_client, $kind, with_idempotency, $variant);
+    };
+    ([$( #[$meta:meta] )*], blocking_client, $kind:ident, key_state, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_client, $kind, key_state, $variant);
+    };
+    ([$( #[$meta:meta] )*], blocking_client, $kind:ident, r#key_state, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_client, $kind, key_state, $variant);
+    };
+    ([$( #[$meta:meta] )*], blocking_client, $kind:ident, close, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_client, $kind, close, $variant);
+    };
+    ([$( #[$meta:meta] )*], blocking_client, $kind:ident, r#close, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_client, $kind, close, $variant);
+    };
+    ([$( #[$meta:meta] )*], blocking_idempotent_client, $kind:ident, key_state, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_idempotent_client, $kind, key_state, $variant);
+    };
+    ([$( #[$meta:meta] )*], blocking_idempotent_client, $kind:ident, r#key_state, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_idempotent_client, $kind, key_state, $variant);
+    };
+    ([$( #[$meta:meta] )*], blocking_idempotent_client, $kind:ident, close, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_idempotent_client, $kind, close, $variant);
+    };
+    ([$( #[$meta:meta] )*], blocking_idempotent_client, $kind:ident, r#close, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_idempotent_client, $kind, close, $variant);
+    };
+    ([$( #[$meta:meta] )*], $surface:ident, tell, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Send the `", stringify!($name), "` tell and return.")]
         ///
@@ -3880,19 +9321,23 @@ macro_rules! __keylink_blocking_method {
             self.runtime.run(self.inner.$name($( $arg ),*))?
         }
     };
-    ([$( #[$meta:meta] )*], rpc, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+    ([$( #[$meta:meta] )*], $surface:ident, rpc, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Call `", stringify!($name), "`, blocking until it answers.")]
         pub fn $name(&self $(, $arg: $ty )*) -> $crate::Result<$ret> {
             self.runtime.run(self.inner.$name($( $arg ),*))?
         }
     };
-    ([$( #[$meta:meta] )*], send, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
-    ([$( #[$meta:meta] )*], recv, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], $surface:ident, send, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], $surface:ident, recv, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
     // Absent for the same reason `send` and `recv` are: a `BlobHandle` fetches
     // asynchronously, so a synchronous wrapper would either buffer the whole
     // blob or hand back a handle that only works inside a runtime.
-    ([$( #[$meta:meta] )*], blob, $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], $surface:ident, blob, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
 }
 
 /// One handler-trait method, shaped by the rpc kind.
@@ -4511,6 +9956,22 @@ macro_rules! __keylink_actor_client_method {
     // it pays for. Absent and documented, rather than present and lying.
     ([$( #[$meta:meta] )*], tell, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], $kind:ident, id, $req:ident, $resp:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], actor_ref, $kind, id, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, r#id, $req:ident, $resp:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], actor_ref, $kind, id, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, __status, $req:ident, $resp:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], actor_ref, $kind, __status, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, r#__status, $req:ident, $resp:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], actor_ref, $kind, __status, $variant);
+    };
     ([$( #[$meta:meta] )*], rpc, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
@@ -4587,6 +10048,74 @@ macro_rules! __keylink_actor_client_method {
     };
 }
 
+/// One method on a local keyed reference, shaped by the rpc kind.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_keyed_local_method {
+    ([$( #[$meta:meta] )*], $kind:ident, id, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_ref, $kind, id, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, r#id, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_ref, $kind, id, $variant);
+    };
+    ([$( #[$meta:meta] )*], rpc, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Call the `", stringify!($variant), "` rpc on this actor in this process.")]
+        pub async fn $name(&self $(, $arg: $ty )*)
+            -> ::core::result::Result<$ret, $crate::LocalError> {
+            self.system
+                .__local_ask(&self.actor, move |__from, __reply| Mail::$variant {
+                    origin: __from,
+                    $( $arg, )*
+                    body: (),
+                    reply: __reply,
+                })
+                .await
+        }
+    };
+    ([$( #[$meta:meta] )*], tell, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Send the `", stringify!($variant), "` tell to this actor in this process.")]
+        pub async fn $name(&self $(, $arg: $ty )*)
+            -> ::core::result::Result<(), $crate::LocalError> {
+            self.system
+                .__local_notify(&self.actor, move |__from, __reply| Mail::$variant {
+                    origin: __from,
+                    $( $arg, )*
+                    body: (),
+                    reply: __reply,
+                })
+                .await
+        }
+    };
+    ([$( #[$meta:meta] )*], blob, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        #[doc = concat!("Call the `", stringify!($variant), "` blob rpc on this actor in this process.")]
+        pub async fn $name(&self $(, $arg: $ty )*)
+            -> ::core::result::Result<($ret, $crate::BlobId), $crate::LocalError> {
+            self.system
+                .__local_ask(&self.actor, move |__from, __reply| Mail::$variant {
+                    origin: __from,
+                    $( $arg, )*
+                    body: (),
+                    reply: __reply,
+                })
+                .await
+        }
+    };
+    // A local keyed reference has no QUIC body stream. Like `Handle`, it does
+    // not invent buffering just to imitate `send` or `recv`.
+    ([$( #[$meta:meta] )*], send, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+    ([$( #[$meta:meta] )*], recv, $name:ident, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+}
+
 /// One method on a local `Handle`, shaped by the rpc kind.
 ///
 /// Every arm builds one variant of the service's own `Mail` and hands it to the
@@ -4613,6 +10142,110 @@ macro_rules! __keylink_actor_client_method {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_local_method {
+    ([$( #[$meta:meta] )*], $kind:ident, service, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, service, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, r#service, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, service, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, serve, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, serve, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, r#serve, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, serve, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, with_state, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, with_state, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, r#with_state, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, with_state, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, stop, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, stop, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, r#stop, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, stop, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, abort, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, abort, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, r#abort, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, abort, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, is_running, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, is_running, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, r#is_running, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, is_running, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, is_busy, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, is_busy, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, r#is_busy, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, is_busy, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, buffered, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, buffered, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, r#buffered, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, buffered, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, __status, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __status, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, r#__status, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __status, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, ended, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, ended, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, r#ended, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, ended, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, __reserve, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __reserve, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, r#__reserve, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __reserve, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, __try_reserve, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __try_reserve, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, r#__try_reserve, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __try_reserve, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, __reserve_owned, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __reserve_owned, $variant);
+    };
+    ([$( #[$meta:meta] )*], $kind:ident, r#__reserve_owned, $variant:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __reserve_owned, $variant);
+    };
     ([$( #[$meta:meta] )*], rpc, $name:ident, $variant:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
@@ -4859,7 +10492,93 @@ macro_rules! __keylink_permit_method {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_client_method {
-    ([$( #[$meta:meta] )*], rpc, $name:ident, $req:ident, $variant:ident, $extract:ident,
+    ([$( #[$meta:meta] )*], client, $kind:ident, connect, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, connect, $variant);
+    };
+    ([$( #[$meta:meta] )*], client, $kind:ident, r#connect, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, connect, $variant);
+    };
+    ([$( #[$meta:meta] )*], client, $kind:ident, with_idempotency, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, with_idempotency, $variant);
+    };
+    ([$( #[$meta:meta] )*], client, $kind:ident, r#with_idempotency, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, with_idempotency, $variant);
+    };
+    ([$( #[$meta:meta] )*], client, $kind:ident, key_state, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, key_state, $variant);
+    };
+    ([$( #[$meta:meta] )*], client, $kind:ident, r#key_state, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, key_state, $variant);
+    };
+    ([$( #[$meta:meta] )*], client, $kind:ident, watch, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, watch, $variant);
+    };
+    ([$( #[$meta:meta] )*], client, $kind:ident, r#watch, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, watch, $variant);
+    };
+    ([$( #[$meta:meta] )*], client, $kind:ident, __status, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, __status, $variant);
+        $crate::__keylink_generated_name_check_item!([
+            $( #[$meta] )*
+        ], wire, __Status, $variant, $kind);
+    };
+    ([$( #[$meta:meta] )*], client, $kind:ident, r#__status, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, __status, $variant);
+        $crate::__keylink_generated_name_check_item!([
+            $( #[$meta] )*
+        ], wire, __Status, $variant, $kind);
+    };
+    ([$( #[$meta:meta] )*], client, $kind:ident, close, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, close, $variant);
+    };
+    ([$( #[$meta:meta] )*], client, $kind:ident, r#close, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, close, $variant);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, $kind:ident, key_state, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], idempotent_client, $kind, key_state, $variant);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, $kind:ident, r#key_state, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], idempotent_client, $kind, key_state, $variant);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, $kind:ident, watch, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], idempotent_client, $kind, watch, $variant);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, $kind:ident, r#watch, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], idempotent_client, $kind, watch, $variant);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, $kind:ident, __status, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], idempotent_client, $kind, __status, $variant);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, $kind:ident, r#__status, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], idempotent_client, $kind, __status, $variant);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, $kind:ident, close, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], idempotent_client, $kind, close, $variant);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, $kind:ident, r#close, $req:ident, $variant:ident, $extract:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_conflicting_method!([$( #[$meta] )*], idempotent_client, $kind, close, $variant);
+    };
+    ([$( #[$meta:meta] )*], $surface:ident, rpc, $name:ident, $req:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Call the `", stringify!($variant), "` rpc.")]
@@ -4871,7 +10590,7 @@ macro_rules! __keylink_client_method {
             response.$extract()
         }
     };
-    ([$( #[$meta:meta] )*], tell, $name:ident, $req:ident, $variant:ident, $extract:ident,
+    ([$( #[$meta:meta] )*], $surface:ident, tell, $name:ident, $req:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Send the `", stringify!($variant), "` tell and return.")]
@@ -4885,7 +10604,7 @@ macro_rules! __keylink_client_method {
             self.inner.tell($req::$variant { $( $arg ),* }).await
         }
     };
-    ([$( #[$meta:meta] )*], send, $name:ident, $req:ident, $variant:ident, $extract:ident,
+    ([$( #[$meta:meta] )*], $surface:ident, send, $name:ident, $req:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Call the `", stringify!($variant), "` rpc, streaming `body` up alongside it.")]
@@ -4897,7 +10616,7 @@ macro_rules! __keylink_client_method {
             response.$extract()
         }
     };
-    ([$( #[$meta:meta] )*], recv, $name:ident, $req:ident, $variant:ident, $extract:ident,
+    ([$( #[$meta:meta] )*], $surface:ident, recv, $name:ident, $req:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Call the `", stringify!($variant), "` rpc, returning its reply and a reader for the payload streaming back.")]
@@ -4910,7 +10629,7 @@ macro_rules! __keylink_client_method {
             Ok((response.$extract()?, body))
         }
     };
-    ([$( #[$meta:meta] )*], blob, $name:ident, $req:ident, $variant:ident, $extract:ident,
+    ([$( #[$meta:meta] )*], $surface:ident, blob, $name:ident, $req:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Call the `", stringify!($variant), "` rpc, returning its reply and a handle to the content it named.")]
@@ -4975,6 +10694,187 @@ macro_rules! __keylink_calls_decl {
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
     ([$( #[$meta:meta] )*], blob, $name:ident, $variant:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_calls_conflict {
+    ([$( #[$meta:meta] )*], $name:ident, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        fn $name(&self $(, $arg: $ty )*)
+            -> impl ::core::future::Future<
+                   Output = ::core::result::Result<$ret, $crate::Failure>
+               > + ::core::marker::Send {
+            async move { ::core::panic!("unreachable generated-name conflict") }
+        }
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_calls_method {
+    ([$( #[$meta:meta] )*], local_handle, service, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], service, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, r#service, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], service, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, serve, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], serve, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, r#serve, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], serve, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, with_state, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], with_state, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, r#with_state, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], with_state, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, stop, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], stop, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, r#stop, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], stop, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, abort, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], abort, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, r#abort, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], abort, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, is_running, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], is_running, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, r#is_running, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], is_running, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, is_busy, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], is_busy, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, r#is_busy, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], is_busy, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, buffered, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], buffered, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, r#buffered, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], buffered, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, __status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, r#__status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, ended, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], ended, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, r#ended, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], ended, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, __reserve, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __reserve, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, r#__reserve, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __reserve, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, __try_reserve, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __try_reserve, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, r#__try_reserve, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __try_reserve, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, __reserve_owned, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __reserve_owned, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_handle, r#__reserve_owned, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __reserve_owned, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], actor_ref, id, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], id, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], actor_ref, r#id, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], id, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], actor_ref, __status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], actor_ref, r#__status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], client, connect, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], connect, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], client, r#connect, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], connect, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], client, with_idempotency, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], with_idempotency, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], client, r#with_idempotency, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], with_idempotency, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], client, key_state, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], key_state, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], client, r#key_state, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], key_state, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], client, watch, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], watch, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], client, r#watch, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], watch, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], client, __status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], client, r#__status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], client, close, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], close, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], client, r#close, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], close, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, key_state, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], key_state, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, r#key_state, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], key_state, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, watch, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], watch, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, r#watch, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], watch, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, __status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, r#__status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, close, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], close, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], idempotent_client, r#close, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], close, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], $surface:ident, $name:ident,
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $( #[$meta] )*
+        fn $name(&self $(, $arg: $ty )*)
+            -> impl ::core::future::Future<
+                   Output = ::core::result::Result<$ret, $crate::Failure>
+               > + ::core::marker::Send {
+            async move {
+                self.$name($( $arg ),*).await.map_err(::core::convert::From::from)
+            }
+        }
+    };
 }
 
 /// One `Calls` body, and there is exactly one for all four implementors.
@@ -5050,25 +10950,20 @@ macro_rules! __keylink_calls_decl {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_calls_impl {
-    ([$( #[$meta:meta] )*], rpc, $name:ident,
+    ([$( #[$meta:meta] )*], $surface:ident, rpc, $name:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $( #[$meta] )*
-        fn $name(&self $(, $arg: $ty )*)
-            -> impl ::core::future::Future<
-                   Output = ::core::result::Result<$ret, $crate::Failure>
-               > + ::core::marker::Send {
-            async move {
-                self.$name($( $arg ),*).await.map_err(::core::convert::From::from)
-            }
-        }
+        $crate::__keylink_calls_method!(
+            [$( #[$meta] )*], $surface, $name,
+            ($( $arg : $ty ),*), $ret
+        );
     };
-    ([$( #[$meta:meta] )*], tell, $name:ident,
+    ([$( #[$meta:meta] )*], $surface:ident, tell, $name:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
-    ([$( #[$meta:meta] )*], send, $name:ident,
+    ([$( #[$meta:meta] )*], $surface:ident, send, $name:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
-    ([$( #[$meta:meta] )*], recv, $name:ident,
+    ([$( #[$meta:meta] )*], $surface:ident, recv, $name:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
-    ([$( #[$meta:meta] )*], blob, $name:ident,
+    ([$( #[$meta:meta] )*], $surface:ident, blob, $name:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
 }
 
