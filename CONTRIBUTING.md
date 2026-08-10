@@ -137,10 +137,13 @@ task lists sub-tasks rather than using bare `depends`: mise parallelizes
 dependencies, and two concurrent cargo invocations contend for one target
 directory and one machine's memory.
 
-The tests inside `mise run test` are the exception, and only because they do not
-share that directory the same way: `cargo nextest run` executes test binaries as
-parallel PROCESSES, which is where most of the gate's time used to go. One file
-needs protecting from that — see `.config/nextest.toml`.
+`mise run test` keeps Cargo invocations serial too. Its speedup is inside one
+libtest process instead: `keylink/gate-tests/gate.rs` includes the native
+integration suites that can safely share a process, so iroh's endpoint teardown
+is paid once rather than once per file or once per test. Process-wide
+measurements, the nested Cargo build, and the scheduling-sensitive reconnect
+suite remain separate. An inventory test makes a newly added suite fail the gate
+until it is included or deliberately isolated.
 
 `mise.toml` pins `sccache` and sets `RUSTC_WRAPPER`, so a cargo command run under
 mise compiles through a shared cache. `mise install` fetches it; there is still

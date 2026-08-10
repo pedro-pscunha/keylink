@@ -1059,10 +1059,9 @@ async fn the_supervised_deep_door_takes_the_depth_it_was_given() {
 ///
 /// Both runs take this test's own name —
 /// `a_self_tell_fits_once_and_is_refused_when_the_mailbox_is_full` — plus
-/// `--test cycles`. The harness appends the filter **positionally** to its runner,
-/// so it is a plain substring and never a nextest `test(..)` filterset: a
-/// filterset there matches nothing, runs zero tests, and exits non-zero, which the
-/// banner prints as a caught defect. The filter was described in prose and not
+/// `--test cycles`. The harness appends the filter **positionally** as a plain
+/// libtest substring. A filterset there matches nothing and exits non-zero, which
+/// the banner prints as a caught defect. The filter was described in prose and not
 /// written down here until a reader had to reconstruct it.
 ///
 /// **CAUTION: the second anchor is 98 of the 100 columns `rustfmt` allows.** Two

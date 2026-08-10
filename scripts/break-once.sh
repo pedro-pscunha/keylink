@@ -4,25 +4,13 @@
 #
 #   break-once.sh <file> <literal-to-replace> <replacement> <test-filter> [cargo args...]
 #
-# The runner is `cargo test` unless `BREAK_RUNNER` says otherwise. That override
-# is not decoration: the gate runs `cargo nextest run`, and some guards exist
-# ONLY under it — `.config/nextest.toml`'s `drift-builds` group is one, because
-# it replaces a `OnceLock` that nextest's process-per-test voids. Under plain
-# `cargo test` that group is never read, so this harness could not reach the
-# guard at all and would report a green that proves nothing.
+# The gate's aggregate target does not replace these named files: a focused
+# break selects the original target with `--test <name>`, which keeps the failure
+# local and preserves the file's deliberate process isolation.
 #
-#   BREAK_RUNNER="cargo nextest run" break-once.sh … --test drift
-#
-# **THE FILTER IS A BARE POSITIONAL UNDER BOTH RUNNERS, and this line used to say
-# "nextest takes a filterset", which sent a reader to a spelling this script cannot
-# deliver.** The filter is appended LAST, after the cargo args, so it lands as the
-# runner's own positional — a SUBSTRING for `cargo test` and, measured on
-# cargo-nextest 0.9.143, a substring for nextest too. A filterset needs `-E`, which
-# can only ride in the cargo args; handed here it matches nothing, and nextest then
-# runs 0 tests and exits 4, which this script's `── exit=` line reads as a caught
-# defect. Pass the plain test name. `-- --exact` in the cargo args reaches BOTH
-# runners' `--exact`, which matches the WHOLE name — see the count below for what
-# that costs a bare `--lib` name.
+# The filter is a bare libtest substring appended after Cargo's arguments. Keep
+# registry filters bare, fully qualified test names; options for libtest itself
+# belong after `--` in the cargo arguments.
 set -euo pipefail
 
 file="$1"
@@ -105,9 +93,7 @@ open(path, "w").write(text.replace(old, new))
 PY
 
 echo "── broken: $file"
-# Word-split on purpose — `BREAK_RUNNER` is a command prefix such as
-# "cargo nextest run", not a single executable.
-read -r -a runner <<< "${BREAK_RUNNER:-cargo test}"
+runner=(cargo test)
 echo "── runner: ${runner[*]}"
 # NOT `tail -15`, which is what this was. A consumer searches this output for the
 # sentence a record says it watched, and `tail` discards the output BEFORE it is
@@ -184,20 +170,6 @@ echo "── log: $log"
 # one break against several tests by name is a legitimate exploratory use and the
 # `replay-anchors` header records somebody doing exactly that.
 #
-# **BOTH RUNNERS, and the count this replaces read only one of them.** It was a
-# libtest-shaped regex inside `replay-fate-breaks.sh`, `[0-9]+ passed; [0-9]+
-# failed`. Measured on this machine 2026-08-09, over real runs of the two-test
-# filter this whole guard exists for:
-#
-#   cargo test    : test result: ok. 2 passed; 0 failed; 0 ignored; …
-#   cargo nextest : Summary [   0.109s] 2 tests run: 2 passed, 18 skipped
-#   cargo nextest : Summary [   0.015s] 1 test run: 0 passed, 1 failed, 182 skipped
-#
-# That regex matches NONE of the nextest lines, so under the runner this script's
-# own header calls required the count came back EMPTY and every arm reading it
-# fell through — the guard was absent exactly where the gate runs. Both forms are
-# read here, and each was measured rather than reasoned about.
-#
 # SUMMED over every totals line rather than read off the first, because a filter
 # with no target runs one binary per target and prints one line each. `?` is NO
 # totals line anywhere: an abort, a tree that did not compile, or a runner whose
@@ -211,8 +183,6 @@ import sys
 text = open(sys.argv[1], errors="replace").read()
 counts = [int(passed) + int(failed) for passed, failed in
           re.findall(r"^test result: \w+\. (\d+) passed; (\d+) failed", text, re.M)]
-counts += [int(ran) for ran in
-           re.findall(r"^\s*Summary \[[^]]*\] (\d+) tests? run:", text, re.M)]
 print(sum(counts) if counts else "?")
 PY
 )"
@@ -229,13 +199,6 @@ echo "── selected=$selected"
 # integration binary only looks like an exception, because there the full path IS
 # the bare name.
 #
-# **ONE remedy, and the draft that branched per runner was WRONG about nextest.**
-# It said nextest has no `--exact` and told the reader to reach for
-# `-E 'test(=…)'`. Measured on cargo-nextest 0.9.143: `--exact` IS accepted after
-# `--`, with libtest's semantics — a bare `--lib` name selects 0 and the full path
-# selects 1, exactly as under `cargo test`, and `cargo nextest run --help` documents
-# it. Writing a remedy that names a flag as absent is the same defect class this
-# whole warning exists for, one level up, so the branch is gone.
 if [ "$selected" != 1 ] && [ "$selected" != "?" ]; then
     echo "── WARNING: this filter selected $selected tests, and a break record names ONE."
     if [ "$selected" = 0 ]; then
@@ -246,9 +209,8 @@ if [ "$selected" != 1 ] && [ "$selected" != "?" ]; then
         echo "──   A break that reddens ANY of them satisfies a record naming one, so"
         echo "──   nothing downstream can say WHICH test printed the watched sentence."
         echo "──   Take the FULL name — \`cargo test\` with these same cargo args and"
-        echo "──   \`-- --list\`, or \`cargo nextest list\` with them — pass THAT as the"
-        echo "──   filter, and add \`-- --exact\` to the cargo args. Both runners match"
-        echo "──   \`--exact\` against the WHOLE name, so a BARE name under --lib"
+        echo "──   \`-- --list\` — pass THAT as the filter, and add \`-- --exact\` to"
+        echo "──   the cargo args. \`--exact\` matches the WHOLE name, so a BARE name under --lib"
         echo "──   selects zero with it."
     fi
 fi

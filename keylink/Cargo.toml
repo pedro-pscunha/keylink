@@ -252,3 +252,11 @@ workspace = true
 [[example]]
 name = "durable_ledger"
 required-features = ["persist-file"]
+
+# The authoritative gate combines native integration modules into one libtest
+# process. `test = false` keeps ordinary `cargo test` and `clippy --all-targets`
+# from running/linting the same sources twice; the canonical tasks select it by name.
+[[test]]
+name = "gate"
+path = "gate-tests/gate.rs"
+test = false

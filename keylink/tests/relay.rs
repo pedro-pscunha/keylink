@@ -338,7 +338,6 @@ async fn a_relayed_connection_upgrades_to_a_direct_path() {
 // reaching n0's infrastructure, and a gate that needs the internet fails on a
 // train. So it is `#[ignore]`d and run on demand:
 //
-//     cargo nextest run --test relay --run-ignored all
 //     cargo test --test relay -- --ignored
 //
 // Run it when you change `Node::bind`, bump iroh, or suspect n0's defaults have

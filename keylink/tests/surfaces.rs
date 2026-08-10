@@ -174,9 +174,8 @@ fn key(text: &str) -> IdempotencyKey {
 /// arise here.
 ///
 /// The filter is this test's own name plus `-p keylink --test surfaces`, and the
-/// harness appends it **positionally**: a plain substring under both runners,
-/// never a nextest filterset. A filterset handed there matches nothing, runs
-/// zero tests and exits 4, which the banner prints as a caught defect.
+/// harness appends it **positionally** as a plain libtest substring. A filterset
+/// handed there matches nothing, which the banner prints as a caught defect.
 #[tokio::test]
 async fn one_function_calls_four_surfaces() {
     let server = local_node().await;

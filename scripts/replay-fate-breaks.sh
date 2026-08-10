@@ -81,14 +81,9 @@ run() {
     # name. A break that reddened the wrong test, reported as success.
     #
     # **THE COUNT ITSELF MOVED INTO `break-once.sh`, and that is a correctness fix
-    # rather than tidying.** It used to be a `[0-9]+ passed; [0-9]+ failed` regex
-    # here. That is libtest's wording; `cargo nextest run` prints
-    # `Summary [ 0.109s] 2 tests run: …`, so under the runner the gate itself uses,
-    # and which `break-once.sh`'s header calls required, the regex matched nothing,
-    # BOTH arms below fell through, and a stanza passed on the sentence alone —
-    # precisely the state the count was added to end. The harness now counts under
-    # either runner, prints one `── selected=` line, and prints the remedy, so the
-    # `replay-anchors` task and every hand-run are covered by the same reading.
+    # rather than tidying.** Every consumer now reads the same `── selected=` line
+    # and the same remedy, so the replay task and every hand-run cannot disagree
+    # about whether one guard actually ran.
     #
     # `?` means the harness found NO totals line: an abort, or a tree that did not
     # compile. That is not zero and it is not two. It is left to the `expected`

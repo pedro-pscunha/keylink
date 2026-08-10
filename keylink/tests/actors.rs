@@ -50,8 +50,8 @@ use keylink::{
 //
 // (That said "a hundred-odd" until the merge gate caught it. The figure came from
 // `grep -c '^async fn \|#\[tokio::test\]'`, which counts the ATTRIBUTE line and the
-// `fn` line as two — an item count read as a test count. `cargo nextest list -p
-// keylink --test actors` counts tests, and counts 48.)
+// `fn` line as two — an item count read as a test count. `cargo test -p keylink
+// --test actors -- --list` counts tests, and counts 48.)
 //
 // **The compiler says whether that set is right, so no count is written here.**
 // `cargo check -p keylink --no-default-features --all-targets` builds this file

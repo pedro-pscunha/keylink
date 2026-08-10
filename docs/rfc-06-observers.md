@@ -1336,3 +1336,23 @@ variant is a compile error at the projection rather than a silent widening of wh
 every service publishes. The cost of that flattening is recorded in RFC-07's
 appendix of the same date, under local fidelity, and it is a trade rather than a
 win.
+
+---
+
+## Appendix, 2026-08-10: the test runner changed again
+
+The 2026-08-08 appendix records the runner that existed then. It is no longer the
+current command. Process-per-test parallelism made the socket-heavy integration
+suite slower by multiplying endpoint teardown and resource contention.
+
+`mise run test` now selects `keylink/gate-tests/gate.rs`, which includes compatible
+native integration files as modules in one libtest process. `actor_memory`,
+`drift`, `mailbox_latency`, and `reliable` remain separate processes for their
+process-wide measurements, nested Cargo builds, or scheduling-sensitive evidence.
+Doctests remain a second explicit Cargo command. The aggregate's inventory test
+fails when a new native integration file is neither included nor deliberately
+isolated.
+
+The invariant in this RFC is unchanged: the canonical task still selects the
+whole workspace. The implementation is now plain Cargo, and nextest is no longer
+a repository tool.

@@ -39,7 +39,7 @@ lines**, `scripts/replay-fate-breaks.sh`, and a break-record registry.
 
 The wave is dominated by the consumers of the channel being deleted, not by the
 channel. Every figure here is a **measurement at `b1f4422` for sizing**, not a
-claim to verify against — the verifications are `cargo nextest run --workspace`,
+claim to verify against — the verifications are `mise run test`,
 `mise run docs` and `mise run anchors`.
 
 ## 2. Six rulings
@@ -317,7 +317,7 @@ commit, and count its uniqueness **after `cargo fmt`**. `anchors` is step 2 of
 changes the watched text, because `tests/observe.rs:456` asserts
 `Undelivered::ObserverPanicked { name }`.
 
-**Per-commit verification must include `cargo nextest run --workspace`.**
+**Per-commit verification must include `mise run test`.**
 `cargo check --all-targets` and `mise run docs` cannot see a red suite, and the
 sites that "fail at run time" are green to both.
 
@@ -381,7 +381,7 @@ failing run, never compute it.**
 | `Gone` crosses as a typed variant | after the wave **five** conditions are both-sided, not four. The equality test must assert `Gone` too, and it is the newest one |
 | `Failed` has no in-crate producer | `rg 'RemoteError::Failed\(\|Self::Failed\(' keylink/src` returns only the carved-out `turns.rs:4775` and any break-record doc line. **There is no `Middleware` producer to expect** — it lives in user code (`rpc.rs:1438`) |
 | The hash moved once | both pins updated in commit 5 from one failing run, release note written naming **both** tests — `CONTRIBUTING.md:197-210` names only the first |
-| Nothing regressed | `mise run gate` (18 steps), `cargo nextest run --workspace`, `mise run anchors`, `mise run replay-anchors`, `mise run docs` under `-D warnings` |
+| Nothing regressed | `mise run gate` (18 steps), `mise run test`, `mise run anchors`, `mise run replay-anchors`, `mise run docs` under `-D warnings` |
 
 **Already discharged at `b1f4422`:** the audit is tracked under
 `docs/audits/2026-08-09-local-vs-remote/` (7 files). Do not re-do it.
@@ -414,7 +414,7 @@ stops compiling". Surface B **is** most of that set.
 
 **The instruction is the predicate, never a total**, and there are two of them:
 every site matching on `Failed` text or a prefix, and every site naming a
-collapsing variant. The verification is `cargo nextest run --workspace` green.
+collapsing variant. The verification is `mise run test` green.
 
 The enumerated floor, which is a starting point and not a boundary. Three use
 the const and break at compile time
