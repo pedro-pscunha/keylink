@@ -126,14 +126,32 @@ fn binaries() -> &'static (PathBuf, PathBuf) {
 /// The ALPN a binary presents, taken from the binary rather than from a
 /// literal.
 ///
-/// `demo connect` prints its ALPN before it dials, so this reads one line and
-/// kills the child rather than waiting for a dial that is meant to fail.
+/// `demo connect` prints its ALPN **before anything that can fail**, so this
+/// reads one line and kills the child rather than waiting for a dial that is
+/// meant to fail.
+///
+/// *Before it dials* is what this said, and it was the weaker property: the
+/// print sat under `dial_target` and the bind, so a transient failure in either
+/// exited the child before the line and left this reading EOF. `main.rs`'s
+/// comment at that `println!` is the other half of this pair.
+///
+/// **The child's stderr is inherited, and that is this function's only
+/// diagnostic.** It was `Stdio::null()`, which cost two blocked pushes: when the
+/// child dies before printing, the reader below sees EOF, `alpn` is `None`, and
+/// the panic could say only that no line arrived — whatever the child said about
+/// why went to `/dev/null`. Inheriting costs nothing on the passing path, since
+/// nextest discards a passing test's captured output and prints it on failure.
+///
+/// It is inherited rather than piped **because piping can hang this function**:
+/// nothing here drains stderr until the stdout read finishes, so a child that
+/// filled the stderr pipe buffer would block writing it, never write stdout, and
+/// leave the reader below waiting on an EOF that cannot come.
 fn alpn_of(demo: &Path) -> String {
     let mut child = Command::new(demo)
         .args(["connect", PEER_ID])
         .env("KEYLINK_OFFLINE", "1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("demo connect starts");
 
@@ -148,9 +166,21 @@ fn alpn_of(demo: &Path) -> String {
 
     // Before the unwrap, so a missing line does not also leak a process.
     let _ = child.kill();
-    let _ = child.wait();
+    // Kept, because it separates the two ways this can fail. On the passing path
+    // we killed a live child and this reports the signal. On the failing path the
+    // child had already exited on its own — `kill` changed nothing — so this
+    // reports what it exited with, which is the fact the old message lacked.
+    // `to_string` rather than `{:?}`, which renders the raw wait status: an
+    // ordinary exit 1 prints as `unix_wait_status(256)` and reads like a number
+    // the reader has to decode. `Display` prints `exit status: 1`.
+    let ended = match child.wait() {
+        Ok(status) => status.to_string(),
+        Err(error) => format!("unreadable ({error})"),
+    };
 
-    alpn.expect("demo connect prints its alpn before it dials")
+    alpn.unwrap_or_else(|| {
+        panic!("demo connect prints its alpn before it dials; it ended with {ended} instead")
+    })
 }
 
 /// A `demo serve` running on loopback, and the address a peer needs to reach it.

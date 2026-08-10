@@ -491,6 +491,18 @@ async fn serve() -> Result<()> {
 }
 
 async fn connect(id: &str, upload: Option<&str>) -> Result<()> {
+    // First, and above everything that can fail. `inventory::alpn()` is a pure
+    // function of the type set: it needs neither the peer nor a bound node, so
+    // nothing here is waiting on it. `keylink/tests/drift.rs` reads this line to
+    // learn what contract a binary derives, and it is the only way to ask a
+    // binary that from outside.
+    //
+    // Under it, that read is a race rather than a question. A transient failure
+    // in `dial_target` or in the bind below exits 1 with the line never printed,
+    // and the test can only observe that as EOF — no line, no reason, and a
+    // discarded stderr. That is what it did, on an otherwise green gate.
+    println!("alpn:      {}", String::from_utf8_lossy(inventory::alpn()));
+
     let peer = dial_target(id)?;
     let node = if offline() {
         offline_node().await?
@@ -498,7 +510,6 @@ async fn connect(id: &str, upload: Option<&str>) -> Result<()> {
         Node::bind_from_env("KEYLINK_SECRET").await?
     };
 
-    println!("alpn:      {}", String::from_utf8_lossy(inventory::alpn()));
     println!("dialing as: {}", node.id());
 
     let client = inventory::Client::connect(&node, peer.clone()).await?;
