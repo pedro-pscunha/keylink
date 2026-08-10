@@ -50,7 +50,7 @@ deletes more than it adds — keep it that way).
 **Caveats:** every `arche-*` skill is for a Python monorepo and is irrelevant
 here. The write-goal template's Python gates (`pyright`, `p:full-check`, cassettes,
 testcontainers) do **not** apply; this repo's gates are `mise run gate`,
-`cargo nextest run --workspace`, `mise run anchors`, `mise run docs`,
+`mise run test`, `mise run anchors`, `mise run docs`,
 `mise run replay-anchors`.
 
 ## Scope
@@ -193,7 +193,7 @@ pub enum Undelivered /* renamed */ { Turn(Withheld), Reentrant }
       release-note sentence `CONTRIBUTING.md:196-210` requires.
 - [ ] `mise run gate` exits 0 — **18 declared steps** (`mise.toml`'s gate list;
       the run prints more banners than that, which is not the same count).
-- [ ] `cargo nextest run --workspace` green; `mise run anchors` green with
+- [ ] `mise run test` green; `mise run anchors` green with
       `RECORD_BLOCKS` **read off the failing run**; `mise run replay-anchors`
       N of N at `── selected=1`; `mise run docs` clean under `-D warnings`.
 - [ ] `git diff main...HEAD -- docs/ | rg '^-' | rg -v '^---'` prints **only**
@@ -276,7 +276,7 @@ Worktree via `wt switch -c`. Atomic commits.
 ```text
 Satisfy every success criterion and Definition-of-done item in
 docs/goals/2026-08-09-one-failure-vocabulary.md. AS THE FINAL STEP print the full
-proof state in ONE block: `mise run gate` (exit 0), `cargo nextest run --workspace`
+proof state in ONE block: `mise run gate` (exit 0), `mise run test`
 (0 failed), `mise run anchors`, `mise run replay-anchors` (N of N), `mise run docs`
 (clean), `rg 'PANICKED|OBSERVER_PANICKED|RESTARTING|DROPPED|REFUSED'
 keylink/src/reply.rs` (empty), `rg 'RemoteError::Failed\(' keylink/src` (Middleware

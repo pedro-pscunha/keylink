@@ -79,8 +79,8 @@ MISE description="Replay each REDNESS row's break and check it reddens its own g
 #     reported at all. Its actor consumes nothing, so at one slot the second of
 #     three `mail.send(..).await`s parks forever — BEFORE the assertion that would
 #     have caught the wrong count. It was killed by hand at 120 s. There is no
-#     in-test timeout, and `.config/nextest.toml` sets `slow-timeout` with no
-#     `terminate-after`, so nextest prints `SLOW` and then waits with you.
+#     in-test timeout, so the runner waits until the replay harness's outer
+#     deadline classifies the hang.
 #
 #     **A hang is the break being OBSERVED, not the harness being broken.** A guard
 #     that stops reporting under a substitution felt that substitution. Scoring it
@@ -173,11 +173,10 @@ MISE description="Replay each REDNESS row's break and check it reddens its own g
 #
 # And the `hang` arm requires a line saying the runner got PAST its build. `running `
 # is libtest's and `Finished ` is cargo's, and both were read off the one measured
-# `break-once.sh` log these fixtures are shaped on. `Starting ` is nextest's and is
-# NOT confirmed here — `BREAK_RUNNER` can select nextest, and no nextest log was in
-# hand. The set is CONSERVATIVE BY DIRECTION: a marker it does not know costs a false
-# FAILURE whose message names its own remedy, and it can never buy a false pass. For
-# a checker that is the direction to be wrong in.
+# `break-once.sh` log these fixtures are shaped on. The set is CONSERVATIVE BY
+# DIRECTION: a marker it does not know costs a false FAILURE whose message names its
+# own remedy, and it can never buy a false pass. For a checker that is the direction
+# to be wrong in.
 #
 # ── THE CLASSIFIER IS A PURE FUNCTION, AND `--selftest` IS WHAT THAT BUYS ──────
 #
@@ -225,8 +224,8 @@ MISE description="Replay each REDNESS row's break and check it reddens its own g
 # would make every arm above decoration.
 #   * `run_watched`'s SIGTERM replaced by SIGKILL, so the restore trap is skipped:
 #     `FAIL the killed shell ran its restore trap` / `the trap left '<no file>'`,
-#     exit 1. The probe's own `sleep` still died, so the process-group half of that
-#     call is not what this perturbation proves.
+#     exit 1. The probe's own `sleep` ignores SIGTERM and still dies under the
+#     group escalation, so this perturbation isolates the restore half.
 #
 # ── AND THE REPLAY IS IN NO GATE, A CORRECTNESS CLAIM AND NOT A SPEED ONE ──────
 #
@@ -476,16 +475,22 @@ def run_watched(argv: list[str], seconds: int) -> tuple[str, bool]:
             done.wait(timeout=seconds)
         except subprocess.TimeoutExpired:
             killed = True
-            for sig in (signal.SIGTERM, signal.SIGKILL):
-                try:
-                    os.killpg(group, sig)
-                except ProcessLookupError:
-                    break
-                try:
-                    done.wait(timeout=GRACE)
-                    break
-                except subprocess.TimeoutExpired:
-                    continue
+            try:
+                os.killpg(group, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                done.wait(timeout=GRACE)
+            except subprocess.TimeoutExpired:
+                pass
+            # The group leader can exit after restoring the file while a child
+            # ignores SIGTERM. Escalate the GROUP even when `done` is already
+            # reaped; stopping at the leader is how an earlier run orphaned cargo.
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            done.wait()
         return sink.read_text(errors="replace"), killed
     finally:
         sink.unlink(missing_ok=True)
@@ -684,16 +689,20 @@ def selftest() -> int:
     # The arms above are strings, and a string cannot show that the signal reached the
     # runner or that the restore ran. This one drives `run_watched` for real. The pid
     # file is what makes the GROUP half checkable: the shell's child has to be gone
-    # too, not just the shell, and a PID-only signal leaves it running.
+    # too, not just the shell. The child deliberately ignores SIGTERM, proving the
+    # SIGKILL escalation still reaches the group after its leader restored and exited.
     scratch = pathlib.Path(tempfile.mkdtemp(prefix="replay-anchors-selftest-"))
-    marker, pidfile = scratch / "trap-ran", scratch / "child-pid"
+    marker, pidfile, ready = (scratch / "trap-ran", scratch / "child-pid",
+                              scratch / "ready")
     probe = scratch / "sleeping-break.sh"
     try:
         probe.write_text("#!/usr/bin/env bash\nset -euo pipefail\n"
                          f'restore() {{ echo RESTORED >> "{marker}"; }}\n'
                          "trap restore EXIT\n"
                          'echo "── broken: <nothing at all>"\n'
-                         f'sleep 120 & echo "$!" > "{pidfile}"\n'
+                         f"bash -c 'trap \"\" TERM; echo READY > \"{ready}\"; "
+                         "exec sleep 120' &\n"
+                         f'echo "$!" > "{pidfile}"\n'
                          "wait\n")
         probe.chmod(0o755)
         out, killed = run_watched([str(probe)], 2)
@@ -701,6 +710,9 @@ def selftest() -> int:
               f"run_watched returned killed={killed} for a shell that sleeps 120 s")
         check("the killed run's partial output is kept", "── broken:" in out,
               f"the sink held {out!r}, so a hang would be scored with nothing to read")
+        armed = ready.read_text().strip() if ready.exists() else "<no file>"
+        check("the child was armed to ignore the graceful signal", armed == "READY",
+              f"the readiness marker held {armed!r}, so the escalation was not tested")
         trap = marker.read_text().strip() if marker.exists() else "<no file>"
         check("the killed shell ran its restore trap", trap == "RESTORED",
               f"the trap left {trap!r}: a break killed this way would stay in the file")

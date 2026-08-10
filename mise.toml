@@ -44,16 +44,6 @@
 # different build times and one confused bug report.
 "aqua:mozilla/sccache" = "0.17.0"
 
-# Test runner. `cargo test` runs test BINARIES one after another; this runs them
-# as parallel processes. Measured here: 34 binaries, 73.4s serial.
-#
-# `ubi:` and not `aqua:` — there is no aqua registry entry for nextest. Two
-# things this line has to spell out, both of which fail as a 404 or an empty
-# archive if you drop them: releases are tagged `cargo-nextest-<version>` rather
-# than the bare version, and the binary inside the archive is `cargo-nextest`
-# while the repository is `nextest`.
-"ubi:nextest-rs/nextest[exe=cargo-nextest]" = "cargo-nextest-0.9.143"
-
 # The harness `mise run wasm-browser` runs keylink's wasm module under. It is
 # the `wasm-bindgen-test-runner` binary out of the wasm-bindgen release archive;
 # `exe=` picks it, because that archive also carries `wasm-bindgen` itself and
@@ -273,27 +263,38 @@ description = "Clippy at both feature ends, every target"
 # until the targets started compiling.
 run = [
     "cargo clippy --all-targets --all-features -- -D warnings",
+    # The aggregate is `test = false`, so `--all-targets` deliberately skips it.
+    # Select it here: it is executable gate code, not an unlinted build artifact.
+    "cargo clippy -p keylink --test gate --all-features -- -D warnings",
     "cargo clippy -p keylink --lib --no-default-features -- -D warnings",
 ]
 
 # ── tests ───────────────────────────────────────────────────────────────────
 
 [tasks.test]
-description = "The whole workspace, binaries in parallel, then the doctests"
-# `cargo test` runs test BINARIES one after another. Measured on this workspace:
-# 34 binaries, 73.4s of execution, of which one binary was 30.2s and the rest of
-# the machine sat idle. nextest runs them as parallel processes.
+description = "Every test once, with native integration suites sharing one process"
+# Starting one process PER TEST made the socket-heavy suite take about ten
+# minutes under nextest: each process paid iroh's teardown cost, and twelve of
+# them fought over the same endpoint resources. Plain Cargo avoids that mistake
+# but starts one process per integration FILE, paying the same two-second drain
+# repeatedly.
 #
-# **The second line is not redundant. nextest NEVER runs doctests.**
-# `cargo test --workspace` was running 22 of them at default features, and
-# `features` runs doctests only at the no-default and `file` ends — a different
-# set. Delete the `--doc` line and the `Versioned` doctest hole reopens, which
-# is the hole `.mise/tasks/features` was extended to close in the first place.
+# `gate-tests/gate.rs` is the middle ground: ordinary native integration files
+# remain independently runnable, while this command includes the safe ones as
+# modules in one libtest process. Four suites stay separate because they use a
+# process-wide measurement, nested Cargo, or scheduling-sensitive handshake
+# evidence. The manifest marks the aggregate `test = false`, so an ordinary
+# `cargo test` does not run everything twice. Its inventory test fails if a new
+# native test file is omitted.
 #
-# `--no-fail-fast` on the doctest line so a doctest failure still reports every
-# other doctest, matching what nextest does for the binaries above it.
+# Unit tests and keylink's native integrations share one workspace feature
+# resolution. A wildcard second selection picks up every integration target in
+# other current or future workspace members; keylink's inventory guard owns its
+# exceptional selection. `--no-fail-fast` reports later targets after one fails.
+# Doctests need their own command whenever Cargo target selectors are present.
 run = [
-    "cargo nextest run --workspace",
+    "cargo test --workspace --lib --bins --test gate --test actor_memory --test drift --test mailbox_latency --test reliable --no-fail-fast",
+    "cargo test --workspace --exclude keylink --test '*' --no-fail-fast",
     "cargo test --workspace --doc --no-fail-fast",
 ]
 

@@ -714,7 +714,7 @@ verified with **all four** of:
 
 ```
 cargo check --workspace --all-targets
-cargo nextest run --workspace
+mise run test
 mise run docs
 cargo test -p keylink --test protocol contract_hash_has_not_moved
 ```
@@ -827,7 +827,7 @@ refusal below quotes the argument that already exists rather than inventing one.
 | The new names resolve from a consumer's position | `tests/api.rs` gains `Calls`, `Governed` and `Failure` — it is "the only place in the repo these names are written from a consumer's position" (`tests/api.rs:36-38`) | **EXISTS** (file), **TO WRITE** (the lines) |
 | The generated code compiles for every kind | `mod expansion` (`macros.rs:4059-4060`) already declares all five kinds and two feeds. Add nothing; the trait must expand there or the commit does not build. `mise run features` runs it across eight feature subsets (`macros.rs:4053-4055`) | **EXISTS** |
 | The wire did not move | `the_contract_hash_has_not_moved` (`tests/protocol.rs:1250`) and `the_inspect_contract_hash_has_not_moved` (`tests/protocol.rs:1379`) stay **green**, at every commit | **EXISTS** |
-| Nothing regressed | `mise run gate`, `cargo nextest run --workspace`, `mise run anchors`, `mise run replay-anchors`, `mise run docs` under `-D warnings` | **EXISTS** |
+| Nothing regressed | `mise run gate`, `mise run test`, `mise run anchors`, `mise run replay-anchors`, `mise run docs` under `-D warnings` | **EXISTS** |
 
 **Both `compile_fail` doctests use a BARE fence, and name `E0277` in a comment
 inside the doctest.** Do not write ```` ```compile_fail,E0277 ````. The crate has

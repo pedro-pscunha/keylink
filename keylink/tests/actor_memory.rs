@@ -6,11 +6,10 @@
 //! four tests: `LIVE` is process-wide, so two `#[test]`s sharing a process
 //! measure each other.
 //!
-//! That reason used to read "cargo runs the tests in a binary on parallel
-//! threads". The gate runs nextest now, which gives every test its own process,
-//! so that sentence stopped being true while the conclusion stayed correct.
-//! Keep the phases: the shape must not depend on which runner is in use, and a
-//! plain `cargo test` still shares one process across a binary's tests.
+//! The fast gate combines ordinary integration suites into one process, but
+//! deliberately keeps this target separate. Keep the phases too: the shape must
+//! not depend on which runner is in use, and a plain `cargo test` still shares
+//! one process across a binary's tests.
 //!
 //! The numbers this prints are the answer to "can one service hold ten thousand
 //! live actors": the framework's own cost per actor, with an empty state, so a

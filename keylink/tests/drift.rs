@@ -106,14 +106,8 @@ fn build_demo(name: &str, features: &[&str]) -> PathBuf {
 ///
 /// Swapped is built first so the tree is left in its default feature state, and
 /// `OnceLock` keeps two test threads from running two cargo processes at each
-/// other.
-///
-/// **The `OnceLock` is only half the guard now.** It spans threads, and the gate
-/// runs this file under nextest, which gives every test its own PROCESS. The
-/// other half lives in `.config/nextest.toml`, as a `max-threads = 1` test group
-/// filtered to `binary(drift)`. Delete that group and these two tests build and
-/// copy at each other again — see the comment there for what that actually
-/// costs. Neither half is sufficient alone.
+/// other. The gate deliberately runs `drift` as its own libtest process, so the
+/// lock spans both tests and the nested builds contend with no aggregate test.
 fn binaries() -> &'static (PathBuf, PathBuf) {
     static BINARIES: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
     BINARIES.get_or_init(|| {
@@ -140,7 +134,7 @@ fn binaries() -> &'static (PathBuf, PathBuf) {
 /// child dies before printing, the reader below sees EOF, `alpn` is `None`, and
 /// the panic could say only that no line arrived — whatever the child said about
 /// why went to `/dev/null`. Inheriting costs nothing on the passing path, since
-/// nextest discards a passing test's captured output and prints it on failure.
+/// libtest captures a passing test's output and prints it on failure.
 ///
 /// It is inherited rather than piped **because piping can hang this function**:
 /// nothing here drains stderr until the stdout read finishes, so a child that

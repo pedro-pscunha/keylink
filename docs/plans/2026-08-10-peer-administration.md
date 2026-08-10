@@ -381,8 +381,8 @@ written. Append to the table below instead.
 
 `lint-fast` is `cargo clippy -p keylink --lib` (`mise.toml:258`) — **library
 target only** — so a green `pre-commit` is not proof a commit compiles. Verify
-each commit with `cargo check --workspace --all-targets`, `cargo nextest run
---workspace` and `mise run docs` before it lands.
+each commit with `cargo check --workspace --all-targets`, `mise run test` and
+`mise run docs` before it lands.
 
 | # | Commit | ALPN pin | anchors registry | rustdoc links |
 |---|---|---|---|---|
@@ -473,7 +473,7 @@ three regions — `demo/src/main.rs`, **two under `keylink/examples/`**
 (`durable_ledger.rs:30` and `reliable_call.rs:54`), and 25 under
 `keylink/tests/` — measured at `2dd3eb4` for sizing. All of them regenerate;
 only `protocol.rs` pins a literal, and `api.rs` is compile-only. The
-verification is `cargo nextest run --workspace` green **and `mise run examples`
+verification is `mise run test` green **and `mise run examples`
 green**, not this count.
 
 **The examples are run, not built.** `mise.toml:300-313` names each example on
@@ -539,7 +539,7 @@ commit 4**, or fold any registry edit into commit 3.
 | `WireRequest` gained nothing | `WireRequest` still has exactly `Call` and `KeyState` (`reply.rs:227-236`) |
 | No destructive verb reaches a peer | `rg -n 'shutdown\|abort\|evict_idle\|mount' keylink/src/macros.rs` names no generated client or served arm |
 | The hash moved once | both pins updated in commit 2 from one failing run showing **two** failures, and the release note names **both** tests, as `CONTRIBUTING.md:199-201` already does |
-| Nothing regressed | `mise run gate` (18 steps), `cargo nextest run --workspace`, `mise run anchors`, `mise run replay-anchors`, `mise run docs` |
+| Nothing regressed | `mise run gate` (18 steps), `mise run test`, `mise run anchors`, `mise run replay-anchors`, `mise run docs` |
 | The new break records actually replay | **`scripts/replay-fate-breaks.sh`, run by hand.** Nothing in the gate replays a break record — `replay-anchors` self-tests the classifier and `mise.toml:158-164` says the replaying arm "is in no list and cannot be" |
 
 ## 6. Tests this wave asks somebody to write

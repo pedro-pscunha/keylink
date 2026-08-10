@@ -66,7 +66,7 @@ the reviewer never fixes its own).
 arche Python monorepo and is irrelevant to this Rust crate. The write-goal
 template's Python gates (`pyright`, `mise run p:full-check`, `dict[`/`Optional`
 greps, cassettes/testcontainers) do **not** apply; this repo's gates are
-`mise run gate`, `cargo nextest run --workspace`, `mise run anchors`,
+`mise run gate`, `mise run test`, `mise run anchors`,
 `mise run docs`, `mise run replay-anchors`.
 
 ## Scope
@@ -255,7 +255,7 @@ Each is binary and names its proof. Proofs must be **printed in the transcript**
       with no `Inspect` connection — proven by a test that stands up **one**
       server and asserts both.
 - [ ] `Undelivered` keeps `Clone + PartialEq + Eq` and every existing
-      `assert_eq!` on it still compiles — `cargo nextest run --workspace` green.
+      `assert_eq!` on it still compiles — `mise run test` green.
 - [ ] `mise run gate` exits 0, all 22 steps, output printed.
 - [ ] `mise run anchors` green; `RECORD_BLOCKS` **read off the failing run**, and
       the ledger entry says which run printed it.
@@ -368,7 +368,7 @@ Isolated worktree via worktrunk (`wt switch -c <branch>` — never raw
 
 - [ ] Every success criterion proven, evidence printed.
 - [ ] Diff inside the blast radius; no unrequested refactors.
-- [ ] `mise run gate` green (22 steps), `cargo nextest run --workspace` green,
+- [ ] `mise run gate` green (22 steps), `mise run test` green,
       `mise run anchors` green, `mise run replay-anchors` N of N,
       `mise run docs` clean.
 - [ ] Review waves clean — no open Critical/Major.
@@ -385,8 +385,7 @@ Isolated worktree via worktrunk (`wt switch -c <branch>` — never raw
 ```text
 Satisfy every success criterion and Definition-of-done item in
 docs/goals/2026-08-09-one-service-one-trait.md. AS THE FINAL STEP, print the full
-proof state in ONE block: `mise run gate` output (exit 0, 22 steps), `cargo nextest
-run --workspace` (0 failed), `mise run anchors`, `mise run replay-anchors` (N of N),
+proof state in ONE block: `mise run gate` output (exit 0, 22 steps), `mise run test` (0 failed), `mise run anchors`, `mise run replay-anchors` (N of N),
 `mise run docs` (clean under -D warnings), `git diff main...HEAD -- docs/ | rg '^-' |
 rg -v '^---'` (identifier renames only), and the invariant-compliance wave's
 per-invariant pass/fail verdict. The hashed contract may move ONCE and only once.

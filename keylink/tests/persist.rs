@@ -21,8 +21,8 @@
 // of a feature.
 //
 // (This said "thirty-two copies of one condition" until the merge gate caught it.
-// `cargo nextest list -p keylink --test persist` counts 13, or 15 with
-// `--run-ignored all` for two `#[ignore]`d measurements. Thirty-two was a grep that
+// `cargo test -p keylink --test persist -- --list` counts 15, including two
+// `#[ignore]`d measurements. Thirty-two was a grep that
 // counted each test's attribute line and its `fn` line separately.)
 #![cfg(feature = "persist-file")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
