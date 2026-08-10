@@ -3744,9 +3744,9 @@ two lines now, and `scripts/replay-fate-breaks.sh` runs the whole set.
 | `remote::no_other_served_failure_begins_with_one_of_the_five` | `RouteError::AtCapacity`'s `Display` gains a `"dropped: "` prefix |
 | `defer::a_local_caller_and_a_peer_agree_about_an_abandoned_deferred` | `lost`'s `Standing::Running` arm → `NoSuchActor` |
 | `defer::a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer` | the same arm → `Failed("panicked: bad")` |
-| `defer::a_stopped_actor_still_tells_a_peer_no_such_actor` | the default `Inbox::ending` → `Standing::Running` |
-| `defer::an_aborted_actor_tells_a_peer_no_such_actor` | `LocalActor::abort`'s settle → `Standing::Running` |
-| `defer::an_aborted_keyed_actor_tells_a_peer_no_such_actor` | `Mailbox`'s `Drop` → `Standing::Running` |
+| `defer::a_stopped_actor_still_tells_a_peer_the_actor_is_gone` | the default `Inbox::ending` → `Standing::Running` |
+| `defer::an_aborted_actor_tells_a_peer_the_actor_is_gone` | `LocalActor::abort`'s settle → `Standing::Running` |
+| `defer::an_aborted_keyed_actor_tells_a_peer_the_actor_is_gone` | `Mailbox`'s `Drop` → `Standing::Running` |
 | `defer::a_keyed_actor_destroyed_by_an_expired_budget_tells_a_peer_no_such_actor` | the same |
 | `supervision::a_peer_whose_factory_panicked_is_told_the_actor_is_gone` | `supervise`'s per-iteration floor disarmed before the factory call |
 | `supervision::a_peer_whose_feed_panicked_is_told_the_actor_is_gone` | `run_loop`'s floor disarmed before the loop |
@@ -4595,3 +4595,184 @@ Cite `no_other_served_failure_begins_with_one_of_the_five` and read the array,
 which is the form §15.1 prefers and the only one that cannot rot: the guard
 renders every case it knows about, and the assertion is against the bytes rather
 than against a total.
+
+---
+
+## 18. Appendix, 2026-08-09: the prefixes are gone, and four arguments went with them
+
+Appended, and **nothing above is edited.** Wave 1 replaced five `Failed(String)`
+prefixes with one typed `Withheld` on the wire. This section is this file's rename
+ledger, in the form §4.11 established for `MailboxClosed`: prose above naming an
+old identifier is **read** through the table and is not rewritten.
+
+| was | is | at |
+| --- | --- | --- |
+| `Withheld`, the private observer verdict in `turns.rs` | `ObserverVerdict` — the public `Withheld` took the word | `ec242c2` |
+| `EndReason`, defined in `console.rs` | moved beside the type it projects, in `observe.rs` | `c165009` |
+| `Undelivered` | `Unanswered` | `8acd7be` |
+| `deliver_to_local` | `deliver_to_singleton` | `80098e4` |
+| `NodeStatus::lost` | `NodeStatus::dropped` | `0c6e6c3` |
+| `RemoteError::{PANICKED, REFUSED, RESTARTING, DROPPED, OBSERVER_PANICKED}` | deleted — `RemoteError::Withheld(Withheld)` carries the value | `0c6e6c3`, `5198ecb` |
+
+**The collapse, at `44399de`.** Three enums listed the same losses and only one of
+the lists was on the wire. `TurnLost` is `Turn(Withheld)`, `Faulted(Panic)` and
+`Reentrant`; `Unanswered` is `Turn(Withheld)` and `Reentrant`. The losses are
+written once, in `Withheld`. **Every figure in §4.11, §15.1 and §16 about how many
+variants either enum has is now a figure about a different type**, and none of
+them is edited: read them as records of their own wave, and read the current width
+off `every_withheld`'s return type, which is the guard rather than a total.
+
+Renamed at `44399de`, under `CONTRIBUTING.md`'s carve-out and edited in place in
+§12.8's table: `defer::a_stopped_actor_still_tells_a_peer_no_such_actor`,
+`an_aborted_actor_tells_a_peer_no_such_actor` and
+`an_aborted_keyed_actor_tells_a_peer_no_such_actor` all end
+`..._tells_a_peer_the_actor_is_gone`, because what they assert is now `Gone` and
+not `NoSuchActor`. Deleted, at `44399de` and `5198ecb`:
+`no_failure_prefix_is_a_prefix_of_another`,
+`no_other_served_failure_begins_with_one_of_the_five`,
+`the_five_prefixes_are_the_text_a_peer_matches_on`, and
+`the_gone_answer_is_not_a_failed_and_carries_no_prefix` — whose successor
+`the_gone_answer_says_the_actor_ran_and_stopped_rather_than_naming_an_id` asserts
+the variant a peer receives rather than the absence of a prefix.
+
+**§17.3 ends by saying "cite `no_other_served_failure_begins_with_one_of_the_five`
+and read the array".** That instruction is spent: the guard was deleted at
+`5198ecb` with the strings it rendered. It is not re-pointed at a surviving test,
+because no surviving test makes that claim — there are no prefixes to collide.
+
+### 18.1 §15's ruling has expired
+
+§15 was written to freeze a name. It ruled that
+`every_turn_lost_except_faulted_has_one_undelivered_twin_with_the_same_words`
+should keep its name while a count inside its bullet was corrected by append.
+
+**That guard no longer exists.** `44399de` deleted it and put
+`one_vocabulary_and_every_loss_in_it_has_a_producer` in its place — not a rename
+but a different assertion, because after the collapse there is no twin to compare:
+one vocabulary means the two doors return the same values, and what needs guarding
+instead is that every variant in that vocabulary has something that builds it.
+
+The ruling is recorded as expired and **is not re-litigated**. §15's reasoning was
+right for the tree it was written against, and §15.1's numberless sentence — *"two
+exhaustive matches, and both are `error[E0004]` the moment either enum grows"* — is
+the part that survived the collapse, exactly as §15.1 predicted it would.
+
+### 18.2 Two break records lost their search literal, and neither is re-quoted
+
+`CONTRIBUTING.md`'s carve-out was widened in this wave to cover a break record's
+**search literal**, on the ground that a literal is a pointer into a source file
+and a stale one stops the record running at all. Two records in §4.11 fall under
+it and are still **not** edited, because the carve-out permits re-quoting a rename
+and these are restructures:
+
+- `Standing::Restarting(reason) => TurnLost::Restarting(reason),` — one line on
+  `main`, now a struct-variant arm spanning three, building
+  `Withheld::Restarting { reason: EndReason::from(&*reason) }`.
+- `Err(TurnLost::Refused { name }) => Err(Undelivered::Refused { name }),` — one
+  line on `main`; the `Refused` arm no longer exists on that path at all, because
+  the value passes through as `Turn(withheld)`.
+
+Writing a fresh literal for either would invent a break nobody ran. Both are
+recorded here as spent. Neither record is registered in `.mise/tasks/anchors`, so
+no gate saw them go stale — which is the hand-maintained registry's own documented
+limitation doing exactly what it says it does, rather than a new finding.
+
+### 18.3 `Gone` and `NoSuchActor` are distinct now, and that overturned two written arguments
+
+A peer could not previously tell *this actor ran and has stopped* from *no actor
+was ever mounted here*: both arrived as `NoSuchActor`. They are separate values
+now — `Withheld::Gone` and `RemoteError::NoSuchActor` — and
+`the_gone_answer_says_the_actor_ran_and_stopped_rather_than_naming_an_id` is what
+makes that a decision rather than a drift.
+
+**Two things that were written down are overturned by it, and both were correct
+when written.**
+
+The first is `reply.rs`'s anti-enumeration argument for `NoSuchActor`: that
+distinguishing "never existed" from "was stopped" would leak that an id was once
+real. That argument is **narrowed, not deleted**, and the narrowing is the whole
+subtlety. `NoSuchActor` still refuses to make that distinction, and it still must:
+it answers a *lookup*, and a lookup that found nothing is all it knows. What
+changed is that an actor which ran and stopped no longer reaches that variant at
+all — it answers `Withheld::Gone`, from a verdict its own loop settled. The
+enumeration risk was never about the actor that ran; it was about the id. So the
+cost is real and is worth naming: a peer that holds an `ActorId` and gets
+`Withheld::Gone` now learns the id **was** real, where before the two answers were
+indistinguishable. That is a deliberate trade for a peer being able to tell
+*retry* from *stop asking*, and a future proposal to widen `NoSuchActor` again
+must pay it back.
+
+The second is a comment that no goal named and that the wave deleted in passing.
+Above `lost`'s `Standing::Gone` arm, `main` read: *"NOT a `Failed`: this is the one
+of the three where there is nothing here, stop asking is true."* That sentence was
+the argument for routing a gone actor to `NoSuchActor`, and it was load-bearing
+for one wave. It is false now in its own terms — *there is nothing here* is exactly
+what the new arm declines to say — and the replacement comment says so, keeping
+the instruction the peer relied on: a peer that matched `NoSuchActor` to mean
+"stop calling" still gets that instruction, from a variant that no longer conflates
+*it ran and ended* with *it never existed*.
+
+### 18.4 Local fidelity was lost, and this is a trade rather than a win
+
+`TurnLost::Restarting(Arc<Ended>)` carried the **whole** `Ended`, including
+`Ended::Observer`'s and `Ended::Feed`'s `Arc<dyn Error + Send + Sync>` and every
+link of its `source()` chain. A local caller matching on a lost turn could walk
+that chain from the failure value it already held.
+
+`Withheld::Restarting { reason: EndReason }` cannot. `EndReason` is the projection
+of an ending that has a schema, and it flattens both error arms to `String`:
+`EndReason::Observer { name, error }` and `EndReason::Feed { name, error }` are
+`String` fields, and `EndReason::Panicked { message }` is one too. **A trait object
+is not data, so a wire type cannot hold one** — that is the reason, and it is a
+good one, but it is not free.
+
+The chain is still reachable: `Handle::ended()` returns the real `Ended`, `Arc`
+and all. What a local caller lost is that the chain used to **ride the failure
+value** and now takes a second call to a different door. Anybody who reads §18.3
+as a straight improvement should read this section as its price: the wave bought
+one vocabulary across both sides by making the local side carry the
+schema-shaped form of an ending rather than the richest one.
+
+### 18.5 `Withheld` is exhaustive, and the ALPN is not why
+
+`Withheld` is deliberately **not** `#[non_exhaustive]`, and the argument is
+`FollowRefused`'s caller-action test: an enum whose every caller does the same
+thing with every variant is sealed, and an enum a caller must be **made** to look
+at a new arm of is not. `Withheld` is the second kind — `Restarting` means retry,
+`Gone` means stop calling, `Refused` means an observer vetoed a turn that ran, and
+a `_ =>` arm silently picks one of those for a caller who never read the fourth.
+`console.rs` is the worked example: a new variant there is a new operator-visible
+state, and a wildcard would report it as an existing one.
+
+**The ALPN is not the argument in either direction**, and the reason to say so
+plainly is that the two mechanisms are about different compatibilities and neither
+substitutes for the other:
+
+- `#[non_exhaustive]` governs **source** compatibility, for a downstream crate
+  **recompiling** against a new keylink. It decides whether adding a variant breaks
+  someone's `match`.
+- The ALPN governs **runtime** wire compatibility, between two **already-built**
+  peers. It decides whether a drifted peer is refused at the handshake.
+
+A new variant moves the ALPN whichever attribute the type carries, so the
+handshake refuses a stale peer in both worlds; the attribute only decides what a
+peer that *can* decode the new variant is allowed to do with it. **Do not read
+this section as a precedent for stripping `#[non_exhaustive]` from `RemoteError`.**
+`RemoteError` is on the same wire and keeps the attribute, on the other half of
+the same rule: it is *handled*, not exhausted — a caller's sensible response to an
+unrecognised serving-side failure is to report it, not to be forced to name it.
+
+### 18.6 Both ALPN pins moved once
+
+One change, both services, one commit — `0c6e6c3`:
+
+| service | was | is |
+| --- | --- | --- |
+| `keylink/Probe` | `d75913b8a4742547` | `75cb158fa0f636c8` |
+| `keylink/Inspect` | `0572763878b7fb9d` | `f62a21fb09137ace` |
+
+Read off the failing run and not computed, which is the only way a hash may be
+written down. Two pins moved because `RemoteError` is carried by every service and
+`Withheld` entered it, so this is the ordinary case rather than a surprise:
+`CONTRIBUTING.md`'s wire-contract section named only the first test for several
+waves and now names both.

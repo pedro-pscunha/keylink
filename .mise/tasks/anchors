@@ -283,9 +283,17 @@ MISE description="Every quoted break anchor resolves exactly once in its target"
 #
 # Deriving it would mean parsing prose for "replacing `X` with `Y` in `path`",
 # and a heuristic that misses a record checks nothing while reporting success.
-# So the list is explicit, exactly as `turns.rs`'s
-# `no_failure_prefix_is_a_prefix_of_another` spells out its four prefixes and
-# says a fifth has to be added by hand.
+# So the list is explicit, exactly as `turns.rs` once spelled out its `Failed`
+# prefixes by hand and said a new one had to be added to that list the same way.
+# The test then called `no_failure_prefix_is_a_prefix_of_another` was DELETED in
+# the wave that replaced the prefixes with a typed `Withheld` on the wire - there
+# are no prefixes left for it to compare against each other. It is named here as
+# the precedent it was, and deliberately NOT re-pointed at a surviving test:
+# nothing in the tree now makes this argument, and swapping in a live name would
+# turn a historical citation into a false current one.
+#
+# The argument it lent is untouched. A derived list that misses an entry checks
+# nothing while reporting success, which is why this one is written out.
 #
 # **The honest limitation, and it is larger than it sounds: this checks the
 # records REGISTERED below, not the records that exist.** A sweep of every
@@ -1049,9 +1057,15 @@ ANCHORS = [
     # two sizes - each reddens a test the other leaves green, measured both ways.
     ("D15", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "                grown.extend(outer.iter().cloned());"),
-    # ── from the `reply-not-gone` branch, where `Unanswered` went from *the actor
-    # is gone* to six variants and `answered` started reading `Fate` to choose
-    # between three of them. `E` for items E+F, on `D`'s reasoning: a fresh letter
+    # ── from the `reply-not-gone` branch, where the type THEN CALLED `Undelivered`
+    # went from *the actor is gone* to six variants and `answered` started reading
+    # `Fate` to choose between three of them. Both halves are that branch's and
+    # neither describes today: it is `Unanswered` now, renamed in the wave that put
+    # a typed `Withheld` on the wire, and that same wave collapsed it to two
+    # variants - `Turn(Withheld)` and `Reentrant` - because the list of losses it
+    # used to spell inline moved into `Withheld`, whose width `every_withheld`
+    # carries in its own return type. Read the era, not the number.
+    # `E` for items E+F, on `D`'s reasoning: a fresh letter
     # cannot collide with a reserved numeric gap by arithmetic.
     #
     # ALL FOUR cross-file, so each record's own quote lives in a `tests/*.rs` file
@@ -2462,11 +2476,18 @@ for record in sorted((FRAGMENT_ANCHORS & resolved) - fragments):
 # rebase that correctly re-quotes a record and forgets this list leaves the gate
 # validating a string no record uses - green.
 #
-# `turns.rs`'s `no_failure_prefix_is_a_prefix_of_another` is NOT the precedent for
-# a hand-written list of copies. Its own comment says it "names the consts rather
-# than the strings, so it cannot drift from the wire" - hand-written *references*
-# to one source of truth. A doc comment cannot be referenced from Python, so the
-# copy is unavoidable here; what was avoidable is leaving it unchecked.
+# The test then called `no_failure_prefix_is_a_prefix_of_another` was NOT the
+# precedent for a hand-written list of copies. Its own comment said it "names the
+# consts rather than the strings, so it cannot drift from the wire" - hand-written
+# *references* to one source of truth. A doc comment cannot be referenced from
+# Python, so the copy is unavoidable here; what was avoidable is leaving it
+# unchecked.
+#
+# That test was DELETED with the prefixes it guarded, in the wave that put a typed
+# `Withheld` on the wire. The distinction it illustrates - a reference cannot
+# drift, a copy can - is why this list is checked, and it outlives the example.
+# No surviving test is substituted for it here, for the reason given at the top of
+# this file: a live name in place of a dead one reads as a current claim.
 #
 # ── the haystack is BACKTICKED SPANS IN COMMENTS, and both narrowings were bugs
 #

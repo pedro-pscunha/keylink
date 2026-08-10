@@ -894,3 +894,70 @@ collide, rather than the eye.
 
 Cite the guard rather than the number it currently spells, which is the form §9.1
 already prefers for callers.
+
+---
+
+## Appendix, 2026-08-09: the guard cited above was deleted, and both pins moved
+
+Appended, and **nothing above is edited** — including the appendix immediately
+above this one, which is three commits old and already overtaken. Wave 1 replaced
+the five `Failed(String)` prefixes with one typed `Withheld` on the wire.
+
+| was | is | at |
+| --- | --- | --- |
+| `Withheld`, the private observer verdict in `turns.rs` | `ObserverVerdict` | `ec242c2` |
+| `EndReason`, defined in `console.rs` | moved beside the type it projects, in `observe.rs` | `c165009` |
+| `Undelivered` | `Unanswered` | `8acd7be` |
+| `deliver_to_local` | `deliver_to_singleton` | `80098e4` |
+| `NodeStatus::lost` | `NodeStatus::dropped` | `0c6e6c3` |
+| the five `RemoteError` prefix consts | deleted — `RemoteError::Withheld(Withheld)` | `0c6e6c3`, `5198ecb` |
+
+**The collapse, at `44399de`:** `Unanswered` is `Turn(Withheld)` and `Reentrant`,
+and the losses are listed once, in `Withheld`. Tests deleted at `44399de` and
+`5198ecb`: `no_failure_prefix_is_a_prefix_of_another`,
+`no_other_served_failure_begins_with_one_of_the_five`,
+`the_five_prefixes_are_the_text_a_peer_matches_on` and
+`the_gone_answer_is_not_a_failed_and_carries_no_prefix`.
+
+### The instruction the appendix above gives cannot be followed
+
+That appendix corrected §9.2's "four prefixes" to five and told the reader to cite
+`turns::tests::no_failure_prefix_is_a_prefix_of_another` rather than count. **That
+guard was deleted at `5198ecb`**, along with the prefixes it compared: a typed
+variant cannot be a prefix of another variant, so there is nothing left to check.
+It is deliberately **not** re-pointed at a surviving test. Substituting a live name
+for a dead one would turn a historical citation into a claim about today, which is
+the failure mode §9.1 exists to prevent and the reason this is an append.
+
+**§9.2's own argument is untouched, and it never depended on the guard.** §9.2
+cites that test only as *precedent* for writing a list out by hand instead of
+deriving it, and the precedent holds regardless of whether the example still
+compiles: a heuristic that parses prose for *"replacing `X` with `Y`"* and misses a
+record checks nothing while reporting success. The registry stays hand-written for
+that reason. `.mise/tasks/anchors` carries the same citation in three comments;
+those are marked as historical in this wave rather than re-pointed, for this
+section's reason.
+
+### The honest limitation from §9.1 was exercised, twice
+
+§9.1 records that *"a record added without an entry there is unchecked"*. This
+wave produced two worked examples of the cost, both in RFC-07 §4.11: break records
+whose search literal named `Undelivered` or a `TurnLost` arm that this wave
+restructured. Neither record is registered, so `mise run anchors` stayed green at
+exit 0 across all six code commits while both literals went stale. RFC-07 §18.2
+records them as spent rather than re-quoting them, because a restructure has no
+rename to apply and a fresh literal would be a break nobody ran.
+
+That is the limitation behaving exactly as documented, not a new defect — but it
+is the first time the file can point at an instance instead of a hypothetical.
+
+### Both ALPN pins moved once, at `0c6e6c3`
+
+| service | was | is |
+| --- | --- | --- |
+| `keylink/Probe` | `d75913b8a4742547` | `75cb158fa0f636c8` |
+| `keylink/Inspect` | `0572763878b7fb9d` | `f62a21fb09137ace` |
+
+Read off the failing run, never computed. `RemoteError` is carried by every
+service, so a variant added to it moves every pin — the keyed side is not special
+here, and a wave that sees one pin go red should expect the other.

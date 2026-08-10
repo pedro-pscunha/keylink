@@ -3703,11 +3703,11 @@ stale the way §16.12's did.
 | §16.12's row | where the mark is now |
 | --- | --- |
 | `System::deliver`, after `mail.send` resolves `Ok` → `enqueued()` | `keylink/src/actor/remote.rs::deliver_to_actor` — same placement, below every refusal above it and above the wait, for the reason §16.12 gives |
-| `LocalActor::ask_catching_before`, once the permit is in hand → `enqueued()` | `keylink/src/local.rs::deliver_to_local`, after `sent.is_err()` is ruled out |
-| keyed loop, queue-deadline expiry arm → `unrun()` | `keylink/src/local.rs::turn`, the `if expired` arm |
+| `LocalActor::ask_catching_before`, once the permit is in hand → `enqueued()` | `keylink/src/turns.rs::deliver_to_singleton`, after `sent.is_err()` is ruled out |
+| keyed loop, queue-deadline expiry arm → `unrun()` | `keylink/src/turns.rs::turn`, the `if expired` arm |
 | keyed loop, decode-refusal arm → `unrun()` | **no such arm.** See below |
 | keyed loop, decode-**panic** arm → `unrun()` | **no such arm.** See below |
-| `Handle::service`, `Queued::Expired` arm → `unrun()` | `keylink/src/local.rs::turn`, the same `if expired` arm as row 3 |
+| `Handle::service`, `Queued::Expired` arm → `unrun()` | `keylink/src/turns.rs::turn`, the same `if expired` arm as row 3 |
 
 Rows 3 and 6 landing on one arm is the whole of `c8712b0`: the queue deadline was three
 hand-written comparisons across two dispatchers, two spelled `>` and one `>=`, and it is
@@ -3834,3 +3834,78 @@ and go on, and the capacity is what bounds how far ahead it can get. The keyed a
 on the local path and buys no such thing for a generated keyed client, and the sentence
 that is false above is true there for that reason. Anybody deleting item 3 on the
 strength of this section is deleting a true statement.
+
+---
+
+## Appendix, 2026-08-09: one failure vocabulary, and §5.5's stated reason was false
+
+Appended, and **nothing above is edited.** Wave 1 replaced five `Failed(String)`
+prefixes on the wire with one typed value. Prose above that names an old
+identifier is read through the ledger below and is left as it was written, which
+is the treatment RFC-07 §4.11 already gives `MailboxClosed`.
+
+| was | is | at |
+| --- | --- | --- |
+| `Withheld`, the private observer verdict in `turns.rs` | `ObserverVerdict` | `ec242c2` |
+| `EndReason`, defined in `console.rs` | moved beside the type it projects, in `observe.rs` | `c165009` |
+| `Undelivered` | `Unanswered` | `8acd7be` |
+| `deliver_to_local` | `deliver_to_singleton` | `80098e4` |
+| `NodeStatus::lost` | `NodeStatus::dropped` | `0c6e6c3` |
+| the five `RemoteError` prefix consts | deleted — `RemoteError::Withheld(Withheld)` carries the value | `0c6e6c3`, `5198ecb` |
+
+**The collapse, at `44399de`.** Three enums listed the same losses and only one of
+the lists was on the wire. `Unanswered` stopped spelling that list inline: it is
+`Turn(Withheld)` and `Reentrant`, and the losses live once, in `Withheld`. Read
+that width off `every_withheld`'s return type rather than copying a number here.
+
+**Tests deleted at `44399de` and `5198ecb`**, each because the property it pinned
+stopped existing rather than stopped holding:
+`no_failure_prefix_is_a_prefix_of_another`,
+`no_other_served_failure_begins_with_one_of_the_five` and
+`the_five_prefixes_are_the_text_a_peer_matches_on` — there are no prefixes left to
+compare — and `the_gone_answer_is_not_a_failed_and_carries_no_prefix`, whose
+successor `the_gone_answer_says_the_actor_ran_and_stopped_rather_than_naming_an_id`
+asserts the variant a peer receives instead of the absence of a prefix.
+
+### §5.5's conclusion stands; the sentence holding it up did not
+
+The ruling is unchanged and this wave is evidence **for** it. Two types, not one.
+
+One of §5.5's two reasons was never true. It reads: *"A local mailbox has exactly
+one failure: the task is gone"*, and it names `MailboxClosed` as that failure's
+type. `MailboxClosed` was deleted in `4e0fcca`, and the type that replaced it
+carried **seven** variants on `main`, not one — `Gone`, `Dropped`, `Restarting`,
+`Refused`, `ObserverPanicked`, `Expired`, `Reentrant`. Four of those describe a
+turn that *ran*. A local caller could already tell a refusal from a dead actor
+long before this wave, so the premise was false at the time it was written and not
+merely overtaken.
+
+**The other reason is the load-bearing one and is untouched:**
+`Error::Transport`, `Error::Closed`, `Error::SchemaMismatch` and `Error::Remote`
+have no local counterpart, and `Error::SchemaMismatch` still has no honest meaning
+for two objects in one process. That is what makes the rejection permanent.
+
+**What this wave adds to it.** The two sides do not differ in *how many* ways they
+fail; they differ in **vocabulary**, and the vocabularies do not merge in either
+direction. `Unanswered::Reentrant` is local-only — a peer cannot make a re-entrant
+call, because it is not inside the turn. `Unauthorized`, `TimedOut` and
+`NoSuchActor` are facts about a connection, a budget and a lookup, none of which a
+local `ask` has. What the two share is the middle — *the turn itself went wrong* —
+and extracting exactly that middle into `Withheld` is this wave. Each side now
+carries the shared part identically and keeps its own type for the part that is
+its own. A unified handle would still have to hold the union, which is the design
+§5.5 rejects. Re-argue any future unification against that, not against the
+one-failure sentence.
+
+### The `file:symbol` table under §16.12 was re-pointed
+
+*"Where each row went"* declares itself a `file:symbol` table, so its cells are
+pointers and `CONTRIBUTING.md`'s carve-out reaches them. Row 2's symbol became
+`deliver_to_singleton` in this wave (`80098e4`). The file half of rows 2, 3 and 6
+was **older rot, from `ee382e8`**, which moved `local.rs` wholesale into
+`turns.rs`; it is corrected here rather than left, because a table whose stated
+purpose is to resolve should resolve. Both targets were read at `5198ecb` before
+the edit: `turns.rs::deliver_to_singleton` contains the `enqueued()` mark, and
+`turns.rs::turn` contains the `if expired` arm and its `unrun()`. The descriptive
+clauses in those cells — *"after `sent.is_err()` is ruled out"* — are claims, not
+pointers, and are **not** edited.
