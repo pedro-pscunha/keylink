@@ -28,11 +28,12 @@
 //!    is encoded as, and postcard encodes an enum variant by declaration index
 //!    with no name on the wire.
 //! 3. **`Body`'s two browser constructors.** These exist for exactly one target
-//!    and had never run on it. `from_web_stream`'s whole reason to return a
-//!    `Result` is that `wasm_streams` PANICS through `expect_throw` on a stream
-//!    that cannot make a BYOB reader — a JS exception, not an unwind, so under
-//!    `panic = "abort"` it ends the module. That claim was untested on the only
-//!    target that can evaluate it.
+//!    and had never run on it. `from_web_stream` refuses a stream that cannot make
+//!    a BYOB reader instead of letting a JS exception end the module.
+//! 4. **The portable topic timeout.** This target checks all four `Patience`
+//!    boundaries without waiting for the accepted maximum, then exercises the
+//!    browser timer and confirms timeout removes the subscriber without queuing
+//!    the item that exceeded its patience.
 //!
 //! Not covered, said here rather than left to be assumed: no `Node`, no
 //! `Server`, no `Client`, no connection, no actor turn, and nothing at all from
@@ -48,28 +49,31 @@
 //! answer: does the derivation RUN, is it stable across calls, and does it still
 //! discriminate between two schemas.
 //!
-//! # The two breaks, watched
+//! # The three breaks, watched
 //!
-//! Both are DESCRIBED and not quoted. A record in the file it breaks makes its
-//! own quote a second occurrence of the literal unless indentation separates the
-//! two, and both edits below are at column 0 — which is the same-file case
-//! `.mise/tasks/anchors` says to describe. Neither is registered there for that
-//! reason.
+//! The first two are described rather than quoted because each edits this file at
+//! column zero; quoting either search literal here would make a second occurrence.
+//! The third edits `topic.rs`, so its quoted literal is registered in
+//! `.mise/tasks/anchors`.
 //!
 //! 1. **The browser is not assumed.** Comment out the
 //!    `wasm_bindgen_test_configure!` call below. The runner then sends this file
-//!    to Node, where **all four tests pass in 0.01s** — the vacuous green this
+//!    to Node, where **all tests pass under Node** — the vacuous green this
 //!    whole task exists to refuse. `mise run wasm-browser` was red anyway, on
 //!    its own check of the runner's announced engine:
 //!    `── the tests passed, but NOT in a browser.`
 //! 2. **A failure in a page reaches the shell.** Change the expected length in
-//!    `a_browser_file_becomes_a_body_that_knows_its_length` from
-//!    `Some(contents.len() as u64)` to that expression `+ 1`. The task exits 1
-//!    with the assertion's own message,
-//!    `the receiver would not be able to refuse this body on size`, and the file
-//!    and line it panicked at. A browser panic is a JS exception, so this is not
-//!    free: it proves the runner turns one back into a test failure rather than
-//!    into a page that stops.
+//!    `a_browser_file_becomes_a_body_that_knows_its_length` by one. The task exits
+//!    1 with the assertion's own message and source line.
+//! 3. **The portable timeout and constructor domain are evaluated here.** The
+//!    independent fractional and maximum substitutions recorded beside the native
+//!    boundary test also fail this Chrome target at their corresponding browser
+//!    assertions. Their production search literals are
+//!    `let whole_millis = duration.subsec_nanos().is_multiple_of(1_000_000);` and
+//!    `let portable = duration.as_millis() <= i32::MAX as u128;`. The timeout
+//!    guard was broken separately by replacing `return Poll::Ready(None);` with
+//!    `return Poll::Ready(Some(Ok(())));`; Chrome reported one delivery instead
+//!    of one drop. The native equality guard separately swaps the poll order.
 
 // Empty on every other target. The runner is `wasm-bindgen-test-runner` and the
 // harness is a browser, neither of which a native `cargo test` has; the file is
@@ -77,8 +81,12 @@
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::compose::{Fanout, Overflow, Patience, Topic};
 use keylink::{derive_alpn, Body, Error, Outcome, RemoteError, WireResponse};
+use n0_future::time::Duration;
+use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -211,4 +219,48 @@ fn a_stream_without_a_byob_reader_is_refused() {
         Err(other) => panic!("refused, but for the wrong reason: {other}"),
         Ok(_) => panic!("a default ReadableStream was accepted as a byte stream"),
     }
+}
+
+/// All portable constructor boundaries run under the browser clock. The accepted
+/// maximum is constructed but never awaited.
+#[wasm_bindgen_test]
+fn patience_constructor_boundaries_hold_in_a_browser() {
+    assert_eq!(
+        Patience::try_after(Duration::ZERO),
+        Err(keylink::compose::PatienceError)
+    );
+    assert_eq!(
+        Patience::try_after(Duration::from_nanos(1_000_001)),
+        Err(keylink::compose::PatienceError),
+        "fractional milliseconds are not portable"
+    );
+
+    let largest = Duration::from_millis(i32::MAX as u64);
+    assert!(Patience::try_after(largest).is_ok());
+    assert_eq!(
+        Patience::try_after(largest + Duration::from_millis(1)),
+        Err(keylink::compose::PatienceError)
+    );
+}
+
+/// The portable timeout path runs on the browser clock: a full subscriber is
+/// removed, keeps only its accepted item, and then ends.
+#[wasm_bindgen_test]
+async fn a_timed_out_topic_subscriber_is_removed_in_a_browser() {
+    let topic = Topic::new(Overflow::BlockThenDrop {
+        depth: NonZeroUsize::MIN,
+        patience: Patience::try_after(Duration::from_millis(1)).expect("portable patience"),
+    });
+    let mut slow = topic.subscribe();
+    assert_eq!(topic.publish(1_u8).await.delivered, 1);
+    assert_eq!(
+        topic.publish(2).await,
+        Fanout {
+            delivered: 0,
+            dropped: 1,
+            gone: 0,
+        }
+    );
+    assert_eq!(slow.next().await, Some(1));
+    assert_eq!(slow.next().await, None);
 }

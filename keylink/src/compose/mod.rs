@@ -54,7 +54,8 @@
 //! | pattern | what a slow consumer costs | how it is bounded |
 //! |---|---|---|
 //! | [`Topic`] with [`Overflow::BlockPublisher`] | the publisher waits after the configured depth is full | a finite, non-zero channel per subscriber. [`publish`](Topic::publish) returns when every channel has accepted the item, not when every subscriber has consumed it |
-//! | [`Topic`] with [`Overflow::DropSubscriber`] | the subscriber is unsubscribed, loudly, after the configured depth is full | a finite, non-zero channel per subscriber. The item that exceeds the bound ends that subscriber's stream, so its actor ends as [`Ended::Feed`](crate::Ended::Feed) |
+//! | [`Topic`] with [`Overflow::BlockThenDrop`] | the publisher waits up to that subscriber's [`Patience`], then unsubscribes it loudly | a finite, non-zero channel per subscriber. Accepted buffered items drain before the stream ends |
+//! | [`Topic`] with [`Overflow::DropSubscriber`] | the subscriber is unsubscribed loudly as soon as the configured depth is full | a finite, non-zero channel per subscriber. The item that exceeds the bound ends that subscriber's stream, so its actor ends as [`Ended::Feed`](crate::Ended::Feed) |
 //! | [`Pool`] | the caller waits, on that member's own mailbox | the pool holds **no** queue at all. [`pick`](Pool::pick) hands back a handle; the wait is the ordinary mailbox permit |
 //! | [`Factory`] | the caller waits, on the chosen member's own mailbox | the factory holds **no** queue at all. [`dispatch`](Factory::dispatch) hands back a [`Permit`](crate::Permit); the wait is the ordinary mailbox permit, taken before the caller's arguments move |
 //! | [`every`] | the next run is late | a run in progress is never re-entered and a missed tick is never queued. The period is a floor on the *gap*, not a rate |
@@ -139,4 +140,4 @@ pub use keyed::Endings;
 pub use names::Names;
 pub use pool::{Member, Pool};
 pub use schedule::{after, every, Scheduled};
-pub use topic::{Fanout, Overflow, Subscription, Topic};
+pub use topic::{Fanout, Overflow, Patience, PatienceError, Subscription, Topic};

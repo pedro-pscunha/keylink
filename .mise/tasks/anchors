@@ -1280,6 +1280,33 @@ ANCHORS = [
      "        let (to, from) = mpsc::channel(depth.get());"),
     ("Q3", "keylink/src/representability.rs", "keylink/src/compose/topic.rs",
      "    BlockPublisher(NonZeroUsize),"),
+    # ── C2 `BlockThenDrop` guards, each observed red and quoted honestly ─────
+    ('C2A', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     'let whole_millis = duration.subsec_nanos().is_multiple_of(1_000_000);'),
+    ('C2B', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     'if elapsed.as_mut().poll(cx).is_ready() {\n                        return Poll::Ready(None);\n                    }\n                    send.as_mut().poll(cx).map(Some)'),
+    ('C2C', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     '    async fn publish_block_then_drop(&self, item: T, patience: Patience) -> Fanout {\n        let to = self.lock().to_vec();\n        let mut delivered = 0;\n        let mut dropped = 0;\n        let mut gone = 0;\n\n        for one in to {\n            let Some(deadline) = Instant::now().checked_add(patience.0) else {'),
+    ('C2D', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     '    async fn publish_block_then_drop(&self, item: T, patience: Patience) -> Fanout {\n        let to = self.lock().to_vec();\n        let mut delivered = 0;\n        let mut dropped = 0;\n        let mut gone = 0;\n\n        for one in to {'),
+    ('C2E', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     '                Some(Err(_)) => {'),
+    ('C2F', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     '                let _ordered = self.publish_order.lock().await;'),
+    ('C2G', 'keylink/src/compose/topic.rs', 'keylink/src/compose/topic.rs',
+     '            let Some(deadline) = Instant::now().checked_add(patience.0) else {\n                self.remove_subscriber(&one);\n                drop(one);\n                dropped += 1;\n                continue;\n            };'),
+    ('C2H', 'keylink/src/representability.rs', 'keylink/src/compose/topic.rs',
+     '    BlockThenDrop {\n        /// The finite, non-zero channel depth for each subscriber.\n        depth: NonZeroUsize,\n        /// How long one full subscriber may hold this publish.\n        patience: Patience,\n    },'),
+    ('C2I', 'keylink/tests/browser.rs', 'keylink/src/compose/topic.rs',
+     'let whole_millis = duration.subsec_nanos().is_multiple_of(1_000_000);'),
+    ('C2J', 'keylink/tests/browser.rs', 'keylink/src/compose/topic.rs',
+     'let portable = duration.as_millis() <= i32::MAX as u128;'),
+    ('C2K', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     '            .retain(|canonical| !canonical.same_channel(sender));'),
+    ('C2L', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     'pub struct Patience(Duration);'),
+    ('C2M', 'keylink/tests/browser.rs', 'keylink/src/compose/topic.rs',
+     'return Poll::Ready(None);'),
     # ── `compose::Group` and `compose::Endings` ──────────────────────────────
     #
     # Twenty-two substitutions were run in the paired gate worktree before any row
@@ -3534,7 +3561,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # `first_available`'s racers — and the two moved together for once. Read off the
 # failing run: `FAIL population: 195 comment blocks mention break-once.sh, but
 # RECORD_BLOCKS says 194.`
-RECORD_BLOCKS = 198
+RECORD_BLOCKS = 203
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

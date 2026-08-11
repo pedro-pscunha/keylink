@@ -7,6 +7,12 @@
 //! | a topic keeps no history, so a late subscriber is not a buffer | `a_topic_with_nobody_listening_drops_the_item_rather_than_keeping_it` |
 //! | `DropSubscriber` accepts its configured depth, then unsubscribes the full subscriber | `drop_subscriber_accepts_two_items_before_removing_the_subscriber` |
 //! | `BlockPublisher` accepts its configured depth, then blocks on the full subscriber | `block_publisher_accepts_two_items_before_blocking` |
+//! | `Patience` accepts only the portable whole-millisecond timer domain | `patience_accepts_only_portable_whole_milliseconds` |
+//! | `BlockThenDrop` waits through the tick before a deadline and timeout wins equality | `block_then_drop_waits_until_the_exact_deadline_and_timeout_wins_equality` |
+//! | each sequential subscriber gets fresh patience | `block_then_drop_starts_patience_for_each_subscriber` |
+//! | cancellation leaves only a delivered subscription-order prefix | `cancelling_block_then_drop_leaves_only_a_delivered_prefix` |
+//! | delivered, dropped, and gone are distinct; accepted items drain; and removal is scoped to one channel | `block_then_drop_accounts_for_every_loud_outcome_and_preserves_healthy_subscribers` |
+//! | two publishers are ordered before a drop is reported | `block_then_drop_orders_two_publishers_before_reporting_a_drop` |
 //! | a slow subscriber under `DropSubscriber` at explicit depth one is unsubscribed and its actor ends **naming the feed** | `a_slow_subscriber_is_unsubscribed_and_its_actor_ends_naming_the_feed` |
 //! | a slow subscriber under `BlockPublisher` at explicit depth one **stops the publisher** instead of growing a buffer | `a_slow_subscriber_blocks_the_publisher_instead_of_growing_a_buffer` |
 //! | a pool spreads turns, and its report agrees with the actor that handled each | `a_pool_spreads_turns_and_each_member_says_which_one_it_is` |
@@ -47,17 +53,13 @@
 //!
 //! # Two ways time is kept out of the assertions, and they are different ways
 //!
-//! **The topic tests read no clock at all.** They borrow `tests/feeds.rs`'s
-//! device: a `hold` method that parks the actor inside one turn, so "a slow
-//! subscriber" is a state the test *constructs* and then releases, rather than a
-//! state it waits for and hopes to catch. Every count below is therefore exact.
-//! A slow subscriber is precisely one that is inside a turn when the next item
-//! arrives, which is the same definition the mailbox already uses.
+//! **The original topic tests read no clock.** They borrow `tests/feeds.rs`'s
+//! device: a `hold` method parks an actor inside one turn, so "slow" is a state
+//! the test constructs rather than a state it waits for and hopes to catch.
 //!
-//! **The scheduler tests pause the clock.** They have no choice — a schedule is
-//! *defined* by elapsed time — so they run on
-//! `#[tokio::test(start_paused = true)]`. No assertion here waits for real time
-//! to pass, and none compares two real instants.
+//! **The scheduler and `BlockThenDrop` tests pause the clock.** Both behaviours
+//! are defined by elapsed time, so they use `#[tokio::test(start_paused = true)]`.
+//! No assertion waits for real time or uses a wall-clock upper bound.
 //!
 //! They move the clock with **`tokio::time::sleep`, never
 //! `tokio::time::advance`**, and that is not a style preference: two of these
@@ -105,7 +107,7 @@ use std::sync::{Arc, Mutex};
 
 use keylink::compose::{
     after, every, Added, Endings, Factory, Fanout, Group, GroupEnded, Membership, Names, Overflow,
-    Pool, Routing, Sample, Shard, Subscription, Topic, Verdict,
+    Patience, PatienceError, Pool, Routing, Sample, Shard, Subscription, Topic, Verdict,
 };
 use keylink::{
     ActorId, Backpressure, Caller, Ended, Eviction, Intensity, Lifecycle, NotQueued, Observer,
@@ -256,6 +258,286 @@ fn desk(fills: Subscription<u64>) -> (desk::Handle<Desk>, mpsc::UnboundedReceive
             release,
         },
     )
+}
+
+/// The private `Patience` field is guarded from a real downstream crate by the
+/// `compile_fail` probe on `Patience` itself. Made red by replacing
+/// `pub struct Patience(Duration);` with `pub struct Patience(pub Duration);`.
+/// Watched through `cargo test -p keylink --doc`: the probe compiled, so rustdoc
+/// reported "Test compiled successfully, but it's marked compile_fail."
+///
+/// `Patience` is exactly the portable `setTimeout` domain: non-zero whole
+/// milliseconds through `i32::MAX`, and no other duration.
+///
+/// Three independent breaks prove the three rejection dimensions. The existing
+/// zero break replaced `if duration.is_zero() || !whole_millis || !portable {`
+/// with `if !portable {` and accepted zero. The fractional break replaces
+/// `let whole_millis = duration.subsec_nanos().is_multiple_of(1_000_000);` with
+/// `let whole_millis = true;`; watched: "fractional milliseconds are not
+/// portable", left `Ok(Patience(1.000001ms))`, right `Err(PatienceError)`. The
+/// maximum break replaces
+/// `let portable = duration.as_millis() <= i32::MAX as u128;` with
+/// `let portable = true;`; watched: the one-millisecond-above assertion, left
+/// `Ok(Patience(2147483.648s))`, right `Err(PatienceError)`.
+#[tokio::test(start_paused = true)]
+async fn patience_accepts_only_portable_whole_milliseconds() {
+    assert_eq!(Patience::try_after(Duration::ZERO), Err(PatienceError));
+    assert_eq!(
+        Patience::try_after(Duration::from_nanos(1_000_001)),
+        Err(PatienceError),
+        "fractional milliseconds are not portable"
+    );
+
+    let largest = Duration::from_millis(i32::MAX as u64);
+    assert!(Patience::try_after(largest).is_ok());
+    assert_eq!(
+        Patience::try_after(largest + Duration::from_millis(1)),
+        Err(PatienceError)
+    );
+}
+
+/// A full subscriber stays subscribed one tick before its deadline and is
+/// removed at the deadline. When capacity and timeout are both ready, patience
+/// wins: the new item is not queued.
+///
+/// Made red by `scripts/break-once.sh`, swapping the two explicit polls so the
+/// send is polled before the elapsed deadline. Search literal:
+/// `if elapsed.as_mut().poll(cx).is_ready() { return Poll::Ready(None); } send.as_mut().poll(cx).map(Some)`.
+/// Watched: the equality assertion received `Fanout { delivered: 1, dropped: 0,
+/// gone: 0 }` instead of the timeout report.
+#[tokio::test(start_paused = true)]
+async fn block_then_drop_waits_until_the_exact_deadline_and_timeout_wins_equality() {
+    let patience = Patience::try_after(Duration::from_millis(10)).expect("valid patience");
+    let topic = Topic::new(Overflow::BlockThenDrop {
+        depth: NonZeroUsize::MIN,
+        patience,
+    });
+    let mut slow = topic.subscribe();
+    assert_eq!(topic.publish(1_u64).await.delivered, 1);
+
+    let publish = topic.publish(2);
+    tokio::pin!(publish);
+    tokio::select! {
+        biased;
+        _ = n0_future::time::sleep(Duration::from_millis(9)) => {}
+        result = &mut publish => panic!("subscriber expired one tick early: {result:?}"),
+    }
+    assert_eq!(topic.subscribers(), 1, "still subscribed before patience");
+
+    tokio::select! {
+        biased;
+        _ = n0_future::time::sleep(Duration::from_millis(1)) => {}
+        result = &mut publish => panic!("test must make acceptance and timeout equal: {result:?}"),
+    }
+    assert_eq!(slow.next().await, Some(1), "free capacity at the deadline");
+    assert_eq!(
+        publish.await,
+        Fanout {
+            delivered: 0,
+            dropped: 1,
+            gone: 0,
+        },
+        "the subscriber's patience wins equality"
+    );
+    assert_eq!(slow.next().await, None, "the timed-out item was not queued");
+}
+
+/// Each subscriber receives its own full patience from the moment its turn in
+/// the sequential fan-out starts; one subscriber does not spend the next one's.
+///
+/// Made red by `scripts/break-once.sh`, moving the `checked_add` before the loop
+/// so both subscribers shared one deadline. Search literal:
+/// `async fn publish_block_then_drop(&self, item: T, patience: Patience) -> Fanout { let to = self.lock().to_vec(); let mut delivered = 0; let mut dropped = 0; let mut gone = 0; for one in to { let Some(deadline) = Instant::now().checked_add(patience.0) else {`.
+/// Watched: the publish returned with both dropped while the second subscriber
+/// still had nine milliseconds left.
+#[tokio::test(start_paused = true)]
+async fn block_then_drop_starts_patience_for_each_subscriber() {
+    let patience = Patience::try_after(Duration::from_millis(10)).expect("valid patience");
+    let topic = Topic::new(Overflow::BlockThenDrop {
+        depth: NonZeroUsize::MIN,
+        patience,
+    });
+    let mut first = topic.subscribe();
+    let mut second = topic.subscribe();
+    assert_eq!(topic.publish(1_u64).await.delivered, 2);
+
+    let publish = topic.publish(2);
+    tokio::pin!(publish);
+    tokio::select! {
+        biased;
+        _ = n0_future::time::sleep(Duration::from_millis(10)) => {}
+        result = &mut publish => panic!("both subscribers shared one deadline: {result:?}"),
+    }
+    tokio::select! {
+        biased;
+        _ = n0_future::time::sleep(Duration::from_millis(9)) => {}
+        result = &mut publish => panic!("the second subscriber did not get its own patience: {result:?}"),
+    }
+    assert_eq!(topic.subscribers(), 1, "only the first patience elapsed");
+    assert_eq!(
+        publish.await,
+        Fanout {
+            delivered: 0,
+            dropped: 2,
+            gone: 0,
+        }
+    );
+    assert_eq!(first.next().await, Some(1));
+    assert_eq!(first.next().await, None);
+    assert_eq!(second.next().await, Some(1));
+    assert_eq!(second.next().await, None);
+}
+
+/// Cancelling a publish leaves only its delivered subscription-order prefix and
+/// does not unsubscribe the subscriber it was waiting on.
+///
+/// Made red by `scripts/break-once.sh`, changing the subscriber loop to
+/// `for one in to.into_iter().rev() {`. Search literal:
+/// `async fn publish_block_then_drop(&self, item: T, patience: Patience) -> Fanout { let to = self.lock().to_vec(); let mut delivered = 0; let mut dropped = 0; let mut gone = 0; for one in to {`.
+/// Watched: the first subscriber had `None` instead of `Some(Some(2))`, so the
+/// delivered set was not the ordered prefix.
+#[tokio::test(start_paused = true)]
+async fn cancelling_block_then_drop_leaves_only_a_delivered_prefix() {
+    let patience = Patience::try_after(Duration::from_millis(10)).expect("valid patience");
+    let topic = Topic::new(Overflow::BlockThenDrop {
+        depth: NonZeroUsize::MIN,
+        patience,
+    });
+    let mut first = topic.subscribe();
+    let mut blocked = topic.subscribe();
+    let mut last = topic.subscribe();
+    assert_eq!(topic.publish(1_u64).await.delivered, 3);
+    assert_eq!(first.next().await, Some(1), "only the first has capacity");
+
+    assert!(
+        n0_future::future::poll_once(topic.publish(2_u64))
+            .await
+            .is_none(),
+        "the publish waits on the second subscriber"
+    );
+    assert_eq!(
+        n0_future::future::poll_once(first.next()).await,
+        Some(Some(2)),
+        "the reached prefix keeps its item"
+    );
+    assert_eq!(blocked.next().await, Some(1));
+    assert!(
+        n0_future::future::poll_once(blocked.next()).await.is_none(),
+        "outer cancellation did not unsubscribe the current subscriber"
+    );
+    assert_eq!(last.next().await, Some(1));
+    assert!(
+        n0_future::future::poll_once(last.next()).await.is_none(),
+        "the suffix was not reached"
+    );
+    assert_eq!(topic.subscribers(), 3);
+}
+
+/// Delivered, gone, and patience-expired subscribers are counted independently.
+/// The expired subscriber drains its accepted buffer before ending, while the
+/// healthy subscriber remains registered and receives a later publish.
+///
+/// Counting was made red by replacing `Some(Err(_)) => {` with that arm plus
+/// `dropped += 1;`; watched: `dropped` was 2 instead of 1. Channel identity was
+/// made red independently by replacing
+/// `.retain(|canonical| !canonical.same_channel(sender));` with
+/// `.retain(|_canonical| false);`. Watched: the later publish reported zero
+/// deliveries instead of one, proving one neighbour cannot remove the survivor.
+#[tokio::test(start_paused = true)]
+async fn block_then_drop_accounts_for_every_loud_outcome_and_preserves_healthy_subscribers() {
+    let patience = Patience::try_after(Duration::from_millis(10)).expect("valid patience");
+    let topic = Topic::new(Overflow::BlockThenDrop {
+        depth: NonZeroUsize::MIN,
+        patience,
+    });
+    let mut delivered = topic.subscribe();
+    let gone = topic.subscribe();
+    let mut slow = topic.subscribe();
+    assert_eq!(topic.publish(1_u64).await.delivered, 3);
+    assert_eq!(delivered.next().await, Some(1));
+    drop(gone);
+
+    assert_eq!(
+        topic.publish(2).await,
+        Fanout {
+            delivered: 1,
+            dropped: 1,
+            gone: 1,
+        }
+    );
+    assert_eq!(delivered.next().await, Some(2));
+    assert_eq!(slow.next().await, Some(1), "accepted buffer drains");
+    assert_eq!(slow.next().await, None, "then the removed subscriber ends");
+
+    assert_eq!(
+        topic.publish(3).await,
+        Fanout {
+            delivered: 1,
+            dropped: 0,
+            gone: 0,
+        },
+        "only the timed-out and closed channels ended"
+    );
+    assert_eq!(
+        delivered.next().await,
+        Some(3),
+        "the survivor stays subscribed"
+    );
+}
+
+/// The per-topic publish mutex orders publishers without storing their items:
+/// once a fan-out reports a drop, a queued publisher cannot reach that subscriber.
+///
+/// Made red by `scripts/break-once.sh`, replacing
+/// `let _ordered = self.publish_order.lock().await;` with `let _ordered = ();`.
+/// Watched: the second publisher also reported one
+/// dropped subscriber instead of seeing the already-removed topic entry.
+#[tokio::test(start_paused = true)]
+async fn block_then_drop_orders_two_publishers_before_reporting_a_drop() {
+    let patience = Patience::try_after(Duration::from_millis(10)).expect("valid patience");
+    let topic = Topic::new(Overflow::BlockThenDrop {
+        depth: NonZeroUsize::MIN,
+        patience,
+    });
+    let mut slow = topic.subscribe();
+    assert_eq!(topic.publish(0_u64).await.delivered, 1);
+
+    let mut first = Box::pin(topic.publish(1));
+    assert!(
+        n0_future::future::poll_once(first.as_mut()).await.is_none(),
+        "the first publisher holds the publication mutex while it waits"
+    );
+    let mut second = Box::pin(topic.publish(2));
+    assert!(
+        n0_future::future::poll_once(second.as_mut())
+            .await
+            .is_none(),
+        "the second publisher waits behind the first"
+    );
+
+    n0_future::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        first.await,
+        Fanout {
+            delivered: 0,
+            dropped: 1,
+            gone: 0,
+        }
+    );
+    assert_eq!(
+        second.await,
+        Fanout {
+            delivered: 0,
+            dropped: 0,
+            gone: 0,
+        }
+    );
+    assert_eq!(slow.next().await, Some(0));
+    assert_eq!(
+        slow.next().await,
+        None,
+        "nothing arrives after dropped was reported"
+    );
 }
 
 // ────────────────────────────────────────────────────────────── the pool member

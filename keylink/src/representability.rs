@@ -429,8 +429,8 @@ impl HasNoDefault for Intensity {}
 /// derive picked.
 impl HasNoDefault for Overflow {}
 
-/// The exact public shape of [`Overflow`]: two exhaustive policies, each carrying
-/// one finite, non-zero depth.
+/// The exact public shape of [`Overflow`]: three exhaustive policies, each carrying
+/// one finite, non-zero depth, with the bounded-wait policy also carrying patience.
 ///
 /// No arm uses `..`, so adding a field or a variant makes this match fail to
 /// compile at the site that owns the exhaustive-policy argument.
@@ -440,9 +440,19 @@ impl HasNoDefault for Overflow {}
 /// `    BlockPublisher(NonZeroUsize, bool),`. The all-feature library test build
 /// emitted `E0023` at `every_overflow_policy_carries_one_depth`: the pattern had
 /// one field while the changed variant had two.
+///
+/// The new struct arm was broken separately by adding `ignored: bool` to this
+/// exact search literal:
+/// `BlockThenDrop { /// The finite, non-zero channel depth for each subscriber. depth: NonZeroUsize, /// How long one full subscriber may hold this publish. patience: Patience, },`.
+/// The library build emitted `E0027` here because the exact pattern did not
+/// mention it; the two test-only constructors also emitted `E0063`.
 fn every_overflow_policy_carries_one_depth(overflow: Overflow) -> NonZeroUsize {
     match overflow {
         Overflow::BlockPublisher(depth) => depth,
+        Overflow::BlockThenDrop { depth, patience } => {
+            let _: crate::compose::Patience = patience;
+            depth
+        }
         Overflow::DropSubscriber(depth) => depth,
     }
 }

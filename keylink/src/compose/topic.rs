@@ -26,29 +26,25 @@
 //! push a message somebody in this process chose to send fire-and-forget, which
 //! is not what happened.
 //!
-//! # THE DECISION THIS MODULE OWNS — a finite subscriber depth, and two ways to be full
+//! # THE DECISION THIS MODULE OWNS — a finite subscriber depth, three policies, two loud outcomes
 //!
 //! **Each subscriber holds at most the finite, non-zero depth carried by
 //! [`Overflow`].** There is no unbounded spelling. A larger depth absorbs a
 //! finite burst; it cannot hide a subscriber that stays slower than the publisher.
-//! Once the configured depth is full, [`Overflow`] says what happens next:
+//! Once the configured depth is full, [`Overflow`] says when one of two loud
+//! outcomes occurs: the publisher waits, or the subscriber ends.
 //!
-//! - [`Overflow::BlockPublisher`] — [`publish`](Topic::publish) waits until every
-//!   subscriber's bounded channel accepts the item. The topic's sustained rate is
-//!   the slowest subscriber's rate. One wedged subscriber eventually wedges the
-//!   publisher, after its configured depth fills, and that is not a defect of the
-//!   mode, it *is* the mode.
-//! - [`Overflow::DropSubscriber`] — the full subscriber is unsubscribed, its
-//!   stream ends after its accepted items are read, and its actor ends as
-//!   [`Ended::Feed`](crate::Ended::Feed)`{ name }`. The publisher is never
-//!   delayed by it. Nothing is lost quietly: an actor ending is the loudest
-//!   thing this crate can say.
+//! - [`Overflow::BlockPublisher`] waits until every bounded channel accepts the
+//!   item. A wedged subscriber wedges the publisher; that is the mode.
+//! - [`Overflow::BlockThenDrop`] waits up to a fresh [`Patience`] for each
+//!   subscriber in subscription order. A subscriber that does not accept in time
+//!   is removed, drains its accepted items, and then ends.
+//! - [`Overflow::DropSubscriber`] waits no time. A full subscriber is removed,
+//!   drains its accepted items, and then ends.
 //!
-//! There is deliberately **no third policy**. A finite per-subscriber queue does
-//! not reintroduce the unbounded queue that `turns.rs` refuses by name: it moves
-//! the moment at which a burst meets the policy, but it cannot keep growing when
-//! a subscriber is durably slower. At the configured bound the publisher still
-//! blocks or the subscriber still ends.
+//! Both removal policies are loud: ending the stream ends a generated actor as
+//! [`Ended::Feed`](crate::Ended::Feed)`{ name }`. The difference is only whether
+//! the publisher gives that subscriber a bounded chance to catch up.
 //!
 //! There is no [`Default`] for either [`Topic`] or [`Overflow`], for the reason
 //! [`Allowlist`](crate::Allowlist) has none: the policy is a decision about the
@@ -58,11 +54,10 @@
 //!
 //! # Three things this does not promise
 //!
-//! - **`publish` is not atomic.** Under [`Overflow::BlockPublisher`] it offers
-//!   in subscription order, awaiting each; dropping its future leaves the item
-//!   accepted by the subscribers already reached and not by the rest. There is
-//!   no rollback, because an accepted item cannot be recalled. A caller that
-//!   needs all-or-nothing needs a transaction, and a fan-out is not one.
+//! - **`publish` is not atomic.** Both waiting policies offer in subscription
+//!   order. Dropping a future leaves the item accepted by the prefix already
+//!   reached and not by the rest; outer cancellation does not remove the current
+//!   subscriber. There is no rollback because an accepted item cannot be recalled.
 //! - **No ordering across topics, and no ordering against the mailbox.** A
 //!   subscriber's feed items and its mailbox messages are ordered at the actor's
 //!   own `select`, which alternates; see `RFC-07 §5.2`.
@@ -80,22 +75,69 @@
 //!
 //! [`Feeds::new`]: crate::Feeds
 
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 
-use tokio::sync::mpsc;
+use n0_future::time::{sleep_until, Duration, Instant};
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
+
+/// How long [`Overflow::BlockThenDrop`] waits for one subscriber.
+///
+/// The duration is private so every value fits both native timers and a browser's
+/// millisecond `setTimeout`: a non-zero whole number of milliseconds no larger
+/// than `i32::MAX`.
+///
+/// The field is intentionally unavailable to callers, so construction always
+/// passes through [`try_after`](Self::try_after). This downstream probe fails
+/// while that field stays private; the in-crate deadline-overflow test also names
+/// the constructor, so this cannot pass merely because the type or constructor
+/// disappeared:
+///
+/// ```compile_fail
+/// use keylink::compose::Patience;
+///
+/// let _ = Patience(Default::default());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Patience(Duration);
+
+/// Why a [`Patience`] could not be represented by every target clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("patience must be a non-zero whole number of milliseconds no larger than i32::MAX")]
+pub struct PatienceError;
+
+impl Patience {
+    /// Wait for a subscriber for this duration before dropping it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PatienceError`] for zero, fractional milliseconds, values above
+    /// `i32::MAX` milliseconds, or a duration the target clock cannot add to now.
+    pub fn try_after(duration: Duration) -> Result<Self, PatienceError> {
+        let whole_millis = duration.subsec_nanos().is_multiple_of(1_000_000);
+        let portable = duration.as_millis() <= i32::MAX as u128;
+        if duration.is_zero() || !whole_millis || !portable {
+            return Err(PatienceError);
+        }
+        Instant::now()
+            .checked_add(duration)
+            .map(|_| Self(duration))
+            .ok_or(PatienceError)
+    }
+}
 
 /// What happens when an item arrives after a subscriber's finite channel is full.
 ///
-/// Named at the call site with its non-zero channel depth, never defaulted. The
-/// two variants are the only two answers once that bound is reached; see the
-/// module documentation.
+/// Named at the call site with its non-zero channel depth, never defaulted.
+/// Three policies choose when one of two loud outcomes occurs: the publisher
+/// waits, or the subscriber ends. See the module documentation.
 ///
 /// Not `#[non_exhaustive]`: a caller constructs one and a caller matches one, so
-/// sealing it would cost every call site a `_ =>` arm for a third policy that
-/// this module argues must not exist.
+/// sealing it would cost every call site a `_ =>` arm and hide a policy added
+/// by this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overflow {
     /// Wait for the subscriber.
@@ -116,6 +158,17 @@ pub enum Overflow {
     /// topic channel. Select [`DropSubscriber`](Self::DropSubscriber) when the
     /// publisher must not wait for a feed subscriber.
     BlockPublisher(NonZeroUsize),
+    /// Wait up to one patience for each subscriber, then unsubscribe it.
+    ///
+    /// Subscribers are visited sequentially in subscription order. Each receives
+    /// a fresh patience; if its bounded channel does not accept in time, it keeps
+    /// every item already accepted, receives no new item, and then its stream ends.
+    BlockThenDrop {
+        /// The finite, non-zero channel depth for each subscriber.
+        depth: NonZeroUsize,
+        /// How long one full subscriber may hold this publish.
+        patience: Patience,
+    },
     /// Unsubscribe the subscriber, and let its actor end saying so.
     ///
     /// The subscriber is removed from the topic, which drops the last sender on
@@ -145,8 +198,8 @@ pub struct Fanout {
     pub delivered: usize,
     /// Subscribers unsubscribed for being too slow.
     ///
-    /// Always zero under [`Overflow::BlockPublisher`], which has no such state:
-    /// there the publisher waits instead.
+    /// Always zero under [`Overflow::BlockPublisher`], which waits instead.
+    /// Under the other policies, each count is a subscriber removed for slowness.
     pub dropped: usize,
     /// Subscribers whose [`Subscription`] had already been dropped, and which
     /// this publish removed.
@@ -180,14 +233,13 @@ pub struct Fanout {
 /// as [`Names`](super::Names)' rule, from the other side — there a registry keeps
 /// an actor alive, here a publisher's departure ends one.
 ///
-/// **With one window, and it is the blocking publish.**
-/// [`Overflow::BlockPublisher`] snapshots the senders and releases the lock before
-/// awaiting any of them — deliberately, because a fan-out holding a mutex across
-/// an await is the deadlock this crate is arranged to avoid — so for the duration
-/// of that fan-out a clone of every sender lives on the publisher's stack. A last
-/// `Topic` clone dropped during that window ends its subscribers when the
-/// **publish** finishes, not when the topic does. The delay is bounded by the
-/// slowest subscriber, which is the same bound the publisher itself is under.
+/// **With one window in either waiting policy.** The senders are snapshotted and
+/// the subscriber-list lock is released before awaiting. During that fan-out a
+/// clone of each sender lives on the publisher's stack, so dropping the last
+/// `Topic` ends subscribers when that publish finishes or is cancelled. Under
+/// [`Overflow::BlockThenDrop`] each current subscriber clone is dropped as soon
+/// as it expires, and the whole publish is ordered against other publishes by a
+/// cancellation-safe Tokio mutex that stores no items.
 #[derive(Debug)]
 pub struct Topic<T> {
     /// The sending half of every live subscriber's channel, and — outside the
@@ -196,6 +248,8 @@ pub struct Topic<T> {
     /// [`Overflow::DropSubscriber`] loud rather than silent.
     to: Arc<Mutex<Vec<mpsc::Sender<T>>>>,
     overflow: Overflow,
+    /// Serialises only `BlockThenDrop` publishes; it never stores an item.
+    publish_order: Arc<AsyncMutex<()>>,
 }
 
 impl<T> Topic<T> {
@@ -205,6 +259,7 @@ impl<T> Topic<T> {
         Self {
             to: Arc::new(Mutex::new(Vec::new())),
             overflow,
+            publish_order: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -223,6 +278,7 @@ impl<T> Topic<T> {
     pub fn subscribe(&self) -> Subscription<T> {
         let depth = match self.overflow {
             Overflow::BlockPublisher(depth) => depth,
+            Overflow::BlockThenDrop { depth, .. } => depth,
             Overflow::DropSubscriber(depth) => depth,
         };
         let (to, from) = mpsc::channel(depth.get());
@@ -263,6 +319,12 @@ impl<T> Topic<T> {
     fn lock(&self) -> MutexGuard<'_, Vec<mpsc::Sender<T>>> {
         self.to.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Remove exactly the canonical sender for one snapshotted subscriber.
+    fn remove_subscriber(&self, sender: &mpsc::Sender<T>) {
+        self.lock()
+            .retain(|canonical| !canonical.same_channel(sender));
+    }
 }
 
 impl<T: Clone> Topic<T> {
@@ -271,23 +333,27 @@ impl<T: Clone> Topic<T> {
     /// A successful delivery means the bounded channel accepted the item. It does
     /// not mean the subscriber consumed it or ran a turn for it.
     ///
-    /// Whether this awaits at all is the policy's business:
-    /// [`Overflow::BlockPublisher`] awaits every subscriber's permit, and
-    /// [`Overflow::DropSubscriber`] never awaits — it completes without yielding,
-    /// which is worth knowing for a caller that publishes from inside a turn.
+    /// Whether this awaits is the policy's business: [`Overflow::BlockPublisher`]
+    /// waits without a deadline, [`Overflow::BlockThenDrop`] waits at most one
+    /// [`Patience`] per subscriber, and [`Overflow::DropSubscriber`] never waits.
     ///
-    /// # An actor must not publish to a topic it subscribes to, under [`Overflow::BlockPublisher`]
+    /// # Self-publication can wedge or end the actor
     ///
-    /// It is [`Handle`](crate::LocalActor)'s self-call deadlock in a second
-    /// costume: the actor is inside a turn, so it is not polling its own feed, so
-    /// the permit it is waiting for can only be freed by the loop it is blocking.
-    /// No type can detect this — a topic cannot tell one subscriber's channel
-    /// from another's — and it is the one composition in this module that
-    /// deadlocks rather than degrades.
+    /// Publishing to the actor's own [`Overflow::BlockPublisher`] topic is
+    /// [`Handle`](crate::LocalActor)'s self-call deadlock in a second costume: the
+    /// actor is inside a turn, so it cannot poll the feed that would free the
+    /// permit. [`Overflow::BlockThenDrop`] cannot wedge forever, but a full
+    /// self-feed removes its own subscription after [`Patience`]; after accepted
+    /// items drain, that feed can end the actor. No type can detect either case —
+    /// a topic cannot identify which subscriber belongs to the publisher.
     pub async fn publish(&self, item: T) -> Fanout {
         match self.overflow {
             Overflow::DropSubscriber(_) => self.publish_dropping(item),
             Overflow::BlockPublisher(_) => self.publish_blocking(item).await,
+            Overflow::BlockThenDrop { patience, .. } => {
+                let _ordered = self.publish_order.lock().await;
+                self.publish_block_then_drop(item, patience).await
+            }
         }
     }
 
@@ -365,6 +431,58 @@ impl<T: Clone> Topic<T> {
             gone,
         }
     }
+
+    /// Snapshot the senders, then give each subscriber a fresh deadline.
+    async fn publish_block_then_drop(&self, item: T, patience: Patience) -> Fanout {
+        let to = self.lock().to_vec();
+        let mut delivered = 0;
+        let mut dropped = 0;
+        let mut gone = 0;
+
+        for one in to {
+            let Some(deadline) = Instant::now().checked_add(patience.0) else {
+                self.remove_subscriber(&one);
+                drop(one);
+                dropped += 1;
+                continue;
+            };
+
+            // Put the send future in its own scope so a timeout drops its item
+            // before the canonical sender is removed.
+            let accepted = {
+                let mut elapsed = std::pin::pin!(sleep_until(deadline));
+                let mut send = std::pin::pin!(one.send(item.clone()));
+                std::future::poll_fn(|cx| {
+                    if elapsed.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(None);
+                    }
+                    send.as_mut().poll(cx).map(Some)
+                })
+                .await
+            };
+
+            match accepted {
+                Some(Ok(())) => delivered += 1,
+                Some(Err(_)) => {
+                    self.remove_subscriber(&one);
+                    gone += 1;
+                }
+                None => {
+                    self.remove_subscriber(&one);
+                    dropped += 1;
+                }
+            }
+            // Once removed, this was the snapshot's last sender for the current
+            // subscriber. Drop it before visiting the next subscriber.
+            drop(one);
+        }
+
+        Fanout {
+            delivered,
+            dropped,
+            gone,
+        }
+    }
 }
 
 /// By hand, because `#[derive(Clone)]` would demand `T: Clone` — and a topic is
@@ -375,6 +493,7 @@ impl<T> Clone for Topic<T> {
         Self {
             to: Arc::clone(&self.to),
             overflow: self.overflow,
+            publish_order: Arc::clone(&self.publish_order),
         }
     }
 }
@@ -406,9 +525,46 @@ impl<T> crate::Stream for Subscription<T> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
         // `None` here is what ends the actor. Under
-        // `Overflow::DropSubscriber` that is the loud ending the policy
-        // promises; under `Overflow::BlockPublisher` it means every `Topic`
-        // clone was dropped, which is a publisher that went away.
+        // Either removal policy makes this the loud ending it promises; under
+        // `Overflow::BlockPublisher` it means every `Topic` clone was dropped.
         self.get_mut().from.poll_recv(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use n0_future::StreamExt;
+
+    /// A long-lived patience whose deadline no longer fits expires its subscriber
+    /// instead of panicking. Constructed here only to put the clock at that edge;
+    /// the public constructor correctly rejects this duration.
+    ///
+    /// Made red by `scripts/break-once.sh`, replacing the checked `let`/`else`
+    /// deadline with `.expect("broken unchecked subscriber deadline")`. Search literal:
+    /// `let Some(deadline) = Instant::now().checked_add(patience.0) else { self.remove_subscriber(&one); drop(one); dropped += 1; continue; };`.
+    /// Watched: this test panicked with that message instead of reporting one drop.
+    #[tokio::test(start_paused = true)]
+    async fn an_unrepresentable_subscriber_deadline_expires_immediately() {
+        let mut topic = Topic::new(Overflow::BlockThenDrop {
+            depth: NonZeroUsize::MIN,
+            patience: Patience(Duration::from_millis(1)),
+        });
+        let mut slow = topic.subscribe();
+        assert_eq!(topic.publish(1_u64).await.delivered, 1);
+        topic.overflow = Overflow::BlockThenDrop {
+            depth: NonZeroUsize::MIN,
+            patience: Patience(Duration::MAX),
+        };
+        assert_eq!(
+            topic.publish(2).await,
+            Fanout {
+                delivered: 0,
+                dropped: 1,
+                gone: 0,
+            }
+        );
+        assert_eq!(slow.next().await, Some(1));
+        assert_eq!(slow.next().await, None);
     }
 }
