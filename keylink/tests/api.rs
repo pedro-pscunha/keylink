@@ -505,7 +505,7 @@ mod capability_matrix {
     fn implements_servable<T: Servable>() {}
 
     #[allow(dead_code)]
-    fn own_associated_types_are_exact<'a>() {
+    fn own_associated_types_are_exact<'a>(_: &'a depot::Handle<Counter>) {
         let state: Option<<depot::Handle<Counter> as Own>::State> = None;
         let _: Option<Counter> = state;
 
