@@ -67,8 +67,9 @@
 //!   [`Unanswered`](crate::Unanswered) or [`NotQueued`](crate::NotQueued), by
 //!   door. **Restarting is the member's own
 //!   job, and it already has one:** build members with the generated
-//!   `supervised()` — or [`LocalActor::spawn_supervised`](crate::LocalActor::spawn_supervised)
-//!   — and each handle survives its own faults without the pool knowing. A
+//!   `restarting(factory, limit).actor()` — or
+//!   [`LocalActor::spawn_supervised`](crate::LocalActor::spawn_supervised) — and
+//!   each handle survives its own faults without the pool knowing. A
 //!   supervised member's mailbox outlives its incarnations, so `pick` keeps
 //!   working across a restart and nothing in this module has to learn about one.
 //!   That is the design rather than an omission, and it is a claim about

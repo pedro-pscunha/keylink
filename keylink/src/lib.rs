@@ -43,7 +43,7 @@
 //!   over the network with no change to the wire. **Two kinds of actor, and
 //!   serving is not a third:** a [`LocalActor`] behind a generated `Handle`, and
 //!   a keyed instance mounted in a [`Registry`] under an [`ActorId`] with its own
-//!   ALPN. `Handle::service` puts a local one on the wire without making it
+//!   ALPN. [`Servable::service`] puts a local one on the wire without making it
 //!   either a new kind or a new type.
 //! - **Content addressing.** A `blob` method hands back an address; iroh-blobs
 //!   moves the bytes, admitted only against a grant keylink recorded when it
@@ -168,7 +168,8 @@ compile_error!(
 // So that keylink can expand its own `service!`.
 //
 // The macro's generated rustdoc links its way back to this crate by name —
-// `[`Handle::service`]`, `[`mount`](keylink::mount)` and a dozen more — because
+// `[`Servable::service`](keylink::Servable::service)`,
+// `[`mount`](keylink::mount)` and a dozen more — because
 // every other expansion of it is rendered in somebody else's crate, where
 // `keylink::` is the only spelling that resolves. Inside keylink there is no such
 // path by default, so `mise run docs` (`-D warnings`, broken intra-doc links

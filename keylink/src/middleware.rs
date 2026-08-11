@@ -511,8 +511,8 @@ impl Queueing {
 /// than left as one sentence about "the deadline", because the sentence above
 /// was true of one path and false of the other for as long as both existed:
 ///
-/// - A singleton served with `Handle::service` has had both from the start, in
-///   what was then the whole of that path's dispatch.
+/// - A singleton served through the former inherent `Handle::service` door had
+///   both from the start, in what was then the whole of that path's dispatch.
 /// - A keyed [`Registry`](crate::Registry) had **neither**: the layer compiled on
 ///   `Registry::service` and guarded nothing there at any budget, because its loop
 ///   never read the [`Context`]. RFC-04 §16.7. It gained the turn-side check

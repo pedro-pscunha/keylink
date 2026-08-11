@@ -90,6 +90,8 @@ A record that expires or is evicted leaves a tombstone, so a forgotten key is
 refused rather than silently run a second time.
 
 ```rust
+use keylink::prelude::*;
+
 // wait for the call already running under this key instead of being refused
 client.with_idempotency(Idempotency::attaching_for(key, Duration::from_secs(5)))
       .reserve("ADU-014".into(), 2).await?;
@@ -107,6 +109,8 @@ after the fact that is. `client.watch()` is a future that resolves when the
 connection ends, and it distinguishes the three cases that matter:
 
 ```rust
+use keylink::prelude::*;
+
 match client.watch().await {
     Departure::Closed  => info!("peer said goodbye"),
     Departure::Local   => {}                  // we shut down; nothing happened
@@ -140,6 +144,8 @@ generates an `Actor` trait taking `&mut self`, so state lives on a task instead
 of behind a `Mutex`:
 
 ```rust
+use keylink::prelude::*;
+
 let warehouse = inventory::actor(Warehouse::seeded());  // in this process
 warehouse.reserve("ADU-014".into(), 2).await?;          // Err = Unanswered
 
@@ -173,9 +179,9 @@ let warehouse = inventory::setup(Warehouse::seeded()).feeds(inventory::Feeds::ne
 `Backpressure::Park(depth)` waits for a slot; `Backpressure::Shed(depth)` refuses
 immediately with `Full`. A deeper mailbox lets callers queue further ahead. It
 does not make self-calls safe, bound the memory held by parked senders, or remove
-the need to budget enough time for shutdown to drain queued turns. Keyed actors
-use the separate `RegistryBuilder::mailbox_depth(NonZeroUsize)` knob and always
-park.
+the need to budget enough time for shutdown to drain queued turns. Keyed actors use `RegistryBuilder::mailbox_depth(NonZeroUsize)` as their default.
+A generated `.backpressure(..).mountable()` setting overrides that default for
+one actor. `Park` waits, and `Shed` returns `MailboxFull`.
 
 A `send` method cannot be served this way at all, and `serve` stops compiling for
 a service declaring one. Its handler reads the upload inside the turn, so a peer
@@ -189,6 +195,8 @@ reply. It sees the state and how the turn went, and never a request or a reply
 payload; a layer sees the opposite. Neither grows toward the other.
 
 ```rust
+use keylink::prelude::*;
+
 let ledger = ledger::setup(state).observe(saver).actor();
 ledger.post(1).await?;             // the observer ran before this returned
 

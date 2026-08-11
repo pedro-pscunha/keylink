@@ -1120,7 +1120,8 @@ where
 /// actor's task can tell a queued message from a running one — RFC-04 §16.2.
 ///
 /// There used to be **three** hand-written comparisons for that: one here, one
-/// in the keyed loop and one in `Handle::service`'s dispatch, and two of them
+/// in the keyed loop and one in the former inherent `Handle::service` dispatch.
+/// Two of them
 /// disagreed on wasm at any whole-tick budget because one spelled `>` and the
 /// other `>=`. `Queueing::expired` is the one comparison now, asked from the one
 /// place a turn begins.
@@ -5260,8 +5261,8 @@ fn withheld_for(standing: Standing) -> Withheld {
 /// came back into what goes on the wire.
 ///
 /// The twin of [`deliver_keyed`](crate::deliver_keyed), for a service
-/// served as **one** actor through `Handle::service` rather than as a registry
-/// of keyed ones. The two share [`rendered`] and differ only in how they find
+/// served as **one** actor through `Servable::service` on its handle rather than
+/// as a registry of keyed ones. The two share [`rendered`] and differ only in how they find
 /// the mailbox: one routes an [`ActorId`](crate::ActorId), this one already has
 /// the actor.
 ///

@@ -57,7 +57,7 @@
 /// That is refused at compile time, at the site that serves the actor:
 ///
 /// ```compile_fail
-/// use keylink::{Allowlist, BodyReader, Caller};
+/// use keylink::{Allowlist, BodyReader, Caller, Servable};
 ///
 /// keylink::service! {
 ///     service Depot;
@@ -73,9 +73,16 @@
 /// let _ = actor.service(Allowlist::anyone());   // <- this line does not compile
 /// ```
 ///
+/// **Watched break.** Changed `ServableAsActor::<A>::CHECK`'s assertion
+/// condition to `true` with `scripts/break-once.sh`. This fence then failed with
+/// "Test compiled successfully, but it's marked `compile_fail`". Before the
+/// [`Servable`](crate::Servable) import above, the same break left this fence green because method
+/// lookup failed first.
+///
 /// And at the other site that serves one, which for a long time it was not.
 /// `CHECK` is an associated const on a generic type, so it is evaluated where it
-/// is *instantiated*; while `Handle::service` held the only instantiation, the
+/// is *instantiated*. The former inherent `Handle::service` held the only
+/// instantiation, so the
 /// identical service was refused there and mounted into a keyed
 /// [`Registry`](crate::Registry) without a word — over an ALPN, reachable by any
 /// admitted peer, with the body read inside the turn exactly as above. §16.9.
@@ -5037,10 +5044,10 @@ macro_rules! __keylink_service {
                 ///
                 /// Declared by no service and generated onto every contract, so
                 /// it moves this service's ALPN once and then never again. The
-                /// two spellings are deliberate and follow the crate's own
-                /// internal convention — `__Status` on the wire, `__status` on
-                /// every client — because a name a user could also write would
-                /// be a name a user could collide with.
+                /// structural spelling is deliberate: `__Status` is internal
+                /// to the wire, while callers reach the operation through the
+                /// [`Status`](keylink::Status) trait. A name a user could also
+                /// write would be a name a user could collide with.
                 ///
                 /// **Never delivered.** Both served closures answer it above
                 /// their delivery call, from the flag beside the mailbox, and
@@ -5601,7 +5608,8 @@ macro_rules! __keylink_service {
                             // the wave's central property rather than an
                             // accident.** `__Status` is answered above BOTH
                             // delivery calls — in `Registry::service` dispatch
-                            // closure and in `Handle::service`'s — so it never
+                            // closure and in the generated `Servable::service`
+                            // implementation's — so it never
                             // becomes mail. It cannot: a question about which
                             // turn is running cannot be answered by a turn,
                             // because that turn would report `busy: true` about
@@ -6089,10 +6097,12 @@ macro_rules! __keylink_service {
             #[must_use = "an unmounted actor is dropped, and the state it was \
                           built around goes with it"]
             pub fn spawn<A: Actor>(state: A) -> Mountable {
-                // The same refusal `Handle::service` makes, and for longer than
+                // The generated `Servable::service` implementation makes the same
+                // refusal, and it did so for longer than
                 // it was made here: `CHECK` is an associated const on a generic
                 // type, so it is evaluated only where it is INSTANTIATED, and
-                // for a long time the one instantiation was in `Handle::service`.
+                // for a long time the one instantiation was in the former inherent
+                // `Handle::service`.
                 // A service declaring `send` was therefore refused by the local
                 // handle at compile time and accepted here without a word —
                 // where the body is read inside the serial turn exactly as it
@@ -6604,15 +6614,6 @@ macro_rules! __keylink_service {
                         .__keylink_declares_blobs(DECLARES_BLOBS)
                 }
 
-                fn serve(
-                    &self,
-                    node: &$crate::Node,
-                    allow: $crate::Allowlist,
-                ) -> $crate::Result<$crate::Server> {
-                    $crate::Server::builder(node)
-                        .service($crate::Servable::service(self, allow).build())
-                        .spawn()
-                }
             }
 
             impl<A: Actor> $crate::Own for Handle<A> {
@@ -7925,24 +7926,6 @@ macro_rules! __keylink_generated_name_check {
     (local_handle, r#__status, $rpc:ident, $kind:ident) => {
         $crate::__keylink_name_conflict!($kind, "Handle", "__status", $rpc);
     };
-    (local_handle, __reserve, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "__reserve", $rpc);
-    };
-    (local_handle, r#__reserve, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "__reserve", $rpc);
-    };
-    (local_handle, __try_reserve, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "__try_reserve", $rpc);
-    };
-    (local_handle, r#__try_reserve, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "__try_reserve", $rpc);
-    };
-    (local_handle, __reserve_owned, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "__reserve_owned", $rpc);
-    };
-    (local_handle, r#__reserve_owned, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "__reserve_owned", $rpc);
-    };
     (local_handle, $name:ident, $rpc:ident, $kind:ident) => {};
 
     (local_ref, $name:ident, $rpc:ident, $kind:ident) => {};
@@ -9019,30 +9002,6 @@ macro_rules! __keylink_local_method {
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __status, $variant);
     };
-    ([$( #[$meta:meta] )*], $kind:ident, __reserve, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __reserve, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, r#__reserve, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __reserve, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, __try_reserve, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __try_reserve, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, r#__try_reserve, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __try_reserve, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, __reserve_owned, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __reserve_owned, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, r#__reserve_owned, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __reserve_owned, $variant);
-    };
     ([$( #[$meta:meta] )*], rpc, $name:ident, $variant:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
@@ -9179,8 +9138,9 @@ macro_rules! __keylink_local_method {
     // `AsyncRead` would rewrite the transport to give a local caller a
     // convenience.
     //
-    // So: absent here, and present the moment the same actor is served with
-    // `Handle::service`, where there IS a stream. Streaming is a transport
+    // So: absent here, and present the moment the same actor is served through
+    // `Servable::service` on its `Handle`, where there IS a stream.
+    // Streaming is a transport
     // capability, and this handle names no transport.
     ([$( #[$meta:meta] )*], send, $name:ident, $variant:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
@@ -9459,24 +9419,6 @@ macro_rules! __keylink_calls_method {
     };
     ([$( #[$meta:meta] )*], local_handle, r#__status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, __reserve, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __reserve, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, r#__reserve, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __reserve, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, __try_reserve, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __try_reserve, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, r#__try_reserve, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __try_reserve, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, __reserve_owned, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __reserve_owned, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, r#__reserve_owned, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __reserve_owned, ($( $arg : $ty ),*), $ret);
     };
     ([$( #[$meta:meta] )*], actor_ref, __status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
@@ -9781,8 +9723,9 @@ mod expansion {
     /// It was measured against tokio's own permit on a scratch integration test
     /// that was then deleted — which is a measurement and not a guard, because
     /// nothing was left behind to fail. This is the guard. If the borrowed form
-    /// ever stopped being `Send`, `Handle::__reserve` would be unusable from any
-    /// caller whose own future has to cross a `tokio::spawn`, and the answer
+    /// ever stopped being `Send`, [`Own::reserve`](keylink::Own::reserve) would
+    /// be unusable from any caller whose own future has to cross a
+    /// `tokio::spawn`, and the answer
     /// would be to make every door take the owned form and pay a refcount.
     ///
     /// **The `yield_now` is fidelity to the measured shape, and it is NOT what

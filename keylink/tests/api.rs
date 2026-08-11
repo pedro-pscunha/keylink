@@ -807,3 +807,54 @@ mod reclaimed_caller_words {
         let _: Result<u64, keylink::Error> = remote.id().await;
     }
 }
+
+/// Retired internal reservation helpers do not keep their user spellings reserved.
+mod retired_reservation_words {
+    keylink::service! {
+        service InternalNames;
+
+        rpc __Reserve() -> u64;
+        rpc __TryReserve() -> u64;
+        rpc __ReserveOwned() -> u64;
+    }
+
+    struct State;
+
+    impl internal_names::Actor for State {
+        async fn __reserve(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn __try_reserve(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            2
+        }
+
+        async fn __reserve_owned(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            3
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_reservation_names_reach_user_operations() {
+        let actor = internal_names::actor(State);
+
+        assert_eq!(
+            internal_names::Calls::__reserve(&actor)
+                .await
+                .expect("__reserve"),
+            1
+        );
+        assert_eq!(
+            internal_names::Calls::__try_reserve(&actor)
+                .await
+                .expect("__try_reserve"),
+            2
+        );
+        assert_eq!(
+            internal_names::Calls::__reserve_owned(&actor)
+                .await
+                .expect("__reserve_owned"),
+            3
+        );
+    }
+}

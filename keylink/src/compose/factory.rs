@@ -103,8 +103,9 @@
 //! # What a factory is not
 //!
 //! - **Not a supervisor.** [`Pool`]'s refusal, unchanged and for the
-//!   same reason: build members with the generated `supervised()`, and a
-//!   supervised member's mailbox outlives its incarnations, so routing keeps
+//!   same reason: build members with the generated
+//!   `restarting(factory, limit).actor()`, and a supervised member's mailbox
+//!   outlives its incarnations, so routing keeps
 //!   working across a restart without this module learning what one is. Nothing
 //!   here restarts a member, kills a stuck one, or takes one out of the rotation.
 //! - **Not a way to make one actor concurrent.** Eight members are eight states.

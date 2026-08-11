@@ -98,16 +98,20 @@ pub trait Own: Sized {
 /// Build or directly serve a generated service.
 pub trait Servable {
     /// The request carried by the service.
-    type Request;
+    type Request: Rpc + DeserializeOwned + Send + Sync + 'static;
     /// The response carried by the service.
-    type Response;
+    type Response: Serialize + Granting + Send + Sync + 'static;
 
     /// Build the service with its allowlist.
     #[must_use = "a service builder does nothing until registered on a server"]
     fn service(&self, allow: Allowlist) -> ServiceBuilder<Self::Request, Self::Response>;
 
     /// Serve this service alone on a node.
-    fn serve(&self, node: &crate::Node, allow: Allowlist) -> Result<Server>;
+    fn serve(&self, node: &crate::Node, allow: Allowlist) -> Result<Server> {
+        Server::builder(node)
+            .service(self.service(allow).build())
+            .spawn()
+    }
 }
 
 /// Generated keyed dispatch for one service's mailbox type.
@@ -134,11 +138,5 @@ where
 
     fn service(&self, allow: Allowlist) -> ServiceBuilder<Self::Request, Self::Response> {
         M::service(self, allow)
-    }
-
-    fn serve(&self, node: &crate::Node, allow: Allowlist) -> Result<Server> {
-        Server::builder(node)
-            .service(<Self as Servable>::service(self, allow).build())
-            .spawn()
     }
 }

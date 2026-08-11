@@ -3523,7 +3523,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # `first_available`'s racers — and the two moved together for once. Read off the
 # failing run: `FAIL population: 195 comment blocks mention break-once.sh, but
 # RECORD_BLOCKS says 194.`
-RECORD_BLOCKS = 195
+RECORD_BLOCKS = 196
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a
