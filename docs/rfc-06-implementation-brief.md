@@ -73,7 +73,7 @@ New file `keylink/src/observe.rs`, exported from `lib.rs`. Exact signatures in R
    - The private `Turn<A>` alias grows a second parameter, so the loop can lend the
      observers per turn. `owned.rs` has the shape.
    - `LocalActor::spawn_observed(state, Vec<Box<dyn Observer<A>>>)`. **Not**
-     `spawn_with` — `SystemBuilder::spawn_with` already exists (`actor.rs:846`) and
+     `spawn_with` — `RegistryBuilder::spawn_with` already exists (`actor.rs:846`) and
      means a factory for keyed actors.
    - `spawn(state)` becomes `spawn_observed(state, vec![])`.
    - The observer chain runs **inside `guarded`**, after the handler and before the
@@ -96,7 +96,7 @@ New file `keylink/src/observe.rs`, exported from `lib.rs`. Exact signatures in R
      only through public methods (`macros.rs:588`, `:804`, `:819`, `:826`).
    - `ask_catching`'s error becomes `TurnLost`. Two callers exist in the whole repo:
      `local.rs:202` and `macros.rs:672`.
-4. `macros.rs`: `actor_with`, `Handle::ended`, route `with_state` at
+4. `macros.rs`: `setup(..).observe(..).actor()`, `Handle::ended`, route `with_state` at
    `LocalActor::read`, and map `TurnLost::Refused` on the served path to
    `RemoteError::Failed` with the prefix `observer refused: {name}`. Change the
    existing panic mapping at `macros.rs:695` to carry `panicked: {msg}` as well — a
@@ -105,7 +105,7 @@ New file `keylink/src/observe.rs`, exported from `lib.rs`. Exact signatures in R
    **Do not add a `RemoteError` variant.** §2.7 explains that a variant moves the ALPN
    and the pinned literal at `keylink/tests/protocol.rs:772`. A `String` payload does
    not.
-5. A doc note beside `spawn` saying the keyed `System` path gets no observers (§5.3).
+5. A doc note beside `spawn` saying the keyed `Registry` path gets no observers (§5.3).
 6. Tests, one per bullet in §9, each break run through `break-once.sh`. Plus the
    shadowing probe for "no `&mut A` route", copying the house pattern at
    `macros.rs:1751`.
@@ -169,7 +169,7 @@ identifiers through this table.
 | `Withheld`, the private observer verdict in `turns.rs` | `ObserverVerdict` | `ec242c2` |
 | `EndReason`, defined in `console.rs` | moved to `observe.rs` | `c165009` |
 | `MailboxClosed`, then `Undelivered` | `Unanswered` | `4e0fcca`, then `8acd7be` |
-| `deliver_to_local` | `deliver_to_singleton` | `80098e4` |
+| `deliver_to_local` | `deliver_unkeyed` | `80098e4` |
 | `NodeStatus::lost` | `NodeStatus::dropped` | `0c6e6c3` |
 | the five `RemoteError` prefix consts | deleted — `RemoteError::Withheld(Withheld)` | `0c6e6c3`, `5198ecb` |
 

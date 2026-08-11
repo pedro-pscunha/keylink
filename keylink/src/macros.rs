@@ -77,7 +77,7 @@
 /// `CHECK` is an associated const on a generic type, so it is evaluated where it
 /// is *instantiated*; while `Handle::service` held the only instantiation, the
 /// identical service was refused there and mounted into a keyed
-/// [`System`](crate::System) without a word — over an ALPN, reachable by any
+/// [`Registry`](crate::Registry) without a word — over an ALPN, reachable by any
 /// admitted peer, with the body read inside the turn exactly as above. §16.9.
 ///
 /// (`crate::` and not `keylink::` there, unlike every link in the *expansion*
@@ -132,162 +132,18 @@
 /// generated namespaces; the explicit taken names below are checked at the
 /// surface that owns them.
 ///
-/// ### A declared name landing on a taken one is refused, per surface
+/// ### Generated namespaces reserve only their structural names
 ///
-/// The generated methods do not all share one type. The macro therefore checks
-/// the names at the emitters that own them and reports the surface directly:
+/// Caller capabilities such as `status`, `close`, `reserve`, and `stop` live on
+/// extension traits. User operations may therefore use those ordinary words.
+/// `connect` remains inherent on the generated clients and is still reserved.
 ///
-/// - local `Handle`: lifecycle, status and reservation doors;
-/// - local keyed `LocalRef`: `id`;
-/// - remote keyed `ActorRef`: `id` and `__status`;
-/// - remote `Client` and `IdempotentClient`: connection, ledger, status and
-///   close doors;
-/// - blocking `Client` and `IdempotentClient`: their synchronous connection,
-///   ledger and close doors.
-///
-/// `KeyedClient::at` is the addressing door, not an operation surface. A
-/// declared `rpc At` is generated on `ActorRef`, so it remains legal. The same
-/// surface rule is why a name such as `ended` is legal on a remote client but
-/// not on a local handle.
-///
-/// The diagnostic is emitted at the declaration site rather than relying on a
-/// later duplicate-method error inside the expansion:
-///
-/// ```compile_fail
-/// // error: rpc `IsBusy` conflicts with generated `Handle::is_busy`. Rename the rpc.
-/// keylink::service! {
-///     service Orders;
-///     rpc Fill(price: u64) -> u64;
-///     rpc IsBusy() -> bool;
-/// }
-/// ```
-///
-/// ### `__Status` is taken on every generated wire/client surface
-///
-/// `pastey`'s `:snake` maps the legal declaration `__Status` to `__status`.
-/// The generated status request/reply variants and status methods therefore
-/// need the same direct name check as ordinary operations. The declaration is
-/// diagnosed before those generated items are emitted, so the direct diagnostic
-/// does not turn into a cascade of duplicate-item and exhaustiveness errors.
-///
-/// The control `rpc Status()` remains valid: it produces `status`, not the
-/// internal `__status` spelling.
-///
-/// ```compile_fail
-/// // error: rpc `__Status` conflicts with a generated status name. Rename the rpc.
-/// keylink::service! {
-///     service Orders;
-///     rpc Fill(price: u64) -> u64;
-///     rpc __Status() -> u64;
-/// }
-/// ```
-///
-/// ```compile_fail
-/// // error: rpc `Id` conflicts with generated `LocalRef::id`. Rename the rpc.
-/// // error: rpc `Id` conflicts with generated `ActorRef::id`. Rename the rpc.
-/// keylink::service! {
-///     service Orders;
-///     rpc Fill(price: u64) -> u64;
-///     rpc Id() -> u64;
-/// }
-/// ```
-///
-/// `Client` and its idempotent and blocking twins have their own taken names.
-/// The checks are attached only to the methods those surfaces emit: a streaming
-/// declaration does not reserve a blocking name when the blocking surface omits it,
-/// and an idempotent client does not reserve `tell` because it has no tell method.
-///
-/// ```compile_fail
-/// // error: rpc `Connect` conflicts with generated `Client::connect`. Rename the rpc.
-/// // error: rpc `Connect` conflicts with generated `blocking::Client::connect`.
-/// // Rename the rpc.
-/// keylink::service! {
-///     service Orders;
-///     rpc Fill(price: u64) -> u64;
-///     rpc Connect() -> u64;
-/// }
-/// ```
-///
-/// ```compile_fail
-/// // error: rpc `KeyState` conflicts with generated `IdempotentClient::key_state`.
-/// // Rename the rpc.
-/// // The same check also names the ordinary and blocking idempotent surfaces.
-/// keylink::service! {
-///     service Orders;
-///     rpc Fill(price: u64) -> u64;
-///     rpc KeyState() -> u64;
-/// }
-/// ```
-///
-/// Wire variants are a separate namespace from generated method identifiers. `Served`
-/// has no taken method spelling, but `Mail::Served` is the envelope used for a peer
-/// request, so it is refused directly. Conversely, `At` is legal: `KeyedClient::at`
-/// addresses an `ActorRef`, and the operation itself is emitted on that other type.
-///
-/// ```compile_fail
-/// // error: rpc `Served` conflicts with generated `Mail::Served`. Rename the rpc.
-/// keylink::service! {
-///     service Orders;
-///     rpc Fill(price: u64) -> u64;
-///     rpc Served() -> u64;
-/// }
-/// ```
-///
-/// ```
-/// keylink::service! {
-///     service Orders;
-///     rpc At() -> u64;
-/// }
-/// ```
-///
-/// Feeds have one generated field of their own, `Feeds::at`, used as the
-/// round-robin cursor. A feed named `At` is therefore refused, while the feed's
-/// `Handler::on_*` and `Feed::*` names remain otherwise independent:
-///
-/// ```compile_fail
-/// // error: feed `At` conflicts with generated `Feeds::at`. Rename the feed.
-/// keylink::service! {
-///     service Orders;
-///     rpc Fill() -> u64;
-///     feed At(item: u64);
-/// }
-/// ```
-///
-/// The raw spelling is checked too; it normalizes to the same `at` field:
-///
-/// ```compile_fail
-/// // error: feed `r#at` conflicts with generated `Feeds::at`. Rename the feed.
-/// keylink::service! {
-///     service Orders;
-///     rpc Fill() -> u64;
-///     feed r#at(item: u64);
-/// }
-/// ```
-///
-/// Generated method identifiers must also be valid Rust identifiers after
-/// snake-casing. The check runs before `pastey` emits a method, so a declaration
-/// such as `Type` reports the name instead of only `expected identifier` from
-/// `fn type`:
-///
-/// ```compile_fail
-/// // error: rpc `Type` generates the reserved Rust keyword `type`. Rename the rpc.
-/// keylink::service! {
-///     service Orders;
-///     rpc Type() -> u64;
-/// }
-/// ```
-///
-/// The method checks deliberately remain independent of the wire check: `Stop` is a
-/// valid request variant but its generated `Handle::stop` method is taken.
-///
-/// ```compile_fail
-/// // error: rpc `Stop` conflicts with generated `Handle::stop`. Rename the rpc.
-/// keylink::service! {
-///     service Orders;
-///     rpc Fill(price: u64) -> u64;
-///     rpc Stop() -> u64;
-/// }
-/// ```
+/// Wire-only names remain structural: `__Status` is the internal status variant,
+/// `Served` is the mailbox envelope, and `Feeds::at` is the feed cursor. Rust
+/// keywords are also rejected after snake-casing. `At` remains legal because
+/// `RegistryClient::at` and an operation on `ActorRef` occupy different types.
+/// These checks use direct declaration-site diagnostics; they are implementation
+/// guards rather than compile-fail name tests.
 ///
 /// ## `#[defer]`: one attribute keylink reads, and the rest it forwards
 ///
@@ -352,8 +208,8 @@
 /// A feed is a locally wired [`Stream`](crate::Stream), selected against the
 /// mailbox inside the actor's own loop, so a feed item is a **turn**: the panic
 /// guard, the observer chain and a durability adapter's commit all apply to one.
-/// Wire it at spawn with `actor_wired(state, observers, Feeds::new(stream))`, or
-/// `spawn_wired(..)` for a keyed actor.
+/// Wire it at spawn with `setup(state).observe(observer).feeds(Feeds::new(stream)).actor()`, or
+/// terminate with `.mountable()` for a keyed actor.
 ///
 /// Four things follow, and each is a decision rather than an accident:
 ///
@@ -408,7 +264,7 @@
 ///
 /// // Fails in `SpawnableUnfed::<Book>::CHECK`, a `const` assertion on a generic
 /// // type, so it is evaluated HERE — at the instantiation — and nowhere else.
-/// // `actor_wired(Book, vec![], orders::Feeds::new(stream))` is the door.
+/// // `setup(Book).feeds(orders::Feeds::new(stream)).actor()` is the door.
 /// let _ = orders::actor(Book);
 /// ```
 ///
@@ -5345,7 +5201,7 @@ macro_rules! __keylink_service {
             ]);
 
             /// Whether any method here reads an upload inside its turn, folded
-            /// the same way. Read by [`Handle::service`], which refuses to
+            /// the same way. Read by [`Servable::service`](keylink::Servable::service), which refuses to
             /// compile for such a service.
             const DECLARES_SEND: bool = __keylink_any(&[
                 false $(, $( #[$cfg] )* $crate::__keylink_is_send!($kind))+
@@ -5407,10 +5263,9 @@ macro_rules! __keylink_service {
                     "this service declares a `feed`, so it cannot be spawned \
                      through a door that wires none - an unwired feed would be a \
                      stream that never yields, which is silence a caller cannot \
-                     tell from a quiet feed. Use `actor_wired(state, observers, \
-                     Feeds::new(..))` for one actor in this process, or \
-                     `spawn_wired(state, observers, Feeds::new(..))` for one \
-                     mounted in a System. `Feeds::new` takes one argument per \
+                     tell from a quiet feed. Use `setup(state).feeds(Feeds::new(..)).actor()` \
+                     for one actor in this process, or terminate with \
+                     `.mountable()` for one mounted in a Registry. `Feeds::new` takes one argument per \
                      declared feed, so forgetting one is an argument count."
                 );
             }
@@ -5582,7 +5437,7 @@ macro_rules! __keylink_service {
             /// Derived, never hand-maintained, and distinct from [`alpn`]: a
             /// node can serve this service as a singleton and as an actor system
             /// at the same time, and one router owns one ALPN.
-            pub fn keyed_alpn() -> &'static [u8] {
+            pub fn registry_alpn() -> &'static [u8] {
                 static CELL: ::std::sync::OnceLock<::std::vec::Vec<u8>> =
                     ::std::sync::OnceLock::new();
                 CELL.get_or_init(|| $crate::derive_alpn::<KeyedContract>(KEYED_PROTOCOL))
@@ -5745,7 +5600,7 @@ macro_rules! __keylink_service {
                             // **Nothing in this crate builds this, and that is
                             // the wave's central property rather than an
                             // accident.** `__Status` is answered above BOTH
-                            // delivery calls — in `keyed_service`'s dispatch
+                            // delivery calls — in `Registry::service` dispatch
                             // closure and in `Handle::service`'s — so it never
                             // becomes mail. It cannot: a question about which
                             // turn is running cannot be answered by a turn,
@@ -5756,7 +5611,7 @@ macro_rules! __keylink_service {
                             // distinction this file's `__Status` doctest already
                             // insists on and the reason the sentence above says
                             // *in this crate*. `Addressed::new` and
-                            // `deliver_to_actor` are `#[doc(hidden)] pub` and
+                            // `deliver_keyed` are `#[doc(hidden)] pub` and
                             // re-exported at the crate root, and
                             // `Request::__Status {}` is a public variant of a
                             // public enum. Every part ships; what does not exist
@@ -5866,7 +5721,7 @@ macro_rules! __keylink_service {
             /// Every feed this service declares, wired to a stream each.
             ///
             /// Built once, at spawn, and handed to
-            /// [`actor_wired`] or [`spawn_wired`]. There is no way to add a feed to
+            /// `setup(state).feeds(feeds)`. There is no way to add a feed to
             /// a running actor and that is deliberate: the loop selects over a fixed
             /// set, so a feed appearing later would need the loop to be
             /// reconfigurable — a second input to the second input.
@@ -5881,7 +5736,7 @@ macro_rules! __keylink_service {
             /// `actor` has already spawned the loop by then.
             ///
             /// Each stream is boxed. One allocation per feed per actor, paid once at
-            /// spawn, against making `Handle`, `Mounted` and `System` generic in one
+            /// spawn, against making `Handle`, `Mountable` and `Registry` generic in one
             /// type parameter per declared feed.
             #[doc(hidden)]
             pub struct Feeds {
@@ -5982,27 +5837,22 @@ macro_rules! __keylink_service {
             /// One system per service, not one per node. That is what makes an
             /// actor of another service a type error at the mount rather than a
             /// schema comparison on the serving node.
-            pub type System = $crate::System<Mail>;
+            pub type Registry = $crate::Registry<Mail>;
 
-            /// Assembles a [`System`]: its eviction policy, its cap, and how it
+            /// Assembles a [`Registry`]: its eviction policy, its cap, and how it
             /// spawns.
-            pub type SystemBuilder = $crate::SystemBuilder<Mail>;
+            pub type RegistryBuilder = $crate::RegistryBuilder<Mail>;
 
             /// A typed address of one actor in this process. Its methods are the
             /// service's declared `rpc` and `tell` operations, with no transport
             /// or remote error in their result.
             #[derive(Clone, Debug)]
             pub struct LocalRef<'a> {
-                system: &'a System,
+                system: &'a Registry,
                 actor: $crate::ActorId,
             }
 
             impl LocalRef<'_> {
-                /// Which actor this reference addresses.
-                pub fn id(&self) -> &$crate::ActorId {
-                    &self.actor
-                }
-
                 $(
                     $crate::__keylink_keyed_local_method!(
                         [$( #[$cfg] )*],
@@ -6017,12 +5867,12 @@ macro_rules! __keylink_service {
 
             /// Address one actor of this service in this process.
             #[must_use]
-            pub fn at_local(system: &System, actor: $crate::ActorId) -> LocalRef<'_> {
+            pub fn at_local(system: &Registry, actor: $crate::ActorId) -> LocalRef<'_> {
                 LocalRef { system, actor }
             }
 
             /// One live actor of this service, ready to be mounted.
-            pub type Mounted = $crate::Mounted<Mail>;
+            pub type Mountable = $crate::Mountable<Mail>;
 
             /// What keylink dispatches this service's keyed system through.
             ///
@@ -6049,121 +5899,53 @@ macro_rules! __keylink_service {
                 }
             }
 
-            /// Serve `system`'s actors to other machines, on this service's own
-            /// keyed ALPN. Register it on a [`Server`](keylink::Server) like any
-            /// other service.
-            ///
-            /// A free function taking `&System`, deliberately: it compiles
-            /// identically whether the registry lives in keylink or in a crate
-            /// of its own, which an inherent method on `System` cannot do.
-            ///
-            /// Because the reply is this service's own typed `Response`,
-            /// everything that reads one works here: per-method
-            /// [`Middleware`](keylink::Middleware), per-method authorization,
-            /// and `blob` methods, whose address the server must see to record a
-            /// grant. A service with a `blob` method must be given a store —
-            /// `keyed_service(..).with_blobs(&blobs)` — or
-            /// [`ServerBuilder::spawn`](keylink::ServerBuilder::spawn) refuses
-            /// it at startup, exactly as it does for [`service`].
-            #[must_use]
-            pub fn keyed_service(
-                system: &System,
-                allow: $crate::Allowlist,
-            ) -> $crate::ServiceBuilder<$crate::Addressed<Request>, Response> {
-                let system = system.clone();
-                let dispatch: $crate::Dispatch<$crate::Addressed<Request>, Response> =
-                    ::std::sync::Arc::new(move |cx: $crate::Context,
-                                                request: $crate::Addressed<Request>,
-                                                body: $crate::BodyReader| {
-                        let system = system.clone();
-                        ::std::boxed::Box::pin(async move {
-                            // **`__Status` is answered here and enqueues
-                            // nothing**, and `serving_of_actor` — the function
-                            // this arm calls — is where that decision is written
-                            // down: why a delivered question could only answer
-                            // the state of asking, and why intercepting it
-                            // removes the mailbox and not the allowlist or the
-                            // layer. Pointed at rather than repeated, because
-                            // this reasoning had nine copies across two files
-                            // and the copies had already drifted apart.
-                            //
-                            // Borrowed rather than split: `Addressed::split` is
-                            // consuming, and an arm that hands the envelope on
-                            // unchanged must not take it apart to look at it.
-                            let __answer = if ::core::matches!(
-                                request.message(),
-                                Request::__Status { .. }
-                            ) {
-                                // Nothing ran, and an arm ending a message
-                                // without entering it has to say so — silence
-                                // here reads as a message that reached a
-                                // mailbox.
-                                cx.progress().unrun();
-                                $crate::serving_of_actor(&system, &request).map(|__serving| {
-                                    (
-                                        $crate::Outcome::Ok(Response::__Status(__serving)),
-                                        $crate::Body::empty(),
-                                    )
-                                })
-                            } else {
-                                $crate::deliver_to_actor::<Actors>(&system, cx, request, body)
-                                    .await
-                            };
-                            match __answer {
-                                ::std::result::Result::Ok(__answer) => __answer,
-                                ::std::result::Result::Err(__refusal) => (
-                                    $crate::Outcome::Err(__refusal),
-                                    $crate::Body::empty(),
-                                ),
-                            }
-                        })
-                    });
-                $crate::ServiceBuilder::new(keyed_alpn(), allow, dispatch)
-                    .__keylink_declares_blobs(DECLARES_BLOBS)
-            }
+            impl $crate::RegistryDispatch for Mail {
+                type Request = Request;
+                type Response = Response;
 
-            /// Serve `system`'s actors alone on `node`, on this service's keyed
-            /// ALPN.
-            ///
-            /// The keyed twin of [`serve`], and the argument order is the same
-            /// one: `node` first, then the thing being served. [`Handle::serve`]
-            /// is the third of the three and does this for a singleton actor.
-            ///
-            /// For several services on one endpoint, build each with
-            /// [`keyed_service`] and register them on a single
-            /// [`Server`](keylink::Server): one router must own every ALPN.
-            ///
-            /// **It decides the same serving-side policies [`serve`] does, and
-            /// takes no argument for any of them.** It calls `build()` itself, so
-            /// a caller never holds the
-            /// [`ServiceBuilder`](keylink::ServiceBuilder) and cannot reach
-            /// [`layer`](keylink::ServiceBuilder::layer),
-            /// [`limits`](keylink::ServiceBuilder::limits),
-            /// [`records`](keylink::ServiceBuilder::records) or
-            /// [`keyable`](keylink::ServiceBuilder::keyable). Go through
-            /// [`keyed_service`] and
-            /// [`Server::builder`](keylink::Server::builder) for any of those.
-            ///
-            /// # Errors
-            ///
-            /// [`ConfigError`](keylink::ConfigError) from
-            /// [`spawn`](keylink::ServerBuilder::spawn), the same as [`serve`].
-            ///
-            /// **A service declaring a `blob` method cannot be served this way**,
-            /// and the refusal is at startup rather than on first call: the store
-            /// is handed over by
-            /// [`with_blobs`](keylink::ServiceBuilder::with_blobs), which is one
-            /// of the builder methods this door cannot reach. Use
-            /// `keyed_service(system, allow).with_blobs(&blobs)` instead.
-            /// [`serve`] has the same limit for the same reason.
-            pub fn keyed_serve(
-                node: &$crate::Node,
-                system: &System,
-                allow: $crate::Allowlist,
-            ) -> $crate::Result<$crate::Server> {
-                $crate::Server::builder(node)
-                    .service(keyed_service(system, allow).build())
-                    .spawn()
+                fn service(
+                    registry: &$crate::Registry<Self>,
+                    allow: $crate::Allowlist,
+                ) -> $crate::ServiceBuilder<$crate::Addressed<Self::Request>, Self::Response> {
+                    let registry = registry.clone();
+                    let dispatch: $crate::Dispatch<$crate::Addressed<Request>, Response> =
+                        ::std::sync::Arc::new(move |cx: $crate::Context,
+                                                    request: $crate::Addressed<Request>,
+                                                    body: $crate::BodyReader| {
+                            let registry = registry.clone();
+                            ::std::boxed::Box::pin(async move {
+                                let __answer = if ::core::matches!(
+                                    request.message(),
+                                    Request::__Status { .. }
+                                ) {
+                                    cx.progress().unrun();
+                                    $crate::serving_keyed(&registry, &request).map(|__serving| {
+                                        (
+                                            $crate::Outcome::Ok(Response::__Status(__serving)),
+                                            $crate::Body::empty(),
+                                        )
+                                    })
+                                } else {
+                                    $crate::deliver_keyed::<Actors>(
+                                        &registry,
+                                        cx,
+                                        request,
+                                        body,
+                                    )
+                                    .await
+                                };
+                                match __answer {
+                                    ::std::result::Result::Ok(__answer) => __answer,
+                                    ::std::result::Result::Err(__refusal) => (
+                                        $crate::Outcome::Err(__refusal),
+                                        $crate::Body::empty(),
+                                    ),
+                                }
+                            })
+                        });
+                    $crate::ServiceBuilder::new(registry_alpn(), allow, dispatch)
+                        .__keylink_declares_blobs(DECLARES_BLOBS)
+                }
             }
 
             /// Serve this service as an actor: `&mut self`, one message at a
@@ -6272,9 +6054,9 @@ macro_rules! __keylink_service {
 
             /// Spawn one actor of this service, ready to be mounted.
             ///
-            /// Hand it to [`System::mount`](keylink::System::mount) under an
+            /// Hand it to [`Registry::mount`](keylink::Registry::mount) under an
             /// id, or return it from
-            /// [`spawn_with`](keylink::SystemBuilder::spawn_with) to have it
+            /// [`spawn_with`](keylink::RegistryBuilder::spawn_with) to have it
             /// built on the first message to an unmounted id.
             ///
             /// For **one** actor rather than many, use [`actor`], which needs
@@ -6287,8 +6069,8 @@ macro_rules! __keylink_service {
             /// # No observers and no feeds on this door
             ///
             /// A shorthand rather than a limit, which it was until Wave 3. Use
-            /// [`spawn_wired`] for a keyed actor that must be observed, or that has
-            /// a feed — and a service that declares a feed cannot reach *this* door
+            /// `setup(state).observe(observer).feeds(feeds).mountable()` for a keyed
+            /// actor that must be observed, or that has a feed — and a service that declares a feed cannot reach *this* door
             /// at all, because `SpawnableUnfed` refuses it at the call site.
             ///
             /// What it no longer is, is a loop. The keyed loop used to read the
@@ -6300,13 +6082,13 @@ macro_rules! __keylink_service {
             /// it; there is one loop now, and this is one call into it.
             ///
             /// Nothing runs until this is mounted:
-            /// [`System::mount`](keylink::System::mount) is what starts the
-            /// task, so a `Mounted` that is refused or dropped costs no task at
+            /// [`Registry::mount`](keylink::Registry::mount) is what starts the
+            /// task, so a `Mountable` that is refused or dropped costs no task at
             /// all. That is where the tokio-runtime panic lives now, and it is
             /// why this function has none.
             #[must_use = "an unmounted actor is dropped, and the state it was \
                           built around goes with it"]
-            pub fn spawn<A: Actor>(state: A) -> Mounted {
+            pub fn spawn<A: Actor>(state: A) -> Mountable {
                 // The same refusal `Handle::service` makes, and for longer than
                 // it was made here: `CHECK` is an associated const on a generic
                 // type, so it is evaluated only where it is INSTANTIATED, and
@@ -6323,205 +6105,242 @@ macro_rules! __keylink_service {
                 // the path that was guarded. §16.9.
                 let () = ServableAsActor::<A>::CHECK;
                 let () = SpawnableUnfed::<A>::CHECK;
-                __mount(state, ::std::vec::Vec::new(), ())
+                __mount(state, ::std::vec::Vec::new(), (), ::core::option::Option::None)
             }
 
-            /// Spawn one keyed actor with its observers and its feeds.
-            ///
-            /// **The general keyed door, and the one that closed the observer gap.**
-            /// A keyed actor mounted through a [`System`](keylink::System) is watched
-            /// by whatever this was given: the same [`Observer`](keylink::Observer)
-            /// chain, the same panic guard and the same
-            /// [`finish`](keylink::Observer::finish) a local actor gets, because it
-            /// is the same loop. RFC-06 §5.3's "no observers on the keyed path" is
-            /// no longer true and the paragraph that said so is in the past tense.
-            ///
-            /// State, observers and feeds together, which is the shape a factory
-            /// needs — [`spawn_with`](keylink::SystemBuilder::spawn_with) builds an
-            /// actor on the first message to an unmounted id, and everything that
-            /// actor needs has to be produced by that one closure:
-            ///
-            /// ```ignore
-            /// let system = orders::System::builder(Eviction::Never)
-            ///     .spawn_with(move |id| {
-            ///         Some(orders::spawn_wired(
-            ///             Book::new(),
-            ///             vec![Box::new(metrics.watching(id))],
-            ///             orders::Feeds::new(exchange.subscribe(id)),
-            ///         ))
-            ///     })
-            ///     .build();
-            /// ```
-            ///
-            /// # A factory is synchronous, and a durable actor is the case that hits it
-            ///
-            /// That closure is a plain `Fn`, so it cannot `await`. A
-            /// [`Persist`](keylink::Persist) has to claim its state before it can
-            /// observe anything, and claiming is I/O — so a durable keyed actor is
-            /// mounted **eagerly**, with
-            /// [`System::mount`](keylink::System::mount) after
-            /// `Persist::open(..).await`, rather than built on first message.
-            /// `keylink/tests/persist.rs::a_keyed_actors_state_survives_its_own_process`
-            /// is that shape. It is a real limit, discovered by the wave that wrote
-            /// the first adapter, and it is stated here rather than left for the next
-            /// author to find at the borrow checker.
-            ///
-            /// # How a keyed actor's ending is observed
-            ///
-            /// A keyed actor's reason — an observer's refusal, a fault, or a feed
-            /// that ended — is published to the registry's shared watch channel.
-            /// Subscribe with [`System::ended`](keylink::System::ended) after the
-            /// id is mounted and before teardown removes it. `System::shutdown`
-            /// remains a separate operation: it reports whether its own drain
-            /// completed, while `System::ended` observes the actor's actual ending.
-            ///
-            /// # Testing: a keyed actor needs no node and no client
-            ///
-            /// Give this door a [`Feeds`] and a keyed actor is driven **entirely
-            /// in-process**: mount it into a
-            /// [`System`](keylink::System), push into the feed's own sender, and the
-            /// loop runs turns with nothing dialled and no `KeyedClient` built.
-            ///
-            /// It works because a feed is the actor's *second input* and needs no
-            /// caller — there is nobody to address, so there is nothing to address it
-            /// over. Both inputs land at one call site: `turns.rs`'s `dispatch` runs
-            /// `Turn::run` for a mailbox message and for a feed item alike, so what a
-            /// feed-driven test exercises is the keyed loop itself.
-            ///
-            /// That is the reason to prefer it rather than a convenience. A keyed test
-            /// that goes through a node proves the loop **and** the transport, so a
-            /// pass has two explanations and a failure has two suspects. Removing the
-            /// transport removes one of each.
-            ///
-            /// `keylink/tests/feeds.rs::an_observer_attached_to_a_keyed_actor_runs` is
-            /// the worked example, and RFC-07 §5.6 is where the pattern was recorded
-            /// before it was written down here.
-            ///
-            /// # Panics
-            ///
-            /// Panics when called outside a tokio runtime.
-            #[must_use = "an unmounted actor is dropped, which stops the task \
-                          this just started"]
-            pub fn spawn_wired<A: Actor>(
-                state: A,
-                observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
-                feeds: Feeds,
-            ) -> Mounted {
-                let () = ServableAsActor::<A>::CHECK;
-                __mount(state, observers, feeds)
-            }
-
-            /// What both keyed doors are, and the only place this service names
-            /// [`mount`](keylink::mount).
-            ///
-            /// Generic in the feeds so that [`spawn`]'s `()` and [`spawn_wired`]'s
-            /// [`Feeds`] go through one body: a second body is a second loop by
-            /// another name, and this wave exists to have one.
             fn __mount<A: Actor, F: $crate::Feeds<A>>(
                 state: A,
                 observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
                 feeds: F,
-            ) -> Mounted {
-                $crate::mount(move |inbox: Mailbox| async move {
-                    // Returned, never discarded: `keylink::mount`'s `Loop` is
-                    // what turns this value into the registry removing its own
-                    // entry, and a `;` here is the defect that costs.
-                    $crate::run_keyed(state, observers, feeds, inbox).await
-                })
+                backpressure: ::core::option::Option<$crate::Backpressure>,
+            ) -> Mountable {
+                match backpressure {
+                    ::core::option::Option::Some(policy) => {
+                        $crate::mount_with_backpressure(
+                            move |inbox: Mailbox| async move {
+                                $crate::run_keyed(state, observers, feeds, inbox).await
+                            },
+                            policy,
+                        )
+                    }
+                    ::core::option::Option::None => {
+                        $crate::mount(move |inbox: Mailbox| async move {
+                            $crate::run_keyed(state, observers, feeds, inbox).await
+                        })
+                    }
+                }
             }
 
-            /// Spawn one **supervised** keyed actor, ready to be mounted.
-            ///
-            /// [`spawn_wired`] with the triple produced by an `async` factory
-            /// rather than written at the call site — which is also what makes
-            /// this the keyed door a *durable* actor can use lazily. The
-            /// factory [`spawn_with`](keylink::SystemBuilder::spawn_with) takes
-            /// is a plain `Fn` and cannot `await`, so a keyed durable actor had
-            /// to be mounted eagerly after `Persist::open(..).await`; this one
-            /// awaits, once per incarnation, which is the same call the first
-            /// mount makes.
-            ///
-            /// Nothing changes in the registry: [`mount`](keylink::mount) takes
-            /// a closure over a mailbox, and the supervisor is that closure's
-            /// whole body. `System::mount`, eviction, `shutdown` and
-            /// `System::status` see one task, exactly as for an unsupervised
-            /// keyed actor.
-            ///
-            /// # A keyed actor's ending is observed through its `System`
-            ///
-            /// A keyed actor is addressed by id, so its system owns the observation
-            /// door: [`System::ended`](keylink::System::ended) subscribes to the
-            /// live entry and resolves with the loop's [`Ended`] value. A caller
-            /// must subscribe after mount and before teardown removes the entry;
-            /// `None` means the id is not live at the instant of the read.
-            ///
-            /// The same ending reaches the system's
-            /// [`Lifecycle`](keylink::Lifecycle): an actor that has given up
-            /// returns its ending from the loop, and the registry unmounts its
-            /// own entry with it, so the id is free again and a lazy factory may
-            /// serve the next message by building a fresh one.
-            ///
-            /// # What a peer whose reply dies is told, and it is three answers
-            ///
-            /// The one message a restart loses is a `#[defer]`red reply parked in
-            /// the state, because the state is dropped when the incarnation ends.
-            /// That loss reaches the peer as
-            /// [`Withheld::Restarting`](keylink::Withheld::Restarting) —
-            /// *the incarnation that owed you an answer is gone, another is
-            /// coming, retry* — carrying the ending that caused it.
-            ///
-            /// A restart is one of **three** ways that channel dies, and the other
-            /// two need no supervisor at all: a handler that takes
-            /// `reply.later()` and drops the `Deferred` — sanctioned, and what its
-            /// `#[must_use]` asks for — reads
-            /// [`Withheld::Dropped`](keylink::Withheld::Dropped), and an
-            /// actor that has genuinely ended, or was aborted or evicted, reads
-            /// [`Withheld::Gone`](keylink::Withheld::Gone).
-            /// The three answers are three different next moves: retry, do not
-            /// retry this one call, stop asking.
-            ///
-            /// **This paragraph read the other way round for one wave**, and the
-            /// correction is worth keeping rather than deleting: every one of the
-            /// three arrived as `NoSuchActor` — *there is nothing here, stop
-            /// asking* — so a client that treats the name as terminal, which is
-            /// what the name tells it to do, stopped retrying an actor that was
-            /// coming back, and a plain **unsupervised** keyed actor said *no
-            /// actor is mounted as X* about a reply it dropped while running. The
-            /// signal was said to be unreachable because it lived on a channel
-            /// nothing outside `mount`'s closure could see. It does not live there
-            /// now: each actor's loop settles a verdict into a cell the registry
-            /// made, next to the one `System::status` already reads, and
-            /// `deliver_to_actor` and `deliver_to_singleton` render it through one
-            /// function. Nothing about this signature, `mount`, `Mounted` or the
-            /// registry's API changed for it.
-            ///
-            /// Every *other* message survives a restart: a turn in flight is
-            /// answered before the loop breaks, and queued turns stay in the
-            /// mailbox the supervisor owns.
-            ///
-            /// # Panics
-            ///
-            /// Panics when called outside a tokio runtime.
-            #[must_use = "an unmounted actor is dropped, and the supervisor \
-                          that would have kept it alive goes with it"]
-            pub fn spawn_supervised<A: Actor, N, Fut, F>(
+            /// State-backed setup mode.
+            #[doc(hidden)]
+            pub struct StateSetup<A, F> {
+                state: A,
+                observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
+                feeds: F,
+            }
+
+            /// Restarting setup mode.
+            #[doc(hidden)]
+            pub struct RestartingSetup<N> {
                 factory: N,
                 limit: $crate::Intensity,
-            ) -> Mounted
+            }
+
+            /// Configure an actor before choosing a local or keyed terminal.
+            #[must_use = "a setup does nothing until actor or mountable is called"]
+            pub struct Setup<A, Mode, F = ()> {
+                mode: Mode,
+                backpressure: ::core::option::Option<$crate::Backpressure>,
+                marker: ::core::marker::PhantomData<fn() -> (A, F)>,
+            }
+
+            /// Configure one state-backed actor.
+            #[must_use = "a setup does nothing until actor or mountable is called"]
+            pub fn setup<A: Actor>(state: A) -> Setup<A, StateSetup<A, ()>> {
+                Setup {
+                    mode: StateSetup {
+                        state,
+                        observers: ::std::vec::Vec::new(),
+                        feeds: (),
+                    },
+                    backpressure: ::core::option::Option::None,
+                    marker: ::core::marker::PhantomData,
+                }
+            }
+
+            /// Configure an actor rebuilt by `factory` after an incarnation fails.
+            #[must_use = "a restarting setup does nothing until actor or mountable is called"]
+            pub fn restarting<A, N, Fut, F>(
+                factory: N,
+                limit: $crate::Intensity,
+            ) -> Setup<A, RestartingSetup<N>, F>
             where
+                A: Actor,
                 N: ::core::ops::FnMut() -> Fut + ::core::marker::Send + 'static,
                 Fut: ::core::future::Future<
-                        Output = ::core::result::Result<
-                            $crate::Incarnation<A, F>,
-                            $crate::Stop,
-                        >,
+                        Output = ::core::result::Result<$crate::Incarnation<A, F>, $crate::Stop>,
                     > + ::core::marker::Send,
                 F: $crate::Feeds<A>,
             {
-                let () = ServableAsActor::<A>::CHECK;
-                $crate::mount(move |inbox: Mailbox| async move {
-                    $crate::run_keyed_supervised(factory, limit, inbox).await
-                })
+                Setup {
+                    mode: RestartingSetup { factory, limit },
+                    backpressure: ::core::option::Option::None,
+                    marker: ::core::marker::PhantomData,
+                }
+            }
+
+            impl<A: Actor, F> Setup<A, StateSetup<A, F>, F> {
+                /// Add one observer to each turn.
+                #[must_use = "the configured observer is lost unless the returned setup is used"]
+                pub fn observe<O>(mut self, observer: O) -> Self
+                where
+                    O: $crate::Observer<A> + 'static,
+                {
+                    self.mode.observers.push(::std::boxed::Box::new(observer));
+                    self
+                }
+
+                /// Wire this service's declared feeds.
+                #[must_use = "the configured feeds are lost unless the returned setup is used"]
+                pub fn feeds(
+                    self,
+                    feeds: Feeds,
+                ) -> Setup<A, StateSetup<A, Feeds>, Feeds> {
+                    Setup {
+                        mode: StateSetup {
+                            state: self.mode.state,
+                            observers: self.mode.observers,
+                            feeds,
+                        },
+                        backpressure: self.backpressure,
+                        marker: ::core::marker::PhantomData,
+                    }
+                }
+
+                /// Set this actor's mailbox depth and overflow policy.
+                #[must_use = "the mailbox policy is lost unless the returned setup is used"]
+                pub fn backpressure(mut self, backpressure: $crate::Backpressure) -> Self {
+                    self.backpressure = ::core::option::Option::Some(backpressure);
+                    self
+                }
+            }
+
+            impl<A: Actor> Setup<A, StateSetup<A, ()>> {
+                /// Start the configured actor locally.
+                #[must_use]
+                pub fn actor(self) -> Handle<A> {
+                    let () = SpawnableUnfed::<A>::CHECK;
+                    let StateSetup { state, observers, feeds } = self.mode;
+                    let inner = match self.backpressure {
+                        ::core::option::Option::Some(policy) => {
+                            $crate::LocalActor::spawn_deep(state, observers, feeds, policy)
+                        }
+                        ::core::option::Option::None => {
+                            $crate::LocalActor::spawn_fed(state, observers, feeds)
+                        }
+                    };
+                    Handle { inner }
+                }
+
+                /// Build the configured actor for a registry mount.
+                #[must_use = "an unmounted actor is dropped"]
+                pub fn mountable(self) -> Mountable {
+                    let () = ServableAsActor::<A>::CHECK;
+                    let () = SpawnableUnfed::<A>::CHECK;
+                    let StateSetup { state, observers, feeds } = self.mode;
+                    __mount(state, observers, feeds, self.backpressure)
+                }
+            }
+
+            impl<A: Actor> Setup<A, StateSetup<A, Feeds>, Feeds> {
+                /// Start the configured actor locally.
+                #[must_use]
+                pub fn actor(self) -> Handle<A> {
+                    let StateSetup { state, observers, feeds } = self.mode;
+                    let inner = match self.backpressure {
+                        ::core::option::Option::Some(policy) => {
+                            $crate::LocalActor::spawn_deep(state, observers, feeds, policy)
+                        }
+                        ::core::option::Option::None => {
+                            $crate::LocalActor::spawn_fed(state, observers, feeds)
+                        }
+                    };
+                    Handle { inner }
+                }
+
+                /// Build the configured actor for a registry mount.
+                #[must_use = "an unmounted actor is dropped"]
+                pub fn mountable(self) -> Mountable {
+                    let () = ServableAsActor::<A>::CHECK;
+                    let StateSetup { state, observers, feeds } = self.mode;
+                    __mount(state, observers, feeds, self.backpressure)
+                }
+            }
+
+            impl<A: Actor, N, F> Setup<A, RestartingSetup<N>, F> {
+                /// Set the mailbox policy shared by every incarnation.
+                #[must_use = "the mailbox policy is lost unless the returned setup is used"]
+                pub fn backpressure(mut self, backpressure: $crate::Backpressure) -> Self {
+                    self.backpressure = ::core::option::Option::Some(backpressure);
+                    self
+                }
+
+                /// Start the supervised actor locally.
+                #[must_use]
+                pub fn actor<Fut>(self) -> Handle<A>
+                where
+                    N: ::core::ops::FnMut() -> Fut + ::core::marker::Send + 'static,
+                    Fut: ::core::future::Future<
+                            Output = ::core::result::Result<
+                                $crate::Incarnation<A, F>,
+                                $crate::Stop,
+                            >,
+                        > + ::core::marker::Send,
+                    F: $crate::Feeds<A>,
+                {
+                    let RestartingSetup { factory, limit } = self.mode;
+                    let inner = match self.backpressure {
+                        ::core::option::Option::Some(policy) => {
+                            $crate::LocalActor::spawn_supervised_deep(factory, limit, policy)
+                        }
+                        ::core::option::Option::None => {
+                            $crate::LocalActor::spawn_supervised(factory, limit)
+                        }
+                    };
+                    Handle { inner }
+                }
+
+                /// Build the supervised actor for a registry mount.
+                #[must_use = "an unmounted actor is dropped"]
+                pub fn mountable<Fut>(self) -> Mountable
+                where
+                    N: ::core::ops::FnMut() -> Fut + ::core::marker::Send + 'static,
+                    Fut: ::core::future::Future<
+                            Output = ::core::result::Result<
+                                $crate::Incarnation<A, F>,
+                                $crate::Stop,
+                            >,
+                        > + ::core::marker::Send,
+                    F: $crate::Feeds<A>,
+                {
+                    let () = ServableAsActor::<A>::CHECK;
+                    let RestartingSetup { factory, limit } = self.mode;
+                    match self.backpressure {
+                        ::core::option::Option::Some(policy) => {
+                            $crate::mount_with_backpressure(
+                                move |inbox: Mailbox| async move {
+                                    $crate::run_keyed_supervised(factory, limit, inbox).await
+                                },
+                                policy,
+                            )
+                        }
+                        ::core::option::Option::None => {
+                            $crate::mount(move |inbox: Mailbox| async move {
+                                $crate::run_keyed_supervised(factory, limit, inbox).await
+                            })
+                        }
+                    }
+                }
             }
 
             /// Start one actor of this service, here, in this process.
@@ -6537,8 +6356,8 @@ macro_rules! __keylink_service {
             /// ```
             ///
             /// To serve the **same** actor to other machines as well, call
-            /// [`Handle::service`]. To serve many keyed instances instead, use
-            /// [`spawn`] with a [`System`](keylink::System).
+            /// [`Servable::service`](keylink::Servable::service). To serve many keyed instances instead, use
+            /// [`spawn`] with a [`Registry`](keylink::Registry).
             ///
             /// # Panics
             ///
@@ -6549,230 +6368,6 @@ macro_rules! __keylink_service {
             pub fn actor<A: Actor>(state: A) -> Handle<A> {
                 let () = SpawnableUnfed::<A>::CHECK;
                 Handle { inner: $crate::LocalActor::spawn_fed(state, ::std::vec::Vec::new(), ()) }
-            }
-
-            /// Start one actor of this service with observers watching its
-            /// turns.
-            ///
-            /// An [`Observer`](keylink::Observer) is called inside each turn,
-            /// after the method and **before the reply**, and it sees the state
-            /// and the outcome — never a request or a reply payload, which is
-            /// [`Middleware`](keylink::Middleware)'s half. Returning `Err` ends
-            /// the actor, and [`Handle::ended`] says which observer and why.
-            ///
-            /// ```ignore
-            /// // `Persist` is keylink's own adapter, behind the `persist-file`
-            /// // feature. It named a `keylink_durable` crate here until Wave 5
-            /// // decided one adapter is a module and not a crate.
-            /// let (restored, saver) = keylink::Persist::<Ledger, _>::open(&store, &id).await?;
-            /// let ledger = ledger::actor_with(restored.unwrap_or_default(), vec![Box::new(saver)]);
-            /// ledger.post(1).await?;   // stored, and fsynced, before this returns
-            /// ```
-            ///
-            /// # Panics
-            ///
-            /// Panics when called outside a tokio runtime, like every other
-            /// spawn.
-            #[must_use]
-            pub fn actor_with<A: Actor>(
-                state: A,
-                observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
-            ) -> Handle<A> {
-                let () = SpawnableUnfed::<A>::CHECK;
-                Handle { inner: $crate::LocalActor::spawn_fed(state, observers, ()) }
-            }
-
-            /// Start one actor of this service with observers **and** feeds.
-            ///
-            /// The general local door: the triple a keyed factory returns, on the
-            /// path that has a [`Handle`]. [`actor`] and [`actor_with`] are
-            /// shorthands for it, and a service declaring a `feed` can use neither.
-            ///
-            /// ```ignore
-            /// let orders = orders::actor_wired(
-            ///     Book::new(),
-            ///     vec![Box::new(saver)],
-            ///     orders::Feeds::new(exchange.subscribe()),
-            /// );
-            /// orders.cancel(id).await?;      // the mailbox, as always
-            /// ```
-            ///
-            /// A feed item and a mailbox message are ordered at **one** `select`, so
-            /// the class of bug where an event is applied after the command that
-            /// should have preempted it does not arise: there is one arrival order,
-            /// not two.
-            ///
-            /// [`Feeds::new`] takes one argument per declared `feed`, in declaration
-            /// order, so a feed left unwired is an argument count rather than a
-            /// stream that never yields.
-            ///
-            /// # Panics
-            ///
-            /// Panics when called outside a tokio runtime, like every other
-            /// spawn.
-            #[must_use]
-            pub fn actor_wired<A: Actor>(
-                state: A,
-                observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
-                feeds: Feeds,
-            ) -> Handle<A> {
-                Handle { inner: $crate::LocalActor::spawn_fed(state, observers, feeds) }
-            }
-
-            /// [`actor_wired`]'s three arguments, plus the **mailbox policy**.
-            ///
-            /// How many messages may wait ahead of the one being handled, and
-            /// what happens to the one that arrives past the last slot.
-            /// [`actor`], [`actor_with`] and [`actor_wired`] all take the
-            /// default — park, at depth 1 — and this is the door that
-            /// overrides it.
-            ///
-            /// ```ignore
-            /// let orders = orders::actor_deep(
-            ///     Book::new(),
-            ///     vec![],
-            ///     orders::Feeds::new(exchange.subscribe()),
-            ///     Backpressure::Park(NonZeroUsize::new(8)?),
-            /// );
-            /// ```
-            ///
-            /// [`Backpressure::Shed`](keylink::Backpressure::Shed) is the other
-            /// arm: a full mailbox refuses at once and **loses the caller's
-            /// arguments**, answering
-            /// [`NotQueued::Full`](keylink::NotQueued::Full) from a `tell` or a
-            /// [`stop`](Handle::stop) and
-            /// [`Unanswered::Full`](keylink::Unanswered::Full) from an `rpc`. A
-            /// caller that cannot afford that reserves first — the permit doors
-            /// keep the payload under either policy.
-            ///
-            /// A deeper mailbox lets a caller get further ahead of the actor,
-            /// and that is the whole of what it buys. It is **not** a bound on
-            /// memory, and it does **not** make a self-call safe: a call made
-            /// from inside the target actor's own turn is refused by identity
-            /// rather than by the permit, so it answers a `Reentrant` at every
-            /// depth:
-            /// [`Unanswered::Reentrant`](keylink::Unanswered::Reentrant) from
-            /// an `rpc`, a `blob` or a [`with_state`](Handle::with_state),
-            /// [`NotQueued::Reentrant`](keylink::NotQueued::Reentrant) from a
-            /// [`stop`](Handle::stop). A `tell` is the one door the permit still
-            /// decides — refused only when the mailbox is **full** — so depth
-            /// changes how often that fires, never whether the hazard is closed.
-            ///
-            /// # CAUTION: a deeper mailbox raises the shutdown budget owed
-            ///
-            /// [`stop`](Handle::stop) still drains what is queued, so raising
-            /// this raises how long it can take, by up to N turns. Nothing can
-            /// check that for you.
-            ///
-            /// # Panics
-            ///
-            /// Panics when called outside a tokio runtime, like every other
-            /// spawn.
-            #[must_use]
-            pub fn actor_deep<A: Actor>(
-                state: A,
-                observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
-                feeds: Feeds,
-                backpressure: $crate::Backpressure,
-            ) -> Handle<A> {
-                Handle {
-                    inner: $crate::LocalActor::spawn_deep(state, observers, feeds, backpressure),
-                }
-            }
-
-            /// Start one actor of this service that is **rebuilt** when an
-            /// incarnation fails.
-            ///
-            /// [`actor_wired`]'s three arguments, produced by one `async`
-            /// closure instead of written at the call site, so that every
-            /// incarnation gets its own state, its own observers and its own
-            /// feed subscriptions — and the previous ones are already dropped
-            /// when it is called.
-            ///
-            /// ```ignore
-            /// let ledger = ledger::supervised(
-            ///     move || {
-            ///         let store = store.clone();
-            ///         let id = id.clone();
-            ///         async move {
-            ///             // The claim the last incarnation held is already free.
-            ///             let (restored, saver) =
-            ///                 keylink::Persist::<Ledger, _>::open(&store, &id).await?;
-            ///             Ok((restored.unwrap_or_default(), vec![Box::new(saver) as _], ()))
-            ///         }
-            ///     },
-            ///     Intensity::new(NonZeroU32::new(3).unwrap(), Duration::from_secs(10)).unwrap(),
-            /// );
-            /// ```
-            ///
-            /// The feeds are whatever the factory returns: `()` for a service
-            /// with none, and [`Feeds::new`] for one that declares them. That is
-            /// [`actor`], [`actor_with`] and [`actor_wired`] collapsed into one
-            /// door rather than three, because a factory names its own triple
-            /// and there is nothing left for a shorthand to leave out.
-            ///
-            /// See [`LocalActor::spawn_supervised`](keylink::LocalActor::spawn_supervised)
-            /// for what a restart is worth, what it costs, and the four
-            /// properties that fall out of supervising in the actor's own task.
-            ///
-            /// # Panics
-            ///
-            /// Panics when called outside a tokio runtime, like every other
-            /// spawn.
-            #[must_use]
-            pub fn supervised<A: Actor, N, Fut, F>(
-                factory: N,
-                limit: $crate::Intensity,
-            ) -> Handle<A>
-            where
-                N: ::core::ops::FnMut() -> Fut + ::core::marker::Send + 'static,
-                Fut: ::core::future::Future<
-                        Output = ::core::result::Result<
-                            $crate::Incarnation<A, F>,
-                            $crate::Stop,
-                        >,
-                    > + ::core::marker::Send,
-                F: $crate::Feeds<A>,
-            {
-                Handle { inner: $crate::LocalActor::spawn_supervised(factory, limit) }
-            }
-
-            /// [`supervised`], plus the **mailbox policy**.
-            ///
-            /// The supervised twin of [`actor_deep`]. The mailbox belongs to the
-            /// actor rather than to an incarnation, so this policy is set once
-            /// and survives every restart — which is the same fact that makes a
-            /// restart need no re-queue, and which means a shedding actor sheds
-            /// while it is rebuilding too.
-            ///
-            /// # CAUTION: a deeper mailbox raises the shutdown budget owed
-            ///
-            /// [`actor_deep`] carries the warning, and under supervision it is
-            /// the same warning with more turns behind it.
-            ///
-            /// # Panics
-            ///
-            /// Panics when called outside a tokio runtime, like every other
-            /// spawn.
-            #[must_use]
-            pub fn supervised_deep<A: Actor, N, Fut, F>(
-                factory: N,
-                limit: $crate::Intensity,
-                backpressure: $crate::Backpressure,
-            ) -> Handle<A>
-            where
-                N: ::core::ops::FnMut() -> Fut + ::core::marker::Send + 'static,
-                Fut: ::core::future::Future<
-                        Output = ::core::result::Result<
-                            $crate::Incarnation<A, F>,
-                            $crate::Stop,
-                        >,
-                    > + ::core::marker::Send,
-                F: $crate::Feeds<A>,
-            {
-                Handle {
-                    inner: $crate::LocalActor::spawn_supervised_deep(factory, limit, backpressure),
-                }
             }
 
             /// A handle to an actor in this process.
@@ -6786,7 +6381,7 @@ macro_rules! __keylink_service {
             /// **Two local error types, and they are the two questions a door
             /// asks.** An `rpc` or a `blob` asks *did I get a value* and answers
             /// [`Unanswered`](keylink::Unanswered). A `tell` or
-            /// [`stop`](Self::stop) asks *did this get queued*, has no reply
+            /// [`Own::stop`](keylink::Own::stop) asks *did this get queued*, has no reply
             /// channel, and answers [`NotQueued`](keylink::NotQueued) — two
             /// states rather than every state a lost reply can be in. One type
             /// for both would advertise on `stop` what `stop` cannot produce.
@@ -6798,9 +6393,9 @@ macro_rules! __keylink_service {
             /// process.
             ///
             /// Cheap to clone: every clone names the same actor. The actor runs
-            /// until the last handle is dropped, or until [`stop`](Self::stop)
+            /// until the last handle is dropped, or until [`Own::stop`](keylink::Own::stop)
             /// — **unless it is served**, in which case
-            /// [`service`](Self::service) put a clone inside the server and that
+            /// [`Servable::service`](keylink::Servable::service) put a clone inside the server and that
             /// one outlives every handle you hold.
             ///
             /// # A panic reaches the caller of an `rpc`
@@ -6838,7 +6433,7 @@ macro_rules! __keylink_service {
             /// [`Unanswered::Reentrant`](keylink::Unanswered::Reentrant) from
             /// an `rpc`,
             /// [`NotQueued::Reentrant`](keylink::NotQueued::Reentrant) from a
-            /// `tell` or a [`stop`](Self::stop), which is the same fact through
+            /// `tell` or a [`Own::stop`](keylink::Own::stop), which is the same fact through
             /// the door that only queues. The four cases and their mechanisms are
             /// unchanged and worth knowing, because what each one *would* have
             /// done is what decides whether it is refused:
@@ -6855,10 +6450,10 @@ macro_rules! __keylink_service {
             ///   is refused. Note the direction — this is the one case that was
             ///   ever load-dependent, and it was *depth 1* that made the block
             ///   likely rather than a deeper mailbox.
-            /// - **[`stop`](Self::stop), refused always.** It takes a permit like
+            /// - **[`Own::stop`](keylink::Own::stop), refused always.** It takes a permit like
             ///   any message, and then waits for a loop that cannot exit. It
             ///   returns a `Result` for this reason and no other.
-            /// - **[`with_state`](Self::with_state), refused always.** A read is
+            /// - **[`Own::with_state`](keylink::Own::with_state), refused always.** A read is
             ///   a message too, so the one method that never touches `&mut self`
             ///   is refused exactly like an `rpc`.
             ///
@@ -6950,158 +6545,26 @@ macro_rules! __keylink_service {
             }
 
             impl<A: Actor> Handle<A> {
-                /// Serve **this** actor to other machines, on this service's
-                /// own ALPN.
-                ///
-                /// The wire does not change: peers call it with the ordinary
-                /// [`Client`], with the same [`alpn`], the same `Request` and
-                /// the same `Response`. Nothing here is an actor concept from
-                /// the outside. What changes is the serving side — messages
-                /// queue in the mailbox and run one at a time against
-                /// `&mut self` instead of concurrently behind an `Arc`.
-                ///
-                /// This is what [`service`] is, with the mailbox in place of the
-                /// `Arc`, and the two are alternatives: one router owns one
-                /// ALPN, so registering both on a node is
-                /// [`ConfigError::DuplicateAlpn`](keylink::ConfigError::DuplicateAlpn).
-                ///
-                /// Because the reply is the service's own typed `Response`,
-                /// everything that reads one keeps working: per-method
-                /// [`Middleware`](keylink::Middleware) and `blob` methods,
-                /// whose address the server must see to record a grant.
-                ///
-                /// **That list used to be a difference from the keyed system,
-                /// and it is not any more.** It said the keyed path could offer
-                /// neither, RFC-04 §14.8, because there the payload was opaque
-                /// to keylink by design. A keyed request is
-                /// [`Addressed<Request>`](keylink::Addressed) now and its reply
-                /// is this same typed `Response`, so per-method layers, per-method
-                /// authorization and `blob` methods all work through
-                /// [`keyed_service`] too. What is left of §14.8 is one QUIC
-                /// connection per actor *service* rather than one for a node's
-                /// whole fleet — and observers came off that list as well, since
-                /// [`spawn_wired`] runs the same loop this handle does. A keyed
-                /// actor's ending is observed through
-                /// [`System::ended`](keylink::System::ended), which subscribes by
-                /// id while the registry entry is live.
-                ///
-                /// The idempotency ledger was never on that list, which is what
-                /// this paragraph used to say and is worth keeping: a key is
-                /// claimed and settled off the *envelope*, and the envelope was
-                /// typed on both paths all along. What the keyed path lacked was
-                /// a way to *send* one, and
-                /// [`KeyedClient::with_idempotency`] is that way.
-                ///
-                /// The local [`Handle`] keeps working while this is served, and
-                /// messages from both sides share the one mailbox.
-                ///
-                /// # This creates no actor, and there is no type for what it makes
-                ///
-                /// **There are two kinds of actor in this crate — local and
-                /// keyed — and serving is not a third.** It is an add-on to a
-                /// local handle. This method takes `&self`, clones the handle's
-                /// inner `LocalActor`, and hands back the same
-                /// [`ServiceBuilder`](keylink::ServiceBuilder) the free
-                /// [`service`] returns, on the **same ALPN** — which is why
-                /// registering both is a `DuplicateAlpn`. It spawns no task and
-                /// allocates no channel.
-                ///
-                /// So a served actor has no mailbox of its own:
-                /// [`deliver_to_singleton`](keylink::deliver_to_singleton) pushes into
-                /// the same `LocalActor` channel this handle's own methods push
-                /// into. **No type represents a served actor**, which is the
-                /// check on everything above — there is nothing for a third row
-                /// in a table to name.
-                ///
-                /// A keyed actor *is* the second kind, and the tree says so with
-                /// types: it is mounted in a [`System`](keylink::System) under an
-                /// [`ActorId`](keylink::ActorId) and carries its own ALPN over
-                /// its own hashed contract.
-                ///
-                /// The word **singleton** appears elsewhere in these docs, and it
-                /// names **two different things**. One gloss cannot cover both.
-                ///
-                /// * Where it names an **actor** — "a singleton has no registry
-                ///   entry" — read *"a local actor"*. That is a way of serving,
-                ///   not a kind of actor.
-                /// * Where it names an **ALPN, a contract or a `Client`** — "the
-                ///   keyed and singleton ALPNs" — read *"unkeyed"*. That wire
-                ///   identity belongs to the **service**, not to any actor.
-                ///
-                /// The second reading is not a refinement of the first, and the
-                /// paragraph above is why: the free [`service`] takes a plain
-                /// `Handler` with **no actor anywhere** and registers on the same
-                /// `alpn()` this method does. So a reader told that "the singleton
-                /// ALPN" means "served from one local handle" would conclude a
-                /// plain concurrent service is served from a handle. It is not —
-                /// the two share a wire identity and nothing else.
-                ///
-                /// An earlier version of this block gave the single gloss "a
-                /// service served from one local handle" for every site, which was
-                /// **false for the ALPN group** and true only for the actor one.
-                /// It was caught by a reviewer reading the sites the gloss governs
-                /// rather than the gloss itself.
-                ///
-                /// # What it costs
-                ///
-                /// Calls no longer overlap. Four concurrent `list`s take four
-                /// turns, and a slow method delays every later message rather
-                /// than only its own caller.
-                ///
-                /// # A layer can refuse a call. It cannot cancel a turn.
-                ///
-                /// Read this before adding [`Timeout`](keylink::Timeout).
-                ///
-                /// A layer runs **outside** the mailbox, which is what keeps a
-                /// refusal from costing a turn. The other half of that is that a
-                /// layer's budget expiring drops the *wait for the reply*, not
-                /// the turn: the turn is on the actor's task and runs to
-                /// completion whatever the caller does.
-                ///
-                /// So `Timeout::after(100ms)` in front of a method that takes
-                /// ten seconds does not shed load. Ten callers get `TimedOut` at
-                /// 100 ms and the actor still spends a hundred seconds producing
-                /// replies nobody is waiting for.
-                ///
-                /// [`QueueTimeout`](keylink::QueueTimeout) is the one that does
-                /// shed load here, and it is why `Timeout` is still worth
-                /// keeping elsewhere rather than being replaced: `QueueTimeout`
-                /// refuses only a message that has not started, and `Timeout` on
-                /// a concurrent [`Handler`] genuinely cancels the work. Two
-                /// behaviours, not two doors to one.
-                ///
-                /// What this paragraph used to say next was that a key and a
-                /// layer do not compose on this path — that a refused call was
-                /// recorded as the settled reply and the turn then ran and
-                /// mutated the state anyway. **That is fixed.** A turn that ran
-                /// and produced no answer anybody received now settles the key
-                /// as `Interrupted`, which is the truth rather than a lie the
-                /// caller would keep being told on every retry. It still does
-                /// not hand the retry the turn's real reply; RFC-05 §7 says why
-                /// and what that would cost.
-                ///
-                /// # A `send` method cannot be served this way at all
-                ///
-                /// A `send` handler reads its upload inside the turn — RFC-04
-                /// §10.4 — and no layer can bound that (see above). A peer that
-                /// declares a large body and then stops writing would hold the
-                /// actor until iroh's connection idle timeout, during which
-                /// nothing else is answered, including the local [`Handle`].
-                ///
-                /// So this no longer compiles for a service declaring one. Not a
-                /// startup error and not an opt-out: a compile error beats a
-                /// runtime one, keeps `Result` off this call site, and matches
-                /// what the rest of the crate does with claims of the form
-                /// "there is no way to do X". Put bulk transfer on a second
-                /// service served with [`service`], which is what the README
-                /// already recommends for it.
-                pub fn service(
+                $(
+                    $crate::__keylink_local_method!(
+                        [$( #[$cfg] )*],
+                        [<$kind>],
+                        [<# $rpc:snake>],
+                        $rpc,
+                        ($( $arg : $ty ),*),
+                        $ret
+                    );
+                )+
+            }
+
+            impl<A: Actor> $crate::Servable for Handle<A> {
+                type Request = Request;
+                type Response = Response;
+
+                fn service(
                     &self,
                     allow: $crate::Allowlist,
-                ) -> $crate::ServiceBuilder<Request, Response> {
-                    // Reached by `serve` too, which goes through here. A service
-                    // declaring a `send` method stops compiling AT THIS CALL
-                    // SITE, and nowhere else.
+                ) -> $crate::ServiceBuilder<Self::Request, Self::Response> {
                     let () = ServableAsActor::<A>::CHECK;
                     let actor = self.inner.clone();
                     let dispatch: $crate::Dispatch<Request, Response> =
@@ -7110,20 +6573,9 @@ macro_rules! __keylink_service {
                                                     body: $crate::BodyReader| {
                             let actor = actor.clone();
                             ::std::boxed::Box::pin(async move {
-                                // **`__Status` is answered here and enqueues
-                                // nothing**, the same way and for the same
-                                // reason the keyed closure answers it.
-                                // `serving_of_singleton` — the function this arm
-                                // calls — carries both halves: why a delivered
-                                // question could only answer the state of
-                                // asking, and why intercepting it leaves
-                                // governance untouched. This arm is what keeps
-                                // that true for a peer on the singleton door.
                                 if ::core::matches!(&req, Request::__Status { .. }) {
-                                    // Nothing ran, and an arm ending a message
-                                    // without entering it has to say so.
                                     cx.progress().unrun();
-                                    return match $crate::serving_of_singleton(&actor) {
+                                    return match $crate::serving_unkeyed(&actor) {
                                         ::std::result::Result::Ok(__serving) => (
                                             $crate::Outcome::Ok(Response::__Status(__serving)),
                                             $crate::Body::empty(),
@@ -7134,22 +6586,7 @@ macro_rules! __keylink_service {
                                         ),
                                     };
                                 }
-                                // Everything this used to do by hand — three
-                                // clones of `Progress` for three facts, the
-                                // queue deadline, the five-arm match that turned
-                                // a `Queued`/`TurnLost` back into an `Outcome` —
-                                // lives in `deliver_to_singleton` now, beside the
-                                // keyed twin it kept disagreeing with. What is
-                                // left here is the one thing only generated code
-                                // can do: name the variant.
-                                //
-                                // The `Origin` is keylink's to build. Both of
-                                // its constructors are `pub(crate)`, which is
-                                // what stops a downstream crate making a second
-                                // origin around a `Context` it already
-                                // delivered — so it is handed IN to this
-                                // closure rather than written here.
-                                $crate::deliver_to_singleton(
+                                $crate::deliver_unkeyed(
                                     &actor,
                                     cx,
                                     move |__from, __reply| Mail::Served {
@@ -7166,334 +6603,98 @@ macro_rules! __keylink_service {
                         .__keylink_declares_blobs(DECLARES_BLOBS)
                 }
 
-                /// Serve this actor alone on `node`.
-                ///
-                /// The twin of [`serve`], and it exists because the first use
-                /// of this API outside the crate found the asymmetry: the
-                /// concurrent model had a one-line front door and the actor
-                /// model made you drop to the builder, which made the actor the
-                /// more verbose choice at exactly the site RFC-04 §1.3
-                /// advertises as "one word".
-                ///
-                /// For several services on one endpoint, build each with
-                /// [`Self::service`] and register them on a single
-                /// [`Server`](keylink::Server): one router must own every ALPN.
-                ///
-                /// **It also decides three serving-side policies and takes no
-                /// argument for any of them**, exactly as the concurrent
-                /// [`serve`] does and for the same reason: it calls `build()`
-                /// itself, so a caller never holds the
-                /// [`ServiceBuilder`](keylink::ServiceBuilder) and cannot reach
-                /// [`limits`](keylink::ServiceBuilder::limits),
-                /// [`records`](keylink::ServiceBuilder::records) or
-                /// [`keyable`](keylink::ServiceBuilder::keyable). It picks
-                /// `Keyable::Any`, `Records::Memory` and
-                /// [`Limits::default`](keylink::Limits::default). To change any of
-                /// them, go through [`Self::service`] and
-                /// [`Server::builder`](keylink::Server::builder) — the route the
-                /// paragraph above names for a different reason.
-                ///
-                /// **No `Limits` parameter here either, and for the reason
-                /// [`serve`] gives**: issue #13 lists adding a parameter to these
-                /// front doors as one of three surfaces that genuinely break once
-                /// this crate is published, so it asked for a documented default
-                /// rather than a wider signature.
-                ///
-                /// # The server holds the actor, and holds it past `shutdown`
-                ///
-                /// The returned [`Server`](keylink::Server) owns a clone of this
-                /// handle, so the actor outlives every handle a caller holds.
-                /// [`Server::shutdown`](keylink::Server::shutdown) stops
-                /// accepting; it does not drop the router, so the actor and its
-                /// state live until the `Server` value itself is dropped. To end
-                /// the actor deterministically, call [`Self::stop`].
-                ///
-                /// # Errors
-                ///
-                /// [`ConfigError`](keylink::ConfigError) from
-                /// [`spawn`](keylink::ServerBuilder::spawn), the same as
-                /// [`serve`].
-                pub fn serve(
+                fn serve(
                     &self,
                     node: &$crate::Node,
                     allow: $crate::Allowlist,
                 ) -> $crate::Result<$crate::Server> {
                     $crate::Server::builder(node)
-                        .service(self.service(allow).build())
+                        .service($crate::Servable::service(self, allow).build())
                         .spawn()
                 }
+            }
 
-                /// Read the state between turns, for something the service's
-                /// own methods do not express.
-                ///
-                /// The seam for a cross-cutting concern: a snapshot for
-                /// persistence, a metric, a debug dump. It takes a turn like any
-                /// other message, so it **cannot observe a half-applied state**
-                /// — which is the entire reason it exists rather than the state
-                /// being shared behind a lock.
-                ///
-                /// ```ignore
-                /// // `snapshot` is the caller's own trait, not keylink's.
-                /// let bytes = warehouse.with_state(Warehouse::snapshot).await?;
-                /// ```
-                ///
-                /// The closure is **synchronous and takes `&A`**, on purpose.
-                /// It cannot await, so it cannot hold the actor open, and it
-                /// cannot mutate, so a concern bolted on from outside cannot
-                /// quietly become a second way to change the state. Use a
-                /// declared method for that.
-                ///
-                /// # Errors
-                ///
-                /// Two answers, because this is
-                /// [`LocalActor::read`](keylink::LocalActor::read) and a read
-                /// runs no observers and carries no queueing budget:
-                /// [`Reentrant`](keylink::Unanswered::Reentrant) when the call
-                /// came from inside this actor's own turn, and
-                /// [`Turn`](keylink::Unanswered::Turn) carrying
-                /// [`Gone`](keylink::Withheld::Gone) when the actor is gone.
-                /// That method's own documentation carries the argument for why
-                /// a dead read channel is `Gone` and never `Dropped` or
-                /// `Restarting`.
-                pub async fn with_state<T, F>(
+            impl<A: Actor> $crate::Own for Handle<A> {
+                type State = A;
+                type Permit<'a> = Permit<'a, A> where Self: 'a;
+                type OwnedPermit = OwnedPermit<A>;
+
+                async fn with_state<T, F>(
                     &self,
                     read: F,
                 ) -> ::core::result::Result<T, $crate::Unanswered>
                 where
                     T: ::core::marker::Send + 'static,
-                    F: ::core::ops::FnOnce(&A) -> T + ::core::marker::Send + 'static,
+                    F: ::core::ops::FnOnce(&Self::State) -> T
+                        + ::core::marker::Send
+                        + 'static,
                 {
-                    // A READ, not a turn: it takes `&A`, cannot mutate, and
-                    // therefore runs no observers. Storing after it would be
-                    // waste, and it also closes a loop a future background
-                    // writer would create — a writer that read through a turn
-                    // would mark the actor dirty and schedule another read,
-                    // forever.
                     self.inner.read(read).await
                 }
 
-                /// Stop after the messages already queued, then wait for the
-                /// actor to end. Every other handle reports a closed mailbox
-                /// from then on — an `rpc` as
-                /// [`Withheld::Gone`](keylink::Withheld::Gone), a `tell`
-                /// as [`NotQueued::Closed`](keylink::NotQueued::Closed).
-                ///
-                /// # Errors
-                ///
-                /// [`NotQueued::Reentrant`](keylink::NotQueued::Reentrant),
-                /// and it is the only error this returns: called from inside
-                /// the actor's own turn, where it would otherwise wait for an
-                /// ending only this turn can reach.
-                ///
-                /// [`NotQueued`](keylink::NotQueued) and not
-                /// [`Unanswered`](keylink::Unanswered) because a `stop` asks
-                /// only whether the request was queued — it has no reply
-                /// channel, so no verdict on a turn can reach it. An actor that
-                /// is already gone is `Ok`, because stopping a stopped actor is
-                /// what the caller asked for.
-                pub async fn stop(&self) -> ::core::result::Result<(), $crate::NotQueued> {
+                async fn stop(&self) -> ::core::result::Result<(), $crate::NotQueued> {
                     self.inner.stop().await
                 }
 
-                /// Cancel the actor where it stands, destroying its state.
-                ///
-                /// Cooperative, like every tokio abort: the turn is dropped at
-                /// its next await point. A turn that never reaches one — a
-                /// compute loop, a blocking syscall — is not interrupted, and
-                /// this returns having done nothing. That is the one case
-                /// [`stop`](Self::stop) also cannot fix.
-                ///
-                /// Asynchronous, too: [`is_running`](Self::is_running) can still
-                /// say `true` between this call and the runtime dropping the
-                /// task. `stop` does not have that gap, because it waits.
-                pub fn abort(&self) {
+                fn abort(&self) {
                     self.inner.abort();
                 }
 
-                /// Whether the actor is still handling messages. Advisory: it
-                /// can stop between this answer and the next call.
-                #[must_use]
-                pub fn is_running(&self) -> bool {
+                fn is_running(&self) -> bool {
                     self.inner.is_running()
                 }
 
-                /// Whether a turn is running right now.
-                ///
-                /// [`is_running`](Self::is_running) answers `true` for an actor
-                /// wedged inside a turn and for one sitting idle. This separates
-                /// them, and it is the question you cannot ask the actor: a
-                /// message asking would queue behind the turn that wedged it.
-                #[must_use]
-                pub fn is_busy(&self) -> bool {
-                    self.inner.is_busy()
-                }
-
-                /// How many messages are waiting ahead of the one being handled.
-                ///
-                /// Zero or one at the local mailbox depth, and never a number to
-                /// compute a queue-length alert from. What it answers exactly is
-                /// whether the next caller will block on the permit.
-                #[must_use]
-                pub fn buffered(&self) -> u64 {
-                    self.inner.buffered()
-                }
-
-                /// [`is_busy`](Self::is_busy) and [`buffered`](Self::buffered),
-                /// folded into the one value a peer reads.
-                ///
-                /// **The same reading, not an equivalent one.** A peer's
-                /// `__status` on this actor is answered from these two loads,
-                /// through the same [`LocalActor::serving`](keylink::LocalActor::serving)
-                /// this calls, so a local caller and a peer cannot be told
-                /// different things about one actor.
-                ///
-                /// See [`Serving`](keylink::Serving) for what the pair does and
-                /// does not claim — in particular that `buffered` compares as a
-                /// predicate and never as a count, and that the two fields are
-                /// two loads rather than one instant.
-                ///
-                /// Synchronous, and that is the whole of it: it reads a flag
-                /// beside the mailbox and sends nothing, so it answers while a
-                /// turn is holding the actor.
-                #[must_use]
-                pub fn __status(&self) -> $crate::Serving {
-                    self.inner.serving()
-                }
-
-                /// Resolve when this actor ends, and say why.
-                ///
-                /// [`Withheld::Gone`](keylink::Withheld::Gone) says
-                /// "gone", and it must not be stretched to say "gave up on
-                /// durability". This is the second question, asked separately.
-                ///
-                /// **It is not where a refusal is learned, in either
-                /// direction.** An `rpc` refused by an
-                /// [`Observer`](keylink::Observer) is answered
-                /// [`Withheld::Refused`](keylink::Withheld::Refused) with
-                /// that observer's name, so the call carries the fact itself;
-                /// and a refusal that did not declare itself
-                /// [`fatal`](keylink::Stop::fatal) ends one incarnation rather
-                /// than the actor, so a supervised actor restarts and this does
-                /// not resolve at all. What it adds is the observer's own
-                /// **error**, which no reply channel carries.
-                ///
-                /// Holds no mailbox sender, so awaiting it does not keep the
-                /// actor alive: dropping every handle both ends the actor and
-                /// resolves this.
-                pub fn ended(&self) -> impl ::core::future::Future<Output = $crate::Ended>
-                    + ::core::marker::Send + 'static {
+                fn ended(
+                    &self,
+                ) -> impl ::core::future::Future<Output = $crate::Ended>
+                    + ::core::marker::Send
+                    + 'static {
                     self.inner.ended()
                 }
 
-                /// Wait for a slot in this actor's mailbox and hold it.
-                ///
-                /// Backpressure, made addressable. Every method below waits for
-                /// a permit inside itself and spends it in the same call, so a
-                /// caller sees the wait and never the slot. This stops at the
-                /// slot and hands over a [`Permit`], which carries the same
-                /// methods and whose send cannot wait again.
-                ///
-                /// [`LocalActor::reserve`](keylink::LocalActor::reserve) is what
-                /// this calls, and it carries the whole argument: what tokio
-                /// guarantees when a racing reserve is cancelled — capacity, not
-                /// a place in the queue — and why the re-entrancy refusal is
-                /// stricter here than a `tell`'s.
-                ///
-                /// # The two underscores, and they are not decoration
-                ///
-                /// The same rule `Request::__Status` is written under: *a name a
-                /// user could also write would be a name a user could collide
-                /// with*. The reservation doors therefore use the `__reserve`,
-                /// `__try_reserve` and `__reserve_owned` spellings. A service may
-                /// still declare the ordinary `Reserve` name; its generated
-                /// `reserve` method remains independent of these internal doors.
-                ///
-                /// The bare names live on
-                /// [`LocalActor`](keylink::LocalActor), which is keylink's own
-                /// type and shares its namespace with nobody.
-                ///
-                /// # Errors
-                ///
-                /// [`NotQueued::Closed`](keylink::NotQueued::Closed) when the
-                /// actor is gone, and
-                /// [`NotQueued::Reentrant`](keylink::NotQueued::Reentrant) when
-                /// the call is made from inside this actor's own turn — at any
-                /// depth, because a permit carries no message and the door
-                /// cannot see whether it is about to be spent on a `tell` or on
-                /// an `rpc`.
-                pub async fn __reserve(&self)
-                    -> ::core::result::Result<Permit<'_, A>, $crate::NotQueued> {
+                fn status(&self) -> $crate::Serving {
+                    self.inner.serving()
+                }
+
+                async fn reserve(
+                    &self,
+                ) -> ::core::result::Result<Self::Permit<'_>, $crate::NotQueued> {
                     self.inner.reserve().await.map(|slot| Permit { inner: slot })
                 }
 
-                /// The same, without waiting. `Ok(None)` means this actor is
-                /// full right now.
-                ///
-                /// Three answers rather than two, so a caller routing across
-                /// several actors can try the next one on a full and stop on a
-                /// closed without reading a discriminant to tell them apart.
-                ///
-                /// # Errors
-                ///
-                /// [`__reserve`](Self::__reserve)'s, and neither of them means
-                /// full.
-                pub fn __try_reserve(&self)
-                    -> ::core::result::Result<
-                        ::core::option::Option<Permit<'_, A>>,
-                        $crate::NotQueued,
-                    > {
+                fn try_reserve(
+                    &self,
+                ) -> ::core::result::Result<
+                    ::core::option::Option<Self::Permit<'_>>,
+                    $crate::NotQueued,
+                > {
                     self.inner
                         .try_reserve()
                         .map(|slot| slot.map(|slot| Permit { inner: slot }))
                 }
 
-                /// The same as [`__reserve`](Self::__reserve), owned, so the
-                /// permit can be stored or moved into a spawned task.
-                ///
-                /// A [`Permit`] borrows this handle, so it cannot outlive the
-                /// frame that reserved it. That is the **only** difference: a
-                /// future holding a borrowed permit across an await is already
-                /// `Send`. Takes `self`, and a handle is `Clone`, so a caller who
-                /// still wants one clones it first.
-                ///
-                /// # Errors
-                ///
-                /// [`__reserve`](Self::__reserve)'s — and
-                /// [`LocalActor::reserve_owned`](keylink::LocalActor::reserve_owned)
-                /// names the hazard the refusal cannot reach once a permit is
-                /// stored.
-                pub async fn __reserve_owned(self)
-                    -> ::core::result::Result<OwnedPermit<A>, $crate::NotQueued> {
+                async fn reserve_owned(
+                    self,
+                ) -> ::core::result::Result<Self::OwnedPermit, $crate::NotQueued> {
                     self.inner
                         .reserve_owned()
                         .await
                         .map(|slot| OwnedPermit { inner: slot })
                 }
-
-                $(
-                    $crate::__keylink_local_method!(
-                        [$( #[$cfg] )*],
-                        [<$kind>],
-                        [<# $rpc:snake>],
-                        $rpc,
-                        ($( $arg : $ty ),*),
-                        $ret
-                    );
-                )+
             }
 
             /// One reserved slot in an actor's mailbox, carrying this service's
             /// own methods.
             ///
-            /// Handed out by [`Handle::__reserve`] and
-            /// [`Handle::__try_reserve`]. Every method here takes `self`, because
+            /// Handed out by [`Own::reserve`](keylink::Own::reserve) and
+            /// [`Own::try_reserve`](keylink::Own::try_reserve). Every method here takes `self`, because
             /// a slot admits one message: spending it is the whole of what a
             /// permit is for, and there is no second send to make.
             ///
             /// **The methods here carry no underscores**, and the reason is that
             /// this type's namespace holds nothing but the service's own methods:
             /// there is no keylink name for one to collide with, which is exactly
-            /// the condition [`Handle::__reserve`] does not meet.
+            /// the condition [`Own::reserve`](keylink::Own::reserve) does not meet.
             ///
             /// **The methods differ from [`Handle`]'s in exactly one way — a
             /// `tell` returns nothing at all rather than a `Result`.** Both of
@@ -7527,7 +6728,7 @@ macro_rules! __keylink_service {
             /// [`Permit`] that owns its sender, so it can be stored or moved into
             /// a spawned task.
             ///
-            /// Handed out by [`Handle::__reserve_owned`], and it carries the same
+            /// Handed out by [`Own::reserve_owned`](keylink::Own::reserve_owned), and it carries the same
             /// methods for the same reasons. The difference is `'static` and
             /// nothing else.
             #[must_use = "a dropped permit returns the slot and sends nothing; \
@@ -7549,7 +6750,7 @@ macro_rules! __keylink_service {
                 )+
             }
 
-            /// [`Handle::__reserve`] and [`Handle::__status`], under the names a
+            /// [`Own::reserve`](keylink::Own::reserve) and [`Own::status`](keylink::Own::status), under the names a
             /// [`Factory`](keylink::compose::Factory) asks a member for.
             ///
             /// **This is the one line `service!` generates because `compose`
@@ -7568,11 +6769,11 @@ macro_rules! __keylink_service {
                 fn reserve(&self) -> impl ::core::future::Future<
                     Output = ::core::result::Result<Permit<'_, A>, $crate::NotQueued>,
                 > + ::core::marker::Send {
-                    Handle::__reserve(self)
+                    $crate::Own::reserve(self)
                 }
 
                 fn status(&self) -> $crate::Serving {
-                    Handle::__status(self)
+                    $crate::Own::status(self)
                 }
             }
 
@@ -7591,9 +6792,9 @@ macro_rules! __keylink_service {
             /// service, a bounded number — and **not** about connection count.
             /// Do not conflate them.
             ///
-            /// Address one actor with [`KeyedClient::at`], which gives back a
+            /// Address one actor with [`RegistryClient::at`], which gives back a
             /// typed handle whose methods are the ones written in `service!`.
-            pub struct KeyedClient {
+            pub struct RegistryClient {
                 inner: $crate::RpcClient<$crate::Addressed<Request>, Response>,
                 /// Attached to every call [`ActorRef`] makes through this
                 /// handle. Held here rather than inside the client, because
@@ -7609,7 +6810,7 @@ macro_rules! __keylink_service {
             /// Every clone names the same connection. Written out rather than
             /// derived for the reason [`Client`]'s is: a derive would demand
             /// `Request: Clone, Response: Clone`, and neither appears in a field.
-            impl ::core::clone::Clone for KeyedClient {
+            impl ::core::clone::Clone for RegistryClient {
                 fn clone(&self) -> Self {
                     Self {
                         inner: self.inner.clone(),
@@ -7618,74 +6819,24 @@ macro_rules! __keylink_service {
                 }
             }
 
-            impl ::core::fmt::Debug for KeyedClient {
+            impl ::core::fmt::Debug for RegistryClient {
                 fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-                    f.debug_struct("KeyedClient")
+                    f.debug_struct("RegistryClient")
                         .field("service", &stringify!($svc))
                         .finish_non_exhaustive()
                 }
             }
 
-            impl KeyedClient {
-                /// Dial a peer's actor system for this service, by public key.
+            impl RegistryClient {
+                /// Dial a peer's actor registry for this service, by public key.
                 pub async fn connect(
                     node: &$crate::Node,
                     peer: impl Into<$crate::EndpointAddr>,
                 ) -> $crate::Result<Self> {
                     Ok(Self {
-                        inner: $crate::RpcClient::connect(node, peer, keyed_alpn()).await?,
+                        inner: $crate::RpcClient::connect(node, peer, registry_alpn()).await?,
                         idempotency: ::core::option::Option::None,
                     })
-                }
-
-                /// The same connection, with an idempotency key on every call
-                /// made through the handle it returns.
-                ///
-                /// **This is the capability a keyed actor was missing**, and it
-                /// was never the ledger: a key is claimed and settled off the
-                /// envelope, and the envelope was typed on both paths, so the
-                /// ledger has always worked here. What did not exist was a
-                /// generated client that could attach one — a key reached a
-                /// keyed actor only from a peer building the envelope through
-                /// [`RpcClient`](keylink::RpcClient) by hand.
-                ///
-                /// See the singleton twin,
-                /// [`Client::with_idempotency`], for what a bare key does on
-                /// collision and how to wait for the call already in flight
-                /// instead.
-                #[must_use]
-                pub fn with_idempotency(
-                    &self,
-                    idempotency: impl ::core::convert::Into<$crate::Idempotency>,
-                ) -> Self {
-                    Self {
-                        inner: self.inner.clone(),
-                        idempotency: ::core::option::Option::Some(idempotency.into()),
-                    }
-                }
-
-                /// Ask what this peer's ledger knows about one of your keys.
-                ///
-                /// A ledger is per service, so this answers about **this
-                /// service's** keyed connection and nothing else. See
-                /// [`RpcClient::key_state`](keylink::RpcClient::key_state).
-                pub async fn key_state(
-                    &self,
-                    key: $crate::IdempotencyKey,
-                ) -> $crate::Result<$crate::KeyState> {
-                    self.inner.key_state(key).await
-                }
-
-                /// Await this peer's departure instead of meeting it on the
-                /// next call. See [`Watch`](keylink::Watch).
-                // No `#[must_use]`: `Watch` already carries one.
-                pub fn watch(&self) -> $crate::Watch {
-                    self.inner.watch()
-                }
-
-                /// Close the connection gracefully.
-                pub async fn close(self) -> $crate::Result<()> {
-                    self.inner.close().await
                 }
 
                 /// Address one actor of this service on this connection.
@@ -7694,9 +6845,6 @@ macro_rules! __keylink_service {
                     ActorRef { client: self, actor }
                 }
 
-                /// Send one message to one actor. Called by [`ActorRef`], which
-                /// is the only thing that should build an
-                /// [`Addressed`](keylink::Addressed).
                 async fn send_to(
                     &self,
                     actor: &$crate::ActorId,
@@ -7715,14 +6863,43 @@ macro_rules! __keylink_service {
                     }
                 }
 
-                /// Point a handle at content this peer just named. Called by a
-                /// generated `blob` method on [`ActorRef`].
                 fn blob_handle(&self, id: $crate::BlobId) -> $crate::BlobHandle {
                     self.inner.blob_handle(id)
                 }
             }
 
-            impl $crate::Dial for KeyedClient {
+            impl $crate::WithIdempotency for RegistryClient {
+                type Output = Self;
+
+                fn with_idempotency(
+                    &self,
+                    idempotency: impl ::core::convert::Into<$crate::Idempotency>,
+                ) -> Self::Output {
+                    Self {
+                        inner: self.inner.clone(),
+                        idempotency: ::core::option::Option::Some(idempotency.into()),
+                    }
+                }
+            }
+
+            impl $crate::Wire for RegistryClient {
+                async fn key_state(
+                    &self,
+                    key: $crate::IdempotencyKey,
+                ) -> $crate::Result<$crate::KeyState> {
+                    self.inner.key_state(key).await
+                }
+
+                fn watch(&self) -> $crate::Watch {
+                    self.inner.watch()
+                }
+
+                async fn close(self) -> $crate::Result<()> {
+                    self.inner.close().await
+                }
+            }
+
+            impl $crate::Dial for RegistryClient {
                 async fn dial(
                     node: &$crate::Node,
                     addr: $crate::EndpointAddr,
@@ -7747,62 +6924,11 @@ macro_rules! __keylink_service {
             /// number inside your own message. See [`Actor`].
             #[derive(Debug)]
             pub struct ActorRef<'a> {
-                client: &'a KeyedClient,
+                client: &'a RegistryClient,
                 actor: $crate::ActorId,
             }
 
             impl ActorRef<'_> {
-                /// Which actor this handle addresses.
-                pub fn id(&self) -> &$crate::ActorId {
-                    &self.actor
-                }
-
-                /// What this actor is doing right now.
-                ///
-                /// The two facts a local
-                /// [`System::serving`](keylink::System::serving) reports, read
-                /// off the same lines on the serving node — see
-                /// [`Serving`](keylink::Serving) for what the pair does and does
-                /// not claim.
-                ///
-                /// **It never enters the mailbox**, so it answers while a turn
-                /// is holding the actor. That is the question's whole point: a
-                /// message asking would queue behind the turn that wedged it,
-                /// and would then report `busy: true` about itself.
-                ///
-                /// **It also does not mount anything.** An ordinary call to an
-                /// unmounted id on a
-                /// [`spawn_with`](keylink::SystemBuilder::spawn_with) system
-                /// builds the actor; this reads the registry and answers
-                /// [`NoSuchActor`](keylink::RemoteError::NoSuchActor). Asking
-                /// what an actor is doing must not be how one comes into
-                /// existence.
-                ///
-                /// A [`Middleware`](keylink::Middleware) on the serving side
-                /// sees this like any other method — under the name `"__Status"`
-                /// — so a node that does not want peers reading turn state
-                /// refuses it there.
-                ///
-                /// # Errors
-                ///
-                /// [`NoSuchActor`](keylink::RemoteError::NoSuchActor) when
-                /// nothing is mounted under this id, and
-                /// [`BadActorId`](keylink::RemoteError::BadActorId) when the id
-                /// is not one — checked before any lookup, so it says nothing
-                /// about what is mounted. Plus whatever the transport or a layer
-                /// answers.
-                pub async fn __status(&self) -> $crate::Result<$crate::Serving> {
-                    let (__response, _body) = self
-                        .client
-                        .send_to(
-                            &self.actor,
-                            Request::__Status {},
-                            $crate::Body::empty(),
-                        )
-                        .await?;
-                    __response.__into_status()
-                }
-
                 $(
                     $crate::__keylink_actor_client_method!(
                         [$( #[$cfg] )*],
@@ -7816,6 +6942,20 @@ macro_rules! __keylink_service {
                         $ret
                     );
                 )+
+            }
+
+            impl $crate::Status for ActorRef<'_> {
+                async fn status(&self) -> $crate::Result<$crate::Serving> {
+                    let (__response, _body) = self
+                        .client
+                        .send_to(
+                            &self.actor,
+                            Request::__Status {},
+                            $crate::Body::empty(),
+                        )
+                        .await?;
+                    __response.__into_status()
+                }
             }
 
             impl $crate::Dial for Client {
@@ -7857,94 +6997,6 @@ macro_rules! __keylink_service {
                     })
                 }
 
-                /// The same connection, with an idempotency key on every call
-                /// made through the handle it returns.
-                ///
-                /// The key is a transport concern rather than a domain one, so
-                /// it goes here instead of into every method signature. Takes a
-                /// bare [`IdempotencyKey`](keylink::IdempotencyKey), which
-                /// refuses on collision, or an
-                /// [`Idempotency`](keylink::Idempotency), which can wait for the
-                /// call already running under the key. See
-                /// [`RpcClient::with_idempotency`](keylink::RpcClient::with_idempotency)
-                /// for why the handle is meant for one call.
-                ///
-                /// Returns an [`IdempotentClient`], which has **no `tell`
-                /// method** — see that type for why the difference is a type
-                /// rather than a paragraph.
-                #[must_use]
-                pub fn with_idempotency(
-                    &self,
-                    idempotency: impl ::core::convert::Into<$crate::Idempotency>,
-                ) -> IdempotentClient {
-                    IdempotentClient {
-                        inner: self.inner.with_idempotency(idempotency),
-                    }
-                }
-
-                /// Ask what this peer's ledger knows about one of your keys.
-                ///
-                /// See
-                /// [`RpcClient::key_state`](keylink::RpcClient::key_state). Runs
-                /// no handler, so it never appears in the [`Handler`] or
-                /// [`Actor`] traits — it is a question about keylink's own
-                /// bookkeeping rather than about your service.
-                pub async fn key_state(
-                    &self,
-                    key: $crate::IdempotencyKey,
-                ) -> $crate::Result<$crate::KeyState> {
-                    self.inner.key_state(key).await
-                }
-
-                /// Await this peer's departure instead of meeting it on the
-                /// next call.
-                ///
-                /// See [`Watch`](keylink::Watch).
-                // No `#[must_use]`: `Watch` already carries one, and repeating it
-                // here is `clippy::double_must_use`. Only visible since the
-                // library expands this macro itself — clippy suppresses lints
-                // from an external macro, so no downstream expansion reports it.
-                pub fn watch(&self) -> $crate::Watch {
-                    self.inner.watch()
-                }
-
-                /// What the actor answering this connection is doing right now.
-                ///
-                /// The two facts a local [`Handle`] reads through its own
-                /// `__status`, over the wire — see
-                /// [`Serving`](keylink::Serving) for what the pair does and does
-                /// not claim.
-                ///
-                /// **It never enters the mailbox**, so it answers while a turn
-                /// is holding the actor. That is the question's whole point: a
-                /// message asking would queue behind the turn that wedged it,
-                /// and would then report `busy: true` about itself.
-                ///
-                /// A [`Middleware`](keylink::Middleware) on the serving side
-                /// sees this like any other method — under the name `"__Status"`
-                /// — so a node that does not want peers reading turn state
-                /// refuses it there.
-                ///
-                /// # Errors
-                ///
-                /// [`NotAnActor`](keylink::RemoteError::NotAnActor) when this
-                /// node serves the service with a [`Handler`] rather than as an
-                /// actor. One ALPN carries both, so which one is behind a
-                /// connection is a fact about that node, and this is where a
-                /// peer learns it.
-                ///
-                /// [`Withheld::Gone`](keylink::Withheld::Gone) once the actor
-                /// has stopped — the same answer every other method gives for
-                /// that one condition. Plus whatever the transport or a layer
-                /// answers.
-                pub async fn __status(&self) -> $crate::Result<$crate::Serving> {
-                    let (__response, _body) = self
-                        .inner
-                        .call(Request::__Status {}, $crate::Body::empty())
-                        .await?;
-                    __response.__into_status()
-                }
-
                 $(
                     $crate::__keylink_client_method!(
                         [$( #[$cfg] )*],
@@ -7958,16 +7010,51 @@ macro_rules! __keylink_service {
                         $ret
                     );
                 )+
+            }
 
-                /// Close the connection gracefully.
-                pub async fn close(self) -> $crate::Result<()> {
+            impl $crate::WithIdempotency for Client {
+                type Output = IdempotentClient;
+
+                fn with_idempotency(
+                    &self,
+                    idempotency: impl ::core::convert::Into<$crate::Idempotency>,
+                ) -> Self::Output {
+                    IdempotentClient {
+                        inner: self.inner.with_idempotency(idempotency),
+                    }
+                }
+            }
+
+            impl $crate::Wire for Client {
+                async fn key_state(
+                    &self,
+                    key: $crate::IdempotencyKey,
+                ) -> $crate::Result<$crate::KeyState> {
+                    self.inner.key_state(key).await
+                }
+
+                fn watch(&self) -> $crate::Watch {
+                    self.inner.watch()
+                }
+
+                async fn close(self) -> $crate::Result<()> {
                     self.inner.close().await
+                }
+            }
+
+            impl $crate::Status for Client {
+                async fn status(&self) -> $crate::Result<$crate::Serving> {
+                    let (__response, _body) = self
+                        .inner
+                        .call(Request::__Status {}, $crate::Body::empty())
+                        .await?;
+                    __response.__into_status()
                 }
             }
 
             /// The same connection, scoped to one idempotency key.
             ///
-            /// Built by [`Client::with_idempotency`]. Its methods are
+            /// Built by [`WithIdempotency::with_idempotency`](keylink::WithIdempotency::with_idempotency). Its methods are
             /// [`Client`]'s, minus every `tell`: a key promises the work runs
             /// at most once, and the ledger keeps that promise by recording the
             /// reply and answering a repeat with it, so a method with no reply
@@ -7990,46 +7077,6 @@ macro_rules! __keylink_service {
             }
 
             impl IdempotentClient {
-                /// Ask what this peer's ledger knows about one of your keys.
-                ///
-                /// See [`Client::key_state`].
-                pub async fn key_state(
-                    &self,
-                    key: $crate::IdempotencyKey,
-                ) -> $crate::Result<$crate::KeyState> {
-                    self.inner.key_state(key).await
-                }
-
-                /// Await this peer's departure instead of meeting it on the
-                /// next call. See [`Watch`](keylink::Watch).
-                // No `#[must_use]`: `Watch` already carries one, and repeating
-                // it here is `clippy::double_must_use`.
-                pub fn watch(&self) -> $crate::Watch {
-                    self.inner.watch()
-                }
-
-                /// What the actor answering this connection is doing right now.
-                ///
-                /// See [`Client::__status`], which this is. Present here because
-                /// this type is [`Client`]'s methods **minus every `tell`**, and
-                /// this is not one.
-                ///
-                /// The key rides along and buys nothing, which is honest rather
-                /// than useful: no handler is entered, so the serving side
-                /// releases the key instead of recording a reply under it, and a
-                /// retry reads the actor again rather than a status from before.
-                ///
-                /// # Errors
-                ///
-                /// [`Client::__status`]'.
-                pub async fn __status(&self) -> $crate::Result<$crate::Serving> {
-                    let (__response, _body) = self
-                        .inner
-                        .call(Request::__Status {}, $crate::Body::empty())
-                        .await?;
-                    __response.__into_status()
-                }
-
                 $(
                     $crate::__keylink_idempotent_client_method!(
                         [$( #[$cfg] )*],
@@ -8042,10 +7089,32 @@ macro_rules! __keylink_service {
                         $ret
                     );
                 )+
+            }
 
-                /// Close the connection gracefully.
-                pub async fn close(self) -> $crate::Result<()> {
+            impl $crate::Wire for IdempotentClient {
+                async fn key_state(
+                    &self,
+                    key: $crate::IdempotencyKey,
+                ) -> $crate::Result<$crate::KeyState> {
+                    self.inner.key_state(key).await
+                }
+
+                fn watch(&self) -> $crate::Watch {
+                    self.inner.watch()
+                }
+
+                async fn close(self) -> $crate::Result<()> {
                     self.inner.close().await
+                }
+            }
+
+            impl $crate::Status for IdempotentClient {
+                async fn status(&self) -> $crate::Result<$crate::Serving> {
+                    let (__response, _body) = self
+                        .inner
+                        .call(Request::__Status {}, $crate::Body::empty())
+                        .await?;
+                    __response.__into_status()
                 }
             }
 
@@ -8236,35 +7305,6 @@ macro_rules! __keylink_service {
                         Ok(Self { inner, runtime })
                     }
 
-                    /// The same connection, with an idempotency key on every
-                    /// call made through the handle it returns.
-                    ///
-                    /// See the async twin,
-                    /// [`Client::with_idempotency`](super::Client::with_idempotency).
-                    /// The returned type has no `tell`, for the reason given on
-                    /// [`IdempotentClient`](super::IdempotentClient).
-                    #[must_use]
-                    pub fn with_idempotency(
-                        &self,
-                        idempotency: impl ::core::convert::Into<$crate::Idempotency>,
-                    ) -> IdempotentClient {
-                        IdempotentClient {
-                            inner: self.inner.with_idempotency(idempotency),
-                            runtime: ::std::sync::Arc::clone(&self.runtime),
-                        }
-                    }
-
-                    /// Ask what this peer's ledger knows about one of your keys.
-                    ///
-                    /// See the async twin,
-                    /// [`Client::key_state`](super::Client::key_state).
-                    pub fn key_state(
-                        &self,
-                        key: $crate::IdempotencyKey,
-                    ) -> $crate::Result<$crate::KeyState> {
-                        self.runtime.run(self.inner.key_state(key))?
-                    }
-
                     $(
                         $crate::__keylink_blocking_method!(
                             [$( #[$cfg] )*],
@@ -8276,10 +7316,35 @@ macro_rules! __keylink_service {
                             $ret
                         );
                     )+
+                }
 
-                    /// Close the connection gracefully.
-                    pub fn close(self) -> $crate::Result<()> {
-                        self.runtime.run(self.inner.close())?
+                impl $crate::WithIdempotency for Client {
+                    type Output = IdempotentClient;
+
+                    fn with_idempotency(
+                        &self,
+                        idempotency: impl ::core::convert::Into<$crate::Idempotency>,
+                    ) -> Self::Output {
+                        IdempotentClient {
+                            inner: $crate::WithIdempotency::with_idempotency(
+                                &self.inner,
+                                idempotency,
+                            ),
+                            runtime: ::std::sync::Arc::clone(&self.runtime),
+                        }
+                    }
+                }
+
+                impl $crate::BlockingWire for Client {
+                    fn key_state(
+                        &self,
+                        key: $crate::IdempotencyKey,
+                    ) -> $crate::Result<$crate::KeyState> {
+                        self.runtime.run($crate::Wire::key_state(&self.inner, key))?
+                    }
+
+                    fn close(self) -> $crate::Result<()> {
+                        self.runtime.run($crate::Wire::close(self.inner))?
                     }
                 }
 
@@ -8294,17 +7359,6 @@ macro_rules! __keylink_service {
                 }
 
                 impl IdempotentClient {
-                    /// Ask what this peer's ledger knows about one of your keys.
-                    ///
-                    /// See the async twin,
-                    /// [`IdempotentClient::key_state`](super::IdempotentClient::key_state).
-                    pub fn key_state(
-                        &self,
-                        key: $crate::IdempotencyKey,
-                    ) -> $crate::Result<$crate::KeyState> {
-                        self.runtime.run(self.inner.key_state(key))?
-                    }
-
                     $(
                         $crate::__keylink_idempotent_blocking_method!(
                             [$( #[$cfg] )*],
@@ -8315,10 +7369,18 @@ macro_rules! __keylink_service {
                             $ret
                         );
                     )+
+                }
 
-                    /// Close the connection gracefully.
-                    pub fn close(self) -> $crate::Result<()> {
-                        self.runtime.run(self.inner.close())?
+                impl $crate::BlockingWire for IdempotentClient {
+                    fn key_state(
+                        &self,
+                        key: $crate::IdempotencyKey,
+                    ) -> $crate::Result<$crate::KeyState> {
+                        self.runtime.run($crate::Wire::key_state(&self.inner, key))?
+                    }
+
+                    fn close(self) -> $crate::Result<()> {
+                        self.runtime.run($crate::Wire::close(self.inner))?
                     }
                 }
             }
@@ -8332,7 +7394,7 @@ macro_rules! __keylink_service {
 /// keylink already owns on that generated surface.
 ///
 /// The check is deliberately surface-specific. A name such as `at` is valid on
-/// an actor handle even though it is the addressing door on `KeyedClient`, and
+/// an actor handle even though it is the addressing door on `RegistryClient`, and
 /// `ended` is valid on a client even though it is an observation door on a local
 /// handle. A flat reserved-name list would reject valid services and still say
 /// nothing about which generated type owns the name.
@@ -8856,65 +7918,11 @@ macro_rules! __keylink_generated_name_check {
     };
     (feeds, $name:ident, $rpc:ident, $kind:ident) => {};
 
-    (local_handle, service, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "service", $rpc);
-    };
-    (local_handle, r#service, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "service", $rpc);
-    };
-    (local_handle, serve, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "serve", $rpc);
-    };
-    (local_handle, r#serve, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "serve", $rpc);
-    };
-    (local_handle, with_state, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "with_state", $rpc);
-    };
-    (local_handle, r#with_state, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "with_state", $rpc);
-    };
-    (local_handle, stop, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "stop", $rpc);
-    };
-    (local_handle, r#stop, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "stop", $rpc);
-    };
-    (local_handle, abort, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "abort", $rpc);
-    };
-    (local_handle, r#abort, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "abort", $rpc);
-    };
-    (local_handle, is_running, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "is_running", $rpc);
-    };
-    (local_handle, r#is_running, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "is_running", $rpc);
-    };
-    (local_handle, is_busy, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "is_busy", $rpc);
-    };
-    (local_handle, r#is_busy, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "is_busy", $rpc);
-    };
-    (local_handle, buffered, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "buffered", $rpc);
-    };
-    (local_handle, r#buffered, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "buffered", $rpc);
-    };
     (local_handle, __status, $rpc:ident, $kind:ident) => {
         $crate::__keylink_name_conflict!($kind, "Handle", "__status", $rpc);
     };
     (local_handle, r#__status, $rpc:ident, $kind:ident) => {
         $crate::__keylink_name_conflict!($kind, "Handle", "__status", $rpc);
-    };
-    (local_handle, ended, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "ended", $rpc);
-    };
-    (local_handle, r#ended, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Handle", "ended", $rpc);
     };
     (local_handle, __reserve, $rpc:ident, $kind:ident) => {
         $crate::__keylink_name_conflict!($kind, "Handle", "__reserve", $rpc);
@@ -8936,20 +7944,8 @@ macro_rules! __keylink_generated_name_check {
     };
     (local_handle, $name:ident, $rpc:ident, $kind:ident) => {};
 
-    (local_ref, id, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "LocalRef", "id", $rpc);
-    };
-    (local_ref, r#id, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "LocalRef", "id", $rpc);
-    };
     (local_ref, $name:ident, $rpc:ident, $kind:ident) => {};
 
-    (actor_ref, id, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "ActorRef", "id", $rpc);
-    };
-    (actor_ref, r#id, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "ActorRef", "id", $rpc);
-    };
     (actor_ref, __status, $rpc:ident, $kind:ident) => {
         $crate::__keylink_name_conflict!($kind, "ActorRef", "__status", $rpc);
     };
@@ -8964,61 +7960,19 @@ macro_rules! __keylink_generated_name_check {
     (client, r#connect, $rpc:ident, $kind:ident) => {
         $crate::__keylink_name_conflict!($kind, "Client", "connect", $rpc);
     };
-    (client, with_idempotency, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Client", "with_idempotency", $rpc);
-    };
-    (client, r#with_idempotency, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Client", "with_idempotency", $rpc);
-    };
-    (client, key_state, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Client", "key_state", $rpc);
-    };
-    (client, r#key_state, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Client", "key_state", $rpc);
-    };
-    (client, watch, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Client", "watch", $rpc);
-    };
-    (client, r#watch, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Client", "watch", $rpc);
-    };
     (client, __status, $rpc:ident, $kind:ident) => {
         $crate::__keylink_name_conflict!($kind, "Client", "__status", $rpc);
     };
     (client, r#__status, $rpc:ident, $kind:ident) => {
         $crate::__keylink_name_conflict!($kind, "Client", "__status", $rpc);
     };
-    (client, close, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Client", "close", $rpc);
-    };
-    (client, r#close, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "Client", "close", $rpc);
-    };
     (client, $name:ident, $rpc:ident, $kind:ident) => {};
 
-    (idempotent_client, key_state, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "IdempotentClient", "key_state", $rpc);
-    };
-    (idempotent_client, r#key_state, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "IdempotentClient", "key_state", $rpc);
-    };
-    (idempotent_client, watch, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "IdempotentClient", "watch", $rpc);
-    };
-    (idempotent_client, r#watch, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "IdempotentClient", "watch", $rpc);
-    };
     (idempotent_client, __status, $rpc:ident, $kind:ident) => {
         $crate::__keylink_name_conflict!($kind, "IdempotentClient", "__status", $rpc);
     };
     (idempotent_client, r#__status, $rpc:ident, $kind:ident) => {
         $crate::__keylink_name_conflict!($kind, "IdempotentClient", "__status", $rpc);
-    };
-    (idempotent_client, close, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "IdempotentClient", "close", $rpc);
-    };
-    (idempotent_client, r#close, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "IdempotentClient", "close", $rpc);
     };
     (idempotent_client, $name:ident, $rpc:ident, $kind:ident) => {};
 
@@ -9028,38 +7982,8 @@ macro_rules! __keylink_generated_name_check {
     (blocking_client, r#connect, $rpc:ident, $kind:ident) => {
         $crate::__keylink_name_conflict!($kind, "blocking::Client", "connect", $rpc);
     };
-    (blocking_client, with_idempotency, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "blocking::Client", "with_idempotency", $rpc);
-    };
-    (blocking_client, r#with_idempotency, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "blocking::Client", "with_idempotency", $rpc);
-    };
-    (blocking_client, key_state, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "blocking::Client", "key_state", $rpc);
-    };
-    (blocking_client, r#key_state, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "blocking::Client", "key_state", $rpc);
-    };
-    (blocking_client, close, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "blocking::Client", "close", $rpc);
-    };
-    (blocking_client, r#close, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "blocking::Client", "close", $rpc);
-    };
     (blocking_client, $name:ident, $rpc:ident, $kind:ident) => {};
 
-    (blocking_idempotent_client, key_state, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "blocking::IdempotentClient", "key_state", $rpc);
-    };
-    (blocking_idempotent_client, r#key_state, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "blocking::IdempotentClient", "key_state", $rpc);
-    };
-    (blocking_idempotent_client, close, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "blocking::IdempotentClient", "close", $rpc);
-    };
-    (blocking_idempotent_client, r#close, $rpc:ident, $kind:ident) => {
-        $crate::__keylink_name_conflict!($kind, "blocking::IdempotentClient", "close", $rpc);
-    };
     (blocking_idempotent_client, $name:ident, $rpc:ident, $kind:ident) => {};
 
     ($surface:ident, $name:ident, $rpc:ident, $kind:ident) => {};
@@ -9268,46 +8192,6 @@ macro_rules! __keylink_blocking_method {
     ([$( #[$meta:meta] )*], blocking_client, $kind:ident, r#connect, $variant:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_client, $kind, connect, $variant);
-    };
-    ([$( #[$meta:meta] )*], blocking_client, $kind:ident, with_idempotency, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_client, $kind, with_idempotency, $variant);
-    };
-    ([$( #[$meta:meta] )*], blocking_client, $kind:ident, r#with_idempotency, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_client, $kind, with_idempotency, $variant);
-    };
-    ([$( #[$meta:meta] )*], blocking_client, $kind:ident, key_state, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_client, $kind, key_state, $variant);
-    };
-    ([$( #[$meta:meta] )*], blocking_client, $kind:ident, r#key_state, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_client, $kind, key_state, $variant);
-    };
-    ([$( #[$meta:meta] )*], blocking_client, $kind:ident, close, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_client, $kind, close, $variant);
-    };
-    ([$( #[$meta:meta] )*], blocking_client, $kind:ident, r#close, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_client, $kind, close, $variant);
-    };
-    ([$( #[$meta:meta] )*], blocking_idempotent_client, $kind:ident, key_state, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_idempotent_client, $kind, key_state, $variant);
-    };
-    ([$( #[$meta:meta] )*], blocking_idempotent_client, $kind:ident, r#key_state, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_idempotent_client, $kind, key_state, $variant);
-    };
-    ([$( #[$meta:meta] )*], blocking_idempotent_client, $kind:ident, close, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_idempotent_client, $kind, close, $variant);
-    };
-    ([$( #[$meta:meta] )*], blocking_idempotent_client, $kind:ident, r#close, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], blocking_idempotent_client, $kind, close, $variant);
     };
     ([$( #[$meta:meta] )*], $surface:ident, tell, $name:ident, $variant:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
@@ -9902,7 +8786,7 @@ macro_rules! __keylink_actor_method {
         #[doc = concat!("Answer the `", stringify!($name), "` rpc, reading the payload the caller streams up.")]
         ///
         /// The body is read inside the turn, so
-        /// [`abort`](keylink::System::abort) can truncate it.
+        /// [`abort`](keylink::Registry::abort) can truncate it.
         fn $name(&mut self, cx: $crate::Caller<'_> $(, $arg: $ty )*, body: $crate::BodyReader)
             -> impl ::core::future::Future<Output = $ret> + Send;
     };
@@ -9911,7 +8795,7 @@ macro_rules! __keylink_actor_method {
         #[doc = concat!("Answer the `", stringify!($name), "` rpc, returning a payload to stream back.")]
         ///
         /// The body is drained by the connection after the turn ends, so
-        /// [`abort`](keylink::System::abort) cannot truncate it.
+        /// [`abort`](keylink::Registry::abort) cannot truncate it.
         fn $name(&mut self, cx: $crate::Caller<'_> $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = ($ret, $crate::Body)> + Send;
     };
@@ -9921,7 +8805,7 @@ macro_rules! __keylink_actor_method {
         ///
         /// Nothing is streamed during the turn: the address is the whole reply,
         /// and the bytes move later on the blobs connection. So
-        /// [`abort`](keylink::System::abort) has nothing here to truncate.
+        /// [`abort`](keylink::Registry::abort) has nothing here to truncate.
         fn $name(&mut self, cx: $crate::Caller<'_> $(, $arg: $ty )*)
             -> impl ::core::future::Future<Output = ($ret, $crate::BlobId)> + Send;
     };
@@ -9956,14 +8840,6 @@ macro_rules! __keylink_actor_client_method {
     // it pays for. Absent and documented, rather than present and lying.
     ([$( #[$meta:meta] )*], tell, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
-    ([$( #[$meta:meta] )*], $kind:ident, id, $req:ident, $resp:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], actor_ref, $kind, id, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, r#id, $req:ident, $resp:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], actor_ref, $kind, id, $variant);
-    };
     ([$( #[$meta:meta] )*], $kind:ident, __status, $req:ident, $resp:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_conflicting_method!([$( #[$meta] )*], actor_ref, $kind, __status, $variant);
@@ -10052,14 +8928,6 @@ macro_rules! __keylink_actor_client_method {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_keyed_local_method {
-    ([$( #[$meta:meta] )*], $kind:ident, id, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_ref, $kind, id, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, r#id, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_ref, $kind, id, $variant);
-    };
     ([$( #[$meta:meta] )*], rpc, $name:ident, $variant:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
@@ -10142,70 +9010,6 @@ macro_rules! __keylink_keyed_local_method {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_local_method {
-    ([$( #[$meta:meta] )*], $kind:ident, service, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, service, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, r#service, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, service, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, serve, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, serve, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, r#serve, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, serve, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, with_state, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, with_state, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, r#with_state, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, with_state, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, stop, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, stop, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, r#stop, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, stop, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, abort, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, abort, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, r#abort, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, abort, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, is_running, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, is_running, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, r#is_running, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, is_running, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, is_busy, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, is_busy, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, r#is_busy, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, is_busy, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, buffered, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, buffered, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, r#buffered, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, buffered, $variant);
-    };
     ([$( #[$meta:meta] )*], $kind:ident, __status, $variant:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __status, $variant);
@@ -10213,14 +9017,6 @@ macro_rules! __keylink_local_method {
     ([$( #[$meta:meta] )*], $kind:ident, r#__status, $variant:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, __status, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, ended, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, ended, $variant);
-    };
-    ([$( #[$meta:meta] )*], $kind:ident, r#ended, $variant:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], local_handle, $kind, ended, $variant);
     };
     ([$( #[$meta:meta] )*], $kind:ident, __reserve, $variant:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
@@ -10500,30 +9296,6 @@ macro_rules! __keylink_client_method {
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, connect, $variant);
     };
-    ([$( #[$meta:meta] )*], client, $kind:ident, with_idempotency, $req:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, with_idempotency, $variant);
-    };
-    ([$( #[$meta:meta] )*], client, $kind:ident, r#with_idempotency, $req:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, with_idempotency, $variant);
-    };
-    ([$( #[$meta:meta] )*], client, $kind:ident, key_state, $req:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, key_state, $variant);
-    };
-    ([$( #[$meta:meta] )*], client, $kind:ident, r#key_state, $req:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, key_state, $variant);
-    };
-    ([$( #[$meta:meta] )*], client, $kind:ident, watch, $req:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, watch, $variant);
-    };
-    ([$( #[$meta:meta] )*], client, $kind:ident, r#watch, $req:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, watch, $variant);
-    };
     ([$( #[$meta:meta] )*], client, $kind:ident, __status, $req:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, __status, $variant);
@@ -10538,30 +9310,6 @@ macro_rules! __keylink_client_method {
             $( #[$meta] )*
         ], wire, __Status, $variant, $kind);
     };
-    ([$( #[$meta:meta] )*], client, $kind:ident, close, $req:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, close, $variant);
-    };
-    ([$( #[$meta:meta] )*], client, $kind:ident, r#close, $req:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], client, $kind, close, $variant);
-    };
-    ([$( #[$meta:meta] )*], idempotent_client, $kind:ident, key_state, $req:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], idempotent_client, $kind, key_state, $variant);
-    };
-    ([$( #[$meta:meta] )*], idempotent_client, $kind:ident, r#key_state, $req:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], idempotent_client, $kind, key_state, $variant);
-    };
-    ([$( #[$meta:meta] )*], idempotent_client, $kind:ident, watch, $req:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], idempotent_client, $kind, watch, $variant);
-    };
-    ([$( #[$meta:meta] )*], idempotent_client, $kind:ident, r#watch, $req:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], idempotent_client, $kind, watch, $variant);
-    };
     ([$( #[$meta:meta] )*], idempotent_client, $kind:ident, __status, $req:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_conflicting_method!([$( #[$meta] )*], idempotent_client, $kind, __status, $variant);
@@ -10569,14 +9317,6 @@ macro_rules! __keylink_client_method {
     ([$( #[$meta:meta] )*], idempotent_client, $kind:ident, r#__status, $req:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_conflicting_method!([$( #[$meta] )*], idempotent_client, $kind, __status, $variant);
-    };
-    ([$( #[$meta:meta] )*], idempotent_client, $kind:ident, close, $req:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], idempotent_client, $kind, close, $variant);
-    };
-    ([$( #[$meta:meta] )*], idempotent_client, $kind:ident, r#close, $req:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_conflicting_method!([$( #[$meta] )*], idempotent_client, $kind, close, $variant);
     };
     ([$( #[$meta:meta] )*], $surface:ident, rpc, $name:ident, $req:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
@@ -11173,7 +9913,7 @@ mod expansion {
         fn assert_spawnable<T: Send + 'static>(_: T) {}
 
         async fn holding_a_borrowed_permit<A: expansion::Actor>(handle: &expansion::Handle<A>) {
-            let Ok(permit) = handle.__reserve().await else {
+            let Ok(permit) = crate::Own::reserve(handle).await else {
                 return;
             };
             tokio::task::yield_now().await;
@@ -11181,7 +9921,7 @@ mod expansion {
         }
 
         async fn holding_an_owned_permit<A: expansion::Actor>(handle: expansion::Handle<A>) {
-            let Ok(permit) = handle.__reserve_owned().await else {
+            let Ok(permit) = crate::Own::reserve_owned(handle).await else {
                 return;
             };
             tokio::task::yield_now().await;

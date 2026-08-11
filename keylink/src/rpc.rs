@@ -1599,7 +1599,7 @@ where
     /// layer is not a place to put an invariant the local path shares.
     ///
     /// **A keyed actor system takes this layer with its impl header changed**, and the
-    /// change is not optional. The generated `keyed_service` hands back a
+    /// change is not optional. The generated `Registry` service path hands back a
     /// [`ServiceBuilder`]`<`[`Addressed`](crate::Addressed)`<Request>, Response>`, and
     /// [`layer`](Self::layer) accepts a [`Middleware`] over that builder's own `Req` — so
     /// the header becomes `Middleware<Addressed<till::Request>, Resp>`, and the form
@@ -1610,7 +1610,7 @@ where
     /// actor's own method name on that path rather than a constant, which is what makes
     /// the `cx.method()` test above mean the same thing there.
     /// `tests/actors.rs`'s `PerMethod` mounts a `Middleware<Addressed<..>, ..>` on a
-    /// `keyed_service` and reads that name, so the keyed header shape is compiled
+    /// `Registry::service` and reads that name, so the keyed header shape is compiled
     /// somewhere in this tree.
     ///
     /// The layer above is held on an ordinary service by

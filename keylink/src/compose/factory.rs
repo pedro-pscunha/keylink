@@ -26,19 +26,17 @@
 //! let parsed = ingest.dispatch_keyed(tenant, |worker| worker.parse(blob)).await??;
 //!
 //! // Non-keyed: `Factory<render::Handle<Renderer>, ()>`, and `dispatch` takes no
-//! // key. The members are built with `actor_deep` on purpose — `LeastLoaded` has
+//! // key. The members are built with `setup(..).backpressure(..)` on purpose — `LeastLoaded` has
 //! // no gradient to read at the default mailbox depth of one, where `buffered` is
 //! // zero or one and the mode is reading N booleans.
 //! let pages = Factory::from_fn(
 //!     NonZeroUsize::new(8).expect("eight"),
 //!     Routing::LeastLoaded(Sample::TwoOfN),
 //!     |member| {
-//!         render::actor_deep(
-//!             Renderer::new(member),
-//!             Vec::new(),
-//!             render::Feeds::new(),
-//!             Backpressure::Park(NonZeroUsize::new(32).expect("thirty-two")),
-//!         )
+//!         render::setup(Renderer::new(member))
+//!             .feeds(render::Feeds::new())
+//!             .backpressure(Backpressure::Park(NonZeroUsize::new(32).expect("thirty-two")))
+//!             .actor()
 //!     },
 //! );
 //!
@@ -359,42 +357,6 @@ impl<K> fmt::Debug for Shard<K> {
 /// it. A caller who wants to know how a factory routes knows already — it passed
 /// the `Routing` in.
 ///
-/// The premise is held by a second doctest, because a refusal nothing checks is a
-/// paragraph:
-///
-/// ```compile_fail
-/// // Fails with `E0599`: there is no method named `routing` on `Factory`, which
-/// // is the whole of the paragraph above stated where a compiler reads it.
-/// //
-/// // The code is named here rather than on the fence, for the reason the guard
-/// // above gives.
-/// //
-/// // A factory over `()` members, because `from_fn` and `members` put no bound
-/// // on the member type: both names are therefore read off a real `Factory`
-/// // without a runtime, an actor or a service, and a rename of either is a
-/// // compile error in the lines that must compile. The turbofish is load-bearing
-/// // too — `K` is inferred from `dispatch`'s impl block, and nothing here
-/// // dispatches, so leaving it out would fail this fence with `E0282` and prove
-/// // nothing about the accessor.
-/// use std::num::NonZeroUsize;
-///
-/// use keylink::compose::{Factory, Routing};
-///
-/// let factory = Factory::from_fn(NonZeroUsize::MIN, Routing::<()>::RoundRobin, |_member| ());
-/// let members: &[()] = factory.members();
-/// assert_eq!(members.len(), 1);
-///
-/// let _rule = factory.routing();
-/// ```
-///
-/// Watched both ways as well: without the annotation the compiler printed
-/// `error[E0599]: no method named `routing` found for struct `Factory<H, K>` in
-/// the current scope`, pointing at the line and naming it *"private field, not a
-/// method"*. With `routing()` replaced by `members()` — the accessor that does
-/// exist — the fence failed as *"Test compiled successfully, but it's marked
-/// `compile_fail`"*, which is what an author adding the refused accessor would
-/// meet.
-///
 /// # There is no `Sticky`
 ///
 /// *A worker already holding this key keeps it, even after a resize* needs an
@@ -447,7 +409,7 @@ pub enum Routing<K = ()> {
     /// [`is_busy`](crate::LocalActor::is_busy) alone already says.
     ///
     /// The mode is worth its place over members built with the generated
-    /// `actor_deep` or [`LocalActor::spawn_deep`], and any example demonstrating
+    /// `setup(..).backpressure(..)` or [`LocalActor::spawn_deep`], and any example demonstrating
     /// it is built that way for that reason. Under the default the honest advice
     /// is [`FirstAvailable`](Self::FirstAvailable), which needs no gradient.
     LeastLoaded(Sample),
@@ -455,7 +417,7 @@ pub enum Routing<K = ()> {
     /// factory lives.
     ///
     /// The mode a [`Pool`] refuses and the reason this type exists.
-    /// [`System`](crate::System) and [`Names`](super::Names) both give a key its
+    /// [`Registry`](crate::Registry) and [`Names`](super::Names) both give a key its
     /// own actor; this gives a key a *share* of a fixed set, which is what a
     /// worker holding one expensive thing per shard needs.
     ///

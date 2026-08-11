@@ -9,6 +9,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -658,7 +659,7 @@ async fn a_concurrent_service_refuses_status_by_name() {
     );
 
     let refused = client
-        .__status()
+        .status()
         .await
         .expect_err("a handler has no turn to report");
     assert!(
@@ -994,12 +995,10 @@ async fn a_timeout_settles_the_key_it_gave_up_on_where_a_queue_timeout_leaves_it
 async fn a_shed_mailbox_answers_an_overload_and_not_a_timeout() {
     let node = local_node().await;
     let caller = local_node().await;
-    let actor = ledger::actor_deep(
-        Ledger::default(),
-        Vec::new(),
-        ledger::Feeds::new(),
-        Backpressure::Shed(NonZeroUsize::MIN),
-    );
+    let actor = ledger::setup(Ledger::default())
+        .feeds(ledger::Feeds::new())
+        .backpressure(Backpressure::Shed(NonZeroUsize::MIN))
+        .actor();
     let server = Server::builder(&node)
         .service(actor.service(Allowlist::anyone()).build())
         .spawn()
@@ -1010,7 +1009,7 @@ async fn a_shed_mailbox_answers_an_overload_and_not_a_timeout() {
 
     // This actor's whole capacity, held by the caller that took it.
     let held = actor
-        .__try_reserve()
+        .try_reserve()
         .expect("the actor is running")
         .expect("the one free slot");
 
@@ -1132,7 +1131,9 @@ fn withheld(error: &keylink::Error) -> &Withheld {
 async fn both_halves_of_a_lost_turn_carry_their_own_variant() {
     let node = local_node().await;
     let caller = local_node().await;
-    let actor = ledger::actor_with(Ledger::default(), vec![Box::new(RefusesWhatCompleted)]);
+    let actor = ledger::setup(Ledger::default())
+        .observe(RefusesWhatCompleted)
+        .actor();
     let server = Server::builder(&node)
         .service(actor.service(Allowlist::anyone()).build())
         .spawn()
@@ -1246,7 +1247,9 @@ impl Observer<Ledger> for PanicsOnWhatCompleted {
 async fn an_observer_that_panicked_reaches_a_peer_under_its_own_variant() {
     let node = local_node().await;
     let caller = local_node().await;
-    let actor = ledger::actor_with(Ledger::default(), vec![Box::new(PanicsOnWhatCompleted)]);
+    let actor = ledger::setup(Ledger::default())
+        .observe(PanicsOnWhatCompleted)
+        .actor();
     let server = Server::builder(&node)
         .service(actor.service(Allowlist::anyone()).build())
         .spawn()
@@ -1361,12 +1364,11 @@ async fn stop_returns_only_once_the_mailbox_is_closed() {
 
     for round in 0..ROUNDS {
         let turns = Arc::new(AtomicUsize::new(0));
-        let actor = ledger::actor_with(
-            Ledger::default(),
-            vec![Box::new(CountsTurns {
+        let actor = ledger::setup(Ledger::default())
+            .observe(CountsTurns {
                 turns: turns.clone(),
-            })],
-        );
+            })
+            .actor();
 
         // One real turn, so the observer is on the path being torn down rather
         // than merely attached to it.
@@ -1397,7 +1399,7 @@ async fn stop_returns_only_once_the_mailbox_is_closed() {
 ///
 /// # It is one condition, and which answer a peer got used to depend on a race
 ///
-/// `deliver_to_singleton` can meet a stopped actor at two points: the send can
+/// `deliver_unkeyed` can meet a stopped actor at two points: the send can
 /// fail with `NotQueued::Closed`, or the send can win a permit and the reply
 /// channel can then die with a `Standing::Gone`. Both mean *this actor ran and
 /// has stopped*. They answered differently — `NoSuchActor { id }` from the first
@@ -1499,7 +1501,9 @@ async fn a_stopped_singleton_answers_gone_rather_than_naming_an_id() {
 async fn a_refused_turn_does_not_settle_its_key_as_the_refusal() {
     let node = local_node().await;
     let caller = local_node().await;
-    let actor = ledger::actor_with(Ledger::default(), vec![Box::new(RefusesWhatCompleted)]);
+    let actor = ledger::setup(Ledger::default())
+        .observe(RefusesWhatCompleted)
+        .actor();
     let _server = Server::builder(&node)
         .service(actor.service(Allowlist::anyone()).build())
         .spawn()

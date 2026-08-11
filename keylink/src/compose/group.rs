@@ -108,13 +108,13 @@
 //! # Keyed actors are members
 //!
 //! A [`Membership`] needs the member's ending. A keyed actor supplies that
-//! future through [`System::ended`](crate::System::ended): after mounting, handle
+//! future through [`Registry::ended`](crate::Registry::ended): after mounting, handle
 //! its `None` case explicitly or use `expect("the member was just mounted")`.
 //! [`Endings`](super::Endings), meanwhile,
 //! [`Endings`](super::Endings) adapts the same ending callback when a composition
 //! wants to file and fan out its own waiters. [`Membership::new`] takes the
 //! ending as an argument rather than asking a handle for one, so local and keyed
-//! members use the same shape. [`System::abort`](crate::System::abort) is the
+//! members use the same shape. [`Registry::abort`](crate::Registry::abort) is the
 //! retiring operation. `keyed.rs` states the miss-window that applies to an
 //! `Endings::watch` filed after an actor already ended.
 //!

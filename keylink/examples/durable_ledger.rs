@@ -143,7 +143,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //  `Deferred::send` is behind the store too. The one send that is not is one
     //  made from a task you spawned yourself, which is answering with something
     //  no turn produced — see `keylink::Persist`'s module header.
-    let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+    let ledger = ledger::setup(state).observe(saver).actor();
     println!("carried over: total {}", ledger.total().await?);
 
     // ── 3. Serve the same actor to other machines. Nothing about persistence

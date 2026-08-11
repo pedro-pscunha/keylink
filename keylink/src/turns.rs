@@ -275,7 +275,7 @@ use crate::{
 /// `DEFAULT_MAILBOX_DEPTH` in `registry.rs` is a default and this is now one too,
 /// with [`LocalActor::spawn_deep`] and [`LocalActor::spawn_supervised_deep`] as
 /// the doors that override it. [`NonZeroUsize`] rather than `usize`, matching
-/// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth) exactly:
+/// [`RegistryBuilder::mailbox_depth`](crate::RegistryBuilder::mailbox_depth) exactly:
 /// `mpsc::channel(0)` panics, and `representability.rs` pins both signatures so a
 /// widening to `usize` — or to an `Option` whose `None` meant unbounded — is
 /// `E0308` rather than a review comment.
@@ -1746,7 +1746,7 @@ enum Message<A, M> {
 /// [`Message<A, M>`] — it has a `read` and a `stop` — and a keyed actor's mailbox
 /// is a [`Mailbox<M>`](crate::Mailbox), because the registry is generic in the
 /// service's message and knows nothing of `A`. Making those one channel would put
-/// the state's type on [`System`](crate::System), [`Mounted`](crate::Mounted) and
+/// the state's type on [`Registry`](crate::Registry), [`Mountable`](crate::Mountable) and
 /// `KeyedService`; abstracting the *receive* instead costs two impls and reaches
 /// nothing outside this file.
 ///
@@ -1768,7 +1768,7 @@ trait Inbox<A, M>: Send {
     /// the rest of that argument.
     ///
     /// Written by whoever has somewhere to put it: [`Keyed`] writes the registry
-    /// entry [`System::status`](crate::System::status) reads, [`Watched`] writes
+    /// entry [`Registry::status`](crate::Registry::status) reads, [`Watched`] writes
     /// the cell a [`LocalActor`] carries on its handle, and a bare
     /// `mpsc::Receiver` keeps this default — the supervision tests in this module
     /// hand `supervise` one and want no cell at all.
@@ -1868,7 +1868,7 @@ trait Inbox<A, M>: Send {
     ///
     /// That window is instructions wide and has no await in it, which is why it is
     /// invisible on a current-thread runtime and why the served answer is **not**
-    /// built on it: `deliver_to_singleton` reads the verdict, not the mailbox. This
+    /// built on it: `deliver_unkeyed` reads the verdict, not the mailbox. This
     /// repairs the public method rather than the wire answer, and the two are
     /// deliberately separate — one fact, two consequences, decided at one place.
     fn close(&mut self);
@@ -1976,7 +1976,7 @@ struct Keyed<M>(crate::Mailbox<M>);
 
 /// [`Message::Read`] and [`Message::Stop`] are unreachable on this path: a keyed
 /// actor is read through a method and stopped by
-/// [`System::shutdown`](crate::System::shutdown) dropping the registry's sender,
+/// [`Registry::stop`](crate::Registry::stop) dropping the registry's sender,
 /// which arrives here as `None`. The loop's arms for them are written to be *correct*
 /// rather than to panic, which is the choice `Mail`'s `send` and `recv` variants
 /// already make one layer out.
@@ -1995,7 +1995,7 @@ impl<A: Send, M: Send> Inbox<A, M> for Keyed<M> {
     }
 
     /// The mailbox is what the registry kept a handle on, so it is the way back to
-    /// the entry [`System::status`](crate::System::status) reads.
+    /// the entry [`Registry::status`](crate::Registry::status) reads.
     fn mark_busy(&self, running: bool) {
         self.0.mark_busy(running);
     }
@@ -2127,7 +2127,7 @@ fn dispatch<'a, A: 'a, T: Turn<A>>(
 /// because a second input needs a `select` and nobody wanted to write two.
 ///
 /// Returns the reason to the keyed registry, which publishes it through the
-/// shared [`System::ended`](crate::System::ended) watch channel. A local actor
+/// shared [`Registry::ended`](crate::Registry::ended) watch channel. A local actor
 /// also exposes its ending directly through [`LocalActor::ended`]. Everything
 /// whose *order* matters happens in here.
 ///
@@ -2270,7 +2270,7 @@ where
     // queued behind this turn, the state that takes its parked replies with it —
     // happens after it in this task's program order, so a reader woken by one of
     // those deaths has a happens-before edge to this store through the reply
-    // channel it was waiting on. `deliver_to_singleton` and `deliver_to_actor` both
+    // channel it was waiting on. `deliver_unkeyed` and `deliver_keyed` both
     // read the result and cannot be early.
     //
     // Disarmed first, because from here the loop has an answer of its own and a
@@ -2314,7 +2314,7 @@ where
 }
 
 /// Run one keyed actor: the same loop, entered from a
-/// [`System`](crate::System)'s mailbox.
+/// [`Registry`](crate::Registry)'s mailbox.
 ///
 /// `#[doc(hidden)] pub` because the generated keyed `spawn` calls it from inside
 /// [`mount`](crate::mount)'s closure, in the **user's** crate. It is the whole of
@@ -2327,14 +2327,14 @@ where
 /// the discarded binding was a live defect rather than a stylistic one. A keyed
 /// actor that ends **on its own** — a feed that ran out, a handler that panicked,
 /// an observer that refused — leaves a registry entry nothing removes:
-/// [`System::status`](crate::System::status) went on listing it with `busy:
+/// [`Registry::status`](crate::Registry::status) went on listing it with `busy:
 /// false` while a real call to it answered
 /// [`NoSuchActor`](crate::RemoteError::NoSuchActor), and no
 /// [`Lifecycle`](crate::Lifecycle) was told. `keylink::mount`'s `Loop` carries
 /// the full argument; the return type here is the half of it that lives in this
 /// file.
 ///
-/// A keyed actor's ending is observable through [`System::ended`](crate::System::ended),
+/// A keyed actor's ending is observable through [`Registry::ended`](crate::Registry::ended),
 /// which subscribes to the entry by id before the registry reaps it. The ending
 /// is therefore no longer lost: the registry and its lifecycle callbacks receive
 /// this value as the actor leaves.
@@ -2351,7 +2351,7 @@ where
     F: Feeds<A>,
 {
     // The registry made this cell and kept a clone beside the entry, so what the
-    // loop settles on its way out is what `deliver_to_actor` reads. Taken before
+    // loop settles on its way out is what `deliver_keyed` reads. Taken before
     // the mailbox moves into `Keyed`.
     let fate = inbox.fate();
     run_loop(state, hooks, feeds, Keyed(inbox), &fate).await.0
@@ -2493,8 +2493,8 @@ impl Intensity {
 
 /// Everything one incarnation needs, in the order the doors already take it.
 ///
-/// The triple [`actor_wired`] and [`spawn_wired`] are called with, produced by
-/// one closure so that a restart cannot rebuild the state and reuse last
+/// The state, observer chain, and feeds a `restarting` factory produces in one
+/// closure so that a restart cannot rebuild the state and reuse last
 /// incarnation's observers — which for a durability adapter would mean reusing a
 /// claim that has to be re-acquired, and for a feed would mean a subscription
 /// nobody re-opened.
@@ -2503,8 +2503,6 @@ impl Intensity {
 /// type here would be a second spelling of a call site that already exists, and
 /// the reader would have to learn which field is which anyway.
 ///
-/// [`actor_wired`]: crate::LocalActor::spawn_fed
-/// [`spawn_wired`]: crate::run_keyed
 pub type Incarnation<A, F> = (A, Vec<Box<dyn Observer<A>>>, F);
 
 /// What a caller whose reply channel died without an answer is allowed to be told.
@@ -2530,7 +2528,7 @@ pub type Incarnation<A, F> = (A, Vec<Box<dyn Observer<A>>>, F);
 ///
 /// **It also replaced a third state on that channel, rather than adding a
 /// mechanism.** Wave 9 gave it a `Life::Restarting(Ended)` arm so that
-/// `deliver_to_singleton` and `supervise` could both read a restart off it. Neither
+/// `deliver_unkeyed` and `supervise` could both read a restart off it. Neither
 /// does now — the first reads this, and the second reads this too — so the arm
 /// went, the channel is back to `Option<Ended>` at eight bytes less per local
 /// actor, and `run_keyed_supervised`'s `watch` channel *with no reader at all* is
@@ -2577,7 +2575,7 @@ pub(crate) enum Standing {
 ///
 /// **Separate from the busy cell and not folded into it**, though both are one
 /// word about one actor. `registry.rs`'s `Busy` is the registry's, written per
-/// turn and read by [`System::status`](crate::System::status); a [`LocalActor`]
+/// turn and read by [`Registry::status`](crate::Registry::status); a [`LocalActor`]
 /// now carries its own, written through [`Watched`] and read by
 /// [`is_busy`](LocalActor::is_busy). They stay two cells because they answer two
 /// questions — this one says what a dead reply means, to a served dispatch and to
@@ -2618,7 +2616,7 @@ pub(crate) struct Fate(Arc<Mutex<Standing>>);
 /// actor is serving*, about an actor that would never answer again.
 ///
 /// It was a **regression** against the shape this design replaced, which is why
-/// it is a floor here and not a filed defect. `deliver_to_singleton` used to read
+/// it is a floor here and not a filed defect. `deliver_unkeyed` used to read
 /// `is_running()` beside the verdict; an unwind drops the `mpsc::Receiver`, and
 /// `Receiver::drop` closes the channel *before* it drains, so `is_closed()` was
 /// already true when the queued message's reply died. Deleting the cross-check
@@ -3099,7 +3097,7 @@ where
 }
 
 /// Run one **supervised** keyed actor: the same outer loop, entered from a
-/// [`System`](crate::System)'s mailbox.
+/// [`Registry`](crate::Registry)'s mailbox.
 ///
 /// `#[doc(hidden)] pub` for [`run_keyed`]'s reason: the generated keyed
 /// `spawn_supervised` calls it from inside [`mount`](crate::mount)'s closure, in
@@ -3107,7 +3105,7 @@ where
 /// closure over a `Mailbox`, and this is that closure's whole body.
 ///
 /// A supervised keyed actor's ending is observable through
-/// [`System::ended`](crate::System::ended). The registry owns one shared watch
+/// [`Registry::ended`](crate::Registry::ended). The registry owns one shared watch
 /// channel per live entry; the supervisor's restart verdict remains in the
 /// [`Fate`] cell, while the channel resolves only when the final incarnation ends.
 ///
@@ -3144,13 +3142,13 @@ where
 /// `#[must_use]` asks for — reads [`Withheld::Dropped`], and an actor that has
 /// genuinely ended, or was aborted or evicted, reads [`Withheld::Gone`]. So a
 /// plain unsupervised keyed actor no longer says *there is nothing here* about a
-/// reply it dropped while running. `deliver_to_actor` and `deliver_to_singleton`
+/// reply it dropped while running. `deliver_keyed` and `deliver_unkeyed`
 /// render all three through one function, [`lost`], so the two paths cannot say
 /// different things about one condition.
 ///
 /// The signal is the [`Fate`] cell, settled by this actor's own loop before it
 /// drops anything and read off the registry entry — which is why none of it
-/// reaches `Mounted`, `mount` or the generated `spawn_supervised`. RFC-07 §12
+/// reaches `Mountable`, `mount` or the generated `spawn_supervised`. RFC-07 §12
 /// carries the design and §9.10 is where the cost was priced at six touch points
 /// and a public type.
 ///
@@ -3509,7 +3507,7 @@ pub enum NotQueued {
 ///
 /// `impl From` rather than a named method so that `?` performs it, which puts the
 /// widening at the call site and leaves nothing to forget. Both callers today are
-/// in this file — `read`'s `?`, and [`deliver_to_singleton`]'s explicit conversion,
+/// in this file — `read`'s `?`, and [`deliver_unkeyed`]'s explicit conversion,
 /// which uses it to decide *which type* renders onto the wire rather than to
 /// propagate.
 ///
@@ -3553,7 +3551,7 @@ impl From<NotQueued> for Unanswered {
 /// reservation that reserves nothing — a representable-but-meaningless state in
 /// the one type the whole permit surface rests on. The older argument still
 /// stands beside it, at
-/// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth): an
+/// [`RegistryBuilder::mailbox_depth`](crate::RegistryBuilder::mailbox_depth): an
 /// unbounded mailbox converts backpressure into memory growth, so a latency
 /// problem becomes an OOM in a process that had been reporting healthy.
 ///
@@ -3659,7 +3657,7 @@ pub struct LocalActor<A, M> {
     /// below now, which is settled early enough to be right; see [`Standing`].
     ended: watch::Receiver<Option<Ended>>,
     /// What a caller whose reply just died is told — a peer through
-    /// [`deliver_to_singleton`], and a local one through [`answered`](Self::answered).
+    /// [`deliver_unkeyed`], and a local one through [`answered`](Self::answered).
     /// **Both, and that is the point**: one cell answers one question, so the two
     /// doors cannot say different things about one dead reply. The keyed twin
     /// lives beside the registry entry; here the handle carries it, because a
@@ -3713,7 +3711,7 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
     /// Start an actor whose turns are watched.
     ///
     /// Named `spawn_observed` and **not** `spawn_with`, because
-    /// [`SystemBuilder::spawn_with`](crate::SystemBuilder::spawn_with) already
+    /// [`RegistryBuilder::spawn_with`](crate::RegistryBuilder::spawn_with) already
     /// exists and means something else — a factory for keyed actors. Two
     /// meanings on one name in one crate is a reading hazard that costs nothing
     /// to avoid now and cannot be fixed after 1.0.
@@ -3754,7 +3752,7 @@ impl<A: Send + 'static, M: Turn<A>> LocalActor<A, M> {
     /// does not say what happens past the last slot. It carries the depth —
     /// [`NonZeroUsize`], because `mpsc::channel(0)` panics — so *a policy without a
     /// depth* and *a depth without a policy* are both unwritable.
-    /// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth) is the
+    /// [`RegistryBuilder::mailbox_depth`](crate::RegistryBuilder::mailbox_depth) is the
     /// keyed twin and still takes the bare number: nothing sheds on that path, and
     /// widening it there would be a knob with no producer behind it.
     ///
@@ -4178,7 +4176,7 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     /// same standing through the same three arms, and this door held its own copy
     /// of them until it did not.
     ///
-    /// The window this cannot close is the one [`deliver_to_singleton`] states, and it
+    /// The window this cannot close is the one [`deliver_unkeyed`] states, and it
     /// is the same window for the same reason — the read is after the death, so an
     /// actor that moved on between the two reads as where it is now.
     async fn answered<T>(
@@ -4422,7 +4420,7 @@ impl<A, M> LocalActor<A, M> {
     ///
     /// # Why "timeout composes" is true here, and was not on the keyed path
     ///
-    /// [`System::shutdown`](crate::System::shutdown) takes a budget because the
+    /// [`Registry::stop`](crate::Registry::stop) takes a budget because the
     /// identical sentence was **false** where the registry wrote it: its `stop`
     /// removed the entry from the map and then awaited a bare `JoinHandle<()>`,
     /// so a timeout that fired dropped the entry, dropped the handle, and
@@ -4512,7 +4510,7 @@ impl<A, M> LocalActor<A, M> {
     /// stays green with the whole line removed, because the floor is strictly
     /// earlier in the same drop. A line that cannot be made red is not a guard,
     /// it is a second writer nobody can hold to account, so it went.
-    /// [`System::abort`](crate::System::abort) and `drain` keep theirs, and their
+    /// [`Registry::abort`](crate::Registry::abort) and `drain` keep theirs, and their
     /// guards say exactly what those still cover: a **hand-written** `mount`
     /// loop, which has no `run_loop` and therefore no floor.
     ///
@@ -4622,7 +4620,7 @@ impl<A, M> LocalActor<A, M> {
     ///
     /// Not a liveness answer: a stopped actor still folds a value here, and
     /// [`is_running`](Self::is_running) is the separate question. The keyed twin
-    /// is [`System::serving`](crate::System::serving), whose `Option` *is* that
+    /// is [`Registry::serving`](crate::Registry::serving), whose `Option` *is* that
     /// answer because a registry either has an entry or does not.
     #[must_use]
     pub fn serving(&self) -> Serving {
@@ -4775,7 +4773,7 @@ impl<A, M> LocalActor<A, M> {
     /// # The re-entrancy check is here, and on the three permit doors, and nowhere else
     ///
     /// Five non-test callers reach **this** function — `answered` (serving both
-    /// asks), `notify`, `read`, `stop` and [`deliver_to_singleton`] — and there is no
+    /// asks), `notify`, `read`, `stop` and [`deliver_unkeyed`] — and there is no
     /// sixth. Which half of the rule applies is [`Refuse`]'s parameter, because the
     /// message alone cannot say.
     ///
@@ -5188,7 +5186,7 @@ pub(crate) fn rendered<Resp>(
 /// A live actor that dropped a reply and then ended reads `Gone`, and *stop
 /// asking* is the right instruction for it. A restart whose next incarnation is
 /// already running reads `Running`, and *the actor is there* is the right one for
-/// that. [`deliver_to_singleton`] and `deliver_to_actor` both state the window they
+/// that. [`deliver_unkeyed`] and `deliver_keyed` both state the window they
 /// cannot close; neither of them can produce a sentence that is false at the
 /// moment it is written.
 pub(crate) fn lost(standing: Standing) -> RemoteError {
@@ -5261,7 +5259,7 @@ fn withheld_for(standing: Standing) -> Withheld {
 /// Answer one peer's request out of this process's own actor, and translate what
 /// came back into what goes on the wire.
 ///
-/// The twin of [`deliver_to_actor`](crate::deliver_to_actor), for a service
+/// The twin of [`deliver_keyed`](crate::deliver_keyed), for a service
 /// served as **one** actor through `Handle::service` rather than as a registry
 /// of keyed ones. The two share [`rendered`] and differ only in how they find
 /// the mailbox: one routes an [`ActorId`](crate::ActorId), this one already has
@@ -5300,7 +5298,7 @@ fn withheld_for(standing: Standing) -> Withheld {
 ///
 /// [`RemoteError::NoSuchActor`]: crate::RemoteError::NoSuchActor
 #[doc(hidden)]
-pub async fn deliver_to_singleton<A, M, Resp>(
+pub async fn deliver_unkeyed<A, M, Resp>(
     actor: &LocalActor<A, M>,
     cx: Context,
     mail: impl FnOnce(Origin, Reply<(Resp, Body)>) -> M,
@@ -5398,7 +5396,7 @@ where
         // bytes a peer reads, and by the paragraph above it is also unreachable —
         // both are true, and neither weakens the other.
         //
-        // **No test covers this path.** Nothing calls `deliver_to_singleton` and
+        // **No test covers this path.** Nothing calls `deliver_unkeyed` and
         // reads its refusal bytes, so reverting this line to
         // `refused.to_string()` leaves the suite green. A guard would have to be
         // **built** rather than watched, because the paragraph above argues a peer
@@ -5467,7 +5465,7 @@ where
 
 /// What this actor is doing, without delivering anything to it.
 ///
-/// The non-enqueuing twin of [`deliver_to_singleton`], and the singleton half of
+/// The non-enqueuing twin of [`deliver_unkeyed`], and the singleton half of
 /// what a generated `__status` answers. Generated dispatch calls this **instead
 /// of** that one, above it in the same closure, and nothing enters the mailbox —
 /// which is the whole mechanism rather than an optimisation. [`is_busy`] states
@@ -5484,7 +5482,7 @@ where
 /// # Errors
 ///
 /// [`Withheld::Gone`] once the mailbox is closed. That is the one condition and
-/// the one answer [`deliver_to_singleton`] already gives a peer whose call finds
+/// the one answer [`deliver_unkeyed`] already gives a peer whose call finds
 /// it closed, and the two say it through the same variant on purpose:
 /// [`LocalActor::serving`] folds a value for a stopped actor too — both fields
 /// at rest — and a peer reading that pair could not tell it from an idle actor.
@@ -5500,7 +5498,7 @@ where
 /// [`buffered`]: LocalActor::buffered
 /// [`is_running`]: LocalActor::is_running
 #[doc(hidden)]
-pub fn serving_of_singleton<A, M>(
+pub fn serving_unkeyed<A, M>(
     actor: &LocalActor<A, M>,
 ) -> std::result::Result<Serving, RemoteError> {
     if actor.is_running() {
@@ -5571,7 +5569,7 @@ mod tests {
     /// `Failed` carries is the one thing in this enum keylink neither writes nor
     /// reads.
     ///
-    /// The one in-crate `Failed` is [`deliver_to_singleton`]'s
+    /// The one in-crate `Failed` is [`deliver_unkeyed`]'s
     /// `NotQueued::Reentrant` arm, which is neither of these two functions and is
     /// unreachable from a peer besides — a request arrives on a connection's task,
     /// which has run no turn.

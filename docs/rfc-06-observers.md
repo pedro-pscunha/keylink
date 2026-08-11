@@ -186,13 +186,13 @@ the `Box` by hand.
 The generated module gains one constructor beside `actor`:
 
 ```rust
-let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+let ledger = ledger::setup(state).observe(saver).actor();
 ```
 
-`actor(state)` stays, and calls `actor_with(state, vec![])`.
+`actor(state)` stays as the zero-configuration shorthand for `setup(state).actor()`.
 
 The `LocalActor` constructor behind it is `spawn_observed`, **not** `spawn_with`.
-`SystemBuilder::spawn_with` already exists (`actor.rs:846`) and means something else —
+`RegistryBuilder::spawn_with` already exists (`actor.rs:846`) and means something else —
 a factory for keyed actors. Two meanings on one name in one crate is a reading hazard
 that costs nothing to avoid now and cannot be fixed after 1.0.
 
@@ -391,7 +391,7 @@ and `Clone` and `abort` never name the alias, so all three are undisturbed.
 With no observers there is no allocation and one branch. An actor without observers
 behaves as it does today, which the 226 existing tests cover.
 
-`macros.rs` changes only to add `actor_with`, `Handle::ended`, and to route
+`macros.rs` changes only to add `setup(..).observe(..).actor()`, `Handle::ended`, and to route
 `with_state` at a read.
 
 ### 2.7 The served path
@@ -503,7 +503,7 @@ let id    = StateId::new("ledgers/sp-01")?;
 // another process owns it. The caller keeps no `Saver`: the actor owns it,
 // and §2.4 releases the claim before `stop()` returns.
 let (state, saver) = keylink_durable::open(&store, id, Ledger::default).await?;
-let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+let ledger = ledger::setup(state).observe(saver).actor();
 
 // From here nothing mentions persistence again.
 ledger.post(1).await?;
@@ -578,7 +578,7 @@ The rule also closes a loop a future background writer would otherwise create: a
 writer that reads the state through a turn would mark the actor dirty, which would
 schedule another read, forever.
 
-### 5.3 The keyed `System` path is out of scope
+### 5.3 The keyed `Registry` path is out of scope
 
 **SUPERSEDED AND REMOVED, 2026-08-07. It is in scope, and it works.** The current model is
 `docs/rfc-07-the-turn-model.md` §5.
@@ -804,7 +804,7 @@ because `Stop::new` is new in revision 4:
 
 `Observer`, `TurnFut`, `TurnInfo`, `TurnOutcome`, `Stop`, `Stop::new`, `TurnLost`,
 `Ended`, `LocalActor::spawn_observed`, `LocalActor::read`, `LocalActor::ended`,
-`Handle::ended`, `actor_with`, `Panic::message`.
+`Handle::ended`, `setup(..).observe(..).actor()`, `Panic::message`.
 
 `LocalActor::ended` must be **public**, and revision 3 missed it. Generated code
 reaches `LocalActor` only through public methods — `macros.rs:588`, `:804`, `:819` and
@@ -825,7 +825,7 @@ nothing, because `Durable::revision` is cut.
 Four names avoid collisions found in review: `Outcome` is already exported from
 `reply.rs`, `Turn` is already a private alias at `local.rs:116`, `Lost` would sit in
 one rustdoc index beside `Departure::Lost` meaning something else, and `spawn_with` is
-already `SystemBuilder`'s (`actor.rs:846`). Hence `TurnOutcome`, `TurnInfo`, `Ended`
+already `RegistryBuilder`'s (`actor.rs:846`). Hence `TurnOutcome`, `TurnInfo`, `Ended`
 and `spawn_observed`.
 
 Apply `CONTRIBUTING.md`'s own test to each item before it becomes `pub`.
@@ -859,7 +859,7 @@ not:
    Restate's K/V store to a caller who already runs Restate.
 
 **Revision 4**, from a pass built entirely from real types. Two confirmed: the turn
-future is `Send`, and `A: Sync` is absent from the closure, from `actor_with` and from
+future is `Send`, and `A: Sync` is absent from the closure, from `setup(..).observe(..).actor()` and from
 the `Saver` impl. Four changes:
 
 1. §2.4 needs a **third** edit, `drop(inbox)`, before the end channel is filled.
@@ -886,7 +886,7 @@ Two commits. Each one is provable alone.
 1. **`Observer` in keylink.** The trait, `TurnInfo`, `TurnOutcome`, `Stop`,
    `Stop::new`, `TurnLost`, `Ended`, `Panic::message`,
    `LocalActor::spawn_observed`, `LocalActor::read`, `LocalActor::ended`,
-   `Handle::ended`, `actor_with`, the three-drop ordering of §2.4, the served-path
+   `Handle::ended`, `setup(..).observe(..).actor()`, the three-drop ordering of §2.4, the served-path
    mapping with **both** pinned prefixes, and the scope note on `spawn`. One counting
    observer in the tests, plus the shadowing probe. No storage anywhere.
 2. **`keylink-durable`.** `Saver`, `open`, the moved test and example, the
@@ -991,7 +991,7 @@ names rather than leaves to a reader.
 `Handle::with_state` is untouched by the waves, so §5.2's routing at
 `LocalActor::read` is as written. `Caller<'_>` as the first argument of every
 generated actor method is invisible to an observer, which sees the state and the
-outcome and never the request. §5.3's exclusion of the keyed `System` path is
+outcome and never the request. §5.3's exclusion of the keyed `Registry` path is
 unaffected: `macros.rs`'s `spawn()` still runs its own loop over `__actor_turn`.
 
 ### 13.6 Correcting §13.3 — a refused turn settles `Interrupted`, not the refusal
@@ -1122,7 +1122,7 @@ which is the head of the record for the turn model and the section to read befor
 **§13.1's table.** `LocalActor::ask_catching_before` does not exist.
 `grep -rn 'ask_catching_before' keylink/src/` finds nothing, and generated dispatch calls
 neither method in that table: it calls `$crate::deliver_to_local`, keylink's own twin of
-`deliver_to_actor`, which sends `Message::Mail` into the mailbox itself. So §10's original
+`deliver_keyed`, which sends `Message::Mail` into the mailbox itself. So §10's original
 claim is nearly true again — `ask_catching` has **one** non-test caller, `LocalActor::ask`,
 plus three call sites in `local.rs`'s own test module, and none in `keylink/tests/`, `demo/`
 or the README. §13.1's correction of §10 was right about its wave and is now a round trip.
@@ -1166,7 +1166,7 @@ the guard, the observers, the marks and the reply, which is the property §13.6 
 establish by argument across two dispatchers.
 
 §13.5's last sentence needs one correction of the same kind. It says *"§5.3's exclusion of
-the keyed `System` path is unaffected: `macros.rs`'s `spawn()` still runs its own loop over
+the keyed `Registry` path is unaffected: `macros.rs`'s `spawn()` still runs its own loop over
 `__actor_turn`."* Half of that holds. `spawn()` does still run its own
 `while let Some(mail) = inbox.recv().await`, but the **turn** inside it is `$crate::turn`
 handed `&mut []` — an empty hook slice, in the one place that would otherwise have to be a
@@ -1289,7 +1289,7 @@ which is why the sections stay and this ledger is the correction.
 | `Withheld`, the private observer verdict in `turns.rs` | `ObserverVerdict` — the public `Withheld` took the word | `ec242c2` |
 | `EndReason`, defined in `console.rs` | moved beside the type it projects, in `observe.rs` | `c165009` |
 | `Undelivered` | `Unanswered` | `8acd7be` |
-| `deliver_to_local` | `deliver_to_singleton` | `80098e4` |
+| `deliver_to_local` | `deliver_unkeyed` | `80098e4` |
 | `NodeStatus::lost` | `NodeStatus::dropped` | `0c6e6c3` |
 | `Failed("observer refused: {name}")` | `Withheld::Refused { name }` | `0c6e6c3`, `5198ecb` |
 | `Failed("observer panicked: {name}")` | `Withheld::ObserverPanicked { name }` | `0c6e6c3`, `5198ecb` |

@@ -80,7 +80,7 @@
 //!   A pool is not that and does not grow into it: `pick` keeps no list of who is
 //!   alive, and a member ending here is nobody's business but its own.
 //! - **Not keyed.** If which member handles a message matters, the member is an
-//!   identity and the thing wanted is [`System`](crate::System) or
+//!   identity and the thing wanted is [`Registry`](crate::Registry) or
 //!   [`Names`](super::Names).
 
 use std::fmt;

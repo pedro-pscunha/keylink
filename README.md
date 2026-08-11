@@ -158,28 +158,23 @@ not stop the handler, and a layer such as `Timeout` refuses the caller without
 ending the turn. And an actor must not call itself: keylink detects a re-entrant
 local call by actor identity and refuses it instead of relying on mailbox depth.
 
-**Local mailbox policy.** The simple `actor`, `actor_with`, `actor_wired`, and
+**Local mailbox policy.** The simple `actor`, `setup(..).observe(..).actor()`, `setup(..).feeds(..).actor()`, and
 supervised doors park at depth 1 by default. The depth is configurable and is not
-pinned at 1. Use the generated `actor_deep` or `supervised_deep` door—or
+pinned at 1. Use the generated `setup(..).backpressure(..).actor()` or `restarting(..).backpressure(..).actor()` door—or
 `LocalActor::spawn_deep` directly—and choose what a full mailbox does:
 
 ```rust
 use std::num::NonZeroUsize;
 use keylink::Backpressure;
 
-let warehouse = inventory::actor_deep(
-    Warehouse::seeded(),
-    vec![],
-    inventory::Feeds::new(),
-    Backpressure::Park(NonZeroUsize::new(32).expect("non-zero depth")),
-);
+let warehouse = inventory::setup(Warehouse::seeded()).feeds(inventory::Feeds::new()).backpressure(Backpressure::Park(NonZeroUsize::new(32).expect("non-zero depth"))).actor();
 ```
 
 `Backpressure::Park(depth)` waits for a slot; `Backpressure::Shed(depth)` refuses
 immediately with `Full`. A deeper mailbox lets callers queue further ahead. It
 does not make self-calls safe, bound the memory held by parked senders, or remove
 the need to budget enough time for shutdown to drain queued turns. Keyed actors
-use the separate `SystemBuilder::mailbox_depth(NonZeroUsize)` knob and always
+use the separate `RegistryBuilder::mailbox_depth(NonZeroUsize)` knob and always
 park.
 
 A `send` method cannot be served this way at all, and `serve` stops compiling for
@@ -194,7 +189,7 @@ reply. It sees the state and how the turn went, and never a request or a reply
 payload; a layer sees the opposite. Neither grows toward the other.
 
 ```rust
-let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+let ledger = ledger::setup(state).observe(saver).actor();
 ledger.post(1).await?;             // the observer ran before this returned
 
 match ledger.ended().await {
@@ -234,11 +229,9 @@ because nobody called and there is nothing to reply to — and a `Stream` is wir
 into the same loop at spawn, one argument per declared feed:
 
 ```rust
-let warehouse = inventory::actor_wired(
-    Warehouse::seeded(),
-    vec![],                                 // observers
-    inventory::Feeds::new(deliveries),      // one argument per declared feed
-);
+let warehouse = inventory::setup(Warehouse::seeded())
+    .feeds(inventory::Feeds::new(deliveries)) // one argument per declared feed
+    .actor();
 ```
 
 Feed items and mailbox messages are interleaved fairly: with everything ready at
@@ -250,15 +243,15 @@ handler may have left half applied — and `Ended` names which happened.
 
 **Many instances behind one ALPN.** Keyed actors, addressed by an id inside the
 request, are `inventory::System`: build one, `mount(id, inventory::spawn(state))`,
-and serve it with `inventory::keyed_service(&system, allow)`, which peers reach
-through `inventory::KeyedClient`. That path once cost per-method layers,
+and serve it with `inventory::registry.service(&system, allow)`, which peers reach
+through `inventory::RegistryClient`. That path once cost per-method layers,
 per-method authorization, `blob` methods and observers, because its payload was
 opaque to keylink. It no longer does: a keyed request is `Addressed<Request>` and
 its reply is the service's own typed `Response`, and a keyed mount runs the same
 turn loop a local `Handle` does — so layers, per-method authorization, `blob`
 grants, observers, the panic guard and `Observer::finish` all reach it. The
 idempotency ledger was never on that list; what was missing was a client that
-could send a key, and `KeyedClient::with_idempotency` is it.
+could send a key, and `RegistryClient::with_idempotency` is it.
 
 What the keyed path still costs: one QUIC connection per actor *service* — not one
 for a node's whole fleet, each with its own handshake, admission decision,
@@ -675,10 +668,10 @@ Known gaps, in rough priority order:
   across a restart runs the handler again. `keylink-persist` is durability for an
   actor's *state*, not for the ledger. The other six limits of the guarantee are
   in **Reliable delivery** above.
-- A keyed instance's `System::ended(&id)` future must be subscribed while the id
+- A keyed instance's `Registry::ended(&id)` future must be subscribed while the id
   is mounted; it returns `None` for an id that is not live and never inserts one.
   The future reports the entry's final loop-or-teardown ending, while
-  `System::shutdown(&id, budget)` separately reports whether that shutdown drained or had to kill it.
+  `Registry::shutdown(&id, budget)` separately reports whether that shutdown drained or had to kill it.
 - **Supervision restarts one actor, and no strategy reaches its siblings.**
   `LocalActor::spawn_supervised`, `spawn_supervised_deep` and
   `run_keyed_supervised` take an `Intensity` and put a fresh incarnation on the

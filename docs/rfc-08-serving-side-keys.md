@@ -102,7 +102,7 @@ one.
 
 ### 2.4 It reaches the keyed-actor path with no second mechanism
 
-`keyed_service` builds a `ServiceBuilder<Addressed<Request>, Response>`, and
+`registry.service` builds a `ServiceBuilder<Addressed<Request>, Response>`, and
 `Rpc::method` for `Addressed<T>` forwards to the inner request — so the same
 `ServiceBuilder::keyable` covers both dispatch paths and Wave 1 needed no change to
 `macros.rs`. `a_keyed_actor_service_applies_the_same_policy` proves it over two
@@ -422,7 +422,7 @@ for one it does not.
 
 `rpc.rs`'s `Claimed` was renamed **out of** the word `Keyed`, and its doc comment
 records why: in this crate a keyed thing is one addressed by an `ActorId` —
-`KeyedService`, `KeyedClient`, `keyed_service`, `keyed_alpn`, `run_keyed`. Two
+`KeyedService`, `RegistryClient`, `registry.service`, `registry_alpn`, `run_keyed`. Two
 unrelated keys, one word, one crate.
 
 The brief this was built from specified `Keyed` for the policy type. Taking the
@@ -908,7 +908,7 @@ the five `Failed(String)` prefixes with one typed `Withheld` on the wire.
 | `Withheld`, the private observer verdict in `turns.rs` | `ObserverVerdict` | `ec242c2` |
 | `EndReason`, defined in `console.rs` | moved beside the type it projects, in `observe.rs` | `c165009` |
 | `Undelivered` | `Unanswered` | `8acd7be` |
-| `deliver_to_local` | `deliver_to_singleton` | `80098e4` |
+| `deliver_to_local` | `deliver_unkeyed` | `80098e4` |
 | `NodeStatus::lost` | `NodeStatus::dropped` | `0c6e6c3` |
 | the five `RemoteError` prefix consts | deleted — `RemoteError::Withheld(Withheld)` | `0c6e6c3`, `5198ecb` |
 

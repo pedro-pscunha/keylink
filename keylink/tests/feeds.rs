@@ -36,6 +36,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "persist-file")]
@@ -223,11 +224,13 @@ fn wired(observers: Vec<Box<dyn Observer<Book>>>) -> (Wired, Gate) {
     let (state, gate) = Book::open(&log);
     let (fills, fill_rx) = mpsc::channel(16);
     let (quotes, quote_rx) = mpsc::channel(16);
-    let book = book::actor_wired(
-        state,
-        observers,
-        book::Feeds::new(feed(fill_rx), feed(quote_rx)),
-    );
+    let book = observers
+        .into_iter()
+        .fold(book::setup(state), |setup, observer| {
+            setup.observe(observer)
+        })
+        .feeds(book::Feeds::new(feed(fill_rx), feed(quote_rx)))
+        .actor();
     (
         Wired {
             book,
@@ -559,7 +562,7 @@ async fn neither_input_starves_the_other() {
 /// declared out of scope and Wave 1b left at "one line": the keyed loop handed the
 /// dispatch an empty hook slice.
 ///
-/// It needs no node and no `KeyedClient`, and that is the interesting part rather
+/// It needs no node and no `RegistryClient`, and that is the interesting part rather
 /// than a shortcut: a keyed actor with a feed is driven entirely from inside this
 /// process, so the thing being tested is the *loop*, with no transport in the way
 /// to explain a pass. The mailbox half of the same loop is `Turn::run` at the same
@@ -573,17 +576,16 @@ async fn an_observer_attached_to_a_keyed_actor_runs() {
     let (state, _gate) = Book::open(&log);
     let (fills, fill_rx) = mpsc::channel(16);
 
-    let system = book::System::builder(keylink::Eviction::Never)
+    let system = book::Registry::builder(keylink::Eviction::Never)
         .capacity(4)
         .build();
     system
         .mount(
             keylink::ActorId::new("books/one").expect("valid"),
-            book::spawn_wired(
-                state,
-                vec![Box::new(Reporting { to: seen })],
-                book::Feeds::new(feed(fill_rx), quiet()),
-            ),
+            book::setup(state)
+                .observe(Reporting { to: seen })
+                .feeds(book::Feeds::new(feed(fill_rx), quiet()))
+                .mountable(),
         )
         .expect("mounts");
 
@@ -603,19 +605,17 @@ async fn a_keyed_system_ending_reports_a_finished_feed() {
     let actor_id = keylink::ActorId::new("books/finished").expect("valid");
     let (fills, fill_rx) = mpsc::channel(1);
     drop(fills);
-    let system = book::System::builder(keylink::Eviction::Never).build();
+    let system = book::Registry::builder(keylink::Eviction::Never).build();
     system
         .mount(
             actor_id.clone(),
-            book::spawn_wired(
-                Book {
-                    log,
-                    entered: None,
-                    gate: None,
-                },
-                Vec::new(),
-                book::Feeds::new(feed(fill_rx), quiet()),
-            ),
+            book::setup(Book {
+                log,
+                entered: None,
+                gate: None,
+            })
+            .feeds(book::Feeds::new(feed(fill_rx), quiet()))
+            .mountable(),
         )
         .expect("mounts");
     let ending = system.ended(&actor_id).expect("the actor is mounted");
@@ -628,19 +628,17 @@ async fn a_keyed_system_ending_reports_a_finished_feed() {
 async fn a_local_keyed_ref_queues_a_tell() {
     let log: Log = Arc::new(Mutex::new(Vec::new()));
     let actor_id = keylink::ActorId::new("books/local").expect("valid");
-    let system = book::System::builder(keylink::Eviction::Never).build();
+    let system = book::Registry::builder(keylink::Eviction::Never).build();
     system
         .mount(
             actor_id.clone(),
-            book::spawn_wired(
-                Book {
-                    log: log.clone(),
-                    entered: None,
-                    gate: None,
-                },
-                Vec::new(),
-                book::Feeds::new(quiet(), quiet()),
-            ),
+            book::setup(Book {
+                log: log.clone(),
+                entered: None,
+                gate: None,
+            })
+            .feeds(book::Feeds::new(quiet(), quiet()))
+            .mountable(),
         )
         .expect("mounts");
 
@@ -649,7 +647,7 @@ async fn a_local_keyed_ref_queues_a_tell() {
         .await
         .expect("the tell enters the keyed mailbox");
     system
-        .shutdown(&actor_id, std::time::Duration::from_secs(1))
+        .stop(&actor_id, std::time::Duration::from_secs(1))
         .await
         .expect("the actor drains the queued tell");
     assert_eq!(*log.lock().unwrap(), vec![Event::Note(9)]);
@@ -777,11 +775,10 @@ async fn a_feed_turn_is_stored_on_the_same_rule_as_a_mailbox_turn() {
         assert!(!opened.was_stored(), "nothing has been stored yet");
         let (state, saver) = opened.start_from(Tape::default);
 
-        let tape = tape::actor_wired(
-            state,
-            vec![Box::new(saver)],
-            tape::Feeds::new(feed(mark_rx)),
-        );
+        let tape = tape::setup(state)
+            .observe(saver)
+            .feeds(tape::Feeds::new(feed(mark_rx)))
+            .actor();
 
         let ended = tape.ended().await;
         assert!(

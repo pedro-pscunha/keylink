@@ -166,7 +166,7 @@ use crate::{Observer, Stop, TurnFut, TurnInfo, TurnOutcome};
 /// let (state, saver) = Persist::<Ledger, _>::open(&store, &id)
 ///     .await?
 ///     .start_from(Ledger::default);
-/// let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+/// let ledger = ledger::setup(state).observe(saver).actor();
 ///
 /// // The store is in front of the reply, so this returning `Ok` means the bytes
 /// // are fsynced. A `#[defer]` method gets the same thing: its parked answer
@@ -316,7 +316,7 @@ impl<D: Durable, S: Snapshots> Persist<D, S> {
     /// `Persist::<Ledger, _>::open(&store, &id)`. Nothing in the arguments says
     /// which state is being claimed, and inference reaches the observer end but
     /// not always the state end: handing the restored value to a generic
-    /// `actor_with<A: Actor>` leaves `D` ambiguous even where exactly one type
+    /// `setup<A: Actor>` leaves `D` ambiguous even where exactly one type
     /// implements that service's `Actor`, because rustc will not pick an impl to
     /// resolve a type parameter. The turbofish reads as "open the Ledger's
     /// state", which is what the line means anyway.
@@ -383,7 +383,7 @@ impl<D: Durable, S: Snapshots> Opened<D, S> {
     ///
     /// ```ignore
     /// let (state, saver) = Persist::<Ledger, _>::open(&store, &id).await?.start_from(Ledger::default);
-    /// let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+    /// let ledger = ledger::setup(state).observe(saver).actor();
     /// ```
     pub fn start_from(self, first: impl FnOnce() -> D) -> (D, Persist<D, S>) {
         (self.restored.unwrap_or_else(first), self.saver)

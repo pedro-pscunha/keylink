@@ -26,7 +26,7 @@
 //! first six patterns; [`Endings`] is a seventh **row** and not a seventh pattern
 //! — it adapts [`Lifecycle::ended`](crate::Lifecycle::ended) for compositions that
 //! want to own keyed ending futures. A one-off keyed observation can use
-//! [`System::ended`](crate::System::ended) directly. The seventh **pattern** has
+//! [`Registry::ended`](crate::Registry::ended) directly. The seventh **pattern** has
 //! no row, and that is the finding rather than an oversight:
 //! handle ergonomics turned out to be a table rather than a type — all of it
 //! already exists under keylink's own names, and the last section here is the
@@ -126,8 +126,8 @@
 //! | `wait_for_shutdown` | [`Handle::ended`] — and it answers *why*, which a `wait_for_shutdown` returning `()` cannot | Wave 2 |
 //!
 //! What was genuinely absent is on the **composition** path, and this module is
-//! where it is filled: a keyed actor reached through [`System`](crate::System) now
-//! has [`System::ended`](crate::System::ended) for direct observation, while
+//! where it is filled: a keyed actor reached through [`Registry`](crate::Registry) now
+//! has [`Registry::ended`](crate::Registry::ended) for direct observation, while
 //! [`Endings`] adapts keyed [`Lifecycle`](crate::Lifecycle) callbacks into
 //! futures a composition can own. [`Names`] and [`Group`] both take the ending future as an argument rather
 //! than asking a handle for one, which lets local and keyed members share their

@@ -2,17 +2,17 @@
 //!
 //! A local actor answers *when did you end, and why* itself:
 //! [`ended()`](crate::LocalActor::ended) hands back a future. A keyed actor is
-//! addressed by id, so [`System::ended`](crate::System::ended) is its direct
+//! addressed by id, so [`Registry::ended`](crate::Registry::ended) is its direct
 //! per-actor observation door.
 //!
 //! [`Endings`] remains the composition adapter: it turns the keyed
 //! [`Lifecycle::ended`] callback into futures that [`Group`](super::Group) and
 //! other compositions can own. It deliberately retains its miss-window
-//! semantics; callers that only need one keyed ending should use `System::ended`.
+//! semantics; callers that only need one keyed ending should use `Registry::ended`.
 //!
 //! ```ignore
 //! let endings = Endings::new();
-//! let system = ledger::System::builder(Eviction::Never)
+//! let system = ledger::Registry::builder(Eviction::Never)
 //!     .lifecycle(endings.clone())
 //!     .build();
 //!
@@ -20,7 +20,7 @@
 //! // Before the mount. An ending reported before a waiter is filed reaches
 //! // nobody — see the miss-window below.
 //! let ended = endings.watch(&id);
-//! system.mount(id.clone(), ledger::spawn_supervised(build, budget))?;
+//! system.mount(id.clone(), ledger::restarting(build, budget).mountable())?;
 //!
 //! // Somewhere else entirely.
 //! match ended.await {
@@ -33,10 +33,10 @@
 //!
 //! [`Membership`](super::Membership) wants two values: a future that says when
 //! the member ended, and a way to end it. A keyed system supplies both now:
-//! [`System::ended`](crate::System::ended) is the exact-entry door for a member
+//! [`Registry::ended`](crate::Registry::ended) is the exact-entry door for a member
 //! already mounted, while this adapter fans lifecycle callbacks into futures for
 //! code that must file the waiter before mounting. Retirement uses
-//! [`System::abort`](crate::System::abort):
+//! [`Registry::abort`](crate::Registry::abort):
 //!
 //! ```ignore
 //! // One member gives up, the group ends.
@@ -44,7 +44,7 @@
 //!
 //! let id = ActorId::new("ledger/7")?;
 //! let ended = endings.watch(&id);
-//! system.mount(id.clone(), ledger::spawn_supervised(build, budget))?;
+//! system.mount(id.clone(), ledger::restarting(build, budget).mountable())?;
 //!
 //! let retiring = system.clone();
 //! let retired = id.clone();
@@ -60,8 +60,8 @@
 //! );
 //! ```
 //!
-//! [`abort`](crate::System::abort) and not
-//! [`shutdown`](crate::System::shutdown), for the reason
+//! [`abort`](crate::Registry::abort) and not
+//! [`shutdown`](crate::Registry::stop), for the reason
 //! [`Membership::new`](super::Membership::new) already gives about local actors:
 //! a supervised member sitting in a backoff sleep polls no inbox, so a draining
 //! teardown of one cannot return until that backoff elapses, while the group is
@@ -80,11 +80,11 @@
 //! Ask for the future before the actor can end:
 //!
 //! - **A hand-mounted actor** — [`watch`](Endings::watch) before
-//!   [`System::mount`](crate::System::mount). The actor is running and
+//!   [`Registry::mount`](crate::Registry::mount). The actor is running and
 //!   addressable the moment `mount` returns.
 //!   [`Endings`] must already be installed on that system, which means the
-//!   [`lifecycle`](crate::SystemBuilder::lifecycle) call happened at build time.
-//! - **A lazily spawned actor** — [`SystemBuilder::spawn_with`](crate::SystemBuilder::spawn_with)
+//!   [`lifecycle`](crate::RegistryBuilder::lifecycle) call happened at build time.
+//! - **A lazily spawned actor** — [`RegistryBuilder::spawn_with`](crate::RegistryBuilder::spawn_with)
 //!   builds it on the first message from the network, so the window opens the
 //!   moment the node serves. There is no call to be "before" from the caller's
 //!   side, and a `watch` racing an id the network already mounted and killed is
@@ -94,7 +94,7 @@
 //! are separated by the registry's opaque incarnation identity. A `watch` filed
 //! after the replacement's mount belongs to the replacement, not to the late old
 //! report. Filing before that mount while the old incarnation is still active is
-//! ambiguous by id alone; use the direct [`System::ended`](crate::System::ended)
+//! ambiguous by id alone; use the direct [`Registry::ended`](crate::Registry::ended)
 //! door after mounting when exact-entry identity matters.
 //!
 //! [`Names::register`](super::Names::register) does the same adaptation without
@@ -102,7 +102,7 @@
 //! `register` takes the ending **as an argument**: the future exists before the
 //! registration does, so there is no interval in which the actor is watchable and
 //! unwatched. For this adapter the signal arrives as a [`Lifecycle`] callback, so
-//! the interval is real. Use [`System::ended`](crate::System::ended) when the
+//! the interval is real. Use [`Registry::ended`](crate::Registry::ended) when the
 //! already-mounted entry itself is the observation source.
 //!
 //! **The alternative was to remember endings for names nobody asked about**, so
@@ -124,8 +124,8 @@
 //! | how it ended | what `why` is | is it *why* |
 //! |---|---|---|
 //! | the actor ended itself — `reap` | the [`Ended`] its own loop returned | **yes.** [`GaveUp`](Ended::GaveUp), [`Panicked`](Ended::Panicked), [`Observer`](Ended::Observer), [`Feed`](Ended::Feed) all arrive intact |
-//! | [`System::shutdown`](crate::System::shutdown) | synthesised from the join | no. [`Stopped`](Ended::Stopped) means *this shutdown drained it*, and an actor that ended on an observer's refusal a second earlier reads `Stopped` here |
-//! | [`System::abort`](crate::System::abort) | the loop's natural ending if it won the cancellation race; otherwise [`Ended::Vanished`] | natural only when the loop published first |
+//! | [`Registry::stop`](crate::Registry::stop) | synthesised from the join | no. [`Stopped`](Ended::Stopped) means *this shutdown drained it*, and an actor that ended on an observer's refusal a second earlier reads `Stopped` here |
+//! | [`Registry::abort`](crate::Registry::abort) | the loop's natural ending if it won the cancellation race; otherwise [`Ended::Vanished`] | natural only when the loop published first |
 //! | eviction, on the idle clock | synthesised from the same join `shutdown` uses | no, and the same two spellings |
 //!
 //! So a group whose policy branches on [`Ended::GaveUp`] is reading a reason
@@ -134,7 +134,7 @@
 //! [`Observer`](Ended::Observer) — can also happen without anybody asking for
 //! teardown. A policy that branches on [`Ended::Stopped`] to mean "somebody stopped it
 //! deliberately" is reading a value that also means "it was already dead and the
-//! shutdown found the corpse". [`System::shutdown`](crate::System::shutdown)
+//! shutdown found the corpse". [`Registry::stop`](crate::Registry::stop)
 //! argues that at length; nothing here re-decides it.
 //!
 //! **Exactly one report fires per incarnation.** `shutdown`, `abort` and the
@@ -243,8 +243,8 @@ fn resolve(waiters: Vec<Waiter>, why: &Ended) {
 
 /// Endings for keyed actors, as futures rather than a callback.
 ///
-/// Install it on a [`System`](crate::System) with
-/// [`SystemBuilder::lifecycle`](crate::SystemBuilder::lifecycle), then ask for an
+/// Install it on a [`Registry`](crate::Registry) with
+/// [`RegistryBuilder::lifecycle`](crate::RegistryBuilder::lifecycle), then ask for an
 /// actor's ending with [`watch`](Self::watch) **before** that actor can end.
 ///
 /// Cheap to clone: every clone names the same waiters, so the code that installs
@@ -292,7 +292,7 @@ impl Endings {
     /// used to say it was. The trigger is the last strong reference dying, and
     /// [`watch`](Self::watch) takes `&self` — so any caller watching a second
     /// name is still holding a clone, as the module doc's own example is. A
-    /// dropped [`System`](crate::System) reports nothing at all: nothing in
+    /// dropped [`Registry`](crate::Registry) reports nothing at all: nothing in
     /// `registry.rs` implements [`Drop`] for it, so the clone it held going away
     /// is one clone of several and the waiters simply stay pending.
     #[must_use = "a `watch` nobody awaits files a waiter and reads no ending; \

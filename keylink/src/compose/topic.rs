@@ -13,8 +13,8 @@
 //! }
 //!
 //! let topic = Topic::new(Overflow::BlockPublisher);
-//! let book = book::actor_wired(Book::new(), vec![], book::Feeds::new(topic.subscribe()));
-//! let risk = risk::actor_wired(Risk::new(), vec![], risk::Feeds::new(topic.subscribe()));
+//! let book = book::setup(Book::new()).feeds(book::Feeds::new(topic.subscribe())).actor();
+//! let risk = risk::setup(Risk::new()).feeds(risk::Feeds::new(topic.subscribe())).actor();
 //!
 //! topic.publish(fill).await;      // both actors take a turn on it
 //! ```

@@ -54,7 +54,7 @@
 //!
 //! This section used to say the opposite, and the paragraph is kept in the past
 //! tense because the *shape* of the limit is the interesting part. A keyed actor
-//! mounted in a [`System`](crate::System) got no observers, first because `spawn`
+//! mounted in a [`Registry`](crate::Registry) got no observers, first because `spawn`
 //! ran a second loop over its own dispatcher and never touched
 //! [`LocalActor`](crate::LocalActor) — two loops, and closing the gap meant
 //! merging them — and then, after Wave 1b made the dispatch one path, because
@@ -65,8 +65,8 @@
 //! the same `select!` a local one does: there is **one loop** now, in `turns.rs`,
 //! and both paths enter it with a state, a `Vec` of observers and a set of feeds.
 //! The owner of the `Vec` is whoever builds the actor —
-//! `<service>::spawn_wired(state, observers, feeds)` for a keyed one, called from
-//! a [`spawn_with`](crate::SystemBuilder::spawn_with) factory when the actor is
+//! `<service>::setup(state).observe(observer).feeds(feeds).mountable()` for a keyed one, called from
+//! a [`spawn_with`](crate::RegistryBuilder::spawn_with) factory when the actor is
 //! built on first message. That triple is also the shape re-incarnation needs.
 //!
 //! `<service>::spawn(state)` still means "no observers", and it is still the door
@@ -105,7 +105,7 @@ pub type FinishFut<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 ///
 /// Observers run in the order they were given, one after another, inside the
 /// same panic guard as the handler. A keyed actor mounted through
-/// [`System`](crate::System) is watched by whatever its factory gave it — see the
+/// [`Registry`](crate::Registry) is watched by whatever its factory gave it — see the
 /// module documentation.
 ///
 /// A `feed` item is a turn like any other: [`after_turn`](Self::after_turn) runs
@@ -165,6 +165,23 @@ pub trait Observer<A>: Send + 'static {
     /// the chain still runs.
     fn finish<'a>(&'a mut self, _state: &'a A, _ended: &'a Ended) -> FinishFut<'a> {
         Box::pin(async {})
+    }
+}
+
+impl<A, O> Observer<A> for Box<O>
+where
+    O: Observer<A> + ?Sized,
+{
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+
+    fn after_turn<'a>(&'a mut self, state: &'a A, turn: TurnInfo<'a>) -> TurnFut<'a> {
+        (**self).after_turn(state, turn)
+    }
+
+    fn finish<'a>(&'a mut self, state: &'a A, ended: &'a Ended) -> FinishFut<'a> {
+        (**self).finish(state, ended)
     }
 }
 
@@ -725,7 +742,7 @@ impl fmt::Display for EndReason {
 /// next caller already about to block on the permit.
 ///
 /// [`LocalActor::serving`](crate::LocalActor::serving) folds it for a singleton
-/// and [`System::serving`](crate::System::serving) for one keyed actor, each
+/// and [`Registry::serving`](crate::Registry::serving) for one keyed actor, each
 /// from the two readings its own side already had. Neither invents a fact and
 /// neither takes a new lock the side was not already taking.
 ///
@@ -733,7 +750,7 @@ impl fmt::Display for EndReason {
 /// reaches it, about a task on another thread, so the value is stale by the time
 /// it is returned and the two halves need not describe the same moment. That is
 /// the honest shape for this question and the same one
-/// [`System::status`](crate::System::status) states about its list. Evidence,
+/// [`Registry::status`](crate::Registry::status) states about its list. Evidence,
 /// never a precondition.
 ///
 /// # Two types, because they answer two questions

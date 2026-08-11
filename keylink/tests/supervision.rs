@@ -36,6 +36,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -460,7 +461,7 @@ async fn an_actor_restarts_from_its_last_committed_state() {
 
     let ledger = {
         let built = built.clone();
-        ledger::supervised(
+        ledger::restarting(
             move || {
                 let files = files.clone();
                 let id = id.clone();
@@ -479,6 +480,7 @@ async fn an_actor_restarts_from_its_last_committed_state() {
             },
             limit(2, Duration::from_millis(50)),
         )
+        .actor()
     };
 
     assert_eq!(ledger.post(1).await.expect("the first turn"), 1);
@@ -509,7 +511,7 @@ async fn a_restart_storm_ends_the_actor() {
     let built = calls();
     let ticker = {
         let built = built.clone();
-        ticker::supervised(
+        ticker::restarting(
             move || {
                 let built = built.clone();
                 async move {
@@ -523,6 +525,7 @@ async fn a_restart_storm_ends_the_actor() {
             },
             limit(3, Duration::from_secs(4)),
         )
+        .actor()
     };
 
     match ended(ticker.ended()).await {
@@ -595,7 +598,7 @@ async fn a_failure_slower_than_its_recovery_span_never_gives_up() {
 
     let ticker = {
         let counted = calls();
-        ticker::supervised(
+        ticker::restarting(
             move || {
                 let counted = counted.clone();
                 let announce = announce.clone();
@@ -617,6 +620,7 @@ async fn a_failure_slower_than_its_recovery_span_never_gives_up() {
             },
             limit(2, recovered_after),
         )
+        .actor()
     };
 
     for expected in 0..6 {
@@ -640,7 +644,7 @@ async fn a_failure_slower_than_its_recovery_span_never_gives_up() {
 /// than fail. Under a paused clock the bound costs no real time.
 #[tokio::test(start_paused = true)]
 async fn a_supervised_actor_that_gave_up_answers_stop() {
-    let ticker = ticker::supervised(
+    let ticker = ticker::restarting(
         move || async move {
             Ok((
                 Ticker::new(&Arc::new(Mutex::new(Vec::new()))),
@@ -649,7 +653,8 @@ async fn a_supervised_actor_that_gave_up_answers_stop() {
             ))
         },
         limit(2, Duration::from_secs(4)),
-    );
+    )
+    .actor();
 
     assert!(
         matches!(ended(ticker.ended()).await, Ended::GaveUp { .. }),
@@ -684,7 +689,7 @@ async fn a_restart_is_not_an_ending() {
     let (announce, mut built) = tokio::sync::mpsc::unbounded_channel();
     let ticker = {
         let built = calls();
-        ticker::supervised(
+        ticker::restarting(
             move || {
                 let built = built.clone();
                 let announce = announce.clone();
@@ -704,6 +709,7 @@ async fn a_restart_is_not_an_ending() {
             },
             limit(3, Duration::from_secs(4)),
         )
+        .actor()
     };
 
     // Evidence the restart happened, reported by the thing that did it.
@@ -737,7 +743,7 @@ async fn the_backoff_spreads_the_budget_across_its_window() {
     let recovered_after = Duration::from_secs(8);
     let started = tokio::time::Instant::now();
 
-    let ticker = ticker::supervised(
+    let ticker = ticker::restarting(
         move || async move {
             Ok((
                 Ticker::new(&Arc::new(Mutex::new(Vec::new()))),
@@ -746,7 +752,8 @@ async fn the_backoff_spreads_the_budget_across_its_window() {
             ))
         },
         limit(4, recovered_after),
-    );
+    )
+    .actor();
 
     assert!(matches!(
         ended(ticker.ended()).await,
@@ -774,7 +781,7 @@ async fn a_fatal_stop_skips_the_budget() {
     let built = calls();
     let ledger = {
         let built = built.clone();
-        ledger::supervised(
+        ledger::restarting(
             move || {
                 let built = built.clone();
                 async move {
@@ -788,6 +795,7 @@ async fn a_fatal_stop_skips_the_budget() {
             },
             limit(5, Duration::from_secs(10)),
         )
+        .actor()
     };
 
     assert!(
@@ -835,7 +843,7 @@ async fn a_fatal_refusal_of_a_panicked_turn_is_not_honoured() {
     let (announce, mut built) = tokio::sync::mpsc::unbounded_channel();
     let ledger = {
         let counted = calls();
-        ledger::supervised(
+        ledger::restarting(
             move || {
                 let counted = counted.clone();
                 let announce = announce.clone();
@@ -848,6 +856,7 @@ async fn a_fatal_refusal_of_a_panicked_turn_is_not_honoured() {
             },
             limit(2, Duration::from_secs(4)),
         )
+        .actor()
     };
 
     let first = tokio::time::timeout(NO_PROGRESS, built.recv())
@@ -893,7 +902,7 @@ async fn an_observer_is_rebuilt_for_each_incarnation() {
     let ticker = {
         let log = log.clone();
         let built = built.clone();
-        ticker::supervised(
+        ticker::restarting(
             move || {
                 let log = log.clone();
                 let built = built.clone();
@@ -910,6 +919,7 @@ async fn an_observer_is_rebuilt_for_each_incarnation() {
             },
             limit(2, Duration::from_secs(4)),
         )
+        .actor()
     };
 
     assert!(matches!(
@@ -946,7 +956,7 @@ async fn a_feed_is_resubscribed_on_each_incarnation() {
     let ticker = {
         let beats = beats.clone();
         let built = built.clone();
-        ticker::supervised(
+        ticker::restarting(
             move || {
                 let beats = beats.clone();
                 let built = built.clone();
@@ -964,6 +974,7 @@ async fn a_feed_is_resubscribed_on_each_incarnation() {
             },
             limit(2, Duration::from_secs(4)),
         )
+        .actor()
     };
 
     match ended(ticker.ended()).await {
@@ -991,7 +1002,7 @@ async fn abort_destroys_a_supervised_actor_rather_than_one_incarnation() {
     let built = calls();
     let ledger = {
         let built = built.clone();
-        ledger::supervised(
+        ledger::restarting(
             move || {
                 let built = built.clone();
                 async move {
@@ -1001,6 +1012,7 @@ async fn abort_destroys_a_supervised_actor_rather_than_one_incarnation() {
             },
             limit(3, Duration::from_secs(10)),
         )
+        .actor()
     };
 
     assert_eq!(ledger.post(1).await.expect("the first turn"), 1);
@@ -1031,7 +1043,7 @@ async fn a_handle_survives_its_actors_restart() {
     let refusals = Arc::new(AtomicU32::new(0));
     let ledger = {
         let refusals = refusals.clone();
-        ledger::supervised(
+        ledger::restarting(
             move || {
                 let refusals = refusals.clone();
                 async move {
@@ -1044,6 +1056,7 @@ async fn a_handle_survives_its_actors_restart() {
             },
             limit(3, Duration::from_secs(10)),
         )
+        .actor()
     };
 
     assert!(
@@ -1117,14 +1130,15 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
 
     // One restart, so the second fault is terminal and "gone" is reachable
     // inside one test without a storm.
-    let desk = desk::supervised(
+    let desk = desk::restarting(
         move || async move {
             let observers: Vec<Box<dyn Observer<Desk>>> =
                 vec![Box::new(RefuseFaults { fatal: false })];
             Ok((Desk::default(), observers, ()))
         },
         limit(1, Duration::from_millis(50)),
-    );
+    )
+    .actor();
     let _server = Server::builder(&server_node)
         .service(desk.service(Allowlist::anyone()).build())
         .spawn()
@@ -1263,14 +1277,15 @@ async fn a_remote_caller_can_tell_restarting_from_gone() {
 async fn a_local_caller_can_tell_restarting_from_gone() {
     // One restart, so the second fault is terminal and "gone" is reachable
     // inside one test without a storm.
-    let desk = desk::supervised(
+    let desk = desk::restarting(
         move || async move {
             let observers: Vec<Box<dyn Observer<Desk>>> =
                 vec![Box::new(RefuseFaults { fatal: false })];
             Ok((Desk::default(), observers, ()))
         },
         limit(1, Duration::from_millis(50)),
-    );
+    )
+    .actor();
 
     for (round, expected) in [
         (
@@ -1342,11 +1357,11 @@ async fn a_local_caller_can_tell_restarting_from_gone() {
 /// Supervision reaches a **keyed** actor, because Wave 3 unified the loops.
 ///
 /// The registry is untouched: `mount` takes a closure over a mailbox, and the
-/// supervisor is that closure's whole body — so `System::mount`, eviction and
+/// supervisor is that closure's whole body — so `Registry::mount`, eviction and
 /// `shutdown` see one task exactly as they do for an unsupervised keyed actor.
 ///
 /// This is also the keyed door a durable actor could not use lazily before:
-/// `SystemBuilder::spawn_with`'s factory is a plain `Fn` and cannot `await`, and
+/// `RegistryBuilder::spawn_with`'s factory is a plain `Fn` and cannot `await`, and
 /// `Persist::open` is I/O. This factory awaits, once per incarnation.
 #[cfg(feature = "persist-file")]
 #[tokio::test]
@@ -1356,13 +1371,13 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
     let actor = keylink::ActorId::new("ledgers/sp-02").expect("valid");
     let built = calls();
 
-    let system = ledger::System::builder(keylink::Eviction::Never)
+    let system = ledger::Registry::builder(keylink::Eviction::Never)
         .capacity(4)
         .build();
     system
         .mount(actor.clone(), {
             let built = built.clone();
-            ledger::spawn_supervised(
+            ledger::restarting(
                 move || {
                     let files = files.clone();
                     let id = id.clone();
@@ -1379,16 +1394,17 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
                 },
                 limit(2, Duration::from_millis(50)),
             )
+            .mountable()
         })
         .expect("mounts");
 
     let server_node = local_node().await;
     let client_node = local_node().await;
     let _server = Server::builder(&server_node)
-        .service(ledger::keyed_service(&system, Allowlist::anyone()).build())
+        .service(system.service(Allowlist::anyone()).build())
         .spawn()
         .expect("one service, one ALPN");
-    let client = ledger::KeyedClient::connect(&client_node, server_node.endpoint().addr())
+    let client = ledger::RegistryClient::connect(&client_node, server_node.endpoint().addr())
         .await
         .expect("the client dials the actor system");
 
@@ -1435,9 +1451,9 @@ async fn a_keyed_actor_restarts_from_its_last_committed_state() {
 ///
 /// Wave 9 gave the singleton served path three answers and left the keyed one
 /// with `NoSuchActor` for all three, because the supervisor's verdict lived on a
-/// channel `deliver_to_actor` could not see. The verdict is a cell on the registry
+/// channel `deliver_keyed` could not see. The verdict is a cell on the registry
 /// entry now, so this is the same test on the same two answers — two prefixes when
-/// it was written, two `Withheld` variants since `5198ecb` — over a `System`:
+/// it was written, two `Withheld` variants since `5198ecb` — over a `Registry`:
 ///
 /// 1. `boom` faults → `Withheld::Panicked`, the actor survives the message;
 /// 2. the parked `place` → `Withheld::Restarting`, the incarnation did not;
@@ -1480,26 +1496,27 @@ async fn a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor() {
 
     // One restart, so the second fault is terminal and "gone" is reachable
     // inside one test without a storm.
-    let system = desk::System::builder(keylink::Eviction::Never).build();
+    let system = desk::Registry::builder(keylink::Eviction::Never).build();
     system
         .mount(
             desk_id.clone(),
-            desk::spawn_supervised(
+            desk::restarting(
                 move || async move {
                     let observers: Vec<Box<dyn Observer<Desk>>> =
                         vec![Box::new(RefuseFaults { fatal: false })];
                     Ok((Desk::default(), observers, ()))
                 },
                 limit(1, Duration::from_millis(50)),
-            ),
+            )
+            .mountable(),
         )
         .expect("mounts");
 
     let _server = Server::builder(&server_node)
-        .service(desk::keyed_service(&system, Allowlist::anyone()).build())
+        .service(system.service(Allowlist::anyone()).build())
         .spawn()
         .expect("one service, one ALPN");
-    let client = desk::KeyedClient::connect(&client_node, server_node.endpoint().addr())
+    let client = desk::RegistryClient::connect(&client_node, server_node.endpoint().addr())
         .await
         .expect("the client dials the actor system");
 
@@ -1632,7 +1649,7 @@ async fn a_peer_whose_factory_panicked_is_told_the_actor_is_gone() {
         // Turbofished because a factory that only ever diverges pins neither the
         // feeds type nor the error: `error[E0283]: type annotations needed`, and
         // the annotation belongs here rather than on an unreachable value.
-        ticker::supervised::<Ticker, _, _, ticker::Feeds>(
+        ticker::restarting::<Ticker, _, _, ticker::Feeds>(
             move || {
                 let go = Arc::clone(&go);
                 async move {
@@ -1644,6 +1661,7 @@ async fn a_peer_whose_factory_panicked_is_told_the_actor_is_gone() {
             },
             limit(3, Duration::from_millis(50)),
         )
+        .actor()
     };
     let _server = Server::builder(&server_node)
         .service(ticker.service(Allowlist::anyone()).build())
@@ -1705,11 +1723,9 @@ async fn a_peer_whose_feed_panicked_is_told_the_actor_is_gone() {
 
     let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let beats = Arc::new(Mutex::new(Vec::new()));
-    let ticker = ticker::actor_wired(
-        Ticker::new(&beats),
-        Vec::new(),
-        ticker::Feeds::new(Exploding(Arc::clone(&armed))),
-    );
+    let ticker = ticker::setup(Ticker::new(&beats))
+        .feeds(ticker::Feeds::new(Exploding(Arc::clone(&armed))))
+        .actor();
     let _server = Server::builder(&server_node)
         .service(ticker.service(Allowlist::anyone()).build())
         .spawn()
@@ -1796,7 +1812,7 @@ async fn a_keyed_call_whose_turn_panicked_stays_interrupted_across_a_restart() {
     let server_node = local_node().await;
     let client_node = local_node().await;
 
-    let ledger = ledger::supervised(
+    let ledger = ledger::restarting(
         move || {
             let files = files.clone();
             let id = id.clone();
@@ -1810,7 +1826,8 @@ async fn a_keyed_call_whose_turn_panicked_stays_interrupted_across_a_restart() {
             }
         },
         limit(2, Duration::from_millis(50)),
-    );
+    )
+    .actor();
     let _server = Server::builder(&server_node)
         .service(ledger.service(Allowlist::anyone()).build())
         .spawn()

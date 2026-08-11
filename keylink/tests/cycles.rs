@@ -55,6 +55,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -860,18 +861,18 @@ async fn a_deeper_mailbox_takes_one_more_message_behind_a_running_turn() {
     let gate = Arc::new(Notify::new());
     let entered = Arc::new(AtomicUsize::new(0));
 
-    let a = ring::actor_deep(
-        Peer {
-            other: me.clone(),
-            me: me.clone(),
-            entered: entered.clone(),
-            gate: gate.clone(),
-            bumps: 0,
-        },
-        Vec::new(),
-        ring::Feeds::new(),
-        Backpressure::Park(NonZeroUsize::new(2).expect("two is not zero")),
-    );
+    let a = ring::setup(Peer {
+        other: me.clone(),
+        me: me.clone(),
+        entered: entered.clone(),
+        gate: gate.clone(),
+        bumps: 0,
+    })
+    .feeds(ring::Feeds::new())
+    .backpressure(Backpressure::Park(
+        NonZeroUsize::new(2).expect("two is not zero"),
+    ))
+    .actor();
     me.set(a.clone()).expect("set once");
 
     let waiting = {
@@ -935,8 +936,8 @@ async fn a_deeper_mailbox_takes_one_more_message_behind_a_running_turn() {
 /// panics here — still holds.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/macros.rs` on the door itself,
-/// `inner: $crate::LocalActor::spawn_supervised_deep(factory, limit, backpressure),`
-/// replaced by `inner: $crate::LocalActor::spawn_supervised(factory, limit),` —
+/// `$crate::LocalActor::spawn_supervised_deep(factory, limit, policy)`
+/// replaced by `$crate::LocalActor::spawn_supervised(factory, limit)` —
 /// the policy accepted and dropped one line later, which is the failure a caller
 /// cannot see. **Hand the harness the whole line with its twenty spaces of
 /// indentation**, which is what `F1` registers. Watched:
@@ -950,7 +951,7 @@ async fn a_deeper_mailbox_takes_one_more_message_behind_a_running_turn() {
 /// both doors share. The gap this closes is the **door**, and the door is one
 /// line in the macro.
 #[tokio::test]
-async fn the_supervised_deep_door_takes_the_depth_it_was_given() {
+async fn the_restarting_builder_takes_the_depth_it_was_given() {
     let me = Arc::new(OnceLock::new());
     let other = Arc::new(OnceLock::new());
     let gate = Arc::new(Notify::new());
@@ -961,7 +962,7 @@ async fn the_supervised_deep_door_takes_the_depth_it_was_given() {
         let other = other.clone();
         let gate = gate.clone();
         let entered = entered.clone();
-        ring::supervised_deep(
+        ring::restarting(
             move || {
                 let me = me.clone();
                 let other = other.clone();
@@ -986,8 +987,11 @@ async fn the_supervised_deep_door_takes_the_depth_it_was_given() {
                 Duration::from_secs(10),
             )
             .expect("a recovery span whose backoff is not zero"),
-            Backpressure::Park(NonZeroUsize::new(2).expect("two is not zero")),
         )
+        .backpressure(Backpressure::Park(
+            NonZeroUsize::new(2).expect("two is not zero"),
+        ))
+        .actor()
     };
     me.set(a.clone()).expect("set once");
 
@@ -1152,7 +1156,7 @@ async fn a_supervised_actor_still_refuses_a_self_call() {
     let a = {
         let me = me.clone();
         let other = other.clone();
-        ring::supervised(
+        ring::restarting(
             move || {
                 let me = me.clone();
                 let other = other.clone();
@@ -1176,6 +1180,7 @@ async fn a_supervised_actor_still_refuses_a_self_call() {
             )
             .expect("a recovery span whose backoff is not zero"),
         )
+        .actor()
     };
     me.set(a.clone()).expect("set once");
     other.set(a.clone()).expect("set once");

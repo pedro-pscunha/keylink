@@ -18,6 +18,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, ConnectionError};
@@ -1284,7 +1285,7 @@ async fn a_keyed_actors_blob_method_grants_the_address_it_returns() {
         .await
         .expect("stores");
 
-    let system: catalog::System = catalog::System::builder(keylink::Eviction::Never).build();
+    let system: catalog::Registry = catalog::Registry::builder(keylink::Eviction::Never).build();
     system
         .mount(
             keylink::ActorId::new("warehouse").expect("a valid id"),
@@ -1297,14 +1298,15 @@ async fn a_keyed_actors_blob_method_grants_the_address_it_returns() {
 
     let _running = keylink::Server::builder(&server)
         .service(
-            catalog::keyed_service(&system, Allowlist::anyone())
+            system
+                .service(Allowlist::anyone())
                 .with_blobs(&blobs)
                 .build(),
         )
         .spawn()
         .expect("a keyed actor system that serves content");
 
-    let client = catalog::KeyedClient::connect(&caller, server.endpoint().addr())
+    let client = catalog::RegistryClient::connect(&caller, server.endpoint().addr())
         .await
         .expect("dials the keyed system");
     let actor = client.at(keylink::ActorId::new("warehouse").expect("a valid id"));
@@ -1338,7 +1340,7 @@ async fn a_local_keyed_blob_method_returns_its_address() {
         .add_bytes(b"the local keyed blob".to_vec())
         .await
         .expect("stores");
-    let system: catalog::System = catalog::System::builder(keylink::Eviction::Never).build();
+    let system: catalog::Registry = catalog::Registry::builder(keylink::Eviction::Never).build();
     let actor_id = keylink::ActorId::new("warehouse").expect("a valid id");
     system
         .mount(
@@ -1361,7 +1363,7 @@ async fn a_local_keyed_blob_method_returns_its_address() {
 /// The startup refusal that could not fire before, and now can.
 ///
 /// `ServerBuilder::spawn` compares `DECLARES_BLOBS` against the store a service
-/// was given. The keyed path never reported the flag — `System::service` did not
+/// was given. The keyed path never reported the flag — `Registry::service` did not
 /// call `__keylink_declares_blobs` — so `ConfigError::MissingBlobStore` was a
 /// check whose flag was always false there, and a keyed service declaring `blob`
 /// started happily and granted nothing.
@@ -1372,10 +1374,10 @@ async fn a_local_keyed_blob_method_returns_its_address() {
 #[tokio::test]
 async fn a_keyed_service_with_blob_methods_and_no_store_is_refused_at_startup() {
     let node = local_node().await;
-    let system: catalog::System = catalog::System::builder(keylink::Eviction::Never).build();
+    let system: catalog::Registry = catalog::Registry::builder(keylink::Eviction::Never).build();
 
     let error = keylink::Server::builder(&node)
-        .service(catalog::keyed_service(&system, Allowlist::anyone()).build())
+        .service(system.service(Allowlist::anyone()).build())
         .spawn()
         .expect_err("a keyed service declaring `blob` must be given a store");
 

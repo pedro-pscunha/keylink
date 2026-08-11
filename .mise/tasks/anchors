@@ -548,7 +548,7 @@ ANCHORS = [
     ("R20", "keylink/tests/idempotency.rs", "keylink/src/idempotency.rs",
      "self.ledger.settle(self.peer, &self.key, slot);"),
     ("R25", "keylink/tests/api.rs", "keylink/src/macros.rs",
-     "pub type SystemBuilder = $crate::SystemBuilder<Mail>;"),
+     "pub type RegistryBuilder = $crate::RegistryBuilder<Mail>;"),
     ("R26b", "keylink/tests/api.rs", "keylink/src/rpc.rs",
      "pub fn keyable(mut self, keyable: Keyable) -> Self {"),
     ("R26c", "keylink/tests/api.rs", "keylink/src/rpc.rs",
@@ -1122,7 +1122,7 @@ ANCHORS = [
     # was widened out of. Measured after the record was written: 1 in `macros.rs`,
     # and the record lives in `cycles.rs`, so its own quote cannot raise that.
     ("F1", "keylink/tests/cycles.rs", "keylink/src/macros.rs",
-     "                    inner: $crate::LocalActor::spawn_supervised_deep(factory, limit, backpressure),"),
+     "                            $crate::LocalActor::spawn_supervised_deep(factory, limit, policy)"),
     # ── from the ledger-limits PR. Both were measured with `grep -cF` AFTER the
     # record was written, which is the order that matters: adding a quote can only
     # RAISE a count, so measuring first reports a 1 that the record itself then
@@ -1240,7 +1240,7 @@ ANCHORS = [
     # count 0, which is loud and is what this gate is for.
     ("A5", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
      "        while inner.held > self.limits.pool_records.get()"),
-    # ── from `mailbox-latency`, which turned `SystemBuilder::mailbox_depth`'s latency
+    # ── from `mailbox-latency`, which turned `RegistryBuilder::mailbox_depth`'s latency
     # prose into a number. ONE row, cross-file, and the anchor is the one line the
     # knob consists of: every keyed mailbox is built from it, so substituting
     # `DEFAULT_MAILBOX_DEPTH` for `self.mailbox_depth` there disables the whole
@@ -1251,7 +1251,7 @@ ANCHORS = [
     # `A` rows document cannot arise — the record is in `tests/` and the code is in
     # `src/`.
     ("N1", "keylink/tests/mailbox_latency.rs", "keylink/src/actor/registry.rs",
-     "        let (mail, slots) = mpsc::channel(self.mailbox_depth);"),
+     "            None => (self.mailbox_depth, false),"),
     # ── `limit-docs` ─────────────────────────────────────────────────────────
     #
     # M1 is SAME-FILE and INDENTED, the narrowed rule again: the record's quote sits
@@ -1437,7 +1437,7 @@ ANCHORS = [
     # restore the line as it stood before the catch, so both are regressions in
     # the literal sense rather than invented defects.
     #
-    # K8 kills the CALLER: the unwind crosses `System::mount` and the test dies at
+    # K8 kills the CALLER: the unwind crosses `Registry::mount` and the test dies at
     # the sink's own `panic!` in 0.00s, before either assertion is read. K9 kills
     # nobody visible: the unwind dies in a teardown task no one joins, the waiter
     # is never answered, and the red arrives by value at the `NO_PROGRESS` bound
@@ -1840,10 +1840,10 @@ ANCHORS = [
     # wait reports `Elapsed(())`. That is the mechanism's own shape and not a
     # copied record.
     ("S1", "keylink/tests/actors.rs", "keylink/src/macros.rs",
-     """                            let __answer = if ::core::matches!(
-                                request.message(),
-                                Request::__Status { .. }
-                            ) {"""),
+     """                                let __answer = if ::core::matches!(
+                                    request.message(),
+                                    Request::__Status { .. }
+                                ) {"""),
     ("S2", "keylink/tests/actors.rs", "keylink/src/actor/remote.rs",
      "        .serving(actor)"),
     ("S3", "keylink/tests/actors.rs", "keylink/src/macros.rs",

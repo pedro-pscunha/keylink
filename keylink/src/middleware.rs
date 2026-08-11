@@ -513,15 +513,15 @@ impl Queueing {
 ///
 /// - A singleton served with `Handle::service` has had both from the start, in
 ///   what was then the whole of that path's dispatch.
-/// - A keyed [`System`](crate::System) had **neither**: the layer compiled on
-///   `System::service` and guarded nothing there at any budget, because its loop
+/// - A keyed [`Registry`](crate::Registry) had **neither**: the layer compiled on
+///   `Registry::service` and guarded nothing there at any budget, because its loop
 ///   never read the [`Context`]. RFC-04 §16.7. It gained the turn-side check
 ///   first and the permit-side one after that, separately, because the first fix
 ///   looked complete.
 ///
 /// **Both paths now make each check in one place, and neither writes it.** The
-/// permit-side bound is in `deliver_to_actor` for a keyed actor and in
-/// `deliver_to_singleton` for a singleton; the turn-side one is in `keylink::turn`,
+/// permit-side bound is in `deliver_keyed` for a keyed actor and in
+/// `deliver_unkeyed` for a singleton; the turn-side one is in `keylink::turn`,
 /// which every generated mailbox arm calls and which reads
 /// [`Queueing::expired`](Queueing::expired) off the origin the message arrived
 /// with.
