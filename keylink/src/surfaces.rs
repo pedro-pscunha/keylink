@@ -36,6 +36,7 @@ pub trait WithIdempotency {
     type Output;
 
     /// Attach the key to subsequent calls through the returned surface.
+    #[must_use = "discarding this value discards the idempotency key"]
     fn with_idempotency(&self, idempotency: impl Into<Idempotency>) -> Self::Output;
 }
 
@@ -102,6 +103,7 @@ pub trait Servable {
     type Response;
 
     /// Build the service with its allowlist.
+    #[must_use = "a service builder does nothing until registered on a server"]
     fn service(&self, allow: Allowlist) -> ServiceBuilder<Self::Request, Self::Response>;
 
     /// Serve this service alone on a node.

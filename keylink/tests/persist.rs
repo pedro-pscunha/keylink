@@ -205,7 +205,7 @@ impl Snapshots for Flaky {
 }
 
 /// [`Flaky`]'s claim. Exclusivity is deliberately not modelled:
-/// `a_second_open_on_one_state_is_busy` holds that against the real adapter, and
+/// `a_second_open_on_one_state_busy` holds that against the real adapter, and
 /// this one exists for one property.
 struct FlakyClaim {
     failing: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -584,7 +584,7 @@ async fn the_claim_is_free_the_instant_stop_returns() {
 /// of `Error::Busy`, which is the shape of any adapter that opens the file and
 /// forgets to lock it: `a second open on a claimed state must be refused`.
 #[tokio::test]
-async fn a_second_open_on_one_state_is_busy() {
+async fn a_second_open_on_one_state_busy() {
     let (_scratch, files) = store("busy").await;
     let id = state_id();
 
@@ -612,14 +612,14 @@ async fn a_second_open_on_one_state_is_busy() {
 /// second loop, generated into the user's crate, which handed the dispatch an
 /// **empty** hook slice — so a keyed actor had no observers, no `finish` and
 /// therefore no route to durability at all. Wave 3 merged the two loops into
-/// `run_loop`, and `spawn_wired` is the door that carries the triple. This test
+/// `run_loop`, and `setup(..).feeds(..).mountable()` is the door that carries the triple. This test
 /// is the payoff: the same `Persist`, on the keyed path, over two real nodes and
 /// the generated `RegistryClient`, because a keyed actor answering a peer is the
 /// only shape a keyed actor has.
 ///
 /// Made red the same way the local test is — a `Persist::after_turn` that does
 /// not store — and it goes red for the keyed reason too: put `Vec::new()` where
-/// `spawn_wired` passes its observers on and the second mount comes back empty.
+/// `setup(..).feeds(..).mountable()` passes its observers on and the second mount comes back empty.
 #[tokio::test]
 async fn a_keyed_actors_state_survives_its_own_process() {
     let (_scratch, files) = store("keyed").await;

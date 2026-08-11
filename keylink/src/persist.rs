@@ -354,7 +354,7 @@ impl<D: Durable, S: Snapshots> Persist<D, S> {
 /// shortest thing a reader can copy is the correct one.
 ///
 /// Holding one of these holds the claim, which is what
-/// `tests/persist.rs::a_second_open_on_one_state_is_busy` leans on.
+/// `tests/persist.rs::a_second_open_on_one_state_busy` leans on.
 #[must_use = "this holds the claim AND the state that was read back; dropping it \
               starts the next run from nothing"]
 pub struct Opened<D, S: Snapshots> {

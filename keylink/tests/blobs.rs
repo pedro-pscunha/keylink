@@ -1181,7 +1181,7 @@ async fn a_blob_response_carries_the_reply_and_the_address_together() {
 ///
 /// The whole chain in one test, because every link is new: the generated
 /// `ActorRef::datasheet` exists at all; the reply is typed, so `Granting` can see
-/// the address; `keyed_service(..).with_blobs(..)` puts the store where
+/// the address; `registry.service(..).with_blobs(..)` puts the store where
 /// `serve_one` can record against it; and the fetch then succeeds on the blobs
 /// connection.
 ///

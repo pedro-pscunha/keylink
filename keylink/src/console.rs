@@ -214,7 +214,7 @@ pub struct NodeStatus {
     pub id: NodeKey,
     /// How many actors are mounted right now, which is [`Registry::len`].
     ///
-    /// `u64` for [`ActorStatus::buffered`]'s reason: `usize` has no wire schema,
+    /// `u64` for [`ActorStatus::queued`]'s reason: `usize` has no wire schema,
     /// because its width is the compiler's choice and a browser's is not the
     /// server's.
     pub actors: u64,

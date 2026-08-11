@@ -128,7 +128,7 @@ impl Watched {
     /// Mount an actor that reports its turns, and hand back the feed it listens
     /// to.
     ///
-    /// `spawn_wired` and not `spawn`, because an observer is how a turn becomes
+    /// `setup(..).feeds(..).mountable()` and not `spawn`, because an observer is how a turn becomes
     /// an event: the registry sees mounts and endings, and only the actor sees
     /// what it ran.
     ///
@@ -260,7 +260,7 @@ async fn the_actor_list_reaches_a_peer_with_every_field_intact() {
             "no turn is running: {} reported busy",
             row.id.as_str()
         );
-        assert_eq!(row.buffered, 0, "nothing is queued for {}", row.id.as_str());
+        assert_eq!(row.queued, 0, "nothing is queued for {}", row.id.as_str());
     }
     // `idle_for` crosses as a `Duration` and is compared against nothing: this
     // suite asserts no wall-clock reading, and the boundary between `idle_for`

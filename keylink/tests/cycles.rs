@@ -905,7 +905,7 @@ async fn a_deeper_mailbox_takes_one_more_message_behind_a_running_turn() {
 
 /// The same knob through the **supervised** door, which had no caller at all.
 ///
-/// `supervised_deep` is the fourth of the generated spawn doors and the only one
+/// `restarting(..).backpressure(..).actor()` is the fourth of the generated spawn doors and the only one
 /// nothing reached: `actor` and `supervised` are used across this suite, the test
 /// above uses `actor_deep`, and this one was written from the macro outwards with
 /// nobody on the other side of it. That is not the same as *no purpose* —

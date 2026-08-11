@@ -27,7 +27,7 @@
 //!
 //! // Non-keyed: `Factory<render::Handle<Renderer>, ()>`, and `dispatch` takes no
 //! // key. The members are built with `setup(..).backpressure(..)` on purpose — `LeastLoaded` has
-//! // no gradient to read at the default mailbox depth of one, where `buffered` is
+//! // no gradient to read at the default mailbox depth of one, where `queued` is
 //! // zero or one and the mode is reading N booleans.
 //! let pages = Factory::from_fn(
 //!     NonZeroUsize::new(8).expect("eight"),
@@ -174,11 +174,11 @@ pub trait Reserving {
     /// would find every door on this type unusable without it.
     fn reserve(&self) -> impl Future<Output = Result<Self::Permit<'_>, NotQueued>> + Send;
 
-    /// [`is_busy`](LocalActor::is_busy) and [`buffered`](LocalActor::buffered),
+    /// [`busy`](LocalActor::busy) and [`queued`](LocalActor::queued),
     /// folded, and read only by [`Routing::LeastLoaded`].
     ///
     /// A factory's members are N readings from **one** side, which is the
-    /// comparison [`Serving::buffered`] licenses. Comparing one of these against a
+    /// comparison [`Serving::queued`] licenses. Comparing one of these against a
     /// keyed actor's is the one it forbids, and nothing here does.
     fn status(&self) -> Serving;
 }
@@ -404,9 +404,9 @@ pub enum Routing<K = ()> {
     /// A local actor's mailbox depth defaults to **one** — `turns.rs`'s private
     /// `DEFAULT_LOCAL_MAILBOX_DEPTH`, and the keyed side's `DEFAULT_MAILBOX_DEPTH`
     /// in `registry.rs` is the same — so
-    /// [`buffered`](crate::LocalActor::buffered) is 0 or 1 and this mode reads N
+    /// [`queued`](crate::LocalActor::queued) is 0 or 1 and this mode reads N
     /// booleans. [`Sample::All`] then pays N relaxed loads to learn what
-    /// [`is_busy`](crate::LocalActor::is_busy) alone already says.
+    /// [`busy`](crate::LocalActor::busy) alone already says.
     ///
     /// The mode is worth its place over members built with the generated
     /// `setup(..).backpressure(..)` or [`LocalActor::spawn_deep`], and any example demonstrating
@@ -627,7 +627,7 @@ impl<H: Reserving, K> Factory<H, K> {
     fn shard(&self, shard: Shard<K>, key: &K) -> &H {
         let size = self.members.size().get();
         // Written as conversions rather than casts for the reason
-        // `LocalActor::buffered` gives: an impossible case is named instead of
+        // `LocalActor::queued` gives: an impossible case is named instead of
         // truncated. `usize` is 64 bits or narrower on every target this crate
         // builds for, so the widening holds; and the remainder is below `size`,
         // which came from a `usize`, so the narrowing does too — which is also
@@ -692,7 +692,7 @@ impl<H: Reserving, K> Factory<H, K> {
 /// better member: fewer queued first, then idle before busy.
 fn load(of: &impl Reserving) -> (u64, bool) {
     let serving = of.status();
-    (serving.buffered, serving.busy)
+    (serving.queued, serving.busy)
 }
 
 /// Keep whichever of two members is carrying less, reading each member's load
@@ -1096,8 +1096,8 @@ mod tests {
     }
 
     /// Made red by `scripts/break-once.sh keylink/src/compose/factory.rs`,
-    /// replacing `(serving.buffered, serving.busy)` with
-    /// `(serving.buffered, false)`, so the load reading keeps the queue depth and
+    /// replacing `(serving.queued, serving.busy)` with
+    /// `(serving.queued, false)`, so the load reading keeps the queue depth and
     /// forgets whether the member is inside a turn. Watched: "All chose the
     /// member that is inside a turn", left `0` against right `0` — an
     /// `assert_ne`, so the two numbers being equal is the failure. Registered as
@@ -1137,7 +1137,7 @@ mod tests {
     ///
     /// **The independence runs one way only, and it was measured rather than
     /// argued.** `B3`'s break leaves this test green — exit 0 under the same
-    /// harness — because forgetting `is_busy` still prefers the member with less
+    /// harness — because forgetting `busy` still prefers the member with less
     /// queued. This break does **not** leave `B3`'s test green: reversing the
     /// comparison reddens that one too, exit 100, since a held member's reading is
     /// the larger of the two there as well. So `B3` is the row that discriminates
@@ -1145,8 +1145,8 @@ mod tests {
     /// keep only this.
     #[tokio::test]
     async fn least_loaded_separates_two_members_by_what_is_queued() {
-        // The depth is the control: at one, `buffered` is 0 or 1 and this
-        // assertion is about `is_busy` alone. At four, member one is genuinely
+        // The depth is the control: at one, `queued` is 0 or 1 and this
+        // assertion is about `busy` alone. At four, member one is genuinely
         // three messages behind while still admitting more, which is the
         // gradient the mode claims to read.
         let (factory, mut handled) = deep(

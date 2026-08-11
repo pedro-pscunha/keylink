@@ -538,7 +538,7 @@ async fn a_key_state_query_on_a_service_that_keys_nothing_is_fresh() {
 /// mechanism.
 ///
 /// It works because `Rpc::method` is implemented for `Addressed<Request>` and
-/// forwards to the inner request, so `keyed_service`'s `ServiceBuilder` reads the
+/// forwards to the inner request, so `registry.service`'s `ServiceBuilder` reads the
 /// real method name rather than a constant. That is the whole of why Wave 1 needed
 /// no change to `macros.rs`.
 ///

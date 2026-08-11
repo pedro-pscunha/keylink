@@ -617,7 +617,7 @@ async fn a_handler_sees_the_calling_peer() {
     server.shutdown().await.expect("stops");
 }
 
-/// **A concurrently served service refuses `__status` rather than folding one.**
+/// **A concurrently served service refuses `status` rather than folding one.**
 ///
 /// The third arm of the generated status door, and the one nobody asks for. One
 /// ALPN carries both ways of serving a singleton — the same `Request` reaches a
@@ -628,7 +628,7 @@ async fn a_handler_sees_the_calling_peer() {
 ///
 /// **It refuses, and a truthful `Serving` is what it refuses to send.** Every
 /// call here takes its own task, so nothing is ever inside a serial turn and
-/// nothing is ever queued behind one: `Serving { busy: false, buffered: 0 }`
+/// nothing is ever queued behind one: `Serving { busy: false, queued: 0 }`
 /// would be *true* and a peer could not tell it from an idle actor. A diagnostic
 /// whose "nothing is happening" is indistinguishable from "this question does not
 /// apply here" is the silent fallback this crate refuses, so the answer is a

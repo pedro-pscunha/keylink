@@ -90,7 +90,7 @@ impl queue::Actor for Queued {
 /// mailbox, so one signal per call here says every call has arrived and is either
 /// in the mailbox or parked in front of it.
 ///
-/// It is not optional. [`keylink::ActorStatus::buffered`] cannot make that
+/// It is not optional. [`keylink::ActorStatus::queued`] cannot make that
 /// distinction alone — a parked sender is not observable at all — so without this
 /// signal "three of four are in the mailbox" could not be told apart from "the
 /// fourth has not landed yet", and the assertion would be a floor instead of an
@@ -178,10 +178,10 @@ async fn at_depth(depth: usize) -> Fixture {
 }
 
 /// The mailbox reading for the fixture's one actor.
-fn buffered(system: &queue::Registry) -> u64 {
+fn queued(system: &queue::Registry) -> u64 {
     let mut rows = system.status();
     assert_eq!(rows.len(), 1, "the fixture mounts exactly one actor");
-    rows.remove(0).buffered
+    rows.remove(0).queued
 }
 
 /// Wait until the mailbox holds `messages`.
@@ -189,9 +189,9 @@ fn buffered(system: &queue::Registry) -> u64 {
 /// Bounded, so a reading that never arrives fails the test instead of hanging it.
 /// Nothing here asserts how long anything took: the budget is three orders of
 /// magnitude out, and its expiry means the count is stuck rather than slow.
-async fn until_buffered(system: &queue::Registry, messages: u64) {
+async fn until_queued(system: &queue::Registry, messages: u64) {
     tokio::time::timeout(Duration::from_secs(30), async {
-        while buffered(system) != messages {
+        while queued(system) != messages {
             tokio::task::yield_now().await;
         }
     })
@@ -252,11 +252,11 @@ async fn until_buffered(system: &queue::Registry, messages: u64) {
 /// # No clock in any assertion, and no order across streams
 ///
 /// Nothing here *asserts on* a clock, so nothing rests on how loaded the machine is.
-/// One clock is read — `until_buffered` bounds its poll loop with a 30 second
+/// One clock is read — `until_queued` bounds its poll loop with a 30 second
 /// `tokio::time::timeout` — and that budget can only turn a hang into a failure,
 /// which its own doc says. The exactness comes from three signals: `hold` is released
 /// by a semaphore rather than by a timer, `Arrived` says every message has reached the
-/// serving side, and [`keylink::ActorStatus::buffered`] is exactly
+/// serving side, and [`keylink::ActorStatus::queued`] is exactly
 /// `max_capacity() - capacity()`.
 ///
 /// It asserts nothing about the order the four messages are *handled* in. Each call
@@ -268,9 +268,9 @@ async fn until_buffered(system: &queue::Registry, messages: u64) {
 /// `DEFAULT_MAILBOX_DEPTH` instead of the system's depth — replacing the whole line
 /// `            None => (self.mailbox_depth, false),` with
 /// `            None => (DEFAULT_MAILBOX_DEPTH, false),`, which is the
-/// whole of what the knob does. Watched here: this test panics in `until_buffered`
+/// whole of what the knob does. Watched here: this test panics in `until_queued`
 /// at "3 messages must reach the mailbox" after its 30 second budget, because a
-/// system asked for three slots that builds one never reaches a `buffered` of 3.
+/// system asked for three slots that builds one never reaches a `queued` of 3.
 ///
 /// **This break is shared, and the record names every guard it reaches rather than
 /// claiming this test is its only reader.** `registry.rs` already records the same
@@ -281,7 +281,7 @@ async fn until_buffered(system: &queue::Registry, messages: u64) {
 /// outcomes are not uniform: one guard HANGS rather than reddens**, so a run that
 /// stalls here is the break working and not a broken harness. Watched, each by name:
 ///
-/// - this test — panics in `until_buffered` at "3 messages must reach the mailbox",
+/// - this test — panics in `until_queued` at "3 messages must reach the mailbox",
 ///   after its 30 second budget;
 /// - `a_budget_sized_for_the_default_depth_under_drains_at_a_deeper_one`, in
 ///   `registry.rs`'s `the mailbox's depth` section — fails its `Ended::Vanished`
@@ -299,8 +299,8 @@ async fn until_buffered(system: &queue::Registry, messages: u64) {
 ///   watched fail;
 /// - `a_saturated_mailbox_at_depth_does_not_starve_a_feed` in `tests/actors.rs` —
 ///   panics after its own 30 second budget, and that number is `actors.rs`'s own
-///   `until_buffered` rather than this file's same-named helper;
-/// - `buffered_is_exact_at_depth_and_counts_no_parked_sender`, also in that section —
+///   `until_queued` rather than this file's same-named helper;
+/// - `queued_is_exact_at_depth_and_counts_no_parked_sender`, also in that section —
 ///   **HANGS. It never reports at all.** Its actor holds every turn, so nothing ever
 ///   frees a permit: at one slot the second of its three `mail.send(..).await`s parks
 ///   forever, before the assertion that would have caught the wrong count. Killed
@@ -353,7 +353,7 @@ async fn a_mailbox_holds_exactly_its_depth_and_releases_no_caller_early() {
     /// outside it.
     const CALLERS: usize = SLOTS + 1;
 
-    // The same three, as `ActorStatus::buffered` reports them: `buffered` is a `u64`
+    // The same three, as `ActorStatus::queued` reports them: `queued` is a `u64`
     // and a mailbox depth is a `usize`, because only one of the two crosses a wire.
     // Converted rather than written out a second time — a second literal would go on
     // compiling after an edit to `SLOTS`, and would leave the assertions below
@@ -398,7 +398,7 @@ async fn a_mailbox_holds_exactly_its_depth_and_releases_no_caller_early() {
         // queued.
         arrived.recv().await.expect("`hold` arrived");
         assert_eq!(
-            buffered(system),
+            queued(system),
             0,
             "the held message is inside the turn and occupies no slot, which is \
              the distinction a free-capacity reading alone cannot make"
@@ -412,9 +412,9 @@ async fn a_mailbox_holds_exactly_its_depth_and_releases_no_caller_early() {
                 .expect("every caller's message arrives");
         }
 
-        until_buffered(system, slots_filled).await;
+        until_queued(system, slots_filled).await;
         assert_eq!(
-            buffered(system),
+            queued(system),
             slots_filled,
             "the mailbox must hold every message its depth allows and not one \
              more: {CALLERS} messages have reached the serving side and {SLOTS} \

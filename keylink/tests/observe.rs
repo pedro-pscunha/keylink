@@ -395,7 +395,7 @@ async fn an_observer_receives_the_handler_duration() {
 /// The port itself: an observer is called once for every turn, and the actor
 /// needs to know nothing about what it does.
 ///
-/// The first thing that breaks without this is the wiring. An `actor_with` that
+/// The first thing that breaks without this is the wiring. An `setup(..).observe(..).actor()` that
 /// takes a `Vec` and never lends it to a turn compiles perfectly, keeps the
 /// whole suite green, and silently gives a caller who asked for durability none
 /// at all.

@@ -208,7 +208,7 @@ impl Busy {
 /// read by different halves of the crate. A
 /// [`LocalActor`](crate::LocalActor) carries both — the fate for a served
 /// dispatch, and its own busy cell for
-/// [`is_busy`](crate::LocalActor::is_busy) — but it carries them **on the
+/// [`busy`](crate::LocalActor::busy) — but it carries them **on the
 /// handle**, because a local actor has no registry entry to hang either on.
 /// Serving it does not give it one: `Handle::service` clones the same
 /// `LocalActor` and adds a door, so what decides where these live is the actor's
@@ -349,8 +349,9 @@ impl<M> Mailbox<M> {
 /// site is unchanged — `spawn(state)` still hands back one of these and
 /// [`Registry::mount`] still takes it — and depth becomes a property of the system
 /// an actor is mounted in rather than of the line that built it. That is the
-/// right home for it twice over: it is the same decision for every actor a system
-/// serves, and a system is the only thing a lazy factory's actors have in common.
+/// default home for it: a system is the only thing a lazy factory's ordinary
+/// actors have in common. An explicitly configured `Mountable` carries an
+/// override into that same entry path.
 ///
 /// The second `Box` is the cost, one per mount, transient like the first.
 ///
@@ -627,8 +628,9 @@ pub(super) enum RouteError {
 /// transport error to report, and folding `NoSuchActor` or `AtCapacity` into a
 /// `Withheld` would claim that a handler had already started. Once a message is
 /// queued, the existing [`Unanswered`] vocabulary carries the turn's outcome.
-/// Keyed local delivery parks on the bounded mailbox until a slot opens; this
-/// surface has no queue-timeout parameter and therefore reports no `Full` case.
+/// Default and `Park` delivery wait for a mailbox slot. An actor built with an
+/// opted-in `Shed` policy reports [`LocalError::MailboxFull`] instead; this
+/// surface has no queue-timeout parameter.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LocalError {
     /// No actor is mounted under this id and no lazy factory built one.
@@ -670,10 +672,9 @@ fn local_error(error: Unanswered) -> LocalError {
     match error {
         Unanswered::Turn(withheld) => LocalError::Turn(withheld),
         Unanswered::Reentrant => LocalError::Reentrant,
-        // Keyed local delivery uses `send`, so a full mailbox parks the caller
-        // until a slot opens. `asked` runs after that send and cannot produce the
-        // local handle's `Full` refusal.
-        Unanswered::Full => unreachable!("keyed local delivery cannot shed a queued message"),
+        // A keyed shed refuses before `asked` runs. Once a message is queued,
+        // this projection cannot receive the local handle's `Full` refusal.
+        Unanswered::Full => unreachable!("keyed delivery cannot shed a queued message"),
     }
 }
 
@@ -723,7 +724,7 @@ impl<M> Entry<M> {
             // widening cannot fail on any target keylink builds for, and a
             // diagnostic must not be the thing that panics if one ever
             // appears.
-            buffered: u64::try_from(
+            queued: u64::try_from(
                 self.mail
                     .max_capacity()
                     .saturating_sub(self.mail.capacity()),
@@ -776,9 +777,8 @@ struct Shared<M> {
     /// [`Lifecycle`].
     lifecycle: Vec<Arc<dyn Lifecycle>>,
     capacity: usize,
-    /// How many messages may wait ahead of the one being handled, for every
-    /// actor in this system. [`RegistryBuilder::mailbox_depth`] is where it means
-    /// something.
+    /// Default mailbox depth for mountables that do not carry their own policy.
+    /// [`RegistryBuilder::mailbox_depth`] configures it.
     mailbox_depth: usize,
     eviction: Eviction,
     /// `n0_future::time::Instant`, which is neither of the obvious two.
@@ -993,14 +993,14 @@ impl<M> Shared<M> {
             .map(|(id, entry)| {
                 // The two turn facts come from `Entry::serving`, so this row and
                 // the `Serving` a peer reads for the same actor cannot disagree.
-                let Serving { busy, buffered } = entry.serving();
+                let Serving { busy, queued } = entry.serving();
                 ActorStatus {
                     id: id.clone(),
                     idle_for: Duration::from_millis(
                         now.saturating_sub(entry.last_seen.load(Ordering::Relaxed)),
                     ),
                     busy,
-                    buffered,
+                    queued,
                 }
             })
             .collect()
@@ -1022,8 +1022,8 @@ impl<M> Shared<M> {
     ///
     /// **The only place an actor's task is spawned**, which is what lets
     /// [`Mountable`] be refused for free — and **the only place a mailbox is
-    /// created**, which is what lets [`RegistryBuilder::mailbox_depth`] reach a
-    /// lazily spawned actor as well as a hand-mounted one.
+    /// created**, which lets an opted-in [`Mountable`] policy override the
+    /// registry default without creating a second mailbox path.
     ///
     /// # Every caller inserts through a `VacantEntry`, and that is structural
     ///
@@ -1390,7 +1390,7 @@ async fn drain<M>(
 ///   number becomes a fact people route on. It belongs to the wave that makes
 ///   re-incarnation a thing that happens.
 /// - **no `queued`.** The total backlog is not observable, and the field that
-///   claimed it is refused by name. [`Self::buffered`] is the part that can be
+///   claimed it is refused by name. [`Self::queued`] is the part that can be
 ///   measured, said as a floor.
 ///
 /// # It crosses the wire, and that was a decision about one ALPN
@@ -1445,7 +1445,7 @@ pub struct ActorStatus {
     /// `max_capacity() - capacity()`, which is exact for what the channel is
     /// *holding* — and callers parked waiting for a permit are not observable at
     /// all, because `tokio`'s `Semaphore` does not expose its waiters. Four
-    /// hundred senders can be queued behind a `buffered` of 3.
+    /// hundred senders can be queued behind a `queued` of 3.
     ///
     /// So: 0 or 1 at the default depth of one, at most
     /// [`RegistryBuilder::mailbox_depth`] at any other, and never a number to
@@ -1466,7 +1466,7 @@ pub struct ActorStatus {
     /// The widening is lossless on every target keylink supports — `usize` is at
     /// most 64 bits on all of them — and the field is bounded by
     /// [`RegistryBuilder::mailbox_depth`] anyway, which is a small number.
-    pub buffered: u64,
+    pub queued: u64,
 }
 
 /// Where a [`Registry`] reports an actor arriving and an actor leaving.
@@ -2384,22 +2384,14 @@ impl<M> RegistryBuilder<M> {
     /// thing to reason from. Two questions decide it: does anything downstream act
     /// on how long this actor took, and how long is the longest turn.
     ///
-    /// # A KEYED mailbox BLOCKS the sender. It never drops and it never errors
+    /// # This is the default; an opted-in actor policy can override it
     ///
-    /// There is no overflow policy on this path because there is no overflow: past
-    /// the last slot, `send` parks the sending task until the loop frees a permit.
-    /// This builder has no policy argument at all, so a keyed actor parks and there
-    /// is nothing to choose.
-    ///
-    /// **This heading read *a full mailbox* and the paragraph said *nothing in this
-    /// crate calls `try_send`*, and both outgrew their scope.**
-    /// [`Backpressure::Shed`](crate::Backpressure::Shed) is a `try_send`, on the
-    /// **local** doors — [`LocalActor::spawn_deep`](crate::LocalActor::spawn_deep)
-    /// and its supervised twin — where a full mailbox answers
-    /// [`NotQueued::Full`](crate::NotQueued::Full) and loses the caller's
-    /// arguments. That is opt-in, it is not this door, and a sentence claiming the
-    /// whole crate from a knob that governs one path is the drift worth naming
-    /// rather than quietly narrowing.
+    /// An unconfigured mountable parks past the last slot and inherits this depth.
+    /// A generated `setup(..).backpressure(..).mountable()` instead carries its
+    /// own [`Backpressure`](crate::Backpressure) into the same registry entry.
+    /// `Park` still waits; `Shed` uses `try_send` and reports a full mailbox
+    /// immediately to local and remote keyed callers. The builder remains the
+    /// single default for ordinary `spawn(state)` and lazy factory results.
     ///
     /// What did **not** change is the part that was refused rather than deferred:
     /// there is still **no `unbounded` spelling — permanently**, on either path. An
@@ -2410,8 +2402,8 @@ impl<M> RegistryBuilder<M> {
     /// the last slot. `keylink/src/representability.rs` holds the probes that say
     /// unbounded cannot be asked for, on both paths.
     ///
-    /// One caller-visible exception, and it is opt-in and does not queue: a
-    /// [`QueueTimeout`](crate::QueueTimeout) layer turns the wait into
+    /// On a parking mailbox, one caller-visible exception is opt-in and does not
+    /// queue: a [`QueueTimeout`](crate::QueueTimeout) layer turns the wait into
     /// [`RemoteError::TimedOut`](crate::RemoteError::TimedOut) for a peer, and a
     /// message refused that way provably never entered the mailbox — the send
     /// future is dropped before a permit arrives. That is a deadline a service
@@ -2467,7 +2459,7 @@ impl<M> RegistryBuilder<M> {
     /// # What you still cannot see, and it is the part that hurts
     ///
     /// The wait list behind the last slot is unbounded and **unobservable**.
-    /// [`ActorStatus::buffered`] reports what the channel is holding, exactly, and
+    /// [`ActorStatus::queued`] reports what the channel is holding, exactly, and
     /// there is no number anywhere for the senders parked behind it, because
     /// `Semaphore` does not expose its waiters. A deeper mailbox does not shorten
     /// that list; it moves the first `N` entries of it somewhere countable.
@@ -2482,12 +2474,12 @@ impl<M> RegistryBuilder<M> {
     /// zero up to one would be the silent fallback this crate refuses everywhere
     /// else.
     ///
-    /// # It is a property of the system, not of the actor
+    /// # It is the system default
     ///
-    /// Every actor in this system gets this depth, including one a lazy
-    /// [`spawn_with`](Self::spawn_with) factory builds — the factory is a `Fn` with
-    /// no argument for it and no caller present to supply one. Per-actor depths
-    /// would be a second construction path for a mailbox, and there is one.
+    /// Every unconfigured actor gets this depth, including one a lazy
+    /// [`spawn_with`](Self::spawn_with) factory builds. A `Mountable` produced by
+    /// generated `setup(..).backpressure(..)` may override it per actor; both
+    /// choices still flow through the one mailbox construction in `Shared::entry`.
     #[must_use]
     pub fn mailbox_depth(mut self, depth: NonZeroUsize) -> Self {
         self.mailbox_depth = depth.get();
@@ -3504,7 +3496,7 @@ mod tests {
             .expect("free");
 
         let mail = system.route(&held).expect("mounted").mail;
-        assert_eq!(only(&system).buffered, 0, "nothing is waiting yet");
+        assert_eq!(only(&system).queued, 0, "nothing is waiting yet");
         mail.send((Box::new(Bare), Chain::Empty))
             .await
             .expect("the one slot is free");
@@ -3525,7 +3517,7 @@ mod tests {
         );
         let full = only(&system);
         assert_eq!(
-            full.buffered, 1,
+            full.queued, 1,
             "the default depth is one slot, and it is full"
         );
         assert!(!full.busy, "the loop is at its gate: no turn has started");
@@ -3552,17 +3544,17 @@ mod tests {
         );
     }
 
-    /// **`buffered` is exact for what the mailbox holds, and counts nobody parked
+    /// **`queued` is exact for what the mailbox holds, and counts nobody parked
     /// behind it.**
     ///
     /// Both halves at once, at a depth where the two can differ: three messages in
-    /// three slots is a `buffered` of 3, and a fourth sender parked on a permit
+    /// three slots is a `queued` of 3, and a fourth sender parked on a permit
     /// leaves it at 3. That is the floor the field's documentation claims, observed
     /// — and the reason the field is not called `queued`, which at this moment
     /// would be four.
     ///
     /// Red-tested by deleting the subtraction in [`Registry::status`], so that
-    /// `buffered` reports the channel's capacity instead of its contents. Watched:
+    /// `queued` reports the channel's capacity instead of its contents. Watched:
     /// this test, `a_full_mailbox_blocks_the_sender_and_never_loses_the_message` and
     /// `status_reports_every_actor_with_the_idle_for_eviction_reads` all fail.
     ///
@@ -3572,7 +3564,7 @@ mod tests {
     /// that cannot tell the measurement from the constant is not a guard, and this
     /// one was watched to be vacuous before it was watched to fail.
     #[tokio::test]
-    async fn buffered_is_exact_at_depth_and_counts_no_parked_sender() {
+    async fn queued_is_exact_at_depth_and_counts_no_parked_sender() {
         let (open, gate) = oneshot::channel();
         let taken = Arc::new(AtomicUsize::new(0));
         let system = Registry::builder(Eviction::Never)
@@ -3585,12 +3577,12 @@ mod tests {
 
         let mail = system.route(&held).expect("mounted").mail;
         // Counted up one at a time, and from zero, because that is what makes this
-        // a count rather than a restatement of the depth. A `buffered` that simply
+        // a count rather than a restatement of the depth. A `queued` that simply
         // reported `max_capacity()` would satisfy "3 at three messages" — measured:
         // deleting the subtraction in `status` left this test passing until these
         // intermediate readings were added.
         assert_eq!(
-            only(&system).buffered,
+            only(&system).queued,
             0,
             "an untouched mailbox holds nothing, whatever its depth"
         );
@@ -3599,7 +3591,7 @@ mod tests {
                 .await
                 .expect("three slots, three messages");
             assert_eq!(
-                only(&system).buffered,
+                only(&system).queued,
                 expected,
                 "each message is counted as it lands"
             );
@@ -3616,9 +3608,9 @@ mod tests {
             "the fourth sender is parked on a permit"
         );
         assert_eq!(
-            only(&system).buffered,
+            only(&system).queued,
             3,
-            "and it is invisible: `buffered` is a FLOOR on the backlog, because \
+            "and it is invisible: `queued` is a FLOOR on the backlog, because \
              tokio's Semaphore does not expose its waiters"
         );
 
@@ -3626,7 +3618,7 @@ mod tests {
         assert!(fourth.await.expect("the sending task reports"));
         settle().await;
         assert_eq!(
-            only(&system).buffered,
+            only(&system).queued,
             0,
             "and it falls again as the loop drains: a count, in both directions"
         );
@@ -3663,7 +3655,7 @@ mod tests {
         for row in &rows {
             assert_eq!(row.idle_for, Duration::from_secs(59));
             assert!(!row.busy, "an idler is never in a turn");
-            assert_eq!(row.buffered, 0, "and nothing is waiting for it");
+            assert_eq!(row.queued, 0, "and nothing is waiting for it");
         }
         system.evict_idle().await;
         assert_eq!(

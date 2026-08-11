@@ -439,8 +439,9 @@ impl From<RouteError> for RemoteError {
 ///
 /// [`RemoteError::BadActorId`] for a malformed id, [`RemoteError::AtCapacity`]
 /// for a full registry, [`RemoteError::NoSuchActor`] when nothing is mounted and
-/// no factory built one, and [`RemoteError::TimedOut`] when the queue budget
-/// expired before a permit arrived.
+/// no factory built one, [`RemoteError::TimedOut`] when a parking queue budget
+/// expired, and [`RemoteError::MailboxFull`] when an opted-in shedding mailbox
+/// had no slot.
 ///
 /// And three more once the message *did* reach an actor and the answer did not
 /// come back, which is [`lost`]'s vocabulary rather than this function's: a
@@ -565,10 +566,10 @@ pub async fn deliver_keyed<S: KeyedService>(
 /// The non-enqueuing twin of [`deliver_keyed`], and the keyed half of what a
 /// generated `__status` answers. Generated dispatch calls this **instead of**
 /// that one, above it in the same closure, and nothing enters a mailbox — which
-/// is the whole mechanism rather than an optimisation. `Handle::is_busy` states
+/// is the whole mechanism rather than an optimisation. `Handle::busy` states
 /// the constraint: a message asking this question would queue behind the turn
 /// that wedged the actor, and if it ever ran it would report `busy: true` about
-/// itself while its own permit counted in `buffered`. It would answer the state
+/// itself while its own permit counted in `queued`. It would answer the state
 /// of asking rather than the state of the actor.
 ///
 /// Governance is untouched by that. The layer chain runs above the dispatch

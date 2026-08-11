@@ -16,14 +16,14 @@
 //! [`Observer`](keylink::Observer) that stores inside the turn — so the loop is
 //! gone and the durability policy is one argument at spawn.
 //!
-//! `Handle::with_state` is unchanged and not deprecated. It is a *read*, and a
+//! `Own::with_state` is unchanged and not deprecated. It is a *read*, and a
 //! read is still the right tool for taking a consistent look at a state from
 //! outside a turn. What Wave 5 subsumed is using it as a **commit** mechanism.
 
 use std::error::Error;
 use std::time::Duration;
 
-use keylink::{Allowlist, Caller, Node, Persist};
+use keylink::{Allowlist, Caller, Node, Own, Persist, Servable};
 use keylink_persist::file::Files;
 use keylink_persist::{Durable, RestoreError, StateId};
 

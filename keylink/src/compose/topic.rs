@@ -26,7 +26,7 @@
 //! push a message somebody in this process chose to send fire-and-forget, which
 //! is not what happened.
 //!
-//! # THE DECISION THIS MODULE OWNS — a slow subscriber is never buffered
+//! # THE DECISION THIS MODULE OWNS — a slow subscriber is never queued
 //!
 //! **Each subscriber holds at most one unread item.** Not "one by default", not
 //! "one, configurable": one, and there is no argument that changes it.

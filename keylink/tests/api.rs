@@ -458,6 +458,25 @@ mod cfg_attr_condition_semantics {
     }
 }
 
+#[allow(dead_code)]
+fn setup_builder_types_are_public_and_typed() {
+    use std::num::{NonZeroU32, NonZeroUsize};
+    use std::time::Duration;
+
+    let _: depot::Handle<Counter> = depot::setup(Counter(0))
+        .backpressure(keylink::Backpressure::Park(NonZeroUsize::MIN))
+        .actor();
+    let _: depot::Mountable = depot::setup(Counter(0)).mountable();
+
+    let limit = keylink::Intensity::new(NonZeroU32::MIN, Duration::from_secs(1))
+        .expect("valid restart intensity");
+    let _: depot::Handle<Counter> = depot::restarting(
+        || async { Ok::<_, keylink::Stop>((Counter(0), Vec::new(), ())) },
+        limit,
+    )
+    .actor();
+}
+
 /// The curated prelude exposes exactly the intended generated capability matrix.
 mod capability_matrix {
     use super::{depot, Counter};
@@ -478,6 +497,7 @@ mod capability_matrix {
     }
 
     fn implements_wire<T: Wire>() {}
+    #[cfg(feature = "blocking")]
     fn implements_blocking_wire<T: BlockingWire>() {}
     fn implements_with_idempotency<T: WithIdempotency>() {}
     fn implements_status<T: Status>() {}
@@ -506,20 +526,61 @@ mod capability_matrix {
         }
     }
 
-    assert_not_impl!(depot::ActorRef<'static>, Wire);
     assert_not_impl!(depot::Handle<Counter>, Wire);
-    assert_not_impl!(depot::RegistryClient, Status);
+    assert_not_impl!(depot::Registry, Wire);
+    assert_not_impl!(depot::LocalRef<'static>, Wire);
+    assert_not_impl!(depot::ActorRef<'static>, Wire);
+
+    assert_not_impl!(depot::Handle<Counter>, BlockingWire);
+    assert_not_impl!(depot::Registry, BlockingWire);
+    assert_not_impl!(depot::LocalRef<'static>, BlockingWire);
+    assert_not_impl!(depot::ActorRef<'static>, BlockingWire);
+    assert_not_impl!(depot::RegistryClient, BlockingWire);
+    assert_not_impl!(depot::Client, BlockingWire);
+    assert_not_impl!(depot::IdempotentClient, BlockingWire);
+
+    assert_not_impl!(depot::Handle<Counter>, WithIdempotency);
+    assert_not_impl!(depot::Registry, WithIdempotency);
+    assert_not_impl!(depot::LocalRef<'static>, WithIdempotency);
+    assert_not_impl!(depot::ActorRef<'static>, WithIdempotency);
     assert_not_impl!(depot::IdempotentClient, WithIdempotency);
-    assert_not_impl!(depot::Client, Own);
+
+    assert_not_impl!(depot::Handle<Counter>, Status);
+    assert_not_impl!(depot::Registry, Status);
+    assert_not_impl!(depot::LocalRef<'static>, Status);
+    assert_not_impl!(depot::RegistryClient, Status);
+
     assert_not_impl!(depot::Registry, Own);
+    assert_not_impl!(depot::LocalRef<'static>, Own);
+    assert_not_impl!(depot::ActorRef<'static>, Own);
+    assert_not_impl!(depot::RegistryClient, Own);
+    assert_not_impl!(depot::Client, Own);
+    assert_not_impl!(depot::IdempotentClient, Own);
+
+    assert_not_impl!(depot::LocalRef<'static>, Servable);
+    assert_not_impl!(depot::ActorRef<'static>, Servable);
+    assert_not_impl!(depot::RegistryClient, Servable);
     assert_not_impl!(depot::Client, Servable);
+    assert_not_impl!(depot::IdempotentClient, Servable);
 
     #[cfg(feature = "blocking")]
     assert_not_impl!(depot::blocking::Client, Wire);
     #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::IdempotentClient, Wire);
+    #[cfg(feature = "blocking")]
     assert_not_impl!(depot::blocking::IdempotentClient, WithIdempotency);
     #[cfg(feature = "blocking")]
     assert_not_impl!(depot::blocking::Client, Status);
+    #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::IdempotentClient, Status);
+    #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::Client, Own);
+    #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::IdempotentClient, Own);
+    #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::Client, Servable);
+    #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::IdempotentClient, Servable);
 }
 
 /// Every ordinary word reclaimed from generated caller surfaces compiles in one service.
@@ -621,6 +682,87 @@ mod reclaimed_caller_words {
         async fn reserve_owned(&mut self, _cx: keylink::Caller<'_>) -> u64 {
             1
         }
+    }
+
+    #[tokio::test]
+    async fn reclaimed_calls_forward_to_user_operations() {
+        let actor = reclaimed::actor(State);
+
+        assert_eq!(reclaimed::Calls::service(&actor).await.expect("service"), 1);
+        assert_eq!(reclaimed::Calls::serve(&actor).await.expect("serve"), 1);
+        assert_eq!(
+            reclaimed::Calls::with_state(&actor)
+                .await
+                .expect("with_state"),
+            1
+        );
+        assert_eq!(reclaimed::Calls::stop(&actor).await.expect("stop"), 1);
+        assert_eq!(reclaimed::Calls::abort(&actor).await.expect("abort"), 1);
+        assert_eq!(
+            reclaimed::Calls::is_running(&actor)
+                .await
+                .expect("is_running"),
+            1
+        );
+        assert_eq!(reclaimed::Calls::is_busy(&actor).await.expect("is_busy"), 1);
+        assert_eq!(
+            reclaimed::Calls::buffered(&actor).await.expect("buffered"),
+            1
+        );
+        assert_eq!(reclaimed::Calls::ended(&actor).await.expect("ended"), 1);
+        assert_eq!(reclaimed::Calls::id(&actor).await.expect("id"), 1);
+        assert_eq!(
+            reclaimed::Calls::with_idempotency(&actor)
+                .await
+                .expect("with_idempotency"),
+            1
+        );
+        assert_eq!(
+            reclaimed::Calls::key_state(&actor)
+                .await
+                .expect("key_state"),
+            1
+        );
+        assert_eq!(reclaimed::Calls::watch(&actor).await.expect("watch"), 1);
+        assert_eq!(reclaimed::Calls::close(&actor).await.expect("close"), 1);
+        assert_eq!(reclaimed::Calls::status(&actor).await.expect("status"), 1);
+        assert_eq!(reclaimed::Calls::reserve(&actor).await.expect("reserve"), 1);
+        assert_eq!(
+            reclaimed::Calls::try_reserve(&actor)
+                .await
+                .expect("try_reserve"),
+            1
+        );
+        assert_eq!(
+            reclaimed::Calls::reserve_owned(&actor)
+                .await
+                .expect("reserve_owned"),
+            1
+        );
+    }
+
+    #[allow(dead_code)]
+    async fn user_methods_and_shadowed_capabilities_are_both_reachable(
+        handle: &reclaimed::Handle<State>,
+        client: &reclaimed::Client,
+        remote: &reclaimed::ActorRef<'_>,
+    ) {
+        let _: Result<u64, keylink::Unanswered> = handle.stop().await;
+        let _: Result<(), keylink::NotQueued> = keylink::Own::stop(handle).await;
+        let _: keylink::Serving = keylink::Own::status(handle);
+        let _: keylink::ServiceBuilder<reclaimed::Request, reclaimed::Response> =
+            keylink::Servable::service(handle, keylink::Allowlist::anyone());
+
+        let _: Result<u64, keylink::Error> = client.close().await;
+        let _: Result<(), keylink::Error> = keylink::Wire::close(client.clone()).await;
+        let _: reclaimed::IdempotentClient = keylink::WithIdempotency::with_idempotency(
+            client,
+            keylink::IdempotencyKey::new("fixture").expect("valid fixture key"),
+        );
+        let _: Result<keylink::Serving, keylink::Error> = keylink::Status::status(client).await;
+
+        let _: Result<u64, keylink::Error> = remote.status().await;
+        let _: Result<keylink::Serving, keylink::Error> = keylink::Status::status(remote).await;
     }
 
     #[allow(dead_code)]

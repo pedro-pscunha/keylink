@@ -65,7 +65,7 @@
 //!
 //! **There is no third option that hides.** A pattern here either applies
 //! backpressure to whoever is producing, or ends the consumer and says so.
-//! Nothing is silently buffered, and nothing is silently dropped: `Topic`'s drop
+//! Nothing is silently queued, and nothing is silently dropped: `Topic`'s drop
 //! policy ends an actor, which is the loudest signal the crate has.
 //!
 //! [`Group`] is neither of those two, and it is written down here rather than

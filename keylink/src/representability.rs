@@ -1238,7 +1238,7 @@ fn no_ledger_bound_can_be_asked_to_be_zero(limits: crate::Limits) -> crate::Limi
 /// A destructuring pattern with no `..`, which is `E0027` the moment a field is
 /// added — in keylink, at the doc comment that records which fields were refused
 /// and why: an `incarnation` that nothing in the crate counts, and a `queued` that
-/// would claim the parked senders [`ActorStatus::buffered`] documents itself as
+/// would claim the parked senders [`ActorStatus::queued`] documents itself as
 /// unable to see.
 ///
 /// `#[non_exhaustive]` is what stops a *caller* writing this pattern, and it is
@@ -1249,10 +1249,10 @@ fn an_actor_status_claims_only_what_it_measures(status: ActorStatus) -> (bool, u
         id,
         idle_for,
         busy,
-        buffered,
+        queued,
     } = status;
     let _ = (id, idle_for);
-    (busy, buffered)
+    (busy, queued)
 }
 
 /// The claim: what a console is told about an actor **is** an [`ActorStatus`],

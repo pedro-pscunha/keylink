@@ -5605,7 +5605,7 @@ macro_rules! __keylink_service {
                             // becomes mail. It cannot: a question about which
                             // turn is running cannot be answered by a turn,
                             // because that turn would report `busy: true` about
-                            // itself and count its own permit in `buffered`.
+                            // itself and count its own permit in `queued`.
                             //
                             // **Taken rather than unreachable**, which is the
                             // distinction this file's `__Status` doctest already
@@ -6131,6 +6131,23 @@ macro_rules! __keylink_service {
                 }
             }
 
+            fn __actor<A: Actor, F: $crate::Feeds<A>>(
+                state: A,
+                observers: ::std::vec::Vec<::std::boxed::Box<dyn $crate::Observer<A>>>,
+                feeds: F,
+                backpressure: ::core::option::Option<$crate::Backpressure>,
+            ) -> Handle<A> {
+                let inner = match backpressure {
+                    ::core::option::Option::Some(policy) => {
+                        $crate::LocalActor::spawn_deep(state, observers, feeds, policy)
+                    }
+                    ::core::option::Option::None => {
+                        $crate::LocalActor::spawn_fed(state, observers, feeds)
+                    }
+                };
+                Handle { inner }
+            }
+
             /// State-backed setup mode.
             #[doc(hidden)]
             pub struct StateSetup<A, F> {
@@ -6231,15 +6248,7 @@ macro_rules! __keylink_service {
                 pub fn actor(self) -> Handle<A> {
                     let () = SpawnableUnfed::<A>::CHECK;
                     let StateSetup { state, observers, feeds } = self.mode;
-                    let inner = match self.backpressure {
-                        ::core::option::Option::Some(policy) => {
-                            $crate::LocalActor::spawn_deep(state, observers, feeds, policy)
-                        }
-                        ::core::option::Option::None => {
-                            $crate::LocalActor::spawn_fed(state, observers, feeds)
-                        }
-                    };
-                    Handle { inner }
+                    __actor(state, observers, feeds, self.backpressure)
                 }
 
                 /// Build the configured actor for a registry mount.
@@ -6257,15 +6266,7 @@ macro_rules! __keylink_service {
                 #[must_use]
                 pub fn actor(self) -> Handle<A> {
                     let StateSetup { state, observers, feeds } = self.mode;
-                    let inner = match self.backpressure {
-                        ::core::option::Option::Some(policy) => {
-                            $crate::LocalActor::spawn_deep(state, observers, feeds, policy)
-                        }
-                        ::core::option::Option::None => {
-                            $crate::LocalActor::spawn_fed(state, observers, feeds)
-                        }
-                    };
-                    Handle { inner }
+                    __actor(state, observers, feeds, self.backpressure)
                 }
 
                 /// Build the configured actor for a registry mount.
@@ -6539,7 +6540,7 @@ macro_rules! __keylink_service {
                         // Follows `LocalActor`'s own `Debug`, which gained this
                         // in the same commit. A handle printing one of the two
                         // facts its holder can ask for is the drift this avoids.
-                        .field("busy", &self.inner.is_busy())
+                        .field("busy", &self.inner.busy())
                         .finish()
                 }
             }
@@ -9453,65 +9454,11 @@ macro_rules! __keylink_calls_conflict {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_calls_method {
-    ([$( #[$meta:meta] )*], local_handle, service, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], service, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, r#service, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], service, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, serve, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], serve, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, r#serve, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], serve, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, with_state, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], with_state, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, r#with_state, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], with_state, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, stop, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], stop, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, r#stop, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], stop, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, abort, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], abort, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, r#abort, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], abort, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, is_running, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], is_running, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, r#is_running, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], is_running, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, is_busy, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], is_busy, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, r#is_busy, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], is_busy, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, buffered, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], buffered, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, r#buffered, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], buffered, ($( $arg : $ty ),*), $ret);
-    };
     ([$( #[$meta:meta] )*], local_handle, __status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
     };
     ([$( #[$meta:meta] )*], local_handle, r#__status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, ended, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], ended, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], local_handle, r#ended, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], ended, ($( $arg : $ty ),*), $ret);
     };
     ([$( #[$meta:meta] )*], local_handle, __reserve, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_calls_conflict!([$( #[$meta] )*], __reserve, ($( $arg : $ty ),*), $ret);
@@ -9531,12 +9478,6 @@ macro_rules! __keylink_calls_method {
     ([$( #[$meta:meta] )*], local_handle, r#__reserve_owned, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_calls_conflict!([$( #[$meta] )*], __reserve_owned, ($( $arg : $ty ),*), $ret);
     };
-    ([$( #[$meta:meta] )*], actor_ref, id, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], id, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], actor_ref, r#id, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], id, ($( $arg : $ty ),*), $ret);
-    };
     ([$( #[$meta:meta] )*], actor_ref, __status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
     };
@@ -9549,59 +9490,17 @@ macro_rules! __keylink_calls_method {
     ([$( #[$meta:meta] )*], client, r#connect, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_calls_conflict!([$( #[$meta] )*], connect, ($( $arg : $ty ),*), $ret);
     };
-    ([$( #[$meta:meta] )*], client, with_idempotency, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], with_idempotency, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], client, r#with_idempotency, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], with_idempotency, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], client, key_state, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], key_state, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], client, r#key_state, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], key_state, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], client, watch, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], watch, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], client, r#watch, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], watch, ($( $arg : $ty ),*), $ret);
-    };
     ([$( #[$meta:meta] )*], client, __status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
     };
     ([$( #[$meta:meta] )*], client, r#__status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
     };
-    ([$( #[$meta:meta] )*], client, close, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], close, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], client, r#close, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], close, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], idempotent_client, key_state, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], key_state, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], idempotent_client, r#key_state, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], key_state, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], idempotent_client, watch, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], watch, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], idempotent_client, r#watch, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], watch, ($( $arg : $ty ),*), $ret);
-    };
     ([$( #[$meta:meta] )*], idempotent_client, __status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
     };
     ([$( #[$meta:meta] )*], idempotent_client, r#__status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], idempotent_client, close, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], close, ($( $arg : $ty ),*), $ret);
-    };
-    ([$( #[$meta:meta] )*], idempotent_client, r#close, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $crate::__keylink_calls_conflict!([$( #[$meta] )*], close, ($( $arg : $ty ),*), $ret);
     };
     ([$( #[$meta:meta] )*], $surface:ident, $name:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {

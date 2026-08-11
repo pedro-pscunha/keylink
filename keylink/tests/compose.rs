@@ -333,8 +333,8 @@ impl bench::Actor for Bench {
 /// [`Gate`] per member in member order.
 ///
 /// The policy is an argument rather than a default because it is the **control**
-/// for [`Routing::LeastLoaded`]: at depth one `buffered` is 0 or 1, so that
-/// mode's assertion would be about `is_busy` alone and the depth is what makes it
+/// for [`Routing::LeastLoaded`]: at depth one `queued` is 0 or 1, so that
+/// mode's assertion would be about `busy` alone and the depth is what makes it
 /// about a gradient.
 fn bench<K>(
     count: usize,
@@ -509,7 +509,7 @@ async fn a_slow_subscriber_is_unsubscribed_and_its_actor_ends_naming_the_feed() 
             dropped: 1,
             gone: 0
         },
-        "the slow subscriber is dropped, not buffered"
+        "the slow subscriber is dropped, not queued"
     );
     assert_eq!(fast_heard.recv().await, Some(2));
     assert_eq!(topic.subscribers(), 1, "and it is gone from the topic");
@@ -877,8 +877,8 @@ async fn the_same_key_reaches_the_same_worker() {
 /// Registered as `B8`.
 ///
 /// **The depth is the control and not a detail.** At the default of one,
-/// `buffered` is 0 or 1 and the busy member has nothing queued behind its turn,
-/// so this would be an assertion about `is_busy` alone. At four, member one is
+/// `queued` is 0 or 1 and the busy member has nothing queued behind its turn,
+/// so this would be an assertion about `busy` alone. At four, member one is
 /// three messages behind **and still admitting**, so choosing it would have
 /// succeeded — the mode declined a member it could have used, which is the only
 /// form in which a gradient is observable from outside.

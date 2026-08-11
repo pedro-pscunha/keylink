@@ -257,7 +257,7 @@ struct Fixture {
 async fn start(system: journal::Registry) -> Fixture {
     let server = local_node().await;
     let client_node = local_node().await;
-    // `keyed_serve` rather than the builder, and this fixture is where it earns
+    // `registry.serve` rather than the builder, and this fixture is where it earns
     // its keep: every keyed test in this file serves through here, so a twin
     // that did not reach the same ALPN would redden the file rather than sit
     // unexercised. The builder form is still what the tests below use whenever
@@ -450,7 +450,7 @@ async fn local_keyed_calls_park_when_the_mailbox_is_full() {
     });
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if status_of(&system, &actor_id).buffered == 1 {
+            if status_of(&system, &actor_id).queued == 1 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -923,7 +923,7 @@ async fn a_panicking_message_costs_one_message_and_not_the_actor() {
 /// once, so this is one process, one state type, two dispatch paths.
 ///
 /// This comparison exercises the default keyed spawn with no observers. Keyed
-/// `spawn_wired` does accept observers; their refusal behavior is covered with
+/// `setup(..).feeds(..).mountable()` does accept observers; their refusal behavior is covered with
 /// the feed and observer lifecycle tests.
 #[tokio::test]
 async fn one_panic_reads_the_same_whichever_way_the_service_is_served() {
@@ -1194,7 +1194,7 @@ async fn the_connection_outlives_the_actors_on_it() {
 /// Two calls and not one, because "queued turns are answered" is the claim and
 /// one message in flight does not queue anything. The default local mailbox depth
 /// is 1, so the second
-/// `apply` is buffered behind the first and is the queued turn; the budget covers
+/// `apply` is queued behind the first and is the queued turn; the budget covers
 /// both holds together, which is the depth-versus-budget relationship 4a's doc
 /// names — at depth N a budget has to cover N + 1 turns, not one.
 ///
@@ -1775,7 +1775,7 @@ async fn a_refused_mount_leaves_no_actor_holding_the_claim_it_was_built_around()
 ///   number.
 /// - **serial**: a third actor, two messages, the second provably in the *mailbox*
 ///   before the first is let go — `Registry::status` reporting `busy` with
-///   `buffered == 1` is what makes "in the mailbox" observable rather than
+///   `queued == 1` is what makes "in the mailbox" observable rather than
 ///   inferred. Both turns run, and the peak is **1**.
 ///
 /// A peak of 1 on a counter just watched to reach 2 is a fact about the loop rather
@@ -1866,11 +1866,11 @@ async fn different_actors_run_concurrently_while_one_actor_stays_serial() {
         let sending = behind.apply(3, 0);
         let checking = async {
             // Waiting until the message is in the MAILBOX rather than somewhere on
-            // a QUIC stream. `buffered` is what makes that observable, and at the
+            // a QUIC stream. `queued` is what makes that observable, and at the
             // default depth of one it is exactly this call's message.
             let held = loop {
                 let row = status_of(&fixture.system, &id("c"));
-                if row.buffered == 1 {
+                if row.queued == 1 {
                     break row;
                 }
                 tokio::task::yield_now().await;
@@ -2938,7 +2938,7 @@ async fn gated_at_depth(bound: impl Middleware<GateWire, gate::Response>, depth:
         .service(
             system
                 .service(Allowlist::anyone())
-                // `keyed_service` gives back an ordinary `ServiceBuilder`, so
+                // `registry.service` gives back an ordinary `ServiceBuilder`, so
                 // this compiles — and until RFC-04 §16.7 the deadline a
                 // `QueueTimeout` stamped was read by nobody on this path.
                 .layer(bound)
@@ -2955,7 +2955,7 @@ async fn gated_at_depth(bound: impl Middleware<GateWire, gate::Response>, depth:
     system
         .mount(
             id("gate"),
-            // `spawn_wired` and not `spawn`: a service that declares a feed has to
+            // `setup(..).feeds(..).mountable()` and not `spawn`: a service that declares a feed has to
             // be handed one, which is the missing-argument the generated
             // `ServableAsActor` check exists to produce.
             gate::setup(Gate {
@@ -3026,11 +3026,11 @@ async fn until_idle(system: &gate::Registry) -> keylink::ActorStatus {
 /// The deterministic way to know a call is in the MAILBOX rather than somewhere on
 /// a QUIC stream, which is what every saturation assertion below rests on. Bounded
 /// for `until_idle`'s reason.
-async fn until_buffered(system: &gate::Registry, messages: u64) -> keylink::ActorStatus {
+async fn until_queued(system: &gate::Registry, messages: u64) -> keylink::ActorStatus {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let row = gate_status(system);
-            if row.buffered == messages {
+            if row.queued == messages {
                 return row;
             }
             tokio::task::yield_now().await;
@@ -3066,7 +3066,7 @@ async fn busy_is_true_during_a_turn_and_false_between_turns() {
 
     let before = gate_status(system);
     assert!(!before.busy, "nothing has been called yet");
-    assert_eq!(before.buffered, 0);
+    assert_eq!(before.queued, 0);
 
     let holding = async { client.at(id("gate")).hold().await };
     let watching = async {
@@ -3077,7 +3077,7 @@ async fn busy_is_true_during_a_turn_and_false_between_turns() {
             "the handler is inside `hold`, so a turn is running"
         );
         assert_eq!(
-            during.buffered, 0,
+            during.queued, 0,
             "and the mailbox is empty: this message is IN the turn rather than \
              waiting for one, which is the distinction `capacity` alone cannot make"
         );
@@ -3087,7 +3087,7 @@ async fn busy_is_true_during_a_turn_and_false_between_turns() {
     answered.expect("the held call answers");
 
     let after = until_idle(system).await;
-    assert_eq!(after.buffered, 0, "and nothing is left waiting");
+    assert_eq!(after.queued, 0, "and nothing is left waiting");
 }
 
 /// **`busy` stays true across an `await` inside a turn.**
@@ -3100,7 +3100,7 @@ async fn busy_is_true_during_a_turn_and_false_between_turns() {
 /// The reading is taken twice, and the second time with a message provably in the
 /// mailbox — which is what makes this more than "the flag we set is still set". A
 /// loop that had finished the turn would have taken that message: at the default
-/// depth of one, `buffered == 1` and `busy` together say the loop is neither at its
+/// depth of one, `queued == 1` and `busy` together say the loop is neither at its
 /// receive nor between turns.
 #[tokio::test]
 async fn busy_stays_true_across_an_await_inside_a_turn() {
@@ -3124,7 +3124,7 @@ async fn busy_stays_true_across_an_await_inside_a_turn() {
             "a turn suspended at an await is still a turn"
         );
 
-        let held = until_buffered(system, 1).await;
+        let held = until_queued(system, 1).await;
         assert!(
             held.busy,
             "and it is still running with a message waiting behind it, which a \
@@ -3166,7 +3166,7 @@ async fn busy_is_true_during_a_feed_turn() {
     let during = gate_status(system);
     assert!(during.busy, "a feed item is a turn, and it is running now");
     assert_eq!(
-        during.buffered, 0,
+        during.queued, 0,
         "with no mailbox message involved anywhere: a feed does not consume a slot"
     );
 
@@ -3179,33 +3179,33 @@ async fn busy_is_true_during_a_feed_turn() {
 /// How long a call that should answer at once is given before it is called stuck.
 ///
 /// Three orders of magnitude out, and nothing here asserts elapsed time: its
-/// expiry means a `__status` is waiting on something, which is the whole defect
+/// expiry means a `status` is waiting on something, which is the whole defect
 /// this section exists to catch. A bare `await` would express the same guard by
 /// hanging, and a guard that fails by hanging says nothing about what happened.
 const NOT_STUCK: Duration = Duration::from_secs(30);
 
-/// **A wedged actor answers `__status` to a peer, during the turn that wedged
+/// **A wedged actor answers `status` to a peer, during the turn that wedged
 /// it.**
 ///
 /// The wave's central claim, on the keyed door — its singleton twin is
 /// `a_wedged_singleton_answers_status_to_its_handle_and_to_a_peer`, and between
-/// them they are the only tests in the tree that can fail if `__status` ever
+/// them they are the only tests in the tree that can fail if `status` ever
 /// becomes a message. `macros.rs` states the constraint on
-/// `Handle::is_busy`: this is the question you cannot ask the actor, because a
+/// `Handle::busy`: this is the question you cannot ask the actor, because a
 /// message asking it queues behind the turn you are asking about. So the answer
 /// is produced inside the `Dispatch` closure, above `deliver_keyed`, and
 /// nothing enters the mailbox.
 ///
 /// **The ordering is the proof, and it is not a clock.** `hold`'s handler is
 /// parked on a semaphore with no permits, so its turn cannot end until this test
-/// adds one — and the permit is added strictly *after* the peer's `__status` has
+/// adds one — and the permit is added strictly *after* the peer's `status` has
 /// answered. There is no arrangement of events in which that answer was produced
 /// after the turn finished.
 ///
 /// **The mailbox is FULL while the question is asked**, which is the second half
-/// and the reason for the queued `touch`: at depth one, `buffered == 1` means
-/// there is no slot left. A `__status` delivered as a message could not even be
-/// accepted, let alone answered — and `buffered` reading `1` rather than `2` is
+/// and the reason for the queued `touch`: at depth one, `queued == 1` means
+/// there is no slot left. A `status` delivered as a message could not even be
+/// accepted, let alone answered — and `queued` reading `1` rather than `2` is
 /// the same fact from the other side, since a status that took a slot would count
 /// itself.
 ///
@@ -3237,7 +3237,7 @@ async fn a_wedged_actor_answers_status_during_its_turn() {
         entered.recv().await.expect("`hold` enters its turn");
         // The mailbox is full before the question is asked, so the answer below
         // cannot have come through it.
-        let held = until_buffered(system, 1).await;
+        let held = until_queued(system, 1).await;
         assert!(held.busy, "the turn holding the actor is still running");
 
         let serving = tokio::time::timeout(NOT_STUCK, client.at(id("gate")).status())
@@ -3250,8 +3250,8 @@ async fn a_wedged_actor_answers_status_during_its_turn() {
             "the actor is inside `hold` and the answer says so"
         );
         assert_eq!(
-            serving.buffered, 1,
-            "the queued `touch` and nothing else: a `__status` that took a mailbox \
+            serving.queued, 1,
+            "the queued `touch` and nothing else: a `status` that took a mailbox \
              slot would have counted itself here"
         );
 
@@ -3277,9 +3277,9 @@ async fn a_wedged_actor_answers_status_during_its_turn() {
         after,
         Serving {
             busy: false,
-            buffered: 0
+            queued: 0
         },
-        "a `__status` reporting the state of asking would read `busy: true` here \
+        "a `status` reporting the state of asking would read `busy: true` here \
          as well, because it would itself be the turn"
     );
     assert_ne!(
@@ -3305,17 +3305,17 @@ async fn a_wedged_actor_answers_status_during_its_turn() {
 ///
 /// **Keyed on both sides on purpose.** A keyed mailbox carries only the service's
 /// own messages while a `LocalActor`'s channel also carries a `read` and the stop
-/// request, so `buffered` compares as a predicate across the two kinds and never
+/// request, so `queued` compares as a predicate across the two kinds and never
 /// as a count. Comparing a keyed `Serving` against a singleton one by value would
 /// assert something this crate does not claim.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/actor/remote.rs`, replacing
 /// `serving_keyed`'s `.serving(actor)` with
-/// `.serving(actor).map(|_| Serving { busy: false, buffered: 0 })`, so the peer's
+/// `.serving(actor).map(|_| Serving { busy: false, queued: 0 })`, so the peer's
 /// answer stops coming from the registry. Watched:
 /// `assertion `left == right` failed: one actor, one instant, two doors`,
-/// `left: Serving { busy: true, buffered: 0 }` and
-/// `right: Serving { busy: false, buffered: 0 }`. Registered as `S2`.
+/// `left: Serving { busy: true, queued: 0 }` and
+/// `right: Serving { busy: false, queued: 0 }`. Registered as `S2`.
 #[tokio::test]
 async fn a_local_caller_and_a_peer_read_the_same_serving() {
     let mut fixture = start_gated().await;
@@ -3339,7 +3339,7 @@ async fn a_local_caller_and_a_peer_read_the_same_serving() {
         idle_here,
         Serving {
             busy: false,
-            buffered: 0
+            queued: 0
         },
         "and nothing has been called yet"
     );
@@ -3368,31 +3368,31 @@ async fn a_local_caller_and_a_peer_read_the_same_serving() {
     );
 }
 
-/// **A wedged singleton answers `__status` to its own `Handle` and to a peer,
+/// **A wedged singleton answers `status` to its own `Handle` and to a peer,
 /// with the same value.**
 ///
-/// The second of the two doors that answer with a `Serving`: `keyed_service`'s
+/// The second of the two doors that answer with a `Serving`: `registry.service`'s
 /// closure answers above `deliver_keyed` and this one answers above
 /// `deliver_unkeyed`. A test of one says nothing about the other, and the
 /// arms are separate code. The concurrent `service<H: Handler>` door answers
 /// `__Status` inside its `Dispatch` too and is the third such closure — it
 /// refuses with `NotAnActor` rather than folding a `Serving`, and `S4` guards it.
-/// This is also the only place `Handle::__status` — the synchronous local door,
+/// This is also the only place `Own::status` — the synchronous local door,
 /// which sends nothing at all — is read.
 ///
 /// The same `Gate` state and the same semaphore as the keyed tests, served the
-/// other way: `actor_wired` rather than `spawn_wired`, `service` rather than
-/// `keyed_service`, `Client` rather than `RegistryClient`. So what differs between
+/// other way: `setup(..).feeds(..).actor()` rather than `setup(..).feeds(..).mountable()`, `service` rather than
+/// `registry.service`, `Client` rather than `RegistryClient`. So what differs between
 /// this test and its keyed twin is the door and nothing else.
 ///
-/// **No value is written down for `buffered`.** The two sides are compared
+/// **No value is written down for `queued`.** The two sides are compared
 /// against each other, never against a literal: a `LocalActor`'s channel carries
 /// more than the service's own messages, and pinning a number here would assert
 /// something `Serving` says it does not claim.
 ///
 /// **Read in two states, because one state is passed by a constant.** Equality
 /// between the doors plus `busy` at the wedged instant is satisfied by a
-/// `Serving { busy: true, buffered: 0 }` hard-coded into `serving_unkeyed`
+/// `Serving { busy: true, queued: 0 }` hard-coded into `serving_unkeyed`
 /// — measured, not assumed, and that is the true reading of those two assertions
 /// on their own. The idle pair taken after the permit closes it: the peer's
 /// wedged answer and the peer's idle answer have to differ, and no constant can
@@ -3508,7 +3508,7 @@ async fn a_wedged_singleton_answers_status_to_its_handle_and_to_a_peer() {
 /// takes the slot's message, runs the turn and polls again without yielding, so the
 /// parked sender has not been rescheduled and the mailbox is deterministically
 /// empty at the next poll."* A depth of three removes that limit — three messages
-/// are genuinely in the mailbox, and `buffered` says so before anything is released
+/// are genuinely in the mailbox, and `queued` says so before anything is released
 /// — so this is the saturated case that could not be built before item 4a.
 ///
 /// The order is exact rather than statistical, because everything is loaded while
@@ -3522,9 +3522,9 @@ async fn a_wedged_singleton_answers_status_to_its_handle_and_to_a_peer() {
 #[tokio::test]
 async fn a_saturated_mailbox_at_depth_does_not_starve_a_feed() {
     const SLOTS: usize = 3;
-    /// The same three, as `ActorStatus::buffered` reports them. `buffered` is a
+    /// The same three, as `ActorStatus::queued` reports them. `queued` is a
     /// `u64` and a mailbox depth is a `usize`, because only one of the two
-    /// crosses a wire — see `ActorStatus::buffered`.
+    /// crosses a wire — see `ActorStatus::queued`.
     const SLOTS_SENT: u64 = 3;
 
     // A whole-call `Timeout` and not the fixture's default `QueueTimeout`: three
@@ -3556,13 +3556,13 @@ async fn a_saturated_mailbox_at_depth_does_not_starve_a_feed() {
     let watching = async {
         entered.recv().await.expect("`hold` enters its turn");
 
-        let full = until_buffered(system, SLOTS_SENT).await;
+        let full = until_queued(system, SLOTS_SENT).await;
         assert!(
             full.busy,
             "the actor is inside `hold` while its mailbox fills"
         );
         assert_eq!(
-            full.buffered, SLOTS_SENT,
+            full.queued, SLOTS_SENT,
             "and the mailbox is FULL: three messages in three slots, which is the \
              state a depth of one cannot hold still"
         );

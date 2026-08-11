@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use keylink::{
     Allowlist, Body, Context, Error, Idempotency, IdempotencyKey, IdempotencyRefusal, KeyState,
-    Node, Peer, RemoteError,
+    Node, Peer, RemoteError, Wire, WithIdempotency,
 };
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};

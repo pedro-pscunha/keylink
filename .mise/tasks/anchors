@@ -1901,7 +1901,7 @@ ANCHORS = [
     ("B2", "keylink/src/compose/factory.rs", "keylink/src/compose/factory.rs",
      "        let at = usize::try_from((shard.of)(key) % wide).unwrap_or(0);"),
     ("B3", "keylink/src/compose/factory.rs", "keylink/src/compose/factory.rs",
-     "    (serving.buffered, serving.busy)"),
+     "    (serving.queued, serving.busy)"),
     ("B4", "keylink/src/compose/factory.rs", "keylink/src/compose/factory.rs",
      "    if next_load < best.0 {"),
     ("B5", "keylink/src/compose/factory.rs", "keylink/src/compose/factory.rs",

@@ -781,10 +781,10 @@ impl fmt::Display for EndReason {
 /// question with its own advisory caveat. A `bool` here would be a third
 /// spelling of what two doors already carry.
 ///
-/// # `Eq` compares `buffered`, and that is a sharp edge the type does not close
+/// # `Eq` compares `queued`, and that is a sharp edge the type does not close
 ///
 /// The derive below is field by field, so `==` does the one thing
-/// [`buffered`](Serving::buffered) says never to do: it compares a keyed
+/// [`queued`](Serving::queued) says never to do: it compares a keyed
 /// mailbox's depth against a singleton channel's as a number. **Prose is the
 /// only thing preventing that**, and a reader who meets the derive before the
 /// field's paragraph would not know it, which is why the warning is here.
@@ -825,10 +825,10 @@ pub struct Serving {
     ///
     /// A floor on the real backlog either way, and `u64` rather than `usize`,
     /// both for the reasons
-    /// [`ActorStatus::buffered`](crate::ActorStatus::buffered) carries: senders
+    /// [`ActorStatus::queued`](crate::ActorStatus::queued) carries: senders
     /// parked waiting for a permit are not observable at all, and a width the
     /// compiler chooses cannot be half of a contract between two machines.
-    pub buffered: u64,
+    pub queued: u64,
 }
 
 /// Why a turn produced no value, at the door that hands a caller the fault
