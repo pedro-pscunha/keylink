@@ -14,7 +14,7 @@
 //!
 //! | pattern | what it is |
 //! |---|---|
-//! | [`Topic`] | fan-out. One publisher, N subscribers, each receiving on a `feed` |
+//! | [`Topic`] / [`KeyedTopic`] | fan-out. One publisher, N subscribers, each receiving on a `feed`, optionally isolated by key |
 //! | [`Pool`] | N interchangeable actors behind one cursor, each saying which it is |
 //! | [`Factory`] | the same N, with the cursor replaced by a [`Routing`] rule — including `hash(key) % N` |
 //! | [`after`] / [`every`] | a delayed run and a repeating one, on a cancellable handle |
@@ -22,7 +22,7 @@
 //! | [`Group`] | a set of actors that end together, or one the rest carry on without |
 //! | [`Endings`] | lifecycle ending → future, for compositions that need keyed waiters |
 //!
-//! Seven types and two functions for the seven rows. Six of the rows are the
+//! Eight types and two functions for the seven rows. Six of the rows are the
 //! first six patterns; [`Endings`] is a seventh **row** and not a seventh pattern
 //! — it adapts [`Lifecycle::ended`](crate::Lifecycle::ended) for compositions that
 //! want to own keyed ending futures. A one-off keyed observation can use
@@ -130,6 +130,7 @@
 mod factory;
 mod group;
 mod keyed;
+mod keyed_topic;
 mod lossy;
 mod names;
 mod pool;
@@ -139,6 +140,7 @@ mod topic;
 pub use factory::{Factory, Reserving, Routing, Sample, Shard};
 pub use group::{Added, Group, GroupEnded, Membership, Retire, Verdict};
 pub use keyed::Endings;
+pub use keyed_topic::{KeyedSubscription, KeyedTopic};
 pub use lossy::{
     BroadcastDepth, BroadcastDepthError, Lagged, Lossy, LossyFanout, LossySubscription, LossyTopic,
 };

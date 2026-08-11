@@ -107,8 +107,9 @@ use std::sync::{Arc, Mutex};
 
 use keylink::compose::{
     after, every, Added, BroadcastDepth, BroadcastDepthError, Endings, Factory, Fanout, Group,
-    GroupEnded, Lagged, Lossy, LossyFanout, LossyTopic, Membership, Names, Overflow, Patience,
-    PatienceError, Pool, Routing, Sample, Shard, Subscription, Topic, Verdict,
+    GroupEnded, KeyedSubscription, KeyedTopic, Lagged, Lossy, LossyFanout, LossyTopic, Membership,
+    Names, Overflow, Patience, PatienceError, Pool, Routing, Sample, Shard, Subscription, Topic,
+    Verdict,
 };
 use keylink::{
     ActorId, Backpressure, Caller, Ended, Eviction, Intensity, Lifecycle, NotQueued, Observer,
@@ -1100,6 +1101,373 @@ async fn a_subscription_dropped_is_a_subscriber_the_next_publish_prunes() {
     );
     assert_eq!(heard.recv().await, Some(1));
     assert_eq!(topic.subscribers(), 1);
+}
+
+/// Keys compare and hash by identity while reporting every clone. This makes
+/// the unknown-key path observable without exposing the keyed topic's map.
+#[derive(Debug)]
+struct CountedKey {
+    id: u64,
+    clones: Arc<AtomicUsize>,
+}
+
+impl CountedKey {
+    fn new(id: u64, clones: &Arc<AtomicUsize>) -> Self {
+        Self {
+            id,
+            clones: Arc::clone(clones),
+        }
+    }
+}
+
+impl Clone for CountedKey {
+    fn clone(&self) -> Self {
+        self.clones.fetch_add(1, Ordering::Relaxed);
+        Self {
+            id: self.id,
+            clones: Arc::clone(&self.clones),
+        }
+    }
+}
+
+impl PartialEq for CountedKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for CountedKey {}
+
+impl std::hash::Hash for CountedKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+/// A keyed route must not keep the publisher storage alive. Replayed with
+/// `scripts/break-once.sh` by replacing the exact production literal
+/// `inner: Arc::downgrade(&self.inner),`. Replacement:
+/// `inner: { std::mem::forget(Arc::clone(&self.inner)); Arc::downgrade(&self.inner) },`.
+/// Watched: the terminal probe returned `None` because
+/// publisher storage remained alive.
+#[tokio::test]
+async fn keyed_topic_last_publisher_drop_ends_its_routes() {
+    let topic = KeyedTopic::<u64, u64>::new(Overflow::BlockPublisher(NonZeroUsize::MIN));
+    let mut route = topic.route(1);
+
+    drop(topic);
+
+    assert_eq!(
+        n0_future::future::poll_once(route.next()).await,
+        Some(None),
+        "dropping the last publisher ends the route"
+    );
+}
+
+/// The two keyed operations expose only the bounds they use. Replayed with
+/// `scripts/break-once.sh` by changing the exact production literal
+/// `K: Eq + Hash + Clone,` to `K: Eq + Hash + Clone, T: Clone,`. Watched: the
+/// route-only `NotClone` item stopped compiling.
+#[tokio::test]
+async fn keyed_topic_operation_bounds_accept_borrowed_non_send_and_non_clone_types() {
+    struct NotClone;
+    #[derive(Eq, Hash, PartialEq)]
+    struct NotCloneKey(u64);
+
+    let borrowed_key = String::from("borrowed");
+    let borrowed = KeyedTopic::<&str, NotClone>::new(Overflow::BlockPublisher(NonZeroUsize::MIN));
+    drop(borrowed.route(borrowed_key.as_str()));
+
+    let non_send =
+        KeyedTopic::<std::rc::Rc<str>, NotClone>::new(Overflow::BlockPublisher(NonZeroUsize::MIN));
+    drop(non_send.route(std::rc::Rc::from("local")));
+
+    let borrowed_item = String::from("item");
+    let publish_only = KeyedTopic::<NotCloneKey, std::rc::Rc<&str>>::new(Overflow::BlockPublisher(
+        NonZeroUsize::MIN,
+    ));
+    assert_eq!(
+        publish_only
+            .publish(&NotCloneKey(1), std::rc::Rc::new(borrowed_item.as_str()))
+            .await,
+        Fanout {
+            delivered: 0,
+            dropped: 0,
+            gone: 0,
+        }
+    );
+}
+
+/// Made red before `KeyedTopic` existed: the import and constructor were
+/// unresolved. Replayed with `scripts/break-once.sh` by replacing the exact
+/// production literal `let entry = if let Some(entry) = entries.get(&key) {` with
+/// `let entry = if let Some(entry) = entries.values().next() {`. Watched: the publish reported
+/// two deliveries because A and B shared one inner topic. The public stream contract
+/// was replayed separately by prefixing the exact production literal
+/// `impl<K: Eq + Hash, T> crate::Stream for KeyedSubscription<K, T> {` with
+/// `#[cfg(any())]`. Watched: the `Stream` bound stopped compiling.
+#[tokio::test]
+async fn keyed_topic_routes_are_isolated_and_are_stream_send_static() {
+    fn stream_send_static<S: keylink::Stream<Item = u64> + Send + 'static>(_: &S) {}
+    fn keyed_stream_send_static<S: keylink::Stream<Item = u64> + Send + 'static>(_: S) {}
+
+    let topic = KeyedTopic::new(Overflow::BlockPublisher(NonZeroUsize::MIN));
+    let mut a: KeyedSubscription<u64, u64> = topic.route(1);
+    let mut b = topic.route(2);
+    stream_send_static(&a);
+
+    assert_eq!(
+        topic.publish(&1, 11).await,
+        Fanout {
+            delivered: 1,
+            dropped: 0,
+            gone: 0,
+        }
+    );
+    assert_eq!(a.next().await, Some(11));
+    assert!(
+        n0_future::future::poll_once(b.next()).await.is_none(),
+        "a route receives only its own key"
+    );
+
+    keyed_stream_send_static(topic.route(3));
+}
+
+/// Made red before `KeyedTopic` existed. Replayed with
+/// `scripts/break-once.sh` by replacing the exact production literal
+/// `delivered: 0,` in the unknown-key arm. Replacement: `delivered: 1,`.
+/// Watched: the unknown-key
+/// publish returned one delivery instead of literal zero. The operation
+/// bounds make cloning or inserting an unknown borrowed key unrepresentable.
+#[tokio::test]
+async fn keyed_topic_unknown_key_is_zero_without_a_clone_or_insertion_and_the_first_route_inserts()
+{
+    let clones = Arc::new(AtomicUsize::new(0));
+    let key = CountedKey::new(7, &clones);
+    let topic = KeyedTopic::new(Overflow::BlockPublisher(NonZeroUsize::MIN));
+
+    assert_eq!(
+        topic.publish(&key, 1_u64).await,
+        Fanout {
+            delivered: 0,
+            dropped: 0,
+            gone: 0,
+        }
+    );
+    assert_eq!(
+        clones.load(Ordering::Relaxed),
+        0,
+        "unknown publish clones no key"
+    );
+
+    let mut first = topic.route(key);
+    assert_eq!(
+        clones.load(Ordering::Relaxed),
+        1,
+        "the first route clones its key into a new map entry"
+    );
+    assert_eq!(
+        topic
+            .publish(&CountedKey::new(7, &clones), 2)
+            .await
+            .delivered,
+        1
+    );
+    assert_eq!(first.next().await, Some(2));
+}
+
+/// Made red before `KeyedTopic` existed. Replayed with
+/// `scripts/break-once.sh` by replacing the exact production literal
+/// `let removed = (previous == 1` with `let removed = (false && previous == 1`.
+/// Watched: the replacement reused the stale entry and the key clone count stayed
+/// one instead of two.
+#[tokio::test]
+async fn keyed_topic_last_route_drop_removes_the_key_and_the_next_route_is_a_fresh_first_route() {
+    let clones = Arc::new(AtomicUsize::new(0));
+    let topic = KeyedTopic::new(Overflow::BlockPublisher(NonZeroUsize::MIN));
+
+    drop(topic.route(CountedKey::new(9, &clones)));
+    assert_eq!(clones.load(Ordering::Relaxed), 1);
+    let mut replacement = topic.route(CountedKey::new(9, &clones));
+    assert_eq!(
+        clones.load(Ordering::Relaxed),
+        2,
+        "a removed key is allocated again"
+    );
+    assert_eq!(
+        topic
+            .publish(&CountedKey::new(9, &clones), 90_u64)
+            .await
+            .delivered,
+        1
+    );
+    assert_eq!(replacement.next().await, Some(90));
+}
+
+/// Made red before `KeyedTopic` existed. Replayed with
+/// `scripts/break-once.sh` by replacing the exact production literal
+/// `let entry = self.inner.lock().get(key).cloned();`. Replacement:
+/// `static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()); let _guard = SERIAL.lock().await; let entry = self.inner.lock().get(key).cloned();`.
+/// Route isolation remains intact. Watched: the `B publishes while A is blocked`
+/// probe returned `None`.
+#[tokio::test]
+async fn keyed_topic_blocked_key_does_not_delay_another_key() {
+    let topic = KeyedTopic::new(Overflow::BlockPublisher(NonZeroUsize::MIN));
+    let a = topic.route('a');
+    let mut b = topic.route('b');
+    assert_eq!(topic.publish(&'a', 1_u64).await.delivered, 1);
+
+    let blocked = topic.publish(&'a', 2);
+    tokio::pin!(blocked);
+    assert!(n0_future::future::poll_once(&mut blocked).await.is_none());
+    assert_eq!(
+        n0_future::future::poll_once(topic.publish(&'b', 3)).await,
+        Some(Fanout {
+            delivered: 1,
+            dropped: 0,
+            gone: 0,
+        }),
+        "B publishes while A is blocked"
+    );
+    assert_eq!(b.next().await, Some(3));
+    drop(a);
+    assert_eq!(blocked.await.gone, 1);
+}
+
+/// Made red before `KeyedTopic` existed. Replayed with
+/// `scripts/break-once.sh` by replacing the exact production literal
+/// `let entry = self.inner.lock().get(key).cloned();`. Replacement:
+/// `tokio::task::yield_now().await; let entry = self.inner.lock().get(key).cloned();`.
+/// Watched: the publish reached the replacement and reported one delivery
+/// instead of one gone old route.
+#[tokio::test]
+async fn keyed_topic_in_flight_publish_finishes_on_its_old_entry_after_last_drop_and_replacement() {
+    let topic = KeyedTopic::new(Overflow::BlockPublisher(NonZeroUsize::MIN));
+    let old = topic.route(1_u64);
+    assert_eq!(topic.publish(&1, 1_u64).await.delivered, 1);
+
+    let in_flight = topic.publish(&1, 2);
+    tokio::pin!(in_flight);
+    assert!(n0_future::future::poll_once(&mut in_flight).await.is_none());
+    drop(old);
+
+    let mut replacement = topic.route(1);
+    assert_eq!(
+        in_flight.await,
+        Fanout {
+            delivered: 0,
+            dropped: 0,
+            gone: 1,
+        },
+        "the cloned old entry remains usable after map removal"
+    );
+    assert_eq!(topic.publish(&1, 3).await.delivered, 1);
+    assert_eq!(replacement.next().await, Some(3));
+}
+
+/// Made red before `KeyedTopic` existed. Replayed with
+/// `scripts/break-once.sh` by replacing the exact production literal
+/// `let removed = (previous == 1` with `let removed = (previous <= 2`. Watched:
+/// dropping the ended old route removed the replacement route's still-live entry,
+/// so the publish delivered to zero.
+#[tokio::test]
+async fn keyed_topic_inner_policy_removal_does_not_end_the_owned_route_or_change_its_route_count() {
+    let topic = KeyedTopic::new(Overflow::DropSubscriber(NonZeroUsize::MIN));
+    let mut old = topic.route(4_u64);
+    assert_eq!(topic.publish(&4, 1_u64).await.delivered, 1);
+    assert_eq!(
+        topic.publish(&4, 2).await,
+        Fanout {
+            delivered: 0,
+            dropped: 1,
+            gone: 0,
+        }
+    );
+    assert_eq!(old.next().await, Some(1));
+    assert_eq!(old.next().await, None, "policy ends the inner stream");
+
+    let mut replacement = topic.route(4);
+    drop(old);
+    assert_eq!(topic.publish(&4, 3).await.delivered, 1);
+    assert_eq!(replacement.next().await, Some(3));
+}
+
+/// Made red before `KeyedTopic` existed. Replayed with
+/// `scripts/break-once.sh` by replacing the exact production literal
+/// `topic: Topic::new(self.inner.overflow),`. Replacement:
+/// `topic: Topic::new(Overflow::DropSubscriber(std::num::NonZeroUsize::MIN)),`.
+/// Watched: the BlockPublisher guard returned immediately instead of remaining pending on
+/// its full route.
+#[tokio::test(start_paused = true)]
+async fn keyed_topic_preserves_all_three_overflow_policies_and_fanout_accounting() {
+    let blocking = KeyedTopic::new(Overflow::BlockPublisher(NonZeroUsize::MIN));
+    let mut blocked_route = blocking.route(1_u64);
+    assert_eq!(
+        blocking.publish(&1, 1_u64).await,
+        Fanout {
+            delivered: 1,
+            dropped: 0,
+            gone: 0,
+        }
+    );
+    let blocked_publish = blocking.publish(&1, 2);
+    tokio::pin!(blocked_publish);
+    assert!(
+        n0_future::future::poll_once(&mut blocked_publish)
+            .await
+            .is_none(),
+        "BlockPublisher waits when the route is full"
+    );
+    assert_eq!(blocked_route.next().await, Some(1));
+    assert_eq!(
+        blocked_publish.await,
+        Fanout {
+            delivered: 1,
+            dropped: 0,
+            gone: 0,
+        }
+    );
+    assert_eq!(blocked_route.next().await, Some(2));
+
+    let dropping = KeyedTopic::new(Overflow::DropSubscriber(NonZeroUsize::MIN));
+    let mut dropped_route = dropping.route(2_u64);
+    assert_eq!(dropping.publish(&2, 1_u64).await.delivered, 1);
+    assert_eq!(
+        dropping.publish(&2, 2).await,
+        Fanout {
+            delivered: 0,
+            dropped: 1,
+            gone: 0,
+        }
+    );
+    assert_eq!(dropped_route.next().await, Some(1));
+    assert_eq!(dropped_route.next().await, None);
+
+    let patience = Patience::try_after(Duration::from_millis(1)).expect("valid patience");
+    let timed = KeyedTopic::new(Overflow::BlockThenDrop {
+        depth: NonZeroUsize::MIN,
+        patience,
+    });
+    let mut timed_route = timed.route(3_u64);
+    assert_eq!(timed.publish(&3, 1_u64).await.delivered, 1);
+    let timed_publish = timed.publish(&3, 2);
+    tokio::pin!(timed_publish);
+    assert!(
+        n0_future::future::poll_once(&mut timed_publish)
+            .await
+            .is_none(),
+        "BlockThenDrop waits for its patience"
+    );
+    assert_eq!(
+        timed_publish.await,
+        Fanout {
+            delivered: 0,
+            dropped: 1,
+            gone: 0,
+        }
+    );
+    assert_eq!(timed_route.next().await, Some(1));
+    assert_eq!(timed_route.next().await, None);
 }
 
 // ──────────────────────────────────────────────────────────────────── the pool

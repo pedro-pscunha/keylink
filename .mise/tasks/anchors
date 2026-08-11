@@ -2030,6 +2030,33 @@ ANCHORS = [
      "        Err(NotQueued::Full) => return (Outcome::Err(RemoteError::MailboxFull), Body::empty()),"),
     ("B11", "keylink/tests/compose.rs", "keylink/src/compose/factory.rs",
      "        while let Some(answer) = racing.next().await {"),
+    # C4 keyed-topic guards. Every row is cross-file, so each record quotes the
+    # exact production search literal. Shared rows are deliberate: KT7/KT8/KT11
+    # perturb the publish snapshot for distinct liveness, generation, and allocation
+    # claims; KT6/KT9 perturb the same removal predicate in opposite directions.
+    ("KT1", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "            inner: Arc::downgrade(&self.inner),"),
+    ("KT2", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "    K: Eq + Hash + Clone,"),
+    ("KT3", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "        let entry = if let Some(entry) = entries.get(&key) {"),
+    ("KT4", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "impl<K: Eq + Hash, T> crate::Stream for KeyedSubscription<K, T> {"),
+    ("KT5", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "                delivered: 0,"),
+    ("KT6", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "        let removed = (previous == 1"),
+    ("KT7", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "        let entry = self.inner.lock().get(key).cloned();"),
+    ("KT8", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "        let entry = self.inner.lock().get(key).cloned();"),
+    ("KT9", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "        let removed = (previous == 1"),
+    ("KT10", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "                topic: Topic::new(self.inner.overflow),"),
+    ("KT11", "keylink/tests/keyed_topic_allocation.rs",
+     "keylink/src/compose/keyed_topic.rs",
+     "        let entry = self.inner.lock().get(key).cloned();"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -3634,7 +3661,11 @@ for record in sorted(set(REDNESS) - row_ids):
 # `first_available`'s racers — and the two moved together for once. Read off the
 # failing run: `FAIL population: 195 comment blocks mention break-once.sh, but
 # RECORD_BLOCKS says 194.`
-RECORD_BLOCKS = 205
+# 206 → 215, for C4's original nine keyed-topic guards. Read off the failing run:
+# `FAIL population: 215 comment blocks mention break-once.sh, but RECORD_BLOCKS says 206.`
+# 215 → 217, for the publisher-drop and operation-bound review guards. Read off
+# the failing run: `FAIL population: 217 comment blocks mention break-once.sh, but RECORD_BLOCKS says 215.`
+RECORD_BLOCKS = 217
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a
