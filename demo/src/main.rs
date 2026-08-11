@@ -18,7 +18,8 @@ use std::task::{Context, Poll};
 
 use anyhow::{bail, Context as _, Result};
 use keylink::{
-    Allowlist, Body, BodyReader, Caller, EndpointAddr, EndpointId, Node, SecretKey, Server,
+    Allowlist, BlockingWire, Body, BodyReader, Caller, EndpointAddr, EndpointId, Node, SecretKey,
+    Servable, Server, Wire,
 };
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
