@@ -985,9 +985,9 @@ ANCHORS = [
     ("D3", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "            Verdict::Committed => reply.answer(Answered::Ran(value)),"),
     ("D4", "keylink/tests/cycles.rs", "keylink/src/compose/topic.rs",
-     "            Overflow::DropSubscriber => self.publish_dropping(item),"),
+     "            Overflow::DropSubscriber(_) => self.publish_dropping(item),"),
     ("D5", "keylink/tests/cycles.rs", "keylink/src/compose/topic.rs",
-     "            Overflow::BlockPublisher => self.publish_blocking(item).await,"),
+     "            Overflow::BlockPublisher(_) => self.publish_blocking(item).await,"),
     ("D6", "keylink/tests/cycles.rs", "keylink/tests/cycles.rs",
      "        if hops == 0 {"),
     # MOVED BY ITEM M, target file and all. It read
@@ -1269,6 +1269,17 @@ ANCHORS = [
     # SAME-FILE and indented, so the record's unindented copy is not a second occurrence.
     ("M2", "keylink/src/rpc.rs", "keylink/src/rpc.rs",
      "        Attaching::Forbidden => return Claimed::Refuse(IdempotencyRefusal::InFlight.into()),"),
+    # ── `compose::Topic` finite subscriber depth ────────────────────────────
+    #
+    # Q1 and Q2 share the one production capacity use. Both were run through
+    # `scripts/break-once.sh` after formatting, one focused test at a time. Each
+    # selected exactly one test and failed on its policy's depth-two assertion.
+    ("Q1", "keylink/tests/compose.rs", "keylink/src/compose/topic.rs",
+     "        let (to, from) = mpsc::channel(depth.get());"),
+    ("Q2", "keylink/tests/compose.rs", "keylink/src/compose/topic.rs",
+     "        let (to, from) = mpsc::channel(depth.get());"),
+    ("Q3", "keylink/src/representability.rs", "keylink/src/compose/topic.rs",
+     "    BlockPublisher(NonZeroUsize),"),
     # ── `compose::Group` and `compose::Endings` ──────────────────────────────
     #
     # Twenty-two substitutions were run in the paired gate worktree before any row
@@ -3523,7 +3534,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # `first_available`'s racers — and the two moved together for once. Read off the
 # failing run: `FAIL population: 195 comment blocks mention break-once.sh, but
 # RECORD_BLOCKS says 194.`
-RECORD_BLOCKS = 196
+RECORD_BLOCKS = 198
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

@@ -5,8 +5,10 @@
 //! |---|---|
 //! | a publisher fans out to N subscribers, each on its own `feed` | `a_publisher_fans_out_to_three_subscribers_each_on_its_own_feed` |
 //! | a topic keeps no history, so a late subscriber is not a buffer | `a_topic_with_nobody_listening_drops_the_item_rather_than_keeping_it` |
-//! | a slow subscriber under `DropSubscriber` is unsubscribed and its actor ends **naming the feed** | `a_slow_subscriber_is_unsubscribed_and_its_actor_ends_naming_the_feed` |
-//! | a slow subscriber under `BlockPublisher` **stops the publisher** instead of growing a buffer | `a_slow_subscriber_blocks_the_publisher_instead_of_growing_a_buffer` |
+//! | `DropSubscriber` accepts its configured depth, then unsubscribes the full subscriber | `drop_subscriber_accepts_two_items_before_removing_the_subscriber` |
+//! | `BlockPublisher` accepts its configured depth, then blocks on the full subscriber | `block_publisher_accepts_two_items_before_blocking` |
+//! | a slow subscriber under `DropSubscriber` at explicit depth one is unsubscribed and its actor ends **naming the feed** | `a_slow_subscriber_is_unsubscribed_and_its_actor_ends_naming_the_feed` |
+//! | a slow subscriber under `BlockPublisher` at explicit depth one **stops the publisher** instead of growing a buffer | `a_slow_subscriber_blocks_the_publisher_instead_of_growing_a_buffer` |
 //! | a pool spreads turns, and its report agrees with the actor that handled each | `a_pool_spreads_turns_and_each_member_says_which_one_it_is` |
 //! | every clone of a pool shares one rotation | `two_clones_of_a_pool_share_one_rotation` |
 //! | a key reaches one member, the keyspace still spreads, and a clone routes it the same way | `the_same_key_reaches_the_same_worker` |
@@ -394,7 +396,7 @@ async fn home(factory: &Factory<bench::Handle<Bench>, u64>, key: u64) -> u64 {
 /// against right `Fanout { delivered: 3, dropped: 0, gone: 0 }`.
 #[tokio::test]
 async fn a_publisher_fans_out_to_three_subscribers_each_on_its_own_feed() {
-    let topic = Topic::new(Overflow::BlockPublisher);
+    let topic = Topic::new(Overflow::BlockPublisher(NonZeroUsize::MIN));
 
     // Three actors, three subscriptions, three feeds. Nothing about the fan-out
     // reaches the service declaration: `Feeds::new` takes a `Stream`, and a
@@ -439,7 +441,7 @@ async fn a_publisher_fans_out_to_three_subscribers_each_on_its_own_feed() {
 /// property, and nothing can.
 #[tokio::test]
 async fn a_topic_with_nobody_listening_drops_the_item_rather_than_keeping_it() {
-    let topic = Topic::new(Overflow::BlockPublisher);
+    let topic = Topic::new(Overflow::BlockPublisher(NonZeroUsize::MIN));
 
     assert_eq!(
         topic.publish(1_u64).await,
@@ -466,16 +468,90 @@ async fn a_topic_with_nobody_listening_drops_the_item_rather_than_keeping_it() {
     assert_eq!(heard.recv().await, Some(2), "the first item it can see");
 }
 
-/// Red-tested in Wave 7 (`9a7fd1d`), and the output is pasted in that commit
-/// rather than here: folding `topic.rs`'s `const IN_FLIGHT: usize = 1` to `8` —
-/// the one number the whole no-third-policy argument rests on — turns this red at
-/// the second publish, left `Fanout { delivered: 2, dropped: 0, gone: 0 }` against
-/// right `Fanout { delivered: 1, dropped: 1, gone: 0 }`. A subscriber holding eight
-/// unread items is not slow by this module's definition, so nothing is dropped,
-/// nothing is unsubscribed, and no actor ends naming a feed.
+/// Made red by `scripts/break-once.sh`, replacing
+/// `        let (to, from) = mpsc::channel(depth.get());` with
+/// `        let (to, from) = mpsc::channel(NonZeroUsize::MIN.get());`.
+/// Watched: "two items fit at depth two", left
+/// `Fanout { delivered: 0, dropped: 1, gone: 0 }` against right
+/// `Fanout { delivered: 1, dropped: 0, gone: 0 }`.
+#[tokio::test]
+async fn drop_subscriber_accepts_two_items_before_removing_the_subscriber() {
+    let topic = Topic::new(Overflow::DropSubscriber(
+        NonZeroUsize::new(2).expect("two is non-zero"),
+    ));
+    let mut slow = topic.subscribe();
+
+    for item in [1_u64, 2] {
+        assert_eq!(
+            topic.publish(item).await,
+            Fanout {
+                delivered: 1,
+                dropped: 0,
+                gone: 0,
+            },
+            "two items fit at depth two"
+        );
+    }
+    assert_eq!(
+        topic.publish(3).await,
+        Fanout {
+            delivered: 0,
+            dropped: 1,
+            gone: 0,
+        },
+        "the third item removes the full subscriber"
+    );
+    assert_eq!(topic.subscribers(), 0);
+    assert_eq!(slow.next().await, Some(1));
+    assert_eq!(slow.next().await, Some(2));
+    assert_eq!(slow.next().await, None);
+}
+
+/// The same production-capacity break as the dropping guard: replace
+/// `        let (to, from) = mpsc::channel(depth.get());` with
+/// `        let (to, from) = mpsc::channel(NonZeroUsize::MIN.get());` through
+/// `scripts/break-once.sh`. Watched: "the second item fits at depth two", left
+/// `None` against right `Some(Fanout { delivered: 1, dropped: 0, gone: 0 })`.
+#[tokio::test]
+async fn block_publisher_accepts_two_items_before_blocking() {
+    let topic = Topic::new(Overflow::BlockPublisher(
+        NonZeroUsize::new(2).expect("two is non-zero"),
+    ));
+    let mut slow = topic.subscribe();
+
+    assert_eq!(
+        topic.publish(1).await,
+        Fanout {
+            delivered: 1,
+            dropped: 0,
+            gone: 0,
+        }
+    );
+    assert_eq!(
+        n0_future::future::poll_once(topic.publish(2)).await,
+        Some(Fanout {
+            delivered: 1,
+            dropped: 0,
+            gone: 0,
+        }),
+        "the second item fits at depth two"
+    );
+    assert!(
+        n0_future::future::poll_once(topic.publish(3))
+            .await
+            .is_none(),
+        "the third item waits for capacity"
+    );
+    assert_eq!(slow.next().await, Some(1));
+    assert_eq!(slow.next().await, Some(2));
+}
+
+/// The original slow-subscriber guard, retained at explicit depth one. The first
+/// item fits; the second reaches the dropping policy and ends the subscriber's
+/// feed loudly.
 #[tokio::test]
 async fn a_slow_subscriber_is_unsubscribed_and_its_actor_ends_naming_the_feed() {
-    let topic = Topic::new(Overflow::DropSubscriber);
+    let topic = Topic::new(Overflow::DropSubscriber(NonZeroUsize::MIN));
     let (slow, mut slow_heard, slow_gate) = desk(topic.subscribe());
     let (fast, mut fast_heard, _fast_gate) = desk(topic.subscribe());
 
@@ -488,7 +564,7 @@ async fn a_slow_subscriber_is_unsubscribed_and_its_actor_ends_naming_the_feed() 
     });
     let release = slow_gate.held().await;
 
-    // One item fits the slow desk's single slot, and the fast desk takes it.
+    // One item fits the slow desk's explicit depth-one slot, and the fast desk takes it.
     assert_eq!(
         topic.publish(1_u64).await,
         Fanout {
@@ -595,7 +671,7 @@ async fn a_panicking_clone_costs_one_publish_and_not_the_topic() {
         }
     }
 
-    let topic = Topic::new(Overflow::DropSubscriber);
+    let topic = Topic::new(Overflow::DropSubscriber(NonZeroUsize::MIN));
     let mut first = topic.subscribe();
     let mut second = topic.subscribe();
     let mut third = topic.subscribe();
@@ -655,16 +731,11 @@ async fn a_panicking_clone_costs_one_publish_and_not_the_topic() {
     assert!(fourth.next().await.is_some());
 }
 
-/// The same break as its `DropSubscriber` sibling, watched against this half.
-/// Wave 7 recorded that `IN_FLIGHT` 1 → 8 turns both policies' guards red at once
-/// but pasted only the other one's output; this is the missing half.
-/// `scripts/break-once.sh` replacing `const IN_FLIGHT: usize = 1;` with `= 8;`
-/// watched: "the publisher waits for the slow subscriber rather than buffering for
-/// it". With eight slots the second `publish` returns on its first poll instead of
-/// parking, which is exactly the buffer this test exists to deny.
+/// The original slow-subscriber guard, retained at explicit depth one. The first
+/// item fits; the second reaches the blocking policy and waits for capacity.
 #[tokio::test]
 async fn a_slow_subscriber_blocks_the_publisher_instead_of_growing_a_buffer() {
-    let topic = Topic::new(Overflow::BlockPublisher);
+    let topic = Topic::new(Overflow::BlockPublisher(NonZeroUsize::MIN));
     let (slow, mut slow_heard, slow_gate) = desk(topic.subscribe());
 
     let holding = tokio::spawn({
@@ -675,7 +746,7 @@ async fn a_slow_subscriber_blocks_the_publisher_instead_of_growing_a_buffer() {
     });
     let release = slow_gate.held().await;
 
-    // The one slot takes the first item.
+    // The explicit depth-one slot takes the first item.
     assert_eq!(
         topic.publish(1_u64).await,
         Fanout {
@@ -729,7 +800,7 @@ async fn a_slow_subscriber_blocks_the_publisher_instead_of_growing_a_buffer() {
 /// removing are two claims and this is the one a report alone cannot make.
 #[tokio::test]
 async fn a_subscription_dropped_is_a_subscriber_the_next_publish_prunes() {
-    let topic = Topic::new(Overflow::BlockPublisher);
+    let topic = Topic::new(Overflow::BlockPublisher(NonZeroUsize::MIN));
     let alive = topic.subscribe();
     drop(topic.subscribe());
     assert_eq!(topic.subscribers(), 2, "nothing sweeps in the background");

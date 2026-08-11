@@ -428,6 +428,25 @@ impl HasNoDefault for Intensity {}
 /// `Topic::default()` would be a topic whose overflow behaviour is whatever the
 /// derive picked.
 impl HasNoDefault for Overflow {}
+
+/// The exact public shape of [`Overflow`]: two exhaustive policies, each carrying
+/// one finite, non-zero depth.
+///
+/// No arm uses `..`, so adding a field or a variant makes this match fail to
+/// compile at the site that owns the exhaustive-policy argument.
+///
+/// Made red by `scripts/break-once.sh`, replacing
+/// `    BlockPublisher(NonZeroUsize),` with
+/// `    BlockPublisher(NonZeroUsize, bool),`. The all-feature library test build
+/// emitted `E0023` at `every_overflow_policy_carries_one_depth`: the pattern had
+/// one field while the changed variant had two.
+fn every_overflow_policy_carries_one_depth(overflow: Overflow) -> NonZeroUsize {
+    match overflow {
+        Overflow::BlockPublisher(depth) => depth,
+        Overflow::DropSubscriber(depth) => depth,
+    }
+}
+
 impl<T> HasNoDefault for Topic<T> {}
 /// The adapter inherits the property from the value it holds. A `Default` here
 /// would mean "a policy you did not name", and the only policy nobody named is

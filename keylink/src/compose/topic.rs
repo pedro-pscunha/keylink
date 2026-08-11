@@ -12,7 +12,7 @@
 //!     feed Fills(fill: Fill);
 //! }
 //!
-//! let topic = Topic::new(Overflow::BlockPublisher);
+//! let topic = Topic::new(Overflow::BlockPublisher(std::num::NonZeroUsize::MIN));
 //! let book = book::setup(Book::new()).feeds(book::Feeds::new(topic.subscribe())).actor();
 //! let risk = risk::setup(Risk::new()).feeds(risk::Feeds::new(topic.subscribe())).actor();
 //!
@@ -26,29 +26,29 @@
 //! push a message somebody in this process chose to send fire-and-forget, which
 //! is not what happened.
 //!
-//! # THE DECISION THIS MODULE OWNS — a slow subscriber is never queued
+//! # THE DECISION THIS MODULE OWNS — a finite subscriber depth, and two ways to be full
 //!
-//! **Each subscriber holds at most one unread item.** Not "one by default", not
-//! "one, configurable": one, and there is no argument that changes it.
+//! **Each subscriber holds at most the finite, non-zero depth carried by
+//! [`Overflow`].** There is no unbounded spelling. A larger depth absorbs a
+//! finite burst; it cannot hide a subscriber that stays slower than the publisher.
+//! Once the configured depth is full, [`Overflow`] says what happens next:
 //!
-//! That leaves exactly two things that can happen when an item arrives for a
-//! subscriber that has not read the last one, and [`Overflow`] is which:
-//!
-//! - [`Overflow::BlockPublisher`] — [`publish`](Topic::publish) does not return
-//!   until every subscriber has taken the item. The topic's rate is the slowest
-//!   subscriber's rate. One wedged subscriber wedges the publisher, and that is
-//!   not a defect of the mode, it *is* the mode.
-//! - [`Overflow::DropSubscriber`] — the slow subscriber is unsubscribed, its
-//!   stream ends, and its actor ends as
+//! - [`Overflow::BlockPublisher`] — [`publish`](Topic::publish) waits until every
+//!   subscriber's bounded channel accepts the item. The topic's sustained rate is
+//!   the slowest subscriber's rate. One wedged subscriber eventually wedges the
+//!   publisher, after its configured depth fills, and that is not a defect of the
+//!   mode, it *is* the mode.
+//! - [`Overflow::DropSubscriber`] — the full subscriber is unsubscribed, its
+//!   stream ends after its accepted items are read, and its actor ends as
 //!   [`Ended::Feed`](crate::Ended::Feed)`{ name }`. The publisher is never
 //!   delayed by it. Nothing is lost quietly: an actor ending is the loudest
 //!   thing this crate can say.
 //!
-//! There is deliberately **no third policy**, and the missing one is the one
-//! every fan-out reaches for: keep the item for later. A per-subscriber queue is
-//! an unbounded queue the moment a subscriber is durably slower than the
-//! publisher, and an unbounded queue is what `turns.rs` refuses by name — it
-//! turns a latency problem into memory growth and a diagnosis into an OOM.
+//! There is deliberately **no third policy**. A finite per-subscriber queue does
+//! not reintroduce the unbounded queue that `turns.rs` refuses by name: it moves
+//! the moment at which a burst meets the policy, but it cannot keep growing when
+//! a subscriber is durably slower. At the configured bound the publisher still
+//! blocks or the subscriber still ends.
 //!
 //! There is no [`Default`] for either [`Topic`] or [`Overflow`], for the reason
 //! [`Allowlist`](crate::Allowlist) has none: the policy is a decision about the
@@ -58,10 +58,10 @@
 //!
 //! # Three things this does not promise
 //!
-//! - **`publish` is not atomic.** Under [`Overflow::BlockPublisher`] it delivers
+//! - **`publish` is not atomic.** Under [`Overflow::BlockPublisher`] it offers
 //!   in subscription order, awaiting each; dropping its future leaves the item
-//!   delivered to the subscribers already reached and not to the rest. There is
-//!   no rollback, because a delivered item cannot be recalled. A caller that
+//!   accepted by the subscribers already reached and not by the rest. There is
+//!   no rollback, because an accepted item cannot be recalled. A caller that
 //!   needs all-or-nothing needs a transaction, and a fan-out is not one.
 //! - **No ordering across topics, and no ordering against the mailbox.** A
 //!   subscriber's feed items and its mailbox messages are ordered at the actor's
@@ -72,33 +72,26 @@
 //!
 //! # Cost
 //!
-//! One `tokio::sync::mpsc` channel of capacity one per subscriber, and one clone
-//! of the item per subscriber per publish. A large item wants an
-//! [`Arc`] around it; the clone is the caller's to make cheap,
+//! Each subscriber has one `tokio::sync::mpsc` channel with the configured finite
+//! capacity. Each publish clones the item once per subscriber. A large item wants
+//! an [`Arc`] around it; the clone is the caller's to make cheap,
 //! because a topic that boxed for you would allocate for the callers whose items
 //! are already two words.
 //!
 //! [`Feeds::new`]: crate::Feeds
 
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 
 use tokio::sync::mpsc;
 
-/// How many unread items a subscriber may hold.
+/// What happens when an item arrives after a subscriber's finite channel is full.
 ///
-/// One, and it is a `const` rather than a parameter so that the number appears
-/// once in the crate and a reader can find every line that depends on it. See
-/// this module's "no third policy" argument for why it is not a knob.
-const IN_FLIGHT: usize = 1;
-
-/// What happens when an item arrives for a subscriber that has not read the last
-/// one.
-///
-/// Named at the call site, never defaulted. The two variants are the only two
-/// answers that do not grow a queue, which is the whole of
-/// [`Topic`]'s design; see the module documentation.
+/// Named at the call site with its non-zero channel depth, never defaulted. The
+/// two variants are the only two answers once that bound is reached; see the
+/// module documentation.
 ///
 /// Not `#[non_exhaustive]`: a caller constructs one and a caller matches one, so
 /// sealing it would cost every call site a `_ =>` arm for a third policy that
@@ -107,8 +100,9 @@ const IN_FLIGHT: usize = 1;
 pub enum Overflow {
     /// Wait for the subscriber.
     ///
-    /// [`Topic::publish`] returns when every subscriber has taken the item, so
-    /// the publisher runs at the slowest subscriber's rate. Backpressure reaches
+    /// [`Topic::publish`] returns when every subscriber's bounded channel has
+    /// accepted the item. This does not mean the subscriber consumed it. Once the
+    /// configured depth is full, backpressure reaches
     /// whoever is producing the events, which is where it can actually be
     /// answered.
     ///
@@ -117,27 +111,23 @@ pub enum Overflow {
     /// slowing the publisher — an order book, a ledger, anything where the
     /// subscriber's state must not skip an event.
     ///
-    /// **A subscriber whose actor was spawned under
-    /// [`Backpressure::Shed`](crate::Backpressure::Shed) does not block the
-    /// publisher, and does not stay in step either.** The wait this arm relies on
-    /// is the subscriber's own mailbox permit; a shedding mailbox refuses instead
-    /// of parking, so that subscriber drops events while the publisher runs on.
-    /// Neither half of the trade above then holds for it. Build subscribers that
-    /// park if this is the arm you chose — the two are opposite answers to one
-    /// question, and the mailbox's answer wins because it is nearer.
-    BlockPublisher,
+    /// Generated feeds are polled beside the actor mailbox and do not enter it.
+    /// Therefore, actor [`Backpressure`](crate::Backpressure) does not change this
+    /// topic channel. Select [`DropSubscriber`](Self::DropSubscriber) when the
+    /// publisher must not wait for a feed subscriber.
+    BlockPublisher(NonZeroUsize),
     /// Unsubscribe the subscriber, and let its actor end saying so.
     ///
     /// The subscriber is removed from the topic, which drops the last sender on
-    /// its channel; its [`Subscription`] then yields the item it had not read
-    /// and ends. A feed that ends ends the actor, as
+    /// its channel; its [`Subscription`] then yields the accepted items it had not
+    /// read and ends. A feed that ends ends the actor, as
     /// [`Ended::Feed`](crate::Ended::Feed)`{ name }`, so a dropped subscriber is
     /// an actor that stopped and named the feed that stopped it.
     ///
     /// Choose it when the publisher must not be held up — a price feed, a metric
     /// stream — and when a subscriber that cannot keep up is better off
     /// restarted than fed stale events.
-    DropSubscriber,
+    DropSubscriber(NonZeroUsize),
 }
 
 /// What one [`publish`](Topic::publish) did.
@@ -151,7 +141,7 @@ pub enum Overflow {
 /// wants to log or meter reads these; one that does not is not hiding anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fanout {
-    /// Subscribers the item reached.
+    /// Subscriber channels that accepted the item.
     pub delivered: usize,
     /// Subscribers unsubscribed for being too slow.
     ///
@@ -178,9 +168,9 @@ pub struct Fanout {
 ///
 /// # Dropping the last `Topic` clone ends every subscriber
 ///
-/// The topic holds the only sender on each subscriber's channel, so when the last
-/// clone goes away every [`Subscription`] yields whatever it had not read and then
-/// ends — and a feed that ends ends its actor, as
+/// The topic holds the only sender on each subscriber's channel. When the last
+/// clone goes away, each [`Subscription`] yields all unread accepted items and
+/// then ends. A feed that ends ends its actor, as
 /// [`Ended::Feed`](crate::Ended::Feed).
 ///
 /// That is the right behaviour and it is worth stating, because it is a second
@@ -218,7 +208,8 @@ impl<T> Topic<T> {
         }
     }
 
-    /// A stream of everything published from now on.
+    /// A stream of everything published from now on, buffered to this topic's
+    /// finite subscriber depth.
     ///
     /// Hand it to a generated `Feeds::new` — it is a
     /// [`Stream`](crate::Stream), which is all a `feed` wants — or drive it
@@ -230,7 +221,11 @@ impl<T> Topic<T> {
     /// exists.
     #[must_use]
     pub fn subscribe(&self) -> Subscription<T> {
-        let (to, from) = mpsc::channel(IN_FLIGHT);
+        let depth = match self.overflow {
+            Overflow::BlockPublisher(depth) => depth,
+            Overflow::DropSubscriber(depth) => depth,
+        };
+        let (to, from) = mpsc::channel(depth.get());
         self.lock().push(to);
         Subscription { from }
     }
@@ -271,7 +266,10 @@ impl<T> Topic<T> {
 }
 
 impl<T: Clone> Topic<T> {
-    /// Send `item` to every subscriber, under this topic's [`Overflow`].
+    /// Offer `item` to every subscriber, under this topic's [`Overflow`].
+    ///
+    /// A successful delivery means the bounded channel accepted the item. It does
+    /// not mean the subscriber consumed it or ran a turn for it.
     ///
     /// Whether this awaits at all is the policy's business:
     /// [`Overflow::BlockPublisher`] awaits every subscriber's permit, and
@@ -288,8 +286,8 @@ impl<T: Clone> Topic<T> {
     /// deadlocks rather than degrades.
     pub async fn publish(&self, item: T) -> Fanout {
         match self.overflow {
-            Overflow::DropSubscriber => self.publish_dropping(item),
-            Overflow::BlockPublisher => self.publish_blocking(item).await,
+            Overflow::DropSubscriber(_) => self.publish_dropping(item),
+            Overflow::BlockPublisher(_) => self.publish_blocking(item).await,
         }
     }
 
@@ -311,8 +309,8 @@ impl<T: Clone> Topic<T> {
                 delivered += 1;
                 true
             }
-            // The subscriber has an unread item. One is the bound, so this one
-            // is its last: it keeps what it had and its stream ends.
+            // The subscriber's configured depth is full, so this item is its
+            // last attempt: it keeps what was already accepted and its stream ends.
             Err(mpsc::error::TrySendError::Full(_)) => {
                 dropped += 1;
                 false
@@ -350,9 +348,9 @@ impl<T: Clone> Topic<T> {
         let mut delivered = 0;
         let mut gone = 0;
         for one in to {
-            // The permit is the bound. `send` resolves when the subscriber has
-            // read the previous item, so a publisher cannot outrun a subscriber
-            // by even one item.
+            // The permit is the bound. `send` resolves when the bounded channel
+            // accepts this item; once the configured depth is full, that requires
+            // the subscriber to read an earlier item.
             match one.send(item.clone()).await {
                 Ok(()) => delivered += 1,
                 Err(_) => gone += 1,

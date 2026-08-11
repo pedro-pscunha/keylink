@@ -1364,18 +1364,18 @@ fn chatter(overflow: Overflow) -> room::Handle<Chatter> {
 /// completes without yielding, which is worth knowing for a caller that
 /// publishes from inside a turn" — and states it as prose. This is the guard.
 ///
-/// `IN_FLIGHT` is 1, so the first item fits and the second finds the subscriber
-/// full. Under this policy that unsubscribes the reader and the publish returns;
-/// nothing awaits, so no edge of the cycle can block.
+/// The policy is constructed with explicit depth one, so the first item fits and
+/// the second finds the subscriber full. This policy unsubscribes the reader, and
+/// the publish returns. Nothing awaits, so no edge of the cycle can block.
 ///
 /// Made red by `scripts/break-once.sh`, replacing `Topic::publish`'s
-/// `Overflow::DropSubscriber => self.publish_dropping(item),` with
-/// `Overflow::DropSubscriber => self.publish_blocking(item).await,` — the policy
+/// `Overflow::DropSubscriber(_) => self.publish_dropping(item),` with
+/// `Overflow::DropSubscriber(_) => self.publish_blocking(item).await,` — the policy
 /// swapped for the one that awaits. Watched: "a dropping publish must not hang:
 /// nothing in it awaits: Elapsed(())".
 #[tokio::test]
 async fn publishing_into_your_own_topic_completes_under_drop_subscriber() {
-    let room = chatter(Overflow::DropSubscriber);
+    let room = chatter(Overflow::DropSubscriber(NonZeroUsize::MIN));
 
     let dropped = n0_future::time::timeout(SETTLE, room.shout(2))
         .await
@@ -1383,7 +1383,7 @@ async fn publishing_into_your_own_topic_completes_under_drop_subscriber() {
         .expect("the actor is running");
     assert_eq!(
         dropped, 1,
-        "IN_FLIGHT is 1: the first item fits, the second unsubscribes the reader"
+        "at depth one, the first item fits and the second unsubscribes the reader"
     );
 
     // And the actor is still taking messages, which is the half that makes this
@@ -1402,12 +1402,12 @@ async fn publishing_into_your_own_topic_completes_under_drop_subscriber() {
 /// preference about throughput.
 ///
 /// Made red by `scripts/break-once.sh`, replacing `Topic::publish`'s
-/// `Overflow::BlockPublisher => self.publish_blocking(item).await,` with
-/// `Overflow::BlockPublisher => self.publish_dropping(item),`. Watched: "a
+/// `Overflow::BlockPublisher(_) => self.publish_blocking(item).await,` with
+/// `Overflow::BlockPublisher(_) => self.publish_dropping(item),`. Watched: "a
 /// blocking publish into your own topic must hang".
 #[tokio::test]
 async fn publishing_into_your_own_topic_hangs_under_block_publisher() {
-    let room = chatter(Overflow::BlockPublisher);
+    let room = chatter(Overflow::BlockPublisher(NonZeroUsize::MIN));
 
     let mut shouting = {
         let room = room.clone();

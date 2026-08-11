@@ -53,8 +53,8 @@
 //!
 //! | pattern | what a slow consumer costs | how it is bounded |
 //! |---|---|---|
-//! | [`Topic`] with [`Overflow::BlockPublisher`] | the publisher waits | one item in flight per subscriber. [`publish`](Topic::publish) does not return until the slowest has taken it |
-//! | [`Topic`] with [`Overflow::DropSubscriber`] | the subscriber is unsubscribed, loudly | one item in flight per subscriber. A second arriving while the first is unread ends that subscriber's stream, so its actor ends as [`Ended::Feed`](crate::Ended::Feed) |
+//! | [`Topic`] with [`Overflow::BlockPublisher`] | the publisher waits after the configured depth is full | a finite, non-zero channel per subscriber. [`publish`](Topic::publish) returns when every channel has accepted the item, not when every subscriber has consumed it |
+//! | [`Topic`] with [`Overflow::DropSubscriber`] | the subscriber is unsubscribed, loudly, after the configured depth is full | a finite, non-zero channel per subscriber. The item that exceeds the bound ends that subscriber's stream, so its actor ends as [`Ended::Feed`](crate::Ended::Feed) |
 //! | [`Pool`] | the caller waits, on that member's own mailbox | the pool holds **no** queue at all. [`pick`](Pool::pick) hands back a handle; the wait is the ordinary mailbox permit |
 //! | [`Factory`] | the caller waits, on the chosen member's own mailbox | the factory holds **no** queue at all. [`dispatch`](Factory::dispatch) hands back a [`Permit`](crate::Permit); the wait is the ordinary mailbox permit, taken before the caller's arguments move |
 //! | [`every`] | the next run is late | a run in progress is never re-entered and a missed tick is never queued. The period is a floor on the *gap*, not a rate |
@@ -87,30 +87,16 @@
 //! nothing can call *into* a group at all — and states the residual it does not
 //! close, which is caller code that blocks inside the policy.
 //!
-//! # Designed against a mailbox of one, and where a deeper one would change this
+//! # Topic depth is explicit and independent of mailbox depth
 //!
-//! `turns.rs`'s `DEFAULT_LOCAL_MAILBOX_DEPTH` is 1 — as is `registry.rs`'s
-//! `DEFAULT_MAILBOX_DEPTH`, the keyed side's — and every number in this module is
-//! chosen against that. Both are DEFAULTS: a caller can raise either, and this
-//! module's numbers do not move with them, which is the whole of the paragraph
-//! below.
-//! One item in flight per subscriber matches it: a subscriber is "slow" exactly
-//! when it is still inside a turn while the next item arrives, which is the same
-//! definition of slow the mailbox already uses.
+//! A mailbox and a topic bound different queues. Mailbox defaults do not limit a
+//! topic, and a topic does not read them. Each [`Overflow`] variant carries the
+//! finite, non-zero depth for one subscriber channel.
 //!
-//! A deeper mailbox would change **one** thing and it is worth naming, because
-//! it is the change that would quietly re-introduce the unbounded queue. With a
-//! mailbox of *k*, the obvious next step is a subscriber buffer of *k* — "for
-//! symmetry" — and the moment that depth is a caller-supplied number, a fan-out
-//! is an unbounded queue with an extra argument. If a per-subscriber depth is
-//! ever added it must be bounded by the same constant the mailbox is, and a
-//! subscriber at its bound must still hit one of the two policies above rather
-//! than a third that grows.
-//!
-//! Nothing in this module reads either constant or depends on its value. Both
-//! are private, which is why they are named here as text rather than linked: a
-//! reader who greps for them finds the declaration, and an intra-doc link would
-//! not resolve.
+//! A larger topic depth absorbs a finite burst. It does not make the queue
+//! unbounded. When the channel reaches that exact depth, the selected policy
+//! waits for capacity or removes the subscriber. Raising an actor's mailbox depth
+//! does not change this decision because generated feeds bypass the mailbox.
 //!
 //! # Handle ergonomics: already here, under keylink's names
 //!
