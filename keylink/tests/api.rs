@@ -505,6 +505,39 @@ mod capability_matrix {
     fn implements_servable<T: Servable>() {}
 
     #[allow(dead_code)]
+    fn own_associated_types_are_exact<'a>() {
+        let state: Option<<depot::Handle<Counter> as Own>::State> = None;
+        let _: Option<Counter> = state;
+
+        let permit: Option<<depot::Handle<Counter> as Own>::Permit<'a>> = None;
+        let _: Option<depot::Permit<'a, Counter>> = permit;
+
+        let owned: Option<<depot::Handle<Counter> as Own>::OwnedPermit> = None;
+        let _: Option<depot::OwnedPermit<Counter>> = owned;
+    }
+
+    #[allow(dead_code)]
+    fn borrowed_permit_keeps_the_handle_lifetime<'a>(
+        handle: &'a depot::Handle<Counter>,
+    ) -> Result<Option<depot::Permit<'a, Counter>>, keylink::NotQueued> {
+        Own::try_reserve(handle)
+    }
+
+    #[allow(dead_code)]
+    async fn reserve_contract_keeps_the_handle_lifetime<'a>(
+        handle: &'a depot::Handle<Counter>,
+    ) -> Result<depot::Permit<'a, Counter>, keylink::NotQueued> {
+        Own::reserve(handle).await
+    }
+
+    #[allow(dead_code)]
+    async fn owned_reserve_contract_is_owned(
+        handle: depot::Handle<Counter>,
+    ) -> Result<depot::OwnedPermit<Counter>, keylink::NotQueued> {
+        Own::reserve_owned(handle).await
+    }
+
+    #[allow(dead_code)]
     fn positive_matrix() {
         implements_wire::<depot::RegistryClient>();
         implements_wire::<depot::Client>();
