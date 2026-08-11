@@ -97,7 +97,7 @@
 use std::num::NonZeroUsize;
 use std::ops::DerefMut;
 
-use crate::compose::{Overflow, Topic};
+use crate::compose::{BroadcastDepth, Lossy, LossySubscription, LossyTopic, Overflow, Topic};
 use crate::{
     ActorId, ActorStatus, Admission, Admittance, AdmittedPeer, Allowlist, Backpressure, BlobId,
     Caller, DynamicAdmission, Ended, Eviction, FinishFut, IdempotencyKey, Intensity, Keyable,
@@ -458,6 +458,25 @@ fn every_overflow_policy_carries_one_depth(overflow: Overflow) -> NonZeroUsize {
 }
 
 impl<T> HasNoDefault for Topic<T> {}
+impl HasNoDefault for BroadcastDepth {}
+impl HasNoDefault for Lossy {}
+impl<T> HasNoDefault for LossyTopic<T> {}
+
+fn every_lossy_policy_carries_one_depth(policy: Lossy) -> NonZeroUsize {
+    match policy {
+        Lossy::DropNewest(depth) => depth,
+        Lossy::DropOldest(depth) => depth.get(),
+    }
+}
+
+fn lossy_subscription_is_a_send_static_stream<T>(subscription: LossySubscription<T>)
+where
+    T: Clone + Send + 'static,
+{
+    fn assert_stream<T>(_: impl crate::Stream<Item = Lagged<T>> + Send + 'static) {}
+    use crate::compose::Lagged;
+    assert_stream(subscription);
+}
 /// The adapter inherits the property from the value it holds. A `Default` here
 /// would mean "a policy you did not name", and the only policy nobody named is
 /// the one that admits everyone.

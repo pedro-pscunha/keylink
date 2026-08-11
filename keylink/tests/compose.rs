@@ -101,20 +101,21 @@
 
 use keylink::prelude::*;
 use std::future::Future;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use keylink::compose::{
-    after, every, Added, Endings, Factory, Fanout, Group, GroupEnded, Membership, Names, Overflow,
-    Patience, PatienceError, Pool, Routing, Sample, Shard, Subscription, Topic, Verdict,
+    after, every, Added, BroadcastDepth, BroadcastDepthError, Endings, Factory, Fanout, Group,
+    GroupEnded, Lagged, Lossy, LossyFanout, LossyTopic, Membership, Names, Overflow, Patience,
+    PatienceError, Pool, Routing, Sample, Shard, Subscription, Topic, Verdict,
 };
 use keylink::{
     ActorId, Backpressure, Caller, Ended, Eviction, Intensity, Lifecycle, NotQueued, Observer,
     Stop, TurnFut, TurnInfo,
 };
 use n0_future::time::Duration;
-use n0_future::StreamExt;
+use n0_future::{FutureExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 // The subscriber under test: it takes fills on a feed, and it can be parked
@@ -4162,3 +4163,504 @@ async fn a_group_accepts_the_direct_system_ending_of_a_keyed_member() {
         } if member == id
     ));
 }
+
+#[test]
+fn lossy_broadcast_depth_accepts_only_tokios_safe_powers_of_two() {
+    let _: fn(NonZeroUsize) -> Result<BroadcastDepth, BroadcastDepthError> =
+        BroadcastDepth::try_new;
+    let _: fn(BroadcastDepth) -> NonZeroUsize = BroadcastDepth::get;
+    let largest = NonZeroUsize::new(1_usize << (usize::BITS - 2)).unwrap();
+    assert_eq!(NonZeroUsize::new(0), None, "zero is unrepresentable");
+    assert_eq!(
+        BroadcastDepth::try_new(NonZeroUsize::new(3).unwrap()),
+        Err(BroadcastDepthError)
+    );
+    assert_eq!(
+        BroadcastDepth::try_new(NonZeroUsize::new(largest.get() * 2).unwrap()),
+        Err(BroadcastDepthError)
+    );
+    assert_eq!(
+        BroadcastDepth::try_new(NonZeroUsize::MIN)
+            .expect("one is valid")
+            .get(),
+        NonZeroUsize::MIN
+    );
+    let two = NonZeroUsize::new(2).unwrap();
+    assert_eq!(
+        BroadcastDepth::try_new(two).expect("two is valid").get(),
+        two
+    );
+    assert_eq!(
+        BroadcastDepth::try_new(largest)
+            .expect("maximum is valid")
+            .get(),
+        largest
+    );
+}
+
+#[tokio::test]
+async fn lossy_drop_oldest_reports_loss_before_surviving_items_at_two_depths() {
+    for depth in [1, 2] {
+        let topic = LossyTopic::new(Lossy::DropOldest(
+            BroadcastDepth::try_new(NonZeroUsize::new(depth).unwrap())
+                .expect("tested power of two"),
+        ));
+        let mut subscription = topic.subscribe();
+        assert_eq!(
+            topic.publish('A'),
+            LossyFanout {
+                subscribers: 1,
+                accepted: 1
+            }
+        );
+        assert_eq!(topic.publish('B').accepted, 1);
+        if depth == 2 {
+            assert_eq!(topic.publish('C').accepted, 1);
+        }
+        assert_eq!(
+            subscription.next().await,
+            Some(Lagged::Skipped(NonZeroU64::MIN))
+        );
+        if depth == 2 {
+            assert_eq!(subscription.next().await, Some(Lagged::Item('B')));
+            assert_eq!(subscription.next().await, Some(Lagged::Item('C')));
+        } else {
+            assert_eq!(subscription.next().await, Some(Lagged::Item('B')));
+        }
+    }
+}
+
+#[tokio::test]
+async fn lossy_drop_newest_depth_two_keeps_backlog_then_marks_before_later_item() {
+    let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::new(2).unwrap()));
+    let mut subscription = topic.subscribe();
+    assert_eq!(topic.publish('A').accepted, 1);
+    assert_eq!(topic.publish('B').accepted, 1);
+    assert_eq!(topic.publish('C').accepted, 0);
+    assert_eq!(topic.publish('D').accepted, 0);
+    assert_eq!(subscription.next().await, Some(Lagged::Item('A')));
+    assert_eq!(subscription.next().await, Some(Lagged::Item('B')));
+    assert_eq!(topic.publish('E').accepted, 1);
+    assert_eq!(
+        subscription.next().await,
+        Some(Lagged::Skipped(NonZeroU64::new(2).unwrap()))
+    );
+    assert_eq!(subscription.next().await, Some(Lagged::Item('E')));
+}
+
+#[tokio::test]
+async fn lossy_drop_newest_emits_no_marker_without_loss() {
+    let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
+    let mut subscription = topic.subscribe();
+    assert_eq!(topic.publish(7).accepted, 1);
+    assert_eq!(subscription.next().await, Some(Lagged::Item(7)));
+}
+
+#[tokio::test]
+async fn lossy_drop_newest_emits_pending_loss_after_backlog_when_publisher_ends() {
+    let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::new(2).unwrap()));
+    let mut subscription = topic.subscribe();
+    topic.publish('A');
+    topic.publish('B');
+    topic.publish('C');
+    drop(topic);
+    assert_eq!(subscription.next().await, Some(Lagged::Item('A')));
+    assert_eq!(subscription.next().await, Some(Lagged::Item('B')));
+    assert_eq!(
+        subscription.next().await,
+        Some(Lagged::Skipped(NonZeroU64::MIN))
+    );
+    assert_eq!(subscription.next().await, None);
+}
+
+#[tokio::test]
+async fn lossy_fanout_counts_live_and_accepting_receivers_without_removing_slow_ones() {
+    let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
+    let mut slow = topic.subscribe();
+    let mut fast = topic.subscribe();
+    assert_eq!(
+        topic.publish('A'),
+        LossyFanout {
+            subscribers: 2,
+            accepted: 2
+        }
+    );
+    assert_eq!(fast.next().await, Some(Lagged::Item('A')));
+    assert_eq!(
+        topic.publish('B'),
+        LossyFanout {
+            subscribers: 2,
+            accepted: 1
+        }
+    );
+    assert_eq!(slow.next().await, Some(Lagged::Item('A')));
+    assert_eq!(fast.next().await, Some(Lagged::Item('B')));
+    drop(fast);
+    assert_eq!(
+        topic.publish('C'),
+        LossyFanout {
+            subscribers: 1,
+            accepted: 1
+        }
+    );
+    assert_eq!(slow.next().await, Some(Lagged::Skipped(NonZeroU64::MIN)));
+    assert_eq!(slow.next().await, Some(Lagged::Item('C')));
+}
+
+#[tokio::test]
+async fn lossy_drop_oldest_counts_every_live_receiver_as_accepting() {
+    let topic = LossyTopic::new(Lossy::DropOldest(
+        BroadcastDepth::try_new(NonZeroUsize::MIN).unwrap(),
+    ));
+    let mut live = topic.subscribe();
+    let closed = topic.subscribe();
+    drop(closed);
+    assert_eq!(
+        topic.publish(9),
+        LossyFanout {
+            subscribers: 1,
+            accepted: 1
+        }
+    );
+    assert_eq!(live.next().await, Some(Lagged::Item(9)));
+}
+
+#[tokio::test]
+async fn lossy_drop_newest_emits_pending_loss_while_the_publisher_is_live() {
+    let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::new(2).unwrap()));
+    let mut subscription = topic.subscribe();
+    assert_eq!(topic.publish('A').accepted, 1);
+    assert_eq!(topic.publish('B').accepted, 1);
+    assert_eq!(topic.publish('C').accepted, 0);
+    assert_eq!(subscription.next().await, Some(Lagged::Item('A')));
+    assert_eq!(subscription.next().await, Some(Lagged::Item('B')));
+    assert_eq!(
+        n0_future::future::poll_once(subscription.next()).await,
+        Some(Some(Lagged::Skipped(NonZeroU64::MIN))),
+        "draining accepted backlog surfaces pending loss without closing the publisher"
+    );
+    assert_eq!(topic.publish('D').accepted, 1, "the publisher remains live");
+    assert_eq!(subscription.next().await, Some(Lagged::Item('D')));
+}
+
+#[tokio::test]
+async fn lossy_drop_newest_orders_a_pending_take_before_a_later_publish() {
+    let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
+    let mut subscription = topic.subscribe();
+    assert_eq!(topic.publish('A').accepted, 1);
+    assert_eq!(topic.publish('B').accepted, 0);
+    assert_eq!(subscription.next().await, Some(Lagged::Item('A')));
+
+    assert_eq!(
+        n0_future::future::poll_once(subscription.next()).await,
+        Some(Some(Lagged::Skipped(NonZeroU64::MIN))),
+        "the receiver takes pending loss first"
+    );
+    assert_eq!(topic.publish('C').accepted, 1);
+    assert_eq!(
+        subscription.next().await,
+        Some(Lagged::Item('C')),
+        "the later accepted item is untagged"
+    );
+}
+
+#[tokio::test]
+async fn lossy_drop_newest_orders_a_successful_publish_before_a_pending_take() {
+    let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
+    let mut subscription = topic.subscribe();
+    assert_eq!(topic.publish('A').accepted, 1);
+    assert_eq!(topic.publish('B').accepted, 0);
+    assert_eq!(subscription.next().await, Some(Lagged::Item('A')));
+
+    assert_eq!(
+        topic.publish('C').accepted,
+        1,
+        "the publisher wins the lock"
+    );
+    assert_eq!(
+        subscription.next().await,
+        Some(Lagged::Skipped(NonZeroU64::MIN)),
+        "the successful publish moves pending loss into its entry"
+    );
+    assert_eq!(subscription.next().await, Some(Lagged::Item('C')));
+}
+
+#[tokio::test]
+async fn lossy_drop_newest_wakes_after_a_cancelled_empty_poll() {
+    let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
+    let mut subscription = topic.subscribe();
+    assert!(
+        n0_future::future::poll_once(subscription.next())
+            .await
+            .is_none(),
+        "the empty receiver parks"
+    );
+
+    assert_eq!(topic.publish('A').accepted, 1);
+    assert_eq!(
+        n0_future::future::poll_once(subscription.next()).await,
+        Some(Some(Lagged::Item('A'))),
+        "publication wakes the receive retained across cancellation"
+    );
+}
+
+#[test]
+fn lossy_drop_newest_close_during_clone_is_not_counted_live() {
+    #[derive(Debug)]
+    struct BlockingClone {
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    }
+
+    impl Clone for BlockingClone {
+        fn clone(&self) -> Self {
+            self.entered.wait();
+            self.release.wait();
+            Self {
+                entered: Arc::clone(&self.entered),
+                release: Arc::clone(&self.release),
+            }
+        }
+    }
+
+    let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
+    let subscription = topic.subscribe();
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let item = BlockingClone {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    };
+
+    std::thread::scope(|scope| {
+        let publishing = scope.spawn(|| topic.publish(item));
+        entered.wait();
+        drop(subscription);
+        release.wait();
+        assert_eq!(
+            publishing.join().expect("the publication thread returns"),
+            LossyFanout {
+                subscribers: 0,
+                accepted: 0,
+            }
+        );
+    });
+}
+
+#[tokio::test]
+async fn lossy_drop_newest_clone_panic_leaves_both_mutexes_usable() {
+    #[derive(Debug)]
+    struct Brittle {
+        clones: Arc<AtomicUsize>,
+        limit: usize,
+    }
+
+    impl Brittle {
+        fn breaking_after(limit: usize) -> Self {
+            Self {
+                clones: Arc::new(AtomicUsize::new(0)),
+                limit,
+            }
+        }
+    }
+
+    impl Clone for Brittle {
+        fn clone(&self) -> Self {
+            assert!(
+                self.clones.fetch_add(1, Ordering::SeqCst) < self.limit,
+                "this Clone has had enough"
+            );
+            Self {
+                clones: Arc::clone(&self.clones),
+                limit: self.limit,
+            }
+        }
+    }
+
+    let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
+    let mut first = topic.subscribe();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            topic.publish(Brittle::breaking_after(0));
+        }))
+        .is_err(),
+        "the caller's Clone panic leaves topic mutexes unlocked"
+    );
+    let state_recovery = std::panic::AssertUnwindSafe(n0_future::future::poll_once(first.next()))
+        .catch_unwind()
+        .await;
+    if state_recovery.is_err() {
+        std::mem::forget(topic);
+        panic!("the subscriber-state mutex was poisoned by caller Clone");
+    }
+    assert!(state_recovery.unwrap().is_none());
+
+    let mut second =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| topic.subscribe())) {
+            Ok(subscription) => subscription,
+            Err(_) => {
+                std::mem::forget(topic);
+                panic!("the subscriber-list mutex was poisoned by caller Clone");
+            }
+        };
+    assert_eq!(
+        topic.publish(Brittle::breaking_after(usize::MAX)),
+        LossyFanout {
+            subscribers: 2,
+            accepted: 2,
+        },
+        "both subscriber mutexes remain usable after caller Clone panics"
+    );
+    assert!(matches!(first.next().await, Some(Lagged::Item(_))));
+    assert!(matches!(second.next().await, Some(Lagged::Item(_))));
+}
+
+#[tokio::test]
+async fn lossy_drop_newest_closes_only_after_the_final_publisher_drops() {
+    let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
+    let remaining = topic.clone();
+    let mut subscription = topic.subscribe();
+
+    assert_eq!(topic.publish('A').accepted, 1);
+    assert_eq!(topic.publish('B').accepted, 0);
+    drop(topic);
+    assert_eq!(subscription.next().await, Some(Lagged::Item('A')));
+    assert_eq!(
+        n0_future::future::poll_once(subscription.next()).await,
+        Some(Some(Lagged::Skipped(NonZeroU64::MIN))),
+        "pending loss is visible while one publisher clone remains"
+    );
+    assert!(
+        n0_future::future::poll_once(subscription.next())
+            .await
+            .is_none(),
+        "one publisher clone keeps the stream open"
+    );
+
+    assert_eq!(remaining.publish('C').accepted, 1);
+    assert_eq!(remaining.publish('D').accepted, 0);
+    drop(remaining);
+    assert_eq!(subscription.next().await, Some(Lagged::Item('C')));
+    assert_eq!(
+        subscription.next().await,
+        Some(Lagged::Skipped(NonZeroU64::MIN))
+    );
+    assert_eq!(
+        n0_future::future::poll_once(subscription.next()).await,
+        Some(None),
+        "the final publisher closes after accepted backlog and pending loss drain"
+    );
+}
+
+#[tokio::test]
+async fn lossy_drop_oldest_closes_only_after_the_final_publisher_drops() {
+    let topic = LossyTopic::new(Lossy::DropOldest(
+        BroadcastDepth::try_new(NonZeroUsize::MIN).unwrap(),
+    ));
+    let remaining = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| topic.clone()))
+        .expect("a publisher clone keeps ownership of the same broadcast sender");
+    let mut subscription = topic.subscribe();
+
+    assert_eq!(topic.publish('A').accepted, 1);
+    drop(topic);
+    assert_eq!(subscription.next().await, Some(Lagged::Item('A')));
+    assert!(
+        n0_future::future::poll_once(subscription.next())
+            .await
+            .is_none(),
+        "one publisher clone keeps the stream open"
+    );
+
+    assert_eq!(remaining.publish('B').accepted, 1);
+    assert_eq!(remaining.publish('C').accepted, 1);
+    drop(remaining);
+    assert_eq!(
+        subscription.next().await,
+        Some(Lagged::Skipped(NonZeroU64::MIN))
+    );
+    assert_eq!(subscription.next().await, Some(Lagged::Item('C')));
+    assert_eq!(
+        n0_future::future::poll_once(subscription.next()).await,
+        Some(None),
+        "the final publisher closes after the surviving ring backlog drains"
+    );
+}
+
+// C3 loss guards were each run through `scripts/break-once.sh` after formatting.
+// Every native behavior break selected one test and failed; the three browser
+// repeats loaded Chrome and failed the selected browser test. Compile probes
+// stopped in rustc, and both private-construction doctests failed because the
+// formerly compile-failing example compiled. Evidence is in `/tmp/c3-break-*.log`.
+//
+// Search literals, kept here because `.mise/tasks/anchors` verifies them:
+// `        if !depth.get().is_power_of_two() || depth.get() > Self::MAX {`
+// `                    NonZeroU64::new(skipped).map(|skipped| (Lagged::Skipped(skipped), from))`
+// `                                .map_or(1, |count| count.get().saturating_add(1));`
+// `                    cursor.held = Some(entry.item);`
+// `                    let pending = recover(&cursor.state).pending.take();`
+// `                        skipped_before: state.pending,`
+// `                            accepted += 1;`
+// `                                    Err(mpsc::error::TrySendError::Closed(entry)) => {`
+// `                let accepted = to.send(item).unwrap_or(0);`
+// `                let (to, from) = broadcast::channel(usize::from(depth.get()));`
+// `                let (to, from) = mpsc::channel(publisher.depth.get());`
+// `pub struct BroadcastDepth(NonZeroUsize);`
+// `pub enum Lossy {`
+// `pub struct LossyTopic<T> {`
+// `    DropNewest(NonZeroUsize),`
+// `    stream: Pin<Box<dyn Stream<Item = Lagged<T>> + Send + 'static>>,`
+
+//
+// C3 review-continuation guards were replayed after formatting. Every behavior
+// break selected exactly one named test and reached its intended assertion; the
+// exact API breaks reached the function-pointer compile probes with E0308.
+// Evidence is in `/tmp/c3-continuation-break-*.log`.
+//
+// The live-marker guard separately broke queue-first ordering and pending take;
+// both failed at their own `Lagged` assertions. The two lock orders broke at the
+// pending-first and tagged-entry assertions. Closed accounting reported 1/0
+// instead of 0/0. Poison recovery reached "did not recover" after the clone
+// bomb poisoned both held mutexes. Publisher ownership breaks reached the
+// one-clone-open and final-close assertions for DropNewest and the caught clone
+// assertion for DropOldest. The retained empty receive break reached the wake
+// assertion after cancellation.
+//
+// Additional exact search literals registered in `.mise/tasks/anchors`:
+// `                match cursor.from.try_recv() {`
+// `                        state.pending.take().map_or(Ready::Empty, Ready::Pending)`
+// `    lock.lock().unwrap_or_else(PoisonError::into_inner)`
+// `            recover(subscriber).to.take();`
+// `            LossyInner::DropNewest(inner) => LossyInner::DropNewest(Arc::clone(inner)),`
+// `            LossyInner::DropOldest(to) => LossyInner::DropOldest(to.clone()),`
+// The constructor, getter, and retained-receive rows use their whole formatted
+// blocks as anchors because each watched break replaced that whole block.
+// Constructor block:
+// `    pub const fn try_new(depth: NonZeroUsize) -> Result<Self, BroadcastDepthError> {
+//         if !depth.get().is_power_of_two() || depth.get() > Self::MAX {
+//             return Err(BroadcastDepthError);
+//         }
+//         Ok(Self(depth))
+//     }`
+// Getter block:
+// `    pub const fn get(self) -> NonZeroUsize {
+//         self.0
+//     }`
+// Retained-receive block:
+// `                Ready::Empty => match cursor.from.recv().await {
+//                     Some(entry) => entry,
+//                     None => {
+//                         cursor.ended = true;
+//                         let pending = recover(&cursor.state).pending.take();
+//                         return pending.map(|skipped| (Lagged::Skipped(skipped), cursor));
+//                     }
+//                 },`
+//
+// C3 callback-lock guards were each replayed through `scripts/break-once.sh`
+// after formatting and selected one unit test. Holding the subscriber-list
+// mutex across Clone reached the Clone lock assertion. Moving deferred payload
+// destruction under the publication-order mutex reached the Full and Closed
+// Drop lock assertions separately. Evidence is in `/tmp/c3-callback-break-*.log`.
+//
+// Additional exact search literals registered in `.mise/tasks/anchors`:
+// `                let snapshot = recover(&publisher.subscribers).clone();`
+// `                drop(rejected);`

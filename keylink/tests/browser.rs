@@ -34,6 +34,8 @@
 //!    boundaries without waiting for the accepted maximum, then exercises the
 //!    browser timer and confirms timeout removes the subscriber without queuing
 //!    the item that exceeded its patience.
+//! 5. **Bounded lossy fan-out.** `BroadcastDepth` boundaries and both loss
+//!    policies run in Chrome, including in-band loss before the surviving item.
 //!
 //! Not covered, said here rather than left to be assumed: no `Node`, no
 //! `Server`, no `Client`, no connection, no actor turn, and nothing at all from
@@ -81,12 +83,15 @@
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use keylink::compose::{Fanout, Overflow, Patience, Topic};
+use keylink::compose::{
+    BroadcastDepth, BroadcastDepthError, Fanout, Lagged, Lossy, LossyTopic, Overflow, Patience,
+    Topic,
+};
 use keylink::{derive_alpn, Body, Error, Outcome, RemoteError, WireResponse};
 use n0_future::time::Duration;
 use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use wasm_bindgen::JsValue;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -263,4 +268,55 @@ async fn a_timed_out_topic_subscriber_is_removed_in_a_browser() {
     );
     assert_eq!(slow.next().await, Some(1));
     assert_eq!(slow.next().await, None);
+}
+
+#[wasm_bindgen_test]
+fn lossy_broadcast_depth_boundaries_hold_in_a_browser() {
+    let largest = NonZeroUsize::new(1_usize << (usize::BITS - 2)).unwrap();
+    assert_eq!(NonZeroUsize::new(0), None, "zero is unrepresentable");
+    assert_eq!(
+        BroadcastDepth::try_new(NonZeroUsize::new(3).unwrap()),
+        Err(BroadcastDepthError)
+    );
+    assert_eq!(
+        BroadcastDepth::try_new(NonZeroUsize::new(largest.get() * 2).unwrap()),
+        Err(BroadcastDepthError)
+    );
+    assert_eq!(
+        BroadcastDepth::try_new(NonZeroUsize::MIN).unwrap().get(),
+        NonZeroUsize::MIN
+    );
+    let two = NonZeroUsize::new(2).unwrap();
+    assert_eq!(BroadcastDepth::try_new(two).unwrap().get(), two);
+    assert_eq!(BroadcastDepth::try_new(largest).unwrap().get(), largest);
+}
+
+#[wasm_bindgen_test]
+async fn lossy_drop_oldest_runs_in_a_browser() {
+    let topic = LossyTopic::new(Lossy::DropOldest(
+        BroadcastDepth::try_new(NonZeroUsize::MIN).unwrap(),
+    ));
+    let mut subscription = topic.subscribe();
+    assert_eq!(topic.publish('A').accepted, 1);
+    assert_eq!(topic.publish('B').accepted, 1);
+    assert_eq!(
+        subscription.next().await,
+        Some(Lagged::Skipped(NonZeroU64::MIN))
+    );
+    assert_eq!(subscription.next().await, Some(Lagged::Item('B')));
+}
+
+#[wasm_bindgen_test]
+async fn lossy_drop_newest_runs_in_a_browser() {
+    let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
+    let mut subscription = topic.subscribe();
+    assert_eq!(topic.publish('A').accepted, 1);
+    assert_eq!(topic.publish('B').accepted, 0);
+    assert_eq!(subscription.next().await, Some(Lagged::Item('A')));
+    assert_eq!(topic.publish('C').accepted, 1);
+    assert_eq!(
+        subscription.next().await,
+        Some(Lagged::Skipped(NonZeroU64::MIN))
+    );
+    assert_eq!(subscription.next().await, Some(Lagged::Item('C')));
 }
