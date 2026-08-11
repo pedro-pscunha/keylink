@@ -11,11 +11,16 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use iroh::endpoint::ConnectionError;
 use keylink::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use keylink::{Admission, Admittance, Allowlist, Context, DynamicAdmission, Error, ProvenPeer};
+use keylink::{
+    Admission, Admittance, Allowlist, Body, BodyReader, ConfigError, Context, DynamicAdmission,
+    Error, Middleware, Next, Outcome, ProvenPeer, RemoteError, Rules,
+};
 use keylink::{Revocable, Server};
 
 mod common;
@@ -33,6 +38,533 @@ impl gate::Handler for Gate {
     async fn knock(&self, _cx: &Context) -> u64 {
         1
     }
+}
+
+keylink::service! {
+    service Methods;
+
+    rpc Read() -> u64;
+    rpc Write() -> u64;
+}
+
+struct Methods {
+    writes: Arc<AtomicUsize>,
+}
+
+struct MethodsActor {
+    writes: Arc<AtomicUsize>,
+}
+
+impl methods::Actor for MethodsActor {
+    async fn read(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+        7
+    }
+
+    async fn write(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        9
+    }
+}
+
+impl methods::Handler for Methods {
+    async fn read(&self, _cx: &Context) -> u64 {
+        7
+    }
+
+    async fn write(&self, _cx: &Context) -> u64 {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        9
+    }
+}
+
+fn rules_for(peer: keylink::EndpointId, allow: &[&str]) -> String {
+    let allow = allow
+        .iter()
+        .map(|method| format!("{method:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[[peer]]\nid = \"{peer}\"\nallow = [{allow}]\n")
+}
+
+fn assert_application_close(error: &Error, code: u32, reason: &[u8]) {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = cause {
+        if let Some(ConnectionError::ApplicationClosed(frame)) =
+            current.downcast_ref::<ConnectionError>()
+        {
+            assert_eq!(frame.error_code, code.into());
+            assert_eq!(frame.reason.as_ref(), reason);
+            return;
+        }
+        cause = current.source();
+    }
+    panic!("expected an application close, got {error:?}");
+}
+
+struct CachedWrite {
+    reached: Arc<AtomicUsize>,
+    answer: u64,
+}
+
+impl Middleware<methods::Request, methods::Response> for CachedWrite {
+    fn handle(
+        &self,
+        cx: Context,
+        req: methods::Request,
+        body: BodyReader,
+        next: Next<methods::Request, methods::Response>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = (Outcome<methods::Response>, Body)> + Send>,
+    > {
+        if matches!(req, methods::Request::Write { .. }) {
+            self.reached.fetch_add(1, Ordering::Relaxed);
+            let answer = self.answer;
+            return Box::pin(async move {
+                (Outcome::Ok(methods::Response::Write(answer)), Body::empty())
+            });
+        }
+        next(cx, req, body)
+    }
+}
+
+struct TrackingAnyone {
+    admitted: Arc<AtomicUsize>,
+}
+
+impl Admission for TrackingAnyone {
+    fn admits(&self, _peer: &ProvenPeer) -> Admittance {
+        Admittance::Admitted
+    }
+
+    fn admitted(&self, _peer: &keylink::AdmittedPeer, _live: keylink::Revocation) {
+        self.admitted.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The second table for one peer is rejected before it can add permissions.
+///
+/// Search `            if allowed.contains_key(&id) {`.
+///
+/// Made red by `scripts/break-once.sh` replacing the condition with `if false`.
+/// The second table compiled instead of returning `DuplicatePeer`.
+#[test]
+fn duplicate_peer_rules_are_rejected_in_source_order() {
+    let peer = keylink::SecretKey::from_bytes(&[40; 32]).public();
+    let raw = format!(
+        "[[peer]]\nid = \"{peer}\"\nallow = [\"Read\"]\n\n\
+         [[peer]]\nid = \"{peer}\"\nallow = [\"Write\"]\n"
+    );
+    let error = Rules::parse(&raw)
+        .expect("valid TOML")
+        .compile::<methods::Request>()
+        .expect_err("a repeated peer must not union permissions");
+
+    assert!(matches!(
+        error,
+        Error::Config(ConfigError::DuplicatePeer { id }) if id == peer
+    ));
+}
+
+#[test]
+fn duplicate_method_names_in_one_peer_rule_harmlessly_deduplicate() {
+    let peer = keylink::SecretKey::from_bytes(&[40; 32]).public();
+    Rules::parse(&rules_for(peer, &["Read", "Read"]))
+        .expect("valid TOML")
+        .compile::<methods::Request>()
+        .expect("duplicate method names denote the same permission");
+}
+
+/// Blank input is not a deny-all policy, and parse diagnostics keep their cause.
+///
+/// Search `    peer: Vec<PeerRules>,` and
+/// `        #[source] error: toml::de::Error,` (whitespace-collapsed).
+///
+/// Made red twice by `scripts/break-once.sh`: adding `#[serde(default)]` let the
+/// blank file parse, and removing `#[source]` ended the error chain at
+/// `ConfigError`.
+#[test]
+fn blank_rules_are_malformed_and_retain_the_toml_source() {
+    use std::error::Error as _;
+
+    let error = Rules::parse("").expect_err("a blank file must not compile");
+    assert!(matches!(
+        error,
+        Error::Config(ConfigError::MalformedRules { .. })
+    ));
+    let config = error.source().expect("the configuration error is retained");
+    let source = config.source().expect("the TOML parser error is retained");
+    assert!(source.downcast_ref::<toml::de::Error>().is_some());
+    assert!(source.to_string().contains("missing field `peer`"));
+}
+
+/// A syntactically valid empty collection is still invalid startup policy.
+///
+/// Search `        if self.peer.is_empty() {`.
+///
+/// Made red by `scripts/break-once.sh` changing the condition to `if false`.
+#[test]
+fn an_explicit_empty_peer_collection_is_rejected() {
+    let error = Rules::parse("peer = []")
+        .expect("valid TOML")
+        .compile::<methods::Request>()
+        .expect_err("an empty peer list must not compile");
+    assert!(matches!(error, Error::Config(ConfigError::EmptyAllowlist)));
+}
+
+/// Connection admission cannot be granted to a peer with no usable method.
+///
+/// Search `            if peer.allow.is_empty() {`.
+///
+/// Made red by `scripts/break-once.sh` changing the condition to `if false`.
+#[test]
+fn a_peer_with_no_methods_is_rejected() {
+    let peer = keylink::SecretKey::from_bytes(&[40; 32]).public();
+    let error = Rules::parse(&rules_for(peer, &[]))
+        .expect("valid TOML")
+        .compile::<methods::Request>()
+        .expect_err("an admitted peer must have at least one method");
+    assert!(matches!(
+        error,
+        Error::Config(ConfigError::EmptyPeerMethods { id }) if id == peer
+    ));
+}
+
+/// A rule name must resolve to one of the generated static method names before
+/// either policy can exist.
+///
+/// Search `                let Some(method) = Req::METHODS.iter().copied().find(|method| *method == named)`.
+///
+/// Made red with `scripts/break-once.sh`, replacing the name lookup with
+/// `Req::METHODS.first().copied()`. The test reached `expect_err` with a compiled
+/// policy mapping the misspelling to `Read`.
+#[test]
+fn an_unknown_rule_method_fails_during_compilation() {
+    let peer = keylink::SecretKey::from_bytes(&[41; 32]).public();
+    let error = Rules::parse(&rules_for(peer, &["Reed"]))
+        .expect("valid TOML")
+        .compile::<methods::Request>()
+        .expect_err("a misspelled method must not compile");
+
+    assert!(matches!(
+        error,
+        Error::Config(ConfigError::UnknownMethod {
+            service: "Methods",
+            named,
+        }) if named == "Reed"
+    ));
+}
+
+/// Required authorization stays outside ordinary layers on both sides of install.
+///
+/// Search `        for layer in self.required_layers.into_iter().rev() {`.
+///
+/// Made red by `scripts/break-once.sh` adding `.take(0)` to that iterator. The
+/// closure-installed cache returned `777` without authorization or dispatch.
+#[tokio::test]
+async fn compiled_authorization_wraps_short_circuits_added_before_and_after_install() {
+    let node = local_node().await;
+    let peer = local_node().await;
+    let writes = Arc::new(AtomicUsize::new(0));
+    let inside = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let compiled = Rules::parse(&rules_for(peer.id(), &["Read"]))
+        .expect("valid TOML")
+        .compile::<methods::Request>()
+        .expect("known methods compile");
+    let service = compiled
+        .install(|allow| {
+            methods::service(
+                Methods {
+                    writes: writes.clone(),
+                },
+                allow,
+            )
+            .layer(CachedWrite {
+                reached: inside.clone(),
+                answer: 777,
+            })
+        })
+        .layer(CachedWrite {
+            reached: after.clone(),
+            answer: 888,
+        })
+        .build();
+    let _running = Server::builder(&node)
+        .service(service)
+        .spawn()
+        .expect("serves");
+
+    let client = methods::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .expect("dials");
+    let refused = client
+        .write()
+        .await
+        .expect_err("ordinary middleware cannot bypass compiled authorization");
+    assert!(matches!(
+        refused,
+        Error::Remote(RemoteError::Unauthorized(ref method)) if method == "Write"
+    ));
+    assert_eq!(inside.load(Ordering::Relaxed), 0, "inside layer ran");
+    assert_eq!(after.load(Ordering::Relaxed), 0, "later layer ran");
+    assert_eq!(writes.load(Ordering::Relaxed), 0, "handler ran");
+}
+
+/// A required-policy refusal keeps its wire-level diagnostic after intersection.
+///
+/// Search `            connection.close(REFUSED.into(), b"unauthorized");`.
+/// Made red with `scripts/break-once.sh` by changing that close to the unavailable
+/// code and reason. The peer observed the wrong application-close frame.
+#[tokio::test]
+async fn post_install_anyone_admission_does_not_widen_compiled_peers() {
+    let node = local_node().await;
+    let listed = local_node().await;
+    let stranger = local_node().await;
+    let compiled = Rules::parse(&rules_for(listed.id(), &["Read"]))
+        .expect("valid TOML")
+        .compile::<methods::Request>()
+        .expect("known methods compile");
+    let service = compiled
+        .install(|allow| {
+            methods::service(
+                Methods {
+                    writes: Arc::new(AtomicUsize::new(0)),
+                },
+                allow,
+            )
+        })
+        .admission(Arc::new(Allowlist::anyone()))
+        .build();
+    let _running = Server::builder(&node)
+        .service(service)
+        .spawn()
+        .expect("serves");
+
+    let outside = methods::Client::connect(&stranger, node.endpoint().addr())
+        .await
+        .expect("the handshake completes before admission");
+    let denied = outside
+        .read()
+        .await
+        .expect_err("ordinary admission cannot replace the compiled peer policy");
+    assert_application_close(&denied, 1, b"unauthorized");
+}
+
+#[tokio::test]
+async fn nested_compiled_installs_intersect_every_required_peer_policy() {
+    let node = local_node().await;
+    let common = local_node().await;
+    let outer_only = local_node().await;
+    let outer_rules = format!(
+        "{}{}",
+        rules_for(common.id(), &["Read"]),
+        rules_for(outer_only.id(), &["Read"]),
+    );
+    let outer = Rules::parse(&outer_rules)
+        .expect("valid TOML")
+        .compile::<methods::Request>()
+        .expect("known methods compile");
+    let inner = Rules::parse(&rules_for(common.id(), &["Read"]))
+        .expect("valid TOML")
+        .compile::<methods::Request>()
+        .expect("known methods compile");
+    let service = outer
+        .install(|outer_allow| {
+            inner.install(|_inner_allow| {
+                methods::service(
+                    Methods {
+                        writes: Arc::new(AtomicUsize::new(0)),
+                    },
+                    outer_allow,
+                )
+            })
+        })
+        .build();
+    let _running = Server::builder(&node)
+        .service(service)
+        .spawn()
+        .expect("serves");
+
+    let allowed = methods::Client::connect(&common, node.endpoint().addr())
+        .await
+        .expect("dials");
+    assert_eq!(allowed.read().await.expect("every policy admits"), 7);
+
+    let outside = methods::Client::connect(&outer_only, node.endpoint().addr())
+        .await
+        .expect("the handshake completes before admission");
+    let denied = outside
+        .read()
+        .await
+        .expect_err("one required refusal denies the peer");
+    assert!(matches!(denied, Error::Transport(_)), "got {denied:?}");
+}
+
+/// Required peer policy is intersected before the caller policy or its callback.
+///
+/// Search `    for policy in required { require_admitted(policy.admits(&proven), connection)?; }`
+/// (whitespace-collapsed).
+///
+/// Made red by `scripts/break-once.sh` adding `.iter().take(0)` to that loop. The
+/// stranger reached the caller policy and its `admitted` callback.
+#[tokio::test]
+async fn later_admission_cannot_replace_compiled_peer_admission() {
+    let node = local_node().await;
+    let peer = local_node().await;
+    let stranger = local_node().await;
+    let admitted = Arc::new(AtomicUsize::new(0));
+    let compiled = Rules::parse(&rules_for(peer.id(), &["Read"]))
+        .expect("valid TOML")
+        .compile::<methods::Request>()
+        .expect("known methods compile");
+    let service = compiled
+        .install(|allow| {
+            methods::service(
+                Methods {
+                    writes: Arc::new(AtomicUsize::new(0)),
+                },
+                allow,
+            )
+        })
+        .admission(Arc::new(TrackingAnyone {
+            admitted: admitted.clone(),
+        }))
+        .build();
+    let _running = Server::builder(&node)
+        .service(service)
+        .spawn()
+        .expect("serves");
+
+    let allowed = methods::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .expect("dials");
+    assert_eq!(allowed.read().await.expect("both policies admit"), 7);
+    assert_eq!(admitted.load(Ordering::Relaxed), 1);
+
+    let outside = methods::Client::connect(&stranger, node.endpoint().addr())
+        .await
+        .expect("the handshake completes before admission");
+    let denied = outside
+        .read()
+        .await
+        .expect_err("the compiled peer policy remains required");
+    assert!(matches!(denied, Error::Transport(_)), "got {denied:?}");
+    assert_eq!(
+        admitted.load(Ordering::Relaxed),
+        1,
+        "caller admission callback ran for a peer a required policy refused"
+    );
+}
+
+/// One compiled value installs two separate decisions: connection admission and
+/// typed per-method middleware authorization.
+///
+/// Search `            .is_some_and(|methods| methods.contains(method))`,
+/// `        let allow = Allowlist::only(allowed.keys().copied());`, and
+/// `            .require_layer(self.authorization)`.
+///
+/// Made red three ways with `scripts/break-once.sh`:
+///
+/// - changing the method predicate to `true` let `Write` dispatch and return `9`;
+/// - changing the compiled allowlist to `Allowlist::anyone()` returned
+///   `Remote(Unauthorized("Read"))` where the test requires a transport close;
+/// - dropping `.require_layer(self.authorization)` let `Write` dispatch and return `9`.
+#[tokio::test]
+async fn compiled_rules_admit_the_peer_once_and_authorize_each_method() {
+    let node = local_node().await;
+    let peer = local_node().await;
+    let stranger = local_node().await;
+    let writes = Arc::new(AtomicUsize::new(0));
+    let compiled = Rules::parse(&rules_for(peer.id(), &["Read"]))
+        .expect("valid TOML")
+        .compile::<methods::Request>()
+        .expect("known methods compile");
+    let service = compiled
+        .install(|allow| {
+            methods::service(
+                Methods {
+                    writes: writes.clone(),
+                },
+                allow,
+            )
+        })
+        .build();
+    let _running = Server::builder(&node)
+        .service(service)
+        .spawn()
+        .expect("serves");
+
+    let allowed = methods::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .expect("dials");
+    assert_eq!(allowed.read().await.expect("authorized"), 7);
+    let refused = allowed
+        .write()
+        .await
+        .expect_err("the admitted peer is not authorized for Write");
+    assert!(matches!(
+        refused,
+        Error::Remote(RemoteError::Unauthorized(ref method)) if method == "Write"
+    ));
+    assert_eq!(
+        writes.load(Ordering::Relaxed),
+        0,
+        "the handler must not run"
+    );
+
+    let outside = methods::Client::connect(&stranger, node.endpoint().addr())
+        .await
+        .expect("the handshake completes before admission");
+    let denied = outside
+        .read()
+        .await
+        .expect_err("an unlisted peer is not admitted");
+    assert!(
+        matches!(denied, Error::Transport(_)),
+        "peer admission must close the connection before method authorization: {denied:?}"
+    );
+}
+
+#[tokio::test]
+async fn compiled_authorization_applies_to_addressed_requests() {
+    let node = local_node().await;
+    let peer = local_node().await;
+    let writes = Arc::new(AtomicUsize::new(0));
+    let system = methods::Registry::builder(keylink::Eviction::Never).build();
+    let actor = keylink::ActorId::new("methods").expect("valid actor id");
+    system
+        .mount(
+            actor.clone(),
+            methods::spawn(MethodsActor {
+                writes: writes.clone(),
+            }),
+        )
+        .expect("the actor id is free");
+
+    let compiled = Rules::parse(&rules_for(peer.id(), &["Read"]))
+        .expect("valid TOML")
+        .compile::<methods::Request>()
+        .expect("known methods compile");
+    let service = compiled.install(|allow| system.service(allow)).build();
+    let _running = Server::builder(&node)
+        .service(service)
+        .spawn()
+        .expect("serves");
+
+    let client = methods::RegistryClient::connect(&peer, node.endpoint().addr())
+        .await
+        .expect("dials");
+    let addressed = client.at(actor);
+    assert_eq!(addressed.read().await.expect("authorized"), 7);
+    let refused = addressed
+        .write()
+        .await
+        .expect_err("Write is not authorized for the addressed request");
+    assert!(matches!(
+        refused,
+        Error::Remote(RemoteError::Unauthorized(ref method)) if method == "Write"
+    ));
+    assert_eq!(writes.load(Ordering::Relaxed), 0, "the actor must not run");
 }
 
 /// A policy whose backend is down. Every answer is `Unavailable`, which refuses
@@ -188,6 +720,10 @@ async fn a_revoked_peer_cannot_reconnect_during_the_revocation() {
 /// list", and an operator who cannot tell a dead authorizer from an unlisted
 /// peer reaches for `Allowlist::anyone()` during an incident — a fail-open
 /// arrived at through a diagnostic hole.
+///
+/// Search `            connection.close(UNAVAILABLE.into(), b"admission unavailable");`.
+/// Made red with `scripts/break-once.sh` by changing that reason to
+/// `"unauthorized"`. The peer observed the wrong application-close frame.
 #[tokio::test]
 async fn a_policy_that_cannot_be_consulted_refuses() {
     let node = local_node().await;
@@ -209,7 +745,7 @@ async fn a_policy_that_cannot_be_consulted_refuses() {
         .knock()
         .await
         .expect_err("an unreachable policy admits nobody");
-    assert!(matches!(error, Error::Transport(_)), "got {error:?}");
+    assert_application_close(&error, 2, b"admission unavailable");
 }
 
 /// The registry forgets a peer that leaves on its own, so a later revocation

@@ -2057,6 +2057,63 @@ ANCHORS = [
     ("KT11", "keylink/tests/keyed_topic_allocation.rs",
      "keylink/src/compose/keyed_topic.rs",
      "        let entry = self.inner.lock().get(key).cloned();"),
+    # ── X IS THE EXTENSION-SURFACE WAVE ──────────────────────────────────────
+    #
+    # X1/X2/X3 intentionally share the normalized-cfg expression. They are three
+    # records because the same production channel is guarded from three directions:
+    # direct cfg, nested cfg_attr, and refusal to forward arbitrary metadata.
+    # X4/X5 similarly share generated status across the macro/API and startup uses.
+    ("X1", "keylink/tests/api.rs", "keylink/src/macros.rs",
+     "                    $( $( #[$cfg] )* stringify!($rpc), )+"),
+    ("X2", "keylink/tests/api.rs", "keylink/src/macros.rs",
+     "                    $( $( #[$cfg] )* stringify!($rpc), )+"),
+    ("X3", "keylink/tests/api.rs", "keylink/src/macros.rs",
+     "                    $( $( #[$cfg] )* stringify!($rpc), )+"),
+    ("X4", "keylink/tests/api.rs", "keylink/src/macros.rs",
+     '                    "__Status",'),
+    ("X5", "keylink/tests/idempotency.rs", "keylink/src/macros.rs",
+     '                    "__Status",'),
+    ("X6", "keylink/tests/api.rs", "keylink/src/actor/remote.rs",
+     "    const METHODS: &'static [&'static str] = T::METHODS;"),
+    ("X7", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "                let Some(method) = Req::METHODS.iter().copied().find(|method| *method == named)"),
+    ("X8", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "            .is_some_and(|methods| methods.contains(method))"),
+    ("X9", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "        let allow = Allowlist::only(allowed.keys().copied());"),
+    ("X10", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "            .require_layer(self.authorization)"),
+    ("X11", "keylink/src/representability.rs", "keylink/src/authz.rs",
+     "impl<Req, Resp> Middleware<Req, Resp> for Authorization<Req>"),
+    ("X12", "keylink/src/representability.rs", "keylink/src/authz.rs",
+     "impl<Req, Resp> Middleware<Addressed<Req>, Resp> for Authorization<Req>"),
+    ("X13", "keylink/tests/idempotency.rs", "keylink/src/rpc.rs",
+     "                .first_unknown(Req::METHODS)"),
+    ("X14", "keylink/tests/idempotency.rs", "keylink/src/rpc.rs",
+     "                .first_unknown(Req::METHODS)"),
+    ("X15", "keylink/tests/idempotency.rs", "keylink/src/rpc.rs",
+     "                return Err(Error::Config(error));"),
+    ("X16", "keylink/tests/admission.rs", "keylink/src/rpc.rs",
+     "        for layer in self.required_layers.into_iter().rev() {"),
+    ("X17", "keylink/tests/admission.rs", "keylink/src/admission.rs",
+     "    for policy in required {\n"
+     "        require_admitted(policy.admits(&proven), connection)?;\n"
+     "    }"),
+    ("X18", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "            if allowed.contains_key(&id) {"),
+    ("X19", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "    peer: Vec<PeerRules>,"),
+    ("X20", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "        if self.peer.is_empty() {"),
+    ("X21", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "            if peer.allow.is_empty() {"),
+    ("X22", "keylink/tests/admission.rs", "keylink/src/error.rs",
+     "        #[source]\n"
+     "        error: toml::de::Error,"),
+    ("X23", "keylink/tests/admission.rs", "keylink/src/admission.rs",
+     '            connection.close(REFUSED.into(), b"unauthorized");'),
+    ("X24", "keylink/tests/admission.rs", "keylink/src/admission.rs",
+     '            connection.close(UNAVAILABLE.into(), b"admission unavailable");'),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -3657,6 +3714,13 @@ for record in sorted(set(REDNESS) - row_ids):
 # reasons. Read off the failing run: `FAIL population: 194 comment blocks mention
 # break-once.sh, but RECORD_BLOCKS says 183.`
 #
+# E1's review-fix pass measured 222 after adding the six authorization-rule
+# guard blocks in `tests/admission.rs`; the same run also found X10's old install
+# anchor gone, so the row was followed to `.require_layer(self.authorization)`.
+# Seven new rows cover those six blocks because blank-rule parsing and its source
+# chain deliberately share one test record. The population figure is read from
+# that failing run, not derived from either count.
+#
 # The merge gate on that same wave added ONE block and ONE row — `B11`, over
 # `first_available`'s racers — and the two moved together for once. Read off the
 # failing run: `FAIL population: 195 comment blocks mention break-once.sh, but
@@ -3665,7 +3729,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # `FAIL population: 215 comment blocks mention break-once.sh, but RECORD_BLOCKS says 206.`
 # 215 → 217, for the publisher-drop and operation-bound review guards. Read off
 # the failing run: `FAIL population: 217 comment blocks mention break-once.sh, but RECORD_BLOCKS says 215.`
-RECORD_BLOCKS = 217
+RECORD_BLOCKS = 235
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

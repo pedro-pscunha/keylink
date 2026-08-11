@@ -303,6 +303,7 @@ pub mod inspect {
         Permit, RegistryClient, RestartingSetup, StateSetup,
     };
 }
+pub use authz::{Authorization, Compiled, Rules};
 pub use error::{ConfigError, Error, Failure, Result, Transport};
 pub use idempotency::{
     Attaching, Idempotency, IdempotencyRefusal, KeyState, Keyable, Limits, Records, MAX_ATTACH,

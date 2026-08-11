@@ -32,6 +32,9 @@ pub trait Rpc {
     /// The service name, as written in `service!`.
     const SERVICE: &'static str;
 
+    /// Every method present in this binary's service contract.
+    const METHODS: &'static [&'static str];
+
     /// The method this request selects, in the `CamelCase` spelling from
     /// `service!`.
     fn method(&self) -> &'static str;

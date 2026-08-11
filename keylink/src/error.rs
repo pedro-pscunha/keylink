@@ -17,7 +17,7 @@
 use iroh::endpoint::{
     BindError, ClosedStream, ConnectError, ConnectionError, ReadError, WriteError,
 };
-use iroh::KeyParsingError;
+use iroh::{EndpointId, KeyParsingError};
 
 use crate::{RemoteError, Unanswered, Withheld};
 
@@ -424,6 +424,33 @@ pub enum ConfigError {
     /// The allowlist parsed to nothing at all.
     #[error("allowlist is empty - refusing to serve a protocol nobody can reach")]
     EmptyAllowlist,
+    /// A data-driven authorization rule file is not valid TOML in the expected shape.
+    #[error("invalid authorization rules: {error}")]
+    MalformedRules {
+        /// Why the file could not be parsed.
+        #[source]
+        error: toml::de::Error,
+    },
+    /// The same peer appeared in more than one authorization table.
+    #[error("duplicate authorization rules for peer {id}")]
+    DuplicatePeer {
+        /// The repeated peer.
+        id: EndpointId,
+    },
+    /// A peer rule names no methods.
+    #[error("peer {id} allows no methods - refusing to admit an unusable peer")]
+    EmptyPeerMethods {
+        /// The peer whose method set was empty.
+        id: EndpointId,
+    },
+    /// A method named by startup configuration is not in this binary's service contract.
+    #[error("unknown method {named:?} for service {service}")]
+    UnknownMethod {
+        /// The generated service name.
+        service: &'static str,
+        /// The name configuration tried to select.
+        named: String,
+    },
     /// Two services were registered on the same ALPN.
     ///
     /// Caught rather than allowed to be last-one-wins: the second registration

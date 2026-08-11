@@ -99,10 +99,10 @@ use std::ops::DerefMut;
 
 use crate::compose::{BroadcastDepth, Lossy, LossySubscription, LossyTopic, Overflow, Topic};
 use crate::{
-    ActorId, ActorStatus, Admission, Admittance, AdmittedPeer, Allowlist, Backpressure, BlobId,
-    Caller, DynamicAdmission, Ended, Eviction, FinishFut, IdempotencyKey, Intensity, Keyable,
-    LocalActor, MountError, Observer, Origin, ProvenPeer, Records, Retention, TurnFut, TurnInfo,
-    TurnOutcome, Unanswered,
+    ActorId, ActorStatus, Addressed, Admission, Admittance, AdmittedPeer, Allowlist, Authorization,
+    Backpressure, BlobId, Caller, DynamicAdmission, Ended, Eviction, FinishFut, IdempotencyKey,
+    Intensity, Keyable, LocalActor, Middleware, MountError, Observer, Origin, ProvenPeer, Records,
+    Retention, TurnFut, TurnInfo, TurnOutcome, Unanswered,
 };
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
@@ -214,6 +214,12 @@ crate::service! {
     rpc Pong(n: u64) -> u64;
 }
 
+// Crate-visible only so the cross-service red break can name the exact pair
+// from the sibling module whose production impl it mutates.
+pub(crate) type AlphaRequest = alpha::Request;
+pub(crate) type BetaRequest = beta::Request;
+pub(crate) type BetaResponse = beta::Response;
+
 /// Deliberately identical to [`BetaState`] in every way but the trait it
 /// implements. Two services with the same shape are the case that matters: if
 /// the separation came from the message *shape* rather than from the service,
@@ -228,6 +234,43 @@ impl alpha::Actor for AlphaState {
         n
     }
     async fn note(&mut self, _cx: Caller<'_>, _line: String) {}
+}
+
+/// Authorization compiled for `Alpha` must never become middleware for `Beta`,
+/// even though both services deliberately declare the same method names.
+///
+/// This is a coherence probe, not an inert `compile_fail` doctest. The marker's
+/// parameter is inferred only while the blanket and bounded impls do not both
+/// apply. A cross-service middleware impl makes it ambiguous during the ordinary
+/// library test build.
+///
+/// Search `impl<Req, Resp> Middleware<Req, Resp> for Authorization<Req>`.
+///
+/// Made red with `scripts/break-once.sh` by injecting one concrete cross-service
+/// middleware impl immediately before that line. The build failed here with
+/// `E0283`, naming both marker impls as candidates.
+const _: fn() = || {
+    trait AmbiguousIfBetaMiddleware<Marker> {
+        fn marker() {}
+    }
+    impl<T: ?Sized> AmbiguousIfBetaMiddleware<()> for T {}
+    struct Forbidden;
+    impl<T: ?Sized + Middleware<BetaRequest, BetaResponse>> AmbiguousIfBetaMiddleware<Forbidden> for T {}
+    let _ = <Authorization<AlphaRequest> as AmbiguousIfBetaMiddleware<_>>::marker;
+};
+
+/// The positive bracket: keyed dispatch wraps the same request in `Addressed`,
+/// and the compiled authorization must fit that exact builder request type.
+///
+/// Search `impl<Req, Resp> Middleware<Addressed<Req>, Resp> for Authorization<Req>`.
+///
+/// Made red with `scripts/break-once.sh` by cfg-disabling that production impl.
+/// The ordinary library test build failed here with `E0277` for the missing exact
+/// middleware impl.
+fn alpha_authorization_supports_addressed_requests()
+where
+    Authorization<alpha::Request>: Middleware<Addressed<alpha::Request>, alpha::Response>,
+{
 }
 
 struct BetaState;

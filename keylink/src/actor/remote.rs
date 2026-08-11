@@ -151,6 +151,7 @@ impl<T> Addressed<T> {
 /// bought back.
 impl<T: Rpc> Rpc for Addressed<T> {
     const SERVICE: &'static str = T::SERVICE;
+    const METHODS: &'static [&'static str] = T::METHODS;
 
     fn method(&self) -> &'static str {
         self.message.method()
@@ -710,6 +711,7 @@ mod tests {
 
     impl Rpc for Ledger {
         const SERVICE: &'static str = "Ledger";
+        const METHODS: &'static [&'static str] = &["Post", "Balance"];
 
         fn method(&self) -> &'static str {
             match self {

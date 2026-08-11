@@ -196,6 +196,7 @@ pub(crate) struct RpcService<Req, Resp> {
     /// generic parameter: the decision is made once per connection and does no
     /// I/O, and a generic would reach every `service!` user's type errors.
     admission: Arc<dyn Admission>,
+    required_admission: Vec<Arc<dyn Admission>>,
     /// The content store this service grants against, when it declares `blob`
     /// methods. `None` for every service that does not, which is why an
     /// ordinary service pays nothing for this feature existing.
@@ -211,6 +212,7 @@ impl<Req, Resp> Clone for RpcService<Req, Resp> {
         Self {
             next: self.next.clone(),
             admission: self.admission.clone(),
+            required_admission: self.required_admission.clone(),
             blobs: self.blobs.clone(),
             keys: self.keys.clone(),
             _p: PhantomData,
@@ -760,7 +762,11 @@ where
         // must remember to have consulted — see `Admittance`. The policy also
         // takes the live connection here, which is the whole of what makes a
         // revocation later able to reach it.
-        let Some((admitted, _live)) = settle(self.admission.as_ref(), &connection) else {
+        let Some((admitted, _live)) = settle(
+            self.admission.as_ref(),
+            &self.required_admission,
+            &connection,
+        ) else {
             return Ok(());
         };
 
@@ -1380,8 +1386,10 @@ mod tests {
 pub struct ServiceBuilder<Req, Resp> {
     alpn: &'static [u8],
     admission: Arc<dyn Admission>,
+    required_admission: Vec<Arc<dyn Admission>>,
     base: Next<Req, Resp>,
     layers: Vec<Arc<dyn Middleware<Req, Resp>>>,
+    required_layers: Vec<Arc<dyn Middleware<Req, Resp>>>,
     blobs: Option<Blobs>,
     /// Set by generated code from `DECLARES_BLOBS`. Compared against `blobs` at
     /// spawn, so "this service serves content but was given no store" is a
@@ -1410,8 +1418,10 @@ where
         Self {
             alpn,
             admission: Arc::new(allow),
+            required_admission: Vec::new(),
             base: dispatch,
             layers: Vec::new(),
+            required_layers: Vec::new(),
             blobs: None,
             declares_blobs: false,
             // Spelled out rather than reached through `Default`, and neither type
@@ -1461,12 +1471,24 @@ where
         self
     }
 
+    pub(crate) fn require_admission(mut self, admission: impl Admission) -> Self {
+        self.required_admission.push(Arc::new(admission));
+        self
+    }
+
+    pub(crate) fn require_layer(mut self, layer: impl Middleware<Req, Resp>) -> Self {
+        self.required_layers.push(Arc::new(layer));
+        self
+    }
+
     /// Admit against a policy rather than against the fixed list this was built
     /// with.
     ///
     /// The list passed to the generated `service(handler, allow)` is itself an
-    /// [`Admission`] — it is the canonical one — so this replaces rather than
-    /// adds. Reach for it when the answer has to be able to change while the
+    /// [`Admission`] — it is the canonical one — so this replaces the caller
+    /// policy rather than adding another. Required policies installed by
+    /// [`Compiled`](crate::Compiled) are intersected with it and cannot be replaced.
+    /// Reach for this when the answer has to be able to change while the
     /// service is running:
     ///
     /// ```ignore
@@ -1483,8 +1505,9 @@ where
         self
     }
 
-    /// Add a layer. The first layer added is the outermost: it sees the request
-    /// first and the reply last.
+    /// Add a layer. The first ordinary layer added is the outermost: it sees the
+    /// request first and the reply last. Required layers installed by
+    /// [`Compiled`](crate::Compiled) remain outside every ordinary layer.
     #[must_use]
     pub fn layer(mut self, layer: impl Middleware<Req, Resp>) -> Self {
         self.layers.push(Arc::new(layer));
@@ -1702,8 +1725,18 @@ where
 
     /// Freeze the chain and erase the schema.
     pub fn build(self) -> Service {
+        let configuration =
+            self.keyable
+                .first_unknown(Req::METHODS)
+                .map(|named| ConfigError::UnknownMethod {
+                    service: Req::SERVICE,
+                    named: named.to_owned(),
+                });
         let mut chain = self.base;
         for layer in self.layers.into_iter().rev() {
+            chain = wrap(layer, chain);
+        }
+        for layer in self.required_layers.into_iter().rev() {
             chain = wrap(layer, chain);
         }
         Service {
@@ -1711,12 +1744,14 @@ where
             handler: Box::new(RpcService {
                 next: chain,
                 admission: self.admission,
+                required_admission: self.required_admission,
                 blobs: self.blobs.clone(),
                 keys: Keys::new(self.keyable, self.records, self.limits),
                 _p: PhantomData,
             }),
             blobs: self.blobs,
             declares_blobs: self.declares_blobs,
+            configuration,
         }
     }
 }
@@ -1758,6 +1793,8 @@ pub struct Service {
     /// these to decide what to mount on `iroh_blobs::ALPN`.
     blobs: Option<Blobs>,
     declares_blobs: bool,
+    /// A typed-builder configuration error retained through schema erasure.
+    configuration: Option<ConfigError>,
 }
 
 impl Service {
@@ -1799,6 +1836,7 @@ impl Service {
             handler: Box::new(handler),
             blobs: None,
             declares_blobs: false,
+            configuration: None,
         }
     }
 }
@@ -1881,6 +1919,9 @@ impl ServerBuilder<'_> {
         let mut store: Option<Blobs> = None;
         let mut builder = Router::builder(self.node.endpoint().clone());
         for service in self.services {
+            if let Some(error) = service.configuration {
+                return Err(Error::Config(error));
+            }
             if RESERVED_ALPNS.contains(&service.alpn) {
                 return Err(Error::Config(ConfigError::ReservedAlpn(
                     String::from_utf8_lossy(service.alpn).into_owned(),

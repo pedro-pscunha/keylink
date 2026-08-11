@@ -9,12 +9,13 @@
 use keylink::prelude::*;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use keylink::{
-    ActorId, Allowlist, Body, BodyReader, Caller, Context, Error, Eviction, IdempotencyKey,
-    IdempotencyRefusal, Keyable, Limits, Middleware, Next, Node, Outcome, Records, RemoteError,
-    Server as KeylinkServer,
+    ActorId, Allowlist, Body, BodyReader, Caller, ConfigError, Context, Error, Eviction,
+    IdempotencyKey, IdempotencyRefusal, Keyable, Limits, Middleware, Next, Node, Outcome, Records,
+    RemoteError, Server as KeylinkServer,
 };
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
@@ -39,12 +40,16 @@ keylink::service! {
     recv Datasheet(bytes: u64) -> Sheet;
 }
 
-#[derive(Default)]
-struct Counter(AtomicU64);
+#[derive(Default, Clone)]
+struct Counter(Arc<AtomicU64>);
 
 impl Counter {
     fn next(&self) -> u64 {
         self.0.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn runs(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
     }
 }
 
@@ -380,6 +385,97 @@ async fn a_key_on_a_method_the_service_does_not_key_is_refused() {
             .is_ok(),
         "`Reserve` IS in the policy, so a key on it must still be taken"
     );
+}
+
+/// `Only` preserves policy order when reporting its first unknown name, and the
+/// erased service returns that error before a handler can run.
+///
+/// Search `                .first_unknown(Req::METHODS)` and
+/// `                return Err(Error::Config(error));`.
+///
+/// Made red twice with `scripts/break-once.sh`: filtering the result of
+/// `first_unknown(Req::METHODS)` away, and replacing the startup return with
+/// `let _ = error;`. Both let server startup succeed and fired the test's
+/// `expect_err` before any call could be made.
+#[tokio::test]
+async fn keyable_only_rejects_its_first_unknown_name_at_startup_before_dispatch() {
+    let server = local_node().await;
+    let reserves = Counter::default();
+    let observed = reserves.clone();
+    let service = till::service(
+        Till {
+            reserves,
+            ..Till::default()
+        },
+        Allowlist::anyone(),
+    )
+    .keyable(Keyable::Only(&["Reserv", "Slaw"]))
+    .build();
+
+    let error = KeylinkServer::builder(&server)
+        .service(service)
+        .spawn()
+        .expect_err("an unknown Only name must refuse startup");
+    assert!(matches!(
+        error,
+        Error::Config(ConfigError::UnknownMethod {
+            service: "Till",
+            named,
+        }) if named == "Reserv"
+    ));
+    assert_eq!(
+        observed.runs(),
+        0,
+        "startup must fail before handler dispatch"
+    );
+}
+
+/// `Except` is validated through the same typed builder path as `Only`.
+///
+/// Search `                .first_unknown(Req::METHODS)`.
+///
+/// Made red with `scripts/break-once.sh` by filtering the
+/// `first_unknown(Req::METHODS)` result away. Server startup succeeded instead of
+/// returning the configured `Slaw` name.
+#[tokio::test]
+async fn keyable_except_rejects_an_unknown_name_at_startup() {
+    let server = local_node().await;
+    let service = till::service(Till::default(), Allowlist::anyone())
+        .keyable(Keyable::Except(&["Reserve", "Slaw"]))
+        .build();
+
+    let error = KeylinkServer::builder(&server)
+        .service(service)
+        .spawn()
+        .expect_err("an unknown Except name must refuse startup");
+    assert!(matches!(
+        error,
+        Error::Config(ConfigError::UnknownMethod {
+            service: "Till",
+            named,
+        }) if named == "Slaw"
+    ));
+}
+
+/// Generated status belongs to the keyable vocabulary even though the caller did
+/// not declare it.
+///
+/// Search `                    "__Status",`.
+///
+/// Made red with `scripts/break-once.sh` by removing `"__Status"` from generated
+/// `METHODS`. Startup returned `Config(UnknownMethod { service: "Till", named:
+/// "__Status" })`.
+#[tokio::test]
+async fn generated_status_is_a_known_keyable_method() {
+    let server = local_node().await;
+    let service = till::service(Till::default(), Allowlist::anyone())
+        .keyable(Keyable::Only(&["__Status"]))
+        .build();
+
+    let _running = KeylinkServer::builder(&server)
+        .service(service)
+        .spawn()
+        .expect("generated status is in Rpc::METHODS");
 }
 
 /// **A refused key never reaches the ledger**, and the ordering is what proves it.

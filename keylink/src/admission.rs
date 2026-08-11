@@ -66,7 +66,7 @@
 //!   peer holding several has its most recent remembered and closed. Two live
 //!   connections from one identity are not two peers.
 
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use iroh::endpoint::Connection;
 use iroh::EndpointId;
@@ -300,20 +300,31 @@ impl Admission for Allowlist {
 /// error in one place.
 pub(crate) fn settle(
     admission: &dyn Admission,
+    required: &[Arc<dyn Admission>],
     connection: &Connection,
 ) -> Option<(AdmittedPeer, Revocation)> {
     let proven = ProvenPeer::on(connection);
-    match admission.admits(&proven) {
-        Admittance::Admitted => {
-            // keylink mints the proof, here, one line after being told yes.
-            // `AdmittedPeer`'s only *public* constructor is still
-            // `Allowlist::admit`, which is what keeps a foreign policy from
-            // manufacturing one.
-            let admitted = AdmittedPeer::mint(proven);
-            let live = Revocation::new(connection.clone(), proven);
-            admission.admitted(&admitted, live.clone());
-            Some((admitted, live))
-        }
+    for policy in required {
+        require_admitted(policy.admits(&proven), connection)?;
+    }
+    require_admitted(admission.admits(&proven), connection)?;
+
+    // keylink mints the proof, here, one line after every policy said yes.
+    // `AdmittedPeer`'s only *public* constructor is still
+    // `Allowlist::admit`, which is what keeps a foreign policy from
+    // manufacturing one.
+    let admitted = AdmittedPeer::mint(proven);
+    let live = Revocation::new(connection.clone(), proven);
+    for policy in required {
+        policy.admitted(&admitted, live.clone());
+    }
+    admission.admitted(&admitted, live.clone());
+    Some((admitted, live))
+}
+
+fn require_admitted(admittance: Admittance, connection: &Connection) -> Option<()> {
+    match admittance {
+        Admittance::Admitted => Some(()),
         Admittance::Refused => {
             connection.close(REFUSED.into(), b"unauthorized");
             None
