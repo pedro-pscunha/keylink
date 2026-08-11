@@ -13,8 +13,8 @@
 //! }
 //!
 //! let topic = Topic::new(Overflow::BlockPublisher);
-//! let book = book::actor_wired(Book::new(), vec![], book::Feeds::new(topic.subscribe()));
-//! let risk = risk::actor_wired(Risk::new(), vec![], risk::Feeds::new(topic.subscribe()));
+//! let book = book::setup(Book::new()).feeds(book::Feeds::new(topic.subscribe())).actor();
+//! let risk = risk::setup(Risk::new()).feeds(risk::Feeds::new(topic.subscribe())).actor();
 //!
 //! topic.publish(fill).await;      // both actors take a turn on it
 //! ```
@@ -26,7 +26,7 @@
 //! push a message somebody in this process chose to send fire-and-forget, which
 //! is not what happened.
 //!
-//! # THE DECISION THIS MODULE OWNS — a slow subscriber is never buffered
+//! # THE DECISION THIS MODULE OWNS — a slow subscriber is never queued
 //!
 //! **Each subscriber holds at most one unread item.** Not "one by default", not
 //! "one, configurable": one, and there is no argument that changes it.

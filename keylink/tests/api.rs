@@ -1,7 +1,7 @@
 //! Where the actor surface is spelled from, now that most of it is generated.
 //!
 //! This file used to assert that thirteen names re-exported out of `actor`
-//! resolved **unparameterized** — `let _: System = ..` — because a downstream
+//! resolved **unparameterized** — `let _: Registry = ..` — because a downstream
 //! crate wrote them that way and a type-parameter default was what made it
 //! possible. That premise is gone rather than reduced. An actor system is
 //! per-service: `M` is the service's own mailbox type, the defaults that stood
@@ -12,8 +12,8 @@
 //!
 //! 1. **Three names still resolve bare**, because they never had a parameter:
 //!    `Eviction`, `MountError` and `mount`. Not eight, not thirteen.
-//! 2. **The generated module supplies the rest** — `System`, `SystemBuilder`,
-//!    `Mounted`, `Mailbox`, `Mail`, `KeyedClient`, `ActorRef` — fully applied,
+//! 2. **The generated module supplies the rest** — `Registry`, `RegistryBuilder`,
+//!    `Mountable`, `Mailbox`, `Mail`, `RegistryClient`, `ActorRef` — fully applied,
 //!    in type position and in expression position wherever each admits one.
 //! 3. **The keylink-level generics need a parameter**, and the one that used to
 //!    be rescued by a default in expression position — `DEFAULT_CAPACITY` — is
@@ -33,8 +33,8 @@
 //!    not exist out here.
 //!
 //! The pairing of the two positions is still the point rather than pedantry:
-//! `SystemBuilder::DEFAULT_CAPACITY` stopped compiling once while
-//! `let _: SystemBuilder = ..` went on compiling, because a type-parameter
+//! `RegistryBuilder::DEFAULT_CAPACITY` stopped compiling once while
+//! `let _: RegistryBuilder = ..` went on compiling, because a type-parameter
 //! default applies in type position and not in expression position. There are no
 //! defaults left to be caught out by, and the pairing is what would notice one
 //! coming back.
@@ -50,6 +50,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use keylink::{
     mount, ActorId, Allowlist, Body, BodyReader, Caller, Ended, Eviction, Failure, Governed,
     Keyable, KeyedService, MountError, Origin, Records, Reply,
@@ -93,7 +94,7 @@ async fn the_three_unparameterized_names_still_resolve_bare() {
     // ── expression position ──────────────────────────────────────────────────
     let _ = Eviction::Never;
     let _ = MountError::AtCapacity {
-        capacity: depot::SystemBuilder::DEFAULT_CAPACITY,
+        capacity: depot::RegistryBuilder::DEFAULT_CAPACITY,
     };
     // `M` is a *function* generic and function generics cannot carry defaults,
     // so it is inferred — and the only thing here to infer it from is the
@@ -106,8 +107,8 @@ async fn the_three_unparameterized_names_still_resolve_bare() {
 }
 
 /// Made red by `scripts/break-once.sh`, replacing the generated
-/// `pub type SystemBuilder = $crate::SystemBuilder<Mail>;` with
-/// `pub type SystemBuilder<M> = $crate::SystemBuilder<M>;` — an alias that passes
+/// `pub type RegistryBuilder = $crate::RegistryBuilder<Mail>;` with
+/// `pub type RegistryBuilder<M> = $crate::RegistryBuilder<M>;` — an alias that passes
 /// the parameter on instead of applying it, which is the shape this whole file
 /// exists to refuse. Watched: this does not run, it does not compile —
 /// `error[E0107]` at the type-position line here, "add missing generic argument",
@@ -116,11 +117,11 @@ async fn the_three_unparameterized_names_still_resolve_bare() {
 #[tokio::test]
 async fn the_generated_module_supplies_the_rest_fully_applied() {
     // ── type position ────────────────────────────────────────────────────────
-    let _: depot::SystemBuilder = depot::System::builder(Eviction::Never);
-    let system: depot::System = depot::System::builder(Eviction::Never).build();
-    let _: depot::Mounted = depot::spawn(Counter(0));
+    let _: depot::RegistryBuilder = depot::Registry::builder(Eviction::Never);
+    let system: depot::Registry = depot::Registry::builder(Eviction::Never).build();
+    let _: depot::Mountable = depot::spawn(Counter(0));
     let _: Option<depot::Mail> = None;
-    let _: Option<depot::KeyedClient> = None;
+    let _: Option<depot::RegistryClient> = None;
     // The type `with_idempotency` hands back. Written from a consumer's
     // position because that is the only place it can be: a caller names it to
     // hold one in a struct or to return one, and until this line nothing
@@ -141,26 +142,26 @@ async fn the_generated_module_supplies_the_rest_fully_applied() {
     let _: Option<depot::blocking::IdempotentClient> = None;
 
     // ── expression position ──────────────────────────────────────────────────
-    // `Mail`, `Mailbox` and `Mounted` admit none: an alias, and two types a
+    // `Mail`, `Mailbox` and `Mountable` admit none: an alias, and two types a
     // consumer never constructs by name.
-    let _ = depot::keyed_alpn();
+    let _ = depot::registry_alpn();
     let _ = depot::alpn();
-    let _ = depot::SystemBuilder::DEFAULT_CAPACITY;
-    let _ = depot::KeyedClient::close;
+    let _ = depot::RegistryBuilder::DEFAULT_CAPACITY;
+    let _ = depot::RegistryClient::close;
     // Annotated, because `impl Into<Idempotency>` makes the function item
     // generic and a bare path is `E0283`. The annotation is the assertion: it
     // names the type `with_idempotency` returns, which is the whole finding.
     let _: fn(&depot::Client, keylink::IdempotencyKey) -> depot::IdempotentClient =
         depot::Client::with_idempotency;
     let _ = depot::IdempotentClient::close;
-    let _ = depot::KeyedClient::at;
-    let _ = depot::keyed_service(&system, Allowlist::anyone());
+    let _ = depot::RegistryClient::at;
+    let _ = system.service(Allowlist::anyone());
     // Annotated rather than bare, and the annotation is the assertion: the one
     // thing a caller can get wrong about this door is the argument order, and
     // it takes `node` first and then the thing being served, exactly as `serve`
     // does. A bare path would compile whichever way round they went.
-    let _: fn(&keylink::Node, &depot::System, Allowlist) -> keylink::Result<keylink::Server> =
-        depot::keyed_serve;
+    let _: fn(&depot::Registry, &keylink::Node, Allowlist) -> keylink::Result<keylink::Server> =
+        <depot::Registry as Servable>::serve;
 
     assert!(system.is_empty());
 }
@@ -453,6 +454,407 @@ mod cfg_attr_condition_semantics {
                 .await
                 .expect("serde metadata stays on the wire variant only"),
             8
+        );
+    }
+}
+
+#[allow(dead_code)]
+fn setup_builder_types_are_public_and_typed() {
+    use std::num::{NonZeroU32, NonZeroUsize};
+    use std::time::Duration;
+
+    let _: depot::Handle<Counter> = depot::setup(Counter(0))
+        .backpressure(keylink::Backpressure::Park(NonZeroUsize::MIN))
+        .actor();
+    let _: depot::Mountable = depot::setup(Counter(0)).mountable();
+
+    let limit = keylink::Intensity::new(NonZeroU32::MIN, Duration::from_secs(1))
+        .expect("valid restart intensity");
+    let _: depot::Handle<Counter> = depot::restarting(
+        || async { Ok::<_, keylink::Stop>((Counter(0), Vec::new(), ())) },
+        limit,
+    )
+    .actor();
+}
+
+/// The curated prelude exposes exactly the intended generated capability matrix.
+mod capability_matrix {
+    use super::{depot, Counter};
+    use keylink::prelude::*;
+
+    macro_rules! assert_not_impl {
+        ($ty:ty, $cap:path) => {
+            const _: fn() = || {
+                trait AmbiguousIfImpl<A> {
+                    fn marker() {}
+                }
+                impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+                struct Invalid;
+                impl<T: ?Sized + $cap> AmbiguousIfImpl<Invalid> for T {}
+                let _ = <$ty as AmbiguousIfImpl<_>>::marker;
+            };
+        };
+    }
+
+    fn implements_wire<T: Wire>() {}
+    #[cfg(feature = "blocking")]
+    fn implements_blocking_wire<T: BlockingWire>() {}
+    fn implements_with_idempotency<T: WithIdempotency>() {}
+    fn implements_status<T: Status>() {}
+    fn implements_own<T: Own>() {}
+    fn implements_servable<T: Servable>() {}
+
+    #[allow(dead_code)]
+    fn own_associated_types_are_exact<'a>(_: &'a depot::Handle<Counter>) {
+        let state: Option<<depot::Handle<Counter> as Own>::State> = None;
+        let _: Option<Counter> = state;
+
+        let permit: Option<<depot::Handle<Counter> as Own>::Permit<'a>> = None;
+        let _: Option<depot::Permit<'a, Counter>> = permit;
+
+        let owned: Option<<depot::Handle<Counter> as Own>::OwnedPermit> = None;
+        let _: Option<depot::OwnedPermit<Counter>> = owned;
+    }
+
+    #[allow(dead_code)]
+    fn borrowed_permit_keeps_the_handle_lifetime<'a>(
+        handle: &'a depot::Handle<Counter>,
+    ) -> Result<Option<depot::Permit<'a, Counter>>, keylink::NotQueued> {
+        Own::try_reserve(handle)
+    }
+
+    #[allow(dead_code)]
+    async fn reserve_contract_keeps_the_handle_lifetime<'a>(
+        handle: &'a depot::Handle<Counter>,
+    ) -> Result<depot::Permit<'a, Counter>, keylink::NotQueued> {
+        Own::reserve(handle).await
+    }
+
+    #[allow(dead_code)]
+    async fn owned_reserve_contract_is_owned(
+        handle: depot::Handle<Counter>,
+    ) -> Result<depot::OwnedPermit<Counter>, keylink::NotQueued> {
+        Own::reserve_owned(handle).await
+    }
+
+    #[allow(dead_code)]
+    fn positive_matrix() {
+        implements_wire::<depot::RegistryClient>();
+        implements_wire::<depot::Client>();
+        implements_wire::<depot::IdempotentClient>();
+        implements_with_idempotency::<depot::RegistryClient>();
+        implements_with_idempotency::<depot::Client>();
+        implements_status::<depot::ActorRef<'static>>();
+        implements_status::<depot::Client>();
+        implements_status::<depot::IdempotentClient>();
+        implements_own::<depot::Handle<Counter>>();
+        implements_servable::<depot::Handle<Counter>>();
+        implements_servable::<depot::Registry>();
+
+        #[cfg(feature = "blocking")]
+        {
+            implements_blocking_wire::<depot::blocking::Client>();
+            implements_blocking_wire::<depot::blocking::IdempotentClient>();
+            implements_with_idempotency::<depot::blocking::Client>();
+        }
+    }
+
+    assert_not_impl!(depot::Handle<Counter>, Wire);
+    assert_not_impl!(depot::Registry, Wire);
+    assert_not_impl!(depot::LocalRef<'static>, Wire);
+    assert_not_impl!(depot::ActorRef<'static>, Wire);
+
+    assert_not_impl!(depot::Handle<Counter>, BlockingWire);
+    assert_not_impl!(depot::Registry, BlockingWire);
+    assert_not_impl!(depot::LocalRef<'static>, BlockingWire);
+    assert_not_impl!(depot::ActorRef<'static>, BlockingWire);
+    assert_not_impl!(depot::RegistryClient, BlockingWire);
+    assert_not_impl!(depot::Client, BlockingWire);
+    assert_not_impl!(depot::IdempotentClient, BlockingWire);
+
+    assert_not_impl!(depot::Handle<Counter>, WithIdempotency);
+    assert_not_impl!(depot::Registry, WithIdempotency);
+    assert_not_impl!(depot::LocalRef<'static>, WithIdempotency);
+    assert_not_impl!(depot::ActorRef<'static>, WithIdempotency);
+    assert_not_impl!(depot::IdempotentClient, WithIdempotency);
+
+    assert_not_impl!(depot::Handle<Counter>, Status);
+    assert_not_impl!(depot::Registry, Status);
+    assert_not_impl!(depot::LocalRef<'static>, Status);
+    assert_not_impl!(depot::RegistryClient, Status);
+
+    assert_not_impl!(depot::Registry, Own);
+    assert_not_impl!(depot::LocalRef<'static>, Own);
+    assert_not_impl!(depot::ActorRef<'static>, Own);
+    assert_not_impl!(depot::RegistryClient, Own);
+    assert_not_impl!(depot::Client, Own);
+    assert_not_impl!(depot::IdempotentClient, Own);
+
+    assert_not_impl!(depot::LocalRef<'static>, Servable);
+    assert_not_impl!(depot::ActorRef<'static>, Servable);
+    assert_not_impl!(depot::RegistryClient, Servable);
+    assert_not_impl!(depot::Client, Servable);
+    assert_not_impl!(depot::IdempotentClient, Servable);
+
+    #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::Client, Wire);
+    #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::IdempotentClient, Wire);
+    #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::IdempotentClient, WithIdempotency);
+    #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::Client, Status);
+    #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::IdempotentClient, Status);
+    #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::Client, Own);
+    #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::IdempotentClient, Own);
+    #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::Client, Servable);
+    #[cfg(feature = "blocking")]
+    assert_not_impl!(depot::blocking::IdempotentClient, Servable);
+}
+
+/// Every ordinary word reclaimed from generated caller surfaces compiles in one service.
+mod reclaimed_caller_words {
+    keylink::service! {
+        service Reclaimed;
+
+        rpc Service() -> u64;
+        rpc Serve() -> u64;
+        rpc WithState() -> u64;
+        rpc Stop() -> u64;
+        rpc Abort() -> u64;
+        rpc IsRunning() -> u64;
+        rpc IsBusy() -> u64;
+        rpc Buffered() -> u64;
+        rpc Ended() -> u64;
+        rpc Id() -> u64;
+        rpc WithIdempotency() -> u64;
+        rpc KeyState() -> u64;
+        rpc Watch() -> u64;
+        rpc Close() -> u64;
+        rpc Status() -> u64;
+        rpc Reserve() -> u64;
+        rpc TryReserve() -> u64;
+        rpc ReserveOwned() -> u64;
+    }
+
+    struct State;
+
+    impl reclaimed::Actor for State {
+        async fn service(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn serve(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn with_state(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn stop(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn abort(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn is_running(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn is_busy(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn buffered(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn ended(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn id(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn with_idempotency(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn key_state(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn watch(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn close(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn status(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn reserve(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn try_reserve(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn reserve_owned(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+    }
+
+    #[tokio::test]
+    async fn reclaimed_calls_forward_to_user_operations() {
+        let actor = reclaimed::actor(State);
+
+        assert_eq!(reclaimed::Calls::service(&actor).await.expect("service"), 1);
+        assert_eq!(reclaimed::Calls::serve(&actor).await.expect("serve"), 1);
+        assert_eq!(
+            reclaimed::Calls::with_state(&actor)
+                .await
+                .expect("with_state"),
+            1
+        );
+        assert_eq!(reclaimed::Calls::stop(&actor).await.expect("stop"), 1);
+        assert_eq!(reclaimed::Calls::abort(&actor).await.expect("abort"), 1);
+        assert_eq!(
+            reclaimed::Calls::is_running(&actor)
+                .await
+                .expect("is_running"),
+            1
+        );
+        assert_eq!(reclaimed::Calls::is_busy(&actor).await.expect("is_busy"), 1);
+        assert_eq!(
+            reclaimed::Calls::buffered(&actor).await.expect("buffered"),
+            1
+        );
+        assert_eq!(reclaimed::Calls::ended(&actor).await.expect("ended"), 1);
+        assert_eq!(reclaimed::Calls::id(&actor).await.expect("id"), 1);
+        assert_eq!(
+            reclaimed::Calls::with_idempotency(&actor)
+                .await
+                .expect("with_idempotency"),
+            1
+        );
+        assert_eq!(
+            reclaimed::Calls::key_state(&actor)
+                .await
+                .expect("key_state"),
+            1
+        );
+        assert_eq!(reclaimed::Calls::watch(&actor).await.expect("watch"), 1);
+        assert_eq!(reclaimed::Calls::close(&actor).await.expect("close"), 1);
+        assert_eq!(reclaimed::Calls::status(&actor).await.expect("status"), 1);
+        assert_eq!(reclaimed::Calls::reserve(&actor).await.expect("reserve"), 1);
+        assert_eq!(
+            reclaimed::Calls::try_reserve(&actor)
+                .await
+                .expect("try_reserve"),
+            1
+        );
+        assert_eq!(
+            reclaimed::Calls::reserve_owned(&actor)
+                .await
+                .expect("reserve_owned"),
+            1
+        );
+    }
+
+    #[allow(dead_code)]
+    async fn user_methods_and_shadowed_capabilities_are_both_reachable(
+        handle: &reclaimed::Handle<State>,
+        client: &reclaimed::Client,
+        remote: &reclaimed::ActorRef<'_>,
+    ) {
+        let _: Result<u64, keylink::Unanswered> = handle.stop().await;
+        let _: Result<(), keylink::NotQueued> = keylink::Own::stop(handle).await;
+        let _: keylink::Serving = keylink::Own::status(handle);
+        let _: keylink::ServiceBuilder<reclaimed::Request, reclaimed::Response> =
+            keylink::Servable::service(handle, keylink::Allowlist::anyone());
+
+        let _: Result<u64, keylink::Error> = client.close().await;
+        let _: Result<(), keylink::Error> = keylink::Wire::close(client.clone()).await;
+        let _: reclaimed::IdempotentClient = keylink::WithIdempotency::with_idempotency(
+            client,
+            keylink::IdempotencyKey::new("fixture").expect("valid fixture key"),
+        );
+        let _: Result<keylink::Serving, keylink::Error> = keylink::Status::status(client).await;
+
+        let _: Result<u64, keylink::Error> = remote.status().await;
+        let _: Result<keylink::Serving, keylink::Error> = keylink::Status::status(remote).await;
+    }
+
+    #[allow(dead_code)]
+    async fn generated_id_methods_are_the_users(
+        local: &reclaimed::LocalRef<'_>,
+        remote: &reclaimed::ActorRef<'_>,
+    ) {
+        let _: Result<u64, keylink::LocalError> = local.id().await;
+        let _: Result<u64, keylink::Error> = remote.id().await;
+    }
+}
+
+/// Retired internal reservation helpers do not keep their user spellings reserved.
+mod retired_reservation_words {
+    keylink::service! {
+        service InternalNames;
+
+        rpc __Reserve() -> u64;
+        rpc __TryReserve() -> u64;
+        rpc __ReserveOwned() -> u64;
+    }
+
+    struct State;
+
+    impl internal_names::Actor for State {
+        async fn __reserve(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            1
+        }
+
+        async fn __try_reserve(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            2
+        }
+
+        async fn __reserve_owned(&mut self, _cx: keylink::Caller<'_>) -> u64 {
+            3
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_reservation_names_reach_user_operations() {
+        let actor = internal_names::actor(State);
+
+        assert_eq!(
+            internal_names::Calls::__reserve(&actor)
+                .await
+                .expect("__reserve"),
+            1
+        );
+        assert_eq!(
+            internal_names::Calls::__try_reserve(&actor)
+                .await
+                .expect("__try_reserve"),
+            2
+        );
+        assert_eq!(
+            internal_names::Calls::__reserve_owned(&actor)
+                .await
+                .expect("__reserve_owned"),
+            3
         );
     }
 }

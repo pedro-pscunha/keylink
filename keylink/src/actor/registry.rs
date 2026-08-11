@@ -14,12 +14,12 @@
 //! not because the split happened but because the wave that made every actor
 //! system per-service removed the reason for them:
 //!
-//! - ~~four type-parameter defaults — `System<M = Mail>` and its three
-//!   relatives~~ — gone. A default existed so that `keylink::System` written
+//! - ~~four type-parameter defaults — `Registry<M = Mail>` and its three
+//!   relatives~~ — gone. A default existed so that `keylink::Registry` written
 //!   with no parameter went on meaning what it always meant. There is no such
-//!   spelling any more: a system is `inventory::System`, a generated alias that
+//!   spelling any more: a system is `inventory::Registry`, a generated alias that
 //!   applies `M` itself, so there is nothing left for a default to rescue.
-//! - ~~`impl SystemBuilder<Mail>`, for one associated constant~~ — gone with
+//! - ~~`impl RegistryBuilder<Mail>`, for one associated constant~~ — gone with
 //!   them. Its own doc called it a compatibility shim; `DEFAULT_CAPACITY` now
 //!   sits on the generic impl where the cap always belonged, and every call site
 //!   reaches it through a fully applied alias.
@@ -44,7 +44,7 @@
 //!
 //! Two names from the rest of the crate appear in that output, and neither is a
 //! wire type: [`ActorId`], which is what a registry is keyed by and which would
-//! move with it, and [`Ended`], which is what [`System::shutdown`] reports.
+//! move with it, and [`Ended`], which is what [`Registry::stop`] reports.
 //! **`Ended` is a new item on §16.8's bill**, and it is put here rather than left
 //! to be counted later: `turns.rs` names it too, so a split would have to give
 //! both halves somewhere to see it from. That is a smaller cost than a second
@@ -75,7 +75,7 @@ use crate::{ActorId, Ended, Origin, Reply, Serving, Unanswered, Withheld};
 /// wrong one to inherit.
 ///
 /// **What the number means, and every consequence of moving it, is on
-/// [`SystemBuilder::mailbox_depth`]** — one place, because this used to be two
+/// [`RegistryBuilder::mailbox_depth`]** — one place, because this used to be two
 /// constants with two different arguments and only one of them was about the
 /// registry. There is no `unbounded`, here or there; that is stated at the
 /// builder because that is where somebody would go looking for it.
@@ -88,7 +88,7 @@ const DEFAULT_MAILBOX_DEPTH: usize = 1;
 /// two unrelated flags and so the invariant has one place to be written. The
 /// invariant is: **`turns.rs`'s `run_loop` sets it on the way into a turn and
 /// clears it on the way out, for both of an actor's inputs, and nothing else
-/// writes it.** [`System::status`] reads it.
+/// writes it.** [`Registry::status`] reads it.
 ///
 /// The loop and not [`Mailbox::recv`], which is where the design this implements
 /// first put it, and the reason is a feed. A feed item is a turn and it never
@@ -133,7 +133,7 @@ impl Busy {
 ///
 /// A `tokio::sync::mpsc` channel allocates its first block of 32 slots eagerly,
 /// so a mailbox costs `32 * size_of::<M>()` whatever its capacity is — which is
-/// why [`SystemBuilder::mailbox_depth`] is free to move below 32 and measured to
+/// why [`RegistryBuilder::mailbox_depth`] is free to move below 32 and measured to
 /// be. At ten thousand idle actors, measured on this machine against a service
 /// with one `u64` argument — the smallest case there is:
 ///
@@ -174,7 +174,7 @@ impl Busy {
 /// # A struct, and it was a `pub type` alias
 ///
 /// It carries two things now, and the second one is why it stopped being an
-/// alias: the slots, and the [`Busy`] flag [`System::status`] reads. The flag has
+/// alias: the slots, and the [`Busy`] flag [`Registry::status`] reads. The flag has
 /// to travel from the registry — which creates the channel — to the loop, which
 /// is the only thing that knows when a turn starts. Widening [`mount`]'s closure
 /// to take a second argument would have carried it just as well and put the
@@ -208,10 +208,10 @@ impl Busy {
 /// read by different halves of the crate. A
 /// [`LocalActor`](crate::LocalActor) carries both — the fate for a served
 /// dispatch, and its own busy cell for
-/// [`is_busy`](crate::LocalActor::is_busy) — but it carries them **on the
+/// [`busy`](crate::LocalActor::busy) — but it carries them **on the
 /// handle**, because a local actor has no registry entry to hang either on.
-/// Serving it does not give it one: `Handle::service` clones the same
-/// `LocalActor` and adds a door, so what decides where these live is the actor's
+/// Serving it does not give it one: `Servable::service` on the handle clones
+/// the same `LocalActor` and adds a door, so what decides where these live is the actor's
 /// kind and never whether anybody serves it. This
 /// sentence used to say a `LocalActor` "deliberately has no `Busy`"; that was
 /// true of the type in this file and stopped being true of the concept when the
@@ -303,7 +303,7 @@ impl<M> Mailbox<M> {
 
 /// An actor ready to run: its loop and the sender that reaches it.
 ///
-/// Produced by the generated `spawn` and handed to [`System::mount`] or
+/// Produced by the generated `spawn` and handed to [`Registry::mount`] or
 /// returned from a factory. Opaque on purpose: the registry owns the pairing of
 /// a loop with the sender that reaches it, and nothing else may take them apart.
 ///
@@ -312,7 +312,7 @@ impl<M> Mailbox<M> {
 /// system is per-service now, so the hash has nothing left to discriminate and
 /// the comparison it fed is unrepresentable rather than refused.
 ///
-/// `M` is the message the mailbox carries. See [`System`] for what a registry is
+/// `M` is the message the mailbox carries. See [`Registry`] for what a registry is
 /// allowed to know about it, which is nothing.
 ///
 /// # This holds a future, and it used to hold a `JoinHandle`
@@ -320,13 +320,13 @@ impl<M> Mailbox<M> {
 /// [`mount`] spawned the task and this struct carried the handle, which meant
 /// **the actor was already running before anybody had accepted it**. Every path
 /// that refused one therefore dropped a `JoinHandle` — and a dropped
-/// `JoinHandle` *detaches*, it does not cancel — so both of [`System::mount`]'s
+/// `JoinHandle` *detaches*, it does not cancel — so both of [`Registry::mount`]'s
 /// refusals left a live, unreachable task behind: [`MountError`] hands nothing
 /// back, and the registry never had it. A durable actor refused for a taken id
 /// went on holding its exclusive claim with no handle anywhere in the process
 /// able to stop it.
 ///
-/// So the loop is carried unstarted and [`System::mount`] is the one place it
+/// So the loop is carried unstarted and [`Registry::mount`] is the one place it
 /// starts, *after* the two refusals. A refused mount now drops a future that
 /// has never been polled: no task, no state moved onto one, nothing to detach.
 /// That is the same guarantee the lazy path already had — the cap is checked
@@ -340,17 +340,18 @@ impl<M> Mailbox<M> {
 ///
 /// [`mount`] made the channel, so the depth was fixed before any registry saw the
 /// actor — which is exactly why the depth could only ever be a constant. A knob
-/// on [`SystemBuilder`] would have applied to nothing: the closure has already
+/// on [`RegistryBuilder`] would have applied to nothing: the closure has already
 /// taken its receiver by then, and a lazily spawned actor's channel is made
-/// inside `Registry::route`, where no caller is present to name anything.
+/// inside `Shared::route`, where no caller is present to name anything.
 ///
 /// So this carries `FnOnce(Mailbox<M>) -> impl Future` and the **registry** makes
-/// the channel, in `Registry::entry`, with its own depth. Every existing call
+/// the channel, in `Shared::entry`, with its own depth. Every existing call
 /// site is unchanged — `spawn(state)` still hands back one of these and
-/// [`System::mount`] still takes it — and depth becomes a property of the system
+/// [`Registry::mount`] still takes it — and depth becomes a property of the system
 /// an actor is mounted in rather than of the line that built it. That is the
-/// right home for it twice over: it is the same decision for every actor a system
-/// serves, and a system is the only thing a lazy factory's actors have in common.
+/// default home for it: a system is the only thing a lazy factory's ordinary
+/// actors have in common. An explicitly configured `Mountable` carries an
+/// override into that same entry path.
 ///
 /// The second `Box` is the cost, one per mount, transient like the first.
 ///
@@ -358,13 +359,14 @@ impl<M> Mailbox<M> {
 /// attribute on one function covers one function. Dropping one of these drops an
 /// actor's state, and it can be produced by [`mount`], by a factory, or by any
 /// helper a service author writes over either — measured: a local
-/// `fn helper() -> Mounted<_>` called as a statement warns with the attribute
+/// `fn helper() -> Mountable<_>` called as a statement warns with the attribute
 /// here and is silent without it. Bind-then-shadow is *not* what this buys;
 /// `unused_variables` already has that one.
 #[must_use = "an unmounted actor is dropped, and the state it was built around \
               goes with it"]
-pub struct Mounted<M> {
-    /// Called once, by [`Registry::entry`], with the mailbox that registry made.
+pub struct Mountable<M> {
+    backpressure: Option<crate::Backpressure>,
+    /// Called once, by [`Shared::entry`], with the mailbox that registry made.
     /// Boxed twice because both the closure and the future it returns are the
     /// caller's own types, and this struct is named in public signatures where two
     /// more parameters would be noise.
@@ -378,12 +380,12 @@ pub struct Mounted<M> {
 ///
 /// # It resolves to an [`Ended`], and that return type is the fourth way out
 ///
-/// A registry entry left the map at three sites — [`System::shutdown`],
-/// [`System::abort`] and [`Registry::sweep`] — and every one of them is
+/// A registry entry left the map at three sites — [`Registry::stop`],
+/// [`Registry::abort`] and [`Shared::sweep`] — and every one of them is
 /// *somebody asking*. The fourth way out has no asker: a feed that ends, a
 /// handler that panics, an observer that refuses, all end the loop where it
 /// stands. The task finished, the receiver dropped, and the [`Entry`] survived
-/// forever: [`System::status`] listed the actor with `busy: false` while a real
+/// forever: [`Registry::status`] listed the actor with `busy: false` while a real
 /// call to it answered
 /// [`NoSuchActor`](crate::RemoteError::NoSuchActor), and no [`Lifecycle`] was
 /// ever told. Under [`Eviction::Never`] that was permanent.
@@ -391,19 +393,19 @@ pub struct Mounted<M> {
 /// `Output = Ended` is the repair, and it is a *type* rather than a call because
 /// the reason was the part that kept getting lost — `run_keyed` computed the
 /// true [`Ended`] and dropped it on the floor. A loop that cannot return without
-/// naming its ending cannot drop it, and [`Registry::entry`] is the one place
+/// naming its ending cannot drop it, and [`Shared::entry`] is the one place
 /// that ending is turned into a removal and a report.
 type Loop<M> = Box<dyn FnOnce(Mailbox<M>) -> Pin<Box<dyn Future<Output = Ended> + Send>> + Send>;
 
-/// Hand-written for the same reason as [`System`]'s, and it was derived by
+/// Hand-written for the same reason as [`Registry`]'s, and it was derived by
 /// mistake: `derive(Debug)` writes `impl<M: Debug> Debug`, which would make
 /// printing a handle depend on a message type nobody prints. There is nothing
 /// left inside to borrow a `Debug` from — a `dyn FnOnce` cannot be printed, and
 /// the sender this used to show belongs to the registry now — which is what
 /// `finish_non_exhaustive` says out loud rather than by inventing a placeholder.
-impl<M> fmt::Debug for Mounted<M> {
+impl<M> fmt::Debug for Mountable<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Mounted").finish_non_exhaustive()
+        f.debug_struct("Mountable").finish_non_exhaustive()
     }
 }
 
@@ -412,8 +414,8 @@ impl<M> fmt::Debug for Mounted<M> {
 /// Called by the generated `spawn`, which supplies the loop.
 ///
 /// **Nothing is spawned here, and nothing is allocated for a mailbox either.**
-/// The loop runs from [`System::mount`], or from the insert a lazy spawn makes,
-/// which is what makes a refused mount cost no task — see [`Mounted`] for the
+/// The loop runs from [`Registry::mount`], or from the insert a lazy spawn makes,
+/// which is what makes a refused mount cost no task — see [`Mountable`] for the
 /// defect that argument comes from, and for why the channel is the registry's to
 /// make.
 ///
@@ -423,7 +425,7 @@ impl<M> fmt::Debug for Mounted<M> {
 /// there are no defaults left to inherit anyway, so `M` is inferred and the only
 /// thing here to infer it from is the closure's own argument. An unannotated
 /// closure is `error[E0282]: type annotations needed`, pointed at the parameter
-/// — or at the binding, as `Mounted<_>`, if the handle is bound before it is
+/// — or at the binding, as `Mountable<_>`, if the handle is bound before it is
 /// used:
 ///
 /// ```compile_fail
@@ -449,11 +451,27 @@ impl<M> fmt::Debug for Mounted<M> {
 /// [`Ended::Stopped`], which is the same value [`drain`] synthesises from a task
 /// that returned.
 #[doc(hidden)]
-pub fn mount<M, F>(run: impl FnOnce(Mailbox<M>) -> F + Send + 'static) -> Mounted<M>
+pub fn mount<M, F>(run: impl FnOnce(Mailbox<M>) -> F + Send + 'static) -> Mountable<M>
 where
     F: Future<Output = Ended> + Send + 'static,
 {
-    Mounted {
+    Mountable {
+        backpressure: None,
+        run: Box::new(move |inbox| Box::pin(run(inbox))),
+    }
+}
+
+/// Hold an actor loop with its own mailbox policy until a registry mounts it.
+#[doc(hidden)]
+pub fn mount_with_backpressure<M, F>(
+    run: impl FnOnce(Mailbox<M>) -> F + Send + 'static,
+    backpressure: crate::Backpressure,
+) -> Mountable<M>
+where
+    F: Future<Output = Ended> + Send + 'static,
+{
+    Mountable {
+        backpressure: Some(backpressure),
         run: Box::new(move |inbox| Box::pin(run(inbox))),
     }
 }
@@ -469,13 +487,13 @@ where
 pub enum Eviction {
     /// Shut down an actor that has not been addressed for a while.
     ///
-    /// Eviction is [`System::shutdown`], not [`System::abort`]: queued messages
+    /// Eviction is [`Registry::stop`], not [`Registry::abort`]: queued messages
     /// drain and the state is dropped after them, never mid-turn — **for as long
     /// as `shutdown_budget` allows.** Past it the actor is destroyed where it
     /// stands, exactly as `abort` would.
     ///
     /// That last clause is the whole of item 4b. This doc used to read "Eviction
-    /// is `System::stop`, not `System::abort`" with nothing after it, and the
+    /// is `Registry::stop`, not `Registry::abort`" with nothing after it, and the
     /// sweeper it described **never awaited at all**: it dropped the entry inside
     /// a `retain` under the write lock, which dropped the `JoinHandle`, which
     /// detached the task. An actor wedged in a turn was neither drained nor
@@ -490,7 +508,7 @@ pub enum Eviction {
         after: Duration,
         /// How long an evicted actor gets to drain before it is destroyed.
         ///
-        /// The same budget [`System::shutdown`] takes, applied by the sweeper
+        /// The same budget [`Registry::stop`] takes, applied by the sweeper
         /// instead of by a caller — so read that method for what a budget buys
         /// and what expiry costs.
         ///
@@ -508,7 +526,7 @@ pub enum Eviction {
         /// under the write guard and only then waits out this budget, so for up to
         /// one budget the id is free and the state behind it is not.
         ///
-        /// With a lazy factory — [`SystemBuilder::spawn_with`] — that window is
+        /// With a lazy factory — [`RegistryBuilder::spawn_with`] — that window is
         /// something a peer can hit. The next message to that id routes, finds
         /// nothing, calls the factory, and the actor it builds goes for a resource
         /// its predecessor has not let go of yet: a
@@ -526,7 +544,7 @@ pub enum Eviction {
         /// stands, and nothing anywhere says so — the `Ended` the sweeper computes
         /// is nobody's answer, an aborted task's observers never run, and the
         /// caller was a peer whose stream is severed rather than answered. That
-        /// gap is known and Wave 6 owns it, where `System::snapshot` and the
+        /// gap is known and Wave 6 owns it, where `Registry::snapshot` and the
         /// console are. Until then this number is the only control over it.
         shutdown_budget: Duration,
     },
@@ -534,14 +552,14 @@ pub enum Eviction {
     ///
     /// Correct when actors are mounted from a fixed configuration. A leak when
     /// they are spawned lazily from the network, which is why
-    /// [`SystemBuilder::capacity`] still applies.
+    /// [`RegistryBuilder::capacity`] still applies.
     Never,
 }
 
-/// Builds an actor's state on first message. See [`SystemBuilder::spawn_with`],
+/// Builds an actor's state on first message. See [`RegistryBuilder::spawn_with`],
 /// which takes the closure directly — this alias is how the system stores it,
 /// not something a caller ever names.
-type Factory<M> = Arc<dyn Fn(&ActorId) -> Option<Mounted<M>> + Send + Sync>;
+type Factory<M> = Arc<dyn Fn(&ActorId) -> Option<Mountable<M>> + Send + Sync>;
 
 /// Why an actor could not be mounted.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -610,8 +628,9 @@ pub(super) enum RouteError {
 /// transport error to report, and folding `NoSuchActor` or `AtCapacity` into a
 /// `Withheld` would claim that a handler had already started. Once a message is
 /// queued, the existing [`Unanswered`] vocabulary carries the turn's outcome.
-/// Keyed local delivery parks on the bounded mailbox until a slot opens; this
-/// surface has no queue-timeout parameter and therefore reports no `Full` case.
+/// Default and `Park` delivery wait for a mailbox slot. An actor built with an
+/// opted-in `Shed` policy reports [`LocalError::MailboxFull`] instead; this
+/// surface has no queue-timeout parameter.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LocalError {
     /// No actor is mounted under this id and no lazy factory built one.
@@ -626,6 +645,9 @@ pub enum LocalError {
         /// The configured live-actor cap.
         capacity: usize,
     },
+    /// The opted-in shedding mailbox was full, so the message was not queued.
+    #[error("the actor mailbox is full")]
+    MailboxFull,
     /// The actor's mailbox closed before this message could be queued.
     #[error("the actor is no longer running")]
     Closed,
@@ -650,15 +672,15 @@ fn local_error(error: Unanswered) -> LocalError {
     match error {
         Unanswered::Turn(withheld) => LocalError::Turn(withheld),
         Unanswered::Reentrant => LocalError::Reentrant,
-        // Keyed local delivery uses `send`, so a full mailbox parks the caller
-        // until a slot opens. `asked` runs after that send and cannot produce the
-        // local handle's `Full` refusal.
-        Unanswered::Full => unreachable!("keyed local delivery cannot shed a queued message"),
+        // A keyed shed refuses before `asked` runs. Once a message is queued,
+        // this projection cannot receive the local handle's `Full` refusal.
+        Unanswered::Full => unreachable!("keyed delivery cannot shed a queued message"),
     }
 }
 
 struct Entry<M> {
     mail: mpsc::Sender<(Box<M>, Chain)>,
+    shed: bool,
     task: JoinHandle<()>,
     /// Identity of this mounted incarnation, distinct from its reusable id.
     /// The task carries a clone so a late natural ending cannot reap a newer
@@ -668,10 +690,10 @@ struct Entry<M> {
     /// here. An atomic so that touching an actor stays on the read lock.
     last_seen: AtomicU64,
     /// Whether this actor is inside a turn. Written by its loop, read by
-    /// [`System::status`] — see [`Busy`], which owns the invariant.
+    /// [`Registry::status`] — see [`Busy`], which owns the invariant.
     busy: Busy,
     /// What a peer whose reply died is told. Written by this actor's loop, read
-    /// by `deliver_to_actor` — see [`Fate`], which owns that invariant, and
+    /// by `deliver_keyed` — see [`Fate`], which owns that invariant, and
     /// [`Route`], which is how it leaves the registry.
     fate: Fate,
     /// The ending reported by the actor's loop, shared with local waiters.
@@ -683,8 +705,8 @@ impl<M> Entry<M> {
     ///
     /// One body rather than two because [`ActorStatus`] and [`Serving`] both
     /// carry this pair, and two computations of one pair is exactly the drift
-    /// [`Serving`] exists to make impossible: [`System::status`]'s row for an
-    /// actor and [`System::serving`]'s answer about the same actor read the same
+    /// [`Serving`] exists to make impossible: [`Registry::status`]'s row for an
+    /// actor and [`Registry::serving`]'s answer about the same actor read the same
     /// lines, so they cannot disagree.
     ///
     /// Takes no lock and touches no clock, so a caller already holding the read
@@ -702,7 +724,7 @@ impl<M> Entry<M> {
             // widening cannot fail on any target keylink builds for, and a
             // diagnostic must not be the thing that panics if one ever
             // appears.
-            buffered: u64::try_from(
+            queued: u64::try_from(
                 self.mail
                     .max_capacity()
                     .saturating_sub(self.mail.capacity()),
@@ -714,7 +736,7 @@ impl<M> Entry<M> {
 
 /// Where a message goes, and what its caller is told if the answer never comes.
 ///
-/// [`Registry::route`]'s answer, and a struct rather than the bare sender it used
+/// [`Shared::route`]'s answer, and a struct rather than the bare sender it used
 /// to be. The pair travels together because they are read together: a dispatch
 /// sends on the first, and reads the second in the one case where the send
 /// succeeded and no answer followed. Looking the fate up again at that point
@@ -724,13 +746,15 @@ impl<M> Entry<M> {
 pub(super) struct Route<M> {
     /// One end of the actor's mailbox, cloned out of the entry.
     pub(super) mail: mpsc::Sender<(Box<M>, Chain)>,
+    /// Whether a full mailbox refuses immediately.
+    pub(super) shed: bool,
     /// The actor identity used by local re-entrancy checks.
     pub(super) actor: Actor,
     /// The cell that actor's own loop settles before it drops anything.
     pub(super) fate: Fate,
 }
 
-/// Hand-written for [`System`]'s reason: the derive would write `impl<M: Debug>`,
+/// Hand-written for [`Registry`]'s reason: the derive would write `impl<M: Debug>`,
 /// and `M` is a mailbox message that owns a reply channel and a stream. It exists
 /// at all because `Result::expect_err` wants the `Ok` side printable, which is
 /// what this file's own routing tests do with one.
@@ -742,7 +766,7 @@ impl<M> fmt::Debug for Route<M> {
     }
 }
 
-struct Registry<M> {
+struct Shared<M> {
     entries: RwLock<HashMap<ActorId, Entry<M>>>,
     factory: Option<Factory<M>>,
     /// Where mounts and endings are reported, in the order they were installed.
@@ -753,9 +777,8 @@ struct Registry<M> {
     /// [`Lifecycle`].
     lifecycle: Vec<Arc<dyn Lifecycle>>,
     capacity: usize,
-    /// How many messages may wait ahead of the one being handled, for every
-    /// actor in this system. [`SystemBuilder::mailbox_depth`] is where it means
-    /// something.
+    /// Default mailbox depth for mountables that do not carry their own policy.
+    /// [`RegistryBuilder::mailbox_depth`] configures it.
     mailbox_depth: usize,
     eviction: Eviction,
     /// `n0_future::time::Instant`, which is neither of the obvious two.
@@ -770,12 +793,12 @@ struct Registry<M> {
     /// `std::time::Instant::now()` — which `tokio::time::Instant` resolves to
     /// off a test runtime — **panics** on `wasm32-unknown-unknown`, where std
     /// dispatches to an unsupported platform stub. This field is built in
-    /// `SystemBuilder::build`, so before this change every actor system panicked
+    /// `RegistryBuilder::build`, so before this change every actor system panicked
     /// in a tab. RFC-03 never caught it because this module postdates the RFC.
     epoch: Instant,
 }
 
-impl<M> Registry<M> {
+impl<M> Shared<M> {
     fn now(&self) -> u64 {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
@@ -819,12 +842,12 @@ impl<M> Registry<M> {
     /// that ended, a handler that panicked, an observer that refused, a
     /// supervisor that gave up. [`Loop`] carries what leaving that entry behind
     /// cost. Called from the actor's own task, by the wrapper
-    /// [`Registry::entry`] spawns, with the [`Ended`] the loop returned — which
+    /// [`Shared::entry`] spawns, with the [`Ended`] the loop returned — which
     /// is the *true* reason rather than [`drain`]'s synthesis from a join.
     ///
     /// # It reports only if the entry was still ours, and that is the whole interlock
     ///
-    /// [`System::shutdown`], [`System::abort`] and [`Registry::sweep`] all take
+    /// [`Registry::stop`], [`Registry::abort`] and [`Shared::sweep`] all take
     /// the entry out **before** they await the task, and each reports its own
     /// ending afterwards. The id may be remounted during that await, so absence
     /// is not the interlock: the task's opaque identity must still match the
@@ -852,7 +875,7 @@ impl<M> Registry<M> {
         };
         // The guard dies with the statement, so `report_ended` runs without it:
         // a `Lifecycle` may ask this same system what is running, exactly as at
-        // `System::mount`'s report site.
+        // `Registry::mount`'s report site.
         if ours {
             self.report_ended(id, identity, why);
         }
@@ -887,7 +910,7 @@ impl<M> Registry<M> {
 
     /// Find the actor, spawning it if the system was given a factory.
     ///
-    /// `self: &Arc<Self>` because a lazy spawn reaches [`Registry::entry`], and
+    /// `self: &Arc<Self>` because a lazy spawn reaches [`Shared::entry`], and
     /// the task that starts there holds a [`Weak`] back to this
     /// registry so it can reap its own entry. There is no other reason.
     fn route(self: &Arc<Self>, id: &ActorId) -> std::result::Result<Route<M>, RouteError>
@@ -921,6 +944,7 @@ impl<M> Registry<M> {
                 (
                     Route {
                         mail: entry.mail.clone(),
+                        shed: entry.shed,
                         actor: entry.busy.identity(),
                         fate: entry.fate.clone(),
                     },
@@ -937,11 +961,12 @@ impl<M> Registry<M> {
                     return Err(RouteError::NoSuchActor { id: id.clone() });
                 };
                 // The sender comes out of the entry rather than out of the
-                // `Mounted`, because the mailbox is made here now — see
-                // [`Mounted`] for why the depth could not otherwise be a knob.
+                // `Mountable`, because the mailbox is made here now — see
+                // [`Mountable`] for why the depth could not otherwise be a knob.
                 let entry = self.entry(free.key(), mounted);
                 let found = Route {
                     mail: entry.mail.clone(),
+                    shed: entry.shed,
                     actor: entry.busy.identity(),
                     fate: entry.fate.clone(),
                 };
@@ -957,10 +982,10 @@ impl<M> Registry<M> {
         Ok(found)
     }
 
-    /// One row per live actor. [`System::status`] is the door and carries what
+    /// One row per live actor. [`Registry::status`] is the door and carries what
     /// every field does and does not claim; this is the body, here because
-    /// [`System::weak_status`] needs it reachable from a
-    /// [`Weak`] that has no `System` around it.
+    /// [`Registry::weak_status`] needs it reachable from a
+    /// [`Weak`] that has no `Registry` around it.
     fn status(&self) -> Vec<ActorStatus> {
         let now = self.now();
         self.read()
@@ -968,14 +993,14 @@ impl<M> Registry<M> {
             .map(|(id, entry)| {
                 // The two turn facts come from `Entry::serving`, so this row and
                 // the `Serving` a peer reads for the same actor cannot disagree.
-                let Serving { busy, buffered } = entry.serving();
+                let Serving { busy, queued } = entry.serving();
                 ActorStatus {
                     id: id.clone(),
                     idle_for: Duration::from_millis(
                         now.saturating_sub(entry.last_seen.load(Ordering::Relaxed)),
                     ),
                     busy,
-                    buffered,
+                    queued,
                 }
             })
             .collect()
@@ -986,6 +1011,7 @@ impl<M> Registry<M> {
         entry.last_seen.store(self.now(), Ordering::Relaxed);
         Some(Route {
             mail: entry.mail.clone(),
+            shed: entry.shed,
             actor: entry.busy.identity(),
             fate: entry.fate.clone(),
         })
@@ -995,9 +1021,9 @@ impl<M> Registry<M> {
     /// reaches it.
     ///
     /// **The only place an actor's task is spawned**, which is what lets
-    /// [`Mounted`] be refused for free — and **the only place a mailbox is
-    /// created**, which is what lets [`SystemBuilder::mailbox_depth`] reach a
-    /// lazily spawned actor as well as a hand-mounted one.
+    /// [`Mountable`] be refused for free — and **the only place a mailbox is
+    /// created**, which lets an opted-in [`Mountable`] policy override the
+    /// registry default without creating a second mailbox path.
     ///
     /// # Every caller inserts through a `VacantEntry`, and that is structural
     ///
@@ -1005,7 +1031,7 @@ impl<M> Registry<M> {
     /// would detach the actor that was there — the defect this wave exists to
     /// remove, in the one shape a type cannot catch: `HashMap::insert` hands the
     /// displaced value back as an `Option` that a caller may discard, and
-    /// [`System::mount`] and [`Registry::route`] both did discard it. Both were
+    /// [`Registry::mount`] and [`Shared::route`] both did discard it. Both were
     /// safe, each by a presence check a few lines up under the same write guard —
     /// an argument that has to be re-made every time either function is edited.
     ///
@@ -1017,26 +1043,31 @@ impl<M> Registry<M> {
     /// # The task is wrapped, and the wrapper is what closes the fourth way out
     ///
     /// The loop resolves to an [`Ended`] — see [`Loop`] — and the wrapper hands
-    /// it to [`Registry::reap`], which is the only site that can unmount an
+    /// it to [`Shared::reap`], which is the only site that can unmount an
     /// actor **nobody asked to unmount**. A [`Weak`] and not an
     /// `Arc`, and not for tidiness: the registry owns the [`Entry`], the entry
     /// owns the `JoinHandle`, and a strong reference here would close that ring.
-    /// A program that dropped every [`System`] clone would keep the registry —
+    /// A program that dropped every [`Registry`] clone would keep the registry —
     /// and therefore every actor's own sender — alive off its actors' tasks, so
     /// `Taken::Mail(None)` would become unreachable and nothing would ever end.
     ///
     /// A `None` from `upgrade` is the honest case rather than an error: the last
-    /// [`System`] is gone, so there is no map to take the entry out of and
+    /// [`Registry`] is gone, so there is no map to take the entry out of and
     /// nobody left holding a [`Lifecycle`] to tell.
     ///
     /// # Panics
     ///
     /// Panics when called outside a tokio runtime, like every other spawn.
-    fn entry(self: &Arc<Self>, id: &ActorId, mounted: Mounted<M>) -> Entry<M>
+    fn entry(self: &Arc<Self>, id: &ActorId, mounted: Mountable<M>) -> Entry<M>
     where
         M: Send + 'static,
     {
-        let (mail, slots) = mpsc::channel(self.mailbox_depth);
+        let (mailbox_depth, shed) = match mounted.backpressure {
+            Some(crate::Backpressure::Park(depth)) => (depth.get(), false),
+            Some(crate::Backpressure::Shed(depth)) => (depth.get(), true),
+            None => (self.mailbox_depth, false),
+        };
+        let (mail, slots) = mpsc::channel(mailbox_depth);
         let busy = Busy::default();
         let fate = Fate::default();
         let (ended, _) = watch::channel(None);
@@ -1050,7 +1081,7 @@ impl<M> Registry<M> {
         };
         // Built here rather than inside the task, so the loop is still a future
         // that has never been polled at the moment the spawn takes it — which is
-        // what [`Mounted`] is for and what a refused mount rests on.
+        // what [`Mountable`] is for and what a refused mount rests on.
         let running = (mounted.run)(inbox);
         let registry = Arc::downgrade(self);
         // One `ActorId` clone per live actor, held for its life. The map already
@@ -1060,6 +1091,7 @@ impl<M> Registry<M> {
         let id = id.clone();
         Entry {
             mail,
+            shed,
             task: n0_future::task::spawn(async move {
                 let why = running.await;
                 ended_for_task.send_if_modified(|slot| {
@@ -1097,7 +1129,7 @@ impl<M> Registry<M> {
     ///
     /// So the lock is used for the one thing it is needed for — deciding who is
     /// expired and taking them out of the map — and released before anything is
-    /// awaited. This is [`Registry::route`]'s discipline read backwards: `route`
+    /// awaited. This is [`Shared::route`]'s discipline read backwards: `route`
     /// holds the guard across the user's `factory` call and is documented as such;
     /// nothing here may hold it across an await.
     ///
@@ -1173,9 +1205,9 @@ impl<M> Registry<M> {
 
 /// Close the mailbox, wait out `budget`, and destroy what is still running.
 ///
-/// The one teardown in this file: [`System::shutdown`] and [`Registry::sweep`]
+/// The one teardown in this file: [`Registry::stop`] and [`Shared::sweep`]
 /// both go through here, so an eviction and a shutdown cannot mean different
-/// things. [`System::abort`] does not, because it never drains — that is a
+/// things. [`Registry::abort`] does not, because it never drains — that is a
 /// different operation rather than this one with a budget of zero.
 ///
 /// # The handle must outlive the timeout, and must not outlive this future
@@ -1204,13 +1236,13 @@ impl<M> Registry<M> {
 /// nothing.
 ///
 /// The second way is **cancellation**, and it is the same defect one level up.
-/// This future is awaited by [`System::shutdown`] and by [`Registry::sweep`],
+/// This future is awaited by [`Registry::stop`] and by [`Shared::sweep`],
 /// and a caller may drop either: `tokio::select!`, a `race`, a `timeout` around
 /// the whole call, a spawned sweep whose handle goes away. Dropping the
 /// *outer* future drops this frame, and this frame is where the handle lives —
 /// so with a bare `JoinHandle` a cancelled `shutdown` reproduced the deleted
 /// `stop` exactly: entry gone from the map, task detached, and
-/// [`System::abort`] answering `false` for an actor that is still running.
+/// [`Registry::abort`] answering `false` for an actor that is still running.
 ///
 /// So the handle is an [`AbortOnDropHandle`], and letting go of it — by expiry,
 /// by cancellation, or by a panic unwinding this frame — aborts instead of
@@ -1227,9 +1259,9 @@ impl<M> Registry<M> {
 ///   remains authoritative for direct observation.
 ///
 /// The `Ended` is **synthesised from the join**, not read from the actor, and
-/// [`System::shutdown`] carries the argument for that and states its residual.
+/// [`Registry::stop`] carries the argument for that and states its residual.
 struct TeardownGuard<M> {
-    registry: Arc<Registry<M>>,
+    registry: Arc<Shared<M>>,
     id: ActorId,
     ended: watch::Sender<Option<Ended>>,
     identity: Arc<()>,
@@ -1269,7 +1301,7 @@ impl<M> Drop for TeardownGuard<M> {
 }
 
 async fn drain<M>(
-    registry: Arc<Registry<M>>,
+    registry: Arc<Shared<M>>,
     id: ActorId,
     entry: Entry<M>,
     budget: Duration,
@@ -1296,7 +1328,7 @@ async fn drain<M>(
     // Which makes this a constraint on every dispatch, and one was breaking it: a
     // caller that keeps its [`Route`] alive across the wait for the *answer* holds
     // this open for as long as it waits, and a parked `#[defer]` reply never
-    // answers. `deliver_to_actor` did exactly that — for no reason of its own,
+    // answers. `deliver_keyed` did exactly that — for no reason of its own,
     // only because the `map_err` at the bottom read the other field — so a keyed
     // actor holding one could not be stopped gracefully at all: every budget was
     // spent in full and the actor was aborted. It clones the [`Fate`] out and
@@ -1344,7 +1376,7 @@ async fn drain<M>(
 
 // ─────────────────────────────────────────────────────────── what is running
 
-/// What one mounted actor is doing, as of the moment [`System::status`] looked.
+/// What one mounted actor is doing, as of the moment [`Registry::status`] looked.
 ///
 /// Stale the instant it is returned — an actor takes its next message on another
 /// task — so it answers "what was going on" and never "what is guaranteed now".
@@ -1358,7 +1390,7 @@ async fn drain<M>(
 ///   number becomes a fact people route on. It belongs to the wave that makes
 ///   re-incarnation a thing that happens.
 /// - **no `queued`.** The total backlog is not observable, and the field that
-///   claimed it is refused by name. [`Self::buffered`] is the part that can be
+///   claimed it is refused by name. [`Self::queued`] is the part that can be
 ///   measured, said as a floor.
 ///
 /// # It crosses the wire, and that was a decision about one ALPN
@@ -1413,10 +1445,10 @@ pub struct ActorStatus {
     /// `max_capacity() - capacity()`, which is exact for what the channel is
     /// *holding* — and callers parked waiting for a permit are not observable at
     /// all, because `tokio`'s `Semaphore` does not expose its waiters. Four
-    /// hundred senders can be queued behind a `buffered` of 3.
+    /// hundred senders can be queued behind a `queued` of 3.
     ///
     /// So: 0 or 1 at the default depth of one, at most
-    /// [`SystemBuilder::mailbox_depth`] at any other, and never a number to
+    /// [`RegistryBuilder::mailbox_depth`] at any other, and never a number to
     /// compute a queue-length alert from. What it is good for is the question it
     /// answers exactly — is this actor's mailbox full, and therefore is anybody
     /// who sends to it going to block.
@@ -1433,11 +1465,11 @@ pub struct ActorStatus {
     ///
     /// The widening is lossless on every target keylink supports — `usize` is at
     /// most 64 bits on all of them — and the field is bounded by
-    /// [`SystemBuilder::mailbox_depth`] anyway, which is a small number.
-    pub buffered: u64,
+    /// [`RegistryBuilder::mailbox_depth`] anyway, which is a small number.
+    pub queued: u64,
 }
 
-/// Where a [`System`] reports an actor arriving and an actor leaving.
+/// Where a [`Registry`] reports an actor arriving and an actor leaving.
 ///
 /// Two methods, because a registry knows exactly two things about an actor's
 /// life that nothing else in the process can see. What happens *in between* is a
@@ -1447,11 +1479,11 @@ pub struct ActorStatus {
 ///
 /// # The ending is the reason this exists, and it closes a stated gap
 ///
-/// [`Self::mounted`] could be reported by whoever called [`System::mount`]. Two
+/// [`Self::mounted`] could be reported by whoever called [`Registry::mount`]. Two
 /// mounts cannot: a lazily spawned actor is built inside
-/// [`SystemBuilder::spawn_with`]'s factory with no caller present, and an actor
+/// [`RegistryBuilder::spawn_with`]'s factory with no caller present, and an actor
 /// **evicted** by the sweeper is torn down on a timer with no caller present
-/// either. The second one was a documented hole — `Registry::sweep` computed an
+/// either. The second one was a documented hole — `Shared::sweep` computed an
 /// [`Ended`] for every actor it destroyed and dropped it, so a
 /// [`shutdown_budget`](Eviction::Idle::shutdown_budget) set below the longest
 /// turn destroyed that turn with no log, no counter, no observer and no caller,
@@ -1472,13 +1504,13 @@ pub struct ActorStatus {
 /// fit, published as [`NodeStatus::dropped`]. Losing a diagnostic loudly beats
 /// blocking a teardown quietly.
 ///
-/// Neither call holds the registry's lock. [`System::mount`] releases the write
+/// Neither call holds the registry's lock. [`Registry::mount`] releases the write
 /// guard before it reports, so an implementation may call back into the same
-/// system — [`System::status`], [`System::len`] — without deadlocking.
+/// system — [`Registry::status`], [`Registry::len`] — without deadlocking.
 ///
 /// # A system holds as many of these as were installed
 ///
-/// [`SystemBuilder::lifecycle`] appends. Every implementation installed on a
+/// [`RegistryBuilder::lifecycle`] appends. Every implementation installed on a
 /// system sees every mount and every ending, in the order the calls were made,
 /// on the one task that mounted or tore down.
 ///
@@ -1496,8 +1528,8 @@ pub struct ActorStatus {
 /// **This doc used to argue the other way**, on the grounds that a
 /// `catch_unwind` here would be inventing a failure policy for caller code the
 /// registry cannot name. What that missed is that unwinding is a policy too, and
-/// nobody chose it: the caller it reaches is `System::mount`, `System::shutdown`,
-/// `System::abort` or the sweeper's own task, none of which asked to die for a
+/// nobody chose it: the caller it reaches is `Registry::mount`, `Registry::stop`,
+/// `Registry::abort` or the sweeper's own task, none of which asked to die for a
 /// diagnostic. Everywhere else this crate does name the policy and it is always
 /// the same one — a panicking turn, observer, group policy or `retire` each
 /// costs one thing and not the run.
@@ -1543,20 +1575,20 @@ pub trait Lifecycle: Send + Sync + 'static {
 /// # Awaiting a keyed actor's ending
 ///
 /// A local actor hands its caller `ended()`. A keyed actor is addressed by id,
-/// so its system owns the observation door: [`System::ended`] returns an
+/// so its system owns the observation door: [`Registry::ended`] returns an
 /// optional future that subscribes to the entry's watch channel without creating
 /// an actor. `None` means the id is not mounted at the instant of the read.
 /// Subscribe after `mount` and before a teardown can remove the entry.
 ///
 /// The channel is shared by the actor loop and the registry. The loop publishes
-/// its actual ending before `Registry::reap` removes the entry; `shutdown` and
+/// its actual ending before `Shared::reap` removes the entry; `shutdown` and
 /// `abort` publish a synthesized `Ended` when they destroy an actor before its
 /// loop can report one. [`Lifecycle::ended`] still reports every removal, and
 /// `compose::Endings` remains useful when a composition wants to fan those
 /// callbacks into a group-level awaitable.
 ///
 /// `compose::Endings` is backticks and not a link, for the reason
-/// [`SystemBuilder::lifecycle`] gives at length: `compose` is built on top of this
+/// [`RegistryBuilder::lifecycle`] gives at length: `compose` is built on top of this
 /// module, and a link from here would point the seam at the layer above it.
 ///
 /// `M` is what a mailbox carries, and it is a parameter because everything here
@@ -1567,16 +1599,16 @@ pub trait Lifecycle: Send + Sync + 'static {
 /// would show it.
 ///
 /// **There is no default, and there used to be.** One system per node held
-/// actors of unrelated services, so `keylink::System` written bare had to mean
+/// actors of unrelated services, so `keylink::Registry` written bare had to mean
 /// something and a type-parameter default was the only way to say it. A system
 /// is per-service now: `M` is that service's own mailbox type, `inventory::Mail`,
-/// and a caller writes the generated `inventory::System` alias rather than this
+/// and a caller writes the generated `inventory::Registry` alias rather than this
 /// type. That is not tidying — a per-service registry **physically cannot hold**
 /// an actor of another service, so mounting the wrong one is `E0308` at the call
 /// site instead of a schema comparison at run time on the serving node.
 ///
-/// `System<YourOwnType>` still compiles, and there is still no way to deliver a
-/// message to anything in it: `route` is `pub(super)` and [`Mounted`] keeps its
+/// `Registry<YourOwnType>` still compiles, and there is still no way to deliver a
+/// message to anything in it: `route` is `pub(super)` and [`Mountable`] keeps its
 /// sender to itself. What you get is a map you can mount into, count, stop and
 /// evict, and never send to. The tests in this file are the exception that
 /// proves it — they are inside the crate, so they can call `route`.
@@ -1585,11 +1617,11 @@ pub trait Lifecycle: Send + Sync + 'static {
 ///
 /// This is where somebody who has just met that error is looking. `M` has to
 /// come from somewhere, and a `let` that binds what
-/// [`build`](SystemBuilder::build) returns without naming its type gives it
+/// [`build`](RegistryBuilder::build) returns without naming its type gives it
 /// nowhere to come from:
 ///
 /// ```compile_fail
-/// let system = keylink::System::builder(keylink::Eviction::Never).build();
+/// let system = keylink::Registry::builder(keylink::Eviction::Never).build();
 /// assert!(system.is_empty());
 /// ```
 ///
@@ -1599,7 +1631,7 @@ pub trait Lifecycle: Send + Sync + 'static {
 /// The second line is what such a system goes on to be used for, and it is why
 /// nothing downstream rescues the binding either — [`contains`](Self::contains),
 /// [`len`](Self::len), [`is_empty`](Self::is_empty),
-/// [`evict_idle`](Self::evict_idle), [`shutdown`](Self::shutdown) and
+/// [`evict_idle`](Self::evict_idle), [`shutdown`](Self::stop) and
 /// [`abort`](Self::abort) never mention `M`, so none of them pins it.
 ///
 /// `compile_fail` says only that it failed, and writing `compile_fail,E0282`
@@ -1612,14 +1644,14 @@ pub trait Lifecycle: Send + Sync + 'static {
 /// site does anyway:
 ///
 /// ```ignore
-/// let system: inventory::System = inventory::System::builder(Eviction::Never).build();
+/// let system: inventory::Registry = inventory::Registry::builder(Eviction::Never).build();
 /// assert!(system.is_empty());
 /// ```
 ///
 /// Most code never meets it, because `mount(id, inventory::spawn(..))` pins `M`
-/// through [`Mounted`] without anybody trying.
-pub struct System<M> {
-    inner: Arc<Registry<M>>,
+/// through [`Mountable`] without anybody trying.
+pub struct Registry<M> {
+    inner: Arc<Shared<M>>,
 }
 
 /// Hand-written, because the derive would bound the impl on `M: Clone` — and a
@@ -1629,7 +1661,7 @@ pub struct System<M> {
 /// The derive does not fail where it is written, either: `self.clone()` in
 /// `dispatch` would quietly resolve to `Clone` on the *reference* and surface
 /// as a lifetime error inside the dispatch closure.
-impl<M> Clone for System<M> {
+impl<M> Clone for Registry<M> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -1637,12 +1669,12 @@ impl<M> Clone for System<M> {
     }
 }
 
-impl<M> System<M> {
+impl<M> Registry<M> {
     /// Configure a system. The eviction policy is an argument because there is
     /// no safe default for it.
     #[must_use]
-    pub fn builder(eviction: Eviction) -> SystemBuilder<M> {
-        SystemBuilder {
+    pub fn builder(eviction: Eviction) -> RegistryBuilder<M> {
+        RegistryBuilder {
             capacity: DEFAULT_CAPACITY,
             mailbox_depth: DEFAULT_MAILBOX_DEPTH,
             eviction,
@@ -1672,12 +1704,21 @@ impl<M> System<M> {
         }
         let fate = route.fate.clone();
         let (reply, answer) = Reply::channel();
-        let sent = route
-            .mail
-            .send((Box::new(mail(Origin::local(), reply)), chain))
-            .await;
+        let message = (Box::new(mail(Origin::local(), reply)), chain);
+        if route.shed {
+            match route.mail.try_send(message) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => return Err(LocalError::MailboxFull),
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err(LocalError::Closed),
+            }
+        } else {
+            route
+                .mail
+                .send(message)
+                .await
+                .map_err(|_| LocalError::Closed)?;
+        }
         drop(route);
-        sent.map_err(|_| LocalError::Closed)?;
         crate::turns::asked(answer, &fate)
             .await
             .map_err(local_error)
@@ -1712,6 +1753,13 @@ impl<M> System<M> {
                 Err(mpsc::error::TrySendError::Closed(_)) => Err(LocalError::Closed),
             };
         }
+        if route.shed {
+            return match route.mail.try_send(message) {
+                Ok(()) => Ok(()),
+                Err(mpsc::error::TrySendError::Full(_)) => Err(LocalError::MailboxFull),
+                Err(mpsc::error::TrySendError::Closed(_)) => Err(LocalError::Closed),
+            };
+        }
         let sent = route.mail.send(message).await;
         drop(route);
         sent.map_err(|_| LocalError::Closed)
@@ -1723,8 +1771,8 @@ impl<M> System<M> {
     /// this registry is taken, and no connection is disturbed.
     ///
     /// **A refusal costs no task.** Both refusals below return before the actor's
-    /// loop is ever polled, so the [`Mounted`] this drops is an unstarted future
-    /// rather than a running task — which is the whole reason [`Mounted`] holds a
+    /// loop is ever polled, so the [`Mountable`] this drops is an unstarted future
+    /// rather than a running task — which is the whole reason [`Mountable`] holds a
     /// future. [`MountError`] hands nothing back, so anything already spawned by
     /// the time a refusal is decided would be unreachable by construction.
     ///
@@ -1739,12 +1787,12 @@ impl<M> System<M> {
     ///
     /// [`MountError::Occupied`] when the id is taken, and
     /// [`MountError::AtCapacity`] when the registry is full.
-    pub fn mount(&self, id: ActorId, actor: Mounted<M>) -> std::result::Result<(), MountError>
+    pub fn mount(&self, id: ActorId, actor: Mountable<M>) -> std::result::Result<(), MountError>
     where
         M: Send + 'static,
     {
         let mut entries = self.inner.write();
-        // See `Registry::route`: a `VacantEntry` borrows the map, so the count is
+        // See `Shared::route`: a `VacantEntry` borrows the map, so the count is
         // taken first. It is the count before this insert, which is the one the
         // cap is about.
         let live = entries.len();
@@ -1783,7 +1831,7 @@ impl<M> System<M> {
     ///
     /// **The whole of the seam**, and an operation rather than a handle on
     /// purpose. With `inner` reachable from `remote.rs`, the transport half held
-    /// the entire [`Registry`] and every method on it, so nothing but manners
+    /// the entire [`Shared`] and every method on it, so nothing but manners
     /// stopped the next change from reaching the map, the cap or the eviction
     /// clock from the side that has a network in it. One `pub(super)` function
     /// is a boundary that can be read in full, and adding a second is a visible
@@ -1865,7 +1913,7 @@ impl<M> System<M> {
     /// survives alongside this because it never drains, which makes it a different
     /// operation rather than this one with a budget of zero.
     ///
-    /// # The `Ended` returned here answers a different question from `System::ended`
+    /// # The `Ended` returned here answers a different question from `Registry::ended`
     ///
     /// This method reports the fate of **this shutdown operation**: `Stopped` when
     /// the task drained inside `budget`, and `Vanished` when the budget expired or
@@ -1874,7 +1922,7 @@ impl<M> System<M> {
     ///
     /// The registry entry also carries a watch channel. The generated loop publishes
     /// its actual [`Ended`] value before the registry reaps it, and
-    /// [`System::ended`] lets a caller that subscribed before removal await that
+    /// [`Registry::ended`] lets a caller that subscribed before removal await that
     /// value. If `shutdown` has to abort the task, `drain` publishes the synthesized
     /// `Vanished` value only when the loop did not publish one first.
     ///
@@ -1884,7 +1932,7 @@ impl<M> System<M> {
     /// observer's refusal can therefore return `Stopped` while a pre-existing
     /// `ended` subscriber receives `Ended::Observer`.
     ///
-    pub async fn shutdown(&self, id: &ActorId, budget: Duration) -> Option<Ended> {
+    pub async fn stop(&self, id: &ActorId, budget: Duration) -> Option<Ended> {
         let entry = self.inner.write().remove(id)?;
         let ended = drain(Arc::clone(&self.inner), id.clone(), entry, budget).await;
         Some(ended)
@@ -1894,7 +1942,7 @@ impl<M> System<M> {
     ///
     /// The state is **destroyed**: the task owns it, `abort` drops that task's
     /// future at its next await point, and unflushed work goes with it. That is
-    /// the difference from [`Self::shutdown`], and it is why the two are separate
+    /// the difference from [`Self::stop`], and it is why the two are separate
     /// methods rather than one with a budget of zero: this one does not drain, so
     /// there is no budget to name.
     ///
@@ -1902,7 +1950,7 @@ impl<M> System<M> {
     /// wave that deleted `stop`. A caller who wraps this in a timeout and lets it
     /// fire loses the wait and not the cancellation — the request has already
     /// landed on the task. The teardown guard also settles a direct
-    /// [`System::ended`] future and every [`Lifecycle`] callback as
+    /// [`Registry::ended`] future and every [`Lifecycle`] callback as
     /// [`Ended::Vanished`] when that outer wait is cancelled; a natural ending
     /// already published by the loop remains authoritative.
     ///
@@ -1934,7 +1982,7 @@ impl<M> System<M> {
         // Publish the synthetic result only after the task has joined. If the
         // loop won the race before cancellation, its natural `Feed`/`Panicked`/
         // `Observer` value is already in the channel and remains authoritative.
-        // Delaying the synthetic send keeps a direct `System::ended` waiter and
+        // Delaying the synthetic send keeps a direct `Registry::ended` waiter and
         // the lifecycle callback on the same final value.
         let published = { ending.borrow().clone() };
         let why = published.unwrap_or(Ended::Vanished);
@@ -2018,7 +2066,7 @@ impl<M> System<M> {
     /// Nothing is mounted under that id. **This is a non-inserting reader, and
     /// that is the whole point of it not going through routing.** Routing takes
     /// the write lock and inserts from the factory a system was built with, so on
-    /// a [`SystemBuilder::spawn_with`] system a status question asked that way
+    /// a [`RegistryBuilder::spawn_with`] system a status question asked that way
     /// would *create* the actor it was asked about. This takes the read lock the
     /// way [`Self::contains`] does and answers about what is already there:
     /// asking what an actor is doing must not be how one comes into existence.
@@ -2064,8 +2112,8 @@ impl<M> System<M> {
     /// system alive.
     ///
     /// `pub(crate)`, and the one caller is [`Inspector`](crate::Inspector),
-    /// which erases a `System<M>` to a closure so that one console can answer
-    /// for a system of any service. Erasing it through a `System` clone made
+    /// which erases a `Registry<M>` to a closure so that one console can answer
+    /// for a system of any service. Erasing it through a `Registry` clone made
     /// that closure an *owner*: a program that dropped its own system went on
     /// running every actor in it, because the inspect actor was holding the
     /// registry — and [`spawn_sweeper`] is already `Weak` for exactly this
@@ -2076,7 +2124,7 @@ impl<M> System<M> {
     /// report a shutting-down node as an idle one.
     ///
     /// An `impl Trait` return rather than the `Weak` itself, because
-    /// [`Registry`] is this module's and is not going to stop being.
+    /// [`Shared`] is this module's and is not going to stop being.
     pub(crate) fn weak_status(
         &self,
     ) -> impl Fn() -> Option<Vec<ActorStatus>> + Send + Sync + 'static
@@ -2118,9 +2166,9 @@ impl<M> System<M> {
     }
 }
 
-impl<M> fmt::Debug for System<M> {
+impl<M> fmt::Debug for Registry<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("System")
+        f.debug_struct("Registry")
             .field("live", &self.len())
             .field("capacity", &self.inner.capacity)
             .field("mailbox_depth", &self.inner.mailbox_depth)
@@ -2130,37 +2178,37 @@ impl<M> fmt::Debug for System<M> {
     }
 }
 
-/// Assembles a [`System`]: its eviction policy, its cap, and how it spawns.
+/// Assembles a [`Registry`]: its eviction policy, its cap, and how it spawns.
 ///
-/// `M` is the system's message type, exactly as on [`System`], and it has no
+/// `M` is the system's message type, exactly as on [`Registry`], and it has no
 /// default for the same reason.
-pub struct SystemBuilder<M> {
+pub struct RegistryBuilder<M> {
     capacity: usize,
     mailbox_depth: usize,
     eviction: Eviction,
     factory: Option<Factory<M>>,
-    /// Every sink [`SystemBuilder::lifecycle`] was given, in call order. A `Vec`
+    /// Every sink [`RegistryBuilder::lifecycle`] was given, in call order. A `Vec`
     /// and not an `Option`, because that method appends — see it for why one
     /// slot was wrong.
     lifecycle: Vec<Arc<dyn Lifecycle>>,
 }
 
-/// The cap, as the generic half spells it. [`SystemBuilder::DEFAULT_CAPACITY`]
+/// The cap, as the generic half spells it. [`RegistryBuilder::DEFAULT_CAPACITY`]
 /// is the public name and carries the reasoning for the number.
 const DEFAULT_CAPACITY: usize = 10_000;
 
-impl<M> SystemBuilder<M> {
+impl<M> RegistryBuilder<M> {
     /// The cap a system has when none is named.
     ///
     /// Ten thousand live actors was the number the design was costed against,
     /// so it is the number a system holds before it starts refusing.
     ///
-    /// This lived on `impl SystemBuilder<Mail>` for one release, under a doc
+    /// This lived on `impl RegistryBuilder<Mail>` for one release, under a doc
     /// comment calling itself a compatibility shim: a type-parameter default
     /// applies in type position and not in expression position, so a constant on
     /// the generic impl left `M` uninferrable at every call site that named it.
     /// The defaults are gone and a caller reaches this through a generated,
-    /// fully applied alias — `inventory::SystemBuilder::DEFAULT_CAPACITY` — so
+    /// fully applied alias — `inventory::RegistryBuilder::DEFAULT_CAPACITY` — so
     /// the constant is back where the cap belongs, on every instantiation at
     /// once.
     pub const DEFAULT_CAPACITY: usize = self::DEFAULT_CAPACITY;
@@ -2178,7 +2226,7 @@ impl<M> SystemBuilder<M> {
     #[must_use]
     pub fn spawn_with<F>(mut self, factory: F) -> Self
     where
-        F: Fn(&ActorId) -> Option<Mounted<M>> + Send + Sync + 'static,
+        F: Fn(&ActorId) -> Option<Mountable<M>> + Send + Sync + 'static,
     {
         self.factory = Some(Arc::new(factory));
         self
@@ -2278,7 +2326,7 @@ impl<M> SystemBuilder<M> {
     /// same dispatch a call does". That is
     /// [`RpcClient::tell`](crate::RpcClient::tell), generic over any `Serialize`
     /// request. What is absent is the generated *method*, not the wire path. So a peer
-    /// that dials a service's `keyed_alpn()` and writes an `Addressed` request by hand
+    /// that dials a service's `registry_alpn()` and writes an `Addressed` request by hand
     /// reaches this mailbox without awaiting anything, and the sender on the mailbox
     /// is the serving task rather than the peer — the peer returned when the bytes
     /// went out.
@@ -2317,7 +2365,7 @@ impl<M> SystemBuilder<M> {
     /// it must not depend on depth, and across four runs it did not, apart from one
     /// 410 µs reading under load against a 137 – 168 µs band. Every figure includes
     /// a QUIC stream setup, a postcard encode and a round trip, because
-    /// `Registry::route` is `pub(super)` and a test reaches a keyed mailbox only
+    /// `Shared::route` is `pub(super)` and a test reaches a keyed mailbox only
     /// through a served client. What survives that noise is the shape: the drain is
     /// 10.8 to 15 times apart within a run, and the burst's own spread narrows from
     /// 70 – 90% at one slot to 3 – 7% at 32. A burst of 32 into 32 slots arrives
@@ -2336,22 +2384,14 @@ impl<M> SystemBuilder<M> {
     /// thing to reason from. Two questions decide it: does anything downstream act
     /// on how long this actor took, and how long is the longest turn.
     ///
-    /// # A KEYED mailbox BLOCKS the sender. It never drops and it never errors
+    /// # This is the default; an opted-in actor policy can override it
     ///
-    /// There is no overflow policy on this path because there is no overflow: past
-    /// the last slot, `send` parks the sending task until the loop frees a permit.
-    /// This builder has no policy argument at all, so a keyed actor parks and there
-    /// is nothing to choose.
-    ///
-    /// **This heading read *a full mailbox* and the paragraph said *nothing in this
-    /// crate calls `try_send`*, and both outgrew their scope.**
-    /// [`Backpressure::Shed`](crate::Backpressure::Shed) is a `try_send`, on the
-    /// **local** doors — [`LocalActor::spawn_deep`](crate::LocalActor::spawn_deep)
-    /// and its supervised twin — where a full mailbox answers
-    /// [`NotQueued::Full`](crate::NotQueued::Full) and loses the caller's
-    /// arguments. That is opt-in, it is not this door, and a sentence claiming the
-    /// whole crate from a knob that governs one path is the drift worth naming
-    /// rather than quietly narrowing.
+    /// An unconfigured mountable parks past the last slot and inherits this depth.
+    /// A generated `setup(..).backpressure(..).mountable()` instead carries its
+    /// own [`Backpressure`](crate::Backpressure) into the same registry entry.
+    /// `Park` still waits; `Shed` uses `try_send` and reports a full mailbox
+    /// immediately to local and remote keyed callers. The builder remains the
+    /// single default for ordinary `spawn(state)` and lazy factory results.
     ///
     /// What did **not** change is the part that was refused rather than deferred:
     /// there is still **no `unbounded` spelling — permanently**, on either path. An
@@ -2362,8 +2402,8 @@ impl<M> SystemBuilder<M> {
     /// the last slot. `keylink/src/representability.rs` holds the probes that say
     /// unbounded cannot be asked for, on both paths.
     ///
-    /// One caller-visible exception, and it is opt-in and does not queue: a
-    /// [`QueueTimeout`](crate::QueueTimeout) layer turns the wait into
+    /// On a parking mailbox, one caller-visible exception is opt-in and does not
+    /// queue: a [`QueueTimeout`](crate::QueueTimeout) layer turns the wait into
     /// [`RemoteError::TimedOut`](crate::RemoteError::TimedOut) for a peer, and a
     /// message refused that way provably never entered the mailbox — the send
     /// future is dropped before a permit arrives. That is a deadline a service
@@ -2405,7 +2445,7 @@ impl<M> SystemBuilder<M> {
     ///
     /// # The shutdown budget's meaning moves with this, and under-draining is a defect
     ///
-    /// [`System::shutdown`] and [`Eviction::Idle::shutdown_budget`] give an actor
+    /// [`Registry::stop`] and [`Eviction::Idle::shutdown_budget`] give an actor
     /// one budget to finish **everything it has**: at depth 1 that is at most one
     /// queued turn plus the one in flight, and at depth `N` it is up to `N + 1`. A
     /// budget chosen against the default therefore silently under-drains at any
@@ -2419,7 +2459,7 @@ impl<M> SystemBuilder<M> {
     /// # What you still cannot see, and it is the part that hurts
     ///
     /// The wait list behind the last slot is unbounded and **unobservable**.
-    /// [`ActorStatus::buffered`] reports what the channel is holding, exactly, and
+    /// [`ActorStatus::queued`] reports what the channel is holding, exactly, and
     /// there is no number anywhere for the senders parked behind it, because
     /// `Semaphore` does not expose its waiters. A deeper mailbox does not shorten
     /// that list; it moves the first `N` entries of it somewhere countable.
@@ -2427,19 +2467,19 @@ impl<M> SystemBuilder<M> {
     /// # Why `NonZeroUsize`
     ///
     /// `mpsc::channel(0)` panics, and after this wave the channel is created per
-    /// actor in `Registry::entry` — so a zero would panic on the first *mount*,
+    /// actor in `Shared::entry` — so a zero would panic on the first *mount*,
     /// or worse, inside a lazy factory on a serving node, one message after the
     /// builder that caused it returned. The type moves that from a runtime panic
     /// nobody can test for to an argument that cannot be written. Saturating a
     /// zero up to one would be the silent fallback this crate refuses everywhere
     /// else.
     ///
-    /// # It is a property of the system, not of the actor
+    /// # It is the system default
     ///
-    /// Every actor in this system gets this depth, including one a lazy
-    /// [`spawn_with`](Self::spawn_with) factory builds — the factory is a `Fn` with
-    /// no argument for it and no caller present to supply one. Per-actor depths
-    /// would be a second construction path for a mailbox, and there is one.
+    /// Every unconfigured actor gets this depth, including one a lazy
+    /// [`spawn_with`](Self::spawn_with) factory builds. A `Mountable` produced by
+    /// generated `setup(..).backpressure(..)` may override it per actor; both
+    /// choices still flow through the one mailbox construction in `Shared::entry`.
     #[must_use]
     pub fn mailbox_depth(mut self, depth: NonZeroUsize) -> Self {
         self.mailbox_depth = depth.get();
@@ -2453,12 +2493,12 @@ impl<M> SystemBuilder<M> {
     /// Panics when [`Eviction::Idle`] is set outside a tokio runtime, because
     /// the sweeper is a task.
     #[must_use]
-    pub fn build(self) -> System<M>
+    pub fn build(self) -> Registry<M>
     where
         M: Send + 'static,
     {
-        let system = System {
-            inner: Arc::new(Registry {
+        let system = Registry {
+            inner: Arc::new(Shared {
                 entries: RwLock::new(HashMap::new()),
                 factory: self.factory,
                 lifecycle: self.lifecycle,
@@ -2475,9 +2515,9 @@ impl<M> SystemBuilder<M> {
     }
 }
 
-impl<M> fmt::Debug for SystemBuilder<M> {
+impl<M> fmt::Debug for RegistryBuilder<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SystemBuilder")
+        f.debug_struct("RegistryBuilder")
             .field("capacity", &self.capacity)
             .field("mailbox_depth", &self.mailbox_depth)
             .field("eviction", &self.eviction)
@@ -2490,7 +2530,7 @@ impl<M> fmt::Debug for SystemBuilder<M> {
     }
 }
 
-/// Sweep on a timer, and stop when the last [`System`] handle goes away.
+/// Sweep on a timer, and stop when the last [`Registry`] handle goes away.
 ///
 /// Holds a `Weak`, so the sweeper never keeps a registry alive. It outlives the
 /// last handle by at most one tick, which nobody can observe.
@@ -2499,8 +2539,8 @@ impl<M> fmt::Debug for SystemBuilder<M> {
 /// promptly a stale actor is noticed, and the budget is about how long its
 /// teardown may take once it has been. A sweep that runs long because something
 /// would not drain delays the next tick, and it delays it by one budget rather
-/// than by one per wedged actor — see [`Registry::sweep`].
-fn spawn_sweeper<M: Send + 'static>(registry: &Arc<Registry<M>>, after: Duration) {
+/// than by one per wedged actor — see [`Shared::sweep`].
+fn spawn_sweeper<M: Send + 'static>(registry: &Arc<Shared<M>>, after: Duration) {
     let registry = Arc::downgrade(registry);
     // Half the budget, so an actor is evicted between one and one and a half
     // budgets after its last message rather than up to two.
@@ -2561,7 +2601,7 @@ mod tests {
 
     use super::*;
 
-    /// The witness: `Send + 'static`, which [`SystemBuilder::build`] requires
+    /// The witness: `Send + 'static`, which [`RegistryBuilder::build`] requires
     /// and no message type can do without, and not one thing more. No derives,
     /// deliberately — every trait added here is a bound this file would stop
     /// noticing.
@@ -2569,7 +2609,7 @@ mod tests {
 
     /// An actor that does nothing at all, for testing the registry rather than
     /// any message it carries.
-    fn idler() -> Mounted<Bare> {
+    fn idler() -> Mountable<Bare> {
         mount(|mut inbox: Mailbox<Bare>| async move {
             while inbox.recv().await.is_some() {}
             Ended::Stopped
@@ -2582,7 +2622,7 @@ mod tests {
     /// `shutdown`, nothing calls `abort`, no sweeper runs, and the loop returns
     /// anyway. `Ended::Feed` is the reason a real one most often ends this way —
     /// a subscription that ran out — and any of the four would do here.
-    fn self_ending(go: oneshot::Receiver<()>) -> Mounted<Bare> {
+    fn self_ending(go: oneshot::Receiver<()>) -> Mountable<Bare> {
         mount(|inbox: Mailbox<Bare>| async move {
             // Held, so the mailbox stays open and the entry stays routable right
             // up to the ending: an actor that had already dropped its receiver
@@ -2599,7 +2639,7 @@ mod tests {
     /// The device every depth test needs: while it is closed, the mailbox fills
     /// deterministically, because the one thing that could empty it is not running
     /// yet. Nothing here reads a clock.
-    fn gated(gate: oneshot::Receiver<()>, taken: &Arc<AtomicUsize>) -> Mounted<Bare> {
+    fn gated(gate: oneshot::Receiver<()>, taken: &Arc<AtomicUsize>) -> Mountable<Bare> {
         let taken = Arc::clone(taken);
         mount(|mut inbox: Mailbox<Bare>| async move {
             let _ = gate.await;
@@ -2617,7 +2657,7 @@ mod tests {
     ///
     /// `n0_future::time::sleep`, so a paused clock drives it and the budget
     /// arithmetic below is exact rather than sampled.
-    fn slow(handled: &Arc<AtomicUsize>) -> Mounted<Bare> {
+    fn slow(handled: &Arc<AtomicUsize>) -> Mountable<Bare> {
         let handled = Arc::clone(handled);
         mount(|mut inbox: Mailbox<Bare>| async move {
             while inbox.recv().await.is_some() {
@@ -2637,7 +2677,7 @@ mod tests {
         entered: oneshot::Sender<()>,
         hold: oneshot::Receiver<()>,
         finished: &Arc<AtomicUsize>,
-    ) -> Mounted<Bare> {
+    ) -> Mountable<Bare> {
         let finished = Arc::clone(finished);
         mount(|mut inbox: Mailbox<Bare>| async move {
             if inbox.recv().await.is_some() {
@@ -2663,7 +2703,7 @@ mod tests {
     }
 
     /// The one row a single-actor test is about.
-    fn only(system: &System<Bare>) -> ActorStatus {
+    fn only(system: &Registry<Bare>) -> ActorStatus {
         let mut rows = system.status();
         assert_eq!(rows.len(), 1, "these tests mount exactly one actor");
         rows.remove(0)
@@ -2704,13 +2744,13 @@ mod tests {
     /// mount announces nothing because there is no actor, and routing to an
     /// actor already there is not a second mount.
     ///
-    /// Red-tested twice, once per direction: announcing from `System::mount`'s
+    /// Red-tested twice, once per direction: announcing from `Registry::mount`'s
     /// `MountError::Occupied` arm puts a fifth line in the list below (a mount
-    /// that never happened), and making `Registry::route`'s vacant arm announce
+    /// that never happened), and making `Shared::route`'s vacant arm announce
     /// nothing removes the second (a mount nobody would have heard about).
     ///
     /// A third break was tried and **retracted**, because it proved the test was
-    /// blind rather than sharp: announcing from `Registry::route`'s *Occupied*
+    /// blind rather than sharp: announcing from `Shared::route`'s *Occupied*
     /// arm left this green. That arm is only reached when two messages to one new
     /// id race between the read lock and the write lock — the second `route` here
     /// finds the actor on `touch`'s fast path and never reaches the match at all.
@@ -2740,7 +2780,7 @@ mod tests {
     #[tokio::test]
     async fn every_way_an_actor_arrives_and_leaves_is_reported() {
         let reported = Reported::default();
-        let system: System<Bare> = System::builder(Eviction::Never)
+        let system: Registry<Bare> = Registry::builder(Eviction::Never)
             .lifecycle(reported.clone())
             .spawn_with(|_| Some(idler()))
             .build();
@@ -2759,7 +2799,7 @@ mod tests {
             .expect("and the second message finds it");
 
         assert!(matches!(
-            system.shutdown(&by_hand, TURN).await,
+            system.stop(&by_hand, TURN).await,
             Some(Ended::Stopped)
         ));
         assert!(system.abort(&lazily).await);
@@ -2787,7 +2827,7 @@ mod tests {
     /// Three assertions, because the defect had three faces on one node at one
     /// instant and a test of any one of them alone would have missed the others:
     ///
-    /// 1. `contains` is false — the entry is gone, so `System::status` and the
+    /// 1. `contains` is false — the entry is gone, so `Registry::status` and the
     ///    console's actor list cannot report an actor a call would refuse;
     /// 2. the id is **free again**, which is what a `mount` succeeding proves. A
     ///    stale entry made a self-ended id permanently unmountable under
@@ -2797,14 +2837,14 @@ mod tests {
     ///    from a join could never have produced: a loop that returns normally
     ///    joins `Ok(())` whatever ended it.
     ///
-    /// Red-tested with `scripts/break-once.sh` by replacing `Registry::reap`'s
+    /// Red-tested with `scripts/break-once.sh` by replacing `Shared::reap`'s
     /// body with `let _ = (id, why);`, which is the code as it stood before this
     /// fix. Watched to fail on assertion 1, printing
     /// `a self-ended actor must not still be mounted`.
     #[tokio::test]
     async fn an_actor_that_ends_itself_is_unmounted_and_reported() {
         let reported = Reported::default();
-        let system: System<Bare> = System::builder(Eviction::Never)
+        let system: Registry<Bare> = Registry::builder(Eviction::Never)
             .lifecycle(reported.clone())
             .build();
 
@@ -2832,7 +2872,7 @@ mod tests {
         );
         assert!(
             system.is_empty(),
-            "and `System::status` reads the same map: {:?}",
+            "and `Registry::status` reads the same map: {:?}",
             system.status()
         );
         system
@@ -2851,12 +2891,12 @@ mod tests {
 
     /// **A shutdown that races the actor's own ending reports it exactly once.**
     ///
-    /// The interlock `Registry::reap` rests on, in the shape that would break it:
+    /// The interlock `Shared::reap` rests on, in the shape that would break it:
     /// both the caller and the loop have a reason in hand at the same moment.
     /// `shutdown` takes the entry out **before** it awaits, so the reap that runs
     /// during that await finds nothing and says nothing — and the caller's answer
     /// and the `Lifecycle`'s are still the same single value, which is the
-    /// property `System::shutdown` already promised.
+    /// property `Registry::stop` already promised.
     ///
     /// Red-tested by dropping the `is_some()` interlock from `reap` — reporting
     /// unconditionally — which puts `ended raced Feed { name: "ticks" }` in the
@@ -2864,7 +2904,7 @@ mod tests {
     #[tokio::test]
     async fn an_ending_the_loop_and_a_shutdown_both_saw_is_reported_once() {
         let reported = Reported::default();
-        let system: System<Bare> = System::builder(Eviction::Never)
+        let system: Registry<Bare> = Registry::builder(Eviction::Never)
             .lifecycle(reported.clone())
             .build();
 
@@ -2880,7 +2920,7 @@ mod tests {
         // not matter.
         end_it.send(()).expect("the actor is waiting on this");
         let ended = system
-            .shutdown(&raced, TURN)
+            .stop(&raced, TURN)
             .await
             .expect("it was mounted when the call was made");
         assert!(
@@ -2899,7 +2939,7 @@ mod tests {
     }
 
     /// **An eviction that destroys a busy actor is no longer silent**, which is
-    /// the gap `Registry::sweep`'s own documentation said Wave 6 owned.
+    /// the gap `Shared::sweep`'s own documentation said Wave 6 owned.
     ///
     /// A `shutdown_budget` below the longest turn destroys that turn where it
     /// stands, and until this wave **nothing anywhere said so**: the `Ended` the
@@ -2926,7 +2966,7 @@ mod tests {
     async fn an_eviction_that_destroys_a_busy_actor_is_no_longer_silent() {
         let reported = Reported::default();
         let finished = Arc::new(AtomicUsize::new(0));
-        let system: System<Bare> = System::builder(Eviction::Idle {
+        let system: Registry<Bare> = Registry::builder(Eviction::Idle {
             after: Duration::from_secs(60),
             shutdown_budget: TURN,
         })
@@ -2997,12 +3037,12 @@ mod tests {
     }
 
     /// Printing a handle must not depend on what its mailbox carries, which a
-    /// `derive(Debug)` on [`Mounted`] would make it do — and nothing else would
+    /// `derive(Debug)` on [`Mountable`] would make it do — and nothing else would
     /// notice, because nothing else here prints one. `Bare` is not `Debug`, so
     /// this line is the notice.
     #[tokio::test]
     async fn a_mounted_actor_prints_without_help_from_its_message_type() {
-        assert!(format!("{:?}", idler()).starts_with("Mounted"));
+        assert!(format!("{:?}", idler()).starts_with("Mountable"));
     }
 
     /// Eviction is by last message, not by mount time, or a busy actor would be
@@ -3015,7 +3055,7 @@ mod tests {
     /// about to address.
     #[tokio::test(start_paused = true)]
     async fn eviction_is_by_last_message_and_not_by_mount_time() {
-        let system = System::builder(idle_after(Duration::from_secs(60))).build();
+        let system = Registry::builder(idle_after(Duration::from_secs(60))).build();
         let busy = ActorId::new("busy").expect("valid");
         let idle = ActorId::new("idle").expect("valid");
         system.mount(busy.clone(), idler()).expect("free");
@@ -3035,7 +3075,7 @@ mod tests {
     /// sweeper runs.
     #[tokio::test(start_paused = true)]
     async fn sweeping_does_not_evict_an_actor_inside_its_budget() {
-        let system = System::builder(idle_after(Duration::from_secs(60))).build();
+        let system = Registry::builder(idle_after(Duration::from_secs(60))).build();
         let fresh = ActorId::new("fresh").expect("valid");
         system.mount(fresh.clone(), idler()).expect("free");
 
@@ -3051,7 +3091,7 @@ mod tests {
     /// for a budget and a tick". A paused clock lands on it exactly, for free.
     #[tokio::test(start_paused = true)]
     async fn an_actor_idle_for_exactly_its_budget_is_evicted() {
-        let system = System::builder(idle_after(Duration::from_secs(60))).build();
+        let system = Registry::builder(idle_after(Duration::from_secs(60))).build();
         let borderline = ActorId::new("borderline").expect("valid");
         system.mount(borderline.clone(), idler()).expect("free");
 
@@ -3067,7 +3107,7 @@ mod tests {
     /// `Eviction::Never` means never, however long nobody calls.
     #[tokio::test(start_paused = true)]
     async fn eviction_never_keeps_an_actor_nobody_addresses() {
-        let system = System::builder(Eviction::Never).build();
+        let system = Registry::builder(Eviction::Never).build();
         let forgotten = ActorId::new("forgotten").expect("valid");
         system.mount(forgotten.clone(), idler()).expect("free");
 
@@ -3079,7 +3119,7 @@ mod tests {
 
     #[test]
     fn a_system_without_a_factory_never_grows_by_itself() {
-        let system: System<Bare> = System::builder(Eviction::Never).build();
+        let system: Registry<Bare> = Registry::builder(Eviction::Never).build();
         let error = system
             .route(&ActorId::new("nobody").expect("valid"))
             .expect_err("nothing is mounted and nothing builds it");
@@ -3092,7 +3132,7 @@ mod tests {
 
     /// The cap is registry policy, so it refuses on both paths to an entry and
     /// it refuses without knowing what a message is: by hand through
-    /// [`System::mount`], and from the factory through [`System::route`].
+    /// [`Registry::mount`], and from the factory through [`Registry::route`].
     ///
     /// The two refusals come from different enums, which is why both are here.
     /// `remote.rs`'s `the_capacity_refusal_reads_the_same_by_hand_and_lazily` is
@@ -3109,7 +3149,7 @@ mod tests {
     async fn a_full_registry_refuses_by_hand_and_lazily() {
         let built = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&built);
-        let system = System::builder(Eviction::Never)
+        let system = Registry::builder(Eviction::Never)
             .capacity(1)
             .spawn_with(move |_| {
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -3143,7 +3183,7 @@ mod tests {
     /// go and make room, which would not help them once they had.
     #[tokio::test]
     async fn a_taken_id_is_occupied_even_when_the_registry_is_full() {
-        let system = System::builder(Eviction::Never).capacity(1).build();
+        let system = Registry::builder(Eviction::Never).capacity(1).build();
         let taken = ActorId::new("taken").expect("valid");
         system.mount(taken.clone(), idler()).expect("free");
 
@@ -3167,7 +3207,7 @@ mod tests {
     /// of what its predecessor's `false` said.
     #[tokio::test]
     async fn shutdown_and_abort_unmount_whatever_the_mailbox_carries() {
-        let system = System::builder(Eviction::Never).build();
+        let system = Registry::builder(Eviction::Never).build();
         let budget = Duration::from_secs(60);
         let drained = ActorId::new("drained").expect("valid");
         let cancelled = ActorId::new("cancelled").expect("valid");
@@ -3176,14 +3216,14 @@ mod tests {
         assert_eq!(system.len(), 2);
 
         assert!(matches!(
-            system.shutdown(&drained, budget).await,
+            system.stop(&drained, budget).await,
             Some(Ended::Stopped)
         ));
         assert!(system.abort(&cancelled).await);
         assert!(system.is_empty());
 
         assert!(
-            system.shutdown(&drained, budget).await.is_none(),
+            system.stop(&drained, budget).await.is_none(),
             "gone stays gone"
         );
         assert!(!system.abort(&cancelled).await);
@@ -3197,7 +3237,7 @@ mod tests {
     #[tokio::test]
     async fn a_late_old_ending_does_not_reap_a_remounted_incarnation() {
         let reports = Reported::default();
-        let system: System<Bare> = System::builder(Eviction::Never)
+        let system: Registry<Bare> = Registry::builder(Eviction::Never)
             .lifecycle(reports.clone())
             .build();
         let id = ActorId::new("reused").expect("valid");
@@ -3209,7 +3249,7 @@ mod tests {
         let shutting_down = {
             let system = system.clone();
             let id = id.clone();
-            tokio::spawn(async move { system.shutdown(&id, Duration::from_secs(60)).await })
+            tokio::spawn(async move { system.stop(&id, Duration::from_secs(60)).await })
         };
         settle().await;
         assert!(!system.contains(&id), "shutdown unmounts before awaiting");
@@ -3249,7 +3289,7 @@ mod tests {
     #[tokio::test]
     async fn a_cancelled_shutdown_reports_vanished_to_direct_and_lifecycle_waiters() {
         let reports = Reported::default();
-        let system: System<Bare> = System::builder(Eviction::Never)
+        let system: Registry<Bare> = Registry::builder(Eviction::Never)
             .lifecycle(reports.clone())
             .build();
         let id = ActorId::new("cancelled-shutdown").expect("valid");
@@ -3262,7 +3302,7 @@ mod tests {
         let shutdown = {
             let system = system.clone();
             let id = id.clone();
-            tokio::spawn(async move { system.shutdown(&id, Duration::from_secs(60)).await })
+            tokio::spawn(async move { system.stop(&id, Duration::from_secs(60)).await })
         };
         settle().await;
         assert!(!system.contains(&id), "shutdown has taken the entry");
@@ -3290,7 +3330,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancelled_abort_reports_vanished_to_direct_and_lifecycle_waiters() {
         let reports = Reported::default();
-        let system: System<Bare> = System::builder(Eviction::Never)
+        let system: Registry<Bare> = Registry::builder(Eviction::Never)
             .lifecycle(reports.clone())
             .build();
         let id = ActorId::new("cancelled-abort").expect("valid");
@@ -3361,7 +3401,7 @@ mod tests {
     #[tokio::test]
     async fn abort_reports_the_same_final_ending_to_both_observation_doors() {
         let reports = Reported::default();
-        let system: System<Bare> = System::builder(Eviction::Never)
+        let system: Registry<Bare> = Registry::builder(Eviction::Never)
             .lifecycle(reports.clone())
             .build();
         let id = ActorId::new("aborted-ending").expect("valid");
@@ -3378,7 +3418,7 @@ mod tests {
 
     /// The refusal that used to cost a task, at the witness type.
     ///
-    /// `Mounted` holds an unstarted future, so a refused mount drops a loop that
+    /// `Mountable` holds an unstarted future, so a refused mount drops a loop that
     /// has never been polled. The guard is the loop's own capture: a `Started`
     /// that increments when the loop first runs, which for a refused actor must
     /// stay at zero however long the test waits.
@@ -3399,7 +3439,7 @@ mod tests {
             })
         };
 
-        let system = System::builder(Eviction::Never).capacity(1).build();
+        let system = Registry::builder(Eviction::Never).capacity(1).build();
         let taken = ActorId::new("taken").expect("valid");
         system.mount(taken.clone(), idler()).expect("free");
 
@@ -3449,14 +3489,14 @@ mod tests {
     async fn a_full_mailbox_blocks_the_sender_and_never_loses_the_message() {
         let (open, gate) = oneshot::channel();
         let taken = Arc::new(AtomicUsize::new(0));
-        let system = System::builder(Eviction::Never).build();
+        let system = Registry::builder(Eviction::Never).build();
         let held = ActorId::new("held").expect("valid");
         system
             .mount(held.clone(), gated(gate, &taken))
             .expect("free");
 
         let mail = system.route(&held).expect("mounted").mail;
-        assert_eq!(only(&system).buffered, 0, "nothing is waiting yet");
+        assert_eq!(only(&system).queued, 0, "nothing is waiting yet");
         mail.send((Box::new(Bare), Chain::Empty))
             .await
             .expect("the one slot is free");
@@ -3477,7 +3517,7 @@ mod tests {
         );
         let full = only(&system);
         assert_eq!(
-            full.buffered, 1,
+            full.queued, 1,
             "the default depth is one slot, and it is full"
         );
         assert!(!full.busy, "the loop is at its gate: no turn has started");
@@ -3494,7 +3534,7 @@ mod tests {
         // the loop ends when every sender is gone and this test holds one.
         drop(mail);
         assert!(matches!(
-            system.shutdown(&held, Duration::from_secs(60)).await,
+            system.stop(&held, Duration::from_secs(60)).await,
             Some(Ended::Stopped)
         ));
         assert_eq!(
@@ -3504,17 +3544,17 @@ mod tests {
         );
     }
 
-    /// **`buffered` is exact for what the mailbox holds, and counts nobody parked
+    /// **`queued` is exact for what the mailbox holds, and counts nobody parked
     /// behind it.**
     ///
     /// Both halves at once, at a depth where the two can differ: three messages in
-    /// three slots is a `buffered` of 3, and a fourth sender parked on a permit
+    /// three slots is a `queued` of 3, and a fourth sender parked on a permit
     /// leaves it at 3. That is the floor the field's documentation claims, observed
     /// — and the reason the field is not called `queued`, which at this moment
     /// would be four.
     ///
-    /// Red-tested by deleting the subtraction in [`System::status`], so that
-    /// `buffered` reports the channel's capacity instead of its contents. Watched:
+    /// Red-tested by deleting the subtraction in [`Registry::status`], so that
+    /// `queued` reports the channel's capacity instead of its contents. Watched:
     /// this test, `a_full_mailbox_blocks_the_sender_and_never_loses_the_message` and
     /// `status_reports_every_actor_with_the_idle_for_eviction_reads` all fail.
     ///
@@ -3524,10 +3564,10 @@ mod tests {
     /// that cannot tell the measurement from the constant is not a guard, and this
     /// one was watched to be vacuous before it was watched to fail.
     #[tokio::test]
-    async fn buffered_is_exact_at_depth_and_counts_no_parked_sender() {
+    async fn queued_is_exact_at_depth_and_counts_no_parked_sender() {
         let (open, gate) = oneshot::channel();
         let taken = Arc::new(AtomicUsize::new(0));
-        let system = System::builder(Eviction::Never)
+        let system = Registry::builder(Eviction::Never)
             .mailbox_depth(depth(3))
             .build();
         let held = ActorId::new("held").expect("valid");
@@ -3537,12 +3577,12 @@ mod tests {
 
         let mail = system.route(&held).expect("mounted").mail;
         // Counted up one at a time, and from zero, because that is what makes this
-        // a count rather than a restatement of the depth. A `buffered` that simply
+        // a count rather than a restatement of the depth. A `queued` that simply
         // reported `max_capacity()` would satisfy "3 at three messages" — measured:
         // deleting the subtraction in `status` left this test passing until these
         // intermediate readings were added.
         assert_eq!(
-            only(&system).buffered,
+            only(&system).queued,
             0,
             "an untouched mailbox holds nothing, whatever its depth"
         );
@@ -3551,7 +3591,7 @@ mod tests {
                 .await
                 .expect("three slots, three messages");
             assert_eq!(
-                only(&system).buffered,
+                only(&system).queued,
                 expected,
                 "each message is counted as it lands"
             );
@@ -3568,9 +3608,9 @@ mod tests {
             "the fourth sender is parked on a permit"
         );
         assert_eq!(
-            only(&system).buffered,
+            only(&system).queued,
             3,
-            "and it is invisible: `buffered` is a FLOOR on the backlog, because \
+            "and it is invisible: `queued` is a FLOOR on the backlog, because \
              tokio's Semaphore does not expose its waiters"
         );
 
@@ -3578,13 +3618,13 @@ mod tests {
         assert!(fourth.await.expect("the sending task reports"));
         settle().await;
         assert_eq!(
-            only(&system).buffered,
+            only(&system).queued,
             0,
             "and it falls again as the loop drains: a count, in both directions"
         );
         drop(mail);
         assert!(matches!(
-            system.shutdown(&held, Duration::from_secs(60)).await,
+            system.stop(&held, Duration::from_secs(60)).await,
             Some(Ended::Stopped)
         ));
         assert_eq!(taken.load(Ordering::SeqCst), 4);
@@ -3603,7 +3643,7 @@ mod tests {
     /// it, exactly as it has for eviction.
     #[tokio::test(start_paused = true)]
     async fn status_reports_every_actor_with_the_idle_for_eviction_reads() {
-        let system = System::builder(idle_after(Duration::from_secs(60))).build();
+        let system = Registry::builder(idle_after(Duration::from_secs(60))).build();
         let one = ActorId::new("one").expect("valid");
         let two = ActorId::new("two").expect("valid");
         system.mount(one.clone(), idler()).expect("free");
@@ -3615,7 +3655,7 @@ mod tests {
         for row in &rows {
             assert_eq!(row.idle_for, Duration::from_secs(59));
             assert!(!row.busy, "an idler is never in a turn");
-            assert_eq!(row.buffered, 0, "and nothing is waiting for it");
+            assert_eq!(row.queued, 0, "and nothing is waiting for it");
         }
         system.evict_idle().await;
         assert_eq!(
@@ -3660,7 +3700,7 @@ mod tests {
     /// one `TURN`, and the budget is two and a half of them, so no assertion rests
     /// on which of two simultaneous timers a runtime fires first.
     ///
-    /// Red-tested by making [`Registry::entry`] build every channel at
+    /// Red-tested by making [`Shared::entry`] build every channel at
     /// [`DEFAULT_MAILBOX_DEPTH`] instead of the system's depth — the one literal in
     /// its `mpsc::channel` argument, which is the whole of what the knob does.
     /// Watched: `Some(Stopped)` where this asserts `Vanished`, because a deep system
@@ -3671,7 +3711,7 @@ mod tests {
         /// flight, and shut down with `budget`.
         async fn drain_at(slots: usize, budget: Duration) -> (Option<Ended>, usize) {
             let handled = Arc::new(AtomicUsize::new(0));
-            let system = System::builder(Eviction::Never)
+            let system = Registry::builder(Eviction::Never)
                 .mailbox_depth(depth(slots))
                 .build();
             let id = ActorId::new("slow").expect("valid");
@@ -3686,7 +3726,7 @@ mod tests {
             // The registry's is not the only sender while this test holds one, and
             // a loop whose channel never closes cannot drain by any budget.
             drop(mail);
-            let ended = system.shutdown(&id, budget).await;
+            let ended = system.stop(&id, budget).await;
             (ended, handled.load(Ordering::SeqCst))
         }
 
@@ -3716,12 +3756,12 @@ mod tests {
     /// well as one a caller mounted, and the default is one.
     ///
     /// The lazy half is why the knob is here rather than on the generated `spawn`:
-    /// a factory is a `Fn(&ActorId) -> Option<Mounted<M>>` with no argument for a
+    /// a factory is a `Fn(&ActorId) -> Option<Mountable<M>>` with no argument for a
     /// depth and no caller present to supply one, so a per-`spawn` depth would have
     /// covered every actor except the ones a serving node builds by itself.
     #[tokio::test]
     async fn the_mailbox_depth_is_the_systems_and_defaults_to_one() {
-        let by_default = System::builder(Eviction::Never).build();
+        let by_default = Registry::builder(Eviction::Never).build();
         let plain = ActorId::new("plain").expect("valid");
         by_default.mount(plain.clone(), idler()).expect("free");
         assert_eq!(
@@ -3735,7 +3775,7 @@ mod tests {
              handled"
         );
 
-        let deeper = System::builder(Eviction::Never)
+        let deeper = Registry::builder(Eviction::Never)
             .mailbox_depth(depth(4))
             .spawn_with(|_| Some(idler()))
             .build();
@@ -3820,7 +3860,7 @@ mod tests {
     fn recording(
         entered: oneshot::Sender<()>,
         seen: &Arc<std::sync::Mutex<Vec<Standing>>>,
-    ) -> Mounted<Bare> {
+    ) -> Mountable<Bare> {
         let seen = Arc::clone(seen);
         mount(move |inbox: Mailbox<Bare>| async move {
             let recorder = Recorder {
@@ -3832,7 +3872,7 @@ mod tests {
         })
     }
 
-    /// [`System::abort`] settles the served answer **before** it destroys the
+    /// [`Registry::abort`] settles the served answer **before** it destroys the
     /// task.
     ///
     /// An aborted loop never reaches `Inbox::ending`, so nothing inside it can say
@@ -3843,14 +3883,14 @@ mod tests {
     /// door, before the request lands on the runtime.
     ///
     /// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs` on
-    /// `System::abort`'s `entry.fate.settle(Standing::Gone);` →
+    /// `Registry::abort`'s `entry.fate.settle(Standing::Gone);` →
     /// `entry.fate.settle(Standing::Running);`. Watched: `an aborted actor is
     /// gone before it is destroyed: [Running]`.
     #[tokio::test]
     async fn abort_settles_the_served_answer_before_it_destroys_the_actor() {
         let seen: Arc<std::sync::Mutex<Vec<Standing>>> = Arc::default();
         let (entered, started) = oneshot::channel();
-        let system: System<Bare> = System::builder(Eviction::Never).build();
+        let system: Registry<Bare> = Registry::builder(Eviction::Never).build();
         let doomed = ActorId::new("doomed").expect("valid");
         system
             .mount(doomed.clone(), recording(entered, &seen))
@@ -3866,7 +3906,7 @@ mod tests {
         );
     }
 
-    /// And the other teardown door: a [`System::shutdown`] whose budget expires
+    /// And the other teardown door: a [`Registry::stop`] whose budget expires
     /// ends in an abort, and that abort needs the same publish.
     ///
     /// A separate line in [`drain`] rather than a share of the one above, because
@@ -3881,7 +3921,7 @@ mod tests {
     async fn an_expired_shutdown_budget_settles_the_served_answer_before_the_abort() {
         let seen: Arc<std::sync::Mutex<Vec<Standing>>> = Arc::default();
         let (entered, started) = oneshot::channel();
-        let system: System<Bare> = System::builder(Eviction::Never).build();
+        let system: Registry<Bare> = Registry::builder(Eviction::Never).build();
         let doomed = ActorId::new("doomed").expect("valid");
         system
             .mount(doomed.clone(), recording(entered, &seen))
@@ -3890,7 +3930,7 @@ mod tests {
 
         assert!(
             matches!(
-                system.shutdown(&doomed, Duration::from_millis(10)).await,
+                system.stop(&doomed, Duration::from_millis(10)).await,
                 Some(Ended::Vanished)
             ),
             "a loop that never returns cannot drain"

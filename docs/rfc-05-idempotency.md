@@ -326,7 +326,7 @@ retry after the actor is mounted replays `NoSuchActor` forever — the same shap
 §2, one layer down, "where the payload is opaque to keylink by design and the
 progress marker therefore cannot reach".
 
-Both halves are now false. `deliver_to_actor` takes the `NoSuchActor` exit at its
+Both halves are now false. `deliver_keyed` takes the `NoSuchActor` exit at its
 `let route = system.route(&actor)?;`, and the first progress mark on that path —
 `progress.enqueued()` — is far below it and after the send. So the `?` returns with
 **nothing marked**, `Progress::reached` reports an unmarked marker as

@@ -5,9 +5,9 @@
 //!
 //! # One system per service, and what that changed here
 //!
-//! Every fixture in this file used to share one node-wide `keylink::System`, and
+//! Every fixture in this file used to share one node-wide `keylink::Registry`, and
 //! several tests mounted actors of unrelated services into it. That cannot be
-//! written any more: a system is `journal::System`, `M` is that service's own
+//! written any more: a system is `journal::Registry`, `M` is that service's own
 //! mailbox type, and mounting a `vault` actor into a `journal` system is `E0308`
 //! at the call site. `keylink/src/representability.rs` holds that property as a
 //! probe; the consequence here is that each service brings its own fixture.
@@ -25,6 +25,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
@@ -33,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use keylink::{
-    ActorId, Addressed, Allowlist, Body, BodyReader, Context, Ended, Error, Eviction,
+    ActorId, Addressed, Allowlist, Backpressure, Body, BodyReader, Context, Ended, Error, Eviction,
     IdempotencyKey, IdempotencyRefusal, LocalError, Middleware, MountError, Next, Node, Outcome,
     QueueTimeout, RemoteError, RpcClient, Server, Serving, Timeout, Withheld,
 };
@@ -131,11 +132,11 @@ struct Journal {
     inside: Option<Arc<Inside>>,
     /// A local keyed reference used from inside one turn to prove the actor
     /// identity is carried through the registry mailbox.
-    nested: Option<(journal::System, ActorId)>,
+    nested: Option<(journal::Registry, ActorId)>,
     /// A keyed actor to call from this actor, used by the registry ring test.
-    forward: Option<(journal::System, ActorId)>,
+    forward: Option<(journal::Registry, ActorId)>,
     /// A keyed actor to call at the closing edge of the registry ring.
-    cycle: Option<(journal::System, ActorId)>,
+    cycle: Option<(journal::Registry, ActorId)>,
 }
 
 /// How many handlers were inside a turn at the same moment, and the most there
@@ -247,23 +248,24 @@ use common::local_node;
 
 /// A running `journal` actor system and a client connected to it.
 struct Fixture {
-    system: journal::System,
-    client: journal::KeyedClient,
+    system: journal::Registry,
+    client: journal::RegistryClient,
     _server: Server,
     _nodes: [Node; 2],
 }
 
-async fn start(system: journal::System) -> Fixture {
+async fn start(system: journal::Registry) -> Fixture {
     let server = local_node().await;
     let client_node = local_node().await;
-    // `keyed_serve` rather than the builder, and this fixture is where it earns
+    // `registry.serve` rather than the builder, and this fixture is where it earns
     // its keep: every keyed test in this file serves through here, so a twin
     // that did not reach the same ALPN would redden the file rather than sit
     // unexercised. The builder form is still what the tests below use whenever
     // they add a layer, a store or a second service — which is most of them.
-    let running = journal::keyed_serve(&server, &system, Allowlist::anyone())
+    let running = system
+        .serve(&server, Allowlist::anyone())
         .expect("one service, no duplicate ALPN");
-    let client = journal::KeyedClient::connect(&client_node, server.endpoint().addr())
+    let client = journal::RegistryClient::connect(&client_node, server.endpoint().addr())
         .await
         .expect("the client dials the actor system");
 
@@ -279,8 +281,8 @@ fn id(name: &str) -> ActorId {
     ActorId::new(name).expect("a valid id")
 }
 
-fn mounted() -> journal::System {
-    journal::System::builder(Eviction::Never).build()
+fn mounted() -> journal::Registry {
+    journal::Registry::builder(Eviction::Never).build()
 }
 
 /// An id a peer can send and our constructor cannot build.
@@ -333,7 +335,7 @@ async fn a_keyed_actor_ending_can_be_awaited_before_shutdown() {
 
     assert!(matches!(
         system
-            .shutdown(&actor_id, Duration::from_secs(1))
+            .stop(&actor_id, Duration::from_secs(1))
             .await
             .expect("the actor drains"),
         Ended::Stopped
@@ -360,7 +362,7 @@ async fn a_local_keyed_ref_rejects_a_reentrant_call() {
         .expect("the re-entrant call must resolve without waiting for the actor");
     assert_eq!(result.expect("the outer turn answers"), 7);
     system
-        .shutdown(&actor_id, Duration::from_secs(1))
+        .stop(&actor_id, Duration::from_secs(1))
         .await
         .expect("the actor drains");
 }
@@ -410,13 +412,13 @@ async fn local_keyed_refs_reject_a_two_actor_ring() {
             .expect("the second actor remains live"),
         vec![7]
     );
-    system.shutdown(&first, Duration::from_secs(1)).await;
-    system.shutdown(&second, Duration::from_secs(1)).await;
+    system.stop(&first, Duration::from_secs(1)).await;
+    system.stop(&second, Duration::from_secs(1)).await;
 }
 
 #[tokio::test]
 async fn local_keyed_calls_park_when_the_mailbox_is_full() {
-    let system: journal::System = journal::System::builder(Eviction::Never)
+    let system: journal::Registry = journal::Registry::builder(Eviction::Never)
         .mailbox_depth(NonZeroUsize::new(1).expect("non-zero depth"))
         .build();
     let actor_id = id("backpressure");
@@ -448,7 +450,7 @@ async fn local_keyed_calls_park_when_the_mailbox_is_full() {
     });
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if status_of(&system, &actor_id).buffered == 1 {
+            if status_of(&system, &actor_id).queued == 1 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -485,7 +487,7 @@ async fn local_keyed_calls_park_when_the_mailbox_is_full() {
         2
     );
     system
-        .shutdown(&actor_id, Duration::from_secs(1))
+        .stop(&actor_id, Duration::from_secs(1))
         .await
         .expect("the actor drains");
 }
@@ -506,7 +508,7 @@ async fn a_local_keyed_ref_reports_a_missing_actor_without_a_remote_error() {
 
 #[tokio::test]
 async fn local_keyed_ref_uses_the_factory_and_reports_capacity() {
-    let system: journal::System = journal::System::builder(Eviction::Never)
+    let system: journal::Registry = journal::Registry::builder(Eviction::Never)
         .capacity(1)
         .spawn_with(|_| Some(journal::spawn(Journal::default())))
         .build();
@@ -526,7 +528,7 @@ async fn local_keyed_ref_uses_the_factory_and_reports_capacity() {
         .expect_err("the registry cap applies to local keyed calls");
     assert!(matches!(error, LocalError::AtCapacity { capacity: 1 }));
     system
-        .shutdown(&id("factory/one"), Duration::from_secs(1))
+        .stop(&id("factory/one"), Duration::from_secs(1))
         .await;
 }
 
@@ -566,7 +568,7 @@ async fn ten_thousand_actors_are_mounted_and_addressable() {
     const ACTORS: usize = 10_000;
 
     let fixture = start(
-        journal::System::builder(Eviction::Never)
+        journal::Registry::builder(Eviction::Never)
             .capacity(ACTORS)
             .build(),
     )
@@ -661,7 +663,7 @@ async fn a_stopped_actor_is_indistinguishable_from_one_that_never_existed() {
         .expect("the id is free");
     assert!(fixture
         .system
-        .shutdown(&id("was/real"), Duration::from_secs(5))
+        .stop(&id("was/real"), Duration::from_secs(5))
         .await
         .is_some());
 
@@ -688,7 +690,7 @@ async fn a_stopped_actor_is_indistinguishable_from_one_that_never_existed() {
 /// system without a factory would answer `NoSuchActor` and the test would pass
 /// for the wrong reason.
 ///
-/// `ActorId::validate` moved from `System::deliver` into `deliver_to_actor` with
+/// `ActorId::validate` moved from `Registry::deliver` into `deliver_keyed` with
 /// this wave, and it moved with its ordering intact — before `route`, so an
 /// over-long id costs no lookup and no lazily spawned state. This test and the
 /// spawn counter are what say so. Made red by moving the `validate` call below
@@ -698,7 +700,7 @@ async fn an_oversized_id_is_refused_before_it_reaches_the_registry() {
     let spawned = Arc::new(AtomicUsize::new(0));
     let counter = spawned.clone();
     let fixture = start(
-        journal::System::builder(Eviction::Never)
+        journal::Registry::builder(Eviction::Never)
             .spawn_with(move |_| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Some(journal::spawn(Journal::default()))
@@ -760,16 +762,16 @@ async fn an_oversized_id_is_refused_before_it_reaches_the_registry() {
 ///
 /// The other half of the old test — that the actor was never touched — is now
 /// unrepresentable rather than refused, and is held as a compile-time probe in
-/// `keylink/src/representability.rs`: a `journal::System` cannot hold a `vault`
+/// `keylink/src/representability.rs`: a `journal::Registry` cannot hold a `vault`
 /// actor.
 ///
 /// **What refuses is the ALPN string, not the type parameter**, and the
 /// distinction is worth being exact about because the first draft of this test
 /// got it wrong. `RpcClient::connect` takes the ALPN as an untyped
 /// `&'static [u8]`, so `RpcClient::<Addressed<vault::Request>, _>::connect(..,
-/// journal::keyed_alpn())` connects perfectly happily — the types are not part of
+/// journal::registry_alpn())` connects perfectly happily — the types are not part of
 /// the handshake, the bytes they hash into are. What makes the pairing safe is
-/// that `vault::KeyedClient` is the only thing that calls `vault::keyed_alpn()`,
+/// that `vault::RegistryClient` is the only thing that calls `vault::registry_alpn()`,
 /// and both are generated from one declaration.
 ///
 /// Made red by giving both services the same keyed protocol name and hashing a
@@ -802,13 +804,13 @@ async fn a_peer_on_another_services_keyed_alpn_is_refused_at_the_handshake() {
         .mount(id("ledger"), journal::spawn(Journal::default()))
         .expect("the id is free");
     let _serving_journal = Server::builder(&journal_only)
-        .service(journal::keyed_service(&journals, Allowlist::anyone()).build())
+        .service(journals.service(Allowlist::anyone()).build())
         .spawn()
         .expect("one service, no duplicate ALPN");
 
     // A peer built against `vault` cannot reach a node serving `journal`'s
     // system, even though its bytes would have decoded there.
-    let refused = vault::KeyedClient::connect(&client_node, journal_only.endpoint().addr())
+    let refused = vault::RegistryClient::connect(&client_node, journal_only.endpoint().addr())
         .await
         .map(|_| ())
         .expect_err("a vault peer must not complete a handshake with journal's system");
@@ -819,7 +821,7 @@ async fn a_peer_on_another_services_keyed_alpn_is_refused_at_the_handshake() {
 
     // Journal's own client reaches it on the same node.
     let journal_client =
-        journal::KeyedClient::connect(&client_node, journal_only.endpoint().addr())
+        journal::RegistryClient::connect(&client_node, journal_only.endpoint().addr())
             .await
             .expect("journal's own keyed client dials journal's ALPN");
     assert_eq!(
@@ -830,7 +832,7 @@ async fn a_peer_on_another_services_keyed_alpn_is_refused_at_the_handshake() {
     // And the two identically shaped services coexist on one node, each holding
     // its own actor under the same id.
     let more_journals = mounted();
-    let vaults: vault::System = vault::System::builder(Eviction::Never).build();
+    let vaults: vault::Registry = vault::Registry::builder(Eviction::Never).build();
     more_journals
         .mount(id("ledger"), journal::spawn(Journal::default()))
         .expect("the id is free");
@@ -838,15 +840,15 @@ async fn a_peer_on_another_services_keyed_alpn_is_refused_at_the_handshake() {
         .mount(id("ledger"), vault::spawn(Vault))
         .expect("the id is free");
     let _serving_both = Server::builder(&both)
-        .service(journal::keyed_service(&more_journals, Allowlist::anyone()).build())
-        .service(vault::keyed_service(&vaults, Allowlist::anyone()).build())
+        .service(more_journals.service(Allowlist::anyone()).build())
+        .service(vaults.service(Allowlist::anyone()).build())
         .spawn()
         .expect("two identically shaped services, two distinct keyed ALPNs");
 
-    let to_journal = journal::KeyedClient::connect(&client_node, both.endpoint().addr())
+    let to_journal = journal::RegistryClient::connect(&client_node, both.endpoint().addr())
         .await
         .expect("dials journal's ALPN");
-    let to_vault = vault::KeyedClient::connect(&client_node, both.endpoint().addr())
+    let to_vault = vault::RegistryClient::connect(&client_node, both.endpoint().addr())
         .await
         .expect("dials vault's ALPN");
     assert_eq!(to_journal.at(id("ledger")).apply(99, 0).await.unwrap(), 99);
@@ -921,7 +923,7 @@ async fn a_panicking_message_costs_one_message_and_not_the_actor() {
 /// once, so this is one process, one state type, two dispatch paths.
 ///
 /// This comparison exercises the default keyed spawn with no observers. Keyed
-/// `spawn_wired` does accept observers; their refusal behavior is covered with
+/// `setup(..).feeds(..).mountable()` does accept observers; their refusal behavior is covered with
 /// the feed and observer lifecycle tests.
 #[tokio::test]
 async fn one_panic_reads_the_same_whichever_way_the_service_is_served() {
@@ -935,12 +937,12 @@ async fn one_panic_reads_the_same_whichever_way_the_service_is_served() {
     let singleton = journal::actor(Journal::default());
 
     let running = Server::builder(&server)
-        .service(journal::keyed_service(&system, Allowlist::anyone()).build())
+        .service(system.service(Allowlist::anyone()).build())
         .service(singleton.service(Allowlist::anyone()).build())
         .spawn()
         .expect("the keyed and singleton ALPNs are distinct");
 
-    let to_keyed = journal::KeyedClient::connect(&caller, server.endpoint().addr())
+    let to_keyed = journal::RegistryClient::connect(&caller, server.endpoint().addr())
         .await
         .expect("dials the actor system");
     let to_singleton = journal::Client::connect(&caller, server.endpoint().addr())
@@ -990,7 +992,7 @@ async fn a_first_message_spawns_an_actor_when_the_system_was_given_a_factory() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let names = seen.clone();
     let fixture = start(
-        journal::System::builder(Eviction::Never)
+        journal::Registry::builder(Eviction::Never)
             .spawn_with(move |id| {
                 names.lock().expect("not poisoned").push(id.to_string());
                 Some(journal::spawn(Journal::default()))
@@ -1021,7 +1023,7 @@ async fn a_first_message_spawns_an_actor_when_the_system_was_given_a_factory() {
 #[tokio::test]
 async fn a_factory_that_declines_an_id_produces_no_such_actor() {
     let fixture = start(
-        journal::System::builder(Eviction::Never)
+        journal::Registry::builder(Eviction::Never)
             .spawn_with(|id| (id.as_str() == "known").then(|| journal::spawn(Journal::default())))
             .build(),
     )
@@ -1045,7 +1047,7 @@ async fn a_factory_that_declines_an_id_produces_no_such_actor() {
 #[tokio::test]
 async fn lazy_spawn_stops_at_the_capacity() {
     let fixture = start(
-        journal::System::builder(Eviction::Never)
+        journal::Registry::builder(Eviction::Never)
             .capacity(2)
             .spawn_with(|_| Some(journal::spawn(Journal::default())))
             .build(),
@@ -1091,7 +1093,7 @@ async fn lazy_spawn_stops_at_the_capacity() {
 #[tokio::test]
 async fn an_idle_actor_is_evicted_without_anyone_asking() {
     let fixture = start(
-        journal::System::builder(Eviction::Idle {
+        journal::Registry::builder(Eviction::Idle {
             after: Duration::from_millis(60),
             shutdown_budget: Duration::from_secs(5),
         })
@@ -1136,7 +1138,7 @@ async fn an_idle_actor_is_evicted_without_anyone_asking() {
 #[tokio::test]
 async fn eviction_inside_its_shutdown_budget_does_not_cut_off_a_message_in_flight() {
     let fixture = start(
-        journal::System::builder(Eviction::Idle {
+        journal::Registry::builder(Eviction::Idle {
             after: Duration::from_millis(30),
             shutdown_budget: Duration::from_secs(5),
         })
@@ -1163,7 +1165,7 @@ async fn eviction_inside_its_shutdown_budget_does_not_cut_off_a_message_in_fligh
 #[tokio::test]
 async fn the_connection_outlives_the_actors_on_it() {
     let fixture = start(
-        journal::System::builder(Eviction::Idle {
+        journal::Registry::builder(Eviction::Idle {
             after: Duration::from_millis(40),
             shutdown_budget: Duration::from_secs(5),
         })
@@ -1192,7 +1194,7 @@ async fn the_connection_outlives_the_actors_on_it() {
 /// Two calls and not one, because "queued turns are answered" is the claim and
 /// one message in flight does not queue anything. The default local mailbox depth
 /// is 1, so the second
-/// `apply` is buffered behind the first and is the queued turn; the budget covers
+/// `apply` is queued behind the first and is the queued turn; the budget covers
 /// both holds together, which is the depth-versus-budget relationship 4a's doc
 /// names — at depth N a budget has to cover N + 1 turns, not one.
 ///
@@ -1258,7 +1260,7 @@ async fn shutdown_inside_its_budget_answers_the_turn_in_flight_and_the_one_queue
             tokio::time::sleep(Duration::from_millis(40)).await;
             fixture
                 .system
-                .shutdown(&id("doc"), Duration::from_secs(5))
+                .stop(&id("doc"), Duration::from_secs(5))
                 .await
         };
         tokio::join!(queued, stopping)
@@ -1334,7 +1336,7 @@ async fn abort_destroys_the_message_in_flight() {
 async fn shutting_down_an_unmounted_id_says_so_rather_than_pretending() {
     let system = mounted();
     assert!(system
-        .shutdown(&id("nobody"), Duration::from_secs(5))
+        .stop(&id("nobody"), Duration::from_secs(5))
         .await
         .is_none());
     assert!(!system.abort(&id("nobody")).await);
@@ -1411,7 +1413,7 @@ impl Drop for Scratch {
 /// nothing here. That is what a wedged actor looks like: the mailbox is shut and
 /// the turn does not care.
 #[cfg(feature = "persist-file")]
-fn wedged(claim: impl Send + 'static) -> journal::Mounted {
+fn wedged(claim: impl Send + 'static) -> journal::Mountable {
     keylink::mount(|inbox: journal::Mailbox| async move {
         let _wedged = (claim, inbox);
         // `pending::<Ended>` and not `pending::<()>`: a loop has to name its
@@ -1455,7 +1457,7 @@ impl Drop for Dropped {
 fn wedged_once_drained(
     claim: impl Send + 'static,
     closed: oneshot::Sender<()>,
-) -> journal::Mounted {
+) -> journal::Mountable {
     keylink::mount(|mut inbox: journal::Mailbox| async move {
         let _held = claim;
         while inbox.recv().await.is_some() {}
@@ -1470,7 +1472,7 @@ fn wedged_once_drained(
 /// Made red by `scripts/break-once.sh`, replacing `drain`'s
 /// `std::pin::pin!(AbortOnDropHandle::new(task))` with
 /// `std::pin::pin!(n0_future::task::spawn(async move { let _ = task.await; }))` —
-/// one literal, and the deleted `System::stop`'s exact shape: the expiry then
+/// one literal, and the deleted `Registry::stop`'s exact shape: the expiry then
 /// aborts a *wrapper* task and drops the real handle, which detaches. Watched:
 /// this test and `an_eviction_whose_budget_expires_destroys_the_actor` both fail
 /// with `Busy { id: StateId("wedged/4471") }`.
@@ -1492,9 +1494,7 @@ async fn a_shutdown_whose_budget_expires_destroys_the_actor() {
         .mount(id("wedged"), wedged(claim))
         .expect("the id is free");
 
-    let ended = system
-        .shutdown(&id("wedged"), Duration::from_millis(50))
-        .await;
+    let ended = system.stop(&id("wedged"), Duration::from_millis(50)).await;
 
     assert!(
         matches!(ended, Some(Ended::Vanished)),
@@ -1516,8 +1516,8 @@ async fn a_shutdown_whose_budget_expires_destroys_the_actor() {
 /// the actor — and with a bare `JoinHandle` in `drain`'s frame, dropping that
 /// frame **detached** it. Byte for byte the deleted `stop`'s outcome, reached
 /// through cancellation instead of through expiry: entry gone, task loose, state
-/// and claim still held, and `System::abort` answering `false` for an actor that
-/// is still running. `System::abort` survives cancellation for the one-line
+/// and claim still held, and `Registry::abort` answering `false` for an actor that
+/// is still running. `Registry::abort` survives cancellation for the one-line
 /// reason its own doc gives — it aborts BEFORE its await — and `drain` cannot
 /// borrow that trick, because aborting first is the opposite of draining.
 ///
@@ -1541,7 +1541,7 @@ async fn a_dropped_shutdown_destroys_the_actor_it_has_already_unmounted() {
 
     let cut = tokio::time::timeout(
         Duration::from_millis(1),
-        system.shutdown(&id("wedged"), Duration::from_secs(10)),
+        system.stop(&id("wedged"), Duration::from_secs(10)),
     )
     .await;
 
@@ -1565,8 +1565,8 @@ async fn a_dropped_shutdown_destroys_the_actor_it_has_already_unmounted() {
 
 /// The same, done by the sweeper's budget instead of a caller's.
 ///
-/// `Eviction::Idle`'s own rustdoc claimed *"Eviction is `System::stop`, not
-/// `System::abort`"*, and the sweeper it described never awaited anything at all:
+/// `Eviction::Idle`'s own rustdoc claimed *"Eviction is `Registry::stop`, not
+/// `Registry::abort`"*, and the sweeper it described never awaited anything at all:
 /// it dropped entries inside a `retain`, under the write lock, which detached
 /// every task it evicted. This is that sentence turned into a test.
 ///
@@ -1596,7 +1596,7 @@ async fn an_eviction_whose_budget_expires_destroys_the_actor() {
     let claim = files.claim(&held).await.expect("nothing holds it yet");
     let (gone, dropped) = oneshot::channel();
 
-    let system: journal::System = journal::System::builder(Eviction::Idle {
+    let system: journal::Registry = journal::Registry::builder(Eviction::Idle {
         after: Duration::from_secs(60),
         shutdown_budget: Duration::from_millis(50),
     })
@@ -1649,7 +1649,7 @@ async fn an_evicted_actor_still_holds_its_state_after_its_id_is_free_again() {
     let claim = files.claim(&held).await.expect("nothing holds it yet");
     let (closed, evicted) = oneshot::channel();
 
-    let system: journal::System = journal::System::builder(Eviction::Idle {
+    let system: journal::Registry = journal::Registry::builder(Eviction::Idle {
         after: Duration::from_millis(1),
         shutdown_budget: Duration::from_secs(60),
     })
@@ -1686,14 +1686,14 @@ async fn an_evicted_actor_still_holds_its_state_after_its_id_is_free_again() {
 
 /// A refused mount leaks nothing, on both refusals.
 ///
-/// The second detach, and it was never a budget problem: `System::mount` takes a
-/// `Mounted` by value and drops it on `Occupied` and on `AtCapacity`, and the
+/// The second detach, and it was never a budget problem: `Registry::mount` takes a
+/// `Mountable` by value and drops it on `Occupied` and on `AtCapacity`, and the
 /// task used to be **already spawned** by then — the generated `spawn` started
 /// it. `MountError` hands nothing back, so the caller who was refused had no
 /// handle, and neither did the registry. Every refused mount was a live actor
 /// nobody could reach, holding whatever its state held.
 ///
-/// `Mounted` carries an unstarted future now, so both refusals drop a loop that
+/// `Mountable` carries an unstarted future now, so both refusals drop a loop that
 /// has never been polled. Nothing is awaited between the claim and the refusal:
 /// the release is synchronous, inside `mount`, which is the strongest form the
 /// guarantee has.
@@ -1715,7 +1715,7 @@ async fn a_refused_mount_leaves_no_actor_holding_the_claim_it_was_built_around()
     let files = Files::open(&scratch.0).await.expect("the store opens");
     let held = StateId::new("refused/4471").expect("a valid state id");
 
-    let system: journal::System = journal::System::builder(Eviction::Never)
+    let system: journal::Registry = journal::Registry::builder(Eviction::Never)
         .capacity(1)
         .build();
     system
@@ -1774,8 +1774,8 @@ async fn a_refused_mount_leaves_no_actor_holding_the_claim_it_was_built_around()
 ///   never come, so the failure mode is the timeout guard rather than a wrong
 ///   number.
 /// - **serial**: a third actor, two messages, the second provably in the *mailbox*
-///   before the first is let go — `System::status` reporting `busy` with
-///   `buffered == 1` is what makes "in the mailbox" observable rather than
+///   before the first is let go — `Registry::status` reporting `busy` with
+///   `queued == 1` is what makes "in the mailbox" observable rather than
 ///   inferred. Both turns run, and the peak is **1**.
 ///
 /// A peak of 1 on a counter just watched to reach 2 is a fact about the loop rather
@@ -1866,11 +1866,11 @@ async fn different_actors_run_concurrently_while_one_actor_stays_serial() {
         let sending = behind.apply(3, 0);
         let checking = async {
             // Waiting until the message is in the MAILBOX rather than somewhere on
-            // a QUIC stream. `buffered` is what makes that observable, and at the
+            // a QUIC stream. `queued` is what makes that observable, and at the
             // default depth of one it is exactly this call's message.
             let held = loop {
                 let row = status_of(&fixture.system, &id("c"));
-                if row.buffered == 1 {
+                if row.queued == 1 {
                     break row;
                 }
                 tokio::task::yield_now().await;
@@ -1912,7 +1912,7 @@ async fn different_actors_run_concurrently_while_one_actor_stays_serial() {
 }
 
 /// The one row a status assertion is about, by id.
-fn status_of(system: &journal::System, id: &ActorId) -> keylink::ActorStatus {
+fn status_of(system: &journal::Registry, id: &ActorId) -> keylink::ActorStatus {
     system
         .status()
         .into_iter()
@@ -1940,22 +1940,22 @@ fn status_of(system: &journal::System, id: &ActorId) -> keylink::ActorStatus {
 /// the panic prints it as decimal bytes rather than as that string).
 #[test]
 fn the_keyed_alpn_separates_two_services_with_identical_shapes() {
-    assert_ne!(journal::keyed_alpn(), vault::keyed_alpn());
+    assert_ne!(journal::registry_alpn(), vault::registry_alpn());
 }
 
 /// A service's two ALPNs are not each other, so one node can serve the same
 /// service as a singleton and as an actor system at once.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/macros.rs`, replacing
-/// `keyed_alpn`'s `derive_alpn::<KeyedContract>(KEYED_PROTOCOL)` with
+/// `registry_alpn`'s `derive_alpn::<KeyedContract>(KEYED_PROTOCOL)` with
 /// `alpn().to_vec()` — the collision `ConfigError::DuplicateAlpn` exists for.
 /// Watched: `assertion `left != right` failed`, both sides
 /// `keylink/Journal/c1794491a027bccd`.
 #[test]
 fn a_services_keyed_alpn_is_not_its_singleton_alpn() {
-    assert_ne!(journal::keyed_alpn(), journal::alpn());
-    assert_ne!(vault::keyed_alpn(), vault::alpn());
-    assert_ne!(journal::keyed_alpn(), vault::alpn());
+    assert_ne!(journal::registry_alpn(), journal::alpn());
+    assert_ne!(vault::registry_alpn(), vault::alpn());
+    assert_ne!(journal::registry_alpn(), vault::alpn());
 }
 
 /// RFC-04 §14.10 item 6: the defect was reproduced in isolation but never
@@ -2064,13 +2064,14 @@ async fn a_layer_refuses_one_keyed_method_and_passes_the_rest() {
 
     let _running = Server::builder(&server)
         .service(
-            journal::keyed_service(&system, Allowlist::anyone())
+            system
+                .service(Allowlist::anyone())
                 .layer(PerMethod { seen: seen.clone() })
                 .build(),
         )
         .spawn()
         .expect("one service, no duplicate ALPN");
-    let client = journal::KeyedClient::connect(&client_node, server.endpoint().addr())
+    let client = journal::RegistryClient::connect(&client_node, server.endpoint().addr())
         .await
         .expect("the client dials the actor system");
     let actor = client.at(id("obra/1"));
@@ -2147,12 +2148,12 @@ impl doorman::Actor for Doorman {
 async fn a_keyed_actor_sees_the_proven_key_of_its_caller() {
     let server = local_node().await;
     let client_node = local_node().await;
-    let system: doorman::System = doorman::System::builder(Eviction::Never).build();
+    let system: doorman::Registry = doorman::Registry::builder(Eviction::Never).build();
     let _running = Server::builder(&server)
-        .service(doorman::keyed_service(&system, Allowlist::anyone()).build())
+        .service(system.service(Allowlist::anyone()).build())
         .spawn()
         .expect("one service, no duplicate ALPN");
-    let client = doorman::KeyedClient::connect(&client_node, server.endpoint().addr())
+    let client = doorman::RegistryClient::connect(&client_node, server.endpoint().addr())
         .await
         .expect("the client dials the actor system");
 
@@ -2291,11 +2292,11 @@ impl ward::Actor for Ward {
 /// `raw` survives for one job only: putting bytes on the wire that are NOT a
 /// message of this contract, which a typed client cannot do by construction.
 struct Keyed {
-    client: ward::KeyedClient,
+    client: ward::RegistryClient,
     /// A hand-rolled peer on `ward`'s keyed ALPN, whose request type is a bare
     /// `u32`. Nothing generated can produce an undecodable payload.
     raw: RpcClient<u32, ward::Response>,
-    _system: ward::System,
+    _system: ward::Registry,
     _server: Server,
     _nodes: [Node; 2],
 }
@@ -2303,17 +2304,21 @@ struct Keyed {
 async fn start_keyed() -> Keyed {
     let server = local_node().await;
     let client_node = local_node().await;
-    let system: ward::System = ward::System::builder(Eviction::Never).build();
+    let system: ward::Registry = ward::Registry::builder(Eviction::Never).build();
     let running = Server::builder(&server)
-        .service(ward::keyed_service(&system, Allowlist::anyone()).build())
+        .service(system.service(Allowlist::anyone()).build())
         .spawn()
         .expect("one service, no duplicate ALPN");
-    let client = ward::KeyedClient::connect(&client_node, server.endpoint().addr())
+    let client = ward::RegistryClient::connect(&client_node, server.endpoint().addr())
         .await
         .expect("the typed client dials the actor system");
-    let raw = RpcClient::connect(&client_node, server.endpoint().addr(), ward::keyed_alpn())
-        .await
-        .expect("a hand-rolled peer dials the same ALPN");
+    let raw = RpcClient::connect(
+        &client_node,
+        server.endpoint().addr(),
+        ward::registry_alpn(),
+    )
+    .await
+    .expect("a hand-rolled peer dials the same ALPN");
     system
         .mount(id("ward"), ward::spawn(Ward::default()))
         .expect("the id is free");
@@ -2338,7 +2343,7 @@ async fn touches(fixture: &Keyed) -> u64 {
 }
 
 /// A keyed handle to `ward`, under `key`.
-fn under(fixture: &Keyed, key: &str) -> ward::KeyedClient {
+fn under(fixture: &Keyed, key: &str) -> ward::RegistryClient {
     fixture
         .client
         .with_idempotency(IdempotencyKey::new(key).expect("a valid key"))
@@ -2414,12 +2419,12 @@ async fn a_key_is_known_to_the_service_it_was_claimed_against_and_no_other() {
     // A second service on a second node, dialled with the same key.
     let server = local_node().await;
     let caller = local_node().await;
-    let system: doorman::System = doorman::System::builder(Eviction::Never).build();
+    let system: doorman::Registry = doorman::Registry::builder(Eviction::Never).build();
     let _running = Server::builder(&server)
-        .service(doorman::keyed_service(&system, Allowlist::anyone()).build())
+        .service(system.service(Allowlist::anyone()).build())
         .spawn()
         .expect("one service, no duplicate ALPN");
-    let elsewhere = doorman::KeyedClient::connect(&caller, server.endpoint().addr())
+    let elsewhere = doorman::RegistryClient::connect(&caller, server.endpoint().addr())
         .await
         .expect("dials");
 
@@ -2700,6 +2705,9 @@ keylink::service! {
     /// turn is visible HERE and nowhere else: the refusal a peer reads says
     /// nothing about whether the actor was touched.
     rpc Touch() -> u64;
+    /// Queue one turn without waiting for a reply.
+    tell Queue() -> ();
+
 
     /// The count, read without a key, so reading it never settles one.
     rpc Touches() -> u64;
@@ -2745,6 +2753,11 @@ impl gate::Actor for Gate {
         self.touches
     }
 
+    async fn queue(&mut self, _cx: keylink::Caller<'_>) {
+        self.touches += 1;
+        let _ = self.turns.send(None);
+    }
+
     async fn touches(&mut self, _cx: keylink::Caller<'_>) -> u64 {
         self.touches
     }
@@ -2760,6 +2773,70 @@ impl gate::Actor for Gate {
             .expect("the test never closes the semaphore")
             .forget();
     }
+}
+
+#[tokio::test]
+async fn a_keyed_shed_refuses_full_mailboxes_locally_and_remotely() {
+    let server_node = local_node().await;
+    let client_node = local_node().await;
+    let system: gate::Registry = gate::Registry::builder(Eviction::Never).build();
+    let (entered_tx, mut entered) = mpsc::unbounded_channel();
+    let (turns_tx, _turns) = mpsc::unbounded_channel();
+    let (_ticks, tick_rx) = mpsc::channel(1);
+    let release = Arc::new(Semaphore::new(0));
+    let actor_id = id("shed");
+
+    system
+        .mount(
+            actor_id.clone(),
+            gate::setup(Gate {
+                entered: entered_tx,
+                release: Arc::clone(&release),
+                touches: 0,
+                turns: turns_tx,
+                ticked: Arc::new(Semaphore::new(0)),
+            })
+            .feeds(gate::Feeds::new(ticking(tick_rx)))
+            .backpressure(Backpressure::Shed(NonZeroUsize::MIN))
+            .mountable(),
+        )
+        .expect("mounts");
+    let _server = system
+        .serve(&server_node, Allowlist::anyone())
+        .expect("serves");
+    let client = gate::RegistryClient::connect(&client_node, server_node.endpoint().addr())
+        .await
+        .expect("dials");
+
+    let holding = {
+        let client = client.clone();
+        let actor_id = actor_id.clone();
+        tokio::spawn(async move { client.at(actor_id).hold().await })
+    };
+    entered.recv().await.expect("the held turn starts");
+
+    gate::at_local(&system, actor_id.clone())
+        .queue()
+        .await
+        .expect("the one mailbox slot is now occupied");
+
+    assert_eq!(
+        gate::at_local(&system, actor_id.clone())
+            .touch()
+            .await
+            .expect_err("local keyed delivery sheds"),
+        keylink::LocalError::MailboxFull,
+    );
+    assert!(matches!(
+        client.at(actor_id).touch().await,
+        Err(keylink::Error::Remote(RemoteError::MailboxFull)),
+    ));
+
+    release.add_permits(1);
+    holding
+        .await
+        .expect("the caller task survives")
+        .expect("the held call answers");
 }
 
 /// Reports every call that has passed the `QueueTimeout` above it, carrying the
@@ -2801,7 +2878,7 @@ type GateWire = Addressed<gate::Request>;
 
 /// One `Gate` behind a bound, reached through its own generated client.
 struct Gated {
-    client: gate::KeyedClient,
+    client: gate::RegistryClient,
     /// Fires when a turn starts.
     entered: mpsc::UnboundedReceiver<()>,
     /// Fires when a call passes the `QueueTimeout`, carrying its budget.
@@ -2816,7 +2893,7 @@ struct Gated {
     /// Every turn the actor ran, in order. `Some(tick)` is a feed turn.
     turns: mpsc::UnboundedReceiver<Option<u64>>,
     /// Read by the `status` tests, which is why it is not `_system`.
-    system: gate::System,
+    system: gate::Registry,
     _server: Server,
     _nodes: [Node; 2],
 }
@@ -2848,7 +2925,7 @@ async fn gated_behind(bound: impl Middleware<GateWire, gate::Response>) -> Gated
 async fn gated_at_depth(bound: impl Middleware<GateWire, gate::Response>, depth: usize) -> Gated {
     let server = local_node().await;
     let client_node = local_node().await;
-    let system: gate::System = gate::System::builder(Eviction::Never)
+    let system: gate::Registry = gate::Registry::builder(Eviction::Never)
         .mailbox_depth(NonZeroUsize::new(depth).expect("a mailbox depth is never zero"))
         .build();
     let (entered_tx, entered) = mpsc::unbounded_channel();
@@ -2859,8 +2936,9 @@ async fn gated_at_depth(bound: impl Middleware<GateWire, gate::Response>, depth:
     let ticked = Arc::new(Semaphore::new(0));
     let running = Server::builder(&server)
         .service(
-            gate::keyed_service(&system, Allowlist::anyone())
-                // `keyed_service` gives back an ordinary `ServiceBuilder`, so
+            system
+                .service(Allowlist::anyone())
+                // `registry.service` gives back an ordinary `ServiceBuilder`, so
                 // this compiles — and until RFC-04 §16.7 the deadline a
                 // `QueueTimeout` stamped was read by nobody on this path.
                 .layer(bound)
@@ -2871,26 +2949,24 @@ async fn gated_at_depth(bound: impl Middleware<GateWire, gate::Response>, depth:
         )
         .spawn()
         .expect("one service, no duplicate ALPN");
-    let client = gate::KeyedClient::connect(&client_node, server.endpoint().addr())
+    let client = gate::RegistryClient::connect(&client_node, server.endpoint().addr())
         .await
         .expect("the client dials the actor system");
     system
         .mount(
             id("gate"),
-            // `spawn_wired` and not `spawn`: a service that declares a feed has to
+            // `setup(..).feeds(..).mountable()` and not `spawn`: a service that declares a feed has to
             // be handed one, which is the missing-argument the generated
             // `ServableAsActor` check exists to produce.
-            gate::spawn_wired(
-                Gate {
-                    entered: entered_tx,
-                    release: Arc::clone(&release),
-                    touches: 0,
-                    turns: turns_tx,
-                    ticked: Arc::clone(&ticked),
-                },
-                Vec::new(),
-                gate::Feeds::new(ticking(tick_rx)),
-            ),
+            gate::setup(Gate {
+                entered: entered_tx,
+                release: Arc::clone(&release),
+                touches: 0,
+                turns: turns_tx,
+                ticked: Arc::clone(&ticked),
+            })
+            .feeds(gate::Feeds::new(ticking(tick_rx)))
+            .mountable(),
         )
         .expect("the id is free");
 
@@ -2920,7 +2996,7 @@ fn ticking(mut items: mpsc::Receiver<u64>) -> impl keylink::Stream<Item = u64> +
 ///
 /// Takes the system rather than the fixture so a test can hold this borrow beside
 /// a `&mut` on one of the fixture's channels, which every test below needs.
-fn gate_status(system: &gate::System) -> keylink::ActorStatus {
+fn gate_status(system: &gate::Registry) -> keylink::ActorStatus {
     let mut rows = system.status();
     assert_eq!(rows.len(), 1, "the gate fixture mounts exactly one actor");
     rows.remove(0)
@@ -2931,7 +3007,7 @@ fn gate_status(system: &gate::System) -> keylink::ActorStatus {
 /// Bounded, so a `busy` that never clears fails the test instead of hanging it.
 /// Nothing here asserts how long anything took: the guard is three orders of
 /// magnitude out, and its expiry means the flag is stuck rather than slow.
-async fn until_idle(system: &gate::System) -> keylink::ActorStatus {
+async fn until_idle(system: &gate::Registry) -> keylink::ActorStatus {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let row = gate_status(system);
@@ -2950,11 +3026,11 @@ async fn until_idle(system: &gate::System) -> keylink::ActorStatus {
 /// The deterministic way to know a call is in the MAILBOX rather than somewhere on
 /// a QUIC stream, which is what every saturation assertion below rests on. Bounded
 /// for `until_idle`'s reason.
-async fn until_buffered(system: &gate::System, messages: u64) -> keylink::ActorStatus {
+async fn until_queued(system: &gate::Registry, messages: u64) -> keylink::ActorStatus {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let row = gate_status(system);
-            if row.buffered == messages {
+            if row.queued == messages {
                 return row;
             }
             tokio::task::yield_now().await;
@@ -2990,7 +3066,7 @@ async fn busy_is_true_during_a_turn_and_false_between_turns() {
 
     let before = gate_status(system);
     assert!(!before.busy, "nothing has been called yet");
-    assert_eq!(before.buffered, 0);
+    assert_eq!(before.queued, 0);
 
     let holding = async { client.at(id("gate")).hold().await };
     let watching = async {
@@ -3001,7 +3077,7 @@ async fn busy_is_true_during_a_turn_and_false_between_turns() {
             "the handler is inside `hold`, so a turn is running"
         );
         assert_eq!(
-            during.buffered, 0,
+            during.queued, 0,
             "and the mailbox is empty: this message is IN the turn rather than \
              waiting for one, which is the distinction `capacity` alone cannot make"
         );
@@ -3011,7 +3087,7 @@ async fn busy_is_true_during_a_turn_and_false_between_turns() {
     answered.expect("the held call answers");
 
     let after = until_idle(system).await;
-    assert_eq!(after.buffered, 0, "and nothing is left waiting");
+    assert_eq!(after.queued, 0, "and nothing is left waiting");
 }
 
 /// **`busy` stays true across an `await` inside a turn.**
@@ -3024,7 +3100,7 @@ async fn busy_is_true_during_a_turn_and_false_between_turns() {
 /// The reading is taken twice, and the second time with a message provably in the
 /// mailbox — which is what makes this more than "the flag we set is still set". A
 /// loop that had finished the turn would have taken that message: at the default
-/// depth of one, `buffered == 1` and `busy` together say the loop is neither at its
+/// depth of one, `queued == 1` and `busy` together say the loop is neither at its
 /// receive nor between turns.
 #[tokio::test]
 async fn busy_stays_true_across_an_await_inside_a_turn() {
@@ -3048,7 +3124,7 @@ async fn busy_stays_true_across_an_await_inside_a_turn() {
             "a turn suspended at an await is still a turn"
         );
 
-        let held = until_buffered(system, 1).await;
+        let held = until_queued(system, 1).await;
         assert!(
             held.busy,
             "and it is still running with a message waiting behind it, which a \
@@ -3090,7 +3166,7 @@ async fn busy_is_true_during_a_feed_turn() {
     let during = gate_status(system);
     assert!(during.busy, "a feed item is a turn, and it is running now");
     assert_eq!(
-        during.buffered, 0,
+        during.queued, 0,
         "with no mailbox message involved anywhere: a feed does not consume a slot"
     );
 
@@ -3103,33 +3179,33 @@ async fn busy_is_true_during_a_feed_turn() {
 /// How long a call that should answer at once is given before it is called stuck.
 ///
 /// Three orders of magnitude out, and nothing here asserts elapsed time: its
-/// expiry means a `__status` is waiting on something, which is the whole defect
+/// expiry means a `status` is waiting on something, which is the whole defect
 /// this section exists to catch. A bare `await` would express the same guard by
 /// hanging, and a guard that fails by hanging says nothing about what happened.
 const NOT_STUCK: Duration = Duration::from_secs(30);
 
-/// **A wedged actor answers `__status` to a peer, during the turn that wedged
+/// **A wedged actor answers `status` to a peer, during the turn that wedged
 /// it.**
 ///
 /// The wave's central claim, on the keyed door — its singleton twin is
 /// `a_wedged_singleton_answers_status_to_its_handle_and_to_a_peer`, and between
-/// them they are the only tests in the tree that can fail if `__status` ever
+/// them they are the only tests in the tree that can fail if `status` ever
 /// becomes a message. `macros.rs` states the constraint on
-/// `Handle::is_busy`: this is the question you cannot ask the actor, because a
+/// `Handle::busy`: this is the question you cannot ask the actor, because a
 /// message asking it queues behind the turn you are asking about. So the answer
-/// is produced inside the `Dispatch` closure, above `deliver_to_actor`, and
+/// is produced inside the `Dispatch` closure, above `deliver_keyed`, and
 /// nothing enters the mailbox.
 ///
 /// **The ordering is the proof, and it is not a clock.** `hold`'s handler is
 /// parked on a semaphore with no permits, so its turn cannot end until this test
-/// adds one — and the permit is added strictly *after* the peer's `__status` has
+/// adds one — and the permit is added strictly *after* the peer's `status` has
 /// answered. There is no arrangement of events in which that answer was produced
 /// after the turn finished.
 ///
 /// **The mailbox is FULL while the question is asked**, which is the second half
-/// and the reason for the queued `touch`: at depth one, `buffered == 1` means
-/// there is no slot left. A `__status` delivered as a message could not even be
-/// accepted, let alone answered — and `buffered` reading `1` rather than `2` is
+/// and the reason for the queued `touch`: at depth one, `queued == 1` means
+/// there is no slot left. A `status` delivered as a message could not even be
+/// accepted, let alone answered — and `queued` reading `1` rather than `2` is
 /// the same fact from the other side, since a status that took a slot would count
 /// itself.
 ///
@@ -3144,8 +3220,8 @@ const NOT_STUCK: Duration = Duration::from_secs(30);
 /// request.message(),
 /// Request::__Status { .. }
 /// ) {` — with `let __answer = if false {`, so `__Status` falls through to
-/// `deliver_to_actor` like any other message. Watched:
-/// `a `__status` that enqueued would wait behind the wedged turn, and this one
+/// `deliver_keyed` like any other message. Watched:
+/// `a `status` that enqueued would wait behind the wedged turn, and this one
 /// did: Elapsed(())`. Registered as `S1`.
 #[tokio::test]
 async fn a_wedged_actor_answers_status_during_its_turn() {
@@ -3161,14 +3237,12 @@ async fn a_wedged_actor_answers_status_during_its_turn() {
         entered.recv().await.expect("`hold` enters its turn");
         // The mailbox is full before the question is asked, so the answer below
         // cannot have come through it.
-        let held = until_buffered(system, 1).await;
+        let held = until_queued(system, 1).await;
         assert!(held.busy, "the turn holding the actor is still running");
 
-        let serving = tokio::time::timeout(NOT_STUCK, client.at(id("gate")).__status())
+        let serving = tokio::time::timeout(NOT_STUCK, client.at(id("gate")).status())
             .await
-            .expect(
-                "a `__status` that enqueued would wait behind the wedged turn, and this one did",
-            )
+            .expect("a `status` that enqueued would wait behind the wedged turn, and this one did")
             .expect("a wedged actor still answers the question it cannot be asked");
 
         assert!(
@@ -3176,8 +3250,8 @@ async fn a_wedged_actor_answers_status_during_its_turn() {
             "the actor is inside `hold` and the answer says so"
         );
         assert_eq!(
-            serving.buffered, 1,
-            "the queued `touch` and nothing else: a `__status` that took a mailbox \
+            serving.queued, 1,
+            "the queued `touch` and nothing else: a `status` that took a mailbox \
              slot would have counted itself here"
         );
 
@@ -3196,16 +3270,16 @@ async fn a_wedged_actor_answers_status_during_its_turn() {
     until_idle(system).await;
     let after = client
         .at(id("gate"))
-        .__status()
+        .status()
         .await
         .expect("an idle actor answers too");
     assert_eq!(
         after,
         Serving {
             busy: false,
-            buffered: 0
+            queued: 0
         },
-        "a `__status` reporting the state of asking would read `busy: true` here \
+        "a `status` reporting the state of asking would read `busy: true` here \
          as well, because it would itself be the turn"
     );
     assert_ne!(
@@ -3219,10 +3293,10 @@ async fn a_wedged_actor_answers_status_during_its_turn() {
 ///
 /// Two doors, one value, asserted by equality rather than field by field. The
 /// callers are named because §5 of the plan names the wrong one: on the keyed
-/// path the local door is **`System::serving`** and not a `Handle` — a keyed
-/// actor has no handle, the registry owns its mailbox, and `System::serving` is
+/// path the local door is **`Registry::serving`** and not a `Handle` — a keyed
+/// actor has no handle, the registry owns its mailbox, and `Registry::serving` is
 /// the reader `Registry::status` shares its body with. The peer's door is
-/// **`gate::at(..).__status()`**, over a real QUIC connection to another node.
+/// **`gate::at(..).status()`**, over a real QUIC connection to another node.
 ///
 /// Asserted in **both** states, because a constant satisfies one of them. Idle
 /// is the cheap half; wedged is the half that matters, and it is deterministic
@@ -3231,17 +3305,17 @@ async fn a_wedged_actor_answers_status_during_its_turn() {
 ///
 /// **Keyed on both sides on purpose.** A keyed mailbox carries only the service's
 /// own messages while a `LocalActor`'s channel also carries a `read` and the stop
-/// request, so `buffered` compares as a predicate across the two kinds and never
+/// request, so `queued` compares as a predicate across the two kinds and never
 /// as a count. Comparing a keyed `Serving` against a singleton one by value would
 /// assert something this crate does not claim.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/actor/remote.rs`, replacing
-/// `serving_of_actor`'s `.serving(actor)` with
-/// `.serving(actor).map(|_| Serving { busy: false, buffered: 0 })`, so the peer's
+/// `serving_keyed`'s `.serving(actor)` with
+/// `.serving(actor).map(|_| Serving { busy: false, queued: 0 })`, so the peer's
 /// answer stops coming from the registry. Watched:
 /// `assertion `left == right` failed: one actor, one instant, two doors`,
-/// `left: Serving { busy: true, buffered: 0 }` and
-/// `right: Serving { busy: false, buffered: 0 }`. Registered as `S2`.
+/// `left: Serving { busy: true, queued: 0 }` and
+/// `right: Serving { busy: false, queued: 0 }`. Registered as `S2`.
 #[tokio::test]
 async fn a_local_caller_and_a_peer_read_the_same_serving() {
     let mut fixture = start_gated().await;
@@ -3254,7 +3328,7 @@ async fn a_local_caller_and_a_peer_read_the_same_serving() {
     let idle_here = system.serving(&who).expect("the actor is mounted");
     let idle_there = client
         .at(who.clone())
-        .__status()
+        .status()
         .await
         .expect("the peer's question is answered");
     assert_eq!(
@@ -3265,7 +3339,7 @@ async fn a_local_caller_and_a_peer_read_the_same_serving() {
         idle_here,
         Serving {
             busy: false,
-            buffered: 0
+            queued: 0
         },
         "and nothing has been called yet"
     );
@@ -3273,7 +3347,7 @@ async fn a_local_caller_and_a_peer_read_the_same_serving() {
     let holding = async { client.at(who.clone()).hold().await };
     let comparing = async {
         entered.recv().await.expect("`hold` enters its turn");
-        let there = tokio::time::timeout(NOT_STUCK, client.at(who.clone()).__status())
+        let there = tokio::time::timeout(NOT_STUCK, client.at(who.clone()).status())
             .await
             .expect("a wedged actor answers its peer")
             .expect("the peer's question is answered");
@@ -3294,31 +3368,31 @@ async fn a_local_caller_and_a_peer_read_the_same_serving() {
     );
 }
 
-/// **A wedged singleton answers `__status` to its own `Handle` and to a peer,
+/// **A wedged singleton answers `status` to its own `Handle` and to a peer,
 /// with the same value.**
 ///
-/// The second of the two doors that answer with a `Serving`: `keyed_service`'s
-/// closure answers above `deliver_to_actor` and this one answers above
-/// `deliver_to_singleton`. A test of one says nothing about the other, and the
+/// The second of the two doors that answer with a `Serving`: `registry.service`'s
+/// closure answers above `deliver_keyed` and this one answers above
+/// `deliver_unkeyed`. A test of one says nothing about the other, and the
 /// arms are separate code. The concurrent `service<H: Handler>` door answers
 /// `__Status` inside its `Dispatch` too and is the third such closure — it
 /// refuses with `NotAnActor` rather than folding a `Serving`, and `S4` guards it.
-/// This is also the only place `Handle::__status` — the synchronous local door,
+/// This is also the only place `Own::status` — the synchronous local door,
 /// which sends nothing at all — is read.
 ///
 /// The same `Gate` state and the same semaphore as the keyed tests, served the
-/// other way: `actor_wired` rather than `spawn_wired`, `service` rather than
-/// `keyed_service`, `Client` rather than `KeyedClient`. So what differs between
+/// other way: `setup(..).feeds(..).actor()` rather than `setup(..).feeds(..).mountable()`, `service` rather than
+/// `registry.service`, `Client` rather than `RegistryClient`. So what differs between
 /// this test and its keyed twin is the door and nothing else.
 ///
-/// **No value is written down for `buffered`.** The two sides are compared
+/// **No value is written down for `queued`.** The two sides are compared
 /// against each other, never against a literal: a `LocalActor`'s channel carries
 /// more than the service's own messages, and pinning a number here would assert
 /// something `Serving` says it does not claim.
 ///
 /// **Read in two states, because one state is passed by a constant.** Equality
 /// between the doors plus `busy` at the wedged instant is satisfied by a
-/// `Serving { busy: true, buffered: 0 }` hard-coded into `serving_of_singleton`
+/// `Serving { busy: true, queued: 0 }` hard-coded into `serving_unkeyed`
 /// — measured, not assumed, and that is the true reading of those two assertions
 /// on their own. The idle pair taken after the permit closes it: the peer's
 /// wedged answer and the peer's idle answer have to differ, and no constant can
@@ -3330,7 +3404,7 @@ async fn a_local_caller_and_a_peer_read_the_same_serving() {
 /// Made red by `scripts/break-once.sh keylink/src/macros.rs`, replacing
 /// `if ::core::matches!(&req, Request::__Status { .. }) {` with `if false {`, so
 /// the singleton door delivers the question instead of answering it. Watched:
-/// `a `__status` that enqueued would wait behind the wedged turn, and this one
+/// `a `status` that enqueued would wait behind the wedged turn, and this one
 /// did: Elapsed(())`. Registered as `S3`.
 #[tokio::test]
 async fn a_wedged_singleton_answers_status_to_its_handle_and_to_a_peer() {
@@ -3342,17 +3416,15 @@ async fn a_wedged_singleton_answers_status_to_its_handle_and_to_a_peer() {
     let release = Arc::new(Semaphore::new(0));
     let ticked = Arc::new(Semaphore::new(0));
 
-    let actor = gate::actor_wired(
-        Gate {
-            entered: entered_tx,
-            release: Arc::clone(&release),
-            touches: 0,
-            turns: turns_tx,
-            ticked,
-        },
-        Vec::new(),
-        gate::Feeds::new(ticking(tick_rx)),
-    );
+    let actor = gate::setup(Gate {
+        entered: entered_tx,
+        release: Arc::clone(&release),
+        touches: 0,
+        turns: turns_tx,
+        ticked,
+    })
+    .feeds(gate::Feeds::new(ticking(tick_rx)))
+    .actor();
     let server = Server::builder(&node)
         .service(actor.service(Allowlist::anyone()).build())
         .spawn()
@@ -3364,15 +3436,13 @@ async fn a_wedged_singleton_answers_status_to_its_handle_and_to_a_peer() {
     let holding = async { client.hold().await };
     let comparing = async {
         entered.recv().await.expect("`hold` enters its turn");
-        let there = tokio::time::timeout(NOT_STUCK, client.__status())
+        let there = tokio::time::timeout(NOT_STUCK, client.status())
             .await
-            .expect(
-                "a `__status` that enqueued would wait behind the wedged turn, and this one did",
-            )
+            .expect("a `status` that enqueued would wait behind the wedged turn, and this one did")
             .expect("a wedged singleton still answers");
         // Synchronous, and that is the point of it: it reads a flag beside the
         // mailbox and sends nothing, so it answers while the turn holds the actor.
-        let here = actor.__status();
+        let here = actor.status();
         release.add_permits(1);
         (here, there)
     };
@@ -3389,14 +3459,14 @@ async fn a_wedged_singleton_answers_status_to_its_handle_and_to_a_peer() {
     // And the reading was about the actor rather than about the asking: once the
     // turn is over, the same two doors answer the opposite way.
     //
-    // Waited out on the LOCAL door deliberately. `serving_of_singleton` is the
+    // Waited out on the LOCAL door deliberately. `serving_unkeyed` is the
     // body a constant answer would be substituted into, so a wait that polled the
     // peer would be satisfied by the very value under test — and a substituted
     // `busy: true` would hang here instead of failing an assertion.
     // `LocalActor::serving` is a different producer and settles on its own.
     let after_here = tokio::time::timeout(NOT_STUCK, async {
         loop {
-            let row = actor.__status();
+            let row = actor.status();
             if !row.busy {
                 return row;
             }
@@ -3406,7 +3476,7 @@ async fn a_wedged_singleton_answers_status_to_its_handle_and_to_a_peer() {
     .await
     .expect("a turn that has answered its caller must clear `busy`");
     let after_there = client
-        .__status()
+        .status()
         .await
         .expect("an idle singleton answers its peer too");
 
@@ -3438,7 +3508,7 @@ async fn a_wedged_singleton_answers_status_to_its_handle_and_to_a_peer() {
 /// takes the slot's message, runs the turn and polls again without yielding, so the
 /// parked sender has not been rescheduled and the mailbox is deterministically
 /// empty at the next poll."* A depth of three removes that limit — three messages
-/// are genuinely in the mailbox, and `buffered` says so before anything is released
+/// are genuinely in the mailbox, and `queued` says so before anything is released
 /// — so this is the saturated case that could not be built before item 4a.
 ///
 /// The order is exact rather than statistical, because everything is loaded while
@@ -3452,9 +3522,9 @@ async fn a_wedged_singleton_answers_status_to_its_handle_and_to_a_peer() {
 #[tokio::test]
 async fn a_saturated_mailbox_at_depth_does_not_starve_a_feed() {
     const SLOTS: usize = 3;
-    /// The same three, as `ActorStatus::buffered` reports them. `buffered` is a
+    /// The same three, as `ActorStatus::queued` reports them. `queued` is a
     /// `u64` and a mailbox depth is a `usize`, because only one of the two
-    /// crosses a wire — see `ActorStatus::buffered`.
+    /// crosses a wire — see `ActorStatus::queued`.
     const SLOTS_SENT: u64 = 3;
 
     // A whole-call `Timeout` and not the fixture's default `QueueTimeout`: three
@@ -3486,13 +3556,13 @@ async fn a_saturated_mailbox_at_depth_does_not_starve_a_feed() {
     let watching = async {
         entered.recv().await.expect("`hold` enters its turn");
 
-        let full = until_buffered(system, SLOTS_SENT).await;
+        let full = until_queued(system, SLOTS_SENT).await;
         assert!(
             full.busy,
             "the actor is inside `hold` while its mailbox fills"
         );
         assert_eq!(
-            full.buffered, SLOTS_SENT,
+            full.queued, SLOTS_SENT,
             "and the mailbox is FULL: three messages in three slots, which is the \
              state a depth of one cannot hold still"
         );
@@ -3527,7 +3597,7 @@ async fn a_saturated_mailbox_at_depth_does_not_starve_a_feed() {
 }
 
 /// A keyed handle to `gate`, under `key`.
-fn gate_under(fixture: &Gated, key: &str) -> gate::KeyedClient {
+fn gate_under(fixture: &Gated, key: &str) -> gate::RegistryClient {
     fixture
         .client
         .with_idempotency(IdempotencyKey::new(key).expect("a valid key"))
@@ -3711,7 +3781,7 @@ async fn two_behind_a_held_turn(
 /// the actor's own task before anyone will look at it takes the one buffer a
 /// legitimate caller needs, and holds it for as long as the current turn lasts. A
 /// peer can do that with garbage, indefinitely, at no cost to itself. What it
-/// watched was `System::deliver`'s hash comparison sitting **before** the send.
+/// watched was `Registry::deliver`'s hash comparison sitting **before** the send.
 ///
 /// There is no hash comparison any more. What is left in front of the send is
 /// `ActorId::validate`, and that is what this pins: a malformed id is refused
@@ -3750,15 +3820,15 @@ async fn a_malformed_id_is_refused_without_taking_the_actors_mailbox_slot() {
     );
 }
 
-/// `deliver_to_singleton` bounds the wait for a mailbox permit, so a message that
+/// `deliver_unkeyed` bounds the wait for a mailbox permit, so a message that
 /// cannot get a slot is refused at its budget and — tokio not queueing a send that
 /// was cancelled before its permit arrived — provably never queued. The keyed walk
 /// awaited `mail.send` with no bound at all.
 ///
 /// The bound used to live in `LocalActor::ask_catching_before`, which this comment
 /// named until Wave 1b deleted it along with `Queued<T>`. Its one caller was
-/// `Handle::service`'s dispatch, which is `deliver_to_singleton` now — the twin of
-/// `deliver_to_actor`, in keylink, so the two halves of this test's subject are one
+/// `Handle::service`'s dispatch, which is `deliver_unkeyed` now — the twin of
+/// `deliver_keyed`, in keylink, so the two halves of this test's subject are one
 /// timeout written once rather than two that disagreed.
 ///
 /// Capacity is one and turns are serial, so with an actor inside a long turn
@@ -3773,7 +3843,7 @@ async fn a_malformed_id_is_refused_without_taking_the_actors_mailbox_slot() {
 /// exactly one of two identical messages can hold the slot, so exactly one must
 /// be answered before the actor is let go.
 ///
-/// Made red by dropping the bound in `deliver_to_actor` back to a bare
+/// Made red by dropping the bound in `deliver_keyed` back to a bare
 /// `mail.send(..).await`, which leaves that count at zero.
 #[tokio::test]
 async fn a_caller_that_cannot_get_a_mailbox_permit_is_refused_at_its_budget() {
@@ -3859,7 +3929,7 @@ async fn queued_when_the_caller_gave_up(fixture: &mut Gated, key: &str) -> Resul
 /// out of the module whose one promise is at-most-once — so reaching the mailbox
 /// is marked, and the key settles `Interrupted` instead.
 ///
-/// Made red by removing the `enqueued()` mark from `deliver_to_actor`, which
+/// Made red by removing the `enqueued()` mark from `deliver_keyed`, which
 /// takes the retry back to a first attempt and the counter to two.
 #[tokio::test]
 async fn a_keyed_message_a_timeout_gave_up_on_in_the_mailbox_settles_its_key() {
@@ -3941,11 +4011,11 @@ async fn two_keyed_behind_a_held_turn(
 /// which. The one that did leaves a turn behind that runs, so its key must
 /// settle. The one that did not queued nothing — tokio drops a send it cancelled
 /// — so its key is owed back and its retry is a first attempt. A mark taken on
-/// the way *into* `deliver_to_actor` would be indistinguishable on every other
+/// the way *into* `deliver_keyed` would be indistinguishable on every other
 /// assertion in this file and would burn that second key.
 ///
 /// Made red by moving `progress.enqueued()` above `mail.send` in
-/// `deliver_to_actor`, which settles both keys and leaves the count at two.
+/// `deliver_keyed`, which settles both keys and leaves the count at two.
 #[tokio::test]
 async fn only_the_keyed_message_that_got_a_mailbox_permit_settles_its_key() {
     let mut fixture = gated_behind(Timeout::after(BUDGET)).await;
@@ -4057,12 +4127,12 @@ impl fuse::Actor for Fuse {
 async fn a_reply_whose_serialize_panics_costs_that_message_and_not_the_actor() {
     let server = local_node().await;
     let client_node = local_node().await;
-    let system: fuse::System = fuse::System::builder(Eviction::Never).build();
+    let system: fuse::Registry = fuse::Registry::builder(Eviction::Never).build();
     let _running = Server::builder(&server)
-        .service(fuse::keyed_service(&system, Allowlist::anyone()).build())
+        .service(system.service(Allowlist::anyone()).build())
         .spawn()
         .expect("one service, no duplicate ALPN");
-    let client = fuse::KeyedClient::connect(&client_node, server.endpoint().addr())
+    let client = fuse::RegistryClient::connect(&client_node, server.endpoint().addr())
         .await
         .expect("the client dials the actor system");
 

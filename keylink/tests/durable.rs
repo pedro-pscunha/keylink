@@ -16,6 +16,7 @@
 #![cfg(feature = "persist-file")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use keylink::Caller;
 use keylink_persist::versioned::{Snapshot, Versioned};
 use keylink_persist::{file::Files, Durable, RestoreError, Snapshots, StateId};

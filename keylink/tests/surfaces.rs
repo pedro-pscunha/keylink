@@ -29,6 +29,7 @@
 
 #![allow(clippy::expect_used)]
 
+use keylink::prelude::*;
 use std::sync::{Arc, OnceLock};
 
 use keylink::{
@@ -147,7 +148,7 @@ fn key(text: &str) -> IdempotencyKey {
 /// keyed system and answers `8` from a total of its own.
 ///
 /// Both ALPNs sit on one node, which `tests/protocol.rs` already holds apart —
-/// `alpn()` and `keyed_alpn()` must not hash the same *"or one node cannot serve
+/// `alpn()` and `registry_alpn()` must not hash the same *"or one node cannot serve
 /// both"*, and `.spawn()` here is the second reading of that.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/macros.rs`, as `T3`. Search
@@ -181,19 +182,19 @@ async fn one_function_calls_four_surfaces() {
     let server = local_node().await;
     let caller = local_node().await;
 
-    let system = ledger::System::builder(Eviction::Never).build();
+    let system = ledger::Registry::builder(Eviction::Never).build();
     system
         .mount(id("addressed"), ledger::spawn(Ledger::default()))
         .expect("the id is free");
     let singleton = ledger::actor(Ledger::default());
 
     let _running = Server::builder(&server)
-        .service(ledger::keyed_service(&system, Allowlist::anyone()).build())
+        .service(system.service(Allowlist::anyone()).build())
         .service(singleton.service(Allowlist::anyone()).build())
         .spawn()
         .expect("the keyed and singleton ALPNs are distinct");
 
-    let to_keyed = ledger::KeyedClient::connect(&caller, server.endpoint().addr())
+    let to_keyed = ledger::RegistryClient::connect(&caller, server.endpoint().addr())
         .await
         .expect("dials the actor system");
     let to_singleton = ledger::Client::connect(&caller, server.endpoint().addr())

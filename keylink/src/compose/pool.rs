@@ -67,8 +67,9 @@
 //!   [`Unanswered`](crate::Unanswered) or [`NotQueued`](crate::NotQueued), by
 //!   door. **Restarting is the member's own
 //!   job, and it already has one:** build members with the generated
-//!   `supervised()` — or [`LocalActor::spawn_supervised`](crate::LocalActor::spawn_supervised)
-//!   — and each handle survives its own faults without the pool knowing. A
+//!   `restarting(factory, limit).actor()` — or
+//!   [`LocalActor::spawn_supervised`](crate::LocalActor::spawn_supervised) — and
+//!   each handle survives its own faults without the pool knowing. A
 //!   supervised member's mailbox outlives its incarnations, so `pick` keeps
 //!   working across a restart and nothing in this module has to learn about one.
 //!   That is the design rather than an omission, and it is a claim about
@@ -80,7 +81,7 @@
 //!   A pool is not that and does not grow into it: `pick` keeps no list of who is
 //!   alive, and a member ending here is nobody's business but its own.
 //! - **Not keyed.** If which member handles a message matters, the member is an
-//!   identity and the thing wanted is [`System`](crate::System) or
+//!   identity and the thing wanted is [`Registry`](crate::Registry) or
 //!   [`Names`](super::Names).
 
 use std::fmt;

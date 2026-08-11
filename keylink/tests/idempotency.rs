@@ -6,6 +6,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -537,7 +538,7 @@ async fn a_key_state_query_on_a_service_that_keys_nothing_is_fresh() {
 /// mechanism.
 ///
 /// It works because `Rpc::method` is implemented for `Addressed<Request>` and
-/// forwards to the inner request, so `keyed_service`'s `ServiceBuilder` reads the
+/// forwards to the inner request, so `registry.service`'s `ServiceBuilder` reads the
 /// real method name rather than a constant. That is the whole of why Wave 1 needed
 /// no change to `macros.rs`.
 ///
@@ -608,16 +609,17 @@ async fn a_key_state_query_on_a_service_that_keys_nothing_is_fresh() {
 async fn a_keyed_actor_service_applies_the_same_policy() {
     let server = local_node().await;
     let client_node = local_node().await;
-    let system: till::System = till::System::builder(Eviction::Never).build();
+    let system: till::Registry = till::Registry::builder(Eviction::Never).build();
     let _running = KeylinkServer::builder(&server)
         .service(
-            till::keyed_service(&system, Allowlist::anyone())
+            system
+                .service(Allowlist::anyone())
                 .keyable(Keyable::Only(&["Reserve"]))
                 .build(),
         )
         .spawn()
         .expect("one service, no duplicate ALPN");
-    let client = till::KeyedClient::connect(&client_node, server.endpoint().addr())
+    let client = till::RegistryClient::connect(&client_node, server.endpoint().addr())
         .await
         .expect("the typed keyed client dials the actor system");
     system

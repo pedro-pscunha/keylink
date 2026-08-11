@@ -167,7 +167,7 @@ caller clones is the `Context`, before the origin exists.
 1. `Origin::Peer(Context)` was a **public tuple variant** over a publicly-`Clone` `Context`,
    so `(Origin::Peer(cx.clone()), Origin::Peer(cx))` type-checked from any crate — two
    origins, one `Arc<AtomicU8>`.
-2. Worse, and untouched by taking that variant away: `deliver_to_actor` is
+2. Worse, and untouched by taking that variant away: `deliver_keyed` is
    `#[doc(hidden)] pub` and takes `cx: Context` **by value**, so two calls with
    `cx.clone()` and `cx` share one marker without naming `Origin` at all.
 3. The mark is writable from outside the crate too — `Caller::Peer(cx)` reaches
@@ -175,7 +175,7 @@ caller clones is the `Context`, before the origin exists.
    dispatch to call.
 
 Wave 1a is what made any of this reachable downstream: the predecessor was a **private
-inherent method**, `System::deliver`.
+inherent method**, `Registry::deliver`.
 
 What Wave 1a's follow-up actually changed, and what it deliberately did not:
 
@@ -188,7 +188,7 @@ What Wave 1a's follow-up actually changed, and what it deliberately did not:
   to name. **Third revision, 2026-08-07 — that bullet read `compile_fail,E0624` until
   now, and there is no code on that fence.** See §1.6.1.
 - (2) and (3) are **not closed**, and the documentation now says so in those words. While
-  `Context: Clone` and `deliver_to_actor` is `pub`, two deliveries can share one marker.
+  `Context: Clone` and `deliver_keyed` is `pub`, two deliveries can share one marker.
   What makes it unreachable today is the call graph — `serve_one` builds one `Context` per
   request and generated dispatch delivers once with it — which is a property of two call
   sites, not of a type. `representability.rs` cannot state it: a compile-time probe refuses
@@ -423,7 +423,7 @@ predicted.
 
 `Queued<T>` and `ask_catching_before` are deleted. Their one caller was
 `Handle::service`'s dispatch, which is now `deliver_to_local` — the twin of
-`deliver_to_actor`, in keylink, sharing one `rendered`.
+`deliver_keyed`, in keylink, sharing one `rendered`.
 
 ### 2.5 The measured result: an idle actor stopped paying for the service's types
 
@@ -541,7 +541,7 @@ resumes `TurnLost::Faulted`, so there is one send-and-wait, in a private `answer
 The issue names arms at `local.rs:551` and `:638`. Verified against `83f92b5`, the second
 was inside `ask_before`, which Wave 1b deleted with its method. What exists now is one
 `Err(_) => Err(TurnLost::Gone)` in `ask_catching` and two structurally identical
-`RecvError` collapses on the served paths — `deliver_to_local` and `deliver_to_actor`,
+`RecvError` collapses on the served paths — `deliver_to_local` and `deliver_keyed`,
 both producing `NoSuchActor`. All three are `Result<_, oneshot::error::RecvError>`, and
 `RecvError` is a unit type, so each is **total over a one-case error** rather than blanket
 over an enum. The blanket-ness was never in the `Err` arm; it was in the `Answered` enum
@@ -692,13 +692,13 @@ sealing is about matching, and matching is the thing that should break.
 #### The number: Wave 2 cost 128 bytes per idle **local** actor, and nothing measured it
 
 `tests/actor_memory.rs` asserted `BUDGET_PER_LOCAL_ACTOR` at exactly one `Mail`
-size, because phase 3 mounted `bulky::System` and never built a single
-`bulky::actor(..)`. Adding that phase found the drift immediately. Bisected by
+size, because phase 3 mounted the then-named `bulky::System`—now
+`bulky::Registry`—and never built a single `bulky::actor(..)`. Adding that phase found the drift immediately. Bisected by
 running the one test at two commits:
 
 | path | `c9056e0` | Wave 1b `c8712b0` | Wave 2 `836179c` |
 |---|---|---|---|
-| keyed, mounted in a `System` | 1,671 | 1,159 | 1,159 |
+| keyed, mounted in a `Registry` | 1,671 | 1,159 | 1,159 |
 | local, `ledger::actor(..)` | 1,725 | 1,469 | **1,597** |
 
 §2.5's table and three comments said 1,469. The keyed column did not move, which
@@ -977,7 +977,7 @@ The *at most once* half is `representability.rs`'s coherence probe: `Reply`,
   attribute, on both the singleton and the keyed ALPN. Red-tested by changing one
   method's argument type. `keylink/Probe/d3fe34471921164e` is unchanged and green.
 - **Reach a keyed actor's observers.** `spawn` still hands an empty hook slice, so a
-  `#[defer]` method mounted in a `System` answers correctly and is observed by nobody
+  `#[defer]` method mounted in a `Registry` answers correctly and is observed by nobody
   — exactly as every other kind is there. Still Wave 3's line.
 - **Give `notify` a deferred shape.** A local `tell` drops the receiving half before
   the send, so a parked reply on that path answers into a channel nobody holds. There
@@ -1250,7 +1250,7 @@ different spellings of "not on the wire", any one of which could be forgotten in
 So `__keylink_service_munch!` **partitions**. A `feed Name(item: Type);` goes into a
 second list and `__keylink_service!` receives `@wire [ .. ] @feeds [ .. ]`. The wire
 list expands into `Request`, `Response`, `Contract`, `WireKinds`, `Handler`, `Client`,
-`KeyedClient`, `Mail` and the rest exactly as before; the feed list reaches four sites
+`RegistryClient`, `Mail` and the rest exactly as before; the feed list reaches four sites
 and none of them is a wire site. **"Feeds are not on the wire" is a fact about which
 list a declaration is in**, checked by the compiler at every wire generator, rather
 than a claim thirteen macros have to keep agreeing about.
@@ -1280,22 +1280,18 @@ exchange.
 What landed instead:
 
 ```rust
-let orders = orders::actor_wired(
-    Book::new(),
-    vec![Box::new(saver)],
-    orders::Feeds::new(exchange.subscribe()),
-);
+let orders = orders::setup(Book::new()).observe(saver).feeds(orders::Feeds::new(exchange.subscribe())).actor();
 ```
 
 `Feeds::new` takes **one argument per declared feed**, in declaration order, so
-forgetting one is `error[E0061]` at the call site. `actor`, `actor_with` and the keyed
+forgetting one is `error[E0061]` at the call site. `actor`, `setup(..).observe(..).actor()` and the keyed
 `spawn` wire none, and a service that declares a feed cannot reach them: `SpawnableUnfed`
 is a `const` assertion on a generic type — `ServableAsActor`'s trick — so it fires at
 the instantiation and nowhere else, and its message names the door to use. Red-tested by
 folding `DECLARES_FEEDS` to `false`, which turns the `compile_fail` fence green.
 
 Each stream is boxed: one allocation per feed per actor, paid once at spawn, against
-making `Handle`, `Mounted` and `System` generic in one parameter per declared feed.
+making `Handle`, `Mountable` and `Registry` generic in one parameter per declared feed.
 
 ### 5.5 One loop, and what it took
 
@@ -1309,7 +1305,7 @@ Three things had to be solved.
 **Two channel shapes, one loop.** A `LocalActor` queues `Message<A, M>` — it has a
 `read` and a `stop` — and a keyed actor's mailbox is `Mailbox<M>`, because the registry
 is generic in the service's message and knows nothing of `A`. Making those one channel
-would put the state's type on `System`, `Mounted` and `KeyedService`, cascading into
+would put the state's type on `Registry`, `Mountable` and `KeyedService`, cascading into
 `registry.rs` and `remote.rs`. Abstracting the *receive* instead costs a private
 `Inbox<A, M>` trait and two impls, and reaches nothing outside `local.rs`. **No line of
 `registry.rs` changed in this wave**, which was a constraint and is also the evidence
@@ -1367,12 +1363,12 @@ Neither regression was visible in any other test, which is the argument for that
 
 ### 5.6 The keyed-observer gap, closed
 
-`spawn_wired(state, observers, feeds)` is the general keyed door and the answer to the
+`setup(state).observe(observer).feeds(feeds).mountable()` is the general keyed door and the answer to the
 question `observe.rs` left open — who owns the `Vec` for a lazily spawned actor. The
 factory does:
 
 ```rust
-.spawn_with(|id| Some(orders::spawn_wired(state, vec![Box::new(saver)], feeds(id))))
+.spawn_with(|id| Some(orders::setup(state).observe(saver).feeds(feeds(id)).mountable()))
 ```
 
 which is the state-observers-feeds triple re-incarnation needs. `spawn(state)` still
@@ -1382,20 +1378,20 @@ paragraphs that said so are in the past tense, in `observe.rs` and on
 `Handle::service`.
 
 Pinned by `an_observer_attached_to_a_keyed_actor_runs`, which needs no node and no
-`KeyedClient` — a keyed actor with a feed is driven entirely in-process, so what is
+`RegistryClient` — a keyed actor with a feed is driven entirely in-process, so what is
 tested is the loop with no transport in the way to explain a pass. Red-tested by having
-`spawn_wired` pass an empty `Vec`.
+`setup(..).feeds(..).mountable()` pass an empty `Vec`.
 
 ### 5.7 What Wave 3 did NOT do
 
-- **Give a keyed actor an `ended()` channel.** It is the one thing `spawn_wired` does
+- **Give a keyed actor an `ended()` channel.** It is the one thing `setup(..).feeds(..).mountable()` does
   not deliver. An observer's `finish` is told why the actor stopped, so a durability
   adapter still commits — but a keyed actor whose observer refused, whose handler
   panicked or whose feed ended reports that to nothing a caller can await, and the
-  registry's eviction clock simply finds a task that already finished. `System::stop`
-  and `System::abort` await the task, not a reason. **This is Wave 9's first
+  registry's eviction clock simply finds a task that already finished. `Registry::stop`
+  and `Registry::abort` await the task, not a reason. **This is Wave 9's first
   requirement**: supervision cannot decide to restart something whose ending it cannot
-  read. It needs a field on `Mounted`, which means `registry.rs`, which is why it was
+  read. It needs a field on `Mountable`, which means `registry.rs`, which is why it was
   not taken here.
 - **Move the ALPN.** Pinned, not asserted:
   `adding_a_feed_to_a_service_does_not_move_the_contract_hash` compares two
@@ -1440,7 +1436,7 @@ implementation nobody had written. This wave writes it.
 pub struct Persist<D, S: Snapshots> { durable: Versioned<S::Claim>, dirty: bool, .. }
 
 let (restored, saver) = Persist::<Ledger, _>::open(&store, &id).await?;
-let ledger = ledger::actor_with(restored.unwrap_or_default(), vec![Box::new(saver)]);
+let ledger = ledger::setup(restored.unwrap_or_default()).observe(saver).actor();
 ledger.post(1).await?;   // stored, and fsynced, before this returns
 ```
 
@@ -1644,20 +1640,20 @@ neither member's removal can make the claim vacuous — the house rule a unit-st
 ### 6.6 A keyed actor's state outlives its process, which Wave 3 is what made possible
 
 `tests/persist.rs::a_keyed_actors_state_survives_its_own_process` mounts a `Persist` on
-a keyed actor, drives it over **two real nodes** through the generated `KeyedClient`,
+a keyed actor, drives it over **two real nodes** through the generated `RegistryClient`,
 stops it, and re-opens the state in a second "process".
 
 Say plainly why it could not be written before. A keyed actor used to run a second loop,
 generated into the user's crate, which handed the dispatch an **empty hook slice** — so
 a keyed actor had no observers, no `finish`, and no route to durability at all. Wave 3
-merged the two loops into `run_loop` and `spawn_wired` is the door that carries the
-triple. Red-tested by putting `Vec::new()` back where `spawn_wired` passes its observers
+merged the two loops into `run_loop` and `setup(..).feeds(..).mountable()` is the door that carries the
+triple. Red-tested by putting `Vec::new()` back where `setup(..).feeds(..).mountable()` passes its observers
 on: `left: [20], right: [10, 20]`, the second run having restored nothing.
 
 **One limit this wave found and did not fix.** A `spawn_with` factory is a plain `Fn`, so
 it cannot `await`, and a `Persist` has to claim its state before it can observe anything.
 A durable keyed actor is therefore mounted **eagerly** — `Persist::open(..).await` and
-then `System::mount` — rather than built on first message. `spawn_wired`'s documentation
+then `Registry::mount` — rather than built on first message. `setup(..).feeds(..).mountable()`'s documentation
 says so now; the doc example that used to imply otherwise named a `store.open_blocking`
 that never existed.
 
@@ -1745,7 +1741,7 @@ did and no longer does.
   tests in `tests/protocol.rs` are green. An observer is local: it is a constructor
   argument, not a declared type, so there is nothing for the wire graph to hash.
 - **Reach `registry.rs`.** Zero lines. A keyed actor's observers arrive through
-  `spawn_wired`, which Wave 3 already built.
+  `setup(..).feeds(..).mountable()`, which Wave 3 already built.
 - **Answer what a dead keyed actor should do.** This wave makes an existing gap
   consequential rather than theoretical, so it is recorded here rather than
   discovered later. `Persist` refuses a panicked turn, which ends the actor — and a
@@ -1755,13 +1751,13 @@ did and no longer does.
   `ended()` channel means nothing can be told **why**. On a `LocalActor` the same
   fault is fully observable through `ended()`, which is what
   `a_panicked_turn_is_not_stored_and_ends_the_actor` asserts. This is Wave 9's
-  problem and it needs the field on `Mounted` that §5.7 already names.
+  problem and it needs the field on `Mountable` that §5.7 already names.
 - **Make the `persist-file` wasm guard fire.** It was watched and it did not: cargo
   compiles dependencies first, so the build stops at tokio's own `compile_error!` naming
   `fs`. `lib.rs` says so at the guard rather than leaving a reader to assume otherwise.
 - **Fix `Persist::open`'s inference.** `D` appears only in the return type, so it usually
   has to be named — `Persist::<Ledger, _>::open(..)`. Handing the restored value to a
-  generic `actor_with<A: Actor>` leaves `D` ambiguous even where exactly one type
+  generic `setup<A: Actor>` leaves `D` ambiguous even where exactly one type
   implements that service's `Actor`, because rustc will not pick an impl to resolve a
   type parameter. Documented on `open` rather than worked around.
 
@@ -1889,7 +1885,7 @@ can exceed one.
 
 `MAILBOX = 1` was a constant in two places. The registry's is now
 `DEFAULT_MAILBOX_DEPTH`, the default behind
-`SystemBuilder::mailbox_depth(NonZeroUsize)`.
+`RegistryBuilder::mailbox_depth(NonZeroUsize)`.
 
 **A builder method with a documented default, not a mandatory argument.** The
 `Eviction`/`Retention`/`Allowlist` family has no `Default` because a wrong choice there
@@ -1905,14 +1901,14 @@ that caused it returned. The type moves that from an untestable runtime panic to
 argument nobody can write. Saturating a zero up to one would have been the silent
 fallback this crate refuses everywhere else.
 
-**The structural change is that `Mounted<M>` no longer holds a mailbox.** It held the
+**The structural change is that `Mountable<M>` no longer holds a mailbox.** It held the
 sender and an already-built future, so the channel — and therefore the depth — was fixed
-by `mount()` before any registry saw the actor. A knob on `SystemBuilder` would have
-applied to nothing. `Mounted` now carries `FnOnce(Mailbox<M>) -> impl Future` and
+by `mount()` before any registry saw the actor. A knob on `RegistryBuilder` would have
+applied to nothing. `Mountable` now carries `FnOnce(Mailbox<M>) -> impl Future` and
 `Registry::entry` makes the channel, which is:
 
 - the **only** place a mailbox is created, so the depth reaches a lazily spawned actor as
-  well as a hand-mounted one — and a factory is a `Fn(&ActorId) -> Option<Mounted<M>>`
+  well as a hand-mounted one — and a factory is a `Fn(&ActorId) -> Option<Mountable<M>>`
   with no argument for a depth and no caller present to supply one, so a per-`spawn`
   depth could not have covered the case a serving node builds by itself;
 - source-compatible: every existing call site compiles unchanged, generated code
@@ -1937,7 +1933,7 @@ pinning `mailbox_depth`'s parameter to `NonZeroUsize` — which is the shape the
 would really arrive in, since nobody adds a method called `unbounded`, they widen the
 argument of the one that exists. Both were watched to fail:
 
-- an inherent `unbounded(&self) -> usize` on `SystemBuilder` →
+- an inherent `unbounded(&self) -> usize` on `RegistryBuilder` →
   `error[E0308]: expected NoSuchMethod, found usize`;
 - `mailbox_depth(mut self, depth: usize)` → `expected fn pointer ... found fn item`.
 
@@ -2039,7 +2035,7 @@ and which of the two is a default, and gains the cross-reference saying why the 
 exists — so the next reader finds a decision rather than an oversight. If a case for a local knob arrives, it has to
 answer the self-call hazard first, and the answer is not a bigger number.
 
-### 7.6 4d — `System::status()`, and the signal `busy` needed
+### 7.6 4d — `Registry::status()`, and the signal `busy` needed
 
 ```rust
 #[non_exhaustive]
@@ -2049,7 +2045,7 @@ pub struct ActorStatus {
     pub busy: bool,
     pub buffered: usize,
 }
-impl<M> System<M> { pub fn status(&self) -> Vec<ActorStatus>; }
+impl<M> Registry<M> { pub fn status(&self) -> Vec<ActorStatus>; }
 ```
 
 Shipped as sketched, including the two fields that are **not** there: no `incarnation`
@@ -2264,7 +2260,7 @@ scheduling.
 `n0_future::Stream` and is therefore exactly what a generated `Feeds::new` takes.
 Nothing about fan-out reaches a `service!` declaration: the actor declares
 `feed Fills(fill: Fill)` as it would for any stream, and the topic is wired in at
-`actor_wired` like any other.
+`setup(..).feeds(..).actor()` like any other.
 
 The alternative was a fan-out task holding `Handle`s and calling `tell`. It is
 worse for the reason §5.2 gives about feeds in general: a `tell` is somebody in
@@ -2353,7 +2349,7 @@ here works when the same actor is later mounted.
 `register(name, handle, ended)` takes the ending future as an **argument** rather
 than asking the handle for one. That is `Subscribers::insert`'s shape and it is
 kept for a second reason here: §5.7's missing keyed `ended()` channel means `H`
-cannot be required to have one, and the day `Mounted` grows that field this takes
+cannot be required to have one, and the day `Mountable` grows that field this takes
 it with no change.
 
 **The rule this type changes, and it is the thing to know:** the registry holds a
@@ -2489,7 +2485,7 @@ that does not survive contact:
   identity model beside `ActorId` for something that is not addressable in the first place.
 
 **What the shape costs, stated rather than hidden:** a schedule has no identity, so it
-cannot be listed by `System::status`, reached by a peer, or supervised. A process that wants
+cannot be listed by `Registry::status`, reached by a peer, or supervised. A process that wants
 those has an actor with a `feed`, not a schedule.
 
 **One thing from the same row WAS re-derived and is now deleted.** `Scheduled::cancel`
@@ -2536,12 +2532,12 @@ the loop that already exists, owns the mailbox for the actor's whole life, and
 lends it to one incarnation at a time. The whole of the new public surface is
 `Intensity`, `Incarnation<A, F>`, `Stop::fatal`, `Stop::is_fatal`,
 `Ended::GaveUp`, one `fatal` field on `Ended::Observer`, `Display for Ended`, and
-two generated doors — `supervised` and `spawn_supervised`.
+two generated doors — `restarting(..).actor()` and `restarting(..).mountable()`.
 
 `registry.rs` is untouched — **zero lines**, verified by `git diff --numstat`.
 `mount` takes a closure over a `Mailbox<M>`, and the
-supervisor is that closure's whole body, so `System::mount`, eviction, `shutdown`
-and `System::status` see one task exactly as they do for an unsupervised keyed
+supervisor is that closure's whole body, so `Registry::mount`, eviction, `shutdown`
+and `Registry::status` see one task exactly as they do for an unsupervised keyed
 actor.
 
 ### 9.1 THE DECISION THIS WAVE OWNS — the sliding window the design asked for cannot terminate, and the replacement terminates only *conditionally* (§9.1.1)
@@ -2766,8 +2762,8 @@ bounded three ways:
 3. **The window is `backoff + claim latency`**, and the backoff is `within / max`.
 
 That the factory is `async` has a second consequence worth stating: the keyed
-`spawn_supervised` is the first keyed door a durable actor can use **lazily**.
-`SystemBuilder::spawn_with`'s factory is a plain `Fn` and cannot `await`, which is
+`restarting(..).mountable()` is the first keyed door a durable actor can use **lazily**.
+`RegistryBuilder::spawn_with`'s factory is a plain `Fn` and cannot `await`, which is
 why §6.6's keyed durable actor is mounted eagerly after `Persist::open(..).await`.
 
 ### 9.6 The served path: `"restarting: "` is a defect fix, not decoration
@@ -2930,14 +2926,14 @@ unbounded wait converts every interesting break into silence.
   keyed actor's `Ended::GaveUp` reaches its own observers' `finish` and nothing a
   caller can await, and `run_keyed_supervised` allocates a `Life` channel with no
   reader to keep one code path rather than two.
-- **Render `"restarting: "` on the *keyed* served path.** `deliver_to_actor` has
+- **Render `"restarting: "` on the *keyed* served path.** `deliver_keyed` has
   no supervisor-visible signal to read, because a keyed actor has no `Life`
   channel anyone reads. A `Deferred` lost to a keyed restart is still reported
   `NoSuchActor`. This is the one asymmetry the wave leaves, and it is a
   consequence of the previous bullet.
 
-  **Citation corrected: `deliver_to_actor` is `keylink/src/actor/remote.rs:419`,
-  and it has never been in `registry.rs`.** `rg -n 'deliver_to_actor'
+  **Citation corrected: `deliver_keyed` is `keylink/src/actor/remote.rs:419`,
+  and it has never been in `registry.rs`.** `rg -n 'deliver_keyed'
   keylink/src/actor/registry.rs` returns nothing. The wrong location was written
   here and in `.tmp/wave-9/commit.txt`, and from there it was copied into the
   wave's review and into the brief that commissioned this fix — four places, each
@@ -2954,18 +2950,18 @@ unbounded wait converts every interesting break into silence.
   terminal — which Wave 8's reliable-delivery recipe encourages — stops retrying
   an actor that is coming back. The sentence now sits on the public
   documentation of the door a user calls: the generated keyed
-  `spawn_supervised` and `run_keyed_supervised`, not only in this RFC.
+  `restarting(..).mountable()` and `run_keyed_supervised`, not only in this RFC.
 
   **The proper fix is declined out loud, and it is not one paragraph.** Traced
   rather than estimated: `run_keyed_supervised` builds the `Life` channel
   *inside* the closure `mount` was already handed, in the user's crate, so
   nothing outside that closure has ever seen it. Reaching it from
-  `deliver_to_actor` means `Life` stops being private to `local.rs`; `Mounted<M>`
+  `deliver_keyed` means `Life` stops being private to `local.rs`; `Mountable<M>`
   carries a receiver beside its `Loop<M>`; `mount` grows a second door to build
   that variant, or every keyed actor pays a `watch` channel it has no reader for;
-  `Registry`'s `Entry` stores it; `System::route` hands back a pair instead of a
+  `Registry`'s `Entry` stores it; `Registry::route` hands back a pair instead of a
   mailbox; and only then does the served path have something to match on. Six
-  touch points across three files, one of them `Mounted` — a public type — and
+  touch points across three files, one of them `Mountable` — a public type — and
   the `Option`-shaped version of it is the *"second construction path that
   quietly does less"* the house rules ban by name.
 
@@ -2982,7 +2978,7 @@ unbounded wait converts every interesting break into silence.
   last handle went; restarting would be overruling them.
 - **Bound the *first* factory call.** A supervised actor whose factory fails
   immediately and fatally ends `GaveUp { after: 0 }` before any incarnation ran,
-  which is honest but means `spawn_supervised` can hand back a handle to an actor
+  which is honest but means `restarting(..).mountable()` can hand back a handle to an actor
   that never existed. There is no `Result` on the call, because the failure is
   asynchronous and `ended()` is where it is reported.
 - **Measure the per-actor cost of the second `watch` state.** `Life` replaced
@@ -3002,7 +2998,7 @@ unbounded wait converts every interesting break into silence.
 
   | | Wave 3 recorded | measured now |
   |---|---|---|
-  | keyed, mounted in a `System` | 1,415 | **1,412** |
+  | keyed, mounted in a `Registry` | 1,415 | **1,412** |
   | local, `ledger::actor(..)` | 1,853 | **1,861** |
 
   **Local is +8, exactly the `Life`.** Keyed is untouched by this wave — an
@@ -3021,9 +3017,9 @@ and no further; §10.8 says exactly what is missing and why that was the right c
 
 ### 10.1 THE DECISION THIS WAVE OWNS — `snapshot()` was refused, and the reason is in `status()`'s own docs
 
-Issue #3 asks for `System::snapshot()`, "named `snapshot`, not `actors`, because
+Issue #3 asks for `Registry::snapshot()`, "named `snapshot`, not `actors`, because
 eviction runs on a timer and the list is stale the instant it returns". Wave 4d had
-already shipped `System::status() -> Vec<ActorStatus>` with exactly the four fields
+already shipped `Registry::status() -> Vec<ActorStatus>` with exactly the four fields
 6a asks for. So the wave's first question was whether `snapshot` is a rename, an
 addition, or nothing.
 
@@ -3122,12 +3118,12 @@ sequence instead of two unrelated logs:
 
 | fact | producer | why not the other one |
 |---|---|---|
-| `Mounted` | the registry | a lazy `spawn_with` factory mounts with **no caller present** |
+| `Mountable` | the registry | a lazy `spawn_with` factory mounts with **no caller present** |
 | `Turn` / `Faulted` | `Events::observer(id)`, one per actor | only the actor sees what it ran |
 | `Ended` | the registry | an **evicted** actor has no caller either |
 
 The registry half is a new `pub trait Lifecycle` with two methods, on
-`SystemBuilder::lifecycle`. It names `ActorId` and `Ended` and nothing else, so
+`RegistryBuilder::lifecycle`. It names `ActorId` and `Ended` and nothing else, so
 `registry.rs`'s standing claim — that it names no wire type — is intact, and
 §16.8's bill does not grow. `LifecycleEvent` and its wire derives live in
 `console.rs`, on the other side of the port.
@@ -3140,7 +3136,7 @@ to one question.
 ### 10.5 The gap this closes, which the tree had already written down
 
 `Registry::sweep` carried a header reading *"A known gap: an eviction that destroys
-a busy actor is silent"*, and ended: *"**Wave 6 owns this.** Its `System::snapshot`
+a busy actor is silent"*, and ended: *"**Wave 6 owns this.** Its `Registry::snapshot`
 and the console are where a destroyed-on-eviction count belongs."* `Eviction::Idle`'s
 `shutdown_budget` carried the same sentence from the other side.
 
@@ -3252,7 +3248,7 @@ it is another reason the two refused fields are refused rather than reserved.
   is not a second mount" claim is carried by the fast path, and the race arm is
   covered by argument.
 - **Give `Inspector` a way to reach the system beyond `status()`.** It holds
-  `Arc<dyn Fn() -> Vec<ActorStatus>>` and not a `System<M>`, which is what lets one
+  `Arc<dyn Fn() -> Vec<ActorStatus>>` and not a `Registry<M>`, which is what lets one
   console answer for a system of any service — a `service!` block generates concrete
   types and cannot be generic in a mailbox. The erasure is narrow on purpose: there
   is no mount, no shutdown, no abort and no downcast that gets them back.
@@ -3299,7 +3295,7 @@ the same property: a `next` that went backwards is a process that restarted.
   before the thing it describes exists — Wave 2's argument about `incarnation`,
   applied to five more fields at once.
 - **`RefCounts { strong, weak }` and `MailboxKind::Unbounded`.** Unrepresentable
-  here, and in the second case *deliberately*: `SystemBuilder` has no `unbounded`
+  here, and in the second case *deliberately*: `RegistryBuilder` has no `unbounded`
   spelling and `representability.rs::no_mailbox_can_be_asked_to_be_unbounded` holds
   the probe that says so. A field with one reachable variant is a field claiming a
   choice nobody has.
@@ -3391,13 +3387,13 @@ would hide the restart, which is the whole signal.
 
 §10.8 defends `Arc<dyn Fn() -> Vec<ActorStatus>>` as a narrow erasure: no mount,
 no shutdown, no abort, no downcast. That much held. What it did not say is that
-the closure captured a `System` **clone**, so an inspector *owned* the registry:
+the closure captured a `Registry` **clone**, so an inspector *owned* the registry:
 a program that dropped its own system went on running every actor in it, for as
 long as the inspect actor lived. `spawn_sweeper` was already `Weak` for exactly
 this reason, which is what made the strong reference here the odd one out rather
 than a considered choice.
 
-`System::weak_status` is the version §10.8 describes. The signature becomes
+`Registry::weak_status` is the version §10.8 describes. The signature becomes
 `Fn() -> Option<Vec<ActorStatus>>`, and the `None` is the system being gone —
 which a caller must be able to tell from a system with nothing in it.
 
@@ -3430,7 +3426,7 @@ An actor that ends **on its own** — a feed that runs out, a handler that panic
 an observer that refuses, a supervisor that gives up — was never removed from the
 registry and never reported. Entries left the map at exactly three sites, and
 every one of them is *somebody asking*. At the same moment on the same node:
-`System::status()` and `Actors()` listed the actor with `busy: false`, a real
+`Registry::status()` and `Actors()` listed the actor with `busy: false`, a real
 call answered `NoSuchActor`, and the event log held no `Ended`. Under
 `Eviction::Never` that was permanent, and the id was unmountable for the life of
 the process.
@@ -3445,7 +3441,7 @@ started. One mechanism serves both keyed paths, supervised and not, because a
 `Output` and returns only when there will be no more.
 
 `route` checking `Sender::is_closed` was the other remedy offered and is refused
-on its merits: it repairs *routing* and leaves `System::status` lying and the
+on its merits: it repairs *routing* and leaves `Registry::status` lying and the
 `Lifecycle` untold, and it cannot carry a reason — `is_closed` knows that an
 actor is gone and never why.
 
@@ -3461,7 +3457,7 @@ A served reply channel that dies without sending has three causes, and the peer'
 next move differs for each: an incarnation that ended with another coming (retry),
 a live actor that dropped one reply (do not retry this call, the actor is fine),
 and an actor that is finished (stop asking). `deliver_to_local` split them in
-a3171df. `deliver_to_actor` rendered all three as `NoSuchActor`.
+a3171df. `deliver_keyed` rendered all three as `NoSuchActor`.
 
 The obvious design is a cause tag travelling with the death. It is not
 buildable, and saying why fixes the shape of everything below. The three causes
@@ -3495,8 +3491,8 @@ fate.settle(inbox.ending(&reason));
 ```
 
 §9.10 priced the keyed half at *"`Life` stops being private to `local.rs`;
-`Mounted<M>` carries a receiver beside its `Loop<M>`; `mount` grows a second door
-…; `Registry`'s `Entry` stores it; `System::route` hands back a pair"* — six touch
+`Mountable<M>` carries a receiver beside its `Loop<M>`; `mount` grows a second door
+…; `Registry`'s `Entry` stores it; `Registry::route` hands back a pair"* — six touch
 points, one of them a public type, and an `Option`-shaped `mount` the house rules
 ban by name. Only the last two happened. The cell rides on `Mailbox<M>`, which
 `registry.rs`'s own documentation had already argued is the right vehicle for
@@ -3520,7 +3516,7 @@ registry.
 
 ### 12.3 The happens-before for each answer
 
-The reader is `deliver_to_local` or `deliver_to_actor`, at the instant
+The reader is `deliver_to_local` or `deliver_keyed`, at the instant
 `answer.await` resolves `Err` — the reply channel's sender was dropped. tokio's
 `oneshot` closes with an AcqRel RMW and the receiver observes it with Acquire, so
 **everything the dropping task did before that drop happens-before the read.**
@@ -3532,7 +3528,7 @@ Every claim below is that edge plus a program order on one task.
 | `Gone`, ordinary ending | The default `Inbox::ending` for an inbox with no supervisor above it, settled at the same line. A loop that reached it and is nobody's incarnation will not run again. |
 | `Gone`, supervised give-up | The same line, the arm `Lent::ending` refuses. This is the Major regression: the old hook wrote a channel itself on the restart arm and returned nothing, so the give-up published *nothing*, and `is_running()` — `!mail.is_closed()` — was `true` because `supervise` owns the receiver for the actor's whole life. A peer was told `dropped: `, *the actor is still there*, about an actor that would never answer again. A hook that must hand a value back has no arm that quietly says nothing. |
 | `Gone`, factory give-up | `supervise` settles before it returns. No incarnation ever reached a loop, and the receiver — this function's own parameter — drops on the way out, killing everything queued behind an actor that will never exist. |
-| `Gone`, destroyed | `LocalActor::abort`, `System::abort` and `drain`'s expired budget settle **before** they ask the runtime. `JoinHandle::abort` is an RMW on the task state; the runtime drops the future after observing it and drops the state after that, so the settle happens-before every reply the destruction kills. An aborted loop never reaches the hook, so nothing inside it could have said this. |
+| `Gone`, destroyed | `LocalActor::abort`, `Registry::abort` and `drain`'s expired budget settle **before** they ask the runtime. `JoinHandle::abort` is an RMW on the task state; the runtime drops the future after observing it and drops the state after that, so the settle happens-before every reply the destruction kills. An aborted loop never reaches the hook, so nothing inside it could have said this. |
 | `Gone`, hand-written loop | `Mailbox`'s `Drop`, which is a **floor and says so**: a `Drop` body runs before its fields, so it lands before the receiver closes and before what is queued behind it is dropped — exact. Where it sits relative to a hand-written loop's own state is not knowable from here, because that state is whatever the closure captured. The loops keylink generates never rely on it. |
 
 The two registry settles look redundant against that floor and are not. On an
@@ -3627,7 +3623,7 @@ a hand-written loop's own state is likewise unstated because it is unstateable.
 
 | path | before (`810650a`) | with `Fate` | with the `Floor` (§12.11) |
 |---|---|---|---|
-| keyed, mounted in a `System` | 1,549 | 1,690 | **1,722** |
+| keyed, mounted in a `Registry` | 1,549 | 1,690 | **1,722** |
 | local, `ledger::actor(..)` | 1,861 | **2,029** | **2,029** |
 
 **+141 keyed, +168 local** for the cell — one `Arc<Mutex<Standing>>` per actor plus
@@ -3683,8 +3679,8 @@ where a reply already died.
 
 Code paths touched: `local.rs` (the type, `run_loop`, `Inbox`, `Lent`,
 `supervise`, `LocalActor`, `lost`, `deliver_to_local`), `actor/registry.rs`
-(`Mailbox`, `Entry`, `Route`, `route`, `touch`, `entry`, `drain`, `System::abort`,
-`System::route`), `actor/remote.rs` (`deliver_to_actor`). `macros.rs` and the
+(`Mailbox`, `Entry`, `Route`, `route`, `touch`, `entry`, `drain`, `Registry::abort`,
+`Registry::route`), `actor/remote.rs` (`deliver_keyed`). `macros.rs` and the
 whole public surface: prose only.
 
 ### 12.6 `Life` is deleted, and the reader-less channel with it
@@ -3711,7 +3707,7 @@ They are corrected here rather than edited there, per this file's habit:
 - *"a keyed actor has no `Life` channel anyone reads"* and *"`run_keyed_supervised`
   allocates a `Life` channel with no reader"* — there is no `Life` at all.
 - *"The proper fix is declined out loud, and it is not one paragraph … Six touch
-  points across three files, one of them `Mounted` — a public type"* — the trace
+  points across three files, one of them `Mountable` — a public type"* — the trace
   was accurate for the design it traced, and that design was not the only one. Two
   touch points, neither public, because the vehicle was already in the tree
   carrying `Busy`. The lesson is narrow and worth keeping: a cost estimate is
@@ -3734,12 +3730,12 @@ two lines now, and `scripts/replay-fate-breaks.sh` runs the whole set.
 
 | guard | break |
 |---|---|
-| `defer::a_live_keyed_actor_does_not_tell_a_peer_no_such_actor` | `deliver_to_actor`'s `lost(..)` → `no_such_actor(&actor)`, the pre-fix line verbatim |
+| `defer::a_live_keyed_actor_does_not_tell_a_peer_no_such_actor` | `deliver_keyed`'s `lost(..)` → `no_such_actor(&actor)`, the pre-fix line verbatim |
 | `supervision::a_remote_caller_can_tell_restarting_from_gone_on_a_keyed_actor` | `Lent::ending`'s `Standing::Restarting(..)` → `Standing::Gone` |
 | `supervision::a_remote_caller_can_tell_restarting_from_gone` | `Lent::ending`'s `Standing::Gone` → `Standing::Running` — the regression verbatim, under four workers |
 | `local::an_ending_incarnation_settles_its_verdict_and_its_mailbox_before_its_state` | three: the settle moved after `drop(state)` via a `Drop` guard holding the same verdict; `Lent::ending`'s `self.close()` deleted; the settle deleted outright |
 | `local::a_supervisor_that_refuses_a_restart_answers_gone_rather_than_running` | the refusal arm answers `Standing::Running` |
-| `registry::abort_settles_the_served_answer_before_it_destroys_the_actor` | `System::abort`'s settle → `Standing::Running` |
+| `registry::abort_settles_the_served_answer_before_it_destroys_the_actor` | `Registry::abort`'s settle → `Standing::Running` |
 | `registry::an_expired_shutdown_budget_settles_the_served_answer_before_the_abort` | `drain`'s settle → `Standing::Running` |
 | `remote::no_other_served_failure_begins_with_one_of_the_five` | `RouteError::AtCapacity`'s `Display` gains a `"dropped: "` prefix |
 | `defer::a_local_caller_and_a_peer_agree_about_an_abandoned_deferred` | `lost`'s `Standing::Running` arm → `NoSuchActor` |
@@ -3764,7 +3760,7 @@ racing an unsaved edit restores over it.
 
 **It counted exit codes first, and that design cannot see the failure this harness
 exists for.** A break that stops reddening because a *second writer* masks it has
-happened three times in this tree — `Mailbox::drop` masking `System::abort`'s
+happened three times in this tree — `Mailbox::drop` masking `Registry::abort`'s
 break, the same masking `drain`'s, and a whole-function `Floor` masking
 `Lent::ending`'s give-up arm, which is why §12.11's third attempt exists. A fourth
 time a break stayed red at a **different** assertion: the record for
@@ -3799,7 +3795,7 @@ nothing, and why the guard is a state whose own `Drop` reads the cell.
 **Three guards are recorded as leaving a line uncovered**, rather than being
 credited with it:
 
-- breaking `System::abort`'s or `drain`'s settle leaves the two keyed end-to-end
+- breaking `Registry::abort`'s or `drain`'s settle leaves the two keyed end-to-end
   teardown tests green, because the `Mailbox` floor answers first on an
   *unsupervised* keyed actor. Those lines are held by the registry unit tests
   above, which observe inside the drop.
@@ -3822,7 +3818,7 @@ at once while the buffer still drains — after which `deliver_to_local`'s
 **Not adopted as the remedy, and adopted anyway for what it independently
 repairs.** The two halves:
 
-- It does not reach the keyed path. `deliver_to_actor` never read `is_running()`
+- It does not reach the keyed path. `deliver_keyed` never read `is_running()`
   and has no `LocalActor` to read it from, so a remedy that repairs the invariant
   behind that read leaves every keyed answer where it was. This wave's brief is
   precisely to remove that asymmetry, and the verdict is what removes it —
@@ -4003,7 +3999,7 @@ is only "unreachable" for the windows the guard you checked actually enters.**
 "No break of this reddens any test" and "no break of this can redden any test" are
 different claims, and the first was mistaken for the second.
 
-`System::abort`'s and `drain`'s settles survive on a narrower claim than they were
+`Registry::abort`'s and `drain`'s settles survive on a narrower claim than they were
 first documented with — they answer for a **hand-written** `mount` loop, which has
 no `run_loop` and therefore no floor. Their guards drive one for that reason, and
 both inline comments say so now.
@@ -4229,7 +4225,7 @@ than cited. It survived the first draft. Three independent facts killed it.
    promise *"nothing in `local.rs` changes"* and the promise *"group restarts are
    bounded by an `Intensity`"* could not both hold, and the draft made both.
 2. **It re-creates the stale reference this crate does not have.**
-   `spawn_supervised` builds a fresh `mpsc::channel` (`local.rs:2918` and
+   `restarting(..).mountable()` builds a fresh `mpsc::channel` (`local.rs:2918` and
    `local.rs:2924`), so a group-driven rebuild produces a new mailbox and every
    handle a caller holds is dead. Issue #3's dead-pid argument is about a problem
    keylink *avoids*; a group restart would import it.
@@ -4250,7 +4246,7 @@ anywhere in the surface.
 `Membership` needs the member's ending, and **a keyed actor has no `ended()` to
 ask for**. `keylink/src/compose/names.rs:129` says so one type over, and §5.7
 (line 1235) has listed it as missing since Wave 3: *"Give a keyed actor an
-`ended()` channel. It is the one thing `spawn_wired` does not deliver."* §9.10
+`ended()` channel. It is the one thing `setup(..).feeds(..).mountable()` does not deliver."* §9.10
 records it as still Wave 9's.
 
 So `Group` watches **local actors only**, today. What closes it costs nothing
@@ -4610,7 +4606,7 @@ old identifier is **read** through the table and is not rewritten.
 | `Withheld`, the private observer verdict in `turns.rs` | `ObserverVerdict` — the public `Withheld` took the word | `ec242c2` |
 | `EndReason`, defined in `console.rs` | moved beside the type it projects, in `observe.rs` | `c165009` |
 | `Undelivered` | `Unanswered` | `8acd7be` |
-| `deliver_to_local` | `deliver_to_singleton` | `80098e4` |
+| `deliver_to_local` | `deliver_unkeyed` | `80098e4` |
 | `NodeStatus::lost` | `NodeStatus::dropped` | `0c6e6c3` |
 | `RemoteError::{PANICKED, REFUSED, RESTARTING, DROPPED, OBSERVER_PANICKED}` | deleted — `RemoteError::Withheld(Withheld)` carries the value | `0c6e6c3`, `5198ecb` |
 

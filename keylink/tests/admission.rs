@@ -11,6 +11,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
 

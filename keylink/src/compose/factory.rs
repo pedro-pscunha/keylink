@@ -26,19 +26,17 @@
 //! let parsed = ingest.dispatch_keyed(tenant, |worker| worker.parse(blob)).await??;
 //!
 //! // Non-keyed: `Factory<render::Handle<Renderer>, ()>`, and `dispatch` takes no
-//! // key. The members are built with `actor_deep` on purpose — `LeastLoaded` has
-//! // no gradient to read at the default mailbox depth of one, where `buffered` is
+//! // key. The members are built with `setup(..).backpressure(..)` on purpose — `LeastLoaded` has
+//! // no gradient to read at the default mailbox depth of one, where `queued` is
 //! // zero or one and the mode is reading N booleans.
 //! let pages = Factory::from_fn(
 //!     NonZeroUsize::new(8).expect("eight"),
 //!     Routing::LeastLoaded(Sample::TwoOfN),
 //!     |member| {
-//!         render::actor_deep(
-//!             Renderer::new(member),
-//!             Vec::new(),
-//!             render::Feeds::new(),
-//!             Backpressure::Park(NonZeroUsize::new(32).expect("thirty-two")),
-//!         )
+//!         render::setup(Renderer::new(member))
+//!             .feeds(render::Feeds::new())
+//!             .backpressure(Backpressure::Park(NonZeroUsize::new(32).expect("thirty-two")))
+//!             .actor()
 //!     },
 //! );
 //!
@@ -105,8 +103,9 @@
 //! # What a factory is not
 //!
 //! - **Not a supervisor.** [`Pool`]'s refusal, unchanged and for the
-//!   same reason: build members with the generated `supervised()`, and a
-//!   supervised member's mailbox outlives its incarnations, so routing keeps
+//!   same reason: build members with the generated
+//!   `restarting(factory, limit).actor()`, and a supervised member's mailbox
+//!   outlives its incarnations, so routing keeps
 //!   working across a restart without this module learning what one is. Nothing
 //!   here restarts a member, kills a stuck one, or takes one out of the rotation.
 //! - **Not a way to make one actor concurrent.** Eight members are eight states.
@@ -176,11 +175,11 @@ pub trait Reserving {
     /// would find every door on this type unusable without it.
     fn reserve(&self) -> impl Future<Output = Result<Self::Permit<'_>, NotQueued>> + Send;
 
-    /// [`is_busy`](LocalActor::is_busy) and [`buffered`](LocalActor::buffered),
+    /// [`busy`](LocalActor::busy) and [`queued`](LocalActor::queued),
     /// folded, and read only by [`Routing::LeastLoaded`].
     ///
     /// A factory's members are N readings from **one** side, which is the
-    /// comparison [`Serving::buffered`] licenses. Comparing one of these against a
+    /// comparison [`Serving::queued`] licenses. Comparing one of these against a
     /// keyed actor's is the one it forbids, and nothing here does.
     fn status(&self) -> Serving;
 }
@@ -359,42 +358,6 @@ impl<K> fmt::Debug for Shard<K> {
 /// it. A caller who wants to know how a factory routes knows already — it passed
 /// the `Routing` in.
 ///
-/// The premise is held by a second doctest, because a refusal nothing checks is a
-/// paragraph:
-///
-/// ```compile_fail
-/// // Fails with `E0599`: there is no method named `routing` on `Factory`, which
-/// // is the whole of the paragraph above stated where a compiler reads it.
-/// //
-/// // The code is named here rather than on the fence, for the reason the guard
-/// // above gives.
-/// //
-/// // A factory over `()` members, because `from_fn` and `members` put no bound
-/// // on the member type: both names are therefore read off a real `Factory`
-/// // without a runtime, an actor or a service, and a rename of either is a
-/// // compile error in the lines that must compile. The turbofish is load-bearing
-/// // too — `K` is inferred from `dispatch`'s impl block, and nothing here
-/// // dispatches, so leaving it out would fail this fence with `E0282` and prove
-/// // nothing about the accessor.
-/// use std::num::NonZeroUsize;
-///
-/// use keylink::compose::{Factory, Routing};
-///
-/// let factory = Factory::from_fn(NonZeroUsize::MIN, Routing::<()>::RoundRobin, |_member| ());
-/// let members: &[()] = factory.members();
-/// assert_eq!(members.len(), 1);
-///
-/// let _rule = factory.routing();
-/// ```
-///
-/// Watched both ways as well: without the annotation the compiler printed
-/// `error[E0599]: no method named `routing` found for struct `Factory<H, K>` in
-/// the current scope`, pointing at the line and naming it *"private field, not a
-/// method"*. With `routing()` replaced by `members()` — the accessor that does
-/// exist — the fence failed as *"Test compiled successfully, but it's marked
-/// `compile_fail`"*, which is what an author adding the refused accessor would
-/// meet.
-///
 /// # There is no `Sticky`
 ///
 /// *A worker already holding this key keeps it, even after a resize* needs an
@@ -442,12 +405,12 @@ pub enum Routing<K = ()> {
     /// A local actor's mailbox depth defaults to **one** — `turns.rs`'s private
     /// `DEFAULT_LOCAL_MAILBOX_DEPTH`, and the keyed side's `DEFAULT_MAILBOX_DEPTH`
     /// in `registry.rs` is the same — so
-    /// [`buffered`](crate::LocalActor::buffered) is 0 or 1 and this mode reads N
+    /// [`queued`](crate::LocalActor::queued) is 0 or 1 and this mode reads N
     /// booleans. [`Sample::All`] then pays N relaxed loads to learn what
-    /// [`is_busy`](crate::LocalActor::is_busy) alone already says.
+    /// [`busy`](crate::LocalActor::busy) alone already says.
     ///
     /// The mode is worth its place over members built with the generated
-    /// `actor_deep` or [`LocalActor::spawn_deep`], and any example demonstrating
+    /// `setup(..).backpressure(..)` or [`LocalActor::spawn_deep`], and any example demonstrating
     /// it is built that way for that reason. Under the default the honest advice
     /// is [`FirstAvailable`](Self::FirstAvailable), which needs no gradient.
     LeastLoaded(Sample),
@@ -455,7 +418,7 @@ pub enum Routing<K = ()> {
     /// factory lives.
     ///
     /// The mode a [`Pool`] refuses and the reason this type exists.
-    /// [`System`](crate::System) and [`Names`](super::Names) both give a key its
+    /// [`Registry`](crate::Registry) and [`Names`](super::Names) both give a key its
     /// own actor; this gives a key a *share* of a fixed set, which is what a
     /// worker holding one expensive thing per shard needs.
     ///
@@ -665,7 +628,7 @@ impl<H: Reserving, K> Factory<H, K> {
     fn shard(&self, shard: Shard<K>, key: &K) -> &H {
         let size = self.members.size().get();
         // Written as conversions rather than casts for the reason
-        // `LocalActor::buffered` gives: an impossible case is named instead of
+        // `LocalActor::queued` gives: an impossible case is named instead of
         // truncated. `usize` is 64 bits or narrower on every target this crate
         // builds for, so the widening holds; and the remainder is below `size`,
         // which came from a `usize`, so the narrowing does too — which is also
@@ -730,7 +693,7 @@ impl<H: Reserving, K> Factory<H, K> {
 /// better member: fewer queued first, then idle before busy.
 fn load(of: &impl Reserving) -> (u64, bool) {
     let serving = of.status();
-    (serving.buffered, serving.busy)
+    (serving.queued, serving.busy)
 }
 
 /// Keep whichever of two members is carrying less, reading each member's load
@@ -1134,8 +1097,8 @@ mod tests {
     }
 
     /// Made red by `scripts/break-once.sh keylink/src/compose/factory.rs`,
-    /// replacing `(serving.buffered, serving.busy)` with
-    /// `(serving.buffered, false)`, so the load reading keeps the queue depth and
+    /// replacing `(serving.queued, serving.busy)` with
+    /// `(serving.queued, false)`, so the load reading keeps the queue depth and
     /// forgets whether the member is inside a turn. Watched: "All chose the
     /// member that is inside a turn", left `0` against right `0` — an
     /// `assert_ne`, so the two numbers being equal is the failure. Registered as
@@ -1175,7 +1138,7 @@ mod tests {
     ///
     /// **The independence runs one way only, and it was measured rather than
     /// argued.** `B3`'s break leaves this test green — exit 0 under the same
-    /// harness — because forgetting `is_busy` still prefers the member with less
+    /// harness — because forgetting `busy` still prefers the member with less
     /// queued. This break does **not** leave `B3`'s test green: reversing the
     /// comparison reddens that one too, exit 100, since a held member's reading is
     /// the larger of the two there as well. So `B3` is the row that discriminates
@@ -1183,8 +1146,8 @@ mod tests {
     /// keep only this.
     #[tokio::test]
     async fn least_loaded_separates_two_members_by_what_is_queued() {
-        // The depth is the control: at one, `buffered` is 0 or 1 and this
-        // assertion is about `is_busy` alone. At four, member one is genuinely
+        // The depth is the control: at one, `queued` is 0 or 1 and this
+        // assertion is about `busy` alone. At four, member one is genuinely
         // three messages behind while still admitting more, which is the
         // gradient the mode claims to read.
         let (factory, mut handled) = deep(

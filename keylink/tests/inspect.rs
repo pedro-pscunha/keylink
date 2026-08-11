@@ -15,6 +15,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -99,9 +100,9 @@ const REFUSAL: Duration = Duration::from_secs(5);
 /// Two services on one endpoint is the arrangement the wave is about: the same
 /// peer reaches the journal and is separately admitted, or not, to the console.
 struct Watched {
-    system: journal::System,
+    system: journal::Registry,
     events: Events,
-    journal: journal::KeyedClient,
+    journal: journal::RegistryClient,
     serving: Node,
     console_node: Node,
     /// Named rather than `_inspector`, because the follower-cap test calls it:
@@ -127,7 +128,7 @@ impl Watched {
     /// Mount an actor that reports its turns, and hand back the feed it listens
     /// to.
     ///
-    /// `spawn_wired` and not `spawn`, because an observer is how a turn becomes
+    /// `setup(..).feeds(..).mountable()` and not `spawn`, because an observer is how a turn becomes
     /// an event: the registry sees mounts and endings, and only the actor sees
     /// what it ran.
     ///
@@ -142,11 +143,10 @@ impl Watched {
         self.system
             .mount(
                 who.clone(),
-                journal::spawn_wired(
-                    Journal::default(),
-                    vec![self.events.observer(who.clone())],
-                    journal::Feeds::new(feed(from)),
-                ),
+                journal::setup(Journal::default())
+                    .observe(self.events.observer(who.clone()))
+                    .feeds(journal::Feeds::new(feed(from)))
+                    .mountable(),
             )
             .expect("the id is free");
         ticks
@@ -161,15 +161,13 @@ async fn start(eviction: Eviction, history: usize, admit_console: bool) -> Watch
     let console_node = local_node().await;
 
     let (events, stream) = Events::new(depth(256));
-    let system: journal::System = journal::System::builder(eviction)
+    let system: journal::Registry = journal::Registry::builder(eviction)
         .lifecycle(events.clone())
         .build();
 
-    let inspector = inspect::actor_wired(
-        Inspector::new(&system, &serving, &events, depth(history)),
-        vec![],
-        inspect::Feeds::new(stream),
-    );
+    let inspector = inspect::setup(Inspector::new(&system, &serving, &events, depth(history)))
+        .feeds(inspect::Feeds::new(stream))
+        .actor();
 
     // A list of exactly one id either way, so the refusing case refuses by
     // naming somebody else rather than by naming nobody — an empty list would
@@ -181,12 +179,12 @@ async fn start(eviction: Eviction, history: usize, admit_console: bool) -> Watch
     }]);
 
     let server = Server::builder(&serving)
-        .service(journal::keyed_service(&system, Allowlist::anyone()).build())
+        .service(system.service(Allowlist::anyone()).build())
         .service(inspector.service(allow).build())
         .spawn()
         .expect("two services, two distinct ALPNs");
 
-    let journal = journal::KeyedClient::connect(&console_node, serving.endpoint().addr())
+    let journal = journal::RegistryClient::connect(&console_node, serving.endpoint().addr())
         .await
         .expect("the journal service admits anyone");
 
@@ -225,7 +223,7 @@ async fn until(console: &mut Console, what: &str, enough: impl Fn(&[LifecycleEve
 /// **The actor list reports every mounted actor with 4d's four fields, read from
 /// another machine.**
 ///
-/// `System::status` is 6a and already existed; what is new is that a peer can
+/// `Registry::status` is 6a and already existed; what is new is that a peer can
 /// ask for it. So this asserts the list is complete *and* that every field
 /// survived the wire — including `idle_for`, whose `Duration` is the one field
 /// that had no obvious encoding.
@@ -262,7 +260,7 @@ async fn the_actor_list_reaches_a_peer_with_every_field_intact() {
             "no turn is running: {} reported busy",
             row.id.as_str()
         );
-        assert_eq!(row.buffered, 0, "nothing is queued for {}", row.id.as_str());
+        assert_eq!(row.queued, 0, "nothing is queued for {}", row.id.as_str());
     }
     // `idle_for` crosses as a `Duration` and is compared against nothing: this
     // suite asserts no wall-clock reading, and the boundary between `idle_for`
@@ -374,7 +372,7 @@ async fn a_console_observes_a_mount_a_turn_and_an_ending() {
     );
     let ended = watched
         .system
-        .shutdown(&who, Duration::from_secs(5))
+        .stop(&who, Duration::from_secs(5))
         .await
         .expect("it was mounted");
     assert!(
@@ -386,7 +384,7 @@ async fn a_console_observes_a_mount_a_turn_and_an_ending() {
         &mut console,
         "the three lifecycle events never arrived",
         |seen| {
-            let mounted = seen.contains(&LifecycleEvent::Mounted { id: who.clone() });
+            let mounted = seen.contains(&LifecycleEvent::Mountable { id: who.clone() });
             let turned = seen.iter().any(|event| {
                 matches!(event, LifecycleEvent::Turn { id, method }
                      if id == &who && method == "Post")
@@ -413,7 +411,7 @@ async fn a_console_observes_a_mount_a_turn_and_an_ending() {
 /// once and any one of them alone is a weaker test:
 ///
 /// 1. the console's **actor list** no longer names it. Before the fix, `Actors()`
-///    and `System::status` both reported it mounted with `busy: false`, forever,
+///    and `Registry::status` both reported it mounted with `busy: false`, forever,
 ///    under `Eviction::Never`;
 /// 2. the console's **event log** carries the ending, with the loop's own reason
 ///    — `Feed { name: "Ticks" }`, which no synthesis from a join could produce;
@@ -643,7 +641,7 @@ async fn a_parked_subscriber_does_not_stop_the_actor_serving_turns() {
     until(
         &mut follower,
         "the mount never reached the console",
-        |seen| seen.contains(&LifecycleEvent::Mounted { id: who.clone() }),
+        |seen| seen.contains(&LifecycleEvent::Mountable { id: who.clone() }),
     )
     .await;
 
@@ -723,16 +721,14 @@ async fn a_page_reports_the_events_the_sink_dropped_before_they_were_sequenced()
     let serving = local_node().await;
     // One slot, so the second event with nowhere to go is dropped and counted.
     let (events, stream) = Events::new(depth(1));
-    let system: journal::System = journal::System::builder(Eviction::Never)
+    let system: journal::Registry = journal::Registry::builder(Eviction::Never)
         .lifecycle(events.clone())
         .build();
-    let inspector = inspect::actor_wired(
-        Inspector::new(&system, &serving, &events, depth(64)),
-        vec![],
-        inspect::Feeds::new(stream),
-    );
+    let inspector = inspect::setup(Inspector::new(&system, &serving, &events, depth(64)))
+        .feeds(inspect::Feeds::new(stream))
+        .actor();
 
-    // Mounted straight into the sink, with nobody reading fast enough: the
+    // Mountable straight into the sink, with nobody reading fast enough: the
     // inspector's feed is one slot deep and this is sixteen mounts back to back.
     let mut ticks = Vec::new();
     for n in 0..16 {
@@ -740,7 +736,9 @@ async fn a_page_reports_the_events_the_sink_dropped_before_they_were_sequenced()
         system
             .mount(
                 id(&format!("obra/{n}")),
-                journal::spawn_wired(Journal::default(), vec![], journal::Feeds::new(feed(from))),
+                journal::setup(Journal::default())
+                    .feeds(journal::Feeds::new(feed(from)))
+                    .mountable(),
             )
             .expect("the id is free");
         ticks.push(to);
@@ -775,10 +773,10 @@ async fn a_page_reports_the_events_the_sink_dropped_before_they_were_sequenced()
 /// **Dropping the system takes its actors with it, even while a console is
 /// watching.**
 ///
-/// `Inspector` erases a `System<M>` to a closure, which is what lets one console
+/// `Inspector` erases a `Registry<M>` to a closure, which is what lets one console
 /// answer for a system of any service, and the erasure is documented as narrow:
 /// no mount, no shutdown, no abort, no downcast. It was narrow in **capability**
-/// and not in **lifetime** — the closure captured a `System` *clone*, so the
+/// and not in **lifetime** — the closure captured a `Registry` *clone*, so the
 /// inspect actor owned the registry and a program that dropped its own system
 /// went on running every actor in it. `spawn_sweeper` was already `Weak` for
 /// exactly this reason, which is what made the strong reference here the odd one
@@ -796,20 +794,20 @@ async fn a_page_reports_the_events_the_sink_dropped_before_they_were_sequenced()
 async fn dropping_the_system_takes_its_actors_with_it_even_while_a_console_watches() {
     let serving = local_node().await;
     let (events, stream) = Events::new(depth(8));
-    let system: journal::System = journal::System::builder(Eviction::Never)
+    let system: journal::Registry = journal::Registry::builder(Eviction::Never)
         .lifecycle(events.clone())
         .build();
-    let inspector = inspect::actor_wired(
-        Inspector::new(&system, &serving, &events, depth(8)),
-        vec![],
-        inspect::Feeds::new(stream),
-    );
+    let inspector = inspect::setup(Inspector::new(&system, &serving, &events, depth(8)))
+        .feeds(inspect::Feeds::new(stream))
+        .actor();
 
     let (_ticks, from) = mpsc::channel(1);
     system
         .mount(
             id("obra/0"),
-            journal::spawn_wired(Journal::default(), vec![], journal::Feeds::new(feed(from))),
+            journal::setup(Journal::default())
+                .feeds(journal::Feeds::new(feed(from)))
+                .mountable(),
         )
         .expect("the id is free");
     assert_eq!(
@@ -871,14 +869,12 @@ async fn dropping_the_system_takes_its_actors_with_it_even_while_a_console_watch
 async fn dropping_every_events_clone_ends_the_inspector_as_a_dead_feed() {
     let serving = local_node().await;
     let (events, stream) = Events::new(depth(8));
-    let system: journal::System = journal::System::builder(Eviction::Never)
+    let system: journal::Registry = journal::Registry::builder(Eviction::Never)
         .lifecycle(events.clone())
         .build();
-    let inspector = inspect::actor_wired(
-        Inspector::new(&system, &serving, &events, depth(8)),
-        vec![],
-        inspect::Feeds::new(stream),
-    );
+    let inspector = inspect::setup(Inspector::new(&system, &serving, &events, depth(8)))
+        .feeds(inspect::Feeds::new(stream))
+        .actor();
 
     // The two clones a program holds: the one it kept, and the one it gave the
     // system as its `Lifecycle`.
@@ -1157,7 +1153,7 @@ async fn a_console_behind_the_ring_is_told_exactly_how_much_it_missed() {
         .events
         .iter()
         .map(|event| match event {
-            LifecycleEvent::Mounted { id } => id.as_str(),
+            LifecycleEvent::Mountable { id } => id.as_str(),
             other => panic!("only mounts happened here: {other:?}"),
         })
         .collect();

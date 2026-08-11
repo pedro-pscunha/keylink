@@ -2,28 +2,29 @@
 //!
 //! A process that runs actors could answer `contains`, `len` and `is_empty`
 //! about them, and nothing else, and only from inside itself. This module is the
-//! other side of both limits: [`System::status`] is the whole list, and
+//! other side of both limits: [`Registry::status`] is the whole list, and
 //! [`Inspect`](crate::inspect) is that list plus a live event log, served on its **own**
 //! ALPN behind its **own** [`Allowlist`](crate::Allowlist), beside whatever else the node serves.
 //!
 //! ```ignore
 //! let (events, stream) = Events::new(EVENT_DEPTH);
 //!
-//! let system: journal::System = journal::System::builder(Eviction::Never)
+//! let system: journal::Registry = journal::Registry::builder(Eviction::Never)
 //!     .lifecycle(events.clone())          // mounts and endings
 //!     .build();
 //!
 //! // one observer per actor, which is where turns come from
-//! system.mount(id.clone(), journal::spawn_with(state, vec![events.observer(id)]))?;
+//! system.mount(
+//!     id.clone(),
+//!     journal::setup(state).observe(events.observer(id)).mountable(),
+//! )?;
 //!
-//! let inspector = inspect::actor_wired(
-//!     Inspector::new(&system, &node, &events, HISTORY),
-//!     vec![],
-//!     inspect::Feeds::new(stream),
-//! );
+//! let inspector = inspect::setup(Inspector::new(&system, &node, &events, HISTORY))
+//!     .feeds(inspect::Feeds::new(stream))
+//!     .actor();
 //!
 //! Server::builder(&node)
-//!     .service(journal::keyed_service(&system, Allowlist::anyone()).build())
+//!     .service(system.service(Allowlist::anyone()).build())
 //!     .service(inspector.service(Allowlist::only([operator])).build())   // its own list
 //!     .spawn()?;
 //! ```
@@ -79,7 +80,7 @@
 //! This paragraph used to claim a stronger property — that such an actor reads
 //! `busy == false` — and named a test for it that does not exist. **It cannot
 //! exist.** `busy` is a *registry* fact, kept beside a keyed entry and read by
-//! [`System::status`](crate::System::status), and the [`Inspector`] is a
+//! [`Registry::status`](crate::Registry::status), and the [`Inspector`] is a
 //! [`LocalActor`](crate::LocalActor) with no registry entry anywhere. There is
 //! nothing to read the flag from, and inventing a second one for actors with no
 //! registry would be exactly the parallel fact this crate refuses. The twenty
@@ -114,7 +115,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     ActorId, ActorStatus, Caller, Deferred, EndReason, Ended, EndpointAddr, Lifecycle, Node,
-    Observer, Replied, Reply, Result, Stream, System, TurnFut, TurnInfo, TurnOutcome,
+    Observer, Registry, Replied, Reply, Result, Stream, TurnFut, TurnInfo, TurnOutcome,
 };
 
 // ────────────────────────────────────────────────────────── what a console reads
@@ -133,7 +134,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Schema)]
 pub enum LifecycleEvent {
     /// An actor was mounted, by hand or by a lazy factory.
-    Mounted {
+    Mountable {
         /// Which actor.
         id: ActorId,
     },
@@ -211,9 +212,9 @@ impl TryFrom<NodeKey> for crate::EndpointId {
 pub struct NodeStatus {
     /// This node's public key — the address peers dial. See [`NodeKey`].
     pub id: NodeKey,
-    /// How many actors are mounted right now, which is [`System::len`].
+    /// How many actors are mounted right now, which is [`Registry::len`].
     ///
-    /// `u64` for [`ActorStatus::buffered`]'s reason: `usize` has no wire schema,
+    /// `u64` for [`ActorStatus::queued`]'s reason: `usize` has no wire schema,
     /// because its width is the compiler's choice and a browser's is not the
     /// server's.
     pub actors: u64,
@@ -410,7 +411,7 @@ pub const MAX_FOLLOWERS: usize = 128;
 /// Where a system and its actors report what they are doing.
 ///
 /// One sink, three producers, and that is the whole reason it is a type rather
-/// than a channel at a call site: a [`System`] reports mounts and endings through
+/// than a channel at a call site: a [`Registry`] reports mounts and endings through
 /// [`Lifecycle`], an [`Observer`] reports turns, and both have to arrive in one
 /// sequence or a console is reading two unrelated logs.
 ///
@@ -420,14 +421,14 @@ pub const MAX_FOLLOWERS: usize = 128;
 ///
 /// [`record`](Self::record) is a `try_send` on a bounded channel. A full channel
 /// drops the event and increments [`lost`](Self::lost). That is deliberate and it
-/// is the opposite of what this crate does with a mailbox — [`SystemBuilder::mailbox_depth`]
+/// is the opposite of what this crate does with a mailbox — [`RegistryBuilder::mailbox_depth`]
 /// blocks the sender, on the argument that an unbounded queue turns a latency
 /// problem into an OOM. Here the sender is a **mount** or an **eviction**, and
 /// blocking one of those on a console would let a diagnostic stall the runtime it
 /// describes. Losing a diagnostic loudly is the lesser failure, so the count is
 /// published at [`NodeStatus::dropped`] rather than kept.
 ///
-/// [`SystemBuilder::mailbox_depth`]: crate::SystemBuilder::mailbox_depth
+/// [`RegistryBuilder::mailbox_depth`]: crate::RegistryBuilder::mailbox_depth
 #[derive(Debug, Clone)]
 pub struct Events {
     to: mpsc::Sender<LifecycleEvent>,
@@ -443,7 +444,7 @@ impl Events {
     /// history is kept. History is [`Inspector::new`]'s parameter.
     ///
     /// `NonZeroUsize` because `mpsc::channel(0)` panics, for
-    /// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth)'s
+    /// [`RegistryBuilder::mailbox_depth`](crate::RegistryBuilder::mailbox_depth)'s
     /// reason: a zero would panic at the first event rather than at the call that
     /// asked for it.
     ///
@@ -509,7 +510,7 @@ impl Events {
 /// Mounts and endings, which is the half a registry knows.
 impl Lifecycle for Events {
     fn mounted(&self, id: &ActorId) {
-        self.record(LifecycleEvent::Mounted { id: id.clone() });
+        self.record(LifecycleEvent::Mountable { id: id.clone() });
     }
 
     fn ended(&self, id: &ActorId, why: &Ended) {
@@ -588,7 +589,7 @@ crate::service! {
     /// [`ActorStatus`] measures.
     ///
     /// Stale on arrival, and the reason is
-    /// [`System::status`](keylink::System::status)' — an id read here may have
+    /// [`Registry::status`](keylink::Registry::status)' — an id read here may have
     /// been evicted before the reply reached you.
     rpc Actors() -> Vec<ActorStatus>;
 
@@ -653,9 +654,9 @@ type Followed = std::result::Result<EventPage, FollowRefused>;
 
 /// The state behind [`inspect`](crate::inspect): what is running, and what has happened.
 ///
-/// # It holds a closure and not a `System<M>`, and that is the seam
+/// # It holds a closure and not a `Registry<M>`, and that is the seam
 ///
-/// A [`System`] is generic in its service's mailbox type and an `Inspect`
+/// A [`Registry`] is generic in its service's mailbox type and an `Inspect`
 /// service is not generic in anything — a `service!` block generates concrete
 /// types. Erasing the system to `Fn() -> Option<Vec<ActorStatus>>` is what lets
 /// one console answer for a system of any service, and it is a narrow erasure:
@@ -664,7 +665,7 @@ type Followed = std::result::Result<EventPage, FollowRefused>;
 /// downcast gets those back.
 ///
 /// **It is also a `Weak` erasure, and that was a hole.** The closure held a
-/// `System` *clone*, so an inspector kept the registry — and therefore every
+/// `Registry` *clone*, so an inspector kept the registry — and therefore every
 /// actor in it — alive after the program had let go of the system. `Option` is
 /// what that costs: `None` is the system being gone, which is not the same fact
 /// as a system with nothing in it.
@@ -713,7 +714,7 @@ impl Inspector {
     /// oldest is dropped and a console that was behind is told how many it missed
     /// at [`EventPage::lost`].
     #[must_use]
-    pub fn new<M>(system: &System<M>, node: &Node, events: &Events, history: NonZeroUsize) -> Self
+    pub fn new<M>(system: &Registry<M>, node: &Node, events: &Events, history: NonZeroUsize) -> Self
     where
         M: Send + 'static,
     {
@@ -805,7 +806,7 @@ impl inspect::Actor for Inspector {
         NodeStatus {
             id: self.id,
             // The same reading `actors()` returns, counted rather than a second
-            // call to `System::len` — one source, so the two answers a console
+            // call to `Registry::len` — one source, so the two answers a console
             // gets from one node cannot disagree by a mount.
             actors: (self.actors)().map_or(0, |rows| u64::try_from(rows.len()).unwrap_or(u64::MAX)),
             dropped: self.dropped.load(Ordering::Relaxed),

@@ -3,7 +3,7 @@
 //! slot in a mailbox.
 //!
 //! This half depends on the registry beside it and serves it, and the
-//! dependency runs this way round on purpose: naming [`System`] here costs
+//! dependency runs this way round on purpose: naming [`Registry`] here costs
 //! nothing, and naming [`Addressed`] there would cost the split.
 //!
 //! # The handshake is the whole gate
@@ -18,7 +18,7 @@
 //! One ALPN **per service** replaces both. The keyed contract hashes
 //! `Envelope<WireRequest<Addressed<Request>>>` against
 //! `Envelope<WireResponse<Response>>`, so a peer built against different types
-//! is refused at the handshake, and a `System` of one service's own generated
+//! is refused at the handshake, and a `Registry` of one service's own generated
 //! mailbox enum cannot physically hold an actor of another service — the
 //! mismatch stops being a refusal and becomes unrepresentable.
 //!
@@ -56,7 +56,7 @@ use n0_future::time::Instant;
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 
-use super::registry::{RouteError, System};
+use super::registry::{Registry, RouteError};
 use crate::turns::{current, lost, rendered, Reply};
 use crate::{
     ActorId, Body, BodyReader, Caller, Context, Outcome, Queueing, RemoteError, Rpc, Serving,
@@ -67,7 +67,7 @@ use crate::{
 /// One message, plus the actor on this node it is addressed to.
 ///
 /// The keyed twin of a bare `Request`: a service's own request type travels
-/// inside this, and a `System` of that service is what takes it apart. Nesting
+/// inside this, and a `Registry` of that service is what takes it apart. Nesting
 /// is `WireRequest<Addressed<Request>>` and **never** the other way round — a
 /// [`KeyState`](crate::KeyState) query names no actor, so the actor id has to
 /// sit inside the arm that is a call rather than outside the arm that chooses.
@@ -223,13 +223,13 @@ impl<T: Rpc> Rpc for Addressed<T> {
 /// ## What neither of them refuses, and this is the part to read
 ///
 /// **Nobody clones an `Origin`. What a caller clones is the `Context` on its way
-/// in.** [`deliver_to_actor`] is `#[doc(hidden)] pub` and takes its `Context`
+/// in.** [`deliver_keyed`] is `#[doc(hidden)] pub` and takes its `Context`
 /// **by value**, so the hazard type-checks from any crate, shares one marker
 /// across two deliveries, and never names `Origin` at all:
 ///
 /// ```ignore
-/// let _ = deliver_to_actor::<S>(&system, cx.clone(), a, body_a).await;
-/// let _ = deliver_to_actor::<S>(&system, cx,         b, body_b).await;
+/// let _ = deliver_keyed::<S>(&system, cx.clone(), a, body_a).await;
+/// let _ = deliver_keyed::<S>(&system, cx,         b, body_b).await;
 /// ```
 ///
 /// The marker is writable from outside as well: [`caller`](Self::caller)'s
@@ -241,7 +241,7 @@ impl<T: Rpc> Rpc for Addressed<T> {
 /// **not** refuse a caller cloning a `Context` into two deliveries. What keeps
 /// that unreachable today is the call graph rather than the type — `serve_one`
 /// builds one `Context` per request and generated keyed dispatch calls
-/// [`deliver_to_actor`] once with it — which is a fact about two call sites in
+/// [`deliver_keyed`] once with it — which is a fact about two call sites in
 /// this crate: reviewable, and unenforced. `representability.rs` cannot state it,
 /// because a compile-time probe can only refuse a shape that does not type-check.
 ///
@@ -324,7 +324,7 @@ impl Origin {
 /// It was an associated type standing in for one keylink-level struct, declared
 /// as the seam the generated enum would arrive through. This is that arrival:
 /// `Mail` is now `<service>::Mail`, one variant per declared method plus the one
-/// a peer's request lands in, and [`deliver_to_actor`] is unchanged by it — which
+/// a peer's request lands in, and [`deliver_keyed`] is unchanged by it — which
 /// is what the seam was for.
 #[doc(hidden)]
 pub trait KeyedService: Send + 'static {
@@ -336,7 +336,7 @@ pub trait KeyedService: Send + 'static {
     type Mail: Send + 'static;
 
     /// Build the mailbox variant a peer's request lands in, out of the parts
-    /// [`deliver_to_actor`] holds.
+    /// [`deliver_keyed`] holds.
     ///
     /// The [`Origin`] is made **here**, by keylink, and handed in: generated code
     /// receives one and never constructs one, which is what keeps both of
@@ -383,11 +383,11 @@ impl From<RouteError> for RemoteError {
 
 /// Walk one arriving request to the actor it names, and wait for the answer.
 ///
-/// **A free function taking `&System<..>`**, and that shape is deliberate: it
-/// compiles identically whether `System` lives in this crate or in another one,
+/// **A free function taking `&Registry<..>`**, and that shape is deliberate: it
+/// compiles identically whether `Registry` lives in this crate or in another one,
 /// which an inherent impl cannot do. RFC-04 §16.8 splits the registry into its
 /// own crate, and this wave is independent of whether that has happened. No
-/// inherent impl on `System` names a service type.
+/// inherent impl on `Registry` names a service type.
 ///
 /// # The dispatch order, each step failing before the next can run
 ///
@@ -439,8 +439,9 @@ impl From<RouteError> for RemoteError {
 ///
 /// [`RemoteError::BadActorId`] for a malformed id, [`RemoteError::AtCapacity`]
 /// for a full registry, [`RemoteError::NoSuchActor`] when nothing is mounted and
-/// no factory built one, and [`RemoteError::TimedOut`] when the queue budget
-/// expired before a permit arrived.
+/// no factory built one, [`RemoteError::TimedOut`] when a parking queue budget
+/// expired, and [`RemoteError::MailboxFull`] when an opted-in shedding mailbox
+/// had no slot.
 ///
 /// And three more once the message *did* reach an actor and the answer did not
 /// come back, which is [`lost`]'s vocabulary rather than this function's: a
@@ -451,8 +452,8 @@ impl From<RouteError> for RemoteError {
 /// is genuinely finished. That last one was `NoSuchActor` — an answer about an
 /// **id**, given after a delivery proved the id was real.
 #[doc(hidden)]
-pub async fn deliver_to_actor<S: KeyedService>(
-    system: &System<S::Mail>,
+pub async fn deliver_keyed<S: KeyedService>(
+    system: &Registry<S::Mail>,
     cx: Context,
     request: Addressed<S::Request>,
     body: BodyReader,
@@ -484,32 +485,35 @@ pub async fn deliver_to_actor<S: KeyedService>(
     // Remote delivery normally starts on a connection task outside any actor
     // turn, so this is `Chain::Empty`; keeping the live value makes the route
     // correct for any in-process caller that reuses this seam as well.
-    let queueing = route.mail.send((
+    let queued = (
         Box::new(S::mail(Origin::peer(cx), message, body, reply)),
         current(),
-    ));
-    let sent = match budget {
-        None => queueing.await,
-        // `saturating_duration_since` on `n0_future::time::Instant`, the clock
-        // `Queueing` was stamped with — tokio's natively, `web_time`'s in a
-        // browser, and `std::time::Instant` on neither, since that one panics on
-        // `wasm32-unknown-unknown`. Reading the same clock as `middleware.rs` is
-        // one fewer place that can drift from it.
-        //
-        // Dropping the send future is what makes the refusal honest: tokio does
-        // not queue a message whose send was cancelled before a permit arrived,
-        // so a message refused here provably never entered the mailbox. The
-        // local path relies on the same property.
-        Some(budget) => n0_future::time::timeout(
-            budget.deadline().saturating_duration_since(Instant::now()),
-            queueing,
-        )
-        .await
-        .map_err(|_| RemoteError::TimedOut {
-            millis: budget.millis(),
-        })?,
-    };
-    sent.map_err(|_| no_such_actor(&actor))?;
+    );
+    if route.shed {
+        match route.mail.try_send(queued) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                return Err(RemoteError::MailboxFull);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(no_such_actor(&actor));
+            }
+        }
+    } else {
+        let queueing = route.mail.send(queued);
+        let sent = match budget {
+            None => queueing.await,
+            Some(budget) => n0_future::time::timeout(
+                budget.deadline().saturating_duration_since(Instant::now()),
+                queueing,
+            )
+            .await
+            .map_err(|_| RemoteError::TimedOut {
+                millis: budget.millis(),
+            })?,
+        };
+        sent.map_err(|_| no_such_actor(&actor))?;
+    }
     // **This clone dies here, and a keyed actor's graceful stop is what that
     // buys.** `drain` ends an actor's loop by dropping the registry's sender, and
     // says the task lives while any other sender does so that "a message already
@@ -548,7 +552,7 @@ pub async fn deliver_to_actor<S: KeyedService>(
     // The cell the route handed back is settled by that actor's own loop before
     // it drops anything, so this read happens-after the verdict for the drop that
     // woke it. What it cannot close is the *late* direction, and
-    // `deliver_to_singleton` states it in full: an actor that moved on between the
+    // `deliver_unkeyed` states it in full: an actor that moved on between the
     // death and this read is described as it is now rather than as it was.
     answer
         .await
@@ -559,13 +563,13 @@ pub async fn deliver_to_actor<S: KeyedService>(
 /// What the actor this envelope addresses is doing, without delivering anything
 /// to it.
 ///
-/// The non-enqueuing twin of [`deliver_to_actor`], and the keyed half of what a
+/// The non-enqueuing twin of [`deliver_keyed`], and the keyed half of what a
 /// generated `__status` answers. Generated dispatch calls this **instead of**
 /// that one, above it in the same closure, and nothing enters a mailbox — which
-/// is the whole mechanism rather than an optimisation. `Handle::is_busy` states
+/// is the whole mechanism rather than an optimisation. `Handle::busy` states
 /// the constraint: a message asking this question would queue behind the turn
 /// that wedged the actor, and if it ever ran it would report `busy: true` about
-/// itself while its own permit counted in `buffered`. It would answer the state
+/// itself while its own permit counted in `queued`. It would answer the state
 /// of asking rather than the state of the actor.
 ///
 /// Governance is untouched by that. The layer chain runs above the dispatch
@@ -575,9 +579,9 @@ pub async fn deliver_to_actor<S: KeyedService>(
 ///
 /// # It reads, and routing is what inserts
 ///
-/// [`System::serving`] takes the read lock, the way `System::contains` does.
+/// [`Registry::serving`] takes the read lock, the way `Registry::contains` does.
 /// `Registry::route` takes the write lock and builds from the factory a
-/// [`SystemBuilder::spawn_with`](crate::SystemBuilder::spawn_with) system was
+/// [`RegistryBuilder::spawn_with`](crate::RegistryBuilder::spawn_with) system was
 /// given, so this question asked through routing would *create* the actor it was
 /// asked about. That is the one behaviour this door has that an ordinary keyed
 /// call does not, and it is why the answer comes from here rather than from a
@@ -586,14 +590,14 @@ pub async fn deliver_to_actor<S: KeyedService>(
 /// # Errors
 ///
 /// [`RemoteError::BadActorId`] for an id [`ActorId::validate`] refuses, checked
-/// first and before any lookup exactly as [`deliver_to_actor`] checks it, so it
+/// first and before any lookup exactly as [`deliver_keyed`] checks it, so it
 /// says nothing about what is mounted. Then [`RemoteError::NoSuchActor`] when
 /// nothing is mounted under a well-formed id — which deliberately does not
 /// separate *never existed* from *was stopped*, for the reason that variant
 /// carries.
 #[doc(hidden)]
-pub fn serving_of_actor<M, T>(
-    system: &System<M>,
+pub fn serving_keyed<M, T>(
+    system: &Registry<M>,
     request: &Addressed<T>,
 ) -> std::result::Result<Serving, RemoteError> {
     let actor = &request.actor;

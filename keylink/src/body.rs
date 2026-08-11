@@ -21,7 +21,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use crate::wire::FrameReader;
 use crate::{Error, Result};
 
-/// Bytes buffered between the source and the transport on the sending side.
+/// Bytes queued between the source and the transport on the sending side.
 const COPY_BUFFER: usize = 64 * 1024;
 
 /// A payload to send alongside a request or a response.

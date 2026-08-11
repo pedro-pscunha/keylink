@@ -1,6 +1,6 @@
 //! Name → local actor, unregistered when the actor ends.
 //!
-//! [`System`](crate::System) can find an actor by [`ActorId`], and that is a
+//! [`Registry`](crate::Registry) can find an actor by [`ActorId`], and that is a
 //! *keyed* system: its entries are mounted, served behind an ALPN, evicted on a
 //! clock, and what you get back is a mailbox rather than a typed handle. Nothing
 //! answers the smaller question — *what is the handle for the local actor called
@@ -122,7 +122,7 @@ impl<H> Names<H> {
     ///
     /// `ended` is that actor's own [`ended()`](crate::LocalActor::ended) —
     /// `handle.ended()` for a generated local handle. For a keyed actor,
-    /// [`System::ended`](crate::System::ended) returns `None` when the id is not
+    /// [`Registry::ended`](crate::Registry::ended) returns `None` when the id is not
     /// mounted, so unwrap that state explicitly before registering:
     /// `let ended = system.ended(&id).expect("the actor was just mounted");`.
     /// Passing the *wrong* actor's future is the one way to misuse this, and it is why the
@@ -130,7 +130,7 @@ impl<H> Names<H> {
     ///
     /// It is an argument rather than something asked of `handle` because `H` is
     /// whatever a caller holds: a local handle can expose its ending directly,
-    /// while a keyed future comes from its [`System`](crate::System).
+    /// while a keyed future comes from its [`Registry`](crate::Registry).
     ///
     /// Returns the handle it displaced, if the name was taken. Dropping that
     /// handle is what lets the displaced actor end, if nothing else holds one.

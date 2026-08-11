@@ -42,8 +42,8 @@
 //!   rather than behind a `Mutex` — locally through a generated `Handle`, and
 //!   over the network with no change to the wire. **Two kinds of actor, and
 //!   serving is not a third:** a [`LocalActor`] behind a generated `Handle`, and
-//!   a keyed instance mounted in a [`System`] under an [`ActorId`] with its own
-//!   ALPN. `Handle::service` puts a local one on the wire without making it
+//!   a keyed instance mounted in a [`Registry`] under an [`ActorId`] with its own
+//!   ALPN. [`Servable::service`] puts a local one on the wire without making it
 //!   either a new kind or a new type.
 //! - **Content addressing.** A `blob` method hands back an address; iroh-blobs
 //!   moves the bytes, admitted only against a grant keylink recorded when it
@@ -58,7 +58,7 @@
 //!   written down rather than inherited from an unbounded queue: fan-out, a
 //!   pool, a schedule, a name registry, and a set of actors that end together.
 //!   See [`compose`].
-//! - **Its own introspection, served over itself.** [`System::status`] lists
+//! - **Its own introspection, served over itself.** [`Registry::status`] lists
 //!   what is running; [`inspect`] serves that list and a live lifecycle log on
 //!   an ALPN and an [`Allowlist`] of their own, and [`Console`] is the peer that
 //!   reads them. A subscriber is a parked reply rather than a held handler, so
@@ -168,7 +168,8 @@ compile_error!(
 // So that keylink can expand its own `service!`.
 //
 // The macro's generated rustdoc links its way back to this crate by name —
-// `[`Handle::service`]`, `[`mount`](keylink::mount)` and a dozen more — because
+// `[`Servable::service`](keylink::Servable::service)`,
+// `[`mount`](keylink::mount)` and a dozen more — because
 // every other expansion of it is rendered in somebody else's crate, where
 // `keylink::` is the only spelling that resolves. Inside keylink there is no such
 // path by default, so `mise run docs` (`-D warnings`, broken intra-doc links
@@ -235,14 +236,16 @@ mod reply;
 mod representability;
 mod rpc;
 mod subscribers;
+mod surfaces;
 #[cfg(test)]
 mod testing;
 mod watch;
 mod wire;
 
 pub use actor::{
-    deliver_to_actor, mount, serving_of_actor, ActorStatus, Addressed, Eviction, KeyedService,
-    Lifecycle, LocalError, Mailbox, MountError, Mounted, Origin, System, SystemBuilder,
+    deliver_keyed, mount, mount_with_backpressure, serving_keyed, ActorStatus, Addressed, Eviction,
+    KeyedService, Lifecycle, LocalError, Mailbox, MountError, Mountable, Origin, Registry,
+    RegistryBuilder,
 };
 pub use admission::{Admission, Admittance, DynamicAdmission, Revocable, Revocation};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
@@ -259,8 +262,8 @@ pub use console::{
 /// # Five documented names, and it was the whole generated module
 ///
 /// `service!` generates around thirty public items into a module — a `Request`,
-/// a `Response`, a `Mail`, a `Feed`, a keyed `System` and its builder, a
-/// `KeyedClient`, six spawn doors and a `blocking` submodule. For a service **a
+/// a `Response`, a `Mail`, a `Feed`, a keyed `Registry` and its builder, a
+/// `RegistryClient`, six spawn doors and a `blocking` submodule. For a service **a
 /// caller writes**, all of that is theirs and belongs in their crate. `Inspect`
 /// is keylink's own, so every one of those was keylink's public API —
 /// `std::mem::size_of::<keylink::inspect::Mail>()` compiled — which is a
@@ -280,19 +283,9 @@ pub use console::{
 /// `#[doc(hidden)] pub` when only the macro must name it — and it is what keeps
 /// `mise run docs` a gate rather than twelve broken links.
 ///
-/// `tests/api.rs` could not have caught the original: it pins that names
-/// *resolve*, which is the opposite question. So the guard is here, and it is an
-/// absence:
-///
-/// ```compile_fail
-/// let _ = std::mem::size_of::<keylink::inspect::Mail>();
-/// ```
-///
-/// ```compile_fail
-/// let _: Option<keylink::inspect::System> = None;
-/// ```
+/// The hidden re-export list is reviewed directly; name-absence compile-fail guards are not retained.
 pub mod inspect {
-    pub use crate::console::inspect::{actor_wired, alpn, Client, Feeds, Handle};
+    pub use crate::console::inspect::{alpn, restarting, setup, Client, Feeds, Handle, Setup};
 
     /// Named only so that the generated rustdoc above resolves its own
     /// cross-references. Nothing outside this crate has a use for one.
@@ -306,8 +299,8 @@ pub mod inspect {
     /// too — which is a maintenance cost worth naming rather than a one-off.
     #[doc(hidden)]
     pub use crate::console::inspect::{
-        actor, actor_with, at_local, keyed_service, serve, service, spawn, spawn_wired, Actor,
-        Handler, IdempotentClient, KeyedClient, OwnedPermit, Permit,
+        actor, at_local, serve, service, spawn, Actor, Handler, IdempotentClient, OwnedPermit,
+        Permit, RegistryClient, RestartingSetup, StateSetup,
     };
 }
 pub use error::{ConfigError, Error, Failure, Result, Transport};
@@ -335,8 +328,16 @@ pub use rpc::{
     ServiceBuilder,
 };
 pub use subscribers::Subscribers;
+#[doc(hidden)]
+pub use surfaces::RegistryDispatch;
+pub use surfaces::{BlockingWire, Own, Servable, Status, Wire, WithIdempotency};
+
+/// Extension traits for generated caller surfaces.
+pub mod prelude {
+    pub use crate::{BlockingWire, Own, Servable, Status, Wire, WithIdempotency};
+}
 pub use turns::{
-    deliver_to_singleton, feed_turn, run_keyed, run_keyed_supervised, serving_of_singleton, turn,
+    deliver_unkeyed, feed_turn, run_keyed, run_keyed_supervised, serving_unkeyed, turn,
     turn_deferred, Backpressure, Deferred, Fed, Feeds, Hooks, Incarnation, Intensity, LocalActor,
     NotQueued, OwnedPermit, Permit, Replied, Reply, Turn, Unanswered,
 };

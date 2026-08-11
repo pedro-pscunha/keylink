@@ -500,8 +500,8 @@ impl From<IdempotencyRefusal> for RemoteError {
 ///
 /// `Keyed` is the obvious name and it is taken. In this crate a **keyed** thing
 /// is one addressed by an [`ActorId`](crate::ActorId) —
-/// [`KeyedService`](crate::KeyedService), `KeyedClient`, `keyed_service`,
-/// `keyed_alpn`, `run_keyed` — and `keylink::Keyed` would sit two lines below
+/// [`KeyedService`](crate::KeyedService), `RegistryClient`, `registry.service(..)`,
+/// `registry_alpn`, `run_keyed` — and `keylink::Keyed` would sit two lines below
 /// `keylink::KeyedService` in the same export list meaning a different key
 /// entirely. `rpc.rs`'s `Claimed` was renamed *out of* the word for exactly this,
 /// and its doc comment records the decision; taking the word back for the
@@ -1073,8 +1073,8 @@ struct Inner {
 ///
 /// The name says `ledger`, not `keylink`: [`MAX_HEADER`](crate::MAX_HEADER),
 /// [`MAX_KEY_LEN`](crate::MAX_KEY_LEN),
-/// [`SystemBuilder::capacity`](crate::SystemBuilder::capacity) and
-/// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth) are all
+/// [`RegistryBuilder::capacity`](crate::RegistryBuilder::capacity) and
+/// [`RegistryBuilder::mailbox_depth`](crate::RegistryBuilder::mailbox_depth) are all
 /// keylink bounds and none of them is in here.
 ///
 /// **[`MAX_ATTACH`] was on that list, as the one bound "genuinely the ledger's
@@ -1124,7 +1124,7 @@ struct Inner {
 /// whole, and the wrong answer is a policy a caller never chose. `Limits` is ten
 /// decisions in one value, and "this type is a tuning decision" is not a
 /// well-formed sentence about it.
-/// [`SystemBuilder::mailbox_depth`](crate::SystemBuilder::mailbox_depth)'s rustdoc
+/// [`RegistryBuilder::mailbox_depth`](crate::RegistryBuilder::mailbox_depth)'s rustdoc
 /// draws the same line between a bound and a policy — it is **one knob**, not a bag
 /// of them, so it is the precedent for the *distinction* rather than for defaulting
 /// ten numbers at once. Nothing in this crate had a precedent for that.

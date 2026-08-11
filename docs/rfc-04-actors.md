@@ -3,8 +3,8 @@
 > **Historical design record.** This RFC preserves the state and decisions at its
 > revision dates; it is not a current capability index. Local mailbox depth is now
 > configurable through `Backpressure::{Park, Shed}(NonZeroUsize)` on
-> `LocalActor::spawn_deep` / `spawn_supervised_deep` and generated `actor_deep` /
-> `supervised_deep`. The default remains `Park(1)`.
+> `LocalActor::spawn_deep` / `spawn_supervised_deep` and generated `setup(..).backpressure(..).actor()` /
+> `restarting(..).backpressure(..).actor()`. The default remains `Park(1)`.
 
 **Status:** proposal, revision 3. Nothing here is implemented.
 **Target:** `keylink` 0.1.0, iroh 1.0.3, edition 2021, rustc 1.97.
@@ -960,7 +960,7 @@ This section said restart was "not in v1" because it "requires a `fn init() -> S
 trait", and pointed at §8 for the argument to keep that door shut. Both halves are now wrong,
 and the second is wrong in a way worth keeping:
 
-- **A factory need not be a trait method.** `spawn_supervised` takes a closure, so nothing was
+- **A factory need not be a trait method.** `restarting(..).mountable()` takes a closure, so nothing was
   added to `Actor` and the `Actor::Args`/`pre_start` shape this section feared never arose. The
   premise that restart forces a trait change was the load-bearing one, and it was false.
 - **§8's conclusion is overturned by the owner**, not by an argument this RFC lost. See §8.
@@ -1110,7 +1110,7 @@ All of that shipped:
 
 - **Durable state** — `docs/rfc-07-the-turn-model.md` §6. A `Persist` observer stores after each
   turn, measured at **7.6 ms** (Apple M5 Max, 2026-08-07), so an actor survives its own process.
-- **Restart-from-a-known-point** — RFC-07 §9. `spawn_supervised` rebuilds from the last
+- **Restart-from-a-known-point** — RFC-07 §9. `restarting(..).mountable()` rebuilds from the last
   committed state, proven over two real nodes.
 - **The keyed shape** — the instance registry, the eviction policy, the per-key mailbox and the
   first-message answer all exist. It was indeed a second RFC; this is it.
@@ -1852,7 +1852,7 @@ truncate a `recv` download, because the body is drained by the connection task a
 turn ends. It **can** truncate a `send` upload, because that body is read inside the turn.
 That is the same `send`/`recv` asymmetry as §10.4, surfacing in a third place.
 
-#### Revision note — issue #3 Wave 4b: `System::stop` is deleted, and the bullet above is why nobody looked
+#### Revision note — issue #3 Wave 4b: `Registry::stop` is deleted, and the bullet above is why nobody looked
 
 The bullet reading *"`stop` works as §10.5 describes, by a different route. Removing the
 entry drops one sender; the task lives while any sender lives and drains what is queued.
@@ -1872,11 +1872,11 @@ a live defect sat:
   `LocalActor` keeps `task: Arc<JoinHandle<()>>` and waits on a separate `ended` channel, so
   a dropped `stop()` future costs the wait and leaves `abort()` reachable. One sentence, true
   of a handle that outlives its own await and false of an entry that does not.
-- `Eviction::Idle`'s rustdoc claimed *"Eviction is `System::stop`, not `System::abort`"*, and
+- `Eviction::Idle`'s rustdoc claimed *"Eviction is `Registry::stop`, not `Registry::abort`"*, and
   the sweeper it described awaited nothing at all: it dropped entries inside a `retain` under
   the write lock, detaching every task it evicted, with nobody watching.
 
-So `System::stop` is **gone**, not kept beside a budgeted twin — the deadline-free spelling
+So `Registry::stop` is **gone**, not kept beside a budgeted twin — the deadline-free spelling
 *is* the hazard, and two ways to do one thing is what let the false sentence sit next to the
 true one. What replaced it:
 
@@ -1885,7 +1885,7 @@ pub async fn shutdown(&self, id: &ActorId, budget: Duration) -> Option<Ended>;
 pub enum Eviction { Idle { after: Duration, shutdown_budget: Duration }, Never }
 ```
 
-`System::abort` survives untouched, and §14.5's `stop`-versus-`abort` distinction survives
+`Registry::abort` survives untouched, and §14.5's `stop`-versus-`abort` distinction survives
 with it: `abort` never drains, so it is a different operation rather than a `shutdown` with a
 budget of zero, and it calls `JoinHandle::abort()` **before** its await, which is the
 asymmetry that made it correct all along. `LocalActor::stop` is untouched and keeps its
@@ -1893,10 +1893,10 @@ sentence. `evict_idle` became `async`, which is a public breaking change and is 
 rather than left to be discovered.
 
 A second detach of the same family, not in issue #3 and fixed in the same wave:
-`System::mount` dropped the `Mounted` on both refusals, and its task had already been spawned
+`Registry::mount` dropped the `Mountable` on both refusals, and its task had already been spawned
 by the free `mount()` — so every refused mount left a live, unreachable actor, because
-`MountError` hands nothing back and the registry never had it either. `Mounted` now carries an
-**unstarted** future and `System::mount` is the one place it starts, after the refusals. That
+`MountError` hands nothing back and the registry never had it either. `Mountable` now carries an
+**unstarted** future and `Registry::mount` is the one place it starts, after the refusals. That
 also puts §14.2's `task: JoinHandle<()>` where it always belonged, on `Entry` alone: a handle
 exists once an actor has been accepted, and not one moment before.
 
@@ -1909,9 +1909,10 @@ above were fixed:
 
 - `shutdown` removes the entry before its first await, and the `JoinHandle` lived in the
   `drain` frame the returned future owns. Drop that future — `tokio::select!`, `race`,
-  `timeout(1ms, system.shutdown(&id, 10s))`, spawn-and-drop — and the handle is dropped
-  without `abort()`. Byte for byte the deleted `stop`'s outcome: entry gone from the map,
-  task detached, state and its exclusive resources still held, and `System::abort(&id)`
+  `timeout(1ms, system.shutdown(&id, 10s))`, spawn-and-drop — using the spelling
+  from that revision; the current call is `registry.stop(&id, 10s)`. The handle is
+  dropped without `abort()`. Byte for byte the deleted `stop`'s outcome: entry gone from the map,
+  task detached, state and its exclusive resources still held, and `Registry::abort(&id)`
   answering `false` for an actor that is still running. `abort` survives cancellation
   because it aborts *before* its await; `drain` cannot borrow that trick, because aborting
   first is the opposite of draining.
@@ -1944,7 +1945,7 @@ the dial is **silent**: a budget below the longest turn destroys that turn where
 the `Ended` the sweeper computes is nobody's answer, an aborted task's observers never run,
 and the caller is a peer whose stream is severed rather than answered. No logging seam is
 added here — that would be a second, quieter path beside the observers. **Wave 6 owns it**,
-where `System::snapshot` and the console are; until then the budget is the only control.
+where `Registry::snapshot` and the console are; until then the budget is the only control.
 
 ### 14.6 A defect found while answering question 4
 
@@ -2225,7 +2226,7 @@ property is what makes keyed actors safe. The point is narrower: **the costs bel
 keyed addressing, not to actors**, and building A first would have shown that a year of
 commits earlier.
 
-`System` and the keyed envelope are unchanged and stay. A node serves either an actor
+`Registry` and the keyed envelope are unchanged and stay. A node serves either an actor
 system or one singleton per service, because one router owns one ALPN — refused at
 startup, with a test.
 
@@ -2515,7 +2516,7 @@ a `send` is perfectly safe.
 Chosen over a startup `ConfigError`, which the programme's own success criteria
 asked for. A compile error beats a runtime one, keeps `Result` off the generated
 serve site, costs no new error variant, does not ripple into `spawn_with`'s
-`Fn(&ActorId) -> Option<Mounted>`, and matches what the rest of this crate does
+`Fn(&ActorId) -> Option<Mountable>`, and matches what the rest of this crate does
 with claims of the form "there is no way to do X" — `representability.rs` exists
 for exactly that.
 
@@ -2582,7 +2583,7 @@ Recorded here rather than forgotten. The shape that would justify it is a turn
 long enough that abandoning it matters — a batch, a scan — and that is also the
 shape §16.2 says to bound from inside the method, where the state is.
 
-## 16.6 The keyed `System` path marked nothing, and gave the key back
+## 16.6 The keyed `Registry` path marked nothing, and gave the key back
 
 Three generated paths dispatch a request, and each has to say how far its call
 got. They say it out of band, on the progress marker `Context` carries, because
@@ -2597,7 +2598,7 @@ RFC-05 §2 records why that channel exists at all.
   still-queued message leaves the key claimable; `completed()` outside it, on
   the one arm holding an answer the turn produced, so an observer's veto does
   not settle the key as the veto.
-- **`spawn()`, the keyed `System` mailbox loop — nothing.** It destructured
+- **`spawn()`, the keyed `Registry` mailbox loop — nothing.** It destructured
   `Mail` and ran `__actor_turn` inside `guarded(..)` without touching
   `cx.progress()` at any point.
 
@@ -2616,7 +2617,7 @@ own client can send one of these**. No user of the shipped API reaches it.
 
 It is not unreachable either. `idempotency` is a field on the `Envelope` that
 carries *every* ALPN, the actor system's included, and `RpcClient`,
-`ActorRequest`, `ActorReply` and `System::alpn` are all public. A peer that
+`ActorRequest`, `ActorReply` and `Registry::alpn` are all public. A peer that
 speaks the protocol by hand reaches it in four lines — which is exactly what
 `keylink/tests/actors.rs` now does. Latent, not impossible, and not a defect the
 client's shape can be relied on to keep buried: the moment `ActorClient` grows a
@@ -2646,7 +2647,7 @@ that panicked was entered, and whatever it mutated before it panicked is in the
 state the actor carries on with. `Interrupted` is right; giving the key back
 would run that half-done work a second time.
 
-### `System::deliver`'s five failure paths need nothing
+### `Registry::deliver`'s five failure paths need nothing
 
 Every one of them was walked against the fix, and none of them wants a mark of
 its own — which is the same argument §16's first list makes: only the code that
@@ -2686,7 +2687,7 @@ hand. Without it the arm that decides what a turn owes when it ran and produced
 nothing sendable is unreachable, and an unreachable arm is a decision nobody has
 checked.
 
-## 16.7 The keyed `System` path never read the deadline it was handed
+## 16.7 The keyed `Registry` path never read the deadline it was handed
 
 §16.2 argues why `QueueTimeout` is the only bound that can shed an actor's load:
 a layer runs outside the mailbox and cannot tell a queued message from a running
@@ -2697,7 +2698,7 @@ The layer's whole contribution is one line — `cx.queueing = Some(Queueing { ..
 Exactly one place did. `Handle::service`'s generated dispatch takes the deadline
 off the context and hands it to `ask_catching_before`, an expired message comes
 back `Queued::Expired`, and it is refused with `RemoteError::TimedOut` without
-the turn running. `spawn`'s mailbox loop — the keyed `System` path — destructured
+the turn running. `spawn`'s mailbox loop — the keyed `Registry` path — destructured
 `Mail { cx, payload, body, reply }` and ran the turn, having consulted
 `cx.queueing()` nowhere.
 
@@ -2712,7 +2713,7 @@ operator's evidence that the load is bounded.
 
 More reachable than §16.6's defect, and by a wide margin.
 
-`System::service` gives back an ordinary `ServiceBuilder<ActorRequest, ActorReply>`,
+`Registry::service` gives back an ordinary `ServiceBuilder<ActorRequest, ActorReply>`,
 `ServiceBuilder::layer` accepts any `Middleware<Req, Resp>`, and `QueueTimeout`
 implements that generically. So
 
@@ -2735,7 +2736,7 @@ mailbox — which is the same place the local path checks, for the same reason
 where "queued" has not happened yet. There is no third place, because once the
 turn starts, stopping it means dropping `&mut A` mid-mutation.
 
-`System::deliver` gets no check of its own, on the argument §16.6 already makes
+`Registry::deliver` gets no check of its own, on the argument §16.6 already makes
 for its five failure paths: only the code that knows when the *work* begins may
 speak about the work, and `deliver` never does. One asymmetry with the local path
 survives and is recorded rather than papered over — see the last section.
@@ -2848,7 +2849,7 @@ Two more are already visible, and neither is fixed here:
 
 - **The wait for a mailbox permit is unbounded on this path.** The local path
   bounds it with the same deadline, so a message that cannot even get a slot is
-  refused at its budget; `System::deliver` awaits `mail.send` with no bound at
+  refused at its budget; `Registry::deliver` awaits `mail.send` with no bound at
   all. The consequence is milder than it sounds — capacity is one and turns are
   serial, so a waiting message is admitted as soon as the current turn ends and
   is then refused by the loop — but the caller waits for the permit instead of
@@ -2877,7 +2878,7 @@ somebody's head.
 
 The structural work is done. No field type, no parameter and no return type in
 `registry.rs` names a transport type, and the registry's tests instantiate
-`System<()>`, `Mounted<()>` and `Mailbox<()>`, so that is checked by the
+`Registry<()>`, `Mountable<()>` and `Mailbox<()>`, so that is checked by the
 compiler rather than argued in a comment. What remains is compatibility, and
 compatibility has a bill.
 
@@ -2887,36 +2888,36 @@ corrected list is six.
 
 ### Blocks `registry.rs` from becoming its own crate
 
-1. **The four `M = Mail` defaults.** `System<M = Mail>`, `SystemBuilder<M = Mail>`,
-   `Mounted<M = Mail>`, `Mailbox<M = Mail>`. A registry crate cannot name `Mail`,
-   so they go, and `keylink::System` stops meaning `System<Mail>`. The transport
-   crate has to supply `pub type System = registry::System<Mail>` and friends to
-   restore the unparameterized names.
+1. **The four `M = Mail` defaults.** `Registry<M = Mail>`, `RegistryBuilder<M = Mail>`,
+   `Mountable<M = Mail>`, `Mailbox<M = Mail>`. A registry crate cannot name `Mail`,
+   so they went, and the then-public `keylink::System` stopped meaning
+   `Registry<Mail>`. The generated alias is now `keylink::Registry`; the transport
+   crate supplies it fully applied to restore the unparameterized name.
 
    **This is the expensive one, and not for the reason it looks.** Four of the
    thirteen re-exported paths break, which is survivable. But `macros.rs` writes
-   `$crate::Mounted`, `$crate::Mailbox` and `$crate::mount` unparameterized, so
+   `$crate::Mountable`, `$crate::Mailbox` and `$crate::mount` unparameterized, so
    the macro must change — and generated code is expanded in the *caller's*
    crate, which means every downstream user's generated code changes shape at
    the same time. Nothing else on this list has that reach.
 
    The obvious escape does not work: republishing defaulted aliases from a
-   facade module (`pub type System<M = Mail> = registry::System<M>;`) is
+   facade module (`pub type Registry<M = Mail> = registry::Registry<M>;`) is
    syntactically fine and is what a crate split would normally do, but a `pub type`
    alias onto a pub-in-private struct renders in rustdoc as an alias stub with no
    methods. Four documented structs would quietly become four alias pages — a
    public API change wearing a refactor's clothes.
 
-2. **`impl SystemBuilder<Mail>`,** which exists for `DEFAULT_CAPACITY` alone. It
+2. **`impl RegistryBuilder<Mail>`,** which exists for `DEFAULT_CAPACITY` alone. It
    survives in neither crate: the registry crate cannot name `Mail`, the
    transport crate cannot write an inherent impl on a foreign type, and an
-   extension trait does not rescue it because `SystemBuilder::DEFAULT_CAPACITY`
+   extension trait does not rescue it because `RegistryBuilder::DEFAULT_CAPACITY`
    puts `M` back in expression position, where a default does not apply. The
-   constant moves to `impl<M> SystemBuilder<M>` and callers write
-   `SystemBuilder::<Mail>::DEFAULT_CAPACITY`.
+   constant moves to `impl<M> RegistryBuilder<M>` and callers write
+   `RegistryBuilder::<Mail>::DEFAULT_CAPACITY`.
 
 3. **The seam becomes a public API.** It is two `pub(super)` items today —
-   `RouteError`, and one `route` function on `System<M>`. Across a crate
+   `RouteError`, and one `route` function on `Registry<M>`. Across a crate
    boundary a within-module courtesy has to become a genuine public routing
    interface, with a name, a doc comment and a compatibility promise. It was
    four items before it was narrowed to two, and narrowing it was worth doing
@@ -2933,12 +2934,12 @@ corrected list is six.
 
 ### Blocks the transport crate, not the registry
 
-5. **`impl System<Mail>`,** holding `alpn`, `service`, `dispatch` and `deliver`.
+5. **`impl Registry<Mail>`,** holding `alpn`, `service`, `dispatch` and `deliver`.
    This was the entry filed against the wrong crate in the earlier draft. It
    lives in `remote.rs`, so it does not stop the registry lifting out at all; it
    stops the *transport* crate adding inherent methods to a type it does not
    define. The replacement is an extension trait, at which point
-   `System::service(allow)` stops being a method call — the one item on this list
+   `Registry::service(allow)` stops being a method call — the one item on this list
    a reader of the current docs would not predict.
 
 6. **`impl From<RouteError> for RemoteError`.** Fine wherever `RemoteError`
@@ -2951,9 +2952,9 @@ becomes private. Listed so the count is honest.
 
 ### The one cost already paid
 
-`System<M = Mail>` has an inference edge a default cannot fix: a system built and
+`Registry<M = Mail>` has an inference edge a default cannot fix: a system built and
 then touched only through the methods that never mention `M` has no type
-position to infer from, and meets `error[E0283]`. It is documented on `System`
+position to infer from, and meets `error[E0283]`. It is documented on `Registry`
 with a `compile_fail` doctest, and the doctest was itself checked to fail for
 `E0283` specifically rather than for any compile error at all — a `compile_fail`
 doctest passes for the wrong reason as easily as the right one.
@@ -2980,8 +2981,8 @@ instantiation, inside `Handle::service`. So:
     depot::spawn(Store)       // compiled, silently
 
 and the second is not a lesser path. It mounts into a keyed
-[`System`](../keylink/src/actor/registry.rs), is served over the system ALPN,
-and reaches every admitted peer. `System::deliver` puts the `BodyReader` into
+[`Registry`](../keylink/src/actor/registry.rs), is served over the system ALPN,
+and reaches every admitted peer. `Registry::deliver` puts the `BodyReader` into
 the `Mail`, and the loop hands it to the turn — the same body, in the same
 serial turn, for the same unbounded time. §10.4's denial of service, on the path
 §10.4 does not mention.
@@ -3013,7 +3014,7 @@ does, and the three found since §16.6 are not in the loop's behaviour at all:
 - and this one, the missing compile guard.
 
 §16.7 called the pattern a property of how the loop was written. That was too
-narrow. The loop, `System::deliver`, and the call site each acquired their own
+narrow. The loop, `Registry::deliver`, and the call site each acquired their own
 version of a decision the local path made once, and no mechanism makes an
 omission visible in any of them — six were found by reading the two paths side
 by side, which is not a technique that scales or that anybody runs on a
@@ -3021,7 +3022,7 @@ schedule. What would make it structural is routing `spawn` through `LocalActor`
 so there is one turn loop rather than two. That is a larger change than any of
 the six, and it is the one worth costing.
 
-Not yet audited: `System::deliver`'s failure paths beyond §16.6's table, and the
+Not yet audited: `Registry::deliver`'s failure paths beyond §16.6's table, and the
 blobs path.
 
 ## 16.10 The one mailbox slot: who may hold it, and for how long
@@ -3036,9 +3037,9 @@ All three are about the same scarce resource. `MAILBOX` is **one**. An actor
 inside a turn has exactly one buffer behind it, and every question below is a
 question about who is allowed to occupy it and for how long.
 
-### `System::deliver`'s schema check was fully masked
+### `Registry::deliver`'s schema check was fully masked
 
-Delete the `ours != request.schema` block from `System::deliver` and
+Delete the `ours != request.schema` block from `Registry::deliver` and
 `a_message_on_a_drifted_schema_is_refused_before_the_payload_is_decoded` — the
 test named for exactly that check — still passes. So does the rest of the suite.
 
@@ -3049,7 +3050,7 @@ Nothing a peer can read distinguishes the two.
 
 **This is a duplicated check, not a divergence, and neither copy should go.**
 `deliver` compares against the registry `Entry`'s schema and the loop against the
-generated `schema()`. They are provably equal for any `Mounted` that `spawn`
+generated `schema()`. They are provably equal for any `Mountable` that `spawn`
 produced, because `mount(schema(), ..)` is the single construction site — and if
 they ever did disagree, the system fails closed. The right response to a check
 that cannot be observed is not to remove it but to find out what it is for.
@@ -3068,7 +3069,7 @@ and it is red on that deletion.
 `LocalActor::ask_catching_before` wraps the send in a timeout, so a message that
 cannot get a slot is refused at its budget — and, because tokio does not queue a
 send that was cancelled before its permit arrived, is **provably never queued**.
-`System::deliver` awaited `mail.send` with no bound at all.
+`Registry::deliver` awaited `mail.send` with no bound at all.
 
 §16.7 listed this and called the consequence "milder than it sounds": capacity is
 one and turns are serial, so a waiting message is admitted as soon as the current
@@ -3101,7 +3102,7 @@ constraints, each of which is a correctness property rather than a preference:
   literal in `tests/protocol.rs` is `keylink/Probe/aa77e29e5e1ccdc7` before this
   change and after it.
 
-§16.6's table of `System::deliver`'s failure paths gains a sixth row, and it
+§16.6's table of `Registry::deliver`'s failure paths gains a sixth row, and it
 wants no mark either:
 
 | Path | Marker on exit | Settles | Right? |
@@ -3161,7 +3162,7 @@ happens:
 1. the panic unwinds out of the mounted task, which dies;
 2. the reply sender is dropped without sending, so the caller is told
    `RemoteError::NoSuchActor`;
-3. **`System::contains` still reports the actor**, because nothing reaps an entry
+3. **`Registry::contains` still reports the actor**, because nothing reaps an entry
    whose task died;
 4. every later call is `NoSuchActor` too, for the life of the process.
 
@@ -3225,7 +3226,7 @@ loop ran **caller-written code on the actor's own task** outside it:
 A panic in either unwound out of the mounted task, dropping the mailbox receiver
 while the registry entry stayed. Every later caller — for the life of the
 process — was answered `NoSuchActor` for an id that was mounted, and
-`System::contains` went on agreeing that it was.
+`Registry::contains` went on agreeing that it was.
 
 Nothing exotic reaches this. A *derived* `Serialize` cannot fail, so a service
 author who needs one that can hand-writes it; `tests/actors.rs` already had one
@@ -3414,7 +3415,7 @@ promise did not run.
 
 | site | mark |
 | --- | --- |
-| `System::deliver`, after `mail.send` resolves `Ok` | `enqueued()` |
+| `Registry::deliver`, after `mail.send` resolves `Ok` | `enqueued()` |
 | `LocalActor::ask_catching_before`, once the permit is in hand | `enqueued()` |
 | keyed loop, queue-deadline expiry arm | `unrun()` |
 | keyed loop, decode-refusal arm (hash or bytes) | `unrun()` |
@@ -3450,7 +3451,7 @@ unknown" survives without either arm saying anything. That the decode side flips
 from silence to a statement and the encode side does not is the whole shape of
 this change, and it falls out of the precedence rather than out of arm order.
 
-**`System::deliver`'s refusals before the send mark nothing**, which is right and
+**`Registry::deliver`'s refusals before the send mark nothing**, which is right and
 is now load-bearing rather than incidental: the schema-hash refusal, the id
 validation, the routing miss and — since §16.10 — the permit-wait bound all
 refuse a message that provably never entered a mailbox, so their keys are owed
@@ -3533,7 +3534,7 @@ Recorded here rather than edited into §16.2, per this document's rule.
 
 ### What this gives up, and the hazard in getting it back
 
-§16.6's table of `System::deliver`'s failure paths, row 5 — a message that
+§16.6's table of `Registry::deliver`'s failure paths, row 5 — a message that
 queued and was then dropped **unrun**, because the actor was `stop`ped, `abort`ed
 or evicted before taking it — used to release its key and now settles
 `Interrupted`. Nothing in the suite asserts either answer; the row is prose.
@@ -3617,7 +3618,7 @@ Every one below was broken with `scripts/break-once.sh` and watched.
 
 The two enqueue marks, broken two ways each:
 
-- `progress.enqueued()` removed from `System::deliver` →
+- `progress.enqueued()` removed from `Registry::deliver` →
   `a_keyed_message_a_timeout_gave_up_on_in_the_mailbox_settles_its_key` fails
   with `a key nobody can report on must be settled, not claimable: Touch(2)`.
   The `2` is the defect verbatim: the retry ran the work again.
@@ -3695,7 +3696,7 @@ was deleted. The rule survives untouched. Only the sites moved.
 the `service!` expansion generates, and collapsed the two dispatchers into one
 `keylink::turn`. RFC-07 §2.4 records the deletions in one sentence: *"`Queued<T>` and
 `ask_catching_before` are deleted. Their one caller was `Handle::service`'s dispatch, which
-is now `deliver_to_local` — the twin of `deliver_to_actor`, in keylink, sharing one
+is now `deliver_to_local` — the twin of `deliver_keyed`, in keylink, sharing one
 `rendered`."* Both symbols in rows 2 and 6 are gone from the crate;
 `grep -rn 'Queued\|ask_catching_before' keylink/src/` finds only two comments mentioning
 them in passing.
@@ -3708,8 +3709,8 @@ stale the way §16.12's did.
 
 | §16.12's row | where the mark is now |
 | --- | --- |
-| `System::deliver`, after `mail.send` resolves `Ok` → `enqueued()` | `keylink/src/actor/remote.rs::deliver_to_actor` — same placement, below every refusal above it and above the wait, for the reason §16.12 gives |
-| `LocalActor::ask_catching_before`, once the permit is in hand → `enqueued()` | `keylink/src/turns.rs::deliver_to_singleton`, after `sent.is_err()` is ruled out |
+| `Registry::deliver`, after `mail.send` resolves `Ok` → `enqueued()` | `keylink/src/actor/remote.rs::deliver_keyed` — same placement, below every refusal above it and above the wait, for the reason §16.12 gives |
+| `LocalActor::ask_catching_before`, once the permit is in hand → `enqueued()` | `keylink/src/turns.rs::deliver_unkeyed`, after `sent.is_err()` is ruled out |
 | keyed loop, queue-deadline expiry arm → `unrun()` | `keylink/src/turns.rs::turn`, the `if expired` arm |
 | keyed loop, decode-refusal arm → `unrun()` | **no such arm.** See below |
 | keyed loop, decode-**panic** arm → `unrun()` | **no such arm.** See below |
@@ -3782,7 +3783,7 @@ have is the record, and a repaired §6.2 would delete it.
 
 **§6.2's condition is met.** It said `.mailbox(n)` "can go on the builder later if
 somebody produces a latency measurement that justifies a number". The knob shipped as
-`SystemBuilder::mailbox_depth` without one. The measurement is now
+`RegistryBuilder::mailbox_depth` without one. The measurement is now
 `what_a_deeper_mailbox_buys_the_caller` in `keylink/tests/mailbox_latency.rs` — an
 `#[ignore]`d run that prints and asserts nothing — and its numbers are tabled in
 `mailbox_depth`'s own rustdoc with the machine, the day and the load average beside
@@ -3856,7 +3857,7 @@ is the treatment RFC-07 §4.11 already gives `MailboxClosed`.
 | `Withheld`, the private observer verdict in `turns.rs` | `ObserverVerdict` | `ec242c2` |
 | `EndReason`, defined in `console.rs` | moved beside the type it projects, in `observe.rs` | `c165009` |
 | `Undelivered` | `Unanswered` | `8acd7be` |
-| `deliver_to_local` | `deliver_to_singleton` | `80098e4` |
+| `deliver_to_local` | `deliver_unkeyed` | `80098e4` |
 | `NodeStatus::lost` | `NodeStatus::dropped` | `0c6e6c3` |
 | the five `RemoteError` prefix consts | deleted — `RemoteError::Withheld(Withheld)` carries the value | `0c6e6c3`, `5198ecb` |
 
@@ -3908,11 +3909,11 @@ one-failure sentence.
 
 *"Where each row went"* declares itself a `file:symbol` table, so its cells are
 pointers and `CONTRIBUTING.md`'s carve-out reaches them. Row 2's symbol became
-`deliver_to_singleton` in this wave (`80098e4`). The file half of rows 2, 3 and 6
+`deliver_unkeyed` in this wave (`80098e4`). The file half of rows 2, 3 and 6
 was **older rot, from `ee382e8`**, which moved `local.rs` wholesale into
 `turns.rs`; it is corrected here rather than left, because a table whose stated
 purpose is to resolve should resolve. Both targets were read at `5198ecb` before
-the edit: `turns.rs::deliver_to_singleton` contains the `enqueued()` mark, and
+the edit: `turns.rs::deliver_unkeyed` contains the `enqueued()` mark, and
 `turns.rs::turn` contains the `if expired` arm and its `unrun()`. The descriptive
 clauses in those cells — *"after `sent.is_err()` is ruled out"* — are claims, not
 pointers, and are **not** edited.

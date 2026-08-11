@@ -29,7 +29,7 @@
 //! for the keyed path and phase 4 for the local one, separately, because the box
 //! that holds the property is a different line of code on each.
 //!
-//! # The measured fact behind `SystemBuilder::mailbox_depth`, published here
+//! # The measured fact behind `RegistryBuilder::mailbox_depth`, published here
 //!
 //! Phase 5 measures what a deeper mailbox costs while it is empty, which is the
 //! whole of that knob's "below 32 it is free" claim. On this machine
@@ -61,6 +61,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use std::alloc::{GlobalAlloc, Layout, System as Libc};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -181,7 +182,7 @@ const KEYED_SLACK: isize = 275;
 const BUDGET_PER_ACTOR: isize = KEYED_MEASURED + KEYED_SLACK;
 
 /// The same ceiling, for an actor started with `ledger::actor(..)` instead of
-/// mounted in a [`System`](keylink::System).
+/// mounted in a [`Registry`](keylink::Registry).
 ///
 /// A separate literal because a local actor pays for a different set of things
 /// and there is no honest way to fold them into one number. It has **two**
@@ -204,7 +205,7 @@ const BUDGET_PER_ACTOR: isize = KEYED_MEASURED + KEYED_SLACK;
 ///
 /// | path | before the generated mailbox (`c9056e0`) | Wave 1b (`c8712b0`) | Wave 2 (`836179c`) | Wave 3 | Wave 9 | before `Fate` (`810650a`) | `Fate` | with the `Floor` | chain propagation |
 /// |---|---|---|---|---|---|---|---|---|---|
-/// | keyed, mounted in a `System` | 1,671 | 1,159 | 1,159 | 1,415 | 1,412 | 1,549 | 1,690 | **1,722** | **2,618** |
+/// | keyed, mounted in a `Registry` | 1,671 | 1,159 | 1,159 | 1,415 | 1,412 | 1,549 | 1,690 | **1,722** | **2,618** |
 /// | local, `ledger::actor(..)`   | 1,725 | 1,469 | 1,597 | 1,853 | 1,861 | 1,861 | **2,029** | **2,029** |
 ///
 /// # The `Floor` cost 32 bytes on the keyed path and nothing measurable on the local one
@@ -477,7 +478,7 @@ async fn ten_thousand_idle_actors_fit_in_the_budget() {
 
     // ── phase 1: keyed, mounted in a registry ────────────────────────────────
 
-    let system: ledger::System = ledger::System::builder(Eviction::Never)
+    let system: ledger::Registry = ledger::Registry::builder(Eviction::Never)
         .capacity(ACTORS)
         .build();
     settle().await;
@@ -553,7 +554,7 @@ async fn ten_thousand_idle_actors_fit_in_the_budget() {
     // thousands of bytes higher and the budgets would be bounding whoever wrote
     // the service rather than the framework.
 
-    let bulky: bulky::System = bulky::System::builder(Eviction::Never)
+    let bulky: bulky::Registry = bulky::Registry::builder(Eviction::Never)
         .capacity(ACTORS)
         .build();
     settle().await;
@@ -638,7 +639,7 @@ async fn ten_thousand_idle_actors_fit_in_the_budget() {
 
     // ── phase 5: what a deeper mailbox costs while it is empty ───────────────
     //
-    // `SystemBuilder::mailbox_depth` documents a memory trade that does not
+    // `RegistryBuilder::mailbox_depth` documents a memory trade that does not
     // begin until 32, and this is the measurement that sentence rests on rather
     // than a reading of tokio's source. Three depths, all measured here at the
     // same actor count so the comparison is between depths and nothing else.
@@ -663,7 +664,7 @@ async fn ten_thousand_idle_actors_fit_in_the_budget() {
             "an idle mailbox at depth {depth} cost {cost} bytes against {flat} at \
              depth 1. The first block of 32 slots is allocated eagerly and the rest \
              are not, so an EMPTY mailbox costs the same at every depth — and \
-             `SystemBuilder::mailbox_depth`'s claim that depth is free below 32 is \
+             `RegistryBuilder::mailbox_depth`'s claim that depth is free below 32 is \
              this number"
         );
     }
@@ -721,8 +722,8 @@ const ACTORS_PER_DEPTH: usize = 2_000;
 
 /// The per-idle-actor cost of a keyed system at one mailbox depth, and the system,
 /// which the caller must keep alive — see phase 5.
-async fn keyed_at_depth(depth: usize) -> (isize, ledger::System) {
-    let system: ledger::System = ledger::System::builder(Eviction::Never)
+async fn keyed_at_depth(depth: usize) -> (isize, ledger::Registry) {
+    let system: ledger::Registry = ledger::Registry::builder(Eviction::Never)
         .capacity(ACTORS_PER_DEPTH)
         .mailbox_depth(NonZeroUsize::new(depth).expect("a mailbox depth is never zero"))
         .build();

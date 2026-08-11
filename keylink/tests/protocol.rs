@@ -6,6 +6,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -1018,7 +1019,7 @@ fn the_keyed_alpn_hashes_the_keyed_wire_type() {
          actor id in one direction and not the other"
     );
 
-    let real = String::from_utf8_lossy(probe::keyed_alpn()).into_owned();
+    let real = String::from_utf8_lossy(probe::registry_alpn()).into_owned();
     let correct_hash = String::from_utf8_lossy(&correct)
         .rsplit('/')
         .next()
@@ -1051,17 +1052,17 @@ fn the_keyed_alpn_hashes_the_keyed_wire_type() {
 #[tokio::test]
 async fn a_service_serves_as_a_singleton_and_as_an_actor_system_on_one_node() {
     let node = local_node().await;
-    let system: probe::System = probe::System::builder(keylink::Eviction::Never).build();
+    let system: probe::Registry = probe::Registry::builder(keylink::Eviction::Never).build();
 
     assert_ne!(
         probe::alpn(),
-        probe::keyed_alpn(),
+        probe::registry_alpn(),
         "the two contracts must not hash the same, or one node cannot serve both"
     );
 
     let _running = keylink::Server::builder(&node)
         .service(probe::service(Server::default(), Allowlist::anyone()).build())
-        .service(probe::keyed_service(&system, Allowlist::anyone()).build())
+        .service(system.service(Allowlist::anyone()).build())
         .spawn()
         .expect("one service, served both ways, on one node");
 }
@@ -1136,7 +1137,7 @@ async fn a_service_serves_as_a_singleton_and_as_an_actor_system_on_one_node() {
 /// The variant was there to report per-actor schema drift inside one system-wide
 /// actor envelope. A keyed system is per-service now, its ALPN hashes
 /// `Envelope<WireRequest<Addressed<Request>>>`, drift is refused at the
-/// handshake, and a `System` of one service physically cannot hold an actor of
+/// handshake, and a `Registry` of one service physically cannot hold an actor of
 /// another. There is nothing left for the variant to say.
 ///
 /// # Moved a third time, to price a refusal a serving side needs
@@ -1572,8 +1573,8 @@ fn adding_defer_to_a_method_does_not_move_the_contract_hash() {
          `Contract` is built from"
     );
     assert_eq!(
-        String::from_utf8_lossy(plain::deferring::keyed_alpn()),
-        String::from_utf8_lossy(deferring::deferring::keyed_alpn()),
+        String::from_utf8_lossy(plain::deferring::registry_alpn()),
+        String::from_utf8_lossy(deferring::deferring::registry_alpn()),
         "the keyed ALPN moved for a change that is not on the wire"
     );
 }
@@ -1644,8 +1645,8 @@ fn adding_a_feed_to_a_service_does_not_move_the_contract_hash() {
          touches none of the six types `Contract` is built from"
     );
     assert_eq!(
-        String::from_utf8_lossy(unfed::fed::keyed_alpn()),
-        String::from_utf8_lossy(fed::fed::keyed_alpn()),
+        String::from_utf8_lossy(unfed::fed::registry_alpn()),
+        String::from_utf8_lossy(fed::fed::registry_alpn()),
         "the keyed ALPN moved for a declaration that is not on the wire"
     );
 }

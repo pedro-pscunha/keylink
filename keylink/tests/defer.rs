@@ -28,6 +28,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -269,10 +270,9 @@ impl Observer<Book> for Vetoing {
 #[tokio::test]
 async fn an_answer_given_inside_a_deferred_turn_is_withheld_when_an_observer_refuses() {
     let saw = Arc::new(AtomicUsize::new(0));
-    let book = orders::actor_with(
-        Book::default(),
-        vec![Box::new(Vetoing { saw: saw.clone() })],
-    );
+    let book = orders::setup(Book::default())
+        .observe(Vetoing { saw: saw.clone() })
+        .actor();
 
     let quoted = book.quote(21).await;
     assert!(
@@ -629,7 +629,7 @@ async fn a_deferred_sent_from_another_task_is_not_gated_by_the_turn_that_spawned
 /// The actor exists, was reached, and ran the turn; a served reply that died
 /// unanswered was reported to the peer as though the service had never been mounted.
 /// The test went red either way — the finding was about what an operator reads.
-/// **Fixed:** `deliver_to_singleton` now splits the dead-channel arm three ways, and the
+/// **Fixed:** `deliver_unkeyed` now splits the dead-channel arm three ways, and the
 /// same break watched under it printed `Remote(Failed("dropped: the reply was taken
 /// out of the turn and never answered"))`. **That is a transcript and not the
 /// current text**, and by now nothing of it survives. The five prefixes were
@@ -936,12 +936,11 @@ async fn a_local_caller_and_a_peer_read_the_same_withheld() {
     // ── Refused: one observer's name, built twice ──────────────────────────
 
     let vetoed_node = local_node().await;
-    let vetoed = orders::actor_with(
-        Book::default(),
-        vec![Box::new(Vetoing {
+    let vetoed = orders::setup(Book::default())
+        .observe(Vetoing {
             saw: Arc::new(AtomicUsize::new(0)),
-        })],
-    );
+        })
+        .actor();
     let _vetoed_server = Server::builder(&vetoed_node)
         .service(vetoed.service(Allowlist::anyone()).build())
         .spawn()
@@ -956,12 +955,11 @@ async fn a_local_caller_and_a_peer_read_the_same_withheld() {
             .expect_err("the observer refused the completed turn"),
     );
 
-    let vetoed_locally = orders::actor_with(
-        Book::default(),
-        vec![Box::new(Vetoing {
+    let vetoed_locally = orders::setup(Book::default())
+        .observe(Vetoing {
             saw: Arc::new(AtomicUsize::new(0)),
-        })],
-    );
+        })
+        .actor();
     let refused_local = local_withheld(
         vetoed_locally
             .fill(1)
@@ -983,7 +981,7 @@ async fn a_local_caller_and_a_peer_read_the_same_withheld() {
     // ── ObserverPanicked: the same shape, one arm apart ────────────────────
 
     let exploding_node = local_node().await;
-    let exploding = orders::actor_with(Book::default(), vec![Box::new(Exploding)]);
+    let exploding = orders::setup(Book::default()).observe(Exploding).actor();
     let _exploding_server = Server::builder(&exploding_node)
         .service(exploding.service(Allowlist::anyone()).build())
         .spawn()
@@ -998,7 +996,7 @@ async fn a_local_caller_and_a_peer_read_the_same_withheld() {
             .expect_err("the observer panicked during the turn"),
     );
 
-    let exploding_locally = orders::actor_with(Book::default(), vec![Box::new(Exploding)]);
+    let exploding_locally = orders::setup(Book::default()).observe(Exploding).actor();
     let panicked_local = local_withheld(
         exploding_locally
             .fill(1)
@@ -1025,7 +1023,7 @@ async fn a_local_caller_and_a_peer_read_the_same_withheld() {
     // ── Restarting: one fault, two parked replies, one ending ──────────────
 
     let desk_node = local_node().await;
-    let desk = orders::supervised(
+    let desk = orders::restarting(
         move || async move {
             let observers: Vec<Box<dyn Observer<Book>>> = vec![Box::new(RefuseFaults)];
             Ok((Book::default(), observers, ()))
@@ -1035,7 +1033,8 @@ async fn a_local_caller_and_a_peer_read_the_same_withheld() {
             Duration::from_millis(50),
         )
         .expect("a recovery span whose backoff is not zero"),
-    );
+    )
+    .actor();
     let _desk_server = Server::builder(&desk_node)
         .service(desk.service(Allowlist::anyone()).build())
         .spawn()
@@ -1236,16 +1235,16 @@ fn book_id() -> ActorId {
 /// The keyed twin of the fixture the singleton tests build inline. It hands the
 /// system back as well as the client, because the interesting endings on this
 /// path are the ones a *registry* causes.
-async fn keyed(nodes: &[keylink::Node; 2]) -> (orders::System, orders::KeyedClient, Server) {
-    let system: orders::System = orders::System::builder(Eviction::Never).build();
+async fn keyed(nodes: &[keylink::Node; 2]) -> (orders::Registry, orders::RegistryClient, Server) {
+    let system: orders::Registry = orders::Registry::builder(Eviction::Never).build();
     system
         .mount(book_id(), orders::spawn(Book::default()))
         .expect("the id is free");
     let server = Server::builder(&nodes[0])
-        .service(orders::keyed_service(&system, Allowlist::anyone()).build())
+        .service(system.service(Allowlist::anyone()).build())
         .spawn()
         .expect("one service, one ALPN");
-    let client = orders::KeyedClient::connect(&nodes[1], nodes[0].endpoint().addr())
+    let client = orders::RegistryClient::connect(&nodes[1], nodes[0].endpoint().addr())
         .await
         .expect("the client dials the actor system");
     (system, client, server)
@@ -1263,7 +1262,7 @@ async fn keyed(nodes: &[keylink::Node; 2]) -> (orders::System, orders::KeyedClie
 /// answers the very next call on the same connection.
 ///
 /// The twin of `a_local_caller_and_a_peer_agree_about_an_abandoned_deferred` one path over,
-/// and the pair is the point: `deliver_to_singleton` and `deliver_to_actor` render
+/// and the pair is the point: `deliver_unkeyed` and `deliver_keyed` render
 /// through one function now, so a condition cannot be answered two ways.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/actor/remote.rs` on the arm
@@ -1308,14 +1307,14 @@ async fn a_live_keyed_actor_does_not_tell_a_peer_no_such_actor() {
 ///
 /// The split must not cost the case it was carved out of. `abort` destroys the
 /// task, so the loop never reaches the hook where an ending settles its own
-/// verdict, and two lines answer instead: `System::abort` publishes before it asks
+/// verdict, and two lines answer instead: `Registry::abort` publishes before it asks
 /// the runtime for the destruction, and `Mailbox`'s `Drop` is the floor under
 /// whatever the loop was.
 ///
 /// **Which of the two answers *here* was measured, and it is the floor.** An
 /// unsupervised keyed actor's mailbox is `run_loop`'s own parameter, so a
 /// destroyed future drops it before the state, and its `Drop` overwrites what
-/// `System::abort` published a moment earlier. Breaking `System::abort`'s settle
+/// `Registry::abort` published a moment earlier. Breaking `Registry::abort`'s settle
 /// alone therefore leaves this test **green** — recorded because it is exactly
 /// the sort of belt that reads like a guard. That line earns its place on the
 /// *supervised* keyed path, where the mailbox belongs to the supervisor's frame
@@ -1356,7 +1355,7 @@ async fn an_aborted_keyed_actor_tells_a_peer_the_actor_is_gone() {
 /// And the third door out of a registry: a `shutdown` that **drains** an actor
 /// holding a parked remote reply.
 ///
-/// **This test asserted the opposite until `deliver_to_actor` stopped holding a
+/// **This test asserted the opposite until `deliver_keyed` stopped holding a
 /// mailbox sender across the wait.** Its rustdoc read *"a peer waiting on a parked
 /// reply holds a clone of the actor's mailbox sender for as long as it waits, so
 /// the loop never sees its senders go and the drain always runs out its budget"*,
@@ -1365,7 +1364,7 @@ async fn an_aborted_keyed_actor_tells_a_peer_the_actor_is_gone() {
 /// the task alive *"while any other sender does"* so that a message **already in
 /// flight** can finish, and a parked `#[defer]` reply is not one — it was
 /// delivered, and its turn ran to completion. A keyed actor holding one could not
-/// be stopped gracefully at all. `deliver_to_actor` drops its `Route` the moment
+/// be stopped gracefully at all. `deliver_keyed` drops its `Route` the moment
 /// the send lands now, and this is the door that proves it.
 ///
 /// **The elapsed time is asserted and not only the variant**, because a `Stopped`
@@ -1428,7 +1427,7 @@ async fn a_keyed_actor_holding_a_parked_reply_drains_inside_its_budget() {
     // noise of a loaded box and a large one cannot.
     let budget = Duration::from_secs(30);
     let started = std::time::Instant::now();
-    let ended = system.shutdown(&book_id(), budget).await;
+    let ended = system.stop(&book_id(), budget).await;
     let spent = started.elapsed();
 
     assert!(
@@ -1470,7 +1469,7 @@ async fn a_keyed_actor_holding_a_parked_reply_drains_inside_its_budget() {
 /// honest answer was there to be given.
 ///
 /// It is also why the sibling above must **not** have a layer. Dropping the wait
-/// drops `deliver_to_actor`'s frame and the sender clone inside it, so on the
+/// drops `deliver_keyed`'s frame and the sender clone inside it, so on the
 /// broken tree the drain finishes *because the peer gave up* — two seconds in
 /// rather than thirty — and an elapsed assertion passes. One defect, two shapes,
 /// and neither shape sees both halves of it.
@@ -1483,19 +1482,20 @@ async fn a_keyed_actor_holding_a_parked_reply_drains_inside_its_budget() {
 async fn a_peer_whose_parked_reply_is_drained_is_not_told_its_call_timed_out() {
     let nodes = [local_node().await, local_node().await];
     // Built inline rather than through `keyed`, because the layer is the subject.
-    let system: orders::System = orders::System::builder(Eviction::Never).build();
+    let system: orders::Registry = orders::Registry::builder(Eviction::Never).build();
     system
         .mount(book_id(), orders::spawn(Book::default()))
         .expect("the id is free");
     let _server = Server::builder(&nodes[0])
         .service(
-            orders::keyed_service(&system, Allowlist::anyone())
+            system
+                .service(Allowlist::anyone())
                 .layer(keylink::Timeout::after(Duration::from_secs(2)))
                 .build(),
         )
         .spawn()
         .expect("one service, one ALPN");
-    let client = orders::KeyedClient::connect(&nodes[1], nodes[0].endpoint().addr())
+    let client = orders::RegistryClient::connect(&nodes[1], nodes[0].endpoint().addr())
         .await
         .expect("the client dials the actor system");
 
@@ -1504,7 +1504,7 @@ async fn a_peer_whose_parked_reply_is_drained_is_not_told_its_call_timed_out() {
         tokio::spawn(async move { client.at(book_id()).place(3).await })
     };
     keyed_parked(&client, 1).await;
-    let ended = system.shutdown(&book_id(), Duration::from_secs(30)).await;
+    let ended = system.stop(&book_id(), Duration::from_secs(30)).await;
     assert!(
         matches!(ended, Some(Ended::Stopped)),
         "the drain is the sibling's claim, and this test rests on it: got {ended:?}"
@@ -1529,7 +1529,7 @@ async fn a_peer_whose_parked_reply_is_drained_is_not_told_its_call_timed_out() {
 ///
 /// `a_deferred_handler_that_panics_costs_its_caller_the_answer_and_not_the_actor`
 /// is a **local** call: it asserts `is_err()` on a `Unanswered` and never
-/// reaches `deliver_to_singleton`, so nothing anywhere asserted what a *peer* reads
+/// reaches `deliver_unkeyed`, so nothing anywhere asserted what a *peer* reads
 /// for this. The arm's own comment concedes the case — "a handler that panics
 /// after taking `reply.later()` arrives here too" — and the sentence it rendered
 /// said "the reply was taken out of the turn and never answered", which names the
@@ -1590,7 +1590,7 @@ async fn a_peer_whose_deferred_handler_panicked_reads_the_same_dropped_answer() 
 }
 
 /// [`parked`]'s keyed twin: wait by asking the actor rather than by sleeping.
-async fn keyed_parked(client: &orders::KeyedClient, want: u64) {
+async fn keyed_parked(client: &orders::RegistryClient, want: u64) {
     for _ in 0..500 {
         if client
             .at(book_id())

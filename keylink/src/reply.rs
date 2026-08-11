@@ -41,7 +41,7 @@ use crate::{FollowRefused, IdempotencyKey, KeyState, Withheld};
 ///
 /// A keyed system is per-service now. Its ALPN hashes
 /// `Envelope<WireRequest<Addressed<Request>>>`, so drift is refused at the
-/// handshake exactly as it is for a singleton, and a `System` of one service
+/// handshake exactly as it is for a singleton, and a `Registry` of one service
 /// physically cannot hold an actor of another. There is nothing left for the
 /// variant to report.
 ///
@@ -114,8 +114,8 @@ pub enum RemoteError {
     /// `5198ecb` replaced the five prefixes with the variant.
     ///
     /// **On both served paths**, which this sentence could not say for one wave:
-    /// `turns.rs`'s `deliver_to_singleton` separated the causes and
-    /// `actor/remote.rs`'s `deliver_to_actor` rendered all of them as this
+    /// `turns.rs`'s `deliver_unkeyed` separated the causes and
+    /// `actor/remote.rs`'s `deliver_keyed` rendered all of them as this
     /// variant, so the paragraph above was a promise a keyed actor did not keep.
     /// The two render through `turns.rs`'s `lost` now, off a verdict each actor's
     /// own loop settles before it drops anything.
@@ -140,7 +140,7 @@ pub enum RemoteError {
     ///
     /// **The one in-crate exception is named here rather than left in a comment
     /// four thousand lines away**, which is where it lived and where no reader of
-    /// this variant would meet it: `turns.rs`'s `deliver_to_singleton` answers a
+    /// this variant would meet it: `turns.rs`'s `deliver_unkeyed` answers a
     /// `Failed` on its `NotQueued::Reentrant` arm, carrying
     /// [`Unanswered`](crate::Unanswered)'s own sentence. A peer cannot produce a
     /// re-entrant call — its request arrives on a connection's task, which has run
@@ -170,7 +170,7 @@ pub enum RemoteError {
     /// The system is at its cap of live actors and would not build another.
     ///
     /// Retryable in the only sense that matters: the cap is a *live* count, so
-    /// an eviction or a shutdown clears it. `SystemBuilder::capacity` sets it.
+    /// an eviction or a shutdown clears it. `RegistryBuilder::capacity` sets it.
     #[error("the actor system is at its capacity of {capacity} live actors")]
     AtCapacity {
         /// The cap that was met.
@@ -252,7 +252,7 @@ pub enum RemoteError {
     ///
     /// **Not [`AtCapacity`](Self::AtCapacity), which already exists and means
     /// something else.** That one is the *registry* — too many live actors, and
-    /// `SystemBuilder::capacity` sets it. This one is one actor's own mailbox.
+    /// `RegistryBuilder::capacity` sets it. This one is one actor's own mailbox.
     /// Two bounds, two facts, and a peer that folded them would back off from a
     /// whole node when one actor is hot.
     ///

@@ -27,6 +27,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use std::io;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -374,7 +375,9 @@ impl Observer<Ledger> for GivesUp {
 #[tokio::test(start_paused = true)]
 async fn an_observer_receives_the_handler_duration() {
     let (durations, mut seen) = mpsc::unbounded_channel();
-    let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(Timing { durations })]);
+    let ledger = ledger::setup(Ledger::default())
+        .observe(Timing { durations })
+        .actor();
 
     let call = tokio::spawn(async move { ledger.slow().await.expect("running") });
     tokio::task::yield_now().await;
@@ -392,17 +395,16 @@ async fn an_observer_receives_the_handler_duration() {
 /// The port itself: an observer is called once for every turn, and the actor
 /// needs to know nothing about what it does.
 ///
-/// The first thing that breaks without this is the wiring. An `actor_with` that
+/// The first thing that breaks without this is the wiring. An `setup(..).observe(..).actor()` that
 /// takes a `Vec` and never lends it to a turn compiles perfectly, keeps the
 /// whole suite green, and silently gives a caller who asked for durability none
 /// at all.
 #[tokio::test]
 async fn an_observer_runs_once_for_every_turn() {
     let ran = ran();
-    let ledger = ledger::actor_with(
-        Ledger::default(),
-        vec![Box::new(Recording::accepting("counter", &ran))],
-    );
+    let ledger = ledger::setup(Ledger::default())
+        .observe(Recording::accepting("counter", &ran))
+        .actor();
 
     for entry in 1..=3 {
         assert_eq!(ledger.post(entry).await.expect("running"), entry);
@@ -425,13 +427,12 @@ async fn an_observer_runs_once_for_every_turn() {
 async fn an_observer_runs_before_the_caller_is_answered() {
     let (saw, mut seen) = mpsc::unbounded_channel();
     let (release, gate) = oneshot::channel();
-    let ledger = ledger::actor_with(
-        Ledger::default(),
-        vec![Box::new(Held {
+    let ledger = ledger::setup(Ledger::default())
+        .observe(Held {
             saw,
             gate: Some(gate),
-        })],
-    );
+        })
+        .actor();
 
     let answered = Arc::new(AtomicBool::new(false));
     let call = {
@@ -488,7 +489,7 @@ async fn an_observer_runs_before_the_caller_is_answered() {
 /// `right: Turn(ObserverPanicked { name: "exploding" })`.
 #[tokio::test]
 async fn a_panicking_observer_ends_the_actor_and_is_named() {
-    let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(Exploding)]);
+    let ledger = ledger::setup(Ledger::default()).observe(Exploding).actor();
 
     let lost = ledger.post(1).await.expect_err("the observer panicked");
     assert_eq!(
@@ -526,7 +527,7 @@ async fn a_panicking_observer_ends_the_actor_and_is_named() {
 /// method, which is why the two variants are not one.
 #[tokio::test]
 async fn a_panicked_turn_reaches_its_caller_and_then_ends_the_actor() {
-    let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(Strict)]);
+    let ledger = ledger::setup(Ledger::default()).observe(Strict).actor();
 
     // Spawned, because the panic is resumed in whoever awaited the call and this
     // test is not willing to be that task.
@@ -554,10 +555,9 @@ async fn a_panicked_turn_reaches_its_caller_and_then_ends_the_actor() {
 #[tokio::test]
 async fn a_refused_turn_answers_its_caller_with_nothing() {
     let ran = ran();
-    let ledger = ledger::actor_with(
-        Ledger::default(),
-        vec![Box::new(Recording::refusing("saver", &ran))],
-    );
+    let ledger = ledger::setup(Ledger::default())
+        .observe(Recording::refusing("saver", &ran))
+        .actor();
 
     assert_eq!(
         ledger.post(1).await,
@@ -627,7 +627,7 @@ async fn a_local_caller_is_told_refused_when_a_non_fatal_observer_refuses() {
     let ran = ran();
     let observed = ran.clone();
     let refused_once = Arc::new(AtomicBool::new(false));
-    let ledger = ledger::supervised(
+    let ledger = ledger::restarting(
         move || {
             let observed = observed.clone();
             let refused_once = refused_once.clone();
@@ -646,7 +646,8 @@ async fn a_local_caller_is_told_refused_when_a_non_fatal_observer_refuses() {
             Duration::from_millis(50),
         )
         .expect("a recovery span whose backoff is not zero"),
-    );
+    )
+    .actor();
 
     assert_eq!(
         ledger.post(1).await,
@@ -721,10 +722,9 @@ async fn a_live_actor_has_not_ended() {
 #[tokio::test]
 async fn a_read_runs_no_observers() {
     let ran = ran();
-    let ledger = ledger::actor_with(
-        Ledger::default(),
-        vec![Box::new(Recording::accepting("saver", &ran))],
-    );
+    let ledger = ledger::setup(Ledger::default())
+        .observe(Recording::accepting("saver", &ran))
+        .actor();
 
     assert_eq!(ledger.post(1).await.expect("running"), 1);
     assert_eq!(*ran.lock().unwrap(), ["saver"]);
@@ -753,7 +753,9 @@ async fn a_read_runs_no_observers() {
 /// lives here.
 #[tokio::test]
 async fn an_observer_can_give_up_with_a_message_or_with_an_error() {
-    let with_message = ledger::actor_with(Ledger::default(), vec![Box::new(GivesUp::WithMessage)]);
+    let with_message = ledger::setup(Ledger::default())
+        .observe(GivesUp::WithMessage)
+        .actor();
     assert_eq!(
         with_message.post(1).await,
         Err(Unanswered::Turn(Withheld::Refused {
@@ -768,7 +770,9 @@ async fn an_observer_can_give_up_with_a_message_or_with_an_error() {
         other => panic!("got {other:?}"),
     }
 
-    let with_error = ledger::actor_with(Ledger::default(), vec![Box::new(GivesUp::WithError)]);
+    let with_error = ledger::setup(Ledger::default())
+        .observe(GivesUp::WithError)
+        .actor();
     assert_eq!(
         with_error.post(1).await,
         Err(Unanswered::Turn(Withheld::Refused {
@@ -797,14 +801,11 @@ async fn an_observer_can_give_up_with_a_message_or_with_an_error() {
 #[tokio::test]
 async fn observers_run_in_order_and_the_first_refusal_stops_the_rest() {
     let ran = ran();
-    let ledger = ledger::actor_with(
-        Ledger::default(),
-        vec![
-            Box::new(Recording::accepting("first", &ran)),
-            Box::new(Recording::refusing("second", &ran)),
-            Box::new(Recording::accepting("third", &ran)),
-        ],
-    );
+    let ledger = ledger::setup(Ledger::default())
+        .observe(Recording::accepting("first", &ran))
+        .observe(Recording::refusing("second", &ran))
+        .observe(Recording::accepting("third", &ran))
+        .actor();
 
     // The name is the refusing observer's and not the chain's first: the caller
     // is told which one stopped it.
@@ -862,7 +863,9 @@ impl Observer<Ledger> for ExplodesBeforeItYields {
 
 #[tokio::test]
 async fn an_observer_that_panics_before_it_yields_is_still_named() {
-    let ledger = ledger::actor_with(Ledger::default(), vec![Box::new(ExplodesBeforeItYields)]);
+    let ledger = ledger::setup(Ledger::default())
+        .observe(ExplodesBeforeItYields)
+        .actor();
 
     // The **synchronous** half reaches the same answer as the half that yields.
     // Two `catch_unwind` sites write one slot, and a caller must not be able to
@@ -902,10 +905,9 @@ async fn an_observer_that_panics_before_it_yields_is_still_named() {
 #[tokio::test]
 async fn an_observer_is_told_which_method_the_turn_ran() {
     let ran = ran();
-    let ledger = ledger::actor_with(
-        Ledger::default(),
-        vec![Box::new(Naming { ran: ran.clone() })],
-    );
+    let ledger = ledger::setup(Ledger::default())
+        .observe(Naming { ran: ran.clone() })
+        .actor();
 
     assert_eq!(ledger.post(1).await.expect("running"), 1);
 
@@ -986,10 +988,9 @@ async fn an_observer_can_be_unit_tested_without_an_actor() {
 async fn finish_runs_once_after_the_last_turn_and_before_stop_returns() {
     let ran = ran();
     let ending = Arc::new(Mutex::new(Vec::new()));
-    let ledger = ledger::actor_with(
-        Ledger::default(),
-        vec![Box::new(Finishing::new("saver", &ran, &ending))],
-    );
+    let ledger = ledger::setup(Ledger::default())
+        .observe(Finishing::new("saver", &ran, &ending))
+        .actor();
 
     for entry in 1..=3 {
         assert_eq!(ledger.post(entry).await.expect("running"), entry);
@@ -1028,13 +1029,10 @@ async fn finish_runs_once_after_the_last_turn_and_before_stop_returns() {
 async fn finish_receives_the_same_ending_the_actor_reports() {
     let ran = ran();
     let ending = Arc::new(Mutex::new(Vec::new()));
-    let ledger = ledger::actor_with(
-        Ledger::default(),
-        vec![
-            Box::new(Recording::refusing("vetoing", &ran)),
-            Box::new(Finishing::new("saver", &ran, &ending)),
-        ],
-    );
+    let ledger = ledger::setup(Ledger::default())
+        .observe(Recording::refusing("vetoing", &ran))
+        .observe(Finishing::new("saver", &ran, &ending))
+        .actor();
 
     assert_eq!(
         ledger.post(1).await,
@@ -1086,24 +1084,21 @@ async fn finish_receives_the_same_ending_the_actor_reports() {
 async fn finish_runs_on_every_observer_even_when_an_earlier_one_panics() {
     let ran = ran();
     let ending = Arc::new(Mutex::new(Vec::new()));
-    let ledger = ledger::actor_with(
-        Ledger::default(),
-        vec![
-            Box::new(Finishing::falling(
-                "early",
-                &ran,
-                &ending,
-                Falls::BeforeItYields,
-            )),
-            Box::new(Finishing::falling(
-                "late",
-                &ran,
-                &ending,
-                Falls::InsideTheFuture,
-            )),
-            Box::new(Finishing::new("last", &ran, &ending)),
-        ],
-    );
+    let ledger = ledger::setup(Ledger::default())
+        .observe(Finishing::falling(
+            "early",
+            &ran,
+            &ending,
+            Falls::BeforeItYields,
+        ))
+        .observe(Finishing::falling(
+            "late",
+            &ran,
+            &ending,
+            Falls::InsideTheFuture,
+        ))
+        .observe(Finishing::new("last", &ran, &ending))
+        .actor();
 
     assert_eq!(ledger.post(1).await.expect("running"), 1);
     ledger
@@ -1147,10 +1142,9 @@ async fn finish_runs_on_stop_and_not_on_abort() {
     let ran = ran();
 
     let aborted_log = Arc::new(Mutex::new(Vec::new()));
-    let aborted = ledger::actor_with(
-        Ledger::default(),
-        vec![Box::new(Finishing::new("saver", &ran, &aborted_log))],
-    );
+    let aborted = ledger::setup(Ledger::default())
+        .observe(Finishing::new("saver", &ran, &aborted_log))
+        .actor();
     assert_eq!(aborted.post(1).await.expect("running"), 1);
     aborted.abort();
     // The abort is cooperative, so wait for it to have landed rather than
@@ -1169,10 +1163,9 @@ async fn finish_runs_on_stop_and_not_on_abort() {
     );
 
     let stopped_log = Arc::new(Mutex::new(Vec::new()));
-    let stopped = ledger::actor_with(
-        Ledger::default(),
-        vec![Box::new(Finishing::new("saver", &ran, &stopped_log))],
-    );
+    let stopped = ledger::setup(Ledger::default())
+        .observe(Finishing::new("saver", &ran, &stopped_log))
+        .actor();
     assert_eq!(stopped.post(1).await.expect("running"), 1);
     stopped
         .stop()

@@ -37,7 +37,7 @@ pub enum Error {
     Codec(#[from] postcard::Error),
 
     /// A header frame announced more bytes than the cap allows. Checked before
-    /// a single byte is buffered, so announcing a huge frame costs the peer
+    /// a single byte is queued, so announcing a huge frame costs the peer
     /// everything and us nothing.
     #[error("header frame of {len} bytes exceeds the {cap} byte cap")]
     FrameTooLarge {

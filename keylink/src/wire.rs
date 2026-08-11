@@ -284,7 +284,7 @@ mod tests {
     /// check happened after buffering it would block until the connection
     /// timed out, because no bytes follow the prefix.
     #[tokio::test]
-    async fn an_announced_frame_over_the_cap_is_refused_before_anything_is_buffered() {
+    async fn an_announced_frame_over_the_cap_is_refused_before_anything_is_queued() {
         let link = testing::link().await;
         let (mut send, _recv) = link.client.open_bi().await.unwrap();
         send.write_all(&u32::MAX.to_le_bytes()).await.unwrap();

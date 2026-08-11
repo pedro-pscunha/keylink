@@ -36,7 +36,7 @@
 //! | a panicking `retire` costs its own member and not the teardown | `a_panicking_retire_costs_its_own_member_and_not_the_teardown` |
 //! | a keyed actor's own ending reaches a `watch` future, carrying the reason its loop returned | `a_keyed_actors_own_ending_reaches_a_watch_future_with_its_reason` |
 //! | every waiter filed under one name is answered, and not just one of them | `two_watchers_on_one_name_are_both_answered` |
-//! | two `Lifecycle`s on one `System` both fire, so watching does not cost the console | `two_lifecycles_on_one_system_both_fire` |
+//! | two `Lifecycle`s on one `Registry` both fire, so watching does not cost the console | `two_lifecycles_on_one_system_both_fire` |
 //! | a sink that panics on a mount costs its own report, not the mount and not the sink behind it | `a_panicking_lifecycle_sink_does_not_unwind_into_the_mount_it_reports` |
 //! | a sink that panics on an ending does not leave the `Endings` behind it waiting for ever | `a_panicking_lifecycle_sink_does_not_deprive_the_next_of_an_ending` |
 //! | an abandoned `watch` unfiles its own waiter and not a later one under that name | `an_abandoned_watch_unfiles_its_own_waiter_and_not_a_later_one` |
@@ -95,6 +95,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use std::future::Future;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -238,15 +239,13 @@ fn desk(fills: Subscription<u64>) -> (desk::Handle<Desk>, mpsc::UnboundedReceive
     let (seen, heard) = mpsc::unbounded_channel();
     let (entered, entered_rx) = oneshot::channel();
     let (release, gate) = oneshot::channel();
-    let actor = desk::actor_wired(
-        Desk {
-            seen,
-            entered: Some(entered),
-            gate: Some(gate),
-        },
-        Vec::new(),
-        desk::Feeds::new(fills),
-    );
+    let actor = desk::setup(Desk {
+        seen,
+        entered: Some(entered),
+        gate: Some(gate),
+    })
+    .feeds(desk::Feeds::new(fills))
+    .actor();
     (
         actor,
         heard,
@@ -334,8 +333,8 @@ impl bench::Actor for Bench {
 /// [`Gate`] per member in member order.
 ///
 /// The policy is an argument rather than a default because it is the **control**
-/// for [`Routing::LeastLoaded`]: at depth one `buffered` is 0 or 1, so that
-/// mode's assertion would be about `is_busy` alone and the depth is what makes it
+/// for [`Routing::LeastLoaded`]: at depth one `queued` is 0 or 1, so that
+/// mode's assertion would be about `busy` alone and the depth is what makes it
 /// about a gradient.
 fn bench<K>(
     count: usize,
@@ -358,17 +357,15 @@ fn bench<K>(
                 entered: entered_rx,
                 release,
             });
-            bench::actor_deep(
-                Bench {
-                    me: numbered(member),
-                    ran: ran.clone(),
-                    entered: Some(entered),
-                    gate: Some(gate),
-                },
-                Vec::new(),
-                bench::Feeds::new(),
-                mailbox,
-            )
+            bench::setup(Bench {
+                me: numbered(member),
+                ran: ran.clone(),
+                entered: Some(entered),
+                gate: Some(gate),
+            })
+            .feeds(bench::Feeds::new())
+            .backpressure(mailbox)
+            .actor()
         },
     );
     (factory, handled, gates)
@@ -512,7 +509,7 @@ async fn a_slow_subscriber_is_unsubscribed_and_its_actor_ends_naming_the_feed() 
             dropped: 1,
             gone: 0
         },
-        "the slow subscriber is dropped, not buffered"
+        "the slow subscriber is dropped, not queued"
     );
     assert_eq!(fast_heard.recv().await, Some(2));
     assert_eq!(topic.subscribers(), 1, "and it is gone from the topic");
@@ -880,8 +877,8 @@ async fn the_same_key_reaches_the_same_worker() {
 /// Registered as `B8`.
 ///
 /// **The depth is the control and not a detail.** At the default of one,
-/// `buffered` is 0 or 1 and the busy member has nothing queued behind its turn,
-/// so this would be an assertion about `is_busy` alone. At four, member one is
+/// `queued` is 0 or 1 and the busy member has nothing queued behind its turn,
+/// so this would be an assertion about `busy` alone. At four, member one is
 /// three messages behind **and still admitting**, so choosing it would have
 /// succeeded — the mode declined a member it could have used, which is the only
 /// form in which a gradient is observable from outside.
@@ -1007,17 +1004,17 @@ async fn racing_reserves_conserves_capacity() {
     let member = &factory.members()[0];
 
     let held = member
-        .__try_reserve()
+        .try_reserve()
         .expect("the member is running")
         .expect("the one free slot");
     assert!(
-        matches!(member.__try_reserve(), Ok(None)),
+        matches!(member.try_reserve(), Ok(None)),
         "the one slot is held, so this mailbox is full",
     );
 
     let racer = tokio::spawn({
         let member = member.clone();
-        async move { member.__reserve_owned().await }
+        async move { member.reserve_owned().await }
     });
     spun().await;
     assert!(
@@ -1034,7 +1031,7 @@ async fn racing_reserves_conserves_capacity() {
     racer.abort();
 
     assert!(
-        settles(|| matches!(member.__try_reserve(), Ok(Some(_)))).await,
+        settles(|| matches!(member.try_reserve(), Ok(Some(_)))).await,
         "a cancelled racer must give its slot back, and this member never got \
          one back",
     );
@@ -1115,7 +1112,7 @@ async fn a_race_across_four_live_members_gives_every_loser_its_slot_back() {
         .iter()
         .map(|member| {
             member
-                .__try_reserve()
+                .try_reserve()
                 .expect("the member is running")
                 .expect("the one free slot")
         })
@@ -1158,7 +1155,7 @@ async fn a_race_across_four_live_members_gives_every_loser_its_slot_back() {
             .members()
             .iter()
             .enumerate()
-            .filter(|(_, member)| !matches!(member.__try_reserve(), Ok(Some(_))))
+            .filter(|(_, member)| !matches!(member.try_reserve(), Ok(Some(_))))
             .map(|(at, _)| at)
             .collect::<Vec<_>>()
     };
@@ -1559,7 +1556,7 @@ fn refusing(fatal: bool, recovered_after: Duration) -> (worker::Handle<Worker>, 
     let seen = Arc::new(AtomicUsize::new(0));
     let member = {
         let built = Arc::clone(&built);
-        worker::supervised(
+        worker::restarting(
             move || {
                 let built = Arc::clone(&built);
                 let seen = Arc::clone(&seen);
@@ -1572,6 +1569,7 @@ fn refusing(fatal: bool, recovered_after: Duration) -> (worker::Handle<Worker>, 
             },
             limit(2, recovered_after),
         )
+        .actor()
     };
     (member, built)
 }
@@ -3087,8 +3085,8 @@ async fn a_panicking_retire_costs_its_own_member_and_not_the_teardown() {
 /// teardown.
 ///
 /// `compose::keyed`'s own four-path table is the argument:
-/// [`System::abort`](keylink::System::abort) reports [`Ended::Vanished`] and
-/// [`System::shutdown`](keylink::System::shutdown) reports [`Ended::Stopped`],
+/// [`Registry::abort`](keylink::Registry::abort) reports [`Ended::Vanished`] and
+/// [`Registry::stop`](keylink::Registry::stop) reports [`Ended::Stopped`],
 /// and neither one asks the loop anything. So a `GaveUp` that arrives at a
 /// waiter came from the loop and from nowhere else.
 fn gave_up(after: u32) -> Ended {
@@ -3108,7 +3106,7 @@ fn gave_up(after: u32) -> Ended {
 /// — which needs a served client, since a keyed mailbox is reachable over a QUIC
 /// stream or not at all. Nothing below needs a message, so nothing below binds a
 /// node.
-fn ending_when(told: oneshot::Receiver<Ended>) -> worker::Mounted {
+fn ending_when(told: oneshot::Receiver<Ended>) -> worker::Mountable {
     keylink::mount(move |_inbox: worker::Mailbox| async move {
         // A dropped sender is a test that went away before it said anything.
         // `Vanished` is what an interrupted loop means, and it fails the
@@ -3148,13 +3146,13 @@ impl Lifecycle for Watched {
 /// dropped-sender arm and never through `send` at all.
 ///
 /// `Vanished` is the replacement and not some other constant, because it is the
-/// synthetic value [`System::abort`](keylink::System::abort) reports when
+/// synthetic value [`Registry::abort`](keylink::Registry::abort) reports when
 /// cancellation wins before the loop publishes: a waiter that answered the
 /// teardown's reason instead of the loop's would look exactly like this.
 #[tokio::test]
 async fn a_keyed_actors_own_ending_reaches_a_watch_future_with_its_reason() {
     let endings = Endings::new();
-    let system = worker::System::builder(Eviction::Never)
+    let system = worker::Registry::builder(Eviction::Never)
         .lifecycle(endings.clone())
         .build();
     let id = ActorId::new("ledger/7").expect("a name");
@@ -3194,7 +3192,7 @@ async fn a_keyed_actors_own_ending_reaches_a_watch_future_with_its_reason() {
 #[tokio::test]
 async fn a_late_old_lifecycle_report_does_not_answer_the_replacements_waiter() {
     let endings = Endings::new();
-    let system = worker::System::builder(Eviction::Never)
+    let system = worker::Registry::builder(Eviction::Never)
         .lifecycle(endings.clone())
         .build();
     let id = ActorId::new("ledger/reused").expect("a name");
@@ -3209,7 +3207,7 @@ async fn a_late_old_lifecycle_report_does_not_answer_the_replacements_waiter() {
         let id = id.clone();
         tokio::spawn(async move {
             system
-                .shutdown(&id, Duration::from_secs(60))
+                .stop(&id, Duration::from_secs(60))
                 .await
                 .expect("the old incarnation was mounted")
         })
@@ -3251,7 +3249,7 @@ async fn a_late_old_lifecycle_report_does_not_answer_the_replacements_waiter() {
 }
 
 /// Made red by `scripts/break-once.sh keylink/src/actor/registry.rs`, replacing
-/// `SystemBuilder::lifecycle`'s `        self.lifecycle.push(Arc::new(lifecycle));`
+/// `RegistryBuilder::lifecycle`'s `        self.lifecycle.push(Arc::new(lifecycle));`
 /// with `        self.lifecycle = vec![Arc::new(lifecycle)];` — the single slot
 /// that method's own doc records as the defect it replaced, where a second
 /// `.lifecycle(..)` displaced the first with no error, no warning and no
@@ -3287,7 +3285,7 @@ async fn a_late_old_lifecycle_report_does_not_answer_the_replacements_waiter() {
 async fn two_lifecycles_on_one_system_both_fire() {
     let endings = Endings::new();
     let seen: Arc<Mutex<Vec<ActorId>>> = Arc::new(Mutex::new(Vec::new()));
-    let system = worker::System::builder(Eviction::Never)
+    let system = worker::Registry::builder(Eviction::Never)
         .lifecycle(Watched {
             seen: Arc::clone(&seen),
         })
@@ -3350,7 +3348,7 @@ impl Lifecycle for Mounts {
 ///
 /// Two types and not one with a flag, because the two report sites fail
 /// differently and each guard installs exactly the one it is about: an unwind
-/// out of `mounted` reaches the caller of [`System::mount`], and an unwind out
+/// out of `mounted` reaches the caller of [`Registry::mount`], and an unwind out
 /// of `ended` reaches a spawned teardown where nobody is waiting at all.
 struct BrokenOnMount;
 
@@ -3394,7 +3392,7 @@ impl Lifecycle for BrokenOnEnding {
 #[tokio::test]
 async fn a_panicking_lifecycle_sink_does_not_unwind_into_the_mount_it_reports() {
     let seen: Arc<Mutex<Vec<ActorId>>> = Arc::new(Mutex::new(Vec::new()));
-    let system = worker::System::builder(Eviction::Never)
+    let system = worker::Registry::builder(Eviction::Never)
         .lifecycle(BrokenOnMount)
         .lifecycle(Mounts {
             seen: Arc::clone(&seen),
@@ -3449,7 +3447,7 @@ async fn a_panicking_lifecycle_sink_does_not_unwind_into_the_mount_it_reports() 
 #[tokio::test]
 async fn a_panicking_lifecycle_sink_does_not_deprive_the_next_of_an_ending() {
     let endings = Endings::new();
-    let system = worker::System::builder(Eviction::Never)
+    let system = worker::Registry::builder(Eviction::Never)
         .lifecycle(BrokenOnEnding)
         .lifecycle(endings.clone())
         .build();
@@ -3557,7 +3555,7 @@ async fn two_watchers_on_one_name_are_both_answered() {
 /// field — but nothing in this file can redden it, so read it as the statement
 /// that the report emptied the map and read the second one as the guard.
 ///
-/// No [`System`](keylink::System) here at all. [`Endings`] is a [`Lifecycle`],
+/// No [`Registry`](keylink::Registry) here at all. [`Endings`] is a [`Lifecycle`],
 /// so the report is made by hand, and a registry between the two would add
 /// scheduling to a test about a map.
 #[tokio::test]
@@ -3648,7 +3646,7 @@ async fn an_abandoned_watch_unfiles_its_own_waiter_and_not_a_later_one() {
 /// at the [`NO_PROGRESS`] bound.
 ///
 /// Built, watched and never installed is exactly that sentence's case, so no
-/// [`System`](keylink::System) is bound here: the map going away with its last
+/// [`Registry`](keylink::Registry) is bound here: the map going away with its last
 /// clone is the whole of what happens, and the [`Endings`] the system would have
 /// held is the clone that is missing.
 #[tokio::test]
@@ -3693,14 +3691,14 @@ async fn a_watch_outliving_its_endings_resolves_vanished_rather_than_hanging() {
 /// The file already runs one literal for two guards on the policy's reason, and
 /// records why they are not one claim; this is that arrangement on the keyed
 /// side. `Vanished` is the replacement because it is the synthetic value
-/// [`System::abort`](keylink::System::abort) reports when cancellation wins, and
+/// [`Registry::abort`](keylink::Registry::abort) reports when cancellation wins, and
 /// `abort` is what this member's `retire` calls — a group reading the teardown's reason instead of
 /// the loop's would be indistinguishable from a correct one under any other
 /// value.
 #[tokio::test]
 async fn a_keyed_actor_is_a_group_member_end_to_end() {
     let endings = Endings::new();
-    let system = worker::System::builder(Eviction::Never)
+    let system = worker::Registry::builder(Eviction::Never)
         .lifecycle(endings.clone())
         .build();
     let id = ActorId::new("ledger/7").expect("a name");
@@ -3715,7 +3713,7 @@ async fn a_keyed_actor_is_a_group_member_end_to_end() {
 
     // The two values a `Membership` wants, both from the keyed side and neither
     // from a handle: the ending from `Endings::watch`, the retiring from
-    // `System::abort`. `abort` and not `shutdown`, for the reason
+    // `Registry::abort`. `abort` and not `shutdown`, for the reason
     // `Membership::new` gives about a member sitting in a backoff.
     let retiring = system.clone();
     let retired = id.clone();
@@ -3779,7 +3777,7 @@ async fn a_keyed_actor_is_a_group_member_end_to_end() {
 /// the actor is mounted; the `Option` is handled at that boundary, not hidden.
 #[tokio::test]
 async fn a_group_accepts_the_direct_system_ending_of_a_keyed_member() {
-    let system = worker::System::builder(Eviction::Never).build();
+    let system = worker::Registry::builder(Eviction::Never).build();
     let id = ActorId::new("ledger/direct").expect("a name");
     let (ends, told) = oneshot::channel();
     system

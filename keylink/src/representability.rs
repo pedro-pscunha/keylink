@@ -147,7 +147,7 @@ impl OriginIsNotClone for Origin {}
 ///
 /// Neither probe touches the hazard as it would actually arrive, because **nobody
 /// duplicates the `Origin` — the caller clones the `Context` on the way in.**
-/// `deliver_to_actor` is `#[doc(hidden)] pub` and takes a `Context` by value, so
+/// `deliver_keyed` is `#[doc(hidden)] pub` and takes a `Context` by value, so
 /// two deliveries sharing one `Progress` type-check without naming `Origin`, and a
 /// probe can only refuse a shape that does *not* type-check. There is no negative
 /// claim to make here and this module must not imply one.
@@ -252,16 +252,16 @@ impl beta::Actor for BetaState {
 /// represent.
 ///
 /// Made red by `scripts/break-once.sh keylink/src/macros.rs`, replacing
-/// `keyed_alpn`'s `derive_alpn::<KeyedContract>(KEYED_PROTOCOL)` with
+/// `registry_alpn`'s `derive_alpn::<KeyedContract>(KEYED_PROTOCOL)` with
 /// `alpn().to_vec()`. Watched: `assertion `left != right` failed`, both sides
 /// `keylink/Alpha/8d5e509da907517a`.
 #[test]
 fn a_services_two_alpns_differ_from_each_other_and_from_another_services() {
-    assert_ne!(alpha::alpn(), alpha::keyed_alpn());
-    assert_ne!(alpha::keyed_alpn(), beta::keyed_alpn());
+    assert_ne!(alpha::alpn(), alpha::registry_alpn());
+    assert_ne!(alpha::registry_alpn(), beta::registry_alpn());
     assert_ne!(alpha::alpn(), beta::alpn());
     assert!(
-        String::from_utf8_lossy(alpha::keyed_alpn()).contains("/Alpha/keyed/"),
+        String::from_utf8_lossy(alpha::registry_alpn()).contains("/Alpha/keyed/"),
         "the keyed ALPN says which of the two it is without anyone hashing anything"
     );
 }
@@ -336,7 +336,7 @@ async fn the_plain_client_does_have_that_tell(plain: alpha::Client) {
     let _: crate::Result<()> = plain.note("a line".to_owned()).await;
 }
 
-/// The claim the whole keyed rewrite rests on: **a per-service `System`
+/// The claim the whole keyed rewrite rests on: **a per-service `Registry`
 /// physically cannot hold another service's actor**, so the mismatch is
 /// unrepresentable rather than refused at run time on the serving node.
 ///
@@ -351,7 +351,7 @@ async fn the_plain_client_does_have_that_tell(plain: alpha::Client) {
 /// can be made to check it: as code that must type-check, whose types are
 /// annotated rather than inferred.
 ///
-/// The annotations are the assertion. `let mounted: alpha::Mounted` pins the
+/// The annotations are the assertion. `let mounted: alpha::Mountable` pins the
 /// generated alias, so this stays a statement about `alpha`'s system rather than
 /// about whatever inference happened to pick.
 ///
@@ -360,9 +360,9 @@ async fn the_plain_client_does_have_that_tell(plain: alpha::Client) {
 ///
 /// ```text
 /// error[E0308]: mismatched types
-///    |     let mounted: alpha::Mounted = beta::spawn(BetaState);
-///    |                  --------------   ^^^^^^^^^^^^^^^^^^^^^^ expected `Mounted<Mail<alpha::Request, alpha::Response>>`,
-///    |                                                           found `Mounted<Mail<beta::Request, beta::Response>>`
+///    |     let mounted: alpha::Mountable = beta::spawn(BetaState);
+///    |                  --------------   ^^^^^^^^^^^^^^^^^^^^^^ expected `Mountable<Mail<alpha::Request, alpha::Response>>`,
+///    |                                                           found `Mountable<Mail<beta::Request, beta::Response>>`
 /// ```
 ///
 /// # What this does NOT prove
@@ -371,22 +371,22 @@ async fn the_plain_client_does_have_that_tell(plain: alpha::Client) {
 /// `ServiceBuilder::new(alpn: &'static [u8], ..)` takes the ALPN as an untyped
 /// slice, so nothing at the type level stops `alpha`'s dispatch from being
 /// registered under `beta`'s ALPN. What prevents that is the generated pairing —
-/// `alpha::keyed_service` is the only thing that calls `alpha::keyed_alpn()` —
+/// `registry.service(..)` is the only path that calls `alpha::registry_alpn()` —
 /// and a hand-written registration could still get it wrong. Saying so is the
 /// difference between a probe and a claim about a probe.
 fn a_system_mounts_only_its_own_services_actors(
-    system: &alpha::System,
+    system: &alpha::Registry,
     id: ActorId,
 ) -> Result<(), MountError> {
-    let mounted: alpha::Mounted = alpha::spawn(AlphaState);
+    let mounted: alpha::Mountable = alpha::spawn(AlphaState);
     system.mount(id, mounted)
 }
 
-/// The same property from the builder's side, so a future `System` that lost
+/// The same property from the builder's side, so a future `Registry` that lost
 /// its parameter would break here too rather than only above.
-fn a_system_is_built_at_one_services_mail() -> beta::System {
-    beta::System::builder(Eviction::Never)
-        .capacity(beta::SystemBuilder::DEFAULT_CAPACITY)
+fn a_system_is_built_at_one_services_mail() -> beta::Registry {
+    beta::Registry::builder(Eviction::Never)
+        .capacity(beta::RegistryBuilder::DEFAULT_CAPACITY)
         .build()
 }
 
@@ -1018,7 +1018,7 @@ fn a_deferred_reply_is_send() {
 /// Two probes, because the two ways it would arrive cannot see each other.
 ///
 /// **A second constructor**, caught by shadowing on the name. While
-/// `SystemBuilder` has no inherent method of these names each call resolves to the
+/// `RegistryBuilder` has no inherent method of these names each call resolves to the
 /// trait default and hands back the marker; add `pub fn unbounded(self) -> Self`
 /// and the inherent method outranks the trait, the marker is not what comes back,
 /// and this module stops compiling. [`Backpressure`](crate::Backpressure) is
@@ -1069,16 +1069,18 @@ trait NoUnboundedMailbox {
     }
 }
 
-impl NoUnboundedMailbox for beta::SystemBuilder {}
+impl NoUnboundedMailbox for beta::RegistryBuilder {}
 impl NoUnboundedMailbox for crate::Backpressure {}
 
-fn no_mailbox_can_be_asked_to_be_unbounded(builder: beta::SystemBuilder) -> beta::SystemBuilder {
+fn no_mailbox_can_be_asked_to_be_unbounded(
+    builder: beta::RegistryBuilder,
+) -> beta::RegistryBuilder {
     let _: NoSuchMethod = builder.unbounded();
     let _: NoSuchMethod = builder.unbounded_mailbox();
     let _: NoSuchMethod = builder.without_backpressure();
 
-    let depth: fn(beta::SystemBuilder, NonZeroUsize) -> beta::SystemBuilder =
-        beta::SystemBuilder::mailbox_depth;
+    let depth: fn(beta::RegistryBuilder, NonZeroUsize) -> beta::RegistryBuilder =
+        beta::RegistryBuilder::mailbox_depth;
     depth(builder, NonZeroUsize::MIN)
 }
 
@@ -1236,7 +1238,7 @@ fn no_ledger_bound_can_be_asked_to_be_zero(limits: crate::Limits) -> crate::Limi
 /// A destructuring pattern with no `..`, which is `E0027` the moment a field is
 /// added — in keylink, at the doc comment that records which fields were refused
 /// and why: an `incarnation` that nothing in the crate counts, and a `queued` that
-/// would claim the parked senders [`ActorStatus::buffered`] documents itself as
+/// would claim the parked senders [`ActorStatus::queued`] documents itself as
 /// unable to see.
 ///
 /// `#[non_exhaustive]` is what stops a *caller* writing this pattern, and it is
@@ -1247,10 +1249,10 @@ fn an_actor_status_claims_only_what_it_measures(status: ActorStatus) -> (bool, u
         id,
         idle_for,
         busy,
-        buffered,
+        queued,
     } = status;
     let _ = (id, idle_for);
-    (busy, buffered)
+    (busy, queued)
 }
 
 /// The claim: what a console is told about an actor **is** an [`ActorStatus`],

@@ -16,7 +16,7 @@
 //!
 //! # One test asserts, one measurement prints
 //!
-//! [`keylink::SystemBuilder::mailbox_depth`] makes a claim with two halves — a
+//! [`keylink::RegistryBuilder::mailbox_depth`] makes a claim with two halves — a
 //! shape and a duration — and they want opposite harnesses. The shape is exact and
 //! belongs in the gate. The duration is a wall-clock reading on a machine doing
 //! other things, and an assertion on it would be a coin flip. So the shape is
@@ -25,6 +25,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
@@ -89,7 +90,7 @@ impl queue::Actor for Queued {
 /// mailbox, so one signal per call here says every call has arrived and is either
 /// in the mailbox or parked in front of it.
 ///
-/// It is not optional. [`keylink::ActorStatus::buffered`] cannot make that
+/// It is not optional. [`keylink::ActorStatus::queued`] cannot make that
 /// distinction alone — a parked sender is not observable at all — so without this
 /// signal "three of four are in the mailbox" could not be told apart from "the
 /// fourth has not landed yet", and the assertion would be a floor instead of an
@@ -112,7 +113,7 @@ impl<Req: Send + 'static, Resp: Send + 'static> Middleware<Req, Resp> for Arrive
 /// One keyed actor at a stated mailbox depth, reached through its own generated
 /// client.
 struct Fixture {
-    client: queue::KeyedClient,
+    client: queue::RegistryClient,
     /// Fires when `hold` starts its turn.
     entered: mpsc::UnboundedReceiver<()>,
     /// Fires when a call reaches the serving side, before the mailbox.
@@ -121,7 +122,7 @@ struct Fixture {
     release: Arc<Semaphore>,
     /// Fires once per completed turn.
     turns: mpsc::UnboundedReceiver<()>,
-    system: queue::System,
+    system: queue::Registry,
     _server: Server,
     _nodes: [Node; 2],
 }
@@ -134,7 +135,7 @@ fn only() -> keylink::ActorId {
 async fn at_depth(depth: usize) -> Fixture {
     let server = local_node().await;
     let client_node = local_node().await;
-    let system: queue::System = queue::System::builder(Eviction::Never)
+    let system: queue::Registry = queue::Registry::builder(Eviction::Never)
         .mailbox_depth(NonZeroUsize::new(depth).expect("a mailbox depth is never zero"))
         .build();
     let (entered_tx, entered) = mpsc::unbounded_channel();
@@ -143,13 +144,14 @@ async fn at_depth(depth: usize) -> Fixture {
     let release = Arc::new(Semaphore::new(0));
     let running = Server::builder(&server)
         .service(
-            queue::keyed_service(&system, Allowlist::anyone())
+            system
+                .service(Allowlist::anyone())
                 .layer(Arrived(arrived_tx))
                 .build(),
         )
         .spawn()
         .expect("one service, no duplicate ALPN");
-    let client = queue::KeyedClient::connect(&client_node, server.endpoint().addr())
+    let client = queue::RegistryClient::connect(&client_node, server.endpoint().addr())
         .await
         .expect("the client dials the actor system");
     system
@@ -176,10 +178,10 @@ async fn at_depth(depth: usize) -> Fixture {
 }
 
 /// The mailbox reading for the fixture's one actor.
-fn buffered(system: &queue::System) -> u64 {
+fn queued(system: &queue::Registry) -> u64 {
     let mut rows = system.status();
     assert_eq!(rows.len(), 1, "the fixture mounts exactly one actor");
-    rows.remove(0).buffered
+    rows.remove(0).queued
 }
 
 /// Wait until the mailbox holds `messages`.
@@ -187,9 +189,9 @@ fn buffered(system: &queue::System) -> u64 {
 /// Bounded, so a reading that never arrives fails the test instead of hanging it.
 /// Nothing here asserts how long anything took: the budget is three orders of
 /// magnitude out, and its expiry means the count is stuck rather than slow.
-async fn until_buffered(system: &queue::System, messages: u64) {
+async fn until_queued(system: &queue::Registry, messages: u64) {
     tokio::time::timeout(Duration::from_secs(30), async {
-        while buffered(system) != messages {
+        while queued(system) != messages {
             tokio::task::yield_now().await;
         }
     })
@@ -202,7 +204,7 @@ async fn until_buffered(system: &queue::System, messages: u64) {
 /// **A mailbox at depth `N` holds exactly `N` messages, and releases none of its
 /// callers early.**
 ///
-/// This is the shape half of [`keylink::SystemBuilder::mailbox_depth`]'s claim, and
+/// This is the shape half of [`keylink::RegistryBuilder::mailbox_depth`]'s claim, and
 /// **writing** it is what corrected that claim — the compiler did, before any of it
 /// ran: the first draft sent a `tell` and did not compile. The doc said the first
 /// `N` callers
@@ -225,7 +227,7 @@ async fn until_buffered(system: &queue::System, messages: u64) {
 /// every part of the spelling is public: [`keylink::RpcClient::tell`] is generic over
 /// any `Serialize` request and opens a unidirectional stream, `keylink::Addressed`
 /// wraps a request with an actor id, and the generated module exports both `Request`
-/// and `keyed_alpn()`. `rpc.rs`'s accept loop takes a unidirectional stream on every
+/// and `registry_alpn()`. `rpc.rs`'s accept loop takes a unidirectional stream on every
 /// served connection, keyed included, and `serve_one_tell` reads the actor off the
 /// envelope. **The macro arm cited above says this itself** — "a keyed `tell` really
 /// would work … `serve_one_tell` walks the same dispatch a call does" — so what is
@@ -250,11 +252,11 @@ async fn until_buffered(system: &queue::System, messages: u64) {
 /// # No clock in any assertion, and no order across streams
 ///
 /// Nothing here *asserts on* a clock, so nothing rests on how loaded the machine is.
-/// One clock is read — `until_buffered` bounds its poll loop with a 30 second
+/// One clock is read — `until_queued` bounds its poll loop with a 30 second
 /// `tokio::time::timeout` — and that budget can only turn a hang into a failure,
 /// which its own doc says. The exactness comes from three signals: `hold` is released
 /// by a semaphore rather than by a timer, `Arrived` says every message has reached the
-/// serving side, and [`keylink::ActorStatus::buffered`] is exactly
+/// serving side, and [`keylink::ActorStatus::queued`] is exactly
 /// `max_capacity() - capacity()`.
 ///
 /// It asserts nothing about the order the four messages are *handled* in. Each call
@@ -264,11 +266,11 @@ async fn until_buffered(system: &queue::System, messages: u64) {
 ///
 /// Red-tested by making `Registry::entry` build every channel at
 /// `DEFAULT_MAILBOX_DEPTH` instead of the system's depth — replacing the whole line
-/// `        let (mail, slots) = mpsc::channel(self.mailbox_depth);` with
-/// `        let (mail, slots) = mpsc::channel(DEFAULT_MAILBOX_DEPTH);`, which is the
-/// whole of what the knob does. Watched here: this test panics in `until_buffered`
+/// `            None => (self.mailbox_depth, false),` with
+/// `            None => (DEFAULT_MAILBOX_DEPTH, false),`, which is the
+/// whole of what the knob does. Watched here: this test panics in `until_queued`
 /// at "3 messages must reach the mailbox" after its 30 second budget, because a
-/// system asked for three slots that builds one never reaches a `buffered` of 3.
+/// system asked for three slots that builds one never reaches a `queued` of 3.
 ///
 /// **This break is shared, and the record names every guard it reaches rather than
 /// claiming this test is its only reader.** `registry.rs` already records the same
@@ -279,7 +281,7 @@ async fn until_buffered(system: &queue::System, messages: u64) {
 /// outcomes are not uniform: one guard HANGS rather than reddens**, so a run that
 /// stalls here is the break working and not a broken harness. Watched, each by name:
 ///
-/// - this test — panics in `until_buffered` at "3 messages must reach the mailbox",
+/// - this test — panics in `until_queued` at "3 messages must reach the mailbox",
 ///   after its 30 second budget;
 /// - `a_budget_sized_for_the_default_depth_under_drains_at_a_deeper_one`, in
 ///   `registry.rs`'s `the mailbox's depth` section — fails its `Ended::Vanished`
@@ -297,8 +299,8 @@ async fn until_buffered(system: &queue::System, messages: u64) {
 ///   watched fail;
 /// - `a_saturated_mailbox_at_depth_does_not_starve_a_feed` in `tests/actors.rs` —
 ///   panics after its own 30 second budget, and that number is `actors.rs`'s own
-///   `until_buffered` rather than this file's same-named helper;
-/// - `buffered_is_exact_at_depth_and_counts_no_parked_sender`, also in that section —
+///   `until_queued` rather than this file's same-named helper;
+/// - `queued_is_exact_at_depth_and_counts_no_parked_sender`, also in that section —
 ///   **HANGS. It never reports at all.** Its actor holds every turn, so nothing ever
 ///   frees a permit: at one slot the second of its three `mail.send(..).await`s parks
 ///   forever, before the assertion that would have caught the wrong count. Killed
@@ -351,7 +353,7 @@ async fn a_mailbox_holds_exactly_its_depth_and_releases_no_caller_early() {
     /// outside it.
     const CALLERS: usize = SLOTS + 1;
 
-    // The same three, as `ActorStatus::buffered` reports them: `buffered` is a `u64`
+    // The same three, as `ActorStatus::queued` reports them: `queued` is a `u64`
     // and a mailbox depth is a `usize`, because only one of the two crosses a wire.
     // Converted rather than written out a second time — a second literal would go on
     // compiling after an edit to `SLOTS`, and would leave the assertions below
@@ -396,7 +398,7 @@ async fn a_mailbox_holds_exactly_its_depth_and_releases_no_caller_early() {
         // queued.
         arrived.recv().await.expect("`hold` arrived");
         assert_eq!(
-            buffered(system),
+            queued(system),
             0,
             "the held message is inside the turn and occupies no slot, which is \
              the distinction a free-capacity reading alone cannot make"
@@ -410,9 +412,9 @@ async fn a_mailbox_holds_exactly_its_depth_and_releases_no_caller_early() {
                 .expect("every caller's message arrives");
         }
 
-        until_buffered(system, slots_filled).await;
+        until_queued(system, slots_filled).await;
         assert_eq!(
-            buffered(system),
+            queued(system),
             slots_filled,
             "the mailbox must hold every message its depth allows and not one \
              more: {CALLERS} messages have reached the serving side and {SLOTS} \
@@ -462,7 +464,7 @@ async fn a_mailbox_holds_exactly_its_depth_and_releases_no_caller_early() {
 /// `CALLERS` messages at every depth, and a `Touch` turn that does one channel
 /// send — so the answer is a function of the queue and not of how far the run got.
 /// The two depths are 1 and 32, which is the range
-/// [`keylink::SystemBuilder::mailbox_depth`] claims is free of any memory trade,
+/// [`keylink::RegistryBuilder::mailbox_depth`] claims is free of any memory trade,
 /// because `tokio::sync::mpsc` allocates its first block of 32 slots eagerly. **That
 /// block size is `tokio`'s and not this repository's**, so it moves on a version bump
 /// with nothing here changing — the external-owner case `rpc.rs`'s module doc states in
@@ -493,7 +495,7 @@ async fn a_mailbox_holds_exactly_its_depth_and_releases_no_caller_early() {
 ///   a depth can buy.
 ///
 /// The numbers this produced, on the machine and day named, are in
-/// [`keylink::SystemBuilder::mailbox_depth`]'s own documentation.
+/// [`keylink::RegistryBuilder::mailbox_depth`]'s own documentation.
 #[tokio::test]
 #[ignore = "a measurement, not an assertion: run with --ignored --nocapture"]
 async fn what_a_deeper_mailbox_buys_the_caller() {

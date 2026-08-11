@@ -27,6 +27,7 @@
 #![cfg(feature = "persist-file")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use keylink::prelude::*;
 use keylink::{
     ActorId, Allowlist, Applied, CallId, Caller, Context, Deferred, Ended, Eviction,
     IdempotencyKey, KeyState, Observer, Persist, Replied, Reply, Server, Stop, TurnFut, TurnInfo,
@@ -204,7 +205,7 @@ impl Snapshots for Flaky {
 }
 
 /// [`Flaky`]'s claim. Exclusivity is deliberately not modelled:
-/// `a_second_open_on_one_state_is_busy` holds that against the real adapter, and
+/// `a_second_open_on_one_state_busy` holds that against the real adapter, and
 /// this one exists for one property.
 struct FlakyClaim {
     failing: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -268,7 +269,7 @@ async fn a_state_survives_the_process_that_built_it() {
         // `start_from` and not `Ledger::default()`, even here where the two are
         // the same value. This line is the one an author copies.
         let (state, saver) = opened.start_from(Ledger::default);
-        let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+        let ledger = ledger::setup(state).observe(saver).actor();
         for entry in [1, 2, 3] {
             ledger.post(entry).await.expect("running");
         }
@@ -287,7 +288,7 @@ async fn a_state_survives_the_process_that_built_it() {
         let (state, saver) = opened.start_from(Ledger::default);
         assert_eq!(state.entries, vec![1, 2, 3]);
 
-        let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+        let ledger = ledger::setup(state).observe(saver).actor();
         ledger.post(4).await.expect("running");
         ledger
             .stop()
@@ -327,7 +328,7 @@ async fn an_answered_call_is_a_stored_call_and_its_bytes_are_framed() {
         .expect("claims and loads")
         .start_from(Ledger::default);
 
-    let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+    let ledger = ledger::setup(state).observe(saver).actor();
     assert_eq!(ledger.post(0x2A).await.expect("running"), 1);
 
     // Nothing between the awaited call and this read.
@@ -392,7 +393,7 @@ async fn a_panicked_turn_is_not_stored_and_ends_the_actor() {
         .expect("claims and loads")
         .start_from(Ledger::default);
 
-    let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+    let ledger = ledger::setup(state).observe(saver).actor();
     ledger.post(1).await.expect("running");
 
     // Spawned, because the panic is resumed in whoever awaited the call.
@@ -437,7 +438,10 @@ async fn a_refusal_before_persist_prevents_the_store() {
         .expect("claims and loads")
         .start_from(Ledger::default);
 
-    let ledger = ledger::actor_with(state, vec![Box::new(Refusing), Box::new(saver)]);
+    let ledger = ledger::setup(state)
+        .observe(Refusing)
+        .observe(saver)
+        .actor();
     assert!(ledger.post(7).await.is_err(), "the turn was refused");
 
     match ledger.ended().await {
@@ -488,7 +492,7 @@ async fn a_turn_whose_store_failed_is_not_written_on_the_way_out() {
     let server = local_node().await;
     let client_node = local_node().await;
 
-    let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+    let ledger = ledger::setup(state).observe(saver).actor();
     let _running = ledger
         .serve(&server, Allowlist::anyone())
         .expect("one service, no duplicate ALPN");
@@ -555,7 +559,7 @@ async fn the_claim_is_free_the_instant_stop_returns() {
         .expect("claims and loads")
         .start_from(Ledger::default);
 
-    let ledger = ledger::actor_with(state, vec![Box::new(saver)]);
+    let ledger = ledger::setup(state).observe(saver).actor();
     ledger.post(1).await.expect("running");
     ledger
         .stop()
@@ -580,7 +584,7 @@ async fn the_claim_is_free_the_instant_stop_returns() {
 /// of `Error::Busy`, which is the shape of any adapter that opens the file and
 /// forgets to lock it: `a second open on a claimed state must be refused`.
 #[tokio::test]
-async fn a_second_open_on_one_state_is_busy() {
+async fn a_second_open_on_one_state_busy() {
     let (_scratch, files) = store("busy").await;
     let id = state_id();
 
@@ -608,14 +612,14 @@ async fn a_second_open_on_one_state_is_busy() {
 /// second loop, generated into the user's crate, which handed the dispatch an
 /// **empty** hook slice — so a keyed actor had no observers, no `finish` and
 /// therefore no route to durability at all. Wave 3 merged the two loops into
-/// `run_loop`, and `spawn_wired` is the door that carries the triple. This test
+/// `run_loop`, and `setup(..).feeds(..).mountable()` is the door that carries the triple. This test
 /// is the payoff: the same `Persist`, on the keyed path, over two real nodes and
-/// the generated `KeyedClient`, because a keyed actor answering a peer is the
+/// the generated `RegistryClient`, because a keyed actor answering a peer is the
 /// only shape a keyed actor has.
 ///
 /// Made red the same way the local test is — a `Persist::after_turn` that does
 /// not store — and it goes red for the keyed reason too: put `Vec::new()` where
-/// `spawn_wired` passes its observers on and the second mount comes back empty.
+/// `setup(..).feeds(..).mountable()` passes its observers on and the second mount comes back empty.
 #[tokio::test]
 async fn a_keyed_actors_state_survives_its_own_process() {
     let (_scratch, files) = store("keyed").await;
@@ -630,19 +634,24 @@ async fn a_keyed_actors_state_survives_its_own_process() {
             .await
             .expect("claims and loads")
             .start_from(Ledger::default);
-        let system = ledger::System::builder(Eviction::Never).capacity(4).build();
+        let system = ledger::Registry::builder(Eviction::Never)
+            .capacity(4)
+            .build();
         system
             .mount(
                 actor.clone(),
-                ledger::spawn_wired(state, vec![Box::new(saver)], ledger::Feeds::new()),
+                ledger::setup(state)
+                    .observe(saver)
+                    .feeds(ledger::Feeds::new())
+                    .mountable(),
             )
             .expect("mounts");
 
         let running = Server::builder(&server)
-            .service(ledger::keyed_service(&system, Allowlist::anyone()).build())
+            .service(system.service(Allowlist::anyone()).build())
             .spawn()
             .expect("one service, no duplicate ALPN");
-        let client = ledger::KeyedClient::connect(&client_node, server.endpoint().addr())
+        let client = ledger::RegistryClient::connect(&client_node, server.endpoint().addr())
             .await
             .expect("the client dials the actor system");
 
@@ -666,7 +675,7 @@ async fn a_keyed_actors_state_survives_its_own_process() {
         // Dropping the observers is the whole of what durability needs here:
         // every accepted turn was already stored before its reply.
         //
-        // `shutdown` rather than `stop`: Wave 4b deleted `System::stop`, whose
+        // `shutdown` rather than `stop`: Wave 4b deleted `Registry::stop`, whose
         // rustdoc claimed `tokio::time::timeout` composes when a fired timeout
         // dropped the `JoinHandle` and detached a live actor still holding this
         // very `Claim`. Every caller names a budget now.
@@ -691,7 +700,7 @@ async fn a_keyed_actors_state_survives_its_own_process() {
         // is NOT watched to fail — nothing available here produces a
         // `Vanished`. It is still strictly stronger than `is_some()`, which
         // accepted every ending there is.
-        match system.shutdown(&actor, Duration::from_secs(5)).await {
+        match system.stop(&actor, Duration::from_secs(5)).await {
             Some(Ended::Stopped) => {}
             other => panic!("the actor was mounted and must drain: got {other:?}"),
         }
@@ -863,7 +872,7 @@ async fn a_deferred_reply_whose_turn_was_not_stored_is_refused() {
         waiting: Vec::new(),
     });
 
-    let vault = teller::actor_with(state, vec![Box::new(saver)]);
+    let vault = teller::setup(state).observe(saver).actor();
 
     // Parked: `withdraw` mutates no balance, so the turn it stores is still 100.
     let receipt = {
@@ -927,7 +936,7 @@ async fn a_deferred_reply_that_is_answered_is_a_stored_reply() {
             waiting: Vec::new(),
         });
 
-    let vault = teller::actor_with(state, vec![Box::new(saver)]);
+    let vault = teller::setup(state).observe(saver).actor();
 
     let receipt = {
         let vault = vault.clone();
@@ -1042,7 +1051,7 @@ async fn a_state_that_is_not_sync_is_still_persisted() {
             .await
             .expect("claims and loads")
             .start_from(Counter::default);
-        let counter = counting::actor_with(state, vec![Box::new(saver)]);
+        let counter = counting::setup(state).observe(saver).actor();
         assert_eq!(counter.hit().await.expect("running"), 1);
         assert_eq!(counter.hit().await.expect("running"), 2);
         counter
@@ -1103,7 +1112,7 @@ async fn the_per_turn_store_cost() {
         .await
         .expect("claims and loads")
         .start_from(Counter::default);
-    let stored = counting::actor_with(state, vec![Box::new(saver)]);
+    let stored = counting::setup(state).observe(saver).actor();
     let started = Instant::now();
     for _ in 0..TURNS {
         stored.hit().await.expect("running");
@@ -1265,7 +1274,7 @@ impl Durable for Till {
 /// `a_keyed_actors_state_survives_its_own_process` does it — because the two runs
 /// here are not the same script: one does the work and the other retries it.
 struct Serving {
-    system: till::System,
+    system: till::Registry,
     running: Server,
 }
 
@@ -1275,15 +1284,18 @@ impl Serving {
             .await
             .expect("claims and loads")
             .start_from(Till::default);
-        let system = till::System::builder(Eviction::Never).capacity(4).build();
+        let system = till::Registry::builder(Eviction::Never).capacity(4).build();
         system
             .mount(
                 actor.clone(),
-                till::spawn_wired(state, vec![Box::new(saver)], till::Feeds::new()),
+                till::setup(state)
+                    .observe(saver)
+                    .feeds(till::Feeds::new())
+                    .mountable(),
             )
             .expect("mounts");
         let running = Server::builder(node)
-            .service(till::keyed_service(&system, Allowlist::anyone()).build())
+            .service(system.service(Allowlist::anyone()).build())
             .spawn()
             .expect("one service, no duplicate ALPN");
         Self { system, running }
@@ -1292,7 +1304,7 @@ impl Serving {
     /// End the process, as far as a claim and a ledger can tell: drain the actor,
     /// which drops the observers and releases the claim, then drop the router.
     async fn stop(self, actor: &ActorId) {
-        match self.system.shutdown(actor, Duration::from_secs(5)).await {
+        match self.system.stop(actor, Duration::from_secs(5)).await {
             Some(Ended::Stopped) => {}
             other => panic!("the actor was mounted and must drain: got {other:?}"),
         }
@@ -1385,7 +1397,7 @@ async fn a_retried_call_across_a_restart_is_applied_once() {
     //    would have suppressed a repeat is in memory only.
     {
         let serving = Serving::start(&files, &id, &actor, &server).await;
-        let client = till::KeyedClient::connect(&caller, server.endpoint().addr())
+        let client = till::RegistryClient::connect(&caller, server.endpoint().addr())
             .await
             .expect("dials");
         assert_eq!(
@@ -1408,7 +1420,7 @@ async fn a_retried_call_across_a_restart_is_applied_once() {
 
     // ── the second process: same store, same served node, same calling keypair.
     let serving = Serving::start(&files, &id, &actor, &server).await;
-    let client = till::KeyedClient::connect(&caller, server.endpoint().addr())
+    let client = till::RegistryClient::connect(&caller, server.endpoint().addr())
         .await
         .expect("dials");
 
@@ -1458,7 +1470,7 @@ async fn a_retried_call_across_a_restart_is_applied_once() {
     // ── the second negative: a caller on a fresh keypair is a different peer, so
     //    the same key is a different call. The precondition, stated as a fact.
     let stranger = local_node().await;
-    let other = till::KeyedClient::connect(&stranger, server.endpoint().addr())
+    let other = till::RegistryClient::connect(&stranger, server.endpoint().addr())
         .await
         .expect("dials");
     assert_eq!(
@@ -1628,7 +1640,7 @@ fn on_disk_booth(scratch: &Scratch) -> Booth {
 
 /// Wait for `want` withdrawals to be parked by asking over the wire, not by
 /// sleeping. `waiting_for` above, with a client instead of a `Handle`.
-async fn parked_over_the_wire(client: &booth::KeyedClient, actor: &ActorId, want: u64) {
+async fn parked_over_the_wire(client: &booth::RegistryClient, actor: &ActorId, want: u64) {
     for _ in 0..500 {
         if client
             .at(actor.clone())
@@ -1648,7 +1660,7 @@ async fn parked_over_the_wire(client: &booth::KeyedClient, actor: &ActorId, want
 /// service, and a generic over `service!`'s generated module is not a thing Rust
 /// can express.
 struct Booking {
-    system: booth::System,
+    system: booth::Registry,
     running: Server,
 }
 
@@ -1661,22 +1673,27 @@ impl Booking {
                 balance: 100,
                 ..Booth::default()
             });
-        let system = booth::System::builder(Eviction::Never).capacity(4).build();
+        let system = booth::Registry::builder(Eviction::Never)
+            .capacity(4)
+            .build();
         system
             .mount(
                 actor.clone(),
-                booth::spawn_wired(state, vec![Box::new(saver)], booth::Feeds::new()),
+                booth::setup(state)
+                    .observe(saver)
+                    .feeds(booth::Feeds::new())
+                    .mountable(),
             )
             .expect("mounts");
         let running = Server::builder(node)
-            .service(booth::keyed_service(&system, Allowlist::anyone()).build())
+            .service(system.service(Allowlist::anyone()).build())
             .spawn()
             .expect("one service, no duplicate ALPN");
         Self { system, running }
     }
 
     async fn stop(self, actor: &ActorId) {
-        match self.system.shutdown(actor, Duration::from_secs(5)).await {
+        match self.system.stop(actor, Duration::from_secs(5)).await {
             Some(Ended::Stopped) => {}
             other => panic!("the actor was mounted and must drain: got {other:?}"),
         }
@@ -1725,7 +1742,7 @@ impl Booking {
 /// followed immediately by `booking.stop(&actor).await; return;` — produced `the
 /// actor was mounted and must drain: got Some(Vanished)`, after the whole 5-second
 /// budget. That was true of the tree and it was a **defect**, not a property:
-/// `deliver_to_actor` held a per-call clone of the actor's mailbox sender across
+/// `deliver_keyed` held a per-call clone of the actor's mailbox sender across
 /// its wait for the answer, so the loop never saw its channel close and no budget
 /// could ever be enough. `parked-drain` drops that clone once the send has landed.
 ///
@@ -1869,7 +1886,7 @@ async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
     let approve_key = IdempotencyKey::new("approve-2").expect("a valid key");
 
     let booking = Booking::start(&files, &id, &actor, &server).await;
-    let client = booth::KeyedClient::connect(&caller, server.endpoint().addr())
+    let client = booth::RegistryClient::connect(&caller, server.endpoint().addr())
         .await
         .expect("dials");
 
@@ -1961,7 +1978,7 @@ async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
     // ── 4: the restart. The channel is gone; the record the RELEASING turn wrote
     //      is not.
     let booking = Booking::start(&files, &id, &actor, &server).await;
-    let client = booth::KeyedClient::connect(&caller, server.endpoint().addr())
+    let client = booth::RegistryClient::connect(&caller, server.endpoint().addr())
         .await
         .expect("dials");
     assert_eq!(
@@ -1997,7 +2014,7 @@ async fn a_deferred_reply_is_named_by_the_turn_that_releases_it() {
     //    call and the withdrawal parks for real — a second piece of work, not a
     //    recognised retry.
     let stranger = local_node().await;
-    let other = booth::KeyedClient::connect(&stranger, server.endpoint().addr())
+    let other = booth::RegistryClient::connect(&stranger, server.endpoint().addr())
         .await
         .expect("dials");
     let strangers = {
