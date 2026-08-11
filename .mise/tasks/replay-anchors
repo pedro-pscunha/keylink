@@ -71,7 +71,7 @@ MISE description="Replay each REDNESS row's break and check it reddens its own g
 # ── THE TWO MODES A PASS/FAIL CELL CANNOT HOLD ─────────────────────────────────
 #
 # Both were MEASURED on 2026-08-08 by applying the registry's `N1` break —
-# `Registry::entry`'s `mpsc::channel(self.mailbox_depth)` replaced by
+# `Shared::entry`'s `mpsc::channel(self.mailbox_depth)` replaced by
 # `DEFAULT_MAILBOX_DEPTH` — and running every `mailbox_depth` call site by name.
 # Neither is a pass, and neither is a failure of the kind the arm above describes.
 #

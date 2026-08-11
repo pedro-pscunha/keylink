@@ -342,10 +342,10 @@ impl<M> Mailbox<M> {
 /// actor — which is exactly why the depth could only ever be a constant. A knob
 /// on [`SystemBuilder`] would have applied to nothing: the closure has already
 /// taken its receiver by then, and a lazily spawned actor's channel is made
-/// inside `Registry::route`, where no caller is present to name anything.
+/// inside `Shared::route`, where no caller is present to name anything.
 ///
 /// So this carries `FnOnce(Mailbox<M>) -> impl Future` and the **registry** makes
-/// the channel, in `Registry::entry`, with its own depth. Every existing call
+/// the channel, in `Shared::entry`, with its own depth. Every existing call
 /// site is unchanged — `spawn(state)` still hands back one of these and
 /// [`System::mount`] still takes it — and depth becomes a property of the system
 /// an actor is mounted in rather than of the line that built it. That is the
@@ -364,7 +364,7 @@ impl<M> Mailbox<M> {
 #[must_use = "an unmounted actor is dropped, and the state it was built around \
               goes with it"]
 pub struct Mounted<M> {
-    /// Called once, by [`Registry::entry`], with the mailbox that registry made.
+    /// Called once, by [`Shared::entry`], with the mailbox that registry made.
     /// Boxed twice because both the closure and the future it returns are the
     /// caller's own types, and this struct is named in public signatures where two
     /// more parameters would be noise.
@@ -379,7 +379,7 @@ pub struct Mounted<M> {
 /// # It resolves to an [`Ended`], and that return type is the fourth way out
 ///
 /// A registry entry left the map at three sites — [`System::shutdown`],
-/// [`System::abort`] and [`Registry::sweep`] — and every one of them is
+/// [`System::abort`] and [`Shared::sweep`] — and every one of them is
 /// *somebody asking*. The fourth way out has no asker: a feed that ends, a
 /// handler that panics, an observer that refuses, all end the loop where it
 /// stands. The task finished, the receiver dropped, and the [`Entry`] survived
@@ -391,7 +391,7 @@ pub struct Mounted<M> {
 /// `Output = Ended` is the repair, and it is a *type* rather than a call because
 /// the reason was the part that kept getting lost — `run_keyed` computed the
 /// true [`Ended`] and dropped it on the floor. A loop that cannot return without
-/// naming its ending cannot drop it, and [`Registry::entry`] is the one place
+/// naming its ending cannot drop it, and [`Shared::entry`] is the one place
 /// that ending is turned into a removal and a report.
 type Loop<M> = Box<dyn FnOnce(Mailbox<M>) -> Pin<Box<dyn Future<Output = Ended> + Send>> + Send>;
 
@@ -714,7 +714,7 @@ impl<M> Entry<M> {
 
 /// Where a message goes, and what its caller is told if the answer never comes.
 ///
-/// [`Registry::route`]'s answer, and a struct rather than the bare sender it used
+/// [`Shared::route`]'s answer, and a struct rather than the bare sender it used
 /// to be. The pair travels together because they are read together: a dispatch
 /// sends on the first, and reads the second in the one case where the send
 /// succeeded and no answer followed. Looking the fate up again at that point
@@ -742,7 +742,7 @@ impl<M> fmt::Debug for Route<M> {
     }
 }
 
-struct Registry<M> {
+struct Shared<M> {
     entries: RwLock<HashMap<ActorId, Entry<M>>>,
     factory: Option<Factory<M>>,
     /// Where mounts and endings are reported, in the order they were installed.
@@ -775,7 +775,7 @@ struct Registry<M> {
     epoch: Instant,
 }
 
-impl<M> Registry<M> {
+impl<M> Shared<M> {
     fn now(&self) -> u64 {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
@@ -819,12 +819,12 @@ impl<M> Registry<M> {
     /// that ended, a handler that panicked, an observer that refused, a
     /// supervisor that gave up. [`Loop`] carries what leaving that entry behind
     /// cost. Called from the actor's own task, by the wrapper
-    /// [`Registry::entry`] spawns, with the [`Ended`] the loop returned — which
+    /// [`Shared::entry`] spawns, with the [`Ended`] the loop returned — which
     /// is the *true* reason rather than [`drain`]'s synthesis from a join.
     ///
     /// # It reports only if the entry was still ours, and that is the whole interlock
     ///
-    /// [`System::shutdown`], [`System::abort`] and [`Registry::sweep`] all take
+    /// [`System::shutdown`], [`System::abort`] and [`Shared::sweep`] all take
     /// the entry out **before** they await the task, and each reports its own
     /// ending afterwards. The id may be remounted during that await, so absence
     /// is not the interlock: the task's opaque identity must still match the
@@ -887,7 +887,7 @@ impl<M> Registry<M> {
 
     /// Find the actor, spawning it if the system was given a factory.
     ///
-    /// `self: &Arc<Self>` because a lazy spawn reaches [`Registry::entry`], and
+    /// `self: &Arc<Self>` because a lazy spawn reaches [`Shared::entry`], and
     /// the task that starts there holds a [`Weak`] back to this
     /// registry so it can reap its own entry. There is no other reason.
     fn route(self: &Arc<Self>, id: &ActorId) -> std::result::Result<Route<M>, RouteError>
@@ -1005,7 +1005,7 @@ impl<M> Registry<M> {
     /// would detach the actor that was there — the defect this wave exists to
     /// remove, in the one shape a type cannot catch: `HashMap::insert` hands the
     /// displaced value back as an `Option` that a caller may discard, and
-    /// [`System::mount`] and [`Registry::route`] both did discard it. Both were
+    /// [`System::mount`] and [`Shared::route`] both did discard it. Both were
     /// safe, each by a presence check a few lines up under the same write guard —
     /// an argument that has to be re-made every time either function is edited.
     ///
@@ -1017,7 +1017,7 @@ impl<M> Registry<M> {
     /// # The task is wrapped, and the wrapper is what closes the fourth way out
     ///
     /// The loop resolves to an [`Ended`] — see [`Loop`] — and the wrapper hands
-    /// it to [`Registry::reap`], which is the only site that can unmount an
+    /// it to [`Shared::reap`], which is the only site that can unmount an
     /// actor **nobody asked to unmount**. A [`Weak`] and not an
     /// `Arc`, and not for tidiness: the registry owns the [`Entry`], the entry
     /// owns the `JoinHandle`, and a strong reference here would close that ring.
@@ -1097,7 +1097,7 @@ impl<M> Registry<M> {
     ///
     /// So the lock is used for the one thing it is needed for — deciding who is
     /// expired and taking them out of the map — and released before anything is
-    /// awaited. This is [`Registry::route`]'s discipline read backwards: `route`
+    /// awaited. This is [`Shared::route`]'s discipline read backwards: `route`
     /// holds the guard across the user's `factory` call and is documented as such;
     /// nothing here may hold it across an await.
     ///
@@ -1173,7 +1173,7 @@ impl<M> Registry<M> {
 
 /// Close the mailbox, wait out `budget`, and destroy what is still running.
 ///
-/// The one teardown in this file: [`System::shutdown`] and [`Registry::sweep`]
+/// The one teardown in this file: [`System::shutdown`] and [`Shared::sweep`]
 /// both go through here, so an eviction and a shutdown cannot mean different
 /// things. [`System::abort`] does not, because it never drains — that is a
 /// different operation rather than this one with a budget of zero.
@@ -1204,7 +1204,7 @@ impl<M> Registry<M> {
 /// nothing.
 ///
 /// The second way is **cancellation**, and it is the same defect one level up.
-/// This future is awaited by [`System::shutdown`] and by [`Registry::sweep`],
+/// This future is awaited by [`System::shutdown`] and by [`Shared::sweep`],
 /// and a caller may drop either: `tokio::select!`, a `race`, a `timeout` around
 /// the whole call, a spawned sweep whose handle goes away. Dropping the
 /// *outer* future drops this frame, and this frame is where the handle lives —
@@ -1229,7 +1229,7 @@ impl<M> Registry<M> {
 /// The `Ended` is **synthesised from the join**, not read from the actor, and
 /// [`System::shutdown`] carries the argument for that and states its residual.
 struct TeardownGuard<M> {
-    registry: Arc<Registry<M>>,
+    registry: Arc<Shared<M>>,
     id: ActorId,
     ended: watch::Sender<Option<Ended>>,
     identity: Arc<()>,
@@ -1269,7 +1269,7 @@ impl<M> Drop for TeardownGuard<M> {
 }
 
 async fn drain<M>(
-    registry: Arc<Registry<M>>,
+    registry: Arc<Shared<M>>,
     id: ActorId,
     entry: Entry<M>,
     budget: Duration,
@@ -1451,7 +1451,7 @@ pub struct ActorStatus {
 /// mounts cannot: a lazily spawned actor is built inside
 /// [`SystemBuilder::spawn_with`]'s factory with no caller present, and an actor
 /// **evicted** by the sweeper is torn down on a timer with no caller present
-/// either. The second one was a documented hole — `Registry::sweep` computed an
+/// either. The second one was a documented hole — `Shared::sweep` computed an
 /// [`Ended`] for every actor it destroyed and dropped it, so a
 /// [`shutdown_budget`](Eviction::Idle::shutdown_budget) set below the longest
 /// turn destroyed that turn with no log, no counter, no observer and no caller,
@@ -1549,7 +1549,7 @@ pub trait Lifecycle: Send + Sync + 'static {
 /// Subscribe after `mount` and before a teardown can remove the entry.
 ///
 /// The channel is shared by the actor loop and the registry. The loop publishes
-/// its actual ending before `Registry::reap` removes the entry; `shutdown` and
+/// its actual ending before `Shared::reap` removes the entry; `shutdown` and
 /// `abort` publish a synthesized `Ended` when they destroy an actor before its
 /// loop can report one. [`Lifecycle::ended`] still reports every removal, and
 /// `compose::Endings` remains useful when a composition wants to fan those
@@ -1619,7 +1619,7 @@ pub trait Lifecycle: Send + Sync + 'static {
 /// Most code never meets it, because `mount(id, inventory::spawn(..))` pins `M`
 /// through [`Mounted`] without anybody trying.
 pub struct System<M> {
-    inner: Arc<Registry<M>>,
+    inner: Arc<Shared<M>>,
 }
 
 /// Hand-written, because the derive would bound the impl on `M: Clone` — and a
@@ -1744,7 +1744,7 @@ impl<M> System<M> {
         M: Send + 'static,
     {
         let mut entries = self.inner.write();
-        // See `Registry::route`: a `VacantEntry` borrows the map, so the count is
+        // See `Shared::route`: a `VacantEntry` borrows the map, so the count is
         // taken first. It is the count before this insert, which is the one the
         // cap is about.
         let live = entries.len();
@@ -1783,7 +1783,7 @@ impl<M> System<M> {
     ///
     /// **The whole of the seam**, and an operation rather than a handle on
     /// purpose. With `inner` reachable from `remote.rs`, the transport half held
-    /// the entire [`Registry`] and every method on it, so nothing but manners
+    /// the entire [`Shared`] and every method on it, so nothing but manners
     /// stopped the next change from reaching the map, the cap or the eviction
     /// clock from the side that has a network in it. One `pub(super)` function
     /// is a boundary that can be read in full, and adding a second is a visible
@@ -2076,7 +2076,7 @@ impl<M> System<M> {
     /// report a shutting-down node as an idle one.
     ///
     /// An `impl Trait` return rather than the `Weak` itself, because
-    /// [`Registry`] is this module's and is not going to stop being.
+    /// [`Shared`] is this module's and is not going to stop being.
     pub(crate) fn weak_status(
         &self,
     ) -> impl Fn() -> Option<Vec<ActorStatus>> + Send + Sync + 'static
@@ -2317,7 +2317,7 @@ impl<M> SystemBuilder<M> {
     /// it must not depend on depth, and across four runs it did not, apart from one
     /// 410 µs reading under load against a 137 – 168 µs band. Every figure includes
     /// a QUIC stream setup, a postcard encode and a round trip, because
-    /// `Registry::route` is `pub(super)` and a test reaches a keyed mailbox only
+    /// `Shared::route` is `pub(super)` and a test reaches a keyed mailbox only
     /// through a served client. What survives that noise is the shape: the drain is
     /// 10.8 to 15 times apart within a run, and the burst's own spread narrows from
     /// 70 – 90% at one slot to 3 – 7% at 32. A burst of 32 into 32 slots arrives
@@ -2427,7 +2427,7 @@ impl<M> SystemBuilder<M> {
     /// # Why `NonZeroUsize`
     ///
     /// `mpsc::channel(0)` panics, and after this wave the channel is created per
-    /// actor in `Registry::entry` — so a zero would panic on the first *mount*,
+    /// actor in `Shared::entry` — so a zero would panic on the first *mount*,
     /// or worse, inside a lazy factory on a serving node, one message after the
     /// builder that caused it returned. The type moves that from a runtime panic
     /// nobody can test for to an argument that cannot be written. Saturating a
@@ -2458,7 +2458,7 @@ impl<M> SystemBuilder<M> {
         M: Send + 'static,
     {
         let system = System {
-            inner: Arc::new(Registry {
+            inner: Arc::new(Shared {
                 entries: RwLock::new(HashMap::new()),
                 factory: self.factory,
                 lifecycle: self.lifecycle,
@@ -2499,8 +2499,8 @@ impl<M> fmt::Debug for SystemBuilder<M> {
 /// promptly a stale actor is noticed, and the budget is about how long its
 /// teardown may take once it has been. A sweep that runs long because something
 /// would not drain delays the next tick, and it delays it by one budget rather
-/// than by one per wedged actor — see [`Registry::sweep`].
-fn spawn_sweeper<M: Send + 'static>(registry: &Arc<Registry<M>>, after: Duration) {
+/// than by one per wedged actor — see [`Shared::sweep`].
+fn spawn_sweeper<M: Send + 'static>(registry: &Arc<Shared<M>>, after: Duration) {
     let registry = Arc::downgrade(registry);
     // Half the budget, so an actor is evicted between one and one and a half
     // budgets after its last message rather than up to two.
@@ -2706,11 +2706,11 @@ mod tests {
     ///
     /// Red-tested twice, once per direction: announcing from `System::mount`'s
     /// `MountError::Occupied` arm puts a fifth line in the list below (a mount
-    /// that never happened), and making `Registry::route`'s vacant arm announce
+    /// that never happened), and making `Shared::route`'s vacant arm announce
     /// nothing removes the second (a mount nobody would have heard about).
     ///
     /// A third break was tried and **retracted**, because it proved the test was
-    /// blind rather than sharp: announcing from `Registry::route`'s *Occupied*
+    /// blind rather than sharp: announcing from `Shared::route`'s *Occupied*
     /// arm left this green. That arm is only reached when two messages to one new
     /// id race between the read lock and the write lock — the second `route` here
     /// finds the actor on `touch`'s fast path and never reaches the match at all.
@@ -2797,7 +2797,7 @@ mod tests {
     ///    from a join could never have produced: a loop that returns normally
     ///    joins `Ok(())` whatever ended it.
     ///
-    /// Red-tested with `scripts/break-once.sh` by replacing `Registry::reap`'s
+    /// Red-tested with `scripts/break-once.sh` by replacing `Shared::reap`'s
     /// body with `let _ = (id, why);`, which is the code as it stood before this
     /// fix. Watched to fail on assertion 1, printing
     /// `a self-ended actor must not still be mounted`.
@@ -2851,7 +2851,7 @@ mod tests {
 
     /// **A shutdown that races the actor's own ending reports it exactly once.**
     ///
-    /// The interlock `Registry::reap` rests on, in the shape that would break it:
+    /// The interlock `Shared::reap` rests on, in the shape that would break it:
     /// both the caller and the loop have a reason in hand at the same moment.
     /// `shutdown` takes the entry out **before** it awaits, so the reap that runs
     /// during that await finds nothing and says nothing — and the caller's answer
@@ -2899,7 +2899,7 @@ mod tests {
     }
 
     /// **An eviction that destroys a busy actor is no longer silent**, which is
-    /// the gap `Registry::sweep`'s own documentation said Wave 6 owned.
+    /// the gap `Shared::sweep`'s own documentation said Wave 6 owned.
     ///
     /// A `shutdown_budget` below the longest turn destroys that turn where it
     /// stands, and until this wave **nothing anywhere said so**: the `Ended` the
@@ -3660,7 +3660,7 @@ mod tests {
     /// one `TURN`, and the budget is two and a half of them, so no assertion rests
     /// on which of two simultaneous timers a runtime fires first.
     ///
-    /// Red-tested by making [`Registry::entry`] build every channel at
+    /// Red-tested by making [`Shared::entry`] build every channel at
     /// [`DEFAULT_MAILBOX_DEPTH`] instead of the system's depth — the one literal in
     /// its `mpsc::channel` argument, which is the whole of what the knob does.
     /// Watched: `Some(Stopped)` where this asserts `Vanished`, because a deep system
