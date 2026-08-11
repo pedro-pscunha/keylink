@@ -1698,8 +1698,8 @@ async fn a_peer_whose_factory_panicked_is_told_the_actor_is_gone() {
 /// `run_loop` polls `Feeds::poll_next` directly inside a `poll_fn`, with no
 /// `catching` around it — a mailbox turn has a panic guard and the second input
 /// does not. So a panic in a caller's `Stream` unwinds the task exactly as a
-/// factory's does, and it needs no supervisor at all: this is
-/// `ticker::actor_wired`, one incarnation, no `Intensity` anywhere.
+/// factory's does, and it needs no supervisor at all. This test uses
+/// `ticker::setup(..).feeds(..).actor()`: one incarnation, with no `Intensity`.
 ///
 /// The reply is **parked** here rather than queued, because the state exists:
 /// what dies is a `Deferred` the state was holding, which is the case the whole

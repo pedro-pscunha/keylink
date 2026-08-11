@@ -903,15 +903,13 @@ async fn a_deeper_mailbox_takes_one_more_message_behind_a_running_turn() {
         .expect("the actor is running");
 }
 
-/// The same knob through the **supervised** door, which had no caller at all.
+/// The same knob through the **supervised** builder.
 ///
-/// `restarting(..).backpressure(..).actor()` is the fourth of the generated spawn doors and the only one
-/// nothing reached: `actor` and `supervised` are used across this suite, the test
-/// above uses `actor_deep`, and this one was written from the macro outwards with
-/// nobody on the other side of it. That is not the same as *no purpose* —
-/// `Handle`'s `inner` field carries no `pub`, so this door is the only route a
-/// `service!` user has to `LocalActor::spawn_supervised_deep`. Unreached and
-/// unreachable-around is the combination worth a test.
+/// The test above uses `setup(..).backpressure(..).actor()`. This test uses
+/// `restarting(..).backpressure(..).actor()`, which is the generated route to
+/// `LocalActor::spawn_supervised_deep`. `Handle` keeps its `inner` field private,
+/// so a `service!` user cannot bypass this forwarding path. That makes the path
+/// worth a direct test.
 ///
 /// # One half is asserted and the other is carried by the signature
 ///

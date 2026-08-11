@@ -1909,8 +1909,9 @@ above were fixed:
 
 - `shutdown` removes the entry before its first await, and the `JoinHandle` lived in the
   `drain` frame the returned future owns. Drop that future — `tokio::select!`, `race`,
-  `timeout(1ms, system.shutdown(&id, 10s))`, spawn-and-drop — and the handle is dropped
-  without `abort()`. Byte for byte the deleted `stop`'s outcome: entry gone from the map,
+  `timeout(1ms, system.shutdown(&id, 10s))`, spawn-and-drop — using the spelling
+  from that revision; the current call is `registry.stop(&id, 10s)`. The handle is
+  dropped without `abort()`. Byte for byte the deleted `stop`'s outcome: entry gone from the map,
   task detached, state and its exclusive resources still held, and `Registry::abort(&id)`
   answering `false` for an actor that is still running. `abort` survives cancellation
   because it aborts *before* its await; `drain` cannot borrow that trick, because aborting
@@ -2889,9 +2890,9 @@ corrected list is six.
 
 1. **The four `M = Mail` defaults.** `Registry<M = Mail>`, `RegistryBuilder<M = Mail>`,
    `Mountable<M = Mail>`, `Mailbox<M = Mail>`. A registry crate cannot name `Mail`,
-   so they go, and `keylink::System` stops meaning `Registry<Mail>`. The transport
-   crate has to supply `pub type Registry = registry::Registry<Mail>` and friends to
-   restore the unparameterized names.
+   so they went, and the then-public `keylink::System` stopped meaning
+   `Registry<Mail>`. The generated alias is now `keylink::Registry`; the transport
+   crate supplies it fully applied to restore the unparameterized name.
 
    **This is the expensive one, and not for the reason it looks.** Four of the
    thirteen re-exported paths break, which is survivable. But `macros.rs` writes

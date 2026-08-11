@@ -692,8 +692,8 @@ sealing is about matching, and matching is the thing that should break.
 #### The number: Wave 2 cost 128 bytes per idle **local** actor, and nothing measured it
 
 `tests/actor_memory.rs` asserted `BUDGET_PER_LOCAL_ACTOR` at exactly one `Mail`
-size, because phase 3 mounted `bulky::System` and never built a single
-`bulky::actor(..)`. Adding that phase found the drift immediately. Bisected by
+size, because phase 3 mounted the then-named `bulky::System`—now
+`bulky::Registry`—and never built a single `bulky::actor(..)`. Adding that phase found the drift immediately. Bisected by
 running the one test at two commits:
 
 | path | `c9056e0` | Wave 1b `c8712b0` | Wave 2 `836179c` |

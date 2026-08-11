@@ -242,9 +242,9 @@ with no caller to resume it into would otherwise be dropped onto a state the
 handler may have left half applied — and `Ended` names which happened.
 
 **Many instances behind one ALPN.** Keyed actors, addressed by an id inside the
-request, are `inventory::System`: build one, `mount(id, inventory::spawn(state))`,
-and serve it with `inventory::registry.service(&system, allow)`, which peers reach
-through `inventory::RegistryClient`. That path once cost per-method layers,
+request, live in `inventory::Registry`. Build one, call
+`registry.mount(id, inventory::spawn(state))`, and serve it with
+`registry.serve(&node, allow)`. Peers reach it through `inventory::RegistryClient`. That path once cost per-method layers,
 per-method authorization, `blob` methods and observers, because its payload was
 opaque to keylink. It no longer does: a keyed request is `Addressed<Request>` and
 its reply is the service's own typed `Response`, and a keyed mount runs the same
@@ -255,14 +255,14 @@ could send a key, and `RegistryClient::with_idempotency` is it.
 
 What the keyed path still costs: one QUIC connection per actor *service* — not one
 for a node's whole fleet, each with its own handshake, admission decision,
-idempotency ledger, keep-alive and congestion window. `system.ended(&id)` now
+idempotency ledger, keep-alive and congestion window. `registry.ended(&id)` now
 returns a non-inserting future for a mounted instance, so a listener can await
-the entry's final loop-or-teardown `Ended`; `system.shutdown(&id, budget)` remains the separate
+the entry's final loop-or-teardown `Ended`; `registry.stop(&id, budget)` remains the separate
 question of whether that shutdown drained before its budget. The budget is not
 optional: every caller names how long it is prepared to wait before the actor is
 killed instead.
 
-**A typed local keyed reference.** `inventory::at_local(&system, id)` addresses a
+**A typed local keyed reference.** `inventory::at_local(&registry, id)` addresses a
 mounted actor in this process and returns `inventory::LocalRef`. Its generated
 `rpc`, `tell`, and `blob` methods use the registry route and the actor's normal
 turn loop, returning transport-free `LocalError`; `send` and `recv` are absent
@@ -671,9 +671,9 @@ Known gaps, in rough priority order:
 - A keyed instance's `Registry::ended(&id)` future must be subscribed while the id
   is mounted; it returns `None` for an id that is not live and never inserts one.
   The future reports the entry's final loop-or-teardown ending, while
-  `Registry::shutdown(&id, budget)` separately reports whether that shutdown drained or had to kill it.
+  `Registry::stop(&id, budget)` separately reports whether that shutdown drained or had to kill it.
 - **Supervision restarts one actor, and no strategy reaches its siblings.**
-  `LocalActor::spawn_supervised`, `spawn_supervised_deep` and
+  `LocalActor::spawn_supervised`, `LocalActor::spawn_supervised_deep`, and
   `run_keyed_supervised` take an `Intensity` and put a fresh incarnation on the
   same task and the same mailbox, so a caller whose reply died mid-restart is
   told `Restarting` rather than `Gone`. There is no `Supervisor` type, no
