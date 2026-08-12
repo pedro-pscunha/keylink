@@ -97,12 +97,12 @@
 use std::num::NonZeroUsize;
 use std::ops::DerefMut;
 
-use crate::compose::{Overflow, Topic};
+use crate::compose::{BroadcastDepth, Lossy, LossySubscription, LossyTopic, Overflow, Topic};
 use crate::{
-    ActorId, ActorStatus, Admission, Admittance, AdmittedPeer, Allowlist, Backpressure, BlobId,
-    Caller, DynamicAdmission, Ended, Eviction, FinishFut, IdempotencyKey, Intensity, Keyable,
-    LocalActor, MountError, Observer, Origin, ProvenPeer, Records, Retention, TurnFut, TurnInfo,
-    TurnOutcome, Unanswered,
+    ActorId, ActorStatus, Addressed, Admission, Admittance, AdmittedPeer, Allowlist, Authorization,
+    Backpressure, BlobId, Caller, DynamicAdmission, Ended, Eviction, FinishFut, IdempotencyKey,
+    Intensity, Keyable, LocalActor, Middleware, MountError, Observer, Origin, ProvenPeer, Records,
+    Retention, TurnFut, TurnInfo, TurnOutcome, Unanswered,
 };
 
 /// Returned by every shadowing probe. Distinct from anything a real accessor
@@ -214,6 +214,12 @@ crate::service! {
     rpc Pong(n: u64) -> u64;
 }
 
+// Crate-visible only so the cross-service red break can name the exact pair
+// from the sibling module whose production impl it mutates.
+pub(crate) type AlphaRequest = alpha::Request;
+pub(crate) type BetaRequest = beta::Request;
+pub(crate) type BetaResponse = beta::Response;
+
 /// Deliberately identical to [`BetaState`] in every way but the trait it
 /// implements. Two services with the same shape are the case that matters: if
 /// the separation came from the message *shape* rather than from the service,
@@ -228,6 +234,43 @@ impl alpha::Actor for AlphaState {
         n
     }
     async fn note(&mut self, _cx: Caller<'_>, _line: String) {}
+}
+
+/// Authorization compiled for `Alpha` must never become middleware for `Beta`,
+/// even though both services deliberately declare the same method names.
+///
+/// This is a coherence probe, not an inert `compile_fail` doctest. The marker's
+/// parameter is inferred only while the blanket and bounded impls do not both
+/// apply. A cross-service middleware impl makes it ambiguous during the ordinary
+/// library test build.
+///
+/// Search `impl<Req, Resp> Middleware<Req, Resp> for Authorization<Req>`.
+///
+/// Made red with `scripts/break-once.sh` by injecting one concrete cross-service
+/// middleware impl immediately before that line. The build failed here with
+/// `E0283`, naming both marker impls as candidates.
+const _: fn() = || {
+    trait AmbiguousIfBetaMiddleware<Marker> {
+        fn marker() {}
+    }
+    impl<T: ?Sized> AmbiguousIfBetaMiddleware<()> for T {}
+    struct Forbidden;
+    impl<T: ?Sized + Middleware<BetaRequest, BetaResponse>> AmbiguousIfBetaMiddleware<Forbidden> for T {}
+    let _ = <Authorization<AlphaRequest> as AmbiguousIfBetaMiddleware<_>>::marker;
+};
+
+/// The positive bracket: keyed dispatch wraps the same request in `Addressed`,
+/// and the compiled authorization must fit that exact builder request type.
+///
+/// Search `impl<Req, Resp> Middleware<Addressed<Req>, Resp> for Authorization<Req>`.
+///
+/// Made red with `scripts/break-once.sh` by cfg-disabling that production impl.
+/// The ordinary library test build failed here with `E0277` for the missing exact
+/// middleware impl.
+fn alpha_authorization_supports_addressed_requests()
+where
+    Authorization<alpha::Request>: Middleware<Addressed<alpha::Request>, alpha::Response>,
+{
 }
 
 struct BetaState;
@@ -428,7 +471,73 @@ impl HasNoDefault for Intensity {}
 /// `Topic::default()` would be a topic whose overflow behaviour is whatever the
 /// derive picked.
 impl HasNoDefault for Overflow {}
+
+/// The exact public shape of [`Overflow`]: three exhaustive policies, each carrying
+/// one finite, non-zero depth, with the bounded-wait policy also carrying patience.
+///
+/// No arm uses `..`, so adding a field or a variant makes this match fail to
+/// compile at the site that owns the exhaustive-policy argument.
+///
+/// Made red by `scripts/break-once.sh`, replacing
+/// `    BlockPublisher(NonZeroUsize),` with
+/// `    BlockPublisher(NonZeroUsize, bool),`. The all-feature library test build
+/// emitted `E0023` at `every_overflow_policy_carries_one_depth`: the pattern had
+/// one field while the changed variant had two.
+///
+/// The new struct arm was broken separately by adding `ignored: bool` to this
+/// exact search literal:
+/// `BlockThenDrop { /// The finite, non-zero channel depth for each subscriber. depth: NonZeroUsize, /// How long one full subscriber may hold this publish. patience: Patience, },`.
+/// The library build emitted `E0027` here because the exact pattern did not
+/// mention it; the two test-only constructors also emitted `E0063`.
+fn every_overflow_policy_carries_one_depth(overflow: Overflow) -> NonZeroUsize {
+    match overflow {
+        Overflow::BlockPublisher(depth) => depth,
+        Overflow::BlockThenDrop { depth, patience } => {
+            let _: crate::compose::Patience = patience;
+            depth
+        }
+        Overflow::DropSubscriber(depth) => depth,
+    }
+}
+
 impl<T> HasNoDefault for Topic<T> {}
+/// Watched break: `scripts/break-once.sh` added
+/// `impl Default for BroadcastDepth { fn default() -> Self {
+/// Self(NonZeroUsize::MIN) } }` after
+/// `pub struct BroadcastDepth(NonZeroUsize);`. Rustc emitted E0119 at this
+/// `HasNoDefault` probe.
+impl HasNoDefault for BroadcastDepth {}
+/// Watched break: `scripts/break-once.sh` inserted
+/// `impl Default for Lossy { fn default() -> Self {
+/// Self::DropNewest(NonZeroUsize::MIN) } }` before `pub enum Lossy {`.
+/// Rustc emitted E0119 at this `HasNoDefault` probe.
+impl HasNoDefault for Lossy {}
+/// Watched break: `scripts/break-once.sh` inserted
+/// `impl<T: Clone + Send + 'static> Default for LossyTopic<T> { fn default() -> Self { Self::new(Lossy::DropNewest(NonZeroUsize::MIN)) } }`
+/// before `pub struct LossyTopic<T> {`. Rustc emitted E0119 at this probe.
+impl<T> HasNoDefault for LossyTopic<T> {}
+
+/// Watched break: `scripts/break-once.sh` replaced
+/// `    DropNewest(NonZeroUsize),` with `    DropNewest(NonZeroUsize, bool),`.
+/// Rustc emitted E0023 here because the exhaustive pattern still had one field.
+fn every_lossy_policy_carries_one_depth(policy: Lossy) -> NonZeroUsize {
+    match policy {
+        Lossy::DropNewest(depth) => depth,
+        Lossy::DropOldest(depth) => depth.get(),
+    }
+}
+
+/// Watched break: `scripts/break-once.sh` removed `Send` from
+/// `    stream: Pin<Box<dyn Stream<Item = Lagged<T>> + Send + 'static>>,`.
+/// Rustc emitted E0277 at this `Send + 'static` stream probe.
+fn lossy_subscription_is_a_send_static_stream<T>(subscription: LossySubscription<T>)
+where
+    T: Clone + Send + 'static,
+{
+    fn assert_stream<T>(_: impl crate::Stream<Item = Lagged<T>> + Send + 'static) {}
+    use crate::compose::Lagged;
+    assert_stream(subscription);
+}
 /// The adapter inherits the property from the value it holds. A `Default` here
 /// would mean "a policy you did not name", and the only policy nobody named is
 /// the one that admits everyone.

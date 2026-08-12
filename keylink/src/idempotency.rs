@@ -546,14 +546,12 @@ impl From<IdempotencyRefusal> for RemoteError {
 ///     .build()
 /// ```
 ///
-/// # A name matching no method is not a startup error, and it could be
+/// # Names are checked against this binary's contract at startup
 ///
-/// Nothing checks these names against the service's own methods, so a typo is
-/// discovered on the first call rather than at `spawn`. Checking would need the
-/// method list *at the builder*, which means a `const METHODS` on
-/// [`Rpc`](crate::Rpc) that every generated service carries — a change to the
-/// macro, for a mistake whose refusal already names the method it did not match.
-/// Left undone deliberately, and recorded here rather than discovered.
+/// [`Only`](Self::Only) and [`Except`](Self::Except) are compared with
+/// [`Rpc::METHODS`](crate::Rpc::METHODS) when the typed service builder is erased.
+/// A typo or a method disabled by `cfg` is returned from server startup as
+/// [`ConfigError::UnknownMethod`](crate::ConfigError::UnknownMethod).
 ///
 /// # `&'static`, so the policy is code
 ///
@@ -596,6 +594,16 @@ impl Keyable {
             Self::Only(named) => named.contains(&method),
             Self::Except(named) => !named.contains(&method),
             Self::None => false,
+        }
+    }
+
+    /// The first selected name absent from `known`, preserving policy order.
+    pub(crate) fn first_unknown(&self, known: &'static [&'static str]) -> Option<&'static str> {
+        match self {
+            Self::Only(named) | Self::Except(named) => {
+                named.iter().copied().find(|method| !known.contains(method))
+            }
+            Self::Any | Self::None => None,
         }
     }
 

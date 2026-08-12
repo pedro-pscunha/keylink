@@ -985,9 +985,9 @@ ANCHORS = [
     ("D3", "keylink/tests/cycles.rs", "keylink/src/turns.rs",
      "            Verdict::Committed => reply.answer(Answered::Ran(value)),"),
     ("D4", "keylink/tests/cycles.rs", "keylink/src/compose/topic.rs",
-     "            Overflow::DropSubscriber => self.publish_dropping(item),"),
+     "            Overflow::DropSubscriber(_) => self.publish_dropping(item),"),
     ("D5", "keylink/tests/cycles.rs", "keylink/src/compose/topic.rs",
-     "            Overflow::BlockPublisher => self.publish_blocking(item).await,"),
+     "            Overflow::BlockPublisher(_) => self.publish_blocking(item).await,"),
     ("D6", "keylink/tests/cycles.rs", "keylink/tests/cycles.rs",
      "        if hops == 0 {"),
     # MOVED BY ITEM M, target file and all. It read
@@ -1269,6 +1269,120 @@ ANCHORS = [
     # SAME-FILE and indented, so the record's unindented copy is not a second occurrence.
     ("M2", "keylink/src/rpc.rs", "keylink/src/rpc.rs",
      "        Attaching::Forbidden => return Claimed::Refuse(IdempotencyRefusal::InFlight.into()),"),
+    # ── `compose::Topic` finite subscriber depth ────────────────────────────
+    #
+    # Q1 and Q2 share the one production capacity use. Both were run through
+    # `scripts/break-once.sh` after formatting, one focused test at a time. Each
+    # selected exactly one test and failed on its policy's depth-two assertion.
+    ("Q1", "keylink/tests/compose.rs", "keylink/src/compose/topic.rs",
+     "        let (to, from) = mpsc::channel(depth.get());"),
+    ("Q2", "keylink/tests/compose.rs", "keylink/src/compose/topic.rs",
+     "        let (to, from) = mpsc::channel(depth.get());"),
+    ("Q3", "keylink/src/representability.rs", "keylink/src/compose/topic.rs",
+     "    BlockPublisher(NonZeroUsize),"),
+    # ── C3 lossy-topic guards: native, Chrome, compile probes, and privacy ───
+    ("C3A", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     "        if !depth.get().is_power_of_two() || depth.get() > Self::MAX {"),
+    ("C3C", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     "                                .map_or(1, |count| count.get().saturating_add(1));"),
+    ("C3D", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     "                    cursor.held = Some(entry.item);"),
+    ("C3E", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     "                    let pending = recover(&cursor.state).pending.take();"),
+    ("C3F", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     "                        skipped_before: state.pending,"),
+    ("C3G", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     "                            accepted += 1;"),
+    ("C3H", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     "                                    Err(mpsc::error::TrySendError::Closed(entry)) => {"),
+    ("C3J", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     "                let accepted = to.send(item).unwrap_or(0);"),
+    ("C3K", "keylink/src/representability.rs", "keylink/src/compose/lossy.rs",
+     "pub struct BroadcastDepth(NonZeroUsize);"),
+    ("C3L", "keylink/src/representability.rs", "keylink/src/compose/lossy.rs",
+     "pub enum Lossy {"),
+    ("C3M", "keylink/src/representability.rs", "keylink/src/compose/lossy.rs",
+     "pub struct LossyTopic<T> {"),
+    ("C3N", "keylink/src/representability.rs", "keylink/src/compose/lossy.rs",
+     "    DropNewest(NonZeroUsize),"),
+    ("C3O", "keylink/src/representability.rs", "keylink/src/compose/lossy.rs",
+     "    stream: Pin<Box<dyn Stream<Item = Lagged<T>> + Send + 'static>>,"),
+    ("C3R", "keylink/tests/browser.rs", "keylink/src/compose/lossy.rs",
+     "        if !depth.get().is_power_of_two() || depth.get() > Self::MAX {"),
+    ("C3T", "keylink/tests/browser.rs", "keylink/src/compose/lossy.rs",
+     "                                .map_or(1, |count| count.get().saturating_add(1));"),
+    ("C3U", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     "                let (to, from) = broadcast::channel(usize::from(depth.get()));"),
+    ("C3V", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     "                let (to, from) = mpsc::channel(publisher.depth.get());"),
+    ('C3W', "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     '                match cursor.from.try_recv() {'),
+    ('C3X', "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     '                        state.pending.take().map_or(Ready::Empty, Ready::Pending)'),
+    ('C3Y', "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     '                        skipped_before: state.pending,'),
+    ('C3Z', "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     '                                    Err(mpsc::error::TrySendError::Closed(entry)) => {'),
+    ('C3AA', "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     '    lock.lock().unwrap_or_else(PoisonError::into_inner)'),
+    ('C3AB', "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     '            recover(subscriber).to.take();'),
+    ('C3AC', "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     '            LossyInner::DropNewest(inner) => LossyInner::DropNewest(Arc::clone(inner)),'),
+    ('C3AD', "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     '            LossyInner::DropOldest(to) => LossyInner::DropOldest(to.clone()),'),
+    ('C3AE', "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     '    pub const fn try_new(depth: NonZeroUsize) -> Result<Self, BroadcastDepthError> {\n        if !depth.get().is_power_of_two() || depth.get() > Self::MAX {\n            return Err(BroadcastDepthError);\n        }\n        Ok(Self(depth))\n    }'),
+    ('C3AF', "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     '    pub const fn get(self) -> NonZeroUsize {\n        self.0\n    }'),
+    ('C3AG', "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+     '                Ready::Empty => match cursor.from.recv().await {\n                    Some(entry) => entry,\n                    None => {\n                        cursor.ended = true;\n                        let pending = recover(&cursor.state).pending.take();\n                        return pending.map(|skipped| (Lagged::Skipped(skipped), cursor));\n                    }\n                },\n'),
+    ('C3AK', "keylink/src/compose/lossy.rs", "keylink/src/compose/lossy.rs",
+     '        "Tokio broadcast reported impossible Lagged(0)"\n'),
+    # ── C2 `BlockThenDrop` guards, each observed red and quoted honestly ─────
+    ('C2A', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     'let whole_millis = duration.subsec_nanos().is_multiple_of(1_000_000);'),
+    ('C2B', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     'if elapsed.as_mut().poll(cx).is_ready() {\n                        return Poll::Ready(None);\n                    }\n                    local.channel.poll_capacity(cx).map(Some)'),
+    ('C2E', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     '                Some(Err(())) => {'),
+    ('C2F', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     '                let ticket = OrderTicket::issue(&self.publish_order);'),
+    ('C2G', 'keylink/src/compose/topic.rs', 'keylink/src/compose/topic.rs',
+     '            let Some(deadline) = Instant::now().checked_add(patience.0) else {\n'),
+    ('C2H', 'keylink/src/representability.rs', 'keylink/src/compose/topic.rs',
+     '    BlockThenDrop {\n        /// The finite, non-zero channel depth for each subscriber.\n        depth: NonZeroUsize,\n        /// How long one full subscriber may hold this publish.\n        patience: Patience,\n    },'),
+    ('C2I', 'keylink/tests/browser.rs', 'keylink/src/compose/topic.rs',
+     'let whole_millis = duration.subsec_nanos().is_multiple_of(1_000_000);'),
+    ('C2J', 'keylink/tests/browser.rs', 'keylink/src/compose/topic.rs',
+     'let portable = duration.as_millis() <= i32::MAX as u128;'),
+    ('C2K', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     '            let Some(index) = canonical\n                .iter()\n                .position(|current| current.same_channel(sender))\n            else {\n                return (false, Vec::new());\n            };'),
+    ('C2L', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     'pub struct Patience(Duration);'),
+    ('C2M', 'keylink/tests/browser.rs', 'keylink/src/compose/topic.rs',
+     'return Poll::Ready(None);'),
+    # Compose callback and route liveness guards added by the concurrency wave.
+    ('C2N', 'keylink/src/compose/topic.rs', 'keylink/src/compose/topic.rs',
+     '        let items: Vec<_> = snapshot.iter().map(|_| item.clone()).collect();'),
+    ('C2P', 'keylink/src/compose/keyed_topic.rs', 'keylink/src/compose/keyed_topic.rs',
+     '        drop(entries);\n        let subscription = subscribe(&entry.topic);'),
+    ('C2Q', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     '            let Some(deadline) = Instant::now().checked_add(patience.0) else {\n'),
+    ('C2R', 'keylink/tests/cycles.rs', 'keylink/src/compose/topic.rs',
+     '                None => {\n                    let (removed, wakers) = self.remove_and_close(one);\n                    if removed {\n                        dropped += 1;\n                        ordered.wakes.extend(wakers);\n                    }\n                }'),
+    ('C2W', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     '                None => {\n                    let (removed, wakers) = self.remove_and_close(one);\n                    if removed {\n                        dropped += 1;\n                        ordered.wakes.extend(wakers);\n                    }\n                }'),
+    ('C2X', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     '                loop {\n                    let serving = state.serving;\n                    if !state.cancelled.remove(&serving) {\n                        break;\n                    }\n                    state.serving += 1;\n                }'),
+    ('C2S', 'keylink/src/compose/topic.rs', 'keylink/src/compose/topic.rs',
+     '        drop(rejected);'),
+    ('C2T', 'keylink/src/compose/topic.rs', 'keylink/src/compose/topic.rs',
+     '        drop(rejected);'),
+    ('C2U', 'keylink/src/compose/keyed_topic.rs', 'keylink/src/compose/topic.rs',
+     '        let items: Vec<_> = snapshot.iter().map(|_| item.clone()).collect();'),
+    ('C2V', 'keylink/src/compose/topic.rs', 'keylink/src/compose/topic.rs',
+     '        let items: Vec<_> = snapshot.iter().map(|_| item.clone()).collect();'),
     # ── `compose::Group` and `compose::Endings` ──────────────────────────────
     #
     # Twenty-two substitutions were run in the paired gate worktree before any row
@@ -1919,6 +2033,98 @@ ANCHORS = [
      "        Err(NotQueued::Full) => return (Outcome::Err(RemoteError::MailboxFull), Body::empty()),"),
     ("B11", "keylink/tests/compose.rs", "keylink/src/compose/factory.rs",
      "        while let Some(answer) = racing.next().await {"),
+    # C4 keyed-topic guards. Every row is cross-file, so each record quotes the
+    # exact production search literal. Shared rows are deliberate: KT7/KT8/KT11
+    # perturb the publish snapshot for distinct liveness, generation, and allocation
+    # claims; KT6/KT9 perturb the same removal predicate in opposite directions.
+    ("KT1", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "            inner: Arc::downgrade(&self.inner),"),
+    ("KT2", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "    K: Eq + Hash + Clone,"),
+    ("KT3", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "        let entry = if let Some(entry) = entries.get(&key) {"),
+    ("KT4", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "impl<K: Eq + Hash, T> crate::Stream for KeyedSubscription<K, T> {"),
+    ("KT5", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "                delivered: 0,"),
+    ("KT6", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "        let removed = (previous == 1"),
+    ("KT7", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "        let entry = self.inner.lock().get(key).cloned();"),
+    ("KT8", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "        let entry = self.inner.lock().get(key).cloned();"),
+    ("KT9", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "        let removed = (previous == 1"),
+    ("KT10", "keylink/tests/compose.rs", "keylink/src/compose/keyed_topic.rs",
+     "                topic: Topic::new(self.inner.overflow),"),
+    ("KT11", "keylink/tests/keyed_topic_allocation.rs",
+     "keylink/src/compose/keyed_topic.rs",
+     "        let entry = self.inner.lock().get(key).cloned();"),
+    # ── X IS THE EXTENSION-SURFACE WAVE ──────────────────────────────────────
+    #
+    # X1/X2/X3 intentionally share the normalized-cfg expression. They are three
+    # records because the same production channel is guarded from three directions:
+    # direct cfg, nested cfg_attr, and refusal to forward arbitrary metadata.
+    # X4/X5 similarly share generated status across the macro/API and startup uses.
+    ("X1", "keylink/tests/api.rs", "keylink/src/macros.rs",
+     "                    $( $( #[$cfg] )* stringify!($rpc), )+"),
+    ("X2", "keylink/tests/api.rs", "keylink/src/macros.rs",
+     "                    $( $( #[$cfg] )* stringify!($rpc), )+"),
+    ("X3", "keylink/tests/api.rs", "keylink/src/macros.rs",
+     "                    $( $( #[$cfg] )* stringify!($rpc), )+"),
+    ("X4", "keylink/tests/api.rs", "keylink/src/macros.rs",
+     '                    "__Status",'),
+    ("X5", "keylink/tests/idempotency.rs", "keylink/src/macros.rs",
+     '                    "__Status",'),
+    ("X6", "keylink/tests/api.rs", "keylink/src/actor/remote.rs",
+     "    const METHODS: &'static [&'static str] = T::METHODS;"),
+    ("X7", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "                let Some(method) = Req::METHODS.iter().copied().find(|method| *method == named)"),
+    ("X8", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "            .is_some_and(|methods| methods.contains(method))"),
+    ("X9", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "        let allow = Allowlist::only(allowed.keys().copied());"),
+    ("X10", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "            .require_authorization(self.authorization)"),
+    ("X11", "keylink/src/representability.rs", "keylink/src/authz.rs",
+     "impl<Req, Resp> Middleware<Req, Resp> for Authorization<Req>"),
+    ("X12", "keylink/src/representability.rs", "keylink/src/authz.rs",
+     "impl<Req, Resp> Middleware<Addressed<Req>, Resp> for Authorization<Req>"),
+    ("X13", "keylink/tests/idempotency.rs", "keylink/src/rpc.rs",
+     "                .first_unknown(Req::METHODS)"),
+    ("X14", "keylink/tests/idempotency.rs", "keylink/src/rpc.rs",
+     "                .first_unknown(Req::METHODS)"),
+    ("X15", "keylink/tests/idempotency.rs", "keylink/src/rpc.rs",
+     "                return Err(Error::Config(error));"),
+    ("X16", "keylink/tests/admission.rs", "keylink/src/rpc.rs",
+     "        for layer in self.required_layers.into_iter().rev() {"),
+    ("X17", "keylink/tests/admission.rs", "keylink/src/admission.rs",
+     "    for policy in required {\n"
+     "        require_admitted(policy.admits(&proven), connection)?;\n"
+     "    }"),
+    ("X18", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "            if allowed.contains_key(&id) {"),
+    ("X19", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "    peer: Vec<PeerRules>,"),
+    ("X20", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "        if self.peer.is_empty() {"),
+    ("X21", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "            if peer.allow.is_empty() {"),
+    ("X22", "keylink/tests/admission.rs", "keylink/src/error.rs",
+     "        #[source]\n"
+     "        error: toml::de::Error,"),
+    ("X23", "keylink/tests/admission.rs", "keylink/src/admission.rs",
+     '            connection.close(REFUSED.into(), b"unauthorized");'),
+    ("X24", "keylink/tests/admission.rs", "keylink/src/admission.rs",
+     '            connection.close(UNAVAILABLE.into(), b"admission unavailable");'),
+    ("X25", "keylink/tests/admission.rs", "keylink/src/rpc.rs",
+     "    for policy in required_authorization.iter() {"),
+    ("X26", "keylink/tests/admission.rs", "keylink/src/rpc.rs",
+     "    for policy in required_authorization.iter() {"),
+    ("X27", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "            return Err(ConfigError::EmptyRules.into());"),
+    ("X28", "keylink/tests/admission.rs", "keylink/src/rpc.rs",
+     "    for policy in required_authorization.iter() {"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -1975,7 +2181,7 @@ ANCHORS = [
 # words - a `const` at column 0 has no indentation to add. "No indentation needed"
 # invites exactly the re-derivation above.
 DESCRIBED = [
-    # The only row left, and the only one of the six whose reason was ever a
+    # The original row, and the only one of the first six whose reason was ever a
     # measurement. Its retired anchor was a slice of `lib.rs`'s `pub use` list; a
     # later wave inserted `Records,` inside that slice and the anchor went to count 0.
     # Re-measured at `7a147c0`: the retired literal counts **0** in `keylink/src/lib.rs`
@@ -1984,6 +2190,27 @@ DESCRIBED = [
     ("R26a", "keylink/tests/api.rs", "positional",
      "a slice of lib.rs's `pub use` list - retired literal counts 0 at 7a147c0, and "
      "re-quoting buys only until the next export lands"),
+    # Six C3 records were later moved beside guards in the same production file.
+    # Each row records the measured one-occurrence state before that move; quoting
+    # the old literal in its new location would create the second occurrence.
+    ("C3I", "keylink/src/compose/lossy.rs", "same-file",
+     "the indented saturating-add literal counts 1 at fb0cbc5; quoting it beside "
+     "the unit guard would make that count 2"),
+    ("C3P", "keylink/src/compose/lossy.rs", "same-file",
+     "the private BroadcastDepth declaration counts 1 at fb0cbc5; quoting it beside "
+     "its doctest would make that count 2"),
+    ("C3Q", "keylink/src/compose/lossy.rs", "same-file",
+     "the private LossyTopic declaration counts 1 at fb0cbc5; quoting it beside its "
+     "doctest would make that count 2"),
+    ("C3AH", "keylink/src/compose/lossy.rs", "same-file",
+     "the snapshot literal counts 1 at fb0cbc5; quoting it beside the callback guard "
+     "would make that count 2"),
+    ("C3AI", "keylink/src/compose/lossy.rs", "same-file",
+     "the deferred-drop literal counts 1 at fb0cbc5; quoting it beside the Full guard "
+     "would make that count 2"),
+    ("C3AJ", "keylink/src/compose/lossy.rs", "same-file",
+     "the deferred-drop literal counts 1 at fb0cbc5; quoting it beside the Closed guard "
+     "would make that count 2"),
 ]
 
 # ── WHAT A ROW'S BREAK PRODUCES, FOR THE ROWS SOMEBODY REPLAYED ────────────────
@@ -3519,11 +3746,36 @@ for record in sorted(set(REDNESS) - row_ids):
 # reasons. Read off the failing run: `FAIL population: 194 comment blocks mention
 # break-once.sh, but RECORD_BLOCKS says 183.`
 #
+# E1's review-fix pass measured 222 after adding the six authorization-rule
+# guard blocks in `tests/admission.rs`; the same run also found X10's old install
+# anchor gone, so the row was followed to `.require_layer(self.authorization)`.
+# Seven new rows cover those six blocks because blank-rule parsing and its source
+# chain deliberately share one test record. The population figure is read from
+# that failing run, not derived from either count.
+#
 # The merge gate on that same wave added ONE block and ONE row — `B11`, over
 # `first_available`'s racers — and the two moved together for once. Read off the
 # failing run: `FAIL population: 195 comment blocks mention break-once.sh, but
 # RECORD_BLOCKS says 194.`
-RECORD_BLOCKS = 196
+# 206 → 215, for C4's original nine keyed-topic guards. Read off the failing run:
+# `FAIL population: 215 comment blocks mention break-once.sh, but RECORD_BLOCKS says 206.`
+# 215 → 217, for the publisher-drop and operation-bound review guards. Read off
+# the failing run: `FAIL population: 217 comment blocks mention break-once.sh, but RECORD_BLOCKS says 215.`
+# The E1 security merge fix added two guard blocks and three rows. The existing
+# empty-rules block gained a second substitution, so it did not add a block.
+# Read off the failing run: `FAIL population: 237 comment blocks mention
+# break-once.sh, but RECORD_BLOCKS says 235.`
+# The nested-policy security guard added one block and one row, X28. Read off the
+# failing run: `FAIL population: 238 comment blocks mention break-once.sh, but
+# RECORD_BLOCKS says 237.`
+# The compose concurrency wave then failed at `246 comment blocks mention
+# break-once.sh, but RECORD_BLOCKS says 238`; its records set the measured value.
+# The bounded queue and publication-ticket correction failed at `253 comment
+# blocks mention break-once.sh, but RECORD_BLOCKS says 246` after its records
+# were complete.
+# The consecutive-cancellation ticket guard then failed at `254 comment blocks
+# mention break-once.sh, but RECORD_BLOCKS says 253`.
+RECORD_BLOCKS = 278
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

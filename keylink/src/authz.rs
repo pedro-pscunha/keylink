@@ -3,13 +3,21 @@
 //! iroh proves *who* a peer is during the handshake. It says nothing about
 //! whether that peer is welcome. This module is the second half.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::marker::PhantomData;
 use std::str::FromStr;
+use std::sync::Weak;
 
 use iroh::endpoint::{Connection, HandshakeCompleted};
 use iroh::EndpointId;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::{ConfigError, Result};
+use crate::middleware::BoxFut;
+use crate::rpc::MethodAuthorization;
+use crate::{
+    Addressed, Body, BodyReader, ConfigError, Context, Granting, Middleware, Next, Outcome,
+    RemoteError, Result, Rpc, ServiceBuilder,
+};
 
 /// A peer iroh proved during a TLS handshake.
 ///
@@ -205,6 +213,257 @@ impl Allowlist {
             Self::Only(ids) if ids.contains(&peer.id()) => Some(AdmittedPeer(peer)),
             Self::Only(_) => None,
         }
+    }
+}
+
+/// Data-driven peer and method authorization rules.
+///
+/// Each TOML table names one peer and the methods that peer can call:
+///
+/// ```toml
+/// [[peer]]
+/// id = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0"
+/// allow = ["GetItem", "Reserve"]
+/// ```
+///
+/// Parse once, then [`compile`](Self::compile) against the generated request type.
+/// Compilation rejects every method absent from that binary's [`Rpc::METHODS`].
+/// A peer may appear once. Repeating a method name inside that peer's `allow`
+/// array is harmless and denotes the same permission once.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rules {
+    peer: Vec<PeerRules>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerRules {
+    id: String,
+    allow: Vec<String>,
+}
+
+impl Rules {
+    /// Parse one `[[peer]]` table per peer.
+    ///
+    /// ```toml
+    /// [[peer]]
+    /// id = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0"
+    /// allow = ["GetItem", "Reserve"]
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::MalformedRules`] when the input is not valid TOML
+    /// with an `id` and `allow` list for each peer.
+    pub fn parse(raw: &str) -> Result<Self> {
+        toml::from_str(raw).map_err(|source| ConfigError::MalformedRules { error: source }.into())
+    }
+
+    /// Validate the `id` and `allow` fields in each `[[peer]]` table against `Req`.
+    ///
+    /// The result can be installed only on `Req` or [`Addressed<Req>`]. For
+    /// example, `allow = ["GetItem", "Reserve"]` must name methods in
+    /// `Req::METHODS`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::MalformedEndpointId`] for a bad peer id and
+    /// [`ConfigError::UnknownMethod`] for the first name absent from
+    /// [`Rpc::METHODS`].
+    pub fn compile<Req: Rpc>(self) -> Result<Compiled<Req>> {
+        if self.peer.is_empty() {
+            return Err(ConfigError::EmptyRules.into());
+        }
+        let mut allowed = BTreeMap::<EndpointId, BTreeSet<&'static str>>::new();
+        for peer in self.peer {
+            let id = EndpointId::from_str(&peer.id).map_err(|source| {
+                ConfigError::MalformedEndpointId {
+                    entry: peer.id.clone(),
+                    source,
+                }
+            })?;
+            if allowed.contains_key(&id) {
+                return Err(ConfigError::DuplicatePeer { id }.into());
+            }
+            if peer.allow.is_empty() {
+                return Err(ConfigError::EmptyPeerMethods { id }.into());
+            }
+            let mut methods = BTreeSet::new();
+            for named in peer.allow {
+                let Some(method) = Req::METHODS.iter().copied().find(|method| *method == named)
+                else {
+                    return Err(ConfigError::UnknownMethod {
+                        service: Req::SERVICE,
+                        named,
+                    }
+                    .into());
+                };
+                methods.insert(method);
+            }
+            allowed.insert(id, methods);
+        }
+        let allow = Allowlist::only(allowed.keys().copied());
+        Ok(Compiled {
+            allow,
+            authorization: Authorization {
+                allowed,
+                request: PhantomData,
+                installed: None,
+            },
+        })
+    }
+}
+
+/// Peer admission plus method authorization compiled for one generated request type.
+///
+/// The source uses `[[peer]]` tables with an endpoint `id` and an `allow` array
+/// of generated method names. The policies have no independent projection.
+/// [`install`](Self::install) gives the validated allowlist to the generated
+/// builder closure and installs the matching middleware itself.
+#[derive(Debug)]
+pub struct Compiled<Req> {
+    allow: Allowlist,
+    authorization: Authorization<Req>,
+}
+
+impl<Req: Rpc + 'static> Compiled<Req> {
+    /// Create a generated service builder with required admission and authorization.
+    ///
+    /// `WireReq` must be `Req` or [`Addressed<Req>`]. This bound keeps rules
+    /// compiled for one generated request type off every unrelated service.
+    ///
+    /// ```no_run
+    /// use keylink::{Allowlist, Context, Rules};
+    ///
+    /// keylink::service! {
+    ///     service Inventory;
+    ///     rpc GetItem(id: u64) -> Option<u64>;
+    /// }
+    ///
+    /// struct Inventory;
+    ///
+    /// impl inventory::Handler for Inventory {
+    ///     async fn get_item(&self, _cx: &Context, id: u64) -> Option<u64> {
+    ///         Some(id)
+    ///     }
+    /// }
+    ///
+    /// let raw = r#"
+    /// [[peer]]
+    /// id = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0"
+    /// allow = ["GetItem"]
+    /// "#;
+    /// let compiled = Rules::parse(raw)?.compile::<inventory::Request>()?;
+    /// let service = compiled
+    ///     .install(|allow| inventory::service(Inventory, allow))
+    ///     .build();
+    /// # let _ = service;
+    /// # Ok::<(), keylink::Error>(())
+    /// ```
+    pub fn install<WireReq, Resp>(
+        self,
+        build: impl FnOnce(Allowlist) -> ServiceBuilder<WireReq, Resp>,
+    ) -> ServiceBuilder<WireReq, Resp>
+    where
+        WireReq: Rpc + DeserializeOwned + Send + Sync + 'static,
+        Resp: Serialize + Granting + Send + Sync + 'static,
+        Authorization<Req>: Middleware<WireReq, Resp>,
+    {
+        build(self.allow.clone())
+            .require_admission(self.allow)
+            .require_authorization(self.authorization)
+    }
+}
+
+/// The method layer retained by [`Compiled`] for one generated request type.
+///
+/// Its fields and constructor are private. The public name exists only because
+/// [`Compiled::install`]'s bound must state that the wire request is either the
+/// compiled request itself or [`Addressed`] around it.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct Authorization<Req> {
+    allowed: BTreeMap<EndpointId, BTreeSet<&'static str>>,
+    request: PhantomData<fn() -> Req>,
+    installed: Option<Weak<dyn MethodAuthorization>>,
+}
+
+impl<Req> Authorization<Req> {
+    fn authorizes(&self, peer: EndpointId, method: &'static str) -> bool {
+        self.allowed
+            .get(&peer)
+            .is_some_and(|methods| methods.contains(method))
+    }
+
+    fn handle<WireReq: Send + 'static, Resp: Send + 'static>(
+        &self,
+        cx: Context,
+        req: WireReq,
+        body: BodyReader,
+        next: Next<WireReq, Resp>,
+    ) -> BoxFut<(Outcome<Resp>, Body)> {
+        let method = cx.method();
+        // `serve_one` already checked this exact installed policy before the
+        // idempotency ledger. Keep the typed middleware installed as the required
+        // layer, but do not repeat an immutable lookup for ordinary wire calls.
+        if self
+            .installed
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|installed| cx.method_authorized_by(&installed))
+            || self.authorizes(cx.peer(), method)
+        {
+            return next(cx, req, body);
+        }
+        Box::pin(async move {
+            (
+                Outcome::Err(RemoteError::Unauthorized(method.to_owned())),
+                Body::empty(),
+            )
+        })
+    }
+}
+
+impl<Req: 'static> MethodAuthorization for Authorization<Req> {
+    fn bind(&mut self, installed: Weak<dyn MethodAuthorization>) {
+        self.installed = Some(installed);
+    }
+
+    fn authorizes(&self, peer: EndpointId, method: &'static str) -> bool {
+        self.authorizes(peer, method)
+    }
+}
+
+impl<Req, Resp> Middleware<Req, Resp> for Authorization<Req>
+where
+    Req: Rpc + Send + 'static,
+    Resp: Send + 'static,
+{
+    fn handle(
+        &self,
+        cx: Context,
+        req: Req,
+        body: BodyReader,
+        next: Next<Req, Resp>,
+    ) -> BoxFut<(Outcome<Resp>, Body)> {
+        self.handle(cx, req, body, next)
+    }
+}
+
+impl<Req, Resp> Middleware<Addressed<Req>, Resp> for Authorization<Req>
+where
+    Req: Rpc + Send + 'static,
+    Resp: Send + 'static,
+{
+    fn handle(
+        &self,
+        cx: Context,
+        req: Addressed<Req>,
+        body: BodyReader,
+        next: Next<Addressed<Req>, Resp>,
+    ) -> BoxFut<(Outcome<Resp>, Body)> {
+        self.handle(cx, req, body, next)
     }
 }
 

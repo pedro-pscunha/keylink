@@ -5279,6 +5279,10 @@ macro_rules! __keylink_service {
 
             impl $crate::Rpc for Request {
                 const SERVICE: &'static str = stringify!($svc);
+                const METHODS: &'static [&'static str] = &[
+                    $( $( #[$cfg] )* stringify!($rpc), )+
+                    "__Status",
+                ];
 
                 fn method(&self) -> &'static str {
                     match self {

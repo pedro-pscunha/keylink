@@ -317,8 +317,7 @@ calls each test inside the page. Both tools are pinned in `mise.toml`; the
 chromedriver pin tracks the **installed Chrome's major version**, not keylink,
 so a Chrome that auto-updates past it reddens the task until the pin follows.
 
-**What now runs in a browser**, all four assertions under `--no-default-features
---features web`:
+**What now runs in a browser**, under `--no-default-features --features web`:
 
 - `derive_alpn` — the schema hash is computed, is stable across two calls, and
   still moves when a field is added.
@@ -327,6 +326,10 @@ so a Chrome that auto-updates past it reddens the task until the pin follows.
 - `Body::from_web_file` — a real `File` becomes a body that declares its length.
 - `Body::from_web_stream` — a `ReadableStream` with no BYOB reader is refused as
   `Error::NotAByteStream` rather than thrown out of.
+- `Patience` — portable constructor boundaries and the topic timeout path run
+  on the browser clock.
+- `BroadcastDepth`, `DropOldest`, and `DropNewest` — constructor boundaries and
+  both bounded lossy fan-out policies run in Chrome.
 
 The task found a defect on its first run, which is the shape of what the three
 build tasks cannot see: keylink asked for `wasm-streams 0.6` while reqwest, which

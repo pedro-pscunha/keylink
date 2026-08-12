@@ -281,8 +281,9 @@ description = "Every test once, with native integration suites sharing one proce
 #
 # `gate-tests/gate.rs` is the middle ground: ordinary native integration files
 # remain independently runnable, while this command includes the safe ones as
-# modules in one libtest process. Four suites stay separate because they use a
-# process-wide measurement, nested Cargo, or scheduling-sensitive handshake
+# modules in one libtest process. Five suites stay separate: two use process-wide
+# measurements, drift runs nested Cargo, `keyed_topic_allocation` owns a
+# process-global allocator, and reliable needs scheduling-sensitive handshake
 # evidence. The manifest marks the aggregate `test = false`, so an ordinary
 # `cargo test` does not run everything twice. Its inventory test fails if a test
 # file is omitted or an isolated suite loses its exact native/browser selector.
@@ -293,7 +294,7 @@ description = "Every test once, with native integration suites sharing one proce
 # exceptional selection. `--no-fail-fast` reports later targets after one fails.
 # Doctests need their own command whenever Cargo target selectors are present.
 run = [
-    "cargo test --workspace --lib --bins --test gate --test actor_memory --test drift --test mailbox_latency --test reliable --no-fail-fast",
+    "cargo test --workspace --lib --bins --test gate --test actor_memory --test drift --test keyed_topic_allocation --test mailbox_latency --test reliable --no-fail-fast",
     "cargo test --workspace --exclude keylink --test '*' --no-fail-fast",
     "cargo test --workspace --doc --no-fail-fast",
 ]

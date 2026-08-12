@@ -4,9 +4,9 @@
 //! endpoint cleanup to process teardown, so that repeats the same two-second drain
 //! for every file. Keeping the modules in one libtest process pays it once.
 //!
-//! `actor_memory`, `mailbox_latency`, `drift`, and `reliable` stay separate:
-//! the first two use process-wide measurements, drift runs nested Cargo builds,
-//! and reliable's handshake counter requires process-level scheduling isolation.
+//! Five suites stay separate: `actor_memory` and `mailbox_latency` use process-wide
+//! measurements, `drift` runs nested Cargo builds, `keyed_topic_allocation` owns a
+//! process-global allocator, and `reliable` needs process-level scheduling isolation.
 //! `browser` is a wasm-only target. `every_test_file_is_in_the_gate` makes this
 //! list and both isolated runner selections fail closed when a file is added.
 
@@ -54,7 +54,13 @@ fn every_test_file_is_in_the_gate() {
     use std::collections::BTreeSet;
     use std::path::Path;
 
-    const NATIVE_SEPARATE: &[&str] = &["actor_memory", "drift", "mailbox_latency", "reliable"];
+    const NATIVE_SEPARATE: &[&str] = &[
+        "actor_memory",
+        "drift",
+        "keyed_topic_allocation",
+        "mailbox_latency",
+        "reliable",
+    ];
     const NON_NATIVE: &[&str] = &["browser"];
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let here = manifest.join("tests");

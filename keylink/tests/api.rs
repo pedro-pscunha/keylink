@@ -276,6 +276,12 @@ async fn the_serving_side_key_policy_resolves_from_outside() {
 ///
 /// All four are `#[doc(hidden)] pub` — hidden from the docs, not from the
 /// compiler, and therefore a compatibility promise whatever the attribute says.
+///
+/// Search `    const METHODS: &'static [&'static str] = T::METHODS;`.
+///
+/// The `METHODS` forwarding was made red with `scripts/break-once.sh`, replacing
+/// `T::METHODS` with `&[]`. The assertion below reported `left: []` against
+/// `right: ["Count", "Note", "__Status"]`.
 #[tokio::test]
 async fn the_hidden_seam_the_macro_writes_is_reachable_and_typed() {
     // `Addressed<T>` has private fields and exactly two doors, `new` and
@@ -287,6 +293,10 @@ async fn the_hidden_seam_the_macro_writes_is_reachable_and_typed() {
         },
     );
     assert_eq!(keylink::Rpc::method(&addressed), "Note");
+    assert_eq!(
+        <keylink::Addressed<depot::Request> as keylink::Rpc>::METHODS,
+        <depot::Request as keylink::Rpc>::METHODS,
+    );
     assert_eq!(
         keylink::Rpc::actor(&addressed).map(ActorId::as_str),
         Some("obra/4471")
@@ -397,6 +407,39 @@ mod cfg_disabled_service_declarations {
     async fn disabled_declarations_leave_no_generated_references() {
         let _actor = disabled::actor(State);
     }
+
+    /// `Rpc::METHODS` is generated from the active wire declarations and the
+    /// generated status operation, never from source declarations alone.
+    ///
+    /// Search `                    $( $( #[$cfg] )* stringify!($rpc), )+` and
+    /// `                    "__Status",` respectively.
+    ///
+    /// Made red with `scripts/break-once.sh` in two production breaks. Removing
+    /// the normalized `$( #[$cfg] )*` from the method expression produced
+    /// `left: ["Type", "Notify", "Upload", "Download", "Snapshot", "Ping", "__Status"]`
+    /// against `right: ["Ping", "__Status"]`. Removing the generated status line
+    /// produced `left: ["Ping"]` against `right: ["Ping", "__Status"]`.
+    #[test]
+    fn methods_exclude_cfg_disabled_declarations_and_include_status() {
+        assert_eq!(
+            <disabled::Request as keylink::Rpc>::METHODS,
+            &["Ping", "__Status"],
+        );
+
+        let peer = keylink::SecretKey::from_bytes(&[42; 32]).public();
+        let raw = format!("[[peer]]\nid = \"{peer}\"\nallow = [\"Type\"]\n");
+        let error = keylink::Rules::parse(&raw)
+            .expect("valid TOML")
+            .compile::<disabled::Request>()
+            .expect_err("a cfg-disabled declaration is unknown in this binary");
+        assert!(matches!(
+            error,
+            keylink::Error::Config(keylink::ConfigError::UnknownMethod {
+                service: "Disabled",
+                named,
+            }) if named == "Type"
+        ));
+    }
 }
 
 mod cfg_attr_declaration_attributes {
@@ -439,6 +482,23 @@ mod cfg_attr_condition_semantics {
         async fn serde_active(&mut self, _cx: keylink::Caller<'_>, value: u64) -> u64 {
             value
         }
+    }
+
+    /// Nested `cfg_attr` is normalized onto expression sites, while arbitrary
+    /// declaration metadata is not.
+    ///
+    /// Search `                    $( $( #[$cfg] )* stringify!($rpc), )+`.
+    ///
+    /// Made red twice with `scripts/break-once.sh`. Removing the normalized cfg
+    /// channel included `NestedDisabled` in the left-hand method list. Replacing
+    /// that channel with `$meta` failed compilation with `E0658: attributes on
+    /// expressions are experimental` at the forwarded serde attribute.
+    #[test]
+    fn methods_follow_nested_cfg_attr_without_forwarding_non_cfg_metadata() {
+        assert_eq!(
+            <conditional::Request as keylink::Rpc>::METHODS,
+            &["Active", "SerdeActive", "__Status"],
+        );
     }
 
     #[tokio::test]

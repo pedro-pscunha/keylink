@@ -23,6 +23,7 @@ tokio = { version = "1", features = ["full"] }
 bytes = "1"
 thiserror = "2"
 pastey = "0.2"
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
 
 # `missing_docs` is not here: it belongs to the library, which declares it
 # itself, and a binary has no public API to document.
