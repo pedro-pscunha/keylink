@@ -1798,21 +1798,21 @@ impl<M> Registry<M> {
             // operation while preserving a non-blocking self-notify when room
             // exists.
             return match route.mail.try_send(message) {
-                Ok(()) => Ok(crate::Queued::__new()),
+                Ok(()) => Ok(crate::Queued::new()),
                 Err(mpsc::error::TrySendError::Full(_)) => Err(LocalTellError::Reentrant),
                 Err(mpsc::error::TrySendError::Closed(_)) => Err(LocalTellError::Closed),
             };
         }
         if route.shed {
             return match route.mail.try_send(message) {
-                Ok(()) => Ok(crate::Queued::__new()),
+                Ok(()) => Ok(crate::Queued::new()),
                 Err(mpsc::error::TrySendError::Full(_)) => Err(LocalTellError::MailboxFull),
                 Err(mpsc::error::TrySendError::Closed(_)) => Err(LocalTellError::Closed),
             };
         }
         let sent = route.mail.send(message).await;
         drop(route);
-        sent.map(|()| crate::Queued::__new())
+        sent.map(|()| crate::Queued::new())
             .map_err(|_| LocalTellError::Closed)
     }
 

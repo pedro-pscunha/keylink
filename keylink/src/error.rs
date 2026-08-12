@@ -33,8 +33,7 @@ pub struct Queued {
 
 impl Queued {
     /// Build the proof after a generated or crate-owned mailbox path admits a message.
-    #[doc(hidden)]
-    pub const fn __new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self { _private: () }
     }
 }

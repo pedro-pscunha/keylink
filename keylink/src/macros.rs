@@ -6703,8 +6703,9 @@ macro_rules! __keylink_service {
             /// the condition [`Own::reserve`](keylink::Own::reserve) does not meet.
             ///
             /// **The methods differ from [`Handle`]'s in exactly one way — a
-            /// `tell` returns nothing at all rather than a `Result`.** Both of
-            /// that door's failures are answered before a permit exists: full is
+            /// `tell` returns [`Queued`](keylink::Queued) directly rather than a
+            /// `Result`.** Both of that door's failures are answered before a
+            /// permit exists: full is
             /// what the reservation waited out, and closed is what it reported.
             /// An `rpc` still returns a `Result`, because a turn can still lose
             /// its reply after it is queued.
@@ -9093,7 +9094,6 @@ macro_rules! __keylink_local_method {
                     reply: __reply,
                 })
                 .await
-                .map(|()| $crate::Queued::__new())
         }
     };
     ([$( #[$meta:meta] )*], blob, $name:ident, $variant:ident,
@@ -9155,9 +9155,9 @@ macro_rules! __keylink_local_method {
 ///
 /// [`__keylink_local_method`]'s set with the wait already paid, so the arms differ
 /// from it in two ways and only two. Every method takes `self`, because a slot
-/// admits one message. And a `tell` returns nothing rather than
-/// `Result<(), NotQueued>`: that door's two failures are a full mailbox and a
-/// closed one, and the reservation answered both before this method existed.
+/// admits one message. A `tell` returns [`Queued`](crate::Queued) directly rather
+/// than `Result<Queued, NotQueued>`: that door's two failures are a full mailbox
+/// and a closed one, and the reservation answered both before this method existed.
 ///
 /// `send` and `recv` are absent here for the reason they are absent from
 /// [`__keylink_local_method`] — a `BodyReader` and a `Body` are a QUIC stream's
@@ -9217,8 +9217,7 @@ macro_rules! __keylink_permit_method {
                     $( $arg, )*
                     body: (),
                     reply: __reply,
-                });
-            $crate::Queued::__new()
+                })
         }
     };
     ([$( #[$meta:meta] )*], blob, $name:ident, $variant:ident,

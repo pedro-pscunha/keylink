@@ -4,11 +4,12 @@
 //! program never writes runtime plumbing:
 //!
 //! ```ignore
-//! fn main() -> keylink::Result<()> {
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let node = keylink::blocking::Node::bind()?;
 //!     let client = inventory::blocking::Client::connect(&node, peer)?;
 //!     println!("{:?}", client.get_item("ADU-014".to_string())?);
-//!     client.close()
+//!     client.close()?;
+//!     Ok(())
 //! }
 //! ```
 //!
@@ -68,8 +69,8 @@ impl Runtime {
 
     /// Drive one future to completion on this runtime.
     ///
-    /// Generated blocking clients call this and nothing else, so the
-    /// async-context check lives in exactly one place.
+    /// Crate-level blocking operations call this. Generated service methods use
+    /// [`Self::run_exact`] so their async error type remains precise.
     ///
     /// # Errors
     ///
@@ -320,6 +321,38 @@ mod tests {
             matches!(err, Error::BlockingInAsync),
             "expected BlockingInAsync, got {err:?}"
         );
+    }
+
+    /// Watched red by replacing the `run_exact` async-context guard with a
+    /// direct `block_on(fut)`. This test terminated red with Tokio's
+    /// `Cannot start a runtime from within a runtime` panic. The post-format
+    /// break anchor is:
+    ///
+    /// `if tokio::runtime::Handle::try_current().is_ok() {
+    ///     return Err(crate::BlockingError::BlockingInAsync);
+    /// }`
+    #[tokio::test]
+    async fn exact_blocking_calls_refuse_an_async_runtime() {
+        let runtime = std::thread::spawn(|| Runtime::new().expect("builds outside tokio"))
+            .join()
+            .expect("thread does not panic");
+
+        let error = runtime
+            .run_exact(async { Ok::<_, Error>(()) })
+            .expect_err("must refuse rather than block");
+        assert!(matches!(error, crate::BlockingError::BlockingInAsync));
+    }
+
+    #[test]
+    fn exact_blocking_calls_keep_the_operation_error() {
+        let runtime = Runtime::new().expect("builds outside tokio");
+        let error = runtime
+            .run_exact(async { Err::<(), _>("operation failed") })
+            .expect_err("the operation fails");
+        assert!(matches!(
+            error,
+            crate::BlockingError::Operation("operation failed")
+        ));
     }
 
     #[test]
