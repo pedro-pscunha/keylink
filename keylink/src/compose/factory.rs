@@ -905,7 +905,7 @@ mod tests {
     async fn dispatched(factory: &Factory<Members, ()>) {
         factory
             .dispatch(|permit| async move {
-                permit.notify(|origin, reply| Mail::Whoami { origin, reply });
+                let _ = permit.notify(|origin, reply| Mail::Whoami { origin, reply });
             })
             .await
             .expect("a slot on some member");
@@ -916,7 +916,7 @@ mod tests {
     async fn hold(member: &Members) -> oneshot::Sender<()> {
         let (entered, started) = oneshot::channel();
         let (release, gate) = oneshot::channel();
-        member
+        let _ = member
             .notify(move |origin, reply| Mail::Hold {
                 origin,
                 entered,
@@ -1157,7 +1157,7 @@ mod tests {
         );
         let release = hold(&factory.members()[1]).await;
         for _ in 0..3 {
-            factory.members()[1]
+            let _ = factory.members()[1]
                 .notify(|origin, reply| Mail::Quiet { origin, reply })
                 .await
                 .expect("the member is running");

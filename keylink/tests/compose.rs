@@ -1754,13 +1754,13 @@ async fn least_loaded_separates_workers_at_depth_above_one() {
         .held()
         .await;
     for _ in 0..3 {
-        factory.members()[1]
+        let _ = factory.members()[1]
             .quiet()
             .await
             .expect("the member is running");
     }
 
-    factory
+    let _ = factory
         .dispatch(|member| async move { member.mark() })
         .await
         .expect("a slot on some member");
@@ -1972,7 +1972,7 @@ async fn a_race_across_four_live_members_gives_every_loser_its_slot_back() {
     let dispatch = tokio::spawn({
         let factory = factory.clone();
         async move {
-            factory
+            let _ = factory
                 .dispatch(|member| async move { member.mark() })
                 .await
                 .expect("a slot on some member");

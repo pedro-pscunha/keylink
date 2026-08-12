@@ -2355,16 +2355,19 @@ where
     ///
     /// Only local ones — opening the stream, encoding, or writing. A refusal on
     /// the far side is not among them, by construction.
-    pub async fn tell(&self, request: Req) -> Result<()> {
+    pub async fn tell(
+        &self,
+        request: Req,
+    ) -> std::result::Result<crate::Transmitted, crate::TellError> {
         let mut send = self.conn.open_uni().await?;
         // `None` for the key, and it is now the only value this line could
         // write: `self.idempotency` is `Some` on no client that has a `tell`.
         // `Some(0)` body length, because a `tell` carries no payload and an
         // open-ended stream would make the receiver wait for an end that says
         // nothing.
-        wire::write_header(&mut send, Some(0), None, &WireRequest::Call(request)).await?;
+        wire::write_tell(&mut send, &WireRequest::Call(request)).await?;
         send.finish()?;
-        Ok(())
+        Ok(crate::Transmitted::new())
     }
 
     /// Close the connection gracefully.

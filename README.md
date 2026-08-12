@@ -296,7 +296,8 @@ it does **not** mean at-most-once, for which the honest instrument is
 
 It carries `rpc` and none of the other four kinds, because `rpc` is the only kind
 all four surfaces declare: an `ActorRef` and an `IdempotentClient` have no `tell`,
-a `Handle` has no `send` and no `recv`, and `blob` answers a `BlobId` locally
+a `Handle` has no `send` or `recv`, `ActorRef` has no validly servable `send`,
+and `blob` answers a `BlobId` locally
 against a `BlobHandle` — a content address plus the node that holds it —
 remotely. One behaviour diverges across the bound, and it is documented rather
 than papered over: a handler panic **unwinds into the calling task** against a
@@ -309,13 +310,21 @@ missing wrappers. A blank cell means the method is not generated on that surface
 
 | generated surface | `rpc` | `tell` | `send` | `recv` | `blob` | error vocabulary |
 | --- | --- | --- | --- | --- | --- | --- |
-| `Handle<A>` | yes | yes |  |  | yes | `Unanswered` / `NotQueued` |
-| `LocalRef<'_>` | yes | yes |  |  | yes | `LocalError` |
-| `ActorRef<'_>` | yes |  | yes | yes | yes | `Error` |
-| `Client` | yes | yes | yes | yes | yes | `Error` |
+| `Handle<A>` | yes | yes |  |  | yes | `Unanswered`; `NotQueued` for `tell` |
+| `LocalRef<'_>` | yes | yes |  |  | yes | `LocalError`; `LocalTellError` for `tell` |
+| `ActorRef<'_>` | yes |  |  | yes | yes | `Error` |
+| `Client` | yes | yes | yes | yes | yes | `Error`; `TellError` for `tell` |
 | `IdempotentClient` | yes |  | yes | yes | yes | `Error` |
-| `blocking::Client` | yes | yes |  |  |  | `Error` |
-| `blocking::IdempotentClient` | yes |  |  |  |  | `Error` |
+| `blocking::Client` | yes | yes |  |  |  | `BlockingError<Error>`; `BlockingError<TellError>` for `tell` |
+| `blocking::IdempotentClient` | yes |  |  |  |  | `BlockingError<Error>` |
+
+A successful local `tell` returns `Queued`: the mailbox admitted the message, but
+its turn has not run. A successful remote `tell` returns `Transmitted`: the bytes
+reached the caller's transport, but the peer may never receive, authorize, route,
+queue, or handle them. Use `rpc ... -> ()` when completion or an idempotency record
+matters. That acknowledged form is why `tell` stays absent from `ActorRef` and both
+idempotent clients: adding it there would hide failures those surfaces exist to
+make observable.
 
 The generated `Calls` trait carries only `rpc`, and is implemented for
 `Handle`, `ActorRef`, `Client`, and `IdempotentClient`; it intentionally does
@@ -325,13 +334,13 @@ surfaces (`ActorRef`, `Client`, and `IdempotentClient`), not on a bare local
 handle or local keyed reference.
 
 **Sync and async.** `keylink::blocking` is a narrow singleton client for programs
-with no runtime. Its generated clients expose unary `rpc` and `tell` methods;
-`send`, `recv`, `blob`, and keyed addressing remain async because they carry a
-stream or an async content handle. The blocking module owns a private
+with no runtime. Its plain generated client exposes unary `rpc` and `tell` methods. Its
+`blocking::IdempotentClient` exposes only `rpc`: idempotency excludes `tell`, and
+blocking excludes `send`, `recv`, and `blob`. Keyed addressing remains async. The blocking module owns a private
 multi-threaded runtime — mandatory, because a current-thread runtime only
 advances iroh's keepalives during `block_on`, so the connection would stall
 between calls. Calling it from inside a runtime returns
-`Error::BlockingInAsync` instead of deadlocking. `Node::enter` lends that
+`BlockingError::BlockingInAsync` from generated methods instead of deadlocking. `Node::enter` lends that
 runtime to the calling thread, which is what a synchronous program needs to
 construct an actor at all.
 

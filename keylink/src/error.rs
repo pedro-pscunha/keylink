@@ -21,6 +21,81 @@ use iroh::{EndpointId, KeyParsingError};
 
 use crate::{RemoteError, Unanswered, Withheld};
 
+/// Proof that a local `tell` entered its target mailbox.
+///
+/// This does not mean the handler started or completed. The private field keeps
+/// callers from fabricating admission evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "queue admission is the only fact a local tell returns"]
+pub struct Queued {
+    _private: (),
+}
+
+impl Queued {
+    /// Build the proof after a generated or crate-owned mailbox path admits a message.
+    pub(crate) const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Proof that a remote `tell` was handed to the local transport.
+///
+/// This does not prove that the peer received, admitted, routed, or handled the
+/// message. The private field prevents stronger code from inventing the proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "transmission is the only fact a remote tell returns"]
+pub struct Transmitted {
+    _private: (),
+}
+
+impl Transmitted {
+    pub(crate) const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// A failure before a remote `tell` was fully handed to the local transport.
+///
+/// There is deliberately no remote-error arm: `tell` has no response stream, so
+/// authorization, routing, middleware, and handler outcomes are unobservable.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TellError {
+    /// The established connection could not open another stream.
+    #[error(transparent)]
+    Connection(#[from] ConnectionError),
+    /// The request could not be encoded.
+    #[error(transparent)]
+    Codec(#[from] postcard::Error),
+    /// The encoded request exceeded the header cap.
+    #[error("header frame of {len} bytes exceeds the {cap} byte cap")]
+    FrameTooLarge {
+        /// The encoded length.
+        len: u64,
+        /// The accepted cap.
+        cap: u32,
+    },
+    /// Writing the request failed.
+    #[error(transparent)]
+    Write(#[from] WriteError),
+    /// The stream was already finished when the request was finalized.
+    #[error(transparent)]
+    StreamClosed(#[from] ClosedStream),
+}
+
+/// A blocking adapter failed before or during its async operation.
+#[cfg(feature = "blocking")]
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum BlockingError<E> {
+    /// The blocking API was called from inside an async runtime.
+    #[error("blocking keylink call from inside an async runtime - use the async API here")]
+    BlockingInAsync,
+    /// The underlying async operation failed.
+    #[error("{0}")]
+    Operation(#[source] E),
+}
+
 /// Everything that can go wrong on a keylink call.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -185,6 +260,36 @@ pub enum Error {
     /// Reading or writing a body against local storage failed.
     #[error("body io: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<crate::wire::HeaderError> for TellError {
+    fn from(error: crate::wire::HeaderError) -> Self {
+        match error {
+            crate::wire::HeaderError::Codec(source) => Self::Codec(source),
+            crate::wire::HeaderError::TooLarge { len, cap } => Self::FrameTooLarge { len, cap },
+        }
+    }
+}
+
+impl From<crate::wire::HeaderError> for Error {
+    fn from(error: crate::wire::HeaderError) -> Self {
+        match error {
+            crate::wire::HeaderError::Codec(source) => Self::Codec(source),
+            crate::wire::HeaderError::TooLarge { len, cap } => Self::FrameTooLarge { len, cap },
+        }
+    }
+}
+
+impl From<TellError> for Error {
+    fn from(error: TellError) -> Self {
+        match error {
+            TellError::Connection(source) => Self::from(source),
+            TellError::Codec(source) => Self::Codec(source),
+            TellError::FrameTooLarge { len, cap } => Self::FrameTooLarge { len, cap },
+            TellError::Write(source) => Self::from(source),
+            TellError::StreamClosed(source) => Self::from(source),
+        }
+    }
 }
 
 /// What a call met, whichever surface carried it.
@@ -539,6 +644,12 @@ mod tests {
     use std::error::Error as _;
 
     use super::*;
+
+    #[test]
+    fn a_tell_error_upcasts_without_erasing_its_cause() {
+        let broad = Error::from(TellError::FrameTooLarge { len: 12, cap: 8 });
+        assert!(matches!(broad, Error::FrameTooLarge { len: 12, cap: 8 }));
+    }
 
     /// One condition, two producers, one arm.
     ///

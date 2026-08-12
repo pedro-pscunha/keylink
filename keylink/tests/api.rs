@@ -53,7 +53,8 @@
 use keylink::prelude::*;
 use keylink::{
     mount, ActorId, Allowlist, Body, BodyReader, Caller, Ended, Eviction, Failure, Governed,
-    Keyable, KeyedService, MountError, Origin, Records, Reply,
+    Keyable, KeyedService, LocalTellError, MountError, Origin, Queued, Records, Reply, TellError,
+    Transmitted,
 };
 
 keylink::service! {
@@ -81,6 +82,84 @@ impl depot::Actor for Counter {
     async fn note(&mut self, _cx: Caller<'_>, _line: String) -> u64 {
         self.0 += 1;
         self.0
+    }
+}
+
+mod surface_contract {
+    use super::{LocalTellError, Queued, TellError, Transmitted};
+
+    struct NoSuchMethod;
+
+    keylink::service! {
+        service SurfaceContract;
+
+        rpc Call(value: u64) -> u64;
+        tell Notify(value: u64) -> ();
+        send Upload(value: u64) -> u64;
+        recv Download(value: u64) -> u64;
+        blob Snapshot(value: u64) -> u64;
+    }
+
+    trait ActorRefHasNoUpload {
+        fn upload(&self) -> NoSuchMethod {
+            NoSuchMethod
+        }
+    }
+
+    impl ActorRefHasNoUpload for surface_contract::ActorRef<'_> {}
+
+    /// Surface absence and exact tell signatures are compile-time guarantees.
+    ///
+    /// Watched red in two production breaks. Re-emitting the `send` arm of
+    /// `__keylink_actor_client_method` makes `actor.upload()` resolve to the
+    /// inherent two-argument method and fail with `E0061`. Changing the keyed
+    /// local `tell` signature back to `Result<(), LocalError>` fails with `E0308`
+    /// against the `Result<Queued, LocalTellError>` annotation below.
+    ///
+    /// The post-format search anchors are:
+    ///
+    /// `    ([$( #[$meta:meta] )*], send, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
+    ///         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};`
+    ///
+    /// `            -> ::core::result::Result<$crate::Queued, $crate::LocalTellError> {`
+    #[allow(dead_code)]
+    async fn exact_surface_signatures(
+        handle: surface_contract::Handle<impl surface_contract::Actor>,
+        permit: surface_contract::Permit<'_, impl surface_contract::Actor>,
+        owned_permit: surface_contract::OwnedPermit<impl surface_contract::Actor>,
+        local: surface_contract::LocalRef<'_>,
+        actor: surface_contract::ActorRef<'_>,
+        client: surface_contract::Client,
+        keyed: surface_contract::IdempotentClient,
+    ) {
+        let _: Result<Queued, keylink::NotQueued> = handle.notify(1).await;
+        let _: Queued = permit.notify(1);
+        let _: Queued = owned_permit.notify(1);
+        let _: Result<Queued, LocalTellError> = local.notify(1).await;
+        let _: Result<Transmitted, TellError> = client.notify(1).await;
+
+        let _: NoSuchMethod = actor.upload();
+        let _: keylink::Result<u64> = client.upload(1, keylink::Body::empty()).await;
+        let _: keylink::Result<u64> = keyed.upload(1, keylink::Body::empty()).await;
+
+        #[cfg(feature = "blocking")]
+        {
+            let blocking = unreachable_blocking_client();
+            let _: Result<Transmitted, keylink::BlockingError<TellError>> = blocking.notify(1);
+
+            let keyed = unreachable_blocking_idempotent_client();
+            let _: Result<u64, keylink::BlockingError<keylink::Error>> = keyed.call(1);
+        }
+    }
+
+    #[cfg(feature = "blocking")]
+    fn unreachable_blocking_client() -> surface_contract::blocking::Client {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "blocking")]
+    fn unreachable_blocking_idempotent_client() -> surface_contract::blocking::IdempotentClient {
+        unimplemented!()
     }
 }
 

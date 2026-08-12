@@ -2125,6 +2125,15 @@ ANCHORS = [
      "            return Err(ConfigError::EmptyRules.into());"),
     ("X28", "keylink/tests/admission.rs", "keylink/src/rpc.rs",
      "    for policy in required_authorization.iter() {"),
+    ("SA1", "keylink/tests/api.rs", "keylink/src/macros.rs",
+     "    ([$( #[$meta:meta] )*], send, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,\n"
+     "        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};"),
+    ("SA2", "keylink/tests/api.rs", "keylink/src/macros.rs",
+     "            -> ::core::result::Result<$crate::Queued, $crate::LocalTellError> {"),
+    ("SA3", "keylink/src/blocking.rs", "keylink/src/blocking.rs",
+     "        if tokio::runtime::Handle::try_current().is_ok() {\n"
+     "            return Err(crate::BlockingError::BlockingInAsync);\n"
+     "        }"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.

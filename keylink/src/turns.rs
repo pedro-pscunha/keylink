@@ -4247,7 +4247,10 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
     /// under the full-mailbox half of the rule above. Nothing that happens to the
     /// turn afterwards is reported, and the paragraph above says why — the
     /// receiving half of the channel that would carry it is dropped here.
-    pub async fn notify<T>(&self, mail: impl FnOnce(Origin, Reply<T>) -> M) -> Result<(), NotQueued>
+    pub async fn notify<T>(
+        &self,
+        mail: impl FnOnce(Origin, Reply<T>) -> M,
+    ) -> Result<crate::Queued, NotQueued>
     where
         T: Send + 'static,
     {
@@ -4261,6 +4264,7 @@ impl<A, M: Send + 'static> LocalActor<A, M> {
             Refuse::WhenFull,
         )
         .await
+        .map(|()| crate::Queued::new())
     }
 }
 
@@ -4923,7 +4927,7 @@ impl<A, M> Permit<'_, A, M> {
     /// call drops the message unrun — which is what `stop` already does to a
     /// queued one, and which the door that returned `Ok` could not have reported
     /// either.
-    pub fn notify<T>(self, mail: impl FnOnce(Origin, Reply<T>) -> M)
+    pub fn notify<T>(self, mail: impl FnOnce(Origin, Reply<T>) -> M) -> crate::Queued
     where
         T: Send + 'static,
     {
@@ -4934,6 +4938,7 @@ impl<A, M> Permit<'_, A, M> {
             Box::new(mail(Origin::local(), reply)),
             current(),
         ));
+        crate::Queued::new()
     }
 }
 
@@ -4979,7 +4984,7 @@ impl<A, M> OwnedPermit<A, M> {
     }
 
     /// [`Permit::notify`], owned.
-    pub fn notify<T>(self, mail: impl FnOnce(Origin, Reply<T>) -> M)
+    pub fn notify<T>(self, mail: impl FnOnce(Origin, Reply<T>) -> M) -> crate::Queued
     where
         T: Send + 'static,
     {
@@ -4990,6 +4995,7 @@ impl<A, M> OwnedPermit<A, M> {
             Box::new(mail(Origin::local(), reply)),
             current(),
         )));
+        crate::Queued::new()
     }
 }
 
@@ -6856,7 +6862,7 @@ mod tests {
         assert_eq!(actor.queued(), 0, "nothing is queued yet");
 
         // `notify` returns when the message has a permit, so this is ordered.
-        actor.notify(add(1)).await.expect("the actor is running");
+        let _ = actor.notify(add(1)).await.expect("the actor is running");
         assert_eq!(
             actor.queued(),
             1,

@@ -161,15 +161,14 @@ async fn two_local_calls_to_one_actor_never_overlap() {
     assert_eq!(ledger.entries().await.expect("running").len(), 8);
 }
 
-/// A local `tell` returns `()` and is ordered, which the remote one is not.
+/// A local `tell` returns queue-admission proof and preserves sequential order.
 #[tokio::test]
-async fn a_local_tell_returns_unit_and_keeps_its_order() {
+async fn a_local_tell_returns_queue_proof_and_keeps_its_order() {
     let ledger = ledger::actor(Ledger::default());
 
-    // Compiles only because the generated method returns `Result<()>`.
-    let unit: () = ledger.note("first".to_owned()).await.expect("running");
-    assert_eq!(unit, ());
-    ledger.note("second".to_owned()).await.expect("running");
+    let queued: keylink::Queued = ledger.note("first".to_owned()).await.expect("queues");
+    assert_eq!(queued, queued);
+    let _ = ledger.note("second".to_owned()).await.expect("running");
 
     // The `entries` rpc is queued behind both tells, in this process, so it
     // cannot observe them half-applied.
