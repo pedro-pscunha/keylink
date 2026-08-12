@@ -61,7 +61,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use keylink::compose::{Overflow, Subscription, Topic};
+use keylink::compose::{Overflow, Patience, Subscription, Topic};
 use keylink::{Backpressure, Caller, Ended, Intensity, Replied, Reply};
 use tokio::sync::Notify;
 
@@ -1392,6 +1392,84 @@ async fn publishing_into_your_own_topic_completes_under_drop_subscriber() {
         .await
         .expect("still polling")
         .expect("still running");
+}
+
+keylink::service! {
+    service FedRoom;
+
+    rpc Shout(times: u64) -> u64;
+    feed SelfPublished(item: u64);
+}
+
+struct FedChatter {
+    topic: Topic<u64>,
+    seen: tokio::sync::mpsc::UnboundedSender<u64>,
+}
+
+impl fed_room::Actor for FedChatter {
+    async fn shout(&mut self, _cx: Caller<'_>, times: u64) -> u64 {
+        let mut dropped = 0;
+        for item in 0..times {
+            dropped += self.topic.publish(item).await.dropped as u64;
+        }
+        dropped
+    }
+
+    async fn on_self_published(&mut self, item: u64) {
+        let _ = self.seen.send(item);
+    }
+}
+
+/// `BlockThenDrop` closes the generated self-feed after its finite patience.
+/// The first accepted item drains after the `shout` turn; the closed feed then
+/// ends the actor loudly with its generated name.
+///
+/// Search this timeout arm:
+/// `                None => {
+///                     let (removed, wakers) = self.remove_and_close(one);
+///                     if removed {
+///                         dropped += 1;
+///                         ordered.wakes.extend(wakers);
+///                     }
+///                 }`
+/// and replace it with `None => {}`. `scripts/break-once.sh` reached the named
+/// count assertion with zero drops instead of hanging.
+#[tokio::test(start_paused = true)]
+async fn publishing_into_your_own_topic_expires_under_block_then_drop() {
+    let patience = Patience::try_after(Duration::from_millis(1)).expect("valid patience");
+    let topic = Topic::new(Overflow::BlockThenDrop {
+        depth: NonZeroUsize::MIN,
+        patience,
+    });
+    let feed = topic.subscribe();
+    let (seen, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let room = fed_room::setup(FedChatter { topic, seen })
+        .feeds(fed_room::Feeds::new(feed))
+        .actor();
+
+    assert_eq!(
+        n0_future::time::timeout(Duration::from_millis(2), room.shout(2))
+            .await
+            .expect("finite patience must end the self-publication wait")
+            .expect("the actor is running"),
+        1,
+        "the full self-route is removed after patience"
+    );
+    assert_eq!(
+        events.recv().await,
+        Some(0),
+        "the accepted feed item drains after the publishing turn"
+    );
+    let ending = room.ended().await;
+    assert!(
+        matches!(
+            ending,
+            Ended::Feed {
+                name: "SelfPublished"
+            }
+        ),
+        "the closed generated feed ends the actor with its exact name: {ending:?}"
+    );
 }
 
 /// The other half of the pair, and the one the crate already documents: under

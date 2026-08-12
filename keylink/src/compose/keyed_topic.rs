@@ -34,7 +34,10 @@ impl<K, T> Inner<K, T> {
 /// no-op: it returns zero counts with literally zero allocations and without
 /// creating a route. Dropping a key's last route removes its map entry; an in-flight
 /// publish may finish on its existing snapshot. Dropping the last keyed publisher
-/// ends every remaining route.
+/// ends every remaining route. The key map is never held across an inner topic
+/// call. Caller `Clone` and locally rejected `Drop` callbacks performed by a
+/// publish run with both locks free. A receiver can drop accepted items on its
+/// own thread at any time.
 ///
 /// A route is directly compatible with a generated feed:
 ///
@@ -85,6 +88,14 @@ where
     /// Own the stream for `key`, creating its inner topic on the first route.
     #[must_use]
     pub fn route(&self, key: K) -> KeyedSubscription<K, T> {
+        self.route_with(key, Topic::subscribe)
+    }
+
+    fn route_with(
+        &self,
+        key: K,
+        subscribe: impl FnOnce(&Topic<T>) -> Subscription<T>,
+    ) -> KeyedSubscription<K, T> {
         let map_key = key.clone();
         let mut entries = self.inner.lock();
         let entry = if let Some(entry) = entries.get(&key) {
@@ -97,9 +108,12 @@ where
             entries.insert(map_key, Arc::clone(&entry));
             entry
         };
+        // This count owns the entry through the gap after the map unlocks and
+        // before the inner subscription exists. A last older route therefore
+        // observes at least two and cannot remove this exact Arc generation.
         entry.live_routes.fetch_add(1, Ordering::Relaxed);
-        let subscription = entry.topic.subscribe();
         drop(entries);
+        let subscription = subscribe(&entry.topic);
 
         KeyedSubscription {
             key,
@@ -238,6 +252,27 @@ mod tests {
     /// Search `        let map_key = key.clone();`. Made red with
     /// `scripts/break-once.sh` by moving that line immediately after the map-lock
     /// acquisition. The clone's `try_lock` assertion observed the held mutex.
+    /// Inner subscription starts only after the global map mutex is released.
+    ///
+    /// Search:
+    /// `        drop(entries);
+    ///         let subscription = subscribe(&entry.topic);`.
+    /// Replace it with inner subscription before `drop(entries)`:
+    /// `let subscription = subscribe(&entry.topic); drop(entries); subscription`.
+    /// `scripts/break-once.sh` made this callback's `try_lock` assertion fail.
+    #[test]
+    fn route_does_not_hold_the_map_while_the_inner_topic_subscribes() {
+        let topic = KeyedTopic::<u64, ()>::new(Overflow::BlockPublisher(NonZeroUsize::MIN));
+        let inner = Arc::clone(&topic.inner);
+        let _route = topic.route_with(1, |entry_topic| {
+            assert!(
+                inner.entries.try_lock().is_ok(),
+                "the key map must be free before inner Topic::subscribe"
+            );
+            entry_topic.subscribe()
+        });
+    }
+
     #[test]
     fn route_clones_the_key_before_locking_the_global_map() {
         let topic =
@@ -248,6 +283,113 @@ mod tests {
         };
 
         let _route = topic.route(key);
+    }
+
+    struct ReentrantPayload {
+        armed: bool,
+        callbacks: bool,
+        topic: KeyedTopic<u64, Self>,
+        route: Arc<Mutex<Option<KeyedSubscription<u64, Self>>>>,
+    }
+
+    impl Clone for ReentrantPayload {
+        fn clone(&self) -> Self {
+            if !self.callbacks {
+                return Self {
+                    armed: false,
+                    callbacks: false,
+                    topic: self.topic.clone(),
+                    route: Arc::clone(&self.route),
+                };
+            }
+            let entry = self
+                .topic
+                .inner
+                .lock()
+                .get(&1)
+                .cloned()
+                .expect("route exists");
+            assert!(
+                entry.topic.list_is_unlocked_for_test(),
+                "caller Clone must not run under the inner Topic list lock"
+            );
+            *self.route.lock().unwrap_or_else(PoisonError::into_inner) = Some(self.topic.route(1));
+            Self {
+                armed: true,
+                callbacks: true,
+                topic: self.topic.clone(),
+                route: Arc::clone(&self.route),
+            }
+        }
+    }
+
+    impl Drop for ReentrantPayload {
+        fn drop(&mut self) {
+            if !self.armed || !self.callbacks {
+                return;
+            }
+            let entry = self
+                .topic
+                .inner
+                .lock()
+                .get(&1)
+                .cloned()
+                .expect("route exists");
+            assert!(
+                entry.topic.list_is_unlocked_for_test(),
+                "rejected payload Drop must not run under the inner Topic list lock"
+            );
+            *self.route.lock().unwrap_or_else(PoisonError::into_inner) = Some(self.topic.route(1));
+        }
+    }
+
+    /// Caller payload callbacks can reenter the same key route without taking
+    /// the key-map and inner-topic locks in a cycle.
+    ///
+    /// Search `let items: Vec<_> = snapshot.iter().map(|_| item.clone()).collect();`.
+    /// Replace it with `let items = { let _held = self.lock(); snapshot.iter().map(|_| item.clone()).collect() };`.
+    /// `scripts/break-once.sh` made the callback fail its inner-list `try_lock` guard.
+    #[tokio::test]
+    async fn payload_clone_and_rejected_drop_can_reenter_the_same_key_route() {
+        let topic = KeyedTopic::new(Overflow::DropSubscriber(NonZeroUsize::MIN));
+        let _full = topic.route(1);
+        let route = Arc::new(Mutex::new(None));
+        let quiet = ReentrantPayload {
+            armed: false,
+            callbacks: false,
+            topic: topic.clone(),
+            route: Arc::clone(&route),
+        };
+        assert_eq!(topic.publish(&1, quiet).await.delivered, 1);
+        route.lock().unwrap_or_else(PoisonError::into_inner).take();
+
+        let payload = ReentrantPayload {
+            armed: false,
+            callbacks: true,
+            topic: topic.clone(),
+            route: Arc::clone(&route),
+        };
+        assert_eq!(topic.publish(&1, payload).await.dropped, 1);
+        assert!(route
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some());
+        assert_eq!(
+            topic
+                .publish(
+                    &1,
+                    ReentrantPayload {
+                        armed: false,
+                        callbacks: false,
+                        topic: topic.clone(),
+                        route: Arc::clone(&route),
+                    }
+                )
+                .await
+                .delivered,
+            1,
+            "the reentrant route remains canonical"
+        );
     }
 
     #[tokio::test]

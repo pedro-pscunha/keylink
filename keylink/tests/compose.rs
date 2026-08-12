@@ -103,7 +103,7 @@ use keylink::prelude::*;
 use std::future::Future;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use keylink::compose::{
     after, every, Added, BroadcastDepth, BroadcastDepthError, Endings, Factory, Fanout, Group,
@@ -303,8 +303,8 @@ async fn patience_accepts_only_portable_whole_milliseconds() {
 /// wins: the new item is not queued.
 ///
 /// Made red by `scripts/break-once.sh`, swapping the two explicit polls so the
-/// send is polled before the elapsed deadline. Search literal:
-/// `if elapsed.as_mut().poll(cx).is_ready() { return Poll::Ready(None); } send.as_mut().poll(cx).map(Some)`.
+/// capacity check is polled before the elapsed deadline. Search literal:
+/// `if elapsed.as_mut().poll(cx).is_ready() { return Poll::Ready(None); } local.channel.poll_capacity(cx).map(Some)`.
 /// Watched: the equality assertion received `Fanout { delivered: 1, dropped: 0,
 /// gone: 0 }` instead of the timeout report.
 #[tokio::test(start_paused = true)]
@@ -344,6 +344,35 @@ async fn block_then_drop_waits_until_the_exact_deadline_and_timeout_wins_equalit
     assert_eq!(slow.next().await, None, "the timed-out item was not queued");
 }
 
+/// When the outer timeout and inner patience deadline become ready together,
+/// `timeout` polls the publication first. The inner removal result wins.
+///
+/// Search `let Some(deadline) = Instant::now().checked_add(patience.0) else {`.
+/// Replace it with `let Some(deadline) = Instant::now().checked_add(patience.0 + Duration::from_millis(1)) else {`.
+/// `scripts/break-once.sh` made the outer timeout return `Elapsed(())`.
+#[tokio::test(start_paused = true)]
+async fn outer_timeout_at_patience_equality_observes_inner_removal() {
+    let duration = Duration::from_millis(10);
+    let topic = Topic::new(Overflow::BlockThenDrop {
+        depth: NonZeroUsize::MIN,
+        patience: Patience::try_after(duration).expect("valid patience"),
+    });
+    let mut slow = topic.subscribe();
+    assert_eq!(topic.publish(1_u64).await.delivered, 1);
+
+    assert_eq!(
+        n0_future::time::timeout(duration, topic.publish(2)).await,
+        Ok(Fanout {
+            delivered: 0,
+            dropped: 1,
+            gone: 0,
+        }),
+        "the inner patience result wins equal outer and inner deadlines"
+    );
+    assert_eq!(slow.next().await, Some(1));
+    assert_eq!(slow.next().await, None);
+}
+
 /// Each subscriber receives its own full patience from the moment its turn in
 /// the sequential fan-out starts; one subscriber does not spend the next one's.
 ///
@@ -351,7 +380,8 @@ async fn block_then_drop_waits_until_the_exact_deadline_and_timeout_wins_equalit
 /// so both subscribers shared one deadline. Search literal:
 /// `async fn publish_block_then_drop(&self, item: T, patience: Patience) -> Fanout { let to = self.lock().to_vec(); let mut delivered = 0; let mut dropped = 0; let mut gone = 0; for one in to { let Some(deadline) = Instant::now().checked_add(patience.0) else {`.
 /// Watched: the publish returned with both dropped while the second subscriber
-/// still had nine milliseconds left.
+/// still had nine milliseconds left. That search literal was spent when the
+/// concurrency fix moved finite snapshots outside the order mutex.
 #[tokio::test(start_paused = true)]
 async fn block_then_drop_starts_patience_for_each_subscriber() {
     let patience = Patience::try_after(Duration::from_millis(10)).expect("valid patience");
@@ -390,6 +420,54 @@ async fn block_then_drop_starts_patience_for_each_subscriber() {
     assert_eq!(second.next().await, None);
 }
 
+/// A timed-out subscriber closes during its own ordered iteration. A later full
+/// subscriber can still be waiting while the first drains and observes `None`.
+///
+/// Search this timeout arm:
+/// `                None => {
+///                     let (removed, wakers) = self.remove_and_close(one);
+///                     if removed {
+///                         dropped += 1;
+///                         ordered.wakes.extend(wakers);
+///                     }
+///                 }`
+/// and replace it with `None => {}`. `scripts/break-once.sh` made the first
+/// subscriber remain pending after its backlog drained.
+#[tokio::test(start_paused = true)]
+async fn block_then_drop_closes_each_timed_out_subscriber_promptly() {
+    let duration = Duration::from_millis(10);
+    let topic = Topic::new(Overflow::BlockThenDrop {
+        depth: NonZeroUsize::MIN,
+        patience: Patience::try_after(duration).expect("valid patience"),
+    });
+    let mut first = topic.subscribe();
+    let mut second = topic.subscribe();
+    assert_eq!(topic.publish(1_u64).await.delivered, 2);
+
+    let publish = topic.publish(2);
+    tokio::pin!(publish);
+    tokio::select! {
+        biased;
+        _ = n0_future::time::sleep(duration) => {}
+        result = &mut publish => panic!("the later subscriber must still be waiting: {result:?}"),
+    }
+    assert!(
+        n0_future::future::poll_once(&mut publish).await.is_none(),
+        "the publisher processes the first deadline and starts the second patience"
+    );
+    assert_eq!(first.next().await, Some(1), "accepted backlog drains first");
+    assert_eq!(
+        n0_future::future::poll_once(first.next()).await,
+        Some(None),
+        "the first subscriber closes before the second patience ends"
+    );
+    assert!(
+        n0_future::future::poll_once(&mut publish).await.is_none(),
+        "the second subscriber still owns its fresh patience"
+    );
+    assert_eq!(second.next().await, Some(1));
+}
+
 /// Cancelling a publish leaves only its delivered subscription-order prefix and
 /// does not unsubscribe the subscriber it was waiting on.
 ///
@@ -397,7 +475,8 @@ async fn block_then_drop_starts_patience_for_each_subscriber() {
 /// `for one in to.into_iter().rev() {`. Search literal:
 /// `async fn publish_block_then_drop(&self, item: T, patience: Patience) -> Fanout { let to = self.lock().to_vec(); let mut delivered = 0; let mut dropped = 0; let mut gone = 0; for one in to {`.
 /// Watched: the first subscriber had `None` instead of `Some(Some(2))`, so the
-/// delivered set was not the ordered prefix.
+/// delivered set was not the ordered prefix. That search literal was spent when
+/// each attempt became a sender-and-payload snapshot.
 #[tokio::test(start_paused = true)]
 async fn cancelling_block_then_drop_leaves_only_a_delivered_prefix() {
     let patience = Patience::try_after(Duration::from_millis(10)).expect("valid patience");
@@ -439,12 +518,17 @@ async fn cancelling_block_then_drop_leaves_only_a_delivered_prefix() {
 /// The expired subscriber drains its accepted buffer before ending, while the
 /// healthy subscriber remains registered and receives a later publish.
 ///
-/// Counting was made red by replacing `Some(Err(_)) => {` with that arm plus
+/// Counting was made red by replacing `Some(Err(())) => {` with that arm plus
 /// `dropped += 1;`; watched: `dropped` was 2 instead of 1. Channel identity was
 /// made red independently by replacing
-/// `.retain(|canonical| !canonical.same_channel(sender));` with
-/// `.retain(|_canonical| false);`. Watched: the later publish reported zero
-/// deliveries instead of one, proving one neighbour cannot remove the survivor.
+/// `            let Some(index) = canonical
+///                 .iter()
+///                 .position(|current| current.same_channel(sender))
+///             else {
+///                 return (false, Vec::new());
+///             };`
+/// with a first-entry choice. Watched: the later publish reported zero deliveries
+/// instead of one, proving one neighbour cannot remove the survivor.
 #[tokio::test(start_paused = true)]
 async fn block_then_drop_accounts_for_every_loud_outcome_and_preserves_healthy_subscribers() {
     let patience = Patience::try_after(Duration::from_millis(10)).expect("valid patience");
@@ -487,13 +571,13 @@ async fn block_then_drop_accounts_for_every_loud_outcome_and_preserves_healthy_s
     );
 }
 
-/// The per-topic publish mutex orders publishers without storing their items:
-/// once a fan-out reports a drop, a queued publisher cannot reach that subscriber.
+/// Per-topic publication tickets preserve one total decision order even while the
+/// first publisher waits for capacity.
 ///
 /// Made red by `scripts/break-once.sh`, replacing
-/// `let _ordered = self.publish_order.lock().await;` with `let _ordered = ();`.
-/// Watched: the second publisher also reported one
-/// dropped subscriber instead of seeing the already-removed topic entry.
+/// `let ticket = OrderTicket::issue(&self.publish_order);` with a ticket issued by
+/// fresh order state. Watched: publisher two accepted the newly freed slot before
+/// publisher one.
 #[tokio::test(start_paused = true)]
 async fn block_then_drop_orders_two_publishers_before_reporting_a_drop() {
     let patience = Patience::try_after(Duration::from_millis(10)).expect("valid patience");
@@ -501,45 +585,111 @@ async fn block_then_drop_orders_two_publishers_before_reporting_a_drop() {
         depth: NonZeroUsize::MIN,
         patience,
     });
-    let mut slow = topic.subscribe();
+    let mut subscriber = topic.subscribe();
     assert_eq!(topic.publish(0_u64).await.delivered, 1);
 
     let mut first = Box::pin(topic.publish(1));
     assert!(
         n0_future::future::poll_once(first.as_mut()).await.is_none(),
-        "the first publisher holds the publication mutex while it waits"
+        "the first publisher owns the publication order while it waits"
     );
     let mut second = Box::pin(topic.publish(2));
     assert!(
         n0_future::future::poll_once(second.as_mut())
             .await
             .is_none(),
-        "the second publisher waits behind the first"
+        "the second publisher waits behind the first ticket"
     );
 
-    n0_future::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(
-        first.await,
-        Fanout {
-            delivered: 0,
-            dropped: 1,
-            gone: 0,
-        }
+        subscriber.next().await,
+        Some(0),
+        "one slot becomes available"
+    );
+    assert!(
+        n0_future::future::poll_once(second.as_mut())
+            .await
+            .is_none(),
+        "publisher two cannot overtake the first ticket"
     );
     assert_eq!(
-        second.await,
-        Fanout {
-            delivered: 0,
+        n0_future::future::poll_once(first.as_mut()).await,
+        Some(Fanout {
+            delivered: 1,
             dropped: 0,
             gone: 0,
-        }
+        })
     );
-    assert_eq!(slow.next().await, Some(0));
+    assert_eq!(subscriber.next().await, Some(1));
     assert_eq!(
-        slow.next().await,
-        None,
-        "nothing arrives after dropped was reported"
+        n0_future::future::poll_once(second.as_mut()).await,
+        Some(Fanout {
+            delivered: 1,
+            dropped: 0,
+            gone: 0,
+        })
     );
+    assert_eq!(subscriber.next().await, Some(2));
+}
+
+/// Consecutive canceled publication tickets cannot strand the next live publisher.
+///
+/// Search:
+/// `                loop {
+///                     let serving = state.serving;
+///                     if !state.cancelled.remove(&serving) {
+///                         break;
+///                     }
+///                     state.serving += 1;
+///                 }`
+/// Replace the loop with `state.cancelled.clear();`. `scripts/break-once.sh`
+/// left `serving` on the first canceled ticket, so the final bounded poll stayed pending.
+#[tokio::test(start_paused = true)]
+async fn block_then_drop_skips_consecutively_cancelled_waiting_publishers() {
+    let topic = Topic::new(Overflow::BlockThenDrop {
+        depth: NonZeroUsize::MIN,
+        patience: Patience::try_after(Duration::from_millis(10)).expect("valid patience"),
+    });
+    let mut subscriber = topic.subscribe();
+    assert_eq!(topic.publish(0_u64).await.delivered, 1);
+
+    let mut first = Box::pin(topic.publish(1));
+    assert!(n0_future::future::poll_once(first.as_mut()).await.is_none());
+    let mut cancelled_one = Box::pin(topic.publish(2));
+    assert!(n0_future::future::poll_once(cancelled_one.as_mut())
+        .await
+        .is_none());
+    let mut cancelled_two = Box::pin(topic.publish(3));
+    assert!(n0_future::future::poll_once(cancelled_two.as_mut())
+        .await
+        .is_none());
+    let mut survivor = Box::pin(topic.publish(4));
+    assert!(n0_future::future::poll_once(survivor.as_mut())
+        .await
+        .is_none());
+
+    drop(cancelled_one);
+    drop(cancelled_two);
+    assert_eq!(subscriber.next().await, Some(0));
+    assert_eq!(
+        n0_future::future::poll_once(first.as_mut()).await,
+        Some(Fanout {
+            delivered: 1,
+            dropped: 0,
+            gone: 0,
+        })
+    );
+    assert_eq!(subscriber.next().await, Some(1));
+    assert_eq!(
+        n0_future::future::poll_once(survivor.as_mut()).await,
+        Some(Fanout {
+            delivered: 1,
+            dropped: 0,
+            gone: 0,
+        }),
+        "the next live ticket proceeds after consecutive cancellations"
+    );
+    assert_eq!(subscriber.next().await, Some(4));
 }
 
 // ────────────────────────────────────────────────────────────── the pool member
@@ -922,11 +1072,14 @@ async fn a_slow_subscriber_is_unsubscribed_and_its_actor_ends_naming_the_feed() 
 /// The "never delivered to" one-poll carries its own break, because an assertion
 /// that something is *absent* is the easiest kind to write vacuously. Pointed
 /// instead at `second` — delivered to before the panic, and left undrained — it
-/// goes red with "the third was never delivered to". It can tell the two apart.
+/// A caller `Clone` panic happens before any send decision and with the topic
+/// mutex free. The panic costs one publication, not the topic.
+///
+/// Search `let items: Vec<_> = snapshot.iter().map(|_| item.clone()).collect();`.
+/// Replace it with `let items = { let _held = self.lock(); snapshot.iter().map(|_| item.clone()).collect() };`.
+/// `scripts/break-once.sh` made the next `subscribers` call observe a poisoned mutex.
 #[tokio::test]
 async fn a_panicking_clone_costs_one_publish_and_not_the_topic() {
-    /// Clones `limit` times and then refuses, so the panic lands part-way through
-    /// a fan-out — inside `retain`, with the guard held.
     #[derive(Debug)]
     struct Brittle {
         cloned: Arc<AtomicUsize>,
@@ -960,58 +1113,34 @@ async fn a_panicking_clone_costs_one_publish_and_not_the_topic() {
     let mut second = topic.subscribe();
     let mut third = topic.subscribe();
 
-    // Three subscribers, two clones: the third one panics under the lock.
     let poisoning = tokio::spawn({
         let topic = topic.clone();
         async move { topic.publish(Brittle::breaking_after(2)).await }
     });
-    let died = poisoning
-        .await
-        .expect_err("the caller's `Clone` panics inside the fan-out");
+    let died = poisoning.await.expect_err("the caller's `Clone` panics");
     assert!(died.is_panic(), "and it is that panic: {died:?}");
 
-    // The mutex is poisoned from here on. Every call below takes it, and the
-    // whole point is that none of them panics.
-    //
-    // What the recorded break falsifies is that `subscribers()` *answers at all*;
-    // the 3 is incidental to it. That value rides on `Vec::retain` keeping the
-    // elements it had not yet visited when the predicate unwound, which std does
-    // not document and has changed once already. Pinned anyway, because it is true
-    // today and a change would be worth hearing about — but if this line ever goes
-    // red on its own, read it as news about `retain` and not about `Topic`.
     assert_eq!(
         topic.subscribers(),
         3,
-        "the topic outlives one caller's bad Clone"
+        "caller Clone did not poison the list"
     );
-
-    // The publish cost exactly itself: the two it reached before the panic keep
-    // what they were handed, and the third was never delivered to.
-    assert!(first.next().await.is_some(), "delivered before the panic");
-    assert!(second.next().await.is_some(), "delivered before the panic");
-
-    // "Never delivered to" is a claim about *now*, so it is asserted now — one
-    // poll, no clock. Drained after the next publish instead, it would pass on
-    // that publish's item and hold nothing: an empty third and a third that was
-    // reached before the panic look identical once a second item is in the
-    // channel.
-    assert!(
-        n0_future::future::poll_once(third.next()).await.is_none(),
-        "the third was never delivered to"
-    );
+    assert!(n0_future::future::poll_once(first.next()).await.is_none());
+    assert!(n0_future::future::poll_once(second.next()).await.is_none());
+    assert!(n0_future::future::poll_once(third.next()).await.is_none());
 
     let mut fourth = topic.subscribe();
-    assert_eq!(topic.subscribers(), 4, "and it still takes subscribers");
     assert_eq!(
         topic.publish(Brittle::breaking_after(usize::MAX)).await,
         Fanout {
             delivered: 4,
             dropped: 0,
             gone: 0
-        },
-        "and publishing after a poisoned publish still reaches everyone"
+        }
     );
-    assert!(third.next().await.is_some(), "including the one skipped");
+    assert!(first.next().await.is_some());
+    assert!(second.next().await.is_some());
+    assert!(third.next().await.is_some());
     assert!(fourth.next().await.is_some());
 }
 
@@ -4774,18 +4903,31 @@ async fn lossy_drop_newest_wakes_after_a_cancelled_empty_poll() {
 
 #[test]
 fn lossy_drop_newest_close_during_clone_is_not_counted_live() {
+    #[derive(Debug, Clone, Copy)]
+    enum Event {
+        CloneEntered,
+        WorkerDone,
+    }
+
     #[derive(Debug)]
     struct BlockingClone {
-        entered: Arc<std::sync::Barrier>,
-        release: Arc<std::sync::Barrier>,
+        events: std::sync::mpsc::Sender<Event>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     }
 
     impl Clone for BlockingClone {
         fn clone(&self) -> Self {
-            self.entered.wait();
-            self.release.wait();
+            self.events
+                .send(Event::CloneEntered)
+                .expect("the test is listening");
+            let (released, wake) = &*self.release;
+            let released = released.lock().unwrap_or_else(PoisonError::into_inner);
+            drop(
+                wake.wait_while(released, |released| !*released)
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
             Self {
-                entered: Arc::clone(&self.entered),
+                events: self.events.clone(),
                 release: Arc::clone(&self.release),
             }
         }
@@ -4793,20 +4935,38 @@ fn lossy_drop_newest_close_during_clone_is_not_counted_live() {
 
     let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
     let subscription = topic.subscribe();
-    let entered = Arc::new(std::sync::Barrier::new(2));
-    let release = Arc::new(std::sync::Barrier::new(2));
+    let (events, observed) = std::sync::mpsc::channel();
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let item = BlockingClone {
-        entered: Arc::clone(&entered),
+        events: events.clone(),
         release: Arc::clone(&release),
     };
 
     std::thread::scope(|scope| {
-        let publishing = scope.spawn(|| topic.publish(item));
-        entered.wait();
-        drop(subscription);
-        release.wait();
+        let publishing = scope.spawn(|| {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| topic.publish(item)));
+            events.send(Event::WorkerDone).ok();
+            result
+        });
+
+        let first = observed
+            .recv()
+            .expect("Clone entry or worker completion is always reported");
+        if matches!(first, Event::CloneEntered) {
+            drop(subscription);
+        }
+        let (released, wake) = &*release;
+        *released.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        wake.notify_all();
+
+        let result = publishing.join().expect("the publication thread joins");
+        assert!(
+            matches!(first, Event::CloneEntered),
+            "production completed or panicked without invoking Clone"
+        );
         assert_eq!(
-            publishing.join().expect("the publication thread returns"),
+            result.expect("the publication does not panic"),
             LossyFanout {
                 subscribers: 0,
                 accepted: 0,
@@ -4963,6 +5123,7 @@ async fn lossy_drop_oldest_closes_only_after_the_final_publisher_drops() {
 // Search literals, kept here because `.mise/tasks/anchors` verifies them:
 // `        if !depth.get().is_power_of_two() || depth.get() > Self::MAX {`
 // `                    NonZeroU64::new(skipped).map(|skipped| (Lagged::Skipped(skipped), from))`
+// That mapping literal is spent: the receiver now loops so impossible `Lagged(0)` cannot end it.
 // `                                .map_or(1, |count| count.get().saturating_add(1));`
 // `                    cursor.held = Some(entry.item);`
 // `                    let pending = recover(&cursor.state).pending.take();`

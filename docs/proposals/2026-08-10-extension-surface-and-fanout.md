@@ -326,17 +326,18 @@ value no longer fits, it expires immediately instead of panicking. The clock is
 The deadline is per subscriber. Publishing remains sequential in subscription
 order, so one publish may wait up to `subscriber_count × patience`. Cancellation
 still delivers to a prefix. On timeout, the new item is not queued. The publisher
-removes the canonical sender by `mpsc::Sender::same_channel` during that
-subscriber's iteration and drops the snapshot clone immediately. The subscriber
-drains its already-buffered items and then ends. `Fanout::dropped` increments. A
-closed receiver increments `gone`. A successful send increments `delivered`.
+closes and removes the canonical bounded subscriber queue during that subscriber's
+iteration. The subscriber drains its already-buffered items and then ends, even
+while a later subscriber is still waiting. `Fanout::dropped` increments. A closed
+receiver increments `gone`. A successful send increments `delivered`.
 
-`BlockThenDrop` totally orders publishes on one topic with a cancellation-safe
-Tokio synchronization mutex. A later publisher waits for the current publish to
-finish or be canceled. The mutex stores no items. Each caller retains ownership
-of its own publish future and item. The subscriber-list mutex is never held across
-an await. A two-publisher paused-clock guard proves that no item arrives after a
-fanout reports the subscriber as dropped.
+`BlockThenDrop` totally orders publishes on one topic with cancellation-safe
+publication tickets. A later publisher waits for the current publish to finish or
+be canceled. The order state stores no items and no lock guard survives a poll.
+Receiver wakes are batched until the current ticket is released. Each caller
+retains ownership of its own publish future and item. The subscriber-list and
+queue mutexes are never held across an await. Paused-clock guards prove that no
+item arrives after a fanout reports the subscriber as dropped.
 
 An outer `timeout(d, topic.publish(x))` remains different: outer cancellation
 does not itself unsubscribe the subscriber at which it stopped. If that

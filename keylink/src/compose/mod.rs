@@ -22,8 +22,8 @@
 //! | [`Group`] | a set of actors that end together, or one the rest carry on without |
 //! | [`Endings`] | lifecycle ending → future, for compositions that need keyed waiters |
 //!
-//! Eight types and two functions for the seven rows. Six of the rows are the
-//! first six patterns; [`Endings`] is a seventh **row** and not a seventh pattern
+//! Six of the rows are the first six patterns; [`Endings`] is a seventh **row**
+//! and not a seventh pattern
 //! — it adapts [`Lifecycle::ended`](crate::Lifecycle::ended) for compositions that
 //! want to own keyed ending futures. A one-off keyed observation can use
 //! [`Registry::ended`](crate::Registry::ended) directly. The seventh **pattern** has
@@ -56,7 +56,7 @@
 //! | [`Topic`] with [`Overflow::BlockPublisher`] | the publisher waits after the configured depth is full | a finite, non-zero channel per subscriber. [`publish`](Topic::publish) returns when every channel has accepted the item, not when every subscriber has consumed it |
 //! | [`Topic`] with [`Overflow::BlockThenDrop`] | the publisher waits up to that subscriber's [`Patience`], then unsubscribes it loudly | a finite, non-zero channel per subscriber. Accepted buffered items drain before the stream ends |
 //! | [`Topic`] with [`Overflow::DropSubscriber`] | the subscriber is unsubscribed loudly as soon as the configured depth is full | a finite, non-zero channel per subscriber. The item that exceeds the bound ends that subscriber's stream, so its actor ends as [`Ended::Feed`](crate::Ended::Feed) |
-//! | [`LossyTopic`] with [`Lossy::DropNewest`] | new items are dropped independently for each full subscriber, which remains subscribed and receives the exact loss count in-band | one finite, non-zero channel per live subscriber, plus one saturating pending-loss counter per subscriber |
+//! | [`LossyTopic`] with [`Lossy::DropNewest`] | new items are dropped independently for each full subscriber, which remains subscribed and receives the exact loss count until `u64` saturation, then at least `u64::MAX`, in-band | one finite, non-zero channel per live subscriber, plus one saturating pending-loss counter per subscriber |
 //! | [`LossyTopic`] with [`Lossy::DropOldest`] | old items are overwritten for every subscriber that falls behind, which receives Tokio's exact lag count in-band | one shared finite broadcast ring, independent of subscriber count |
 //! | [`Pool`] | the caller waits, on that member's own mailbox | the pool holds **no** queue at all. [`pick`](Pool::pick) hands back a handle; the wait is the ordinary mailbox permit |
 //! | [`Factory`] | the caller waits, on the chosen member's own mailbox | the factory holds **no** queue at all. [`dispatch`](Factory::dispatch) hands back a [`Permit`](crate::Permit); the wait is the ordinary mailbox permit, taken before the caller's arguments move |
@@ -67,8 +67,9 @@
 //! | [`Endings`] | nothing waits | a map, a lock, and one `oneshot` per waiter. No channel is ever full, so [`ended`](crate::Lifecycle::ended) cannot block a mount; bounded by the number of **live** [`watch`](Endings::watch) futures, and dropping one takes its waiter back out |
 //!
 //! **There is no hidden option.** A fan-out either applies backpressure, ends
-//! the consumer, or discards within an explicit bound and reports the exact loss
-//! in-band. Nothing is silently queued or silently dropped.
+//! the consumer, or discards within an explicit bound and reports loss in-band.
+//! `DropNewest` is exact until its counter saturates. `u64::MAX` then means at
+//! least that many skipped items. Nothing is silently queued or silently dropped.
 //!
 //! [`Group`] is neither of those two, and it is written down here rather than
 //! filed under the nearer one. Nothing *produces* an ending — a member already

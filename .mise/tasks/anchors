@@ -1283,8 +1283,6 @@ ANCHORS = [
     # ── C3 lossy-topic guards: native, Chrome, compile probes, and privacy ───
     ("C3A", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
      "        if !depth.get().is_power_of_two() || depth.get() > Self::MAX {"),
-    ("C3B", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
-     "                    NonZeroU64::new(skipped).map(|skipped| (Lagged::Skipped(skipped), from))"),
     ("C3C", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
      "                                .map_or(1, |count| count.get().saturating_add(1));"),
     ("C3D", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
@@ -1317,8 +1315,6 @@ ANCHORS = [
      "pub struct LossyTopic<T> {"),
     ("C3R", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
      "        if !depth.get().is_power_of_two() || depth.get() > Self::MAX {"),
-    ("C3S", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
-     "                    NonZeroU64::new(skipped).map(|skipped| (Lagged::Skipped(skipped), from))"),
     ("C3T", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
      "                                .map_or(1, |count| count.get().saturating_add(1));"),
     ("C3U", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
@@ -1353,21 +1349,19 @@ ANCHORS = [
      '                drop(rejected);'),
     ('C3AJ', "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
      '                drop(rejected);'),
+    ('C3AK', "keylink/src/compose/lossy.rs", "keylink/src/compose/lossy.rs",
+     '        "Tokio broadcast reported impossible Lagged(0)"\n'),
     # ── C2 `BlockThenDrop` guards, each observed red and quoted honestly ─────
     ('C2A', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
      'let whole_millis = duration.subsec_nanos().is_multiple_of(1_000_000);'),
     ('C2B', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
-     'if elapsed.as_mut().poll(cx).is_ready() {\n                        return Poll::Ready(None);\n                    }\n                    send.as_mut().poll(cx).map(Some)'),
-    ('C2C', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
-     '    async fn publish_block_then_drop(&self, item: T, patience: Patience) -> Fanout {\n        let to = self.lock().to_vec();\n        let mut delivered = 0;\n        let mut dropped = 0;\n        let mut gone = 0;\n\n        for one in to {\n            let Some(deadline) = Instant::now().checked_add(patience.0) else {'),
-    ('C2D', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
-     '    async fn publish_block_then_drop(&self, item: T, patience: Patience) -> Fanout {\n        let to = self.lock().to_vec();\n        let mut delivered = 0;\n        let mut dropped = 0;\n        let mut gone = 0;\n\n        for one in to {'),
+     'if elapsed.as_mut().poll(cx).is_ready() {\n                        return Poll::Ready(None);\n                    }\n                    local.channel.poll_capacity(cx).map(Some)'),
     ('C2E', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
-     '                Some(Err(_)) => {'),
+     '                Some(Err(())) => {'),
     ('C2F', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
-     '                let _ordered = self.publish_order.lock().await;'),
+     '                let ticket = OrderTicket::issue(&self.publish_order);'),
     ('C2G', 'keylink/src/compose/topic.rs', 'keylink/src/compose/topic.rs',
-     '            let Some(deadline) = Instant::now().checked_add(patience.0) else {\n                self.remove_subscriber(&one);\n                drop(one);\n                dropped += 1;\n                continue;\n            };'),
+     '            let Some(deadline) = Instant::now().checked_add(patience.0) else {\n'),
     ('C2H', 'keylink/src/representability.rs', 'keylink/src/compose/topic.rs',
      '    BlockThenDrop {\n        /// The finite, non-zero channel depth for each subscriber.\n        depth: NonZeroUsize,\n        /// How long one full subscriber may hold this publish.\n        patience: Patience,\n    },'),
     ('C2I', 'keylink/tests/browser.rs', 'keylink/src/compose/topic.rs',
@@ -1375,11 +1369,32 @@ ANCHORS = [
     ('C2J', 'keylink/tests/browser.rs', 'keylink/src/compose/topic.rs',
      'let portable = duration.as_millis() <= i32::MAX as u128;'),
     ('C2K', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
-     '            .retain(|canonical| !canonical.same_channel(sender));'),
+     '            let Some(index) = canonical\n                .iter()\n                .position(|current| current.same_channel(sender))\n            else {\n                return (false, Vec::new());\n            };'),
     ('C2L', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
      'pub struct Patience(Duration);'),
     ('C2M', 'keylink/tests/browser.rs', 'keylink/src/compose/topic.rs',
      'return Poll::Ready(None);'),
+    # Compose callback and route liveness guards added by the concurrency wave.
+    ('C2N', 'keylink/src/compose/topic.rs', 'keylink/src/compose/topic.rs',
+     '        let items: Vec<_> = snapshot.iter().map(|_| item.clone()).collect();'),
+    ('C2P', 'keylink/src/compose/keyed_topic.rs', 'keylink/src/compose/keyed_topic.rs',
+     '        drop(entries);\n        let subscription = subscribe(&entry.topic);'),
+    ('C2Q', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     '            let Some(deadline) = Instant::now().checked_add(patience.0) else {\n'),
+    ('C2R', 'keylink/tests/cycles.rs', 'keylink/src/compose/topic.rs',
+     '                None => {\n                    let (removed, wakers) = self.remove_and_close(one);\n                    if removed {\n                        dropped += 1;\n                        ordered.wakes.extend(wakers);\n                    }\n                }'),
+    ('C2W', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     '                None => {\n                    let (removed, wakers) = self.remove_and_close(one);\n                    if removed {\n                        dropped += 1;\n                        ordered.wakes.extend(wakers);\n                    }\n                }'),
+    ('C2X', 'keylink/tests/compose.rs', 'keylink/src/compose/topic.rs',
+     '                loop {\n                    let serving = state.serving;\n                    if !state.cancelled.remove(&serving) {\n                        break;\n                    }\n                    state.serving += 1;\n                }'),
+    ('C2S', 'keylink/src/compose/topic.rs', 'keylink/src/compose/topic.rs',
+     '        drop(rejected);'),
+    ('C2T', 'keylink/src/compose/topic.rs', 'keylink/src/compose/topic.rs',
+     '        drop(rejected);'),
+    ('C2U', 'keylink/src/compose/keyed_topic.rs', 'keylink/src/compose/topic.rs',
+     '        let items: Vec<_> = snapshot.iter().map(|_| item.clone()).collect();'),
+    ('C2V', 'keylink/src/compose/topic.rs', 'keylink/src/compose/topic.rs',
+     '        let items: Vec<_> = snapshot.iter().map(|_| item.clone()).collect();'),
     # ── `compose::Group` and `compose::Endings` ──────────────────────────────
     #
     # Twenty-two substitutions were run in the paired gate worktree before any row
@@ -3744,7 +3759,14 @@ for record in sorted(set(REDNESS) - row_ids):
 # The nested-policy security guard added one block and one row, X28. Read off the
 # failing run: `FAIL population: 238 comment blocks mention break-once.sh, but
 # RECORD_BLOCKS says 237.`
-RECORD_BLOCKS = 238
+# The compose concurrency wave then failed at `246 comment blocks mention
+# break-once.sh, but RECORD_BLOCKS says 238`; its records set the measured value.
+# The bounded queue and publication-ticket correction failed at `253 comment
+# blocks mention break-once.sh, but RECORD_BLOCKS says 246` after its records
+# were complete.
+# The consecutive-cancellation ticket guard then failed at `254 comment blocks
+# mention break-once.sh, but RECORD_BLOCKS says 253`.
+RECORD_BLOCKS = 254
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

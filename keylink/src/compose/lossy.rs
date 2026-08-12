@@ -17,6 +17,8 @@ pub enum Lagged<T> {
     /// One item accepted by this receiver.
     Item(T),
     /// This many published items were not retained for this receiver.
+    /// `DropNewest` is exact until saturation; `u64::MAX` then means at least
+    /// that many skipped items.
     Skipped(NonZeroU64),
 }
 
@@ -307,15 +309,29 @@ pub struct LossySubscription<T> {
     stream: Pin<Box<dyn Stream<Item = Lagged<T>> + Send + 'static>>,
 }
 
+fn broadcast_lag(skipped: u64) -> Option<NonZeroU64> {
+    let skipped = NonZeroU64::new(skipped);
+    debug_assert!(
+        skipped.is_some(),
+        "Tokio broadcast reported impossible Lagged(0)"
+    );
+    skipped
+}
+
 impl<T: Clone + Send + 'static> LossySubscription<T> {
     fn from_broadcast(from: broadcast::Receiver<T>) -> Self {
         let stream = stream::unfold(from, |mut from| async move {
-            match from.recv().await {
-                Ok(item) => Some((Lagged::Item(item), from)),
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    NonZeroU64::new(skipped).map(|skipped| (Lagged::Skipped(skipped), from))
+            loop {
+                match from.recv().await {
+                    Ok(item) => return Some((Lagged::Item(item), from)),
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        let Some(skipped) = broadcast_lag(skipped) else {
+                            continue;
+                        };
+                        return Some((Lagged::Skipped(skipped), from));
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
                 }
-                Err(broadcast::error::RecvError::Closed) => None,
             }
         });
         Self {
@@ -406,6 +422,19 @@ impl<T> Stream for LossySubscription<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tokio documents a positive lag count. Zero is an invariant failure, not
+    /// a stream-ending marker.
+    ///
+    /// Search the `debug_assert!` whose message is `Tokio broadcast reported impossible Lagged(0)`.
+    /// Anchor: `        "Tokio broadcast reported impossible Lagged(0)"`.
+    /// Replace it with `debug_assert!(true);`. `scripts/break-once.sh` made this test stop panicking.
+    #[test]
+    #[should_panic(expected = "Tokio broadcast reported impossible Lagged(0)")]
+    fn impossible_zero_broadcast_lag_fails_loudly() {
+        let _ = broadcast_lag(0);
+    }
+
     use n0_future::StreamExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Weak;
