@@ -212,6 +212,7 @@ pub mod compose;
 // caller writes `keylink::inspect::Client` and never `keylink::console::inspect`.
 mod console;
 mod error;
+pub mod extend;
 mod idempotency;
 mod keys;
 mod macros;

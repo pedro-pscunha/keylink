@@ -44,11 +44,13 @@
 //! member that is mid-turn while a sibling is idle, and the caller then waits on
 //! the busy one.
 //!
-//! Least-loaded would need to read how many permits each member's mailbox has
-//! free, and a [`Handle`](crate::LocalActor) does not expose that — a `try_pick`
-//! across N mailboxes needs a `try_reserve` the handle does not have. That is a
-//! real gap and it is named here rather than hidden behind a claim of fairness:
-//! this is fair in *dispatch* and not in *service time*.
+//! Generated handles already expose nonwaiting permit acquisition through
+//! [`Own::try_reserve`](crate::Own::try_reserve). The missing seam is a
+//! nonwaiting [`Factory::try_dispatch`](super::Factory), which does not exist.
+//! [`Reserving`](super::Reserving) intentionally exposes only waiting
+//! [`reserve`](super::Reserving::reserve) and [`status`](super::Reserving::status).
+//! Thus, a factory cannot try all N mailboxes without waiting. This pool remains
+//! fair in *dispatch* and not in *service time*.
 //!
 //! With a mailbox of one, the two coincide more often than they look like they
 //! would: a member is either running a turn or has a free permit, so round-robin
