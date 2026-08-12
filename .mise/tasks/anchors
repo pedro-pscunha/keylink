@@ -2134,6 +2134,8 @@ ANCHORS = [
      "        if tokio::runtime::Handle::try_current().is_ok() {\n"
      "            return Err(crate::BlockingError::BlockingInAsync);\n"
      "        }"),
+    ("HJ1", "keylink/tests/api.rs", "keylink/src/macros.rs",
+     "            @rpcs [ $( $rpcs )* { [ $( #[$cfg] )* ] $rpc ( $( $arg : $ty ),* ) -> $ret } ]"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -2350,6 +2352,10 @@ REDNESS = {
     "A5": ("        while inner.held > 0",
            "a bound nothing can reach must evict nothing",
            "a_maximal_pool_evicts_nothing", ["-p", "keylink", "--lib"]),
+    "HJ1": ("            @rpcs [ $( $rpcs )* ]",
+            "left: []",
+            "generated_external_marker_names_only_enabled_plain_rpcs",
+            ["-p", "keylink", "--test", "api"]),
 }
 
 def flat(text: str) -> str:
@@ -3784,7 +3790,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 278
+RECORD_BLOCKS = 279
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

@@ -997,3 +997,62 @@ mod retired_reservation_words {
         );
     }
 }
+
+mod external_contract {
+    keylink::service! {
+        service ExternalContract;
+
+        rpc Empty() -> ();
+        #[serde(rename = "wire-name")]
+        rpc One(value: u64) -> u64;
+        rpc Many(name: String, count: u16) -> String;
+        tell Notify(value: u64) -> ();
+        send Upload(value: u64) -> u64;
+        recv Download(value: u64) -> u64;
+        blob Snapshot(value: u64) -> u64;
+        feed Ticks(value: u64);
+        #[cfg(any())]
+        rpc Disabled(value: u64) -> u64;
+    }
+}
+
+#[derive(Clone)]
+struct PostcardCodec;
+
+impl keylink::ServiceCodec for PostcardCodec {
+    type Error = postcard::Error;
+    type Output = Vec<u8>;
+
+    fn decode<T: serde::de::DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, Self::Error> {
+        postcard::from_bytes(bytes)
+    }
+
+    fn encode<T: serde::Serialize>(&self, value: &T) -> Result<Self::Output, Self::Error> {
+        postcard::to_stdvec(value)
+    }
+}
+
+/// Watched red with `scripts/break-once.sh` by dropping the accumulated `rpc`
+/// record from `__keylink_external!`. The exact test failed with `left: []` and
+/// `right: ["Empty", "One", "Many"]`; the registered search literal is
+/// `            @rpcs [ $( $rpcs )* { [ $( #[$cfg] )* ] $rpc ( $( $arg : $ty ),* ) -> $ret } ]`.
+/// Non-rpc and cfg-disabled declarations
+/// remained absent, so the break isolates the generated rpc inventory.
+#[test]
+fn generated_external_marker_names_only_enabled_plain_rpcs() {
+    fn assert_external<T: keylink::ExternalService<PostcardCodec>>() {}
+
+    assert_external::<external_contract::external_contract::External>();
+    assert_eq!(
+        <external_contract::external_contract::External as keylink::ExternalService<
+            PostcardCodec,
+        >>::RPC_METHODS,
+        &["Empty", "One", "Many"]
+    );
+    assert_eq!(
+        <external_contract::external_contract::External as keylink::ExternalService<
+            PostcardCodec,
+        >>::SERVICE,
+        "ExternalContract"
+    );
+}
