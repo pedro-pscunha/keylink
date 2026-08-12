@@ -91,25 +91,31 @@ Caveats:
   arguments; a successful body is only the declared return value.
 - Keep `service!` syntax and generated Rust calling methods unchanged. No HTTP
   attributes or route annotations enter service declarations.
-- Generate one private-to-the-contract, public-to-adapters conversion type per
-  service, implementing a narrow `HttpService` trait owned by `keylink-http`.
-  This trait is implemented only for generated plain singleton contracts and
-  operates on the generated client, so `Addressed<Request>`/registry clients and
-  manually implemented `Rpc` types cannot accidentally satisfy it.
+- Add dependency-neutral `ServiceCodec` and generated `ExternalService<C>`
+  traits to `keylink`. `ServiceCodec` has generic Serde decode/encode operations
+  but no HTTP or JSON type. Generated code implements `ExternalService<C>` where
+  its local service types satisfy coherence; `keylink-http` supplies the bounded
+  JSON codec. `Addressed<Request>`/registry clients and manual `Rpc` types do not
+  implement this generated seam.
 - The generated implementation owns four facts in one match over the declaration
-  list: which methods are plain `rpc`; how an argument object becomes the exact
-  `Request` variant; how the expected `Response` variant yields only its inner
-  value; and how a generated `Client` performs that call. It must honor cfg and
-  forwarded Serde metadata without depending on enum ordinals, variant order,
-  externally tagged JSON names, or parsing the ordinary wire JSON shape.
+  list: which methods are plain `rpc`; how codec-decoded argument fields invoke
+  the exact generated Client method; how only that method's declared return value
+  reaches codec encoding; and how an optional idempotency key selects the
+  generated `IdempotentClient`. It honors cfg without depending on enum ordinals,
+  variant order, externally tagged JSON names, or ordinary wire JSON.
+- HTTP argument field names are the Rust argument identifiers from `service!`.
+  Method-level Serde attributes remain wire-variant metadata and are not replayed
+  onto HTTP argument structs. Nested argument/return domain types retain their
+  own Serde behavior. Routes always use declared CamelCase method identity.
 - `tell`, `send`, `recv`, `blob`, feeds, and internal `__Status` generate no HTTP
   method and no conversion arm. The generated HTTP metadata/conversion is not a
   wire field and must not participate in Serde/Schema-derived contract types.
 - Require verified principal identity and access for every matched call:
   deployment middleware inserts `Principal` in `http::Extensions`; `Access`
   receives extensions, headers, service, and validated method, then allows or
-  returns unauthenticated/forbidden. Missing principal fails closed. `Access`
-  may be async so deployments can make a real policy decision without blocking.
+  returns unauthenticated/forbidden. a validated `Challenge` supplied to `Gateway::new` provides the single
+  `WWW-Authenticate` value for missing-principal and access-denied 401s.
+  `Access` may be async and returns only allow/unauthenticated/forbidden.
 - Select and authorize a known rpc method before polling/reading the request body.
   Unknown/non-rpc/internal methods do not invoke `Access` or Keylink.
 - Support optional `Idempotency-Key`: validate it as visible ASCII within
@@ -141,8 +147,9 @@ Caveats:
 - Streaming HTTP request/response bodies. Oversized JSON is rejected.
 - HTTP ingress into `Dispatch`, `ServiceBuilder`, mailboxes, middleware, the
   ledger, or serving-side authorization.
-- Generic `Rpc` metadata or widening `Rpc`; ordinal-based/custom enum
-  deserializers; reliance on generated enum variant order.
+- Widening the existing `Rpc` trait; ordinal-based/custom enum deserializers;
+  reliance on generated enum variant order. The separate dependency-neutral
+  codec/service traits are intentionally in scope.
 - Generated per-method route functions or SDKs, OpenAPI/JSON Schema, GraphQL,
   gRPC, reflection, or discovery routes.
 - TLS, CORS policy, rate limiting, tracing backend, credential verification/API
@@ -160,11 +167,10 @@ May modify:
 
 - Root `Cargo.toml` and `Cargo.lock` for workspace/dependencies.
 - New `keylink-http/**` package, tests, examples, and docs.
-- `keylink/src/macros.rs` only to emit the dedicated non-wire HTTP conversion
-  implementation, behind an opt-in `http` feature if required to avoid a base
-  dependency edge.
-- `keylink/src/lib.rs` and `keylink/Cargo.toml` only for that opt-in expansion
-  support; default `keylink` builds must not acquire HTTP dependencies.
+- `keylink/src/macros.rs` to emit the generated dependency-neutral external
+  service implementation.
+- `keylink/src/lib.rs` and one focused new `keylink/src/external.rs` module for
+  the codec/service traits. Default builds acquire no HTTP/JSON dependency.
 - Focused `keylink/tests/**` for generated-surface, cfg, Serde-rename,
   representability, schema, and downstream compatibility guards.
 - `README.md`, `CONTRIBUTING.md`, `docs/**`, and minimum mise/anchor files needed
@@ -177,6 +183,7 @@ Must not modify:
   an accepted review proves a criterion impossible. Widening requires Pedro's
   approval.
 - The existing public `Rpc` trait or production `Addressed<T>` implementation.
+  The new external codec traits remain separate and have no blanket impl.
 - Historical documents to rewrite history; GitHub Actions; or tracked `.tmp`.
 
 ## Public interface
@@ -204,8 +211,13 @@ pub struct Call<'a> {
 }
 
 pub enum AccessError {
-    Unauthenticated { challenge: HeaderValue },
+    Unauthenticated,
     Forbidden,
+}
+
+pub struct Challenge { /* private validated non-empty HeaderValue */ }
+impl Challenge {
+    pub fn new(value: HeaderValue) -> Result<Self, ConfigError>;
 }
 
 pub trait Access: Clone + Send + Sync + 'static {
@@ -215,6 +227,15 @@ pub trait Access: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), AccessError>> + Send;
 }
 
+#[non_exhaustive]
+pub enum ConfigError {
+    EmptyPrincipal,
+    PrincipalTooLong { max: usize },
+    ZeroRequestLimit,
+    ZeroResponseLimit,
+    InvalidChallenge,
+}
+
 pub struct JsonLimits { /* private positive inclusive ceilings */ }
 impl JsonLimits {
     pub fn new(request_bytes: usize, response_bytes: usize)
@@ -222,21 +243,32 @@ impl JsonLimits {
 }
 impl Default for JsonLimits { /* finite documented defaults */ }
 
-/// Implemented by a generated private marker for one service contract.
-/// Not implemented by Addressed<Request> or hand-written Rpc types.
-pub trait HttpService: Send + Sync + 'static {
+// Owned by `keylink`; contains no HTTP/JSON type.
+pub trait ServiceCodec {
+    type Error: std::error::Error + Send + Sync + 'static;
+    type Output: Send + 'static;
+    fn decode<T: serde::de::DeserializeOwned>(&self, bytes: &[u8])
+        -> Result<T, Self::Error>;
+    fn encode<T: serde::Serialize>(&self, value: &T)
+        -> Result<Self::Output, Self::Error>;
+}
+
+// Implemented by generated plain singleton service marker only.
+pub trait ExternalService<C: ServiceCodec>: Send + Sync + 'static {
     const SERVICE: &'static str;
     const RPC_METHODS: &'static [&'static str];
     type Client: Clone + Send + Sync + 'static;
-
-    // Exact opaque associated request/response conversion types are decided in
-    // the implementation plan. They must not expose serde_json::Value or raw
-    // maps as caller-facing structured data.
+    fn invoke(/* client, method, bounded bytes, optional key, codec */)
+        -> impl Future<Output = Result<C::Output, ExternalError<C::Error>>> + Send;
 }
 
 pub struct Gateway<S, A> { /* private generated client/access/limits */ }
-impl<S: HttpService, A: Access> Gateway<S, A> {
-    pub fn new(client: S::Client, access: A) -> Self;
+impl<S, A> Gateway<S, A>
+where
+    S: keylink::ExternalService<JsonCodec>,
+    A: Access,
+{
+    pub fn new(client: S::Client, access: A, challenge: Challenge) -> Self;
     pub fn limits(self, limits: JsonLimits) -> Self;
     pub fn router<State>(self) -> axum::Router<State>
     where
@@ -244,19 +276,22 @@ impl<S: HttpService, A: Access> Gateway<S, A> {
 }
 ```
 
-The macro generates a marker, not a new calling surface:
+The macro generates a marker and dependency-neutral implementation, not a new
+calling surface:
 
 ```rust
 // Generated in `inventory`; exact reserved name may differ.
-pub struct Http;
-impl keylink_http::HttpService for Http { /* one cfg-aware method match */ }
+pub struct External;
+impl<C: keylink::ServiceCodec> keylink::ExternalService<C> for External {
+    /* one cfg-aware rpc match */
+}
 ```
 
 Usage in an application with existing Axum state:
 
 ```rust
 let client = inventory::Client::connect(&node, peer).await?;
-let inventory = Gateway::<inventory::Http, _>::new(client, access)
+let inventory = Gateway::<inventory::External, _>::new(client, access, challenge)
     .limits(JsonLimits::new(64 * 1024, 64 * 1024)?)
     .router::<AppState>();
 
@@ -311,7 +346,7 @@ For requests that match the gateway prefix, adapter-owned responses are:
 | 400 | `invalid_request` | malformed JSON, wrong argument shape, malformed path encoding |
 | 400 | `invalid_idempotency_key` | malformed `Idempotency-Key` |
 | 400 | `idempotency_not_supported` | upstream `NotKeyable` |
-| 401 | `unauthenticated` | missing `Principal` or access denial; valid challenge required |
+| 401 | `unauthenticated` | missing `Principal` or access denial; cached validated Challenge required |
 | 403 | `forbidden` | edge denial or upstream `Unauthorized` |
 | 404 | `method_not_found` | unknown/internal/non-rpc method, missing method segment, unmatched nested path, or trailing slash |
 | 404 | `actor_not_found` | upstream `NoSuchActor` if a singleton domain RPC reports it |
@@ -342,12 +377,13 @@ Content-Type values on a body-bearing rpc are 415. No trailing-slash alias exist
   probes pass. Structural review confirms HTTP metadata is outside every wire
   `Serialize`/`Deserialize`/`Schema` type; no literal ALPN pin is introduced.
 - [ ] A mixed, cfg-conditional service exposes exactly its enabled plain `rpc`
-  methods through its generated `Http` marker; excludes tell/send/recv/blob/feed/
-  `__Status`; and does not implement `HttpService` for `Addressed<Request>` or a
+  methods through its generated `External` marker; excludes tell/send/recv/blob/feed/
+  `__Status`; and does not implement `ExternalService<JsonCodec>` for `Addressed<Request>` or a
   manual `Rpc` — focused runtime and compile-fail probes prove each absence.
 - [ ] Arguments-only JSON works for zero/one/multiple arguments, `{}` for zero
-  arguments, unit returns as `null`, forwarded `#[serde(rename)]`/field Serde
-  metadata, and cfg-disabled declarations — focused conversion and e2e tests.
+  arguments, unit returns as `null`, nested domain types' own Serde metadata, and
+  cfg-disabled declarations. Method-level `#[serde(rename)]` remains wire-only;
+  route/method identity stays declared CamelCase — focused conversion/e2e tests.
 - [ ] A deliberately wrong response variant becomes stable `502 upstream_error`,
   never HTTP 200 — focused conversion test watches the guard fail when variant
   checking is broken.
@@ -357,14 +393,17 @@ Content-Type values on a body-bearing rpc are 415. No trailing-slash alias exist
   valid authenticated JSON call from an ordinary HTTP client and returns only
   the declared value with 200/application-json.
 - [ ] Outer middleware inserts `Principal`; `Access` consumes it and extensions
-  asynchronously without reverifying credentials. Missing principal fails 401.
+  asynchronously without reverifying credentials. Missing principal fails 401
+  using the Gateway's cached validated Challenge.
   Unknown/non-rpc/internal methods invoke neither `Access` nor Keylink.
 - [ ] Method selection and authorization precede body polling: denied requests
   return 401/403 even with malformed/oversized/never-yielding bodies — focused
   ordering test uses a body stream that records whether it was polled.
 - [ ] `Access` and `Principal` are mandatory; no zero-argument, allow-all, or
-  default construction compiles. 401 includes the supplied valid
-  `WWW-Authenticate`; 403 does not — downstream compile-fail and HTTP tests.
+  default construction compiles. Missing-principal and access-denied 401s use
+  the cached validated `Challenge` exactly; 403 has no challenge — compile-fail/HTTP tests.
+- [ ] Adapter `ConfigError` has the exact non-exhaustive variants in the public
+  sketch; its Debug/Display never contains principal bytes — unit/rustdoc tests.
 - [ ] Limits are positive, inclusive, documented, and enforced at `limit-1`,
   `limit`, `limit+1`. Input over limit never dispatches. Success output uses a
   capacity-enforcing writer, emits no partial success, and returns bounded JSON
@@ -436,10 +475,11 @@ Content-Type values on a body-bearing rpc are 415. No trailing-slash alias exist
   core mocks.
 - Gates: Rust fmt; focused tests; all-target/all-feature Clippy; docs; feature/
   browser/wasm; package; MSRV; anchors; authoritative pre-push gate.
-- New package: `keylink-http`, with only the public surface above.
+- New package: `keylink-http`, with only Gateway, Principal, Call, Access,
+  AccessError, Challenge, JsonLimits, and ConfigError public; HTTP error DTOs stay private.
 - Ports/adapters: existing generated `Client` is outbound seam;
-  `Gateway<Http, Access>` is HTTP adapter; generated `HttpService` conversion is
-  the narrow bridge. No serving-side port.
+  `Gateway<External, Access>` is HTTP adapter; dependency-neutral
+  `ServiceCodec`/`ExternalService` is the narrow bridge. No serving-side port.
 - Type boundary: bounded argument JSON becomes an exact generated Request inside
   the generated conversion implementation; exact expected Response becomes
   bounded JSON only at the response edge.
