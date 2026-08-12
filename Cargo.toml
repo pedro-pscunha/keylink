@@ -1,5 +1,5 @@
 [workspace]
-members = ["keylink", "keylink-persist", "demo"]
+members = ["keylink", "keylink-persist", "keylink-http", "demo"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -21,6 +21,11 @@ postcard-rpc = "0.12"
 # For `demo` only. `keylink` declares tokio itself, scoped per target.
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
+axum = "0.8"
+http = "1"
+serde_json = "1"
+blake3 = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 thiserror = "2"
 pastey = "0.2"
 toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }

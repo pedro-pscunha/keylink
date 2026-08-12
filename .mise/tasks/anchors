@@ -2136,6 +2136,8 @@ ANCHORS = [
      "        }"),
     ("HJ1", "keylink/tests/api.rs", "keylink/src/macros.rs",
      "            @rpcs [ $( $rpcs )* { [ $( #[$cfg] )* ] $rpc ( $( $arg : $ty ),* ) -> $ret } ]"),
+    ("HJ2", "keylink-http/src/limits.rs", "keylink-http/src/limits.rs",
+     '        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {\n            return Err(std::io::Error::other(\n                "successful response exceeds its JSON limit",\n            ));\n        }'),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -2356,6 +2358,10 @@ REDNESS = {
             "left: []",
             "generated_external_marker_names_only_enabled_plain_rpcs",
             ["-p", "keylink", "--test", "api"]),
+    "HJ2": ('        if false {\n            return Err(std::io::Error::other(\n                "successful response exceeds its JSON limit",\n            ));\n        }',
+            "assertion failed: writer.write_all(b\"d\").is_err()",
+            "limits::tests::bounded_writer_accepts_limit_and_refuses_limit_plus_one",
+            ["-p", "keylink-http", "--lib"]),
 }
 
 def flat(text: str) -> str:
