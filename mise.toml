@@ -313,6 +313,7 @@ description = "Every example RUNS. Building one asserts nothing"
 run = [
     "cargo run -p keylink --example reliable_call",
     "cargo run -p keylink --example durable_ledger",
+    "cargo run -p keylink-http --example inventory -- --self-test",
 ]
 
 # ── documentation ───────────────────────────────────────────────────────────
@@ -512,13 +513,13 @@ description = "rustdoc as a gate, not as decoration"
 # Cheapest first, as everywhere else in this gate.
 run = [
     { task = "headings" },
-    "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --all-features -p keylink -p keylink-persist -p demo",
+    "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --all-features -p keylink -p keylink-persist -p keylink-http -p demo",
 ]
 
 # ── shipping ────────────────────────────────────────────────────────────────
 
 [tasks.package]
-description = "Both crates still package, so neither has become unpublishable"
+description = "Every publishable workspace crate still packages"
 # A manifest can stop being publishable without one line of code changing, and
 # nothing else in this gate looks. It happened: Wave 5 promoted `keylink-persist`
 # from a dev-dependency to a real one, and cargo strips unversioned dev-deps when

@@ -348,6 +348,15 @@ carries the same list beside the tests.
 
 ## Tests
 
+`keylink-http` owns its unit tests and real loopback HTTP integration tests. Run
+one async or liveness test by its exact name before you run its test binary.
+The workspace test task selects all integration targets outside `keylink` with
+`--test '*'`, so a new adapter test file needs no second test inventory.
+
+The docs task names `keylink-http` explicitly because the crate denies missing
+documentation through `RUSTDOCFLAGS`. The examples task runs the adapter example
+with `--self-test`; a build without execution does not verify its HTTP behavior.
+
 - A guard you have not watched fail is not a guard. Break it, see the red,
   restore it. A check that cannot fail looks exactly like a check that passes.
 - Record the break beside the guard, and **`mise run anchors` decides how.** If the
