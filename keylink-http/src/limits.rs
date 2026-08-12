@@ -78,6 +78,8 @@ impl std::io::Write for BoundedWriter {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use std::io::Write;
 
     use super::BoundedWriter;

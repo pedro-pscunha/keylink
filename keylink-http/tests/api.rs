@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 use keylink_http::{ConfigError, Principal};
 
 #[test]

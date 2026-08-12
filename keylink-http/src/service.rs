@@ -5,18 +5,25 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::limits::BoundedWriter;
 
+/// Internal bounded JSON conversion failure.
+#[doc(hidden)]
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum JsonError {
+pub enum JsonError {
+    /// The argument object was malformed or had the wrong shape.
     #[error("invalid JSON arguments")]
     InvalidJson,
+    /// The declared return value crossed the configured success ceiling.
     #[error("successful response exceeds its JSON limit")]
     ResponseTooLarge,
+    /// The declared return value could not be serialized.
     #[error("return value could not be encoded as JSON")]
     Codec,
 }
 
+/// Internal bounded JSON codec selected by [`crate::Gateway`].
+#[doc(hidden)]
 #[derive(Clone)]
-pub(crate) struct JsonCodec {
+pub struct JsonCodec {
     response_limit: usize,
 }
 

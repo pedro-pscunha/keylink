@@ -2140,6 +2140,7 @@ ANCHORS = [
      '        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {\n            self.overflowed = true;\n            return Err(std::io::Error::other(\n                "successful response exceeds its JSON limit",\n            ));\n        }'),
     ("HJ3", "keylink-http/src/service.rs", "keylink/src/macros.rs",
      '                                    codec.encode(&value).map_err($crate::ExternalError::Codec)'),
+    ("HJ4", "keylink-http/tests/http.rs", "keylink-http/src/gateway.rs", '    hasher.update(principal);'),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -2368,6 +2369,9 @@ REDNESS = {
             "left: [110, 117, 108, 108]",
             "service::tests::json_conversion_uses_declared_arguments_and_return_values",
             ["-p", "keylink-http", "--lib"]),
+    "HJ4": ('    hasher.update(&[]);', "left: \"1\"",
+            "external_idempotency_keys_are_namespaced_by_principal",
+            ["-p", "keylink-http", "--test", "http"]),
 }
 
 def flat(text: str) -> str:
