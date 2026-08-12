@@ -20,12 +20,20 @@ keylink::service! {
 
     rpc Add(left: u64, right: u64) -> u64;
     rpc Count(value: u64) -> u64;
+    rpc Block(token: u64) -> u64;
     tell Ignored(value: u64) -> ();
 }
 
 #[derive(Clone, Default)]
 struct Handler {
     runs: Arc<AtomicU64>,
+    gate: Option<Gate>,
+}
+
+#[derive(Clone)]
+struct Gate {
+    entered: tokio::sync::mpsc::UnboundedSender<u64>,
+    release: Arc<tokio::sync::Notify>,
 }
 
 impl inventory::Handler for Handler {
@@ -35,6 +43,14 @@ impl inventory::Handler for Handler {
 
     async fn count(&self, _cx: &Context, _value: u64) -> u64 {
         self.runs.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    async fn block(&self, _cx: &Context, token: u64) -> u64 {
+        if let Some(gate) = &self.gate {
+            gate.entered.send(token).expect("test receiver stays open");
+            gate.release.notified().await;
+        }
+        token
     }
 
     async fn ignored(&self, _cx: &Context, _value: u64) {}
@@ -455,5 +471,55 @@ async fn reusing_one_key_for_a_different_method_is_never_http_success() {
     assert_eq!(
         (status, code.as_str()),
         (http::StatusCode::BAD_GATEWAY, "upstream_error")
+    );
+}
+
+#[tokio::test]
+async fn concurrent_http_calls_enter_keylink_before_either_is_released() {
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handler = Handler {
+        runs: Arc::new(AtomicU64::new(0)),
+        gate: Some(Gate {
+            entered: entered_tx,
+            release: Arc::clone(&release),
+        }),
+    };
+    let running = start(handler, Allow, None).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{}/v1/inventory/rpc/Block", running.address);
+    let call = |token| {
+        client
+            .post(&url)
+            .header("x-test-principal", "tenant-a")
+            .header("content-type", "application/json")
+            .body(format!(r#"{{"token":{token}}}"#))
+            .send()
+    };
+    let first = tokio::spawn(call(1));
+    let second = tokio::spawn(call(2));
+
+    let mut entered = [
+        entered_rx.recv().await.expect("first call enters"),
+        entered_rx.recv().await.expect("second call enters"),
+    ];
+    entered.sort_unstable();
+    assert_eq!(entered, [1, 2]);
+    release.notify_waiters();
+    assert_eq!(
+        first
+            .await
+            .expect("request task")
+            .expect("HTTP call")
+            .status(),
+        http::StatusCode::OK
+    );
+    assert_eq!(
+        second
+            .await
+            .expect("request task")
+            .expect("HTTP call")
+            .status(),
+        http::StatusCode::OK
     );
 }
