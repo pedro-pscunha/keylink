@@ -82,6 +82,21 @@ impl Runtime {
         Ok(inner.block_on(fut))
     }
 
+    /// Drive an operation while preserving its exact async error type.
+    #[doc(hidden)]
+    pub fn run_exact<F, T, E>(&self, fut: F) -> std::result::Result<T, crate::BlockingError<E>>
+    where
+        F: Future<Output = std::result::Result<T, E>>,
+    {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(crate::BlockingError::BlockingInAsync);
+        }
+        let Some(inner) = self.inner.as_ref() else {
+            return Err(crate::BlockingError::BlockingInAsync);
+        };
+        inner.block_on(fut).map_err(crate::BlockingError::Operation)
+    }
+
     /// Make this runtime the current one for as long as the guard lives.
     ///
     /// For constructors that *spawn* rather than await — see

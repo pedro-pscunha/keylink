@@ -107,6 +107,14 @@ pub struct Envelope<T> {
     pub(crate) message: T,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum HeaderError {
+    #[error(transparent)]
+    Codec(#[from] postcard::Error),
+    #[error("header frame of {len} bytes exceeds the {cap} byte cap")]
+    TooLarge { len: u64, cap: u32 },
+}
+
 /// Serialise a header frame and hand it to the transport as one owned chunk.
 ///
 /// The length prefix is reserved at the front of the same buffer postcard
@@ -119,6 +127,16 @@ pub(crate) async fn write_header<T: Serialize>(
     message: &T,
 ) -> Result<()> {
     write_frame(stream, encode_header(body_len, idempotency, message)?).await
+}
+
+/// Write the one request frame a `tell` carries, preserving its narrower error set.
+pub(crate) async fn write_tell<T: Serialize>(
+    stream: &mut SendStream,
+    message: &T,
+) -> std::result::Result<(), crate::TellError> {
+    let frame = encode_header(Some(0), None, message)?;
+    stream.write_chunk(frame).await?;
+    Ok(())
 }
 
 /// Hand an already-encoded frame to the transport.
@@ -137,7 +155,7 @@ pub(crate) fn encode_header<T: Serialize>(
     body_len: Option<u64>,
     idempotency: Option<&crate::Idempotency>,
     message: &T,
-) -> Result<Bytes> {
+) -> std::result::Result<Bytes, HeaderError> {
     let mut buf = BytesMut::with_capacity(256);
     buf.extend_from_slice(&[0u8; PREFIX]);
     // The clone is bounded at MAX_KEY_LEN and happens once per call. Borrowing
@@ -154,13 +172,13 @@ pub(crate) fn encode_header<T: Serialize>(
 
     let encoded = buf.len() - PREFIX;
     let Ok(len) = u32::try_from(encoded) else {
-        return Err(Error::FrameTooLarge {
+        return Err(HeaderError::TooLarge {
             len: encoded as u64,
             cap: MAX_HEADER,
         });
     };
     if len > MAX_HEADER {
-        return Err(Error::FrameTooLarge {
+        return Err(HeaderError::TooLarge {
             len: u64::from(len),
             cap: MAX_HEADER,
         });

@@ -295,7 +295,7 @@ async fn an_actor_takes_feed_items_interleaved_with_its_mailbox() {
     for fill in [1, 2, 3] {
         wired.fills.send(fill).await.expect("the feed accepts");
     }
-    wired.book.note(7).await.expect("running");
+    let _ = wired.book.note(7).await.expect("running");
     drop(wired.fills);
 
     let _ = release.send(());
@@ -474,7 +474,7 @@ async fn a_full_mailbox_still_admits_feed_items() {
     let (held, release) = hold(&wired.book, gate).await;
 
     // One in the slot.
-    wired.book.note(1).await.expect("running");
+    let _ = wired.book.note(1).await.expect("running");
     // And one parked on a permit that only the loop can free.
     let parked = {
         let book = wired.book.clone();
@@ -492,7 +492,7 @@ async fn a_full_mailbox_still_admits_feed_items() {
 
     let _ = release.send(());
     held.await.expect("no panic");
-    parked.await.expect("no panic").expect("running");
+    let _ = parked.await.expect("no panic").expect("running");
 
     drop(wired.fills);
     let _ = wired.book.ended().await;
@@ -537,7 +537,7 @@ async fn neither_input_starves_the_other() {
     for fill in 1..=16 {
         wired.fills.send(fill).await.expect("the feed accepts");
     }
-    wired.book.note(7).await.expect("running");
+    let _ = wired.book.note(7).await.expect("running");
     drop(wired.fills);
     let _ = release.send(());
     held.await.expect("no panic");
@@ -642,7 +642,7 @@ async fn a_local_keyed_ref_queues_a_tell() {
         )
         .expect("mounts");
 
-    book::at_local(&system, actor_id.clone())
+    let _ = book::at_local(&system, actor_id.clone())
         .note(9)
         .await
         .expect("the tell enters the keyed mailbox");

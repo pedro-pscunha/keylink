@@ -376,7 +376,7 @@ fn a_blocking_key_scoped_client_has_no_tell(generated: alpha::blocking::Idempote
 /// that return type. Absent there, present here — a pair, because either half
 /// alone can be green for the wrong reason.
 async fn the_plain_client_does_have_that_tell(plain: alpha::Client) {
-    let _: crate::Result<()> = plain.note("a line".to_owned()).await;
+    let _: Result<crate::Transmitted, crate::TellError> = plain.note("a line".to_owned()).await;
 }
 
 /// The claim the whole keyed rewrite rests on: **a per-service `Registry`

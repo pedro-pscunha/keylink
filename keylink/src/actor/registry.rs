@@ -659,6 +659,56 @@ pub enum LocalError {
     Turn(Withheld),
 }
 
+/// What prevented a keyed local `tell` from entering its mailbox.
+///
+/// There is no turn-outcome arm: success returns as soon as the message is
+/// queued, before its handler can produce any outcome.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LocalTellError {
+    /// No actor is mounted under this id and no lazy factory built one.
+    #[error("nothing is mounted as {id} and no factory built one")]
+    NoSuchActor {
+        /// The id that was addressed.
+        id: ActorId,
+    },
+    /// The registry cannot admit another live actor.
+    #[error("the actor system is at its capacity of {capacity} live actors")]
+    AtCapacity {
+        /// The configured live-actor cap.
+        capacity: usize,
+    },
+    /// The opted-in shedding mailbox was full.
+    #[error("the actor mailbox is full")]
+    MailboxFull,
+    /// The actor's mailbox closed before admission.
+    #[error("the actor is no longer running")]
+    Closed,
+    /// A self-`tell` found the actor's mailbox full.
+    #[error("this call was made from inside the target actor's own turn: it would deadlock")]
+    Reentrant,
+}
+
+impl From<RouteError> for LocalTellError {
+    fn from(error: RouteError) -> Self {
+        match error {
+            RouteError::NoSuchActor { id } => Self::NoSuchActor { id },
+            RouteError::AtCapacity { capacity } => Self::AtCapacity { capacity },
+        }
+    }
+}
+
+impl From<LocalTellError> for LocalError {
+    fn from(error: LocalTellError) -> Self {
+        match error {
+            LocalTellError::NoSuchActor { id } => Self::NoSuchActor { id },
+            LocalTellError::AtCapacity { capacity } => Self::AtCapacity { capacity },
+            LocalTellError::MailboxFull => Self::MailboxFull,
+            LocalTellError::Closed => Self::Closed,
+            LocalTellError::Reentrant => Self::Reentrant,
+        }
+    }
+}
+
 impl From<RouteError> for LocalError {
     fn from(error: RouteError) -> Self {
         match error {
@@ -1730,12 +1780,12 @@ impl<M> Registry<M> {
         &self,
         actor: &ActorId,
         mail: impl FnOnce(Origin, Reply<T>) -> M,
-    ) -> Result<(), LocalError>
+    ) -> Result<crate::Queued, LocalTellError>
     where
         M: Send + 'static,
         T: Send + 'static,
     {
-        let route = self.route(actor).map_err(LocalError::from)?;
+        let route = self.route(actor).map_err(LocalTellError::from)?;
         let chain = current();
         let reentrant = chain.holds(&route.actor);
         let (reply, answer) = Reply::channel();
@@ -1748,21 +1798,22 @@ impl<M> Registry<M> {
             // operation while preserving a non-blocking self-notify when room
             // exists.
             return match route.mail.try_send(message) {
-                Ok(()) => Ok(()),
-                Err(mpsc::error::TrySendError::Full(_)) => Err(LocalError::Reentrant),
-                Err(mpsc::error::TrySendError::Closed(_)) => Err(LocalError::Closed),
+                Ok(()) => Ok(crate::Queued::__new()),
+                Err(mpsc::error::TrySendError::Full(_)) => Err(LocalTellError::Reentrant),
+                Err(mpsc::error::TrySendError::Closed(_)) => Err(LocalTellError::Closed),
             };
         }
         if route.shed {
             return match route.mail.try_send(message) {
-                Ok(()) => Ok(()),
-                Err(mpsc::error::TrySendError::Full(_)) => Err(LocalError::MailboxFull),
-                Err(mpsc::error::TrySendError::Closed(_)) => Err(LocalError::Closed),
+                Ok(()) => Ok(crate::Queued::__new()),
+                Err(mpsc::error::TrySendError::Full(_)) => Err(LocalTellError::MailboxFull),
+                Err(mpsc::error::TrySendError::Closed(_)) => Err(LocalTellError::Closed),
             };
         }
         let sent = route.mail.send(message).await;
         drop(route);
-        sent.map_err(|_| LocalError::Closed)
+        sent.map(|()| crate::Queued::__new())
+            .map_err(|_| LocalTellError::Closed)
     }
 
     /// Mount an actor under `id`, starting it.
@@ -2594,6 +2645,12 @@ mod tests {
     //! real payload live in `remote.rs`, where a payload exists.
 
     #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    #[test]
+    fn a_local_tell_error_upcasts_without_inventing_a_turn() {
+        let broad = LocalError::from(LocalTellError::MailboxFull);
+        assert_eq!(broad, LocalError::MailboxFull);
+    }
 
     use std::sync::atomic::AtomicUsize;
 

@@ -230,8 +230,8 @@ impl ring::Actor for Peer {
         let first = me.bump().await;
         let second = me.bump().await;
         match (first, second) {
-            (Ok(()), Err(keylink::NotQueued::Reentrant)) => TELL_THEN_REFUSED,
-            (Ok(()), Ok(())) => BOTH_TELLS_LANDED,
+            (Ok(_), Err(keylink::NotQueued::Reentrant)) => TELL_THEN_REFUSED,
+            (Ok(_), Ok(_)) => BOTH_TELLS_LANDED,
             (Err(keylink::NotQueued::Reentrant), _) => FIRST_TELL_REFUSED,
             _ => TELL_SURPRISE,
         }
@@ -466,7 +466,7 @@ async fn a_running_turn_leaves_exactly_one_free_permit_behind_it() {
     };
     inside_a_turn(&entered).await;
 
-    n0_future::time::timeout(SETTLE, a.bump())
+    let _ = n0_future::time::timeout(SETTLE, a.bump())
         .await
         .expect("the permit the loop released when it took `wait` is free")
         .expect("the actor is running");
@@ -593,7 +593,7 @@ async fn a_two_actor_cycle_is_refused_at_the_closing_edge() {
     // is used for A because it is the method that can see a full mailbox — it
     // resolves at the send — and a `ping` for B because it is the method that can
     // see a loop that is not polling.
-    n0_future::time::timeout(SETTLE, a.bump())
+    let _ = n0_future::time::timeout(SETTLE, a.bump())
         .await
         .expect("A's mailbox is empty: nothing was left waiting in it")
         .expect("A is running");
@@ -881,11 +881,11 @@ async fn a_deeper_mailbox_takes_one_more_message_behind_a_running_turn() {
     };
     inside_a_turn(&entered).await;
 
-    n0_future::time::timeout(SETTLE, a.bump())
+    let _ = n0_future::time::timeout(SETTLE, a.bump())
         .await
         .expect("the permit the loop released when it took `wait` is free")
         .expect("the actor is running");
-    n0_future::time::timeout(SETTLE, a.bump())
+    let _ = n0_future::time::timeout(SETTLE, a.bump())
         .await
         .expect("a second message must fit at depth 2: the knob was ignored")
         .expect("the actor is running");
@@ -999,11 +999,11 @@ async fn the_restarting_builder_takes_the_depth_it_was_given() {
     };
     inside_a_turn(&entered).await;
 
-    n0_future::time::timeout(SETTLE, a.bump())
+    let _ = n0_future::time::timeout(SETTLE, a.bump())
         .await
         .expect("the permit the loop released when it took `wait` is free")
         .expect("the actor is running");
-    n0_future::time::timeout(SETTLE, a.bump())
+    let _ = n0_future::time::timeout(SETTLE, a.bump())
         .await
         .expect("a second message must fit at depth 2: the supervised door dropped it")
         .expect("the actor is running");

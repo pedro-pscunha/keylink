@@ -488,7 +488,7 @@ async fn an_actor_restarts_from_its_last_committed_state() {
 
     // Applied, then faulted. The observer refuses it, the actor ends, and the
     // supervisor builds the next one.
-    ledger.bad(9).await.expect("queued");
+    let _ = ledger.bad(9).await.expect("queued");
 
     assert_eq!(
         ledger
@@ -866,7 +866,7 @@ async fn a_fatal_refusal_of_a_panicked_turn_is_not_honoured() {
 
     // Applied, and then panicked. The observer refuses it **fatally** — and the
     // loop drops the flag along with the rest of the refusal.
-    ledger.bad(9).await.expect("queued");
+    let _ = ledger.bad(9).await.expect("queued");
 
     let second = tokio::time::timeout(NO_PROGRESS, built.recv())
         .await

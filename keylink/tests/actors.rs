@@ -2815,7 +2815,7 @@ async fn a_keyed_shed_refuses_full_mailboxes_locally_and_remotely() {
     };
     entered.recv().await.expect("the held turn starts");
 
-    gate::at_local(&system, actor_id.clone())
+    let _ = gate::at_local(&system, actor_id.clone())
         .queue()
         .await
         .expect("the one mailbox slot is now occupied");

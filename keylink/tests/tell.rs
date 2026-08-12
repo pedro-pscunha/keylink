@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use keylink::{Allowlist, Context};
+use keylink::{Allowlist, Context, Transmitted};
 
 mod common;
 use common::local_node;
@@ -45,7 +45,7 @@ async fn a_tell_is_delivered_and_handled() {
         .await
         .expect("dials");
 
-    client.note("first".to_owned()).await.expect("tells");
+    let _ = client.note("first".to_owned()).await.expect("tells");
 
     // A `tell` returns before the handler runs, so the only honest way to
     // observe it is to ask afterwards on a stream that DOES have a reply. This
@@ -61,10 +61,10 @@ async fn a_tell_is_delivered_and_handled() {
     assert_eq!(seen, 1, "the tell reached the handler");
 }
 
-/// The signature is the guarantee: a `tell` hands back `()`, never the method's
-/// declared return type. There is no reply stream to decode one from.
+/// The signature is the guarantee: a remote `tell` hands back proof of local
+/// transmission, never the method's declared return type or proof of delivery.
 #[tokio::test]
-async fn a_tell_returns_unit_not_a_value() {
+async fn a_tell_returns_transmission_proof_not_a_value() {
     let server = local_node().await;
     let caller = local_node().await;
     let _running =
@@ -74,12 +74,14 @@ async fn a_tell_returns_unit_not_a_value() {
         .await
         .expect("dials");
 
-    // Compiles only because `note` returns `Result<()>`. If it ever returned a
-    // value, this binding would fail to type-check — which is the cheapest
-    // available proof, since "returns no value" is a positive claim about a
-    // generated signature and no absence-probe can express it.
-    let unit: () = client.note("only unit".to_owned()).await.expect("tells");
-    assert_eq!(unit, ());
+    // The private-field proof can only come from the transport path. It says
+    // exactly which phase was observed and cannot be mistaken for a handler
+    // result.
+    let transmitted: Transmitted = client
+        .note("only transmission".to_owned())
+        .await
+        .expect("transmits");
+    assert_eq!(transmitted, transmitted);
 }
 
 /// Many tells keep their order relative to each other on one client.
@@ -95,7 +97,7 @@ async fn tells_on_one_client_arrive_in_the_order_they_were_sent() {
         .expect("dials");
 
     for n in 0..20 {
-        client.note(format!("line {n}")).await.expect("tells");
+        let _ = client.note(format!("line {n}")).await.expect("tells");
     }
 
     let mut seen = 0u64;

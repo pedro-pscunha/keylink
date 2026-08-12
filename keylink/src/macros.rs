@@ -7158,7 +7158,9 @@ macro_rules! __keylink_service {
             ///   client holding a key no longer has a `tell` to call.
             /// - **`send`** and **`recv`** — a `Handle` has neither. Both halves
             ///   of streaming are a QUIC stream, and a local handle names no
-            ///   transport to open one on.
+            ///   transport to open one on. `ActorRef` also omits `send`: every
+            ///   generated service declaring one is rejected by the actor-serving
+            ///   doors because upload reads would hold the serial turn.
             /// - **`blob`** — all four have one and they do not agree on the
             ///   answer. A `Handle` gives a [`BlobId`](keylink::BlobId); a served
             ///   surface gives a [`BlobHandle`](keylink::BlobHandle), which is a
@@ -7357,8 +7359,10 @@ macro_rules! __keylink_service {
                 /// The same connection, scoped to one idempotency key.
                 ///
                 /// See the async twin,
-                /// [`IdempotentClient`](super::IdempotentClient). No `tell`
-                /// here either, for the same reason.
+                /// [`IdempotentClient`](super::IdempotentClient). This blocking,
+                /// key-scoped intersection exposes only declared `rpc` methods:
+                /// idempotency excludes `tell`, while blocking excludes `send`,
+                /// `recv`, and `blob`.
                 pub struct IdempotentClient {
                     inner: super::IdempotentClient,
                     runtime: ::std::sync::Arc<$crate::blocking::Runtime>,
@@ -8189,16 +8193,18 @@ macro_rules! __keylink_blocking_method {
         /// Unlike `send` and `recv`, a blocking `tell` is buildable: there is no
         /// stream to hand back and no body to buffer, so the synchronous wrapper
         /// is the whole operation rather than half of one.
-        pub fn $name(&self $(, $arg: $ty )*) -> $crate::Result<()> {
-            self.runtime.run(self.inner.$name($( $arg ),*))?
+        pub fn $name(&self $(, $arg: $ty )*)
+            -> ::core::result::Result<$crate::Transmitted, $crate::BlockingError<$crate::TellError>> {
+            self.runtime.run_exact(self.inner.$name($( $arg ),*))
         }
     };
     ([$( #[$meta:meta] )*], $surface:ident, rpc, $name:ident, $variant:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
         #[doc = concat!("Call `", stringify!($name), "`, blocking until it answers.")]
-        pub fn $name(&self $(, $arg: $ty )*) -> $crate::Result<$ret> {
-            self.runtime.run(self.inner.$name($( $arg ),*))?
+        pub fn $name(&self $(, $arg: $ty )*)
+            -> ::core::result::Result<$ret, $crate::BlockingError<$crate::Error>> {
+            self.runtime.run_exact(self.inner.$name($( $arg ),*))
         }
     };
     ([$( #[$meta:meta] )*], $surface:ident, send, $name:ident, $variant:ident,
@@ -8848,18 +8854,11 @@ macro_rules! __keylink_actor_client_method {
             response.$extract()
         }
     };
+    // Absent: a service declaring `send` cannot pass either actor-serving
+    // compile-time door, because its handler would read an upload inside the
+    // serial turn. Emitting a caller for an unservable capability is misleading.
     ([$( #[$meta:meta] )*], send, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
-        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
-        $( #[$meta] )*
-        #[doc = concat!("Call the `", stringify!($variant), "` rpc on this actor, streaming `body` up alongside it.")]
-        pub async fn $name(&self $(, $arg: $ty )*, body: $crate::Body) -> $crate::Result<$ret> {
-            let (response, _body) = self
-                .client
-                .send_to(&self.actor, $req::$variant { $( $arg ),* }, body)
-                .await?;
-            response.$extract()
-        }
-    };
+        ($( $arg:ident : $ty:ty ),*), $ret:ty) => {};
     ([$( #[$meta:meta] )*], recv, $name:ident, $req:ident, $resp:ident, $variant:ident, $extract:ident,
         ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $( #[$meta] )*
@@ -8937,7 +8936,7 @@ macro_rules! __keylink_keyed_local_method {
         $( #[$meta] )*
         #[doc = concat!("Send the `", stringify!($variant), "` tell to this actor in this process.")]
         pub async fn $name(&self $(, $arg: $ty )*)
-            -> ::core::result::Result<(), $crate::LocalError> {
+            -> ::core::result::Result<$crate::Queued, $crate::LocalTellError> {
             self.system
                 .__local_notify(&self.actor, move |__from, __reply| Mail::$variant {
                     origin: __from,
@@ -9059,9 +9058,8 @@ macro_rules! __keylink_local_method {
         $( #[$meta] )*
         #[doc = concat!("Send the `", stringify!($variant), "` tell to this actor and return.")]
         ///
-        /// Returns `()` rather than the method's declared type, exactly as the
-        /// remote client does, and for the same reason: a `tell` has no reply
-        /// channel. The `Ok` means the message is in the mailbox — it has not
+        /// Returns [`Queued`](keylink::Queued) rather than the method's declared
+        /// type. The proof means the message is in the mailbox — it has not
         /// run, it may panic, and there is nothing here on which to learn
         /// either.
         ///
@@ -9086,7 +9084,7 @@ macro_rules! __keylink_local_method {
         /// self-`tell` into a **full** mailbox — into a free slot it is queued
         /// and runs after the current turn returns.
         pub async fn $name(&self $(, $arg: $ty )*)
-            -> ::core::result::Result<(), $crate::NotQueued> {
+            -> ::core::result::Result<$crate::Queued, $crate::NotQueued> {
             self.inner
                 .notify(move |__from, __reply| Mail::$variant {
                     origin: __from,
@@ -9095,6 +9093,7 @@ macro_rules! __keylink_local_method {
                     reply: __reply,
                 })
                 .await
+                .map(|()| $crate::Queued::__new())
         }
     };
     ([$( #[$meta:meta] )*], blob, $name:ident, $variant:ident,
@@ -9202,8 +9201,8 @@ macro_rules! __keylink_permit_method {
         $( #[$meta] )*
         #[doc = concat!("Spend this permit on the `", stringify!($variant), "` tell.")]
         ///
-        /// **Returns nothing at all**, where the same method on [`Handle`]
-        /// returns [`Result`]`<(), `[`NotQueued`](keylink::NotQueued)`>`. Both of
+        /// Returns [`Queued`](keylink::Queued) directly, where the same method
+        /// on [`Handle`] can return [`NotQueued`](keylink::NotQueued). Both of
         /// that door's failures are answered before this one is reachable: full
         /// is what the reservation waited out, and closed is what it reported.
         ///
@@ -9211,7 +9210,7 @@ macro_rules! __keylink_permit_method {
         /// mailbox that closes between the reservation and this call drops the
         /// message unrun — which is what
         /// [`stop`](Handle::stop) already does to a queued one.
-        pub fn $name(self $(, $arg: $ty )*) {
+        pub fn $name(self $(, $arg: $ty )*) -> $crate::Queued {
             self.inner
                 .notify(move |__from, __reply| Mail::$variant {
                     origin: __from,
@@ -9219,6 +9218,7 @@ macro_rules! __keylink_permit_method {
                     body: (),
                     reply: __reply,
                 });
+            $crate::Queued::__new()
         }
     };
     ([$( #[$meta:meta] )*], blob, $name:ident, $variant:ident,
@@ -9300,12 +9300,14 @@ macro_rules! __keylink_client_method {
         $( #[$meta] )*
         #[doc = concat!("Send the `", stringify!($variant), "` tell and return.")]
         ///
-        /// Returns `Result<()>` rather than the method's declared type: there
-        /// is no reply stream, so there is nothing to decode. The `Ok` means
-        /// the bytes reached the transport and nothing more — see
+        /// Returns [`Transmitted`](keylink::Transmitted) rather than the method's
+        /// declared type: there is no reply stream, so there is nothing to
+        /// decode. The proof means the bytes reached the local transport and
+        /// nothing more — see
         /// [`RpcClient::tell`](keylink::RpcClient::tell) for what that does and
         /// does not promise.
-        pub async fn $name(&self $(, $arg: $ty )*) -> $crate::Result<()> {
+        pub async fn $name(&self $(, $arg: $ty )*)
+            -> ::core::result::Result<$crate::Transmitted, $crate::TellError> {
             self.inner.tell($req::$variant { $( $arg ),* }).await
         }
     };

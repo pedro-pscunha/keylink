@@ -246,8 +246,8 @@ mod wire;
 
 pub use actor::{
     deliver_keyed, mount, mount_with_backpressure, serving_keyed, ActorStatus, Addressed, Eviction,
-    KeyedService, Lifecycle, LocalError, Mailbox, MountError, Mountable, Origin, Registry,
-    RegistryBuilder,
+    KeyedService, Lifecycle, LocalError, LocalTellError, Mailbox, MountError, Mountable, Origin,
+    Registry, RegistryBuilder,
 };
 pub use admission::{Admission, Admittance, DynamicAdmission, Revocable, Revocation};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
@@ -306,7 +306,9 @@ pub mod inspect {
     };
 }
 pub use authz::{Authorization, Compiled, Rules};
-pub use error::{ConfigError, Error, Failure, Result, Transport};
+#[cfg(feature = "blocking")]
+pub use error::BlockingError;
+pub use error::{ConfigError, Error, Failure, Queued, Result, TellError, Transmitted, Transport};
 pub use idempotency::{
     Attaching, Idempotency, IdempotencyRefusal, KeyState, Keyable, Limits, Records, MAX_ATTACH,
     MAX_RECORDED_BYTES, MAX_RECORDED_FRAME, MAX_RECORDS, MAX_RUNNING, MAX_RUNNING_PER_PEER,

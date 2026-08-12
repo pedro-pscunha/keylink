@@ -98,7 +98,7 @@ mod registry;
 mod remote;
 
 pub use registry::{
-    mount, mount_with_backpressure, ActorStatus, Eviction, Lifecycle, LocalError, Mailbox,
-    MountError, Mountable, Registry, RegistryBuilder,
+    mount, mount_with_backpressure, ActorStatus, Eviction, Lifecycle, LocalError, LocalTellError,
+    Mailbox, MountError, Mountable, Registry, RegistryBuilder,
 };
 pub use remote::{deliver_keyed, serving_keyed, Addressed, KeyedService, Origin};
