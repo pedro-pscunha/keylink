@@ -44,6 +44,11 @@ pub enum Lagged<T> {
 ///
 /// let _ = BroadcastDepth(NonZeroUsize::MIN);
 /// ```
+///
+/// Watched break beside this guard: the tuple field was changed from private to
+/// public, with replacement `pub struct BroadcastDepth(pub NonZeroUsize);`.
+/// `scripts/break-once.sh` selected this doctest, and rustdoc failed because the
+/// compile-fail example compiled successfully.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BroadcastDepth(NonZeroUsize);
 
@@ -121,6 +126,12 @@ pub struct LossyFanout {
 ///
 /// let _ = LossyTopic::<u8> { inner: unreachable!() };
 /// ```
+///
+/// Watched break beside this guard: the `inner` field and `LossyInner` enum were
+/// both made public. The replacement used `pub inner: LossyInner<T>` for the
+/// field and `pub enum LossyInner<T>` for its storage type.
+/// `scripts/break-once.sh` selected this doctest, and rustdoc failed because the
+/// compile-fail example compiled successfully.
 pub struct LossyTopic<T> {
     inner: LossyInner<T>,
 }
@@ -514,6 +525,12 @@ mod tests {
         })
     }
 
+    /// Watched break: `scripts/break-once.sh` held the subscriber-list guard
+    /// across the snapshot and caller clones, then released it afterward. The
+    /// replacement introduced
+    /// `let subscriber_guard = recover(&publisher.subscribers);` around both operations.
+    /// This test failed at "Clone runs without the subscriber-list, state, or
+    /// ordering mutex".
     #[test]
     fn drop_newest_clone_runs_lock_free_and_can_reenter_subscribe() {
         let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
@@ -542,6 +559,10 @@ mod tests {
         );
     }
 
+    /// Watched break: `scripts/break-once.sh` moved the deferred payload
+    /// destruction into the publication-order scope. The replacement called
+    /// `drop(rejected);` before that scope ended. This test failed at "a Full
+    /// rejected payload is destroyed after every mutex unlocks".
     #[test]
     fn drop_newest_full_rejection_drops_payload_lock_free() {
         let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
@@ -573,6 +594,10 @@ mod tests {
         assert_eq!(recover(&publisher.subscribers).len(), 2);
     }
 
+    /// Watched break: `scripts/break-once.sh` moved the deferred payload
+    /// destruction into the publication-order scope. The replacement called
+    /// `drop(rejected);` before that scope ended. This test failed at "a Closed
+    /// rejected payload is destroyed after every mutex unlocks".
     #[test]
     fn drop_newest_closed_rejection_drops_payload_lock_free_and_prunes_by_identity() {
         let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
@@ -612,6 +637,9 @@ mod tests {
         );
     }
 
+    /// Watched break: `scripts/break-once.sh` changed the pending-loss increment
+    /// from saturating addition to replacement `count.get() + 1`. This test
+    /// panicked on overflow at the production increment.
     #[tokio::test]
     async fn drop_newest_pending_loss_saturates_at_u64_max() {
         let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));

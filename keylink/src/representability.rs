@@ -501,10 +501,25 @@ fn every_overflow_policy_carries_one_depth(overflow: Overflow) -> NonZeroUsize {
 }
 
 impl<T> HasNoDefault for Topic<T> {}
+/// Watched break: `scripts/break-once.sh` added
+/// `impl Default for BroadcastDepth { fn default() -> Self {
+/// Self(NonZeroUsize::MIN) } }` after
+/// `pub struct BroadcastDepth(NonZeroUsize);`. Rustc emitted E0119 at this
+/// `HasNoDefault` probe.
 impl HasNoDefault for BroadcastDepth {}
+/// Watched break: `scripts/break-once.sh` inserted
+/// `impl Default for Lossy { fn default() -> Self {
+/// Self::DropNewest(NonZeroUsize::MIN) } }` before `pub enum Lossy {`.
+/// Rustc emitted E0119 at this `HasNoDefault` probe.
 impl HasNoDefault for Lossy {}
+/// Watched break: `scripts/break-once.sh` inserted
+/// `impl<T: Clone + Send + 'static> Default for LossyTopic<T> { fn default() -> Self { Self::new(Lossy::DropNewest(NonZeroUsize::MIN)) } }`
+/// before `pub struct LossyTopic<T> {`. Rustc emitted E0119 at this probe.
 impl<T> HasNoDefault for LossyTopic<T> {}
 
+/// Watched break: `scripts/break-once.sh` replaced
+/// `    DropNewest(NonZeroUsize),` with `    DropNewest(NonZeroUsize, bool),`.
+/// Rustc emitted E0023 here because the exhaustive pattern still had one field.
 fn every_lossy_policy_carries_one_depth(policy: Lossy) -> NonZeroUsize {
     match policy {
         Lossy::DropNewest(depth) => depth,
@@ -512,6 +527,9 @@ fn every_lossy_policy_carries_one_depth(policy: Lossy) -> NonZeroUsize {
     }
 }
 
+/// Watched break: `scripts/break-once.sh` removed `Send` from
+/// `    stream: Pin<Box<dyn Stream<Item = Lagged<T>> + Send + 'static>>,`.
+/// Rustc emitted E0277 at this `Send + 'static` stream probe.
 fn lossy_subscription_is_a_send_static_stream<T>(subscription: LossySubscription<T>)
 where
     T: Clone + Send + 'static,

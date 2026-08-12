@@ -1295,27 +1295,21 @@ ANCHORS = [
      "                            accepted += 1;"),
     ("C3H", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
      "                                    Err(mpsc::error::TrySendError::Closed(entry)) => {"),
-    ("C3I", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
-     "                                .map_or(1, |count| count.get().saturating_add(1));"),
     ("C3J", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
      "                let accepted = to.send(item).unwrap_or(0);"),
-    ("C3K", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+    ("C3K", "keylink/src/representability.rs", "keylink/src/compose/lossy.rs",
      "pub struct BroadcastDepth(NonZeroUsize);"),
-    ("C3L", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+    ("C3L", "keylink/src/representability.rs", "keylink/src/compose/lossy.rs",
      "pub enum Lossy {"),
-    ("C3M", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+    ("C3M", "keylink/src/representability.rs", "keylink/src/compose/lossy.rs",
      "pub struct LossyTopic<T> {"),
-    ("C3N", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+    ("C3N", "keylink/src/representability.rs", "keylink/src/compose/lossy.rs",
      "    DropNewest(NonZeroUsize),"),
-    ("C3O", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+    ("C3O", "keylink/src/representability.rs", "keylink/src/compose/lossy.rs",
      "    stream: Pin<Box<dyn Stream<Item = Lagged<T>> + Send + 'static>>,"),
-    ("C3P", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
-     "pub struct BroadcastDepth(NonZeroUsize);"),
-    ("C3Q", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
-     "pub struct LossyTopic<T> {"),
-    ("C3R", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+    ("C3R", "keylink/tests/browser.rs", "keylink/src/compose/lossy.rs",
      "        if !depth.get().is_power_of_two() || depth.get() > Self::MAX {"),
-    ("C3T", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
+    ("C3T", "keylink/tests/browser.rs", "keylink/src/compose/lossy.rs",
      "                                .map_or(1, |count| count.get().saturating_add(1));"),
     ("C3U", "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
      "                let (to, from) = broadcast::channel(usize::from(depth.get()));"),
@@ -1343,12 +1337,6 @@ ANCHORS = [
      '    pub const fn get(self) -> NonZeroUsize {\n        self.0\n    }'),
     ('C3AG', "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
      '                Ready::Empty => match cursor.from.recv().await {\n                    Some(entry) => entry,\n                    None => {\n                        cursor.ended = true;\n                        let pending = recover(&cursor.state).pending.take();\n                        return pending.map(|skipped| (Lagged::Skipped(skipped), cursor));\n                    }\n                },\n'),
-    ('C3AH', "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
-     '                let snapshot = recover(&publisher.subscribers).clone();'),
-    ('C3AI', "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
-     '                drop(rejected);'),
-    ('C3AJ', "keylink/tests/compose.rs", "keylink/src/compose/lossy.rs",
-     '                drop(rejected);'),
     ('C3AK', "keylink/src/compose/lossy.rs", "keylink/src/compose/lossy.rs",
      '        "Tokio broadcast reported impossible Lagged(0)"\n'),
     # ── C2 `BlockThenDrop` guards, each observed red and quoted honestly ─────
@@ -2193,7 +2181,7 @@ ANCHORS = [
 # words - a `const` at column 0 has no indentation to add. "No indentation needed"
 # invites exactly the re-derivation above.
 DESCRIBED = [
-    # The only row left, and the only one of the six whose reason was ever a
+    # The original row, and the only one of the first six whose reason was ever a
     # measurement. Its retired anchor was a slice of `lib.rs`'s `pub use` list; a
     # later wave inserted `Records,` inside that slice and the anchor went to count 0.
     # Re-measured at `7a147c0`: the retired literal counts **0** in `keylink/src/lib.rs`
@@ -2202,6 +2190,27 @@ DESCRIBED = [
     ("R26a", "keylink/tests/api.rs", "positional",
      "a slice of lib.rs's `pub use` list - retired literal counts 0 at 7a147c0, and "
      "re-quoting buys only until the next export lands"),
+    # Six C3 records were later moved beside guards in the same production file.
+    # Each row records the measured one-occurrence state before that move; quoting
+    # the old literal in its new location would create the second occurrence.
+    ("C3I", "keylink/src/compose/lossy.rs", "same-file",
+     "the indented saturating-add literal counts 1 at fb0cbc5; quoting it beside "
+     "the unit guard would make that count 2"),
+    ("C3P", "keylink/src/compose/lossy.rs", "same-file",
+     "the private BroadcastDepth declaration counts 1 at fb0cbc5; quoting it beside "
+     "its doctest would make that count 2"),
+    ("C3Q", "keylink/src/compose/lossy.rs", "same-file",
+     "the private LossyTopic declaration counts 1 at fb0cbc5; quoting it beside its "
+     "doctest would make that count 2"),
+    ("C3AH", "keylink/src/compose/lossy.rs", "same-file",
+     "the snapshot literal counts 1 at fb0cbc5; quoting it beside the callback guard "
+     "would make that count 2"),
+    ("C3AI", "keylink/src/compose/lossy.rs", "same-file",
+     "the deferred-drop literal counts 1 at fb0cbc5; quoting it beside the Full guard "
+     "would make that count 2"),
+    ("C3AJ", "keylink/src/compose/lossy.rs", "same-file",
+     "the deferred-drop literal counts 1 at fb0cbc5; quoting it beside the Closed guard "
+     "would make that count 2"),
 ]
 
 # ── WHAT A ROW'S BREAK PRODUCES, FOR THE ROWS SOMEBODY REPLAYED ────────────────
@@ -3766,7 +3775,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 254
+RECORD_BLOCKS = 278
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

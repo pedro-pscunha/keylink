@@ -4661,6 +4661,38 @@ async fn a_group_accepts_the_direct_system_ending_of_a_keyed_member() {
     ));
 }
 
+/// Three watched breaks guard the validated public shape.
+///
+/// `scripts/break-once.sh` replaced
+/// `        if !depth.get().is_power_of_two() || depth.get() > Self::MAX {` with
+/// `        if depth.get() > Self::MAX {`; the non-power-of-two assertion saw
+/// `Ok(BroadcastDepth(3))` instead of `Err(BroadcastDepthError)`.
+///
+/// The constructor search block was:
+/// `    pub const fn try_new(depth: NonZeroUsize) -> Result<Self, BroadcastDepthError> {
+///         if !depth.get().is_power_of_two() || depth.get() > Self::MAX {
+///             return Err(BroadcastDepthError);
+///         }
+///         Ok(Self(depth))
+///     }`
+/// Its replacement was:
+/// `    pub const fn try_new(depth: usize) -> Result<Self, BroadcastDepthError> {
+///         if depth == 0 || !depth.is_power_of_two() || depth > Self::MAX {
+///             return Err(BroadcastDepthError);
+///         }
+///         match NonZeroUsize::new(depth) {
+///             Some(depth) => Ok(Self(depth)),
+///             None => Err(BroadcastDepthError),
+///         }
+///     }`
+/// Rustc emitted E0308 at the constructor function-pointer probe.
+///
+/// The getter search block was:
+/// `    pub const fn get(self) -> NonZeroUsize {
+///         self.0
+///     }`
+/// It was replaced with `get(self) -> usize { self.0.get() }`; rustc emitted
+/// E0308 at its function-pointer probe.
 #[test]
 fn lossy_broadcast_depth_accepts_only_tokios_safe_powers_of_two() {
     let _: fn(NonZeroUsize) -> Result<BroadcastDepth, BroadcastDepthError> =
@@ -4695,6 +4727,16 @@ fn lossy_broadcast_depth_accepts_only_tokios_safe_powers_of_two() {
     );
 }
 
+/// Two watched breaks guard the ring depth and skipped count.
+///
+/// `scripts/break-once.sh` replaced
+/// `                let (to, from) = broadcast::channel(usize::from(depth.get()));`
+/// with `                let (to, from) = broadcast::channel(1);`. The depth-two
+/// assertion saw `Skipped(2)` instead of `Skipped(1)`.
+///
+/// Before zero lag became an explicit invariant failure, replacing the conversion
+/// of Tokio's lag count with `NonZeroU64::new(skipped.saturating_add(1))` reached
+/// the same assertion with `Skipped(2)` instead of `Skipped(1)`.
 #[tokio::test]
 async fn lossy_drop_oldest_reports_loss_before_surviving_items_at_two_depths() {
     for depth in [1, 2] {
@@ -4727,6 +4769,20 @@ async fn lossy_drop_oldest_reports_loss_before_surviving_items_at_two_depths() {
     }
 }
 
+/// Three watched breaks guard depth, accumulation, and marker-before-item order.
+///
+/// `scripts/break-once.sh` replaced
+/// `                let (to, from) = mpsc::channel(publisher.depth.get());` with
+/// `                let (to, from) = mpsc::channel(1);`; the second publish
+/// reported `accepted == 0` instead of `1`.
+///
+/// Replacing
+/// `                                .map_or(1, |count| count.get().saturating_add(1));`
+/// with `                                .map_or(0, |_| 0);` made the receiver see
+/// `Item('E')` instead of `Skipped(2)`. Replacing the `Some(skipped)` arm with
+/// `Some(_skipped) => Some((Lagged::Item(entry.item), cursor))` reached the same
+/// watched assertion. Search literal:
+/// `                    cursor.held = Some(entry.item);`
 #[tokio::test]
 async fn lossy_drop_newest_depth_two_keeps_backlog_then_marks_before_later_item() {
     let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::new(2).unwrap()));
@@ -4745,6 +4801,10 @@ async fn lossy_drop_newest_depth_two_keeps_backlog_then_marks_before_later_item(
     assert_eq!(subscription.next().await, Some(Lagged::Item('E')));
 }
 
+/// Watched break: `scripts/break-once.sh` replaced
+/// `                        skipped_before: state.pending,` with
+/// `                        skipped_before: Some(NonZeroU64::MIN),`.
+/// The first receive saw `Skipped(1)` instead of `Item(7)`.
 #[tokio::test]
 async fn lossy_drop_newest_emits_no_marker_without_loss() {
     let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
@@ -4753,6 +4813,10 @@ async fn lossy_drop_newest_emits_no_marker_without_loss() {
     assert_eq!(subscription.next().await, Some(Lagged::Item(7)));
 }
 
+/// Watched break: `scripts/break-once.sh` replaced
+/// `                    let pending = recover(&cursor.state).pending.take();`
+/// with `                    let pending = None;`. After the accepted backlog,
+/// the assertion saw `None` instead of `Skipped(1)`.
 #[tokio::test]
 async fn lossy_drop_newest_emits_pending_loss_after_backlog_when_publisher_ends() {
     let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::new(2).unwrap()));
@@ -4770,6 +4834,15 @@ async fn lossy_drop_newest_emits_pending_loss_after_backlog_when_publisher_ends(
     assert_eq!(subscription.next().await, None);
 }
 
+/// Two watched breaks guard accepted and closed-receiver accounting.
+///
+/// Replacing `                            accepted += 1;` with
+/// `                            accepted += 0;` reported `2/0` instead of `2/2`.
+/// Search literal:
+/// `                                    Err(mpsc::error::TrySendError::Closed(entry)) => {`
+/// Reclassifying the `TrySendError::Closed(entry)` decision as `Decision::Full(entry)`
+/// reported the closed receiver as live: `2/1` instead of `1/1`. Each mutation was
+/// run alone through `scripts/break-once.sh` and selected this test.
 #[tokio::test]
 async fn lossy_fanout_counts_live_and_accepting_receivers_without_removing_slow_ones() {
     let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
@@ -4804,6 +4877,10 @@ async fn lossy_fanout_counts_live_and_accepting_receivers_without_removing_slow_
     assert_eq!(slow.next().await, Some(Lagged::Item('C')));
 }
 
+/// Watched break: `scripts/break-once.sh` replaced
+/// `                let accepted = to.send(item).unwrap_or(0);` with
+/// `                let accepted = { let _ = to.send(item); 0 };`.
+/// Fan-out was `0/0` instead of `1/1`.
 #[tokio::test]
 async fn lossy_drop_oldest_counts_every_live_receiver_as_accepting() {
     let topic = LossyTopic::new(Lossy::DropOldest(
@@ -4822,6 +4899,15 @@ async fn lossy_drop_oldest_counts_every_live_receiver_as_accepting() {
     assert_eq!(live.next().await, Some(Lagged::Item(9)));
 }
 
+/// Two watched breaks guard queue-before-pending and live pending observation.
+///
+/// Replacing `                match cursor.from.try_recv() {` with
+/// `                match cursor.from.try_recv().and(Err(mpsc::error::TryRecvError::Empty)) {`
+/// made the first receive see `Skipped(1)` instead of
+/// `Item('A')`. Replacing
+/// `                        state.pending.take().map_or(Ready::Empty, Ready::Pending)`
+/// with `                        Ready::Empty` made the bounded poll return `None`
+/// instead of `Skipped(1)`. Each break selected this test.
 #[tokio::test]
 async fn lossy_drop_newest_emits_pending_loss_while_the_publisher_is_live() {
     let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::new(2).unwrap()));
@@ -4840,6 +4926,10 @@ async fn lossy_drop_newest_emits_pending_loss_while_the_publisher_is_live() {
     assert_eq!(subscription.next().await, Some(Lagged::Item('D')));
 }
 
+/// Watched break: `scripts/break-once.sh` replaced
+/// `                        state.pending.take().map_or(Ready::Empty, Ready::Pending)`
+/// with `                        Ready::Empty`. The receiver-first bounded poll
+/// returned `None` instead of `Skipped(1)`.
 #[tokio::test]
 async fn lossy_drop_newest_orders_a_pending_take_before_a_later_publish() {
     let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
@@ -4861,6 +4951,10 @@ async fn lossy_drop_newest_orders_a_pending_take_before_a_later_publish() {
     );
 }
 
+/// Watched break: `scripts/break-once.sh` replaced
+/// `                        skipped_before: state.pending,` with
+/// `                        skipped_before: None,`. The publish-first receive saw
+/// `Item('C')` instead of `Skipped(1)`.
 #[tokio::test]
 async fn lossy_drop_newest_orders_a_successful_publish_before_a_pending_take() {
     let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
@@ -4882,6 +4976,17 @@ async fn lossy_drop_newest_orders_a_successful_publish_before_a_pending_take() {
     assert_eq!(subscription.next().await, Some(Lagged::Item('C')));
 }
 
+/// Watched break: `scripts/break-once.sh` replaced this retained block:
+/// `                Ready::Empty => match cursor.from.recv().await {
+///                     Some(entry) => entry,
+///                     None => {
+///                         cursor.ended = true;
+///                         let pending = recover(&cursor.state).pending.take();
+///                         return pending.map(|skipped| (Lagged::Skipped(skipped), cursor));
+///                     }
+///                 },`
+/// with `Ready::Empty => std::future::pending::<Tagged<T>>().await,`.
+/// The bounded post-publication poll returned `None` instead of `Item('A')`.
 #[tokio::test]
 async fn lossy_drop_newest_wakes_after_a_cancelled_empty_poll() {
     let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
@@ -4901,6 +5006,11 @@ async fn lossy_drop_newest_wakes_after_a_cancelled_empty_poll() {
     );
 }
 
+/// Watched break at
+/// `                                    Err(mpsc::error::TrySendError::Closed(entry)) => {`:
+/// reclassifying `TrySendError::Closed(entry)` as
+/// `Decision::Full(entry)` through `scripts/break-once.sh` reported fan-out `1/0`
+/// instead of `0/0` after the receiver closed during caller `Clone`.
 #[test]
 fn lossy_drop_newest_close_during_clone_is_not_counted_live() {
     #[derive(Debug, Clone, Copy)]
@@ -4975,6 +5085,10 @@ fn lossy_drop_newest_close_during_clone_is_not_counted_live() {
     });
 }
 
+/// Watched break: `scripts/break-once.sh` replaced
+/// `    lock.lock().unwrap_or_else(PoisonError::into_inner)` with
+/// `    lock.lock().unwrap()`. After the clone bomb, the explicit state-recovery
+/// assertion reported that the subscriber-state mutex did not recover.
 #[tokio::test]
 async fn lossy_drop_newest_clone_panic_leaves_both_mutexes_usable() {
     #[derive(Debug)]
@@ -5043,6 +5157,16 @@ async fn lossy_drop_newest_clone_panic_leaves_both_mutexes_usable() {
     assert!(matches!(second.next().await, Some(Lagged::Item(_))));
 }
 
+/// Two watched breaks guard shared ownership and final close.
+///
+/// Replacing
+/// `            LossyInner::DropNewest(inner) => LossyInner::DropNewest(Arc::clone(inner)),`
+/// with the watched replacement
+/// `LossyInner::DropNewest(Arc::new(NewestPublisher { subscribers: Mutex::new(Vec::new()), depth: inner.depth }))`
+/// made the one-clone-open assertion fail. Replacing
+/// `            recover(subscriber).to.take();` with
+/// `            let _ = subscriber;` left retained senders open, so the final
+/// bounded close assertion returned `None` instead of `Some(None)`.
 #[tokio::test]
 async fn lossy_drop_newest_closes_only_after_the_final_publisher_drops() {
     let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
@@ -5080,6 +5204,11 @@ async fn lossy_drop_newest_closes_only_after_the_final_publisher_drops() {
     );
 }
 
+/// Watched break: `scripts/break-once.sh` replaced
+/// `            LossyInner::DropOldest(to) => LossyInner::DropOldest(to.clone()),`
+/// with
+/// `LossyInner::DropOldest(_) => panic!("lost broadcast sender clone")`.
+/// The caught clone assertion failed before the lifecycle checks.
 #[tokio::test]
 async fn lossy_drop_oldest_closes_only_after_the_final_publisher_drops() {
     let topic = LossyTopic::new(Lossy::DropOldest(
@@ -5113,83 +5242,3 @@ async fn lossy_drop_oldest_closes_only_after_the_final_publisher_drops() {
         "the final publisher closes after the surviving ring backlog drains"
     );
 }
-
-// C3 loss guards were each run through `scripts/break-once.sh` after formatting.
-// Every native behavior break selected one test and failed; the three browser
-// repeats loaded Chrome and failed the selected browser test. Compile probes
-// stopped in rustc, and both private-construction doctests failed because the
-// formerly compile-failing example compiled. Evidence is in `/tmp/c3-break-*.log`.
-//
-// Search literals, kept here because `.mise/tasks/anchors` verifies them:
-// `        if !depth.get().is_power_of_two() || depth.get() > Self::MAX {`
-// `                    NonZeroU64::new(skipped).map(|skipped| (Lagged::Skipped(skipped), from))`
-// That mapping literal is spent: the receiver now loops so impossible `Lagged(0)` cannot end it.
-// `                                .map_or(1, |count| count.get().saturating_add(1));`
-// `                    cursor.held = Some(entry.item);`
-// `                    let pending = recover(&cursor.state).pending.take();`
-// `                        skipped_before: state.pending,`
-// `                            accepted += 1;`
-// `                                    Err(mpsc::error::TrySendError::Closed(entry)) => {`
-// `                let accepted = to.send(item).unwrap_or(0);`
-// `                let (to, from) = broadcast::channel(usize::from(depth.get()));`
-// `                let (to, from) = mpsc::channel(publisher.depth.get());`
-// `pub struct BroadcastDepth(NonZeroUsize);`
-// `pub enum Lossy {`
-// `pub struct LossyTopic<T> {`
-// `    DropNewest(NonZeroUsize),`
-// `    stream: Pin<Box<dyn Stream<Item = Lagged<T>> + Send + 'static>>,`
-
-//
-// C3 review-continuation guards were replayed after formatting. Every behavior
-// break selected exactly one named test and reached its intended assertion; the
-// exact API breaks reached the function-pointer compile probes with E0308.
-// Evidence is in `/tmp/c3-continuation-break-*.log`.
-//
-// The live-marker guard separately broke queue-first ordering and pending take;
-// both failed at their own `Lagged` assertions. The two lock orders broke at the
-// pending-first and tagged-entry assertions. Closed accounting reported 1/0
-// instead of 0/0. Poison recovery reached "did not recover" after the clone
-// bomb poisoned both held mutexes. Publisher ownership breaks reached the
-// one-clone-open and final-close assertions for DropNewest and the caught clone
-// assertion for DropOldest. The retained empty receive break reached the wake
-// assertion after cancellation.
-//
-// Additional exact search literals registered in `.mise/tasks/anchors`:
-// `                match cursor.from.try_recv() {`
-// `                        state.pending.take().map_or(Ready::Empty, Ready::Pending)`
-// `    lock.lock().unwrap_or_else(PoisonError::into_inner)`
-// `            recover(subscriber).to.take();`
-// `            LossyInner::DropNewest(inner) => LossyInner::DropNewest(Arc::clone(inner)),`
-// `            LossyInner::DropOldest(to) => LossyInner::DropOldest(to.clone()),`
-// The constructor, getter, and retained-receive rows use their whole formatted
-// blocks as anchors because each watched break replaced that whole block.
-// Constructor block:
-// `    pub const fn try_new(depth: NonZeroUsize) -> Result<Self, BroadcastDepthError> {
-//         if !depth.get().is_power_of_two() || depth.get() > Self::MAX {
-//             return Err(BroadcastDepthError);
-//         }
-//         Ok(Self(depth))
-//     }`
-// Getter block:
-// `    pub const fn get(self) -> NonZeroUsize {
-//         self.0
-//     }`
-// Retained-receive block:
-// `                Ready::Empty => match cursor.from.recv().await {
-//                     Some(entry) => entry,
-//                     None => {
-//                         cursor.ended = true;
-//                         let pending = recover(&cursor.state).pending.take();
-//                         return pending.map(|skipped| (Lagged::Skipped(skipped), cursor));
-//                     }
-//                 },`
-//
-// C3 callback-lock guards were each replayed through `scripts/break-once.sh`
-// after formatting and selected one unit test. Holding the subscriber-list
-// mutex across Clone reached the Clone lock assertion. Moving deferred payload
-// destruction under the publication-order mutex reached the Full and Closed
-// Drop lock assertions separately. Evidence is in `/tmp/c3-callback-break-*.log`.
-//
-// Additional exact search literals registered in `.mise/tasks/anchors`:
-// `                let snapshot = recover(&publisher.subscribers).clone();`
-// `                drop(rejected);`

@@ -270,6 +270,10 @@ async fn a_timed_out_topic_subscriber_is_removed_in_a_browser() {
     assert_eq!(slow.next().await, None);
 }
 
+/// Watched in headless Chrome: `scripts/break-once.sh` replaced
+/// `        if !depth.get().is_power_of_two() || depth.get() > Self::MAX {` with
+/// `        if depth.get() > Self::MAX {`. Chrome saw `Ok(BroadcastDepth(3))`
+/// instead of `Err(BroadcastDepthError)`.
 #[wasm_bindgen_test]
 fn lossy_broadcast_depth_boundaries_hold_in_a_browser() {
     let largest = NonZeroUsize::new(1_usize << (usize::BITS - 2)).unwrap();
@@ -291,6 +295,10 @@ fn lossy_broadcast_depth_boundaries_hold_in_a_browser() {
     assert_eq!(BroadcastDepth::try_new(largest).unwrap().get(), largest);
 }
 
+/// Watched in headless Chrome before zero lag became an explicit invariant
+/// failure: the lag-count conversion was replaced with
+/// `NonZeroU64::new(skipped.saturating_add(1))`. Chrome saw `Skipped(2)`
+/// instead of `Skipped(1)`.
 #[wasm_bindgen_test]
 async fn lossy_drop_oldest_runs_in_a_browser() {
     let topic = LossyTopic::new(Lossy::DropOldest(
@@ -306,6 +314,10 @@ async fn lossy_drop_oldest_runs_in_a_browser() {
     assert_eq!(subscription.next().await, Some(Lagged::Item('B')));
 }
 
+/// Watched in headless Chrome: `scripts/break-once.sh` replaced
+/// `                                .map_or(1, |count| count.get().saturating_add(1));` with
+/// `                                .map_or(0, |_| 0);`. Chrome saw `Item('C')`
+/// instead of `Skipped(1)`.
 #[wasm_bindgen_test]
 async fn lossy_drop_newest_runs_in_a_browser() {
     let topic = LossyTopic::new(Lossy::DropNewest(NonZeroUsize::MIN));
