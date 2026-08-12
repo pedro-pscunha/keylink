@@ -424,6 +424,9 @@ pub enum ConfigError {
     /// The allowlist parsed to nothing at all.
     #[error("allowlist is empty - refusing to serve a protocol nobody can reach")]
     EmptyAllowlist,
+    /// A data-driven authorization rule file contains no peer rules.
+    #[error("authorization rules contain no peers - refusing to start")]
+    EmptyRules,
     /// A data-driven authorization rule file is not valid TOML in the expected shape.
     #[error("invalid authorization rules: {error}")]
     MalformedRules {

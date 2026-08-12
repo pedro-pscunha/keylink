@@ -13,6 +13,11 @@
 //! | [`Observer`](crate::Observer) | `&A` and [`TurnInfo`](crate::TurnInfo) with outcome, method, and duration | After the handler and before the reply, on local and keyed actors. | The caller sees [`Withheld::Refused`](crate::Withheld::Refused). The actor reports [`Ended::Observer`](crate::Ended::Observer). | The caller sees [`Withheld::ObserverPanicked`](crate::Withheld::ObserverPanicked). The actor reports [`Ended::Observer`](crate::Ended::Observer), or supervision restarts it. |
 //! | generated `Feeds` | No caller context. A feed is a local input. | Interleaved with the mailbox. | Stream exhaustion reports [`Ended::Feed`](crate::Ended::Feed). | A feed-handler panic is a panicked turn. It reports [`Ended::Panicked`](crate::Ended::Panicked), or supervision restarts it. |
 //!
+//! [`Rules`](crate::Rules) and [`Compiled`](crate::Compiled) are the data-driven
+//! front end to two existing seams. They compile one TOML policy and install
+//! required [`Admission`](crate::Admission) and [`Middleware`](crate::Middleware)
+//! behavior. They are not a fifth extension mechanism.
+//!
 //! Generated feeds have no single root type. The [`inspect`](crate::inspect) service
 //! has one generated `Feeds` example. A generated `Feeds::new` accepts one local
 //! [`Stream`](crate::Stream) for each declared feed.

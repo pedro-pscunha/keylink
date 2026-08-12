@@ -2082,7 +2082,7 @@ ANCHORS = [
     ("X9", "keylink/tests/admission.rs", "keylink/src/authz.rs",
      "        let allow = Allowlist::only(allowed.keys().copied());"),
     ("X10", "keylink/tests/admission.rs", "keylink/src/authz.rs",
-     "            .require_layer(self.authorization)"),
+     "            .require_authorization(self.authorization)"),
     ("X11", "keylink/src/representability.rs", "keylink/src/authz.rs",
      "impl<Req, Resp> Middleware<Req, Resp> for Authorization<Req>"),
     ("X12", "keylink/src/representability.rs", "keylink/src/authz.rs",
@@ -2114,6 +2114,14 @@ ANCHORS = [
      '            connection.close(REFUSED.into(), b"unauthorized");'),
     ("X24", "keylink/tests/admission.rs", "keylink/src/admission.rs",
      '            connection.close(UNAVAILABLE.into(), b"admission unavailable");'),
+    ("X25", "keylink/tests/admission.rs", "keylink/src/rpc.rs",
+     "    for policy in required_authorization.iter() {"),
+    ("X26", "keylink/tests/admission.rs", "keylink/src/rpc.rs",
+     "    for policy in required_authorization.iter() {"),
+    ("X27", "keylink/tests/admission.rs", "keylink/src/authz.rs",
+     "            return Err(ConfigError::EmptyRules.into());"),
+    ("X28", "keylink/tests/admission.rs", "keylink/src/rpc.rs",
+     "    for policy in required_authorization.iter() {"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -3729,7 +3737,14 @@ for record in sorted(set(REDNESS) - row_ids):
 # `FAIL population: 215 comment blocks mention break-once.sh, but RECORD_BLOCKS says 206.`
 # 215 → 217, for the publisher-drop and operation-bound review guards. Read off
 # the failing run: `FAIL population: 217 comment blocks mention break-once.sh, but RECORD_BLOCKS says 215.`
-RECORD_BLOCKS = 235
+# The E1 security merge fix added two guard blocks and three rows. The existing
+# empty-rules block gained a second substitution, so it did not add a block.
+# Read off the failing run: `FAIL population: 237 comment blocks mention
+# break-once.sh, but RECORD_BLOCKS says 235.`
+# The nested-policy security guard added one block and one row, X28. Read off the
+# failing run: `FAIL population: 238 comment blocks mention break-once.sh, but
+# RECORD_BLOCKS says 237.`
+RECORD_BLOCKS = 238
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

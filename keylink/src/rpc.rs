@@ -188,6 +188,15 @@ pub trait Governed: GovernedSeal {}
 #[doc(hidden)]
 pub trait GovernedSeal {}
 
+/// A compiled method policy checked before idempotency state is touched.
+pub(crate) trait MethodAuthorization: Send + Sync + 'static {
+    /// Bind a typed layer to the same policy object used by preflight.
+    fn bind(&mut self, installed: std::sync::Weak<dyn MethodAuthorization>);
+
+    /// Whether `peer` may call `method`.
+    fn authorizes(&self, peer: EndpointId, method: &'static str) -> bool;
+}
+
 /// Serves one protocol: authorizes the peer once per connection, then answers
 /// every stream that connection opens, concurrently.
 pub(crate) struct RpcService<Req, Resp> {
@@ -197,6 +206,7 @@ pub(crate) struct RpcService<Req, Resp> {
     /// I/O, and a generic would reach every `service!` user's type errors.
     admission: Arc<dyn Admission>,
     required_admission: Vec<Arc<dyn Admission>>,
+    required_authorization: Arc<[Arc<dyn MethodAuthorization>]>,
     /// The content store this service grants against, when it declares `blob`
     /// methods. `None` for every service that does not, which is why an
     /// ordinary service pays nothing for this feature existing.
@@ -213,6 +223,7 @@ impl<Req, Resp> Clone for RpcService<Req, Resp> {
             next: self.next.clone(),
             admission: self.admission.clone(),
             required_admission: self.required_admission.clone(),
+            required_authorization: self.required_authorization.clone(),
             blobs: self.blobs.clone(),
             keys: self.keys.clone(),
             _p: PhantomData,
@@ -604,6 +615,7 @@ where
 /// Answer one call on its own stream.
 async fn serve_one<Req, Resp>(
     next: Next<Req, Resp>,
+    required_authorization: Arc<[Arc<dyn MethodAuthorization>]>,
     keys: Keys,
     blobs: Option<Blobs>,
     admitted: AdmittedPeer,
@@ -629,6 +641,19 @@ where
         WireRequest::Call(message) => message,
     };
 
+    // Required method policy runs before key validation, claim, attach, replay,
+    // or refusal. The ledger is scoped to `(peer, key)`, so a replay cannot be
+    // allowed to answer a method this policy denies.
+    for policy in required_authorization.iter() {
+        if !policy.authorizes(peer, message.method()) {
+            return refuse::<Resp>(
+                &mut send,
+                RemoteError::Unauthorized(message.method().to_owned()),
+            )
+            .await;
+        }
+    }
+
     // Named BEFORE the key is consumed below, and by reference rather than by
     // clone: this is the one place both halves of the digest exist, exactly as it
     // is the one place both halves of a blob grant do.
@@ -636,7 +661,7 @@ where
     // Computed for a key that has not been validated yet, which is harmless and
     // worth saying: `claim_key` refuses a malformed key before the chain is
     // entered, so no handler ever sees a `CallId` derived from one.
-    let cx = Context::new(peer, Req::SERVICE, message.method())
+    let mut cx = Context::new(peer, Req::SERVICE, message.method())
         .with_actor(message.actor().cloned())
         .with_call(
             request
@@ -644,6 +669,9 @@ where
                 .as_ref()
                 .map(|idem| CallId::of(peer, idem.key())),
         );
+    if !required_authorization.is_empty() {
+        cx = cx.with_method_authorized(required_authorization.clone());
+    }
     // Kept while the chain runs, because the chain's own `Outcome` cannot say
     // whether the work was entered — see `Reached`.
     let progress = cx.progress();
@@ -792,6 +820,7 @@ where
                 Ok(Stream::Bi((send, recv))) => {
                     calls.spawn(serve_one(
                         self.next.clone(),
+                        self.required_authorization.clone(),
                         self.keys.clone(),
                         self.blobs.clone(),
                         admitted,
@@ -1387,6 +1416,7 @@ pub struct ServiceBuilder<Req, Resp> {
     alpn: &'static [u8],
     admission: Arc<dyn Admission>,
     required_admission: Vec<Arc<dyn Admission>>,
+    required_authorization: Vec<Arc<dyn MethodAuthorization>>,
     base: Next<Req, Resp>,
     layers: Vec<Arc<dyn Middleware<Req, Resp>>>,
     required_layers: Vec<Arc<dyn Middleware<Req, Resp>>>,
@@ -1419,6 +1449,7 @@ where
             alpn,
             admission: Arc::new(allow),
             required_admission: Vec::new(),
+            required_authorization: Vec::new(),
             base: dispatch,
             layers: Vec::new(),
             required_layers: Vec::new(),
@@ -1476,8 +1507,16 @@ where
         self
     }
 
-    pub(crate) fn require_layer(mut self, layer: impl Middleware<Req, Resp>) -> Self {
-        self.required_layers.push(Arc::new(layer));
+    pub(crate) fn require_authorization<A>(mut self, mut authorization: A) -> Self
+    where
+        A: MethodAuthorization + Middleware<Req, Resp>,
+    {
+        let authorization = Arc::new_cyclic(|installed| {
+            authorization.bind(installed.clone() as std::sync::Weak<dyn MethodAuthorization>);
+            authorization
+        });
+        self.required_authorization.push(authorization.clone());
+        self.required_layers.push(authorization);
         self
     }
 
@@ -1745,6 +1784,7 @@ where
                 next: chain,
                 admission: self.admission,
                 required_admission: self.required_admission,
+                required_authorization: self.required_authorization.into(),
                 blobs: self.blobs.clone(),
                 keys: Keys::new(self.keyable, self.records, self.limits),
                 _p: PhantomData,

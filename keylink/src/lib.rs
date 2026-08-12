@@ -48,8 +48,9 @@
 //! - **Content addressing.** A `blob` method hands back an address; iroh-blobs
 //!   moves the bytes, admitted only against a grant keylink recorded when it
 //!   returned that address to that peer. See [`Blobs`].
-//! - **Extension, at two boundaries and not one.** [`Middleware`] intercepts a
-//!   **message on the wire**; [`Observer`] watches a **turn against the state**.
+//! - **Extension, at two boundaries and not one.** The [`extend`] page maps the
+//!   complete extension surface. [`Middleware`] intercepts a **message on the
+//!   wire**; [`Observer`] watches a **turn against the state**.
 //!   One sentence decides which to reach for, and neither grows toward the
 //!   other — an observer never sees a request or a reply payload, and a layer
 //!   never sees the state. Durability is the first thing built on the second

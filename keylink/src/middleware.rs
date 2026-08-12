@@ -206,11 +206,17 @@ impl Progress {
     }
 }
 
+#[derive(Clone)]
+enum MethodAuthorizationState {
+    Unchecked,
+    Authorized(Arc<[Arc<dyn crate::rpc::MethodAuthorization>]>),
+}
+
 /// Who is calling, and what they are calling.
 ///
 /// `peer` is the key iroh proved during the handshake — not a claim carried in
 /// the request body, which is why it is safe to authorize against.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Context {
     peer: EndpointId,
     service: &'static str,
@@ -219,6 +225,21 @@ pub struct Context {
     progress: Progress,
     queueing: Option<Queueing>,
     call: Option<CallId>,
+    method_authorized: MethodAuthorizationState,
+}
+
+impl std::fmt::Debug for Context {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Context")
+            .field("peer", &self.peer)
+            .field("service", &self.service)
+            .field("method", &self.method)
+            .field("actor", &self.actor)
+            .field("progress", &self.progress)
+            .field("queueing", &self.queueing)
+            .field("call", &self.call)
+            .finish()
+    }
 }
 
 impl Context {
@@ -231,6 +252,7 @@ impl Context {
             progress: Progress::new(),
             queueing: None,
             call: None,
+            method_authorized: MethodAuthorizationState::Unchecked,
         }
     }
 
@@ -270,6 +292,28 @@ impl Context {
     pub(crate) fn with_call(mut self, call: Option<CallId>) -> Self {
         self.call = call;
         self
+    }
+
+    /// Carry the required policy set that authorized this call before idempotency.
+    pub(crate) fn with_method_authorized(
+        mut self,
+        authorization: Arc<[Arc<dyn crate::rpc::MethodAuthorization>]>,
+    ) -> Self {
+        self.method_authorized = MethodAuthorizationState::Authorized(authorization);
+        self
+    }
+
+    /// Whether this exact required policy already authorized the call.
+    pub(crate) fn method_authorized_by(
+        &self,
+        authorization: &Arc<dyn crate::rpc::MethodAuthorization>,
+    ) -> bool {
+        match &self.method_authorized {
+            MethodAuthorizationState::Unchecked => false,
+            MethodAuthorizationState::Authorized(required) => required
+                .iter()
+                .any(|policy| Arc::ptr_eq(policy, authorization)),
+        }
     }
 
     /// The proven public key of the calling peer.

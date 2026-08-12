@@ -199,16 +199,19 @@ fn blank_rules_are_malformed_and_retain_the_toml_source() {
 
 /// A syntactically valid empty collection is still invalid startup policy.
 ///
-/// Search `        if self.peer.is_empty() {`.
+/// Search `        if self.peer.is_empty() {` and
+/// `            return Err(ConfigError::EmptyRules.into());`.
 ///
-/// Made red by `scripts/break-once.sh` changing the condition to `if false`.
+/// Made red twice by `scripts/break-once.sh`: changing the condition to
+/// `if false` accepted the empty policy, and replacing `EmptyRules` with
+/// `EmptyAllowlist` returned the wrong configuration error.
 #[test]
 fn an_explicit_empty_peer_collection_is_rejected() {
     let error = Rules::parse("peer = []")
         .expect("valid TOML")
         .compile::<methods::Request>()
         .expect_err("an empty peer list must not compile");
-    assert!(matches!(error, Error::Config(ConfigError::EmptyAllowlist)));
+    assert!(matches!(error, Error::Config(ConfigError::EmptyRules)));
 }
 
 /// Connection admission cannot be granted to a peer with no usable method.
@@ -461,14 +464,15 @@ async fn later_admission_cannot_replace_compiled_peer_admission() {
 ///
 /// Search `            .is_some_and(|methods| methods.contains(method))`,
 /// `        let allow = Allowlist::only(allowed.keys().copied());`, and
-/// `            .require_layer(self.authorization)`.
+/// `            .require_authorization(self.authorization)`.
 ///
 /// Made red three ways with `scripts/break-once.sh`:
 ///
 /// - changing the method predicate to `true` let `Write` dispatch and return `9`;
 /// - changing the compiled allowlist to `Allowlist::anyone()` returned
 ///   `Remote(Unauthorized("Read"))` where the test requires a transport close;
-/// - dropping `.require_layer(self.authorization)` let `Write` dispatch and return `9`.
+/// - replacing `.require_authorization(self.authorization)` with the empty
+///   string `""` let `Write` dispatch and return `9`.
 #[tokio::test]
 async fn compiled_rules_admit_the_peer_once_and_authorize_each_method() {
     let node = local_node().await;
@@ -522,6 +526,197 @@ async fn compiled_rules_admit_the_peer_once_and_authorize_each_method() {
     assert!(
         matches!(denied, Error::Transport(_)),
         "peer admission must close the connection before method authorization: {denied:?}"
+    );
+}
+
+/// Method authorization runs before a same-peer idempotency replay.
+///
+/// A peer first records `Read` under one key. Reusing that key for denied
+/// `Write` must not reveal or replay the earlier response.
+///
+/// Search `    for policy in required_authorization.iter() {`.
+///
+/// Made red by `scripts/break-once.sh` replacing it with
+/// `    for policy in required_authorization.iter().take(0) {`. The peer got
+/// `UnexpectedResponse { expected: "Write", actual: "Read" }`.
+#[tokio::test]
+async fn denied_method_cannot_replay_an_allowed_method_under_the_same_key() {
+    let node = local_node().await;
+    let peer = local_node().await;
+    let writes = Arc::new(AtomicUsize::new(0));
+    let compiled = Rules::parse(&rules_for(peer.id(), &["Read"]))
+        .expect("valid TOML")
+        .compile::<methods::Request>()
+        .expect("known methods compile");
+    let service = compiled
+        .install(|allow| {
+            methods::service(
+                Methods {
+                    writes: writes.clone(),
+                },
+                allow,
+            )
+        })
+        .build();
+    let _running = Server::builder(&node)
+        .service(service)
+        .spawn()
+        .expect("serves");
+
+    let client = methods::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .expect("dials");
+    let key = keylink::IdempotencyKey::new("authorization-before-replay").expect("a valid key");
+    assert_eq!(
+        client
+            .with_idempotency(key.clone())
+            .read()
+            .await
+            .expect("Read is authorized"),
+        7,
+    );
+
+    let refused = client
+        .with_idempotency(key)
+        .write()
+        .await
+        .expect_err("Write is denied before the recorded Read can replay");
+    assert!(
+        matches!(
+            refused,
+            Error::Remote(RemoteError::Unauthorized(ref method)) if method == "Write"
+        ),
+        "got {refused:?}"
+    );
+    assert_eq!(
+        writes.load(Ordering::Relaxed),
+        0,
+        "the handler must not run"
+    );
+}
+
+/// Every nested required method policy runs before a same-peer replay.
+///
+/// The first policy permits both methods, while the second permits only `Read`.
+/// Reusing a recorded `Read` key for `Write` must reach the second refusal first.
+///
+/// Search `    for policy in required_authorization.iter() {`.
+///
+/// Made red with `scripts/break-once.sh` by replacing it with
+/// `    for policy in required_authorization.iter().take(1) {`. The peer got
+/// `UnexpectedResponse { expected: "Write", actual: "Read" }`.
+#[tokio::test]
+async fn every_nested_method_policy_precedes_same_peer_replay() {
+    let node = local_node().await;
+    let peer = local_node().await;
+    let writes = Arc::new(AtomicUsize::new(0));
+    let first = Rules::parse(&rules_for(peer.id(), &["Read", "Write"]))
+        .expect("valid TOML")
+        .compile::<methods::Request>()
+        .expect("known methods compile");
+    let second = Rules::parse(&rules_for(peer.id(), &["Read"]))
+        .expect("valid TOML")
+        .compile::<methods::Request>()
+        .expect("known methods compile");
+    let service = second
+        .install(|second_allow| {
+            first.install(|_first_allow| {
+                methods::service(
+                    Methods {
+                        writes: writes.clone(),
+                    },
+                    second_allow,
+                )
+            })
+        })
+        .build();
+    let _running = Server::builder(&node)
+        .service(service)
+        .spawn()
+        .expect("serves");
+
+    let client = methods::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .expect("dials");
+    let key =
+        keylink::IdempotencyKey::new("nested-authorization-before-replay").expect("a valid key");
+    assert_eq!(
+        client
+            .with_idempotency(key.clone())
+            .read()
+            .await
+            .expect("both policies authorize Read"),
+        7,
+    );
+
+    let refused = client
+        .with_idempotency(key)
+        .write()
+        .await
+        .expect_err("the second policy denies Write before Read can replay");
+    assert!(
+        matches!(
+            refused,
+            Error::Remote(RemoteError::Unauthorized(ref method)) if method == "Write"
+        ),
+        "got {refused:?}"
+    );
+    assert_eq!(
+        writes.load(Ordering::Relaxed),
+        0,
+        "the handler must not run"
+    );
+}
+
+/// Authorization also precedes the idempotency policy lookup.
+///
+/// `Keyable::None` would return `NotKeyable` if the ledger policy ran first.
+/// The required policy must instead return the exact method denial.
+///
+/// Search `    for policy in required_authorization.iter() {`.
+///
+/// Made red by `scripts/break-once.sh` replacing it with
+/// `    for policy in required_authorization.iter().take(0) {`. The peer got
+/// `Remote(Idempotency(NotKeyable { method: "Write" }))`.
+#[tokio::test]
+async fn denied_method_does_not_reach_the_idempotency_policy() {
+    let node = local_node().await;
+    let peer = local_node().await;
+    let compiled = Rules::parse(&rules_for(peer.id(), &["Read"]))
+        .expect("valid TOML")
+        .compile::<methods::Request>()
+        .expect("known methods compile");
+    let service = compiled
+        .install(|allow| {
+            methods::service(
+                Methods {
+                    writes: Arc::new(AtomicUsize::new(0)),
+                },
+                allow,
+            )
+            .keyable(keylink::Keyable::None)
+        })
+        .build();
+    let _running = Server::builder(&node)
+        .service(service)
+        .spawn()
+        .expect("serves");
+
+    let client = methods::Client::connect(&peer, node.endpoint().addr())
+        .await
+        .expect("dials");
+    let key = keylink::IdempotencyKey::new("authorization-before-key-policy").expect("a valid key");
+    let refused = client
+        .with_idempotency(key)
+        .write()
+        .await
+        .expect_err("Write is denied before key policy is consulted");
+    assert!(
+        matches!(
+            refused,
+            Error::Remote(RemoteError::Unauthorized(ref method)) if method == "Write"
+        ),
+        "got {refused:?}"
     );
 }
 

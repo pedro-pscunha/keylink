@@ -51,7 +51,7 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 pastey = { workspace = true }
 # Parses startup authorization rules. Already present in the resolved graph.
-toml = "1"
+toml = { workspace = true }
 # For one 16-byte digest: `CallId`, which folds the calling peer into the hash of
 # its idempotency key so a handler can dedupe a retry without being handed the
 # ledger's peer-scoping rule to re-implement.
