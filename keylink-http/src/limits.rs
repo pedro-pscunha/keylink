@@ -38,6 +38,7 @@ impl Default for JsonLimits {
 pub(crate) struct BoundedWriter {
     bytes: Vec<u8>,
     limit: usize,
+    overflowed: bool,
 }
 
 impl BoundedWriter {
@@ -45,17 +46,23 @@ impl BoundedWriter {
         Self {
             bytes: Vec::with_capacity(limit),
             limit,
+            overflowed: false,
         }
     }
 
     pub(crate) fn into_inner(self) -> Vec<u8> {
         self.bytes
     }
+
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflowed
+    }
 }
 
 impl std::io::Write for BoundedWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            self.overflowed = true;
             return Err(std::io::Error::other(
                 "successful response exceeds its JSON limit",
             ));
@@ -77,6 +84,7 @@ mod tests {
 
     /// Watched red with `scripts/break-once.sh` by replacing
     /// `        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+    ///             self.overflowed = true;
     ///             return Err(std::io::Error::other(
     ///                 "successful response exceeds its JSON limit",
     ///             ));

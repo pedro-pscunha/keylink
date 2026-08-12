@@ -20,6 +20,8 @@ thiserror = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 reqwest = { workspace = true }
+iroh = { workspace = true, features = ["test-utils"] }
+postcard-schema = { workspace = true }
 
 [lints]
 workspace = true

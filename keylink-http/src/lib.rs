@@ -5,6 +5,7 @@
 mod access;
 mod error;
 mod limits;
+mod service;
 
 pub use access::{Access, AccessError, Call, Challenge, Principal};
 pub use error::ConfigError;
