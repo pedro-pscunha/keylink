@@ -959,9 +959,12 @@ mod tests {
             .subscription
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        assert!(Pin::new(held.as_mut().expect("subscription is installed"))
-            .poll_next(&mut cx)
-            .is_pending());
+        assert!(Pin::new(
+            held.as_mut()
+                .unwrap_or_else(|| panic!("subscription is installed"))
+        )
+        .poll_next(&mut cx)
+        .is_pending());
         drop(held);
         guard
     }
@@ -1017,7 +1020,8 @@ mod tests {
     async fn block_then_drop_accepted_wake_drop_runs_lock_free_and_reenters() {
         let topic = Topic::new(Overflow::BlockThenDrop {
             depth: NonZeroUsize::MIN,
-            patience: Patience::try_after(Duration::from_millis(1)).unwrap(),
+            patience: Patience::try_after(Duration::from_millis(1))
+                .unwrap_or_else(|error| panic!("one millisecond is portable: {error:?}")),
         });
         let subscription = topic.subscribe();
         let _wake_guard = register_drop_on_wake(subscription);
@@ -1063,7 +1067,8 @@ mod tests {
     async fn block_then_drop_cancellation_wakes_prefix_and_drops_suffix_lock_free() {
         let topic = Topic::new(Overflow::BlockThenDrop {
             depth: NonZeroUsize::MIN,
-            patience: Patience::try_after(Duration::from_millis(10)).unwrap(),
+            patience: Patience::try_after(Duration::from_millis(10))
+                .unwrap_or_else(|error| panic!("ten milliseconds are portable: {error:?}")),
         });
         let mut first = topic.subscribe();
         let mut blocked = topic.subscribe();
@@ -1074,7 +1079,12 @@ mod tests {
                 .delivered,
             2
         );
-        drop(first.next().await.expect("first backlog"));
+        drop(
+            first
+                .next()
+                .await
+                .unwrap_or_else(|| panic!("first backlog")),
+        );
         let first = register_drop_on_wake(first);
 
         let callback_topic = topic.clone();
@@ -1127,7 +1137,7 @@ mod tests {
             blocked
                 .next()
                 .await
-                .expect("only the original backlog reached suffix"),
+                .unwrap_or_else(|| panic!("only the original backlog reached suffix")),
         );
         assert!(n0_future::future::poll_once(blocked.next()).await.is_none());
     }
@@ -1147,7 +1157,9 @@ mod tests {
         let reentered = Arc::new(Mutex::new(None));
         let callback_reentered = Arc::clone(&reentered);
         let callback = Arc::new(move || {
-            let channel = channel.upgrade().expect("receiver retains its queue");
+            let channel = channel
+                .upgrade()
+                .unwrap_or_else(|| panic!("receiver retains its queue"));
             assert!(
                 channel.state.try_lock().is_ok(),
                 "payload dropped under queue lock"
@@ -1192,7 +1204,9 @@ mod tests {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let callback_called = Arc::clone(&called);
         let callback = Arc::new(move || {
-            let channel = channel.upgrade().expect("receiver retains its queue");
+            let channel = channel
+                .upgrade()
+                .unwrap_or_else(|| panic!("receiver retains its queue"));
             assert!(
                 channel.state.try_lock().is_ok(),
                 "payload dropped under queue lock"
@@ -1450,7 +1464,7 @@ mod tests {
         };
 
         std::thread::scope(|scope| {
-            let first = scope.spawn(&publish_one);
+            let first = scope.spawn(publish_one);
             let (state_lock, wake) = &*state;
             let mut shared = state_lock.lock().unwrap_or_else(PoisonError::into_inner);
             shared = wake
@@ -1465,7 +1479,7 @@ mod tests {
             }
             drop(shared);
 
-            let second = scope.spawn(&publish_one);
+            let second = scope.spawn(publish_one);
             let mut shared = state_lock.lock().unwrap_or_else(PoisonError::into_inner);
             shared = wake
                 .wait_while(shared, |state| state.entered < 2 && state.worker_done == 0)
@@ -1482,12 +1496,12 @@ mod tests {
             let mut reports = [
                 first
                     .join()
-                    .expect("first publisher joins")
-                    .expect("first publisher does not panic"),
+                    .unwrap_or_else(|_| panic!("first publisher joins"))
+                    .unwrap_or_else(|_| panic!("first publisher does not panic")),
                 second
                     .join()
-                    .expect("second publisher joins")
-                    .expect("second publisher does not panic"),
+                    .unwrap_or_else(|_| panic!("second publisher joins"))
+                    .unwrap_or_else(|_| panic!("second publisher does not panic")),
             ];
             reports.sort_by_key(|report| report.dropped);
             assert_eq!(
@@ -1516,7 +1530,8 @@ mod tests {
     /// the callback observed an unreleased publication ticket.
     #[tokio::test(start_paused = true)]
     async fn block_then_drop_clone_and_timeout_drop_run_outside_custom_locks() {
-        let patience = Patience::try_after(Duration::from_millis(1)).unwrap();
+        let patience = Patience::try_after(Duration::from_millis(1))
+            .unwrap_or_else(|error| panic!("one millisecond is portable: {error:?}"));
         let topic = Topic::new(Overflow::BlockThenDrop {
             depth: NonZeroUsize::MIN,
             patience,

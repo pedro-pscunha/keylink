@@ -221,7 +221,9 @@ impl<T: Clone + Send + 'static> LossyTopic<T> {
             panic!("pending loss exists only under DropNewest");
         };
         let subscribers = recover(&publisher.subscribers);
-        let subscriber = subscribers.first().expect("the test subscribed first");
+        let subscriber = subscribers
+            .first()
+            .unwrap_or_else(|| panic!("the test subscribed first"));
         recover(subscriber).pending = NonZeroU64::new(pending);
     }
 
@@ -496,7 +498,7 @@ mod tests {
         let state = Arc::clone(
             recover(&publisher.subscribers)
                 .first()
-                .expect("the test subscribed first"),
+                .unwrap_or_else(|| panic!("the test subscribed first")),
         );
         (Arc::clone(publisher), state)
     }
@@ -508,10 +510,12 @@ mod tests {
         reentries: Arc<AtomicUsize>,
     ) -> Arc<dyn Fn() + Send + Sync> {
         Arc::new(move || {
-            let publisher = publisher.upgrade().expect("the topic remains live");
+            let publisher = publisher
+                .upgrade()
+                .unwrap_or_else(|| panic!("the topic remains live"));
             let state = state
                 .upgrade()
-                .expect("the subscription state remains live");
+                .unwrap_or_else(|| panic!("the subscription state remains live"));
             let free = publisher.subscribers.try_lock().is_ok()
                 && state.try_lock().is_ok()
                 && publisher.publish_order.try_lock().is_ok();
@@ -652,7 +656,7 @@ mod tests {
         assert_eq!(topic.publish('D').accepted, 1);
         assert_eq!(
             subscription.next().await,
-            Some(Lagged::Skipped(NonZeroU64::new(u64::MAX).unwrap()))
+            Some(Lagged::Skipped(NonZeroU64::MAX))
         );
         assert_eq!(subscription.next().await, Some(Lagged::Item('D')));
     }

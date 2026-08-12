@@ -221,7 +221,10 @@ mod tests {
 
     impl Clone for ReentrantCloneKey {
         fn clone(&self) -> Self {
-            let inner = self.inner.upgrade().expect("the topic is alive");
+            let inner = self
+                .inner
+                .upgrade()
+                .unwrap_or_else(|| panic!("the topic is alive"));
             assert!(
                 inner.entries.try_lock().is_ok(),
                 "key cloning must not run under the global map lock"
@@ -308,7 +311,7 @@ mod tests {
                 .lock()
                 .get(&1)
                 .cloned()
-                .expect("route exists");
+                .unwrap_or_else(|| panic!("route exists"));
             assert!(
                 entry.topic.list_is_unlocked_for_test(),
                 "caller Clone must not run under the inner Topic list lock"
@@ -334,7 +337,7 @@ mod tests {
                 .lock()
                 .get(&1)
                 .cloned()
-                .expect("route exists");
+                .unwrap_or_else(|| panic!("route exists"));
             assert!(
                 entry.topic.list_is_unlocked_for_test(),
                 "rejected payload Drop must not run under the inner Topic list lock"
