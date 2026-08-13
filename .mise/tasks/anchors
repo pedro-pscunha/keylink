@@ -2149,6 +2149,13 @@ ANCHORS = [
      "    let Ok(media) = value.parse::<mime::Mime>() else {\n        return false;\n    };"),
     ("HJ9", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
      "            Err(_) => return GatewayError::InvalidRequest.response(None),\n"),
+    ("HJ10", "keylink/tests/protocol.rs", "keylink/src/body.rs",
+     "        if drained.is_err() && declared_len.is_none() {"),
+    ("HJ11", "keylink-http/src/gateway.rs", "keylink/src/body.rs",
+     "                tokio::io::copy_buf(&mut reader, stream)\n"
+     "                    .await\n"
+     "                    .map(drop)\n"
+     "                    .map_err(Error::from)"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -3835,7 +3842,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 286
+RECORD_BLOCKS = 289
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

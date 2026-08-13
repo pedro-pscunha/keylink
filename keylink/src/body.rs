@@ -24,6 +24,13 @@ use crate::{Error, Result};
 /// Bytes queued between the source and the transport on the sending side.
 const COPY_BUFFER: usize = 64 * 1024;
 
+/// Application error code on the reset that abandons a body whose source failed.
+///
+/// Named rather than interpreted: keylink never reads a peer's reset code,
+/// because the reset itself is the whole signal. This exists so the number in
+/// the wire trace has a meaning written down somewhere.
+const BODY_SOURCE_FAILED: u32 = 1;
+
 /// A payload to send alongside a request or a response.
 ///
 /// This is a *value*, not a stream handle: a handler returns one and keylink
@@ -100,16 +107,37 @@ impl Body {
 
     /// Drain into the stream. Consumes the body, because a body is sendable
     /// exactly once and the type system should say so.
+    ///
+    /// # Why a failure resets the stream
+    ///
+    /// Dropping a `SendStream` *finishes* it, and a body that declared no length
+    /// ends exactly where its stream ends. So returning the error and walking
+    /// away would hand the peer a complete, shorter body — a truncated upload
+    /// stored as if it were whole, with nothing on either side saying otherwise.
+    /// A reset is the one ending that cannot be read as an ending.
+    ///
+    /// A declared length needs none of this and does not get it: the receiver
+    /// counts what it was promised and raises [`Error::BodyTruncated`] itself,
+    /// which says strictly more than a reset code does.
     pub(crate) async fn write_to(self, stream: &mut SendStream) -> Result<()> {
-        match self.source {
+        let declared_len = self.declared_len;
+        let drained = match self.source {
             Source::Bytes(bytes) if bytes.is_empty() => Ok(()),
-            Source::Bytes(bytes) => Ok(stream.write_chunk(bytes).await?),
+            Source::Bytes(bytes) => stream.write_chunk(bytes).await.map_err(Error::from),
             Source::Reader(reader) => {
                 let mut reader = BufReader::with_capacity(COPY_BUFFER, reader);
-                tokio::io::copy_buf(&mut reader, stream).await?;
-                Ok(())
+                tokio::io::copy_buf(&mut reader, stream)
+                    .await
+                    .map(drop)
+                    .map_err(Error::from)
             }
+        };
+        if drained.is_err() && declared_len.is_none() {
+            // Already reset, or already finished by a peer that stopped us.
+            // Either way the peer will not read this as a complete body.
+            let _ = stream.reset(BODY_SOURCE_FAILED.into());
         }
+        drained
     }
 }
 

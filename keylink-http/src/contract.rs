@@ -141,16 +141,28 @@ impl Route {
     }
 }
 
-const ROUTES: &[Route] = &[Route {
-    kind: RouteKind::Rpc,
-    addressing: Addressing::Singleton,
-    template: "/rpc/{method}",
-    method: http::Method::POST,
-    success: http::StatusCode::OK,
-    request_media: Some("application/json"),
-    response_media: Some("application/json"),
-    streaming: false,
-}];
+const ROUTES: &[Route] = &[
+    Route {
+        kind: RouteKind::Rpc,
+        addressing: Addressing::Singleton,
+        template: "/rpc/{method}",
+        method: http::Method::POST,
+        success: http::StatusCode::OK,
+        request_media: Some("application/json"),
+        response_media: Some("application/json"),
+        streaming: false,
+    },
+    Route {
+        kind: RouteKind::Send,
+        addressing: Addressing::Singleton,
+        template: "/send/{method}",
+        method: http::Method::POST,
+        success: http::StatusCode::OK,
+        request_media: Some("application/octet-stream"),
+        response_media: Some("application/json"),
+        streaming: true,
+    },
+];
 
 #[cfg(test)]
 pub(crate) const fn singleton_rpc_route() -> &'static Route {
@@ -176,6 +188,12 @@ pub enum ErrorKind {
     InvalidIdempotencyKey,
     /// The selected operation cannot promise idempotent replay.
     IdempotencyNotSupported,
+    /// Streaming metadata is missing, malformed, noncanonical, or over limit.
+    InvalidStreamMetadata,
+    /// A Range or If-Range header was supplied where ranges are not supported.
+    RangeNotSupported,
+    /// A declared or observed upload exceeds its configured limit.
+    RequestStreamTooLarge,
     /// A verified principal is absent or no longer accepted.
     Unauthenticated,
     /// The verified principal may not invoke the operation.
@@ -210,6 +228,9 @@ impl ErrorKind {
         Self::InvalidRequest,
         Self::InvalidIdempotencyKey,
         Self::IdempotencyNotSupported,
+        Self::InvalidStreamMetadata,
+        Self::RangeNotSupported,
+        Self::RequestStreamTooLarge,
         Self::Unauthenticated,
         Self::Forbidden,
         Self::MethodNotFound,
@@ -232,6 +253,9 @@ impl ErrorKind {
             Self::InvalidRequest => &INVALID_REQUEST,
             Self::InvalidIdempotencyKey => &INVALID_IDEMPOTENCY_KEY,
             Self::IdempotencyNotSupported => &IDEMPOTENCY_NOT_SUPPORTED,
+            Self::InvalidStreamMetadata => &INVALID_STREAM_METADATA,
+            Self::RangeNotSupported => &RANGE_NOT_SUPPORTED,
+            Self::RequestStreamTooLarge => &REQUEST_STREAM_TOO_LARGE,
             Self::Unauthenticated => &UNAUTHENTICATED,
             Self::Forbidden => &FORBIDDEN,
             Self::MethodNotFound => &METHOD_NOT_FOUND,
@@ -325,6 +349,27 @@ error_spec!(
     BAD_REQUEST,
     "idempotency_not_supported",
     "this method does not accept idempotency keys"
+);
+error_spec!(
+    INVALID_STREAM_METADATA,
+    InvalidStreamMetadata,
+    BAD_REQUEST,
+    "invalid_stream_metadata",
+    "the streaming metadata header is invalid"
+);
+error_spec!(
+    RANGE_NOT_SUPPORTED,
+    RangeNotSupported,
+    BAD_REQUEST,
+    "range_not_supported",
+    "this streaming route does not accept byte ranges"
+);
+error_spec!(
+    REQUEST_STREAM_TOO_LARGE,
+    RequestStreamTooLarge,
+    PAYLOAD_TOO_LARGE,
+    "request_stream_too_large",
+    "the request stream exceeds its limit"
 );
 const UNAUTHENTICATED: ErrorSpec = ErrorSpec {
     kind: ErrorKind::Unauthenticated,
@@ -424,7 +469,7 @@ error_spec!(
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::{Addressing, ErrorKind, HttpSurface, RouteKind};
+    use super::{Addressing, ErrorKind, HttpSurface, Route, RouteKind};
 
     #[test]
     fn configured_surface_filters_the_single_runtime_route_inventory() {
@@ -444,7 +489,13 @@ mod tests {
         let streaming_singleton = HttpSurface::new("/v1", Addressing::Singleton)
             .expect("valid singleton surface")
             .with_streaming(limits);
-        assert_eq!(streaming_singleton.routes().count(), 1);
+        assert_eq!(
+            streaming_singleton
+                .routes()
+                .map(Route::kind)
+                .collect::<Vec<_>>(),
+            [RouteKind::Rpc, RouteKind::Send]
+        );
         let streaming_actors = HttpSurface::new("/v1", Addressing::Actors)
             .expect("valid actor surface")
             .with_streaming(limits);

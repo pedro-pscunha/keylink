@@ -7,6 +7,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink::prelude::*;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -51,6 +52,17 @@ keylink::service! {
 #[derive(Default)]
 struct Server {
     rendezvous: Option<Rendezvous>,
+    upload_report: Option<tokio::sync::mpsc::UnboundedSender<Progress>>,
+}
+
+/// What the upload handler tells a watching test, in the order it happens.
+///
+/// `Chunk` exists so a test can make something occur *after* the receiver
+/// provably holds the request header and some body, rather than racing it.
+#[derive(Debug)]
+enum Progress {
+    Chunk,
+    Done(Received),
 }
 
 impl probe::Handler for Server {
@@ -90,23 +102,36 @@ impl probe::Handler for Server {
     async fn upload(&self, _cx: &KeylinkContext, _name: String, mut body: BodyReader) -> Received {
         let mut checksum = Fnv1a::new();
         let mut bytes = 0u64;
-        loop {
+        let outcome = loop {
             match body.next_chunk().await {
                 Ok(Some(chunk)) => {
                     checksum.update(&chunk);
                     bytes += chunk.len() as u64;
+                    self.report(Progress::Chunk);
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    break Received::Stored {
+                        bytes,
+                        checksum: checksum.finish(),
+                    }
+                }
                 Err(error) => {
-                    return Received::Failed {
+                    break Received::Failed {
                         reason: error.to_string(),
                     }
                 }
             }
-        }
-        Received::Stored {
-            bytes,
-            checksum: checksum.finish(),
+        };
+        self.report(Progress::Done(outcome.clone()));
+        outcome
+    }
+}
+
+impl Server {
+    /// Silent unless a test asked to watch, which is every test but one.
+    fn report(&self, progress: Progress) {
+        if let Some(report) = &self.upload_report {
+            report.send(progress).expect("test receiver stays open");
         }
     }
 }
@@ -200,6 +225,7 @@ async fn concurrent_calls_do_not_queue_behind_each_other() {
     let fixture = start_with(
         Server {
             rendezvous: Some(rendezvous),
+            ..Server::default()
         },
         Allowlist::anyone(),
     )
@@ -292,6 +318,92 @@ async fn a_body_far_larger_than_the_header_cap_transfers_intact() {
 
     assert_eq!(received, LEN);
     assert_eq!(checksum.finish(), meta.checksum);
+}
+
+/// Yields one chunk, then fails — but not before `release` fires.
+///
+/// The gate is what makes the test deterministic rather than a race. A stream
+/// reset discards whatever the peer has not read yet, request header included,
+/// so a source that fails in the same poll that wrote the header would sometimes
+/// leave the peer with nothing to dispatch and no outcome to report.
+struct FailsWhenReleased {
+    yielded: bool,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl AsyncRead for FailsWhenReleased {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if !self.yielded {
+            self.yielded = true;
+            buf.put_slice(b"body");
+            return Poll::Ready(Ok(()));
+        }
+        match Pin::new(&mut self.release).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(_) => Poll::Ready(Err(io::Error::other("source failed"))),
+        }
+    }
+}
+
+/// A body whose length was never declared ends at the stream's end, so the one
+/// thing the receiver must never conclude from a failed source is "complete".
+///
+/// There is no length to check it against and no sentinel frame to miss: only
+/// the difference between finishing the stream and resetting it carries this.
+///
+/// Watched red with `scripts/break-once.sh` by replacing
+/// `        if drained.is_err() && declared_len.is_none() {`
+/// with `is_some`, so the reset fires for the one case that does not need it and
+/// never for the case that does. The exact test terminated with
+/// `Stored { bytes: 4, checksum: 14793735007222968981 }` — the handler counting a
+/// failed upload as a whole one.
+#[tokio::test]
+async fn an_unknown_length_source_error_resets_the_receivers_body() {
+    let (report, mut progress) = tokio::sync::mpsc::unbounded_channel();
+    let fixture = start_with(
+        Server {
+            upload_report: Some(report),
+            ..Server::default()
+        },
+        Allowlist::anyone(),
+    )
+    .await;
+
+    let (release, released) = tokio::sync::oneshot::channel();
+    let source = FailsWhenReleased {
+        yielded: false,
+        release: released,
+    };
+
+    let watching = async {
+        // The handler holds the header and the first chunk. What follows cannot
+        // be mistaken for a request that never arrived.
+        assert!(
+            matches!(progress.recv().await, Some(Progress::Chunk)),
+            "the handler reads the first chunk before the source fails"
+        );
+        release.send(()).expect("the source is still waiting");
+        match progress.recv().await {
+            Some(Progress::Done(received)) => received,
+            other => panic!("the handler reports one body outcome, got {other:?}"),
+        }
+    };
+    let calling = fixture
+        .client
+        .upload("broken".to_string(), Body::from_reader(source, None));
+
+    let (result, received) = tokio::join!(calling, watching);
+
+    let error = result.expect_err("the caller preserves its local source error");
+    assert!(matches!(error, Error::Io(_)), "got {error:?}");
+    assert!(
+        matches!(received, Received::Failed { .. }),
+        "the receiver must not accept a failed source as clean EOF: {received:?}"
+    );
 }
 
 /// The receiver knows the size before a byte moves, which is what makes

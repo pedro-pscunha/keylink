@@ -73,6 +73,28 @@ fn http_surface_is_immutable_and_streaming_is_explicit() {
     assert_eq!(actors.streaming(), Some(limits));
 }
 
+/// Streaming is opt-in at the surface, so an operator who never supplied a
+/// finite upload ceiling never gets a route that would need one.
+#[test]
+fn streaming_routes_require_explicit_limits() {
+    use keylink_http::__contract::RouteKind;
+    use keylink_http::{Addressing, HttpSurface, StreamingLimits};
+
+    let plain = HttpSurface::new("/v1", Addressing::Singleton).expect("valid surface");
+    assert!(
+        plain.routes().all(|route| route.kind() == RouteKind::Rpc),
+        "a surface without limits offers no streaming route"
+    );
+
+    let limits = StreamingLimits::new(1024, 4096, 8192, 16).expect("positive streaming limits");
+    let streaming = HttpSurface::new("/v1", Addressing::Singleton)
+        .expect("valid surface")
+        .with_streaming(limits);
+    assert!(streaming
+        .routes()
+        .any(|route| route.kind() == RouteKind::Send));
+}
+
 #[test]
 fn streaming_limits_reject_each_zero_field() {
     use keylink_http::StreamingLimits;

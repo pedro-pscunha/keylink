@@ -59,6 +59,7 @@ mod gateway;
 mod limits;
 mod raw_path;
 mod service;
+mod stream;
 
 pub use __contract::{Addressing, HttpSurface};
 pub use access::{Access, AccessError, Call, Challenge, Principal};

@@ -68,34 +68,55 @@ where
         if surface.addressing() != Addressing::Singleton {
             return Err(ConfigError::WrongAddressing);
         }
-        let Some(route) = surface
+        let Some(rpc) = surface
             .routes()
             .find(|route| route.kind() == RouteKind::Rpc)
         else {
             return Err(ConfigError::MissingRuntimeRoute);
         };
-        let path = format!("{}{}", surface.prefix(), route.template());
-        let handler_path = path.clone();
+        let rpc_path = format!("{}{}", surface.prefix(), rpc.template());
+        let handler_path = rpc_path.clone();
         let gateway = Arc::new(self);
-        Ok(Router::new()
-            .route(
+        let rpc_gateway = Arc::clone(&gateway);
+        let mut router = Router::new().route(
+            &rpc_path,
+            any(move |request: Request<Body>| {
+                let gateway = Arc::clone(&rpc_gateway);
+                let path = handler_path.clone();
+                async move { gateway.handle_rpc(request, rpc, &path).await }
+            }),
+        );
+        if let (Some(limits), Some(send)) = (
+            surface.streaming(),
+            surface
+                .routes()
+                .find(|route| route.kind() == RouteKind::Send),
+        ) {
+            let path = format!("{}{}", surface.prefix(), send.template());
+            let handler_path = path.clone();
+            router = router.route(
                 &path,
                 any(move |request: Request<Body>| {
                     let gateway = Arc::clone(&gateway);
                     let path = handler_path.clone();
-                    async move { gateway.handle(request, route, &path).await }
+                    async move { gateway.handle_send(request, send, &path, limits).await }
                 }),
-            )
-            .fallback(|| async { GatewayError::MethodNotFound.response(None) }))
+            );
+        }
+        Ok(router.fallback(|| async { GatewayError::MethodNotFound.response(None) }))
     }
 
-    async fn handle(
+    async fn handle_rpc(
         &self,
         request: Request<Body>,
         route: &'static Route,
         route_path: &str,
     ) -> Response<Body> {
-        let decoded = match decode_method::<S>(request.uri().path(), route_path) {
+        let decoded = match decode_method::<S>(
+            request.uri().path(),
+            route_path,
+            keylink::ExternalKind::Rpc,
+        ) {
             Ok(method) => method,
             Err(error) => return error.response(None),
         };
@@ -162,6 +183,95 @@ where
             Err(error) => GatewayError::from_external(error).response(None),
         }
     }
+
+    async fn handle_send(
+        &self,
+        request: Request<Body>,
+        route: &'static Route,
+        route_path: &str,
+        limits: crate::StreamingLimits,
+    ) -> Response<Body> {
+        let decoded = match decode_method::<S>(
+            request.uri().path(),
+            route_path,
+            keylink::ExternalKind::Send,
+        ) {
+            Ok(method) => method,
+            Err(error) => return error.response(None),
+        };
+        let Some(method) = S::METHODS
+            .iter()
+            .copied()
+            .find(|candidate| {
+                candidate.name() == decoded && candidate.kind() == keylink::ExternalKind::Send
+            })
+            .map(keylink::ExternalMethod::name)
+        else {
+            return GatewayError::MethodNotFound.response(None);
+        };
+        if request.method() != route.method() {
+            return GatewayError::MethodNotAllowed.response(None);
+        }
+        let Some(principal) = request.extensions().get::<Principal>().cloned() else {
+            return GatewayError::Unauthenticated.response(Some(self.challenge.header()));
+        };
+        match self
+            .access
+            .authorize(Call {
+                extensions: request.extensions(),
+                headers: request.headers(),
+                principal: &principal,
+                service: S::SERVICE,
+                method,
+            })
+            .await
+        {
+            Ok(()) => {}
+            Err(AccessError::Unauthenticated) => {
+                return GatewayError::Unauthenticated.response(Some(self.challenge.header()));
+            }
+            Err(AccessError::Forbidden) => return GatewayError::Forbidden.response(None),
+        }
+        if request.headers().get(IDEMPOTENCY_HEADER).is_some() {
+            return GatewayError::IdempotencyNotSupported.response(None);
+        }
+        if request.headers().get(header::RANGE).is_some()
+            || request.headers().get(header::IF_RANGE).is_some()
+        {
+            return GatewayError::RangeNotSupported.response(None);
+        }
+        if !crate::stream::is_octet_stream(request.headers()) {
+            return GatewayError::UnsupportedMediaType.response(None);
+        }
+        let arguments =
+            match crate::stream::arguments(request.headers(), limits.metadata_json_bytes()) {
+                Ok(arguments) => arguments,
+                Err(_) => return GatewayError::InvalidStreamMetadata.response(None),
+            };
+        let declared_len = request
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        if declared_len.is_some_and(|len| len > limits.max_upload_bytes()) {
+            return GatewayError::RequestStreamTooLarge.response(None);
+        }
+        let (_, body) = request.into_parts();
+        let invocation = S::invoke(
+            &self.client,
+            method,
+            &arguments,
+            keylink::ExternalCall::Send {
+                body: crate::stream::upload_body(body, declared_len, limits.max_upload_bytes()),
+            },
+            JsonCodec::new(self.limits.response.get()),
+        );
+        match invocation.await {
+            Ok(keylink::ExternalOutput::Json(json)) => json_response(json, route),
+            Ok(_) => GatewayError::UpstreamError.response(None),
+            Err(error) => GatewayError::from_external(error).response(None),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -183,7 +293,11 @@ fn json_response(json: Vec<u8>, route: &Route) -> Response<Body> {
     response
 }
 
-fn decode_method<S: ExternalService>(path: &str, route_path: &str) -> Result<String, GatewayError> {
+fn decode_method<S: ExternalService>(
+    path: &str,
+    route_path: &str,
+    kind: keylink::ExternalKind,
+) -> Result<String, GatewayError> {
     let prefix = route_path
         .strip_suffix("{method}")
         .ok_or(GatewayError::MethodNotFound)?;
@@ -195,7 +309,7 @@ fn decode_method<S: ExternalService>(path: &str, route_path: &str) -> Result<Str
     }
     let max_bytes = S::METHODS
         .iter()
-        .filter(|method| method.kind() == keylink::ExternalKind::Rpc)
+        .filter(|method| method.kind() == kind)
         .map(|method| method.name().len())
         .max()
         .unwrap_or(0);
@@ -204,9 +318,6 @@ fn decode_method<S: ExternalService>(path: &str, route_path: &str) -> Result<Str
 }
 
 fn is_media(headers: &HeaderMap, expected: Option<&str>) -> bool {
-    if expected != Some("application/json") {
-        return false;
-    }
     let mut values = headers.get_all(header::CONTENT_TYPE).iter();
     let Some(value) = values.next() else {
         return false;
@@ -220,8 +331,18 @@ fn is_media(headers: &HeaderMap, expected: Option<&str>) -> bool {
     let Ok(media) = value.parse::<mime::Mime>() else {
         return false;
     };
-    media.type_() == mime::APPLICATION
-        && (media.subtype() == mime::JSON || media.suffix() == Some(mime::JSON))
+    match expected {
+        Some("application/json") => {
+            media.type_() == mime::APPLICATION
+                && (media.subtype() == mime::JSON || media.suffix() == Some(mime::JSON))
+        }
+        Some("application/octet-stream") => {
+            media.type_() == mime::APPLICATION
+                && media.subtype() == mime::OCTET_STREAM
+                && media.params().next().is_none()
+        }
+        _ => false,
+    }
 }
 
 fn is_length_limit(error: &axum::Error) -> bool {
@@ -272,6 +393,7 @@ fn derived_key(
 mod tests {
     #![allow(clippy::expect_used)]
 
+    use std::sync::atomic::AtomicU64;
     use std::{
         convert::Infallible,
         future::{pending, Future},
@@ -483,13 +605,267 @@ mod tests {
     #[test]
     fn malformed_percent_encoding_is_an_invalid_adapter_request() {
         assert!(matches!(
-            super::decode_method::<TestService>("/rpc/%ZZ", super::SINGLETON_RPC_PATH),
+            super::decode_method::<TestService>(
+                "/rpc/%ZZ",
+                super::SINGLETON_RPC_PATH,
+                keylink::ExternalKind::Rpc,
+            ),
             Err(crate::error::GatewayError::InvalidRequest)
         ));
         assert!(matches!(
-            super::decode_method::<TestService>("/rpc/%FF", super::SINGLETON_RPC_PATH),
+            super::decode_method::<TestService>(
+                "/rpc/%FF",
+                super::SINGLETON_RPC_PATH,
+                keylink::ExternalKind::Rpc,
+            ),
             Err(crate::error::GatewayError::InvalidRequest)
         ));
+    }
+
+    #[derive(Clone)]
+    struct SendClient {
+        invoked: Arc<Mutex<Vec<keylink::ExternalKind>>>,
+    }
+
+    struct SendService;
+
+    impl ExternalService for SendService {
+        const SERVICE: &'static str = "SendService";
+        const METHODS: &'static [keylink::ExternalMethod] = &[
+            keylink::ExternalMethod::new("Run", keylink::ExternalKind::Rpc),
+            keylink::ExternalMethod::new("Upload", keylink::ExternalKind::Send),
+        ];
+        type Client = SendClient;
+
+        fn invoke<C: keylink::ServiceCodec>(
+            client: &Self::Client,
+            _method: &str,
+            _arguments: &[u8],
+            call: keylink::ExternalCall,
+            codec: C,
+        ) -> ExternalFuture<C> {
+            client.invoked.lock().expect("test mutex").push(call.kind());
+            Box::pin(async move {
+                codec
+                    .encode(&7_u64)
+                    .map(keylink::ExternalOutput::Json)
+                    .map_err(ExternalError::Codec)
+            })
+        }
+    }
+
+    fn send_gateway(
+        invoked: Arc<Mutex<Vec<keylink::ExternalKind>>>,
+    ) -> Gateway<SendService, Denyless> {
+        Gateway::<SendService, _>::new(
+            SendClient { invoked },
+            Denyless,
+            Challenge::new(HeaderValue::from_static("Bearer realm=keylink"))
+                .expect("valid challenge"),
+        )
+        .limits(crate::JsonLimits::new(32, 32).expect("positive JSON limits"))
+    }
+
+    /// One refusal case: content type, arguments header, one extra header,
+    /// declared `Content-Length`, and the status all four must produce.
+    type Refusal = (
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<(&'static str, &'static str)>,
+        Option<&'static str>,
+        http::StatusCode,
+    );
+
+    /// Everything a `send` refuses on its headers alone, and the one property
+    /// they share: the upload never starts. Refusing after the body has been
+    /// read costs the bytes it was refusing.
+    async fn refused_before_any_poll(cases: &[Refusal]) {
+        for &(media, arguments, extra, length, status) in cases {
+            let invoked = Arc::new(Mutex::new(Vec::new()));
+            let polls = Arc::new(AtomicUsize::new(0));
+            let limits = crate::StreamingLimits::new(2, 4, 4, 1).expect("positive limits");
+            let route = crate::HttpSurface::new("", crate::Addressing::Singleton)
+                .expect("valid surface")
+                .with_streaming(limits)
+                .routes()
+                .find(|route| route.kind() == crate::__contract::RouteKind::Send)
+                .expect("send route");
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/send/Upload")
+                .extension(Principal::new(b"tenant-a").expect("valid principal"));
+            if let Some(media) = media {
+                request = request.header("content-type", media);
+            }
+            if let Some(arguments) = arguments {
+                request = request.header("keylink-arguments", arguments);
+            }
+            if let Some((name, value)) = extra {
+                request = request.header(name, value);
+            }
+            if let Some(length) = length {
+                request = request.header("content-length", length);
+            }
+            let response = send_gateway(Arc::clone(&invoked))
+                .handle_send(
+                    request
+                        .body(Body::new(RecordingBody::new(Arc::clone(&polls))))
+                        .expect("request"),
+                    route,
+                    "/send/{method}",
+                    limits,
+                )
+                .await;
+            assert_eq!(
+                response.status(),
+                status,
+                "{media:?} {arguments:?} {extra:?} {length:?}"
+            );
+            assert_eq!(polls.load(Ordering::SeqCst), 0);
+            assert!(invoked.lock().expect("test mutex").is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn send_rejects_malformed_metadata_before_body_poll() {
+        refused_before_any_poll(&[
+            (
+                None,
+                None,
+                None,
+                None,
+                http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                Some("application/json"),
+                Some("e30"),
+                None,
+                None,
+                http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                Some("application/octet-stream"),
+                None,
+                None,
+                None,
+                http::StatusCode::BAD_REQUEST,
+            ),
+            (
+                Some("application/octet-stream"),
+                Some("e30="),
+                None,
+                None,
+                http::StatusCode::BAD_REQUEST,
+            ),
+        ])
+        .await;
+    }
+
+    /// A `send` has no reply to replay and no range to serve, so both headers
+    /// are refused rather than quietly ignored — and refused before the upload
+    /// they would otherwise have consumed.
+    #[tokio::test]
+    async fn send_rejects_idempotency_and_range_before_body_poll() {
+        refused_before_any_poll(&[
+            (
+                Some("application/octet-stream"),
+                Some("e30"),
+                Some(("idempotency-key", "x")),
+                None,
+                http::StatusCode::BAD_REQUEST,
+            ),
+            (
+                Some("application/octet-stream"),
+                Some("e30"),
+                Some(("range", "bytes=0-1")),
+                None,
+                http::StatusCode::BAD_REQUEST,
+            ),
+            (
+                Some("application/octet-stream"),
+                Some("e30"),
+                Some(("if-range", "\"etag\"")),
+                None,
+                http::StatusCode::BAD_REQUEST,
+            ),
+        ])
+        .await;
+    }
+
+    /// A sender that announces more than the ceiling is refused on the
+    /// announcement. Discovering it byte by byte would mean accepting the bytes.
+    #[tokio::test]
+    async fn send_rejects_declared_oversize_before_body_poll() {
+        refused_before_any_poll(&[(
+            Some("application/octet-stream"),
+            Some("e30"),
+            None,
+            Some("5"),
+            http::StatusCode::PAYLOAD_TOO_LARGE,
+        )])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn send_route_selects_only_enabled_send_methods() {
+        let invoked = Arc::new(Mutex::new(Vec::new()));
+        let gateway = Gateway::<SendService, _>::new(
+            SendClient {
+                invoked: Arc::clone(&invoked),
+            },
+            Denyless,
+            Challenge::new(HeaderValue::from_static("Bearer realm=keylink"))
+                .expect("valid challenge"),
+        );
+        let limits = crate::StreamingLimits::new(32, 32, 32, 1).expect("positive limits");
+        let router = gateway
+            .router::<()>(
+                crate::HttpSurface::new("", crate::Addressing::Singleton)
+                    .expect("valid surface")
+                    .with_streaming(limits),
+            )
+            .expect("surface builds");
+        let app = router.layer(axum::middleware::from_fn(
+            |mut request: Request<Body>, next: axum::middleware::Next| async move {
+                request
+                    .extensions_mut()
+                    .insert(Principal::new(b"tenant-a").expect("valid principal"));
+                next.run(request).await
+            },
+        ));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let client = reqwest::Client::new();
+
+        let upload = client
+            .post(format!("http://{address}/send/Upload"))
+            .header("content-type", "application/octet-stream")
+            .header("keylink-arguments", "e30")
+            .body("bytes")
+            .send()
+            .await
+            .expect("HTTP response");
+        assert_eq!(upload.status(), http::StatusCode::OK);
+        assert_eq!(
+            *invoked.lock().expect("test mutex"),
+            [keylink::ExternalKind::Send]
+        );
+
+        let wrong_kind = client
+            .post(format!("http://{address}/send/Run"))
+            .header("content-type", "application/octet-stream")
+            .header("keylink-arguments", "e30")
+            .body("bytes")
+            .send()
+            .await
+            .expect("HTTP response");
+        assert_eq!(wrong_kind.status(), http::StatusCode::NOT_FOUND);
+        assert_eq!(invoked.lock().expect("test mutex").len(), 1);
+        server.abort();
     }
 
     #[derive(Clone)]
@@ -545,7 +921,7 @@ mod tests {
                 .expect("valid challenge"),
         );
         let response = gateway
-            .handle(
+            .handle_rpc(
                 request("/rpc/Run", Body::from("{}")),
                 super::singleton_rpc_route(),
                 super::SINGLETON_RPC_PATH,
@@ -560,7 +936,7 @@ mod tests {
         let client = client();
         let polls = Arc::new(AtomicUsize::new(0));
         let response = gateway(client.clone(), PanicAccess)
-            .handle(
+            .handle_rpc(
                 request(
                     "/rpc/%61%61%61%61",
                     Body::new(RecordingBody::new(Arc::clone(&polls))),
@@ -580,7 +956,7 @@ mod tests {
         let client = client();
         let polls = Arc::new(AtomicUsize::new(0));
         let response = gateway(client.clone(), PanicAccess)
-            .handle(
+            .handle_rpc(
                 request(
                     "/rpc/Bad",
                     Body::new(RecordingBody::new(Arc::clone(&polls))),
@@ -600,7 +976,7 @@ mod tests {
         let client = client();
         let polls = Arc::new(AtomicUsize::new(0));
         let response = gateway(client.clone(), Deny)
-            .handle(
+            .handle_rpc(
                 request(
                     "/rpc/Run",
                     Body::new(RecordingBody::new(Arc::clone(&polls))),
@@ -635,7 +1011,7 @@ mod tests {
         );
 
         let response = gateway(client.clone(), Denyless)
-            .handle(
+            .handle_rpc(
                 request,
                 super::singleton_rpc_route(),
                 super::SINGLETON_RPC_PATH,
@@ -660,7 +1036,7 @@ mod tests {
                 .insert(http::header::CONTENT_TYPE, HeaderValue::from_static(value));
 
             let response = gateway(client.clone(), Denyless)
-                .handle(
+                .handle_rpc(
                     request,
                     super::singleton_rpc_route(),
                     super::SINGLETON_RPC_PATH,
@@ -682,7 +1058,7 @@ mod tests {
     async fn short_body_collection_failure_is_not_reported_as_too_large() {
         let client = client();
         let response = gateway(client.clone(), Denyless)
-            .handle(
+            .handle_rpc(
                 request("/rpc/Run", Body::new(ErrorBody)),
                 super::singleton_rpc_route(),
                 super::SINGLETON_RPC_PATH,
@@ -706,7 +1082,7 @@ mod tests {
         );
 
         let response = gateway(client.clone(), Denyless)
-            .handle(
+            .handle_rpc(
                 request,
                 super::singleton_rpc_route(),
                 super::SINGLETON_RPC_PATH,
@@ -733,7 +1109,7 @@ mod tests {
         request.extensions_mut().insert(7_u64);
 
         let response = gateway(client.clone(), Capture(Arc::clone(&captured)))
-            .handle(
+            .handle_rpc(
                 request,
                 super::singleton_rpc_route(),
                 super::SINGLETON_RPC_PATH,
@@ -759,12 +1135,12 @@ mod tests {
     fn concurrent_handlers_poll_independent_invocations_without_waiting() {
         let client = client();
         let gateway = gateway(client.clone(), Denyless);
-        let mut first = Box::pin(gateway.handle(
+        let mut first = Box::pin(gateway.handle_rpc(
             request("/rpc/Run", Body::from("{}")),
             super::singleton_rpc_route(),
             super::SINGLETON_RPC_PATH,
         ));
-        let mut second = Box::pin(gateway.handle(
+        let mut second = Box::pin(gateway.handle_rpc(
             request("/rpc/Run", Body::from("{}")),
             super::singleton_rpc_route(),
             super::SINGLETON_RPC_PATH,
@@ -781,7 +1157,7 @@ mod tests {
     fn dropping_handler_drops_the_adapter_owned_invocation_future() {
         let client = client();
         let gateway = gateway(client.clone(), Denyless);
-        let mut handler = Box::pin(gateway.handle(
+        let mut handler = Box::pin(gateway.handle_rpc(
             request("/rpc/Run", Body::from("{}")),
             super::singleton_rpc_route(),
             super::SINGLETON_RPC_PATH,
@@ -798,6 +1174,166 @@ mod tests {
     keylink::service! {
         service Cancellation;
         rpc Wait(token: u64) -> u64;
+        send Upload(prefix: u64) -> u64;
+    }
+
+    /// The serving endpoint's per-stream receive window for the backpressure
+    /// test. Pinned rather than inherited, so the bound below is measured
+    /// against a number this file owns instead of a dependency's default.
+    const RECEIVE_WINDOW: u32 = 16 * 1024;
+
+    /// An upload the gateway polls directly, counting what it hands over.
+    ///
+    /// Directly is the point. Behind a real socket this same measurement reads
+    /// the kernel's buffers rather than the adapter's behaviour, and a megabyte
+    /// disappears into them before Keylink is involved at all.
+    struct CountingBody {
+        chunks: u64,
+        chunk_len: usize,
+        produced: Arc<AtomicU64>,
+        first: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl HttpBody for CountingBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if self.chunks == 0 {
+                return Poll::Ready(None);
+            }
+            self.chunks -= 1;
+            let chunk_len = self.chunk_len;
+            self.produced.fetch_add(chunk_len as u64, Ordering::SeqCst);
+            if let Some(first) = self.first.take() {
+                let _ = first.send(());
+            }
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![b'k'; chunk_len])))))
+        }
+    }
+
+    /// The HTTP body is pulled by the Keylink writer, not drained into it. While
+    /// the receiver reads nothing its flow-control window closes, the gateway's
+    /// write parks, and the body stops being polled — so peak memory is a
+    /// bounded amount of transport buffer however long the upload is.
+    ///
+    /// # Why this counts bytes rather than polls
+    ///
+    /// The first shape of this test asserted "no second poll after the first"
+    /// and was wrong: keylink's frame reader pulls a whole transport read to
+    /// find the request header, so a receiver legitimately absorbs more than one
+    /// chunk before the handler asks for anything. The window is not the only
+    /// slack, and pinning the assertion to one chunk pinned it to an accident.
+    ///
+    /// So the claim is measured as what it is: an upper bound on what a
+    /// *non-reading* receiver can pull through. Half the offered payload is
+    /// eight times the slack expected here and half of what an adapter that
+    /// drained the body would show, so nothing in between is a near miss. Load
+    /// can only make the body produce less, so the bound cannot redden under
+    /// load — only a real regression moves it.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HJ11`) by replacing
+    /// `tokio::io::copy_buf(&mut reader, stream)
+    /// .await
+    /// .map(drop)
+    /// .map_err(Error::from)`
+    /// in `keylink/src/body.rs` with one that drains the reader into a `Vec`
+    /// and writes that afterwards, which is the regression this bound exists
+    /// for. The exact test terminated with `pulled 1048576 of 1048576 offered
+    /// bytes` — every byte pulled through, with the receiver reading none.
+    #[tokio::test]
+    async fn send_backpressure_stops_http_body_polling() {
+        let chunks = 64_u64;
+        let offered = u64::from(RECEIVE_WINDOW) * chunks;
+        let limits = crate::StreamingLimits::new(32, offered, 64, 1).expect("positive limits");
+        let route = crate::HttpSurface::new("", crate::Addressing::Singleton)
+            .expect("valid surface")
+            .with_streaming(limits)
+            .routes()
+            .find(|route| route.kind() == crate::__contract::RouteKind::Send)
+            .expect("send route");
+
+        let server_node = Node::from_endpoint(
+            Endpoint::builder(presets::Minimal)
+                .transport_config(
+                    iroh::endpoint::QuicTransportConfig::builder()
+                        .stream_receive_window(RECEIVE_WINDOW.into())
+                        .build(),
+                )
+                .bind()
+                .await
+                .expect("a local endpoint binds"),
+        );
+        let client_node = local_node().await;
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let _keylink = cancellation::serve(
+            &server_node,
+            CancellationHandler {
+                entered: entered_tx,
+                release: Arc::clone(&release),
+            },
+            Allowlist::anyone(),
+        )
+        .expect("service starts");
+        let client = cancellation::Client::connect(&client_node, server_node.endpoint().addr())
+            .await
+            .expect("client connects");
+        let gateway = Gateway::<cancellation::External, _>::new(
+            client,
+            Denyless,
+            Challenge::new(HeaderValue::from_static("Bearer realm=keylink"))
+                .expect("valid challenge"),
+        );
+
+        let produced = Arc::new(AtomicU64::new(0));
+        let (first_tx, first) = tokio::sync::oneshot::channel();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/send/Upload")
+            .header("content-type", "application/octet-stream")
+            .header("keylink-arguments", {
+                use base64::Engine as _;
+
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"prefix":3}"#)
+            })
+            .extension(Principal::new(b"tenant-a").expect("valid principal"))
+            .body(Body::new(CountingBody {
+                chunks,
+                chunk_len: RECEIVE_WINDOW as usize,
+                produced: Arc::clone(&produced),
+                first: Some(first_tx),
+            }))
+            .expect("request");
+
+        let responding = gateway.handle_send(request, route, "/send/{method}", limits);
+        let watching = async {
+            entered_rx.recv().await.expect("the handler is dispatched");
+            first.await.expect("the body is polled at least once");
+            tokio::task::yield_now().await;
+            let stalled = produced.load(Ordering::SeqCst);
+            assert!(
+                stalled <= offered / 2,
+                "a receiver that reads nothing pulled {stalled} of {offered} offered bytes"
+            );
+            release.notify_waiters();
+            stalled
+        };
+        let (response, stalled) = tokio::join!(responding, watching);
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            produced.load(Ordering::SeqCst),
+            offered,
+            "and once the receiver reads, the whole upload still arrives"
+        );
+        assert!(
+            stalled < offered,
+            "a reader that resumes is what let the rest through"
+        );
     }
 
     struct CancellationHandler {
@@ -810,6 +1346,19 @@ mod tests {
             self.entered.send(()).expect("test receiver stays open");
             self.release.notified().await;
             token
+        }
+
+        /// Reports that it holds the request, then reads nothing until released.
+        /// That gap is the window the backpressure test measures across.
+        async fn upload(
+            &self,
+            _cx: &KeylinkContext,
+            prefix: u64,
+            body: keylink::BodyReader,
+        ) -> u64 {
+            self.entered.send(()).expect("test receiver stays open");
+            self.release.notified().await;
+            prefix + body.drain().await.expect("the upload arrives whole")
         }
     }
 

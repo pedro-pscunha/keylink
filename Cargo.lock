@@ -2186,6 +2186,7 @@ name = "keylink-http"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "blake3",
  "bytes",
  "http",
@@ -2194,12 +2195,14 @@ dependencies = [
  "iroh",
  "keylink",
  "mime",
+ "n0-future",
  "postcard-schema",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
