@@ -2135,16 +2135,14 @@ ANCHORS = [
      "            return Err(crate::BlockingError::BlockingInAsync);\n"
      "        }"),
     ("HJ1", "keylink/tests/api.rs", "keylink/src/macros.rs",
-     "            @rpcs [ $( $rpcs )* { [ $( #[$cfg] )* ] $rpc ( $( $arg : $ty ),* ) -> $ret } ]"),
+     "            @methods [ $( $methods )* { [ $( #[$cfg] )* ] rpc $method ( $( $arg : $ty ),* ) -> $ret } ]"),
     ("HJ2", "keylink-http/src/limits.rs", "keylink-http/src/limits.rs",
      '        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {\n            self.overflowed = true;\n            return Err(std::io::Error::other(\n                "successful response exceeds its JSON limit",\n            ));\n        }'),
     ("HJ3", "keylink-http/src/service.rs", "keylink/src/macros.rs",
-     '                                    codec.encode(&value).map_err($crate::ExternalError::Codec)'),
+     '                }\n                .map_err($crate::ExternalError::Client)?;\n                $codec.encode(&value)\n                    .map($crate::ExternalOutput::Json)'),
     ("HJ4", "keylink-http/tests/http.rs", "keylink-http/src/gateway.rs", '    hasher.update(principal);'),
     ("HJ5", "keylink-http/src/limits.rs", "keylink-http/src/limits.rs",
      "            bytes: Vec::new(),\n"),
-    ("HJ6", "keylink-http/tests/http.rs", "keylink/src/macros.rs",
-     "                            #[serde(deny_unknown_fields)]"),
     ("HJ7", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
      "    if values.next().is_some() {\n        return false;\n    }"),
     ("HJ8", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
@@ -2237,6 +2235,14 @@ DESCRIBED = [
     ("C3AJ", "keylink/src/compose/lossy.rs", "same-file",
      "the deferred-drop literal counts 1 at fb0cbc5; quoting it beside the Closed guard "
      "would make that count 2"),
+    # The external seam now emits the same attribute once for rpc, send, recv and
+    # blob. The bare one-line literal counts 4 at 957891a56c2c; distinguishing the
+    # rpc copy requires formatter-owned macro context spanning eleven lines. The
+    # exact RPC-specific edit was replayed after this migration and selected one
+    # guard, returning HTTP 200 instead of 400.
+    ("HJ6", "keylink-http/tests/http.rs", "formatter-owned-multiline",
+     "the deny_unknown_fields literal counts 4 at 957891a56c2c; a unique rpc "
+     "discriminator spans formatter-owned macro lines"),
 ]
 
 # ── WHAT A ROW'S BREAK PRODUCES, FOR THE ROWS SOMEBODY REPLAYED ────────────────
@@ -2367,15 +2373,15 @@ REDNESS = {
     "A5": ("        while inner.held > 0",
            "a bound nothing can reach must evict nothing",
            "a_maximal_pool_evicts_nothing", ["-p", "keylink", "--lib"]),
-    "HJ1": ("            @rpcs [ $( $rpcs )* ]",
-            "left: []",
-            "generated_external_marker_names_only_enabled_plain_rpcs",
+    "HJ1": ("            @methods [ $( $methods )* ]",
+            "left: [ExternalMethod",
+            "generated_external_marker_names_only_enabled_adaptable_methods",
             ["-p", "keylink", "--test", "api"]),
     "HJ2": ('        if false {\n            self.overflowed = true;\n            return Err(std::io::Error::other(\n                "successful response exceeds its JSON limit",\n            ));\n        }',
             "assertion failed: writer.write_all(b\"d\").is_err()",
             "limits::tests::bounded_writer_accepts_limit_and_refuses_limit_plus_one",
             ["-p", "keylink-http", "--lib"]),
-    "HJ3": ('                                    codec.encode(&()).map_err($crate::ExternalError::Codec)',
+    "HJ3": ('                }\n                .map_err($crate::ExternalError::Client)?;\n                $codec.encode(&())\n                    .map($crate::ExternalOutput::Json)',
             "left: [110, 117, 108, 108]",
             "service::tests::json_conversion_uses_declared_arguments_and_return_values",
             ["-p", "keylink-http", "--lib"]),
@@ -2385,9 +2391,6 @@ REDNESS = {
     "HJ5": ("            bytes: Vec::with_capacity(limit),", "capacity overflow",
             "limits::tests::bounded_writer_does_not_reserve_the_configured_ceiling",
             ["-p", "keylink-http", "--lib", "--", "--exact"]),
-    "HJ6": ("", "left: 200",
-            "unknown_argument_fields_fail_before_zero_one_or_many_argument_dispatch",
-            ["-p", "keylink-http", "--test", "http", "--", "--exact"]),
     "HJ7": ("    if false {\n        return false;\n    }", "left: 200",
             "gateway::tests::duplicate_content_types_are_rejected",
             ["-p", "keylink-http", "--lib", "--", "--exact"]),

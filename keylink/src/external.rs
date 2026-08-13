@@ -27,9 +27,17 @@ pub enum ExternalError<E>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    /// The method is not an enabled plain `rpc` declaration.
-    #[error("unknown external rpc method")]
+    /// The method is not an enabled externally adaptable declaration.
+    #[error("unknown external method")]
     UnknownMethod,
+    /// The method exists, but the requested operation kind does not match it.
+    #[error("external method kind mismatch: expected {expected:?}, got {actual:?}")]
+    WrongKind {
+        /// The generated method kind.
+        expected: ExternalKind,
+        /// The kind requested by the adapter.
+        actual: ExternalKind,
+    },
     /// The codec could not decode arguments or encode the return value.
     #[error("external service codec failed: {0}")]
     Codec(#[source] E),
@@ -43,12 +51,107 @@ pub type ExternalFuture<C> = Pin<
     Box<
         dyn Future<
                 Output = Result<
-                    <C as ServiceCodec>::Output,
+                    ExternalOutput<<C as ServiceCodec>::Output>,
                     ExternalError<<C as ServiceCodec>::Error>,
                 >,
             > + Send,
     >,
 >;
+
+/// A generated method kind that an external adapter can expose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExternalKind {
+    /// A bounded argument object and bounded return value.
+    Rpc,
+    /// A request body streams to the handler.
+    Send,
+    /// A response body streams from the handler.
+    Recv,
+    /// The handler grants content-addressed bytes.
+    Blob,
+}
+
+/// One enabled generated method in the external adapter inventory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExternalMethod {
+    name: &'static str,
+    kind: ExternalKind,
+}
+
+impl ExternalMethod {
+    /// Build a generated method descriptor.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn new(name: &'static str, kind: ExternalKind) -> Self {
+        Self { name, kind }
+    }
+
+    /// The declared Rust method name used by external routes.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+
+    /// The declared operation kind.
+    #[must_use]
+    pub const fn kind(self) -> ExternalKind {
+        self.kind
+    }
+}
+
+/// The transport shape requested from a generated external method.
+#[derive(Debug)]
+pub enum ExternalCall {
+    /// Bounded arguments and a bounded declared return value.
+    Rpc {
+        /// Optional process-lifetime replay key.
+        key: Option<IdempotencyKey>,
+    },
+    /// Bounded arguments plus a streaming upload.
+    Send {
+        /// The upload that the generated client streams to the handler.
+        body: crate::Body,
+    },
+    /// Bounded arguments plus a one-shot streaming download.
+    Recv,
+    /// Bounded arguments plus a granted content handle.
+    Blob,
+}
+
+impl ExternalCall {
+    /// The operation kind selected by this call.
+    #[must_use]
+    pub const fn kind(&self) -> ExternalKind {
+        match self {
+            Self::Rpc { .. } => ExternalKind::Rpc,
+            Self::Send { .. } => ExternalKind::Send,
+            Self::Recv => ExternalKind::Recv,
+            Self::Blob => ExternalKind::Blob,
+        }
+    }
+}
+
+/// The exact generated output shape of an external method.
+#[derive(Debug)]
+pub enum ExternalOutput<O> {
+    /// A bounded encoded declared return value.
+    Json(O),
+    /// A bounded encoded declared return value plus a one-shot body reader.
+    Recv {
+        /// The encoded declared return value.
+        value: O,
+        /// The response payload.
+        body: crate::BodyReader,
+    },
+    /// A bounded encoded declared return value plus a granted content handle.
+    Blob {
+        /// The encoded declared return value.
+        value: O,
+        /// The granted content handle.
+        handle: crate::BlobHandle,
+    },
+}
 
 /// Generated conversion seam for one singleton service.
 ///
@@ -91,8 +194,8 @@ pub type ExternalFuture<C> = Pin<
 pub trait ExternalService: Send + Sync + 'static {
     /// The service name declared in `service!`.
     const SERVICE: &'static str;
-    /// Enabled plain `rpc` declarations, in declaration order.
-    const RPC_METHODS: &'static [&'static str];
+    /// Enabled externally adaptable declarations, in declaration order.
+    const METHODS: &'static [ExternalMethod];
     /// The generated connected client.
     type Client: Clone + Send + Sync + 'static;
 
@@ -101,7 +204,7 @@ pub trait ExternalService: Send + Sync + 'static {
         client: &Self::Client,
         method: &str,
         body: &[u8],
-        key: Option<IdempotencyKey>,
+        call: ExternalCall,
         codec: C,
     ) -> ExternalFuture<C>;
 }

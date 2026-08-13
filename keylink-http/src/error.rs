@@ -22,10 +22,27 @@ pub enum ConfigError {
     /// The authentication challenge was empty or not a legal header value.
     #[error("authentication challenge must be a non-empty header value")]
     InvalidChallenge,
+    /// The configured HTTP prefix was not empty or one canonical absolute path.
+    #[error("HTTP surface prefix must be empty or a canonical absolute path")]
+    InvalidSurfacePrefix,
+    /// A singleton gateway was given a keyed-actor surface.
+    #[error("the configured HTTP addressing mode does not match this gateway")]
+    WrongAddressing,
+    /// The configured surface selected a route missing from the runtime inventory.
+    #[error("the configured HTTP surface has no matching runtime route")]
+    MissingRuntimeRoute,
+    /// One explicit streaming limit was zero.
+    #[error("streaming limit `{field}` must be positive")]
+    ZeroStreamingLimit {
+        /// The zero-valued limit.
+        field: &'static str,
+    },
 }
 
 use axum::{body::Body, response::Response};
-use http::{header, HeaderValue, StatusCode};
+#[cfg(test)]
+use http::StatusCode;
+use http::{header, HeaderValue};
 use serde::Serialize;
 
 use crate::service::JsonError;
@@ -66,96 +83,43 @@ struct ErrorBody {
 }
 
 impl GatewayError {
-    fn status(self) -> StatusCode {
+    const fn kind(self) -> crate::__contract::ErrorKind {
+        use crate::__contract::ErrorKind;
         match self {
-            Self::InvalidRequest | Self::InvalidIdempotencyKey | Self::IdempotencyNotSupported => {
-                StatusCode::BAD_REQUEST
-            }
-            Self::Unauthenticated => StatusCode::UNAUTHORIZED,
-            Self::Forbidden => StatusCode::FORBIDDEN,
-            Self::MethodNotFound | Self::ActorNotFound => StatusCode::NOT_FOUND,
-            Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
-            Self::IdempotencyConflict => StatusCode::CONFLICT,
-            Self::RequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            Self::IdempotencyCapacity => StatusCode::TOO_MANY_REQUESTS,
-            Self::UpstreamError => StatusCode::BAD_GATEWAY,
-            Self::ResponseTooLarge => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::UpstreamUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-            Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::InvalidRequest => ErrorKind::InvalidRequest,
+            Self::InvalidIdempotencyKey => ErrorKind::InvalidIdempotencyKey,
+            Self::IdempotencyNotSupported => ErrorKind::IdempotencyNotSupported,
+            Self::Unauthenticated => ErrorKind::Unauthenticated,
+            Self::Forbidden => ErrorKind::Forbidden,
+            Self::MethodNotFound => ErrorKind::MethodNotFound,
+            Self::ActorNotFound => ErrorKind::ActorNotFound,
+            Self::MethodNotAllowed => ErrorKind::MethodNotAllowed,
+            Self::IdempotencyConflict => ErrorKind::IdempotencyConflict,
+            Self::RequestTooLarge => ErrorKind::RequestTooLarge,
+            Self::UnsupportedMediaType => ErrorKind::UnsupportedMediaType,
+            Self::IdempotencyCapacity => ErrorKind::IdempotencyCapacity,
+            Self::UpstreamError => ErrorKind::UpstreamError,
+            Self::UpstreamUnavailable => ErrorKind::UpstreamUnavailable,
+            Self::UpstreamTimeout => ErrorKind::UpstreamTimeout,
+            Self::ResponseTooLarge => ErrorKind::ResponseTooLarge,
         }
     }
 
+    #[cfg(test)]
+    fn status(self) -> StatusCode {
+        self.kind().spec().status()
+    }
+
     fn body(self) -> ErrorBody {
-        match self {
-            Self::InvalidRequest => ErrorBody {
-                code: "invalid_request",
-                message: "the request JSON or path is invalid",
-            },
-            Self::InvalidIdempotencyKey => ErrorBody {
-                code: "invalid_idempotency_key",
-                message: "the idempotency key is invalid",
-            },
-            Self::IdempotencyNotSupported => ErrorBody {
-                code: "idempotency_not_supported",
-                message: "this method does not accept idempotency keys",
-            },
-            Self::Unauthenticated => ErrorBody {
-                code: "unauthenticated",
-                message: "authentication is required",
-            },
-            Self::Forbidden => ErrorBody {
-                code: "forbidden",
-                message: "this caller may not invoke this method",
-            },
-            Self::MethodNotFound => ErrorBody {
-                code: "method_not_found",
-                message: "the RPC method was not found",
-            },
-            Self::ActorNotFound => ErrorBody {
-                code: "actor_not_found",
-                message: "the addressed actor was not found",
-            },
-            Self::MethodNotAllowed => ErrorBody {
-                code: "method_not_allowed",
-                message: "this route accepts POST only",
-            },
-            Self::IdempotencyConflict => ErrorBody {
-                code: "idempotency_conflict",
-                message: "the idempotency key cannot be replayed",
-            },
-            Self::RequestTooLarge => ErrorBody {
-                code: "request_too_large",
-                message: "the request JSON exceeds its limit",
-            },
-            Self::UnsupportedMediaType => ErrorBody {
-                code: "unsupported_media_type",
-                message: "a JSON content type is required",
-            },
-            Self::IdempotencyCapacity => ErrorBody {
-                code: "idempotency_capacity",
-                message: "the upstream idempotency capacity is exhausted",
-            },
-            Self::UpstreamError => ErrorBody {
-                code: "upstream_error",
-                message: "the upstream call failed",
-            },
-            Self::UpstreamUnavailable => ErrorBody {
-                code: "upstream_unavailable",
-                message: "the upstream service is unavailable",
-            },
-            Self::UpstreamTimeout => ErrorBody {
-                code: "upstream_timeout",
-                message: "the upstream call timed out",
-            },
-            Self::ResponseTooLarge => ErrorBody {
-                code: "response_too_large",
-                message: "the successful response JSON exceeds its limit",
-            },
+        let spec = self.kind().spec();
+        ErrorBody {
+            code: spec.code(),
+            message: spec.message(),
         }
     }
 
     pub(crate) fn response(self, challenge: Option<&HeaderValue>) -> Response<Body> {
+        let spec = self.kind().spec();
         let encoded = serde_json::to_vec(&ErrorEnvelope { error: self.body() })
             .unwrap_or_else(|_| FALLBACK_ERROR.to_vec());
         let encoded = if encoded.len() <= MAX_ERROR_BYTES {
@@ -164,20 +128,22 @@ impl GatewayError {
             FALLBACK_ERROR.to_vec()
         };
         let mut response = Response::new(Body::from(encoded));
-        *response.status_mut() = self.status();
+        *response.status_mut() = spec.status();
         response.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
-        if let Some(challenge) = challenge {
-            response
-                .headers_mut()
-                .insert(header::WWW_AUTHENTICATE, challenge.clone());
+        if spec.challenge() {
+            if let Some(challenge) = challenge {
+                response
+                    .headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, challenge.clone());
+            }
         }
-        if matches!(self, Self::MethodNotAllowed) {
+        if let Some(allow) = spec.allow() {
             response
                 .headers_mut()
-                .insert(header::ALLOW, HeaderValue::from_static("POST"));
+                .insert(header::ALLOW, HeaderValue::from_static(allow));
         }
         response
     }
@@ -185,6 +151,7 @@ impl GatewayError {
     pub(crate) fn from_external(error: keylink::ExternalError<JsonError>) -> Self {
         match error {
             keylink::ExternalError::UnknownMethod => Self::MethodNotFound,
+            keylink::ExternalError::WrongKind { .. } => Self::UpstreamError,
             keylink::ExternalError::Codec(JsonError::InvalidJson) => Self::InvalidRequest,
             keylink::ExternalError::Codec(JsonError::ResponseTooLarge) => Self::ResponseTooLarge,
             keylink::ExternalError::Codec(JsonError::Codec) => Self::UpstreamError,
@@ -224,7 +191,9 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use axum::body::to_bytes;
-    use http::{header, HeaderValue, StatusCode};
+    #[cfg(test)]
+    use http::StatusCode;
+    use http::{header, HeaderValue};
     use keylink::{Error, IdempotencyRefusal, RemoteError};
 
     use super::{GatewayError, MAX_ERROR_BYTES};

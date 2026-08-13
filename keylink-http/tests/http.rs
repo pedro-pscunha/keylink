@@ -13,7 +13,9 @@ use std::sync::{
 };
 
 use keylink::{Allowlist, Context, Keyable, Node, Server};
-use keylink_http::{Access, AccessError, Call, Challenge, Gateway, JsonLimits, Principal};
+use keylink_http::{
+    Access, AccessError, Addressing, Call, Challenge, Gateway, HttpSurface, JsonLimits, Principal,
+};
 
 keylink::service! {
     service Inventory;
@@ -132,8 +134,11 @@ async fn start_with_keyable<A: Access>(
     } else {
         gateway
     }
-    .router::<AppState>();
-    let app: Router<AppState> = Router::new().nest("/v1/inventory", gateway);
+    .router::<AppState>(
+        HttpSurface::new("/v1/inventory", Addressing::Singleton).expect("valid singleton surface"),
+    )
+    .expect("surface matches singleton gateway");
+    let app: Router<AppState> = Router::new().merge(gateway);
     let app = app
         .layer(middleware::from_fn(authenticate))
         .with_state(AppState);
@@ -206,7 +211,14 @@ async fn unknown_and_non_rpc_methods_bypass_access() {
     let running = start(Handler::default(), access.clone(), None).await;
     let client = reqwest::Client::new();
 
-    for method in ["Missing", "Ignored", "__Status"] {
+    for (method, expected) in [
+        ("Missing", (http::StatusCode::NOT_FOUND, "method_not_found")),
+        ("Ignored", (http::StatusCode::NOT_FOUND, "method_not_found")),
+        (
+            "__Status",
+            (http::StatusCode::BAD_REQUEST, "invalid_request"),
+        ),
+    ] {
         let response = client
             .post(format!(
                 "http://{}/v1/inventory/rpc/{method}",
@@ -218,10 +230,7 @@ async fn unknown_and_non_rpc_methods_bypass_access() {
             .await
             .expect("HTTP call completes");
         let (status, code, _) = error_code(response).await;
-        assert_eq!(
-            (status, code.as_str()),
-            (http::StatusCode::NOT_FOUND, "method_not_found")
-        );
+        assert_eq!((status, code.as_str()), expected, "{method}");
     }
     assert_eq!(access.0.load(Ordering::SeqCst), 0);
 }
@@ -342,14 +351,42 @@ async fn path_matrix_and_external_identity_are_exact() {
     let client = reqwest::Client::new();
     let base = format!("http://{}/v1/inventory", running.address);
 
-    for (case, path) in [
-        ("missing method segment", "/rpc"),
-        ("empty method segment", "/rpc/"),
-        ("trailing slash", "/rpc/Add/"),
-        ("extra segment", "/rpc/Add/extra"),
-        ("unknown method", "/rpc/Missing"),
-        ("wire rename is not route identity", "/rpc/wire-name"),
-        ("cfg-disabled method", "/rpc/Disabled"),
+    for (case, path, expected) in [
+        (
+            "missing method segment",
+            "/rpc",
+            (http::StatusCode::NOT_FOUND, "method_not_found"),
+        ),
+        (
+            "empty method segment",
+            "/rpc/",
+            (http::StatusCode::NOT_FOUND, "method_not_found"),
+        ),
+        (
+            "trailing slash",
+            "/rpc/Add/",
+            (http::StatusCode::NOT_FOUND, "method_not_found"),
+        ),
+        (
+            "extra segment",
+            "/rpc/Add/extra",
+            (http::StatusCode::NOT_FOUND, "method_not_found"),
+        ),
+        (
+            "unknown method",
+            "/rpc/Missing",
+            (http::StatusCode::NOT_FOUND, "method_not_found"),
+        ),
+        (
+            "over-cap wire rename",
+            "/rpc/wire-name",
+            (http::StatusCode::BAD_REQUEST, "invalid_request"),
+        ),
+        (
+            "over-cap cfg-disabled method",
+            "/rpc/Disabled",
+            (http::StatusCode::BAD_REQUEST, "invalid_request"),
+        ),
     ] {
         let response = client
             .post(format!("{base}{path}"))
@@ -360,11 +397,7 @@ async fn path_matrix_and_external_identity_are_exact() {
             .await
             .expect("HTTP call completes");
         let (status, code, _) = error_code(response).await;
-        assert_eq!(
-            (status, code.as_str()),
-            (http::StatusCode::NOT_FOUND, "method_not_found"),
-            "{case}"
-        );
+        assert_eq!((status, code.as_str()), expected, "{case}");
     }
 
     let response = client
@@ -549,9 +582,9 @@ async fn access_denial_precedes_json_validation_and_uses_only_the_cached_challen
     );
 }
 
-/// Watched red with `scripts/break-once.sh` by removing
-/// `                            #[serde(deny_unknown_fields)]` from generated arguments.
-/// The exact test dispatched `Ping` and returned HTTP 200 instead of 400.
+/// Watched red with `scripts/break-once.sh` by removing the RPC arm's generated
+/// `#[serde(deny_unknown_fields)]`. The exact test selected one guard, dispatched
+/// `Ping`, and returned HTTP 200 instead of 400.
 #[tokio::test]
 async fn unknown_argument_fields_fail_before_zero_one_or_many_argument_dispatch() {
     for (method, body) in [

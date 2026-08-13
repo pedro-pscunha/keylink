@@ -54,7 +54,7 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use iroh::{endpoint::presets, Endpoint};
-    use keylink::{Allowlist, Context, ExternalService, Node};
+    use keylink::{Allowlist, Context, ExternalCall, ExternalOutput, ExternalService, Node};
     use postcard_schema::Schema;
     use serde::{Deserialize, Serialize};
 
@@ -72,6 +72,7 @@ mod tests {
         rpc Empty() -> ();
         rpc One(value: u64) -> u64;
         rpc Many(name: String, count: u16) -> String;
+        rpc Optional(r#type: Option<u64>) -> Option<u64>;
         #[serde(rename = "wire-name")]
         rpc Nested(item: Item) -> Item;
         tell Ignored(value: u64) -> ();
@@ -92,11 +93,24 @@ mod tests {
             format!("{name}-{count}")
         }
 
+        async fn optional(&self, _cx: &Context, r#type: Option<u64>) -> Option<u64> {
+            r#type
+        }
+
         async fn nested(&self, _cx: &Context, item: Item) -> Item {
             item
         }
 
         async fn ignored(&self, _cx: &Context, _value: u64) {}
+    }
+
+    fn json(output: ExternalOutput<Vec<u8>>) -> Vec<u8> {
+        match output {
+            ExternalOutput::Json(json) => json,
+            ExternalOutput::Recv { .. } | ExternalOutput::Blob { .. } => {
+                panic!("unary RPC returned a streaming output")
+            }
+        }
     }
 
     async fn local_node() -> Node {
@@ -108,8 +122,12 @@ mod tests {
     }
 
     /// Watched red with `scripts/break-once.sh` by replacing
-    /// `                                    codec.encode(&value).map_err($crate::ExternalError::Codec)`
-    /// with unit encoding. The exact async test terminated and failed on the one-argument return.
+    /// `                }
+    ///                 .map_err($crate::ExternalError::Client)?;
+    ///                 $codec.encode(&value)
+    ///                     .map($crate::ExternalOutput::Json)`
+    /// with the same typed output block encoding `()`. The exact async test selected
+    /// one guard and failed with `null` instead of the declared return value.
     #[tokio::test]
     async fn json_conversion_uses_declared_arguments_and_return_values() {
         let server_node = local_node().await;
@@ -121,38 +139,76 @@ mod tests {
             .expect("client connects");
         let codec = JsonCodec::new(1024);
 
-        let empty = conversion::External::invoke(&client, "Empty", b"{}", None, codec.clone())
-            .await
-            .expect("empty call");
+        let empty = conversion::External::invoke(
+            &client,
+            "Empty",
+            b"{}",
+            ExternalCall::Rpc { key: None },
+            codec.clone(),
+        )
+        .await
+        .expect("empty call");
+        let empty = json(empty);
         assert_eq!(empty, b"null");
 
-        let one =
-            conversion::External::invoke(&client, "One", br#"{"value":4}"#, None, codec.clone())
-                .await
-                .expect("one argument");
+        let one = conversion::External::invoke(
+            &client,
+            "One",
+            br#"{"value":4}"#,
+            ExternalCall::Rpc { key: None },
+            codec.clone(),
+        )
+        .await
+        .expect("one argument");
+        let one = json(one);
         assert_eq!(one, b"5");
 
         let many = conversion::External::invoke(
             &client,
             "Many",
             br#"{"name":"box","count":2}"#,
-            None,
+            ExternalCall::Rpc { key: None },
             codec.clone(),
         )
         .await
         .expect("many arguments");
+        let many = json(many);
         assert_eq!(many, br#""box-2""#);
 
         let nested = conversion::External::invoke(
             &client,
             "Nested",
             br#"{"item":{"displayName":"crate"}}"#,
-            None,
+            ExternalCall::Rpc { key: None },
             codec,
         )
         .await
         .expect("nested serde metadata");
+        let nested = json(nested);
         assert_eq!(nested, br#"{"displayName":"crate"}"#);
+
+        for body in [b"{}".as_slice(), br#"{"type":null}"#.as_slice()] {
+            let optional = conversion::External::invoke(
+                &client,
+                "Optional",
+                body,
+                ExternalCall::Rpc { key: None },
+                JsonCodec::new(1024),
+            )
+            .await
+            .expect("missing and null option");
+            assert_eq!(json(optional), b"null");
+        }
+        let optional = conversion::External::invoke(
+            &client,
+            "Optional",
+            br#"{"type":7}"#,
+            ExternalCall::Rpc { key: None },
+            JsonCodec::new(1024),
+        )
+        .await
+        .expect("raw identifier uses Serde spelling");
+        assert_eq!(json(optional), b"7");
 
         for (method, body) in [
             ("Empty", br#"{"unexpected":1}"#.as_slice()),
@@ -162,15 +218,149 @@ mod tests {
                 br#"{"name":"box","count":2,"unexpected":1}"#.as_slice(),
             ),
         ] {
-            let error =
-                conversion::External::invoke(&client, method, body, None, JsonCodec::new(1024))
-                    .await
-                    .expect_err("undeclared argument fields are rejected before dispatch");
+            let error = conversion::External::invoke(
+                &client,
+                method,
+                body,
+                ExternalCall::Rpc { key: None },
+                JsonCodec::new(1024),
+            )
+            .await
+            .expect_err("undeclared argument fields are rejected before dispatch");
             assert!(matches!(
                 error,
                 keylink::ExternalError::Codec(super::JsonError::InvalidJson)
             ));
         }
+    }
+
+    keylink::service! {
+        service Transport;
+
+        rpc Sum(value: u64) -> u64;
+        send Upload(prefix: u64) -> u64;
+        recv Download(value: u64) -> u64;
+        blob Asset() -> u64;
+        tell IgnoredTransport(value: u64) -> ();
+    }
+
+    #[derive(Clone)]
+    struct TransportHandler {
+        id: keylink::BlobId,
+    }
+
+    impl transport::Handler for TransportHandler {
+        async fn sum(&self, _cx: &Context, value: u64) -> u64 {
+            value + 1
+        }
+
+        async fn upload(&self, _cx: &Context, prefix: u64, body: keylink::BodyReader) -> u64 {
+            let bytes = body.read_to_bytes(32).await.expect("finite upload");
+            prefix + bytes.len() as u64
+        }
+
+        async fn download(&self, _cx: &Context, value: u64) -> (u64, keylink::Body) {
+            (value + 1, keylink::Body::from_bytes(b"download".as_slice()))
+        }
+
+        async fn asset(&self, _cx: &Context) -> (u64, keylink::BlobId) {
+            (7, self.id)
+        }
+
+        async fn ignored_transport(&self, _cx: &Context, _value: u64) {}
+    }
+
+    #[tokio::test]
+    async fn generated_external_invocation_uses_exact_kind_and_output() {
+        let server_node = local_node().await;
+        let client_node = local_node().await;
+        let blobs = keylink::Blobs::memory();
+        let id = blobs
+            .add_bytes(b"asset".as_slice())
+            .await
+            .expect("asset stores");
+        let server = keylink::Server::builder(&server_node)
+            .service(
+                transport::service(TransportHandler { id }, Allowlist::anyone())
+                    .with_blobs(&blobs)
+                    .build(),
+            )
+            .spawn()
+            .expect("service starts");
+        let client = transport::Client::connect(&client_node, server_node.endpoint().addr())
+            .await
+            .expect("client connects");
+        let codec = JsonCodec::new(1024);
+
+        let rpc = transport::External::invoke(
+            &client,
+            "Sum",
+            br#"{"value":4}"#,
+            ExternalCall::Rpc { key: None },
+            codec.clone(),
+        )
+        .await
+        .expect("rpc");
+        assert_eq!(json(rpc), b"5");
+
+        let send = transport::External::invoke(
+            &client,
+            "Upload",
+            br#"{"prefix":3}"#,
+            ExternalCall::Send {
+                body: keylink::Body::from_bytes(b"body".as_slice()),
+            },
+            codec.clone(),
+        )
+        .await
+        .expect("send");
+        assert_eq!(json(send), b"7");
+
+        let recv = transport::External::invoke(
+            &client,
+            "Download",
+            br#"{"value":8}"#,
+            ExternalCall::Recv,
+            codec.clone(),
+        )
+        .await
+        .expect("recv");
+        let ExternalOutput::Recv { value, body } = recv else {
+            panic!("recv returned the wrong output kind");
+        };
+        assert_eq!(value, b"9");
+        assert_eq!(
+            body.read_to_bytes(32).await.expect("download"),
+            b"download"[..]
+        );
+
+        let blob =
+            transport::External::invoke(&client, "Asset", b"{}", ExternalCall::Blob, codec.clone())
+                .await
+                .expect("blob");
+        let ExternalOutput::Blob { value, handle } = blob else {
+            panic!("blob returned the wrong output kind");
+        };
+        assert_eq!(value, b"7");
+        assert_eq!(handle.id(), id);
+
+        let wrong = transport::External::invoke(
+            &client,
+            "Upload",
+            br#"{"prefix":3}"#,
+            ExternalCall::Rpc { key: None },
+            codec,
+        )
+        .await
+        .expect_err("kind mismatch");
+        assert!(matches!(
+            wrong,
+            keylink::ExternalError::WrongKind {
+                expected: keylink::ExternalKind::Send,
+                actual: keylink::ExternalKind::Rpc,
+            }
+        ));
+        drop(server);
     }
 
     #[test]
@@ -200,7 +390,15 @@ mod tests {
         let names: Vec<_> = variants.iter().map(|variant| variant.name).collect();
         assert_eq!(
             names,
-            ["Empty", "One", "Many", "wire-name", "Ignored", "__Status"]
+            [
+                "Empty",
+                "One",
+                "Many",
+                "Optional",
+                "wire-name",
+                "Ignored",
+                "__Status"
+            ]
         );
         let nested = variants
             .iter()
@@ -239,7 +437,9 @@ mod tests {
             &client,
             "One",
             br#"{"value":4}"#,
-            Some(key.clone()),
+            ExternalCall::Rpc {
+                key: Some(key.clone()),
+            },
             codec.clone(),
         )
         .await
@@ -249,7 +449,7 @@ mod tests {
             &client,
             "Many",
             br#"{"name":"box","count":2}"#,
-            Some(key),
+            ExternalCall::Rpc { key: Some(key) },
             codec,
         )
         .await

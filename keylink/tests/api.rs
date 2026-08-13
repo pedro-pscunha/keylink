@@ -1016,20 +1016,25 @@ mod external_contract {
     }
 }
 
-/// Watched red with `scripts/break-once.sh` by dropping the accumulated `rpc`
-/// record from `__keylink_external!`. The exact test failed with `left: []` and
-/// `right: ["Empty", "One", "Many"]`; the registered search literal is
-/// `            @rpcs [ $( $rpcs )* { [ $( #[$cfg] )* ] $rpc ( $( $arg : $ty ),* ) -> $ret } ]`.
-/// Non-rpc and cfg-disabled declarations
-/// remained absent, so the break isolates the generated rpc inventory.
+/// Watched red with `scripts/break-once.sh` by replacing
+/// `            @methods [ $( $methods )* { [ $( #[$cfg] )* ] rpc $method ( $( $arg : $ty ),* ) -> $ret } ]`
+/// with `            @methods [ $( $methods )* ]`. The exact test selected one guard
+/// and failed with only the three RPC descriptors absent.
 #[test]
-fn generated_external_marker_names_only_enabled_plain_rpcs() {
+fn generated_external_marker_names_only_enabled_adaptable_methods() {
     fn assert_external<T: keylink::ExternalService>() {}
 
     assert_external::<external_contract::external_contract::External>();
     assert_eq!(
-        <external_contract::external_contract::External as keylink::ExternalService>::RPC_METHODS,
-        &["Empty", "One", "Many"]
+        <external_contract::external_contract::External as keylink::ExternalService>::METHODS,
+        &[
+            keylink::ExternalMethod::new("Empty", keylink::ExternalKind::Rpc),
+            keylink::ExternalMethod::new("One", keylink::ExternalKind::Rpc),
+            keylink::ExternalMethod::new("Many", keylink::ExternalKind::Rpc),
+            keylink::ExternalMethod::new("Upload", keylink::ExternalKind::Send),
+            keylink::ExternalMethod::new("Download", keylink::ExternalKind::Recv),
+            keylink::ExternalMethod::new("Snapshot", keylink::ExternalKind::Blob),
+        ]
     );
     assert_eq!(
         <external_contract::external_contract::External as keylink::ExternalService>::SERVICE,

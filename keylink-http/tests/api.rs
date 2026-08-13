@@ -55,3 +55,47 @@ fn json_limits_require_two_positive_ceilings() {
     ));
     JsonLimits::new(1, 1).expect("tiny positive limits are valid");
 }
+
+#[test]
+fn http_surface_is_immutable_and_streaming_is_explicit() {
+    use keylink_http::{Addressing, HttpSurface, StreamingLimits};
+
+    let singleton = HttpSurface::new("/v1/inventory", Addressing::Singleton).expect("valid prefix");
+    assert_eq!(singleton.prefix(), "/v1/inventory");
+    assert_eq!(singleton.addressing(), Addressing::Singleton);
+    assert!(singleton.streaming().is_none());
+
+    let limits = StreamingLimits::new(1024, 4096, 8192, 16).expect("positive streaming limits");
+    let actors = HttpSurface::new("/v1/inventory", Addressing::Actors)
+        .expect("valid prefix")
+        .with_streaming(limits);
+    assert_eq!(actors.addressing(), Addressing::Actors);
+    assert_eq!(actors.streaming(), Some(limits));
+}
+
+#[test]
+fn streaming_limits_reject_each_zero_field() {
+    use keylink_http::StreamingLimits;
+
+    for values in [(0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 0, 1), (1, 1, 1, 0)] {
+        assert!(StreamingLimits::new(values.0, values.1, values.2, values.3).is_err());
+    }
+}
+
+#[test]
+fn hidden_contract_exposes_the_runtime_route_and_error_inventories() {
+    use keylink_http::__contract::{ErrorKind, RouteKind};
+    use keylink_http::{Addressing, HttpSurface};
+
+    let surface = HttpSurface::new("/v1", Addressing::Singleton).expect("valid surface");
+    assert_eq!(
+        surface
+            .routes()
+            .map(|route| route.kind())
+            .collect::<Vec<_>>(),
+        [RouteKind::Rpc]
+    );
+    assert!(ErrorKind::ALL
+        .iter()
+        .all(|kind| !kind.spec().code().is_empty()));
+}

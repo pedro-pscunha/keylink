@@ -310,7 +310,10 @@ pub use authz::{Authorization, Compiled, Rules};
 #[cfg(feature = "blocking")]
 pub use error::BlockingError;
 pub use error::{ConfigError, Error, Failure, Queued, Result, TellError, Transmitted, Transport};
-pub use external::{ExternalError, ExternalFuture, ExternalService, ServiceCodec};
+pub use external::{
+    ExternalCall, ExternalError, ExternalFuture, ExternalKind, ExternalMethod, ExternalOutput,
+    ExternalService, ServiceCodec,
+};
 pub use idempotency::{
     Attaching, Idempotency, IdempotencyRefusal, KeyState, Keyable, Limits, Records, MAX_ATTACH,
     MAX_RECORDED_BYTES, MAX_RECORDED_FRAME, MAX_RECORDS, MAX_RUNNING, MAX_RUNNING_PER_PEER,

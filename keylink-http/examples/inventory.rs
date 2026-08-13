@@ -81,9 +81,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let challenge = Challenge::new(http::HeaderValue::from_static("Bearer realm=keylink"))?;
     let gateway = Gateway::<inventory::External, _>::new(client, ExampleAccess, challenge)
         .limits(JsonLimits::new(64 * 1024, 64 * 1024)?)
-        .router::<()>();
+        .router::<()>(keylink_http::HttpSurface::new(
+            "/inventory",
+            keylink_http::Addressing::Singleton,
+        )?)?;
     let app: Router<()> = Router::new()
-        .nest("/inventory", gateway)
+        .merge(gateway)
         .layer(middleware::from_fn(authenticate));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;

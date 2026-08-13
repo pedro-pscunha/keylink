@@ -1,8 +1,9 @@
 //! Bounded, authenticated HTTP/JSON gateway for generated Keylink services.
 //!
 //! `Gateway` exposes only enabled singleton `rpc` declarations from a generated
-//! `External` marker. Applications select the URL prefix with [`axum::Router::nest`].
-//! The adapter uses the existing generated Keylink client and does not create a
+//! `External` marker. Applications select the URL prefix with [`HttpSurface`]
+//! and merge the resulting router into their application. The adapter uses the
+//! existing generated Keylink client and does not create a
 //! second serving path.
 //!
 //! Outer authentication middleware must insert a verified [`Principal`] in the
@@ -17,10 +18,13 @@
 //!     keylink_http::Challenge::new("Bearer realm=keylink".parse()?)?,
 //! )
 //! .limits(keylink_http::JsonLimits::new(64 * 1024, 64 * 1024)?)
-//! .router::<AppState>();
+//! .router::<AppState>(keylink_http::HttpSurface::new(
+//!     "/v1/inventory",
+//!     keylink_http::Addressing::Singleton,
+//! )?)?;
 //!
 //! let app: axum::Router<AppState> = axum::Router::new()
-//!     .nest("/v1/inventory", gateway)
+//!     .merge(gateway)
 //!     .with_state(app_state);
 //! ```
 //!
@@ -46,13 +50,18 @@
 
 #![warn(missing_docs)]
 
+#[doc(hidden)]
+#[path = "contract.rs"]
+pub mod __contract;
 mod access;
 mod error;
 mod gateway;
 mod limits;
+mod raw_path;
 mod service;
 
+pub use __contract::{Addressing, HttpSurface};
 pub use access::{Access, AccessError, Call, Challenge, Principal};
 pub use error::ConfigError;
 pub use gateway::Gateway;
-pub use limits::JsonLimits;
+pub use limits::{JsonLimits, StreamingLimits};

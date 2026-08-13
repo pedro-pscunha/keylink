@@ -4985,14 +4985,208 @@ macro_rules! __keylink_service_munch {
     };
 }
 
-/// Generate the dependency-neutral external conversion seam for plain `rpc` declarations.
+/// Invoke one generated external method with its exact transport shape.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_external_invoke {
+    (rpc, $client:expr, $method:ident, ($( $arg:ident : $ty:ty ),*), $body:expr, $call:expr, $codec:expr) => {{
+        let key = match $call {
+            $crate::ExternalCall::Rpc { key } => key,
+            other => return ::std::boxed::Box::pin(::core::future::ready(
+                ::core::result::Result::Err($crate::ExternalError::WrongKind {
+                    expected: $crate::ExternalKind::Rpc,
+                    actual: other.kind(),
+                })
+            )),
+        };
+        #[derive(::serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct __ExternalArgs { $( $arg: $ty, )* }
+        let __ExternalArgs { $( $arg, )* } = match $codec.decode($body) {
+            ::core::result::Result::Ok(args) => args,
+            ::core::result::Result::Err(error) => return ::std::boxed::Box::pin(
+                ::core::future::ready(::core::result::Result::Err(
+                    $crate::ExternalError::Codec(error)
+                ))
+            ),
+        };
+        let client = $client.clone();
+        $crate::pastey::paste! {
+            ::std::boxed::Box::pin(async move {
+                let value = match key {
+                    ::core::option::Option::Some(key) => {
+                        let client = $crate::WithIdempotency::with_idempotency(&client, key);
+                        client.[<$method:snake>]($( $arg ),*).await
+                    }
+                    ::core::option::Option::None => client.[<$method:snake>]($( $arg ),*).await,
+                }
+                .map_err($crate::ExternalError::Client)?;
+                $codec.encode(&value)
+                    .map($crate::ExternalOutput::Json)
+                    .map_err($crate::ExternalError::Codec)
+            })
+        }
+    }};
+    (send, $client:expr, $method:ident, ($( $arg:ident : $ty:ty ),*), $body:expr, $call:expr, $codec:expr) => {{
+        let upload = match $call {
+            $crate::ExternalCall::Send { body } => body,
+            other => return ::std::boxed::Box::pin(::core::future::ready(
+                ::core::result::Result::Err($crate::ExternalError::WrongKind {
+                    expected: $crate::ExternalKind::Send,
+                    actual: other.kind(),
+                })
+            )),
+        };
+        #[derive(::serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct __ExternalArgs { $( $arg: $ty, )* }
+        let __ExternalArgs { $( $arg, )* } = match $codec.decode($body) {
+            ::core::result::Result::Ok(args) => args,
+            ::core::result::Result::Err(error) => return ::std::boxed::Box::pin(
+                ::core::future::ready(::core::result::Result::Err(
+                    $crate::ExternalError::Codec(error)
+                ))
+            ),
+        };
+        let client = $client.clone();
+        $crate::pastey::paste! {
+            ::std::boxed::Box::pin(async move {
+                let value = client.[<$method:snake>]($( $arg, )* upload)
+                    .await
+                    .map_err($crate::ExternalError::Client)?;
+                $codec.encode(&value)
+                    .map($crate::ExternalOutput::Json)
+                    .map_err($crate::ExternalError::Codec)
+            })
+        }
+    }};
+    (recv, $client:expr, $method:ident, ($( $arg:ident : $ty:ty ),*), $body:expr, $call:expr, $codec:expr) => {{
+        match $call {
+            $crate::ExternalCall::Recv => {}
+            other => return ::std::boxed::Box::pin(::core::future::ready(
+                ::core::result::Result::Err($crate::ExternalError::WrongKind {
+                    expected: $crate::ExternalKind::Recv,
+                    actual: other.kind(),
+                })
+            )),
+        }
+        #[derive(::serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct __ExternalArgs { $( $arg: $ty, )* }
+        let __ExternalArgs { $( $arg, )* } = match $codec.decode($body) {
+            ::core::result::Result::Ok(args) => args,
+            ::core::result::Result::Err(error) => return ::std::boxed::Box::pin(
+                ::core::future::ready(::core::result::Result::Err(
+                    $crate::ExternalError::Codec(error)
+                ))
+            ),
+        };
+        let client = $client.clone();
+        $crate::pastey::paste! {
+            ::std::boxed::Box::pin(async move {
+                let (value, body) = client.[<$method:snake>]($( $arg ),*)
+                    .await
+                    .map_err($crate::ExternalError::Client)?;
+                let value = $codec.encode(&value).map_err($crate::ExternalError::Codec)?;
+                ::core::result::Result::Ok($crate::ExternalOutput::Recv { value, body })
+            })
+        }
+    }};
+    (blob, $client:expr, $method:ident, ($( $arg:ident : $ty:ty ),*), $body:expr, $call:expr, $codec:expr) => {{
+        match $call {
+            $crate::ExternalCall::Blob => {}
+            other => return ::std::boxed::Box::pin(::core::future::ready(
+                ::core::result::Result::Err($crate::ExternalError::WrongKind {
+                    expected: $crate::ExternalKind::Blob,
+                    actual: other.kind(),
+                })
+            )),
+        }
+        #[derive(::serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct __ExternalArgs { $( $arg: $ty, )* }
+        let __ExternalArgs { $( $arg, )* } = match $codec.decode($body) {
+            ::core::result::Result::Ok(args) => args,
+            ::core::result::Result::Err(error) => return ::std::boxed::Box::pin(
+                ::core::future::ready(::core::result::Result::Err(
+                    $crate::ExternalError::Codec(error)
+                ))
+            ),
+        };
+        let client = $client.clone();
+        $crate::pastey::paste! {
+            ::std::boxed::Box::pin(async move {
+                let (value, handle) = client.[<$method:snake>]($( $arg ),*)
+                    .await
+                    .map_err($crate::ExternalError::Client)?;
+                let value = $codec.encode(&value).map_err($crate::ExternalError::Codec)?;
+                ::core::result::Result::Ok($crate::ExternalOutput::Blob { value, handle })
+            })
+        }
+    }};
+}
+
+/// Add one generated declaration to the external inventory when its kind is supported.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_external_kind {
+    (@value rpc) => { $crate::ExternalKind::Rpc };
+    (@value send) => { $crate::ExternalKind::Send };
+    (@value recv) => { $crate::ExternalKind::Recv };
+    (@value blob) => { $crate::ExternalKind::Blob };
+    (@service [ $svc:ident ] @methods [ $( $methods:tt )* ]
+     @item [ [ $( #[$cfg:meta] )* ] rpc $method:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty ]
+     @rest [ $( $rest:tt )* ]) => {
+        $crate::__keylink_external! {
+            @service [ $svc ]
+            @methods [ $( $methods )* { [ $( #[$cfg] )* ] rpc $method ( $( $arg : $ty ),* ) -> $ret } ]
+            @rest [ $( $rest )* ]
+        }
+    };
+    (@service [ $svc:ident ] @methods [ $( $methods:tt )* ]
+     @item [ [ $( #[$cfg:meta] )* ] send $method:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty ]
+     @rest [ $( $rest:tt )* ]) => {
+        $crate::__keylink_external! {
+            @service [ $svc ]
+            @methods [ $( $methods )* { [ $( #[$cfg] )* ] send $method ( $( $arg : $ty ),* ) -> $ret } ]
+            @rest [ $( $rest )* ]
+        }
+    };
+    (@service [ $svc:ident ] @methods [ $( $methods:tt )* ]
+     @item [ [ $( #[$cfg:meta] )* ] recv $method:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty ]
+     @rest [ $( $rest:tt )* ]) => {
+        $crate::__keylink_external! {
+            @service [ $svc ]
+            @methods [ $( $methods )* { [ $( #[$cfg] )* ] recv $method ( $( $arg : $ty ),* ) -> $ret } ]
+            @rest [ $( $rest )* ]
+        }
+    };
+    (@service [ $svc:ident ] @methods [ $( $methods:tt )* ]
+     @item [ [ $( #[$cfg:meta] )* ] blob $method:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty ]
+     @rest [ $( $rest:tt )* ]) => {
+        $crate::__keylink_external! {
+            @service [ $svc ]
+            @methods [ $( $methods )* { [ $( #[$cfg] )* ] blob $method ( $( $arg : $ty ),* ) -> $ret } ]
+            @rest [ $( $rest )* ]
+        }
+    };
+    (@service [ $svc:ident ] @methods [ $( $methods:tt )* ]
+     @item [ [ $( #[$cfg:meta] )* ] $kind:ident $method:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty ]
+     @rest [ $( $rest:tt )* ]) => {
+        $crate::__keylink_external! {
+            @service [ $svc ] @methods [ $( $methods )* ] @rest [ $( $rest )* ]
+        }
+    };
+}
+
+/// Generate the dependency-neutral external conversion seam.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __keylink_external {
     (
         @service [ $svc:ident ]
-        @rpcs [ $( { [ $( #[$rcfg:meta] )* ] $rrpc:ident
-                       ( $( $rarg:ident : $rty:ty ),* ) -> $rret:ty } )* ]
+        @methods [ $( { [ $( #[$cfg:meta] )* ] $kind:ident $method:ident
+                         ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty } )* ]
         @rest [ ]
     ) => {
         /// Marker for this generated singleton service's external conversion seam.
@@ -5000,8 +5194,10 @@ macro_rules! __keylink_external {
 
         impl $crate::ExternalService for External {
             const SERVICE: &'static str = ::core::stringify!($svc);
-            const RPC_METHODS: &'static [&'static str] = &[
-                $( $( #[$rcfg] )* ::core::stringify!($rrpc), )*
+            const METHODS: &'static [$crate::ExternalMethod] = &[
+                $( $( #[$cfg] )* $crate::ExternalMethod::new(
+                    ::core::stringify!($method), $crate::__keylink_external_kind!(@value $kind)
+                ), )*
             ];
             type Client = Client;
 
@@ -5009,43 +5205,16 @@ macro_rules! __keylink_external {
                 client: &Self::Client,
                 method: &str,
                 body: &[u8],
-                key: ::core::option::Option<$crate::IdempotencyKey>,
+                call: $crate::ExternalCall,
                 codec: C,
             ) -> $crate::ExternalFuture<C> {
-                let _ = (client, body, &key, &codec);
+                let _ = (client, body, &call, &codec);
                 match method {
                     $(
-                        $( #[$rcfg] )*
-                        ::core::stringify!($rrpc) => {
-                            #[derive(::serde::Deserialize)]
-                            #[serde(deny_unknown_fields)]
-                            struct __ExternalArgs { $( $rarg: $rty, )* }
-                            let __ExternalArgs { $( $rarg, )* } = match codec.decode(body) {
-                                ::core::result::Result::Ok(args) => args,
-                                ::core::result::Result::Err(error) => return ::std::boxed::Box::pin(
-                                    ::core::future::ready(::core::result::Result::Err(
-                                        $crate::ExternalError::Codec(error)
-                                    ))
-                                ),
-                            };
-                            let client = client.clone();
-                            $crate::pastey::paste! {
-                                ::std::boxed::Box::pin(async move {
-                                    let value = match key {
-                                        ::core::option::Option::Some(key) => {
-                                            let client = $crate::WithIdempotency::with_idempotency(
-                                                &client, key
-                                            );
-                                            client.[<$rrpc:snake>]($( $rarg ),*).await
-                                        }
-                                        ::core::option::Option::None =>
-                                            client.[<$rrpc:snake>]($( $rarg ),*).await,
-                                    }
-                                    .map_err($crate::ExternalError::Client)?;
-                                    codec.encode(&value).map_err($crate::ExternalError::Codec)
-                                })
-                            }
-                        }
+                        $( #[$cfg] )*
+                        ::core::stringify!($method) => $crate::__keylink_external_invoke!(
+                            $kind, client, $method, ($( $arg : $ty ),*), body, call, codec
+                        ),
                     )*
                     _ => ::std::boxed::Box::pin(::core::future::ready(
                         ::core::result::Result::Err($crate::ExternalError::UnknownMethod)
@@ -5055,27 +5224,16 @@ macro_rules! __keylink_external {
         }
     };
     (
-        @service [ $svc:ident ] @rpcs [ $( $rpcs:tt )* ]
+        @service [ $svc:ident ] @methods [ $( $methods:tt )* ]
         @rest [ { [ $( #[$meta:meta] )* ] [ $( #[$cfg:meta] )* ]
-                  [ $( $defer:tt )? ] rpc $rpc:ident
+                  [ $( $defer:tt )? ] $kind:ident $method:ident
                   ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty }
                 $( $rest:tt )* ]
     ) => {
-        $crate::__keylink_external! {
-            @service [ $svc ]
-            @rpcs [ $( $rpcs )* { [ $( #[$cfg] )* ] $rpc ( $( $arg : $ty ),* ) -> $ret } ]
+        $crate::__keylink_external_kind! {
+            @service [ $svc ] @methods [ $( $methods )* ]
+            @item [ [ $( #[$cfg] )* ] $kind $method ( $( $arg : $ty ),* ) -> $ret ]
             @rest [ $( $rest )* ]
-        }
-    };
-    (
-        @service [ $svc:ident ] @rpcs [ $( $rpcs:tt )* ]
-        @rest [ { [ $( #[$meta:meta] )* ] [ $( #[$cfg:meta] )* ]
-                  [ $( $defer:tt )? ] $kind:ident $rpc:ident
-                  ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty }
-                $( $rest:tt )* ]
-    ) => {
-        $crate::__keylink_external! {
-            @service [ $svc ] @rpcs [ $( $rpcs )* ] @rest [ $( $rest )* ]
         }
     };
 }
@@ -5119,7 +5277,7 @@ macro_rules! __keylink_service {
             const PROTOCOL: &str = concat!(env!("CARGO_PKG_NAME"), "/", stringify!($svc));
 
             $crate::__keylink_external! {
-                @service [ $svc ] @rpcs [ ]
+                @service [ $svc ] @methods [ ]
                 @rest [ $( { [ $( #[$meta] )* ] [ $( #[$cfg] )* ]
                     [ $( $defer )? ] $kind $rpc ( $( $arg : $ty ),* ) -> $ret } )+ ]
             }

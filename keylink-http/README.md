@@ -24,10 +24,13 @@ let gateway = keylink_http::Gateway::<inventory::External, _>::new(
     keylink_http::Challenge::new("Bearer realm=keylink".parse()?)?,
 )
 .limits(keylink_http::JsonLimits::new(64 * 1024, 64 * 1024)?)
-.router::<AppState>();
+.router::<AppState>(keylink_http::HttpSurface::new(
+    "/v1/inventory",
+    keylink_http::Addressing::Singleton,
+)?)?;
 
 let app: axum::Router<AppState> = axum::Router::new()
-    .nest("/v1/inventory", gateway)
+    .merge(gateway)
     .with_state(app_state);
 ```
 
@@ -44,7 +47,8 @@ The repository gate runs `.mise/tasks/http-smoke` against this URL with `curl`.
 
 A route has the exact form `POST <prefix>/rpc/<DeclaredRustMethodName>`.
 The route has no trailing-slash alias.
-Unknown, disabled, non-RPC, and internal methods return `method_not_found`.
+An unknown, disabled, non-RPC, or internal name within the generated method byte cap returns `method_not_found`.
+A malformed or over-cap encoded method segment returns `invalid_request` before authorization.
 All other HTTP methods return `method_not_allowed` and `Allow: POST`.
 
 The request must contain exactly one valid JSON media type.

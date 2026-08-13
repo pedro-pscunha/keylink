@@ -1,6 +1,6 @@
 //! Finite inclusive JSON byte ceilings.
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 use crate::ConfigError;
 
@@ -32,6 +32,75 @@ impl Default for JsonLimits {
             request: NonZeroUsize::new(DEFAULT_JSON_BYTES).unwrap_or(NonZeroUsize::MIN),
             response: NonZeroUsize::new(DEFAULT_JSON_BYTES).unwrap_or(NonZeroUsize::MIN),
         }
+    }
+}
+
+/// Explicit finite limits that enable streaming and blob HTTP routes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamingLimits {
+    pub(crate) metadata_json: NonZeroUsize,
+    pub(crate) upload: NonZeroU64,
+    pub(crate) download: NonZeroU64,
+    pub(crate) blob_tickets: NonZeroUsize,
+}
+
+impl StreamingLimits {
+    /// Build positive streaming metadata, transfer, and ticket limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ZeroStreamingLimit`] for the first zero field.
+    pub fn new(
+        metadata_json_bytes: usize,
+        max_upload_bytes: u64,
+        max_download_bytes: u64,
+        max_blob_tickets: usize,
+    ) -> Result<Self, ConfigError> {
+        let metadata_json =
+            NonZeroUsize::new(metadata_json_bytes).ok_or(ConfigError::ZeroStreamingLimit {
+                field: "metadata_json_bytes",
+            })?;
+        let upload = NonZeroU64::new(max_upload_bytes).ok_or(ConfigError::ZeroStreamingLimit {
+            field: "max_upload_bytes",
+        })?;
+        let download =
+            NonZeroU64::new(max_download_bytes).ok_or(ConfigError::ZeroStreamingLimit {
+                field: "max_download_bytes",
+            })?;
+        let blob_tickets =
+            NonZeroUsize::new(max_blob_tickets).ok_or(ConfigError::ZeroStreamingLimit {
+                field: "max_blob_tickets",
+            })?;
+        Ok(Self {
+            metadata_json,
+            upload,
+            download,
+            blob_tickets,
+        })
+    }
+
+    /// Maximum decoded JSON metadata bytes.
+    #[must_use]
+    pub const fn metadata_json_bytes(self) -> usize {
+        self.metadata_json.get()
+    }
+
+    /// Maximum upload payload bytes.
+    #[must_use]
+    pub const fn max_upload_bytes(self) -> u64 {
+        self.upload.get()
+    }
+
+    /// Maximum one-shot download payload bytes.
+    #[must_use]
+    pub const fn max_download_bytes(self) -> u64 {
+        self.download.get()
+    }
+
+    /// Maximum process-local blob tickets.
+    #[must_use]
+    pub const fn max_blob_tickets(self) -> usize {
+        self.blob_tickets.get()
     }
 }
 

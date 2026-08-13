@@ -3,11 +3,14 @@
 use std::{error::Error as _, marker::PhantomData, sync::Arc};
 
 use axum::{body::Body, routing::any, Router};
-use http::{header, HeaderMap, Method, Request, Response};
+use http::{header, HeaderMap, Request, Response};
 use keylink::ExternalService;
 
 use crate::{
-    error::GatewayError, service::JsonCodec, Access, AccessError, Call, Challenge, JsonLimits,
+    __contract::{Route, RouteKind},
+    error::GatewayError,
+    service::JsonCodec,
+    Access, AccessError, Addressing, Call, Challenge, ConfigError, HttpSurface, JsonLimits,
     Principal,
 };
 
@@ -51,36 +54,62 @@ where
         self
     }
 
-    /// Build a router that can be nested into an application router with any state.
-    pub fn router<State>(self) -> Router<State>
+    /// Build the configured absolute routes for merging into an application router.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::WrongAddressing`] when this singleton gateway receives
+    /// an actor surface, or [`ConfigError::MissingRuntimeRoute`] when the selected
+    /// surface has no implemented singleton RPC route.
+    pub fn router<State>(self, surface: HttpSurface) -> Result<Router<State>, ConfigError>
     where
         State: Clone + Send + Sync + 'static,
     {
+        if surface.addressing() != Addressing::Singleton {
+            return Err(ConfigError::WrongAddressing);
+        }
+        let Some(route) = surface
+            .routes()
+            .find(|route| route.kind() == RouteKind::Rpc)
+        else {
+            return Err(ConfigError::MissingRuntimeRoute);
+        };
+        let path = format!("{}{}", surface.prefix(), route.template());
+        let handler_path = path.clone();
         let gateway = Arc::new(self);
-        Router::new()
+        Ok(Router::new()
             .route(
-                "/rpc/{method}",
+                &path,
                 any(move |request: Request<Body>| {
                     let gateway = Arc::clone(&gateway);
-                    async move { gateway.handle(request).await }
+                    let path = handler_path.clone();
+                    async move { gateway.handle(request, route, &path).await }
                 }),
             )
-            .fallback(|| async { GatewayError::MethodNotFound.response(None) })
+            .fallback(|| async { GatewayError::MethodNotFound.response(None) }))
     }
 
-    async fn handle(&self, request: Request<Body>) -> Response<Body> {
-        let decoded = match decode_method(request.uri().path()) {
+    async fn handle(
+        &self,
+        request: Request<Body>,
+        route: &'static Route,
+        route_path: &str,
+    ) -> Response<Body> {
+        let decoded = match decode_method::<S>(request.uri().path(), route_path) {
             Ok(method) => method,
             Err(error) => return error.response(None),
         };
-        let Some(method) = S::RPC_METHODS
+        let Some(method) = S::METHODS
             .iter()
             .copied()
-            .find(|candidate| *candidate == decoded)
+            .find(|candidate| {
+                candidate.name() == decoded && candidate.kind() == keylink::ExternalKind::Rpc
+            })
+            .map(keylink::ExternalMethod::name)
         else {
             return GatewayError::MethodNotFound.response(None);
         };
-        if request.method() != Method::POST {
+        if request.method() != route.method() {
             return GatewayError::MethodNotAllowed.response(None);
         }
         let Some(principal) = request.extensions().get::<Principal>().cloned() else {
@@ -103,7 +132,7 @@ where
             }
             Err(AccessError::Forbidden) => return GatewayError::Forbidden.response(None),
         }
-        if !is_json(request.headers()) {
+        if !is_media(request.headers(), route.request_media()) {
             return GatewayError::UnsupportedMediaType.response(None);
         }
         let key = match derived_key(request.headers(), &principal) {
@@ -124,66 +153,60 @@ where
             &self.client,
             method,
             &body,
-            key,
+            keylink::ExternalCall::Rpc { key },
             JsonCodec::new(self.limits.response.get()),
         );
         match invocation.await {
-            Ok(json) => json_response(json),
+            Ok(keylink::ExternalOutput::Json(json)) => json_response(json, route),
+            Ok(_) => GatewayError::UpstreamError.response(None),
             Err(error) => GatewayError::from_external(error).response(None),
         }
     }
 }
 
-fn json_response(json: Vec<u8>) -> Response<Body> {
+#[cfg(test)]
+const SINGLETON_RPC_PATH: &str = "/rpc/{method}";
+
+#[cfg(test)]
+fn singleton_rpc_route() -> &'static Route {
+    crate::__contract::singleton_rpc_route()
+}
+
+fn json_response(json: Vec<u8>, route: &Route) -> Response<Body> {
     let mut response = Response::new(Body::from(json));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        http::HeaderValue::from_static("application/json"),
-    );
+    *response.status_mut() = route.success_status();
+    if let Some(media) = route.response_media() {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, http::HeaderValue::from_static(media));
+    }
     response
 }
 
-fn decode_method(path: &str) -> Result<String, GatewayError> {
+fn decode_method<S: ExternalService>(path: &str, route_path: &str) -> Result<String, GatewayError> {
+    let prefix = route_path
+        .strip_suffix("{method}")
+        .ok_or(GatewayError::MethodNotFound)?;
     let encoded = path
-        .strip_prefix("/rpc/")
+        .strip_prefix(prefix)
         .ok_or(GatewayError::MethodNotFound)?;
     if encoded.is_empty() || encoded.contains('/') {
         return Err(GatewayError::MethodNotFound);
     }
-    let bytes = encoded.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let Some(pair) = bytes.get(index + 1..index + 3) else {
-                return Err(GatewayError::InvalidRequest);
-            };
-            let Some(high) = hex(pair[0]) else {
-                return Err(GatewayError::InvalidRequest);
-            };
-            let Some(low) = hex(pair[1]) else {
-                return Err(GatewayError::InvalidRequest);
-            };
-            decoded.push((high << 4) | low);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(decoded).map_err(|_| GatewayError::InvalidRequest)
+    let max_bytes = S::METHODS
+        .iter()
+        .filter(|method| method.kind() == keylink::ExternalKind::Rpc)
+        .map(|method| method.name().len())
+        .max()
+        .unwrap_or(0);
+    crate::raw_path::parse(encoded, crate::raw_path::Shape::Segment { max_bytes })
+        .map_err(|_| GatewayError::InvalidRequest)
 }
 
-fn hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
+fn is_media(headers: &HeaderMap, expected: Option<&str>) -> bool {
+    if expected != Some("application/json") {
+        return false;
     }
-}
-
-fn is_json(headers: &HeaderMap) -> bool {
     let mut values = headers.get_all(header::CONTENT_TYPE).iter();
     let Some(value) = values.next() else {
         return false;
@@ -284,14 +307,17 @@ mod tests {
 
     impl ExternalService for TestService {
         const SERVICE: &'static str = "CapturedService";
-        const RPC_METHODS: &'static [&'static str] = &["Run"];
+        const METHODS: &'static [keylink::ExternalMethod] = &[keylink::ExternalMethod::new(
+            "Run",
+            keylink::ExternalKind::Rpc,
+        )];
         type Client = TestClient;
 
         fn invoke<C: keylink::ServiceCodec>(
             client: &Self::Client,
             _method: &str,
             _body: &[u8],
-            _key: Option<keylink::IdempotencyKey>,
+            _call: keylink::ExternalCall,
             codec: C,
         ) -> ExternalFuture<C> {
             client.invoked.fetch_add(1, Ordering::SeqCst);
@@ -299,11 +325,17 @@ mod tests {
             if client.pending {
                 Box::pin(async move {
                     let _sentinel = sentinel;
-                    pending::<Result<C::Output, ExternalError<C::Error>>>().await
+                    pending::<Result<keylink::ExternalOutput<C::Output>, ExternalError<C::Error>>>()
+                        .await
                 })
             } else {
                 drop(sentinel);
-                Box::pin(async move { codec.encode(&()).map_err(ExternalError::Codec) })
+                Box::pin(async move {
+                    codec
+                        .encode(&())
+                        .map(keylink::ExternalOutput::Json)
+                        .map_err(ExternalError::Codec)
+                })
             }
         }
     }
@@ -439,15 +471,108 @@ mod tests {
     }
 
     #[test]
+    fn singleton_gateway_rejects_an_actor_surface() {
+        let surface =
+            crate::HttpSurface::new("/v1", crate::Addressing::Actors).expect("valid actor surface");
+        let error = gateway(ready_client(), Denyless)
+            .router::<()>(surface)
+            .expect_err("singleton client cannot serve actors");
+        assert_eq!(error, crate::ConfigError::WrongAddressing);
+    }
+
+    #[test]
     fn malformed_percent_encoding_is_an_invalid_adapter_request() {
         assert!(matches!(
-            super::decode_method("/rpc/%ZZ"),
+            super::decode_method::<TestService>("/rpc/%ZZ", super::SINGLETON_RPC_PATH),
             Err(crate::error::GatewayError::InvalidRequest)
         ));
         assert!(matches!(
-            super::decode_method("/rpc/%FF"),
+            super::decode_method::<TestService>("/rpc/%FF", super::SINGLETON_RPC_PATH),
             Err(crate::error::GatewayError::InvalidRequest)
         ));
+    }
+
+    #[derive(Clone)]
+    struct WrongOutputClient(Arc<Mutex<Option<keylink::BlobHandle>>>);
+
+    struct WrongOutputService;
+
+    impl ExternalService for WrongOutputService {
+        const SERVICE: &'static str = "WrongOutput";
+        const METHODS: &'static [keylink::ExternalMethod] = &[keylink::ExternalMethod::new(
+            "Run",
+            keylink::ExternalKind::Rpc,
+        )];
+        type Client = WrongOutputClient;
+
+        fn invoke<C: keylink::ServiceCodec>(
+            client: &Self::Client,
+            _method: &str,
+            _body: &[u8],
+            _call: keylink::ExternalCall,
+            codec: C,
+        ) -> ExternalFuture<C> {
+            let handle = client
+                .0
+                .lock()
+                .expect("test mutex")
+                .take()
+                .expect("one call");
+            Box::pin(async move {
+                let value = codec.encode(&()).map_err(ExternalError::Codec)?;
+                Ok(keylink::ExternalOutput::Blob { value, handle })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn unary_gateway_rejects_the_wrong_generated_output_variant() {
+        let node = local_node().await;
+        let blobs = keylink::Blobs::memory();
+        let id = blobs
+            .add_bytes(b"wrong-output".as_slice())
+            .await
+            .expect("blob stores");
+        let client = WrongOutputClient(Arc::new(Mutex::new(Some(keylink::BlobHandle::new(
+            &node,
+            node.endpoint().addr(),
+            id,
+        )))));
+        let gateway = Gateway::<WrongOutputService, _>::new(
+            client,
+            Denyless,
+            Challenge::new(HeaderValue::from_static("Bearer realm=keylink"))
+                .expect("valid challenge"),
+        );
+        let response = gateway
+            .handle(
+                request("/rpc/Run", Body::from("{}")),
+                super::singleton_rpc_route(),
+                super::SINGLETON_RPC_PATH,
+            )
+            .await;
+
+        assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn singleton_routes_use_bounded_raw_parser() {
+        let client = client();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let response = gateway(client.clone(), PanicAccess)
+            .handle(
+                request(
+                    "/rpc/%61%61%61%61",
+                    Body::new(RecordingBody::new(Arc::clone(&polls))),
+                ),
+                super::singleton_rpc_route(),
+                super::SINGLETON_RPC_PATH,
+            )
+            .await;
+
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert_eq!(client.invoked.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -455,10 +580,14 @@ mod tests {
         let client = client();
         let polls = Arc::new(AtomicUsize::new(0));
         let response = gateway(client.clone(), PanicAccess)
-            .handle(request(
-                "/rpc/Missing",
-                Body::new(RecordingBody::new(Arc::clone(&polls))),
-            ))
+            .handle(
+                request(
+                    "/rpc/Bad",
+                    Body::new(RecordingBody::new(Arc::clone(&polls))),
+                ),
+                super::singleton_rpc_route(),
+                super::SINGLETON_RPC_PATH,
+            )
             .await;
 
         assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
@@ -471,10 +600,14 @@ mod tests {
         let client = client();
         let polls = Arc::new(AtomicUsize::new(0));
         let response = gateway(client.clone(), Deny)
-            .handle(request(
-                "/rpc/Run",
-                Body::new(RecordingBody::new(Arc::clone(&polls))),
-            ))
+            .handle(
+                request(
+                    "/rpc/Run",
+                    Body::new(RecordingBody::new(Arc::clone(&polls))),
+                ),
+                super::singleton_rpc_route(),
+                super::SINGLETON_RPC_PATH,
+            )
             .await;
 
         assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
@@ -501,7 +634,13 @@ mod tests {
             HeaderValue::from_static("text/plain"),
         );
 
-        let response = gateway(client.clone(), Denyless).handle(request).await;
+        let response = gateway(client.clone(), Denyless)
+            .handle(
+                request,
+                super::singleton_rpc_route(),
+                super::SINGLETON_RPC_PATH,
+            )
+            .await;
         assert_eq!(response.status(), http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
         assert_eq!(client.invoked.load(Ordering::SeqCst), 0);
     }
@@ -520,7 +659,13 @@ mod tests {
                 .headers_mut()
                 .insert(http::header::CONTENT_TYPE, HeaderValue::from_static(value));
 
-            let response = gateway(client.clone(), Denyless).handle(request).await;
+            let response = gateway(client.clone(), Denyless)
+                .handle(
+                    request,
+                    super::singleton_rpc_route(),
+                    super::SINGLETON_RPC_PATH,
+                )
+                .await;
             assert_eq!(
                 response.status(),
                 http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -537,7 +682,11 @@ mod tests {
     async fn short_body_collection_failure_is_not_reported_as_too_large() {
         let client = client();
         let response = gateway(client.clone(), Denyless)
-            .handle(request("/rpc/Run", Body::new(ErrorBody)))
+            .handle(
+                request("/rpc/Run", Body::new(ErrorBody)),
+                super::singleton_rpc_route(),
+                super::SINGLETON_RPC_PATH,
+            )
             .await;
         assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
         assert_eq!(client.invoked.load(Ordering::SeqCst), 0);
@@ -556,7 +705,13 @@ mod tests {
             HeaderValue::from_bytes(&[0xff]).expect("opaque header value"),
         );
 
-        let response = gateway(client.clone(), Denyless).handle(request).await;
+        let response = gateway(client.clone(), Denyless)
+            .handle(
+                request,
+                super::singleton_rpc_route(),
+                super::SINGLETON_RPC_PATH,
+            )
+            .await;
 
         assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
         assert_eq!(polls.load(Ordering::SeqCst), 0);
@@ -578,7 +733,11 @@ mod tests {
         request.extensions_mut().insert(7_u64);
 
         let response = gateway(client.clone(), Capture(Arc::clone(&captured)))
-            .handle(request)
+            .handle(
+                request,
+                super::singleton_rpc_route(),
+                super::SINGLETON_RPC_PATH,
+            )
             .await;
 
         assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
@@ -600,8 +759,16 @@ mod tests {
     fn concurrent_handlers_poll_independent_invocations_without_waiting() {
         let client = client();
         let gateway = gateway(client.clone(), Denyless);
-        let mut first = Box::pin(gateway.handle(request("/rpc/Run", Body::from("{}"))));
-        let mut second = Box::pin(gateway.handle(request("/rpc/Run", Body::from("{}"))));
+        let mut first = Box::pin(gateway.handle(
+            request("/rpc/Run", Body::from("{}")),
+            super::singleton_rpc_route(),
+            super::SINGLETON_RPC_PATH,
+        ));
+        let mut second = Box::pin(gateway.handle(
+            request("/rpc/Run", Body::from("{}")),
+            super::singleton_rpc_route(),
+            super::SINGLETON_RPC_PATH,
+        ));
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
 
@@ -614,7 +781,11 @@ mod tests {
     fn dropping_handler_drops_the_adapter_owned_invocation_future() {
         let client = client();
         let gateway = gateway(client.clone(), Denyless);
-        let mut handler = Box::pin(gateway.handle(request("/rpc/Run", Body::from("{}"))));
+        let mut handler = Box::pin(gateway.handle(
+            request("/rpc/Run", Body::from("{}")),
+            super::singleton_rpc_route(),
+            super::SINGLETON_RPC_PATH,
+        ));
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
 
@@ -652,18 +823,18 @@ mod tests {
 
     impl ExternalService for Tracked {
         const SERVICE: &'static str = <cancellation::External as ExternalService>::SERVICE;
-        const RPC_METHODS: &'static [&'static str] =
-            <cancellation::External as ExternalService>::RPC_METHODS;
+        const METHODS: &'static [keylink::ExternalMethod] =
+            <cancellation::External as ExternalService>::METHODS;
         type Client = TrackedClient;
 
         fn invoke<C: keylink::ServiceCodec>(
             client: &Self::Client,
             method: &str,
             body: &[u8],
-            key: Option<keylink::IdempotencyKey>,
+            call: keylink::ExternalCall,
             codec: C,
         ) -> ExternalFuture<C> {
-            let future = cancellation::External::invoke(&client.inner, method, body, key, codec);
+            let future = cancellation::External::invoke(&client.inner, method, body, call, codec);
             let dropped = client.dropped.clone();
             Box::pin(async move {
                 struct SignalDrop {
@@ -725,9 +896,13 @@ mod tests {
             Challenge::new(HeaderValue::from_static("Bearer realm=keylink"))
                 .expect("valid challenge"),
         )
-        .router::<()>();
+        .router::<()>(
+            crate::HttpSurface::new("/v1", crate::Addressing::Singleton)
+                .expect("valid singleton surface"),
+        )
+        .expect("surface matches singleton gateway");
         let app: Router<()> = Router::new()
-            .nest("/v1", gateway)
+            .merge(gateway)
             .layer(axum::middleware::from_fn(
                 |mut request: Request<Body>, next: axum::middleware::Next| async move {
                     request
