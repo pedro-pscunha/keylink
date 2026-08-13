@@ -44,7 +44,7 @@ pub(crate) struct BoundedWriter {
 impl BoundedWriter {
     pub(crate) fn new(limit: usize) -> Self {
         Self {
-            bytes: Vec::with_capacity(limit),
+            bytes: Vec::new(),
             limit,
             overflowed: false,
         }
@@ -92,6 +92,15 @@ mod tests {
     ///             ));
     ///         }`
     /// with an always-false branch. The exact test failed at its error assertion.
+    /// Watched red with `scripts/break-once.sh` by replacing
+    /// `            bytes: Vec::new(),` with `Vec::with_capacity(limit)`.
+    /// The exact test terminated with `capacity overflow`.
+    #[test]
+    fn bounded_writer_does_not_reserve_the_configured_ceiling() {
+        let writer = BoundedWriter::new(usize::MAX);
+        assert!(writer.bytes.capacity() < 1024);
+    }
+
     #[test]
     fn bounded_writer_accepts_limit_and_refuses_limit_plus_one() {
         let mut writer = BoundedWriter::new(3);

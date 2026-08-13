@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/keylink-http-smoke.XXXXXX")"
+server_pid=""
+passed=false
+cleanup() {
+    rc=$?
+    if [[ "$passed" != true ]]; then
+        cat "$scratch/server.log" >&2 2>/dev/null || true
+        for file in "$scratch"/*.status "$scratch"/*.body; do
+            [[ -e "$file" ]] || continue
+            echo "--- $file" >&2
+            cat "$file" >&2
+            echo >&2
+        done
+    fi
+    if [[ -n "$server_pid" ]]; then
+        kill -TERM "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+    fi
+    rm -rf "$scratch"
+    exit "$rc"
+}
+trap cleanup EXIT
+
+mkfifo "$scratch/url"
+cargo run -p keylink-http --example inventory >"$scratch/url" 2>"$scratch/server.log" &
+server_pid=$!
+IFS= read -r base <"$scratch/url"
+
+cat >"$scratch/json.headers" <<'EOF'
+Authorization: Bearer allow
+Content-Type: application/json
+EOF
+cat >"$scratch/deny.headers" <<'EOF'
+Authorization: Bearer deny
+Content-Type: application/json
+EOF
+cat >"$scratch/add.json" <<'EOF'
+{"left":2,"right":3}
+EOF
+cat >"$scratch/count.json" <<'EOF'
+{"value":7}
+EOF
+cat >"$scratch/audit.json" <<'EOF'
+{"line":"x"}
+EOF
+cat >"$scratch/malformed.json" <<'EOF'
+{
+EOF
+
+request() {
+    local name="$1"
+    local path="$2"
+    local headers="$3"
+    local body="$4"
+    shift 4
+    curl --silent --show-error         --output "$scratch/$name.body"         --write-out '%{http_code}'         --request POST         --header "@$headers"         --data-binary "@$body"         "$@"         "$base/rpc/$path" >"$scratch/$name.status"
+}
+
+request normal Add "$scratch/json.headers" "$scratch/add.json"
+request retry-first Count "$scratch/json.headers" "$scratch/count.json"     --header 'Idempotency-Key: example-operation'
+request retry-second Count "$scratch/json.headers" "$scratch/count.json"     --header 'Idempotency-Key: example-operation'
+request denied Add "$scratch/deny.headers" "$scratch/add.json"
+request malformed Add "$scratch/json.headers" "$scratch/malformed.json"
+request unsupported Audit "$scratch/json.headers" "$scratch/audit.json"
+
+assert_response() {
+    local name="$1"
+    local status="$2"
+    local body="${3-}"
+    [[ "$(<"$scratch/$name.status")" == "$status" ]]
+    if [[ -n "$body" ]]; then
+        [[ "$(<"$scratch/$name.body")" == "$body" ]]
+    fi
+}
+
+assert_response normal 200 5
+assert_response retry-first 200 1
+assert_response retry-second 200 1
+assert_response denied 403
+assert_response malformed 400
+assert_response unsupported 404
+passed=true
+
+for name in normal retry-first retry-second denied malformed unsupported; do
+    echo "$name $(<"$scratch/$name.status") $(<"$scratch/$name.body")"
+done

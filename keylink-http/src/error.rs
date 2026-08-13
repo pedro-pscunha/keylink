@@ -28,7 +28,7 @@ use axum::{body::Body, response::Response};
 use http::{header, HeaderValue, StatusCode};
 use serde::Serialize;
 
-use crate::JsonError;
+use crate::service::JsonError;
 
 const MAX_ERROR_BYTES: usize = 512;
 const FALLBACK_ERROR: &[u8] =
@@ -215,6 +215,237 @@ impl GatewayError {
                 _ => Self::UpstreamError,
             },
             _ => Self::UpstreamError,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use axum::body::to_bytes;
+    use http::{header, HeaderValue, StatusCode};
+    use keylink::{Error, IdempotencyRefusal, RemoteError};
+
+    use super::{GatewayError, MAX_ERROR_BYTES};
+
+    async fn rendered(error: GatewayError) -> (StatusCode, http::HeaderMap, String) {
+        let response = error.response(None);
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), MAX_ERROR_BYTES)
+            .await
+            .expect("adapter error body");
+        (
+            status,
+            headers,
+            String::from_utf8(bytes.to_vec()).expect("JSON is UTF-8"),
+        )
+    }
+
+    #[tokio::test]
+    async fn every_adapter_error_has_an_exact_stable_http_representation() {
+        let cases = [
+            (
+                GatewayError::InvalidRequest,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "the request JSON or path is invalid",
+            ),
+            (
+                GatewayError::InvalidIdempotencyKey,
+                StatusCode::BAD_REQUEST,
+                "invalid_idempotency_key",
+                "the idempotency key is invalid",
+            ),
+            (
+                GatewayError::IdempotencyNotSupported,
+                StatusCode::BAD_REQUEST,
+                "idempotency_not_supported",
+                "this method does not accept idempotency keys",
+            ),
+            (
+                GatewayError::Unauthenticated,
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated",
+                "authentication is required",
+            ),
+            (
+                GatewayError::Forbidden,
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "this caller may not invoke this method",
+            ),
+            (
+                GatewayError::MethodNotFound,
+                StatusCode::NOT_FOUND,
+                "method_not_found",
+                "the RPC method was not found",
+            ),
+            (
+                GatewayError::ActorNotFound,
+                StatusCode::NOT_FOUND,
+                "actor_not_found",
+                "the addressed actor was not found",
+            ),
+            (
+                GatewayError::MethodNotAllowed,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+                "this route accepts POST only",
+            ),
+            (
+                GatewayError::IdempotencyConflict,
+                StatusCode::CONFLICT,
+                "idempotency_conflict",
+                "the idempotency key cannot be replayed",
+            ),
+            (
+                GatewayError::RequestTooLarge,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                "the request JSON exceeds its limit",
+            ),
+            (
+                GatewayError::UnsupportedMediaType,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+                "a JSON content type is required",
+            ),
+            (
+                GatewayError::IdempotencyCapacity,
+                StatusCode::TOO_MANY_REQUESTS,
+                "idempotency_capacity",
+                "the upstream idempotency capacity is exhausted",
+            ),
+            (
+                GatewayError::UpstreamError,
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                "the upstream call failed",
+            ),
+            (
+                GatewayError::UpstreamUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream_unavailable",
+                "the upstream service is unavailable",
+            ),
+            (
+                GatewayError::UpstreamTimeout,
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream_timeout",
+                "the upstream call timed out",
+            ),
+            (
+                GatewayError::ResponseTooLarge,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response_too_large",
+                "the successful response JSON exceeds its limit",
+            ),
+        ];
+
+        for (error, status, code, message) in cases {
+            let (actual_status, headers, body) = rendered(error).await;
+            assert_eq!(actual_status, status, "{code}");
+            assert_eq!(headers[header::CONTENT_TYPE], "application/json", "{code}");
+            assert_eq!(
+                body,
+                format!(r#"{{"error":{{"code":"{code}","message":"{message}"}}}}"#),
+                "{code}"
+            );
+            assert_eq!(
+                headers.get(header::ALLOW),
+                (code == "method_not_allowed")
+                    .then(|| HeaderValue::from_static("POST"))
+                    .as_ref(),
+                "{code}"
+            );
+        }
+
+        let challenge = HeaderValue::from_static("Bearer realm=stable");
+        let response = GatewayError::Unauthenticated.response(Some(&challenge));
+        assert_eq!(response.headers()[header::WWW_AUTHENTICATE], challenge);
+    }
+
+    #[tokio::test]
+    async fn keylink_failures_map_completely_without_upstream_text_leakage() {
+        let secret = "principal=tenant-secret key=raw-secret upstream=private";
+        let cases = [
+            (Error::Closed, GatewayError::UpstreamUnavailable),
+            (
+                Error::Remote(RemoteError::Unauthorized(secret.into())),
+                GatewayError::Forbidden,
+            ),
+            (
+                Error::Remote(RemoteError::TimedOut { millis: 9 }),
+                GatewayError::UpstreamTimeout,
+            ),
+            (
+                Error::Remote(RemoteError::NoSuchActor { id: secret.into() }),
+                GatewayError::ActorNotFound,
+            ),
+            (
+                Error::Remote(RemoteError::AtCapacity { capacity: 7 }),
+                GatewayError::UpstreamUnavailable,
+            ),
+            (
+                Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::Malformed(
+                    secret.into(),
+                ))),
+                GatewayError::InvalidIdempotencyKey,
+            ),
+            (
+                Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::NotKeyable {
+                    method: secret.into(),
+                })),
+                GatewayError::IdempotencyNotSupported,
+            ),
+            (
+                Error::Remote(RemoteError::Idempotency(
+                    IdempotencyRefusal::TooManyRunning { limit: 1 },
+                )),
+                GatewayError::IdempotencyCapacity,
+            ),
+            (
+                Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::InFlight)),
+                GatewayError::IdempotencyConflict,
+            ),
+            (
+                Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::Interrupted)),
+                GatewayError::IdempotencyConflict,
+            ),
+            (
+                Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::Unrecordable)),
+                GatewayError::IdempotencyConflict,
+            ),
+            (
+                Error::Remote(RemoteError::Idempotency(IdempotencyRefusal::Forgotten)),
+                GatewayError::IdempotencyConflict,
+            ),
+            (
+                Error::Remote(RemoteError::Failed(secret.into())),
+                GatewayError::UpstreamError,
+            ),
+            (
+                Error::HandlerPanic(secret.into()),
+                GatewayError::UpstreamError,
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let mapped = GatewayError::from_keylink(source);
+            assert_eq!(mapped.status(), expected.status());
+            assert_eq!(mapped.body().code, expected.body().code);
+            let (_, _, body) = rendered(mapped).await;
+            for forbidden in [
+                "tenant-secret",
+                "raw-secret",
+                "private",
+                "principal=",
+                "key=",
+            ] {
+                assert!(!body.contains(forbidden), "{forbidden} leaked in {body}");
+            }
         }
     }
 }

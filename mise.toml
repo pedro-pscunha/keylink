@@ -313,7 +313,7 @@ description = "Every example RUNS. Building one asserts nothing"
 run = [
     "cargo run -p keylink --example reliable_call",
     "cargo run -p keylink --example durable_ledger",
-    "cargo run -p keylink-http --example inventory -- --self-test",
+    { task = "http-smoke" },
 ]
 
 # ── documentation ───────────────────────────────────────────────────────────

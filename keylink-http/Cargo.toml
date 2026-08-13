@@ -6,14 +6,16 @@ rust-version = "1.91"
 description = "Bounded authenticated HTTP/JSON gateway for generated Keylink services."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pedrocunha/keylink"
+readme = "README.md"
 
 [dependencies]
 keylink = { path = "../keylink", version = "0.1.0", default-features = false }
 axum = { workspace = true }
 http = { workspace = true }
+http-body-util = { workspace = true }
+mime = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-bytes = { workspace = true }
 blake3 = { workspace = true }
 thiserror = { workspace = true }
 
@@ -22,6 +24,8 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 iroh = { workspace = true, features = ["test-utils"] }
 postcard-schema = { workspace = true }
+bytes = { workspace = true }
+http-body = "1"
 
 [lints]
 workspace = true

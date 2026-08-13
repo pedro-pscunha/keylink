@@ -56,5 +56,3 @@ pub use access::{Access, AccessError, Call, Challenge, Principal};
 pub use error::ConfigError;
 pub use gateway::Gateway;
 pub use limits::JsonLimits;
-#[doc(hidden)]
-pub use service::{JsonCodec, JsonError};

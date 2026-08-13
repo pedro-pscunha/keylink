@@ -1016,22 +1016,6 @@ mod external_contract {
     }
 }
 
-#[derive(Clone)]
-struct PostcardCodec;
-
-impl keylink::ServiceCodec for PostcardCodec {
-    type Error = postcard::Error;
-    type Output = Vec<u8>;
-
-    fn decode<T: serde::de::DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, Self::Error> {
-        postcard::from_bytes(bytes)
-    }
-
-    fn encode<T: serde::Serialize>(&self, value: &T) -> Result<Self::Output, Self::Error> {
-        postcard::to_stdvec(value)
-    }
-}
-
 /// Watched red with `scripts/break-once.sh` by dropping the accumulated `rpc`
 /// record from `__keylink_external!`. The exact test failed with `left: []` and
 /// `right: ["Empty", "One", "Many"]`; the registered search literal is
@@ -1040,19 +1024,15 @@ impl keylink::ServiceCodec for PostcardCodec {
 /// remained absent, so the break isolates the generated rpc inventory.
 #[test]
 fn generated_external_marker_names_only_enabled_plain_rpcs() {
-    fn assert_external<T: keylink::ExternalService<PostcardCodec>>() {}
+    fn assert_external<T: keylink::ExternalService>() {}
 
     assert_external::<external_contract::external_contract::External>();
     assert_eq!(
-        <external_contract::external_contract::External as keylink::ExternalService<
-            PostcardCodec,
-        >>::RPC_METHODS,
+        <external_contract::external_contract::External as keylink::ExternalService>::RPC_METHODS,
         &["Empty", "One", "Many"]
     );
     assert_eq!(
-        <external_contract::external_contract::External as keylink::ExternalService<
-            PostcardCodec,
-        >>::SERVICE,
+        <external_contract::external_contract::External as keylink::ExternalService>::SERVICE,
         "ExternalContract"
     );
 }

@@ -4,7 +4,7 @@
 
 **Goal:** Add a bounded, authenticated HTTP/JSON adapter for generated singleton unary RPC services without changing Keylink's existing Rust caller or wire interfaces.
 
-**Architecture:** A new `keylink-http` workspace crate owns Axum, JSON, access control, limits, error mapping, and the generic gateway router. `keylink` owns dependency-neutral `ServiceCodec` and generated `ExternalService<C>` traits. `service!` implements `ExternalService<C>` for a generated local marker, which satisfies coherence even when another crate imports the contract; `keylink-http` supplies the bounded JSON codec. The generated implementation invokes exact Client/IdempotentClient methods and encodes only their declared values, without a second wire/dispatch path.
+**Architecture:** A new `keylink-http` workspace crate owns Axum, JSON, access control, limits, error mapping, and the generic gateway router. `keylink` owns dependency-neutral `ServiceCodec` and generated `ExternalService` traits. `service!` implements `ExternalService` for a generated local marker, which satisfies coherence even when another crate imports the contract; `keylink-http` supplies the bounded JSON codec. The generated implementation invokes exact Client/IdempotentClient methods and encodes only their declared values, without a second wire/dispatch path.
 
 **Tech Stack:** Rust 1.91, `macro_rules!`, Keylink generated clients, Axum 0.8, Hyper/HTTP 1, Serde/serde_json, Tokio, BLAKE3, bytes, thiserror, reqwest dev tests.
 
@@ -13,9 +13,9 @@
 ## File map
 
 - Modify `Cargo.toml`, `Cargo.lock`: add `keylink-http` workspace member and shared adapter dependencies only.
-- Create `keylink/src/external.rs`: dependency-neutral `ServiceCodec`, `ExternalService<C>`, and precise generated-seam errors.
+- Create `keylink/src/external.rs`: dependency-neutral `ServiceCodec`, `ExternalService`, and precise generated-seam errors.
 - Modify `keylink/src/lib.rs`: curated exports for that seam.
-- Modify `keylink/src/macros.rs`: generate an `External` marker and cfg-aware `ExternalService<C>` implementation; no HTTP/JSON crate path.
+- Modify `keylink/src/macros.rs`: generate an `External` marker and cfg-aware `ExternalService` implementation; no HTTP/JSON crate path.
 - Modify `keylink/tests/api.rs`: prove existing syntax/surfaces, marker availability, cfg/Serde metadata replay, and non-HTTP builds.
 - Modify `keylink/tests/protocol.rs`: structural/property guard that HTTP marker/replay metadata is outside Contract and KeyedContract; never pin a literal hash.
 - Create `keylink-http/Cargo.toml`: publishable adapter manifest.
@@ -27,7 +27,7 @@
 - Create `keylink-http/src/gateway.rs`: state-generic Axum router and ordered request pipeline.
 - Create `keylink-http/tests/compile.rs` plus `tests/ui/**`: downstream compile-pass/fail representability.
 - Create `keylink-http/tests/http.rs`: real loopback HTTP→Keylink behavior.
-- Create `keylink-http/tests/cancellation.rs`: real TCP disconnect/future-drop behavior, individually terminating.
+- Add a private gateway test: real TCP disconnect/future-drop behavior, individually terminating.
 - Create `keylink-http/examples/inventory.rs`: runnable curl target.
 - Modify `README.md`, `CONTRIBUTING.md`: usage, guarantees, unsupported surface, gate/package notes.
 - Modify `.mise/tasks/anchors` and `.mise/tasks/replay-anchors` only for guards actually watched red.
@@ -66,16 +66,21 @@ pub trait ServiceCodec: Clone + Send + Sync + 'static {
     fn encode<T: Serialize>(&self, value: &T) -> Result<Self::Output, Self::Error>;
 }
 
-pub trait ExternalService<C: ServiceCodec>: Send + Sync + 'static {
+pub trait ExternalService: Send + Sync + 'static {
     const SERVICE: &'static str;
     const RPC_METHODS: &'static [&'static str];
     type Client: Clone + Send + Sync + 'static;
-    fn invoke(client: &Self::Client, method: &str, body: &[u8], key: Option<IdempotencyKey>, codec: C)
-      -> Pin<Box<dyn Future<Output = Result<C::Output, ExternalError<C::Error>>> + Send>>;
+    fn invoke<C: ServiceCodec>(
+        client: &Self::Client,
+        method: &str,
+        body: &[u8],
+        key: Option<IdempotencyKey>,
+        codec: C,
+    ) -> Pin<Box<dyn Future<Output = Result<C::Output, ExternalError<C::Error>>> + Send>>;
 }
 ```
 
-`service!` emits local `pub struct External` and its generic impl. Per rpc it
+`service!` emits local `pub struct External` and its `ExternalService` impl. Per rpc it
 emits a private argument struct from plain Rust argument identifiers, decodes it,
 and calls the exact generated Client/IdempotentClient method. Method-level Serde
 attrs stay only on the wire Request variant; nested argument/return types keep
@@ -158,17 +163,17 @@ Inventory every new guard (including missing-doc lint, mandatory access, Challen
 
 - [ ] **Step 1: Write failing conversion tests**
 
-Use the generated `inventory::External` through `keylink::ExternalService<JsonCodec>`. Prove RPC_METHODS includes only enabled rpc methods. Prove arguments-only JSON for zero/one/multiple args, unit response null, cfg-disabled exclusion, nested domain types with their own Serde-renamed fields/return values, and wrong method. Compile-fail proves `Addressed<Request>` and manual Rpc types cannot implement/use the generated service marker.
+Use the generated `inventory::External` through `keylink::ExternalService`; invoke it with `JsonCodec`. Prove RPC_METHODS includes only enabled rpc methods. Prove arguments-only JSON for zero/one/multiple args, unit response null, cfg-disabled exclusion, nested domain types with their own Serde-renamed fields/return values, and wrong method. Compile-fail proves `Addressed<Request>` and manual Rpc types cannot implement/use the generated service marker.
 
 - [ ] **Step 2: Observe every conversion test red individually**
 
-Run each exact test. Expected: missing/incomplete `ExternalService<JsonCodec>`, then behavior-specific failures as slices are added. Do not run a broad filter until each async test terminates alone.
+Run each exact test. Expected: missing/incomplete `ExternalService` or its codec-generic `invoke`, then behavior-specific failures as slices are added. Do not run a broad filter until each async test terminates alone.
 
 - [ ] **Step 3: Implement the generated typed call path**
 
-The generated `ExternalService<C>` implementation from Task 1 receives `JsonCodec`. For each rpc its private argument struct uses declared Rust argument identifiers; method-level Serde attrs are deliberately not replayed. It invokes `Client::$method` or `IdempotentClient::$method`, and hands the concrete return value to the bounded codec. Non-rpc declarations have no arm. No Value, enum ordinal, ordinary Request JSON, or app-side trait impl is used.
+The generated `ExternalService` implementation from Task 1 receives `JsonCodec`. For each rpc its private argument struct uses declared Rust argument identifiers; method-level Serde attrs are deliberately not replayed. It invokes `Client::$method` or `IdempotentClient::$method`, and hands the concrete return value to the bounded codec. Non-rpc declarations have no arm. No Value, enum ordinal, ordinary Request JSON, or app-side trait impl is used.
 
-Retain the single Task 1 `keylink::ExternalService<C>` signature. Decode and method selection happen before boxing; clone the cheap generated client and move decoded args plus `JsonCodec` into the future; encode the concrete return after await. Map `ExternalError<JsonError>` into private GatewayError only inside `keylink-http`.
+Retain the single Task 1 codec-generic `keylink::ExternalService::invoke<C>` signature. Decode and method selection happen before boxing; clone the cheap generated client and move decoded args plus `JsonCodec` into the future; encode the concrete return after await. Map `ExternalError<JsonError>` into private GatewayError only inside `keylink-http`.
 
 - [ ] **Step 4: Run all focused conversion/compile tests green**
 
@@ -222,7 +227,7 @@ Inventory every new router/error guard; observe each coherent break red alone (i
 ### Task 5: Prove concurrency and disconnect cancellation
 
 **Files:**
-- Create: `keylink-http/tests/cancellation.rs`
+- Modify: `keylink-http/src/gateway.rs` for private cancellation instrumentation
 - Modify: `keylink-http/tests/http.rs` only for shared test support if necessary
 
 - [ ] **Step 1: Write individually terminating tests**
@@ -257,7 +262,7 @@ Document exact startup, generated `External` marker use, outer middleware Princi
 
 The example serves a real Inventory service and prints its loopback address. It supports deterministic curl normal/retry/denied/malformed/unsupported-tell smoke.
 
-- [ ] **Step 3: Update `mise.toml`: add `-p keylink-http` to docs (with `#![warn(missing_docs)]` already enabled) and a deterministic terminating `keylink-http` example self-test to `tasks.examples`. Then run focused docs/example/package checks and real curl smoke**
+- [ ] **Step 3: Update `mise.toml`: add `-p keylink-http` to docs (with `#![warn(missing_docs)]` already enabled) and a deterministic terminating `curl` task for the `keylink-http` example. Then run focused docs/example/package checks and the real curl smoke**
 
 Capture server/client output in `/tmp` with terminators. Verify no Rust client is used for smoke calls.
 

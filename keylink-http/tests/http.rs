@@ -12,32 +12,34 @@ use std::sync::{
     Arc,
 };
 
-use keylink::{Allowlist, Context, Node};
+use keylink::{Allowlist, Context, Keyable, Node, Server};
 use keylink_http::{Access, AccessError, Call, Challenge, Gateway, JsonLimits, Principal};
 
 keylink::service! {
     service Inventory;
 
+    rpc Ping() -> u64;
     rpc Add(left: u64, right: u64) -> u64;
     rpc Count(value: u64) -> u64;
-    rpc Block(token: u64) -> u64;
+    rpc Echo(value: String) -> String;
+    #[serde(rename = "wire-name")]
+    rpc Renamed(value: u64) -> u64;
     tell Ignored(value: u64) -> ();
 }
 
 #[derive(Clone, Default)]
 struct Handler {
     runs: Arc<AtomicU64>,
-    gate: Option<Gate>,
-}
-
-#[derive(Clone)]
-struct Gate {
-    entered: tokio::sync::mpsc::UnboundedSender<u64>,
-    release: Arc<tokio::sync::Notify>,
 }
 
 impl inventory::Handler for Handler {
+    async fn ping(&self, _cx: &Context) -> u64 {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        1
+    }
+
     async fn add(&self, _cx: &Context, left: u64, right: u64) -> u64 {
+        self.runs.fetch_add(1, Ordering::SeqCst);
         left + right
     }
 
@@ -45,12 +47,13 @@ impl inventory::Handler for Handler {
         self.runs.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    async fn block(&self, _cx: &Context, token: u64) -> u64 {
-        if let Some(gate) = &self.gate {
-            gate.entered.send(token).expect("test receiver stays open");
-            gate.release.notified().await;
-        }
-        token
+    async fn echo(&self, _cx: &Context, value: String) -> String {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        value
+    }
+
+    async fn renamed(&self, _cx: &Context, value: u64) -> u64 {
+        value
     }
 
     async fn ignored(&self, _cx: &Context, _value: u64) {}
@@ -99,10 +102,25 @@ impl Drop for Running {
 }
 
 async fn start<A: Access>(handler: Handler, access: A, limits: Option<JsonLimits>) -> Running {
+    start_with_keyable(handler, access, limits, Keyable::Any).await
+}
+
+async fn start_with_keyable<A: Access>(
+    handler: Handler,
+    access: A,
+    limits: Option<JsonLimits>,
+    keyable: Keyable,
+) -> Running {
     let server_node = local_node().await;
     let client_node = local_node().await;
-    let keylink =
-        inventory::serve(&server_node, handler, Allowlist::anyone()).expect("service starts");
+    let keylink = Server::builder(&server_node)
+        .service(
+            inventory::service(handler, Allowlist::anyone())
+                .keyable(keyable)
+                .build(),
+        )
+        .spawn()
+        .expect("service starts");
     let client = inventory::Client::connect(&client_node, server_node.endpoint().addr())
         .await
         .expect("client connects");
@@ -168,7 +186,11 @@ impl Access for CountingAccess {
 async fn error_code(response: reqwest::Response) -> (http::StatusCode, String, HeaderMap) {
     let status = response.status();
     let headers = response.headers().clone();
+    assert_eq!(headers[http::header::CONTENT_TYPE], "application/json");
     let body: serde_json::Value = response.json().await.expect("JSON error");
+    assert_eq!(body.as_object().map(serde_json::Map::len), Some(1));
+    assert_eq!(body["error"].as_object().map(serde_json::Map::len), Some(2));
+    assert!(body["error"]["message"].is_string());
     let code = body["error"]["code"]
         .as_str()
         .expect("string error code")
@@ -176,7 +198,7 @@ async fn error_code(response: reqwest::Response) -> (http::StatusCode, String, H
     (status, code, headers)
 }
 
-use http::HeaderMap;
+use http::{HeaderMap, HeaderValue};
 
 #[tokio::test]
 async fn unknown_and_non_rpc_methods_bypass_access() {
@@ -205,19 +227,16 @@ async fn unknown_and_non_rpc_methods_bypass_access() {
 }
 
 #[tokio::test]
-async fn adapter_owned_failures_are_json_with_stable_status_headers_and_codes() {
+async fn missing_principal_uses_the_cached_challenge() {
     let running = start(Handler::default(), Allow, None).await;
-    let client = reqwest::Client::new();
-    let base = format!("http://{}/v1/inventory", running.address);
-
-    let missing_principal = client
-        .post(format!("{base}/rpc/Add"))
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/v1/inventory/rpc/Add", running.address))
         .header("content-type", "application/json")
         .body(r#"{"left":1,"right":2}"#)
         .send()
         .await
         .expect("HTTP call completes");
-    let (status, code, headers) = error_code(missing_principal).await;
+    let (status, code, headers) = error_code(response).await;
     assert_eq!(
         (status, code.as_str()),
         (http::StatusCode::UNAUTHORIZED, "unauthenticated")
@@ -226,66 +245,112 @@ async fn adapter_owned_failures_are_json_with_stable_status_headers_and_codes() 
         headers[http::header::WWW_AUTHENTICATE],
         "Bearer realm=keylink"
     );
+}
 
-    let wrong_verb = client
-        .get(format!("{base}/rpc/Add"))
-        .header("x-test-principal", "tenant-a")
-        .send()
-        .await
-        .expect("HTTP call completes");
-    let (status, code, headers) = error_code(wrong_verb).await;
-    assert_eq!(
-        (status, code.as_str()),
-        (http::StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
-    );
-    assert_eq!(headers[http::header::ALLOW], "POST");
+#[tokio::test]
+async fn every_non_post_verb_is_rejected_with_post_in_allow() {
+    let running = start(Handler::default(), Allow, None).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{}/v1/inventory/rpc/Add", running.address);
 
-    let no_content_type = client
-        .post(format!("{base}/rpc/Add"))
-        .header("x-test-principal", "tenant-a")
-        .body(r#"{"left":1,"right":2}"#)
-        .send()
-        .await
-        .expect("HTTP call completes");
-    let (status, code, _) = error_code(no_content_type).await;
-    assert_eq!(
-        (status, code.as_str()),
-        (
-            http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_media_type"
-        )
-    );
+    for verb in [
+        reqwest::Method::GET,
+        reqwest::Method::PUT,
+        reqwest::Method::PATCH,
+        reqwest::Method::DELETE,
+        reqwest::Method::OPTIONS,
+        reqwest::Method::HEAD,
+    ] {
+        let response = client
+            .request(verb.clone(), &url)
+            .header("x-test-principal", "tenant-a")
+            .send()
+            .await
+            .expect("HTTP call completes");
+        assert_eq!(
+            response.status(),
+            http::StatusCode::METHOD_NOT_ALLOWED,
+            "{verb}"
+        );
+        assert_eq!(
+            response.headers()[http::header::CONTENT_TYPE],
+            "application/json",
+            "{verb}"
+        );
+        assert_eq!(response.headers()[http::header::ALLOW], "POST", "{verb}");
+        if verb != reqwest::Method::HEAD {
+            let (_, code, _) = error_code(response).await;
+            assert_eq!(code, "method_not_allowed", "{verb}");
+        }
+    }
+}
 
-    let bad_key = client
-        .post(format!("{base}/rpc/Add"))
-        .header("x-test-principal", "tenant-a")
-        .header("content-type", "application/json")
-        .header("idempotency-key", "bad key")
-        .body(r#"{\"left\":1,\"right\":2}"#)
-        .send()
-        .await
-        .expect("HTTP call completes");
-    let (status, code, _) = error_code(bad_key).await;
-    assert_eq!(
-        (status, code.as_str()),
-        (http::StatusCode::BAD_REQUEST, "invalid_idempotency_key")
-    );
+#[tokio::test]
+async fn json_content_type_compatibility_matrix_uses_real_listener() {
+    let running = start(Handler::default(), Allow, None).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{}/v1/inventory/rpc/Add", running.address);
 
-    let malformed = client
-        .post(format!("{base}/rpc/Add"))
-        .header("x-test-principal", "tenant-a")
-        .header("content-type", "application/problem+json; charset=utf-8")
-        .body("{")
-        .send()
-        .await
-        .expect("HTTP call completes");
-    let (status, code, _) = error_code(malformed).await;
-    assert_eq!(
-        (status, code.as_str()),
-        (http::StatusCode::BAD_REQUEST, "invalid_request")
-    );
+    for content_type in [
+        "application/json",
+        "application/json; charset=utf-8",
+        "Application/JSON; Charset=UTF-8",
+        "application/problem+json",
+        "application/vnd.keylink+json; version=1",
+    ] {
+        let response = client
+            .post(&url)
+            .header("x-test-principal", "tenant-a")
+            .header("content-type", content_type)
+            .body(r#"{"left":1,"right":2}"#)
+            .send()
+            .await
+            .expect("HTTP call completes");
+        assert_eq!(response.status(), http::StatusCode::OK, "{content_type}");
+        assert_eq!(response.text().await.expect("body"), "3", "{content_type}");
+    }
 
-    for path in ["/rpc", "/rpc/Add/", "/rpc/Add/extra"] {
+    for content_type in [
+        None,
+        Some("text/json"),
+        Some("application/jsonp"),
+        Some("application/problem+xml"),
+    ] {
+        let mut request = client
+            .post(&url)
+            .header("x-test-principal", "tenant-a")
+            .body(r#"{"left":1,"right":2}"#);
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        let response = request.send().await.expect("HTTP call completes");
+        let (status, code, _) = error_code(response).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (
+                http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type"
+            ),
+            "{content_type:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn path_matrix_and_external_identity_are_exact() {
+    let running = start(Handler::default(), Allow, None).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}/v1/inventory", running.address);
+
+    for (case, path) in [
+        ("missing method segment", "/rpc"),
+        ("empty method segment", "/rpc/"),
+        ("trailing slash", "/rpc/Add/"),
+        ("extra segment", "/rpc/Add/extra"),
+        ("unknown method", "/rpc/Missing"),
+        ("wire rename is not route identity", "/rpc/wire-name"),
+        ("cfg-disabled method", "/rpc/Disabled"),
+    ] {
         let response = client
             .post(format!("{base}{path}"))
             .header("x-test-principal", "tenant-a")
@@ -297,7 +362,139 @@ async fn adapter_owned_failures_are_json_with_stable_status_headers_and_codes() 
         let (status, code, _) = error_code(response).await;
         assert_eq!(
             (status, code.as_str()),
-            (http::StatusCode::NOT_FOUND, "method_not_found")
+            (http::StatusCode::NOT_FOUND, "method_not_found"),
+            "{case}"
+        );
+    }
+
+    let response = client
+        .post(format!("{base}/rpc/Renamed"))
+        .header("x-test-principal", "tenant-a")
+        .header("content-type", "application/json")
+        .body(r#"{"value":7}"#)
+        .send()
+        .await
+        .expect("HTTP call completes");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(response.text().await.expect("body"), "7");
+}
+
+async fn raw_http(address: std::net::SocketAddr, request: &[u8]) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut socket = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("raw client connects");
+    socket.write_all(request).await.expect("raw request writes");
+    socket.shutdown().await.expect("request half closes");
+    let mut response = Vec::new();
+    socket
+        .read_to_end(&mut response)
+        .await
+        .expect("raw response reads");
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+#[tokio::test]
+async fn malformed_percent_encoded_paths_are_rejected_without_dispatch() {
+    let handler = Handler::default();
+    let runs = Arc::clone(&handler.runs);
+    let running = start(handler, Allow, None).await;
+    for path in ["/v1/inventory/rpc/%FF", "/v1/inventory/rpc/%C3%28"] {
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nX-Test-Principal: tenant-a\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        );
+        let response = raw_http(running.address, request.as_bytes()).await;
+        assert!(
+            response.is_empty() || response.starts_with("HTTP/1.1 400"),
+            "{path}: {response}"
+        );
+    }
+
+    let parser_rejected = raw_http(
+        running.address,
+        b"POST /v1/inventory/rpc/%ZZ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(parser_rejected.is_empty() || parser_rejected.starts_with("HTTP/1.1 400"));
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn idempotency_header_compatibility_matrix_is_exact() {
+    let running = start(Handler::default(), Allow, None).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{}/v1/inventory/rpc/Add", running.address);
+
+    for key in [
+        "x",
+        &"x".repeat(keylink::MAX_KEY_LEN - 1),
+        &"x".repeat(keylink::MAX_KEY_LEN),
+    ] {
+        let response = client
+            .post(&url)
+            .header("x-test-principal", "tenant-a")
+            .header("content-type", "application/json")
+            .header("idempotency-key", key)
+            .body(r#"{"left":1,"right":2}"#)
+            .send()
+            .await
+            .expect("HTTP call completes");
+        assert_eq!(
+            response.status(),
+            http::StatusCode::OK,
+            "valid key length {}",
+            key.len()
+        );
+    }
+
+    for key in ["", "bad key", &"x".repeat(keylink::MAX_KEY_LEN + 1)] {
+        let response = client
+            .post(&url)
+            .header("x-test-principal", "tenant-a")
+            .header("content-type", "application/json")
+            .header("idempotency-key", key)
+            .body(r#"{"left":1,"right":2}"#)
+            .send()
+            .await
+            .expect("HTTP call completes");
+        let (status, code, _) = error_code(response).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (http::StatusCode::BAD_REQUEST, "invalid_idempotency_key"),
+            "invalid key length {}",
+            key.len()
+        );
+    }
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.append("idempotency-key", HeaderValue::from_static("one"));
+    headers.append("idempotency-key", HeaderValue::from_static("two"));
+    let response = client
+        .post(&url)
+        .header("x-test-principal", "tenant-a")
+        .header("content-type", "application/json")
+        .headers(headers)
+        .body(r#"{"left":1,"right":2}"#)
+        .send()
+        .await
+        .expect("HTTP call completes");
+    let (status, code, _) = error_code(response).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (http::StatusCode::BAD_REQUEST, "invalid_idempotency_key")
+    );
+
+    for raw_value in [b"\xff".as_slice(), b"bad\x01value".as_slice()] {
+        let mut request = b"POST /v1/inventory/rpc/Add HTTP/1.1\r\nHost: localhost\r\nX-Test-Principal: tenant-a\r\nContent-Type: application/json\r\nIdempotency-Key: ".to_vec();
+        request.extend_from_slice(raw_value);
+        request.extend_from_slice(
+            b"\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"left\":1,\"right\":2}",
+        );
+        let response = raw_http(running.address, &request).await;
+        assert!(
+            response.is_empty() || response.starts_with("HTTP/1.1 400"),
+            "{response}"
         );
     }
 }
@@ -352,66 +549,128 @@ async fn access_denial_precedes_json_validation_and_uses_only_the_cached_challen
     );
 }
 
+/// Watched red with `scripts/break-once.sh` by removing
+/// `                            #[serde(deny_unknown_fields)]` from generated arguments.
+/// The exact test dispatched `Ping` and returned HTTP 200 instead of 400.
 #[tokio::test]
-async fn request_and_success_response_limits_are_inclusive() {
-    let body = r#"{"left":2,"right":3}"#;
-    let running = start(
-        Handler::default(),
-        Allow,
-        Some(JsonLimits::new(body.len(), 1).expect("positive limits")),
-    )
-    .await;
-    let client = reqwest::Client::new();
-    let url = format!("http://{}/v1/inventory/rpc/Add", running.address);
-    let response = client
-        .post(&url)
-        .header("x-test-principal", "tenant-a")
-        .header("content-type", "application/json")
-        .body(body)
-        .send()
-        .await
-        .expect("HTTP call completes");
-    assert_eq!(response.status(), http::StatusCode::OK);
-    assert_eq!(response.text().await.expect("body"), "5");
+async fn unknown_argument_fields_fail_before_zero_one_or_many_argument_dispatch() {
+    for (method, body) in [
+        ("Ping", r#"{"unexpected":1}"#),
+        ("Count", r#"{"value":7,"unexpected":1}"#),
+        ("Add", r#"{"left":1,"right":2,"unexpected":1}"#),
+    ] {
+        let handler = Handler::default();
+        let runs = Arc::clone(&handler.runs);
+        let running = start(handler, Allow, None).await;
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://{}/v1/inventory/rpc/{method}",
+                running.address
+            ))
+            .header("x-test-principal", "tenant-a")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .expect("HTTP call completes");
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST, "{method}");
+        let (_, code, _) = error_code(response).await;
+        assert_eq!(code, "invalid_request", "{method}");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "{method}");
+    }
+}
 
-    let response = client
-        .post(&url)
-        .header("x-test-principal", "tenant-a")
-        .header("content-type", "application/json")
-        .body(format!("{body} "))
-        .send()
-        .await
-        .expect("HTTP call completes");
-    let (status, code, _) = error_code(response).await;
-    assert_eq!(
-        (status, code.as_str()),
-        (http::StatusCode::PAYLOAD_TOO_LARGE, "request_too_large")
-    );
+#[tokio::test]
+async fn request_limits_cover_limit_minus_one_limit_and_limit_plus_one_without_overlimit_dispatch()
+{
+    let limit = r#"{"value":7} "#.len();
+    for (case, body, expected_status, expected_runs) in [
+        ("limit minus one", r#"{"value":7}"#, http::StatusCode::OK, 1),
+        ("exact limit", r#"{"value":7} "#, http::StatusCode::OK, 1),
+        (
+            "limit plus one",
+            r#"{"value":7}  "#,
+            http::StatusCode::PAYLOAD_TOO_LARGE,
+            0,
+        ),
+    ] {
+        let handler = Handler::default();
+        let runs = Arc::clone(&handler.runs);
+        let running = start(
+            handler,
+            Allow,
+            Some(JsonLimits::new(limit, 32).expect("positive limits")),
+        )
+        .await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/inventory/rpc/Count", running.address))
+            .header("x-test-principal", "tenant-a")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .expect("HTTP call completes");
+        assert_eq!(response.status(), expected_status, "{case}");
+        assert_eq!(runs.load(Ordering::SeqCst), expected_runs, "{case}");
+    }
+}
 
-    let large_response = start(
-        Handler::default(),
-        Allow,
-        Some(JsonLimits::new(1024, 1).expect("positive limits")),
-    )
-    .await;
-    let response = client
+#[tokio::test]
+async fn response_limits_cover_limit_minus_one_limit_and_limit_plus_one() {
+    for (case, value, expected_status) in [
+        ("limit minus one", "aa", http::StatusCode::OK),
+        ("exact limit", "aaa", http::StatusCode::OK),
+        (
+            "limit plus one",
+            "aaaa",
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    ] {
+        let handler = Handler::default();
+        let runs = Arc::clone(&handler.runs);
+        let running = start(
+            handler,
+            Allow,
+            Some(JsonLimits::new(64, 5).expect("positive limits")),
+        )
+        .await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/inventory/rpc/Echo", running.address))
+            .header("x-test-principal", "tenant-a")
+            .header("content-type", "application/json")
+            .body(format!(r#"{{"value":"{value}"}}"#))
+            .send()
+            .await
+            .expect("HTTP call completes");
+        assert_eq!(response.status(), expected_status, "{case}");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "{case}");
+        if expected_status == http::StatusCode::INTERNAL_SERVER_ERROR {
+            let (_, code, _) = error_code(response).await;
+            assert_eq!(code, "response_too_large", "{case}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn real_ledger_maps_not_keyable_refusal() {
+    let not_keyable =
+        start_with_keyable(Handler::default(), Allow, None, Keyable::Only(&["Count"])).await;
+    let response = reqwest::Client::new()
         .post(format!(
             "http://{}/v1/inventory/rpc/Add",
-            large_response.address
+            not_keyable.address
         ))
         .header("x-test-principal", "tenant-a")
         .header("content-type", "application/json")
-        .body(r#"{"left":10,"right":2}"#)
+        .header("idempotency-key", "not-keyable")
+        .body(r#"{"left":1,"right":2}"#)
         .send()
         .await
         .expect("HTTP call completes");
     let (status, code, _) = error_code(response).await;
     assert_eq!(
         (status, code.as_str()),
-        (
-            http::StatusCode::INTERNAL_SERVER_ERROR,
-            "response_too_large"
-        )
+        (http::StatusCode::BAD_REQUEST, "idempotency_not_supported")
     );
 }
 
@@ -471,55 +730,5 @@ async fn reusing_one_key_for_a_different_method_is_never_http_success() {
     assert_eq!(
         (status, code.as_str()),
         (http::StatusCode::BAD_GATEWAY, "upstream_error")
-    );
-}
-
-#[tokio::test]
-async fn concurrent_http_calls_enter_keylink_before_either_is_released() {
-    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
-    let release = Arc::new(tokio::sync::Notify::new());
-    let handler = Handler {
-        runs: Arc::new(AtomicU64::new(0)),
-        gate: Some(Gate {
-            entered: entered_tx,
-            release: Arc::clone(&release),
-        }),
-    };
-    let running = start(handler, Allow, None).await;
-    let client = reqwest::Client::new();
-    let url = format!("http://{}/v1/inventory/rpc/Block", running.address);
-    let call = |token| {
-        client
-            .post(&url)
-            .header("x-test-principal", "tenant-a")
-            .header("content-type", "application/json")
-            .body(format!(r#"{{"token":{token}}}"#))
-            .send()
-    };
-    let first = tokio::spawn(call(1));
-    let second = tokio::spawn(call(2));
-
-    let mut entered = [
-        entered_rx.recv().await.expect("first call enters"),
-        entered_rx.recv().await.expect("second call enters"),
-    ];
-    entered.sort_unstable();
-    assert_eq!(entered, [1, 2]);
-    release.notify_waiters();
-    assert_eq!(
-        first
-            .await
-            .expect("request task")
-            .expect("HTTP call")
-            .status(),
-        http::StatusCode::OK
-    );
-    assert_eq!(
-        second
-            .await
-            .expect("request task")
-            .expect("HTTP call")
-            .status(),
-        http::StatusCode::OK
     );
 }

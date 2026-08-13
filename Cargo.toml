@@ -23,6 +23,8 @@ tokio = { version = "1", features = ["full"] }
 bytes = "1"
 axum = "0.8"
 http = "1"
+http-body-util = "0.1"
+mime = "0.3"
 serde_json = "1"
 blake3 = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }

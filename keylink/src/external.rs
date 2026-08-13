@@ -51,7 +51,44 @@ pub type ExternalFuture<C> = Pin<
 >;
 
 /// Generated conversion seam for one singleton service.
-pub trait ExternalService<C: ServiceCodec>: Send + Sync + 'static {
+///
+/// Addressed actor requests do not acquire the singleton external surface:
+///
+/// ```compile_fail
+/// use keylink::{Addressed, ExternalService, ServiceCodec};
+/// #[derive(Clone)] struct Codec;
+/// impl ServiceCodec for Codec {
+///     type Error = std::io::Error;
+///     type Output = Vec<u8>;
+///     fn decode<T: serde::de::DeserializeOwned>(&self, _: &[u8]) -> Result<T, Self::Error> { unreachable!() }
+///     fn encode<T: serde::Serialize>(&self, _: &T) -> Result<Vec<u8>, Self::Error> { unreachable!() }
+/// }
+/// keylink::service! { service Inventory; rpc Count(value: u64) -> u64; }
+/// fn require<T: ExternalService>() {}
+/// require::<Addressed<inventory::Request>>();
+/// ```
+///
+/// Implementing [`crate::Rpc`] manually does not opt a type into generated conversion:
+///
+/// ```compile_fail
+/// use keylink::{ExternalService, Rpc, ServiceCodec};
+/// #[derive(Clone)] struct Codec;
+/// impl ServiceCodec for Codec {
+///     type Error = std::io::Error;
+///     type Output = Vec<u8>;
+///     fn decode<T: serde::de::DeserializeOwned>(&self, _: &[u8]) -> Result<T, Self::Error> { unreachable!() }
+///     fn encode<T: serde::Serialize>(&self, _: &T) -> Result<Vec<u8>, Self::Error> { unreachable!() }
+/// }
+/// struct Manual;
+/// impl Rpc for Manual {
+///     const SERVICE: &'static str = "Manual";
+///     const METHODS: &'static [&'static str] = &["Run"];
+///     fn method(&self) -> &'static str { "Run" }
+/// }
+/// fn require<T: ExternalService>() {}
+/// require::<Manual>();
+/// ```
+pub trait ExternalService: Send + Sync + 'static {
     /// The service name declared in `service!`.
     const SERVICE: &'static str;
     /// Enabled plain `rpc` declarations, in declaration order.
@@ -60,7 +97,7 @@ pub trait ExternalService<C: ServiceCodec>: Send + Sync + 'static {
     type Client: Clone + Send + Sync + 'static;
 
     /// Decode arguments, invoke the exact generated client method, and encode its return value.
-    fn invoke(
+    fn invoke<C: ServiceCodec>(
         client: &Self::Client,
         method: &str,
         body: &[u8],

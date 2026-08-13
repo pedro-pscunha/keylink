@@ -91,11 +91,11 @@ Caveats:
   arguments; a successful body is only the declared return value.
 - Keep `service!` syntax and generated Rust calling methods unchanged. No HTTP
   attributes or route annotations enter service declarations.
-- Add dependency-neutral `ServiceCodec` and generated `ExternalService<C>`
+- Add dependency-neutral `ServiceCodec` and generated `ExternalService`
   traits to `keylink`. `ServiceCodec` has generic Serde decode/encode operations
-  but no HTTP or JSON type. Generated code implements `ExternalService<C>` where
-  its local service types satisfy coherence; `keylink-http` supplies the bounded
-  JSON codec. `Addressed<Request>`/registry clients and manual `Rpc` types do not
+  but no HTTP or JSON type. Generated code implements `ExternalService` on its
+  local marker. Its `invoke<C>` method accepts the bounded JSON codec from
+  `keylink-http`. `Addressed<Request>`/registry clients and manual `Rpc` types do not
   implement this generated seam.
 - The generated implementation owns four facts in one match over the declaration
   list: which methods are plain `rpc`; how codec-decoded argument fields invoke
@@ -254,18 +254,18 @@ pub trait ServiceCodec {
 }
 
 // Implemented by generated plain singleton service marker only.
-pub trait ExternalService<C: ServiceCodec>: Send + Sync + 'static {
+pub trait ExternalService: Send + Sync + 'static {
     const SERVICE: &'static str;
     const RPC_METHODS: &'static [&'static str];
     type Client: Clone + Send + Sync + 'static;
-    fn invoke(/* client, method, bounded bytes, optional key, codec */)
+    fn invoke<C: ServiceCodec>(/* client, method, bounded bytes, optional key, codec */)
         -> impl Future<Output = Result<C::Output, ExternalError<C::Error>>> + Send;
 }
 
 pub struct Gateway<S, A> { /* private generated client/access/limits */ }
 impl<S, A> Gateway<S, A>
 where
-    S: keylink::ExternalService<JsonCodec>,
+    S: keylink::ExternalService,
     A: Access,
 {
     pub fn new(client: S::Client, access: A, challenge: Challenge) -> Self;
@@ -282,7 +282,7 @@ calling surface:
 ```rust
 // Generated in `inventory`; exact reserved name may differ.
 pub struct External;
-impl<C: keylink::ServiceCodec> keylink::ExternalService<C> for External {
+impl keylink::ExternalService for External {
     /* one cfg-aware rpc match */
 }
 ```
@@ -378,7 +378,7 @@ Content-Type values on a body-bearing rpc are 415. No trailing-slash alias exist
   `Serialize`/`Deserialize`/`Schema` type; no literal ALPN pin is introduced.
 - [ ] A mixed, cfg-conditional service exposes exactly its enabled plain `rpc`
   methods through its generated `External` marker; excludes tell/send/recv/blob/feed/
-  `__Status`; and does not implement `ExternalService<JsonCodec>` for `Addressed<Request>` or a
+  `__Status`; and does not implement `ExternalService` for `Addressed<Request>` or a
   manual `Rpc` — focused runtime and compile-fail probes prove each absence.
 - [ ] Arguments-only JSON works for zero/one/multiple arguments, `{}` for zero
   arguments, unit returns as `null`, nested domain types' own Serde metadata, and

@@ -4998,14 +4998,14 @@ macro_rules! __keylink_external {
         /// Marker for this generated singleton service's external conversion seam.
         pub struct External;
 
-        impl<C: $crate::ServiceCodec> $crate::ExternalService<C> for External {
+        impl $crate::ExternalService for External {
             const SERVICE: &'static str = ::core::stringify!($svc);
             const RPC_METHODS: &'static [&'static str] = &[
                 $( $( #[$rcfg] )* ::core::stringify!($rrpc), )*
             ];
             type Client = Client;
 
-            fn invoke(
+            fn invoke<C: $crate::ServiceCodec>(
                 client: &Self::Client,
                 method: &str,
                 body: &[u8],
@@ -5018,6 +5018,7 @@ macro_rules! __keylink_external {
                         $( #[$rcfg] )*
                         ::core::stringify!($rrpc) => {
                             #[derive(::serde::Deserialize)]
+                            #[serde(deny_unknown_fields)]
                             struct __ExternalArgs { $( $rarg: $rty, )* }
                             let __ExternalArgs { $( $rarg, )* } = match codec.decode(body) {
                                 ::core::result::Result::Ok(args) => args,

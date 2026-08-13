@@ -2141,6 +2141,16 @@ ANCHORS = [
     ("HJ3", "keylink-http/src/service.rs", "keylink/src/macros.rs",
      '                                    codec.encode(&value).map_err($crate::ExternalError::Codec)'),
     ("HJ4", "keylink-http/tests/http.rs", "keylink-http/src/gateway.rs", '    hasher.update(principal);'),
+    ("HJ5", "keylink-http/src/limits.rs", "keylink-http/src/limits.rs",
+     "            bytes: Vec::new(),\n"),
+    ("HJ6", "keylink-http/tests/http.rs", "keylink/src/macros.rs",
+     "                            #[serde(deny_unknown_fields)]"),
+    ("HJ7", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
+     "    if values.next().is_some() {\n        return false;\n    }"),
+    ("HJ8", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
+     "    let Ok(media) = value.parse::<mime::Mime>() else {\n        return false;\n    };"),
+    ("HJ9", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
+     "            Err(_) => return GatewayError::InvalidRequest.response(None),\n"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -2372,6 +2382,22 @@ REDNESS = {
     "HJ4": ('    hasher.update(&[]);', "left: \"1\"",
             "external_idempotency_keys_are_namespaced_by_principal",
             ["-p", "keylink-http", "--test", "http"]),
+    "HJ5": ("            bytes: Vec::with_capacity(limit),", "capacity overflow",
+            "limits::tests::bounded_writer_does_not_reserve_the_configured_ceiling",
+            ["-p", "keylink-http", "--lib", "--", "--exact"]),
+    "HJ6": ("", "left: 200",
+            "unknown_argument_fields_fail_before_zero_one_or_many_argument_dispatch",
+            ["-p", "keylink-http", "--test", "http", "--", "--exact"]),
+    "HJ7": ("    if false {\n        return false;\n    }", "left: 200",
+            "gateway::tests::duplicate_content_types_are_rejected",
+            ["-p", "keylink-http", "--lib", "--", "--exact"]),
+    "HJ8": ("    let Ok(media) = value\n        .split(';')\n        .next()\n        .unwrap_or_default()\n        .parse::<mime::Mime>()\n    else {\n        return false;\n    };",
+            "left: 200", "gateway::tests::malformed_content_types_are_rejected",
+            ["-p", "keylink-http", "--lib", "--", "--exact"]),
+    "HJ9": ("            Err(_) => return GatewayError::RequestTooLarge.response(None),",
+            "left: 413",
+            "gateway::tests::short_body_collection_failure_is_not_reported_as_too_large",
+            ["-p", "keylink-http", "--lib", "--", "--exact"]),
 }
 
 def flat(text: str) -> str:
@@ -3806,7 +3832,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 279
+RECORD_BLOCKS = 286
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a
@@ -3880,6 +3906,7 @@ def script(path: pathlib.Path) -> bool:
 all_blocks: list[str] = []
 for path in sorted(
     list((ROOT / "keylink").rglob("*.rs"))
+    + list((ROOT / "keylink-http").rglob("*.rs"))
     + list((ROOT / "keylink-persist").rglob("*.rs"))
     + list((ROOT / "demo").rglob("*.rs"))
     + list((ROOT / "scripts").glob("*.sh"))

@@ -36,27 +36,37 @@ impl inventory::Handler for Inventory {
     async fn audit(&self, _cx: &Context, _line: String) {}
 }
 
+#[derive(Clone, Copy)]
+struct VerifiedClaims {
+    can_call_inventory: bool,
+}
+
 #[derive(Clone)]
 struct ExampleAccess;
 
 impl Access for ExampleAccess {
     async fn authorize(&self, call: Call<'_>) -> Result<(), AccessError> {
-        match call.headers.get(http::header::AUTHORIZATION) {
-            Some(value) if value == "Bearer allow" => Ok(()),
+        match call.extensions.get::<VerifiedClaims>() {
+            Some(claims) if claims.can_call_inventory => Ok(()),
             _ => Err(AccessError::Forbidden),
         }
     }
 }
 
 async fn authenticate(mut request: Request<axum::body::Body>, next: Next) -> Response {
-    let verified = request
-        .headers()
-        .get(http::header::AUTHORIZATION)
-        .filter(|value| *value == "Bearer allow" || *value == "Bearer deny")
-        .cloned();
-    if let Some(verified) = verified {
-        if let Ok(principal) = Principal::new(verified.as_bytes()) {
+    let claims = match request.headers().get(http::header::AUTHORIZATION) {
+        Some(value) if value == "Bearer allow" => Some(VerifiedClaims {
+            can_call_inventory: true,
+        }),
+        Some(value) if value == "Bearer deny" => Some(VerifiedClaims {
+            can_call_inventory: false,
+        }),
+        _ => None,
+    };
+    if let Some(claims) = claims {
+        if let Ok(principal) = Principal::new(b"tenant-a") {
             request.extensions_mut().insert(principal);
+            request.extensions_mut().insert(claims);
         }
     }
     next.run(request).await
@@ -79,75 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
-    if std::env::args().any(|arg| arg == "--self-test") {
-        self_test(address).await?;
-        server.abort();
-        return Ok(());
-    }
-
     println!("http://{address}/inventory");
     server.await??;
     Ok(())
-}
-
-async fn self_test(address: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    let base = format!("http://{address}/inventory/rpc");
-    let normal = client
-        .post(format!("{base}/Add"))
-        .header("authorization", "Bearer allow")
-        .header("content-type", "application/json")
-        .body(r#"{"left":2,"right":3}"#)
-        .send()
-        .await?;
-    require(
-        normal.status() == http::StatusCode::OK,
-        "normal call failed",
-    )?;
-
-    for expected in ["1", "1"] {
-        let retry = client
-            .post(format!("{base}/Count"))
-            .header("authorization", "Bearer allow")
-            .header("content-type", "application/json")
-            .header("idempotency-key", "example-operation")
-            .body(r#"{"value":7}"#)
-            .send()
-            .await?;
-        require(retry.text().await? == expected, "idempotent retry failed")?;
-    }
-
-    for (authorization, path, body, status) in [
-        (
-            "Bearer deny",
-            "Add",
-            r#"{"left":2,"right":3}"#,
-            http::StatusCode::FORBIDDEN,
-        ),
-        ("Bearer allow", "Add", "{", http::StatusCode::BAD_REQUEST),
-        (
-            "Bearer allow",
-            "Audit",
-            r#"{"line":"x"}"#,
-            http::StatusCode::NOT_FOUND,
-        ),
-    ] {
-        let response = client
-            .post(format!("{base}/{path}"))
-            .header("authorization", authorization)
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await?;
-        require(response.status() == status, "example failure smoke failed")?;
-    }
-    Ok(())
-}
-
-fn require(condition: bool, message: &'static str) -> Result<(), std::io::Error> {
-    if condition {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(message))
-    }
 }

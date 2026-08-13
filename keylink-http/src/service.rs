@@ -6,9 +6,8 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::limits::BoundedWriter;
 
 /// Internal bounded JSON conversion failure.
-#[doc(hidden)]
 #[derive(Debug, thiserror::Error)]
-pub enum JsonError {
+pub(crate) enum JsonError {
     /// The argument object was malformed or had the wrong shape.
     #[error("invalid JSON arguments")]
     InvalidJson,
@@ -21,9 +20,8 @@ pub enum JsonError {
 }
 
 /// Internal bounded JSON codec selected by [`crate::Gateway`].
-#[doc(hidden)]
 #[derive(Clone)]
-pub struct JsonCodec {
+pub(crate) struct JsonCodec {
     response_limit: usize,
 }
 
@@ -155,6 +153,74 @@ mod tests {
         .await
         .expect("nested serde metadata");
         assert_eq!(nested, br#"{"displayName":"crate"}"#);
+
+        for (method, body) in [
+            ("Empty", br#"{"unexpected":1}"#.as_slice()),
+            ("One", br#"{"value":4,"unexpected":1}"#.as_slice()),
+            (
+                "Many",
+                br#"{"name":"box","count":2,"unexpected":1}"#.as_slice(),
+            ),
+        ] {
+            let error =
+                conversion::External::invoke(&client, method, body, None, JsonCodec::new(1024))
+                    .await
+                    .expect_err("undeclared argument fields are rejected before dispatch");
+            assert!(matches!(
+                error,
+                keylink::ExternalError::Codec(super::JsonError::InvalidJson)
+            ));
+        }
+    }
+
+    #[test]
+    fn ordinary_generated_serde_and_schema_keep_the_wire_shape() {
+        use postcard_schema::schema::{DataModelType, DataModelVariant};
+
+        let request = conversion::Request::Nested {
+            item: Item {
+                display_name: "crate".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&request).expect("request JSON"),
+            r#"{"wire-name":{"item":{"displayName":"crate"}}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&conversion::Response::Nested(Item {
+                display_name: "crate".into(),
+            }))
+            .expect("response JSON"),
+            r#"{"Nested":{"displayName":"crate"}}"#
+        );
+
+        let DataModelType::Enum(variants) = conversion::Request::SCHEMA.ty else {
+            panic!("generated request remains an enum");
+        };
+        let names: Vec<_> = variants.iter().map(|variant| variant.name).collect();
+        assert_eq!(
+            names,
+            ["Empty", "One", "Many", "wire-name", "Ignored", "__Status"]
+        );
+        let nested = variants
+            .iter()
+            .find(|variant| variant.name == "wire-name")
+            .expect("renamed wire variant");
+        let DataModelVariant::StructVariant(fields) = nested.ty else {
+            panic!("Nested remains a struct variant");
+        };
+        assert_eq!(
+            fields.iter().map(|field| field.name).collect::<Vec<_>>(),
+            ["item"]
+        );
+    }
+
+    #[test]
+    fn success_encoding_uses_the_capacity_enforcing_writer_in_production() {
+        let source = include_str!("service.rs");
+        assert!(source.contains("let mut writer = BoundedWriter::new(self.response_limit);"));
+        assert!(source.contains("serde_json::to_writer(&mut writer, value)"));
+        assert!(!source.contains(&["serde_json::", "to_vec(value)"].concat()));
     }
 
     #[tokio::test]
