@@ -86,22 +86,29 @@ where
                 async move { gateway.handle_rpc(request, rpc, &path).await }
             }),
         );
-        if let (Some(limits), Some(send)) = (
-            surface.streaming(),
-            surface
-                .routes()
-                .find(|route| route.kind() == RouteKind::Send),
-        ) {
-            let path = format!("{}{}", surface.prefix(), send.template());
-            let handler_path = path.clone();
-            router = router.route(
-                &path,
-                any(move |request: Request<Body>| {
-                    let gateway = Arc::clone(&gateway);
-                    let path = handler_path.clone();
-                    async move { gateway.handle_send(request, send, &path, limits).await }
-                }),
-            );
+        if let Some(limits) = surface.streaming() {
+            for route in surface.routes() {
+                let path = format!("{}{}", surface.prefix(), route.template());
+                let handler_path = path.clone();
+                let gateway = Arc::clone(&gateway);
+                let handler = match route.kind() {
+                    RouteKind::Send => any(move |request: Request<Body>| {
+                        let gateway = Arc::clone(&gateway);
+                        let path = handler_path.clone();
+                        async move { gateway.handle_send(request, route, &path, limits).await }
+                    }),
+                    RouteKind::Recv => any(move |request: Request<Body>| {
+                        let gateway = Arc::clone(&gateway);
+                        let path = handler_path.clone();
+                        async move { gateway.handle_recv(request, route, &path, limits).await }
+                    }),
+                    // Installed above, or not implemented at this phase. The
+                    // inventory lists only what a phase actually serves, so a
+                    // kind arriving here is a route added without a handler.
+                    _ => continue,
+                };
+                router = router.route(&path, handler);
+            }
         }
         Ok(router.fallback(|| async { GatewayError::MethodNotFound.response(None) }))
     }
@@ -161,14 +168,9 @@ where
             Err(error) => return error.response(None),
         };
         let (_, body) = request.into_parts();
-        let request_limit = self.limits.request.get();
-        let body = match axum::body::to_bytes(body, request_limit.saturating_add(1)).await {
-            Ok(body) if body.len() <= request_limit => body,
-            Ok(_) => return GatewayError::RequestTooLarge.response(None),
-            Err(error) if is_length_limit(&error) => {
-                return GatewayError::RequestTooLarge.response(None);
-            }
-            Err(_) => return GatewayError::InvalidRequest.response(None),
+        let body = match bounded_json(body, self.limits.request.get()).await {
+            Ok(body) => body,
+            Err(error) => return error.response(None),
         };
         let invocation = S::invoke(
             &self.client,
@@ -272,6 +274,129 @@ where
             Err(error) => GatewayError::from_external(error).response(None),
         }
     }
+
+    async fn handle_recv(
+        &self,
+        request: Request<Body>,
+        route: &'static Route,
+        route_path: &str,
+        limits: crate::StreamingLimits,
+    ) -> Response<Body> {
+        let decoded = match decode_method::<S>(
+            request.uri().path(),
+            route_path,
+            keylink::ExternalKind::Recv,
+        ) {
+            Ok(method) => method,
+            Err(error) => return error.response(None),
+        };
+        let Some(method) = S::METHODS
+            .iter()
+            .copied()
+            .find(|candidate| {
+                candidate.name() == decoded && candidate.kind() == keylink::ExternalKind::Recv
+            })
+            .map(keylink::ExternalMethod::name)
+        else {
+            return GatewayError::MethodNotFound.response(None);
+        };
+        if request.method() != route.method() {
+            return GatewayError::MethodNotAllowed.response(None);
+        }
+        let Some(principal) = request.extensions().get::<Principal>().cloned() else {
+            return GatewayError::Unauthenticated.response(Some(self.challenge.header()));
+        };
+        match self
+            .access
+            .authorize(Call {
+                extensions: request.extensions(),
+                headers: request.headers(),
+                principal: &principal,
+                service: S::SERVICE,
+                method,
+            })
+            .await
+        {
+            Ok(()) => {}
+            Err(AccessError::Unauthenticated) => {
+                return GatewayError::Unauthenticated.response(Some(self.challenge.header()));
+            }
+            Err(AccessError::Forbidden) => return GatewayError::Forbidden.response(None),
+        }
+        // A one-shot download has no reply to replay and no range to serve. Both
+        // are refused rather than ignored, and refused before the arguments are
+        // read, so a caller that asked for either is never charged for a body.
+        if request.headers().get(IDEMPOTENCY_HEADER).is_some() {
+            return GatewayError::IdempotencyNotSupported.response(None);
+        }
+        if request.headers().get(header::RANGE).is_some()
+            || request.headers().get(header::IF_RANGE).is_some()
+        {
+            return GatewayError::RangeNotSupported.response(None);
+        }
+        if !is_media(request.headers(), route.request_media()) {
+            return GatewayError::UnsupportedMediaType.response(None);
+        }
+        let (_, body) = request.into_parts();
+        let arguments = match bounded_json(body, self.limits.request.get()).await {
+            Ok(arguments) => arguments,
+            Err(error) => return error.response(None),
+        };
+        let invocation = S::invoke(
+            &self.client,
+            method,
+            &arguments,
+            keylink::ExternalCall::Recv,
+            JsonCodec::new(limits.metadata_json_bytes()),
+        );
+        let (value, reader) = match invocation.await {
+            Ok(keylink::ExternalOutput::Recv { value, body }) => (value, body),
+            Ok(_) => return GatewayError::UpstreamError.response(None),
+            Err(error) => return GatewayError::from_external(error).response(None),
+        };
+        // Everything refusable is refused here, while a status line can still
+        // say why. Past this point the only way to report a fault is to break
+        // the body, so a length the sender already declared is checked now.
+        if reader
+            .declared_len()
+            .is_some_and(|len| len > limits.max_download_bytes())
+        {
+            return GatewayError::ResponseStreamTooLarge.response(None);
+        }
+        let result = match crate::stream::result_header(&value, limits.metadata_json_bytes()) {
+            Ok(result) => result,
+            Err(_) => return GatewayError::ResponseTooLarge.response(None),
+        };
+        stream_response(reader, result, route, limits)
+    }
+}
+
+/// A `recv` reply: the declared value in one header, the payload as the body.
+fn stream_response(
+    reader: keylink::BodyReader,
+    result: (http::HeaderName, http::HeaderValue),
+    route: &Route,
+    limits: crate::StreamingLimits,
+) -> Response<Body> {
+    let declared = reader.declared_len();
+    let mut response = Response::new(crate::stream::download_body(
+        reader,
+        limits.max_download_bytes(),
+    ));
+    *response.status_mut() = route.success_status();
+    let headers = response.headers_mut();
+    if let Some(media) = route.response_media() {
+        headers.insert(header::CONTENT_TYPE, http::HeaderValue::from_static(media));
+    }
+    headers.insert(result.0, result.1);
+    // Only when the sender knew. Announcing a length for an open-ended stream
+    // would be a promise the adapter cannot keep.
+    if let Some(len) = declared {
+        if let Ok(value) = http::HeaderValue::from_str(&len.to_string()) {
+            headers.insert(header::CONTENT_LENGTH, value);
+        }
+    }
+    response
 }
 
 #[cfg(test)]
@@ -280,6 +405,23 @@ const SINGLETON_RPC_PATH: &str = "/rpc/{method}";
 #[cfg(test)]
 fn singleton_rpc_route() -> &'static Route {
     crate::__contract::singleton_rpc_route()
+}
+
+/// Collect a bounded JSON request body, or the refusal that replaces it.
+///
+/// Shared by every route that takes JSON in. It was duplicated per handler
+/// once, which is how `HJ9`'s registered anchor stopped being unique the moment
+/// a second route was added — a copy is not only harder to change, it can also
+/// make the thing that watches it ambiguous.
+async fn bounded_json(body: Body, limit: usize) -> Result<axum::body::Bytes, GatewayError> {
+    match axum::body::to_bytes(body, limit.saturating_add(1)).await {
+        Ok(body) if body.len() <= limit => Ok(body),
+        Ok(_) => Err(GatewayError::RequestTooLarge),
+        // A collection failure that is not the cap is a broken request, and
+        // saying "too large" about a short one would be a lie with a status.
+        Err(error) if is_length_limit(&error) => Err(GatewayError::RequestTooLarge),
+        Err(_) => Err(GatewayError::InvalidRequest),
+    }
 }
 
 fn json_response(json: Vec<u8>, route: &Route) -> Response<Body> {
@@ -634,6 +776,7 @@ mod tests {
         const METHODS: &'static [keylink::ExternalMethod] = &[
             keylink::ExternalMethod::new("Run", keylink::ExternalKind::Rpc),
             keylink::ExternalMethod::new("Upload", keylink::ExternalKind::Send),
+            keylink::ExternalMethod::new("Download", keylink::ExternalKind::Recv),
         ];
         type Client = SendClient;
 
@@ -1052,8 +1195,9 @@ mod tests {
     }
 
     /// Watched red with `scripts/break-once.sh` by replacing
-    /// `            Err(_) => return GatewayError::InvalidRequest.response(None),`
-    /// with `RequestTooLarge`. The exact test terminated with HTTP 413 instead of 400.
+    /// `Err(_) => Err(GatewayError::InvalidRequest),`
+    /// with `RequestTooLarge`. The exact test terminated with HTTP 413 instead
+    /// of 400.
     #[tokio::test]
     async fn short_body_collection_failure_is_not_reported_as_too_large() {
         let client = client();
@@ -1175,6 +1319,61 @@ mod tests {
         service Cancellation;
         rpc Wait(token: u64) -> u64;
         send Upload(prefix: u64) -> u64;
+        recv Stream(polls: u64) -> u64;
+    }
+
+    /// What a `recv` source tells a test: how much it has handed over, and
+    /// when it was dropped.
+    ///
+    /// Both live on the *serving* side on purpose. A gateway's `BodyReader` has
+    /// no public constructor and cannot be wrapped, so the honest place to watch
+    /// the chain is the far end of it — which is also where a regression would
+    /// keep producing bytes nobody asked for.
+    #[derive(Clone)]
+    struct DownloadProbe {
+        produced: Arc<AtomicU64>,
+        dropped: tokio::sync::watch::Sender<bool>,
+        /// When present, the source fails instead of ending — but only once the
+        /// test releases it. The wait is what keeps the failure from racing the
+        /// response header a stream reset would otherwise discard.
+        fail: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    }
+
+    /// A source that counts what it hands over and reports its own drop.
+    struct CountingSource {
+        polls: u64,
+        chunk_len: usize,
+        probe: DownloadProbe,
+        fail: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    impl tokio::io::AsyncRead for CountingSource {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.polls == 0 {
+                let Some(fail) = self.fail.as_mut() else {
+                    return Poll::Ready(Ok(()));
+                };
+                return match Pin::new(fail).poll(_cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(_) => Poll::Ready(Err(std::io::Error::other("source failed"))),
+                };
+            }
+            let len = self.chunk_len.min(buf.remaining());
+            buf.put_slice(&vec![b'd'; len]);
+            self.polls -= 1;
+            self.probe.produced.fetch_add(len as u64, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Drop for CountingSource {
+        fn drop(&mut self) {
+            let _ = self.probe.dropped.send(true);
+        }
     }
 
     /// The serving endpoint's per-stream receive window for the backpressure
@@ -1275,6 +1474,7 @@ mod tests {
             CancellationHandler {
                 entered: entered_tx,
                 release: Arc::clone(&release),
+                download: None,
             },
             Allowlist::anyone(),
         )
@@ -1336,9 +1536,244 @@ mod tests {
         );
     }
 
+    /// A download the test drives itself, so a `recv` gateway can be built
+    /// without a listener between it and the assertions.
+    async fn recv_gateway(
+        probe: DownloadProbe,
+    ) -> (
+        Gateway<cancellation::External, Denyless>,
+        keylink::Server,
+        Vec<Node>,
+        // Held by the caller only so the handler's reporting channel outlives
+        // the gateway. Dropping it here would turn an unrelated handler call
+        // into a panic on a closed receiver.
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        let server_node = local_node().await;
+        // The gateway RECEIVES here, so the window that throttles the sender is
+        // the one this side advertises.
+        let client_node = Node::from_endpoint(
+            Endpoint::builder(presets::Minimal)
+                .transport_config(
+                    iroh::endpoint::QuicTransportConfig::builder()
+                        .stream_receive_window(RECEIVE_WINDOW.into())
+                        .build(),
+                )
+                .bind()
+                .await
+                .expect("a local endpoint binds"),
+        );
+        let (entered_tx, entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = cancellation::serve(
+            &server_node,
+            CancellationHandler {
+                entered: entered_tx,
+                release: Arc::new(tokio::sync::Notify::new()),
+                download: Some(probe),
+            },
+            Allowlist::anyone(),
+        )
+        .expect("service starts");
+        let client = cancellation::Client::connect(&client_node, server_node.endpoint().addr())
+            .await
+            .expect("client connects");
+        let gateway = Gateway::<cancellation::External, _>::new(
+            client,
+            Denyless,
+            Challenge::new(HeaderValue::from_static("Bearer realm=keylink"))
+                .expect("valid challenge"),
+        )
+        .limits(crate::JsonLimits::new(64, 64).expect("positive JSON limits"));
+        (gateway, server, vec![server_node, client_node], entered_rx)
+    }
+
+    fn stream_request(polls: u64) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/recv/Stream")
+            .header("content-type", "application/json")
+            .extension(Principal::new(b"tenant-a").expect("valid principal"))
+            .body(Body::from(format!(r#"{{"polls":{polls}}}"#)))
+            .expect("request")
+    }
+
+    fn recv_route(limits: crate::StreamingLimits) -> &'static crate::__contract::Route {
+        crate::HttpSurface::new("", crate::Addressing::Singleton)
+            .expect("valid surface")
+            .with_streaming(limits)
+            .routes()
+            .find(|route| route.kind() == crate::__contract::RouteKind::Recv)
+            .expect("recv route")
+    }
+
+    /// The response body pulls the Keylink reader, and nothing pulls it while
+    /// the HTTP side is not reading. A client that stops consuming closes the
+    /// flow-control window and the far end stops producing.
+    ///
+    /// Measured as bytes rather than polls, and against a body this test polls
+    /// itself rather than one behind a socket, for the reasons written up on
+    /// `send_backpressure_stops_http_body_polling`. Both traps apply here in
+    /// mirror image.
+    #[tokio::test]
+    async fn recv_backpressure_stops_keylink_reader_polling() {
+        let polls = 64_u64;
+        let offered = u64::from(RECEIVE_WINDOW) * polls;
+        let limits = crate::StreamingLimits::new(64, 64, offered, 1).expect("positive limits");
+        let produced = Arc::new(AtomicU64::new(0));
+        let (dropped, _dropped_rx) = tokio::sync::watch::channel(false);
+        let probe = DownloadProbe {
+            produced: Arc::clone(&produced),
+            dropped,
+            fail: Arc::new(Mutex::new(None)),
+        };
+        let (gateway, _server, _nodes, _entered) = recv_gateway(probe).await;
+
+        let response = gateway
+            .handle_recv(
+                stream_request(polls),
+                recv_route(limits),
+                "/recv/{method}",
+                limits,
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+
+        let mut body = response.into_body();
+        let first = http_body_util::BodyExt::frame(&mut body)
+            .await
+            .expect("a first frame")
+            .expect("a readable frame");
+        assert!(first.into_data().is_ok(), "the first frame carries bytes");
+        tokio::task::yield_now().await;
+        let stalled = produced.load(Ordering::SeqCst);
+        assert!(
+            stalled <= offered / 2,
+            "an unread response pulled {stalled} of {offered} offered bytes"
+        );
+
+        let rest = http_body_util::BodyExt::collect(body)
+            .await
+            .expect("the rest of the body")
+            .to_bytes();
+        assert_eq!(
+            produced.load(Ordering::SeqCst),
+            offered,
+            "and once the client reads, the whole download still arrives"
+        );
+        assert!(!rest.is_empty());
+    }
+
+    /// A reply that fails mid-stream with no declared length must break the
+    /// HTTP body. Nothing else can catch this one.
+    ///
+    /// This is the guard `recv_propagates_truncation_as_body_error` cannot be.
+    /// That case declares a length, so hyper's own `Content-Length` check
+    /// rejects the short body whether or not the adapter noticed — measured:
+    /// swallowing the reader error there still leaves that test green. Without
+    /// a declared length there is no second check, and a swallowed error
+    /// becomes a clean, short download that every layer calls a success.
+    ///
+    /// The failure is released only after the first frame, because a stream
+    /// reset discards what the peer has not read and would otherwise destroy
+    /// the response header instead of the body.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HJ12`) by replacing
+    /// `Err(_) => Some((
+    /// Err(std::io::Error::other("the response stream failed")),
+    /// Download::Ended,
+    /// )),`
+    /// in `keylink-http/src/stream.rs` with `Err(_) => None`, which ends the
+    /// body cleanly instead of breaking it. The same break leaves
+    /// `recv_propagates_truncation_as_body_error` GREEN, which is why this row
+    /// exists.
+    #[tokio::test]
+    async fn recv_late_source_error_breaks_the_undeclared_body() {
+        let polls = 1_u64;
+        let limits = crate::StreamingLimits::new(64, 64, u64::from(RECEIVE_WINDOW) * 8, 1)
+            .expect("positive limits");
+        let (dropped, _dropped_rx) = tokio::sync::watch::channel(false);
+        let (release, released) = tokio::sync::oneshot::channel();
+        let probe = DownloadProbe {
+            produced: Arc::new(AtomicU64::new(0)),
+            dropped,
+            fail: Arc::new(Mutex::new(Some(released))),
+        };
+        let (gateway, _server, _nodes, _entered) = recv_gateway(probe).await;
+
+        let response = gateway
+            .handle_recv(
+                stream_request(polls),
+                recv_route(limits),
+                "/recv/{method}",
+                limits,
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .is_none(),
+            "nothing declared a length, so nothing else can check one"
+        );
+
+        let mut body = response.into_body();
+        http_body_util::BodyExt::frame(&mut body)
+            .await
+            .expect("a first frame")
+            .expect("a readable frame");
+        release.send(()).expect("the source is still waiting");
+
+        assert!(
+            http_body_util::BodyExt::collect(body).await.is_err(),
+            "a reply whose source failed must break, not end early and cleanly"
+        );
+    }
+
+    /// Dropping the response drops the Keylink reader it owns, and that reaches
+    /// the far end: the serving source is dropped rather than left producing
+    /// bytes for a client that has gone.
+    #[tokio::test]
+    async fn recv_disconnect_drops_body_reader() {
+        let polls = 64_u64;
+        let limits = crate::StreamingLimits::new(64, 64, u64::from(RECEIVE_WINDOW) * polls, 1)
+            .expect("positive limits");
+        let (dropped, mut dropped_rx) = tokio::sync::watch::channel(false);
+        let probe = DownloadProbe {
+            produced: Arc::new(AtomicU64::new(0)),
+            dropped,
+            fail: Arc::new(Mutex::new(None)),
+        };
+        let (gateway, _server, _nodes, _entered) = recv_gateway(probe).await;
+
+        let response = gateway
+            .handle_recv(
+                stream_request(polls),
+                recv_route(limits),
+                "/recv/{method}",
+                limits,
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+
+        let mut body = response.into_body();
+        http_body_util::BodyExt::frame(&mut body)
+            .await
+            .expect("a first frame")
+            .expect("a readable frame");
+        drop(body);
+
+        dropped_rx
+            .changed()
+            .await
+            .expect("the serving source reports its drop");
+        assert!(*dropped_rx.borrow());
+    }
+
     struct CancellationHandler {
         entered: tokio::sync::mpsc::UnboundedSender<()>,
         release: Arc<tokio::sync::Notify>,
+        download: Option<DownloadProbe>,
     }
 
     impl cancellation::Handler for CancellationHandler {
@@ -1359,6 +1794,23 @@ mod tests {
             self.entered.send(()).expect("test receiver stays open");
             self.release.notified().await;
             prefix + body.drain().await.expect("the upload arrives whole")
+        }
+
+        async fn stream(&self, _cx: &KeylinkContext, polls: u64) -> (u64, keylink::Body) {
+            let probe = self.download.clone().expect("this test set a probe");
+            let fail = probe.fail.lock().expect("test mutex").take();
+            (
+                polls,
+                keylink::Body::from_reader(
+                    CountingSource {
+                        polls,
+                        chunk_len: RECEIVE_WINDOW as usize,
+                        probe,
+                        fail,
+                    },
+                    None,
+                ),
+            )
         }
     }
 
@@ -1428,6 +1880,7 @@ mod tests {
             CancellationHandler {
                 entered: entered_tx,
                 release: Arc::clone(&release),
+                download: None,
             },
             Allowlist::anyone(),
         )

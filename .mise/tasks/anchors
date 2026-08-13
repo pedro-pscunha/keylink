@@ -2148,9 +2148,18 @@ ANCHORS = [
     ("HJ8", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
      "    let Ok(media) = value.parse::<mime::Mime>() else {\n        return false;\n    };"),
     ("HJ9", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
-     "            Err(_) => return GatewayError::InvalidRequest.response(None),\n"),
+     "        Err(_) => Err(GatewayError::InvalidRequest),"),
     ("HJ10", "keylink/tests/protocol.rs", "keylink/src/body.rs",
      "        if drained.is_err() && declared_len.is_none() {"),
+    ("HJ12", "keylink-http/src/gateway.rs", "keylink-http/src/stream.rs",
+     "                Err(_) => Some((\n"
+     "                    Err(std::io::Error::other(\"the response stream failed\")),\n"
+     "                    Download::Ended,\n"
+     "                )),"),
+    ("HJ13", "keylink-http/tests/streaming.rs", "keylink-http/src/stream.rs",
+     "                    if observed > limit {"),
+    ("HJ14", "keylink-http/tests/streaming.rs", "keylink-http/src/gateway.rs",
+     "            .is_some_and(|len| len > limits.max_download_bytes())"),
     ("HJ11", "keylink-http/src/gateway.rs", "keylink/src/body.rs",
      "                tokio::io::copy_buf(&mut reader, stream)\n"
      "                    .await\n"
@@ -3842,7 +3851,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 289
+RECORD_BLOCKS = 292
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

@@ -65,6 +65,77 @@ pub(crate) fn arguments(
     Ok(decoded)
 }
 
+/// The header name carrying a `recv` method's declared return value.
+const RESULT_HEADER: &str = "keylink-result";
+
+/// Encode one declared return value into the bounded `Keylink-Result` header.
+///
+/// The ceiling is checked against the *decoded* JSON, not the base64url. That
+/// is the same limit [`arguments`] enforces on the way in, so one configured
+/// number governs both directions and neither can be tightened by accident.
+/// Encoding only ever grows the value by a fixed ratio, so bounding the decoded
+/// form bounds what reaches the wire.
+pub(crate) fn result_header(
+    value: &[u8],
+    decoded_limit: usize,
+) -> Result<(http::HeaderName, http::HeaderValue), MetadataError> {
+    if value.len() > decoded_limit {
+        return Err(MetadataError::DecodedTooLong);
+    }
+    let name = http::HeaderName::from_static(RESULT_HEADER);
+    // Unreachable in practice — every base64url byte is a valid header byte —
+    // but an adapter that cannot say "no" here would have to `expect`, and an
+    // impossible branch costs one line while a panic costs the process.
+    let encoded = http::HeaderValue::from_str(&URL_SAFE_NO_PAD.encode(value))
+        .map_err(|_| MetadataError::Invalid)?;
+    Ok((name, encoded))
+}
+
+/// Stream a Keylink response body as HTTP bytes, stopping at `limit`.
+///
+/// The limit is inclusive and counted as bytes arrive, because an undeclared
+/// length is exactly the case where nothing can be refused up front. Crossing
+/// it ends the HTTP body in an error, which is all a response can still say
+/// once its headers have gone.
+pub(crate) fn download_body(reader: keylink::BodyReader, limit: u64) -> axum::body::Body {
+    /// Reading, or finished for good. Without the second state an error would
+    /// be yielded forever, because `unfold` ends only on `None`.
+    enum Download {
+        Reading(keylink::BodyReader, u64),
+        Ended,
+    }
+
+    axum::body::Body::from_stream(n0_future::stream::unfold(
+        Download::Reading(reader, 0),
+        move |state| async move {
+            let Download::Reading(mut reader, observed) = state else {
+                return None;
+            };
+            match reader.next_chunk().await {
+                Ok(None) => None,
+                // Deliberately not the upstream text: past the headers there is
+                // no envelope left to redact it in.
+                Err(_) => Some((
+                    Err(std::io::Error::other("the response stream failed")),
+                    Download::Ended,
+                )),
+                Ok(Some(chunk)) => {
+                    let observed = observed.saturating_add(chunk.len() as u64);
+                    if observed > limit {
+                        return Some((
+                            Err(std::io::Error::other(
+                                "the response stream exceeds its limit",
+                            )),
+                            Download::Ended,
+                        ));
+                    }
+                    Some((Ok(chunk), Download::Reading(reader, observed)))
+                }
+            }
+        },
+    ))
+}
+
 pub(crate) fn upload_body(
     body: axum::body::Body,
     declared_len: Option<u64>,

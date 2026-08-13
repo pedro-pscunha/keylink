@@ -162,6 +162,18 @@ const ROUTES: &[Route] = &[
         response_media: Some("application/json"),
         streaming: true,
     },
+    Route {
+        kind: RouteKind::Recv,
+        addressing: Addressing::Singleton,
+        template: "/recv/{method}",
+        method: http::Method::POST,
+        success: http::StatusCode::OK,
+        request_media: Some("application/json"),
+        // The declared return value travels in `Keylink-Result`, because the
+        // body is the payload and a response has only one of those.
+        response_media: Some("application/octet-stream"),
+        streaming: true,
+    },
 ];
 
 #[cfg(test)]
@@ -194,6 +206,8 @@ pub enum ErrorKind {
     RangeNotSupported,
     /// A declared or observed upload exceeds its configured limit.
     RequestStreamTooLarge,
+    /// A declared download exceeds its configured limit.
+    ResponseStreamTooLarge,
     /// A verified principal is absent or no longer accepted.
     Unauthenticated,
     /// The verified principal may not invoke the operation.
@@ -231,6 +245,7 @@ impl ErrorKind {
         Self::InvalidStreamMetadata,
         Self::RangeNotSupported,
         Self::RequestStreamTooLarge,
+        Self::ResponseStreamTooLarge,
         Self::Unauthenticated,
         Self::Forbidden,
         Self::MethodNotFound,
@@ -256,6 +271,7 @@ impl ErrorKind {
             Self::InvalidStreamMetadata => &INVALID_STREAM_METADATA,
             Self::RangeNotSupported => &RANGE_NOT_SUPPORTED,
             Self::RequestStreamTooLarge => &REQUEST_STREAM_TOO_LARGE,
+            Self::ResponseStreamTooLarge => &RESPONSE_STREAM_TOO_LARGE,
             Self::Unauthenticated => &UNAUTHENTICATED,
             Self::Forbidden => &FORBIDDEN,
             Self::MethodNotFound => &METHOD_NOT_FOUND,
@@ -370,6 +386,13 @@ error_spec!(
     PAYLOAD_TOO_LARGE,
     "request_stream_too_large",
     "the request stream exceeds its limit"
+);
+error_spec!(
+    RESPONSE_STREAM_TOO_LARGE,
+    ResponseStreamTooLarge,
+    BAD_GATEWAY,
+    "response_stream_too_large",
+    "the response stream exceeds its limit"
 );
 const UNAUTHENTICATED: ErrorSpec = ErrorSpec {
     kind: ErrorKind::Unauthenticated,
@@ -494,7 +517,7 @@ mod tests {
                 .routes()
                 .map(Route::kind)
                 .collect::<Vec<_>>(),
-            [RouteKind::Rpc, RouteKind::Send]
+            [RouteKind::Rpc, RouteKind::Send, RouteKind::Recv]
         );
         let streaming_actors = HttpSurface::new("/v1", Addressing::Actors)
             .expect("valid actor surface")
