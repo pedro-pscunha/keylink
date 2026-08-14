@@ -164,7 +164,7 @@ pub enum ExternalOutput<O> {
 /// itself does not, which is what stops an adapter reaching past the generated
 /// method it is supposed to call:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use keylink::ExternalActorService;
 /// keylink::service! { service Ledger; rpc Count(value: u64) -> u64; }
 /// fn require<T: ExternalActorService>() {}
@@ -189,6 +189,12 @@ pub trait ExternalActorService: Send + Sync + 'static {
     const METHODS: &'static [ExternalMethod];
     /// The generated connected registry client.
     type Client: Clone + Send + Sync + 'static;
+
+    // A service declaring only `send` and `tell` still implements this trait,
+    // with an empty `METHODS` and an `invoke_at` that answers `UnknownMethod`
+    // to everything. So the bound alone does not say a service can serve
+    // anything keyed — a surface that routes to it must refuse an empty
+    // inventory at configuration time rather than answering `404` per request.
 
     /// Decode arguments, invoke the exact generated `at(actor)` method, and
     /// encode its return value.

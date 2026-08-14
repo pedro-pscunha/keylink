@@ -5164,8 +5164,12 @@ macro_rules! __keylink_address {
     (@to $client:expr, $seed:expr, ()) => {
         &$client
     };
+    // Moved, not cloned. The `rpc` arm expands this twice, in the two arms of
+    // one `match`, and Rust permits moving the same local in exclusive arms —
+    // so the clone that looks required is one `String` allocation per keyed
+    // call that nothing needs.
     (@to $client:expr, $seed:expr, ($actor:expr)) => {
-        $client.at($seed.clone())
+        $client.at($seed)
     };
 }
 

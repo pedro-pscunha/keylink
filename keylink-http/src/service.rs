@@ -295,9 +295,24 @@ mod tests {
     /// `?` is the tell: nothing ran. A `send` cannot reach the actor inventory
     /// because there is no generated `ActorRef` method for it to call, so the
     /// exclusion is a property of the generated code rather than of this
-    /// assertion. What this row adds is the CONTROL — that the singleton list
-    /// really does carry a `send`, so the comparison is not satisfied by two
-    /// empty lists — and the exact contents of both.
+    /// assertion.
+    ///
+    /// **And the guard is ONE-WAY.** `E0599` fires when the inventory names a
+    /// kind whose `ActorRef` method is absent. The other direction is silent:
+    /// adding a `send` arm to `__keylink_actor_client_method!` would leave the
+    /// inventory without it and nothing would fail, and the symptom is a
+    /// missing route, which reads as an unimplemented feature rather than a
+    /// defect. The two macros are 4000 lines apart in the same file.
+    ///
+    /// The row's other two assertions ARE runtime-checkable, and one of them
+    /// is watched. Row `HK28`: dropping `recv` from the actor accumulator by
+    /// replacing
+    /// `@actor [ $( $actor )* { [ $( #[$cfg] )* ] recv $method ( $( $arg : $ty ),* ) -> $ret } ]`
+    /// in `keylink/src/macros.rs` with `@actor [ $( $actor )* ]` compiles and
+    /// reports `left: [("Sum", Rpc), ("Asset", Blob)]`.
+    ///
+    /// The CONTROL is the third: the singleton list must really carry a
+    /// `send`, or the comparison is satisfied by two empty lists.
     #[test]
     fn the_actor_inventory_is_the_singleton_one_without_send() {
         use keylink::{ExternalActorService, ExternalKind, ExternalService};
@@ -334,6 +349,175 @@ mod tests {
             <transport::External as ExternalActorService>::SERVICE,
             <transport::External as ExternalService>::SERVICE,
             "one service, two address spaces"
+        );
+    }
+
+    // Its own declaration, because `Transport` carries a `send` and keylink
+    // refuses to serve such a service as an actor AT ALL — `ServableAsActor`
+    // is a const assertion whose message is four lines long. That is the real
+    // guard behind "no keyed `send`", and it fires long before any inventory.
+    keylink::service! {
+        service Keyed;
+
+        rpc Sum(value: u64) -> u64;
+        recv Download(value: u64) -> u64;
+        blob Asset() -> u64;
+    }
+
+    #[derive(Clone)]
+    struct KeyedHandler {
+        id: keylink::BlobId,
+    }
+
+    impl keyed::Actor for KeyedHandler {
+        async fn sum(&mut self, _cx: keylink::Caller<'_>, value: u64) -> u64 {
+            value + 1
+        }
+
+        async fn download(&mut self, _cx: keylink::Caller<'_>, value: u64) -> (u64, keylink::Body) {
+            (value + 1, keylink::Body::from_bytes(b"download".as_slice()))
+        }
+
+        async fn asset(&mut self, _cx: keylink::Caller<'_>) -> (u64, keylink::BlobId) {
+            (7, self.id)
+        }
+    }
+
+    /// The keyed seam runs, against a real registry, once per kind it serves.
+    ///
+    /// The twin below proves the singleton path. Without this one the whole
+    /// `invoke_at` body — the `@seed`/`@to` split, the `WithIdempotency`
+    /// rebinding, both arms of `match key`, and the error mapping — shipped on
+    /// compilation alone, and a macro is exactly where "it compiles" sits
+    /// furthest from "it works".
+    ///
+    /// It also pins the refusal that has no `ActorRef` method behind it: a
+    /// `send` reaches `invoke_at` as an unknown method rather than as a
+    /// mis-typed call, because the actor inventory never named it.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK29`) by replacing
+    /// `$actor.clone()`
+    /// in `keylink/src/macros.rs` with a constant id, which reports
+    /// `keyed rpc: Client(Remote(NoSuchActor { id: "elsewhere" }))`. Dropping
+    /// the addressing entirely is NOT a red — `&RegistryClient` has no
+    /// per-method surface, so it is `error[E0599] no method named 'sum'` with
+    /// `selected=?`, and the `?` is the tell that nothing ran. The seam cannot
+    /// silently degrade to a singleton call; it can only address the wrong
+    /// actor, which is what this row watches.
+    #[tokio::test]
+    async fn generated_actor_invocation_addresses_one_actor_per_kind() {
+        use keylink::prelude::*;
+        use keylink::ExternalActorService;
+
+        let server_node = local_node().await;
+        let client_node = local_node().await;
+        let blobs = keylink::Blobs::memory();
+        let id = blobs
+            .add_bytes(b"asset".as_slice())
+            .await
+            .expect("asset stores");
+
+        let system: keyed::Registry = keyed::Registry::builder(keylink::Eviction::Never).build();
+        system
+            .mount(
+                keylink::ActorId::new("one").expect("a valid id"),
+                keyed::spawn(KeyedHandler { id }),
+            )
+            .expect("mounts");
+        let _running = keylink::Server::builder(&server_node)
+            .service(
+                system
+                    .service(Allowlist::anyone())
+                    .with_blobs(&blobs)
+                    .build(),
+            )
+            .spawn()
+            .expect("a keyed system that serves content");
+        let client = keyed::RegistryClient::connect(&client_node, server_node.endpoint().addr())
+            .await
+            .expect("dials the keyed system");
+        let actor = keylink::ActorId::new("one").expect("a valid id");
+        let codec = JsonCodec::new(1024);
+
+        let rpc = keyed::External::invoke_at(
+            &client,
+            &actor,
+            "Sum",
+            br#"{"value":4}"#,
+            ExternalCall::Rpc { key: None },
+            codec.clone(),
+        )
+        .await
+        .expect("keyed rpc");
+        assert_eq!(json(rpc), b"5");
+
+        // The idempotency branch of `match key`, which the singleton twin also
+        // does not reach. Both arms of that match are now executed.
+        let keyed = keyed::External::invoke_at(
+            &client,
+            &actor,
+            "Sum",
+            br#"{"value":9}"#,
+            ExternalCall::Rpc {
+                key: Some(keylink::IdempotencyKey::new("k1").expect("a valid key")),
+            },
+            codec.clone(),
+        )
+        .await
+        .expect("keyed rpc with a replay key");
+        assert_eq!(json(keyed), b"10");
+
+        let recv = keyed::External::invoke_at(
+            &client,
+            &actor,
+            "Download",
+            br#"{"value":1}"#,
+            ExternalCall::Recv,
+            codec.clone(),
+        )
+        .await
+        .expect("keyed recv");
+        let keylink::ExternalOutput::Recv { value, body } = recv else {
+            panic!("a recv answers with a value and a body");
+        };
+        assert_eq!(value, b"2");
+        assert_eq!(
+            body.read_to_bytes(64)
+                .await
+                .expect("a finite body")
+                .as_ref(),
+            b"download"
+        );
+
+        let blob = keyed::External::invoke_at(
+            &client,
+            &actor,
+            "Asset",
+            b"{}",
+            ExternalCall::Blob,
+            codec.clone(),
+        )
+        .await
+        .expect("keyed blob");
+        let keylink::ExternalOutput::Blob { value, handle } = blob else {
+            panic!("a blob answers with a value and a handle");
+        };
+        assert_eq!(value, b"7");
+        assert_eq!(handle.id(), id);
+
+        // No `ActorRef::upload` exists, and the inventory never named `Upload`.
+        let refused = keyed::External::invoke_at(
+            &client,
+            &actor,
+            "Upload",
+            br#"{"prefix":3}"#,
+            ExternalCall::Rpc { key: None },
+            codec,
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(keylink::ExternalError::UnknownMethod)),
+            "a `send` is unknown on the keyed surface, not mis-typed: {refused:?}"
         );
     }
 
