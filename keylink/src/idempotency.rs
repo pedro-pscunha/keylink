@@ -2140,13 +2140,6 @@ impl Ledger {
         peer: EndpointId,
         key: IdempotencyKey,
     ) -> Claim {
-        // Before the claim rather than after, so that the one place a caller is
-        // already waiting to start work is the place that pays for the store's
-        // housekeeping — and never the path that is holding a finished reply.
-        //
-        // It reports nothing on purpose, and its own doc says why.
-        self.housekeep().await;
-
         // Moved rather than cloned: every arm but `Fresh` drops the key, and the
         // `Fresh` arm's guard is holding it, so the write below borrows it back
         // instead of being handed a second copy.
@@ -2216,17 +2209,22 @@ impl Ledger {
     /// Take the keys memory has dropped off the disk, and shorten the store if
     /// it is carrying more than it holds.
     ///
+    /// Called by `claim_key`, once, before it claims anything. `pub(crate)` for
+    /// that one caller: it used to run inside [`claim_durably`](Self::claim_durably),
+    /// which the two attach paths also reach, and an attaching caller never
+    /// receives [`Claim::Fresh`].
+    ///
     /// Returns nothing, including no error, and that is the decision rather
     /// than an omission: every failure here is a store that will refuse the
-    /// claim being written two lines later, on this same call, with the
-    /// sentence that names it. A key that could not be removed goes back in the
-    /// queue, so nothing is dropped by not reporting it here.
+    /// claim its caller is about to write, on this same call, with the sentence
+    /// that names it. A key that could not be removed goes back in the queue,
+    /// so nothing is dropped by not reporting it here.
     #[allow(
         clippy::unused_async,
         reason = "there is nothing to await without the `persist` feature, and the caller \
                   should not have to know which features are on"
     )]
-    async fn housekeep(&self) {
+    pub(crate) async fn housekeep(&self) {
         #[cfg(feature = "persist")]
         {
             let Some(store) = self.records.store() else {

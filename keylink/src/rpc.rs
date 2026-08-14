@@ -407,6 +407,18 @@ async fn claim_key(
     if let Err(error) = idem.key().validate() {
         return Claimed::Refuse(IdempotencyRefusal::Malformed(error.to_string()).into());
     }
+    // Before the claim rather than after, so that the one place a caller is
+    // already waiting to start work is the place that pays for the store's
+    // housekeeping — and never the path that is holding a finished reply.
+    //
+    // It reports nothing on purpose, and its own doc says why.
+    //
+    // Here and not inside `claim_durably`, which is also reached by the two
+    // ATTACH paths below. An attaching caller never receives `Claim::Fresh`, so
+    // it is not the caller the paragraph above describes — and `housekeep`
+    // takes the same store lock `Guard::record` needs, so an attacher's
+    // housekeeping could block the very settle it is parked waiting for.
+    ledger.housekeep().await;
     let key = idem.key().clone();
 
     let notify = match ledger.claim_durably(peer, key.clone()).await {
