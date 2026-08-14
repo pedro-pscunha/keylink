@@ -163,14 +163,21 @@ pub trait Claim: Send + 'static {
 /// records — an idempotency ledger, a set of leases — would otherwise rewrite
 /// the whole set to add one.
 ///
-/// [`claim`](Self::claim) for the reason [`Snapshots::claim`] is the only
+/// [`hold`](Self::hold) for the reason [`Snapshots::claim`] is the only
 /// operation there: two writers of one set is the situation exclusivity exists
 /// to make visible.
+///
+/// **`hold` and not `claim`, which is what it used to be called.** The two
+/// ports do different things — [`Snapshots`] replaces one blob wholesale, this
+/// one keys many entries — so they must not share a verb. Sharing it forced one
+/// adapter type per port, because a concrete type carrying both made
+/// `files.claim(&id)` ambiguous (`E0034`) for any caller that had imported both
+/// traits.
 pub trait Entries: Send + Sync + 'static {
     /// The exclusive handle this store hands out.
     type Held: Held;
 
-    /// Take exclusive write access to one set of entries.
+    /// Take exclusive hold of one set of entries.
     ///
     /// Held until the handle is dropped, and enforced against whatever the
     /// adapter can reach — for the file adapter, every other process on the
@@ -180,7 +187,7 @@ pub trait Entries: Send + Sync + 'static {
     ///
     /// [`Error::Busy`] when somebody else holds it, which is not a wait to
     /// retry. [`Error::Io`] when the store cannot be opened.
-    fn claim(&self, id: &StateId) -> impl Future<Output = Result<Self::Held>> + Send;
+    fn hold(&self, id: &StateId) -> impl Future<Output = Result<Self::Held>> + Send;
 }
 
 /// Exclusive access to one set of entries, for as long as this value lives.

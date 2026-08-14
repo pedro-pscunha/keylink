@@ -3170,7 +3170,7 @@ mod tests {
         impl Entries for Stalling {
             type Held = Stalled;
 
-            async fn claim(&self, _id: &StateId) -> keylink_persist::Result<Stalled> {
+            async fn hold(&self, _id: &StateId) -> keylink_persist::Result<Stalled> {
                 Ok(Stalled)
             }
         }
@@ -3226,7 +3226,7 @@ mod tests {
         impl Entries for Refusing {
             type Held = Refused;
 
-            async fn claim(&self, _id: &StateId) -> keylink_persist::Result<Refused> {
+            async fn hold(&self, _id: &StateId) -> keylink_persist::Result<Refused> {
                 Ok(Refused)
             }
         }

@@ -2127,7 +2127,7 @@ mod stored {
         limits: Limits,
         refusing: bool,
     ) -> (Fixture, Counter) {
-        let files = keylink_persist::file::EntryFiles::open(root)
+        let files = keylink_persist::file::Files::open(root)
             .await
             .expect("opens")
             .limit(limit);
@@ -2291,7 +2291,7 @@ mod stored {
     #[tokio::test]
     async fn a_durable_store_without_keys_is_refused_at_startup() {
         let scratch = Scratch::new("durable-without-keys");
-        let files = keylink_persist::file::EntryFiles::open(&scratch.0)
+        let files = keylink_persist::file::Files::open(&scratch.0)
             .await
             .expect("opens");
         let records = keylink::DurableRecords::open(&files, &ledger_id())

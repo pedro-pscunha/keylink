@@ -334,7 +334,7 @@ impl DurableRecords {
     /// process believes it owns this ledger. [`RecordError::Unreadable`] when a
     /// stored record is not one this build can read.
     pub async fn open<E: Entries>(store: &E, id: &StateId) -> Result<Self, RecordError> {
-        let held = store.claim(id).await?;
+        let held = store.hold(id).await?;
         let stored = held.load().await?;
 
         let mut recovered = Vec::with_capacity(stored.len());

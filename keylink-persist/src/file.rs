@@ -403,51 +403,27 @@ fn read_len(four: &[u8]) -> usize {
 
 /// Entries as append-only logs under one directory, one log per state.
 ///
-/// The [`Entries`] adapter, and [`Files`] is the [`Snapshots`] one. They share a
-/// root, a lock protocol and a limit, and they are **two types rather than one
-/// type with two impls** for a reason that was measured rather than guessed:
-/// both traits name their operation `claim`, so a single type carrying both
-/// makes `files.claim(&id)` ambiguous the moment a caller has imported both
-/// traits — which this module's own tests did, and which no amount of
-/// documentation makes pleasant.
+/// [`Files`] carries **both** ports: [`Snapshots::claim`] replaces one blob
+/// wholesale and [`Entries::hold`] keys many entries, under one root, one lock
+/// protocol and one limit.
 ///
-/// The two can share one root safely. A state's lock guards its base name, so
-/// `treasury/ledger` claimed here excludes `treasury/ledger` claimed through
-/// [`Files`], which is the answer a caller wants: one state, one writer.
-#[derive(Debug, Clone)]
-pub struct EntryFiles(Files);
-
-impl EntryFiles {
-    /// Store entry logs under `root`, creating it if it is not there.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Io`] when the directory cannot be created.
-    pub async fn open(root: impl Into<PathBuf>) -> Result<Self> {
-        Ok(Self(Files::open(root).await?))
-    }
-
-    /// Refuse a single entry larger than this. The default is
-    /// [`Files::DEFAULT_LIMIT`].
-    ///
-    /// Counted on **one record** — the operation byte, the two lengths, the key
-    /// and the value — rather than on the log, which grows without a ceiling
-    /// until [`compact`](Held::compact) is called. A caller that needs the file
-    /// bounded compacts it; there is no setting that makes an append-only log
-    /// refuse an append because of its own length, because the record that
-    /// would be refused is the one carrying the caller's newest fact.
-    #[must_use]
-    pub fn limit(self, bytes: u64) -> Self {
-        Self(self.0.limit(bytes))
-    }
-}
-
-impl Entries for EntryFiles {
+/// There used to be an `EntryFiles(Files)` newtype here, and it existed for one
+/// reason: both traits named their operation `claim`, so a concrete type
+/// carrying both made `files.claim(&id)` ambiguous (`E0034`) for any caller
+/// that had imported both. Renaming the entry port's verb removed the
+/// collision, and the newtype with it — it was a large interface over a thin
+/// implementation, where `open` and `limit` each delegated and a third setter
+/// on `Files` would have needed a third delegate.
+///
+/// The two ports share one root safely. A state's lock guards its base name, so
+/// `treasury/ledger` held here excludes `treasury/ledger` claimed as a
+/// snapshot, which is the answer a caller wants: one state, one writer.
+impl Entries for Files {
     type Held = FileLog;
 
-    /// Claim this state's entry log, creating it if it is not there.
-    async fn claim(&self, id: &StateId) -> Result<FileLog> {
-        let (lock, base, parent) = self.0.locked(id).await?;
+    /// Take hold of this state's entry log, creating it if it is not there.
+    async fn hold(&self, id: &StateId) -> Result<FileLog> {
+        let (lock, base, parent) = self.locked(id).await?;
         let mut log = base.into_os_string();
         log.push(".log");
         let log = PathBuf::from(log);
@@ -479,7 +455,7 @@ impl Entries for EntryFiles {
             id: id.clone(),
             log,
             parent,
-            limit: self.0.limit,
+            limit: self.limit,
             handle: Some(handle),
         })
     }
@@ -809,9 +785,9 @@ mod tests {
 
     // ─────────────────────────────────────────────────────── the entry log
 
-    async fn logs(name: &str) -> (Scratch, EntryFiles) {
+    async fn logs(name: &str) -> (Scratch, Files) {
         let scratch = Scratch::new(name);
-        let files = EntryFiles::open(&scratch.0).await.expect("opens");
+        let files = Files::open(&scratch.0).await.expect("opens");
         (scratch, files)
     }
 
@@ -832,14 +808,14 @@ mod tests {
     #[tokio::test]
     async fn a_log_that_was_never_written_loads_as_nothing() {
         let (_scratch, files) = logs("empty").await;
-        let log = files.claim(&id("treasury/ledger")).await.expect("claims");
+        let log = files.hold(&id("treasury/ledger")).await.expect("claims");
         assert_eq!(entries(&log).await, Vec::new());
     }
 
     #[tokio::test]
     async fn a_second_put_under_one_key_replaces_the_first() {
         let (_scratch, files) = logs("replace").await;
-        let mut log = files.claim(&id("treasury/ledger")).await.expect("claims");
+        let mut log = files.hold(&id("treasury/ledger")).await.expect("claims");
 
         log.put(&record("order-1"), b"paid").await.expect("puts");
         log.put(&record("order-2"), b"held").await.expect("puts");
@@ -860,7 +836,7 @@ mod tests {
     #[tokio::test]
     async fn a_removed_entry_is_gone_and_its_neighbours_are_not() {
         let (_scratch, files) = logs("remove").await;
-        let mut log = files.claim(&id("treasury/ledger")).await.expect("claims");
+        let mut log = files.hold(&id("treasury/ledger")).await.expect("claims");
 
         log.put(&record("order-1"), b"paid").await.expect("puts");
         log.put(&record("order-2"), b"held").await.expect("puts");
@@ -883,7 +859,7 @@ mod tests {
         let (scratch, files) = logs("truncated").await;
         let path = scratch.0.join("treasury").join("ledger.log");
         {
-            let mut log = files.claim(&id("treasury/ledger")).await.expect("claims");
+            let mut log = files.hold(&id("treasury/ledger")).await.expect("claims");
             log.put(&record("order-1"), b"paid").await.expect("puts");
             log.put(&record("order-2"), b"half-written")
                 .await
@@ -898,7 +874,7 @@ mod tests {
             .set_len(whole - 5)
             .expect("truncates");
 
-        let log = files.claim(&id("treasury/ledger")).await.expect("claims");
+        let log = files.hold(&id("treasury/ledger")).await.expect("claims");
         assert_eq!(
             entries(&log).await,
             vec![(b"order-1".to_vec(), b"paid".to_vec())],
@@ -921,7 +897,7 @@ mod tests {
         let (scratch, files) = logs("zero-tail").await;
         let path = scratch.0.join("treasury").join("ledger.log");
         {
-            let mut log = files.claim(&id("treasury/ledger")).await.expect("claims");
+            let mut log = files.hold(&id("treasury/ledger")).await.expect("claims");
             log.put(&record("order-1"), b"paid").await.expect("puts");
         }
 
@@ -933,7 +909,7 @@ mod tests {
             .set_len(whole + 64)
             .expect("extends with zeros");
 
-        let log = files.claim(&id("treasury/ledger")).await.expect("claims");
+        let log = files.hold(&id("treasury/ledger")).await.expect("claims");
         assert_eq!(
             entries(&log).await,
             vec![(b"order-1".to_vec(), b"paid".to_vec())],
@@ -948,7 +924,7 @@ mod tests {
         let (scratch, files) = logs("zero-middle").await;
         let path = scratch.0.join("treasury").join("ledger.log");
         {
-            let mut log = files.claim(&id("treasury/ledger")).await.expect("claims");
+            let mut log = files.hold(&id("treasury/ledger")).await.expect("claims");
             log.put(&record("order-1"), b"paid").await.expect("puts");
         }
 
@@ -958,7 +934,7 @@ mod tests {
         bytes[LOG_MAGIC.len()] = 0;
         std::fs::write(&path, &bytes).expect("writes");
 
-        let log = files.claim(&id("treasury/ledger")).await.expect("claims");
+        let log = files.hold(&id("treasury/ledger")).await.expect("claims");
         let error = log.load().await.expect_err("not a torn tail");
         assert!(
             matches!(
@@ -984,7 +960,7 @@ mod tests {
         )
         .expect("writes");
 
-        let log = files.claim(&id("treasury/ledger")).await.expect("claims");
+        let log = files.hold(&id("treasury/ledger")).await.expect("claims");
         let error = log.load().await.expect_err("not a log this build reads");
         assert!(
             matches!(
@@ -1002,7 +978,7 @@ mod tests {
     async fn compacting_shortens_the_file_and_changes_nothing_it_holds() {
         let (scratch, files) = logs("compact").await;
         let path = scratch.0.join("treasury").join("ledger.log");
-        let mut log = files.claim(&id("treasury/ledger")).await.expect("claims");
+        let mut log = files.hold(&id("treasury/ledger")).await.expect("claims");
 
         for round in 0..20_u32 {
             log.put(&record("order-1"), &round.to_be_bytes())
@@ -1029,17 +1005,17 @@ mod tests {
     #[tokio::test]
     async fn a_second_claim_on_one_log_is_refused() {
         let (_scratch, files) = logs("busy-log").await;
-        let held = files.claim(&id("treasury/ledger")).await.expect("claims");
+        let held = files.hold(&id("treasury/ledger")).await.expect("claims");
 
         let error = files
-            .claim(&id("treasury/ledger"))
+            .hold(&id("treasury/ledger"))
             .await
             .expect_err("somebody already holds it");
         assert!(matches!(error, Error::Busy { .. }), "got {error:?}");
 
         drop(held);
         files
-            .claim(&id("treasury/ledger"))
+            .hold(&id("treasury/ledger"))
             .await
             .expect("the claim was released");
     }
@@ -1050,18 +1026,18 @@ mod tests {
     async fn a_snapshot_claim_and_a_log_claim_on_one_name_exclude_each_other() {
         let scratch = Scratch::new("both-ports");
         let snapshots = Files::open(&scratch.0).await.expect("opens");
-        let logs = EntryFiles::open(&scratch.0).await.expect("opens");
+        let logs = Files::open(&scratch.0).await.expect("opens");
 
         let held = Snapshots::claim(&snapshots, &id("treasury/ledger"))
             .await
             .expect("claims");
-        let error = Entries::claim(&logs, &id("treasury/ledger"))
+        let error = Entries::hold(&logs, &id("treasury/ledger"))
             .await
             .expect_err("the snapshot port holds it");
         assert!(matches!(error, Error::Busy { .. }), "got {error:?}");
 
         drop(held);
-        Entries::claim(&logs, &id("treasury/ledger"))
+        Entries::hold(&logs, &id("treasury/ledger"))
             .await
             .expect("the claim was released");
     }
@@ -1070,7 +1046,7 @@ mod tests {
     async fn an_entry_over_the_limit_is_refused_and_the_log_survives() {
         let (_scratch, files) = logs("log-limit").await;
         let files = files.limit(32);
-        let mut log = files.claim(&id("treasury/ledger")).await.expect("claims");
+        let mut log = files.hold(&id("treasury/ledger")).await.expect("claims");
         log.put(&record("order-1"), b"paid").await.expect("puts");
 
         let error = log
