@@ -28,75 +28,153 @@ let item = client.get_item("ADU-014".into()).await?;   // this is the whole API
 No IP address, no port, no framing, no serialization call, no ALPN string, no
 version number appears in your code.
 
+**Status: early, and nothing here has ever run in production.** The API will
+move. Read [Status](#status) before you build on it.
+
+## Install
+
+Not on crates.io yet, so a git dependency is the only way in. keylink needs
+**Rust 1.91** or later, which is the floor its own dependency graph imposes.
+
+```toml
+[dependencies]
+keylink = { git = "https://github.com/pedro-pscunha/keylink" }
+```
+
+`default = ["blocking", "fs", "env", "persist-file"]`. Build with
+`--no-default-features` for a browser: all four need an OS facility a tab does
+not have. Three say so with keylink's own `compile_error!` rather than failing
+deep inside a dependency, and `persist-file` stops earlier still, inside tokio.
+
+| feature | default | what it adds |
+| --- | --- | --- |
+| `blocking` | yes | The synchronous client, and `Node::enter`. Needs OS threads. |
+| `fs` | yes | `Body::from_file`. Needs a filesystem. |
+| `env` | yes | `Node::bind_from_env` and `Allowlist::from_env`. Needs a process environment. |
+| `persist-file` | yes | `persist`, plus `keylink-persist`'s local-file adapter. |
+| `persist` | no | The `Persist` observer over the port alone. No adapter, and it compiles for a browser. |
+| `web` | no | `Body::from_web_file` and `Body::from_web_stream`. Meaningful on `wasm32-unknown-unknown` alone. |
+| `blobs-fs` | no | `Blobs::persistent`, which pulls redb and reflink-copy. `Blobs::memory` needs neither, and is the one to reach for first. |
+
+## The workspace
+
+| crate | what it is |
+| --- | --- |
+| [`keylink`](keylink) | The library. `service!`, `Node`, `Server`, the generated clients, actors and the registry. |
+| [`keylink-persist`](keylink-persist) | A port for actor state that outlives its process, and its local-file adapter. |
+| [`keylink-http`](keylink-http) | The HTTP/JSON gateway, for callers that speak neither Rust nor the Keylink protocol. |
+| [`keylink-openapi`](keylink-openapi) | OpenAPI 3.1 and JSON Schema for a gateway surface. Opt-in, and its schema dependency reaches neither crate above. |
+| [`demo`](demo) | The two-machine walkthrough under [Try it](#try-it). Not published. |
+| [`fixtures/imported-ledger`](fixtures/imported-ledger) | A service *defined* in one crate and consumed by another, so the generated seam is tested across a crate boundary. Not published. |
+
+## Documentation
+
+- [`keylink-http/README.md`](keylink-http/README.md) — the gateway's route table, its error codes and its limits
+- [`keylink-openapi/README.md`](keylink-openapi/README.md) — generating an OpenAPI 3.1 document from a mounted surface
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — the gate, the wire-contract pin, the public API rules, and when `--no-verify` is legitimate
+- `mise run docs` builds the rustdoc, which is the complete API reference
+- Examples: [`reliable_call`](keylink/examples/reliable_call.rs), [`durable_ledger`](keylink/examples/durable_ledger.rs), [`inventory`](keylink-http/examples/inventory.rs), [`gateway`](keylink-openapi/examples/gateway.rs) — commands under [Try it](#try-it)
+
+The RFCs carry the design reasoning, including the decisions that were reversed.
+
+- [RFC-01](docs/rfc-01-blobs.md) — iroh-blobs in keylink
+- [RFC-02](docs/rfc-02-runtime-router.md) — runtime mount and unmount of protocols
+- [RFC-03](docs/rfc-03-wasm.md) — keylink in the browser
+- [RFC-04](docs/rfc-04-actors.md) — an actor model for keylink
+- [RFC-05](docs/rfc-05-idempotency.md) — idempotency: what settles a key, and what does not
+- [RFC-06](docs/rfc-06-observers.md) — observers, and durable state as an adapter, plus an [implementation brief](docs/rfc-06-implementation-brief.md) that shares its number
+- [RFC-07](docs/rfc-07-the-turn-model.md) — the turn model: one dispatch path, a typed mailbox, two inputs
+- [RFC-08](docs/rfc-08-serving-side-keys.md) — serving-side idempotency: which methods accept a key, and where its reply lives
+
 ## What it handles
 
-**Addressing.** Peers are dialed by Ed25519 public key. iroh hole-punches
-directly when it can and relays when it cannot; neither side names a location.
+### Addressing
 
-**Concurrency.** Every call takes its own QUIC stream, so calls run in parallel
-and a slow handler blocks nobody. There is no client mutex, no request-id
-correlation and no cancellation bookkeeping — dropping the stream cancels the
-call.
+Peers are dialed by Ed25519 public key. iroh hole-punches directly when it can
+and relays when it cannot; neither side names a location.
 
-**Fire-and-forget.** A `tell` travels on a unidirectional stream and returns
-`Result<()>`, never the declared type: there is no reply stream to decode one
-from. The `Ok` means the bytes reached the transport and nothing more — not
-delivery, not handling, and no order against a `call`. It does not accept an
-idempotency key either, and the compiler is what says so: `with_idempotency`
-hands back an `IdempotentClient`, and a `tell` is not among its methods. The
-ledger answers a repeat with the recorded reply and a `tell` has no reply to
-record, so a key attached to one could only be discarded. **There is no reliable
-`tell`.** Anything that has to arrive is an `rpc`.
+### Concurrency
 
-**Large payloads.** A body is not framed: its extent is the rest of the stream
-and its flow control is QUIC's. A 4 GiB file costs zero framing bytes and one
-chunk of peak memory. A body that ends early is an error, never a short file.
+Every call takes its own QUIC stream, so calls run in parallel and a slow
+handler blocks nobody. There is no client mutex, no request-id correlation and
+no cancellation bookkeeping — dropping the stream cancels the call.
 
-**Content addressing.** A `blob` method returns an address; iroh-blobs moves the
-bytes, with verified resume and deduplication. keylink owns the mount, because
-the mount iroh-blobs' own documentation teaches serves every hash to every peer
-and accepts writes. Returning an address to a peer records a grant for that
-exact `(peer, hash)` pair, and a blobs request is admitted only against a grant
-— so every entry was created by an RPC that already passed its service's
-allowlist and layers.
+### Fire-and-forget
 
-**Schema safety.** postcard is not self-describing — enum variants encode by
-declaration index, so swapping two variants with identical shapes decodes
-cleanly as the wrong one. So the ALPN is a hash of the contract, and a drifted
-peer is refused at the handshake:
+A `tell` travels on a unidirectional stream and returns a proof of admission —
+`Queued` locally, `Transmitted` remotely — never the declared type: there is no
+reply stream to decode one from. The `Ok` means the
+bytes reached the transport and nothing more — not delivery, not handling, and
+no order against a `call`. It does not accept an idempotency key either, and
+the compiler is what says so: `with_idempotency` hands back an
+`IdempotentClient`, and a `tell` is not among its methods. The ledger answers a
+repeat with the recorded reply and a `tell` has no reply to record, so a key
+attached to one could only be discarded. **There is no reliable `tell`.**
+Anything that has to arrive is an `rpc`.
+
+### Large payloads
+
+A body is not framed: its extent is the rest of the stream and its flow control
+is QUIC's. A 4 GiB file costs zero framing bytes and one chunk of peak memory.
+A body that ends early is an error, never a short file.
+
+### Content addressing
+
+A `blob` method returns an address; iroh-blobs moves the bytes, with verified
+resume and deduplication. keylink owns the mount, because the mount iroh-blobs'
+own documentation teaches serves every hash to every peer and accepts writes.
+Returning an address to a peer records a grant for that exact `(peer, hash)`
+pair, and a blobs request is admitted only against a grant — so every entry was
+created by an RPC that already passed its service's allowlist and layers.
+
+### Schema safety
+
+postcard is not self-describing — enum variants encode by declaration index, so
+swapping two variants with identical shapes decodes cleanly as the wrong one.
+So the ALPN is a hash of the contract, and a drifted peer is refused at the
+handshake:
 
 ```
-Error: schema mismatch: the peer was built against a different contract
+Error: schema mismatch: the peer was built against a different contract (ours is <hash>)
 ```
 
-Nothing to bump by hand. Change any type reachable from the protocol —
-including one three structs deep — and the ALPN moves with it.
+Nothing to bump by hand. Change the *shape* of any type reachable from the
+protocol — add or rename a field three structs deep — and the ALPN moves with
+it. Renaming that type, or moving it to another module, does not: the hash walks
+fields and variants, never paths.
 
-**Authorization.** iroh proves *who* a peer is; it never decides whether they
-are welcome. `Allowlist` does, and fails closed: it has no `Default`, admitting
-everyone must be typed out, and `from_env` errors at startup rather than
-bouncing every peer at runtime.
+### Authorization
 
-**Retry safety.** A call that fails mid-flight leaves the caller unable to say
-whether it ran. `client.with_idempotency(key)` removes the choice between a
-double booking and no booking: the serving side records the reply under
-`(peer, key)` and answers a repeat from that record, byte for byte, without
-entering the handler again.
+iroh proves *who* a peer is; it never decides whether they are welcome.
+`Allowlist` does, and fails closed: it has no `Default`, admitting everyone
+must be typed out, and `from_env` errors at startup rather than bouncing every
+peer at runtime.
+
+### Retry safety
+
+A call that fails mid-flight leaves the caller unable to say whether it ran.
+`client.with_idempotency(key)` removes the choice between a double booking and
+no booking: the serving side records the reply under `(peer, key)` and answers
+a repeat from that record, byte for byte, without entering the handler again.
 
 The word that does the work is *ran*. A layer that refuses a call before it
 reaches the handler leaves the key claimable, because nothing happened; one that
 refuses after leaves `Interrupted`, because what happened is genuinely unknown.
 A record that expires or is evicted leaves a tombstone, so a forgotten key is
-refused rather than silently run a second time.
+refused rather than silently run a second time — for as long as the tombstone
+pool holds it, which is limit 4 below.
 
 ```rust
+use std::time::Duration;
+
 use keylink::prelude::*;
+use keylink::Idempotency;
 
 // wait for the call already running under this key instead of being refused
 client.with_idempotency(Idempotency::attaching_for(key, Duration::from_secs(5)))
       .reserve("ADU-014".into(), 2).await?;
 
-client.key_state(key).await?   // Fresh is the one answer a retry cannot give you
+client.key_state(key).await?   // Fresh means the ledger holds nothing for this key
 ```
 
 The record is in memory by default and dies with the process. `Records::Durable`
@@ -104,13 +182,16 @@ puts it on a disk instead, at two `fsync`s per keyed call. Composed with a
 reconnecting handle it is effectively-once for one `rpc`, which is the recipe
 below; RFC-05 has the reasoning.
 
-**Departure.** Every other failure here arrives as the answer to a question you
-asked. A dead peer does not — you find out on your next call, however long
-after the fact that is. `client.watch()` is a future that resolves when the
-connection ends, and it distinguishes the three cases that matter:
+### Departure
+
+Every other failure here arrives as the answer to a question you asked. A dead
+peer does not — you find out on your next call, however long after the fact
+that is. `client.watch()` is a future that resolves when the connection ends,
+and it distinguishes the three cases that matter:
 
 ```rust
 use keylink::prelude::*;
+use keylink::Departure;
 
 match client.watch().await {
     Departure::Closed  => info!("peer said goodbye"),
@@ -119,30 +200,40 @@ match client.watch().await {
 }
 ```
 
-**Reconnecting handles.** Dial-per-message is wasteful and holding one client
-forever is fragile. `Peer<C>` connects on first use, reuses the connection, and
-reconnects **exactly once** when a call reports `Transport` or `Closed`. Remote,
-local I/O, and per-stream errors return without replay:
+### Reconnecting handles
+
+Dial-per-message is wasteful and holding one client forever is fragile.
+`Peer<C>` connects on first use, reuses the connection, and reconnects
+**exactly once** when a call reports `Transport` or `Closed`. Remote, local
+I/O, and per-stream errors return without replay:
 
 ```rust
 let peer: Peer<inventory::Client> = Peer::new(&node, addr);
-let item = peer.call(|c| async move { c.get_item(sku).await }).await?;
+let item = peer.call(|c| {
+    let sku = sku.clone();                             // `call` takes an FnMut
+    async move { c.get_item(sku).await }
+}).await?;
 ```
 
 Once, not until it works. Retrying forever turns a peer that is genuinely gone
 into a caller that never returns.
 
-**Composition.** Many services share one node, and a keylink service can sit
-beside a foreign iroh protocol via `Server::router()`. Registering two services
-on one ALPN is a configuration error, not a last-one-wins race.
+### Composition
 
-**Layers.** A `Middleware` sees the request *typed*, so a per-method rule is a
-`match` on the real enum. Make the impl generic over `Req: Rpc` and one layer
-covers every service you ever define. `Timeout` ships with the crate.
+Many services share one node, and a keylink service can sit beside a foreign
+iroh protocol via `Server::router()`. Registering two services on one ALPN is a
+configuration error, not a last-one-wins race.
 
-**Actors, when shared state is the awkward part.** The same `service!` block also
-generates an `Actor` trait taking `&mut self`, so state lives on a task instead
-of behind a `Mutex`:
+### Layers
+
+A `Middleware` sees the request *typed*, so a per-method rule is a `match` on
+the real enum. Make the impl generic over `Req: Rpc` and one layer covers every
+service you ever define. `Timeout` ships with the crate.
+
+### Actors, when shared state is the awkward part
+
+The same `service!` block also generates an `Actor` trait taking `&mut self`,
+so state lives on a task instead of behind a `Mutex`:
 
 ```rust
 use keylink::prelude::*;
@@ -165,16 +256,23 @@ not stop the handler, and a layer such as `Timeout` refuses the caller without
 ending the turn. And an actor must not call itself: keylink detects a re-entrant
 local call by actor identity and refuses it instead of relying on mailbox depth.
 
-**Local mailbox policy.** The simple `actor`, `setup(..).observe(..).actor()`, `setup(..).feeds(..).actor()`, and
-supervised doors park at depth 1 by default. The depth is configurable and is not
-pinned at 1. Use the generated `setup(..).backpressure(..).actor()` or `restarting(..).backpressure(..).actor()` door—or
-`LocalActor::spawn_deep` directly—and choose what a full mailbox does:
+### Local mailbox policy
+
+The simple `actor`, `setup(..).observe(..).actor()`,
+`setup(..).feeds(..).actor()`, and supervised doors park at depth 1 by default.
+The depth is configurable and is not pinned at 1. Use the generated
+`setup(..).backpressure(..).actor()` or
+`restarting(..).backpressure(..).actor()` door—or `LocalActor::spawn_deep`
+directly—and choose what a full mailbox does:
 
 ```rust
 use std::num::NonZeroUsize;
 use keylink::Backpressure;
 
-let warehouse = inventory::setup(Warehouse::seeded()).feeds(inventory::Feeds::new()).backpressure(Backpressure::Park(NonZeroUsize::new(32).expect("non-zero depth"))).actor();
+let depth = NonZeroUsize::new(32).expect("non-zero depth");
+let warehouse = inventory::setup(Warehouse::seeded())
+    .backpressure(Backpressure::Park(depth))
+    .actor();
 ```
 
 `Backpressure::Park(depth)` waits for a slot; `Backpressure::Shed(depth)` refuses
@@ -190,13 +288,16 @@ that declares a large body and then stops writing holds the actor until the
 connection idle timeout, answering nothing else meanwhile. Bulk transfer goes on
 a second service, registered beside the actor on the same node.
 
-**Watching a turn, from outside.** `Middleware` intercepts a message on the wire.
-An `Observer` watches a turn against the state — after the method, before the
-reply. It sees the state and how the turn went, and never a request or a reply
-payload; a layer sees the opposite. Neither grows toward the other.
+### Watching a turn, from outside
+
+`Middleware` intercepts a message on the wire. An `Observer` watches a turn
+against the state — after the method, before the reply. It sees the state and
+how the turn went, and never a request or a reply payload; a layer sees the
+opposite. Neither grows toward the other.
 
 ```rust
 use keylink::prelude::*;
+use keylink::Ended;
 
 let ledger = ledger::setup(state).observe(saver).actor();
 ledger.post(1).await?;             // the observer ran before this returned
@@ -218,12 +319,13 @@ which would say "there is nothing here, stop asking" about a turn that ran. The
 peer decodes the same `Withheld` the local caller matches on, rather than reading
 a prefix off the front of a string.
 
-**An observer that panics is a third answer and not that one.** The value is
-withheld either way — a veto says "do not commit", a crash says nobody read back
-whether it committed — but both are told
+### An observer that panics is a third answer and not that one
+
+The value is withheld either way — a veto says "do not commit", a crash says
+nobody read back whether it committed — but both are told
 `Withheld::ObserverPanicked { name }`, which is a variant of its own and not a
-shade of the one above it. Reporting a crash as a refusal named a decision nobody
-made.
+shade of the one above it. Reporting a crash as a refusal named a decision
+nobody made.
 
 The actor owns its observers, so nothing is shared and no `Sync` bound appears
 anywhere. `after_turn` returns a boxed future rather than being an `async fn`,
@@ -231,11 +333,13 @@ which is what lets an implementation finish with the state before it awaits — 
 implementation that holds it across an await needs `A: Sync`, and one that does
 not, does not.
 
-**A second input.** A mailbox is one way into an actor. A `feed` is the other.
-Declare `feed Restocked(item: Restock);` and the generated `Actor` trait grows
-`async fn on_restocked(&mut self, item: Restock)` — no `Caller`, no return value,
-because nobody called and there is nothing to reply to — and a `Stream` is wired
-into the same loop at spawn, one argument per declared feed:
+### A second input
+
+A mailbox is one way into an actor. A `feed` is the other. Declare `feed
+Restocked(item: Restock);` and the generated `Actor` trait grows `async fn
+on_restocked(&mut self, item: Restock)` — no `Caller`, no return value, because
+nobody called and there is nothing to reply to — and a `Stream` is wired into
+the same loop at spawn, one argument per declared feed:
 
 ```rust
 let warehouse = inventory::setup(Warehouse::seeded())
@@ -250,17 +354,20 @@ A feed that ends, and a feed handler that panics, both end the actor — a fault
 with no caller to resume it into would otherwise be dropped onto a state the
 handler may have left half applied — and `Ended` names which happened.
 
-**Many instances behind one ALPN.** Keyed actors, addressed by an id inside the
-request, live in `inventory::Registry`. Build one, call
-`registry.mount(id, inventory::spawn(state))`, and serve it with
-`registry.serve(&node, allow)`. Peers reach it through `inventory::RegistryClient`. That path once cost per-method layers,
-per-method authorization, `blob` methods and observers, because its payload was
-opaque to keylink. It no longer does: a keyed request is `Addressed<Request>` and
-its reply is the service's own typed `Response`, and a keyed mount runs the same
-turn loop a local `Handle` does — so layers, per-method authorization, `blob`
-grants, observers, the panic guard and `Observer::finish` all reach it. The
-idempotency ledger was never on that list; what was missing was a client that
-could send a key, and `RegistryClient::with_idempotency` is it.
+### Many instances behind one ALPN
+
+Keyed actors, addressed by an id inside the request, live in
+`inventory::Registry`. Build one, call `registry.mount(id,
+inventory::spawn(state))`, and serve it with `registry.serve(&node, allow)`.
+Peers reach it through `inventory::RegistryClient`. That path once cost
+per-method layers, per-method authorization, `blob` methods and observers,
+because its payload was opaque to keylink. It no longer does: a keyed request
+is `Addressed<Request>` and its reply is the service's own typed `Response`,
+and a keyed mount runs the same turn loop a local `Handle` does — so layers,
+per-method authorization, `blob` grants, observers, the panic guard and
+`Observer::finish` all reach it. The idempotency ledger was never on that list;
+what was missing was a client that could send a key, and
+`RegistryClient::with_idempotency` is it.
 
 What the keyed path still costs: one QUIC connection per actor *service* — not one
 for a node's whole fleet, each with its own handshake, admission decision,
@@ -271,29 +378,33 @@ question of whether that shutdown drained before its budget. The budget is not
 optional: every caller names how long it is prepared to wait before the actor is
 killed instead.
 
-**A typed local keyed reference.** `inventory::at_local(&registry, id)` addresses a
-mounted actor in this process and returns `inventory::LocalRef`. Its generated
-`rpc`, `tell`, and `blob` methods use the registry route and the actor's normal
-turn loop, returning transport-free `LocalError`; `send` and `recv` are absent
-because a local reference has no QUIC body stream. Missing ids, capacity and
-closed mailboxes remain distinct from a turn that ran, and the same lifecycle,
-factory and eviction machinery is used as for peer delivery.
+### A typed local keyed reference
 
-**One function, either surface.** A function that runs against a local actor in a
-test and a remote one in production could not be written: a local call answers
-`Unanswered`, a served one answers `Error`, and no `Result` type is both.
-`service!` also generates `inventory::Calls`, a trait carrying the service's `rpc`
-methods with **one** error type — `Failure`, which puts a `Withheld` in the same
-arm whichever side withheld the value. It is implemented for `Handle`, `ActorRef`,
-`Client` and `IdempotentClient`, so one
-`async fn stock<C: inventory::Calls>(surface: &C) -> Result<u64, Failure>` runs
-against all four. The concrete surfaces are untouched — their own methods still
-answer `Unanswered` and `Error`, and `Failure` is reachable only through the
-bound, which is the act of saying *I have chosen not to know which surface I
-hold*. `impl Calls + Governed` narrows it to the surfaces a `Dispatch` stands in
-front of, which refuses a `Handle`: it means the layers and the allowlist ran, and
-it does **not** mean at-most-once, for which the honest instrument is
-`IdempotentClient` named in the signature.
+`inventory::at_local(&registry, id)` addresses a mounted actor in this process
+and returns `inventory::LocalRef`. Its generated `rpc`, `tell`, and `blob`
+methods use the registry route and the actor's normal turn loop, returning
+transport-free `LocalError`; `send` and `recv` are absent because a local
+reference has no QUIC body stream. Missing ids, capacity and closed mailboxes
+remain distinct from a turn that ran, and the same lifecycle, factory and
+eviction machinery is used as for peer delivery.
+
+### One function, either surface
+
+A function that runs against a local actor in a test and a remote one in
+production could not be written: a local call answers `Unanswered`, a served
+one answers `Error`, and no `Result` type is both. `service!` also generates
+`inventory::Calls`, a trait carrying the service's `rpc` methods with **one**
+error type — `Failure`, which puts a `Withheld` in the same arm whichever side
+withheld the value. It is implemented for `Handle`, `ActorRef`, `Client` and
+`IdempotentClient`, so one `async fn stock<C: inventory::Calls>(surface: &C) ->
+Result<u64, Failure>` runs against all four. The concrete surfaces are
+untouched — their own methods still answer `Unanswered` and `Error`, and
+`Failure` is reachable only through the bound, which is the act of saying *I
+have chosen not to know which surface I hold*. `impl Calls + Governed` narrows
+it to the surfaces a `Dispatch` stands in front of, which refuses a `Handle`:
+it means the layers and the allowlist ran, and it does **not** mean
+at-most-once, for which the honest instrument is `IdempotentClient` named in
+the signature.
 
 It carries `rpc` and none of the other four kinds, because `rpc` is the only kind
 all four surfaces declare: an `ActorRef` and an `IdempotentClient` have no `tell`,
@@ -306,8 +417,10 @@ than papered over: a handler panic **unwinds into the calling task** against a
 served surface. `Failure` cannot express an unwind, and `TurnLost` argues at
 length why it should not try.
 
-**Generated surface matrix.** These are deliberate capability boundaries, not
-missing wrappers. A blank cell means the method is not generated on that surface.
+### Generated surface matrix
+
+These are deliberate capability boundaries, not missing wrappers. A blank cell
+means the method is not generated on that surface.
 
 | generated surface | `rpc` | `tell` | `send` | `recv` | `blob` | error vocabulary |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -334,26 +447,31 @@ synchronous execution model. `Governed` is present on the three served async
 surfaces (`ActorRef`, `Client`, and `IdempotentClient`), not on a bare local
 handle or local keyed reference.
 
-**Sync and async.** `keylink::blocking` is a narrow singleton client for programs
-with no runtime. Its plain generated client exposes unary `rpc` and `tell` methods. Its
-`blocking::IdempotentClient` exposes only `rpc`: idempotency excludes `tell`, and
-blocking excludes `send`, `recv`, and `blob`. Keyed addressing remains async. The blocking module owns a private
-multi-threaded runtime — mandatory, because a current-thread runtime only
-advances iroh's keepalives during `block_on`, so the connection would stall
-between calls. Calling it from inside a runtime returns
-`BlockingError::BlockingInAsync` from generated methods instead of deadlocking. `Node::enter` lends that
-runtime to the calling thread, which is what a synchronous program needs to
-construct an actor at all.
+### Sync and async
 
-**The browser.** The crate compiles and links for `wasm32-unknown-unknown` with
+`keylink::blocking` is a narrow singleton client for programs with no runtime.
+Its plain generated client exposes unary `rpc` and `tell` methods. Its
+`blocking::IdempotentClient` exposes only `rpc`: idempotency excludes `tell`,
+and blocking excludes `send`, `recv`, and `blob`. Keyed addressing remains
+async. The blocking module owns a private multi-threaded runtime — mandatory,
+because a current-thread runtime only advances iroh's keepalives during
+`block_on`, so the connection would stall between calls. Calling it from inside
+a runtime returns `BlockingError::BlockingInAsync` from generated methods
+instead of deadlocking. `Node::enter` lends that runtime to the calling thread,
+which is what a synchronous program needs to construct an actor at all.
+
+### The browser
+
+The crate compiles and links for `wasm32-unknown-unknown` with
 `--no-default-features`. The `web` feature adds `Body::from_web_file` and
-`Body::from_web_stream`, so a `<input type=file>` streams up the same way a path
-does on a server. `blocking`, `fs` and `env` refuse the target by
-`compile_error!` — each needs an OS facility a browser does not have.
-`mise run wasm-browser` loads the module into headless Chrome and runs the ALPN
-derivation, a `postcard` round trip of the reply type, and both `web`
-constructors there. A page cannot open a UDP socket, so no connection runs in a
-tab and none is claimed; see Status.
+`Body::from_web_stream`, so a `<input type=file>` streams up the same way a
+path does on a server. `blocking`, `fs` and `env` refuse the target by
+`compile_error!` — each needs an OS facility a browser does not have. `mise run
+wasm-browser` loads the module into headless Chrome and runs
+`keylink/tests/browser.rs` there: the ALPN derivation, a `postcard` round trip of
+the reply type, both `web` constructors, and the compose boundaries. A page
+cannot open a UDP socket, so no connection runs in a tab and none is claimed; see
+[Status](#status).
 
 ## Reliable delivery, and its seven limits
 
@@ -381,8 +499,8 @@ recipe rather than a feature:
    spends no waiting place — distinct from `Attaching::UpTo(Duration::ZERO)`, which
    admits the attacher and holds it for no time.
 
-`examples/reliable_call.rs` is that recipe, compiled by the gate and run over two
-nodes. `tests/reliable.rs::a_retried_call_across_a_reconnect_runs_exactly_once` is
+`keylink/examples/reliable_call.rs` is that recipe, compiled by the gate and run over two
+nodes. `keylink/tests/reliable.rs::a_retried_call_across_a_reconnect_runs_exactly_once` is
 the proof: the work runs, the serving side closes the connection that was carrying
 its answer, and the retry — over a second handshake, against the same ledger — is
 answered from the record without entering the handler again.
@@ -474,7 +592,7 @@ detect. See `docs/rfc-08-serving-side-keys.md`.
    record with no work behind it. `Applied<()>` is the valueless form for exactly
    that shape, where there is no answer to replay.
 
-   `Applied` derives `Serialize`/`Deserialize` and no `Schema`, so it cannot reach an
+   `Applied` implements `Serialize`/`Deserialize` and no `Schema`, so it cannot reach an
    ALPN and `postcard::to_allocvec(self)` keeps compiling when you add the field.
    Take that encoder rather than writing your own: a hand-rolled snapshot that omits
    the field compiles, passes every test, and starts empty after every restart, which
@@ -497,10 +615,11 @@ detect. See `docs/rfc-08-serving-side-keys.md`.
    **And the set is a term in that turn rate, so measure at the bound you mean to
    run.** `Persist` re-encodes the whole state every completed turn, so an `Applied`
    costs its entries on every turn whether one changed or not — 4096 entries is
-   ~92 µs, which is 1.2% of an `fsync` turn and **6.5× a non-syncing one** — that
-   ratio and its denominator are sourced in `APPLIED_BOUND`'s rustdoc. Raise the
-   bound for slow callers; lower it for cheap turns. `APPLIED_BOUND`'s rustdoc has the
-   measured table.
+   ~92 µs, which is 1.2% of an `fsync` turn and **6.5× a non-syncing one**. That
+   ratio divides by 14.0 µs, not by the ~13 µs above: both halves come from one
+   run, and dividing by the tabled figure instead gives 7.2×. `APPLIED_BOUND`'s
+   rustdoc has the measured table and says why the two differ. Raise the bound for
+   slow callers; lower it for cheap turns.
 
    The busiest window is the one right after the restart, which *concentrates*
    arrivals — every peer's backoff fires at once. What drains the set, though, is
@@ -532,7 +651,7 @@ detect. See `docs/rfc-08-serving-side-keys.md`.
    cannot detect. A long-lived `SecretKey` on the calling side is the precondition,
    not a deployment preference.
 
-   `tests/persist.rs::a_retried_call_across_a_restart_is_applied_once` is the
+   `keylink/tests/persist.rs::a_retried_call_across_a_restart_is_applied_once` is the
    proof, over two real nodes and the real file store: the process dies, the
    restarted ledger answers `Fresh`, the retry is dispatched, and the work does not
    happen twice.
@@ -609,17 +728,19 @@ detect. See `docs/rfc-08-serving-side-keys.md`.
 
 ## HTTP/JSON gateway
 
-Use the separate `keylink-http` package when a caller cannot use Rust or the
-Keylink protocol. It serves generated `rpc`, `send`, `recv` and `blob`
-declarations on a singleton surface, and `rpc`, `recv` and `blob` on a keyed
-actor surface. `tell` has no route, and a keyed surface serves no `send`.
+Use the separate [`keylink-http`](keylink-http/README.md) package when a caller
+cannot use Rust or the Keylink protocol. It serves generated `rpc`, `send`,
+`recv` and `blob` declarations on a singleton surface, and `rpc`, `recv` and
+`blob` on a keyed actor surface. `tell` has no route, and a keyed surface serves
+no `send`. Its README carries the route table and the error codes with their
+statuses; this section is the summary.
 
-`keylink-openapi` is a separate opt-in package that generates an OpenAPI 3.1
-document and a standalone JSON Schema from the same surface the gateway is
-mounted with. Its schema dependency reaches neither `keylink` nor
-`keylink-http`.
-It calls the existing generated `Client`, so the Keylink server has one serving
-pipeline.
+[`keylink-openapi`](keylink-openapi/README.md) is a separate opt-in package that
+generates an OpenAPI 3.1 document and a standalone JSON Schema from the same
+surface the gateway is mounted with. Its schema dependency reaches neither
+`keylink` nor `keylink-http`.
+The gateway calls the existing generated `Client`, so the Keylink server has one
+serving pipeline.
 
 Run the example:
 
@@ -670,8 +791,11 @@ The stable codes are `invalid_request`, `invalid_idempotency_key`,
 `request_too_large`, `request_stream_too_large`, `unsupported_media_type`,
 `range_not_satisfiable`, `idempotency_capacity`, `response_too_large`,
 `response_stream_too_large`, `upstream_error`, `upstream_unavailable` and
-`upstream_timeout`. The package README carries the table with statuses, and a
-test pins it to the inventory.
+`upstream_timeout`. The [package README](keylink-http/README.md) carries the same
+set with each status. `the_readme_documents_every_error_code` reads **both** files
+and fails when a code the gateway can answer with is missing from either, so this
+list cannot fall behind the enum. It compares codes alone: no test checks a status
+or a description, and those are reviewed by hand.
 
 A client disconnect drops the gateway-owned Keylink call future. Work that
 already entered the backend can continue, and an idempotent call can settle as
@@ -685,6 +809,7 @@ carries the route table.
 ## Try it
 
 ```sh
+export KEYLINK_SECRET=$(openssl rand -hex 32)      # 64 hex characters, one identity
 cargo run -p demo -- id                            # the id peers dial
 
 # machine A
@@ -694,6 +819,12 @@ KEYLINK_SECRET=<64-hex> KEYLINK_ALLOWED_IDS=<peer-id> cargo run -p demo -- serve
 cargo run -p demo -- connect <endpoint-id> [file-to-upload]
 cargo run -p demo -- connect-sync <endpoint-id>    # the same, without a runtime
 ```
+
+**Set `KEYLINK_SECRET` before you read an id.** Every subcommand binds through
+`Node::bind_from_env`, which falls back to a *random* identity when the variable
+is unset — so `demo -- id` without it prints an address that the next command
+will not answer on. Each side keeps its own secret and puts the other side's
+printed id in `KEYLINK_ALLOWED_IDS`.
 
 With one machine and no internet, set `KEYLINK_OFFLINE=1` on both sides: the
 demo binds without discovery, prints a `<id>@<ip:port>` line, and accepts that
@@ -739,14 +870,37 @@ check green. The task now requires the failure to quote keylink's own
 `compile_error!`, which is the claim the workflow's comment made and did not
 check.
 
-You need [`mise`](https://mise.jdx.dev) and rustup, and nothing else.
-`rust-toolchain.toml` asks for the `wasm32-unknown-unknown` target and the
-`llvm-tools` component — the second because `ring` links its C through `ar`, and
-Apple's writes an archive index `rust-lld` cannot read.
+### What the gate needs on the machine
+
+Install [`mise`](https://mise.jdx.dev) and rustup, then `mise install`. That
+fetches the five pinned tools — `cargo-deny`, ripgrep, sccache,
+`wasm-bindgen-test-runner` and chromedriver — and `rust-toolchain.toml` adds the
+`wasm32-unknown-unknown` target and the `llvm-tools` component. The second is
+not decoration: `ring` links its C through `ar`, and Apple's writes an archive
+index `rust-lld` cannot read.
+
+Four things mise does not install, each named here because a missing one fails
+somewhere unhelpful:
+
+- **Google Chrome**, for `wasm-browser`. The chromedriver pin is coupled to the
+  installed browser's *major* version, so a Chrome that auto-updates past the
+  pinned one reddens the task. Move the pin, never bypass the task.
+- **`python3`**, which five gate steps are written in — `anchors`,
+  `anchors-selftest`, `headings`, `replay-anchors` and `task-lists`.
+- **`curl`**, which both HTTP smokes drive the running gateway with.
+- **A second Rust toolchain, `1.91`**, for `msrv`. About 200 MB on first use.
+  That cost used to sit on CI; it is paid once per clone now, because an MSRV
+  nobody compiles is a promise broken silently.
+
+The steps run cheapest-failure-first, and `[tasks.gate]` in `mise.toml` is the
+list — not repeated here, because a second copy is a copy that goes stale.
+`mise run pre-commit` is the cheap subset a commit pays, and that one *is*
+pinned: `mise run task-lists` fails when any copy of it disagrees with
+`mise.toml`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the wire-contract pin, the public API
-rules, and when `--no-verify` is legitimate. `docs/rfc-*.md` record the
-decisions, including the reversed ones.
+rules, and when `--no-verify` is legitimate. The [RFCs](#documentation) record
+the decisions, including the reversed ones.
 
 ## Status
 
@@ -771,9 +925,10 @@ come back and reversing it is the point of reaching one.
 Known gaps, in rough priority order:
 
 - **No connection has ever run in a browser.** `mise run wasm-browser` loads the
-  module into headless Chrome and runs four tests there — the schema hash, a
-  `postcard` round trip of `WireResponse`, and both `web` body constructors — so
-  the module is no longer merely linked. What is untested in a tab is everything
+  module into headless Chrome and runs every test in `keylink/tests/browser.rs`
+  there — the schema hash, a `postcard` round trip of `WireResponse`, both `web`
+  body constructors, and the compose patience and lossy-broadcast boundaries —
+  so the module is no longer merely linked. What is untested in a tab is everything
   that needs a socket: no `Node`, no `Server`, no `Client`, no actor turn. A page
   cannot open a UDP socket, so QUIC is out of reach whatever keylink does.
   Threaded wasm is refused outright: the local mailbox holds a thread-affine
@@ -817,6 +972,22 @@ Known gaps, in rough priority order:
   the TLS alert code is several private layers down. Narrow and tested, but it
   would break if iroh reworded its message.
 
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) first, then run
+`./scripts/install-hooks.sh` so `mise run gate` fires before your push rather
+than after it. There is no CI to catch what the hook misses — see
+[Working on it](#working-on-it) for why, and for what that costs.
+
 ## License
 
-MIT or Apache-2.0, at your option.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.

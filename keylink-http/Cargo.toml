@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.91"
 description = "Bounded authenticated HTTP/JSON gateway for generated Keylink services."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/pedrocunha/keylink"
+repository = "https://github.com/pedro-pscunha/keylink"
 readme = "README.md"
 
 [dependencies]

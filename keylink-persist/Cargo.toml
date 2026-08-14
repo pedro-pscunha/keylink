@@ -7,7 +7,7 @@ edition = "2021"
 rust-version = "1.91"
 description = "A port for actor state that outlives its process, and the local-file adapter."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/pedrocunha/keylink"
+repository = "https://github.com/pedro-pscunha/keylink"
 # Publishable, and it has to be. `keylink` depends on this crate for real —
 # `persist-file` is a default feature — and cargo refuses to publish a crate
 # whose dependency cannot be published. `publish = false` here made `keylink`

@@ -20,7 +20,7 @@
 //! [`CallId`] is that name and [`Applied`] is somewhere to keep it. Neither is held
 //! by this crate: the set lives in the caller's own state, beside the balance it is
 //! protecting, and is written by that state's own `Durable` snapshot — `Serialize`
-//! and `Deserialize` are derived so that a `postcard::to_allocvec(self)` snapshot
+//! and `Deserialize` are implemented so that a `postcard::to_allocvec(self)` snapshot
 //! keeps compiling when the field is added, and so that a hand-written one needs a
 //! line rather than a loop.
 //!
@@ -401,7 +401,7 @@ impl std::fmt::Debug for CallId {
 ///
 /// # Snapshotting it
 ///
-/// `Serialize` and `Deserialize` are derived, so a state whose `snapshot` is
+/// `Serialize` and `Deserialize` are implemented by hand, so a state whose `snapshot` is
 /// `postcard::to_allocvec(self)` keeps compiling when this field is added, and one
 /// whose snapshot is hand-written needs one line rather than a loop. The encoding
 /// carries the **bound** as well as the entries, so a round trip restores the
