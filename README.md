@@ -433,6 +433,19 @@ detect. See `docs/rfc-08-serving-side-keys.md`.
    process died comes back `Interrupted` — unknown — because the caller it
    belonged to held a live stream, and no disk carries one of those forward.
 
+   **A store that refuses a write is answered, not swallowed, and the two
+   refusals are on opposite sides of the handler.** If it cannot write the
+   *claim*, nothing ran and the caller is told `NotClaimed` — the same key is
+   safe to send again. If it cannot write the *settle*, the call ran and its
+   reply is discarded rather than sent, which is `Unrecordable`; a reply this
+   ledger cannot replay is a reply the caller would ask for again. Neither is
+   `Interrupted`, which means the handler produced nothing at all.
+
+   **`Records::Durable` on a service that accepts no idempotency key is refused
+   at startup**, as `ConfigError::DurableWithoutKeys`. No ledger is built, so the
+   store would be held and never written — and its exclusive claim on the log
+   file would refuse the next service that meant to use it.
+
    So **effectively-once is a property of one process's lifetime, not of a key** —
    for as long as the only thing that knows about the key is the ledger.
    `cx.call()` is what changes that. It hands the handler a `CallId` — the calling
@@ -474,6 +487,13 @@ detect. See `docs/rfc-08-serving-side-keys.md`.
    with no `fsync` behind it is ~13 µs, where 4096 entries is well under a second.
    Measure and divide, and treat the count as the guarantee.
 
+   **That 7.6 ms is a macOS number and it does not carry to Linux.**
+   `std::fs::File::sync_data` issues `F_FULLFSYNC` on macOS, which asks the drive to
+   flush its own write cache — measured at about **12x** a plain `libc::fsync`,
+   5498 µs against 462 µs. On Linux the same call is `fdatasync`, so a Linux
+   deployment is faster by roughly that order and every figure derived from 7.6 ms
+   in this file is pessimistic there. Measure on the platform you will run on.
+
    **And the set is a term in that turn rate, so measure at the bound you mean to
    run.** `Persist` re-encodes the whole state every completed turn, so an `Applied`
    costs its entries on every turn whether one changed or not — 4096 entries is
@@ -489,7 +509,8 @@ detect. See `docs/rfc-08-serving-side-keys.md`.
    client supplies both, and it is the new work that spends the bound.
 
    **What this does not buy, in full.** The duplicate still *enters the handler*
-   and still costs a turn — about 7.6 ms of `fsync` on a state it did not change —
+   and still costs a turn — about 7.6 ms of `fsync` on macOS, less on Linux, on a
+   state it did not change —
    because only a durable ledger could refuse it before dispatch, and that one is
    structural: the record lives in your state, so reaching it means dispatching to
    your state. And the dedupe is yours to write, because the correct version knows
