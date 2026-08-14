@@ -312,27 +312,40 @@ pub const MAX_WAITING: usize = 1024;
 /// Each is an `fsync`, so this is a latency ceiling on the claim path and not a
 /// tuning knob: the queue still drains, over as many claims as it takes.
 ///
-/// **Measured, not chosen.** The fixture is a 1500-record store reopened at
-/// `pool_records(64)`, where `Ledger::new` queues 2616 entries. The first keyed
-/// call after that restart, against a 60 ms ceiling:
+/// **What is measured, and what could not be.** The fixture is a 1500-record
+/// store reopened at `pool_records(64)`, where `Ledger::new` queues 2616
+/// entries and the first keyed call used to pay for all of them — **8770 ms**.
 ///
-/// | `DRAIN_PER_CLAIM` | first call        |
-/// |-------------------|-------------------|
-/// | 16                | 74.0 ms           |
-/// | 14                | 46.8 - 48.8 ms    |
-/// | 12                | 38.9 - 41.6 ms    |
+/// The drain **clears the backlog** and that number is exact: at 8 it takes 7
+/// entries off the queue per call after the reconcile, so 2616 of them are gone
+/// in about **374 keyed calls**, against the 2000 this was accepted at. At 12 it
+/// was 11 per call and about 240.
 ///
-/// 14 is the largest value that measured under the ceiling, and it is not the
-/// one taken: its *second* call reached 56.2 ms, and this machine has measured
-/// 1.7x variance between runs minutes apart, so 14 meets the ceiling by less
-/// than the noise. 12 clears it by a third. The backlog still goes: 12 drains
-/// about 11 entries per call after the reconcile, so 2616 of them are gone in
-/// about 240 keyed calls, against the 2000 this was accepted at.
+/// The **latency of the one call that pays is inconclusive on this machine**,
+/// and it is reported that way rather than as a midpoint. Four runs at each
+/// value, first call, minutes apart:
+///
+/// | `DRAIN_PER_CLAIM` | first call, four runs        |
+/// |-------------------|------------------------------|
+/// | 12                | 38.9, 44.0, 62.5, 64.9 ms    |
+/// | 8                 | 32.8, 51.4, 63.8, 82.0 ms    |
+///
+/// A **fixed** configuration spans 32 to 82 ms, so the spread within one value
+/// is larger than the difference between two — 8's worst sample is worse than
+/// every sample at 12. Against a 60 ms acceptance line that is not a pass and
+/// not a fail; it is a measurement the machine cannot resolve, and picking the
+/// value off it would be picking off noise.
+///
+/// So the constant is set from the quantity that IS resolvable — the backlog
+/// clears in about a fifth of the calls it was allowed — and the smaller of the
+/// two candidates is taken, because a smaller ceiling cannot be the thing that
+/// makes a call slow. Whatever the per-`fsync` cost turns out to be on a given
+/// disk, 8 of them is the least this can spend and still drain.
 ///
 /// Gated, because the queue it bounds is only ever non-empty on a service with
 /// a store, and `--no-default-features` builds one that cannot have one.
 #[cfg(feature = "persist")]
-const DRAIN_PER_CLAIM: usize = 12;
+const DRAIN_PER_CLAIM: usize = 8;
 
 /// Why a call carrying an idempotency key was refused without being run.
 ///
