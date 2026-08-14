@@ -200,21 +200,30 @@ pub enum ExternalOutput<O> {
 /// require::<ledger::ActorRef>();
 /// ```
 ///
-/// The positive control, so "nothing implements it" is not trivially true —
-/// the generated marker does, and each probe above therefore measures a
-/// specific type's absence rather than an empty trait:
+/// The control, and it does two jobs. It shows the trait is implemented at all,
+/// so "nothing implements it" is not trivially true — and it NAMES every type
+/// probed above in a position that must compile, so a typo in one of those
+/// probes reddens this block instead of passing silently:
 ///
 /// ```
-/// use keylink::ExternalActorService;
+/// use keylink::{Addressed, ExternalActorService};
 /// keylink::service! { service Ledger; rpc Count(value: u64) -> u64; }
 /// fn require<T: ExternalActorService>() {}
 /// require::<ledger::External>();
+///
+/// fn exists<T>() {}
+/// exists::<ledger::RegistryClient>();
+/// exists::<Addressed<ledger::Request>>();
+/// exists::<ledger::Request>();
+/// exists::<ledger::ActorRef>();
 /// ```
 ///
-/// Every refusal above is pinned to `E0277`, the unsatisfied-bound error. That
-/// pin is what makes them measurements: a probe naming a type that does not
-/// exist would fail to compile with `E0412` and rustdoc would report the test
-/// as failed, not passed.
+/// The `E0277` on each block above is a label, NOT a check. Measured on
+/// `rustc 1.97.1`: a `compile_fail,E0277` block whose real error is `E0412`
+/// passes, and so does one pinned to an `E0999` that does not exist — rustdoc
+/// enforces the code only on nightly. This doc said the opposite for one
+/// commit, which is exactly the shape of invented enforcement that makes a
+/// conclusion look earned. The control above is the enforcement.
 ///
 /// And implementing [`crate::Rpc`] by hand does not opt a type in either:
 ///

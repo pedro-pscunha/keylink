@@ -772,8 +772,18 @@ async fn an_over_long_method_name_is_refused_like_an_unknown_one() {
 ///
 /// Watched red with `scripts/break-once.sh` (row `HK43`) by replacing
 /// `        actor: surface.actor.clone(),`
-/// with `        actor: None,`. Probe 2 answered `200` where this asserts
-/// `404`: the revoked actor's bytes came back under a permitted actor's path.
+/// with `        actor: None,`. Terminated on `a permitted actor does not
+/// inherit a revoked actor's grant`, `left: 200` against `right: 404`.
+///
+/// That is PROBE 2, and probe 2 is the half `HK38` already covers through
+/// `a_blob_ticket_is_bound_to_the_actor_that_minted_it` — the two rows quote
+/// the same line. What is unique here is probe 1: a revocation reaching a
+/// grant that was minted while the policy still allowed it. Its mechanism is
+/// the prelude's `Forbidden` arm, which `HK44` breaks. Measured under that
+/// break: probe 1 terminated on `a revoked actor cannot read the grant it
+/// minted`, `left: 200` against `right: 403` — the revoked caller reached the
+/// table and found its own still-valid ticket. Recorded here rather than
+/// registered a third time on the same literal.
 #[tokio::test]
 async fn a_revoked_actors_bytes_are_reachable_from_no_path() {
     let running = start().await;
@@ -947,6 +957,12 @@ async fn no_refusal_repeats_the_actor_id_back() {
 /// it. A test that only stopped an eagerly mounted actor would report
 /// "stopped means gone" as a property of the registry when it is a property of
 /// that mount.
+///
+/// Reddened by row `HK42`'s break — `decode_actor(path, route_path)?` replaced
+/// by a constant `"one"`. Terminated on `left: 404` against `right: 200`:
+/// with every path resolving to `one`, the `lazy` rebuild probe finds a
+/// stopped actor. Measured, so this row is not merely assumed to depend on the
+/// gateway line it shares with the rest of the file.
 #[tokio::test]
 async fn a_stopped_actor_answers_as_missing_until_something_remounts_it() {
     let running = start().await;
@@ -994,6 +1010,9 @@ async fn a_stopped_actor_answers_as_missing_until_something_remounts_it() {
 /// its actor was mounted under, so a call that resolved another actor's mount
 /// says so in its own body — which is what makes this a routing test rather
 /// than a throughput one.
+///
+/// Reddened by row `HK42`'s break. Terminated on `obra/4471 in round 0 was
+/// answered by another actor`, `left: "one"` against `right: "obra/4471"`.
 #[tokio::test]
 async fn concurrent_keyed_calls_each_reach_their_own_actor() {
     let running = std::sync::Arc::new(start().await);
@@ -1032,6 +1051,11 @@ async fn concurrent_keyed_calls_each_reach_their_own_actor() {
 ///
 /// The fixture holds three eager mounts and room for one lazy build, so the
 /// SECOND lazy id meets the cap.
+///
+/// This row carries no external break and needs none: its own control is the
+/// measurement. Freeing one slot flips `lazy-b` from `503` to `200` and flips
+/// `unbuildable` from `503` back to `404`, in the same run, so a gateway that
+/// answered `503` for another reason cannot satisfy it.
 ///
 /// The refusal is `503`, not `404`: the id is perfectly good and a caller
 /// retrying later may well get it. And while the registry is full, an id the
@@ -1083,7 +1107,8 @@ async fn a_registry_at_capacity_refuses_without_an_existence_answer() {
     );
 }
 
-/// A saturated mailbox makes callers WAIT. It does not refuse them.
+/// A queue of keyed calls WAITS. It is never refused, and the mailbox depth is
+/// not observable through this surface at all.
 ///
 /// This row was written to assert a `503`, on the reading that a full mailbox
 /// maps to `UpstreamUnavailable` the way a full registry does. It measured
@@ -1097,11 +1122,23 @@ async fn a_registry_at_capacity_refuses_without_an_existence_answer() {
 /// latency, not an error category. A deployment that needs it to become one
 /// has to bound the wait somewhere above this gateway.
 ///
-/// One actor, a mailbox one deep, twelve calls each holding the loop 40ms. The
-/// time bound is a LOWER bound and nothing else — a slow machine only makes it
-/// larger, so it cannot flake in the direction that matters.
+/// And the depth is genuinely invisible: raise `mailbox_depth` from 1 to 64 and
+/// this row still passes, because an actor loop handles one message at a time
+/// and twelve 40ms calls serialise at any depth. That is not a hole in the row
+/// — it is the finding. There is no assertion here that depends on the depth
+/// because no HTTP-observable behaviour does. The fixture keeps a depth of 1
+/// so the queue is as short as it can be and the row still sees waiting.
+///
+/// One actor, twelve calls each holding the loop 40ms. The time bound is a
+/// LOWER bound and nothing else — a slow machine only makes it larger, so it
+/// cannot flake in the direction that matters. It is discriminating in the
+/// direction that does: concurrent calls would finish in about one hold.
+///
+/// `HK42`'s break leaves this row GREEN, `exit=0`, and that is correct — every
+/// path here names one actor already, so redirecting them all to `one` changes
+/// nothing it measures.
 #[tokio::test]
-async fn a_saturated_mailbox_makes_callers_wait_rather_than_refusing_them() {
+async fn a_queue_of_keyed_calls_waits_and_is_never_refused() {
     let running = std::sync::Arc::new(start().await);
     const CALLS: usize = 12;
     const HOLD_MS: u64 = 40;
