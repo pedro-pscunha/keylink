@@ -26,28 +26,43 @@
 //! repeating it here would hide the three parts above. The retry is written out
 //! as a second call, which is what a reconnect would issue anyway.
 //!
-//! # Two memories with two lifetimes
+//! # Two memories, and both of them outlive the process
 //!
 //! A treasury that forgets what it paid is the wrong kind of treasury, so this
-//! one is durable: [`Persist`] stores the state inside every turn, and an
-//! answered call is a stored call.
+//! one is durable twice over, through two different ports of the same crate.
 //!
-//! What is **not** durable is the idempotency record. It lives in the served
-//! service, never reaches a disk, and dies with the process. The last act below
-//! restarts the treasury and measures both halves: the payments come back, the
-//! replay record does not, and the same key pays a second time. A caller that
-//! must not double-pay across a restart has to ask the domain, and the last
-//! section shows that too.
+//! - **The state.** [`Persist`] stores the treasury inside every turn, over
+//!   [`Snapshots`](keylink_persist::Snapshots) — one whole value, replaced
+//!   atomically. An answered call is a stored call.
+//! - **The idempotency record.** [`Records::Durable`] writes one entry per
+//!   claimed key, over [`Entries`](keylink_persist::Entries) — many small
+//!   values, each written on its own. A settled key stays settled.
+//!
+//! **This example asserted the opposite until the second port existed**, and
+//! the sentence it carried is worth keeping as the reason the port does: the
+//! replay record lived in the served service, never reached a disk, and died
+//! with the process — so the key that read `Done` read `Fresh` after a restart
+//! and the same call paid a second time. Act 11 is that measurement, inverted.
+//!
+//! # What durability costs here, stated rather than discovered
+//!
+//! Two `fsync`s per keyed call: one before the handler is entered, and one
+//! before its reply is written. Neither is free and neither is optional — the
+//! second is what makes the record a fact the caller can rely on, and the first
+//! is what makes an interrupted call recoverable as *unknown* rather than as
+//! never having happened. [`Records::Memory`] is still the default, and a
+//! service that does not need this should not pay it.
 
 use std::error::Error as StdError;
 use std::time::Duration;
 
 use keylink::prelude::*;
 use keylink::{
-    Allowlist, Caller, Deferred, Error, Idempotency, IdempotencyKey, IdempotencyRefusal, KeyState,
-    Node, Persist, Refusal, RemoteError, Replied, Reply,
+    Allowlist, Caller, Deferred, DurableRecords, Error, Idempotency, IdempotencyKey,
+    IdempotencyRefusal, KeyState, Node, Persist, RecordError, Records, Refusal, RemoteError,
+    Replied, Reply, Server,
 };
-use keylink_persist::file::Files;
+use keylink_persist::file::{EntryFiles, Files};
 use keylink_persist::{Durable, RestoreError, StateId};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
@@ -215,6 +230,13 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let store = Files::open(&root).await?.limit(1024 * 1024);
     let id = StateId::new("treasury/main")?;
 
+    //  The second store, under the same root and a different name. It holds one
+    //  entry per idempotency key rather than one whole value, which is the whole
+    //  reason it is a different port: recording one reply through `Snapshots`
+    //  would rewrite every reply already held.
+    let keys = EntryFiles::open(&root).await?;
+    let ledger_id = StateId::new("treasury/keys")?;
+
     //  `open` claims the state exclusively and reads it back in one call, and
     //  `start_from` is the only way to reach the observer. There is no spelling
     //  of these two lines that starts the actor empty while a full state sits
@@ -234,7 +256,18 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     //  answered payment is a stored payment, and a panicked turn is refused
     //  rather than written.
     let desk = treasury::setup(state).observe(saver).actor();
-    let server = desk.serve(&treasury_node, Allowlist::only([finance_node.id()]))?;
+    //  `Server::builder` rather than `desk.serve`, because the shorthand takes a
+    //  policy and nothing else, and this service has a second thing to say:
+    //  where its idempotency records live.
+    let server = Server::builder(&treasury_node)
+        .service(
+            desk.service(Allowlist::only([finance_node.id()]))
+                .records(Records::Durable(
+                    DurableRecords::open(&keys, &ledger_id).await?,
+                ))
+                .build(),
+        )
+        .spawn()?;
 
     // ── 2. Authentication, and the part a reader guesses wrong.
     //
@@ -424,59 +457,83 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     );
     assert_eq!(restored.paid.len(), 4, "every payment came back");
 
+    //  The record store is claimed too, and released on the same schedule, so
+    //  reopening it waits the same way and for the same reason.
+    let recovered = {
+        let mut opened = None;
+        for _ in 0..200 {
+            match DurableRecords::open(&keys, &ledger_id).await {
+                Ok(ready) => {
+                    opened = Some(ready);
+                    break;
+                }
+                Err(RecordError::Store(keylink_persist::Error::Busy { .. })) => {
+                    n0_future::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(other) => return Err(other.into()),
+            }
+        }
+        opened.ok_or("the previous incarnation never released its record store")?
+    };
+
     let treasury_again = Node::bind_local().await?;
     let desk = treasury::setup(restored).observe(saver).actor();
-    let _serving = desk.serve(&treasury_again, Allowlist::only([finance_node.id()]))?;
+    let _serving = Server::builder(&treasury_again)
+        .service(
+            desk.service(Allowlist::only([finance_node.id()]))
+                .records(Records::Durable(recovered))
+                .build(),
+        )
+        .spawn()?;
+    //  The SAME finance node, which is load bearing rather than convenient. A
+    //  record is keyed on the peer the treasury proved, so a desk that came back
+    //  with a fresh identity would read `Fresh` whatever the disk held — and
+    //  this act would be measuring the key instead of the ledger.
     let finance =
         treasury::Client::connect(&finance_node, treasury_again.endpoint().addr()).await?;
 
-    // ── 11. What did NOT come back, measured rather than asserted in prose.
+    // ── 11. What came back, measured rather than asserted in prose.
     //
-    //  The replay record lives in the served service and never reached the
-    //  disk. So the key that read `Done` a moment ago reads `Fresh`, and the
-    //  same call pays a second time.
+    //  The record was written to the disk before its reply went to the wire, so
+    //  the key that read `Done` before the restart reads `Done` after it.
+    let after_the_restart = finance.key_state(invoice.clone()).await?;
+    println!("after the restart, the ledger says {after_the_restart:?}");
     assert_eq!(
-        finance.key_state(invoice.clone()).await?,
-        KeyState::Fresh,
-        "the replay record lives in the service, not in the state"
-    );
-    let repeat = {
-        let finance = finance.clone();
-        let invoice = invoice.clone();
-        tokio::spawn(async move {
-            finance
-                .with_idempotency(invoice)
-                .instruct("ACME Bolts".to_string(), 12_500)
-                .await
-        })
-    };
-    parked(&desk, 1).await?;
-    desk.approve().await?;
-    let paid_again = repeat.await??;
-    assert_ne!(
-        paid_again.run, first.run,
-        "a fresh key ran the work again: this is a second payment"
-    );
-    assert_eq!(finance.paid().await?.len(), 5, "ACME Bolts was paid twice");
-    println!(
-        "the same key paid again after the restart: run {} then {}",
-        first.run, paid_again.run
+        after_the_restart,
+        KeyState::Done,
+        "a settled key must survive the process that settled it"
     );
 
-    // ── 12. The remedy, which is a domain question and not a ledger question.
+    //  And the retry is answered from the record rather than by the treasury.
+    //  No approval is needed, because nothing parks: the second signature
+    //  belongs to a payment that already happened.
+    let replayed = finance
+        .with_idempotency(invoice.clone())
+        .instruct("ACME Bolts".to_string(), 12_500)
+        .await?;
+    assert_eq!(
+        replayed, first,
+        "the repeat must be the first reply, byte for byte"
+    );
+    let after = finance.paid().await?.len();
+    println!(
+        "the same key replayed run {} instead of paying again, and the count is still {after}",
+        replayed.run
+    );
+    assert_eq!(after, 4, "a replayed key must not add a payment");
+
+    // ── 12. The half that is still not durable, and cannot be.
     //
-    //  The state is durable, so the treasury itself knows what it paid. A
-    //  caller that must not double-pay across a restart asks that, and never
-    //  asks `key_state`, which answers only about this service's lifetime.
+    //  A key CLAIMED when the process died belongs to a caller holding a live
+    //  stream, and no disk carries one of those forward. It comes back
+    //  `Interrupted` — the state that already means *whether it took effect is
+    //  unknown* — rather than vacant, which would run the work twice. That is
+    //  the conservative answer, and it is where the domain question still
+    //  applies: the state is durable, so the treasury itself knows what it paid.
     let history = finance.paid().await?;
     let already = history.iter().filter(|s| s.payee == "ACME Bolts").count();
-    assert_eq!(
-        already, 2,
-        "the domain kept both, so the domain can be asked"
-    );
-    println!(
-        "the durable ledger shows {already} payments to ACME Bolts, which is the check to make"
-    );
+    assert_eq!(already, 1, "one instruction, one payment, across a restart");
+    println!("the durable state shows {already} payment to ACME Bolts, and the ledger agrees");
 
     desk.stop().await?;
     Ok(())
