@@ -193,8 +193,26 @@ impl Error {
     /// }
     /// # }
     /// ```
+    /// # One event, two spellings, and both are a refusal
+    ///
+    /// The same policy close arrives in two different shapes depending on
+    /// whether the local side notices the connection go away before or after it
+    /// decodes the close frame. One renders `transport: connection lost` and
+    /// carries a typed [`ConnectionError`](iroh::endpoint::ConnectionError) in
+    /// its source chain; the other renders `transport: closed by peer:
+    /// unauthorized (code 1)` and does not — the frame is in the *text* and the
+    /// chain stops above it.
+    ///
+    /// **Which one you get is a race**, so a reader that handled only the typed
+    /// one answered `None` to a genuine refusal, intermittently. This is the
+    /// same trade `classify_connect` in `rpc.rs` documents: the typed route is
+    /// tried first and completely, and the rendered chain is the fallback,
+    /// narrow enough that anything unrecognised stays `None`.
     #[must_use]
     pub fn refusal(&self) -> Option<crate::Refusal> {
+        use std::fmt::Write as _;
+
+        let mut rendered = String::new();
         let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(self);
         while let Some(current) = cause {
             if let Some(iroh::endpoint::ConnectionError::ApplicationClosed(frame)) =
@@ -202,10 +220,23 @@ impl Error {
             {
                 return crate::Refusal::from_code(u64::from(frame.error_code));
             }
+            let _ = write!(rendered, "{current} ");
             cause = current.source();
         }
-        None
+        close_code(&rendered).and_then(crate::Refusal::from_code)
     }
+}
+
+/// The application-close code in a rendered error chain.
+///
+/// Matched on quinn's own `ApplicationClosed` wording, which is what reaches a
+/// caller when the typed error is out of the source chain's reach:
+/// `closed by peer: unauthorized (code 1)`. Both markers are required, so a
+/// message that merely contains a number is not read as a close.
+fn close_code(rendered: &str) -> Option<u64> {
+    let after = rendered.split("closed by peer:").nth(1)?;
+    let digits = after.split("(code ").nth(1)?.split(')').next()?;
+    digits.trim().parse().ok()
 }
 
 /// Everything that can go wrong on a keylink call.
@@ -825,6 +856,33 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
+
+    /// The rendered fallback in [`Error::refusal`], which the typed route
+    /// cannot reach and a live run cannot be made to produce on demand.
+    ///
+    /// The first string is **verbatim what `mise run gate` printed** when this
+    /// spelling appeared: `transport: closed by peer: unauthorized (code 1)`.
+    /// It is quoted rather than reconstructed, because a reconstruction would
+    /// be a guess at the format this function exists to read.
+    #[test]
+    fn a_close_code_is_read_out_of_a_rendered_chain() {
+        use super::close_code;
+
+        assert_eq!(
+            close_code("transport: closed by peer: unauthorized (code 1) "),
+            Some(1)
+        );
+        assert_eq!(
+            close_code("transport: closed by peer: unavailable (code 2) "),
+            Some(2)
+        );
+        // The other spelling of the same event carries no code, and the typed
+        // route is what reads that one.
+        assert_eq!(close_code("transport: connection lost "), None);
+        // Both markers are required, so an unrelated number is not a close.
+        assert_eq!(close_code("the handler returned (code 7) "), None);
+        assert_eq!(close_code("closed by peer: no code at all "), None);
+    }
 
     use std::error::Error as _;
 
