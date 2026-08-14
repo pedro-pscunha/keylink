@@ -754,7 +754,11 @@ pub enum ConfigError {
     /// is refused [`Busy`](keylink_persist::Error::Busy) by one that will never
     /// write a record. Refused at startup rather than left to be discovered as
     /// that refusal.
-    #[cfg(feature = "persist")]
+    ///
+    /// Not feature-gated, although the configuration it names needs `persist`
+    /// to exist: the check that produces it is unconditional, and a variant
+    /// that appears and disappears with a feature is exactly the trap
+    /// [`Records`](crate::Records) carries `#[non_exhaustive]` for.
     #[error(
         "a service that accepts no idempotency key was given a durable record store - it would \
          hold the store's claim and never write to it"

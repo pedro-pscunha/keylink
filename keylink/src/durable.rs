@@ -148,7 +148,7 @@ pub enum RecordFault {
     /// constructor.
     #[error("a record key is text this build does not accept as an idempotency key")]
     KeyRefused,
-    /// The first [`PEER_LEN`] bytes of a record key are not a peer id.
+    /// The bytes before the idempotency key are not a peer id.
     ///
     /// Its own variant because [`KeyRefused`](Self::KeyRefused) named three
     /// causes and could only have happened for two of them. This one is about
