@@ -126,6 +126,16 @@ etag=$(header etag)
 check "blob carries an ETag" 0 "$([[ -n "$etag" ]] && echo 0 || echo 1)"
 check "blob conditional GET" 304 "$(status_of "${allow[@]}" --header "If-None-Match: $etag" "$base$location")"
 
+# A wrong verb on a BYTE route. These register through a `MethodRouter` rather
+# than `any()`, and axum's default for one is a bare 405 with no body — which
+# the crate documentation, the README and the published OpenAPI all contradict.
+check "blob wrong verb" 405 "$(status_of "${allow[@]}" --request POST "$base$location")"
+check "blob wrong verb is JSON" "application/json" "$(header_of 'content_type' "${allow[@]}" --request POST "$base$location")"
+check "blob wrong verb is uncacheable" 0 "$(curl --silent --output /dev/null --dump-header "$scratch/verb.txt" "${allow[@]}" --request POST "$base$location"; grep -qi '^cache-control: private, no-store' "$scratch/verb.txt" && echo 0 || echo 1)"
+# axum fills the verb set per path; a fallback that set its own would answer
+# `Allow: POST` on a route serving GET and HEAD.
+check "blob wrong verb allows its own verbs" 0 "$(grep -qi '^allow: GET,HEAD' "$scratch/verb.txt" && echo 0 || echo 1)"
+
 check "blob GET denied" 403 "$(status_of "${deny[@]}" "$base$location")"
 check "blob GET unknown address" 404 "$(status_of "${allow[@]}" "$base/inventory/blob/Datasheet/$(printf 'ab%.0s' {1..32})")"
 

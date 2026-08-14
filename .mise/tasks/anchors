@@ -3963,7 +3963,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 328
+RECORD_BLOCKS = 332
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a
@@ -4039,6 +4039,14 @@ for path in sorted(
     list((ROOT / "keylink").rglob("*.rs"))
     + list((ROOT / "keylink-http").rglob("*.rs"))
     + list((ROOT / "keylink-persist").rglob("*.rs"))
+    # Both added when the workspace grew to six members. A registered record
+    # living where the walk does not look is reported as a record this tripwire
+    # CANNOT SEE — a false `unseen`, manufactured by registering it. Seven rows
+    # (`HL1`-`HL7`) were in exactly that state, and `RECORD_BLOCKS` understated
+    # the population by four. `fixtures/` holds no record today and is walked
+    # anyway, because the moment it costs nothing is the only cheap moment.
+    + list((ROOT / "keylink-openapi").rglob("*.rs"))
+    + list((ROOT / "fixtures").rglob("*.rs"))
     + list((ROOT / "demo").rglob("*.rs"))
     + list((ROOT / "scripts").glob("*.sh"))
     + [p for p in (ROOT / ".githooks").iterdir() if p.is_file() and script(p)]

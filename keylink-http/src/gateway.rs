@@ -506,6 +506,22 @@ where
                             .await
                         }
                     })
+                    .fallback(|| async {
+                        // The blob byte routes are the only ones registered
+                        // through a `MethodRouter` rather than `any`, so they
+                        // are the only ones whose wrong-verb answer is axum's
+                        // rather than this gateway's. Measured before this
+                        // existed: `405` with no body, no content type and no
+                        // `Cache-Control`, on the routes whose answers are the
+                        // most principal-dependent in the crate.
+                        //
+                        // `Allow` is REMOVED so axum fills the verb set for this
+                        // path. Left in, `MethodNotAllowed`'s spec would answer
+                        // `Allow: POST` on a route serving `GET, HEAD`.
+                        let mut response = GatewayError::MethodNotAllowed.response(None);
+                        response.headers_mut().remove(header::ALLOW);
+                        response
+                    })
                     .head(move |request: Request<Body>| {
                         let mount = Arc::clone(&head_mount);
                         let tickets = Arc::clone(&head_tickets);
