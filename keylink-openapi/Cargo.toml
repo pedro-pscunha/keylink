@@ -25,6 +25,9 @@ tokio = { workspace = true }
 # dependency names into every consumer's namespace.
 postcard-schema = { workspace = true }
 serde = { workspace = true }
+schemars = "1"
+tower = "0.5"
+blake3 = { workspace = true }
 
 [lints]
 workspace = true

@@ -13,6 +13,39 @@
 /// `pub(crate)` in the generated module, so a downstream crate cannot reach it
 /// — which is what stops one service being documented twice, differently, by
 /// two crates that both depend on it.
+///
+/// # A type without `JsonSchema` is refused, by name
+///
+/// `JsonSchema` is required only where documents are generated. A service can
+/// use any type it likes until someone asks for a document, and then the
+/// missing bound is a compile error naming the type — not a fallback schema
+/// that says `{}` and describes nothing:
+///
+/// ```compile_fail
+/// fn main() {}
+/// #[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema, Clone, Debug, PartialEq)]
+/// pub struct Weight { pub grams: u64 }
+///
+/// keylink::service! { service Scales; rpc Weigh(item: Weight) -> u64; }
+/// keylink_openapi::document_service!(scales);
+/// ```
+///
+/// The control is what makes that refusal a measurement. It is the SAME
+/// fixture with one derive added, so the only thing the two blocks disagree
+/// about is the bound — and a `compile_fail` that failed for a typo or a
+/// scoping mistake would take this one down with it. (The error-code
+/// annotation is not a check: rustdoc enforces it only on nightly, measured on
+/// `rustc 1.97.1`.)
+///
+/// ```
+/// fn main() {}
+/// #[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema,
+///          schemars::JsonSchema, Clone, Debug, PartialEq)]
+/// pub struct Weight { pub grams: u64 }
+///
+/// keylink::service! { service Scales; rpc Weigh(item: Weight) -> u64; }
+/// keylink_openapi::document_service!(scales);
+/// ```
 #[macro_export]
 macro_rules! document_service {
     ($module:ident) => {
