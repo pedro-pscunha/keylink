@@ -580,7 +580,14 @@ detect. See `docs/rfc-08-serving-side-keys.md`.
 ## HTTP/JSON gateway
 
 Use the separate `keylink-http` package when a caller cannot use Rust or the
-Keylink protocol. The gateway accepts only generated singleton `rpc` methods.
+Keylink protocol. It serves generated `rpc`, `send`, `recv` and `blob`
+declarations on a singleton surface, and `rpc`, `recv` and `blob` on a keyed
+actor surface. `tell` has no route, and a keyed surface serves no `send`.
+
+`keylink-openapi` is a separate opt-in package that generates an OpenAPI 3.1
+document and a standalone JSON Schema from the same surface the gateway is
+mounted with. Its schema dependency reaches neither `keylink` nor
+`keylink-http`.
 It calls the existing generated `Client`, so the Keylink server has one serving
 pipeline.
 

@@ -1,9 +1,32 @@
 # keylink-http
 
 `keylink-http` is a bounded HTTP/JSON gateway for generated Keylink services.
-It exposes enabled singleton `rpc` declarations only.
-The gateway calls the existing generated Keylink client.
-It does not create a second server pipeline.
+`Gateway` serves one singleton service; `ActorGateway` serves one keyed actor
+registry. Both call the existing generated Keylink client and neither creates a
+second server pipeline.
+
+| Declaration | Singleton | Keyed |
+|---|---|---|
+| `rpc` | `POST /rpc/{method}` | `POST /{actor}/rpc/{method}` |
+| `send` | `POST /send/{method}` | — |
+| `recv` | `POST /recv/{method}` | `POST /{actor}/recv/{method}` |
+| `blob` | `POST /blob/{method}` | `POST /{actor}/blob/{method}` |
+| blob bytes | `GET`/`HEAD` `/blob/{method}/{id}` | `GET`/`HEAD` `/{actor}/blob/{method}/{id}` |
+
+`tell` has no route in either space, and a keyed surface serves no `send`. The
+streaming families are installed only when `HttpSurface::with_streaming` is
+called.
+
+A byte body cannot carry a declared value, so one rides a header as base64url:
+`Keylink-Arguments` on a `send` request, `Keylink-Result` on a `recv` response.
+
+`keylink-openapi` is a separate opt-in package that builds an OpenAPI 3.1
+document and a standalone JSON Schema from the same `HttpSurface`. Its schema
+dependency does not reach this package.
+
+The crate documentation is the complete reference: limits, the error envelope,
+idempotency, cancellation, blob resume, actor ids, and what to configure on a
+proxy in front of it.
 
 ## Start a gateway
 
@@ -121,3 +144,20 @@ The gateway does not promise rollback.
 An idempotent call can settle as `Interrupted`.
 
 This version does not expose `tell`, `send`, `recv`, blobs, feeds, actors, `__Status`, WebSockets, streaming HTTP, OpenAPI, or administration.
+
+## Every surface at once
+
+The example above is the small one. For a process serving a singleton surface,
+a keyed surface and the two document endpoints together:
+
+```sh
+cargo run -p keylink-openapi --example gateway
+mise run http-smoke-full
+```
+
+The smoke drives 45 checks against it with real curl, including ranges,
+conditional GETs, encoded actor ids and both document media types.
+
+Two gateways merged into one axum router need
+`HttpSurface::without_fallback()` on the second: axum permits one fallback per
+router.
