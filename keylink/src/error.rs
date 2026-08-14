@@ -198,7 +198,7 @@ impl Error {
     /// The same policy close arrives in two different shapes depending on
     /// whether the local side notices the connection go away before or after it
     /// decodes the close frame. One renders `transport: connection lost` and
-    /// carries a typed [`ConnectionError`](iroh::endpoint::ConnectionError) in
+    /// carries a typed [`ConnectionError`] in
     /// its source chain; the other renders `transport: closed by peer:
     /// unauthorized (code 1)` and does not — the frame is in the *text* and the
     /// chain stops above it.

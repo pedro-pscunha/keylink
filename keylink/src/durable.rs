@@ -46,7 +46,7 @@
 //! Reconciling reads what **memory** now says and makes the disk agree, rather
 //! than replaying the operation that queued it. That is what makes the queue
 //! safe against a key being re-claimed while its removal is still pending: the
-//! new claim is a [`Slot::Running`], and a running slot is left alone.
+//! new claim is a `Slot::Running`, and a running slot is left alone.
 
 use std::fmt;
 use std::future::Future;
