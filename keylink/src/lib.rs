@@ -250,7 +250,7 @@ pub use actor::{
     KeyedService, Lifecycle, LocalError, LocalTellError, Mailbox, MountError, Mountable, Origin,
     Registry, RegistryBuilder,
 };
-pub use admission::{Admission, Admittance, DynamicAdmission, Revocable, Revocation};
+pub use admission::{Admission, Admittance, DynamicAdmission, Refusal, Revocable, Revocation};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
 pub use blobs::{
     BlobHandle, BlobId, BlobReader, Blobs, BlobsAdmission, Granting, Retention, MAX_GRANTS,
@@ -372,3 +372,40 @@ pub use iroh::{protocol::Router, EndpointAddr, EndpointId, SecretKey};
 pub use n0_future::Stream;
 #[doc(hidden)]
 pub use pastey;
+
+/// A [`NonZeroUsize`](core::num::NonZeroUsize) from a literal, checked while it
+/// compiles.
+///
+/// Every bounded knob in this crate takes one: [`Overflow`](compose::Overflow),
+/// [`BroadcastDepth`](compose::BroadcastDepth), [`Backpressure`],
+/// [`RegistryBuilder::mailbox_depth`], and every setter on
+/// [`Limits`]. That is the right type — a depth of zero panics
+/// inside `tokio::sync::mpsc` rather than failing — but building one from a
+/// literal otherwise costs `NonZeroUsize::new(4).unwrap()`, and a crate that
+/// denies `clippy::unwrap_used` cannot write that at all.
+///
+/// A zero is a compile error rather than a panic at startup, because the
+/// argument is a literal and a literal is known now.
+///
+/// ```
+/// let bound = keylink::depth!(4);
+/// assert_eq!(bound.get(), 4);
+/// ```
+///
+/// ```compile_fail
+/// // `depth!(0)` does not build: there is no non-zero zero.
+/// let bound = keylink::depth!(0);
+/// ```
+#[macro_export]
+macro_rules! depth {
+    ($n:literal) => {{
+        const __KEYLINK_DEPTH: ::core::num::NonZeroUsize = match ::core::num::NonZeroUsize::new($n)
+        {
+            ::core::option::Option::Some(bound) => bound,
+            ::core::option::Option::None => {
+                ::core::panic!("a depth must be non-zero: `depth!(0)` cannot be built")
+            }
+        };
+        __KEYLINK_DEPTH
+    }};
+}

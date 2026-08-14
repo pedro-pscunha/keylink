@@ -593,6 +593,47 @@ macro_rules! __keylink_service_munch {
         }
     };
 
+    // A wire declaration named `Request` or `Response` collides with the two
+    // enums every service generates, and the collision is silent at the
+    // declaration: it surfaces as `error: ambiguous associated item` pointing at
+    // the `service!` invocation, under `#[deny(ambiguous_associated_items)]`,
+    // which is a `future_incompatible` lint and therefore a warning today in
+    // some editions and a hard error later. Neither name appears in the
+    // reserved-name section above, so the first person to write
+    // `rpc Request(..)` reads an error about an associated type they never
+    // wrote.
+    //
+    // A `feed` of either name is NOT rejected, and that is measured rather than
+    // assumed: a feed reaches no `Request` or `Response` enum, so
+    // `feed Request(v: u64)` compiles clean today and this arm would break
+    // working code for a collision that does not exist.
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident Request ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_wire_name_check_item!(
+            [ $( $attrs )* ], Request, $kind, Request
+        );
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+    (
+        @svc $svc:tt @done [ $( $done:tt )* ] @feeds [ $( $feeds:tt )* ]
+        @attrs [ $( $attrs:tt )* ] @cfg [ $( $cfg:tt )* ] @defer [ $( $seen:tt )* ]
+        @rest [ $kind:ident Response ( $( $args:tt )* ) -> $ret:ty ; $( $rest:tt )* ]
+    ) => {
+        $( $cfg )* $crate::__keylink_wire_name_check_item!(
+            [ $( $attrs )* ], Response, $kind, Response
+        );
+        $crate::__keylink_service_munch! {
+            @svc $svc @done [ $( $done )* ] @feeds [ $( $feeds )* ]
+            @attrs [ ] @cfg [ ] @defer [ ] @rest [ $( $rest )* ]
+        }
+    };
+
     // Feed fields are not rawized, so every CamelCase spelling whose snake-case
     // result is a keyword is rejected before `Feeds` is emitted.
     (
@@ -7642,6 +7683,19 @@ macro_rules! __keylink_service {
                 )+
             }
 
+            impl Calls for LocalRef<'_> {
+                $(
+                    $crate::__keylink_calls_impl!(
+                        [$( #[$cfg] )*],
+                        local_ref,
+                        [<$kind>],
+                        [<# $rpc:snake>],
+                        ($( $arg : $ty ),*),
+                        $ret
+                    );
+                )+
+            }
+
             impl Calls for ActorRef<'_> {
                 $(
                     $crate::__keylink_calls_impl!(
@@ -8312,6 +8366,41 @@ macro_rules! __keylink_keyword_name_conflict {
             "` generates the reserved Rust keyword `",
             ::core::stringify!($name),
             "`. Rename the ",
+            stringify!($kind),
+            "."
+        ));
+    };
+}
+
+/// Reject a wire declaration whose name is one this service already generates.
+///
+/// The keyword check above is about a token Rust refuses. This one is about a
+/// token Rust accepts and then resolves to the wrong item, so the diagnostic has
+/// to say which item rather than which keyword.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_wire_name_check_item {
+    ([$( #[$meta:meta] )*], $name:ident, $kind:ident, $decl:ident) => {
+        $( #[$meta] )*
+        const _: () = {
+            $crate::__keylink_wire_name_conflict!($name, $kind, $decl);
+        };
+    };
+}
+
+/// The message for the above. Named at the declaration the author wrote, which
+/// is the whole point: the error this replaces pointed at `service!` itself.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __keylink_wire_name_conflict {
+    ($name:ident, $kind:ident, $decl:ident) => {
+        ::core::compile_error!(::core::concat!(
+            stringify!($kind),
+            " `",
+            ::core::stringify!($decl),
+            "` collides with the `",
+            ::core::stringify!($name),
+            "` enum every service generates. Rename the ",
             stringify!($kind),
             "."
         ));
@@ -9836,6 +9925,12 @@ macro_rules! __keylink_calls_method {
         $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
     };
     ([$( #[$meta:meta] )*], local_handle, r#__status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_ref, __status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
+        $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
+    };
+    ([$( #[$meta:meta] )*], local_ref, r#__status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {
         $crate::__keylink_calls_conflict!([$( #[$meta] )*], __status, ($( $arg : $ty ),*), $ret);
     };
     ([$( #[$meta:meta] )*], actor_ref, __status, ($( $arg:ident : $ty:ty ),*), $ret:ty) => {

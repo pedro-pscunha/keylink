@@ -25,10 +25,21 @@ use crate::{RemoteError, Unanswered, Withheld};
 ///
 /// This does not mean the handler started or completed. The private field keeps
 /// callers from fabricating admission evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[must_use = "queue admission is the only fact a local tell returns"]
 pub struct Queued {
     _private: (),
+}
+
+/// Written out rather than derived.
+///
+/// A derived `Debug` prints `Queued { _private: () }`, which shows a caller the
+/// field that exists to keep them from building one. The name is the whole
+/// value here.
+impl core::fmt::Debug for Queued {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Queued")
+    }
 }
 
 impl Queued {
@@ -42,10 +53,17 @@ impl Queued {
 ///
 /// This does not prove that the peer received, admitted, routed, or handled the
 /// message. The private field prevents stronger code from inventing the proof.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[must_use = "transmission is the only fact a remote tell returns"]
 pub struct Transmitted {
     _private: (),
+}
+
+/// Written out for the reason [`Queued`]'s is.
+impl core::fmt::Debug for Transmitted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Transmitted")
+    }
 }
 
 impl Transmitted {
@@ -147,6 +165,47 @@ pub enum BlobFault {
         /// Where the previous leaf ended.
         expected: u64,
     },
+}
+
+impl Error {
+    /// Whether the far side's admission policy closed the connection, and why.
+    ///
+    /// A refused peer completes the handshake and fails on its first *call*,
+    /// because admission runs one layer above the handshake. So a policy
+    /// refusal and a dead network both arrive as
+    /// [`Transport`](Self::Transport) and both read `transport: connection
+    /// lost`. The difference is the application-close frame underneath, and
+    /// reading it used to mean depending on `iroh` directly and comparing
+    /// reason bytes by hand.
+    ///
+    /// `None` means the connection was not closed by an admission policy. It
+    /// does **not** mean the call was authorized: a per-method refusal is
+    /// [`RemoteError::Unauthorized`], which
+    /// is an answer rather than a closed connection.
+    ///
+    /// ```no_run
+    /// # use keylink::{Error, Refusal};
+    /// # fn act(error: &Error) {
+    /// match error.refusal() {
+    ///     Some(Refusal::Denied) => { /* ask for access; a retry cannot help */ }
+    ///     Some(Refusal::Unavailable) => { /* back off and try again */ }
+    ///     None => { /* not an admission decision */ }
+    /// }
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn refusal(&self) -> Option<crate::Refusal> {
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(self);
+        while let Some(current) = cause {
+            if let Some(iroh::endpoint::ConnectionError::ApplicationClosed(frame)) =
+                current.downcast_ref::<iroh::endpoint::ConnectionError>()
+            {
+                return crate::Refusal::from_code(u64::from(frame.error_code));
+            }
+            cause = current.source();
+        }
+        None
+    }
 }
 
 /// Everything that can go wrong on a keylink call.
@@ -539,6 +598,40 @@ impl From<Unanswered> for Failure {
             Unanswered::Turn(withheld) => Self::Turn(withheld),
             Unanswered::Reentrant => Self::Reentrant,
             Unanswered::Full => Self::Full,
+        }
+    }
+}
+
+/// The keyed local surface's losses, in the shared vocabulary.
+///
+/// Every arm maps to the value a **served** caller reads for the same
+/// condition, which is the whole job of this type: one function written against
+/// the generated `Calls` trait has to match one condition in one place whichever
+/// surface it ran on.
+///
+/// Two arms cross a boundary to do that, and both are deliberate.
+/// [`LocalError::Closed`](crate::LocalError::Closed) carries `Withheld::Gone`'s sentence already, so it
+/// becomes that rather than a fifth spelling of it. [`LocalError::NoSuchActor`](crate::LocalError::NoSuchActor)
+/// and [`LocalError::AtCapacity`](crate::LocalError::AtCapacity) have no local arm here and are lifted into the
+/// `RemoteError` a peer meets — not because they came off a wire, but because
+/// that is the one value both sides already agree on.
+impl From<crate::LocalError> for Failure {
+    fn from(local: crate::LocalError) -> Self {
+        match local {
+            crate::LocalError::Turn(withheld) => Self::Turn(withheld),
+            crate::LocalError::Reentrant => Self::Reentrant,
+            crate::LocalError::MailboxFull => Self::Full,
+            crate::LocalError::Closed => Self::Turn(Withheld::Gone),
+            crate::LocalError::NoSuchActor { id } => {
+                Self::Other(Error::Remote(RemoteError::NoSuchActor {
+                    id: id.to_string(),
+                }))
+            }
+            crate::LocalError::AtCapacity { capacity } => {
+                Self::Other(Error::Remote(RemoteError::AtCapacity {
+                    capacity: u64::try_from(capacity).unwrap_or(u64::MAX),
+                }))
+            }
         }
     }
 }

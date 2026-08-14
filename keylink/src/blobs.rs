@@ -754,9 +754,16 @@ pub struct BlobHandle {
 impl BlobHandle {
     /// Point a handle at content on `holder`.
     ///
-    /// Public only because generated `blob` client code names it. A caller
-    /// receives handles; it does not build them.
-    #[doc(hidden)]
+    /// A `blob` method hands back a [`BlobHandle`] already built, and that is
+    /// the ordinary route. This constructor is for the other one: a [`BlobId`]
+    /// is `Serialize`, so a peer can pass an address on to somebody else, and
+    /// that recipient needs a way to spend it.
+    ///
+    /// **An address is not a capability.** The grant is recorded for the exact
+    /// `(peer, hash)` pair the *handler* answered, so a handle built here
+    /// reaches the content only if the holder has already granted it to this
+    /// node. Building one for an address nobody granted you is refused at the
+    /// fetch, not here.
     #[must_use]
     pub fn new(node: &Node, holder: impl Into<EndpointAddr>, id: BlobId) -> Self {
         Self::on(node.endpoint().clone(), holder, id)
