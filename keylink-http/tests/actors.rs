@@ -65,8 +65,15 @@ impl ledger::Actor for Book {
     }
 }
 
-/// Records the actor every authorized call named, so a test can assert that
-/// the policy is asked about the id BEFORE the registry is.
+/// Records the actor every authorized call named.
+///
+/// **This log alone cannot show ORDER.** No registry event enters it, so it
+/// reads identically whether the policy runs before the call or after it. The
+/// ordering guarantee is held by `a_denied_caller_never_reaches_the_lazy_factory`,
+/// which records what the REGISTRY was asked to build — the moment a lazy mount
+/// would happen — and by the `forbidden` against `forbidden-absent` body parity
+/// below. This comment used to claim the ordering, and a reader who trusted it
+/// would have believed the guarantee was pinned here.
 #[derive(Clone)]
 struct Watching {
     seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
@@ -848,4 +855,53 @@ async fn a_denied_caller_never_reaches_the_lazy_factory() {
     let again = running.post("/v1/forbidden-lazy/rpc/Tick", "{}").await;
     assert_eq!(running.asked().len(), 1);
     assert_eq!(again.status(), http::StatusCode::FORBIDDEN);
+}
+
+/// No refusal names the actor it refused.
+///
+/// An id is a caller's own text, and echoing it back is how a shared error
+/// surface becomes a confirmation oracle: a body that repeats `secret-tenant`
+/// tells a caller that string reached something. Every refusal on the keyed
+/// surface is checked here — malformed, denied, permitted-but-absent, and an
+/// unknown method — over an id no other test uses.
+///
+/// `Location` is exempt BY DESIGN and is not tested here: it is minted only on
+/// a success, and it echoes the caller's own canonical encoded segment because
+/// a relative resource path has to.
+///
+/// **No break, and the reason is the guarantee.** `GatewayError` is a
+/// fieldless enum and its body is rendered from `kind()` alone, so there is no
+/// value in the type an id could travel in. Expressing this leak means ADDING a
+/// field and threading it to `body()`, which `break-once.sh` cannot write in
+/// one line. The row is a canary over a structural absence — like
+/// `the_keyed_surface_exposes_no_lifecycle_or_discovery` — and what it catches
+/// is the direction this actually fails in: someone enriching an error with the
+/// thing that caused it.
+#[tokio::test]
+async fn no_refusal_repeats_the_actor_id_back() {
+    let running = start().await;
+    const SECRET: &str = "secret-tenant";
+
+    for (case, path) in [
+        ("denied", format!("/v1/forbidden{SECRET}/rpc/Count")),
+        ("absent", format!("/v1/{SECRET}/rpc/Count")),
+        ("unknown method", format!("/v1/{SECRET}/rpc/Nope")),
+        ("malformed", format!("/v1/{SECRET}%2/rpc/Count")),
+    ] {
+        let response = running.post(&path, r#"{"value":1}"#).await;
+        let headers: String = response
+            .headers()
+            .iter()
+            .map(|(name, value)| format!("{name}: {}", value.to_str().unwrap_or("")))
+            .collect();
+        let body = response.text().await.expect("a body");
+        assert!(
+            !body.contains(SECRET),
+            "{case}: the body repeated the actor id — {body}"
+        );
+        assert!(
+            !headers.contains(SECRET),
+            "{case}: a header repeated the actor id — {headers}"
+        );
+    }
 }

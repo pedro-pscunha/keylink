@@ -295,6 +295,16 @@ where
 /// Both refusals belong to the router rather than the prelude, and in this
 /// order. The verb is a fact about the ROUTE, knowable with no address at all;
 /// the address is what the prelude then hands `Access`.
+///
+/// DEVIATION from the plan, which asks to "select a supported method before
+/// actor validation". The order here is verb, address, method, principal,
+/// policy: the address is decoded first because it is what builds the
+/// [`Surface`] the prelude runs on. It is unobservable — a malformed id and an
+/// unknown method both answer `GatewayError::MethodNotFound`, byte for byte,
+/// so no caller can tell which one answered — and the property the checkbox
+/// protects is that they are INDISTINGUISHABLE, which holds either way. Written
+/// here rather than only in a commit message, because a commit message is not
+/// where the next reader looks.
 fn addressed<'a, M: Mount>(
     mount: &'a M,
     request: &Request<Body>,
