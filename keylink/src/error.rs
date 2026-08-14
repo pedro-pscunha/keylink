@@ -96,6 +96,59 @@ pub enum BlockingError<E> {
     Operation(#[source] E),
 }
 
+/// How a blob holder's answer contradicted itself.
+///
+/// Carried by [`Error::BlobUnverified`]. Each variant records the numbers that
+/// made it detectable, in the same shape [`Error::BodyTruncated`] and
+/// [`Error::FrameTruncated`] use: what arrived beside what was promised.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum BlobFault {
+    /// The data response declared a different size from the verified probe.
+    ///
+    /// Reading would reject it too — different bytes cannot pass validation for
+    /// one address — but only after a reader existed and announced a length.
+    #[error("announced {announced} bytes on its data response after verifying {verified}")]
+    Size {
+        /// The size on the data response.
+        announced: u64,
+        /// The size the last-chunk probe validated.
+        verified: u64,
+    },
+
+    /// The transfer did not deliver exactly the bytes the selection names.
+    ///
+    /// Short in every reachable case — a stream that ended early. Named for
+    /// the comparison rather than for one side of it, because the guard is an
+    /// equality and a broken slicer makes it long.
+    #[error("delivered {received} of {selected} selected bytes")]
+    Incomplete {
+        /// Bytes handed to the caller.
+        received: u64,
+        /// Bytes the selection names.
+        selected: u64,
+    },
+
+    /// The read already failed, and a later call must not read as a clean end.
+    #[error("the read already failed, after {received} bytes")]
+    Aborted {
+        /// Bytes handed to the caller before it failed.
+        received: u64,
+    },
+
+    /// A leaf did not continue where the previous one ended.
+    ///
+    /// A sink is not seekable, so out-of-order delivery cannot be corrected —
+    /// only detected.
+    #[error("delivered a leaf at offset {offset} after {expected} bytes")]
+    Order {
+        /// Where the leaf claimed to start.
+        offset: u64,
+        /// Where the previous leaf ended.
+        expected: u64,
+    },
+}
+
 /// Everything that can go wrong on a keylink call.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -251,6 +304,45 @@ pub enum Error {
     BlobRefused {
         /// The content that was refused.
         id: crate::BlobId,
+    },
+
+    /// The holder answered something a correct one could not.
+    ///
+    /// One variant rather than three, because every caller of a blob read acts
+    /// on it the same way: the bytes are not trustworthy and the holder is why.
+    /// An HTTP gateway answers all of it with one upstream status. The three
+    /// shapes underneath keep their own numbers for the log line, which is the
+    /// only place they differ.
+    ///
+    /// Distinct from [`Error::Io`], which on a blob read now means only that
+    /// something LOCAL failed — the sink, or an invariant keylink itself holds.
+    #[error("blob {id}: {fault}")]
+    BlobUnverified {
+        /// The content that was being read.
+        id: crate::BlobId,
+        /// How the answer contradicted itself.
+        fault: BlobFault,
+    },
+
+    /// A byte range the verified content does not contain.
+    ///
+    /// Empty, reversed and out-of-bounds all arrive here, because against a
+    /// known size they are one fact: bytes were asked for that do not exist.
+    ///
+    /// Distinct from [`Error::Io`] because nothing failed. The holder was
+    /// never asked, the network is fine, and the caller's own argument is
+    /// what cannot be satisfied — which is why an HTTP gateway answers it
+    /// with `416` rather than a bad-gateway.
+    #[error("blob {id} holds {len} bytes, which do not contain {start}..{end}")]
+    BlobRange {
+        /// The content that was asked for.
+        id: crate::BlobId,
+        /// Its verified size.
+        len: u64,
+        /// The first byte requested.
+        start: u64,
+        /// One past the last byte requested.
+        end: u64,
     },
 
     /// Bad or missing configuration, reported at startup rather than on first use.

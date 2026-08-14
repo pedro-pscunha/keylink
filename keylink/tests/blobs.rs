@@ -19,12 +19,14 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use keylink::prelude::*;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, ConnectionError};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh_blobs::protocol::{
-    ChunkRanges, ChunkRangesSeq, GetManyRequest, GetRequest, ObserveRequest, PushRequest,
+    ChunkRanges, ChunkRangesExt, ChunkRangesSeq, GetManyRequest, GetRequest, ObserveRequest,
+    PushRequest,
 };
 use iroh_blobs::store::mem::MemStore;
 use keylink::{Allowlist, BlobHandle, BlobId, Blobs, Caller, Context, Error, Node, ProvenPeer};
@@ -152,8 +154,12 @@ impl Cluster {
     }
 
     async fn add(&self, content: &str) -> BlobId {
+        self.add_bytes(content.as_bytes()).await
+    }
+
+    async fn add_bytes(&self, content: &[u8]) -> BlobId {
         self.blobs
-            .add_bytes(content.as_bytes().to_vec())
+            .add_bytes(content.to_vec())
             .await
             .expect("the store accepts content")
     }
@@ -741,6 +747,854 @@ async fn a_blob_fetched_twice_into_one_store_costs_one_transfer() {
         .await
         .expect("the second fetch is free");
     assert_eq!(second, 0, "content already held costs no payload bytes");
+}
+
+// ───────────────────────────────────────────────── verified readers and ranges
+
+/// Content whose every byte depends on its position.
+///
+/// A slice taken from the wrong offset cannot coincidentally equal the right
+/// one, which is what makes the unaligned-range assertions able to fail.
+fn payload(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// Longer than one 16 KiB bao block, and aligned to none of them: an unaligned
+/// range over this has to slice a first leaf and a last leaf, not just one.
+const SPANNING: usize = 70_000;
+
+// ─────────────────────────────────────────── a holder that answers dishonestly
+//
+// Everything else in this file runs against a real provider on a real
+// connection, because framing and flow control are transport behaviour and a
+// hand-written stand-in would encode the assumptions under test. These three
+// answers are the exception the goal sanctions: a wrong size, a corrupted bao
+// frame and a truncated one are answers a CORRECT provider cannot produce, so
+// there is no honest peer that could send them.
+//
+// The forgery is still real on both sides of the client. The request is parsed
+// by iroh-blobs' own `Request::read_async`, the reply is a real provider's
+// answer with one deliberate mutation, and the code under test is the real
+// client FSM.
+
+/// The bytes to answer one parsed request with.
+///
+/// Async because two rows need the answer to depend on a live provider: the
+/// resume row cannot know which ranges the store will still be missing until
+/// the store asks for them, so its holder relays the real request onward.
+type Reply = Arc<dyn Fn(GetRequest) -> BoxFuture<Vec<u8>> + Send + Sync>;
+
+type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
+
+/// What one forging holder did, in the order it did it.
+#[derive(Debug, PartialEq, Eq)]
+enum Seen {
+    /// A whole answer went out and the stream was finished.
+    Answered,
+    /// The reader went away before the answer was finished.
+    Abandoned,
+    /// The connection ended.
+    Closed,
+}
+
+/// A blobs holder whose answer the test chooses.
+#[derive(Clone)]
+struct Forger {
+    /// Every request this holder parsed, in order. Both the observation event
+    /// and the counter: a test that expects no data request asserts on the
+    /// length after the call it is watching has already returned.
+    asked: Arc<Mutex<Vec<GetRequest>>>,
+    seen: tokio::sync::mpsc::UnboundedSender<Seen>,
+    reply: Reply,
+}
+
+impl std::fmt::Debug for Forger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Forger").finish_non_exhaustive()
+    }
+}
+
+/// Reports the end of a connection however the accept ends.
+///
+/// Two `?` sites below return without reaching the end of the loop, and the
+/// `Forger` holds the sender for the router's whole life, so the channel never
+/// closes. A test waiting on `seen()` would then wait for ever instead of
+/// failing. `keylink::blobs`' own `Admitted` guard exists for exactly this,
+/// under the same reason: a dropped future never reaches its next line.
+struct Ended(tokio::sync::mpsc::UnboundedSender<Seen>);
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        self.0.send(Seen::Closed).ok();
+    }
+}
+
+impl ProtocolHandler for Forger {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let _ended = Ended(self.seen.clone());
+        loop {
+            // One connection carries the size preflight and the data request on
+            // two streams. Accepting until the reader goes away is what lets a
+            // single forger answer both, and the loop ending is what reports
+            // that the reader went away.
+            let Ok((mut send, mut recv)) = connection.accept_bi().await else {
+                break;
+            };
+            let (request, _) = iroh_blobs::protocol::Request::read_async(&mut recv)
+                .await
+                .map_err(AcceptError::from_err)?;
+            let iroh_blobs::protocol::Request::Get(request) = request else {
+                connection.close(1u32.into(), b"only get");
+                break;
+            };
+            let reply = (self.reply)(request.clone()).await;
+            self.asked
+                .lock()
+                .expect("the record is not poisoned")
+                .push(request);
+            // A failed write is not an error here, it is the observation: a
+            // reader that was dropped mid-transfer stops the holder, and that
+            // is what the cancellation row asserts on.
+            let outcome = match send.write_all(&reply).await {
+                Ok(()) => {
+                    send.finish().map_err(AcceptError::from_err)?;
+                    Seen::Answered
+                }
+                Err(_) => Seen::Abandoned,
+            };
+            self.seen.send(outcome).ok();
+        }
+        Ok(())
+    }
+}
+
+/// A dishonest holder and a real client pointed at it.
+struct Forgery {
+    reader: Node,
+    holder: iroh::EndpointAddr,
+    asked: Arc<Mutex<Vec<GetRequest>>>,
+    seen: tokio::sync::mpsc::UnboundedReceiver<Seen>,
+    _holder: Node,
+    _router: Router,
+}
+
+async fn forgery<F>(reply: impl Fn(GetRequest) -> F + Send + Sync + 'static) -> Forgery
+where
+    F: std::future::Future<Output = Vec<u8>> + Send + 'static,
+{
+    let holder = local_node().await;
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let (seen, received) = tokio::sync::mpsc::unbounded_channel();
+    let router = Router::builder(holder.endpoint().clone())
+        .accept(
+            iroh_blobs::ALPN,
+            Forger {
+                asked: Arc::clone(&asked),
+                seen,
+                reply: Arc::new(move |request| Box::pin(reply(request))),
+            },
+        )
+        .spawn();
+
+    Forgery {
+        reader: local_node().await,
+        holder: holder.endpoint().addr(),
+        asked,
+        seen: received,
+        _holder: holder,
+        _router: router,
+    }
+}
+
+impl Forgery {
+    fn handle(&self, id: BlobId) -> BlobHandle {
+        BlobHandle::new(&self.reader, self.holder.clone(), id)
+    }
+
+    fn asked(&self) -> Vec<GetRequest> {
+        self.asked
+            .lock()
+            .expect("the record is not poisoned")
+            .clone()
+    }
+
+    /// The next thing the holder did. Every branch of the accept loop reports,
+    /// so this cannot outlast the holder.
+    async fn seen(&mut self) -> Seen {
+        self.seen
+            .recv()
+            .await
+            .expect("the holder reports every outcome")
+    }
+}
+
+/// What the client's size preflight asks for. `get_verified_size` requests the
+/// last chunk, so this is how a forged answer tells the two requests apart.
+fn preflight_ranges() -> ChunkRangesSeq {
+    ChunkRangesSeq::from_ranges([ChunkRanges::last_chunk()])
+}
+
+/// A holder that answers the size preflight honestly and the data request with
+/// whatever `forge` makes of a correct answer.
+///
+/// Six rows wanted this shape. Copying it six times is how a registered anchor
+/// stops resolving exactly once, which already cost `HJ9` a gate failure on
+/// this branch.
+async fn forging(cluster: &Cluster, id: BlobId, forge: impl FnOnce(Vec<u8>) -> Vec<u8>) -> Forgery {
+    let preflight = honest_answer(cluster, GetRequest::new(hash_of(id), preflight_ranges())).await;
+    let data = forge(honest_answer(cluster, GetRequest::blob(hash_of(id))).await);
+    forgery(move |request: GetRequest| {
+        let answer = if request.ranges == preflight_ranges() {
+            preflight.clone()
+        } else {
+            data.clone()
+        };
+        std::future::ready(answer)
+    })
+    .await
+}
+
+/// The exact bytes a correct provider answers `request` with.
+///
+/// Captured from the real store rather than encoded by hand, so the honest
+/// prefix of every forged answer is real bao that the real client accepts.
+async fn honest_answer(cluster: &Cluster, request: GetRequest) -> Vec<u8> {
+    ask(
+        cluster.peer.endpoint().clone(),
+        cluster.server.endpoint().addr(),
+        request,
+    )
+    .await
+}
+
+/// The same question, asked from an owned endpoint so a forging holder can
+/// relay onward from inside its reply.
+async fn ask(from: iroh::Endpoint, holder: iroh::EndpointAddr, request: GetRequest) -> Vec<u8> {
+    let connection = from
+        .connect(holder, iroh_blobs::ALPN)
+        .await
+        .expect("dials the blobs protocol");
+    let (mut send, mut recv) = connection.open_bi().await.expect("opens a request stream");
+    let asked = postcard::to_stdvec(&iroh_blobs::protocol::Request::Get(request))
+        .expect("encodes a get request");
+    send.write_all(&asked).await.expect("writes the request");
+    send.finish().expect("finishes the request");
+    recv.read_to_end(16 * 1024 * 1024)
+        .await
+        .expect("reads the whole answer")
+}
+
+/// Two reads from one address must not share a stream.
+///
+/// The clone is what a caller reaches for when one address feeds two consumers
+/// — an HTTP range request beside a full download, in the gateway's case. If
+/// they shared transport state, each would see the other's bytes; reading them
+/// one after the other would hide exactly that, so they are interleaved here.
+#[tokio::test]
+async fn blob_handle_clone_opens_independent_full_reads() {
+    let cluster = cluster().await;
+    let content = payload(SPANNING);
+    let id = cluster.add_bytes(&content).await;
+    cluster.grant(&cluster.peer, &[id]).await;
+
+    let handle = BlobHandle::new(&cluster.peer, cluster.server.endpoint().addr(), id);
+    let clone = handle.clone();
+
+    let mut first = handle.open().await.expect("opens the first read");
+    let mut second = clone.open().await.expect("opens the second read");
+    assert_eq!(first.total_len(), content.len() as u64);
+    assert_eq!(second.total_len(), content.len() as u64);
+
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    loop {
+        let a = first.next_chunk().await.expect("the first read continues");
+        let b = second
+            .next_chunk()
+            .await
+            .expect("the second read continues");
+        match (a, b) {
+            (None, None) => break,
+            (a, b) => {
+                left.extend_from_slice(a.as_deref().unwrap_or_default());
+                right.extend_from_slice(b.as_deref().unwrap_or_default());
+            }
+        }
+    }
+
+    assert_eq!(left, content, "the first read is complete");
+    assert_eq!(right, content, "and so is the second, interleaved with it");
+}
+
+/// The data response's size must be the one the preflight verified.
+///
+/// The assertion is that `open` FAILS, not merely that reading fails. Watched
+/// red with `scripts/break-once.sh` (row `HK1`) by replacing
+/// `if announced != total {`
+/// in `keylink/src/blobs.rs` with `if false {`, and the reader that came back
+/// is what says why the comparison earns its place:
+///
+/// ```text
+/// BlobReader { id: BlobId(5a8ef06db0fc4e6c27f6e4a44e333916934b860d747d8d65f56df4597f0421bf), total_len: 70000, selected_len: 70000, emitted: 0 }
+/// ```
+///
+/// It announces 70000 because `total` still comes from the preflight — while
+/// its decoder was built on the forged 1024, so it can never deliver them. The
+/// forgery is still caught eventually: one chunk cannot pass bao validation
+/// against a 70 KiB root hash. But by then a gateway has read `total_len`,
+/// sent `200` with `Content-Length: 70000`, and the only report left is a
+/// broken body. The comparison moves that from a failed download to a refused
+/// open.
+#[tokio::test]
+async fn blob_open_rejects_data_size_different_from_verified_size() {
+    let cluster = cluster().await;
+    let content = payload(SPANNING);
+    let id = cluster.add_bytes(&content).await;
+    cluster.grant(&cluster.peer, &[id]).await;
+
+    // Only the eight size bytes move. Everything the client checks before the
+    // comparison still passes, so the comparison is the only thing that can
+    // fail first.
+    let holder = forging(&cluster, id, |mut honest| {
+        honest[..8].copy_from_slice(&1024u64.to_le_bytes());
+        honest
+    })
+    .await;
+
+    let error = holder
+        .handle(id)
+        .open()
+        .await
+        .expect_err("a data size the preflight did not verify yields no reader");
+    // Matched on the type, not on the message. An assertion over a format
+    // string is a contract on prose, and the numbers are what a gateway logs.
+    assert!(
+        matches!(
+            error,
+            Error::BlobUnverified {
+                fault: keylink::BlobFault::Size {
+                    announced: 1024,
+                    verified: 70_000
+                },
+                ..
+            }
+        ),
+        "the refusal names both sizes: {error:?}"
+    );
+}
+
+/// A copy that fails must say so, never return a shorter success.
+///
+/// **The first version of this row was measured and thrown away.** It forged
+/// the data size and asserted that `copy_to` refused with an empty sink, on the
+/// reasoning that a detached copy path would copy happily. Under `HK1`'s break
+/// it came back GREEN, `exit=0`: bao rejects a 1024-byte tree against a 70 KiB
+/// root hash on its own, so `copy_to` failed and wrote nothing either way. The
+/// forged size is a case a second checker already covers, and a guard another
+/// layer also enforces is not a guard on this one.
+///
+/// What has no second checker is the shape below. A truncated answer leaves
+/// `copy_to` holding real, verified, short content, and reporting that as a
+/// success is the one outcome every layer above would believe.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK7`) by replacing
+/// `while let Some(chunk) = self.next_chunk().await? {`
+/// in `keylink/src/blobs.rs` with `while let Ok(Some(chunk)) =
+/// self.next_chunk().await {`.
+#[tokio::test]
+async fn blob_copy_to_reports_the_readers_failure_instead_of_a_short_success() {
+    let cluster = cluster().await;
+    let content = payload(SPANNING);
+    let id = cluster.add_bytes(&content).await;
+    cluster.grant(&cluster.peer, &[id]).await;
+
+    let holder = forging(&cluster, id, |honest| {
+        let half = honest.len() / 2;
+        honest[..half].to_vec()
+    })
+    .await;
+
+    let mut sink = Vec::new();
+    holder
+        .handle(id)
+        .copy_to(&mut sink)
+        .await
+        .expect_err("a copy reports the read's failure");
+    assert!(
+        sink.len() < content.len(),
+        "control: it really did stop short, so a silent success was available"
+    );
+}
+
+/// Read to EOF, keeping whatever arrived before a failure.
+async fn read_all(reader: &mut keylink::BlobReader) -> (Vec<u8>, Option<Error>) {
+    let mut out = Vec::new();
+    loop {
+        match reader.next_chunk().await {
+            Ok(Some(chunk)) => out.extend_from_slice(&chunk),
+            Ok(None) => return (out, None),
+            Err(error) => return (out, Some(error)),
+        }
+    }
+}
+
+/// One flipped payload byte must break the read, and must never be handed on.
+///
+/// **Dependency-path evidence, and it carries no keylink anchor.** bao owns
+/// this rejection, not keylink, and the plan says so. What is worth measuring
+/// is that driving the FSM by hand did not lose it: the previous
+/// implementation went through `get_blob`, which validated on keylink's behalf,
+/// and `BlobReader` walks `fsm` directly.
+///
+/// The second assertion is the one with teeth. An error alone would also
+/// follow from a reader that emitted the corrupt bytes and complained
+/// afterwards, which is the failure that matters — a gateway has already sent
+/// them by then.
+#[tokio::test]
+async fn blob_open_rejects_corrupt_bao_from_real_fsm() {
+    let cluster = cluster().await;
+    let content = payload(SPANNING);
+    let id = cluster.add_bytes(&content).await;
+    cluster.grant(&cluster.peer, &[id]).await;
+
+    // The last byte of the answer is payload in the final leaf, so every
+    // earlier leaf still validates and the break lands as late as it can.
+    let holder = forging(&cluster, id, |mut honest| {
+        let last = honest.len() - 1;
+        honest[last] ^= 0xff;
+        honest
+    })
+    .await;
+
+    let mut reader = holder
+        .handle(id)
+        .open()
+        .await
+        .expect("the size header is honest, so the reader opens");
+    let (read, error) = read_all(&mut reader).await;
+
+    assert!(error.is_some(), "a corrupt leaf must fail the read");
+    assert!(
+        content.starts_with(&read),
+        "and nothing that failed verification may reach the caller"
+    );
+    assert!(
+        read.len() < content.len(),
+        "control: the corrupt tail really was withheld"
+    );
+}
+
+/// An answer that stops early must not read as a complete short blob.
+///
+/// Also dependency-path evidence. The distinction it draws is the one
+/// `Error::BodyTruncated` draws for bodies: a transfer that ended before its
+/// content did is a failure, never a shorter success. Both the FSM's own EOF
+/// handling and `Selection::finish` can report it; the assertion names neither,
+/// because either is correct and pinning one would fail on a dependency bump
+/// that changed nothing about the guarantee.
+#[tokio::test]
+async fn blob_open_rejects_truncated_bao_from_real_fsm() {
+    let cluster = cluster().await;
+    let content = payload(SPANNING);
+    let id = cluster.add_bytes(&content).await;
+    cluster.grant(&cluster.peer, &[id]).await;
+
+    let holder = forging(&cluster, id, |honest| {
+        let half = honest.len() / 2;
+        honest[..half].to_vec()
+    })
+    .await;
+
+    let mut reader = holder
+        .handle(id)
+        .open()
+        .await
+        .expect("the size header is honest, so the reader opens");
+    assert_eq!(
+        reader.total_len(),
+        content.len() as u64,
+        "the length it promised is the verified one"
+    );
+    let (read, error) = read_all(&mut reader).await;
+
+    assert!(error.is_some(), "a truncated answer must fail the read");
+    assert!(
+        read.len() < content.len(),
+        "control: it really did stop short, so a silent success was available"
+    );
+}
+
+/// Read to EOF and require it to get there.
+async fn collect(reader: &mut keylink::BlobReader) -> Vec<u8> {
+    let (read, error) = read_all(reader).await;
+    assert!(error.is_none(), "the read reaches EOF: {error:?}");
+    read
+}
+
+/// One serving cluster with content, and a handle onto it.
+async fn served(content: &[u8]) -> (Cluster, BlobHandle) {
+    let cluster = cluster().await;
+    let id = cluster.add_bytes(content).await;
+    cluster.grant(&cluster.peer, &[id]).await;
+    let handle = BlobHandle::new(&cluster.peer, cluster.server.endpoint().addr(), id);
+    (cluster, handle)
+}
+
+/// A whole-blob read reports the verified length and stops at it.
+#[tokio::test]
+async fn blob_reader_reads_verified_full_content() {
+    let content = payload(SPANNING);
+    let (_cluster, handle) = served(&content).await;
+
+    assert_eq!(
+        handle.verified_len().await.expect("the size is verified"),
+        content.len() as u64
+    );
+
+    let mut reader = handle.open().await.expect("opens a full read");
+    assert_eq!(reader.total_len(), content.len() as u64);
+    assert_eq!(
+        reader.selected_len(),
+        content.len() as u64,
+        "a full read selects everything"
+    );
+
+    assert_eq!(collect(&mut reader).await, content);
+    assert!(
+        reader
+            .next_chunk()
+            .await
+            .expect("EOF is idempotent")
+            .is_none(),
+        "and stays at EOF"
+    );
+}
+
+/// One 16 KiB block, asked for on its own boundaries.
+///
+/// The block size is the unit that arrives, not the unit that is asked for:
+/// `IROH_BLOCK_SIZE` is `BlockSize::from_chunk_log(4)`, so a leaf is 16 KiB
+/// while range selection is in 1024-byte chunks. An aligned range is therefore
+/// the case where the two happen to agree and no slicing is required — which is
+/// exactly why it cannot stand in for the unaligned one below.
+#[tokio::test]
+async fn blob_reader_reads_aligned_range() {
+    let content = payload(SPANNING);
+    let (_cluster, handle) = served(&content).await;
+
+    let want = 16_384..32_768;
+    let mut reader = handle
+        .open_range(want.clone())
+        .await
+        .expect("opens an aligned range");
+
+    assert_eq!(
+        reader.total_len(),
+        content.len() as u64,
+        "the whole-blob length is still the verified one"
+    );
+    assert_eq!(reader.selected_len(), 16_384);
+    assert_eq!(
+        collect(&mut reader).await,
+        &content[want.start as usize..want.end as usize]
+    );
+}
+
+/// A range that lands inside a leaf at both ends.
+///
+/// Both overhangs are real and both are 16 KiB wide, so writing whole leaves
+/// would overrun by up to 32 KiB. `payload` makes every byte depend on its
+/// position, so an output of the right LENGTH taken from the wrong offset still
+/// fails this comparison.
+///
+/// Both clamps are watched, because HK2 alone would prove only one of them.
+///
+/// Head, row `HK2`: replacing
+/// `let head = self.start.max(offset);`
+/// in `keylink/src/blobs.rs` with `let head = offset;` reports
+/// `Incomplete { received: 40000, selected: 39000 }`.
+///
+/// Tail, row `HK8`: replacing
+/// `let tail = self.end().min(stop);`
+/// with `let tail = stop;` reports
+/// `Incomplete { received: 39960, selected: 39000 }`.
+///
+/// The overhangs are 1000 and 960 bytes only because of where this range
+/// falls. Each is up to 16 KiB in general, and each is the accidental
+/// off-by-one the separated counters exist to prevent.
+#[tokio::test]
+async fn blob_reader_slices_unaligned_first_and_last_chunks() {
+    let content = payload(SPANNING);
+    let (_cluster, handle) = served(&content).await;
+
+    let want = 1_000..40_000;
+    let mut reader = handle
+        .open_range(want.clone())
+        .await
+        .expect("opens an unaligned range");
+
+    assert_eq!(reader.selected_len(), 39_000);
+    assert_eq!(
+        collect(&mut reader).await,
+        &content[want.start as usize..want.end as usize]
+    );
+}
+
+/// Zero bytes is content, not an error, and nothing about it may underflow.
+///
+/// The arithmetic that could: `last_chunk()` is `ChunkNum(u64::MAX)..`, and
+/// the range check subtracts. codex found no upstream end-to-end test for the
+/// 0-byte case, so this proves it here rather than assuming iroh-blobs does.
+#[tokio::test]
+async fn blob_reader_handles_empty_blob_without_underflow() {
+    let (_cluster, handle) = served(&[]).await;
+
+    assert_eq!(
+        handle.verified_len().await.expect("a zero size verifies"),
+        0
+    );
+
+    let mut reader = handle.open().await.expect("opens an empty read");
+    assert_eq!(reader.total_len(), 0);
+    assert_eq!(reader.selected_len(), 0);
+    assert!(
+        reader
+            .next_chunk()
+            .await
+            .expect("an empty read succeeds")
+            .is_none(),
+        "a full read of nothing is EOF, not a failure"
+    );
+
+    for want in [0..1, 0..u64::MAX, 1..2, u64::MAX - 1..u64::MAX] {
+        assert!(
+            handle.open_range(want.clone()).await.is_err(),
+            "{want:?} cannot be satisfied by a blob with no bytes"
+        );
+    }
+}
+
+/// A range the content cannot satisfy must cost the holder nothing.
+///
+/// The holder here replays a real provider's captured answers, so the only
+/// thing it adds is a record of what was asked. That record is the proof: an
+/// unsatisfiable range must be refused against the verified size, not sent and
+/// then discovered — a data request costs the holder a stream and a bao
+/// traversal, and a caller who can spend those by asking for `500..100` has
+/// found a way to make somebody else work.
+///
+/// Two guards, watched separately, because they are refused in different
+/// places and only one of them needs the size.
+///
+/// Out of bounds, row `HK3`: replacing
+/// `if range.end > total {`
+/// in `keylink/src/blobs.rs` with `if false {` reddens on `70000..70001` and
+/// on nothing earlier. An empty or reversed range converts to an empty chunk
+/// set, which the FSM refuses on its own, so out of bounds is the case this
+/// half uniquely owns — and it is the one an HTTP `Range` header reaches first.
+///
+/// Empty and reversed, row `HK10`: replacing
+/// `let Some(len) = range.end.checked_sub(range.start).filter(|len| *len > 0) else {`
+/// with `let Some(len) = Some(range.end.wrapping_sub(range.start)) else {`
+/// takes the holder from 5 requests to 10 — every free refusal turns into a
+/// handshake and a probe. An earlier shape kept the guard beside a plain `-`
+/// and its break panicked with `attempt to subtract with overflow` before this
+/// assertion could run, which is why the guard is now the subtraction itself.
+#[tokio::test]
+#[expect(
+    clippy::reversed_empty_ranges,
+    reason = "a reversed range is one of the inputs under test, not a mistake"
+)]
+async fn blob_reader_rejects_invalid_ranges_before_data_request() {
+    let cluster = cluster().await;
+    let content = payload(SPANNING);
+    let id = cluster.add_bytes(&content).await;
+    cluster.grant(&cluster.peer, &[id]).await;
+    let len = content.len() as u64;
+
+    // Honest bytes: this holder is a request RECORD, not a liar.
+    let holder = forging(&cluster, id, |honest| honest).await;
+    let handle = holder.handle(id);
+
+    // Empty and reversed need no size to refuse, so they cost the holder
+    // nothing at all — not even a handshake.
+    let free = [0..0, 40..40, 500..100, len..len, u64::MAX..u64::MAX];
+    // Out of bounds needs the verified size, so each of these buys one probe
+    // and must stop there.
+    let probed = [len..len + 1, 0..len + 1, (len - 1)..u64::MAX];
+
+    for want in free.iter().chain(probed.iter()) {
+        assert!(
+            handle.open_range(want.clone()).await.is_err(),
+            "{want:?} is not inside {len} verified bytes"
+        );
+    }
+
+    // Control: the holder does answer data requests, so a harness that silently
+    // never asked would not be what makes the counts below hold.
+    let mut reader = handle.open().await.expect("a whole-blob read is served");
+    assert_eq!(collect(&mut reader).await.len(), content.len());
+
+    let asked = holder.asked();
+    let data = asked
+        .iter()
+        .filter(|request| request.ranges != preflight_ranges())
+        .count();
+    assert_eq!(
+        data, 1,
+        "only the control read reached the holder as a data request: {asked:?}"
+    );
+    assert_eq!(
+        asked.len(),
+        probed.len() + 2,
+        "one probe per out-of-bounds range, plus the control's probe and data \
+         request — and nothing at all for the {} that need no size: {asked:?}",
+        free.len()
+    );
+}
+
+/// Abandoning a reader must stop the holder, not just stop reading.
+///
+/// The payload is deliberately larger than a QUIC stream's receive window, so
+/// the holder is still inside `write_all` when the reader goes away. On a small
+/// blob the whole answer fits in the window before the first `next_chunk`
+/// returns, and `Seen::Abandoned` would be unreachable however the reader
+/// behaved — the test would then be measuring the window, not the cancellation.
+///
+/// The window is quinn's default and keylink overrides no transport config
+/// here: `STREAM_RWND = MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT` is
+/// `1_250_000` bytes at `quinn-proto-0.11.15/src/config/transport.rs:355-366`.
+/// 4 MiB is 3.4 times that. The constant cannot be imported, so it is recorded
+/// here rather than derived, and a quinn bump that raised it past 4 MiB would
+/// turn this row green for the wrong reason.
+///
+/// **It proves that dropping cancels; it does not attribute which signal did
+/// it.** Two leave at the same instant — `STOP_SENDING` from the dropped
+/// `RecvStream`, and the connection close from the last `Connection` handle
+/// going — and either alone fails the holder's write. Ownership of both is the
+/// design; the assertion below covers the pair, not one of them.
+#[tokio::test]
+async fn dropping_blob_reader_cancels_get_and_allows_reopen() {
+    let cluster = cluster().await;
+    let content = payload(4 * 1024 * 1024);
+    let id = cluster.add_bytes(&content).await;
+    cluster.grant(&cluster.peer, &[id]).await;
+
+    // Honest bytes again: this holder is an observation point.
+    let mut holder = forging(&cluster, id, |honest| honest).await;
+    let handle = holder.handle(id);
+
+    let mut first = handle.open().await.expect("opens the first read");
+    assert!(
+        first.next_chunk().await.expect("bytes arrive").is_some(),
+        "the transfer is under way"
+    );
+    assert_eq!(
+        holder.seen().await,
+        Seen::Answered,
+        "the size preflight completed"
+    );
+
+    drop(first);
+    assert_eq!(
+        holder.seen().await,
+        Seen::Abandoned,
+        "the holder stopped part way through the answer"
+    );
+    assert_eq!(
+        holder.seen().await,
+        Seen::Closed,
+        "and the connection ended"
+    );
+
+    let mut second = handle.open().await.expect("a later read reopens");
+    assert_eq!(collect(&mut second).await, content, "and completes");
+}
+
+/// Whether an interrupted `fetch_into` really resumes.
+///
+/// A characterization test, and it is here because the rustdoc on `fetch_into`
+/// promises resume and nothing measured it. The holder relays every request to
+/// the real provider and cuts the first data answer in half, so the first fetch
+/// fails with a genuinely partial store and the second asks the same real
+/// provider for whatever is left.
+///
+/// The number that decides it is the second fetch's payload count. Equal to the
+/// content length means nothing was kept and the promise is wrong; smaller
+/// means the store asked only for the suffix.
+///
+/// Measured, by tightening the bound to `second < 1` and reading the failure:
+/// **37232 of 70000 bytes**. So the store kept the 32768 bytes it had already
+/// verified — two whole 16 KiB blocks — and the rustdoc promise stands as
+/// written.
+#[tokio::test]
+async fn interrupted_fetch_into_resumes_from_store_progress() {
+    let cluster = cluster().await;
+    let content = payload(SPANNING);
+    let id = cluster.add_bytes(&content).await;
+    cluster.grant(&cluster.peer, &[id]).await;
+
+    let from = cluster.peer.endpoint().clone();
+    let to = cluster.server.endpoint().addr();
+    let cut = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let holder = forgery(move |request: GetRequest| {
+        let from = from.clone();
+        let to = to.clone();
+        let cut = Arc::clone(&cut);
+        async move {
+            let answer = ask(from, to, request.clone()).await;
+            if request.ranges != preflight_ranges()
+                && cut.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                answer[..answer.len() / 2].to_vec()
+            } else {
+                answer
+            }
+        }
+    })
+    .await;
+
+    let local = Blobs::memory();
+    let handle = holder.handle(id);
+    assert!(
+        handle.fetch_into(&local).await.is_err(),
+        "an answer that stops half way does not complete a fetch"
+    );
+
+    let second = handle
+        .fetch_into(&local)
+        .await
+        .expect("the second fetch completes");
+    assert!(
+        second > 0,
+        "control: the first fetch did not quietly finish, so there was a suffix to ask for"
+    );
+    assert!(
+        second < content.len() as u64,
+        "resume asks only for what the store is missing, not {second} of {} bytes",
+        content.len()
+    );
+}
+
+/// The three ranges an off-by-one reaches first.
+#[tokio::test]
+async fn blob_reader_reads_first_last_and_single_byte_ranges() {
+    let content = payload(SPANNING);
+    let (_cluster, handle) = served(&content).await;
+    let len = content.len() as u64;
+
+    for want in [0..1, (len - 1)..len, 20_000..20_001, 0..len] {
+        let mut reader = handle
+            .open_range(want.clone())
+            .await
+            .unwrap_or_else(|error| panic!("opens {want:?}: {error}"));
+        assert_eq!(reader.selected_len(), want.end - want.start, "{want:?}");
+        assert_eq!(
+            collect(&mut reader).await,
+            &content[want.start as usize..want.end as usize],
+            "{want:?}"
+        );
+    }
 }
 
 // ────────────────────────────────────────────────────────── the reservation

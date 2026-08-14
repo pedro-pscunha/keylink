@@ -252,7 +252,9 @@ pub use actor::{
 };
 pub use admission::{Admission, Admittance, DynamicAdmission, Revocable, Revocation};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
-pub use blobs::{BlobHandle, BlobId, Blobs, BlobsAdmission, Granting, Retention, MAX_GRANTS};
+pub use blobs::{
+    BlobHandle, BlobId, BlobReader, Blobs, BlobsAdmission, Granting, Retention, MAX_GRANTS,
+};
 pub use body::{Body, BodyReader};
 pub use call::{Applied, CallId, APPLIED_BOUND};
 pub use console::{
@@ -309,7 +311,9 @@ pub mod inspect {
 pub use authz::{Authorization, Compiled, Rules};
 #[cfg(feature = "blocking")]
 pub use error::BlockingError;
-pub use error::{ConfigError, Error, Failure, Queued, Result, TellError, Transmitted, Transport};
+pub use error::{
+    BlobFault, ConfigError, Error, Failure, Queued, Result, TellError, Transmitted, Transport,
+};
 pub use external::{
     ExternalCall, ExternalError, ExternalFuture, ExternalKind, ExternalMethod, ExternalOutput,
     ExternalService, ServiceCodec,

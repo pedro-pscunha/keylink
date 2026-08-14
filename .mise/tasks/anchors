@@ -2165,6 +2165,28 @@ ANCHORS = [
      "                    .await\n"
      "                    .map(drop)\n"
      "                    .map_err(Error::from)"),
+    ("HK1", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "        if announced != total {"),
+    ("HK2", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "        let head = self.start.max(offset);"),
+    ("HK3", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "        if range.end > total {"),
+    ("HK10", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "        let Some(len) = range.end.checked_sub(range.start).filter(|len| *len > 0) else {"),
+    # HK4 and HK5 are recorded in the file they break, so their literals stay
+    # unindented in the record and indented here - see rot mode 1 above.
+    ("HK4", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "            if offset != expected {"),
+    ("HK5", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "        if self.emitted == self.len {"),
+    ("HK6", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "    if !msg.request.ranges.is_blob() {"),
+    ("HK7", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "        while let Some(chunk) = self.next_chunk().await? {"),
+    ("HK8", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "        let tail = self.end().min(stop);"),
+    ("HK9", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "        if self.broken {"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -3851,7 +3873,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 292
+RECORD_BLOCKS = 298
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a
