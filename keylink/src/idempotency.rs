@@ -307,6 +307,29 @@ pub const MAX_WAITING_PER_PEER: usize = 128;
 /// smaller share of its budget on calls it has already decided not to run.
 pub const MAX_WAITING: usize = 1024;
 
+/// How many queued disk reconciliations one claim pays for.
+///
+/// Each is an `fsync`, so this is a latency ceiling on the claim path and not a
+/// tuning knob: the queue still drains, over as many claims as it takes.
+///
+/// **Measured, not chosen.** The fixture is a 1500-record store reopened at
+/// `pool_records(64)`, where `Ledger::new` queues 2616 entries. The first keyed
+/// call after that restart, against a 60 ms ceiling:
+///
+/// | `DRAIN_PER_CLAIM` | first call        |
+/// |-------------------|-------------------|
+/// | 16                | 74.0 ms           |
+/// | 14                | 46.8 - 48.8 ms    |
+/// | 12                | 38.9 - 41.6 ms    |
+///
+/// 14 is the largest value that measured under the ceiling, and it is not the
+/// one taken: its *second* call reached 56.2 ms, and this machine has measured
+/// 1.7x variance between runs minutes apart, so 14 meets the ceiling by less
+/// than the noise. 12 clears it by a third. The backlog still goes: 12 drains
+/// about 11 entries per call after the reconcile, so 2616 of them are gone in
+/// about 240 keyed calls, against the 2000 this was accepted at.
+const DRAIN_PER_CLAIM: usize = 12;
+
 /// Why a call carrying an idempotency key was refused without being run.
 ///
 /// Grouped under one [`RemoteError`] variant rather than spread across six,
@@ -1150,16 +1173,22 @@ struct Inner {
     /// under this lock and cannot await. Drained by the next claim, which can.
     /// Empty forever on a service with no store.
     ///
-    /// **Bounded by the evictions between two claims**, and a settle evicts at
-    /// most one tombstone because it adds at most one. The exception is the
-    /// eviction `Ledger::new` runs over a recovered set, which is bounded by
-    /// what the store held and is drained by the first claim.
+    /// **Not bounded by the evictions between two claims, and not drained in
+    /// one go.** Ordinary traffic queues about one entry per settle, because a
+    /// settle evicts at most one tombstone and adds at most one. The eviction
+    /// `Ledger::new` runs over a recovered set is the exception that sets the
+    /// shape here: it is bounded by what the store held, which was **2616
+    /// entries** at a 1500-record fixture reopened under narrower bounds, and
+    /// every entry is an `fsync`. So a claim drains at most
+    /// [`DRAIN_PER_CLAIM`] of them, from the **front**, and the queue is a
+    /// [`VecDeque`] so that costs `O(DRAIN_PER_CLAIM)` rather than shifting the
+    /// remainder. The backlog still clears; it clears over several claims.
     ///
     /// A **downgrade** is deliberately not in here. `expire` and `evict` turn a
     /// held reply into a tombstone, and the disk keeps the reply — which costs
     /// space and loses nothing, because a recovered ledger runs the same
     /// eviction over the same bounds the moment it is built.
-    pending: Vec<(EndpointId, IdempotencyKey)>,
+    pending: VecDeque<(EndpointId, IdempotencyKey)>,
     /// Every peer holding at least one replayable reply, as `(len, id)`, so the
     /// largest holder is one `last()` rather than a scan of every peer.
     ///
@@ -2195,7 +2224,22 @@ impl Ledger {
             let Some(store) = self.records.store() else {
                 return;
             };
-            let batch = std::mem::take(&mut self.lock().pending);
+            // A bounded prefix, and never the whole queue. Every entry is one
+            // `fsync`, so taking all of them puts the entire backlog on
+            // whichever caller happens to be first — measured at **8770 ms on
+            // one call** against a 1500-record store reopened under narrower
+            // bounds, where `Ledger::new` had already queued 2616 entries.
+            //
+            // From the front. Taking from the tail is O(k) too, and it starves:
+            // the failure path below returns what it could not write to the
+            // back, so under sustained traffic the front would never be reached
+            // and its records would stay on the disk for the life of the
+            // process.
+            let batch: Vec<_> = {
+                let mut guard = self.lock();
+                let take = guard.pending.len().min(DRAIN_PER_CLAIM);
+                guard.pending.drain(..take).collect()
+            };
             if !batch.is_empty() {
                 let left = store
                     .reconcile(batch, |peer, key| self.reconcile_for(peer, key))
@@ -2336,7 +2380,7 @@ impl Ledger {
         // dispatch leaves the key claimable. Queued rather than written,
         // because this runs under the lock.
         if self.records.stores_durably() {
-            inner.pending.push((peer, key.clone()));
+            inner.pending.push_back((peer, key.clone()));
         }
     }
 
@@ -2433,7 +2477,7 @@ impl Ledger {
             // The reply leaves the disk when it leaves memory, for the reason
             // `expire` gives: otherwise `pool_bytes` bounds one tier of two.
             if self.records.stores_durably() {
-                inner.pending.push((peer, key));
+                inner.pending.push_back((peer, key));
             }
         }
 
@@ -2459,7 +2503,7 @@ impl Ledger {
             // kept it would grow for the life of the disk, so the removal is
             // queued for the next claim, which is the next code that can await.
             if self.records.stores_durably() {
-                inner.pending.push((peer, key));
+                inner.pending.push_back((peer, key));
             }
         }
     }
