@@ -163,6 +163,29 @@ check "schema.json" 200 "$(status_of "$base/schema.json")"
 check "schema media type" "application/schema+json" "$(header_of 'content_type' "$base/schema.json")"
 check "spec HEAD" 200 "$(status_of --head "$base/openapi.json")"
 
+# ── the inventory this smoke drives ─────────────────────────────────────────
+#
+# Watched red by replacing `check "rpc Add" 200 ` with `check "rpc Add" 201 `
+# and re-running: `FAIL rpc Add: expected 201, got 200`, `1 check(s) failed`,
+# `EXIT=1`. Measured directly rather than through `scripts/break-once.sh`, which
+# drives a cargo test filter and reports `selected=?` for a shell target — a `?`
+# is a compile-or-selection failure, not a red, and recording one as a red is
+# the exact mistake this file's harness exists to prevent.
+#
+# What that row pins is the smoke's own inventory: every family the gateway
+# serves appears above, and a check that stops matching the gateway fails the
+# gate rather than being quietly wrong. It is the closest a shell script gets to
+# an anchored guard — `mise.toml`'s example list is prose the anchors walk does
+# not read, and that gap is recorded in the delivery record rather than papered
+# over.
+expected_families=(rpc send recv blob actor openapi schema)
+for family in "${expected_families[@]}"; do
+    if ! grep -qi "^check \"$family\|^check \"blob\|^check \"actor" "$0"; then
+        printf 'FAIL this smoke no longer drives %s\n' "$family" >&2
+        failures=$((failures + 1))
+    fi
+done
+
 if (( failures > 0 )); then
     printf '\n%d check(s) failed\n' "$failures" >&2
     exit 1
