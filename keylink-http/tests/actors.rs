@@ -946,6 +946,21 @@ async fn a_denied_caller_never_reaches_the_lazy_factory() {
 
     // Denied, and never mounted. `forbidden-lazy` would build if it were asked
     // for, so the factory's silence is about the policy and not about the id.
+    // A FREE SLOT before the probe, and this is not incidental. The fixture is
+    // capped at four and the control above took the last one, so without this
+    // the denied call meets the CAP — which is checked before the factory — and
+    // the factory record stays `["lazy"]` whether or not the policy ran. The
+    // row would pass under its own break, which is what `replay-anchors` caught
+    // after a later commit added the cap.
+    running
+        .system
+        .stop(
+            &keylink::ActorId::new("lazy").expect("a valid id"),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect("the actor was running");
+
     let refused = running.post("/v1/forbidden-lazy/rpc/Whoami", "{}").await;
     // The factory FIRST, and deliberately. A denied call that reached the
     // registry answers `404` rather than `403`, so a status assertion placed

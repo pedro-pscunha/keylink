@@ -364,7 +364,7 @@ pub fn schemas<D: Documented>(surface: &HttpSurface) -> Result<Document, Documen
     // resolves in. Running it on only one of the two published documents would
     // make every dangling reference silent in the other.
     check_references(&value, "#/$defs/", &["$defs"])?;
-    let bytes = serde_json::to_vec_pretty(&value).unwrap_or_default();
+    let bytes = render(&value);
     Ok(Document { value, bytes })
 }
 
