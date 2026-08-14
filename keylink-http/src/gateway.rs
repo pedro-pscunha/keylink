@@ -198,47 +198,21 @@ where
         route_path: &str,
         kind: keylink::ExternalKind,
     ) -> Result<Admitted, Response<Body>> {
-        let decoded = decode_method::<S>(parts.uri.path(), route_path, kind)
-            .map_err(|error| error.response(None))?;
-        let Some(method) = S::METHODS
-            .iter()
-            .copied()
-            .find(|candidate| candidate.name() == decoded && candidate.kind() == kind)
-            .map(keylink::ExternalMethod::name)
-        else {
-            return Err(GatewayError::MethodNotFound.response(None));
-        };
-        if parts.method != route.method() {
-            return Err(GatewayError::MethodNotAllowed.response(None));
-        }
-        let Some(principal) = parts.extensions.get::<Principal>().cloned() else {
-            return Err(GatewayError::Unauthenticated.response(Some(self.challenge.header())));
-        };
-        match self
-            .access
-            .authorize(Call {
-                extensions: &parts.extensions,
-                headers: &parts.headers,
-                principal: &principal,
-                service: S::SERVICE,
-                method,
-                // Singleton surface. Task 6's actor routes pass the validated
-                // id here, and `Access` sees the difference in one field
-                // rather than in a second trait.
-                actor: None,
-            })
-            .await
-        {
-            Ok(()) => Ok(Admitted { method, principal }),
-            Err(AccessError::Unauthenticated) => {
-                Err(GatewayError::Unauthenticated.response(Some(self.challenge.header())))
-            }
-            // Watched red as row `HK20`: replacing this arm with `Ok(Admitted
-            // { method, principal })` lets a denied caller reach the ticket
-            // lookup, after which a resource it holds and one that never
-            // existed stop answering alike.
-            Err(AccessError::Forbidden) => Err(GatewayError::Forbidden.response(None)),
-        }
+        // Singleton surface, so no actor. Task 6's actor routes call the same
+        // free function with the validated id, and `Access` sees the difference
+        // in one field rather than in a second trait.
+        admit(
+            &self.access,
+            &self.challenge,
+            S::SERVICE,
+            S::METHODS,
+            parts,
+            route,
+            route_path,
+            kind,
+            None,
+        )
+        .await
     }
 
     async fn handle_rpc(
@@ -644,6 +618,84 @@ where
 }
 
 /// A `recv` reply: the declared value in one header, the payload as the body.
+/// Everything every route does before it looks at a request body.
+///
+/// A FREE function, not a method, because the actor surface holds a different
+/// client type and therefore cannot be the same struct — and a prelude copied
+/// into a second gateway is the duplication that has already cost this branch
+/// two anchors, `HJ9` and `HJ3`. The inventory and the service name arrive as
+/// arguments so both surfaces pass their own.
+///
+/// The order is a guarantee, and a narrower one than it looks. A method nobody
+/// serves is refused before the verb, the verb before the principal, and the
+/// principal before `Access`. What that buys is that **`Access` is never asked
+/// about a route that does not exist**.
+///
+/// It does NOT hide which methods exist: because the method check precedes the
+/// principal check, an unauthenticated caller separates a real method (`401`)
+/// from a missing one (`404`), and a forbidden caller separates them the same
+/// way. That is the Task 1 shape and it is deliberate — enumerating method
+/// names off a generated inventory is low value — but the reason written here
+/// used to claim the opposite, which is the kind of wrong reason that survives
+/// review and gets defended.
+///
+/// Takes the request PARTS rather than the request. `axum::body::Body` is
+/// `Send` and not `Sync`, so a `&Request<Body>` held across the `Access` await
+/// would make every handler future non-`Send` and no route would install.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every argument is one fact the caller owns and this function must               not: two of them are the caller's own inventory, and folding them               into a struct would put the singleton and actor surfaces back               into one type, which is what this split exists to avoid"
+)]
+async fn admit<A: Access>(
+    access: &A,
+    challenge: &Challenge,
+    service: &'static str,
+    methods: &'static [keylink::ExternalMethod],
+    parts: &http::request::Parts,
+    route: &'static Route,
+    route_path: &str,
+    kind: keylink::ExternalKind,
+    actor: Option<&keylink::ActorId>,
+) -> Result<Admitted, Response<Body>> {
+    let decoded = decode_method_in(methods, parts.uri.path(), route_path, kind)
+        .map_err(|error| error.response(None))?;
+    let Some(method) = methods
+        .iter()
+        .copied()
+        .find(|candidate| candidate.name() == decoded && candidate.kind() == kind)
+        .map(keylink::ExternalMethod::name)
+    else {
+        return Err(GatewayError::MethodNotFound.response(None));
+    };
+    if parts.method != route.method() {
+        return Err(GatewayError::MethodNotAllowed.response(None));
+    }
+    let Some(principal) = parts.extensions.get::<Principal>().cloned() else {
+        return Err(GatewayError::Unauthenticated.response(Some(challenge.header())));
+    };
+    match access
+        .authorize(Call {
+            extensions: &parts.extensions,
+            headers: &parts.headers,
+            principal: &principal,
+            service,
+            method,
+            actor,
+        })
+        .await
+    {
+        Ok(()) => Ok(Admitted { method, principal }),
+        Err(AccessError::Unauthenticated) => {
+            Err(GatewayError::Unauthenticated.response(Some(challenge.header())))
+        }
+        // Watched red as row `HK20`: replacing this arm with `Ok(Admitted
+        // { method, principal })` lets a denied caller reach the ticket
+        // lookup, after which a resource it holds and one that never existed
+        // stop answering alike.
+        Err(AccessError::Forbidden) => Err(GatewayError::Forbidden.response(None)),
+    }
+}
+
 /// What survived the shared prelude: the exact generated method, and who asked.
 struct Admitted {
     method: &'static str,
@@ -713,7 +765,13 @@ fn json_response(json: Vec<u8>, route: &Route) -> Response<Body> {
     response
 }
 
-fn decode_method<S: ExternalService>(
+/// Decode the method segment against an inventory the caller names.
+///
+/// Both surfaces have their own `METHODS`, and the actor one is a strict
+/// subset, so the bound on the method segment differs between them — which is
+/// the whole reason this takes a list rather than a type.
+fn decode_method_in(
+    methods: &'static [keylink::ExternalMethod],
     path: &str,
     route_path: &str,
     kind: keylink::ExternalKind,
@@ -738,7 +796,7 @@ fn decode_method<S: ExternalService>(
     if encoded.is_empty() || encoded.contains('/') {
         return Err(GatewayError::MethodNotFound);
     }
-    let max_bytes = S::METHODS
+    let max_bytes = methods
         .iter()
         .filter(|method| method.kind() == kind)
         .map(|method| method.name().len())
@@ -1195,7 +1253,8 @@ mod tests {
     #[test]
     fn malformed_percent_encoding_is_an_invalid_adapter_request() {
         assert!(matches!(
-            super::decode_method::<TestService>(
+            super::decode_method_in(
+                <TestService as keylink::ExternalService>::METHODS,
                 "/rpc/%ZZ",
                 super::SINGLETON_RPC_PATH,
                 keylink::ExternalKind::Rpc,
@@ -1203,7 +1262,8 @@ mod tests {
             Err(crate::error::GatewayError::InvalidRequest)
         ));
         assert!(matches!(
-            super::decode_method::<TestService>(
+            super::decode_method_in(
+                <TestService as keylink::ExternalService>::METHODS,
                 "/rpc/%FF",
                 super::SINGLETON_RPC_PATH,
                 keylink::ExternalKind::Rpc,

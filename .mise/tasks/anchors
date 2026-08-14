@@ -2213,7 +2213,7 @@ ANCHORS = [
     ("HK19", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
      "        let wants_bytes = route.kind() == RouteKind::BlobGet;"),
     ("HK20", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
-     "            Err(AccessError::Forbidden) => Err(GatewayError::Forbidden.response(None)),"),
+     "        Err(AccessError::Forbidden) => Err(GatewayError::Forbidden.response(None)),"),
     ("HK23", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
      "    tickets.remove(ticket, generation);"),
     ("HK24", "keylink-http/tests/blobs.rs", "keylink-http/src/blob.rs",
