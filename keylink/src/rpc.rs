@@ -409,7 +409,7 @@ async fn claim_key(
     }
     let key = idem.key().clone();
 
-    let notify = match ledger.claim(peer, key.clone()) {
+    let notify = match ledger.claim_durably(peer, key.clone()).await {
         Claim::Running(notify) => notify,
         settled => return resolve(settled),
     };
@@ -461,14 +461,14 @@ async fn claim_key(
     // under load.
     notified.as_mut().enable();
 
-    match ledger.claim(peer, key.clone()) {
+    match ledger.claim_durably(peer, key.clone()).await {
         Claim::Running(_) => {}
         settled => return resolve(settled),
     }
     if n0_future::time::timeout(budget, notified).await.is_err() {
         return Claimed::Refuse(IdempotencyRefusal::InFlight.into());
     }
-    resolve(ledger.claim(peer, key))
+    resolve(ledger.claim_durably(peer, key).await)
 }
 
 /// Write a recorded reply again, byte for byte.
@@ -727,9 +727,19 @@ where
     // A reply with a payload behind it is recorded as unrecordable rather than
     // as itself. Bodies are streamed and never held, and a header replayed
     // without its payload decodes into a body that never arrives.
+    //
+    // A durable ledger is the one that can REFUSE to settle. Its `record` does
+    // not resolve until the record is on the disk, and if it cannot be, the
+    // reply below is never written: a reply this service cannot replay is a
+    // reply the caller will ask for again, and answering it once would be
+    // exactly the double execution the key was sent to prevent.
     if let Some(guard) = keyed {
         match progress.reached() {
-            Reached::Completed => guard.record(&frame, body.declared_len() != Some(0)),
+            Reached::Completed => {
+                if let Err(refusal) = guard.record(&frame, body.declared_len() != Some(0)).await {
+                    return refuse::<Resp>(&mut send, refusal).await;
+                }
+            }
             // A layer said no without calling through; or the work was entered,
             // or merely reached a mailbox, and produced nothing. Dropping the
             // guard is what settles those, and it settles them the same way
@@ -1705,7 +1715,10 @@ where
     ///
     /// # It is not free, and [`Records`] is where the cost is written
     ///
-    /// The key state never leaves memory whatever this says. **What
+    /// The key state never leaves memory under either of the first two
+    /// settings, and [`Records::Durable`] is the third — the one that puts it on
+    /// a disk, and the one that charges two `fsync`s per keyed call to do it.
+    /// **What
     /// [`Records::None`] does shorten is the at-most-once *window*, by about a
     /// ninth**, because a settled key skips the record pool and enters the tombstone
     /// pool directly. That lands on the one degradation a caller cannot detect: past

@@ -212,6 +212,9 @@ pub mod compose;
 // The generated module — `inspect` — is re-exported at the root below, so a
 // caller writes `keylink::inspect::Client` and never `keylink::console::inspect`.
 mod console;
+/// The idempotency ledger's records on a durable store.
+#[cfg(feature = "persist")]
+mod durable;
 mod error;
 pub mod extend;
 mod external;
@@ -309,6 +312,8 @@ pub mod inspect {
     };
 }
 pub use authz::{Authorization, Compiled, Rules};
+#[cfg(feature = "persist")]
+pub use durable::{DurableRecords, RecordError, RecordFault};
 #[cfg(feature = "blocking")]
 pub use error::BlockingError;
 pub use error::{
