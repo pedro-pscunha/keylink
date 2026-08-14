@@ -17,7 +17,9 @@
 //!            │  Versioned    the frame      │   ← the only writer of a header
 //!            └───────────────┬──────────────┘
 //!            ┌───────────────▼──────────────┐
-//!            │  PORT   Snapshots · Claim    │   ← this crate's whole surface
+//!            │  PORT   Snapshots · Claim    │   ← one whole value at a time
+//!            ├──────────────────────────────┤
+//!            │  PORT   Entries   · Held     │   ← many small ones, separately
 //!            └───┬─────────────┬────────────┘
 //!                │             │
 //!        ┌───────▼──────┐  ┌───▼──────────────┐
@@ -25,6 +27,22 @@
 //!        │  (built)     │  │ (not built)      │
 //!        └──────────────┘  └──────────────────┘
 //! ```
+//!
+//! # The second need, and why it is a second port
+//!
+//! **Many small entries, each written and removed on its own.** An idempotency
+//! ledger is the case: one record per settled call, arriving one at a time and
+//! expiring one at a time.
+//!
+//! [`Snapshots`] can express that and should not. `Claim::store` replaces the
+//! whole value, so recording one reply would rewrite every reply already held —
+//! quadratic in the number of records, and the cost is paid on the call path
+//! rather than at a checkpoint. [`Entries`] and [`Held`] are the same sentence
+//! with the granularity the caller actually has.
+//!
+//! One adapter carries both, because a store that can hold one value can hold
+//! many. They stay two traits because a caller needs exactly one of them and
+//! reading the other tells it nothing.
 //!
 //! # Why the claim is in the port and not in an adapter
 //!
@@ -133,6 +151,159 @@ pub trait Claim: Send + 'static {
     ///
     /// [`Error::Io`] when the write fails. The previous snapshot is intact.
     fn store(&mut self, bytes: &[u8]) -> impl Future<Output = Result<()>> + Send;
+}
+
+// ─────────────────────────────────────────────────── the port, entry by entry
+
+/// A place many small entries live, each written and removed on its own.
+///
+/// The sibling of [`Snapshots`], and the difference is granularity rather than
+/// durability: [`Claim::store`] replaces one whole value, and [`Held::put`]
+/// writes one entry out of many. A caller with a growing set of independent
+/// records — an idempotency ledger, a set of leases — would otherwise rewrite
+/// the whole set to add one.
+///
+/// [`claim`](Self::claim) for the reason [`Snapshots::claim`] is the only
+/// operation there: two writers of one set is the situation exclusivity exists
+/// to make visible.
+pub trait Entries: Send + Sync + 'static {
+    /// The exclusive handle this store hands out.
+    type Held: Held;
+
+    /// Take exclusive write access to one set of entries.
+    ///
+    /// Held until the handle is dropped, and enforced against whatever the
+    /// adapter can reach — for the file adapter, every other process on the
+    /// machine, and nothing beyond it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Busy`] when somebody else holds it, which is not a wait to
+    /// retry. [`Error::Io`] when the store cannot be opened.
+    fn claim(&self, id: &StateId) -> impl Future<Output = Result<Self::Held>> + Send;
+}
+
+/// Exclusive access to one set of entries, for as long as this value lives.
+///
+/// Dropping it releases the claim, exactly as [`Claim`] does.
+///
+/// # What "durable" means on each method
+///
+/// [`put`](Self::put) and [`remove`](Self::remove) resolve **after** the change
+/// is on the storage device. That is the property the whole port exists for: a
+/// caller may treat a resolved `put` as a fact that survives losing the process,
+/// and may not treat an unresolved one as anything at all.
+///
+/// A caller that crashes mid-`put` sees, on the next [`load`](Self::load),
+/// either the entry or no entry. Never half of one.
+pub trait Held: Send + 'static {
+    /// Every entry currently stored.
+    ///
+    /// The recovery path, called once before the caller starts writing. Order
+    /// is the order the entries were last written in, which a caller is free to
+    /// ignore.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the store cannot be read, and [`Error::NotALog`] when
+    /// what is stored is not something this build can read.
+    fn load(&self) -> impl Future<Output = Result<Vec<(EntryKey, Vec<u8>)>>> + Send;
+
+    /// Write one entry, replacing any entry already under `key`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] when the entry is over the adapter's cap, and
+    /// [`Error::Io`] when the write fails. Neither disturbs what is stored.
+    fn put(&mut self, key: &EntryKey, bytes: &[u8]) -> impl Future<Output = Result<()>> + Send;
+
+    /// Remove one entry. Removing an entry that is not there is not an error.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the write fails.
+    fn remove(&mut self, key: &EntryKey) -> impl Future<Output = Result<()>> + Send;
+
+    /// Reclaim whatever removed and replaced entries still cost.
+    ///
+    /// **Never required for correctness**, and a caller that never calls it
+    /// reads back exactly what a caller that calls it every time reads back.
+    /// What it changes is the space a store occupies and how long
+    /// [`load`](Self::load) takes, and an adapter that has nothing to reclaim
+    /// implements it as a no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the rewrite fails. What was stored is intact.
+    fn compact(&mut self) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// One entry's address within a [`Held`] set.
+///
+/// Opaque bytes with a length bound and nothing else, which is deliberate: a
+/// caller's key is a caller's business, and an adapter that needed it to be a
+/// path or an identifier would be asking the caller to escape its own data.
+/// [`StateId`] names a *state* and is a path on purpose; this names an entry
+/// inside one and is not.
+///
+/// Validated once, here, so an adapter never meets an empty or unbounded key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EntryKey(Vec<u8>);
+
+impl EntryKey {
+    /// The longest key this accepts.
+    ///
+    /// A judgement rather than a measurement: long enough for a peer identity
+    /// and a caller-chosen string together, short enough that an adapter can
+    /// hold the whole key set in memory while it reads.
+    pub const MAX_LEN: usize = 256;
+
+    /// Validate a key.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidEntryKey`] naming which rule was broken.
+    pub fn new(bytes: impl Into<Vec<u8>>) -> std::result::Result<Self, InvalidEntryKey> {
+        let bytes = bytes.into();
+        if bytes.is_empty() {
+            return Err(InvalidEntryKey::Empty);
+        }
+        if bytes.len() > Self::MAX_LEN {
+            return Err(InvalidEntryKey::TooLong {
+                len: bytes.len(),
+                max: Self::MAX_LEN,
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// The key, as written.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Why a key was refused.
+///
+/// `Copy`, unlike [`InvalidStateId`], because every variant holds numbers: this
+/// is reported from inside [`Error::NotALog`], which an adapter builds while
+/// reading, and a reason that had to be cloned there would be a reason an
+/// adapter is tempted to drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum InvalidEntryKey {
+    /// A key with nothing in it.
+    #[error("a record key cannot be empty")]
+    Empty,
+    /// Longer than [`EntryKey::MAX_LEN`].
+    #[error("a record key is at most {max} bytes, and this one is {len}")]
+    TooLong {
+        /// What arrived.
+        len: usize,
+        /// The cap.
+        max: usize,
+    },
 }
 
 /// State that knows how to become bytes, come back, and grow a field without
@@ -468,6 +639,39 @@ pub enum InvalidStateId {
 /// What this crate reports.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Which check refused a stored set of entries.
+///
+/// The sibling of [`versioned::FrameFault`], and it lives here for the reason
+/// that one lives beside the frame it describes: the layout an entry store
+/// writes is this crate's, not each adapter's, so a second adapter reading a log
+/// written by the first is reading a format both were told.
+///
+/// `#[non_exhaustive]` because an adapter over something other than a file can
+/// refuse for reasons a file cannot have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum EntryFault {
+    /// The stored bytes do not begin with the entry log's magic.
+    ///
+    /// What a file written by something else, or by a build from before entry
+    /// logs existed, looks like. It is a loud error rather than a payload read
+    /// as garbage, which is the whole reason a magic is written at all.
+    #[error("the stored bytes do not begin with this crate's entry-log magic")]
+    WrongMagic,
+    /// An entry names an operation this build does not know.
+    #[error("an entry names operation {op}, which this build does not know")]
+    UnknownOperation {
+        /// The byte that was read.
+        op: u8,
+    },
+    /// An entry's key is not one [`EntryKey`] accepts.
+    ///
+    /// The load path re-validates every key, because bytes read off a disk
+    /// never met the constructor.
+    #[error("an entry's key was refused: {0}")]
+    BadKey(InvalidEntryKey),
+}
+
 /// Why a store operation did not happen.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -509,6 +713,26 @@ pub enum Error {
     /// Stored bytes that did not become a state.
     #[error(transparent)]
     Restore(#[from] RestoreError),
+
+    /// Stored entries that did not become a set.
+    ///
+    /// Reported by [`Held::load`], and it is a *refusal to guess*: the bytes
+    /// under this id are not something this build can read as entries, so it
+    /// says so instead of returning the prefix it understood. Recovering from
+    /// half a ledger is worse than recovering from none, because a caller
+    /// cannot see which half is missing.
+    ///
+    /// **A truncated tail is not this**, and the difference is the whole reason
+    /// the two are told apart. An entry that was being written when the process
+    /// died is incomplete, expected, and dropped in silence — the caller
+    /// treated it as unwritten anyway, because the `put` never resolved.
+    #[error("the stored entries under {id} could not be read: {fault}")]
+    NotALog {
+        /// Whose entries they are.
+        id: StateId,
+        /// Which check refused them.
+        fault: EntryFault,
+    },
 
     /// The underlying store failed.
     #[error("the snapshot store failed: {0}")]

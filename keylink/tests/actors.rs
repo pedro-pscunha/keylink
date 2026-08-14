@@ -412,8 +412,8 @@ async fn local_keyed_refs_reject_a_two_actor_ring() {
             .expect("the second actor remains live"),
         vec![7]
     );
-    system.stop(&first, Duration::from_secs(1)).await;
-    system.stop(&second, Duration::from_secs(1)).await;
+    let _ = system.stop(&first, Duration::from_secs(1)).await;
+    let _ = system.stop(&second, Duration::from_secs(1)).await;
 }
 
 #[tokio::test]
@@ -527,7 +527,7 @@ async fn local_keyed_ref_uses_the_factory_and_reports_capacity() {
         .await
         .expect_err("the registry cap applies to local keyed calls");
     assert!(matches!(error, LocalError::AtCapacity { capacity: 1 }));
-    system
+    let _ = system
         .stop(&id("factory/one"), Duration::from_secs(1))
         .await;
 }

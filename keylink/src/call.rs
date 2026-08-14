@@ -39,17 +39,20 @@
 //!   [`Persist`](crate::Persist)-backed actor that turn is an `fsync` of a state
 //!   the handler did not change — about 7.6 ms, measured and dated in that type's
 //!   own module header.
-//! - **Today [`key_state`](crate::RpcClient::key_state) answers
-//!   [`Fresh`](crate::KeyState::Fresh) after a restart**, because the ledger is what
-//!   that query reads and the ledger is memory. So a peer currently learns nothing
-//!   about a key this state is about to deduplicate. Asking is still safe — it runs
-//!   no handler — it is just uninformative across a restart *as the tree stands*.
+//! - **[`key_state`](crate::RpcClient::key_state) answers
+//!   [`Fresh`](crate::KeyState::Fresh) after a restart on a
+//!   [`Records::Memory`](crate::Records) service**, because the ledger is what
+//!   that query reads. So a peer learns nothing there about a key this state is
+//!   about to deduplicate. Asking is still safe — it runs no handler — it is just
+//!   uninformative.
 //!
-//!   Stated that way on purpose: it is a property of the ledger being volatile, not
-//!   a limit of the query, and a durable record store would give the answer back
-//!   without anything here changing. What would **not** come back is the cost above
-//!   it — a duplicate entering the handler is a consequence of the record living in
-//!   the caller's state, and no store on disk alters that.
+//!   This paragraph used to say *as the tree stands*, and predicted that "a
+//!   durable record store would give the answer back without anything here
+//!   changing". [`Records::Durable`](crate::Records) is that store, and nothing
+//!   here changed: the query answers [`Done`](crate::KeyState::Done) after a
+//!   restart. What did **not** come back is the cost above it — a duplicate
+//!   entering the handler is a consequence of the record living in the caller's
+//!   state, and no store on a disk alters that.
 //! - **The dedupe is yours to write.** Three lines, in the handler you are already
 //!   editing. keylink will not write them for you, because the only correct
 //!   version knows what your answer is and whether replaying it is better than

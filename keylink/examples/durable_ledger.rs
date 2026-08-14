@@ -174,8 +174,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //  storing — does not exist when the store is inside the turn. Two things
     //  the store's placement does not cover, both named rather than implied: a
     //  `Deferred` answered from a task you spawned yourself, which is answering
-    //  with something no turn produced, and the volatile idempotency ledger a
-    //  retrying peer is matched against (RFC-07 §6.8).
+    //  with something no turn produced, and the idempotency ledger a retrying
+    //  peer is matched against (RFC-07 §6.8) — which is memory here, because
+    //  this service leaves `Records` at its default. `payment_approval.rs`
+    //  serves the other port beside this one and closes that half.
     ledger.stop().await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
     Ok(())

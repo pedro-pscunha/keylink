@@ -320,6 +320,20 @@ the handler again. `keylink-persist` is deliberately not the answer — it says 
 itself: *"No history. One state, one current value. A journal is a different port
 with different operations."* The ledger is journal-shaped.
 
+**Closed, and this paragraph is why it took the shape it did.** `Records::Durable`
+survives a restart, and it does **not** reach for `Snapshots`: the quoted sentence
+was right that one whole value replaced atomically is the wrong shape, so
+`keylink-persist` grew a second port — `Entries` and `Held`, many small values
+each written on its own — beside the one this paragraph refused. The record is
+written before the handler is entered and again before the reply is written, and
+`Records::Memory` is still the default because the two `fsync`s are not free.
+
+What stays true is the sentence's premise about *history*. There is still no
+journal and no replay of past states; there is one current entry per key, which
+is the same "one state, one current value" promise applied per key rather than
+per store. And the in-flight half is still not durable and cannot be — a claimed
+key belongs to a caller holding a live stream, so it recovers as `Interrupted`.
+
 **A wart this recorded as live, and the tree has since closed it.** The claim was
 that a `NoSuchActor` refusal from an actor system's `deliver` settles the key, so a
 retry after the actor is mounted replays `NoSuchActor` forever — the same shape as
