@@ -139,6 +139,16 @@ pub enum RecordFault {
     /// constructor.
     #[error("a record key is text this build does not accept as an idempotency key")]
     KeyRefused,
+    /// The first [`PEER_LEN`] bytes of a record key are not a peer id.
+    ///
+    /// Its own variant because [`KeyRefused`](Self::KeyRefused) named three
+    /// causes and could only have happened for two of them. This one is about
+    /// the bytes BEFORE the key, and it is the only one of the three that a
+    /// stored record can actually reach: the write-path spelling was covered by
+    /// the `const _` above, which proves a peer id plus a bounded idempotency
+    /// key always fits.
+    #[error("the first {PEER_LEN} bytes of a record key are not a peer id")]
+    PeerNotAnId,
     /// A record with no state byte at all.
     #[error("a record holds no state")]
     Empty,
@@ -154,6 +164,18 @@ pub enum RecordFault {
 // ─────────────────────────────────────────────────────────────────── the codec
 
 /// The address one key is stored under.
+///
+/// **The `Result` cannot be `Err`**, and it is still a `Result`: the `const _`
+/// above proves a peer id plus a bounded idempotency key fits inside
+/// [`EntryKey::MAX_LEN`], so [`EntryKey::new`] cannot refuse one of these. The
+/// total spelling would be an `expect`, which this crate denies, so the type
+/// carries an outcome nothing produces rather than the crate carrying an
+/// `#[allow]`.
+///
+/// [`RecordFault::KeyRefused`] is what it would report, and that is a lie about
+/// which check refused — this is the WRITE path, and `RecordFault`'s own type
+/// doc says it names which check refused a **stored** record. Left alone
+/// because no caller can observe it.
 fn encode_key(peer: EndpointId, key: &IdempotencyKey) -> Result<EntryKey, RecordFault> {
     let key = key.as_str().as_bytes();
     let mut bytes = Vec::with_capacity(PEER_LEN + key.len());
@@ -170,7 +192,7 @@ fn decode_key(stored: &EntryKey) -> Result<(EndpointId, IdempotencyKey), RecordF
     }
     let mut id = [0_u8; PEER_LEN];
     id.copy_from_slice(&bytes[..PEER_LEN]);
-    let peer = EndpointId::from_bytes(&id).map_err(|_| RecordFault::KeyRefused)?;
+    let peer = EndpointId::from_bytes(&id).map_err(|_| RecordFault::PeerNotAnId)?;
     let text = std::str::from_utf8(&bytes[PEER_LEN..]).map_err(|_| RecordFault::KeyNotText)?;
     let key = IdempotencyKey::new(text).map_err(|_| RecordFault::KeyRefused)?;
     Ok((peer, key))
