@@ -19,8 +19,23 @@
 //! exactly the downstream case:
 //!
 //! ```compile_fail
-//! imported_ledger::ledger::__keylink_declarations!(anything);
+//! macro_rules! reader { ($($rest:tt)*) => { fn read() {} }; }
+//! imported_ledger::ledger::__keylink_declarations!(reader);
+//! # fn main() {}
 //! ```
+//!
+//! The callback is a REAL macro, defined right there. Without it the block
+//! would fail because `anything` does not exist — which it did in its first
+//! version, and a `compile_fail` that fails for a missing name measures
+//! nothing.
+//!
+//! What holds the boundary is NOT the `pub(crate)`, and that is measured:
+//! relaxing it to `pub` in `keylink/src/macros.rs` leaves this block still
+//! failing and the doctest still green. A `macro_rules!` without
+//! `#[macro_export]` is crate-local whatever a `use` says, so the re-export
+//! makes the macro nameable as `module::name!` WITHIN its own crate and cannot
+//! make it nameable outside one. The `pub(crate)` is the narrower of two
+//! boundaries and the redundant one.
 //!
 //! The control, so the refusal above is about VISIBILITY and not about a
 //! mistyped path. Same crate, same module, a public item:

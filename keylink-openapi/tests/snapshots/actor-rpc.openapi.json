@@ -68,7 +68,7 @@
                 "required": [
                   "value"
                 ],
-                "title": "Request",
+                "title": "Inventory.Count.request",
                 "type": "object"
               }
             }
@@ -276,7 +276,7 @@
                 "required": [
                   "value"
                 ],
-                "title": "Request",
+                "title": "Inventory.Echo.request",
                 "type": "object"
               }
             }

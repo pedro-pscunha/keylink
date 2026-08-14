@@ -284,6 +284,16 @@ pub fn schemas<D: Documented>(surface: &HttpSurface) -> Result<Document, Documen
         if keyed && !operation.keyed {
             continue;
         }
+        // The SAME route intersection the OpenAPI document uses. Without it the
+        // two published documents disagree: a surface with no streaming would
+        // describe `send` and `recv` contracts in `/schema.json` that
+        // `/openapi.json` has no path for.
+        if !surface
+            .routes()
+            .any(|route| serves(operation.kind, route.kind()))
+        {
+            continue;
+        }
         // A standalone document resolves against `#/$defs`, which is where a
         // JSON Schema reader looks. Same hoist, different destination.
         hoist(&mut operation.request, &mut defs, "#/$defs")?;
@@ -321,10 +331,16 @@ pub fn schemas<D: Documented>(surface: &HttpSurface) -> Result<Document, Documen
 /// not have — which `check_references` catches, and which is how this function
 /// came to exist rather than being designed in.
 ///
-/// The component name carries the logical name AND its digest. The name is for
-/// the person reading the document; the digest is what keeps two services'
-/// `Item` from being one component. Collisions are still refused rather than
-/// merged, because two schemas under one digest is a fact worth failing on.
+/// The component name carries the logical name AND a digest OF THAT NAME. The
+/// name is for the person reading the document; the digest makes the rendered
+/// component id stable and pins it to a recorded vector, so a rename is visible
+/// in every published document rather than silent.
+///
+/// It does NOT disambiguate two different schemas that share a logical name —
+/// it cannot, being a pure function of that name. A review reported this crate
+/// claiming otherwise, and the claim was wrong. What separates them is
+/// [`__register`], which refuses two shapes under one component instead of
+/// keeping whichever the iteration reached second.
 fn hoist(
     schema: &mut Value,
     components: &mut BTreeMap<String, Value>,

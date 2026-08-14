@@ -5256,12 +5256,17 @@ macro_rules! __keylink_external {
         /// only thing a caller can usefully do with a declaration is name its
         /// request and response types in code it generates.
         ///
-        /// MODULE-SCOPED, not crate-root exported. `pub(crate) use` below makes
-        /// it `module::__keylink_declarations!`, which is reachable from the
-        /// crate that wrote the `service!` block and from nowhere else. That is
-        /// the whole of the orphan story: a downstream crate cannot invoke it,
-        /// so it cannot implement a foreign documentation trait for this
-        /// crate's `External`.
+        /// MODULE-SCOPED, not crate-root exported. Two things stack here and
+        /// only one of them is load-bearing: `pub(crate) use` makes it
+        /// nameable as `module::__keylink_declarations!` within its own crate,
+        /// and the ABSENCE of `#[macro_export]` is what keeps it out of every
+        /// other crate — measured, by relaxing the `use` to `pub` and watching
+        /// the downstream `compile_fail` in `fixtures/imported-ledger` stay
+        /// red.
+        ///
+        /// That is the orphan story: a downstream crate cannot invoke this, so
+        /// it cannot implement a foreign documentation trait for this crate's
+        /// `External`.
         ///
         /// The `$d:tt` indirection is how a `macro_rules!` writes another
         /// `macro_rules!` on stable: `$` cannot be escaped inside a macro body,

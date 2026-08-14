@@ -40,7 +40,7 @@
       "required": [
         "value"
       ],
-      "title": "Request",
+      "title": "Inventory.Count.request",
       "type": "object"
     },
     "Inventory.Count.response": {
@@ -61,7 +61,7 @@
       "required": [
         "value"
       ],
-      "title": "Request",
+      "title": "Inventory.Echo.request",
       "type": "object"
     },
     "Inventory.Echo.response": {
@@ -80,7 +80,7 @@
       "required": [
         "sku"
       ],
-      "title": "Request",
+      "title": "Inventory.Fetch.request",
       "type": "object"
     },
     "Inventory.Fetch.response": {
@@ -101,7 +101,7 @@
       "required": [
         "sku"
       ],
-      "title": "Request",
+      "title": "Inventory.Take.request",
       "type": "object"
     },
     "Inventory.Take.response": {

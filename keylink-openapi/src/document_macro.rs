@@ -104,9 +104,25 @@ macro_rules! __keylink_document_impl {
                             method: $method,
                             kind: $crate::__keylink_document_kind!($kind),
                             keyed: keyed.contains(&$method),
-                            request: ::serde_json::to_value(
-                                ::schemars::schema_for!(Request)
-                            ).unwrap_or_default(),
+                            request: {
+                                let mut schema = ::serde_json::to_value(
+                                    ::schemars::schema_for!(Request)
+                                ).unwrap_or_default();
+                                // Every operation's argument struct is called
+                                // `Request`, so every request schema arrived
+                                // titled `Request`. A generator names its types
+                                // from that title, and one document would
+                                // declare a dozen unrelated `Request`s.
+                                if let Some(map) = schema.as_object_mut() {
+                                    map.insert(
+                                        "title".to_owned(),
+                                        ::serde_json::Value::String(
+                                            ::std::format!("{}.{}.request", $svc, $method)
+                                        ),
+                                    );
+                                }
+                                schema
+                            },
                             // The SERIALIZE contract, which is a different
                             // schema from the deserialize one whenever a DTO
                             // carries `skip_serializing` or `skip_deserializing`.

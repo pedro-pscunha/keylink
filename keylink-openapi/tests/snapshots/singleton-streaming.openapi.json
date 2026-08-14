@@ -54,7 +54,7 @@
                 "required": [
                   "sku"
                 ],
-                "title": "Request",
+                "title": "Inventory.Take.request",
                 "type": "object"
               }
             }
@@ -616,7 +616,7 @@
                 "required": [
                   "sku"
                 ],
-                "title": "Request",
+                "title": "Inventory.Fetch.request",
                 "type": "object"
               }
             }
@@ -812,7 +812,7 @@
                 "required": [
                   "value"
                 ],
-                "title": "Request",
+                "title": "Inventory.Count.request",
                 "type": "object"
               }
             }
@@ -1008,7 +1008,7 @@
                 "required": [
                   "value"
                 ],
-                "title": "Request",
+                "title": "Inventory.Echo.request",
                 "type": "object"
               }
             }
@@ -1391,7 +1391,7 @@
           "required": [
             "name"
           ],
-          "title": "Request",
+          "title": "Inventory.Upload.request",
           "type": "object"
         }
       }

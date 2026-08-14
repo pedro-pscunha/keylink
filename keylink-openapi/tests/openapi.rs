@@ -402,3 +402,61 @@ fn a_component_written_twice_with_two_shapes_is_refused() {
         })
     );
 }
+
+/// The documented envelope is the envelope the runtime writes.
+///
+/// `error_envelope()` is hand-written JSON, because the runtime's body is
+/// assembled from a fieldless enum and carries no Rust type to derive from.
+/// Hand-written means it can drift, so this is the row that holds it — and the
+/// source used to CITE this test by name before it existed, which is how it
+/// came to be written.
+///
+/// The comparison is against `ErrorKind::ALL`, the same inventory the gateway
+/// answers from: every category's code and message are non-empty and stable,
+/// and the schema's shape is exactly `{"error":{"code","message"}}` with
+/// nothing else permitted at either level.
+#[test]
+fn the_error_envelope_matches_the_runtime_one() {
+    use keylink_http::__contract::ErrorKind;
+
+    let surface = HttpSurface::new("/v1", Addressing::Singleton).expect("valid surface");
+    let document = document::<inventory::External>(&surface, &config()).expect("a document");
+    let envelope = &document.value()["components"]["schemas"]["ErrorEnvelope"];
+
+    assert_eq!(envelope["required"], serde_json::json!(["error"]));
+    assert_eq!(envelope["additionalProperties"], false);
+    let inner = &envelope["properties"]["error"];
+    assert_eq!(inner["required"], serde_json::json!(["code", "message"]));
+    assert_eq!(inner["additionalProperties"], false);
+
+    // Every category the runtime can answer with fits that shape, and every
+    // documented status is one a category really uses.
+    let mut statuses: Vec<u16> = Vec::new();
+    for kind in ErrorKind::ALL {
+        let spec = kind.spec();
+        assert!(!spec.code().is_empty(), "{kind:?} has a code");
+        assert!(!spec.message().is_empty(), "{kind:?} has a message");
+        assert!(
+            spec.code()
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+            "{kind:?} code is stable snake_case: {}",
+            spec.code()
+        );
+        statuses.push(spec.status().as_u16());
+    }
+
+    let documented: Vec<u16> = document.value()["paths"]["/v1/rpc/Count"]["post"]["responses"]
+        .as_object()
+        .expect("an object")
+        .keys()
+        .filter_map(|key| key.parse().ok())
+        .filter(|status| *status >= 400)
+        .collect();
+    for status in documented {
+        assert!(
+            statuses.contains(&status),
+            "the document promises {status}, which no error category answers"
+        );
+    }
+}
