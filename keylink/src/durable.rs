@@ -387,19 +387,21 @@ impl DurableRecords {
     /// a live claim and leave a handler running with nothing on the disk.
     pub(crate) async fn reconcile<F>(
         &self,
-        batch: Vec<(EndpointId, IdempotencyKey)>,
+        mut batch: Vec<(EndpointId, IdempotencyKey)>,
         mut current: F,
     ) -> Vec<(EndpointId, IdempotencyKey)>
     where
         F: FnMut(EndpointId, &IdempotencyKey) -> Reconcile,
     {
         let mut held = self.store.held.lock().await;
-        for (index, (peer, key)) in batch.iter().enumerate() {
-            let Ok(address) = encode_key(*peer, key) else {
+        for index in 0..batch.len() {
+            let (peer, key) = &batch[index];
+            let (peer, key) = (*peer, key);
+            let Ok(address) = encode_key(peer, key) else {
                 // A key this build cannot address is a key it never wrote.
                 continue;
             };
-            let wrote = match current(*peer, key) {
+            let wrote = match current(peer, key) {
                 Reconcile::Untouched => continue,
                 Reconcile::Erase => held.remove(&address).await,
                 Reconcile::Write(value) => held.put(&address, &value).await,
@@ -407,7 +409,12 @@ impl DurableRecords {
             if wrote.is_err() {
                 // A store that refuses one write refuses the next. Hand the
                 // rest back rather than burning the batch against it.
-                return batch[index..].to_vec();
+                //
+                // `split_off` and not `[index..].to_vec()`: the remainder is
+                // moved out of a `Vec` that is about to drop, so the clone that
+                // spelling paid for bought nothing. The loop is indexed for the
+                // same reason — an iterator would still be borrowing `batch`.
+                return batch.split_off(index);
             }
             self.store.since_compaction.fetch_add(1, Ordering::Relaxed);
         }
