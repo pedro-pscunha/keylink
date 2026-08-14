@@ -107,7 +107,18 @@ macro_rules! __keylink_document_impl {
                             request: {
                                 let mut schema = ::serde_json::to_value(
                                     ::schemars::schema_for!(Request)
-                                ).unwrap_or_default();
+                                ).unwrap_or_else(|error| {
+                                    // A schema that failed to serialize is an
+                                    // unconstrained one if it falls back to
+                                    // null, which describes anything. Louder is
+                                    // correct: this runs at document-build time
+                                    // in a test or a build script, never in a
+                                    // request path.
+                                    ::std::panic!(
+                                        "the request schema for {} did not serialize: {error}",
+                                        $method
+                                    )
+                                });
                                 // Every operation's argument struct is called
                                 // `Request`, so every request schema arrived
                                 // titled `Request`. A generator names its types
@@ -136,7 +147,12 @@ macro_rules! __keylink_document_impl {
                                     .for_serialize()
                                     .into_generator()
                                     .into_root_schema_for::<$ret>()
-                            ).unwrap_or_default(),
+                            ).unwrap_or_else(|error| {
+                                ::std::panic!(
+                                    "the response schema for {} did not serialize: {error}",
+                                    $method
+                                )
+                            }),
                         });
                     }
                 )*

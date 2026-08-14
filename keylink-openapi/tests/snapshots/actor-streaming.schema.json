@@ -28,7 +28,6 @@
       "type": "object"
     },
     "Inventory.Count.request": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
         "value": {
@@ -44,14 +43,12 @@
       "type": "object"
     },
     "Inventory.Count.response": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "format": "uint64",
       "minimum": 0,
       "title": "uint64",
       "type": "integer"
     },
     "Inventory.Echo.request": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
         "value": {
@@ -65,12 +62,10 @@
       "type": "object"
     },
     "Inventory.Echo.response": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "string",
       "type": "string"
     },
     "Inventory.Fetch.request": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
         "sku": {
@@ -84,14 +79,12 @@
       "type": "object"
     },
     "Inventory.Fetch.response": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "format": "uint32",
       "minimum": 0,
       "title": "uint32",
       "type": "integer"
     },
     "Inventory.Take.request": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
         "sku": {
@@ -105,7 +98,6 @@
       "type": "object"
     },
     "Inventory.Take.response": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "format": "uint64",
       "minimum": 0,
       "title": "uint64",

@@ -4,6 +4,8 @@
 //! and a crate that installed the route on its own would make that decision by
 //! being linked.
 
+use std::sync::Arc;
+
 use axum::{body::Body, routing::get, Router};
 use http::{header, Response, StatusCode};
 
@@ -20,28 +22,32 @@ pub fn router<State>(openapi: Vec<u8>, schema: Vec<u8>) -> Router<State>
 where
     State: Clone + Send + Sync + 'static,
 {
-    let openapi_head = openapi.clone();
-    let schema_head = schema.clone();
+    // One buffer each, shared. The streaming document is tens of kilobytes and
+    // a clone per request would copy all of it to answer a `HEAD`.
+    let openapi: Arc<[u8]> = Arc::from(openapi);
+    let schema: Arc<[u8]> = Arc::from(schema);
+    let openapi_head = Arc::clone(&openapi);
+    let schema_head = Arc::clone(&schema);
     Router::new()
         .route(
             "/openapi.json",
             get(move || {
-                let bytes = openapi.clone();
+                let bytes = Arc::clone(&openapi);
                 async move { serve(bytes, OPENAPI_MEDIA, true) }
             })
             .head(move || {
-                let bytes = openapi_head.clone();
+                let bytes = Arc::clone(&openapi_head);
                 async move { serve(bytes, OPENAPI_MEDIA, false) }
             }),
         )
         .route(
             "/schema.json",
             get(move || {
-                let bytes = schema.clone();
+                let bytes = Arc::clone(&schema);
                 async move { serve(bytes, SCHEMA_MEDIA, true) }
             })
             .head(move || {
-                let bytes = schema_head.clone();
+                let bytes = Arc::clone(&schema_head);
                 async move { serve(bytes, SCHEMA_MEDIA, false) }
             }),
         )
@@ -50,10 +56,10 @@ where
 /// One builder for both verbs, because RFC 9110 §9.3.2 asks a HEAD to carry the
 /// fields its GET would — including `Content-Length`, which is why the length
 /// is taken before the body is dropped.
-fn serve(bytes: Vec<u8>, media: &'static str, with_body: bool) -> Response<Body> {
+fn serve(bytes: Arc<[u8]>, media: &'static str, with_body: bool) -> Response<Body> {
     let length = bytes.len();
     let body = if with_body {
-        Body::from(bytes)
+        Body::from(bytes.to_vec())
     } else {
         Body::empty()
     };

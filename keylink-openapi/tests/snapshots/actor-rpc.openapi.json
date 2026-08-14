@@ -56,7 +56,6 @@
           "content": {
             "application/json": {
               "schema": {
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "additionalProperties": false,
                 "properties": {
                   "value": {
@@ -80,7 +79,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$schema": "https://json-schema.org/draft/2020-12/schema",
                   "format": "uint64",
                   "minimum": 0,
                   "title": "uint64",
@@ -150,16 +148,6 @@
             },
             "description": "A refusal, in the one shared envelope."
           },
-          "410": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
           "413": {
             "content": {
               "application/json": {
@@ -171,16 +159,6 @@
             "description": "A refusal, in the one shared envelope."
           },
           "415": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
-          "416": {
             "content": {
               "application/json": {
                 "schema": {
@@ -266,7 +244,6 @@
           "content": {
             "application/json": {
               "schema": {
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "additionalProperties": false,
                 "properties": {
                   "value": {
@@ -288,7 +265,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$schema": "https://json-schema.org/draft/2020-12/schema",
                   "title": "string",
                   "type": "string"
                 }
@@ -356,16 +332,6 @@
             },
             "description": "A refusal, in the one shared envelope."
           },
-          "410": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
           "413": {
             "content": {
               "application/json": {
@@ -377,16 +343,6 @@
             "description": "A refusal, in the one shared envelope."
           },
           "415": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
-          "416": {
             "content": {
               "application/json": {
                 "schema": {

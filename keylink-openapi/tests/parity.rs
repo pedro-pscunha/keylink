@@ -285,3 +285,103 @@ fn a_request_and_a_response_are_described_by_their_own_contracts() {
     assert!(back.get("client_only").is_none(), "a response omits it");
     assert!(back.get("server_only").is_some());
 }
+
+#[derive(
+    Serialize, Deserialize, postcard_schema::Schema, schemars::JsonSchema, Clone, Debug, PartialEq,
+)]
+pub struct Inner {
+    pub depth: u64,
+}
+
+#[derive(
+    Serialize, Deserialize, postcard_schema::Schema, schemars::JsonSchema, Clone, Debug, PartialEq,
+)]
+pub struct Flattened {
+    pub name: String,
+    #[serde(flatten)]
+    pub inner: Inner,
+}
+
+keylink::service! {
+    service Flat;
+    rpc Take(item: Flattened) -> u64;
+}
+
+keylink_openapi::document_service!(flat);
+
+/// `flatten` puts the inner fields on the outer object, in both readings.
+///
+/// serde writes `{"name":"x","depth":1}` and reads it back. A document that
+/// described `inner` as a nested object would tell a generator to write
+/// `{"name":"x","inner":{"depth":1}}`, which serde refuses.
+#[test]
+fn a_flattened_field_is_described_where_serde_writes_it() {
+    let surface = HttpSurface::new("/v1", Addressing::Singleton).expect("valid surface");
+    let config = DocumentConfig::new(
+        "Flat",
+        "1.0.0",
+        Security::External {
+            description: "Ahead of the gateway.".to_owned(),
+        },
+    );
+    let document = document::<flat::External>(&surface, &config).expect("a document");
+    let item = &document.value()["paths"]["/v1/rpc/Take"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"]["item"];
+    let schema = item.get("$ref").and_then(Value::as_str).map_or_else(
+        || item.clone(),
+        |reference| {
+            let name = reference
+                .strip_prefix("#/components/schemas/")
+                .expect("an OpenAPI reference");
+            document.value()["components"]["schemas"][name].clone()
+        },
+    );
+    let rendered = serde_json::to_string(&schema).expect("renderable");
+    assert!(
+        !rendered.contains("\"inner\""),
+        "a flattened field has no name of its own on the wire: {rendered}"
+    );
+    assert!(rendered.contains("depth"), "{rendered}");
+
+    let wire = json!({ "name": "x", "depth": 1 });
+    let decoded: Flattened = serde_json::from_value(wire.clone()).expect("serde accepts it");
+    assert_eq!(decoded.inner.depth, 1);
+    assert_eq!(serde_json::to_value(&decoded).expect("serializable"), wire);
+}
+
+/// Every route family maps to its own operation-id segment.
+///
+/// `kind_name` has a `_ => "unknown"` arm over a `#[non_exhaustive]` enum, so a
+/// family added upstream would silently produce `Service.singleton.unknown.M` —
+/// and two such families would collide into one id. This row is what turns that
+/// from a silent rename into a failing test.
+#[test]
+fn every_route_family_has_its_own_name() {
+    use std::collections::BTreeSet;
+
+    // Through `HttpSurface`, not through the private table: a test that needed
+    // that table public would widen `keylink-http`'s surface in order to be
+    // tested. Two surfaces with streaming enumerate every family the inventory
+    // has.
+    let limits = keylink_http::StreamingLimits::new(32, 64, 64, 4).expect("positive limits");
+    let mut names = BTreeSet::new();
+    let mut kinds = BTreeSet::new();
+    for addressing in [Addressing::Singleton, Addressing::Actors] {
+        let surface = HttpSurface::new("/v1", addressing)
+            .expect("valid surface")
+            .with_streaming(limits);
+        for route in surface.routes() {
+            kinds.insert(format!("{:?}", route.kind()));
+            names.insert(keylink_openapi::__kind_name(route.kind()).to_owned());
+        }
+    }
+    assert!(
+        !names.contains("unknown"),
+        "a route family this crate cannot name: {names:?}"
+    );
+    assert_eq!(
+        names.len(),
+        kinds.len(),
+        "two families share one operation-id segment: {names:?} for {kinds:?}"
+    );
+}

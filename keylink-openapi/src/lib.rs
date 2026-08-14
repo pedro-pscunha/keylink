@@ -230,7 +230,7 @@ pub fn document<D: Documented>(
             if ids.insert(id.clone(), ()).is_some() {
                 return Err(DocumentError::OperationIdCollision { id });
             }
-            let item = operation_object(D::SERVICE, &operation, route, &config.security);
+            let item = operation_object(D::SERVICE, &operation, route);
             let verb = route.method().as_str().to_ascii_lowercase();
             let entry = paths.entry(path.clone()).or_insert_with(|| json!({}));
             let Some(map) = entry.as_object_mut() else {
@@ -248,6 +248,20 @@ pub fn document<D: Documented>(
         "info".to_owned(),
         json!({ "title": config.title, "version": config.version }),
     );
+    if let Some(limits) = surface.streaming() {
+        // The bounds a caller meets as a `413` or a `503` if they are not
+        // published. Named as an extension because OpenAPI has no field for
+        // "this many bytes", and unpublished they are learned by being refused.
+        root.insert(
+            "x-keylink-limits".to_owned(),
+            json!({
+                "maxUploadBytes": limits.max_upload_bytes(),
+                "maxDownloadBytes": limits.max_download_bytes(),
+                "metadataJsonBytes": limits.metadata_json_bytes(),
+                "maxBlobTickets": limits.max_blob_tickets(),
+            }),
+        );
+    }
     root.insert(
         "tags".to_owned(),
         json!([{ "name": D::SERVICE, "description": "One keylink service." }]),
@@ -257,16 +271,36 @@ pub fn document<D: Documented>(
         "components".to_owned(),
         json!({ "schemas": to_value(components) }),
     );
-    if let Security::External { description } = &config.security {
-        root.insert(
-            "x-keylink-authentication".to_owned(),
-            json!({ "kind": "external", "description": description }),
-        );
+    match &config.security {
+        // No scheme is invented for a deployment that authenticates ahead of
+        // this gateway. An extension says so; a `securitySchemes` entry would
+        // publish a credential nobody reads.
+        Security::External { description } => {
+            root.insert(
+                "x-keylink-authentication".to_owned(),
+                json!({ "kind": "external", "description": description }),
+            );
+        }
+        // A scheme the deployment really implements goes where a generator
+        // looks for one, and carries a `security` requirement so it is applied
+        // rather than merely described.
+        Security::Http { scheme, format } => {
+            let mut entry = json!({ "type": "http", "scheme": scheme });
+            if let (Some(map), Some(format)) = (entry.as_object_mut(), format) {
+                map.insert("bearerFormat".to_owned(), json!(format));
+            }
+            security_scheme(&mut root, "keylink", entry);
+        }
+        Security::ApiKey { header } => security_scheme(
+            &mut root,
+            "keylink",
+            json!({ "type": "apiKey", "in": "header", "name": header }),
+        ),
     }
 
     let value = Value::Object(root);
     check_references(&value, "#/components/schemas/", &["components", "schemas"])?;
-    let bytes = serde_json::to_vec_pretty(&value).unwrap_or_default();
+    let bytes = render(&value);
     Ok(Document { value, bytes })
 }
 
@@ -341,11 +375,31 @@ pub fn schemas<D: Documented>(surface: &HttpSurface) -> Result<Document, Documen
 /// claiming otherwise, and the claim was wrong. What separates them is
 /// [`__register`], which refuses two shapes under one component instead of
 /// keeping whichever the iteration reached second.
+/// Serialize a document, or say so.
+///
+/// An empty `Vec` here would be served with `200` and the OpenAPI content type,
+/// which is a document that says nothing while looking like one. `serde_json`
+/// fails only on a non-string map key or a non-finite float, neither of which a
+/// schema can contain — so this is unreachable, and it is loud rather than
+/// silent because being wrong about that is worse than a panic in a build step.
+fn render(value: &Value) -> Vec<u8> {
+    match serde_json::to_vec_pretty(value) {
+        Ok(bytes) => bytes,
+        Err(error) => panic!("a document that cannot be serialized is not a document: {error}"),
+    }
+}
+
 fn hoist(
     schema: &mut Value,
     components: &mut BTreeMap<String, Value>,
     into: &str,
 ) -> Result<(), DocumentError> {
+    // `$schema` is legal inside an OpenAPI 3.1 Schema Object and says nothing a
+    // reader of THIS document needs — the dialect is fixed by the OpenAPI
+    // version. Stripped so it is not repeated on every contract.
+    if let Some(map) = schema.as_object_mut() {
+        map.remove("$schema");
+    }
     let taken = schema
         .as_object_mut()
         .and_then(|map| map.remove("$defs"))
@@ -452,6 +506,14 @@ pub fn __register(
     }
 }
 
+/// Put one scheme where a generator looks for it, and require it.
+fn security_scheme(root: &mut Map<String, Value>, name: &str, entry: Value) {
+    if let Some(Value::Object(components)) = root.get_mut("components") {
+        components.insert("securitySchemes".to_owned(), json!({ name: entry }));
+    }
+    root.insert("security".to_owned(), json!([{ name: [] }]));
+}
+
 fn to_value(map: BTreeMap<String, Value>) -> Value {
     Value::Object(map.into_iter().collect())
 }
@@ -478,7 +540,7 @@ fn operation_id(service: &str, operation: &Operation, route: &Route) -> String {
     };
     format!(
         "{service}.{space}.{}.{}",
-        kind_name(route.kind()),
+        __kind_name(route.kind()),
         operation.method
     )
 }
@@ -504,7 +566,86 @@ const fn serves(declared: RouteKind, route: RouteKind) -> bool {
     }
 }
 
-const fn kind_name(kind: RouteKind) -> &'static str {
+/// Which refusals one route family can actually answer with.
+///
+/// Every operation carried every category, which is a document that says a
+/// `rpc` can answer `416 Range Not Satisfiable` and a blob byte route can
+/// answer `415 Unsupported Media Type`. A generator writes an arm for each, and
+/// a reader learns nothing about which are real.
+///
+/// The shared set is everything a request meets before its family matters: the
+/// prelude, the principal, the policy and the upstream. The rest is per family
+/// and follows the handler, not a guess — a category listed here that the
+/// handler cannot raise is the same lie in the other direction.
+fn errors_for(kind: RouteKind) -> Vec<ErrorKind> {
+    let shared = [
+        ErrorKind::InvalidRequest,
+        ErrorKind::Unauthenticated,
+        ErrorKind::Forbidden,
+        ErrorKind::MethodNotFound,
+        ErrorKind::MethodNotAllowed,
+        ErrorKind::UpstreamError,
+        ErrorKind::UpstreamUnavailable,
+        ErrorKind::UpstreamTimeout,
+    ];
+    let extra: &[ErrorKind] = match kind {
+        RouteKind::Rpc => &[
+            ErrorKind::InvalidIdempotencyKey,
+            ErrorKind::IdempotencyConflict,
+            ErrorKind::IdempotencyCapacity,
+            ErrorKind::RequestTooLarge,
+            ErrorKind::UnsupportedMediaType,
+            ErrorKind::ResponseTooLarge,
+            ErrorKind::ActorNotFound,
+        ],
+        RouteKind::Send => &[
+            ErrorKind::IdempotencyNotSupported,
+            ErrorKind::InvalidStreamMetadata,
+            ErrorKind::RangeNotSupported,
+            ErrorKind::RequestStreamTooLarge,
+            ErrorKind::UnsupportedMediaType,
+            ErrorKind::ResponseTooLarge,
+        ],
+        RouteKind::Recv => &[
+            ErrorKind::IdempotencyNotSupported,
+            ErrorKind::RangeNotSupported,
+            ErrorKind::RequestTooLarge,
+            ErrorKind::UnsupportedMediaType,
+            ErrorKind::ResponseStreamTooLarge,
+            ErrorKind::ResponseTooLarge,
+            ErrorKind::ActorNotFound,
+        ],
+        RouteKind::BlobLookup => &[
+            ErrorKind::IdempotencyNotSupported,
+            ErrorKind::RequestTooLarge,
+            ErrorKind::UnsupportedMediaType,
+            ErrorKind::ResponseTooLarge,
+            ErrorKind::ActorNotFound,
+        ],
+        RouteKind::BlobGet | RouteKind::BlobHead => &[
+            ErrorKind::IdempotencyNotSupported,
+            ErrorKind::UnsupportedMediaType,
+            ErrorKind::ResponseStreamTooLarge,
+            ErrorKind::BlobNotFound,
+            ErrorKind::BlobGone,
+            ErrorKind::RangeNotSatisfiable,
+        ],
+        // A family this crate has not been taught. Everything, which is the
+        // honest answer for a route nobody here has read.
+        _ => ErrorKind::ALL,
+    };
+    let mut out = shared.to_vec();
+    out.extend(extra.iter().copied());
+    out.sort_unstable_by_key(|kind| kind.spec().status().as_u16());
+    out.dedup_by_key(|kind| kind.spec().code());
+    out
+}
+
+/// `#[doc(hidden)] pub` so `every_route_family_has_its_own_name` can walk the
+/// inventory and assert this mapping is total and injective. The `_` arm below
+/// is over a `#[non_exhaustive]` enum and cannot be removed.
+#[doc(hidden)]
+pub const fn __kind_name(kind: RouteKind) -> &'static str {
     match kind {
         RouteKind::Rpc => "rpc",
         RouteKind::Send => "send",
@@ -516,12 +657,7 @@ const fn kind_name(kind: RouteKind) -> &'static str {
     }
 }
 
-fn operation_object(
-    service: &str,
-    operation: &Operation,
-    route: &Route,
-    security: &Security,
-) -> Value {
+fn operation_object(service: &str, operation: &Operation, route: &Route) -> Value {
     let mut object = Map::new();
     object.insert(
         "operationId".to_owned(),
@@ -570,6 +706,24 @@ fn operation_object(
     let mut responses = Map::new();
     let success = route.success_status().as_u16().to_string();
     let body = match route.response_media() {
+        // A byte reply's DECLARED value is not in the body — it rides
+        // `Keylink-Result` as base64url. Documenting only the bytes would leave
+        // a `recv`'s return type undocumented anywhere in the document.
+        Some("application/octet-stream") if route.kind() == RouteKind::Recv => json!({
+            "description": "Raw bytes. The declared return value is in the \
+                            Keylink-Result header.",
+            "headers": {
+                "Keylink-Result": {
+                    "required": true,
+                    "description": "The declared return value, as base64url \
+                                    with no padding, decoding to JSON matching \
+                                    x-keylink-result-schema.",
+                    "schema": { "type": "string", "contentEncoding": "base64url" },
+                },
+            },
+            "content": { "application/octet-stream": { "schema": schema::octet_stream_schema() } },
+            "x-keylink-result-schema": operation.response.clone(),
+        }),
         Some("application/octet-stream") => json!({
             "description": "Raw bytes.",
             "content": { "application/octet-stream": { "schema": schema::octet_stream_schema() } },
@@ -581,7 +735,7 @@ fn operation_object(
         None => json!({ "description": "No body." }),
     };
     responses.insert(success, body);
-    for kind in ErrorKind::ALL {
+    for kind in errors_for(route.kind()) {
         responses.insert(
             kind.spec().status().as_u16().to_string(),
             json!({
@@ -595,15 +749,6 @@ fn operation_object(
         );
     }
     object.insert("responses".to_owned(), Value::Object(responses));
-    if let Security::Http { scheme, format } = security {
-        object.insert(
-            "x-keylink-http-auth".to_owned(),
-            json!({ "scheme": scheme, "bearerFormat": format }),
-        );
-    }
-    if let Security::ApiKey { header } = security {
-        object.insert("x-keylink-api-key".to_owned(), json!({ "header": header }));
-    }
     Value::Object(object)
 }
 

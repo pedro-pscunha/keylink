@@ -56,7 +56,6 @@
           "content": {
             "application/json": {
               "schema": {
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "additionalProperties": false,
                 "properties": {
                   "sku": {
@@ -78,7 +77,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$schema": "https://json-schema.org/draft/2020-12/schema",
                   "format": "uint64",
                   "minimum": 0,
                   "title": "uint64",
@@ -138,26 +136,6 @@
             },
             "description": "A refusal, in the one shared envelope."
           },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
-          "410": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
           "413": {
             "content": {
               "application/json": {
@@ -169,26 +147,6 @@
             "description": "A refusal, in the one shared envelope."
           },
           "415": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
-          "416": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
-          "429": {
             "content": {
               "application/json": {
                 "schema": {
@@ -333,27 +291,7 @@
             },
             "description": "A refusal, in the one shared envelope."
           },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
           "410": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
-          "413": {
             "content": {
               "application/json": {
                 "schema": {
@@ -374,26 +312,6 @@
             "description": "A refusal, in the one shared envelope."
           },
           "416": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
-          "500": {
             "content": {
               "application/json": {
                 "schema": {
@@ -526,27 +444,7 @@
             },
             "description": "A refusal, in the one shared envelope."
           },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
           "410": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
-          "413": {
             "content": {
               "application/json": {
                 "schema": {
@@ -567,26 +465,6 @@
             "description": "A refusal, in the one shared envelope."
           },
           "416": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
-          "500": {
             "content": {
               "application/json": {
                 "schema": {
@@ -652,7 +530,6 @@
           "content": {
             "application/json": {
               "schema": {
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "additionalProperties": false,
                 "properties": {
                   "sku": {
@@ -680,7 +557,23 @@
                 }
               }
             },
-            "description": "Raw bytes."
+            "description": "Raw bytes. The declared return value is in the Keylink-Result header.",
+            "headers": {
+              "Keylink-Result": {
+                "description": "The declared return value, as base64url with no padding, decoding to JSON matching x-keylink-result-schema.",
+                "required": true,
+                "schema": {
+                  "contentEncoding": "base64url",
+                  "type": "string"
+                }
+              }
+            },
+            "x-keylink-result-schema": {
+              "format": "uint32",
+              "minimum": 0,
+              "title": "uint32",
+              "type": "integer"
+            }
           },
           "400": {
             "content": {
@@ -732,26 +625,6 @@
             },
             "description": "A refusal, in the one shared envelope."
           },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
-          "410": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
           "413": {
             "content": {
               "application/json": {
@@ -763,26 +636,6 @@
             "description": "A refusal, in the one shared envelope."
           },
           "415": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
-          "416": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
-          "429": {
             "content": {
               "application/json": {
                 "schema": {
@@ -858,7 +711,6 @@
           "content": {
             "application/json": {
               "schema": {
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "additionalProperties": false,
                 "properties": {
                   "value": {
@@ -882,7 +734,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$schema": "https://json-schema.org/draft/2020-12/schema",
                   "format": "uint64",
                   "minimum": 0,
                   "title": "uint64",
@@ -952,16 +803,6 @@
             },
             "description": "A refusal, in the one shared envelope."
           },
-          "410": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
           "413": {
             "content": {
               "application/json": {
@@ -973,16 +814,6 @@
             "description": "A refusal, in the one shared envelope."
           },
           "415": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
-          "416": {
             "content": {
               "application/json": {
                 "schema": {
@@ -1068,7 +899,6 @@
           "content": {
             "application/json": {
               "schema": {
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "additionalProperties": false,
                 "properties": {
                   "value": {
@@ -1090,7 +920,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$schema": "https://json-schema.org/draft/2020-12/schema",
                   "title": "string",
                   "type": "string"
                 }
@@ -1158,16 +987,6 @@
             },
             "description": "A refusal, in the one shared envelope."
           },
-          "410": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
           "413": {
             "content": {
               "application/json": {
@@ -1179,16 +998,6 @@
             "description": "A refusal, in the one shared envelope."
           },
           "415": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "A refusal, in the one shared envelope."
-          },
-          "416": {
             "content": {
               "application/json": {
                 "schema": {
@@ -1264,5 +1073,11 @@
   "x-keylink-authentication": {
     "description": "The deployment authenticates ahead of this gateway.",
     "kind": "external"
+  },
+  "x-keylink-limits": {
+    "maxBlobTickets": 4,
+    "maxDownloadBytes": 64,
+    "maxUploadBytes": 64,
+    "metadataJsonBytes": 32
   }
 }

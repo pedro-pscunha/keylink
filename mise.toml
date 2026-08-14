@@ -513,7 +513,7 @@ description = "rustdoc as a gate, not as decoration"
 # Cheapest first, as everywhere else in this gate.
 run = [
     { task = "headings" },
-    "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --all-features -p keylink -p keylink-persist -p keylink-http -p demo",
+    "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --all-features -p keylink -p keylink-persist -p keylink-http -p keylink-openapi -p demo",
 ]
 
 # ── shipping ────────────────────────────────────────────────────────────────

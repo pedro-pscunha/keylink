@@ -18,10 +18,13 @@ pub fn component_name(id: &str) -> String {
     hasher.update(&(id.len() as u64).to_be_bytes());
     hasher.update(id.as_bytes());
     let digest = hasher.finalize();
-    let short = &digest.as_bytes()[..6];
+    use std::fmt::Write as _;
+
     let mut out = String::with_capacity(12);
-    for byte in short {
-        out.push_str(&format!("{byte:02x}"));
+    for byte in &digest.as_bytes()[..6] {
+        // `write!` into the buffer. `format!` in a loop allocates a `String`
+        // per byte and throws each away.
+        let _ = write!(out, "{byte:02x}");
     }
     out
 }

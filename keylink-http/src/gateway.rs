@@ -98,13 +98,7 @@ where
         route_path: &str,
         kind: keylink::ExternalKind,
     ) -> Result<&'static str, GatewayError> {
-        let decoded = decode_method_in(S::METHODS, path, route_path, kind)?;
-        S::METHODS
-            .iter()
-            .copied()
-            .find(|candidate| candidate.name() == decoded && candidate.kind() == kind)
-            .map(keylink::ExternalMethod::name)
-            .ok_or(GatewayError::MethodNotFound)
+        select_method(S::METHODS, path, route_path, kind)
     }
 
     #[expect(
@@ -195,8 +189,9 @@ where
 ///
 /// Everything else is shared. The prelude, the path decoders, the response
 /// builders and the handler bodies are free functions both surfaces call, so
-/// the address space is the only thing that differs — which is what
-/// [`Surface`] carries.
+/// the address space is the only thing that differs — which is what `Surface`
+/// carries. (Named without a link: it is private, and a public page cannot
+/// point at it.)
 pub struct ActorGateway<S, A>
 where
     S: keylink::ExternalActorService,
@@ -366,16 +361,7 @@ fn addressed<'a, M: Mount>(
     if request.method() != route.method() {
         return Err(GatewayError::MethodNotAllowed);
     }
-    let methods = mount.methods();
-    let decoded = decode_method_in(methods, request.uri().path(), route_path, kind)?;
-    let Some(method) = methods
-        .iter()
-        .copied()
-        .find(|candidate| candidate.name() == decoded && candidate.kind() == kind)
-        .map(keylink::ExternalMethod::name)
-    else {
-        return Err(GatewayError::MethodNotFound);
-    };
+    let method = select_method(mount.methods(), request.uri().path(), route_path, kind)?;
     let surface = mount
         .surface(request.uri().path(), route_path)
         .ok_or(GatewayError::MethodNotFound)?;
@@ -1205,6 +1191,27 @@ fn decode_method_in(
             _ => GatewayError::MethodNotFound,
         },
     )
+}
+
+/// The exact generated method a path names, or the refusal.
+///
+/// One definition, called from [`addressed`] and from the test-only wrapper.
+/// Written twice — which it was — the wrapper's own claim that it "has to behave
+/// as `addressed` does or it is measuring a different gateway" stops being true
+/// the moment one copy changes.
+fn select_method(
+    methods: &'static [keylink::ExternalMethod],
+    path: &str,
+    route_path: &str,
+    kind: keylink::ExternalKind,
+) -> Result<&'static str, GatewayError> {
+    let decoded = decode_method_in(methods, path, route_path, kind)?;
+    methods
+        .iter()
+        .copied()
+        .find(|candidate| candidate.name() == decoded && candidate.kind() == kind)
+        .map(keylink::ExternalMethod::name)
+        .ok_or(GatewayError::MethodNotFound)
 }
 
 /// The `{actor}` segment of an actor-route path, decoded once.
