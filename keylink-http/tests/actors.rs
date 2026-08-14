@@ -70,6 +70,9 @@ impl ledger::Actor for Book {
 #[derive(Clone)]
 struct Watching {
     seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    /// Ids refused from now on. A test revokes an actor mid-run, which is the
+    /// only way to ask what a grant recorded before the revocation is worth.
+    denied: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Access for Watching {
@@ -78,10 +81,15 @@ impl Access for Watching {
             .lock()
             .expect("the record is not poisoned")
             .push(call.actor.map(|id| id.as_str().to_owned()));
-        if call
-            .actor
-            .is_some_and(|id| id.as_str().starts_with("forbidden"))
-        {
+        let denied = call.actor.is_some_and(|id| {
+            id.as_str().starts_with("forbidden")
+                || self
+                    .denied
+                    .lock()
+                    .expect("the record is not poisoned")
+                    .contains(id.as_str())
+        });
+        if denied {
             return Err(AccessError::Forbidden);
         }
         Ok(())
@@ -106,6 +114,7 @@ async fn local_node() -> Node {
 struct Running {
     address: std::net::SocketAddr,
     seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    denied: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     ticks: std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>>,
     task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
     _server: keylink::Server,
@@ -157,6 +166,7 @@ async fn start() -> Running {
         .expect("dials the keyed system");
 
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let denied = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let surface = HttpSurface::new("/v1", Addressing::Actors)
         .expect("valid actor surface")
         .with_streaming(StreamingLimits::new(32, 64, 64, 1).expect("positive limits"));
@@ -164,6 +174,7 @@ async fn start() -> Running {
         client,
         Watching {
             seen: std::sync::Arc::clone(&seen),
+            denied: std::sync::Arc::clone(&denied),
         },
         Challenge::new(http::HeaderValue::from_static("Bearer realm=keylink"))
             .expect("valid challenge"),
@@ -182,6 +193,7 @@ async fn start() -> Running {
     Running {
         address,
         seen,
+        denied,
         ticks,
         task,
         _server: server,
@@ -223,6 +235,14 @@ impl Running {
             .send()
             .await
             .expect("the request completes")
+    }
+
+    /// Refuse one actor from the next request onward.
+    fn deny(&self, actor: &str) {
+        self.denied
+            .lock()
+            .expect("the record is not poisoned")
+            .insert(actor.to_owned());
     }
 
     fn seen(&self) -> Vec<Option<String>> {
@@ -515,5 +535,93 @@ async fn a_wrong_verb_is_refused_before_the_actor_is_decoded() {
     assert!(
         running.seen().is_empty(),
         "no policy was asked about any of them"
+    );
+}
+
+/// Revoking an actor makes its recorded answer unreachable, from any path.
+///
+/// The plan's shape: record under `A`, deny `A`, permit `B`, reuse the SAME
+/// external key. `A`'s answer must not come back — not to `A`, whose access is
+/// gone, and not to `B`, who never made it.
+///
+/// The two halves fail differently and both matter. `A` is stopped by the
+/// policy, which runs before any call is made. `B` is stopped by the key
+/// derivation, which gives `B` an identity `A`'s record cannot satisfy — and
+/// that half would still hold if the policy were removed entirely.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK40`) by replacing the
+/// actor field of the derivation
+/// `.map_or(b"", |id| id.as_str().as_bytes()),`
+/// with `.map_or(b"", |_id| b""),`. The row failed on `B`'s execution count:
+/// `left: 0` against `right: 1` — `B` replayed the revoked actor's answer.
+#[tokio::test]
+async fn a_revoked_actors_recorded_answer_replays_to_nobody() {
+    let running = start().await;
+
+    let recorded = running.replayable("/v1/one/rpc/Tick", "revocable").await;
+    assert_eq!(recorded.status(), http::StatusCode::OK);
+    assert_eq!(recorded.text().await.expect("a body"), "1");
+    assert_eq!(running.ticks("one"), 1);
+
+    running.deny("one");
+
+    let refused = running.replayable("/v1/one/rpc/Tick", "revocable").await;
+    assert_eq!(
+        refused.status(),
+        http::StatusCode::FORBIDDEN,
+        "the recorded answer is not reachable by the actor that recorded it"
+    );
+
+    let other = running
+        .replayable("/v1/obra%2F4471/rpc/Tick", "revocable")
+        .await;
+    assert_eq!(other.status(), http::StatusCode::OK);
+    assert_eq!(other.text().await.expect("a body"), "1");
+    assert_eq!(
+        running.ticks("obra/4471"),
+        1,
+        "the permitted actor ran its own call rather than replaying the revoked one's"
+    );
+    assert_eq!(
+        running.ticks("one"),
+        1,
+        "and the revoked actor never ran again"
+    );
+}
+
+/// The keyed surface serves calls, and nothing else.
+///
+/// No `send`, no status, no lifecycle, no discovery, no administration. This
+/// is not an omission to be filled in later: a registry is a private detail of
+/// the serving node, and an HTTP surface that could list, spawn or stop actors
+/// would make it a public one. `send` is absent for a different reason — a
+/// service that declares one cannot be served as an actor at all, which the
+/// generated code enforces before any of this is reachable.
+///
+/// Every path below answers the same `404` an unknown method answers, so the
+/// surface does not say which of them are ideas it has heard of.
+#[tokio::test]
+async fn the_keyed_surface_exposes_no_lifecycle_or_discovery() {
+    let running = start().await;
+
+    for path in [
+        "/v1/one/send/Upload",
+        "/v1/one/tell/Count",
+        "/v1/one/status",
+        "/v1/one/stop",
+        "/v1/one/spawn",
+        "/v1/actors",
+        "/v1/one",
+    ] {
+        let response = running.post(path, "{}").await;
+        assert_eq!(
+            response.status(),
+            http::StatusCode::NOT_FOUND,
+            "{path}: a keyed surface answers calls and nothing else"
+        );
+    }
+    assert!(
+        running.seen().is_empty(),
+        "and no policy was asked about any of them"
     );
 }
