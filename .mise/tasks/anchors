@@ -2140,7 +2140,8 @@ ANCHORS = [
      '        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {\n            self.overflowed = true;\n            return Err(std::io::Error::other(\n                "successful response exceeds its JSON limit",\n            ));\n        }'),
     ("HJ3", "keylink-http/src/service.rs", "keylink/src/macros.rs",
      '                }\n                .map_err($crate::ExternalError::Client)?;\n                $codec.encode(&value)\n                    .map($crate::ExternalOutput::Json)'),
-    ("HJ4", "keylink-http/tests/http.rs", "keylink-http/src/gateway.rs", '    hasher.update(principal);'),
+    ("HJ4", "keylink-http/tests/http.rs", "keylink-http/src/gateway.rs",
+     "    delimited(&mut hasher, principal.as_bytes());"),
     ("HJ5", "keylink-http/src/limits.rs", "keylink-http/src/limits.rs",
      "            bytes: Vec::new(),\n"),
     ("HJ7", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
@@ -2204,7 +2205,7 @@ ANCHORS = [
     ("HK16", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
      "        principal,\n"
      "        method,\n"
-     "        actor: None,\n"
+     "        actor: surface.actor.clone(),\n"
      "        id,"),
     ("HK17", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
      "        Ok(true) => return not_modified(&tag),"),
@@ -2226,6 +2227,12 @@ ANCHORS = [
      "            @actor [ $( $actor )* { [ $( #[$cfg] )* ] recv $method ( $( $arg : $ty ),* ) -> $ret } ]"),
     ("HK27", "keylink-http/src/contract.rs", "keylink-http/src/contract.rs",
      "            route.addressing == self.addressing && (!route.streaming || self.streaming.is_some())"),
+    ("HK37", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
+     "            .map_or(b\"\", |id| id.as_str().as_bytes()),"),
+    ("HK38", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
+     "        actor: surface.actor.clone(),"),
+    ("HK36", "keylink-http/tests/http.rs", "keylink-http/src/gateway.rs",
+     "    delimited(&mut hasher, method.as_bytes());"),
     ("HK33", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
      "                RouteKind::Recv => any(move |request: Request<Body>| {"),
     ("HK34", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
@@ -2471,7 +2478,7 @@ REDNESS = {
             "left: [110, 117, 108, 108]",
             "service::tests::json_conversion_uses_declared_arguments_and_return_values",
             ["-p", "keylink-http", "--lib"]),
-    "HJ4": ('    hasher.update(&[]);', "left: \"1\"",
+    "HJ4": ('    delimited(&mut hasher, b"");', "left: \"1\"",
             "external_idempotency_keys_are_namespaced_by_principal",
             ["-p", "keylink-http", "--test", "http"]),
     "HJ5": ("            bytes: Vec::with_capacity(limit),", "capacity overflow",
@@ -3921,7 +3928,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 315
+RECORD_BLOCKS = 318
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

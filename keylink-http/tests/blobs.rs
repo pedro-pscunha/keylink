@@ -807,7 +807,7 @@ async fn empty_blob_get_head_conditions_and_ranges_are_exact() {
 /// existence oracle over content this caller was never granted.
 ///
 /// Watched red with `scripts/break-once.sh` (row `HK16`) by replacing
-/// `principal, method, actor: None, id,`
+/// `principal, method, actor: surface.actor.clone(), id,`
 /// in `keylink-http/src/gateway.rs` with a constant principal, which lets
 /// `tenant-z` read what `tenant-a` was handed.
 ///

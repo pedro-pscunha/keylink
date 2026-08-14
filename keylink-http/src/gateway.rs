@@ -15,7 +15,7 @@ use crate::{
 };
 
 const IDEMPOTENCY_HEADER: &str = "idempotency-key";
-const KEY_DOMAIN: &[u8] = b"keylink-http/idempotency/v1\0";
+const KEY_DOMAIN: &[u8] = b"keylink-http/idempotency/v2\0";
 
 /// HTTP/JSON adapter for one already-connected generated singleton client.
 pub struct Gateway<S, A>
@@ -673,7 +673,7 @@ async fn handle_blob_lookup<A: Access>(
         return GatewayError::UpstreamError.response(None);
     };
     let mut response = json_response(value, route);
-    tickets.insert(ticket_for(principal, method, address), handle);
+    tickets.insert(ticket_for(principal, method, address, surface), handle);
     response.headers_mut().insert(header::LOCATION, location);
     response
 }
@@ -733,7 +733,7 @@ async fn handle_blob_bytes<A: Access>(
     let Some(address) = decode_blob_address(parts.uri.path(), route_path) else {
         return GatewayError::BlobNotFound.response(None);
     };
-    let ticket = ticket_for(principal, method, address.clone());
+    let ticket = ticket_for(principal, method, address.clone(), surface);
     let Some((generation, handle)) = tickets.get(&ticket) else {
         return GatewayError::BlobNotFound.response(None);
     };
@@ -858,7 +858,7 @@ async fn handle_rpc<A: Access>(
     if !is_media(&parts.headers, route.request_media()) {
         return GatewayError::UnsupportedMediaType.response(None);
     }
-    let key = match derived_key(&parts.headers, &principal) {
+    let key = match derived_key(&parts.headers, &principal, method, surface) {
         Ok(key) => key,
         Err(error) => return error.response(None),
     };
@@ -1118,17 +1118,29 @@ fn decode_blob_address(path: &str, route_path: &str) -> Option<crate::blob::Addr
 /// absences stays green while the scoping is gone. Measured — the first
 /// version of row `HK16` came back `exit=0`. One definition is what makes the
 /// break reach both sides at once.
-fn ticket_for(
+fn ticket_for<A: Access>(
     principal: Principal,
     method: &'static str,
     id: crate::blob::Address,
+    surface: &Surface<'_, A>,
 ) -> crate::blob::Ticket {
     crate::blob::Ticket {
         principal,
         method,
-        actor: None,
+        actor: surface.actor.clone(),
         id,
     }
+}
+
+/// One length-delimited field.
+///
+/// The length goes in FIRST and is fixed width, so no field's bytes can be
+/// read as another's. Concatenating `principal || service || method` lets a
+/// boundary move: `("ab", "c")` and `("a", "bc")` hash the same, and two
+/// callers who should never share an identity would share one.
+fn delimited(hasher: &mut blake3::Hasher, field: &[u8]) {
+    hasher.update(&(field.len() as u64).to_be_bytes());
+    hasher.update(field);
 }
 
 /// `Content-Length: 0` is an empty body. A positive length or a transfer
@@ -1242,9 +1254,11 @@ fn is_length_limit(error: &axum::Error) -> bool {
     false
 }
 
-fn derived_key(
+fn derived_key<A: Access>(
     headers: &HeaderMap,
     principal: &Principal,
+    method: &'static str,
+    surface: &Surface<'_, A>,
 ) -> Result<Option<keylink::IdempotencyKey>, GatewayError> {
     let mut values = headers.get_all(IDEMPOTENCY_HEADER).iter();
     let Some(value) = values.next() else {
@@ -1262,13 +1276,23 @@ fn derived_key(
     {
         return Err(GatewayError::InvalidIdempotencyKey);
     }
-    let principal = principal.as_bytes();
     let mut hasher = blake3::Hasher::new();
     hasher.update(KEY_DOMAIN);
-    hasher.update(&(principal.len() as u64).to_be_bytes());
-    hasher.update(principal);
-    hasher.update(&(value.len() as u64).to_be_bytes());
-    hasher.update(value.as_bytes());
+    delimited(&mut hasher, principal.as_bytes());
+    delimited(&mut hasher, surface.service.as_bytes());
+    delimited(&mut hasher, method.as_bytes());
+    // The addressing mode, not just the id. A singleton and an actor whose id
+    // is empty cannot both exist, but the tag is what makes that a fact about
+    // the encoding rather than a fact about `ActorId`'s validation.
+    hasher.update(&[u8::from(surface.actor.is_some())]);
+    delimited(
+        &mut hasher,
+        surface
+            .actor
+            .as_ref()
+            .map_or(b"", |id| id.as_str().as_bytes()),
+    );
+    delimited(&mut hasher, value.as_bytes());
     let encoded = hasher.finalize().to_hex().to_string();
     keylink::IdempotencyKey::new(encoded)
         .map(Some)

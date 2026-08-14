@@ -6,7 +6,7 @@ use axum::{middleware, response::Response, Router};
 use http::Request;
 use iroh::{endpoint::presets, Endpoint};
 use keylink::prelude::*;
-use keylink::{Allowlist, Caller, Node};
+use keylink::{Allowlist, BlobId, Blobs, Caller, Node};
 use keylink_http::{
     Access, AccessError, ActorGateway, Addressing, Call, Challenge, HttpSurface, Principal,
     StreamingLimits,
@@ -16,12 +16,21 @@ keylink::service! {
     service Ledger;
     rpc Count(value: u64) -> u64;
     rpc Whoami() -> String;
+    rpc Tick() -> u64;
     recv Read(chunks: u64) -> String;
+    // Every actor owns a DIFFERENT blob, so a ticket that reached the wrong
+    // actor's bytes answers with content the test can name.
+    blob Take() -> u64;
 }
 
 #[derive(Clone)]
 struct Book {
     name: String,
+    /// This actor's own blob, and how many bytes are in it.
+    blob: (BlobId, u64),
+    /// How many times this actor really ran a `Tick`, so a replayed answer is
+    /// distinguishable from a second execution.
+    ticks: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ledger::Actor for Book {
@@ -35,6 +44,14 @@ impl ledger::Actor for Book {
 
     /// The declared value AND the payload both name the actor, so one response
     /// proves which mount answered on both halves of a `recv` reply.
+    async fn tick(&mut self, _cx: Caller<'_>) -> u64 {
+        self.ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    async fn take(&mut self, _cx: Caller<'_>) -> (u64, BlobId) {
+        (self.blob.1, self.blob.0)
+    }
+
     async fn read(&mut self, _cx: Caller<'_>, chunks: u64) -> (String, keylink::Body) {
         let bytes = self
             .name
@@ -89,6 +106,7 @@ async fn local_node() -> Node {
 struct Running {
     address: std::net::SocketAddr,
     seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    ticks: std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>>,
     task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
     _server: keylink::Server,
     _nodes: Vec<Node>,
@@ -103,20 +121,35 @@ impl Drop for Running {
 async fn start() -> Running {
     let server_node = local_node().await;
     let client_node = local_node().await;
+    let blobs = Blobs::memory();
 
     let system: ledger::Registry = ledger::Registry::builder(keylink::Eviction::Never).build();
+    let mut ticks = std::collections::HashMap::new();
     for name in ["one", "obra/4471", "forbidden"] {
+        // Content that names its own actor, so bytes reached through the wrong
+        // ticket say whose they are.
+        let bytes = format!("bytes of {name}").into_bytes();
+        let id = blobs.add_bytes(bytes.clone()).await.expect("stores");
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        ticks.insert(name.to_owned(), std::sync::Arc::clone(&counter));
         system
             .mount(
                 keylink::ActorId::new(name).expect("a valid id"),
                 ledger::spawn(Book {
                     name: name.to_owned(),
+                    blob: (id, bytes.len() as u64),
+                    ticks: counter,
                 }),
             )
             .expect("mounts");
     }
     let server = keylink::Server::builder(&server_node)
-        .service(system.service(Allowlist::anyone()).build())
+        .service(
+            system
+                .service(Allowlist::anyone())
+                .with_blobs(&blobs)
+                .build(),
+        )
         .spawn()
         .expect("a keyed system");
     let client = ledger::RegistryClient::connect(&client_node, server_node.endpoint().addr())
@@ -149,6 +182,7 @@ async fn start() -> Running {
     Running {
         address,
         seen,
+        ticks,
         task,
         _server: server,
         _nodes: vec![server_node, client_node],
@@ -161,6 +195,31 @@ impl Running {
             .post(format!("http://{}{path}", self.address))
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(body)
+            .send()
+            .await
+            .expect("the request completes")
+    }
+
+    /// How many times one actor really ran `Tick`.
+    fn ticks(&self, actor: &str) -> u64 {
+        self.ticks[actor].load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A `POST` carrying a replay key.
+    async fn replayable(&self, path: &str, key: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("http://{}{path}", self.address))
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", key)
+            .body("{}")
+            .send()
+            .await
+            .expect("the request completes")
+    }
+
+    async fn get(&self, path: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .get(format!("http://{}{path}", self.address))
             .send()
             .await
             .expect("the request completes")
@@ -332,4 +391,92 @@ fn result_of(response: &reqwest::Response) -> String {
         .decode(encoded)
         .expect("canonical unpadded base64url");
     String::from_utf8(decoded).expect("the declared value is JSON text")
+}
+
+/// One replay key under two actors is two identities.
+///
+/// The plan's derivation binds the actor into the Keylink key, so `one` and
+/// `obra/4471` under `shared-key` are two calls rather than one caller
+/// replaying the other's answer. Each actor counts its own executions, so a
+/// leaked identity shows up as a run that never happened.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK37`) by replacing the
+/// actor field of the derivation
+/// `.map_or(b"", |id| id.as_str().as_bytes()),`
+/// with `.map_or(b"", |_id| b""),`. The run terminated on
+/// `the second actor ran its own call rather than replaying the first's`,
+/// `left: 0` against `right: 1` — the second actor never executed, because
+/// the reply was `one`'s recorded answer.
+///
+/// The addressing-mode tag beside that field cannot catch this: both calls
+/// here are keyed, so both tag as keyed. Only the id tells them apart.
+#[tokio::test]
+async fn one_replay_key_under_two_actors_is_two_identities() {
+    let running = start().await;
+
+    let first = running.replayable("/v1/one/rpc/Tick", "shared-key").await;
+    assert_eq!(first.status(), http::StatusCode::OK);
+    assert_eq!(first.text().await.expect("a body"), "1");
+    assert_eq!(running.ticks("one"), 1);
+
+    let other = running
+        .replayable("/v1/obra%2F4471/rpc/Tick", "shared-key")
+        .await;
+    assert_eq!(other.status(), http::StatusCode::OK);
+    assert_eq!(other.text().await.expect("a body"), "1");
+    assert_eq!(
+        running.ticks("obra/4471"),
+        1,
+        "the second actor ran its own call rather than replaying the first's"
+    );
+
+    // And within one actor the key still replays, so the binding narrowed the
+    // identity without removing it.
+    let again = running.replayable("/v1/one/rpc/Tick", "shared-key").await;
+    assert_eq!(again.text().await.expect("a body"), "1");
+    assert_eq!(running.ticks("one"), 1, "the replay ran nothing");
+}
+
+/// A blob ticket minted for one actor never reaches another actor's bytes.
+///
+/// The keyed surface serves the same four route families the singleton one
+/// does, so a lookup under `/v1/one/blob/Take` mints a grant and the byte
+/// route under the SAME actor serves it. The address is content-derived, so
+/// nothing but the ticket's actor field stops the identical `GET` under
+/// another actor's path from reading it.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK38`) by replacing
+/// `        actor: surface.actor.clone(),`
+/// with `        actor: None,`. The run terminated on
+/// `a grant minted for one actor is not a grant under another`, `left: 200`
+/// against `right: 404` — the cross-actor `GET` succeeded.
+#[tokio::test]
+async fn a_blob_ticket_is_bound_to_the_actor_that_minted_it() {
+    let running = start().await;
+
+    let minted = running.post("/v1/one/blob/Take", "{}").await;
+    assert_eq!(minted.status(), http::StatusCode::CREATED);
+    let location = minted
+        .headers()
+        .get(http::header::LOCATION)
+        .expect("a lookup says where the bytes live")
+        .to_str()
+        .expect("a header-safe path")
+        .to_owned();
+    assert_eq!(minted.text().await.expect("a body"), "12");
+
+    // Control: the actor that minted the grant can read it.
+    let mine = running.get(&location).await;
+    assert_eq!(mine.status(), http::StatusCode::OK);
+    assert_eq!(mine.text().await.expect("a body"), "bytes of one");
+
+    // The same address, the same principal, the same method — another actor.
+    let theirs = location.replacen("/one/", "/obra%2F4471/", 1);
+    assert_ne!(theirs, location, "the probe really changed the actor");
+    let crossed = running.get(&theirs).await;
+    assert_eq!(
+        crossed.status(),
+        http::StatusCode::NOT_FOUND,
+        "a grant minted for one actor is not a grant under another"
+    );
 }

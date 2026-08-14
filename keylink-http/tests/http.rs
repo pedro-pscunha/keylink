@@ -708,8 +708,10 @@ async fn real_ledger_maps_not_keyable_refusal() {
 }
 
 /// Watched red with `scripts/break-once.sh` by replacing
-/// `    hasher.update(principal);` with an empty namespace update. The exact async
-/// test terminated with the second principal replaying `1` instead of running as `2`.
+/// `delimited(&mut hasher, principal.as_bytes());`
+/// with a call passing `b""`, which drops the principal from the identity. The
+/// exact async test terminated with the second principal replaying `1` instead
+/// of running as `2`.
 #[tokio::test]
 async fn external_idempotency_keys_are_namespaced_by_principal() {
     let handler = Handler::default();
@@ -734,34 +736,69 @@ async fn external_idempotency_keys_are_namespaced_by_principal() {
     assert_eq!(runs.load(Ordering::SeqCst), 2);
 }
 
+/// One key on two methods is two identities, and one key twice on one method
+/// is one.
+///
+/// A replay key names an operation, so the method is part of what it names.
+/// The gateway hashes the method into the derived key, which is what makes
+/// `Add` and `Count` under `one-call` two independent calls rather than a
+/// caller replaying `Add`'s answer out of `Count`.
+///
+/// This row USED to assert `502 upstream_error` on the second call. That
+/// status was keylink's own refusal — the core saw one key reach two methods
+/// and rejected it — and asserting it made a gateway defect indistinguishable
+/// from a correct gateway: a caller doing an ordinary, legal thing got an
+/// error naming the upstream. The behaviour changed with the derivation, and
+/// the row changed with it rather than being deleted.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK36`) by replacing
+/// `delimited(&mut hasher, method.as_bytes());`
+/// with a call passing `b""`, which drops the method from the identity. The
+/// row failed on the SECOND call's status: `502` where it asserts `200`.
+///
+/// Not the replay the first draft of this note predicted, and the difference
+/// matters. keylink's core keeps its own record of what a key was used for and
+/// refuses to let one reach a second method, so the leak this derivation would
+/// otherwise open is caught one layer down — as a `502` on a request that is
+/// perfectly legal. The gateway binding does not add the refusal. It removes
+/// the need for one, by giving the two calls two identities.
 #[tokio::test]
-async fn reusing_one_key_for_a_different_method_is_never_http_success() {
-    let running = start(Handler::default(), Allow, None).await;
+async fn one_key_names_one_method_and_replays_only_within_it() {
+    let handler = Handler::default();
+    let runs = Arc::clone(&handler.runs);
+    let running = start(handler, Allow, None).await;
     let client = reqwest::Client::new();
     let base = format!("http://{}/v1/inventory/rpc", running.address);
-    let first = client
-        .post(format!("{base}/Add"))
-        .header("x-test-principal", "tenant-a")
-        .header("content-type", "application/json")
-        .header("idempotency-key", "one-call")
-        .body(r#"{"left":1,"right":2}"#)
-        .send()
+    let call = |path: String, body: &'static str| {
+        client
+            .post(path)
+            .header("x-test-principal", "tenant-a")
+            .header("content-type", "application/json")
+            .header("idempotency-key", "one-call")
+            .body(body)
+            .send()
+    };
+
+    let first = call(format!("{base}/Add"), r#"{"left":1,"right":2}"#)
         .await
         .expect("HTTP call completes");
     assert_eq!(first.status(), http::StatusCode::OK);
+    assert_eq!(first.text().await.expect("a body"), "3");
 
-    let wrong = client
-        .post(format!("{base}/Count"))
-        .header("x-test-principal", "tenant-a")
-        .header("content-type", "application/json")
-        .header("idempotency-key", "one-call")
-        .body(r#"{"value":7}"#)
-        .send()
+    // Same key, different method. `Count` answers from the shared run counter,
+    // so a key that had leaked across methods would answer `Add`'s `3` here.
+    let other = call(format!("{base}/Count"), r#"{"value":7}"#)
         .await
         .expect("HTTP call completes");
-    let (status, code, _) = error_code(wrong).await;
-    assert_eq!(
-        (status, code.as_str()),
-        (http::StatusCode::BAD_GATEWAY, "upstream_error")
-    );
+    assert_eq!(other.status(), http::StatusCode::OK);
+    assert_eq!(other.text().await.expect("a body"), "2");
+    assert_eq!(runs.load(Ordering::SeqCst), 2, "both methods ran once");
+
+    // Same key, same method: one execution, and the recorded answer.
+    let again = call(format!("{base}/Count"), r#"{"value":7}"#)
+        .await
+        .expect("HTTP call completes");
+    assert_eq!(again.status(), http::StatusCode::OK);
+    assert_eq!(again.text().await.expect("a body"), "2");
+    assert_eq!(runs.load(Ordering::SeqCst), 2, "the replay ran nothing");
 }
