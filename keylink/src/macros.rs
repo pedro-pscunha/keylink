@@ -5248,6 +5248,60 @@ macro_rules! __keylink_external {
                          ( $( $aarg:ident : $aty:ty ),* ) -> $aret:ty } )* ]
         @rest [ ]
     ) => {
+        /// Hand this service's declaration list to a macro that wants to read it.
+        ///
+        /// The one seam a documentation generator gets, and it is deliberately
+        /// narrow: a callback macro path in, the declarations out, nothing
+        /// else. It carries the TYPES rather than their names, because the
+        /// only thing a caller can usefully do with a declaration is name its
+        /// request and response types in code it generates.
+        ///
+        /// MODULE-SCOPED, not crate-root exported. `pub(crate) use` below makes
+        /// it `module::__keylink_declarations!`, which is reachable from the
+        /// crate that wrote the `service!` block and from nowhere else. That is
+        /// the whole of the orphan story: a downstream crate cannot invoke it,
+        /// so it cannot implement a foreign documentation trait for this
+        /// crate's `External`.
+        ///
+        /// The `$d:tt` indirection is how a `macro_rules!` writes another
+        /// `macro_rules!` on stable: `$` cannot be escaped inside a macro body,
+        /// so the dollar arrives as a token.
+        #[doc(hidden)]
+        macro_rules! __keylink_declarations_with {
+            ( $d:tt ) => {
+                #[doc(hidden)]
+                macro_rules! __keylink_declarations {
+                    ( $d callback:path $d (, $d extra:tt )* ) => {
+                        $d callback! {
+                            $d ( $d extra, )*
+                            service = ::core::stringify!($svc),
+                            singleton = [ $(
+                                {
+                                    cfg = [ $( #[$cfg] )* ],
+                                    kind = $kind,
+                                    method = ::core::stringify!($method),
+                                    args = [ $( $arg : $ty ),* ],
+                                    ret = $ret,
+                                }
+                            )* ],
+                            actor = [ $(
+                                {
+                                    cfg = [ $( #[$acfg] )* ],
+                                    kind = $akind,
+                                    method = ::core::stringify!($amethod),
+                                    args = [ $( $aarg : $aty ),* ],
+                                    ret = $aret,
+                                }
+                            )* ],
+                        }
+                    };
+                }
+            };
+        }
+        __keylink_declarations_with!($);
+        #[doc(hidden)]
+        pub(crate) use __keylink_declarations;
+
         /// Marker for this generated singleton service's external conversion seam.
         pub struct External;
 

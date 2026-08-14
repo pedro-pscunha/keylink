@@ -10,6 +10,33 @@
 //! This crate exists only to be imported. It has no tests of its own — the
 //! measurement is that `keylink-http` can build a gateway over
 //! [`ledger::External`] and [`ledger::RegistryClient`] from here.
+//!
+//! # The declaration callback does not cross a crate boundary
+//!
+//! `service!` emits one hidden callback per generated module, `pub(crate)`, so
+//! it is reachable from the crate that wrote the declaration and from nowhere
+//! else. A doctest is a SEPARATE crate that depends on this one, which is
+//! exactly the downstream case:
+//!
+//! ```compile_fail
+//! imported_ledger::ledger::__keylink_declarations!(anything);
+//! ```
+//!
+//! The control, so the refusal above is about VISIBILITY and not about a
+//! mistyped path. Same crate, same module, a public item:
+//!
+//! ```
+//! fn exists<T>() {}
+//! exists::<imported_ledger::ledger::External>();
+//! ```
+//!
+//! That refusal is what makes the orphan rule hold for documentation. A
+//! documentation trait lives in `keylink-openapi`, `External` lives here, and
+//! the only macro that can implement one for the other is invocable only from
+//! this crate — so a third crate cannot write the impl even by naming both.
+//!
+//! The positive half is in `keylink/tests/declaration_seam.rs`, whose own
+//! `service!` blocks it reads without difficulty.
 
 // A keyed service whose declarations cover every kind the actor seam serves, so
 // a consumer exercises all three of them across the boundary.
