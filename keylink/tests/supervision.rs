@@ -1795,7 +1795,7 @@ async fn a_peer_whose_feed_panicked_is_told_the_actor_is_gone() {
 /// Real time and a real file store, and nothing here asserts a duration.
 ///
 /// Made red by `scripts/break-once.sh` replacing
-/// `if self.progress.as_ref().map(Progress::reached) == Some(Reached::NotDispatched) {`
+/// `if self.progress.reached() == Reached::NotDispatched {`
 /// with `if true {` in `keylink/src/idempotency.rs`, which releases every key a guard
 /// drops — the BROAD close this gap deliberately does not take. That is R11's
 /// registered literal with a replacement of its own, so it adds no row; the search form

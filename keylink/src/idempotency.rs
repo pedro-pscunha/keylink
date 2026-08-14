@@ -2072,7 +2072,10 @@ impl Ledger {
             peer,
             key,
             settled: false,
-            progress: None,
+            // Reads `NotDispatched`, which is the truth about a key nothing has
+            // been dispatched under yet. `serve_one` replaces it with the
+            // call's own marker before anything is.
+            progress: Progress::new(),
         })
     }
 
@@ -2654,17 +2657,24 @@ pub(crate) struct Guard {
     peer: EndpointId,
     key: IdempotencyKey,
     settled: bool,
-    /// How far the call got. `None` for a guard nothing is watching, which
-    /// settles `Interrupted` on drop — the conservative answer, and the one the
-    /// ledger gave before anything watched.
-    progress: Option<Progress>,
+    /// How far the call got.
+    ///
+    /// Built by [`Ledger::claim`], where it reads `NotDispatched`, and replaced
+    /// by [`watching`](Self::watching) the moment `serve_one` has the call's
+    /// own. **Not an `Option`, and that is item 2 of the ledger audit:** an
+    /// absent marker settled `Interrupted` on drop, so a guard dropped between
+    /// the claim and the dispatch — which is what an abort during the durable
+    /// claim write is — refused a retry of a call that provably never ran. A
+    /// guard that nobody has watched yet is a guard nothing has been dispatched
+    /// under, and now it says so.
+    progress: Progress,
 }
 
 impl Guard {
     /// Watch how far this call gets, so an abort settles honestly.
     #[must_use]
     pub(crate) fn watching(mut self, progress: Progress) -> Self {
-        self.progress = Some(progress);
+        self.progress = progress;
         self
     }
 
@@ -2793,7 +2803,7 @@ impl Drop for Guard {
         // owed and the key goes back. Anything else — entered and unfinished,
         // finished with nobody left to record it, or still in a mailbox whose
         // turn nobody stayed to watch — is genuinely unknown.
-        if self.progress.as_ref().map(Progress::reached) == Some(Reached::NotDispatched) {
+        if self.progress.reached() == Reached::NotDispatched {
             self.ledger.release(self.peer, &self.key);
         } else {
             self.ledger.settle(self.peer, &self.key, Slot::Interrupted);
@@ -3157,6 +3167,17 @@ mod tests {
 
             assert_eq!(ledger.key_state(peer(A), &key("k")), KeyState::Interrupted);
         }
+
+        /// Nothing ran: the claim write parked and the task was killed before
+        /// the handler was ever entered. The key must be claimable, which is
+        /// the same answer `claim_durably`'s own error path already gives.
+        #[test]
+        fn an_abort_during_the_claim_write_leaves_the_key_claimable() {
+            let ledger = stalling();
+            abort(ledger.claim_durably(peer(A), key("k")));
+
+            assert_eq!(ledger.key_state(peer(A), &key("k")), KeyState::Fresh);
+        }
     }
 
     /// [`Records`], which decides what a settled key holds rather than whether it
@@ -3351,20 +3372,21 @@ mod tests {
         }
 
         /// `Records::None` must not touch the paths that decide whether the work
-        /// ran. A guard dropped without a reply is still `Interrupted`, and one
+        /// ran. A guard dropped after dispatch is still `Interrupted`, and one
         /// dropped with nothing dispatched is still claimable — the two halves of
         /// RFC-05 §2, asked of a ledger that records no replies.
         ///
         /// Made red by `scripts/break-once.sh` making `Guard::drop`'s
         /// `Reached::NotDispatched` test unreachable. Search, **with its
         /// indentation**, which is what keeps it unique against this quote:
-        /// `if self.progress.as_ref().map(Progress::reached) == Some(Reached::NotDispatched) {`
+        /// `if self.progress.reached() == Reached::NotDispatched {`
         /// and replace with `if false {`, so every dropped guard settles rather than
         /// releasing. The replacement is quoted too, which is always safe.
         ///
         /// This record and that condition are in one file, and that is not a reason to
-        /// describe rather than quote — measured at `7a147c0`, the indented form
-        /// counts **1** with this quote present while the bare form counts 2. The
+        /// describe rather than quote — first measured at `7a147c0` and re-measured
+        /// here after item 2 of the ledger audit moved the line: the indented form
+        /// counts **1** with this quote present while the bare form counts **2**. The
         /// indentation is the whole mechanism. Watched:
         /// `panicked at .., a key nothing ran under must still be claimable`. It also
         /// reddens
@@ -3374,7 +3396,12 @@ mod tests {
         #[test]
         fn records_none_changes_nothing_about_who_settles() {
             let ledger = recordless();
-            drop(guard(ledger.claim(peer(A), key("entered"))));
+            // Watched with a DISPATCHED marker, which is what "entered" means.
+            // A guard out of `claim` reads `NotDispatched` and releases, so an
+            // unwatched drop here would be asking a different question.
+            let entered = Progress::new();
+            entered.dispatched();
+            drop(guard(ledger.claim(peer(A), key("entered"))).watching(entered));
             assert_eq!(
                 refusal(ledger.claim(peer(A), key("entered"))),
                 IdempotencyRefusal::Interrupted,
@@ -3499,23 +3526,11 @@ mod tests {
             );
         }
 
-        /// A handler that was entered and produced nothing leaves uncertainty,
-        /// not a vacant key. Re-running it is the double booking this module
-        /// exists to prevent.
-        #[test]
-        fn a_guard_dropped_without_a_reply_leaves_the_key_interrupted() {
-            let ledger = ledger();
-            drop(guard(ledger.claim(peer(A), key("k"))));
-
-            assert_eq!(
-                refusal(ledger.claim(peer(A), key("k"))),
-                IdempotencyRefusal::Interrupted
-            );
-        }
-
-        /// The other half of the same rule, and the one that was missing: a key
-        /// nothing ever entered goes back to vacant, so the caller's retry is a
-        /// first attempt rather than a permanent refusal.
+        /// A key nothing ever entered goes back to vacant, so the caller's retry
+        /// is a first attempt rather than a permanent refusal.
+        ///
+        /// The marker is written out even though `claim` now builds the same
+        /// value, so the test states the rule instead of leaning on a default.
         #[test]
         fn a_guard_dropped_with_nothing_dispatched_leaves_the_key_claimable() {
             let ledger = ledger();
@@ -4007,7 +4022,12 @@ mod tests {
             let ledger = bounded(holding(1));
             assert_eq!(ledger.key_state(peer(A), &key("never")), KeyState::Fresh);
 
-            let running = guard(ledger.claim(peer(A), key("running")));
+            // Watched as dispatched, because `Interrupted` is what a call that
+            // ENTERED the handler leaves. A guard out of `claim` reads
+            // `NotDispatched` and releases the key instead.
+            let entered = Progress::new();
+            entered.dispatched();
+            let running = guard(ledger.claim(peer(A), key("running"))).watching(entered);
             assert_eq!(
                 ledger.key_state(peer(A), &key("running")),
                 KeyState::Running
