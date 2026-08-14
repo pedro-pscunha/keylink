@@ -54,6 +54,7 @@
 #[path = "contract.rs"]
 pub mod __contract;
 mod access;
+mod blob;
 mod error;
 mod gateway;
 mod limits;

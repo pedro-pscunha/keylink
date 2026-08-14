@@ -26,6 +26,13 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 iroh = { workspace = true, features = ["test-utils"] }
+# Test-only, and only so a holder can REVOKE a grant mid-run. Four mapped rows
+# turn on a grant that stops working while the gateway still holds a ticket,
+# and nothing in `keylink::Blobs` revokes one: shutting the holder down yields
+# `Error::Transport`, which is a different answer from the refusal those rows
+# are about. Pinned to keylink's own version so the two cannot disagree.
+iroh-blobs = { version = "0.103.0", default-features = false }
+postcard = { workspace = true }
 postcard-schema = { workspace = true }
 bytes = { workspace = true }
 http-body = "1"

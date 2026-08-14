@@ -91,22 +91,47 @@ pub(crate) fn result_header(
     Ok((name, encoded))
 }
 
+/// Anything Keylink hands over one verified chunk at a time.
+///
+/// Two implementors and one consumer, which is what makes this a seam rather
+/// than a hypothetical one: `BodyReader` carries a `recv` reply and
+/// `BlobReader` carries content-addressed bytes, and the download path cares
+/// about neither. Copying the loop instead would give the blob routes their
+/// own bounded-stream bug to fix twice.
+pub(crate) trait Chunks {
+    fn next_chunk(
+        &mut self,
+    ) -> impl std::future::Future<Output = keylink::Result<Option<axum::body::Bytes>>> + Send;
+}
+
+impl Chunks for keylink::BodyReader {
+    async fn next_chunk(&mut self) -> keylink::Result<Option<axum::body::Bytes>> {
+        keylink::BodyReader::next_chunk(self).await
+    }
+}
+
+impl Chunks for keylink::BlobReader {
+    async fn next_chunk(&mut self) -> keylink::Result<Option<axum::body::Bytes>> {
+        keylink::BlobReader::next_chunk(self).await
+    }
+}
+
 /// Stream a Keylink response body as HTTP bytes, stopping at `limit`.
 ///
 /// The limit is inclusive and counted as bytes arrive, because an undeclared
 /// length is exactly the case where nothing can be refused up front. Crossing
 /// it ends the HTTP body in an error, which is all a response can still say
 /// once its headers have gone.
-pub(crate) fn download_body(reader: keylink::BodyReader, limit: u64) -> axum::body::Body {
+pub(crate) fn download_body<R: Chunks + Send + 'static>(reader: R, limit: u64) -> axum::body::Body {
     /// Reading, or finished for good. Without the second state an error would
     /// be yielded forever, because `unfold` ends only on `None`.
-    enum Download {
-        Reading(keylink::BodyReader, u64),
+    enum Download<R> {
+        Reading(R, u64),
         Ended,
     }
 
     axum::body::Body::from_stream(n0_future::stream::unfold(
-        Download::Reading(reader, 0),
+        Download::<R>::Reading(reader, 0),
         move |state| async move {
             let Download::Reading(mut reader, observed) = state else {
                 return None;

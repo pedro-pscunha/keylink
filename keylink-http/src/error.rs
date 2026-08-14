@@ -73,6 +73,9 @@ pub(crate) enum GatewayError {
     UpstreamUnavailable,
     UpstreamTimeout,
     ResponseTooLarge,
+    BlobNotFound,
+    BlobGone,
+    RangeNotSatisfiable,
 }
 
 #[derive(Serialize)]
@@ -110,6 +113,9 @@ impl GatewayError {
             Self::UpstreamUnavailable => ErrorKind::UpstreamUnavailable,
             Self::UpstreamTimeout => ErrorKind::UpstreamTimeout,
             Self::ResponseTooLarge => ErrorKind::ResponseTooLarge,
+            Self::BlobNotFound => ErrorKind::BlobNotFound,
+            Self::BlobGone => ErrorKind::BlobGone,
+            Self::RangeNotSatisfiable => ErrorKind::RangeNotSatisfiable,
         }
     }
 
@@ -141,6 +147,18 @@ impl GatewayError {
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
+        // Every refusal, not just the ones that look sensitive. `404` and
+        // `410` are heuristically cacheable under RFC 9111 §4.2.2, and both
+        // depend on WHICH principal asked — so a shared cache in front of this
+        // gateway would store one tenant's `404` for a byte resource and serve
+        // it to the tenant that holds the grant. RFC 9111 §3.2 protects only
+        // the case where the identity came from an `Authorization` field, and
+        // `Principal` is a deployment-inserted extension that may come from a
+        // cookie, a custom header or mTLS instead.
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
         if spec.challenge() {
             if let Some(challenge) = challenge {
                 response
@@ -167,7 +185,7 @@ impl GatewayError {
         }
     }
 
-    fn from_keylink(error: keylink::Error) -> Self {
+    pub(crate) fn from_keylink(error: keylink::Error) -> Self {
         match error {
             keylink::Error::Transport(_) | keylink::Error::Closed => Self::UpstreamUnavailable,
             keylink::Error::Remote(remote) => match remote {
@@ -319,7 +337,68 @@ mod tests {
                 "response_too_large",
                 "the successful response JSON exceeds its limit",
             ),
+            (
+                GatewayError::InvalidStreamMetadata,
+                StatusCode::BAD_REQUEST,
+                "invalid_stream_metadata",
+                "the streaming metadata header is invalid",
+            ),
+            (
+                GatewayError::RangeNotSupported,
+                StatusCode::BAD_REQUEST,
+                "range_not_supported",
+                "this streaming route does not accept byte ranges",
+            ),
+            (
+                GatewayError::RequestStreamTooLarge,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_stream_too_large",
+                "the request stream exceeds its limit",
+            ),
+            (
+                GatewayError::ResponseStreamTooLarge,
+                StatusCode::BAD_GATEWAY,
+                "response_stream_too_large",
+                "the response stream exceeds its limit",
+            ),
+            (
+                GatewayError::BlobNotFound,
+                StatusCode::NOT_FOUND,
+                "blob_not_found",
+                "no such byte resource",
+            ),
+            (
+                GatewayError::BlobGone,
+                StatusCode::GONE,
+                "blob_gone",
+                "the byte resource is no longer available",
+            ),
+            (
+                GatewayError::RangeNotSatisfiable,
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "range_not_satisfiable",
+                "the requested range cannot be satisfied",
+            ),
         ];
+
+        // The list is hand written, so nothing forced a new variant into it.
+        // Seven had accumulated unpinned, three of them added by the blob
+        // routes. Comparing it against the maintained `ErrorKind::ALL` is what
+        // makes the next omission a failing test rather than a silent gap.
+        let covered: Vec<_> = cases.iter().map(|(error, ..)| error.kind()).collect();
+        let missing: Vec<_> = crate::__contract::ErrorKind::ALL
+            .iter()
+            .filter(|kind| !covered.contains(kind))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "every declared error kind needs a row here; missing: {missing:?}"
+        );
+        assert_eq!(
+            covered.len(),
+            crate::__contract::ErrorKind::ALL.len(),
+            "and no kind is pinned twice"
+        );
 
         for (error, status, code, message) in cases {
             let (actual_status, headers, body) = rendered(error).await;

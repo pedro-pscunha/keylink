@@ -2187,6 +2187,40 @@ ANCHORS = [
      "        let tail = self.end().min(stop);"),
     ("HK9", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
      "        if self.broken {"),
+    ("HK11", "keylink-http/src/blob.rs", "keylink-http/src/blob.rs",
+     "            if let Some(at) = book.order.iter().position(|held| held == &ticket) {"),
+    ("HK12", "keylink-http/src/blob.rs", "keylink-http/src/blob.rs",
+     "        while book.order.len() > self.max {"),
+    ("HK13", "keylink-http/src/blob.rs", "keylink-http/src/blob.rs",
+     "    if start >= len {"),
+    ("HK14", "keylink-http/src/blob.rs", "keylink-http/src/blob.rs",
+     "                .and_then(|rest| rest.strip_suffix('\"'))"),
+    ("HK21", "keylink-http/src/blob.rs", "keylink-http/src/blob.rs",
+     "    if wildcard && entries > 1 {"),
+    ("HK22", "keylink-http/src/blob.rs", "keylink-http/src/blob.rs",
+     "            if inner.contains('\"') {"),
+    ("HK15", "keylink-http/src/blob.rs", "keylink-http/src/blob.rs",
+     "    value.to_str().is_ok_and(|value| value.trim() == tag)"),
+    ("HK16", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
+     "        principal,\n"
+     "        method,\n"
+     "        actor: None,\n"
+     "        id,"),
+    ("HK17", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
+     "            Ok(true) => return not_modified(&tag),"),
+    ("HK18", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
+     "        Some(value) => value.to_str().is_ok_and(|value| value.trim() == \"0\"),"),
+    ("HK19", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
+     "        let wants_bytes = route.kind() == RouteKind::BlobGet;"),
+    ("HK20", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
+     "            Err(AccessError::Forbidden) => Err(GatewayError::Forbidden.response(None)),"),
+    ("HK23", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
+     "    tickets.remove(ticket, generation);"),
+    ("HK24", "keylink-http/tests/blobs.rs", "keylink-http/src/blob.rs",
+     "            .is_none_or(|(live, _)| *live != generation)"),
+    ("HK25", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
+     "        // Silently ignoring a caller's replay key is worse than refusing it.\n"
+     "        if parts.headers.get(IDEMPOTENCY_HEADER).is_some() {"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -3873,7 +3907,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 298
+RECORD_BLOCKS = 310
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

@@ -174,6 +174,42 @@ const ROUTES: &[Route] = &[
         response_media: Some("application/octet-stream"),
         streaming: true,
     },
+    Route {
+        kind: RouteKind::BlobLookup,
+        addressing: Addressing::Singleton,
+        template: "/blob/{method}",
+        method: http::Method::POST,
+        success: http::StatusCode::CREATED,
+        request_media: Some("application/json"),
+        response_media: Some("application/json"),
+        streaming: true,
+    },
+    // One template, two entries. The verb is what decides whether a byte
+    // reader is opened at all, so a route that answered to both would have no
+    // single answer for `method()` and no single answer for what it does.
+    Route {
+        kind: RouteKind::BlobGet,
+        addressing: Addressing::Singleton,
+        template: "/blob/{method}/{id}",
+        method: http::Method::GET,
+        success: http::StatusCode::OK,
+        // Not `application/json` and not absent-by-oversight: a byte route
+        // accepts no request body of any type, which is a different fact from
+        // "accepts any type".
+        request_media: None,
+        response_media: Some("application/octet-stream"),
+        streaming: true,
+    },
+    Route {
+        kind: RouteKind::BlobHead,
+        addressing: Addressing::Singleton,
+        template: "/blob/{method}/{id}",
+        method: http::Method::HEAD,
+        success: http::StatusCode::OK,
+        request_media: None,
+        response_media: Some("application/octet-stream"),
+        streaming: true,
+    },
 ];
 
 #[cfg(test)]
@@ -234,6 +270,17 @@ pub enum ErrorKind {
     UpstreamTimeout,
     /// A successful response exceeds its configured metadata limit.
     ResponseTooLarge,
+    /// No byte resource of this identity is available to this caller.
+    ///
+    /// One shape for every reason: a guessed identity, another principal's,
+    /// another method's, one evicted from the finite table, and one that never
+    /// existed. Telling them apart is an existence oracle.
+    BlobNotFound,
+    /// The byte resource existed for this caller and the holder no longer
+    /// serves it.
+    BlobGone,
+    /// A syntactically valid range that the representation cannot satisfy.
+    RangeNotSatisfiable,
 }
 
 impl ErrorKind {
@@ -259,6 +306,9 @@ impl ErrorKind {
         Self::UpstreamUnavailable,
         Self::UpstreamTimeout,
         Self::ResponseTooLarge,
+        Self::BlobNotFound,
+        Self::BlobGone,
+        Self::RangeNotSatisfiable,
     ];
 
     /// The stable HTTP representation of this category.
@@ -285,6 +335,9 @@ impl ErrorKind {
             Self::UpstreamUnavailable => &UPSTREAM_UNAVAILABLE,
             Self::UpstreamTimeout => &UPSTREAM_TIMEOUT,
             Self::ResponseTooLarge => &RESPONSE_TOO_LARGE,
+            Self::BlobNotFound => &BLOB_NOT_FOUND,
+            Self::BlobGone => &BLOB_GONE,
+            Self::RangeNotSatisfiable => &RANGE_NOT_SATISFIABLE,
         }
     }
 }
@@ -432,6 +485,27 @@ const METHOD_NOT_ALLOWED: ErrorSpec = ErrorSpec {
     challenge: false,
 };
 error_spec!(
+    BLOB_NOT_FOUND,
+    BlobNotFound,
+    NOT_FOUND,
+    "blob_not_found",
+    "no such byte resource"
+);
+error_spec!(
+    BLOB_GONE,
+    BlobGone,
+    GONE,
+    "blob_gone",
+    "the byte resource is no longer available"
+);
+error_spec!(
+    RANGE_NOT_SATISFIABLE,
+    RangeNotSatisfiable,
+    RANGE_NOT_SATISFIABLE,
+    "range_not_satisfiable",
+    "the requested range cannot be satisfied"
+);
+error_spec!(
     IDEMPOTENCY_CONFLICT,
     IdempotencyConflict,
     CONFLICT,
@@ -517,7 +591,28 @@ mod tests {
                 .routes()
                 .map(Route::kind)
                 .collect::<Vec<_>>(),
-            [RouteKind::Rpc, RouteKind::Send, RouteKind::Recv]
+            [
+                RouteKind::Rpc,
+                RouteKind::Send,
+                RouteKind::Recv,
+                RouteKind::BlobLookup,
+                RouteKind::BlobGet,
+                RouteKind::BlobHead,
+            ]
+        );
+        // The two byte routes share one template and differ only in verb, so
+        // one `Route` per verb is what keeps `method()` a single answer.
+        let blob: Vec<_> = streaming_singleton
+            .routes()
+            .filter(|route| route.template() == "/blob/{method}/{id}")
+            .collect();
+        assert_eq!(blob.len(), 2);
+        assert_eq!(blob[0].method(), http::Method::GET);
+        assert_eq!(blob[1].method(), http::Method::HEAD);
+        assert_eq!(
+            blob[0].request_media(),
+            None,
+            "a byte route takes no request body at all"
         );
         let streaming_actors = HttpSurface::new("/v1", Addressing::Actors)
             .expect("valid actor surface")
