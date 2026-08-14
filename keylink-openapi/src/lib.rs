@@ -368,6 +368,27 @@ pub fn schemas<D: Documented>(surface: &HttpSurface) -> Result<Document, Documen
     Ok(Document { value, bytes })
 }
 
+//
+// The blank-line break below is load-bearing. Without it this whole block
+// documents `render`, and `hoist` — which carries the subtlest reasoning in the
+// crate — is left with none. That is what happened when `render` was inserted
+// between the block and the function it describes, and rustdoc renders the
+// result without complaint because both are private.
+
+/// Serialize a document, or say so.
+///
+/// An empty `Vec` here would be served with `200` and the OpenAPI content type,
+/// which is a document that says nothing while looking like one. `serde_json`
+/// fails only on a non-string map key or a non-finite float, neither of which a
+/// schema can contain — so this is unreachable, and it is loud rather than
+/// silent because being wrong about that is worse than a panic in a build step.
+fn render(value: &Value) -> Vec<u8> {
+    match serde_json::to_vec_pretty(value) {
+        Ok(bytes) => bytes,
+        Err(error) => panic!("a document that cannot be serialized is not a document: {error}"),
+    }
+}
+
 /// Move a schemars schema's `$defs` into the shared table and rewrite its
 /// references to point there.
 ///
@@ -387,20 +408,6 @@ pub fn schemas<D: Documented>(surface: &HttpSurface) -> Result<Document, Documen
 /// claiming otherwise, and the claim was wrong. What separates them is
 /// [`__register`], which refuses two shapes under one component instead of
 /// keeping whichever the iteration reached second.
-/// Serialize a document, or say so.
-///
-/// An empty `Vec` here would be served with `200` and the OpenAPI content type,
-/// which is a document that says nothing while looking like one. `serde_json`
-/// fails only on a non-string map key or a non-finite float, neither of which a
-/// schema can contain — so this is unreachable, and it is loud rather than
-/// silent because being wrong about that is worse than a panic in a build step.
-fn render(value: &Value) -> Vec<u8> {
-    match serde_json::to_vec_pretty(value) {
-        Ok(bytes) => bytes,
-        Err(error) => panic!("a document that cannot be serialized is not a document: {error}"),
-    }
-}
-
 fn hoist(
     schema: &mut Value,
     components: &mut BTreeMap<String, Value>,

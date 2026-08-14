@@ -203,3 +203,46 @@ async fn an_empty_generated_inventory_is_refused_at_configuration() {
     );
     assert!(matches!(router, Err(ConfigError::MissingRuntimeRoute)));
 }
+
+/// Both READMEs document every error code the gateway can answer with.
+///
+/// The package README is what crates.io renders, so its table IS the published
+/// error contract. It was hand-maintained against a growing enum and drifted to
+/// 16 of 23 — every code Tasks 4 through 8 added was missing, including both
+/// blob refusals and every streaming one.
+///
+/// Pinned to `ErrorKind::ALL`, which `error.rs` already pins its own render
+/// table to. That chain now ends where it should: a new category forces a
+/// `spec()` arm, an `ALL` entry, a render row and a README row.
+///
+/// Compares the CODE only. A status or a sentence is prose a reader judges; a
+/// code is an identifier a client matches on, and a missing one is a client
+/// that cannot name what it received.
+#[test]
+fn the_readme_documents_every_error_code() {
+    use keylink_http::__contract::ErrorKind;
+
+    let package =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .expect("the package README is readable");
+    let root = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../README.md"),
+    )
+    .expect("the root README is readable");
+
+    let mut missing = Vec::new();
+    for kind in ErrorKind::ALL {
+        let code = kind.spec().code();
+        let quoted = format!("`{code}`");
+        if !package.contains(&quoted) {
+            missing.push(format!("keylink-http/README.md: {code}"));
+        }
+        if !root.contains(&quoted) {
+            missing.push(format!("README.md: {code}"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "a code the gateway answers with and no README names: {missing:?}"
+    );
+}

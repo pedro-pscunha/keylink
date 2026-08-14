@@ -120,24 +120,35 @@ The gateway does not include credentials, principal bytes, authorization details
 |---:|---|---|
 | 400 | `invalid_request` | The path or JSON argument object is invalid. |
 | 400 | `invalid_idempotency_key` | The idempotency key is invalid. |
-| 400 | `idempotency_not_supported` | The RPC does not accept idempotency keys. |
+| 400 | `idempotency_not_supported` | The route does not accept idempotency keys. Only `rpc` does. |
+| 400 | `invalid_stream_metadata` | The `Keylink-Arguments` header is missing or undecodable. |
+| 400 | `range_not_supported` | `Range` or `If-Range` on a route that serves no ranges. |
 | 401 | `unauthenticated` | Authentication is required. |
 | 403 | `forbidden` | The verified caller cannot invoke this method. |
 | 404 | `method_not_found` | The RPC route does not exist. |
-| 404 | `actor_not_found` | The addressed actor does not exist. This code is reserved for actor HTTP support. |
-| 405 | `method_not_allowed` | The route accepts `POST` only. |
+| 404 | `actor_not_found` | The addressed actor does not exist, or the policy refused it — the two answer alike. |
+| 405 | `method_not_allowed` | The route does not serve this verb. Call routes take `POST`; blob byte routes take `GET` and `HEAD`. |
 | 409 | `idempotency_conflict` | The key cannot be replayed. |
+| 404 | `blob_not_found` | No grant of this caller's names these bytes. |
+| 410 | `blob_gone` | The grant existed and the holder no longer serves it. |
 | 413 | `request_too_large` | The request exceeds its byte limit. |
+| 413 | `request_stream_too_large` | The upload exceeds its byte limit. |
+| 416 | `range_not_satisfiable` | The requested range lies outside the content. |
 | 415 | `unsupported_media_type` | One valid JSON media type is required. |
 | 429 | `idempotency_capacity` | The upstream idempotency capacity is exhausted. |
 | 500 | `response_too_large` | The success JSON exceeds its byte limit. |
+| 500 | `response_stream_too_large` | The download exceeds its byte limit. |
 | 502 | `upstream_error` | The upstream call failed. |
 | 503 | `upstream_unavailable` | The upstream service is unavailable. |
 | 504 | `upstream_timeout` | The upstream call timed out. |
 
 A `401` response includes the configured `WWW-Authenticate` challenge.
-A `405` response includes `Allow: POST`.
-All error responses use `application/json`.
+A `405` response includes `Allow` naming the verbs that route does serve.
+All error responses use `application/json` and `Cache-Control: private, no-store`.
+
+This table is the complete inventory and a test says so:
+`the_readme_documents_every_error_code` compares it against `ErrorKind::ALL`.
+Seven codes were missing from it before that test existed.
 
 ## Cancellation and unsupported capabilities
 

@@ -634,12 +634,14 @@ Errors use this shape:
 ```
 
 The stable codes are `invalid_request`, `invalid_idempotency_key`,
-`idempotency_not_supported`, `unauthenticated`, `forbidden`,
-`method_not_found`, `actor_not_found`, `method_not_allowed`,
-`idempotency_conflict`, `request_too_large`, `unsupported_media_type`,
-`idempotency_capacity`, `upstream_error`, `upstream_unavailable`,
-`upstream_timeout`, and `response_too_large`. Upstream text and authorization
-internals never enter the response.
+`idempotency_not_supported`, `invalid_stream_metadata`, `range_not_supported`,
+`unauthenticated`, `forbidden`, `method_not_found`, `actor_not_found`,
+`method_not_allowed`, `blob_not_found`, `idempotency_conflict`, `blob_gone`,
+`request_too_large`, `request_stream_too_large`, `unsupported_media_type`,
+`range_not_satisfiable`, `idempotency_capacity`, `response_too_large`,
+`response_stream_too_large`, `upstream_error`, `upstream_unavailable` and
+`upstream_timeout`. The package README carries the table with statuses, and a
+test pins it to the inventory.
 
 A client disconnect drops the gateway-owned Keylink call future. Work that
 already entered the backend can continue, and an idempotent call can settle as
