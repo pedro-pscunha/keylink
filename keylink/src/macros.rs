@@ -6269,8 +6269,8 @@ macro_rules! __keylink_service {
             pub type RegistryBuilder = $crate::RegistryBuilder<Mail>;
 
             /// A typed address of one actor in this process. Its methods are the
-            /// service's declared `rpc` and `tell` operations, with no transport
-            /// or remote error in their result.
+            /// service's declared `rpc`, `tell` and `blob` operations, with no
+            /// transport or remote error in their result.
             #[derive(Clone, Debug)]
             pub struct LocalRef<'a> {
                 system: &'a Registry,
