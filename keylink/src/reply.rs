@@ -138,9 +138,11 @@ pub enum RemoteError {
     /// to that peer and useless to this crate: it is not a discriminator, and
     /// nothing in keylink matches on it.
     ///
-    /// **The two in-crate exceptions are named here rather than left in comments
-    /// four thousand lines away**, which is where the first one lived and where
-    /// no reader of this variant would meet it.
+    /// **The one in-crate exception is named here rather than left in a comment
+    /// four thousand lines away**, which is where it lived and where no reader
+    /// of this variant would meet it. There were two: `write_claim`'s is gone,
+    /// minted as [`IdempotencyRefusal::NotClaimed`](crate::IdempotencyRefusal)
+    /// once the ALPN argument that forbade it was repealed.
     ///
     /// `turns.rs`'s `deliver_unkeyed` answers a `Failed` on its
     /// `NotQueued::Reentrant` arm, carrying
@@ -149,14 +151,6 @@ pub enum RemoteError {
     /// no turn — so that arm is written to be right rather than to fire.
     /// `turns.rs`'s `neither_served_door_answers_a_failed` holds the rest of the
     /// boundary: nothing `rendered` or `lost` answers is one of these.
-    ///
-    /// `idempotency.rs`'s `write_claim` answers one when a
-    /// [`Records::Durable`](crate::Records) service cannot write the claim it
-    /// has just taken, so the call is not run. There is no wire variant for
-    /// *the serving side could not write its own ledger*, and minting one would
-    /// move the ALPN and break every handshake to say something only an
-    /// operator acts on. The sentence is what the caller needs: nothing ran,
-    /// and the same key is safe to send again.
     ///
     /// The `String` **was** a discriminator that keylink wrote and a peer read off
     /// the front with `starts_with`, against five prefix constants on this type.

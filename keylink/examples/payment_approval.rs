@@ -62,7 +62,7 @@ use keylink::{
     IdempotencyRefusal, KeyState, Node, Persist, RecordError, Records, Refusal, RemoteError,
     Replied, Reply, Server,
 };
-use keylink_persist::file::{EntryFiles, Files};
+use keylink_persist::file::Files;
 use keylink_persist::{Durable, RestoreError, StateId};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
@@ -230,11 +230,12 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let store = Files::open(&root).await?.limit(1024 * 1024);
     let id = StateId::new("treasury/main")?;
 
-    //  The second store, under the same root and a different name. It holds one
-    //  entry per idempotency key rather than one whole value, which is the whole
-    //  reason it is a different port: recording one reply through `Snapshots`
-    //  would rewrite every reply already held.
-    let keys = EntryFiles::open(&root).await?;
+    //  The second store, under the same root and a different name. One type,
+    //  two ports: `Files` serves `Snapshots::claim` above and `Entries::hold`
+    //  here. This one holds one entry per idempotency key rather than one whole
+    //  value, which is the whole reason it is a different port — recording one
+    //  reply through `Snapshots` would rewrite every reply already held.
+    let keys = Files::open(&root).await?;
     let ledger_id = StateId::new("treasury/keys")?;
 
     //  `open` claims the state exclusively and reads it back in one call, and

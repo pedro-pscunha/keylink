@@ -745,6 +745,25 @@ pub enum ConfigError {
     /// The allowlist parsed to nothing at all.
     #[error("allowlist is empty - refusing to serve a protocol nobody can reach")]
     EmptyAllowlist,
+    /// [`Records::Durable`](crate::Records) was configured on a service that
+    /// accepts no idempotency key.
+    ///
+    /// No ledger is built, so the store is never read and never written — and
+    /// it still holds the exclusive claim on its log file for as long as the
+    /// service lives. The next service configured to use that ledger properly
+    /// is refused [`Busy`](keylink_persist::Error::Busy) by one that will never
+    /// write a record. Refused at startup rather than left to be discovered as
+    /// that refusal.
+    ///
+    /// Not feature-gated, although the configuration it names needs `persist`
+    /// to exist: the check that produces it is unconditional, and a variant
+    /// that appears and disappears with a feature is exactly the trap
+    /// [`Records`](crate::Records) carries `#[non_exhaustive]` for.
+    #[error(
+        "a service that accepts no idempotency key was given a durable record store - it would \
+         hold the store's claim and never write to it"
+    )]
+    DurableWithoutKeys,
     /// A data-driven authorization rule file contains no peer rules.
     #[error("authorization rules contain no peers - refusing to start")]
     EmptyRules,

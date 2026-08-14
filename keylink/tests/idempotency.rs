@@ -2127,7 +2127,7 @@ mod stored {
         limits: Limits,
         refusing: bool,
     ) -> (Fixture, Counter) {
-        let files = keylink_persist::file::EntryFiles::open(root)
+        let files = keylink_persist::file::Files::open(root)
             .await
             .expect("opens")
             .limit(limit);
@@ -2249,13 +2249,14 @@ mod stored {
             .expect_err("the store could not hold the record, so the reply is not sent");
         assert_eq!(
             refusal(&error),
-            IdempotencyRefusal::Interrupted,
-            "it ran and the record is not held, which is exactly what Interrupted means"
+            IdempotencyRefusal::Unrecordable,
+            "it ran and the reply is not something this ledger can hold, which is \
+             Unrecordable word for word - Interrupted says no reply came out at all"
         );
 
         // It DID run. That is the whole reason the caller must not be told it
-        // succeeded — and the reason the answer is `Interrupted` rather than a
-        // refusal that invites an immediate retry.
+        // succeeded — and the reason the answer is not a refusal that invites an
+        // immediate retry.
         assert_eq!(
             runs.runs(),
             1,
@@ -2268,11 +2269,49 @@ mod stored {
             .reserve("ADU-014".to_string(), 2)
             .await
             .expect_err("still unknown");
-        assert_eq!(refusal(&again), IdempotencyRefusal::Interrupted);
+        assert_eq!(refusal(&again), IdempotencyRefusal::Unrecordable);
         assert_eq!(
             runs.runs(),
             1,
             "a key whose record failed must not be free to run again"
+        );
+    }
+
+    /// A durable store on a service that accepts no key is refused at startup.
+    ///
+    /// `Keyable::None` builds no ledger, so the store is never read and never
+    /// written — and it holds the exclusive claim on its log file for as long
+    /// as the service lives. The next service configured to use that ledger
+    /// properly is then told `Busy` by one that will never write a record.
+    ///
+    /// `a_second_process_cannot_claim_a_running_actor` in
+    /// `keylink/tests/durable.rs` is the other end of the same rope: it asserts
+    /// the `Busy`, and this asserts that a misconfiguration cannot be the
+    /// reason for one.
+    #[tokio::test]
+    async fn a_durable_store_without_keys_is_refused_at_startup() {
+        let scratch = Scratch::new("durable-without-keys");
+        let files = keylink_persist::file::Files::open(&scratch.0)
+            .await
+            .expect("opens");
+        let records = keylink::DurableRecords::open(&files, &ledger_id())
+            .await
+            .expect("nobody else holds this ledger");
+
+        let server = local_node().await;
+        let service = till::service(Till::default(), Allowlist::anyone())
+            .keyable(Keyable::None)
+            .records(Records::Durable(records))
+            .build();
+
+        let error = KeylinkServer::builder(&server)
+            .service(service)
+            .spawn()
+            .expect_err("a store held and never written must refuse startup");
+
+        assert!(
+            matches!(error, Error::Config(ConfigError::DurableWithoutKeys)),
+            "got {error:?}"
         );
     }
 

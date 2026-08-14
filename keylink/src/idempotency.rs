@@ -121,7 +121,7 @@
 //! [`Notify::notify_waiters`]: tokio::sync::Notify::notify_waiters
 //! [`Notified::enable`]: tokio::sync::futures::Notified::enable
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -307,6 +307,46 @@ pub const MAX_WAITING_PER_PEER: usize = 128;
 /// smaller share of its budget on calls it has already decided not to run.
 pub const MAX_WAITING: usize = 1024;
 
+/// How many queued disk reconciliations one claim pays for.
+///
+/// Each is an `fsync`, so this is a latency ceiling on the claim path and not a
+/// tuning knob: the queue still drains, over as many claims as it takes.
+///
+/// **What is measured, and what could not be.** The fixture is a 1500-record
+/// store reopened at `pool_records(64)`, where `Ledger::new` queues 2616
+/// entries and the first keyed call used to pay for all of them — **8770 ms**.
+///
+/// The drain **clears the backlog** and that number is exact: at 8 it takes 7
+/// entries off the queue per call after the reconcile, so 2616 of them are gone
+/// in about **374 keyed calls**, against the 2000 this was accepted at. At 12 it
+/// was 11 per call and about 240.
+///
+/// The **latency of the one call that pays is inconclusive on this machine**,
+/// and it is reported that way rather than as a midpoint. Four runs at each
+/// value, first call, minutes apart:
+///
+/// | `DRAIN_PER_CLAIM` | first call, four runs        |
+/// |-------------------|------------------------------|
+/// | 12                | 38.9, 44.0, 62.5, 64.9 ms    |
+/// | 8                 | 32.8, 51.4, 63.8, 82.0 ms    |
+///
+/// A **fixed** configuration spans 32 to 82 ms, so the spread within one value
+/// is larger than the difference between two — 8's worst sample is worse than
+/// every sample at 12. Against a 60 ms acceptance line that is not a pass and
+/// not a fail; it is a measurement the machine cannot resolve, and picking the
+/// value off it would be picking off noise.
+///
+/// So the constant is set from the quantity that IS resolvable — the backlog
+/// clears in about a fifth of the calls it was allowed — and the smaller of the
+/// two candidates is taken, because a smaller ceiling cannot be the thing that
+/// makes a call slow. Whatever the per-`fsync` cost turns out to be on a given
+/// disk, 8 of them is the least this can spend and still drain.
+///
+/// Gated, because the queue it bounds is only ever non-empty on a service with
+/// a store, and `--no-default-features` builds one that cannot have one.
+#[cfg(feature = "persist")]
+const DRAIN_PER_CLAIM: usize = 8;
+
 /// Why a call carrying an idempotency key was refused without being run.
 ///
 /// Grouped under one [`RemoteError`] variant rather than spread across six,
@@ -464,6 +504,35 @@ pub enum IdempotencyRefusal {
         /// The method a key was attached to, `CamelCase` as `service!` wrote it.
         method: String,
     },
+
+    /// This service records keys durably and could not write this one, so the
+    /// handler was never entered.
+    ///
+    /// The one fact a caller most wants after a refusal — *nothing ran, send it
+    /// again* — and it used to arrive as prose inside [`RemoteError`]'s untyped
+    /// variant, whose own doc says it is not a discriminator. Both this file
+    /// and `reply.rs` justified that on the grounds that minting a variant
+    /// would shift the contract hash. `AGENTS.md` rules such a move free until
+    /// keylink has a stable version, so the justification is repealed and both
+    /// copies of it are deleted.
+    ///
+    /// **Here rather than on [`RemoteError`]**, because this file and
+    /// `reply.rs` both rule that this vocabulary belongs to one enum: one
+    /// variant on `RemoteError` rather than six, because `RemoteError` belongs
+    /// to every service keylink will ever carry and this belongs to one
+    /// feature.
+    ///
+    /// **Appended rather than inserted.** `reply.rs` rules that an insert
+    /// renumbers every later variant, which turns one refusal into another on a
+    /// peer built against the old order.
+    ///
+    /// Told apart from [`Interrupted`](Self::Interrupted) by which side of the
+    /// handler the failure is on: this one is before it, so the work provably
+    /// did not happen. `Interrupted` is after, where it is unknowable.
+    #[error(
+        "this service could not record the key, so nothing ran - the same key is safe to send again"
+    )]
+    NotClaimed,
 }
 
 impl From<IdempotencyRefusal> for RemoteError {
@@ -494,7 +563,10 @@ impl From<IdempotencyRefusal> for RemoteError {
 /// there, so nobody should reach it by leaving a field out; the default lives in
 /// `ServiceBuilder::new`, where it is written once and is visible. And
 /// `CONTRIBUTING.md` reserves `#[non_exhaustive]` for error enums rather than for
-/// ones a caller constructs, which is what this is.
+/// ones a caller constructs, which is what this is. [`Records`] is the one
+/// exception in this file and its own doc says why: a feature-gated variant
+/// makes an exhaustive match break on a feature the matching crate did not turn
+/// on. Every variant here is unconditional, so that reason does not reach it.
 ///
 /// # Why this is not called `Keyed`
 ///
@@ -715,7 +787,24 @@ impl Keyable {
 /// — an `Arc<dyn ..>` — rather than a discriminant. `Copy` today would have to be
 /// withdrawn then, and withdrawing a trait impl is a breaking change no attribute
 /// covers.
+///
+/// # Why this one IS `#[non_exhaustive]` when the rule says otherwise
+///
+/// The rule — in `CONTRIBUTING.md`, and restated on [`Keyable`] and
+/// [`KeyState`] — reserves the attribute for error enums rather than for ones a
+/// caller constructs and matches. This is one a caller constructs, and it is
+/// still the exception, because **one of its variants is feature-gated**.
+///
+/// Cargo unifies features across a build. A downstream crate that matches this
+/// exhaustively compiles while nothing enables `persist`, and stops compiling
+/// the moment an unrelated crate in the same build turns it on — a break its
+/// author did not cause and cannot prevent. `#[non_exhaustive]` costs that
+/// author a `_ =>` arm and removes the trap.
+///
+/// It does **not** block constructing the existing variants, so the argument
+/// above about a caller building one of these is untouched.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Records {
     /// Memory, bounded by [`MAX_RECORDS`], [`MAX_RECORDED_BYTES`] and
     /// [`RECORD_TTL`] — the three that evict — and by [`MAX_RECORDED_FRAME`], which
@@ -791,7 +880,14 @@ impl Records {
     /// Separate from [`store`](Self::store) because `evict` runs under the
     /// ledger's lock, where a `&DurableRecords` it cannot await on would be a
     /// borrow it has no use for.
-    fn stores_durably(&self) -> bool {
+    ///
+    /// **That sentence is true and it is not the reason the split is forced.**
+    /// [`store`](Self::store) is `#[cfg(feature = "persist")]` and `evict`,
+    /// `release` and `expire` are not, so without that feature they cannot call
+    /// it at all — an `E0599` at `--no-default-features`, which
+    /// `.mise/tasks/features` is the only gate step to reach. Uselessness is
+    /// the softer half of the argument; not compiling is the binding one.
+    pub(crate) fn stores_durably(&self) -> bool {
         match self {
             Self::Memory | Self::None => false,
             #[cfg(feature = "persist")]
@@ -808,7 +904,10 @@ impl Records {
 ///
 /// Exhaustive on purpose. `#[non_exhaustive]` would be contradictory three ways:
 /// this crate reserves that attribute for error enums rather than for ones a
-/// caller matches; `postcard_schema` derives from the variant list and ignores
+/// caller matches — [`Records`] is the one exception, and only because a
+/// feature-gated variant makes an exhaustive match break on a feature the
+/// matching crate did not turn on, which is not true of anything here;
+/// `postcard_schema` derives from the variant list and ignores
 /// the attribute, so a seventh variant moves the ALPN and breaks every handshake
 /// anyway — the attribute would advertise source compatibility on a hard wire
 /// break; and it forces the `_ =>` arm this crate spent eleven catch-all-free
@@ -1119,6 +1218,15 @@ struct Bucket {
     spent: VecDeque<IdempotencyKey>,
     /// [`Slot::Running`] keys, which appear in neither queue.
     running: usize,
+    /// What `held.len()` was when [`refile`] last wrote this peer into
+    /// [`Inner::by_held`], and the same for `spent` and [`Inner::by_spent`].
+    ///
+    /// Remembered rather than recomputed, because the stale index entry is
+    /// keyed by the **old** length and the queue no longer holds it. Zero means
+    /// nothing is filed: an empty queue is absent from the index, exactly as
+    /// the scan this replaced skipped an empty bucket.
+    filed_held: usize,
+    filed_spent: usize,
 }
 
 #[derive(Debug, Default)]
@@ -1141,16 +1249,113 @@ struct Inner {
     /// under this lock and cannot await. Drained by the next claim, which can.
     /// Empty forever on a service with no store.
     ///
-    /// **Bounded by the evictions between two claims**, and a settle evicts at
-    /// most one tombstone because it adds at most one. The exception is the
-    /// eviction `Ledger::new` runs over a recovered set, which is bounded by
-    /// what the store held and is drained by the first claim.
+    /// **Not bounded by the evictions between two claims, and not drained in
+    /// one go.** Ordinary traffic queues about one entry per settle, because a
+    /// settle evicts at most one tombstone and adds at most one. The eviction
+    /// `Ledger::new` runs over a recovered set is the exception that sets the
+    /// shape here: it is bounded by what the store held, which was **2616
+    /// entries** at a 1500-record fixture reopened under narrower bounds, and
+    /// every entry is an `fsync`. So a claim drains at most
+    /// [`DRAIN_PER_CLAIM`] of them, from the **front**, and the queue is a
+    /// [`VecDeque`] so that costs `O(DRAIN_PER_CLAIM)` rather than shifting the
+    /// remainder. The backlog still clears; it clears over several claims.
     ///
     /// A **downgrade** is deliberately not in here. `expire` and `evict` turn a
     /// held reply into a tombstone, and the disk keeps the reply — which costs
     /// space and loses nothing, because a recovered ledger runs the same
     /// eviction over the same bounds the moment it is built.
-    pending: Vec<(EndpointId, IdempotencyKey)>,
+    pending: VecDeque<(EndpointId, IdempotencyKey)>,
+    /// Every peer holding at least one replayable reply, as `(len, id)`, so the
+    /// largest holder is one `last()` rather than a scan of every peer.
+    ///
+    /// `evict` runs on every settle, and it ran `max_by_key` over `peers` twice
+    /// each time, under the one lock the whole service shares. Interleaved A/B,
+    /// 21 samples per arm, 200 keyed calls per sample, release profile, median
+    /// ns per call: **27.3x at 4096 peers, 11.0x at 1024, 5.8x at 256, 2.4x at
+    /// 64, 1.2x at 8.** `BTreeSet::last` on `(len, id)` and
+    /// `max_by_key` on `(len, id)` select the same peer, because ids are unique
+    /// and so the tie-break is total either way.
+    ///
+    /// Written only by [`refile`] and [`drop_peer`]. The `debug_assert` in
+    /// [`Ledger::lock`] is what makes a forgotten call visible.
+    by_held: BTreeSet<(usize, EndpointId)>,
+    /// The same, for tombstones.
+    by_spent: BTreeSet<(usize, EndpointId)>,
+}
+
+#[cfg(debug_assertions)]
+impl Inner {
+    /// Every value derived from `peers`, checked against `peers`.
+    ///
+    /// **Six facts, not five.** The four counters and `waiting` all stay
+    /// correct while [`Inner::by_held`] and [`Inner::by_spent`] rot, because
+    /// nothing but [`refile`] writes them — so a five-fact check cannot see the
+    /// one mistake the indexes made possible, which is a settle path that
+    /// forgot to call it.
+    ///
+    /// Unbounded on purpose, and the cost was measured rather than assumed:
+    /// `mise run test`, warm, ran **16.02 s without this check and 16.43 s with
+    /// it**. That is one sample per arm on a machine whose repeated runs of one
+    /// configuration have spanned a factor of two elsewhere in this file, so
+    /// read it as *the suite did not get noticeably slower* and not as a
+    /// percentage.
+    ///
+    /// **What that measurement does NOT cover.** It is O(peers x slots) on
+    /// every [`Ledger::lock`], which is every keyed path, and the suite never
+    /// approaches the shipped bounds — a bucket set may hold
+    /// [`MAX_RECORDS`] + [`MAX_TOMBSTONES`] + [`MAX_RUNNING`] slots, so a
+    /// debug-profile service
+    /// near them walks orders of magnitude more per call than any test here.
+    /// `debug_assertions` is off in release, so no shipped binary pays it, and
+    /// a debug build at production scale will.
+    ///
+    /// A peer-count ceiling was written and then removed: it would buy the
+    /// difference back by switching the check off exactly where a large ledger
+    /// makes the drift most likely.
+    fn agrees(&self) {
+        let mut held = 0;
+        let mut bytes = 0;
+        let mut spent = 0;
+        let mut running = 0;
+        let mut by_held = BTreeSet::new();
+        let mut by_spent = BTreeSet::new();
+        for (peer, bucket) in &self.peers {
+            held += bucket.held.len();
+            spent += bucket.spent.len();
+            running += bucket.running;
+            bytes += bucket
+                .slots
+                .values()
+                .map(|entry| entry.slot.held_bytes())
+                .sum::<usize>();
+            if !bucket.held.is_empty() {
+                by_held.insert((bucket.held.len(), *peer));
+            }
+            if !bucket.spent.is_empty() {
+                by_spent.insert((bucket.spent.len(), *peer));
+            }
+        }
+        debug_assert_eq!(self.held, held, "`held` disagrees with the buckets");
+        debug_assert_eq!(self.bytes, bytes, "`bytes` disagrees with the slots");
+        debug_assert_eq!(self.spent, spent, "`spent` disagrees with the buckets");
+        debug_assert_eq!(
+            self.running, running,
+            "`running` disagrees with the buckets"
+        );
+        debug_assert_eq!(
+            self.waiting,
+            self.waiters.values().sum::<usize>(),
+            "`waiting` disagrees with `waiters`"
+        );
+        debug_assert_eq!(
+            self.by_held, by_held,
+            "`by_held` disagrees with the buckets: a `refile` call is missing"
+        );
+        debug_assert_eq!(
+            self.by_spent, by_spent,
+            "`by_spent` disagrees with the buckets: a `refile` call is missing"
+        );
+    }
 }
 
 /// Every bound the **idempotency ledger** enforces, in one value.
@@ -1953,6 +2158,9 @@ impl Ledger {
             peer,
             key,
             settled: false,
+            // Nothing is watching yet, which `Drop` reads as `NotDispatched` —
+            // the truth about a key nothing has been dispatched under.
+            // `serve_one` fills it before anything is.
             progress: None,
         })
     }
@@ -2018,46 +2226,37 @@ impl Ledger {
         peer: EndpointId,
         key: IdempotencyKey,
     ) -> Claim {
-        // Before the claim rather than after, so that the one place a caller is
-        // already waiting to start work is the place that pays for the store's
-        // housekeeping — and never the path that is holding a finished reply.
-        //
-        // It reports nothing on purpose, and its own doc says why.
-        self.housekeep().await;
-
-        let claim = self.claim(peer, key.clone());
-        if !matches!(claim, Claim::Fresh(_)) {
+        // Moved rather than cloned: every arm but `Fresh` drops the key, and the
+        // `Fresh` arm's guard is holding it, so the write below borrows it back
+        // instead of being handed a second copy.
+        let claim = self.claim(peer, key);
+        let Claim::Fresh(guard) = claim else {
             return claim;
-        }
-        if let Err(refusal) = self.write_claim(peer, &key).await {
+        };
+        if let Err(refusal) = self.write_claim(peer, &guard.key).await {
             // Nothing ran, so the key goes back and the caller's retry is a
             // first attempt. If the write in fact reached the disk and reported
             // otherwise, that retry reads `Interrupted` instead — refused rather
             // than run, which is the direction to be wrong in.
-            if let Claim::Fresh(guard) = claim {
-                guard.give_back();
-            }
+            guard.give_back();
             return Claim::Refused(refusal);
         }
-        claim
+        Claim::Fresh(guard)
     }
 
     /// Record that this key is taken, before the handler is entered.
     ///
     /// # Errors
     ///
-    /// [`RemoteError::Failed`] naming the store, because there is no wire
-    /// variant for "the serving side could not write its own ledger" and
-    /// inventing one would move the ALPN. The sentence is what the caller acts
-    /// on: nothing ran, and the same key is safe to send again.
+    /// [`IdempotencyRefusal::NotClaimed`], which says the one thing the caller
+    /// can act on: nothing ran, and the same key is safe to send again. The
+    /// store's own error is not carried, because it names a disk the caller has
+    /// no access to and cannot do anything about.
     async fn write_claim(&self, peer: EndpointId, key: &IdempotencyKey) -> Result<(), RemoteError> {
         #[cfg(feature = "persist")]
         if let Some(store) = self.records.store() {
-            if let Err(err) = store.claimed(peer, key).await {
-                return Err(RemoteError::Failed(format!(
-                    "this service records idempotency keys durably and could not write one, \
-                     so the call was not run: {err}"
-                )));
+            if store.claimed(peer, key).await.is_err() {
+                return Err(IdempotencyRefusal::NotClaimed.into());
             }
         }
         #[cfg(not(feature = "persist"))]
@@ -2069,10 +2268,11 @@ impl Ledger {
     ///
     /// # Errors
     ///
-    /// [`IdempotencyRefusal::Interrupted`], which is the truth and not an
-    /// approximation of it: the handler ran, and this ledger cannot promise the
-    /// record, so whether the work took effect is exactly what the caller must
-    /// now decide out of band.
+    /// [`IdempotencyRefusal::Unrecordable`], which is what happened word for
+    /// word: the handler ran, and its reply is not something this ledger can
+    /// hold. It is **not** [`Interrupted`](IdempotencyRefusal::Interrupted),
+    /// whose own doc says the handler produced no reply — here it produced one
+    /// and the ledger is discarding it.
     async fn write_settled(
         &self,
         peer: EndpointId,
@@ -2082,7 +2282,7 @@ impl Ledger {
         #[cfg(feature = "persist")]
         if let Some(store) = self.records.store() {
             if store.write(peer, key, slot).await.is_err() {
-                return Err(IdempotencyRefusal::Interrupted.into());
+                return Err(IdempotencyRefusal::Unrecordable.into());
             }
         }
         #[cfg(not(feature = "persist"))]
@@ -2093,23 +2293,43 @@ impl Ledger {
     /// Take the keys memory has dropped off the disk, and shorten the store if
     /// it is carrying more than it holds.
     ///
+    /// Called by `claim_key`, once, before it claims anything. `pub(crate)` for
+    /// that one caller: it used to run inside [`claim_durably`](Self::claim_durably),
+    /// which the two attach paths also reach, and an attaching caller never
+    /// receives [`Claim::Fresh`].
+    ///
     /// Returns nothing, including no error, and that is the decision rather
     /// than an omission: every failure here is a store that will refuse the
-    /// claim being written two lines later, on this same call, with the
-    /// sentence that names it. A key that could not be removed goes back in the
-    /// queue, so nothing is dropped by not reporting it here.
+    /// claim its caller is about to write, on this same call, with the sentence
+    /// that names it. A key that could not be removed goes back in the queue,
+    /// so nothing is dropped by not reporting it here.
     #[allow(
         clippy::unused_async,
         reason = "there is nothing to await without the `persist` feature, and the caller \
                   should not have to know which features are on"
     )]
-    async fn housekeep(&self) {
+    pub(crate) async fn housekeep(&self) {
         #[cfg(feature = "persist")]
         {
             let Some(store) = self.records.store() else {
                 return;
             };
-            let batch = std::mem::take(&mut self.lock().pending);
+            // A bounded prefix, and never the whole queue. Every entry is one
+            // `fsync`, so taking all of them puts the entire backlog on
+            // whichever caller happens to be first — measured at **8770 ms on
+            // one call** against a 1500-record store reopened under narrower
+            // bounds, where `Ledger::new` had already queued 2616 entries.
+            //
+            // From the front. Taking from the tail is O(k) too, and it starves:
+            // the failure path below returns what it could not write to the
+            // back, so under sustained traffic the front would never be reached
+            // and its records would stay on the disk for the life of the
+            // process.
+            let batch: Vec<_> = {
+                let mut guard = self.lock();
+                let take = guard.pending.len().min(DRAIN_PER_CLAIM);
+                guard.pending.drain(..take).collect()
+            };
             if !batch.is_empty() {
                 let left = store
                     .reconcile(batch, |peer, key| self.reconcile_for(peer, key))
@@ -2162,7 +2382,10 @@ impl Ledger {
     /// one request. Nothing here can panic while the lock is held, so this arm
     /// is unreachable in practice and must still be typed.
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+        let guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(debug_assertions)]
+        guard.agrees();
+        guard
     }
 
     /// Move a claimed slot to its settled state and make room for it.
@@ -2200,6 +2423,7 @@ impl Ledger {
         } else {
             bucket.spent.push_back(key.clone());
         }
+        refile(inner, peer);
 
         if was_running {
             inner.running = inner.running.saturating_sub(1);
@@ -2211,6 +2435,18 @@ impl Ledger {
             inner.spent += 1;
         }
         self.evict(inner);
+    }
+
+    /// Ask the next [`housekeep`](Ledger::housekeep) to make the disk agree with
+    /// memory about this key.
+    ///
+    /// Beside [`release`](Ledger::release)'s own queueing and for the same
+    /// reason: this runs where nothing can await, and the store is told what
+    /// memory says now rather than what happened.
+    fn queue_reconcile(&self, peer: EndpointId, key: &IdempotencyKey) {
+        if self.records.stores_durably() {
+            self.lock().pending.push_back((peer, key.clone()));
+        }
     }
 
     /// Give a claimed key back, because nothing ran under it.
@@ -2238,7 +2474,7 @@ impl Ledger {
         let empty = bucket.slots.is_empty();
         inner.running = inner.running.saturating_sub(1);
         if empty {
-            inner.peers.remove(&peer);
+            drop_peer(inner, peer);
         }
         // The key is vacant again, and a store still holding its claim would
         // answer `Interrupted` to a retry of a call that provably never ran —
@@ -2246,7 +2482,7 @@ impl Ledger {
         // dispatch leaves the key claimable. Queued rather than written,
         // because this runs under the lock.
         if self.records.stores_durably() {
-            inner.pending.push((peer, key.clone()));
+            inner.pending.push_back((peer, key.clone()));
         }
     }
 
@@ -2265,28 +2501,56 @@ impl Ledger {
         // Collected rather than pushed inside the loop, because `inner.pending`
         // and the bucket below are two fields of one `&mut Inner`.
         let mut downgraded = Vec::new();
+        let mut moved = false;
         let Some(bucket) = inner.peers.get_mut(&peer) else {
             return;
         };
-        while let Some(key) = bucket.held.front().cloned() {
-            let Some(entry) = bucket.slots.get_mut(&key) else {
-                bucket.held.pop_front();
-                inner.held = inner.held.saturating_sub(1);
+        loop {
+            // Peeked by reference. The common case is a front record still
+            // inside its budget, and an owned key is needed only to move one
+            // between the queues — so cloning to reach the `break` below spent
+            // an allocation on every claim that expired nothing at all.
+            let freed = match bucket.held.front() {
+                None => break,
+                Some(key) => match bucket.slots.get(key) {
+                    None => None,
+                    Some(entry) if now.saturating_duration_since(entry.at) < ttl => break,
+                    Some(entry) => Some(entry.slot.held_bytes()),
+                },
+            };
+            let Some(key) = bucket.held.pop_front() else {
+                break;
+            };
+            // Here and not at the bottom of the loop. The `continue` below also
+            // pops, so a flag set only on the full move would let a changed
+            // queue skip the `refile` — the exact drift `Inner::agrees` exists
+            // to report. The flag means "the queue changed", not "a key
+            // completed the move".
+            inner.held = inner.held.saturating_sub(1);
+            moved = true;
+            let Some(freed) = freed else {
                 continue;
             };
-            if now.saturating_duration_since(entry.at) < ttl {
-                break;
+            if let Some(entry) = bucket.slots.get_mut(&key) {
+                entry.slot = Slot::Forgotten;
             }
-            let freed = entry.slot.held_bytes();
-            entry.slot = Slot::Forgotten;
-            bucket.held.pop_front();
             if durable {
                 downgraded.push(key.clone());
             }
             bucket.spent.push_back(key);
             inner.bytes = inner.bytes.saturating_sub(freed);
-            inner.held = inner.held.saturating_sub(1);
             inner.spent += 1;
+        }
+        // One call for the whole loop: it moves keys between two queues of the
+        // same peer, and nothing reads the indexes until it returns.
+        //
+        // Conditional, because the common case is a front record still inside
+        // its budget and this runs on every `claim` and every `key_state`. A
+        // `refile` that files what is already filed costs a `HashMap` lookup
+        // and two comparisons, which is the same hot path two allocations were
+        // just taken off.
+        if moved {
+            refile(inner, peer);
         }
         // A tombstone on the disk is one byte; the reply it replaced is up to
         // `frame_bytes`. Without this the store would keep every expired reply
@@ -2315,7 +2579,7 @@ impl Ledger {
         while inner.held > self.limits.pool_records.get()
             || inner.bytes > self.limits.pool_bytes.get()
         {
-            let Some(peer) = largest(inner, |bucket| bucket.held.len()) else {
+            let Some(peer) = inner.by_held.last().map(|&(_, peer)| peer) else {
                 return;
             };
             let Some(bucket) = inner.peers.get_mut(&peer) else {
@@ -2333,18 +2597,19 @@ impl Ledger {
                 }
                 None => 0,
             };
+            refile(inner, peer);
             inner.bytes = inner.bytes.saturating_sub(freed);
             inner.held = inner.held.saturating_sub(1);
             inner.spent += 1;
             // The reply leaves the disk when it leaves memory, for the reason
             // `expire` gives: otherwise `pool_bytes` bounds one tier of two.
             if self.records.stores_durably() {
-                inner.pending.push((peer, key));
+                inner.pending.push_back((peer, key));
             }
         }
 
         while inner.spent > self.limits.tombstones.get() {
-            let Some(peer) = largest(inner, |bucket| bucket.spent.len()) else {
+            let Some(peer) = inner.by_spent.last().map(|&(_, peer)| peer) else {
                 return;
             };
             let Some(bucket) = inner.peers.get_mut(&peer) else {
@@ -2357,13 +2622,15 @@ impl Ledger {
             let empty = bucket.slots.is_empty();
             inner.spent = inner.spent.saturating_sub(1);
             if empty {
-                inner.peers.remove(&peer);
+                drop_peer(inner, peer);
+            } else {
+                refile(inner, peer);
             }
             // The one place a key leaves this ledger entirely. A store that
             // kept it would grow for the life of the disk, so the removal is
             // queued for the next claim, which is the next code that can await.
             if self.records.stores_durably() {
-                inner.pending.push((peer, key));
+                inner.pending.push_back((peer, key));
             }
         }
     }
@@ -2405,18 +2672,60 @@ fn recover(stored: Vec<(EndpointId, IdempotencyKey, Slot)>) -> Inner {
             inner.spent += 1;
         }
     }
+    // The one path into a bucket that does not go through `claim` or `settle`,
+    // so it is the one path no `refile` reaches. `Ledger::new` runs `evict`
+    // over this set the moment it is built, and `evict` reads nothing but the
+    // indexes — an unfilled index there evicts nothing at all, and every bound
+    // this build configures would be silently unenforced on a recovered ledger.
+    let peers: Vec<EndpointId> = inner.peers.keys().copied().collect();
+    for peer in peers {
+        refile(&mut inner, peer);
+    }
     inner
 }
 
-/// The peer holding the most of whatever `size` counts, ties broken by id so
-/// the order is deterministic rather than whatever the hasher happened to seed.
-fn largest(inner: &Inner, size: impl Fn(&Bucket) -> usize) -> Option<EndpointId> {
-    inner
-        .peers
-        .iter()
-        .filter(|(_, bucket)| size(bucket) > 0)
-        .max_by_key(|(id, bucket)| (size(bucket), **id))
-        .map(|(id, _)| *id)
+/// Put this peer's queue lengths back in the indexes.
+///
+/// The one place [`Inner::by_held`] and [`Inner::by_spent`] are written for a
+/// peer that still exists. Call it after **any** change to `held.len()` or
+/// `spent.len()`; adjacent changes inside one loop iteration can share a call,
+/// but the index must agree with the queues before anything reads it again —
+/// and `evict` reads it on its very next turn round the loop.
+///
+/// Idempotent, so a call one line too many costs a comparison and nothing else.
+fn refile(inner: &mut Inner, peer: EndpointId) {
+    let Some(bucket) = inner.peers.get_mut(&peer) else {
+        return;
+    };
+    let held = bucket.held.len();
+    let spent = bucket.spent.len();
+    let filed_held = std::mem::replace(&mut bucket.filed_held, held);
+    let filed_spent = std::mem::replace(&mut bucket.filed_spent, spent);
+    if filed_held != held {
+        inner.by_held.remove(&(filed_held, peer));
+        if held > 0 {
+            inner.by_held.insert((held, peer));
+        }
+    }
+    if filed_spent != spent {
+        inner.by_spent.remove(&(filed_spent, peer));
+        if spent > 0 {
+            inner.by_spent.insert((spent, peer));
+        }
+    }
+}
+
+/// Drop a peer and its index entries in one move.
+///
+/// The one way a bucket leaves [`Inner::peers`]. A bare `peers.remove` cannot
+/// be right: the lengths the indexes are keyed by live in the bucket, so once
+/// it is gone there is nothing left to remove them with.
+fn drop_peer(inner: &mut Inner, peer: EndpointId) {
+    let Some(bucket) = inner.peers.remove(&peer) else {
+        return;
+    };
+    inner.by_held.remove(&(bucket.filed_held, peer));
+    inner.by_spent.remove(&(bucket.filed_spent, peer));
 }
 
 /// One refusal, built in one place, so every cap reports the same way.
@@ -2457,9 +2766,23 @@ pub(crate) struct Guard {
     peer: EndpointId,
     key: IdempotencyKey,
     settled: bool,
-    /// How far the call got. `None` for a guard nothing is watching, which
-    /// settles `Interrupted` on drop — the conservative answer, and the one the
-    /// ledger gave before anything watched.
+    /// How far the call got.
+    ///
+    /// `None` until `serve_one` calls [`watching`](Self::watching) with the
+    /// call's own.
+    ///
+    /// **An absent marker reads `NotDispatched`, and that is item 2 of the
+    /// ledger audit.** It used to settle `Interrupted` on drop, so a guard
+    /// dropped between the claim and the dispatch — which is exactly what an
+    /// abort during the durable claim write is — refused a retry of a call that
+    /// provably never ran. A guard nobody has watched yet is a guard nothing
+    /// has been dispatched under, so the default belongs on that side.
+    ///
+    /// The default is written in [`Drop`] rather than by handing `claim` a
+    /// fresh `Progress` to hold, which is how this was first fixed:
+    /// `Progress` is an `Arc<AtomicU8>`, so that spent one allocation on every
+    /// keyed call to name a state, and `serve_one` overwrote it unused a moment
+    /// later.
     progress: Option<Progress>,
 }
 
@@ -2479,7 +2802,7 @@ impl Guard {
     ///
     /// # Errors
     ///
-    /// [`IdempotencyRefusal::Interrupted`] when a durable store refused the
+    /// [`IdempotencyRefusal::Unrecordable`] when a durable store refused the
     /// record. The caller must not be sent its reply then, because a reply this
     /// ledger cannot replay is a reply the caller will ask for again.
     /// `Records::Memory` and `Records::None` cannot fail and this is always
@@ -2489,7 +2812,6 @@ impl Guard {
         frame: &Bytes,
         carries_body: bool,
     ) -> Result<(), RemoteError> {
-        self.settled = true;
         // Three causes, one slot, and that is the whole of Wave 2's wire cost:
         // nothing. `Slot::Unrecordable` reads "the handler ran, and its reply is
         // not something this ledger can hold", which is true word for word of a
@@ -2532,10 +2854,34 @@ impl Guard {
         // reply went out puts the caller back on a `Fresh` key, and the work
         // runs a second time. That is the failure this whole setting exists to
         // remove, so the await is here rather than after the write.
-        if let Err(refusal) = self.ledger.write_settled(self.peer, &self.key, &slot).await {
-            // It ran, and this ledger cannot promise the record. `Interrupted`
-            // is not an approximation of that — it is the definition.
-            self.ledger.settle(self.peer, &self.key, Slot::Interrupted);
+        //
+        // **`settled` is set after this await and not before it.** A serving
+        // task can be aborted while parked here — `rpc.rs` shuts down every
+        // in-flight call when its connection ends — and that drops this guard.
+        // A guard that had already set the flag returns from `Drop` having
+        // settled nothing, so the slot stays [`Slot::Running`], which is never
+        // evicted. The key would answer `InFlight` for the life of the process,
+        // and after `running` such aborts the service refuses every keyed call.
+        //
+        // Bound rather than written one line lower, because the await sits
+        // inside the `if let` head below and there is no position between them.
+        let stored = self.ledger.write_settled(self.peer, &self.key, &slot).await;
+        self.settled = true;
+        if let Err(refusal) = stored {
+            // It RAN and produced a reply this ledger cannot hold, which is
+            // `Slot::Unrecordable` word for word. NOT `Slot::Interrupted`,
+            // whose own doc says the handler was entered and no reply came out
+            // — here one came out and is being discarded.
+            self.ledger.settle(self.peer, &self.key, Slot::Unrecordable);
+            // The disk still holds `TAG_CLAIMED`, which recovers as
+            // `Interrupted`, so leaving it there would give a live retry and a
+            // post-restart retry two different answers for one event. Queued
+            // rather than written: the write that just failed is the one that
+            // would have to be retried, and the next `housekeep` is where a
+            // store gets its next chance. If the process dies before then the
+            // disk still says `Interrupted`, which is the conservative
+            // direction to be wrong in.
+            self.ledger.queue_reconcile(self.peer, &self.key);
             return Err(refusal);
         }
         self.ledger.settle(self.peer, &self.key, slot);
@@ -2584,7 +2930,11 @@ impl Drop for Guard {
         // owed and the key goes back. Anything else — entered and unfinished,
         // finished with nobody left to record it, or still in a mailbox whose
         // turn nobody stayed to watch — is genuinely unknown.
-        if self.progress.as_ref().map(Progress::reached) == Some(Reached::NotDispatched) {
+        let reached = self
+            .progress
+            .as_ref()
+            .map_or(Reached::NotDispatched, Progress::reached);
+        if reached == Reached::NotDispatched {
             self.ledger.release(self.peer, &self.key);
         } else {
             self.ledger.settle(self.peer, &self.key, Slot::Interrupted);
@@ -2848,6 +3198,174 @@ mod tests {
         }
     }
 
+    /// What a durable write leaves behind when it does not succeed — because
+    /// the serving task was **aborted** while it was parked, or because the
+    /// store **refused** it.
+    ///
+    /// A peer disconnect aborts every in-flight call, so the first two run in
+    /// production the first time a caller's connection drops mid-call. Neither
+    /// can be reached with a store that answers: the abort has to land while a
+    /// write is still parked, so `Stalling` never answers one.
+    #[cfg(feature = "persist")]
+    mod aborts {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        use keylink_persist::{Entries, EntryKey, Held, StateId};
+
+        use super::*;
+
+        /// A store that accepts a claim, holds nothing, and never finishes a
+        /// write.
+        struct Stalling;
+
+        struct Stalled;
+
+        impl Entries for Stalling {
+            type Held = Stalled;
+
+            async fn hold(&self, _id: &StateId) -> keylink_persist::Result<Stalled> {
+                Ok(Stalled)
+            }
+        }
+
+        impl Held for Stalled {
+            async fn load(&self) -> keylink_persist::Result<Vec<(EntryKey, Vec<u8>)>> {
+                Ok(Vec::new())
+            }
+
+            async fn put(&mut self, _key: &EntryKey, _bytes: &[u8]) -> keylink_persist::Result<()> {
+                std::future::pending().await
+            }
+
+            async fn remove(&mut self, _key: &EntryKey) -> keylink_persist::Result<()> {
+                std::future::pending().await
+            }
+
+            async fn compact(&mut self) -> keylink_persist::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// A future polled once and dropped, which is what an abort does.
+        ///
+        /// It asserts the poll parked, so a store that quietly answered would
+        /// fail here rather than turn the test below green for the wrong
+        /// reason.
+        fn abort<F: Future>(future: F) {
+            let mut future = std::pin::pin!(future);
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                future.as_mut().poll(&mut cx).is_pending(),
+                "the store answered, so nothing was aborted mid-write"
+            );
+        }
+
+        /// A future driven to completion, for the parts of the setup that do
+        /// answer.
+        fn now<F: Future>(future: F) -> F::Output {
+            let mut future = std::pin::pin!(future);
+            let mut cx = Context::from_waker(Waker::noop());
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(value) => value,
+                Poll::Pending => panic!("the setup parked"),
+            }
+        }
+
+        /// A store that accepts a claim, holds nothing, and refuses every write.
+        struct Refusing;
+
+        struct Refused;
+
+        impl Entries for Refusing {
+            type Held = Refused;
+
+            async fn hold(&self, _id: &StateId) -> keylink_persist::Result<Refused> {
+                Ok(Refused)
+            }
+        }
+
+        impl Held for Refused {
+            async fn load(&self) -> keylink_persist::Result<Vec<(EntryKey, Vec<u8>)>> {
+                Ok(Vec::new())
+            }
+
+            async fn put(&mut self, _key: &EntryKey, _bytes: &[u8]) -> keylink_persist::Result<()> {
+                Err(keylink_persist::Error::TooLarge {
+                    offered: 1,
+                    limit: 0,
+                })
+            }
+
+            async fn remove(&mut self, _key: &EntryKey) -> keylink_persist::Result<()> {
+                Err(keylink_persist::Error::TooLarge {
+                    offered: 1,
+                    limit: 0,
+                })
+            }
+
+            async fn compact(&mut self) -> keylink_persist::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn ledger_on<E: Entries>(store: &E) -> Arc<Ledger> {
+            let id = StateId::new("test/ledger").expect("a valid id");
+            let records = now(crate::durable::DurableRecords::open(store, &id))
+                .expect("nobody else holds this ledger");
+            Ledger::new(Limits::default(), Records::Durable(records))
+        }
+
+        fn stalling() -> Arc<Ledger> {
+            ledger_on(&Stalling)
+        }
+
+        fn dispatched() -> Progress {
+            let progress = Progress::new();
+            progress.dispatched();
+            progress
+        }
+
+        /// The handler ran, the record write parked, and the task was killed.
+        /// The key must not be left claimed forever.
+        #[test]
+        fn an_abort_during_the_settle_does_not_leak_a_running_slot() {
+            let ledger = stalling();
+            // Dispatched on purpose, and not the marker `claim` builds: this
+            // test is about the call that DID enter the handler, and a
+            // `NotDispatched` guard releases instead, which would be green for
+            // the wrong reason.
+            let claimed = guard(ledger.claim(peer(A), key("k"))).watching(dispatched());
+            abort(claimed.record(&frame(16), false));
+
+            assert_eq!(ledger.key_state(peer(A), &key("k")), KeyState::Interrupted);
+        }
+
+        /// Nothing ran: the claim write parked and the task was killed before
+        /// the handler was ever entered. The key must be claimable, which is
+        /// the same answer `claim_durably`'s own error path already gives.
+        #[test]
+        fn an_abort_during_the_claim_write_leaves_the_key_claimable() {
+            let ledger = stalling();
+            abort(ledger.claim_durably(peer(A), key("k")));
+
+            assert_eq!(ledger.key_state(peer(A), &key("k")), KeyState::Fresh);
+        }
+
+        /// A store that refuses the claim refuses the call, and the caller is
+        /// told the one thing it can act on: nothing ran.
+        ///
+        /// The refusal used to be [`RemoteError`]'s untyped variant carrying
+        /// that sentence as prose, which no caller can match on.
+        #[test]
+        fn a_store_that_refuses_the_claim_says_nothing_ran() {
+            let ledger = ledger_on(&Refusing);
+            let claim = now(ledger.claim_durably(peer(A), key("k")));
+
+            assert_eq!(refusal(claim), IdempotencyRefusal::NotClaimed);
+        }
+    }
+
     /// [`Records`], which decides what a settled key holds rather than whether it
     /// settles.
     ///
@@ -3040,20 +3558,21 @@ mod tests {
         }
 
         /// `Records::None` must not touch the paths that decide whether the work
-        /// ran. A guard dropped without a reply is still `Interrupted`, and one
+        /// ran. A guard dropped after dispatch is still `Interrupted`, and one
         /// dropped with nothing dispatched is still claimable — the two halves of
         /// RFC-05 §2, asked of a ledger that records no replies.
         ///
         /// Made red by `scripts/break-once.sh` making `Guard::drop`'s
         /// `Reached::NotDispatched` test unreachable. Search, **with its
         /// indentation**, which is what keeps it unique against this quote:
-        /// `if self.progress.as_ref().map(Progress::reached) == Some(Reached::NotDispatched) {`
+        /// `if reached == Reached::NotDispatched {`
         /// and replace with `if false {`, so every dropped guard settles rather than
         /// releasing. The replacement is quoted too, which is always safe.
         ///
         /// This record and that condition are in one file, and that is not a reason to
-        /// describe rather than quote — measured at `7a147c0`, the indented form
-        /// counts **1** with this quote present while the bare form counts 2. The
+        /// describe rather than quote — first measured at `7a147c0` and re-measured
+        /// here after item 2 of the ledger audit moved the line: the indented form
+        /// counts **1** with this quote present while the bare form counts **2**. The
         /// indentation is the whole mechanism. Watched:
         /// `panicked at .., a key nothing ran under must still be claimable`. It also
         /// reddens
@@ -3063,7 +3582,12 @@ mod tests {
         #[test]
         fn records_none_changes_nothing_about_who_settles() {
             let ledger = recordless();
-            drop(guard(ledger.claim(peer(A), key("entered"))));
+            // Watched with a DISPATCHED marker, which is what "entered" means.
+            // A guard out of `claim` reads `NotDispatched` and releases, so an
+            // unwatched drop here would be asking a different question.
+            let entered = Progress::new();
+            entered.dispatched();
+            drop(guard(ledger.claim(peer(A), key("entered"))).watching(entered));
             assert_eq!(
                 refusal(ledger.claim(peer(A), key("entered"))),
                 IdempotencyRefusal::Interrupted,
@@ -3188,23 +3712,11 @@ mod tests {
             );
         }
 
-        /// A handler that was entered and produced nothing leaves uncertainty,
-        /// not a vacant key. Re-running it is the double booking this module
-        /// exists to prevent.
-        #[test]
-        fn a_guard_dropped_without_a_reply_leaves_the_key_interrupted() {
-            let ledger = ledger();
-            drop(guard(ledger.claim(peer(A), key("k"))));
-
-            assert_eq!(
-                refusal(ledger.claim(peer(A), key("k"))),
-                IdempotencyRefusal::Interrupted
-            );
-        }
-
-        /// The other half of the same rule, and the one that was missing: a key
-        /// nothing ever entered goes back to vacant, so the caller's retry is a
-        /// first attempt rather than a permanent refusal.
+        /// A key nothing ever entered goes back to vacant, so the caller's retry
+        /// is a first attempt rather than a permanent refusal.
+        ///
+        /// The marker is written out even though `claim` now builds the same
+        /// value, so the test states the rule instead of leaning on a default.
         #[test]
         fn a_guard_dropped_with_nothing_dispatched_leaves_the_key_claimable() {
             let ledger = ledger();
@@ -3696,7 +4208,12 @@ mod tests {
             let ledger = bounded(holding(1));
             assert_eq!(ledger.key_state(peer(A), &key("never")), KeyState::Fresh);
 
-            let running = guard(ledger.claim(peer(A), key("running")));
+            // Watched as dispatched, because `Interrupted` is what a call that
+            // ENTERED the handler leaves. A guard out of `claim` reads
+            // `NotDispatched` and releases the key instead.
+            let entered = Progress::new();
+            entered.dispatched();
+            let running = guard(ledger.claim(peer(A), key("running"))).watching(entered);
             assert_eq!(
                 ledger.key_state(peer(A), &key("running")),
                 KeyState::Running

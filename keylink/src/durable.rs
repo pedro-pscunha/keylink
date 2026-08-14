@@ -36,6 +36,15 @@
 //! per second whatever its connection count. An operator sizing a desk needs
 //! that sentence and not only the per-call one.
 //!
+//! **That 7.6 ms is a macOS figure and it does not carry to Linux.**
+//! `std::fs::File::sync_data` issues `F_FULLFSYNC` on macOS, which asks the
+//! drive to flush its own write cache — measured here at about **12x a plain
+//! `libc::fsync`**, 5498 µs against 462 µs. On Linux the same call is
+//! `fdatasync`, so the per-call cost is lower by roughly that order and the
+//! throughput above is correspondingly pessimistic. `sync_data` is still the
+//! right call for the promise this ledger makes, and is not changing: the
+//! figure needs a platform beside it, not a weaker flush.
+//!
 //! # Three ways a key leaves memory, and the disk is told about all of them
 //!
 //! A settle writes its own record. Everything else — a released claim, a reply
@@ -139,6 +148,16 @@ pub enum RecordFault {
     /// constructor.
     #[error("a record key is text this build does not accept as an idempotency key")]
     KeyRefused,
+    /// The bytes before the idempotency key are not a peer id.
+    ///
+    /// Its own variant because [`KeyRefused`](Self::KeyRefused) named three
+    /// causes and could only have happened for two of them. This one is about
+    /// the bytes BEFORE the key, and it is the only one of the three that a
+    /// stored record can actually reach: the write-path spelling was covered by
+    /// the `const _` above, which proves a peer id plus a bounded idempotency
+    /// key always fits.
+    #[error("the first {PEER_LEN} bytes of a record key are not a peer id")]
+    PeerNotAnId,
     /// A record with no state byte at all.
     #[error("a record holds no state")]
     Empty,
@@ -154,6 +173,18 @@ pub enum RecordFault {
 // ─────────────────────────────────────────────────────────────────── the codec
 
 /// The address one key is stored under.
+///
+/// **The `Result` cannot be `Err`**, and it is still a `Result`: the `const _`
+/// above proves a peer id plus a bounded idempotency key fits inside
+/// [`EntryKey::MAX_LEN`], so [`EntryKey::new`] cannot refuse one of these. The
+/// total spelling would be an `expect`, which this crate denies, so the type
+/// carries an outcome nothing produces rather than the crate carrying an
+/// `#[allow]`.
+///
+/// [`RecordFault::KeyRefused`] is what it would report, and that is a lie about
+/// which check refused — this is the WRITE path, and `RecordFault`'s own type
+/// doc says it names which check refused a **stored** record. Left alone
+/// because no caller can observe it.
 fn encode_key(peer: EndpointId, key: &IdempotencyKey) -> Result<EntryKey, RecordFault> {
     let key = key.as_str().as_bytes();
     let mut bytes = Vec::with_capacity(PEER_LEN + key.len());
@@ -170,7 +201,7 @@ fn decode_key(stored: &EntryKey) -> Result<(EndpointId, IdempotencyKey), RecordF
     }
     let mut id = [0_u8; PEER_LEN];
     id.copy_from_slice(&bytes[..PEER_LEN]);
-    let peer = EndpointId::from_bytes(&id).map_err(|_| RecordFault::KeyRefused)?;
+    let peer = EndpointId::from_bytes(&id).map_err(|_| RecordFault::PeerNotAnId)?;
     let text = std::str::from_utf8(&bytes[PEER_LEN..]).map_err(|_| RecordFault::KeyNotText)?;
     let key = IdempotencyKey::new(text).map_err(|_| RecordFault::KeyRefused)?;
     Ok((peer, key))
@@ -303,7 +334,7 @@ impl DurableRecords {
     /// process believes it owns this ledger. [`RecordError::Unreadable`] when a
     /// stored record is not one this build can read.
     pub async fn open<E: Entries>(store: &E, id: &StateId) -> Result<Self, RecordError> {
-        let held = store.claim(id).await?;
+        let held = store.hold(id).await?;
         let stored = held.load().await?;
 
         let mut recovered = Vec::with_capacity(stored.len());
@@ -348,14 +379,35 @@ impl DurableRecords {
         key: &IdempotencyKey,
     ) -> Result<(), RecordError> {
         let address = encode_key(peer, key)?;
-        self.store
+        let wrote = self
+            .store
             .held
             .lock()
             .await
             .put(&address, &[TAG_CLAIMED])
-            .await?;
-        self.store.since_compaction.fetch_add(1, Ordering::Relaxed);
+            .await;
+        self.counted(wrote)?;
         Ok(())
+    }
+
+    /// The one place `since_compaction` is incremented.
+    ///
+    /// Wraps the **outcome** rather than the write. A helper that took the
+    /// store's lock itself would deadlock in
+    /// [`reconcile`](Self::reconcile), which holds that lock across its whole
+    /// loop — and one named `put` could not carry the `remove` that loop also
+    /// makes. So it takes what a write returned and counts it.
+    ///
+    /// Three paths write, and every one of them had to remember this line. A
+    /// fourth added without it would disable compaction silently: the counter
+    /// would stay under the threshold, the log would grow for the life of the
+    /// disk, and no test could see it, because nothing observes a rewrite that
+    /// does not happen.
+    fn counted<T, E>(&self, outcome: Result<T, E>) -> Result<T, E> {
+        if outcome.is_ok() {
+            self.store.since_compaction.fetch_add(1, Ordering::Relaxed);
+        }
+        outcome
     }
 
     /// Write one key's state, and resolve only once it is on the disk.
@@ -367,8 +419,8 @@ impl DurableRecords {
     ) -> Result<(), RecordError> {
         let address = encode_key(peer, key)?;
         let value = encode_slot(slot);
-        self.store.held.lock().await.put(&address, &value).await?;
-        self.store.since_compaction.fetch_add(1, Ordering::Relaxed);
+        let wrote = self.store.held.lock().await.put(&address, &value).await;
+        self.counted(wrote)?;
         Ok(())
     }
 
@@ -387,29 +439,35 @@ impl DurableRecords {
     /// a live claim and leave a handler running with nothing on the disk.
     pub(crate) async fn reconcile<F>(
         &self,
-        batch: Vec<(EndpointId, IdempotencyKey)>,
+        mut batch: Vec<(EndpointId, IdempotencyKey)>,
         mut current: F,
     ) -> Vec<(EndpointId, IdempotencyKey)>
     where
         F: FnMut(EndpointId, &IdempotencyKey) -> Reconcile,
     {
         let mut held = self.store.held.lock().await;
-        for (index, (peer, key)) in batch.iter().enumerate() {
-            let Ok(address) = encode_key(*peer, key) else {
+        for index in 0..batch.len() {
+            let (peer, key) = &batch[index];
+            let (peer, key) = (*peer, key);
+            let Ok(address) = encode_key(peer, key) else {
                 // A key this build cannot address is a key it never wrote.
                 continue;
             };
-            let wrote = match current(*peer, key) {
+            let wrote = match current(peer, key) {
                 Reconcile::Untouched => continue,
                 Reconcile::Erase => held.remove(&address).await,
                 Reconcile::Write(value) => held.put(&address, &value).await,
             };
-            if wrote.is_err() {
+            if self.counted(wrote).is_err() {
                 // A store that refuses one write refuses the next. Hand the
                 // rest back rather than burning the batch against it.
-                return batch[index..].to_vec();
+                //
+                // `split_off` and not `[index..].to_vec()`: the remainder is
+                // moved out of a `Vec` that is about to drop, so the clone that
+                // spelling paid for bought nothing. The loop is indexed for the
+                // same reason — an iterator would still be borrowing `batch`.
+                return batch.split_off(index);
             }
-            self.store.since_compaction.fetch_add(1, Ordering::Relaxed);
         }
         Vec::new()
     }
@@ -430,6 +488,19 @@ impl DurableRecords {
     /// attempt reads and encodes the whole log before failing. So the counter is
     /// reset either way, and a failed rewrite waits another `live` entries like
     /// any other.
+    ///
+    /// **What one rewrite costs, and how often it is paid.** Measured at **10
+    /// to 20 ms**, and it did not grow with the live count over a 144x range —
+    /// so two `fsync`s and a rename dominate, not the copy. With
+    /// [`COMPACTION_SLACK`] at 64 it fires once every `live + 64` writes: about
+    /// one call in 4640 at a full default ledger, where `live` is 9216.
+    ///
+    /// **Open question, and it is the small end that raises it.** At a ledger
+    /// holding 10 live entries it fires about once in 37 calls, and a 10-to-20
+    /// ms rewrite one call in 37 is a different proposition from one in 4640.
+    /// Nothing measured says that is wrong — a small log is also the cheapest
+    /// one to rewrite — and nothing measured says the floor is the right shape
+    /// either. No code change is made on this.
     pub(crate) async fn compact_if_worthwhile(&self, live: usize) {
         let written = self.store.since_compaction.load(Ordering::Relaxed);
         let Ok(live) = u64::try_from(live) else {

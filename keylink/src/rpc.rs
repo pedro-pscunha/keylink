@@ -407,6 +407,18 @@ async fn claim_key(
     if let Err(error) = idem.key().validate() {
         return Claimed::Refuse(IdempotencyRefusal::Malformed(error.to_string()).into());
     }
+    // Before the claim rather than after, so that the one place a caller is
+    // already waiting to start work is the place that pays for the store's
+    // housekeeping — and never the path that is holding a finished reply.
+    //
+    // It reports nothing on purpose, and its own doc says why.
+    //
+    // Here and not inside `claim_durably`, which is also reached by the two
+    // ATTACH paths below. An attaching caller never receives `Claim::Fresh`, so
+    // it is not the caller the paragraph above describes — and `housekeep`
+    // takes the same store lock `Guard::record` needs, so an attacher's
+    // housekeeping could block the very settle it is parked waiting for.
+    ledger.housekeep().await;
     let key = idem.key().clone();
 
     let notify = match ledger.claim_durably(peer, key.clone()).await {
@@ -1801,6 +1813,18 @@ where
                     service: Req::SERVICE,
                     named: named.to_owned(),
                 });
+        // A service that accepts no key builds no ledger, so nothing ever takes
+        // the recovered records or writes one. The `DurableRecords` still lives
+        // in `Keys` and still holds the exclusive claim on the log file, so a
+        // correctly configured second service on the same `StateId` is told
+        // `Busy` by a service that will never use it.
+        //
+        // A second statement rather than an `.or_else` on the chain above,
+        // because the chain's `.first_unknown` line is a registered break
+        // anchor and growing the expression makes the formatter re-indent it.
+        let held_and_unused = !self.keyable.needs_a_ledger() && self.records.stores_durably();
+        let configuration =
+            configuration.or_else(|| held_and_unused.then_some(ConfigError::DurableWithoutKeys));
         let mut chain = self.base;
         for layer in self.layers.into_iter().rev() {
             chain = wrap(layer, chain);
