@@ -787,6 +787,7 @@ impl Keyable {
 /// — an `Arc<dyn ..>` — rather than a discriminant. `Copy` today would have to be
 /// withdrawn then, and withdrawing a trait impl is a breaking change no attribute
 /// covers.
+///
 /// # Why this one IS `#[non_exhaustive]` when the rule says otherwise
 ///
 /// The rule — in `CONTRIBUTING.md`, and restated on [`Keyable`] and
@@ -1268,8 +1269,10 @@ struct Inner {
     /// largest holder is one `last()` rather than a scan of every peer.
     ///
     /// `evict` runs on every settle, and it ran `max_by_key` over `peers` twice
-    /// each time — measured at 63.8x the indexed cost at 4096 peers, under the
-    /// one lock the whole service shares. `BTreeSet::last` on `(len, id)` and
+    /// each time, under the one lock the whole service shares. Interleaved A/B,
+    /// 21 samples per arm, 200 keyed calls per sample, release profile, median
+    /// ns per call: **27.3x at 4096 peers, 11.0x at 1024, 5.8x at 256, 2.4x at
+    /// 64, 1.2x at 8.** `BTreeSet::last` on `(len, id)` and
     /// `max_by_key` on `(len, id)` select the same peer, because ids are unique
     /// and so the tie-break is total either way.
     ///
@@ -1290,13 +1293,24 @@ impl Inner {
     /// one mistake the indexes made possible, which is a settle path that
     /// forgot to call it.
     ///
-    /// Unbounded on purpose. It is O(peers x slots) on every [`Ledger::lock`],
-    /// which is every keyed path, so the cost was measured rather than
-    /// assumed: `mise run test` warm ran **16.02 s without it and 16.43 s with
-    /// it**, or 2.6%. A peer-count ceiling was written and then removed — it
-    /// would buy that 2.6% by switching the check off exactly where a large
-    /// ledger makes the drift most likely. `debug_assertions` is off in
-    /// release, so the fixtures that reach thousands of peers never run this.
+    /// Unbounded on purpose, and the cost was measured rather than assumed:
+    /// `mise run test`, warm, ran **16.02 s without this check and 16.43 s with
+    /// it**. That is one sample per arm on a machine whose repeated runs of one
+    /// configuration have spanned a factor of two elsewhere in this file, so
+    /// read it as *the suite did not get noticeably slower* and not as a
+    /// percentage.
+    ///
+    /// **What that measurement does NOT cover.** It is O(peers x slots) on
+    /// every [`Ledger::lock`], which is every keyed path, and the suite never
+    /// approaches the shipped bounds — a bucket set may hold
+    /// [`MAX_RECORDS`] + [`MAX_TOMBSTONES`] slots, so a debug-profile service
+    /// near them walks orders of magnitude more per call than any test here.
+    /// `debug_assertions` is off in release, so no shipped binary pays it, and
+    /// a debug build at production scale will.
+    ///
+    /// A peer-count ceiling was written and then removed: it would buy the
+    /// difference back by switching the check off exactly where a large ledger
+    /// makes the drift most likely.
     fn agrees(&self) {
         let mut held = 0;
         let mut bytes = 0;
@@ -2143,10 +2157,10 @@ impl Ledger {
             peer,
             key,
             settled: false,
-            // Reads `NotDispatched`, which is the truth about a key nothing has
-            // been dispatched under yet. `serve_one` replaces it with the
-            // call's own marker before anything is.
-            progress: Progress::new(),
+            // Nothing is watching yet, which `Drop` reads as `NotDispatched` —
+            // the truth about a key nothing has been dispatched under.
+            // `serve_one` fills it before anything is.
+            progress: None,
         })
     }
 
@@ -2486,6 +2500,7 @@ impl Ledger {
         // Collected rather than pushed inside the loop, because `inner.pending`
         // and the bucket below are two fields of one `&mut Inner`.
         let mut downgraded = Vec::new();
+        let mut moved = false;
         let Some(bucket) = inner.peers.get_mut(&peer) else {
             return;
         };
@@ -2518,10 +2533,19 @@ impl Ledger {
             bucket.spent.push_back(key);
             inner.bytes = inner.bytes.saturating_sub(freed);
             inner.spent += 1;
+            moved = true;
         }
         // One call for the whole loop: it moves keys between two queues of the
         // same peer, and nothing reads the indexes until it returns.
-        refile(inner, peer);
+        //
+        // Conditional, because the common case is a front record still inside
+        // its budget and this runs on every `claim` and every `key_state`. A
+        // `refile` that files what is already filed costs a `HashMap` lookup
+        // and two comparisons, which is the same hot path two allocations were
+        // just taken off.
+        if moved {
+            refile(inner, peer);
+        }
         // A tombstone on the disk is one byte; the reply it replaced is up to
         // `frame_bytes`. Without this the store would keep every expired reply
         // until its key left the tombstone pool, so `pool_bytes` would bind
@@ -2738,22 +2762,29 @@ pub(crate) struct Guard {
     settled: bool,
     /// How far the call got.
     ///
-    /// Built by [`Ledger::claim`], where it reads `NotDispatched`, and replaced
-    /// by [`watching`](Self::watching) the moment `serve_one` has the call's
-    /// own. **Not an `Option`, and that is item 2 of the ledger audit:** an
-    /// absent marker settled `Interrupted` on drop, so a guard dropped between
-    /// the claim and the dispatch — which is what an abort during the durable
-    /// claim write is — refused a retry of a call that provably never ran. A
-    /// guard that nobody has watched yet is a guard nothing has been dispatched
-    /// under, and now it says so.
-    progress: Progress,
+    /// `None` until `serve_one` calls [`watching`](Self::watching) with the
+    /// call's own.
+    ///
+    /// **An absent marker reads `NotDispatched`, and that is item 2 of the
+    /// ledger audit.** It used to settle `Interrupted` on drop, so a guard
+    /// dropped between the claim and the dispatch — which is exactly what an
+    /// abort during the durable claim write is — refused a retry of a call that
+    /// provably never ran. A guard nobody has watched yet is a guard nothing
+    /// has been dispatched under, so the default belongs on that side.
+    ///
+    /// The default is written in [`Drop`] rather than by handing `claim` a
+    /// fresh [`Progress`] to hold, which is how this was first fixed:
+    /// `Progress` is an `Arc<AtomicU8>`, so that spent one allocation on every
+    /// keyed call to name a state, and `serve_one` overwrote it unused a moment
+    /// later.
+    progress: Option<Progress>,
 }
 
 impl Guard {
     /// Watch how far this call gets, so an abort settles honestly.
     #[must_use]
     pub(crate) fn watching(mut self, progress: Progress) -> Self {
-        self.progress = progress;
+        self.progress = Some(progress);
         self
     }
 
@@ -2893,7 +2924,11 @@ impl Drop for Guard {
         // owed and the key goes back. Anything else — entered and unfinished,
         // finished with nobody left to record it, or still in a mailbox whose
         // turn nobody stayed to watch — is genuinely unknown.
-        if self.progress.reached() == Reached::NotDispatched {
+        let reached = self
+            .progress
+            .as_ref()
+            .map_or(Reached::NotDispatched, Progress::reached);
+        if reached == Reached::NotDispatched {
             self.ledger.release(self.peer, &self.key);
         } else {
             self.ledger.settle(self.peer, &self.key, Slot::Interrupted);
@@ -3524,7 +3559,7 @@ mod tests {
         /// Made red by `scripts/break-once.sh` making `Guard::drop`'s
         /// `Reached::NotDispatched` test unreachable. Search, **with its
         /// indentation**, which is what keeps it unique against this quote:
-        /// `if self.progress.reached() == Reached::NotDispatched {`
+        /// `if reached == Reached::NotDispatched {`
         /// and replace with `if false {`, so every dropped guard settles rather than
         /// releasing. The replacement is quoted too, which is always safe.
         ///

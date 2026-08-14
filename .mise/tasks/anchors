@@ -842,7 +842,7 @@ ANCHORS = [
     # of the indented one, which counts 1 - the same remedy five sibling rows were
     # already using when these two were written.
     ("R11", "keylink/src/idempotency.rs", "keylink/src/idempotency.rs",
-     "        if self.progress.reached() == Reached::NotDispatched {"),
+     "        if reached == Reached::NotDispatched {"),
     # ── R19's record carried a SIXTH rot mode, and it is the first one this file has
     # seen that touches neither the anchor nor the watched message. **A record can cite
     # a LINE NUMBER in a third file, and a line number rots without anything the anchor
