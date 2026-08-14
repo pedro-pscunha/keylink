@@ -255,6 +255,11 @@ async fn the_document_endpoints_serve_their_exact_media_types() {
 
 /// The four canonical surfaces, byte for byte.
 ///
+/// Watched red with `scripts/break-once.sh` (row `HL7`) by replacing
+/// `    for kind in errors_for(route.kind()) {`
+/// with `ErrorKind::ALL.iter().copied()`, which restores the document that
+/// tells a caller a `rpc` can answer `416`. Terminated on a snapshot diff.
+///
 /// Watched red with `scripts/break-once.sh` (row `HL6`) by replacing
 /// `        let body = if media == "application/octet-stream" {`
 /// with `if false`, which publishes a `send`'s ARGUMENT OBJECT as its

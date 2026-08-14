@@ -208,6 +208,18 @@ pub fn document<D: Documented>(
 
     let keyed = surface.addressing() == Addressing::Actors;
     for mut operation in D::operations() {
+        // A keyed surface serves only what the ACTOR list carries. This is the
+        // authority on per-METHOD keyed-ness, which the route table cannot
+        // express — the table says an actor surface has a `recv` route, not
+        // which methods it routes.
+        //
+        // UNBREAKABLE today, measured: disabling it leaves
+        // `an_actor_surface_documents_the_keyed_intersection_and_no_send`
+        // GREEN at `exit=0`, because the only kind the two lists disagree about
+        // is `send` and the actor route table independently has no `send`
+        // route. Two layers, one outcome. It stays because it is the narrower
+        // and more direct statement, and it is recorded as unwatched rather
+        // than left to look guarded.
         if keyed && !operation.keyed {
             continue;
         }

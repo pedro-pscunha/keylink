@@ -2227,6 +2227,8 @@ ANCHORS = [
      "            @actor [ $( $actor )* { [ $( #[$cfg] )* ] recv $method ( $( $arg : $ty ),* ) -> $ret } ]"),
     ("HK27", "keylink-http/src/contract.rs", "keylink-http/src/contract.rs",
      "            route.addressing == self.addressing && (!route.streaming || self.streaming.is_some())"),
+    ("HL7", "keylink-openapi/tests/openapi.rs", "keylink-openapi/src/lib.rs",
+     "    for kind in errors_for(route.kind()) {"),
     ("HL5", "keylink-openapi/tests/parity.rs", "keylink-openapi/src/document_macro.rs",
      "                                    .for_serialize()"),
     ("HL6", "keylink-openapi/tests/openapi.rs", "keylink-openapi/src/lib.rs",
