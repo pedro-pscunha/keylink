@@ -68,151 +68,30 @@ where
         if surface.addressing() != Addressing::Singleton {
             return Err(ConfigError::WrongAddressing);
         }
-        let Some(rpc) = surface
-            .routes()
-            .find(|route| route.kind() == RouteKind::Rpc)
-        else {
-            return Err(ConfigError::MissingRuntimeRoute);
-        };
-        let rpc_path = format!("{}{}", surface.prefix(), rpc.template());
-        let handler_path = rpc_path.clone();
-        let gateway = Arc::new(self);
-        let rpc_gateway = Arc::clone(&gateway);
-        let mut router = Router::new().route(
-            &rpc_path,
-            any(move |request: Request<Body>| {
-                let gateway = Arc::clone(&rpc_gateway);
-                let path = handler_path.clone();
-                async move { gateway.handle_rpc(request, rpc, &path).await }
-            }),
-        );
-        if let Some(limits) = surface.streaming() {
-            // Sized here rather than on the gateway, because the bound arrives
-            // with the surface: a gateway built without streaming serves no
-            // byte resources and needs no table at all.
-            let tickets = Arc::new(crate::blob::Tickets::new(limits.max_blob_tickets()));
-            for route in surface.routes() {
-                let path = format!("{}{}", surface.prefix(), route.template());
-                let handler_path = path.clone();
-                let gateway = Arc::clone(&gateway);
-                let handler = match route.kind() {
-                    RouteKind::Send => any(move |request: Request<Body>| {
-                        let gateway = Arc::clone(&gateway);
-                        let path = handler_path.clone();
-                        async move { gateway.handle_send(request, route, &path, limits).await }
-                    }),
-                    RouteKind::Recv => any(move |request: Request<Body>| {
-                        let gateway = Arc::clone(&gateway);
-                        let path = handler_path.clone();
-                        async move { gateway.handle_recv(request, route, &path, limits).await }
-                    }),
-                    // One template, two verbs, and therefore ONE registration:
-                    // `Router::route` panics on a second `any` for a path it
-                    // already serves. Each verb still carries its own `Route`,
-                    // so the shared prelude's verb check stays an exact
-                    // comparison rather than a set membership test.
-                    RouteKind::BlobHead => continue,
-                    RouteKind::BlobGet => {
-                        let Some(head) = surface
-                            .routes()
-                            .find(|route| route.kind() == RouteKind::BlobHead)
-                        else {
-                            return Err(ConfigError::MissingRuntimeRoute);
-                        };
-                        let head_path = handler_path.clone();
-                        let head_tickets = Arc::clone(&tickets);
-                        let head_gateway = Arc::clone(&gateway);
-                        let tickets = Arc::clone(&tickets);
-                        axum::routing::get(move |request: Request<Body>| {
-                            let gateway = Arc::clone(&gateway);
-                            let tickets = Arc::clone(&tickets);
-                            let path = handler_path.clone();
-                            async move {
-                                gateway
-                                    .handle_blob_bytes(request, route, &path, limits, &tickets)
-                                    .await
-                            }
-                        })
-                        .head(move |request: Request<Body>| {
-                            let gateway = Arc::clone(&head_gateway);
-                            let tickets = Arc::clone(&head_tickets);
-                            let path = head_path.clone();
-                            async move {
-                                gateway
-                                    .handle_blob_bytes(request, head, &path, limits, &tickets)
-                                    .await
-                            }
-                        })
-                    }
-                    RouteKind::BlobLookup => {
-                        let tickets = Arc::clone(&tickets);
-                        any(move |request: Request<Body>| {
-                            let gateway = Arc::clone(&gateway);
-                            let tickets = Arc::clone(&tickets);
-                            let path = handler_path.clone();
-                            async move {
-                                gateway
-                                    .handle_blob_lookup(request, route, &path, &tickets)
-                                    .await
-                            }
-                        })
-                    }
-                    // Installed above, or not implemented at this phase. The
-                    // inventory lists only what a phase actually serves, so a
-                    // kind arriving here is a route added without a handler.
-                    _ => continue,
-                };
-                router = router.route(&path, handler);
-            }
-        }
-        Ok(router.fallback(|| async { GatewayError::MethodNotFound.response(None) }))
+        install(self, surface)
     }
+}
 
-    /// Everything every route does before it looks at a request body.
-    ///
-    /// Extracted rather than copied a fourth time. Three handlers already
-    /// carried it verbatim, and a fourth copy is not only harder to change: a
-    /// duplicated block makes a registered break anchor resolve twice, which
-    /// took `HJ9` from a guard to a gate failure on this branch.
-    ///
-    /// The order is a guarantee, and it is a narrower one than it looks. A
-    /// method nobody serves is refused before the verb, the verb before the
-    /// principal, and the principal before `Access`. What that buys is that
-    /// **`Access` is never asked about a route that does not exist**.
-    ///
-    /// It does NOT hide which methods exist: because the method check precedes
-    /// the principal check, an unauthenticated caller separates a real method
-    /// (`401`) from a missing one (`404`), and a forbidden caller separates
-    /// them the same way. That is the Task 1 shape and it is deliberate —
-    /// enumerating method names off a generated inventory is low value — but
-    /// the reason written here used to claim the opposite, which is the kind of
-    /// wrong reason that survives review and gets defended.
-    /// Takes the request PARTS rather than the request. `axum::body::Body` is
-    /// `Send` and not `Sync`, so a `&Request<Body>` held across the `Access`
-    /// await would make every handler future non-`Send` and no route would
-    /// install at all.
-    async fn admit(
-        &self,
-        parts: &http::request::Parts,
-        route: &'static Route,
-        route_path: &str,
-        kind: keylink::ExternalKind,
-    ) -> Result<Admitted, Response<Body>> {
-        // Singleton surface, so no actor. Task 6's actor routes call the same
-        // free function with the validated id, and `Access` sees the difference
-        // in one field rather than in a second trait.
-        admit(
-            &self.access,
-            &self.challenge,
-            S::SERVICE,
-            S::METHODS,
-            parts,
-            route,
-            route_path,
-            kind,
-            None,
-        )
-        .await
+/// Reaching one handler without a router in front of it.
+///
+/// Test-only, and deliberately not a production seam: an in-process unit test
+/// drives a single handler with a hand-built request, and going through
+/// [`Router`] would put path matching and extractor machinery between the test
+/// and what it is measuring. Each is the same two lines the router runs, so no
+/// handler body is duplicated here.
+#[cfg(test)]
+impl<S, A> Gateway<S, A>
+where
+    S: ExternalService + Send + Sync + 'static,
+    A: Access,
+{
+    #[expect(
+        clippy::expect_used,
+        reason = "test-only, and a singleton surface decodes nothing it could refuse"
+    )]
+    fn only(&self) -> Surface<'_, A> {
+        self.surface("", "")
+            .expect("a singleton surface always builds")
     }
 
     async fn handle_rpc(
@@ -221,268 +100,7 @@ where
         route: &'static Route,
         route_path: &str,
     ) -> Response<Body> {
-        let client = &self.client;
-        let limit = self.limits.response.get();
-        handle_rpc(
-            request,
-            route,
-            route_path,
-            &Surface {
-                access: &self.access,
-                challenge: &self.challenge,
-                limits: self.limits,
-                service: S::SERVICE,
-                methods: S::METHODS,
-                actor: None,
-                invoke: &move |method, body, call| {
-                    S::invoke(client, method, body, call, JsonCodec::new(limit))
-                },
-            },
-        )
-        .await
-    }
-
-    /// `POST /blob/{method}`: invoke, record a ticket, and answer with the
-    /// declared value and where the bytes live.
-    ///
-    /// **Nothing is fetched.** A blob method hands back an address plus a
-    /// grant, and the payload can be gigabytes; turning a lookup into a
-    /// download would make the smallest call the most expensive one. The bytes
-    /// are a separate resource, and this is the only place its identity is
-    /// minted.
-    ///
-    /// **The ticket is recorded last.** Insertion happens after the invocation
-    /// AND after the declared value encodes, so a call that failed on the way
-    /// out cannot leave a grant behind that no caller was ever told about.
-    async fn handle_blob_lookup(
-        &self,
-        request: Request<Body>,
-        route: &'static Route,
-        route_path: &str,
-        tickets: &crate::blob::Tickets<keylink::BlobHandle>,
-    ) -> Response<Body> {
-        let (parts, body) = request.into_parts();
-        let admitted = match self
-            .admit(&parts, route, route_path, keylink::ExternalKind::Blob)
-            .await
-        {
-            Ok(admitted) => admitted,
-            Err(response) => return response,
-        };
-        let Admitted { method, principal } = admitted;
-        // `Range` and `If-Range` are IGNORED here, not refused. RFC 9110 §14.2:
-        // "A server MUST ignore a Range header field received with a request
-        // method ... for which range handling is not defined", and §13.1.5
-        // says the same of `If-Range` without a `Range`. A lookup addresses no
-        // bytes yet, so there is nothing for either field to name — and a
-        // download manager that attaches `Range` to every request would meet a
-        // hard refusal on a route the specification guarantees drops it.
-        //
-        // The plan's route table says to reject both. RFC 9110 says otherwise,
-        // and an HTTP gateway follows the RFC.
-        // DEVIATION from the plan's route table, which lists idempotency as
-        // optional here. `keylink::ExternalCall::Blob` carries no key slot, so
-        // Adding the slot is `keylink/src/external.rs`, which Task 6 owns, and
-        // the gateway has nowhere to put one until then.
-        //
-        // Anchored on this comment line as well as the check, because the same
-        // check appears in four handlers and nothing else tells them apart.
-        // Silently ignoring a caller's replay key is worse than refusing it.
-        if parts.headers.get(IDEMPOTENCY_HEADER).is_some() {
-            return GatewayError::IdempotencyNotSupported.response(None);
-        }
-        if !is_media(&parts.headers, route.request_media()) {
-            return GatewayError::UnsupportedMediaType.response(None);
-        }
-        let arguments = match bounded_json(body, self.limits.request.get()).await {
-            Ok(arguments) => arguments,
-            Err(error) => return error.response(None),
-        };
-        let invocation = S::invoke(
-            &self.client,
-            method,
-            &arguments,
-            keylink::ExternalCall::Blob,
-            JsonCodec::new(self.limits.response.get()),
-        );
-        let (value, handle) = match invocation.await {
-            Ok(keylink::ExternalOutput::Blob { value, handle }) => (value, handle),
-            Ok(_) => return GatewayError::UpstreamError.response(None),
-            Err(error) => return GatewayError::from_external(error).response(None),
-        };
-
-        let address = crate::blob::Address::of(handle.id());
-        // Prefix-preserving because it is built from the path the caller
-        // actually reached, not from the template. A gateway mounted under
-        // `/v1` answers `/v1/blob/Fetch/<address>` without being told it is.
-        let location = format!("{}/{}", parts.uri.path(), address.as_str());
-        let Ok(location) = http::HeaderValue::from_str(&location) else {
-            return GatewayError::UpstreamError.response(None);
-        };
-        let mut response = json_response(value, route);
-        tickets.insert(ticket_for(principal, method, address), handle);
-        response.headers_mut().insert(header::LOCATION, location);
-        response
-    }
-
-    /// `GET` and `HEAD` on `/blob/{method}/{id}`.
-    ///
-    /// One function for both verbs, because every check up to the last one is
-    /// identical and the plan's own rule is that HEAD answers the same
-    /// metadata. What differs is one thing: HEAD never opens a byte reader,
-    /// and never applies a range.
-    ///
-    /// The order is the whole design, and each step is placed where it is for
-    /// a reason a later reader will otherwise remove:
-    ///
-    /// 1. `Access` runs before the ticket lookup, so a caller who may not
-    ///    reach this method learns nothing about which resources exist.
-    /// 2. The path address is a lookup key and never a handle. A perfectly
-    ///    formed address nobody granted finds nothing.
-    /// 3. Availability is rechecked on EVERY request. A ticket is a record
-    ///    that a grant was issued, not a promise the holder still serves it.
-    /// 4. Conditions before ranges: a `304` is a complete answer and a range
-    ///    of a representation the caller already has is wasted work.
-    /// 5. `If-Range` only after a valid range, because it modifies a range and
-    ///    has no meaning without one.
-    async fn handle_blob_bytes(
-        &self,
-        request: Request<Body>,
-        route: &'static Route,
-        route_path: &str,
-        limits: crate::StreamingLimits,
-        tickets: &crate::blob::Tickets<keylink::BlobHandle>,
-    ) -> Response<Body> {
-        let (parts, body) = request.into_parts();
-        let admitted = match self
-            .admit(&parts, route, route_path, keylink::ExternalKind::Blob)
-            .await
-        {
-            Ok(admitted) => admitted,
-            Err(response) => return response,
-        };
-        let Admitted { method, principal } = admitted;
-
-        // Refused before anything is looked up, while a status line can still
-        // carry the reason. A byte route addresses existing content: there is
-        // nothing for a request body to say and nothing for a replay key to
-        // replay.
-        if parts.headers.get(IDEMPOTENCY_HEADER).is_some() {
-            return GatewayError::IdempotencyNotSupported.response(None);
-        }
-        if !is_empty_body(&parts.headers) {
-            return GatewayError::UnsupportedMediaType.response(None);
-        }
-
-        // A malformed address is the same `404` as a well formed one nobody
-        // holds. Telling them apart is an oracle for what a valid address even
-        // looks like.
-        let Some(address) = decode_blob_address(parts.uri.path(), route_path) else {
-            return GatewayError::BlobNotFound.response(None);
-        };
-        let ticket = ticket_for(principal, method, address.clone());
-        let Some((generation, handle)) = tickets.get(&ticket) else {
-            return GatewayError::BlobNotFound.response(None);
-        };
-
-        // Fresh, every time, and the clone above is what lets it happen with no
-        // lock held across the await.
-        let total = match handle.verified_len().await {
-            Ok(total) => total,
-            Err(keylink::Error::BlobRefused { .. }) => return gone(tickets, &ticket, generation),
-            // The same mapping `handle_rpc` uses. Collapsing every upstream
-            // failure to `502` here would tell a caller to stop retrying a
-            // holder that is merely unreachable.
-            Err(error) => return GatewayError::from_keylink(error).response(None),
-        };
-
-        let tag = crate::blob::etag(&address);
-        match crate::blob::none_match(&parts.headers, &tag) {
-            Ok(true) => return not_modified(&tag),
-            Ok(false) => {}
-            Err(()) => return GatewayError::InvalidRequest.response(None),
-        }
-
-        let wants_bytes = route.kind() == RouteKind::BlobGet;
-        let asked = if wants_bytes {
-            match crate::blob::range(&parts.headers, total) {
-                Ok(asked) => asked,
-                Err(crate::blob::RangeError::Malformed) => {
-                    return GatewayError::InvalidRequest.response(None)
-                }
-                Err(crate::blob::RangeError::Unsatisfiable) => return unsatisfiable(&tag, total),
-            }
-        } else {
-            // HEAD ignores `Range` and `If-Range` entirely and answers for the
-            // full representation, which is what a client uses it to size.
-            crate::blob::Asked::Whole
-        };
-        let asked = match asked {
-            crate::blob::Asked::Part(_) if !crate::blob::if_range_allows(&parts.headers, &tag) => {
-                crate::blob::Asked::Whole
-            }
-            asked => asked,
-        };
-
-        drop(body);
-        let mut response = Response::builder().header(header::ETAG, tag.clone());
-        response = response
-            .header(header::ACCEPT_RANGES, "bytes")
-            // `private` because a ticket is bound to one principal, and
-            // `no-transform` because a proxy that recompresses content-addressed
-            // bytes breaks the address they are named by.
-            .header(header::CACHE_CONTROL, "private, no-transform");
-        if let Some(media) = route.response_media() {
-            // From the inventory, not a literal. Task 7 generates the OpenAPI
-            // document from the same `Route`, so a literal here would let the
-            // document describe a media type the gateway does not send.
-            response = response.header(header::CONTENT_TYPE, media);
-        }
-
-        let (status, span) = match &asked {
-            crate::blob::Asked::Whole => (route.success_status(), 0..total),
-            crate::blob::Asked::Part(range) => {
-                response = response.header(
-                    header::CONTENT_RANGE,
-                    format!("bytes {}-{}/{total}", range.start, range.end - 1),
-                );
-                (http::StatusCode::PARTIAL_CONTENT, range.clone())
-            }
-        };
-        let length = span.end - span.start;
-        response = response
-            .status(status)
-            .header(header::CONTENT_LENGTH, length.to_string());
-
-        // Checked for BOTH verbs, and above the HEAD return. RFC 9110 §9.3.2
-        // asks a server to answer a HEAD with the fields it would send for the
-        // GET, and a HEAD that says `200` for content the GET refuses is the
-        // one answer a client uses to decide whether to start.
-        if length > limits.max_download_bytes() {
-            return GatewayError::ResponseStreamTooLarge.response(None);
-        }
-        if !wants_bytes {
-            return response
-                .body(Body::empty())
-                .unwrap_or_else(|_| GatewayError::UpstreamError.response(None));
-        }
-        let reader = match if span == (0..total) {
-            handle.open().await
-        } else {
-            handle.open_range(span).await
-        } {
-            Ok(reader) => reader,
-            Err(keylink::Error::BlobRefused { .. }) => return gone(tickets, &ticket, generation),
-            Err(error) => return GatewayError::from_keylink(error).response(None),
-        };
-        response
-            // Bounded by the length this response just declared, not by the
-            // gateway ceiling. A one-byte range under an 8 MiB ceiling would
-            // otherwise run to 8 MiB before the adapter objected, and what
-            // stopped it would be hyper's framing — a broken connection rather
-            // than this adapter saying which limit was crossed.
-            .body(crate::stream::download_body(reader, length))
-            .unwrap_or_else(|_| GatewayError::UpstreamError.response(None))
+        handle_rpc(request, route, route_path, &self.only()).await
     }
 
     async fn handle_send(
@@ -492,53 +110,7 @@ where
         route_path: &str,
         limits: crate::StreamingLimits,
     ) -> Response<Body> {
-        let (parts, body) = request.into_parts();
-        let admitted = match self
-            .admit(&parts, route, route_path, keylink::ExternalKind::Send)
-            .await
-        {
-            Ok(admitted) => admitted,
-            Err(response) => return response,
-        };
-        let Admitted { method, .. } = admitted;
-        if parts.headers.get(IDEMPOTENCY_HEADER).is_some() {
-            return GatewayError::IdempotencyNotSupported.response(None);
-        }
-        if parts.headers.get(header::RANGE).is_some()
-            || parts.headers.get(header::IF_RANGE).is_some()
-        {
-            return GatewayError::RangeNotSupported.response(None);
-        }
-        if !crate::stream::is_octet_stream(&parts.headers) {
-            return GatewayError::UnsupportedMediaType.response(None);
-        }
-        let arguments = match crate::stream::arguments(&parts.headers, limits.metadata_json_bytes())
-        {
-            Ok(arguments) => arguments,
-            Err(_) => return GatewayError::InvalidStreamMetadata.response(None),
-        };
-        let declared_len = parts
-            .headers
-            .get(header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok());
-        if declared_len.is_some_and(|len| len > limits.max_upload_bytes()) {
-            return GatewayError::RequestStreamTooLarge.response(None);
-        }
-        let invocation = S::invoke(
-            &self.client,
-            method,
-            &arguments,
-            keylink::ExternalCall::Send {
-                body: crate::stream::upload_body(body, declared_len, limits.max_upload_bytes()),
-            },
-            JsonCodec::new(self.limits.response.get()),
-        );
-        match invocation.await {
-            Ok(keylink::ExternalOutput::Json(json)) => json_response(json, route),
-            Ok(_) => GatewayError::UpstreamError.response(None),
-            Err(error) => GatewayError::from_external(error).response(None),
-        }
+        handle_send(request, route, route_path, limits, &self.only()).await
     }
 
     async fn handle_recv(
@@ -548,63 +120,20 @@ where
         route_path: &str,
         limits: crate::StreamingLimits,
     ) -> Response<Body> {
-        let (parts, body) = request.into_parts();
-        let admitted = match self
-            .admit(&parts, route, route_path, keylink::ExternalKind::Recv)
-            .await
-        {
-            Ok(admitted) => admitted,
-            Err(response) => return response,
-        };
-        let Admitted { method, .. } = admitted;
-        // A one-shot download has no reply to replay and no range to serve. Both
-        // are refused rather than ignored, and refused before the arguments are
-        // read, so a caller that asked for either is never charged for a body.
-        if parts.headers.get(IDEMPOTENCY_HEADER).is_some() {
-            return GatewayError::IdempotencyNotSupported.response(None);
-        }
-        if parts.headers.get(header::RANGE).is_some()
-            || parts.headers.get(header::IF_RANGE).is_some()
-        {
-            return GatewayError::RangeNotSupported.response(None);
-        }
-        if !is_media(&parts.headers, route.request_media()) {
-            return GatewayError::UnsupportedMediaType.response(None);
-        }
-        let arguments = match bounded_json(body, self.limits.request.get()).await {
-            Ok(arguments) => arguments,
-            Err(error) => return error.response(None),
-        };
-        let invocation = S::invoke(
-            &self.client,
-            method,
-            &arguments,
-            keylink::ExternalCall::Recv,
-            JsonCodec::new(limits.metadata_json_bytes()),
-        );
-        let (value, reader) = match invocation.await {
-            Ok(keylink::ExternalOutput::Recv { value, body }) => (value, body),
-            Ok(_) => return GatewayError::UpstreamError.response(None),
-            Err(error) => return GatewayError::from_external(error).response(None),
-        };
-        // Everything refusable is refused here, while a status line can still
-        // say why. Past this point the only way to report a fault is to break
-        // the body, so a length the sender already declared is checked now.
-        if reader
-            .declared_len()
-            .is_some_and(|len| len > limits.max_download_bytes())
-        {
-            return GatewayError::ResponseStreamTooLarge.response(None);
-        }
-        let result = match crate::stream::result_header(&value, limits.metadata_json_bytes()) {
-            Ok(result) => result,
-            Err(_) => return GatewayError::ResponseTooLarge.response(None),
-        };
-        stream_response(reader, result, route, limits)
+        handle_recv(request, route, route_path, limits, &self.only()).await
+    }
+
+    async fn handle_blob_lookup(
+        &self,
+        request: Request<Body>,
+        route: &'static Route,
+        route_path: &str,
+        tickets: &crate::blob::Tickets<keylink::BlobHandle>,
+    ) -> Response<Body> {
+        handle_blob_lookup(request, route, route_path, tickets, &self.only()).await
     }
 }
 
-/// A `recv` reply: the declared value in one header, the payload as the body.
 /// A gateway onto one node's KEYED actors.
 ///
 /// A separate type rather than a mode of [`Gateway`], and not by preference:
@@ -675,67 +204,211 @@ where
         if S::METHODS.is_empty() {
             return Err(ConfigError::MissingRuntimeRoute);
         }
-        let Some(rpc) = surface
-            .routes()
-            .find(|route| route.kind() == RouteKind::Rpc)
-        else {
-            return Err(ConfigError::MissingRuntimeRoute);
-        };
-        let path = format!("{}{}", surface.prefix(), rpc.template());
-        let handler_path = path.clone();
-        let gateway = Arc::new(self);
-        let router = Router::new().route(
-            &path,
-            any(move |request: Request<Body>| {
-                let gateway = Arc::clone(&gateway);
-                let path = handler_path.clone();
-                async move { gateway.handle_rpc(request, rpc, &path).await }
-            }),
-        );
-        Ok(router.fallback(|| async { GatewayError::MethodNotFound.response(None) }))
+        install(self, surface)
     }
+}
 
-    async fn handle_rpc(
-        &self,
-        request: Request<Body>,
-        route: &'static Route,
-        route_path: &str,
-    ) -> Response<Body> {
-        // The actor is decoded BEFORE the prelude, because `Access` is asked
-        // about it and a policy must never be handed a raw path segment. A
-        // malformed id is the same `404` a missing method is: telling them
-        // apart says which ids are well formed.
-        let Some(actor) = decode_actor(request.uri().path(), route_path) else {
-            return GatewayError::MethodNotFound.response(None);
-        };
+/// How a mounted service turns a request path into the surface that answers it.
+///
+/// The two gateways disagree about exactly two things: which generated function
+/// an invocation goes through, and whether an actor id has to be decoded out of
+/// the path before anything else happens. This is where both live, so the route
+/// table, the prelude and every handler body exist once.
+trait Mount: Send + Sync + 'static {
+    /// The policy this mount asks. A named associated type rather than a second
+    /// parameter on every function that takes a mount.
+    type Access: Access;
+
+    /// `None` when the path addresses nothing: on an actor surface a malformed
+    /// id, and on a singleton surface never.
+    fn surface<'a>(&'a self, path: &str, route_path: &str) -> Option<Surface<'a, Self::Access>>;
+}
+
+impl<S, A> Mount for Gateway<S, A>
+where
+    S: keylink::ExternalService + Send + Sync + 'static,
+    A: Access,
+{
+    type Access = A;
+
+    fn surface<'a>(&'a self, _path: &str, _route_path: &str) -> Option<Surface<'a, A>> {
         let client = &self.client;
-        let limit = self.limits.response.get();
-        let addressed = actor.clone();
-        handle_rpc(
-            request,
-            route,
-            route_path,
-            &Surface {
-                access: &self.access,
-                challenge: &self.challenge,
-                limits: self.limits,
-                service: S::SERVICE,
-                methods: S::METHODS,
-                actor: Some(&actor),
-                invoke: &move |method, body, call| {
-                    S::invoke_at(
-                        client,
-                        &addressed,
-                        method,
-                        body,
-                        call,
-                        JsonCodec::new(limit),
-                    )
-                },
-            },
-        )
-        .await
+        Some(Surface {
+            access: &self.access,
+            challenge: &self.challenge,
+            limits: self.limits,
+            service: S::SERVICE,
+            methods: S::METHODS,
+            actor: None,
+            invoke: Box::new(move |method, body, call, codec| {
+                S::invoke(client, method, body, call, codec)
+            }),
+        })
     }
+}
+
+impl<S, A> Mount for ActorGateway<S, A>
+where
+    S: keylink::ExternalActorService + Send + Sync + 'static,
+    A: Access,
+{
+    type Access = A;
+
+    /// The actor is decoded BEFORE anything else, because `Access` is asked
+    /// about it and a policy must never be handed a raw path segment. A
+    /// malformed id is the same `404` a missing method is: telling them apart
+    /// says which ids are well formed.
+    fn surface<'a>(&'a self, path: &str, route_path: &str) -> Option<Surface<'a, A>> {
+        let actor = decode_actor(path, route_path)?;
+        let client = &self.client;
+        let addressed = actor.clone();
+        Some(Surface {
+            access: &self.access,
+            challenge: &self.challenge,
+            limits: self.limits,
+            service: S::SERVICE,
+            methods: S::METHODS,
+            actor: Some(actor),
+            invoke: Box::new(move |method, body, call, codec| {
+                S::invoke_at(client, &addressed, method, body, call, codec)
+            }),
+        })
+    }
+}
+
+/// Every route one surface serves, installed from the generated inventory.
+///
+/// Written once for both address spaces. A keyed surface serves the same route
+/// families a singleton one does, under a template carrying one more segment,
+/// and the only thing that differs is what [`Mount::surface`] builds — so a
+/// second copy of this table would be a second place for a route to go missing.
+///
+/// Refuses [`ConfigError::MissingRuntimeRoute`] when the inventory carries no
+/// rpc route, and an EMPTY inventory with it. A service that declares nothing
+/// this gateway serves would answer `404` per request instead of saying at
+/// startup that there is nothing to serve.
+fn install<M: Mount, State>(mount: M, contract: HttpSurface) -> Result<Router<State>, ConfigError>
+where
+    State: Clone + Send + Sync + 'static,
+{
+    let Some(rpc) = contract
+        .routes()
+        .find(|route| route.kind() == RouteKind::Rpc)
+    else {
+        return Err(ConfigError::MissingRuntimeRoute);
+    };
+    let rpc_path = format!("{}{}", contract.prefix(), rpc.template());
+    let handler_path = rpc_path.clone();
+    let mount = Arc::new(mount);
+    let rpc_mount = Arc::clone(&mount);
+    let mut router = Router::new().route(
+        &rpc_path,
+        any(move |request: Request<Body>| {
+            let mount = Arc::clone(&rpc_mount);
+            let path = handler_path.clone();
+            async move {
+                let Some(surface) = mount.surface(request.uri().path(), &path) else {
+                    return GatewayError::MethodNotFound.response(None);
+                };
+                handle_rpc(request, rpc, &path, &surface).await
+            }
+        }),
+    );
+    if let Some(limits) = contract.streaming() {
+        // Sized here rather than on the gateway, because the bound arrives with
+        // the surface: a gateway built without streaming serves no byte
+        // resources and needs no table at all.
+        let tickets = Arc::new(crate::blob::Tickets::new(limits.max_blob_tickets()));
+        for route in contract.routes() {
+            let path = format!("{}{}", contract.prefix(), route.template());
+            let handler_path = path.clone();
+            let mount = Arc::clone(&mount);
+            let handler = match route.kind() {
+                RouteKind::Send => any(move |request: Request<Body>| {
+                    let mount = Arc::clone(&mount);
+                    let path = handler_path.clone();
+                    async move {
+                        let Some(surface) = mount.surface(request.uri().path(), &path) else {
+                            return GatewayError::MethodNotFound.response(None);
+                        };
+                        handle_send(request, route, &path, limits, &surface).await
+                    }
+                }),
+                RouteKind::Recv => any(move |request: Request<Body>| {
+                    let mount = Arc::clone(&mount);
+                    let path = handler_path.clone();
+                    async move {
+                        let Some(surface) = mount.surface(request.uri().path(), &path) else {
+                            return GatewayError::MethodNotFound.response(None);
+                        };
+                        handle_recv(request, route, &path, limits, &surface).await
+                    }
+                }),
+                // One template, two verbs, and therefore ONE registration:
+                // `Router::route` panics on a second `any` for a path it already
+                // serves. Each verb still carries its own `Route`, so the shared
+                // prelude's verb check stays an exact comparison rather than a
+                // set membership test.
+                RouteKind::BlobHead => continue,
+                RouteKind::BlobGet => {
+                    let Some(head) = contract
+                        .routes()
+                        .find(|route| route.kind() == RouteKind::BlobHead)
+                    else {
+                        return Err(ConfigError::MissingRuntimeRoute);
+                    };
+                    let head_path = handler_path.clone();
+                    let head_tickets = Arc::clone(&tickets);
+                    let head_mount = Arc::clone(&mount);
+                    let tickets = Arc::clone(&tickets);
+                    axum::routing::get(move |request: Request<Body>| {
+                        let mount = Arc::clone(&mount);
+                        let tickets = Arc::clone(&tickets);
+                        let path = handler_path.clone();
+                        async move {
+                            let Some(surface) = mount.surface(request.uri().path(), &path) else {
+                                return GatewayError::BlobNotFound.response(None);
+                            };
+                            handle_blob_bytes(request, route, &path, limits, &tickets, &surface)
+                                .await
+                        }
+                    })
+                    .head(move |request: Request<Body>| {
+                        let mount = Arc::clone(&head_mount);
+                        let tickets = Arc::clone(&head_tickets);
+                        let path = head_path.clone();
+                        async move {
+                            let Some(surface) = mount.surface(request.uri().path(), &path) else {
+                                return GatewayError::BlobNotFound.response(None);
+                            };
+                            handle_blob_bytes(request, head, &path, limits, &tickets, &surface)
+                                .await
+                        }
+                    })
+                }
+                RouteKind::BlobLookup => {
+                    let tickets = Arc::clone(&tickets);
+                    any(move |request: Request<Body>| {
+                        let mount = Arc::clone(&mount);
+                        let tickets = Arc::clone(&tickets);
+                        let path = handler_path.clone();
+                        async move {
+                            let Some(surface) = mount.surface(request.uri().path(), &path) else {
+                                return GatewayError::MethodNotFound.response(None);
+                            };
+                            handle_blob_lookup(request, route, &path, &tickets, &surface).await
+                        }
+                    })
+                }
+                // Installed above, or not implemented at this phase. The
+                // inventory lists only what a phase actually serves, so a kind
+                // arriving here is a route added without a handler.
+                _ => continue,
+            };
+            router = router.route(&path, handler);
+        }
+    }
+    Ok(router.fallback(|| async { GatewayError::MethodNotFound.response(None) }))
 }
 
 /// How a handler reaches the generated client, and everything else it needs
@@ -758,15 +431,88 @@ struct Surface<'a, A: Access> {
     methods: &'static [keylink::ExternalMethod],
     /// `None` on a singleton surface. The validated id on an actor one, passed
     /// to `Access` before the call is made.
-    actor: Option<&'a keylink::ActorId>,
-    invoke: &'a Invoke<'a>,
+    ///
+    /// Owned rather than borrowed, and the invocation is boxed for the same
+    /// reason: a `Surface` holding references to a caller's locals could only
+    /// be built inside the handler that uses it, which is what forced every
+    /// handler to be written twice. One allocation per request, against a QUIC
+    /// round trip, buys one copy of every handler.
+    actor: Option<keylink::ActorId>,
+    invoke: Box<Invoke<'a>>,
 }
 
-/// The one generated call a handler makes, already bound to its client.
-type Invoke<'a> = dyn Fn(&'static str, &[u8], keylink::ExternalCall) -> keylink::ExternalFuture<JsonCodec>
+/// The one generated call a handler makes, already bound to its client and,
+/// on an actor surface, to its actor.
+///
+/// The codec is an argument because the ceilings differ by route family: a
+/// `recv` bounds its declared value by the streaming metadata limit, an `rpc`
+/// by the JSON response limit.
+type Invoke<'a> = dyn Fn(&'static str, &[u8], keylink::ExternalCall, JsonCodec) -> keylink::ExternalFuture<JsonCodec>
     + Send
     + Sync
     + 'a;
+
+/// `POST /recv/{method}` and `POST /{actor}/recv/{method}`: bounded JSON in,
+/// raw bytes out.
+async fn handle_recv<A: Access>(
+    request: Request<Body>,
+    route: &'static Route,
+    route_path: &str,
+    limits: crate::StreamingLimits,
+    surface: &Surface<'_, A>,
+) -> Response<Body> {
+    let (parts, body) = request.into_parts();
+    let admitted = match surface
+        .admit(&parts, route, route_path, keylink::ExternalKind::Recv)
+        .await
+    {
+        Ok(admitted) => admitted,
+        Err(response) => return response,
+    };
+    let Admitted { method, .. } = admitted;
+    // A one-shot download has no reply to replay and no range to serve. Both
+    // are refused rather than ignored, and refused before the arguments are
+    // read, so a caller that asked for either is never charged for a body.
+    if parts.headers.get(IDEMPOTENCY_HEADER).is_some() {
+        return GatewayError::IdempotencyNotSupported.response(None);
+    }
+    if parts.headers.get(header::RANGE).is_some() || parts.headers.get(header::IF_RANGE).is_some() {
+        return GatewayError::RangeNotSupported.response(None);
+    }
+    if !is_media(&parts.headers, route.request_media()) {
+        return GatewayError::UnsupportedMediaType.response(None);
+    }
+    let arguments = match bounded_json(body, surface.limits.request.get()).await {
+        Ok(arguments) => arguments,
+        Err(error) => return error.response(None),
+    };
+    let (value, reader) = match (surface.invoke)(
+        method,
+        &arguments,
+        keylink::ExternalCall::Recv,
+        JsonCodec::new(limits.metadata_json_bytes()),
+    )
+    .await
+    {
+        Ok(keylink::ExternalOutput::Recv { value, body }) => (value, body),
+        Ok(_) => return GatewayError::UpstreamError.response(None),
+        Err(error) => return GatewayError::from_external(error).response(None),
+    };
+    // Everything refusable is refused here, while a status line can still say
+    // why. Past this point the only way to report a fault is to break the body,
+    // so a length the sender already declared is checked now.
+    if reader
+        .declared_len()
+        .is_some_and(|len| len > limits.max_download_bytes())
+    {
+        return GatewayError::ResponseStreamTooLarge.response(None);
+    }
+    let result = match crate::stream::result_header(&value, limits.metadata_json_bytes()) {
+        Ok(result) => result,
+        Err(_) => return GatewayError::ResponseTooLarge.response(None),
+    };
+    stream_response(reader, result, route, limits)
+}
 
 impl<A: Access> Surface<'_, A> {
     async fn admit(
@@ -785,10 +531,311 @@ impl<A: Access> Surface<'_, A> {
             route,
             route_path,
             kind,
-            self.actor,
+            self.actor.as_ref(),
         )
         .await
     }
+}
+
+/// `POST /send/{method}`: raw bytes in, bounded JSON out.
+///
+/// Singleton only, and that is a guarantee rather than an omission: a keyed
+/// service that declares `send` cannot be served as an actor at all, so no
+/// actor surface ever reaches this.
+async fn handle_send<A: Access>(
+    request: Request<Body>,
+    route: &'static Route,
+    route_path: &str,
+    limits: crate::StreamingLimits,
+    surface: &Surface<'_, A>,
+) -> Response<Body> {
+    let (parts, body) = request.into_parts();
+    let admitted = match surface
+        .admit(&parts, route, route_path, keylink::ExternalKind::Send)
+        .await
+    {
+        Ok(admitted) => admitted,
+        Err(response) => return response,
+    };
+    let Admitted { method, .. } = admitted;
+    if parts.headers.get(IDEMPOTENCY_HEADER).is_some() {
+        return GatewayError::IdempotencyNotSupported.response(None);
+    }
+    if parts.headers.get(header::RANGE).is_some() || parts.headers.get(header::IF_RANGE).is_some() {
+        return GatewayError::RangeNotSupported.response(None);
+    }
+    if !crate::stream::is_octet_stream(&parts.headers) {
+        return GatewayError::UnsupportedMediaType.response(None);
+    }
+    let arguments = match crate::stream::arguments(&parts.headers, limits.metadata_json_bytes()) {
+        Ok(arguments) => arguments,
+        Err(_) => return GatewayError::InvalidStreamMetadata.response(None),
+    };
+    let declared_len = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared_len.is_some_and(|len| len > limits.max_upload_bytes()) {
+        return GatewayError::RequestStreamTooLarge.response(None);
+    }
+    match (surface.invoke)(
+        method,
+        &arguments,
+        keylink::ExternalCall::Send {
+            body: crate::stream::upload_body(body, declared_len, limits.max_upload_bytes()),
+        },
+        JsonCodec::new(surface.limits.response.get()),
+    )
+    .await
+    {
+        Ok(keylink::ExternalOutput::Json(json)) => json_response(json, route),
+        Ok(_) => GatewayError::UpstreamError.response(None),
+        Err(error) => GatewayError::from_external(error).response(None),
+    }
+}
+
+/// `POST /blob/{method}`: invoke, record a ticket, and answer with the
+/// declared value and where the bytes live.
+///
+/// **Nothing is fetched.** A blob method hands back an address plus a
+/// grant, and the payload can be gigabytes; turning a lookup into a
+/// download would make the smallest call the most expensive one. The bytes
+/// are a separate resource, and this is the only place its identity is
+/// minted.
+///
+/// **The ticket is recorded last.** Insertion happens after the invocation
+/// AND after the declared value encodes, so a call that failed on the way
+/// out cannot leave a grant behind that no caller was ever told about.
+async fn handle_blob_lookup<A: Access>(
+    request: Request<Body>,
+    route: &'static Route,
+    route_path: &str,
+    tickets: &crate::blob::Tickets<keylink::BlobHandle>,
+    surface: &Surface<'_, A>,
+) -> Response<Body> {
+    let (parts, body) = request.into_parts();
+    let admitted = match surface
+        .admit(&parts, route, route_path, keylink::ExternalKind::Blob)
+        .await
+    {
+        Ok(admitted) => admitted,
+        Err(response) => return response,
+    };
+    let Admitted { method, principal } = admitted;
+    // `Range` and `If-Range` are IGNORED here, not refused. RFC 9110 §14.2:
+    // "A server MUST ignore a Range header field received with a request
+    // method ... for which range handling is not defined", and §13.1.5
+    // says the same of `If-Range` without a `Range`. A lookup addresses no
+    // bytes yet, so there is nothing for either field to name — and a
+    // download manager that attaches `Range` to every request would meet a
+    // hard refusal on a route the specification guarantees drops it.
+    //
+    // The plan's route table says to reject both. RFC 9110 says otherwise,
+    // and an HTTP gateway follows the RFC.
+    // DEVIATION from the plan's route table, which lists idempotency as
+    // optional here. `keylink::ExternalCall::Blob` carries no key slot, so
+    // Adding the slot is `keylink/src/external.rs`, which Task 6 owns, and
+    // the gateway has nowhere to put one until then.
+    //
+    // Anchored on this comment line as well as the check, because the same
+    // check appears in four handlers and nothing else tells them apart.
+    // Silently ignoring a caller's replay key is worse than refusing it.
+    if parts.headers.get(IDEMPOTENCY_HEADER).is_some() {
+        return GatewayError::IdempotencyNotSupported.response(None);
+    }
+    if !is_media(&parts.headers, route.request_media()) {
+        return GatewayError::UnsupportedMediaType.response(None);
+    }
+    let arguments = match bounded_json(body, surface.limits.request.get()).await {
+        Ok(arguments) => arguments,
+        Err(error) => return error.response(None),
+    };
+    let (value, handle) = match (surface.invoke)(
+        method,
+        &arguments,
+        keylink::ExternalCall::Blob,
+        JsonCodec::new(surface.limits.response.get()),
+    )
+    .await
+    {
+        Ok(keylink::ExternalOutput::Blob { value, handle }) => (value, handle),
+        Ok(_) => return GatewayError::UpstreamError.response(None),
+        Err(error) => return GatewayError::from_external(error).response(None),
+    };
+
+    let address = crate::blob::Address::of(handle.id());
+    // Prefix-preserving because it is built from the path the caller
+    // actually reached, not from the template. A gateway mounted under
+    // `/v1` answers `/v1/blob/Fetch/<address>` without being told it is.
+    let location = format!("{}/{}", parts.uri.path(), address.as_str());
+    let Ok(location) = http::HeaderValue::from_str(&location) else {
+        return GatewayError::UpstreamError.response(None);
+    };
+    let mut response = json_response(value, route);
+    tickets.insert(ticket_for(principal, method, address), handle);
+    response.headers_mut().insert(header::LOCATION, location);
+    response
+}
+
+/// `GET` and `HEAD` on `/blob/{method}/{id}`.
+///
+/// One function for both verbs, because every check up to the last one is
+/// identical and the plan's own rule is that HEAD answers the same
+/// metadata. What differs is one thing: HEAD never opens a byte reader,
+/// and never applies a range.
+///
+/// The order is the whole design, and each step is placed where it is for
+/// a reason a later reader will otherwise remove:
+///
+/// 1. `Access` runs before the ticket lookup, so a caller who may not
+///    reach this method learns nothing about which resources exist.
+/// 2. The path address is a lookup key and never a handle. A perfectly
+///    formed address nobody granted finds nothing.
+/// 3. Availability is rechecked on EVERY request. A ticket is a record
+///    that a grant was issued, not a promise the holder still serves it.
+/// 4. Conditions before ranges: a `304` is a complete answer and a range
+///    of a representation the caller already has is wasted work.
+/// 5. `If-Range` only after a valid range, because it modifies a range and
+///    has no meaning without one.
+async fn handle_blob_bytes<A: Access>(
+    request: Request<Body>,
+    route: &'static Route,
+    route_path: &str,
+    limits: crate::StreamingLimits,
+    tickets: &crate::blob::Tickets<keylink::BlobHandle>,
+    surface: &Surface<'_, A>,
+) -> Response<Body> {
+    let (parts, body) = request.into_parts();
+    let admitted = match surface
+        .admit(&parts, route, route_path, keylink::ExternalKind::Blob)
+        .await
+    {
+        Ok(admitted) => admitted,
+        Err(response) => return response,
+    };
+    let Admitted { method, principal } = admitted;
+
+    // Refused before anything is looked up, while a status line can still
+    // carry the reason. A byte route addresses existing content: there is
+    // nothing for a request body to say and nothing for a replay key to
+    // replay.
+    if parts.headers.get(IDEMPOTENCY_HEADER).is_some() {
+        return GatewayError::IdempotencyNotSupported.response(None);
+    }
+    if !is_empty_body(&parts.headers) {
+        return GatewayError::UnsupportedMediaType.response(None);
+    }
+
+    // A malformed address is the same `404` as a well formed one nobody
+    // holds. Telling them apart is an oracle for what a valid address even
+    // looks like.
+    let Some(address) = decode_blob_address(parts.uri.path(), route_path) else {
+        return GatewayError::BlobNotFound.response(None);
+    };
+    let ticket = ticket_for(principal, method, address.clone());
+    let Some((generation, handle)) = tickets.get(&ticket) else {
+        return GatewayError::BlobNotFound.response(None);
+    };
+
+    // Fresh, every time, and the clone above is what lets it happen with no
+    // lock held across the await.
+    let total = match handle.verified_len().await {
+        Ok(total) => total,
+        Err(keylink::Error::BlobRefused { .. }) => return gone(tickets, &ticket, generation),
+        // The same mapping `handle_rpc` uses. Collapsing every upstream
+        // failure to `502` here would tell a caller to stop retrying a
+        // holder that is merely unreachable.
+        Err(error) => return GatewayError::from_keylink(error).response(None),
+    };
+
+    let tag = crate::blob::etag(&address);
+    match crate::blob::none_match(&parts.headers, &tag) {
+        Ok(true) => return not_modified(&tag),
+        Ok(false) => {}
+        Err(()) => return GatewayError::InvalidRequest.response(None),
+    }
+
+    let wants_bytes = route.kind() == RouteKind::BlobGet;
+    let asked = if wants_bytes {
+        match crate::blob::range(&parts.headers, total) {
+            Ok(asked) => asked,
+            Err(crate::blob::RangeError::Malformed) => {
+                return GatewayError::InvalidRequest.response(None)
+            }
+            Err(crate::blob::RangeError::Unsatisfiable) => return unsatisfiable(&tag, total),
+        }
+    } else {
+        // HEAD ignores `Range` and `If-Range` entirely and answers for the
+        // full representation, which is what a client uses it to size.
+        crate::blob::Asked::Whole
+    };
+    let asked = match asked {
+        crate::blob::Asked::Part(_) if !crate::blob::if_range_allows(&parts.headers, &tag) => {
+            crate::blob::Asked::Whole
+        }
+        asked => asked,
+    };
+
+    drop(body);
+    let mut response = Response::builder().header(header::ETAG, tag.clone());
+    response = response
+        .header(header::ACCEPT_RANGES, "bytes")
+        // `private` because a ticket is bound to one principal, and
+        // `no-transform` because a proxy that recompresses content-addressed
+        // bytes breaks the address they are named by.
+        .header(header::CACHE_CONTROL, "private, no-transform");
+    if let Some(media) = route.response_media() {
+        // From the inventory, not a literal. Task 7 generates the OpenAPI
+        // document from the same `Route`, so a literal here would let the
+        // document describe a media type the gateway does not send.
+        response = response.header(header::CONTENT_TYPE, media);
+    }
+
+    let (status, span) = match &asked {
+        crate::blob::Asked::Whole => (route.success_status(), 0..total),
+        crate::blob::Asked::Part(range) => {
+            response = response.header(
+                header::CONTENT_RANGE,
+                format!("bytes {}-{}/{total}", range.start, range.end - 1),
+            );
+            (http::StatusCode::PARTIAL_CONTENT, range.clone())
+        }
+    };
+    let length = span.end - span.start;
+    response = response
+        .status(status)
+        .header(header::CONTENT_LENGTH, length.to_string());
+
+    // Checked for BOTH verbs, and above the HEAD return. RFC 9110 §9.3.2
+    // asks a server to answer a HEAD with the fields it would send for the
+    // GET, and a HEAD that says `200` for content the GET refuses is the
+    // one answer a client uses to decide whether to start.
+    if length > limits.max_download_bytes() {
+        return GatewayError::ResponseStreamTooLarge.response(None);
+    }
+    if !wants_bytes {
+        return response
+            .body(Body::empty())
+            .unwrap_or_else(|_| GatewayError::UpstreamError.response(None));
+    }
+    let reader = match if span == (0..total) {
+        handle.open().await
+    } else {
+        handle.open_range(span).await
+    } {
+        Ok(reader) => reader,
+        Err(keylink::Error::BlobRefused { .. }) => return gone(tickets, &ticket, generation),
+        Err(error) => return GatewayError::from_keylink(error).response(None),
+    };
+    response
+        // Bounded by the length this response just declared, not by the
+        // gateway ceiling. A one-byte range under an 8 MiB ceiling would
+        // otherwise run to 8 MiB before the adapter objected, and what
+        // stopped it would be hyper's framing — a broken connection rather
+        // than this adapter saying which limit was crossed.
+        .body(crate::stream::download_body(reader, length))
+        .unwrap_or_else(|_| GatewayError::UpstreamError.response(None))
 }
 
 /// `POST /rpc/{method}` and `POST /{actor}/rpc/{method}`: bounded JSON in,
@@ -819,7 +866,14 @@ async fn handle_rpc<A: Access>(
         Ok(body) => body,
         Err(error) => return error.response(None),
     };
-    match (surface.invoke)(method, &body, keylink::ExternalCall::Rpc { key }).await {
+    match (surface.invoke)(
+        method,
+        &body,
+        keylink::ExternalCall::Rpc { key },
+        JsonCodec::new(surface.limits.response.get()),
+    )
+    .await
+    {
         Ok(keylink::ExternalOutput::Json(json)) => json_response(json, route),
         Ok(_) => GatewayError::UpstreamError.response(None),
         Err(error) => GatewayError::from_external(error).response(None),
@@ -2698,16 +2752,56 @@ mod tests {
         )
     }
 
+    /// A client that hangs up drops the invocation the adapter owns.
+    ///
+    /// Two guards, and they answer different questions. The runtime half below
+    /// hangs up a raw socket mid-call and watches the generated client's future
+    /// get dropped. The source half above is what keeps that true: it reads
+    /// this file's own text and refuses the two shapes that would detach the
+    /// future from the request — storing it in a binding, and spawning it.
+    ///
+    /// A TEXT guard, and knowingly so: it can be defeated by a spelling it does
+    /// not enumerate. What it buys is that the two ways this has actually been
+    /// written wrong both fail here rather than in production.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK34`) by replacing
+    /// `keylink::ExternalCall::Blob,`
+    /// with `{ let call = keylink::ExternalCall::Blob; call },`, which is
+    /// behaviour-identical and puts a `;` between the invocation and its
+    /// `.await`. The await-shape assertion fired.
+    ///
+    /// And (row `HK35`) by replacing
+    /// `// One template, two verbs, and therefore ONE registration:`
+    /// with a comment naming `tokio::spawn(`. The spawn ban fired.
     #[tokio::test]
     async fn tcp_disconnect_drops_the_adapter_owned_invoke_future() {
         let source = include_str!("gateway.rs");
+        // Split on the test MODULE, not on the attribute: several test-only
+        // items sit above it, and splitting on `#[cfg(test)]` alone would cut
+        // production off at the first one and leave nothing to inspect.
         let production = source
-            .split("#[cfg(test)]")
+            .split("#[cfg(test)]\nmod tests")
             .next()
-            .expect("production precedes tests");
-        assert!(production.contains("let invocation = S::invoke("));
-        assert!(production.contains("match invocation.await"));
-        assert!(!production.contains("tokio::spawn(invocation)"));
+            .expect("production precedes the test module");
+        let calls = production.split("(surface.invoke)(").skip(1).count();
+        assert!(
+            calls > 0,
+            "the handlers reach the client through the surface"
+        );
+        for tail in production.split("(surface.invoke)(").skip(1) {
+            // Awaited in the same expression it is made in. A future that is
+            // bound to a name can be detached later; one that is awaited where
+            // it is built is owned by the request, and a client that hangs up
+            // drops it.
+            let (arguments, _) = tail
+                .split_once(".await")
+                .expect("an invocation is awaited, not stored");
+            assert!(
+                !arguments.contains(';'),
+                "an invocation was made without being awaited in the same expression"
+            );
+        }
+        assert!(!production.contains("tokio::spawn("));
 
         let server_node = local_node().await;
         let client_node = local_node().await;

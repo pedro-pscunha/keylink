@@ -2159,7 +2159,7 @@ ANCHORS = [
     ("HJ13", "keylink-http/tests/streaming.rs", "keylink-http/src/stream.rs",
      "                    if observed > limit {"),
     ("HJ14", "keylink-http/tests/streaming.rs", "keylink-http/src/gateway.rs",
-     "            .is_some_and(|len| len > limits.max_download_bytes())"),
+     "        .is_some_and(|len| len > limits.max_download_bytes())"),
     ("HJ11", "keylink-http/src/gateway.rs", "keylink/src/body.rs",
      "                tokio::io::copy_buf(&mut reader, stream)\n"
      "                    .await\n"
@@ -2207,11 +2207,11 @@ ANCHORS = [
      "        actor: None,\n"
      "        id,"),
     ("HK17", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
-     "            Ok(true) => return not_modified(&tag),"),
+     "        Ok(true) => return not_modified(&tag),"),
     ("HK18", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
      "        Some(value) => value.to_str().is_ok_and(|value| value.trim() == \"0\"),"),
     ("HK19", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
-     "        let wants_bytes = route.kind() == RouteKind::BlobGet;"),
+     "    let wants_bytes = route.kind() == RouteKind::BlobGet;"),
     ("HK20", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
      "        Err(AccessError::Forbidden) => Err(GatewayError::Forbidden.response(None)),"),
     ("HK23", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
@@ -2226,9 +2226,15 @@ ANCHORS = [
      "            @actor [ $( $actor )* { [ $( #[$cfg] )* ] recv $method ( $( $arg : $ty ),* ) -> $ret } ]"),
     ("HK27", "keylink-http/src/contract.rs", "keylink-http/src/contract.rs",
      "            route.addressing == self.addressing && (!route.streaming || self.streaming.is_some())"),
+    ("HK33", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
+     "                RouteKind::Recv => any(move |request: Request<Body>| {"),
+    ("HK34", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
+     "        keylink::ExternalCall::Blob,"),
+    ("HK35", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
+     "                // One template, two verbs, and therefore ONE registration:"),
     ("HK25", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
-     "        // Silently ignoring a caller's replay key is worse than refusing it.\n"
-     "        if parts.headers.get(IDEMPOTENCY_HEADER).is_some() {"),
+     "    // Silently ignoring a caller's replay key is worse than refusing it.\n"
+     "    if parts.headers.get(IDEMPOTENCY_HEADER).is_some() {"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -3915,7 +3921,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 313
+RECORD_BLOCKS = 315
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a
