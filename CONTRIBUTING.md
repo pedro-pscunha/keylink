@@ -444,7 +444,7 @@ in place. RFC-07 §13, §15.1 and §16 are three worked examples.
 
 Two smokes, and they are not redundant. `mise run http-smoke` drives the
 singleton `rpc` surface — the small example, the fast check. `mise run
-http-smoke-full` drives every route the gateway serves against a second example
+http-smoke-full` drives every route in the crate table against a second example
 that mounts a singleton surface, a keyed surface and the two document endpoints
 in one process: streaming both ways, blob bytes, ranges, conditional GETs,
 encoded actor ids, and both document media types. Both run in `gate`.

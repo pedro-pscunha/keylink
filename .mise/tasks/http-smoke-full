@@ -148,7 +148,21 @@ check "actor id with an encoded slash" 200 "$(status_of "${allow[@]}" "${json[@]
 check "actor id with an encoded slash body" '"bay/2"' "$(<"$scratch/body")"
 check "actor recv" 200 "$(status_of "${allow[@]}" "${json[@]}" --data-binary "@$scratch/fetch.json" "$base/bays/bay-1/recv/Fetch")"
 check "actor recv body" "bay-1" "$(<"$scratch/body")"
+# The keyed blob LOOKUP and the keyed blob BYTES are two routes, and only the
+# first was driven here — the script minted a `Location` and never followed it.
+# That left one of the nine templates in the crate's own route table
+# unexercised while this file printed "every route answered as documented".
+keyed_location=$(curl --silent --output /dev/null --dump-header "$scratch/keyed.txt" \
+    "${allow[@]}" "${json[@]}" --data-binary "@$scratch/sheet.json" \
+    "$base/bays/bay-1/blob/Datasheet"; grep -i '^location:' "$scratch/keyed.txt" | tr -d '\r' | cut -d' ' -f2 || true)
 check "actor blob lookup" 201 "$(status_of "${allow[@]}" "${json[@]}" --data-binary "@$scratch/sheet.json" "$base/bays/bay-1/blob/Datasheet")"
+check "actor blob mints a Location" 0 "$([[ -n "$keyed_location" ]] && echo 0 || echo 1)"
+check "actor blob GET" 200 "$(status_of "${allow[@]}" "$base$keyed_location")"
+check "actor blob GET body" "0123456789abcdefghijklmnopqrstuvwxyz" "$(<"$scratch/body")"
+check "actor blob GET range" 206 "$(status_of "${allow[@]}" --header 'Range: bytes=0-3' "$base$keyed_location")"
+check "actor blob HEAD" 200 "$(curl --silent --head --output /dev/null --write-out '%{http_code}' "${allow[@]}" "$base$keyed_location")"
+# A grant minted under one actor is not a grant under another.
+check "actor blob is bound to its actor" 404 "$(status_of "${allow[@]}" "$base${keyed_location/\/bay-1\//\/bay%2F2\/}")"
 check "actor missing" 404 "$(status_of "${allow[@]}" "${json[@]}" --data-binary "@$scratch/empty.json" "$base/bays/absent/rpc/Whoami")"
 check "actor malformed id" 404 "$(status_of "${allow[@]}" "${json[@]}" --data-binary "@$scratch/empty.json" "$base/bays/a%2/rpc/Whoami")"
 check "actor wrong verb beats a bad id" 405 "$(status_of "${allow[@]}" --request GET "$base/bays/a%2/rpc/Whoami")"
@@ -191,4 +205,4 @@ if (( failures > 0 )); then
     exit 1
 fi
 passed=true
-printf '\nevery route answered as documented\n'
+printf '\nevery route in the crate table answered as documented\n'

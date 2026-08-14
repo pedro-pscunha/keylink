@@ -50,10 +50,16 @@
 //!
 //! [`JsonLimits`] bounds request and response JSON. [`StreamingLimits`] bounds
 //! metadata JSON, uploads, downloads and the blob ticket table. Every one is a
-//! positive inclusive ceiling with no default — a limit nobody chose is a limit
-//! nobody can reason about. Crossing one is `request_too_large`,
+//! positive inclusive ceiling. Crossing one is `request_too_large`,
 //! `request_stream_too_large`, `response_too_large` or
 //! `response_stream_too_large`, never a truncated body.
+//!
+//! The two differ on defaults, and the difference is deliberate.
+//! [`StreamingLimits`] has none — streaming is opt-in, and a byte ceiling
+//! nobody chose is one nobody can reason about. [`JsonLimits`] DOES default,
+//! to 64 KiB each way, because the singleton `rpc` surface predates the
+//! builder and a gateway built without `.limits(..)` still has to bound
+//! something. Choose them anyway: a default is a decision somebody else made.
 //!
 //! The ticket bound is GLOBAL, not per principal. One caller issuing
 //! `max_blob_tickets` lookups evicts every other caller's outstanding grants,
