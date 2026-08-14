@@ -315,8 +315,8 @@ pub use error::{
     BlobFault, ConfigError, Error, Failure, Queued, Result, TellError, Transmitted, Transport,
 };
 pub use external::{
-    ExternalCall, ExternalError, ExternalFuture, ExternalKind, ExternalMethod, ExternalOutput,
-    ExternalService, ServiceCodec,
+    ExternalActorService, ExternalCall, ExternalError, ExternalFuture, ExternalKind,
+    ExternalMethod, ExternalOutput, ExternalService, ServiceCodec,
 };
 pub use idempotency::{
     Attaching, Idempotency, IdempotencyRefusal, KeyState, Keyable, Limits, Records, MAX_ATTACH,

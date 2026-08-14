@@ -153,6 +153,60 @@ pub enum ExternalOutput<O> {
     },
 }
 
+/// Generated conversion seam for one KEYED service, addressed per actor.
+///
+/// A second trait rather than a variant of [`ExternalService`], and the
+/// separation is the point: the two take different clients — a singleton
+/// `Client` against a `RegistryClient` — so a gateway configured for one
+/// address space cannot be handed the other's client by mistake.
+///
+/// **Only the generated `External` marker implements it.** The registry client
+/// itself does not, which is what stops an adapter reaching past the generated
+/// method it is supposed to call:
+///
+/// ```compile_fail
+/// use keylink::ExternalActorService;
+/// keylink::service! { service Ledger; rpc Count(value: u64) -> u64; }
+/// fn require<T: ExternalActorService>() {}
+/// require::<ledger::RegistryClient>();
+/// ```
+///
+/// # `send` and `tell` are absent, and that is not an oversight
+///
+/// [`METHODS`](Self::METHODS) lists `rpc`, `recv` and `blob` only. A keyed
+/// `send` would stream a body to an actor that four separate refusals can
+/// reject after the bytes are already on the wire — a malformed id, an id
+/// nothing is mounted under, a registry at capacity, and an expired queue
+/// budget — and a keyed `tell` has no reply to carry any of them. Neither has
+/// a generated `ActorRef` method, so there is nothing here to call even if the
+/// inventory named them.
+pub trait ExternalActorService: Send + Sync + 'static {
+    /// The service name declared in `service!`.
+    const SERVICE: &'static str;
+    /// Enabled declarations a keyed actor can serve, in declaration order. A
+    /// strict subset of [`ExternalService::METHODS`], folded from the same
+    /// declaration list rather than written a second time.
+    const METHODS: &'static [ExternalMethod];
+    /// The generated connected registry client.
+    type Client: Clone + Send + Sync + 'static;
+
+    /// Decode arguments, invoke the exact generated `at(actor)` method, and
+    /// encode its return value.
+    ///
+    /// The actor is addressed through the generated `RegistryClient::at`, never
+    /// by constructing an `Addressed<Request>` or reaching through a private
+    /// field — an adapter that built the envelope itself would be a second
+    /// implementation of the routing rules, free to disagree with the first.
+    fn invoke_at<C: ServiceCodec>(
+        client: &Self::Client,
+        actor: &crate::ActorId,
+        method: &str,
+        body: &[u8],
+        call: ExternalCall,
+        codec: C,
+    ) -> ExternalFuture<C>;
+}
+
 /// Generated conversion seam for one singleton service.
 ///
 /// Addressed actor requests do not acquire the singleton external surface:

@@ -270,6 +270,73 @@ mod tests {
         async fn ignored_transport(&self, _cx: &Context, _value: u64) {}
     }
 
+    /// A keyed actor serves `rpc`, `recv` and `blob`, and no more than those.
+    ///
+    /// The actor inventory is folded from the SAME declaration list as the
+    /// singleton one, so the two cannot drift by a method — only by a kind,
+    /// deliberately. `send` is absent because a keyed upload would stream a
+    /// body to an actor that four separate refusals can reject after the bytes
+    /// are already on the wire, and `tell` is absent from both because it has
+    /// no reply to carry any of them.
+    ///
+    /// The control comes first: the singleton inventory must actually contain a
+    /// `send`, or the assertion below is satisfied by an empty list.
+    ///
+    /// **NO ANCHOR, because the compiler is the guard.** Letting a `send` into
+    /// the actor accumulator in `keylink/src/macros.rs` does not produce a
+    /// failing assertion — it produces a compile error, twice:
+    ///
+    /// ```text
+    /// error[E0599]: no method named `upload` found for struct `transport::ActorRef<'a>`
+    /// error[E0599]: no method named `upload` found for struct `cancellation::ActorRef<'a>`
+    /// ```
+    ///
+    /// `break-once.sh` reports that as `── exit=101 ── selected=?`, and the
+    /// `?` is the tell: nothing ran. A `send` cannot reach the actor inventory
+    /// because there is no generated `ActorRef` method for it to call, so the
+    /// exclusion is a property of the generated code rather than of this
+    /// assertion. What this row adds is the CONTROL — that the singleton list
+    /// really does carry a `send`, so the comparison is not satisfied by two
+    /// empty lists — and the exact contents of both.
+    #[test]
+    fn the_actor_inventory_is_the_singleton_one_without_send() {
+        use keylink::{ExternalActorService, ExternalKind, ExternalService};
+
+        let singleton: Vec<_> = <transport::External as ExternalService>::METHODS
+            .iter()
+            .map(|method| (method.name(), method.kind()))
+            .collect();
+        let actor: Vec<_> = <transport::External as ExternalActorService>::METHODS
+            .iter()
+            .map(|method| (method.name(), method.kind()))
+            .collect();
+
+        assert_eq!(
+            singleton,
+            [
+                ("Sum", ExternalKind::Rpc),
+                ("Upload", ExternalKind::Send),
+                ("Download", ExternalKind::Recv),
+                ("Asset", ExternalKind::Blob),
+            ],
+            "control: the singleton surface really does carry a `send`"
+        );
+        assert_eq!(
+            actor,
+            [
+                ("Sum", ExternalKind::Rpc),
+                ("Download", ExternalKind::Recv),
+                ("Asset", ExternalKind::Blob),
+            ],
+            "and the actor surface is that list with the `send` removed"
+        );
+        assert_eq!(
+            <transport::External as ExternalActorService>::SERVICE,
+            <transport::External as ExternalService>::SERVICE,
+            "one service, two address spaces"
+        );
+    }
+
     #[tokio::test]
     async fn generated_external_invocation_uses_exact_kind_and_output() {
         let server_node = local_node().await;
