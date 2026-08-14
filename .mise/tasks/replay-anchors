@@ -272,6 +272,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = pathlib.Path(
     subprocess.run(
@@ -717,11 +718,25 @@ def selftest() -> int:
         check("the killed shell ran its restore trap", trap == "RESTORED",
               f"the trap left {trap!r}: a break killed this way would stay in the file")
         child = int(pidfile.read_text().strip()) if pidfile.exists() else 0
-        try:
-            os.kill(child, 0)
-            alive = True
-        except (ProcessLookupError, PermissionError):
-            alive = False
+        # POLLED, not sampled once. `SIGKILL` to a group is delivered
+        # synchronously and reaped ASYNCHRONOUSLY, so for a short window after
+        # the kill the pid still answers `kill(pid, 0)` — the process is gone
+        # and its slot is not. Sampling once turned that window into a gate
+        # failure: this guard failed inside a full `pre-push` run and passed on
+        # a re-run seconds later, which is the shape that trains people to
+        # re-run a gate instead of reading it.
+        #
+        # Two seconds is far longer than a reap and far shorter than the 120 s
+        # the child would sleep for if the kill had genuinely missed it, so the
+        # guard still fails loudly for the fault it is about.
+        alive = True
+        for _ in range(200):
+            try:
+                os.kill(child, 0)
+            except (ProcessLookupError, PermissionError):
+                alive = False
+                break
+            time.sleep(0.01)
         check("the signal reached the shell's child, not only the shell", not alive,
               f"pid {child} is still running, so a killed row would leave the runner "
               "behind")
