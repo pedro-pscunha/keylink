@@ -2140,21 +2140,22 @@ impl Ledger {
         // It reports nothing on purpose, and its own doc says why.
         self.housekeep().await;
 
-        let claim = self.claim(peer, key.clone());
-        if !matches!(claim, Claim::Fresh(_)) {
+        // Moved rather than cloned: every arm but `Fresh` drops the key, and the
+        // `Fresh` arm's guard is holding it, so the write below borrows it back
+        // instead of being handed a second copy.
+        let claim = self.claim(peer, key);
+        let Claim::Fresh(guard) = claim else {
             return claim;
-        }
-        if let Err(refusal) = self.write_claim(peer, &key).await {
+        };
+        if let Err(refusal) = self.write_claim(peer, &guard.key).await {
             // Nothing ran, so the key goes back and the caller's retry is a
             // first attempt. If the write in fact reached the disk and reported
             // otherwise, that retry reads `Interrupted` instead — refused rather
             // than run, which is the direction to be wrong in.
-            if let Claim::Fresh(guard) = claim {
-                guard.give_back();
-            }
+            guard.give_back();
             return Claim::Refused(refusal);
         }
-        claim
+        Claim::Fresh(guard)
     }
 
     /// Record that this key is taken, before the handler is entered.
@@ -2402,24 +2403,34 @@ impl Ledger {
         let Some(bucket) = inner.peers.get_mut(&peer) else {
             return;
         };
-        while let Some(key) = bucket.held.front().cloned() {
-            let Some(entry) = bucket.slots.get_mut(&key) else {
-                bucket.held.pop_front();
-                inner.held = inner.held.saturating_sub(1);
+        loop {
+            // Peeked by reference. The common case is a front record still
+            // inside its budget, and an owned key is needed only to move one
+            // between the queues — so cloning to reach the `break` below spent
+            // an allocation on every claim that expired nothing at all.
+            let freed = match bucket.held.front() {
+                None => break,
+                Some(key) => match bucket.slots.get(key) {
+                    None => None,
+                    Some(entry) if now.saturating_duration_since(entry.at) < ttl => break,
+                    Some(entry) => Some(entry.slot.held_bytes()),
+                },
+            };
+            let Some(key) = bucket.held.pop_front() else {
+                break;
+            };
+            inner.held = inner.held.saturating_sub(1);
+            let Some(freed) = freed else {
                 continue;
             };
-            if now.saturating_duration_since(entry.at) < ttl {
-                break;
+            if let Some(entry) = bucket.slots.get_mut(&key) {
+                entry.slot = Slot::Forgotten;
             }
-            let freed = entry.slot.held_bytes();
-            entry.slot = Slot::Forgotten;
-            bucket.held.pop_front();
             if durable {
                 downgraded.push(key.clone());
             }
             bucket.spent.push_back(key);
             inner.bytes = inner.bytes.saturating_sub(freed);
-            inner.held = inner.held.saturating_sub(1);
             inner.spent += 1;
         }
         // One call for the whole loop: it moves keys between two queues of the
