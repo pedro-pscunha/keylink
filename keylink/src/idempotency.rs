@@ -2109,16 +2109,17 @@ impl Ledger {
             let Some(store) = self.records.store() else {
                 return;
             };
-            loop {
-                let next = self.lock().pending.pop();
-                let Some((peer, key)) = next else {
-                    break;
-                };
-                if store.erase(peer, &key).await.is_err() {
-                    // Put it back and stop. A store that refuses one removal
-                    // refuses the next, and retrying them all here would turn
-                    // one broken disk into an unbounded loop on the call path.
-                    self.lock().pending.push((peer, key));
+            let batch = std::mem::take(&mut self.lock().pending);
+            if !batch.is_empty() {
+                let left = store
+                    .reconcile(batch, |peer, key| self.reconcile_for(peer, key))
+                    .await;
+                if !left.is_empty() {
+                    // Back in the queue for the next claim. A store that
+                    // refuses one write refuses the next, so retrying the rest
+                    // here would turn one broken disk into a loop on the call
+                    // path.
+                    self.lock().pending.extend(left);
                     return;
                 }
             }
@@ -2126,7 +2127,33 @@ impl Ledger {
                 let guard = self.lock();
                 guard.held + guard.spent + guard.running
             };
-            let _ = store.compact_if_worthwhile(live).await;
+            store.compact_if_worthwhile(live).await;
+        }
+    }
+
+    /// What the disk should be told about `key`, read off memory right now.
+    ///
+    /// Called by [`DurableRecords::reconcile`](crate::durable::DurableRecords::reconcile)
+    /// while that store's lock is held, which is what orders it against a
+    /// concurrent claim. **It reads the current state rather than replaying the
+    /// operation that queued the key**, so a key that was evicted and then
+    /// claimed again is left to its own claim instead of being erased out from
+    /// under a running handler.
+    #[cfg(feature = "persist")]
+    fn reconcile_for(&self, peer: EndpointId, key: &IdempotencyKey) -> crate::durable::Reconcile {
+        use crate::durable::Reconcile;
+
+        let guard = self.lock();
+        match guard
+            .peers
+            .get(&peer)
+            .and_then(|bucket| bucket.slots.get(key))
+        {
+            None => Reconcile::Erase,
+            Some(entry) => match &entry.slot {
+                Slot::Running(_) => Reconcile::Untouched,
+                settled => Reconcile::Write(crate::durable::encode_slot(settled)),
+            },
         }
     }
 
@@ -2213,6 +2240,14 @@ impl Ledger {
         if empty {
             inner.peers.remove(&peer);
         }
+        // The key is vacant again, and a store still holding its claim would
+        // answer `Interrupted` to a retry of a call that provably never ran —
+        // inverting this module's own header, which says a refusal before
+        // dispatch leaves the key claimable. Queued rather than written,
+        // because this runs under the lock.
+        if self.records.stores_durably() {
+            inner.pending.push((peer, key.clone()));
+        }
     }
 
     /// Age one peer's settled records out, oldest first.
@@ -2226,6 +2261,10 @@ impl Ledger {
     /// reply is gone; the promise is not.
     fn expire(&self, inner: &mut Inner, peer: EndpointId, now: Instant) {
         let ttl = self.limits.ttl;
+        let durable = self.records.stores_durably();
+        // Collected rather than pushed inside the loop, because `inner.pending`
+        // and the bucket below are two fields of one `&mut Inner`.
+        let mut downgraded = Vec::new();
         let Some(bucket) = inner.peers.get_mut(&peer) else {
             return;
         };
@@ -2241,11 +2280,22 @@ impl Ledger {
             let freed = entry.slot.held_bytes();
             entry.slot = Slot::Forgotten;
             bucket.held.pop_front();
+            if durable {
+                downgraded.push(key.clone());
+            }
             bucket.spent.push_back(key);
             inner.bytes = inner.bytes.saturating_sub(freed);
             inner.held = inner.held.saturating_sub(1);
             inner.spent += 1;
         }
+        // A tombstone on the disk is one byte; the reply it replaced is up to
+        // `frame_bytes`. Without this the store would keep every expired reply
+        // until its key left the tombstone pool, so `pool_bytes` would bind
+        // memory and nothing else — and a restart would read `Done` for a key
+        // that had already read `Forgotten`.
+        inner
+            .pending
+            .extend(downgraded.into_iter().map(|key| (peer, key)));
     }
 
     /// Bring both pools back inside their bounds.
@@ -2278,7 +2328,7 @@ impl Ledger {
                 Some(entry) => {
                     let freed = entry.slot.held_bytes();
                     entry.slot = Slot::Forgotten;
-                    bucket.spent.push_back(key);
+                    bucket.spent.push_back(key.clone());
                     freed
                 }
                 None => 0,
@@ -2286,6 +2336,11 @@ impl Ledger {
             inner.bytes = inner.bytes.saturating_sub(freed);
             inner.held = inner.held.saturating_sub(1);
             inner.spent += 1;
+            // The reply leaves the disk when it leaves memory, for the reason
+            // `expire` gives: otherwise `pool_bytes` bounds one tier of two.
+            if self.records.stores_durably() {
+                inner.pending.push((peer, key));
+            }
         }
 
         while inner.spent > self.limits.tombstones.get() {
@@ -2497,6 +2552,26 @@ impl Guard {
     pub(crate) fn give_back(mut self) {
         self.settled = true;
         self.ledger.release(self.peer, &self.key);
+    }
+
+    /// Give the key back, and wait for the store to agree before returning.
+    ///
+    /// The caller is about to be told that nothing ran. A queued removal is not
+    /// enough here, and that is not a preference: a refused call is often the
+    /// last thing a process does, and a removal drained by "the next claim" is
+    /// a removal that never happens. The disk would keep the claim, and the
+    /// retry this refusal invites would read
+    /// [`Interrupted`](KeyState::Interrupted) forever.
+    ///
+    /// [`Drop`] still cannot do this, so a guard released by an **aborted**
+    /// task leaves its removal queued and its key reading `Interrupted` until
+    /// the next claim drains it. That is the conservative direction — refused
+    /// rather than run twice — and it is the residue of `Drop` not being able
+    /// to await, not a second policy.
+    pub(crate) async fn give_back_durably(mut self) {
+        self.settled = true;
+        self.ledger.release(self.peer, &self.key);
+        self.ledger.housekeep().await;
     }
 }
 

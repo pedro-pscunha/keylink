@@ -705,11 +705,17 @@ where
     // nothing about ids. Neither could record this on its own, which is why the
     // reply carries the address back here through `Granting` rather than the
     // store being threaded down into dispatch.
-    if let (Some(blobs), Outcome::Ok(response)) = (&blobs, &outcome) {
-        if let Some(id) = response.granted() {
-            blobs.grant(&admitted, id);
-        }
-    }
+    //
+    // **Read here and recorded after the ledger settles**, which is a
+    // consequence of a durable ledger being able to refuse. A grant written
+    // above and a record refused below would leave the far side holding a live
+    // grant for an address this reply never carried — reachable only since
+    // `record` gained a failure, and closed by moving the write rather than by
+    // narrowing it.
+    let granting = match (&blobs, &outcome) {
+        (Some(_), Outcome::Ok(response)) => response.granted(),
+        _ => None,
+    };
 
     let frame = wire::encode_header(
         body.declared_len(),
@@ -740,12 +746,23 @@ where
                     return refuse::<Resp>(&mut send, refusal).await;
                 }
             }
-            // A layer said no without calling through; or the work was entered,
-            // or merely reached a mailbox, and produced nothing. Dropping the
-            // guard is what settles those, and it settles them the same way
-            // whether this task returned or was aborted.
-            Reached::NotDispatched | Reached::Dispatched => drop(guard),
+            // A layer said no WITHOUT calling through. Nothing ran and nothing
+            // is owed, so the key goes back — and on a durable service the
+            // store has to hear that before this refusal reaches the caller,
+            // for the same reason a settle does. Queuing it would be enough
+            // only if another call followed, and a refused call is often the
+            // last thing a process does.
+            Reached::NotDispatched => guard.give_back_durably().await,
+            // The work was entered, or merely reached a mailbox, and produced
+            // nothing. Dropping the guard settles that, and settles it the same
+            // way whether this task returned or was aborted. The disk already
+            // holds the claim, and a claim is what recovers as `Interrupted`,
+            // so the two agree with no write at all.
+            Reached::Dispatched => drop(guard),
         }
+    }
+    if let (Some(blobs), Some(id)) = (&blobs, granting) {
+        blobs.grant(&admitted, id);
     }
     wire::write_frame(&mut send, frame).await?;
     body.write_to(&mut send).await?;

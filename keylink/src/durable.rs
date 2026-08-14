@@ -27,6 +27,26 @@
 //! That is two `fsync`s a memory ledger does not pay, which is why
 //! [`Records::Durable`](crate::Records) is opt-in and
 //! [`Records::Memory`](crate::Records) is still the default.
+//!
+//! **And they are taken under one lock per service, so keyed calls do not
+//! overlap.** Two `fsync`s is the latency of one call on an idle service; it is
+//! also the whole service's keyed throughput, because the store is one lane. At
+//! the 7.6 ms figure `keylink/examples/durable_ledger.rs` measures for a
+//! comparable store, a durable service serves keyed calls in the low hundreds
+//! per second whatever its connection count. An operator sizing a desk needs
+//! that sentence and not only the per-call one.
+//!
+//! # Three ways a key leaves memory, and the disk is told about all of them
+//!
+//! A settle writes its own record. Everything else — a released claim, a reply
+//! downgraded to a tombstone, a tombstone evicted — happens under the ledger's
+//! lock, where nothing can await. Those keys are queued on `Inner::pending` and
+//! reconciled by the next claim, which is the next code that can.
+//!
+//! Reconciling reads what **memory** now says and makes the disk agree, rather
+//! than replaying the operation that queued it. That is what makes the queue
+//! safe against a key being re-claimed while its removal is still pending: the
+//! new claim is a [`Slot::Running`], and a running slot is left alone.
 
 use std::fmt;
 use std::future::Future;
@@ -36,7 +56,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use iroh::EndpointId;
-use keylink_persist::{Entries, Held, RecordKey, StateId};
+use keylink_persist::{Entries, EntryKey, Held, StateId};
 use tokio::sync::Mutex;
 
 use crate::idempotency::Slot;
@@ -61,7 +81,7 @@ const TAG_FORGOTTEN: u8 = 4;
 /// be a key that cannot be stored and therefore a call that cannot be made
 /// durable — and the constants are known now.
 const _: () = assert!(
-    PEER_LEN + crate::MAX_KEY_LEN <= RecordKey::MAX_LEN,
+    PEER_LEN + crate::MAX_KEY_LEN <= EntryKey::MAX_LEN,
     "a peer id plus a bounded idempotency key must fit in one record key"
 );
 
@@ -69,8 +89,13 @@ const _: () = assert!(
 ///
 /// The log is rewritten once the entries written since the last rewrite exceed
 /// the live count plus this, which bounds the file at roughly twice what it
-/// holds and makes the rewrite's cost amortized: each rewrite is paid for by at
-/// least as many writes as it copies.
+/// holds and makes the rewrite amortized: each one is paid for by at least as
+/// many writes as it copies.
+///
+/// That holds only while the live count the ledger reports is the store's live
+/// count too, which is what `reconcile` is for. A key dropped from memory
+/// without the disk being told would make this bound a fiction, and the file
+/// would grow while the threshold stayed small.
 ///
 /// The floor exists so that a ledger holding almost nothing does not rewrite
 /// itself on every second call.
@@ -129,16 +154,16 @@ pub enum RecordFault {
 // ─────────────────────────────────────────────────────────────────── the codec
 
 /// The address one key is stored under.
-fn encode_key(peer: EndpointId, key: &IdempotencyKey) -> Result<RecordKey, RecordFault> {
+fn encode_key(peer: EndpointId, key: &IdempotencyKey) -> Result<EntryKey, RecordFault> {
     let key = key.as_str().as_bytes();
     let mut bytes = Vec::with_capacity(PEER_LEN + key.len());
     bytes.extend_from_slice(peer.as_bytes());
     bytes.extend_from_slice(key);
-    RecordKey::new(bytes).map_err(|_| RecordFault::KeyRefused)
+    EntryKey::new(bytes).map_err(|_| RecordFault::KeyRefused)
 }
 
 /// The pair a stored address names.
-fn decode_key(stored: &RecordKey) -> Result<(EndpointId, IdempotencyKey), RecordFault> {
+fn decode_key(stored: &EntryKey) -> Result<(EndpointId, IdempotencyKey), RecordFault> {
     let bytes = stored.as_bytes();
     if bytes.len() <= PEER_LEN {
         return Err(RecordFault::KeyTooShort { len: bytes.len() });
@@ -156,7 +181,7 @@ fn decode_key(stored: &RecordKey) -> Result<(EndpointId, IdempotencyKey), Record
 /// [`Slot::Running`] stores as [`TAG_CLAIMED`], which is the whole of how an
 /// interrupted call is recovered: the claim is written before the handler runs,
 /// so a process that dies mid-call leaves exactly this.
-fn encode_slot(slot: &Slot) -> Vec<u8> {
+pub(crate) fn encode_slot(slot: &Slot) -> Vec<u8> {
     match slot {
         Slot::Running(_) => vec![TAG_CLAIMED],
         Slot::Done(frame) => {
@@ -202,17 +227,17 @@ type Writing<'a> = Pin<Box<dyn Future<Output = keylink_persist::Result<()>> + Se
 /// wanted one. The boxed future costs one allocation per durable write, beside
 /// an `fsync`.
 trait ErasedStore: Send {
-    fn put<'a>(&'a mut self, key: &'a RecordKey, bytes: &'a [u8]) -> Writing<'a>;
-    fn remove<'a>(&'a mut self, key: &'a RecordKey) -> Writing<'a>;
+    fn put<'a>(&'a mut self, key: &'a EntryKey, bytes: &'a [u8]) -> Writing<'a>;
+    fn remove<'a>(&'a mut self, key: &'a EntryKey) -> Writing<'a>;
     fn compact(&mut self) -> Writing<'_>;
 }
 
 impl<H: Held> ErasedStore for H {
-    fn put<'a>(&'a mut self, key: &'a RecordKey, bytes: &'a [u8]) -> Writing<'a> {
+    fn put<'a>(&'a mut self, key: &'a EntryKey, bytes: &'a [u8]) -> Writing<'a> {
         Box::pin(Held::put(self, key, bytes))
     }
 
-    fn remove<'a>(&'a mut self, key: &'a RecordKey) -> Writing<'a> {
+    fn remove<'a>(&'a mut self, key: &'a EntryKey) -> Writing<'a> {
         Box::pin(Held::remove(self, key))
     }
 
@@ -347,36 +372,88 @@ impl DurableRecords {
         Ok(())
     }
 
-    /// Take one key off the disk.
-    pub(crate) async fn erase(
+    /// Make the disk agree with memory about a batch of keys, and return the
+    /// ones it could not.
+    ///
+    /// `current` is asked, key by key, what memory says **now**. It is called
+    /// while this store's lock is held and takes the ledger's own lock, which is
+    /// the ordering that makes the whole thing safe: every disk write for a key
+    /// goes through this lock, so a claim that beats the check to memory cannot
+    /// also beat this erase to the disk. It arrives after, and its record wins.
+    ///
+    /// Reversing that — checking memory first and taking the lock second — is
+    /// the race this shape exists to remove: a key evicted past the tombstone
+    /// pool is immediately claimable again, so a removal in flight could delete
+    /// a live claim and leave a handler running with nothing on the disk.
+    pub(crate) async fn reconcile<F>(
         &self,
-        peer: EndpointId,
-        key: &IdempotencyKey,
-    ) -> Result<(), RecordError> {
-        let address = encode_key(peer, key)?;
-        self.store.held.lock().await.remove(&address).await?;
-        self.store.since_compaction.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        batch: Vec<(EndpointId, IdempotencyKey)>,
+        mut current: F,
+    ) -> Vec<(EndpointId, IdempotencyKey)>
+    where
+        F: FnMut(EndpointId, &IdempotencyKey) -> Reconcile,
+    {
+        let mut held = self.store.held.lock().await;
+        for (index, (peer, key)) in batch.iter().enumerate() {
+            let Ok(address) = encode_key(*peer, key) else {
+                // A key this build cannot address is a key it never wrote.
+                continue;
+            };
+            let wrote = match current(*peer, key) {
+                Reconcile::Untouched => continue,
+                Reconcile::Erase => held.remove(&address).await,
+                Reconcile::Write(value) => held.put(&address, &value).await,
+            };
+            if wrote.is_err() {
+                // A store that refuses one write refuses the next. Hand the
+                // rest back rather than burning the batch against it.
+                return batch[index..].to_vec();
+            }
+            self.store.since_compaction.fetch_add(1, Ordering::Relaxed);
+        }
+        Vec::new()
     }
 
     /// Rewrite the store if it is carrying more dead weight than `live` entries
-    /// justify, and say whether it did.
+    /// justify.
     ///
     /// The ledger is the only thing that knows `live`, and the store is the only
     /// thing that knows how much has been written. Neither can make this
-    /// decision alone, so the number crosses here.
+    /// decision alone, so the number crosses here. `live` is the ledger's count
+    /// and the store's, which the reconcile above is what keeps equal.
     ///
-    /// # Errors
-    ///
-    /// [`RecordError::Store`] when the rewrite fails. What is stored is intact,
-    /// and the count is left alone so the next caller tries again.
-    pub(crate) async fn compact_if_worthwhile(&self, live: usize) -> Result<bool, RecordError> {
+    /// **Reports nothing, failure included.** A rewrite is never required for
+    /// correctness, so there is no outcome for a caller to act on. What a
+    /// failure must not do is retry on the next call and every call after it,
+    /// which is what leaving the counter alone would produce — a full disk is
+    /// exactly when compaction is wanted and exactly when it fails, and each
+    /// attempt reads and encodes the whole log before failing. So the counter is
+    /// reset either way, and a failed rewrite waits another `live` entries like
+    /// any other.
+    pub(crate) async fn compact_if_worthwhile(&self, live: usize) {
         let written = self.store.since_compaction.load(Ordering::Relaxed);
-        if written <= live as u64 + COMPACTION_SLACK {
-            return Ok(false);
+        let Ok(live) = u64::try_from(live) else {
+            return;
+        };
+        if written <= live.saturating_add(COMPACTION_SLACK) {
+            return;
         }
-        self.store.held.lock().await.compact().await?;
-        self.store.since_compaction.store(0, Ordering::Relaxed);
-        Ok(true)
+        let _ = self.store.held.lock().await.compact().await;
+        // `fetch_sub` and not `store(0)`: the lock is released at the end of the
+        // statement above, so a put that lands between there and here has
+        // already counted itself, and a store would throw that count away.
+        self.store
+            .since_compaction
+            .fetch_sub(written, Ordering::Relaxed);
     }
+}
+
+/// What the disk should be told about one key whose memory state moved.
+pub(crate) enum Reconcile {
+    /// Memory holds nothing under it. Take it off the disk.
+    Erase,
+    /// Memory holds a settled slot. Write it.
+    Write(Vec<u8>),
+    /// A claim owns the key now, so the write that counts is its own.
+    Untouched,
 }

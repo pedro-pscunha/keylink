@@ -71,7 +71,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::{Claim, Entries, EntryFault, Error, Held, RecordKey, Result, Snapshots, StateId};
+use crate::{Claim, Entries, EntryFault, EntryKey, Error, Held, Result, Snapshots, StateId};
 
 /// Snapshots as files under one directory.
 #[derive(Debug, Clone)]
@@ -290,13 +290,13 @@ const OP_REMOVE: u8 = 2;
 const RECORD_HEADER: usize = 1 + 4 + 4;
 
 /// One record's bytes: the operation, the two lengths, then the two payloads.
-fn encode(op: u8, key: &RecordKey, value: &[u8]) -> Vec<u8> {
+fn encode(op: u8, key: &EntryKey, value: &[u8]) -> Vec<u8> {
     let key = key.as_bytes();
     let mut record = Vec::with_capacity(RECORD_HEADER + key.len() + value.len());
     record.push(op);
     // `as` is wrong here and `try_from` is right: a length that did not fit
     // would be written truncated and read back as a different record.
-    // `RecordKey::MAX_LEN` and `Files::limit` both bound this well below
+    // `EntryKey::MAX_LEN` and `Files::limit` both bound this well below
     // `u32::MAX`, so the fallback is unreachable and still typed.
     record.extend_from_slice(&u32::try_from(key.len()).unwrap_or(u32::MAX).to_be_bytes());
     record.extend_from_slice(&u32::try_from(value.len()).unwrap_or(u32::MAX).to_be_bytes());
@@ -315,7 +315,7 @@ fn encode(op: u8, key: &RecordKey, value: &[u8]) -> Vec<u8> {
 /// resolved, so the caller already treats it as unwritten. Refusing the whole
 /// log for it would turn every crash into an unrecoverable state, which is the
 /// opposite of what a log is for.
-fn replay(id: &StateId, bytes: &[u8]) -> Result<Vec<(RecordKey, Vec<u8>)>> {
+fn replay(id: &StateId, bytes: &[u8]) -> Result<Vec<(EntryKey, Vec<u8>)>> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
@@ -329,32 +329,59 @@ fn replay(id: &StateId, bytes: &[u8]) -> Result<Vec<(RecordKey, Vec<u8>)>> {
 
     // Tombstoned in place rather than removed, so one pass stays linear: a key
     // written twice frees its first slot and takes a new one at the end.
-    let mut slots: Vec<Option<(RecordKey, Vec<u8>)>> = Vec::new();
+    let mut slots: Vec<Option<(EntryKey, Vec<u8>)>> = Vec::new();
     let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut at = LOG_MAGIC.len();
 
     while at + RECORD_HEADER <= bytes.len() {
         let op = bytes[at];
+        // **A run of zeros to the end of the file is not a record.** A
+        // size-extending append can reach the disk ahead of the bytes it was
+        // extended for, so a power cut mid-`put` leaves a zero-filled tail
+        // rather than a short one — and a zero op with zero lengths passes
+        // every length check while naming an empty key. Read as a record it
+        // refuses the whole log, which would leave a service unable to start
+        // over the one entry its own caller already treats as unwritten.
+        //
+        // Checked as "the rest is zeros" rather than as "the last record", so a
+        // zero op in the middle of a file that continues is still the loud
+        // `UnknownOperation` it should be.
+        if op == 0 && bytes[at..].iter().all(|byte| *byte == 0) {
+            break;
+        }
+        if op != OP_PUT && op != OP_REMOVE {
+            return Err(fault(EntryFault::UnknownOperation { op }));
+        }
         let key_len = read_len(&bytes[at + 1..at + 5]);
         let value_len = read_len(&bytes[at + 5..at + 9]);
         let body = at + RECORD_HEADER;
-        let end = body + key_len + value_len;
+        // `checked_add` because both lengths are read off the disk: this is
+        // sound on 64-bit and wraps on a 32-bit target in a release build, and
+        // the guard below would then pass on a wrapped value.
+        let Some(end) = key_len
+            .checked_add(value_len)
+            .and_then(|span| body.checked_add(span))
+        else {
+            break;
+        };
         if end > bytes.len() {
             break;
         }
-        let key = RecordKey::new(&bytes[body..body + key_len])
+        let key = EntryKey::new(&bytes[body..body + key_len])
             .map_err(|reason| fault(EntryFault::BadKey(reason)))?;
         let taken = index.insert(key.as_bytes().to_vec(), slots.len());
         if let Some(previous) = taken {
             slots[previous] = None;
         }
+        // Exhaustive against the two operations checked above, so a third one
+        // added without an arm here is a compile error rather than a silent
+        // skip.
         match op {
             OP_PUT => slots.push(Some((key, bytes[body + key_len..end].to_vec()))),
-            OP_REMOVE => {
+            _ => {
                 index.remove(key.as_bytes());
                 slots.push(None);
             }
-            other => return Err(fault(EntryFault::UnknownOperation { op: other })),
         }
         at = end;
     }
@@ -524,7 +551,7 @@ impl FileLog {
 }
 
 impl Held for FileLog {
-    async fn load(&self) -> Result<Vec<(RecordKey, Vec<u8>)>> {
+    async fn load(&self) -> Result<Vec<(EntryKey, Vec<u8>)>> {
         let bytes = match tokio::fs::read(&self.log).await {
             Ok(bytes) => bytes,
             // Never written is not a failure. It is the first run.
@@ -534,11 +561,21 @@ impl Held for FileLog {
         replay(&self.id, &bytes)
     }
 
-    async fn put(&mut self, key: &RecordKey, bytes: &[u8]) -> Result<()> {
+    async fn put(&mut self, key: &EntryKey, bytes: &[u8]) -> Result<()> {
+        // Refused before it is encoded, because the record's own length fields
+        // are `u32`: `Files::limit` takes any `u64`, so a caller that raised it
+        // past 4 GiB could otherwise write a truncated length and make every
+        // record after this one unreadable.
+        if u32::try_from(bytes.len()).is_err() {
+            return Err(Error::TooLarge {
+                offered: bytes.len() as u64,
+                limit: u64::from(u32::MAX),
+            });
+        }
         self.append(encode(OP_PUT, key, bytes)).await
     }
 
-    async fn remove(&mut self, key: &RecordKey) -> Result<()> {
+    async fn remove(&mut self, key: &EntryKey) -> Result<()> {
         self.append(encode(OP_REMOVE, key, &[])).await
     }
 
@@ -778,8 +815,8 @@ mod tests {
         (scratch, files)
     }
 
-    fn record(text: &str) -> RecordKey {
-        RecordKey::new(text.as_bytes()).expect("a valid key")
+    fn record(text: &str) -> EntryKey {
+        EntryKey::new(text.as_bytes()).expect("a valid key")
     }
 
     /// Everything a log holds, as pairs a test can compare against a literal.
@@ -866,6 +903,72 @@ mod tests {
             entries(&log).await,
             vec![(b"order-1".to_vec(), b"paid".to_vec())],
             "the interrupted record goes and the settled one stays"
+        );
+    }
+
+    /// A zero-filled tail is a torn write, not a corrupt log.
+    ///
+    /// A size-extending append can reach the disk ahead of the bytes it was
+    /// extended for, so this is what a power cut mid-`put` leaves on an
+    /// ext4-family filesystem — and a zero operation with zero lengths passes
+    /// every length check while naming an empty key. Read as a record it
+    /// refuses the whole log, and a service cannot start over the one entry its
+    /// own caller already treats as unwritten.
+    ///
+    /// Made red by deleting the all-zeros check in `replay`.
+    #[tokio::test]
+    async fn a_zero_filled_tail_is_dropped_and_the_rest_survives() {
+        let (scratch, files) = logs("zero-tail").await;
+        let path = scratch.0.join("treasury").join("ledger.log");
+        {
+            let mut log = files.claim(&id("treasury/ledger")).await.expect("claims");
+            log.put(&record("order-1"), b"paid").await.expect("puts");
+        }
+
+        let whole = std::fs::metadata(&path).expect("reads").len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("opens")
+            .set_len(whole + 64)
+            .expect("extends with zeros");
+
+        let log = files.claim(&id("treasury/ledger")).await.expect("claims");
+        assert_eq!(
+            entries(&log).await,
+            vec![(b"order-1".to_vec(), b"paid".to_vec())],
+            "the zeros are an unwritten tail and the record before them stands"
+        );
+    }
+
+    /// A zero operation is only a torn tail when the rest of the file is zeros.
+    /// One in the middle of a file that continues is a fault, and says so.
+    #[tokio::test]
+    async fn a_zero_operation_in_the_middle_is_still_refused() {
+        let (scratch, files) = logs("zero-middle").await;
+        let path = scratch.0.join("treasury").join("ledger.log");
+        {
+            let mut log = files.claim(&id("treasury/ledger")).await.expect("claims");
+            log.put(&record("order-1"), b"paid").await.expect("puts");
+        }
+
+        let mut bytes = std::fs::read(&path).expect("reads");
+        // The operation byte of the one record, blanked, with a real record's
+        // worth of bytes still after it.
+        bytes[LOG_MAGIC.len()] = 0;
+        std::fs::write(&path, &bytes).expect("writes");
+
+        let log = files.claim(&id("treasury/ledger")).await.expect("claims");
+        let error = log.load().await.expect_err("not a torn tail");
+        assert!(
+            matches!(
+                error,
+                Error::NotALog {
+                    fault: EntryFault::UnknownOperation { op: 0 },
+                    ..
+                }
+            ),
+            "got {error:?}"
         );
     }
 
@@ -988,11 +1091,11 @@ mod tests {
 
     #[test]
     fn a_record_key_is_bounded_and_never_empty() {
-        assert!(RecordKey::new(Vec::new()).is_err());
-        assert!(RecordKey::new(vec![b'x'; RecordKey::MAX_LEN]).is_ok());
-        assert!(RecordKey::new(vec![b'x'; RecordKey::MAX_LEN + 1]).is_err());
+        assert!(EntryKey::new(Vec::new()).is_err());
+        assert!(EntryKey::new(vec![b'x'; EntryKey::MAX_LEN]).is_ok());
+        assert!(EntryKey::new(vec![b'x'; EntryKey::MAX_LEN + 1]).is_err());
         // Arbitrary bytes, on purpose: a key is not a path and needs no escape.
-        assert!(RecordKey::new(vec![0, 255, b'/', b'.']).is_ok());
+        assert!(EntryKey::new(vec![0, 255, b'/', b'.']).is_ok());
     }
 
     /// The id is a path, and the path stays under the root. This is the test

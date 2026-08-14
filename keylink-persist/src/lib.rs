@@ -207,7 +207,7 @@ pub trait Held: Send + 'static {
     ///
     /// [`Error::Io`] when the store cannot be read, and [`Error::NotALog`] when
     /// what is stored is not something this build can read.
-    fn load(&self) -> impl Future<Output = Result<Vec<(RecordKey, Vec<u8>)>>> + Send;
+    fn load(&self) -> impl Future<Output = Result<Vec<(EntryKey, Vec<u8>)>>> + Send;
 
     /// Write one entry, replacing any entry already under `key`.
     ///
@@ -215,14 +215,14 @@ pub trait Held: Send + 'static {
     ///
     /// [`Error::TooLarge`] when the entry is over the adapter's cap, and
     /// [`Error::Io`] when the write fails. Neither disturbs what is stored.
-    fn put(&mut self, key: &RecordKey, bytes: &[u8]) -> impl Future<Output = Result<()>> + Send;
+    fn put(&mut self, key: &EntryKey, bytes: &[u8]) -> impl Future<Output = Result<()>> + Send;
 
     /// Remove one entry. Removing an entry that is not there is not an error.
     ///
     /// # Errors
     ///
     /// [`Error::Io`] when the write fails.
-    fn remove(&mut self, key: &RecordKey) -> impl Future<Output = Result<()>> + Send;
+    fn remove(&mut self, key: &EntryKey) -> impl Future<Output = Result<()>> + Send;
 
     /// Reclaim whatever removed and replaced entries still cost.
     ///
@@ -248,9 +248,9 @@ pub trait Held: Send + 'static {
 ///
 /// Validated once, here, so an adapter never meets an empty or unbounded key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RecordKey(Vec<u8>);
+pub struct EntryKey(Vec<u8>);
 
-impl RecordKey {
+impl EntryKey {
     /// The longest key this accepts.
     ///
     /// A judgement rather than a measurement: long enough for a peer identity
@@ -262,14 +262,14 @@ impl RecordKey {
     ///
     /// # Errors
     ///
-    /// [`InvalidRecordKey`] naming which rule was broken.
-    pub fn new(bytes: impl Into<Vec<u8>>) -> std::result::Result<Self, InvalidRecordKey> {
+    /// [`InvalidEntryKey`] naming which rule was broken.
+    pub fn new(bytes: impl Into<Vec<u8>>) -> std::result::Result<Self, InvalidEntryKey> {
         let bytes = bytes.into();
         if bytes.is_empty() {
-            return Err(InvalidRecordKey::Empty);
+            return Err(InvalidEntryKey::Empty);
         }
         if bytes.len() > Self::MAX_LEN {
-            return Err(InvalidRecordKey::TooLong {
+            return Err(InvalidEntryKey::TooLong {
                 len: bytes.len(),
                 max: Self::MAX_LEN,
             });
@@ -292,11 +292,11 @@ impl RecordKey {
 /// adapter is tempted to drop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub enum InvalidRecordKey {
+pub enum InvalidEntryKey {
     /// A key with nothing in it.
     #[error("a record key cannot be empty")]
     Empty,
-    /// Longer than [`RecordKey::MAX_LEN`].
+    /// Longer than [`EntryKey::MAX_LEN`].
     #[error("a record key is at most {max} bytes, and this one is {len}")]
     TooLong {
         /// What arrived.
@@ -664,12 +664,12 @@ pub enum EntryFault {
         /// The byte that was read.
         op: u8,
     },
-    /// An entry's key is not one [`RecordKey`] accepts.
+    /// An entry's key is not one [`EntryKey`] accepts.
     ///
     /// The load path re-validates every key, because bytes read off a disk
     /// never met the constructor.
     #[error("an entry's key was refused: {0}")]
-    BadKey(InvalidRecordKey),
+    BadKey(InvalidEntryKey),
 }
 
 /// Why a store operation did not happen.
