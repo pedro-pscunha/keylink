@@ -370,14 +370,35 @@ impl DurableRecords {
         key: &IdempotencyKey,
     ) -> Result<(), RecordError> {
         let address = encode_key(peer, key)?;
-        self.store
+        let wrote = self
+            .store
             .held
             .lock()
             .await
             .put(&address, &[TAG_CLAIMED])
-            .await?;
-        self.store.since_compaction.fetch_add(1, Ordering::Relaxed);
+            .await;
+        self.counted(wrote)?;
         Ok(())
+    }
+
+    /// The one place `since_compaction` is incremented.
+    ///
+    /// Wraps the **outcome** rather than the write. A helper that took the
+    /// store's lock itself would deadlock in
+    /// [`reconcile`](Self::reconcile), which holds that lock across its whole
+    /// loop — and one named `put` could not carry the `remove` that loop also
+    /// makes. So it takes what a write returned and counts it.
+    ///
+    /// Three paths write, and every one of them had to remember this line. A
+    /// fourth added without it would disable compaction silently: the counter
+    /// would stay under the threshold, the log would grow for the life of the
+    /// disk, and no test could see it, because nothing observes a rewrite that
+    /// does not happen.
+    fn counted<T, E>(&self, outcome: Result<T, E>) -> Result<T, E> {
+        if outcome.is_ok() {
+            self.store.since_compaction.fetch_add(1, Ordering::Relaxed);
+        }
+        outcome
     }
 
     /// Write one key's state, and resolve only once it is on the disk.
@@ -389,8 +410,8 @@ impl DurableRecords {
     ) -> Result<(), RecordError> {
         let address = encode_key(peer, key)?;
         let value = encode_slot(slot);
-        self.store.held.lock().await.put(&address, &value).await?;
-        self.store.since_compaction.fetch_add(1, Ordering::Relaxed);
+        let wrote = self.store.held.lock().await.put(&address, &value).await;
+        self.counted(wrote)?;
         Ok(())
     }
 
@@ -428,7 +449,7 @@ impl DurableRecords {
                 Reconcile::Erase => held.remove(&address).await,
                 Reconcile::Write(value) => held.put(&address, &value).await,
             };
-            if wrote.is_err() {
+            if self.counted(wrote).is_err() {
                 // A store that refuses one write refuses the next. Hand the
                 // rest back rather than burning the batch against it.
                 //
@@ -438,7 +459,6 @@ impl DurableRecords {
                 // same reason — an iterator would still be borrowing `batch`.
                 return batch.split_off(index);
             }
-            self.store.since_compaction.fetch_add(1, Ordering::Relaxed);
         }
         Vec::new()
     }
