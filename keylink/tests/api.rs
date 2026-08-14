@@ -997,3 +997,47 @@ mod retired_reservation_words {
         );
     }
 }
+
+mod external_contract {
+    keylink::service! {
+        service ExternalContract;
+
+        rpc Empty() -> ();
+        #[serde(rename = "wire-name")]
+        rpc One(value: u64) -> u64;
+        rpc Many(name: String, count: u16) -> String;
+        tell Notify(value: u64) -> ();
+        send Upload(value: u64) -> u64;
+        recv Download(value: u64) -> u64;
+        blob Snapshot(value: u64) -> u64;
+        feed Ticks(value: u64);
+        #[cfg(any())]
+        rpc Disabled(value: u64) -> u64;
+    }
+}
+
+/// Watched red with `scripts/break-once.sh` by replacing
+/// `            @methods [ $( $methods )* { [ $( #[$cfg] )* ] rpc $method ( $( $arg : $ty ),* ) -> $ret } ]`
+/// with `            @methods [ $( $methods )* ]`. The exact test selected one guard
+/// and failed with only the three RPC descriptors absent.
+#[test]
+fn generated_external_marker_names_only_enabled_adaptable_methods() {
+    fn assert_external<T: keylink::ExternalService>() {}
+
+    assert_external::<external_contract::external_contract::External>();
+    assert_eq!(
+        <external_contract::external_contract::External as keylink::ExternalService>::METHODS,
+        &[
+            keylink::ExternalMethod::new("Empty", keylink::ExternalKind::Rpc),
+            keylink::ExternalMethod::new("One", keylink::ExternalKind::Rpc),
+            keylink::ExternalMethod::new("Many", keylink::ExternalKind::Rpc),
+            keylink::ExternalMethod::new("Upload", keylink::ExternalKind::Send),
+            keylink::ExternalMethod::new("Download", keylink::ExternalKind::Recv),
+            keylink::ExternalMethod::new("Snapshot", keylink::ExternalKind::Blob),
+        ]
+    );
+    assert_eq!(
+        <external_contract::external_contract::External as keylink::ExternalService>::SERVICE,
+        "ExternalContract"
+    );
+}

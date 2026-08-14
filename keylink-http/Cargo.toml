@@ -1,0 +1,44 @@
+[package]
+name = "keylink-http"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+description = "Bounded authenticated HTTP/JSON gateway for generated Keylink services."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pedrocunha/keylink"
+readme = "README.md"
+
+[dependencies]
+keylink = { path = "../keylink", version = "0.1.0", default-features = false }
+axum = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+base64 = { workspace = true }
+n0-future = { workspace = true }
+tokio-util = { workspace = true }
+mime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The imported-service fixture: a service DEFINED in another crate, so the
+# generated actor seam is exercised across a crate boundary.
+imported-ledger = { path = "../fixtures/imported-ledger" }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+iroh = { workspace = true, features = ["test-utils"] }
+# Test-only, and only so a holder can REVOKE a grant mid-run. Four mapped rows
+# turn on a grant that stops working while the gateway still holds a ticket,
+# and nothing in `keylink::Blobs` revokes one: shutting the holder down yields
+# `Error::Transport`, which is a different answer from the refusal those rows
+# are about. Pinned to keylink's own version so the two cannot disagree.
+iroh-blobs = { version = "0.103.0", default-features = false }
+postcard = { workspace = true }
+postcard-schema = { workspace = true }
+bytes = { workspace = true }
+http-body = "1"
+
+[lints]
+workspace = true

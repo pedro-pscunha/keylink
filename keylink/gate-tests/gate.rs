@@ -31,6 +31,7 @@ gate_modules! {
     blocking_work => "../tests/blocking_work.rs",
     compose => "../tests/compose.rs",
     cycles => "../tests/cycles.rs",
+    declaration_seam => "../tests/declaration_seam.rs",
     defer => "../tests/defer.rs",
     durable => "../tests/durable.rs",
     feeds => "../tests/feeds.rs",

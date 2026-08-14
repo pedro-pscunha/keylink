@@ -348,6 +348,15 @@ carries the same list beside the tests.
 
 ## Tests
 
+`keylink-http` owns its unit tests and real loopback HTTP integration tests. Run
+one async or liveness test by its exact name before you run its test binary.
+The workspace test task selects all integration targets outside `keylink` with
+`--test '*'`, so a new adapter test file needs no second test inventory.
+
+The docs task names `keylink-http` explicitly because the crate denies missing
+documentation through `RUSTDOCFLAGS`. The examples task runs the adapter example through `.mise/tasks/http-smoke`.
+The task uses `curl`; a build without execution does not verify HTTP behavior.
+
 - A guard you have not watched fail is not a guard. Break it, see the red,
   restore it. A check that cannot fail looks exactly like a check that passes.
 - Record the break beside the guard, and **`mise run anchors` decides how.** If the
@@ -430,3 +439,24 @@ still, cite the guard rather than the count, and there is nothing to pin.
 This is a rule for writing a **new** figure. A bare one already in a file is
 corrected the way everything else is — by appending, never by editing the number
 in place. RFC-07 §13, §15.1 and §16 are three worked examples.
+
+## HTTP gateway and documents
+
+Two smokes, and they are not redundant. `mise run http-smoke` drives the
+singleton `rpc` surface — the small example, the fast check. `mise run
+http-smoke-full` drives every route the gateway serves against a second example
+that mounts a singleton surface, a keyed surface and the two document endpoints
+in one process: streaming both ways, blob bytes, ranges, conditional GETs,
+encoded actor ids, and both document media types. Both run in `gate`.
+
+They use real curl on purpose. Everything else in this workspace goes through
+`reqwest` or `tower`, and both normalise things a deployment's client will not.
+
+`keylink-openapi`'s snapshots under `tests/snapshots/` are the published
+contract. `KEYLINK_OPENAPI_BLESS=1 cargo nextest run -p keylink-openapi` rewrites
+them; read the diff before committing it, because a change there is a change to
+what every generated client will be built from.
+
+A document is built from the same `HttpSurface` the gateway is mounted with. If
+you find yourself constructing a second surface to describe the first, the
+document and the runtime have already diverged.

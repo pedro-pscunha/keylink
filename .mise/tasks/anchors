@@ -2134,6 +2134,151 @@ ANCHORS = [
      "        if tokio::runtime::Handle::try_current().is_ok() {\n"
      "            return Err(crate::BlockingError::BlockingInAsync);\n"
      "        }"),
+    ("HJ1", "keylink/tests/api.rs", "keylink/src/macros.rs",
+     "            @methods [ $( $methods )* { [ $( #[$cfg] )* ] rpc $method ( $( $arg : $ty ),* ) -> $ret } ]"),
+    ("HJ2", "keylink-http/src/limits.rs", "keylink-http/src/limits.rs",
+     '        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {\n            self.overflowed = true;\n            return Err(std::io::Error::other(\n                "successful response exceeds its JSON limit",\n            ));\n        }'),
+    ("HJ3", "keylink-http/src/service.rs", "keylink/src/macros.rs",
+     '                }\n                .map_err($crate::ExternalError::Client)?;\n                $codec.encode(&value)\n                    .map($crate::ExternalOutput::Json)'),
+    ("HJ4", "keylink-http/tests/http.rs", "keylink-http/src/gateway.rs",
+     "    delimited(&mut hasher, principal.as_bytes());"),
+    ("HJ5", "keylink-http/src/limits.rs", "keylink-http/src/limits.rs",
+     "            bytes: Vec::new(),\n"),
+    ("HJ7", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
+     "    if values.next().is_some() {\n        return false;\n    }"),
+    ("HJ8", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
+     "    let Ok(media) = value.parse::<mime::Mime>() else {\n        return false;\n    };"),
+    ("HJ9", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
+     "        Err(_) => Err(GatewayError::InvalidRequest),"),
+    ("HJ10", "keylink/tests/protocol.rs", "keylink/src/body.rs",
+     "        if drained.is_err() && declared_len.is_none() {"),
+    ("HJ12", "keylink-http/src/gateway.rs", "keylink-http/src/stream.rs",
+     "                Err(_) => Some((\n"
+     "                    Err(std::io::Error::other(\"the response stream failed\")),\n"
+     "                    Download::Ended,\n"
+     "                )),"),
+    ("HJ13", "keylink-http/tests/streaming.rs", "keylink-http/src/stream.rs",
+     "                    if observed > limit {"),
+    ("HJ14", "keylink-http/tests/streaming.rs", "keylink-http/src/gateway.rs",
+     "        .is_some_and(|len| len > limits.max_download_bytes())"),
+    ("HJ11", "keylink-http/src/gateway.rs", "keylink/src/body.rs",
+     "                tokio::io::copy_buf(&mut reader, stream)\n"
+     "                    .await\n"
+     "                    .map(drop)\n"
+     "                    .map_err(Error::from)"),
+    ("HK1", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "        if announced != total {"),
+    ("HK2", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "        let head = self.start.max(offset);"),
+    ("HK3", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "        if range.end > total {"),
+    ("HK10", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "        let Some(len) = range.end.checked_sub(range.start).filter(|len| *len > 0) else {"),
+    # HK4 and HK5 are recorded in the file they break, so their literals stay
+    # unindented in the record and indented here - see rot mode 1 above.
+    ("HK4", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "            if offset != expected {"),
+    ("HK5", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "        if self.emitted == self.len {"),
+    ("HK6", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "    if !msg.request.ranges.is_blob() {"),
+    ("HK7", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "        while let Some(chunk) = self.next_chunk().await? {"),
+    ("HK8", "keylink/tests/blobs.rs", "keylink/src/blobs.rs",
+     "        let tail = self.end().min(stop);"),
+    ("HK9", "keylink/src/blobs.rs", "keylink/src/blobs.rs",
+     "        if self.broken {"),
+    ("HK11", "keylink-http/src/blob.rs", "keylink-http/src/blob.rs",
+     "            if let Some(at) = book.order.iter().position(|held| held == &ticket) {"),
+    ("HK12", "keylink-http/src/blob.rs", "keylink-http/src/blob.rs",
+     "        while book.order.len() > self.max {"),
+    ("HK13", "keylink-http/src/blob.rs", "keylink-http/src/blob.rs",
+     "    if start >= len {"),
+    ("HK14", "keylink-http/src/blob.rs", "keylink-http/src/blob.rs",
+     "                .and_then(|rest| rest.strip_suffix('\"'))"),
+    ("HK21", "keylink-http/src/blob.rs", "keylink-http/src/blob.rs",
+     "    if wildcard && entries > 1 {"),
+    ("HK22", "keylink-http/src/blob.rs", "keylink-http/src/blob.rs",
+     "            if inner.contains('\"') {"),
+    ("HK15", "keylink-http/src/blob.rs", "keylink-http/src/blob.rs",
+     "    value.to_str().is_ok_and(|value| value.trim() == tag)"),
+    ("HK16", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
+     "        principal,\n"
+     "        method,\n"
+     "        actor: surface.actor.clone(),\n"
+     "        id,"),
+    ("HK17", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
+     "        Ok(true) => return not_modified(&tag),"),
+    ("HK18", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
+     "        Some(value) => value.to_str().is_ok_and(|value| value.trim() == \"0\"),"),
+    ("HK19", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
+     "    let wants_bytes = route.kind() == RouteKind::BlobGet;"),
+    ("HK20", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
+     "        Err(AccessError::Forbidden) => Err(GatewayError::Forbidden.response(None)),"),
+    ("HK23", "keylink-http/tests/blobs.rs", "keylink-http/src/gateway.rs",
+     "    tickets.remove(ticket, generation);"),
+    ("HK24", "keylink-http/tests/blobs.rs", "keylink-http/src/blob.rs",
+     "            .is_none_or(|(live, _)| *live != generation)"),
+    ("HK32", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
+     "        } else if !(part.starts_with('{') && part.ends_with('}')) && segment != part {"),
+    ("HK29", "keylink-http/src/service.rs", "keylink/src/macros.rs",
+     "        $actor.clone()"),
+    ("HK28", "keylink-http/src/service.rs", "keylink/src/macros.rs",
+     "            @actor [ $( $actor )* { [ $( #[$cfg] )* ] recv $method ( $( $arg : $ty ),* ) -> $ret } ]"),
+    ("HK27", "keylink-http/src/contract.rs", "keylink-http/src/contract.rs",
+     "            route.addressing == self.addressing && (!route.streaming || self.streaming.is_some())"),
+    ("HL7", "keylink-openapi/tests/openapi.rs", "keylink-openapi/src/lib.rs",
+     "    for kind in errors_for(route.kind()) {"),
+    ("HL5", "keylink-openapi/tests/parity.rs", "keylink-openapi/src/document_macro.rs",
+     "                                    .for_serialize()"),
+    ("HL6", "keylink-openapi/tests/openapi.rs", "keylink-openapi/src/lib.rs",
+     "        let body = if media == \"application/octet-stream\" {"),
+    ("HL1", "keylink-openapi/tests/openapi.rs", "keylink-openapi/src/endpoints.rs",
+     "const OPENAPI_MEDIA: &str = \"application/vnd.oai.openapi+json;version=3.1\";"),
+    ("HL2", "keylink-openapi/tests/openapi.rs", "keylink-openapi/src/endpoints.rs",
+     "const SCHEMA_MEDIA: &str = \"application/schema+json\";"),
+    ("HL3", "keylink-openapi/tests/openapi.rs", "keylink-openapi/src/schema.rs",
+     "        \"contentMediaType\": \"application/octet-stream\","),
+    ("HL4", "keylink-openapi/tests/openapi.rs", "keylink-openapi/src/lib.rs",
+     "        Some(_) => Err(DocumentError::ComponentCollision {"),
+    ("HK49", "keylink-http/tests/actors.rs", "keylink-http/src/raw_path.rs",
+     "    for (index, byte) in raw.bytes().enumerate() {"),
+    ("HK48", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
+     "                actor: self.actor.as_ref(),"),
+    ("HK45", "keylink-http/tests/api.rs", "keylink-http/src/gateway.rs",
+     "    if mount.methods().is_empty() {"),
+    ("HK46", "keylink-http/src/contract.rs", "keylink-http/src/contract.rs",
+     "        template: \"/{actor}/recv/{method}\",\n"
+     "        method: http::Method::POST,\n"
+     "        success: http::StatusCode::OK,\n"
+     "        request_media: Some(\"application/json\"),"),
+    ("HK43", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
+     "        actor: surface.actor.clone(),"),
+    ("HK44", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
+     "            Err(AccessError::Forbidden) => Err(GatewayError::Forbidden.response(None)),"),
+    ("HK41", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
+     "            _ => GatewayError::MethodNotFound,"),
+    ("HK42", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
+     "        let actor = decode_actor(path, route_path)?;"),
+    ("HK40", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
+     "            .map_or(b\"\", |id| id.as_str().as_bytes()),"),
+    ("HK39", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
+     "    if request.method() != route.method() {"),
+    ("HK37", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
+     "            .map_or(b\"\", |id| id.as_str().as_bytes()),"),
+    ("HK38", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
+     "        actor: surface.actor.clone(),"),
+    ("HK36", "keylink-http/tests/http.rs", "keylink-http/src/gateway.rs",
+     "    delimited(&mut hasher, method.as_bytes());"),
+    ("HK33", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
+     "                RouteKind::Recv => any(move |request: Request<Body>| {"),
+    ("HK34", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
+     "        keylink::ExternalCall::Blob,"),
+    ("HK35", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
+     "                // One template, two verbs, and therefore ONE registration:"),
+    ("HK25", "keylink-http/src/gateway.rs", "keylink-http/src/gateway.rs",
+     "    // Silently ignoring a caller's replay key is worse than refusing it.\n"
+     "    if parts.headers.get(IDEMPOTENCY_HEADER).is_some() {"),
 ]
 
 # Records whose search edit is DESCRIBED, deliberately, and must stay that way.
@@ -2220,6 +2365,14 @@ DESCRIBED = [
     ("C3AJ", "keylink/src/compose/lossy.rs", "same-file",
      "the deferred-drop literal counts 1 at fb0cbc5; quoting it beside the Closed guard "
      "would make that count 2"),
+    # The external seam now emits the same attribute once for rpc, send, recv and
+    # blob. The bare one-line literal counts 4 at 957891a56c2c; distinguishing the
+    # rpc copy requires formatter-owned macro context spanning eleven lines. The
+    # exact RPC-specific edit was replayed after this migration and selected one
+    # guard, returning HTTP 200 instead of 400.
+    ("HJ6", "keylink-http/tests/http.rs", "formatter-owned-multiline",
+     "the deny_unknown_fields literal counts 4 at 957891a56c2c; a unique rpc "
+     "discriminator spans formatter-owned macro lines"),
 ]
 
 # ── WHAT A ROW'S BREAK PRODUCES, FOR THE ROWS SOMEBODY REPLAYED ────────────────
@@ -2350,6 +2503,71 @@ REDNESS = {
     "A5": ("        while inner.held > 0",
            "a bound nothing can reach must evict nothing",
            "a_maximal_pool_evicts_nothing", ["-p", "keylink", "--lib"]),
+    "HJ1": ("            @methods [ $( $methods )* ]",
+            "left: [ExternalMethod",
+            "generated_external_marker_names_only_enabled_adaptable_methods",
+            ["-p", "keylink", "--test", "api"]),
+    "HJ2": ('        if false {\n            self.overflowed = true;\n            return Err(std::io::Error::other(\n                "successful response exceeds its JSON limit",\n            ));\n        }',
+            "assertion failed: writer.write_all(b\"d\").is_err()",
+            "limits::tests::bounded_writer_accepts_limit_and_refuses_limit_plus_one",
+            ["-p", "keylink-http", "--lib"]),
+    "HJ3": ('                }\n                .map_err($crate::ExternalError::Client)?;\n                $codec.encode(&())\n                    .map($crate::ExternalOutput::Json)',
+            "left: [110, 117, 108, 108]",
+            "service::tests::json_conversion_uses_declared_arguments_and_return_values",
+            ["-p", "keylink-http", "--lib"]),
+    # Tasks 6-7. Every row here was watched red once by hand; a REPLAY entry is
+    # what makes that reproducible by a gate rather than by a commit message.
+    # Security-weighted rather than exhaustive: the identity binding, the ticket
+    # scoping, the refusal order, the two document media types and the
+    # serialize contract. The remaining `HK*`/`HL*` rows stay
+    # resolution-checked, which this file is explicit is a weaker claim.
+    "HK37": ('            .map_or(b"", |_id| b""),', "right: 1",
+             "one_replay_key_under_two_actors_is_two_identities",
+             ["-p", "keylink-http", "--test", "actors"]),
+    "HK38": ("        actor: None,", "right: 404",
+             "a_blob_ticket_is_bound_to_the_actor_that_minted_it",
+             ["-p", "keylink-http", "--test", "actors"]),
+    "HK39": ("    if false {", "right: 405",
+             "a_wrong_verb_is_refused_before_the_actor_is_decoded",
+             ["-p", "keylink-http", "--test", "actors"]),
+    "HK41": ("            _ => GatewayError::InvalidRequest,", "right: 404",
+             "an_over_long_method_name_is_refused_like_an_unknown_one",
+             ["-p", "keylink-http", "--test", "actors"]),
+    "HK42": ('        let actor = keylink::ActorId::new("one").ok()?;', "right: \"\\\"obra/4471\\\"\"",
+             "a_keyed_call_reaches_the_actor_its_path_names",
+             ["-p", "keylink-http", "--test", "actors"]),
+    "HK44": ("            Err(AccessError::Forbidden) => Ok(Admitted { principal }),",
+             "right: [\"lazy\"]",
+             "a_denied_caller_never_reaches_the_lazy_factory",
+             ["-p", "keylink-http", "--test", "actors"]),
+    "HL1": ('const OPENAPI_MEDIA: &str = "application/json";',
+            "right: \"application/vnd.oai.openapi+json;version=3.1\"",
+            "the_document_endpoints_serve_their_exact_media_types",
+            ["-p", "keylink-openapi", "--test", "openapi"]),
+    "HL2": ('const SCHEMA_MEDIA: &str = "application/json";',
+            "right: \"application/schema+json\"",
+            "the_document_endpoints_serve_their_exact_media_types",
+            ["-p", "keylink-openapi", "--test", "openapi"]),
+    "HL5": ("                                    .for_deserialize()",
+            "response_properties.contains_key(\"server_only\")",
+            "a_request_and_a_response_are_described_by_their_own_contracts",
+            ["-p", "keylink-openapi", "--test", "parity"]),
+    "HJ4": ('    delimited(&mut hasher, b"");', "left: \"1\"",
+            "external_idempotency_keys_are_namespaced_by_principal",
+            ["-p", "keylink-http", "--test", "http"]),
+    "HJ5": ("            bytes: Vec::with_capacity(limit),", "capacity overflow",
+            "limits::tests::bounded_writer_does_not_reserve_the_configured_ceiling",
+            ["-p", "keylink-http", "--lib", "--", "--exact"]),
+    "HJ7": ("    if false {\n        return false;\n    }", "left: 200",
+            "gateway::tests::duplicate_content_types_are_rejected",
+            ["-p", "keylink-http", "--lib", "--", "--exact"]),
+    "HJ8": ("    let Ok(media) = value\n        .split(';')\n        .next()\n        .unwrap_or_default()\n        .parse::<mime::Mime>()\n    else {\n        return false;\n    };",
+            "left: 200", "gateway::tests::malformed_content_types_are_rejected",
+            ["-p", "keylink-http", "--lib", "--", "--exact"]),
+    "HJ9": ("        Err(_) => Err(GatewayError::RequestTooLarge),",
+            "left: 413",
+            "gateway::tests::short_body_collection_failure_is_not_reported_as_too_large",
+            ["-p", "keylink-http", "--lib", "--", "--exact"]),
 }
 
 def flat(text: str) -> str:
@@ -3784,7 +4002,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 278
+RECORD_BLOCKS = 333
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a
@@ -3858,7 +4076,16 @@ def script(path: pathlib.Path) -> bool:
 all_blocks: list[str] = []
 for path in sorted(
     list((ROOT / "keylink").rglob("*.rs"))
+    + list((ROOT / "keylink-http").rglob("*.rs"))
     + list((ROOT / "keylink-persist").rglob("*.rs"))
+    # Both added when the workspace grew to six members. A registered record
+    # living where the walk does not look is reported as a record this tripwire
+    # CANNOT SEE — a false `unseen`, manufactured by registering it. Seven rows
+    # (`HL1`-`HL7`) were in exactly that state, and `RECORD_BLOCKS` understated
+    # the population by four. `fixtures/` holds no record today and is walked
+    # anyway, because the moment it costs nothing is the only cheap moment.
+    + list((ROOT / "keylink-openapi").rglob("*.rs"))
+    + list((ROOT / "fixtures").rglob("*.rs"))
     + list((ROOT / "demo").rglob("*.rs"))
     + list((ROOT / "scripts").glob("*.sh"))
     + [p for p in (ROOT / ".githooks").iterdir() if p.is_file() and script(p)]

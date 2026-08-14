@@ -313,6 +313,8 @@ description = "Every example RUNS. Building one asserts nothing"
 run = [
     "cargo run -p keylink --example reliable_call",
     "cargo run -p keylink --example durable_ledger",
+    { task = "http-smoke" },
+    { task = "http-smoke-full" },
 ]
 
 # ── documentation ───────────────────────────────────────────────────────────
@@ -512,13 +514,13 @@ description = "rustdoc as a gate, not as decoration"
 # Cheapest first, as everywhere else in this gate.
 run = [
     { task = "headings" },
-    "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --all-features -p keylink -p keylink-persist -p demo",
+    "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --all-features -p keylink -p keylink-persist -p keylink-http -p keylink-openapi -p demo",
 ]
 
 # ── shipping ────────────────────────────────────────────────────────────────
 
 [tasks.package]
-description = "Both crates still package, so neither has become unpublishable"
+description = "Every publishable workspace crate still packages"
 # A manifest can stop being publishable without one line of code changing, and
 # nothing else in this gate looks. It happened: Wave 5 promoted `keylink-persist`
 # from a dev-dependency to a real one, and cargo strips unversioned dev-deps when
@@ -539,7 +541,13 @@ description = "Both crates still package, so neither has become unpublishable"
 # correct for a demo and is a manifest error for anything shipped. Excluding by
 # name means a NEW workspace member is checked by default, which is the way round
 # that fails loudly.
-run = "cargo package --workspace --exclude demo --no-verify --allow-dirty"
+# `--exclude imported-ledger` for the same reason as `demo`: it is a test
+# fixture whose only purpose is to be depended on from another crate's tests,
+# it depends on `keylink` by path with no version, and publishing it would mean
+# nothing. `keylink-openapi` is NOT excluded — it is an opt-in crate a real
+# downstream user has to be able to depend on, so its path deps carry versions
+# and it packages like every other shipped crate.
+run = "cargo package --workspace --exclude demo --exclude imported-ledger --no-verify --allow-dirty"
 
 # ── supply chain ────────────────────────────────────────────────────────────
 

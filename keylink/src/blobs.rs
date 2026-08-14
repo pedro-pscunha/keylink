@@ -48,6 +48,7 @@
 //! [iroh-blobs]: https://docs.rs/iroh-blobs
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bao_tree::io::BaoContentItem;
@@ -56,20 +57,21 @@ use iroh::endpoint::{ConnectError, Connection, ConnectionError};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::api::Store;
-use iroh_blobs::get::request::{get_blob, GetBlobItem};
-use iroh_blobs::get::GetError;
-use iroh_blobs::protocol::{GetRequest, ERR_PERMISSION};
+use iroh_blobs::get::request::get_verified_size;
+use iroh_blobs::get::{fsm, GetError};
+use iroh_blobs::protocol::{
+    ChunkRanges, ChunkRangesExt, ChunkRangesSeq, GetRequest, ERR_PERMISSION,
+};
 use iroh_blobs::provider::events::{
     AbortReason, ClientConnected, ConnectMode, EventMask, EventSender, ObserveMode,
     ProviderMessage, RequestMode, RequestReceived, ThrottleMode,
 };
 use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::{BlobsProtocol, Hash};
-use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::{AdmittedPeer, Error, Node, ProvenPeer, Result};
+use crate::{AdmittedPeer, BlobFault, Error, Node, ProvenPeer, Result};
 
 /// Grants one node holds before it starts evicting the oldest.
 ///
@@ -734,7 +736,15 @@ fn admits_get(
 ///
 /// Opens the blobs connection internally, so a call site names no ALPN and no
 /// second dial.
-#[derive(Debug)]
+///
+/// # Cloning opens a second read, it does not share one
+///
+/// Every read dials its own connection, so two clones interleave without
+/// seeing each other's bytes — which is what an HTTP gateway needs when one
+/// address feeds a range request and a full download at once. The cost is that
+/// two clones can start two concurrent downloads of the same content; that is
+/// an API cost the caller controls, not a way to corrupt a stream.
+#[derive(Debug, Clone)]
 pub struct BlobHandle {
     endpoint: Endpoint,
     holder: EndpointAddr,
@@ -769,63 +779,192 @@ impl BlobHandle {
         self.id
     }
 
-    /// Stream the verified bytes into `sink`.
+    /// The verified size of the content, without transferring it.
     ///
-    /// No local store, so no deduplication and no resume across a restart. Peak
-    /// memory is one chunk. This is the direct replacement for
-    /// [`BodyReader::copy_to`](crate::BodyReader::copy_to).
+    /// One last-chunk request, validated against the address. iroh-blobs' own
+    /// caveat applies and is worth repeating: this proves the holder can
+    /// produce the last chunk of content with this hash, not that it holds
+    /// every chunk in between.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BlobRefused`] when the holder denies the probe,
+    /// [`Error::Transport`] when the dial fails, and [`Error::Io`] when the
+    /// answer does not validate.
+    pub async fn verified_len(&self) -> Result<u64> {
+        let connection = self.dial().await?;
+        self.verified_len_on(&connection).await
+    }
+
+    async fn verified_len_on(&self, connection: &Connection) -> Result<u64> {
+        get_verified_size(connection, &self.id.hash())
+            .await
+            .map(|(size, _)| size)
+            .map_err(|error| self.classify(error, connection))
+    }
+
+    /// Open a verified read of the whole blob.
+    ///
+    /// Completes the size preflight and compares the data response against it
+    /// before returning, so [`BlobReader::total_len`] is a number the content
+    /// address has already vouched for.
     ///
     /// # Errors
     ///
     /// [`Error::BlobRefused`] when the holder denies the fetch,
     /// [`Error::Transport`] when the dial fails, and [`Error::Io`] when the
-    /// transfer or the sink does.
-    pub async fn copy_to<W: AsyncWrite + Unpin>(self, sink: &mut W) -> Result<u64> {
+    /// holder answers something a correct one would not.
+    pub async fn open(&self) -> Result<BlobReader> {
         let connection = self.dial().await?;
-        // `get_blob` takes the connection by value. A `Connection` is a handle,
-        // so this clone is what keeps the close code readable after the
-        // transfer has failed — see `classify`.
-        let watched = connection.clone();
-        let mut items = get_blob(connection, self.id.hash());
-        let mut written: u64 = 0;
+        let total = self.verified_len_on(&connection).await?;
+        self.reader(connection, total, 0, total, ChunkRanges::all())
+            .await
+    }
 
-        while let Some(item) = items.next().await {
-            match item {
-                GetBlobItem::Item(BaoContentItem::Leaf(leaf)) => {
-                    // RFC-01 §3.3 flagged leaf ordering as unverified: the
-                    // iroh-blobs example writes leaves in arrival order and
-                    // expects correct output, which ASSUMES a whole-blob
-                    // request delivers them in offset order. A sink is not
-                    // seekable, so the assumption cannot be worked around — it
-                    // can only be checked. Checked here, once per leaf, so a
-                    // change in the bao-tree traversal is a loud failure
-                    // instead of a file that is silently scrambled.
-                    if leaf.offset != written {
-                        return Err(Error::Io(std::io::Error::other(format!(
-                            "blob {} arrived out of order: leaf at offset {} after {} bytes",
-                            self.id, leaf.offset, written
-                        ))));
-                    }
-                    sink.write_all(&leaf.data).await?;
-                    written += leaf.data.len() as u64;
-                }
-                // A hash-tree node, not payload. Verification is bao-tree's
-                // job and it has already happened by the time an item arrives.
-                GetBlobItem::Item(BaoContentItem::Parent(_)) => {}
-                GetBlobItem::Done(_) => {
-                    sink.flush().await?;
-                    return Ok(written);
-                }
-                GetBlobItem::Error(error) => return Err(self.classify(error, &watched)),
-            }
+    /// Open a verified read of one half-open byte range.
+    ///
+    /// The same preflight as [`open`](Self::open), so
+    /// [`BlobReader::total_len`] is still the whole blob and
+    /// [`BlobReader::selected_len`] is what this reader will yield.
+    ///
+    /// # Errors
+    ///
+    /// The same set as [`open`](Self::open).
+    pub async fn open_range(&self, range: Range<u64>) -> Result<BlobReader> {
+        // Empty and reversed need no size to refuse, so they never reach the
+        // dial: the holder pays nothing at all for `500..100`, not a handshake
+        // and not a probe. The guard IS the subtraction rather than a check
+        // beside one, so there is no `-` here that a later edit could leave
+        // unprotected — that shape had already produced `attempt to subtract
+        // with overflow` when its guard was broken.
+        let Some(len) = range.end.checked_sub(range.start).filter(|len| *len > 0) else {
+            return Err(self.no_such_range(0, &range));
+        };
+        let connection = self.dial().await?;
+        let total = self.verified_len_on(&connection).await?;
+        // Against the VERIFIED size, and before the data request, so a range
+        // nobody can satisfy costs one probe and no bao traversal.
+        if range.end > total {
+            return Err(self.no_such_range(total, &range));
         }
+        // `ChunkRanges::bytes` and not `ChunkRanges::from`. `from` takes CHUNK
+        // numbers, accepts byte offsets through `ChunkNum` without complaint,
+        // and silently requests a region 1024 times away from the one asked
+        // for. The conversion is upstream's, and its own note is that byte
+        // bounds round out to whole chunks — which is why the reader slices
+        // every leaf rather than writing it.
+        let ranges = ChunkRanges::bytes(range.clone());
+        self.reader(connection, total, range.start, len, ranges)
+            .await
+    }
 
-        // The stream ended without `Done`. Short content is never mistaken for
-        // complete content, the same call `Error::BodyTruncated` makes.
-        Err(Error::Io(std::io::Error::other(format!(
-            "blob {} ended after {written} bytes without completing",
-            self.id
-        ))))
+    fn no_such_range(&self, len: u64, range: &Range<u64>) -> Error {
+        Error::BlobRange {
+            id: self.id,
+            len,
+            start: range.start,
+            end: range.end,
+        }
+    }
+
+    /// Send the data request and hold the answer to the verified size.
+    ///
+    /// **The comparison is not theatre, and it is not an atomic snapshot
+    /// either.** Two requests can meet two different behaviours from one
+    /// holder. What it buys is precise: the probe validated the advertised
+    /// size and last chunk against this address, the data response advertised
+    /// the same number, and bao validates every delivered leaf against the
+    /// same address as it is consumed. A holder that changes its answer
+    /// between the two produces an error, never a successful wrong read —
+    /// different bytes cannot pass validation for one hash.
+    ///
+    /// What it prevents is narrower and is the reason it runs before a reader
+    /// exists: a size that reading would eventually reject is still a size an
+    /// HTTP gateway announces as `Content-Length` before the first byte moves.
+    async fn reader(
+        &self,
+        connection: Connection,
+        total: u64,
+        start: u64,
+        len: u64,
+        ranges: ChunkRanges,
+    ) -> Result<BlobReader> {
+        let (content, announced) = self.request(&connection, ranges).await?;
+        if announced != total {
+            return Err(Error::BlobUnverified {
+                id: self.id,
+                fault: BlobFault::Size {
+                    announced,
+                    verified: total,
+                },
+            });
+        }
+        Ok(BlobReader {
+            connection,
+            total,
+            take: Selection::new(self.id, start, len),
+            state: State::Reading(content),
+        })
+    }
+
+    /// Send one root-only get request and read the size header off its answer.
+    ///
+    /// The non-root arm is refused rather than `unreachable!()`, and the reason
+    /// is NOT that a peer chose it. `ConnectedNext` comes from the request's own
+    /// ranges iterator (`iroh-blobs get.rs:375-395`), which is walked before a
+    /// single response byte is read, so it is decided by the request built two
+    /// lines above and by nothing on the wire.
+    ///
+    /// It is refused because it is unreachable *for the requests this function
+    /// builds*: [`ChunkRangesSeq::from_ranges`] over one non-empty range yields
+    /// offset 0, which is also exactly what keylink's own admission requires.
+    /// An upstream change to that walk should therefore surface as an error
+    /// here rather than as a panic on a path nobody exercises.
+    async fn request(
+        &self,
+        connection: &Connection,
+        ranges: ChunkRanges,
+    ) -> Result<(fsm::AtBlobContent, u64)> {
+        let request = GetRequest::new(self.id.hash(), ChunkRangesSeq::from_ranges([ranges]));
+        let at = fsm::start(connection.clone(), request, fsm::RequestCounters::default());
+        let connected = at
+            .next()
+            .await
+            .map_err(|error| self.classify(error.into(), connection))?;
+        let fsm::ConnectedNext::StartRoot(root) = connected
+            .next()
+            .await
+            .map_err(|error| self.classify(error.into(), connection))?
+        else {
+            // Both remaining variants land here and they are different facts:
+            // `StartChild` is child content, `Closing` is iroh-blobs deciding
+            // the request selected nothing. Naming only the first would send a
+            // reader of the second to look in the wrong place.
+            return Err(Error::Io(std::io::Error::other(format!(
+                "blob {} root-only request did not start at the root",
+                self.id
+            ))));
+        };
+        root.next()
+            .next()
+            .await
+            .map_err(|error| self.classify(error.into(), connection))
+    }
+
+    /// Stream the verified bytes into `sink`.
+    ///
+    /// No local store, so no deduplication and no resume across a restart. Peak
+    /// memory is one chunk. One extra round trip compared with a bare fetch,
+    /// because it goes through [`open`](Self::open) and therefore pays for the
+    /// size preflight — one more stream on the same connection. This is the
+    /// direct replacement for [`BodyReader::copy_to`](crate::BodyReader::copy_to).
+    ///
+    /// # Errors
+    ///
+    /// The same set as [`open`](Self::open), plus [`Error::Io`] when the sink
+    /// fails.
+    pub async fn copy_to<W: AsyncWrite + Unpin>(&self, sink: &mut W) -> Result<u64> {
+        self.open().await?.copy_to(sink).await
     }
 
     /// Fetch into a local store.
@@ -833,12 +972,26 @@ impl BlobHandle {
     /// Deduplication and resume come from the store: an interrupted transfer
     /// continues where it stopped, and content already present costs nothing.
     /// Returns the payload bytes that crossed the wire, which is zero for a
-    /// blob the store already held.
+    /// blob the store already held. Measured by
+    /// `interrupted_fetch_into_resumes_from_store_progress`: after an answer
+    /// cut in half, the second fetch read 37232 of 70000 bytes, so the two
+    /// whole 16 KiB blocks the store had already validated were kept.
+    ///
+    /// # It does not inherit the reader's size guarantee, on purpose
+    ///
+    /// This hands the connection to iroh-blobs' own `Remote::fetch`, which
+    /// decides what is missing and asks for exactly that. There is no
+    /// [`verified_len`](Self::verified_len) preflight and no comparison,
+    /// because there is no number handed back to announce: the content is
+    /// validated against its address as it lands in the store, and the return
+    /// value describes bytes that already arrived rather than bytes to expect.
+    /// Reach for [`open`](Self::open) when a length has to be trusted before
+    /// the transfer.
     ///
     /// # Errors
     ///
     /// The same set as [`copy_to`](Self::copy_to).
-    pub async fn fetch_into(self, store: &Blobs) -> Result<u64> {
+    pub async fn fetch_into(&self, store: &Blobs) -> Result<u64> {
         let connection = self.dial().await?;
         let watched = connection.clone();
         let stats = store
@@ -876,10 +1029,7 @@ impl BlobHandle {
     /// connection rather than on the error, which is why the connection is
     /// still in hand here.
     fn classify(&self, error: GetError, connection: &Connection) -> Error {
-        if error.iroh_error_code() == Some(ERR_PERMISSION) || refused(connection) {
-            return Error::BlobRefused { id: self.id };
-        }
-        Error::Io(std::io::Error::other(error.to_string()))
+        classify(self.id, error, connection)
     }
 
     /// The same question, asked one layer earlier.
@@ -903,6 +1053,285 @@ impl BlobHandle {
     }
 }
 
+// ─────────────────────────────────────────────────────── the verified reader
+
+/// Turns verified leaves into the selected bytes, in order.
+///
+/// # Two counters, and they are not the same number
+///
+/// `next` is the RAW protocol offset the following leaf must carry. Leaves
+/// arrive on 16 KiB block boundaries whatever byte range was asked for
+/// (`IROH_BLOCK_SIZE` is `BlockSize::from_chunk_log(4)`), so for an unaligned
+/// range the first one begins BEFORE the requested bytes and the last one ends
+/// after them. `emitted` counts only what the caller received.
+///
+/// Checking a leaf offset against `emitted` reads as equivalent and is off by
+/// the head overhang on the very first leaf. Keeping the two apart is the whole
+/// reason this is a type rather than two locals in a loop.
+#[derive(Debug)]
+struct Selection {
+    id: BlobId,
+    start: u64,
+    len: u64,
+    next: Option<u64>,
+    emitted: u64,
+    /// Whether this read already failed.
+    ///
+    /// `finish` without it is a completeness test and nothing more, so a
+    /// failure arriving once every selected byte is already out satisfies it
+    /// and the next call reads as a clean end. Unreachable over the network
+    /// today — the decoder stops at the last selected block, so nothing follows
+    /// it to go wrong — and one read-ahead or one multi-range request away from
+    /// being reachable.
+    broken: bool,
+}
+
+impl Selection {
+    /// `len` bytes from `start`.
+    ///
+    /// Taking a length rather than a `Range` is what makes a reversed
+    /// selection unrepresentable: every caller has already checked the range
+    /// against the verified size, and there is no subtraction left to underflow.
+    fn new(id: BlobId, start: u64, len: u64) -> Self {
+        Self {
+            id,
+            start,
+            len,
+            next: None,
+            emitted: 0,
+            broken: false,
+        }
+    }
+
+    /// Record that this read failed somewhere the selection could not see.
+    fn broke(&mut self) {
+        self.broken = true;
+    }
+
+    fn end(&self) -> u64 {
+        self.start + self.len
+    }
+
+    /// The part of one verified leaf the caller asked for, if any.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when a leaf does not continue where the last one ended.
+    /// RFC-01 §3.3 flagged leaf ordering as unverified: the iroh-blobs example
+    /// writes leaves in arrival order and expects correct output, which ASSUMES
+    /// offset order. A sink is not seekable, so the assumption cannot be worked
+    /// around — only checked, once per leaf, so a change in the bao-tree
+    /// traversal is a loud failure instead of a file that is silently scrambled.
+    fn leaf(&mut self, offset: u64, data: Bytes) -> Result<Option<Bytes>> {
+        if let Some(expected) = self.next {
+            if offset != expected {
+                self.broken = true;
+                return Err(Error::BlobUnverified {
+                    id: self.id,
+                    fault: BlobFault::Order { offset, expected },
+                });
+            }
+        }
+        let stop = offset.saturating_add(data.len() as u64);
+        self.next = Some(stop);
+
+        let head = self.start.max(offset);
+        let tail = self.end().min(stop);
+        if head >= tail {
+            return Ok(None);
+        }
+        self.emitted += tail - head;
+        Ok(Some(
+            data.slice((head - offset) as usize..(tail - offset) as usize),
+        ))
+    }
+
+    /// # Errors
+    ///
+    /// [`Error::Io`] when fewer bytes were emitted than the selection names.
+    /// A transfer that stopped early is never reported as a complete one, the
+    /// same call [`Error::BodyTruncated`] makes.
+    fn finish(&self) -> Result<()> {
+        if self.broken {
+            return Err(Error::BlobUnverified {
+                id: self.id,
+                fault: BlobFault::Aborted {
+                    received: self.emitted,
+                },
+            });
+        }
+        if self.emitted == self.len {
+            return Ok(());
+        }
+        Err(Error::BlobUnverified {
+            id: self.id,
+            fault: BlobFault::Incomplete {
+                received: self.emitted,
+                selected: self.len,
+            },
+        })
+    }
+}
+
+/// The get state, or the fact that there is none left.
+///
+/// Two states and not three, deliberately. "This read broke" lives in
+/// [`Selection`], because that is where a test can reach it: a reader can only
+/// be driven by a real holder, and no holder can produce a failure after the
+/// last selected byte — the decoder stops there. A third state here would be
+/// defence in depth nobody could watch fail.
+#[derive(Debug)]
+enum State {
+    Reading(fsm::AtBlobContent),
+    Ended,
+}
+
+/// One verified read of a blob, or of one byte range of it.
+///
+/// # Dropping it cancels the transfer
+///
+/// The reader owns the connection **and** the get state. quinn sends
+/// `STOP_SENDING` when a receive stream with unread data is dropped, so
+/// abandoning a reader stops the holder rather than letting it finish into a
+/// buffer nobody reads. A reader that kept only the `Connection` and let the
+/// stream state go early would compile, read correctly, and cancel nothing.
+///
+/// # The end of the selection is the end of the read
+///
+/// [`next_chunk`](Self::next_chunk) stops at the last selected byte and does
+/// not walk iroh-blobs' closing state, deliberately. `AtClosing::next` waits
+/// for the holder to finish the stream and only *logs* trailing data rather
+/// than rejecting it, so running it would hand a holder that sends valid
+/// content and then keeps the stream open a way to park the reader with no
+/// timeout to stop it.
+///
+/// The cost is that a completed read still drops an unfinished receive stream,
+/// so the holder sees `STOP_SENDING` after a normal read as well as after an
+/// abandoned one. Nothing here reads that signal, and neither should a caller:
+/// completion is `Ok(None)` from `next_chunk`, which fires only once every
+/// selected byte arrived and was validated.
+pub struct BlobReader {
+    /// Held so a refusal stays distinguishable from a network fault after the
+    /// handle is gone, and so the connection outlives the read.
+    connection: Connection,
+    total: u64,
+    take: Selection,
+    state: State,
+}
+
+/// Written by hand because the derived form prints the whole quinn connection
+/// and the bao decoder state, which is a page of transport internals in every
+/// assertion message a test writes about a reader.
+impl std::fmt::Debug for BlobReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobReader")
+            .field("id", &self.take.id)
+            .field("total_len", &self.total)
+            .field("selected_len", &self.take.len)
+            .field("emitted", &self.take.emitted)
+            .finish()
+    }
+}
+
+impl BlobReader {
+    /// The verified size of the whole blob.
+    ///
+    /// Safe to announce as an HTTP `Content-Length`, and that is a claim about
+    /// the NUMBER rather than about the bytes. Two requests agreed on it and
+    /// the content address vouched for the last chunk, so no holder can later
+    /// deliver a different length and be believed.
+    ///
+    /// It is not a promise that the holder can deliver them. iroh-blobs' own
+    /// probe "does not validate that the peer has all the data", so a holder
+    /// with a hole in the middle passes both checks and fails during the read.
+    /// A gateway that has already sent this as a `Content-Length` then has a
+    /// broken body and nothing else to report with.
+    #[must_use]
+    pub fn total_len(&self) -> u64 {
+        self.total
+    }
+
+    /// The bytes this reader will yield. Equal to [`total_len`](Self::total_len)
+    /// for a whole-blob read.
+    #[must_use]
+    pub fn selected_len(&self) -> u64 {
+        self.take.len
+    }
+
+    /// The next verified slice, or `None` once the selection is complete.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BlobRefused`] when the holder denies the transfer part way, and
+    /// [`Error::Io`] when a leaf fails verification, arrives out of order, or
+    /// the stream ends before every selected byte arrived.
+    pub async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
+        loop {
+            // Taking the state before the `await` is what stops a failed reader
+            // continuing a transfer it has already reported broken. What stops
+            // it reporting a CLEAN END is `Selection::broke`, not this line.
+            match std::mem::replace(&mut self.state, State::Ended) {
+                State::Ended => return self.take.finish().map(|()| None),
+                State::Reading(content) => match content.next().await {
+                    fsm::BlobContentNext::More((next, item)) => {
+                        let item = item.map_err(|error| {
+                            // `Selection` remembers, so the terminal call above
+                            // reports the failure instead of a clean end.
+                            self.take.broke();
+                            classify(self.take.id, error.into(), &self.connection)
+                        })?;
+                        // A hash-tree node, not payload. Verification is
+                        // bao-tree's job and has already happened by the time an
+                        // item arrives.
+                        let slice = match item {
+                            BaoContentItem::Leaf(leaf) => self.take.leaf(leaf.offset, leaf.data)?,
+                            BaoContentItem::Parent(_) => None,
+                        };
+                        self.state = State::Reading(next);
+                        if let Some(bytes) = slice {
+                            return Ok(Some(bytes));
+                        }
+                    }
+                    fsm::BlobContentNext::Done(_) => {
+                        self.take.finish()?;
+                        self.state = State::Ended;
+                        return Ok(None);
+                    }
+                },
+            }
+        }
+    }
+
+    /// Stream every selected byte into `sink`.
+    ///
+    /// Consuming, because a read is linear: there is no second pass over a
+    /// reader that has already been drained.
+    ///
+    /// # Errors
+    ///
+    /// The same set as [`next_chunk`](Self::next_chunk), plus [`Error::Io`]
+    /// when the sink fails.
+    pub async fn copy_to<W: AsyncWrite + Unpin>(mut self, sink: &mut W) -> Result<u64> {
+        let mut written = 0;
+        while let Some(chunk) = self.next_chunk().await? {
+            sink.write_all(&chunk).await?;
+            written += chunk.len() as u64;
+        }
+        sink.flush().await?;
+        Ok(written)
+    }
+}
+
+/// The one implementation of [`BlobHandle::classify`], shared with
+/// [`BlobReader`], which meets the same two refusal shapes after the handle it
+/// came from is gone.
+fn classify(id: BlobId, error: GetError, connection: &Connection) -> Error {
+    if error.iroh_error_code() == Some(ERR_PERMISSION) || refused(connection) {
+        return Error::BlobRefused { id };
+    }
+    Error::Io(std::io::Error::other(error.to_string()))
+}
+
 /// Whether a connection was closed with the refusal code.
 ///
 /// `None` means it is still open, which is not a refusal.
@@ -922,8 +1351,6 @@ fn is_permission(error: &ConnectionError) -> bool {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
-
-    use iroh_blobs::protocol::{ChunkRanges, ChunkRangesSeq};
 
     use super::*;
 
@@ -1088,6 +1515,155 @@ mod tests {
         assert!(
             admits_get(&grants, &live, &get(1, blob(1), whole_blob())).is_ok(),
             "control: the same request is admitted once the connection is known"
+        );
+    }
+
+    /// Range reads must not have widened admission.
+    ///
+    /// keylink's own client now sends two request shapes it never sent before:
+    /// the last-chunk size preflight and an arbitrary byte range. Both are
+    /// root-only, so `is_blob()` admits them and the hash-sequence hole stays
+    /// shut. Had it not, the obvious repair would have been to relax the
+    /// check — which is the change this row exists to make loud.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK6`) by replacing
+    /// `if !msg.request.ranges.is_blob() {`
+    /// with `if false {`.
+    #[test]
+    fn blob_admission_accepts_only_finite_root_ranges() {
+        let grants = Grants::new();
+        let live = Connections::default();
+        grants.grant(admitted(1), blob(1));
+        live.admit(1, peer(1));
+        let admits = |ranges| admits_get(&grants, &live, &get(1, blob(1), ranges)).is_ok();
+
+        assert!(admits(whole_blob()), "the whole blob");
+        assert!(
+            admits(ChunkRangesSeq::from_ranges([ChunkRanges::last_chunk()])),
+            "the size preflight `open` and `verified_len` send"
+        );
+        assert!(
+            admits(ChunkRangesSeq::from_ranges([ChunkRanges::bytes(
+                1_000..40_000
+            )])),
+            "an unaligned byte range"
+        );
+        assert!(
+            admits(ChunkRangesSeq::from_ranges([ChunkRanges::bytes(0..1)])),
+            "a single byte"
+        );
+
+        assert!(
+            !admits(ChunkRangesSeq::all()),
+            "every child of a hash sequence"
+        );
+        assert!(
+            !admits(ChunkRangesSeq::from_ranges_infinite([ChunkRanges::all()])),
+            "an infinite sequence"
+        );
+        assert!(
+            !admits(ChunkRangesSeq::from_ranges([
+                ChunkRanges::empty(),
+                ChunkRanges::all()
+            ])),
+            "a selection that skips the root and names a child"
+        );
+    }
+
+    // ───────────────────────────── the selection, on injected verified items
+    //
+    // `Selection` is the part of a read with no network in it: leaves arrive
+    // already verified by bao, and what is left is ordering, slicing, and
+    // knowing when the selection is complete. Feeding it items directly is
+    // what makes the two failures below reachable at all — a correct holder
+    // cannot produce them, and neither can the forging holder in
+    // `tests/blobs.rs`, because a leaf whose offset moved fails bao
+    // verification before `Selection` ever sees it. Synchronous, so there is
+    // no terminator to prove.
+
+    fn leaf(len: usize) -> Bytes {
+        Bytes::from(vec![7u8; len])
+    }
+
+    /// Leaves must continue where the last one ended.
+    ///
+    /// RFC-01 §3.3: a sink is not seekable, so a traversal that stopped
+    /// arriving in offset order would silently scramble a file. Watched red
+    /// with `scripts/break-once.sh` (row `HK4`) by replacing
+    /// `if offset != expected {`
+    /// with `if false {`.
+    #[test]
+    fn blob_reader_rejects_gap_and_out_of_order_offsets() {
+        let mut take = Selection::new(blob(1), 0, 40_000);
+        assert!(
+            take.leaf(0, leaf(16_384)).is_ok(),
+            "control: the first leaf is accepted wherever it starts"
+        );
+        assert!(
+            take.leaf(32_768, leaf(16_384)).is_err(),
+            "a leaf that skips a whole block is a gap"
+        );
+
+        let mut take = Selection::new(blob(1), 0, 40_000);
+        take.leaf(0, leaf(16_384)).expect("the first leaf");
+        take.leaf(16_384, leaf(16_384)).expect("the second leaf");
+        assert!(
+            take.leaf(0, leaf(16_384)).is_err(),
+            "and one that goes backwards is out of order"
+        );
+    }
+
+    /// A stream that ends early is a failure, never a shorter success.
+    ///
+    /// The same call [`Error::BodyTruncated`] makes. Watched red with
+    /// `scripts/break-once.sh` (row `HK5`) by replacing
+    /// `if self.emitted == self.len {`
+    /// with `if true {`.
+    #[test]
+    fn blob_reader_rejects_short_eof() {
+        let mut take = Selection::new(blob(1), 0, 40_000);
+        take.leaf(0, leaf(16_384)).expect("the first leaf");
+        assert!(
+            take.finish().is_err(),
+            "16384 of 40000 selected bytes has not completed"
+        );
+
+        take.leaf(16_384, leaf(16_384)).expect("the second leaf");
+        take.leaf(32_768, leaf(16_384)).expect("the third leaf");
+        assert!(
+            take.finish().is_ok(),
+            "control: the same selection completes once every byte arrived"
+        );
+    }
+
+    /// A selection that rejected a leaf never reports completion.
+    ///
+    /// The counterexample is codex's, and it is why `broken` exists: with a
+    /// one-byte selection the very first leaf satisfies `emitted == len`, so a
+    /// failure AFTER that point leaves a completeness test with nothing to
+    /// object to. The reader's terminal call then answers `Ok(None)` and every
+    /// layer above reads a clean end off a read that broke.
+    ///
+    /// Watched red with `scripts/break-once.sh` (row `HK9`) by replacing
+    /// `if self.broken {`
+    /// with `if false {`.
+    #[test]
+    fn a_selection_that_rejected_a_leaf_never_reports_completion() {
+        let mut take = Selection::new(blob(1), 0, 1);
+        take.leaf(0, leaf(16_384))
+            .expect("the first leaf covers it");
+        assert!(
+            take.finish().is_ok(),
+            "control: one byte was asked for and one byte was delivered"
+        );
+
+        assert!(
+            take.leaf(2, leaf(16_384)).is_err(),
+            "and then a gap arrives"
+        );
+        assert!(
+            take.finish().is_err(),
+            "after which there is no clean end left to report"
         );
     }
 

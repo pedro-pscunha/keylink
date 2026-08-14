@@ -214,6 +214,7 @@ pub mod compose;
 mod console;
 mod error;
 pub mod extend;
+mod external;
 mod idempotency;
 mod keys;
 mod macros;
@@ -251,7 +252,9 @@ pub use actor::{
 };
 pub use admission::{Admission, Admittance, DynamicAdmission, Revocable, Revocation};
 pub use authz::{AdmittedPeer, Allowlist, ProvenPeer};
-pub use blobs::{BlobHandle, BlobId, Blobs, BlobsAdmission, Granting, Retention, MAX_GRANTS};
+pub use blobs::{
+    BlobHandle, BlobId, BlobReader, Blobs, BlobsAdmission, Granting, Retention, MAX_GRANTS,
+};
 pub use body::{Body, BodyReader};
 pub use call::{Applied, CallId, APPLIED_BOUND};
 pub use console::{
@@ -308,7 +311,13 @@ pub mod inspect {
 pub use authz::{Authorization, Compiled, Rules};
 #[cfg(feature = "blocking")]
 pub use error::BlockingError;
-pub use error::{ConfigError, Error, Failure, Queued, Result, TellError, Transmitted, Transport};
+pub use error::{
+    BlobFault, ConfigError, Error, Failure, Queued, Result, TellError, Transmitted, Transport,
+};
+pub use external::{
+    ExternalActorService, ExternalCall, ExternalError, ExternalFuture, ExternalKind,
+    ExternalMethod, ExternalOutput, ExternalService, ServiceCodec,
+};
 pub use idempotency::{
     Attaching, Idempotency, IdempotencyRefusal, KeyState, Keyable, Limits, Records, MAX_ATTACH,
     MAX_RECORDED_BYTES, MAX_RECORDED_FRAME, MAX_RECORDS, MAX_RUNNING, MAX_RUNNING_PER_PEER,

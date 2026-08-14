@@ -1,0 +1,128 @@
+{
+  "$defs": {
+    "ErrorEnvelope": {
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "A stable machine-readable category.",
+              "type": "string"
+            },
+            "message": {
+              "description": "A fixed sentence. Never carries caller input.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "type": "object"
+    },
+    "Inventory.Count.request": {
+      "additionalProperties": false,
+      "properties": {
+        "value": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "title": "Inventory.Count.request",
+      "type": "object"
+    },
+    "Inventory.Count.response": {
+      "format": "uint64",
+      "minimum": 0,
+      "title": "uint64",
+      "type": "integer"
+    },
+    "Inventory.Echo.request": {
+      "additionalProperties": false,
+      "properties": {
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "title": "Inventory.Echo.request",
+      "type": "object"
+    },
+    "Inventory.Echo.response": {
+      "title": "string",
+      "type": "string"
+    },
+    "Inventory.Fetch.request": {
+      "additionalProperties": false,
+      "properties": {
+        "sku": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sku"
+      ],
+      "title": "Inventory.Fetch.request",
+      "type": "object"
+    },
+    "Inventory.Fetch.response": {
+      "format": "uint32",
+      "minimum": 0,
+      "title": "uint32",
+      "type": "integer"
+    },
+    "Inventory.Take.request": {
+      "additionalProperties": false,
+      "properties": {
+        "sku": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sku"
+      ],
+      "title": "Inventory.Take.request",
+      "type": "object"
+    },
+    "Inventory.Take.response": {
+      "format": "uint64",
+      "minimum": 0,
+      "title": "uint64",
+      "type": "integer"
+    },
+    "Inventory.Upload.request": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "Inventory.Upload.request",
+      "type": "object"
+    },
+    "Inventory.Upload.response": {
+      "format": "uint64",
+      "minimum": 0,
+      "title": "uint64",
+      "type": "integer"
+    }
+  },
+  "$id": "urn:keylink:Inventory",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}
