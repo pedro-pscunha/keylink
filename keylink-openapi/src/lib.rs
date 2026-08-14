@@ -207,10 +207,20 @@ pub fn document<D: Documented>(
     register(&mut components, "ErrorEnvelope", envelope)?;
 
     let keyed = surface.addressing() == Addressing::Actors;
-    for operation in D::operations() {
+    for mut operation in D::operations() {
         if keyed && !operation.keyed {
             continue;
         }
+        hoist(
+            &mut operation.request,
+            &mut components,
+            "#/components/schemas",
+        )?;
+        hoist(
+            &mut operation.response,
+            &mut components,
+            "#/components/schemas",
+        )?;
         for route in surface.routes() {
             if !serves(operation.kind, route.kind()) {
                 continue;
@@ -270,10 +280,14 @@ pub fn schemas<D: Documented>(surface: &HttpSurface) -> Result<Document, Documen
     let mut defs: BTreeMap<String, Value> = BTreeMap::new();
     register(&mut defs, "ErrorEnvelope", schema::error_envelope())?;
     let keyed = surface.addressing() == Addressing::Actors;
-    for operation in D::operations() {
+    for mut operation in D::operations() {
         if keyed && !operation.keyed {
             continue;
         }
+        // A standalone document resolves against `#/$defs`, which is where a
+        // JSON Schema reader looks. Same hoist, different destination.
+        hoist(&mut operation.request, &mut defs, "#/$defs")?;
+        hoist(&mut operation.response, &mut defs, "#/$defs")?;
         register(
             &mut defs,
             &format!("{}.{}.request", D::SERVICE, operation.method),
@@ -292,6 +306,80 @@ pub fn schemas<D: Documented>(surface: &HttpSurface) -> Result<Document, Documen
     });
     let bytes = serde_json::to_vec_pretty(&value).unwrap_or_default();
     Ok(Document { value, bytes })
+}
+
+/// Move a schemars schema's `$defs` into the shared table and rewrite its
+/// references to point there.
+///
+/// `schemars` emits `#/$defs/Name` and keeps the definitions inside the schema
+/// it produced. An OpenAPI document resolves against `#/components/schemas/`,
+/// so an inlined `$defs` block is a reference to a location the document does
+/// not have — which `check_references` catches, and which is how this function
+/// came to exist rather than being designed in.
+///
+/// The component name carries the logical name AND its digest. The name is for
+/// the person reading the document; the digest is what keeps two services'
+/// `Item` from being one component. Collisions are still refused rather than
+/// merged, because two schemas under one digest is a fact worth failing on.
+fn hoist(
+    schema: &mut Value,
+    components: &mut BTreeMap<String, Value>,
+    into: &str,
+) -> Result<(), DocumentError> {
+    let taken = schema
+        .as_object_mut()
+        .and_then(|map| map.remove("$defs"))
+        .and_then(|defs| defs.as_object().cloned());
+    let Some(defs) = taken else {
+        rewrite_refs(schema, into, &BTreeMap::new());
+        return Ok(());
+    };
+    let mut names = BTreeMap::new();
+    for (logical, mut definition) in defs {
+        let component = format!("{logical}_{}", digest::component_name(&logical));
+        // Depth first: a definition can reference another definition.
+        rewrite_refs(&mut definition, into, &names);
+        register(components, &component, definition)?;
+        names.insert(logical, component);
+    }
+    // A second pass, so a definition registered early can reference one
+    // registered late. Mutual recursion needs both directions.
+    for (logical, component) in &names {
+        let Some(mut definition) = components.get(component).cloned() else {
+            continue;
+        };
+        rewrite_refs(&mut definition, into, &names);
+        components.insert(component.clone(), definition);
+        let _ = logical;
+    }
+    rewrite_refs(schema, into, &names);
+    Ok(())
+}
+
+/// Rewrite every `#/$defs/Name` to `<into>/<component>`.
+fn rewrite_refs(value: &mut Value, into: &str, names: &BTreeMap<String, String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(reference)) = map.get_mut("$ref") {
+                if let Some(logical) = reference.strip_prefix("#/$defs/") {
+                    let target = names
+                        .get(logical)
+                        .cloned()
+                        .unwrap_or_else(|| logical.to_owned());
+                    *reference = format!("{into}/{target}");
+                }
+            }
+            for child in map.values_mut() {
+                rewrite_refs(child, into, names);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                rewrite_refs(item, into, names);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn register(
