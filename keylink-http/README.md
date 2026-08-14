@@ -5,6 +5,20 @@
 registry. Both call the existing generated Keylink client and neither creates a
 second server pipeline.
 
+Part of the [keylink workspace](../README.md). Use this package when a caller
+cannot speak Rust or the Keylink protocol.
+
+```toml
+[dependencies]
+keylink = { git = "https://github.com/pedro-pscunha/keylink" }
+keylink-http = { git = "https://github.com/pedro-pscunha/keylink" }
+axum = "0.8"
+```
+
+Not published to crates.io yet, so a git dependency is the only way in. Requires
+Rust 1.91 or later. You bring the axum server; this package produces a `Router`
+to merge into it.
+
 | Declaration | Singleton | Keyed |
 |---|---|---|
 | `rpc` | `POST /rpc/{method}` | `POST /{actor}/rpc/{method}` |
@@ -36,7 +50,8 @@ Use a stable, non-secret principal namespace.
 Store verified authorization claims in a separate extension.
 
 `Access` is mandatory.
-It checks the principal, claims, service, and method before the gateway reads the request body.
+It checks the principal, claims, service, method and addressed actor before the gateway reads the request body.
+The actor is `None` on a singleton surface, and it is the whole difference an `Access` implementation sees between the two.
 The Keylink server sees the gateway node as its peer.
 It does not see the HTTP principal as an `EndpointId`.
 
@@ -63,8 +78,29 @@ Run the complete example from the workspace root:
 cargo run -p keylink-http --example inventory
 ```
 
-The example prints its loopback URL.
-The repository gate runs `.mise/tasks/http-smoke` against this URL with `curl`.
+The example prints its loopback URL, and mounts its surface at `/inventory`
+rather than the `/v1/inventory` of the snippet above — the prefix is yours to
+choose, so read it off the printed URL rather than off this page. One call
+against it:
+
+```sh
+curl -i -X POST "$URL/rpc/Add" \
+  -H 'Authorization: Bearer allow' \
+  -H 'Content-Type: application/json' \
+  --data '{"left":2,"right":3}'
+```
+
+```
+HTTP/1.1 200 OK
+content-type: application/json
+
+5
+```
+
+The success body is the declared return value alone, never a Keylink `Response`
+envelope. Send `Bearer deny` instead and the same call answers `403` with the
+error envelope below. The repository gate runs `.mise/tasks/http-smoke` against
+this URL with `curl`.
 
 ## HTTP contract
 
@@ -79,7 +115,8 @@ All other HTTP methods return `method_not_allowed` and `Allow: POST`.
 
 The request must contain exactly one valid JSON media type.
 The gateway accepts `application/json` and valid `application/*+json` media types.
-Parameters are valid when the MIME parser accepts them.
+Parameters are valid when the MIME parser accepts them, so `application/json; charset=utf-8` is a JSON media type.
+A `send` route is the exception: it takes `application/octet-stream` with no parameters at all.
 Missing, duplicate, malformed, or non-JSON content types return `unsupported_media_type`.
 
 The request body is one JSON object with the declared Rust argument names.
@@ -92,7 +129,9 @@ A unit return becomes `null`.
 Set positive request and success limits with `JsonLimits`.
 Both byte limits are inclusive.
 The gateway stops request collection and success encoding at these limits.
-Error bodies have a separate fixed limit.
+A gateway built without `.limits(..)` uses the `JsonLimits` default of 64 KiB each way, so it is bounded before you configure anything.
+`StreamingLimits` has no default, which is what keeps the streaming and blob route families opt-in.
+Error bodies have a separate fixed limit of 512 bytes.
 JavaScript clients must use safe integers or JSON-safe domain types.
 
 ## Idempotency
@@ -120,24 +159,24 @@ The gateway does not include credentials, principal bytes, authorization details
 |---:|---|---|
 | 400 | `invalid_request` | The path or JSON argument object is invalid. |
 | 400 | `invalid_idempotency_key` | The idempotency key is invalid. |
-| 400 | `idempotency_not_supported` | The route does not accept idempotency keys. Only `rpc` does. |
-| 400 | `invalid_stream_metadata` | The `Keylink-Arguments` header is missing or undecodable. |
+| 400 | `idempotency_not_supported` | This method does not accept idempotency keys. The gateway refuses the header on `send`, `recv` and every blob route; Keylink refuses it for an `rpc` method its service does not key. |
+| 400 | `invalid_stream_metadata` | The `Keylink-Arguments` header is missing, duplicated, not canonical base64url, or over its metadata limit. |
 | 400 | `range_not_supported` | `Range` or `If-Range` on a route that serves no ranges. |
 | 401 | `unauthenticated` | Authentication is required. |
 | 403 | `forbidden` | The verified caller cannot invoke this method. |
 | 404 | `method_not_found` | The RPC route does not exist. |
-| 404 | `actor_not_found` | The addressed actor does not exist, or the policy refused it — the two answer alike. |
+| 404 | `actor_not_found` | No actor of this id is mounted. |
+| 404 | `blob_not_found` | No byte resource of this id is available to this caller. A guessed id, another caller's, another method's, and one evicted from the finite table all answer alike. |
 | 405 | `method_not_allowed` | The route does not serve this verb. Call routes take `POST`; blob byte routes take `GET` and `HEAD`. |
 | 409 | `idempotency_conflict` | The key cannot be replayed. |
-| 404 | `blob_not_found` | No grant of this caller's names these bytes. |
-| 410 | `blob_gone` | The grant existed and the holder no longer serves it. |
+| 410 | `blob_gone` | The byte resource existed for this caller and the holder no longer serves it. |
 | 413 | `request_too_large` | The request exceeds its byte limit. |
 | 413 | `request_stream_too_large` | The upload exceeds its byte limit. |
-| 416 | `range_not_satisfiable` | The requested range lies outside the content. |
 | 415 | `unsupported_media_type` | One valid JSON media type is required. |
+| 416 | `range_not_satisfiable` | The requested range lies outside the content. |
 | 429 | `idempotency_capacity` | The upstream idempotency capacity is exhausted. |
 | 500 | `response_too_large` | The success JSON exceeds its byte limit. |
-| 500 | `response_stream_too_large` | The download exceeds its byte limit. |
+| 502 | `response_stream_too_large` | The download exceeds its byte limit. |
 | 502 | `upstream_error` | The upstream call failed. |
 | 503 | `upstream_unavailable` | The upstream service is unavailable. |
 | 504 | `upstream_timeout` | The upstream call timed out. |
@@ -146,9 +185,16 @@ A `401` response includes the configured `WWW-Authenticate` challenge.
 A `405` response includes `Allow` naming the verbs that route does serve.
 All error responses use `application/json` and `Cache-Control: private, no-store`.
 
-This table is the complete inventory and a test says so:
-`the_readme_documents_every_error_code` compares it against `ErrorKind::ALL`.
-Seven codes were missing from it before that test existed.
+**A refusal never says whether the actor exists.** A caller the policy refuses
+gets `403` byte for byte whether the actor is mounted or was never mounted. Only
+a caller the policy *admits* can reach `404 actor_not_found`, which is the
+registry answering. Read `403` as "not for you" and never as "not there".
+
+This table names every code the gateway can answer with, and
+`the_readme_documents_every_error_code` in `keylink-http/tests/api.rs` fails when
+a new one is missing from either README. It compares the **codes only** — no test
+checks the status or the meaning beside one, so those two columns are reviewed by
+hand. Seven codes were missing before that test existed.
 
 ## Cancellation and unsupported capabilities
 
@@ -159,7 +205,9 @@ An idempotent call can settle as `Interrupted`.
 
 This gateway does not expose `tell`, feeds, `__Status`, WebSockets, actor
 lifecycle, actor discovery, Keylink administration, or CORS. `send`, `recv`,
-blobs, keyed actors and OpenAPI all exist — see the route table above.
+blobs and keyed actors all exist — see the route table above. OpenAPI documents
+are not a gateway route: they come from [`keylink-openapi`](../keylink-openapi),
+which installs its own two endpoints and is never mounted for you.
 
 ## Every surface at once
 
@@ -171,9 +219,34 @@ cargo run -p keylink-openapi --example gateway
 mise run http-smoke-full
 ```
 
-The smoke drives 45 checks against it with real curl, including ranges,
-conditional GETs, encoded actor ids and both document media types.
+The smoke drives every route family in the table above with real curl, including
+ranges, conditional GETs, encoded actor ids and both document media types. It
+also fails when a family stops being driven, so the coverage claim is checked
+rather than asserted. No count is written here: it would rot on the next check
+added, and the script is the inventory.
+
+The keyed half differs from the singleton in three things — the marker type, the
+client, and `Addressing::Actors`:
+
+```rust,ignore
+let keyed = keylink_http::ActorGateway::<bays::External, _>::new(
+    bays::RegistryClient::connect(&node, addr).await?,
+    access,
+    challenge,
+)
+.limits(keylink_http::JsonLimits::new(64 * 1024, 64 * 1024)?)
+.router::<AppState>(
+    keylink_http::HttpSurface::new("/bays", keylink_http::Addressing::Actors)?
+        .with_streaming(streaming_limits)
+        .without_fallback(),
+)?;
+```
 
 Two gateways merged into one axum router need
-`HttpSurface::without_fallback()` on the second: axum permits one fallback per
-router.
+`HttpSurface::without_fallback()` on the second, as above: axum permits one
+fallback per router, and merging two that both have one panics.
+
+## License
+
+MIT or Apache-2.0, at your option. See [LICENSE-MIT](../LICENSE-MIT) and
+[LICENSE-APACHE](../LICENSE-APACHE) at the workspace root.

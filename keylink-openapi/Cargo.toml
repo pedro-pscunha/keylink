@@ -2,8 +2,12 @@
 name = "keylink-openapi"
 version = "0.1.0"
 edition = "2021"
+# The floor the rest of the workspace compiles on. This crate was the one member
+# that never stated it, so `cargo +1.91 check` covered it and nothing promised it.
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/pedrocunha/keylink"
+repository = "https://github.com/pedro-pscunha/keylink"
+readme = "README.md"
 description = "OpenAPI 3.1 and JSON Schema documents for a keylink-http surface"
 
 [dependencies]

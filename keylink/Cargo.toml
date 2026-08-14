@@ -9,7 +9,7 @@ edition = "2021"
 rust-version = "1.91"
 description = "Typed peer-to-peer RPC over iroh, with a schema-derived ALPN and fail-closed authorization."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/pedrocunha/keylink"
+repository = "https://github.com/pedro-pscunha/keylink"
 
 [features]
 default = ["blocking", "fs", "env", "persist-file"]
