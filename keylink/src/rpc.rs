@@ -1813,6 +1813,18 @@ where
                     service: Req::SERVICE,
                     named: named.to_owned(),
                 });
+        // A service that accepts no key builds no ledger, so nothing ever takes
+        // the recovered records or writes one. The `DurableRecords` still lives
+        // in `Keys` and still holds the exclusive claim on the log file, so a
+        // correctly configured second service on the same `StateId` is told
+        // `Busy` by a service that will never use it.
+        //
+        // A second statement rather than an `.or_else` on the chain above,
+        // because the chain's `.first_unknown` line is a registered break
+        // anchor and growing the expression makes the formatter re-indent it.
+        let held_and_unused = !self.keyable.needs_a_ledger() && self.records.stores_durably();
+        let configuration =
+            configuration.or_else(|| held_and_unused.then_some(ConfigError::DurableWithoutKeys));
         let mut chain = self.base;
         for layer in self.layers.into_iter().rev() {
             chain = wrap(layer, chain);

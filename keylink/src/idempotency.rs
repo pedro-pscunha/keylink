@@ -847,7 +847,7 @@ impl Records {
     /// Separate from [`store`](Self::store) because `evict` runs under the
     /// ledger's lock, where a `&DurableRecords` it cannot await on would be a
     /// borrow it has no use for.
-    fn stores_durably(&self) -> bool {
+    pub(crate) fn stores_durably(&self) -> bool {
         match self {
             Self::Memory | Self::None => false,
             #[cfg(feature = "persist")]

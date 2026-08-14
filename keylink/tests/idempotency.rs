@@ -2277,6 +2277,44 @@ mod stored {
         );
     }
 
+    /// A durable store on a service that accepts no key is refused at startup.
+    ///
+    /// `Keyable::None` builds no ledger, so the store is never read and never
+    /// written — and it holds the exclusive claim on its log file for as long
+    /// as the service lives. The next service configured to use that ledger
+    /// properly is then told `Busy` by one that will never write a record.
+    ///
+    /// `a_second_process_cannot_claim_a_running_actor` in
+    /// `keylink/tests/durable.rs` is the other end of the same rope: it asserts
+    /// the `Busy`, and this asserts that a misconfiguration cannot be the
+    /// reason for one.
+    #[tokio::test]
+    async fn a_durable_store_without_keys_is_refused_at_startup() {
+        let scratch = Scratch::new("durable-without-keys");
+        let files = keylink_persist::file::EntryFiles::open(&scratch.0)
+            .await
+            .expect("opens");
+        let records = keylink::DurableRecords::open(&files, &ledger_id())
+            .await
+            .expect("nobody else holds this ledger");
+
+        let server = local_node().await;
+        let service = till::service(Till::default(), Allowlist::anyone())
+            .keyable(Keyable::None)
+            .records(Records::Durable(records))
+            .build();
+
+        let error = KeylinkServer::builder(&server)
+            .service(service)
+            .spawn()
+            .expect_err("a store held and never written must refuse startup");
+
+        assert!(
+            matches!(error, Error::Config(ConfigError::DurableWithoutKeys)),
+            "got {error:?}"
+        );
+    }
+
     /// A key claimed when the process died comes back `Interrupted`.
     ///
     /// Not `Fresh`, which would run the work a second time, and not `Done`, which
