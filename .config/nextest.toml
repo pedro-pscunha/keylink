@@ -1,0 +1,22 @@
+# `keylink::drift` builds the `demo` binary twice, with two different type sets,
+# into one target path. Run in parallel, the second build replaces a Mach-O the
+# first is executing and macOS kills it with SIGKILL — the tests report a child
+# that "never printed a dial line" or that ended with `signal: 9`, which reads
+# like a protocol failure and is a build-artifact race.
+#
+# Measured: both rows fail together under the default concurrency and pass at
+# `--test-threads 1`, on a clean `main` at `841c095` as well as on this branch,
+# sandboxed and not. It predates this work.
+#
+# One group with one thread, rather than lowering the whole run's concurrency:
+# every other test in the workspace is unaffected and there are 800+ of them.
+#
+# Red-tested by raising the group to `max-threads = 2` and re-running the
+# workspace: both rows fail again, at 869/871. Restored, they pass at 871/871.
+# The number 1 is the guard, so 1 is what is measured.
+[test-groups]
+drift = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(drift)'
+test-group = 'drift'
