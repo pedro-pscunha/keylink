@@ -560,7 +560,10 @@ where
             router = router.route(&path, handler);
         }
     }
-    Ok(router.fallback(|| async { GatewayError::MethodNotFound.response(None) }))
+    if contract.serves_fallback() {
+        router = router.fallback(|| async { GatewayError::MethodNotFound.response(None) });
+    }
+    Ok(router)
 }
 
 /// How a handler reaches the generated client, and everything else it needs

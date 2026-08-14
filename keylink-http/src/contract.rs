@@ -18,6 +18,7 @@ pub struct HttpSurface {
     prefix: String,
     addressing: Addressing,
     streaming: Option<StreamingLimits>,
+    fallback: bool,
 }
 
 impl HttpSurface {
@@ -43,6 +44,7 @@ impl HttpSurface {
             prefix,
             addressing,
             streaming: None,
+            fallback: true,
         })
     }
 
@@ -69,6 +71,30 @@ impl HttpSurface {
     #[must_use]
     pub const fn streaming(&self) -> Option<StreamingLimits> {
         self.streaming
+    }
+
+    /// Serve no fallback, so this router can be merged with another that does.
+    ///
+    /// A gateway router answers an unmatched path with the same JSON refusal
+    /// every other route uses, which is better than axum's bare `404` — but
+    /// axum permits ONE fallback per router, so two gateways merged into one
+    /// application panic with "Cannot merge two `Router`s that both have a
+    /// fallback". A deployment serving a singleton surface AND a keyed one
+    /// turns it off for the second.
+    ///
+    /// What is lost is only the body of a `404` for a path matching no template
+    /// at all. Every path that DOES match still answers through the gateway,
+    /// including the refusals for unknown methods and malformed ids.
+    #[must_use]
+    pub fn without_fallback(mut self) -> Self {
+        self.fallback = false;
+        self
+    }
+
+    /// Whether this surface's router answers unmatched paths.
+    #[must_use]
+    pub const fn serves_fallback(&self) -> bool {
+        self.fallback
     }
 }
 

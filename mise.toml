@@ -314,6 +314,7 @@ run = [
     "cargo run -p keylink --example reliable_call",
     "cargo run -p keylink --example durable_ledger",
     { task = "http-smoke" },
+    { task = "http-smoke-full" },
 ]
 
 # ── documentation ───────────────────────────────────────────────────────────
