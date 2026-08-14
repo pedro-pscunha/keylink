@@ -93,7 +93,7 @@ impl<C: Dial + Send + Sync> Peer<C> {
         // concurrent first-callers may both dial; one of them wins the slot and
         // the other's client is dropped. That is a wasted handshake, not a bug,
         // and it is much cheaper than holding a lock across a network dial.
-        if let Some(client) = self.slot().clone() {
+        if let Some(client) = self.slot() {
             return Ok(client);
         }
         let fresh = Arc::new(C::dial(&self.node, self.addr.clone()).await?);
