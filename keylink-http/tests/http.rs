@@ -214,9 +214,13 @@ async fn unknown_and_non_rpc_methods_bypass_access() {
     for (method, expected) in [
         ("Missing", (http::StatusCode::NOT_FOUND, "method_not_found")),
         ("Ignored", (http::StatusCode::NOT_FOUND, "method_not_found")),
+        // Longer than any served method name, so it names no method. It used
+        // to answer `400`, and the flip point between the two statuses was the
+        // exact length of the longest name — readable byte by byte, before
+        // authentication. Now indistinguishable from `Missing`.
         (
             "__Status",
-            (http::StatusCode::BAD_REQUEST, "invalid_request"),
+            (http::StatusCode::NOT_FOUND, "method_not_found"),
         ),
     ] {
         let response = client
@@ -377,15 +381,19 @@ async fn path_matrix_and_external_identity_are_exact() {
             "/rpc/Missing",
             (http::StatusCode::NOT_FOUND, "method_not_found"),
         ),
+        // Both are over the length cap, and a segment too long to be any
+        // method names no method. Answering `400` here made the cap itself
+        // readable: the status flipped at the exact length of the longest
+        // served name, and it flipped before the principal was looked at.
         (
             "over-cap wire rename",
             "/rpc/wire-name",
-            (http::StatusCode::BAD_REQUEST, "invalid_request"),
+            (http::StatusCode::NOT_FOUND, "method_not_found"),
         ),
         (
             "over-cap cfg-disabled method",
             "/rpc/Disabled",
-            (http::StatusCode::BAD_REQUEST, "invalid_request"),
+            (http::StatusCode::NOT_FOUND, "method_not_found"),
         ),
     ] {
         let response = client

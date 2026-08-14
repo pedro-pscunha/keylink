@@ -390,6 +390,16 @@ where
                         async move {
                             let surface = match addressed(&*mount, &request, route, &path) {
                                 Ok(surface) => surface,
+                                // Matched by variant, not swallowed. A wrong
+                                // verb cannot reach here today because the byte
+                                // routes register through a `MethodRouter` that
+                                // filters it first — but every other route in
+                                // this table registers through `any`, and an
+                                // `Err(_)` would turn that change into a silent
+                                // `404`.
+                                Err(GatewayError::MethodNotAllowed) => {
+                                    return GatewayError::MethodNotAllowed.response(None)
+                                }
                                 Err(_) => return GatewayError::BlobNotFound.response(None),
                             };
                             handle_blob_bytes(request, route, &path, limits, &tickets, &surface)
@@ -403,6 +413,9 @@ where
                         async move {
                             let surface = match addressed(&*mount, &request, head, &path) {
                                 Ok(surface) => surface,
+                                Err(GatewayError::MethodNotAllowed) => {
+                                    return GatewayError::MethodNotAllowed.response(None)
+                                }
                                 Err(_) => return GatewayError::BlobNotFound.response(None),
                             };
                             handle_blob_bytes(request, head, &path, limits, &tickets, &surface)
@@ -1062,6 +1075,20 @@ fn raw_segment<'a>(path: &'a str, template: &str, name: &str) -> Option<&'a str>
 /// Both surfaces have their own `METHODS`, and the actor one is a strict
 /// subset, so the bound on the method segment differs between them — which is
 /// the whole reason this takes a list rather than a type.
+///
+/// **A segment too long to be any method NAMES no method.** It used to answer
+/// `400 invalid_request`, and that was an oracle: the flip point between the
+/// two statuses is the exact byte length of the longest method name of that
+/// kind, readable one byte at a time by a caller who has not authenticated,
+/// because this runs before the principal lookup. Worse at the bound: a keyed
+/// service declaring no `recv` method sized the bound at ZERO, so EVERY well
+/// formed path on that route family answered `400` — which is both a lie about
+/// the request and a way to ask whether a service serves any method of a kind.
+/// A keyed inventory is a strict subset of a singleton one, so an empty
+/// kind-filtered inventory is ordinary rather than a misconfiguration.
+///
+/// `InvalidRequest` is kept for `InvalidEncoding` alone, which is a statement
+/// about the request's syntax and no statement at all about the inventory.
 fn decode_method_in(
     methods: &'static [keylink::ExternalMethod],
     path: &str,
@@ -1074,9 +1101,13 @@ fn decode_method_in(
         .filter(|method| method.kind() == kind)
         .map(|method| method.name().len())
         .max()
-        .unwrap_or(0);
-    crate::raw_path::parse(encoded, crate::raw_path::Shape::Segment { max_bytes })
-        .map_err(|_| GatewayError::InvalidRequest)
+        .ok_or(GatewayError::MethodNotFound)?;
+    crate::raw_path::parse(encoded, crate::raw_path::Shape::Segment { max_bytes }).map_err(
+        |error| match error {
+            crate::raw_path::ParseError::InvalidEncoding => GatewayError::InvalidRequest,
+            _ => GatewayError::MethodNotFound,
+        },
+    )
 }
 
 /// The `{actor}` segment of an actor-route path, decoded once.
@@ -2005,7 +2036,11 @@ mod tests {
             )
             .await;
 
-        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+        // `%61%61%61%61` decodes to `aaaa`, longer than any served method
+        // name. The refusal is `404` rather than `400` because a segment too
+        // long to be any method names no method — and a `400` here reported
+        // the length cap to a caller who had not authenticated.
+        assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
         assert_eq!(polls.load(Ordering::SeqCst), 0);
         assert_eq!(client.invoked.load(Ordering::SeqCst), 0);
     }

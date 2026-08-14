@@ -258,6 +258,15 @@ impl Running {
 /// `Whoami` returns the id the actor was mounted under, so the answer IS the
 /// address that was resolved. A gateway that dropped the actor and called the
 /// registry's first mount would answer with a name, and the wrong one.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK42`) by replacing
+/// `let actor = decode_actor(path, route_path)?;`
+/// with a constant `"one"`, which is the shape of a gateway that decodes the
+/// path and then ignores what it decoded. The `%2F` case answered `"one"`
+/// where this asserts `"obra/4471"`.
+///
+/// This is the flagship row of the keyed surface and it carried no measured
+/// red until a review asked for one. Its claim was asserted in prose.
 #[tokio::test]
 async fn a_keyed_call_reaches_the_actor_its_path_names() {
     let running = start().await;
@@ -623,5 +632,47 @@ async fn the_keyed_surface_exposes_no_lifecycle_or_discovery() {
     assert!(
         running.seen().is_empty(),
         "and no policy was asked about any of them"
+    );
+}
+
+/// An unknown method name says nothing about how long a real one is.
+///
+/// The method segment is bounded before it is decoded, and the bound is the
+/// longest served name of that kind. Refusing an over-long segment with a
+/// DIFFERENT status from an unknown short one made that length readable: walk
+/// the length up one byte at a time and the status flips at the answer. It
+/// runs before the principal is looked at, so no credential is needed to walk
+/// it.
+///
+/// Both answers are now the same `404`, byte for byte.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK41`) by replacing
+/// `            _ => GatewayError::MethodNotFound,`
+/// with `            _ => GatewayError::InvalidRequest,`. The over-long name
+/// answered `400` where this asserts `404`.
+#[tokio::test]
+async fn an_over_long_method_name_is_refused_like_an_unknown_one() {
+    let running = start().await;
+
+    let unknown = running.post("/v1/one/rpc/Nope", "{}").await;
+    let status = unknown.status();
+    let body = unknown.text().await.expect("a body");
+    assert_eq!(status, http::StatusCode::NOT_FOUND);
+
+    // Longer than `Whoami`, the longest `rpc` name this service serves.
+    for len in [7, 8, 64, 512] {
+        let name = "N".repeat(len);
+        let over = running.post(&format!("/v1/one/rpc/{name}"), "{}").await;
+        assert_eq!(over.status(), status, "a {len}-byte name");
+        assert_eq!(
+            over.text().await.expect("a body"),
+            body,
+            "a {len}-byte name answers what an unknown short one answers"
+        );
+    }
+
+    assert!(
+        running.seen().is_empty(),
+        "and none of them reached the policy"
     );
 }
