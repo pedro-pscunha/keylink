@@ -71,7 +71,10 @@ The repository gate runs `.mise/tasks/http-smoke` against this URL with `curl`.
 A route has the exact form `POST <prefix>/rpc/<DeclaredRustMethodName>`.
 The route has no trailing-slash alias.
 An unknown, disabled, non-RPC, or internal name within the generated method byte cap returns `method_not_found`.
-A malformed or over-cap encoded method segment returns `invalid_request` before authorization.
+A malformed encoded method segment returns `invalid_request` before
+authorization. An over-cap one returns `method_not_found`: a segment too long to
+be any method names no method, and answering `400` there reported the longest
+served name's length to a caller who had not authenticated.
 All other HTTP methods return `method_not_allowed` and `Allow: POST`.
 
 The request must contain exactly one valid JSON media type.
@@ -143,7 +146,9 @@ Backend work that already started can continue.
 The gateway does not promise rollback.
 An idempotent call can settle as `Interrupted`.
 
-This version does not expose `tell`, `send`, `recv`, blobs, feeds, actors, `__Status`, WebSockets, streaming HTTP, OpenAPI, or administration.
+This gateway does not expose `tell`, feeds, `__Status`, WebSockets, actor
+lifecycle, actor discovery, Keylink administration, or CORS. `send`, `recv`,
+blobs, keyed actors and OpenAPI all exist — see the route table above.
 
 ## Every surface at once
 

@@ -645,9 +645,10 @@ A client disconnect drops the gateway-owned Keylink call future. Work that
 already entered the backend can continue, and an idempotent call can settle as
 `Interrupted`. The gateway does not promise rollback.
 
-Version one does not expose `tell`, `send`, `recv`, `blob`, feeds, actors,
-`__Status`, WebSockets, streaming HTTP, OpenAPI, registry administration, or
-console methods.
+The gateway does not expose `tell`, feeds, `__Status`, WebSockets, actor
+lifecycle, actor discovery, Keylink administration, or CORS. `send`, `recv`,
+`blob`, keyed actors and OpenAPI generation all exist — the package README
+carries the route table.
 
 ## Try it
 

@@ -1461,3 +1461,42 @@ async fn a_keyed_client_that_hangs_up_drops_the_invocation() {
     assert!(*dropped_rx.borrow(), "the adapter released its future");
     served.abort();
 }
+
+/// A malformed segment answers the same way at every length.
+///
+/// The 400/404 split is the one status difference a caller can read, and it
+/// must depend on the REQUEST's syntax and never on the service's inventory.
+/// It used to depend on both: `raw_path::parse` applied an inventory-derived
+/// length gate before it looked at the encoding, so a run of `%` characters
+/// flipped from `400` to `404` at exactly three times the longest served
+/// method name — 15→16 for a five-byte name, measured, with no credential.
+///
+/// This probes the flip point rather than one length, because a single-length
+/// row cannot see a boundary move.
+///
+/// Watched red with `scripts/break-once.sh` (row `HK49`) by moving the gate
+/// back in front of the scan — replacing
+/// `    for (index, byte) in raw.bytes().enumerate() {`
+/// with `    for (index, byte) in raw.bytes().take(0).enumerate() {`, which
+/// disables the syntax pass. Terminated on `left: {400, 404}` against
+/// `right: {400}` — two statuses across the probe set, which is the flip point
+/// reappearing.
+#[tokio::test]
+async fn a_malformed_method_segment_answers_alike_at_every_length() {
+    let running = start().await;
+
+    // `Whoami` is the longest `rpc` name this service serves, at six bytes, so
+    // the old flip point was 18. Probing either side of it and well past.
+    let mut seen = std::collections::BTreeSet::new();
+    for len in [1, 5, 15, 16, 17, 18, 19, 20, 64, 256] {
+        let segment = "%".repeat(len);
+        let response = running.post(&format!("/v1/one/rpc/{segment}"), "{}").await;
+        seen.insert(response.status().as_u16());
+    }
+    assert_eq!(
+        seen,
+        std::collections::BTreeSet::from([400]),
+        "a malformed segment is malformed at every length; a second status here \
+         is the inventory leaking through the syntax error"
+    );
+}

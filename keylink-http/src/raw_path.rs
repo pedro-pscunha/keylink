@@ -31,6 +31,33 @@ pub(crate) fn parse(raw: &str, shape: Shape) -> Result<String, ParseError> {
         Shape::Segment { max_bytes } => max_bytes,
         Shape::BlobId => unreachable!(),
     };
+    // SYNTAX BEFORE SIZE, and the order is the whole point.
+    //
+    // The length gate below is derived from the caller's inventory, and
+    // `InvalidEncoding` is the one error a caller can tell apart from
+    // `MethodNotFound`. Applied first, the gate decided which of the two a
+    // MALFORMED segment got — so the status flipped at exactly three times the
+    // longest served method name, and an unauthenticated caller could read that
+    // length off by lengthening a run of `%` characters. Measured before this
+    // moved: 15→16 for a five-byte name, 27→28 for a nine-byte one, three
+    // families, three exact hits.
+    //
+    // A byte scan, no allocation, so "refuse before allocating" survives: the
+    // decode loop below still refuses an oversized segment before building the
+    // string, and this pass only looks.
+    for (index, byte) in raw.bytes().enumerate() {
+        if byte != b'%' {
+            continue;
+        }
+        let pair = raw
+            .as_bytes()
+            .get(index + 1..index + 3)
+            .ok_or(ParseError::InvalidEncoding)?;
+        if hex(pair[0]).is_none() || hex(pair[1]).is_none() {
+            return Err(ParseError::InvalidEncoding);
+        }
+    }
+
     let encoded_limit = decoded_limit
         .checked_mul(3)
         .ok_or(ParseError::EncodedTooLong)?;
@@ -97,8 +124,18 @@ mod tests {
             parse("%61%62%63", Shape::Segment { max_bytes: 3 }).as_deref(),
             Ok("abc")
         );
+        // BOTH malformed and over-long, and syntax is what answers. It used to
+        // answer `EncodedTooLong`, which made the reported error depend on a
+        // bound derived from the caller's inventory — and that bound is exactly
+        // what the 400/404 split then leaked. Syntax is a fact about the
+        // request; length is a fact about the service.
         assert_eq!(
             parse("%61%62%63%", Shape::Segment { max_bytes: 3 }),
+            Err(ParseError::InvalidEncoding)
+        );
+        // Over-long and WELL FORMED still reports length.
+        assert_eq!(
+            parse("%61%62%63%64", Shape::Segment { max_bytes: 3 }),
             Err(ParseError::EncodedTooLong)
         );
 
@@ -123,9 +160,20 @@ mod tests {
             .as_deref(),
             Ok("a".repeat(keylink::MAX_KEY_LEN).as_str())
         );
+        // Same inversion as above: a trailing `%` is malformed at any length, so
+        // syntax answers rather than the id cap.
         assert_eq!(
             parse(
-                &(actor_at + "%"),
+                &(actor_at.clone() + "%"),
+                Shape::Segment {
+                    max_bytes: keylink::MAX_KEY_LEN
+                }
+            ),
+            Err(ParseError::InvalidEncoding)
+        );
+        assert_eq!(
+            parse(
+                &(actor_at + "%61"),
                 Shape::Segment {
                     max_bytes: keylink::MAX_KEY_LEN
                 }

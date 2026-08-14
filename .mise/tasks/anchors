@@ -2241,6 +2241,8 @@ ANCHORS = [
      "        \"contentMediaType\": \"application/octet-stream\","),
     ("HL4", "keylink-openapi/tests/openapi.rs", "keylink-openapi/src/lib.rs",
      "        Some(_) => Err(DocumentError::ComponentCollision {"),
+    ("HK49", "keylink-http/tests/actors.rs", "keylink-http/src/raw_path.rs",
+     "    for (index, byte) in raw.bytes().enumerate() {"),
     ("HK48", "keylink-http/tests/actors.rs", "keylink-http/src/gateway.rs",
      "                actor: self.actor.as_ref(),"),
     ("HK45", "keylink-http/tests/api.rs", "keylink-http/src/gateway.rs",
@@ -4000,7 +4002,7 @@ for record in sorted(set(REDNESS) - row_ids):
 # were complete.
 # The consecutive-cancellation ticket guard then failed at `254 comment blocks
 # mention break-once.sh, but RECORD_BLOCKS says 253`.
-RECORD_BLOCKS = 332
+RECORD_BLOCKS = 333
 
 # The one marker the tripwire counts, and the phrasings records use INSTEAD of
 # naming the harness. All are read by the same walk, so the blind spot below is a

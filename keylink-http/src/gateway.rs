@@ -1191,6 +1191,13 @@ fn raw_segment<'a>(path: &'a str, template: &str, name: &str) -> Option<&'a str>
 ///
 /// `InvalidRequest` is kept for `InvalidEncoding` alone, which is a statement
 /// about the request's syntax and no statement at all about the inventory.
+///
+/// That sentence was FALSE for one commit, and the way it was false is worth
+/// keeping. `raw_path::parse` applied its inventory-derived length gate before
+/// it looked at the encoding, so a malformed segment's status still depended on
+/// the longest served name — the flip point was exactly three times it, and an
+/// unauthenticated caller could walk it with a run of `%` characters. The scan
+/// moved ahead of the gate; the sentence is true now.
 fn decode_method_in(
     methods: &'static [keylink::ExternalMethod],
     path: &str,
